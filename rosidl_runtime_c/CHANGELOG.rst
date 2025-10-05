@@ -2,6 +2,11 @@
 Changelog for package rosidl_runtime_c
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
+Forthcoming
+-----------
+* Fix copy/paste errors in type support docs (`#906 <https://github.com/ros2/rosidl/issues/906>`_)
+* Contributors: Christophe Bedard
+
 5.0.1 (2025-07-29)
 ------------------
 
