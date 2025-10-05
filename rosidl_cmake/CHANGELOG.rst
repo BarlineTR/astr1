@@ -2,8 +2,8 @@
 Changelog for package rosidl_cmake
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
-Forthcoming
------------
+5.1.0 (2025-10-05)
+------------------
 * Export typing Information (`#903 <https://github.com/ros2/rosidl/issues/903>`_)
 * remove deprecated rosidl_target_interfaces. (`#898 <https://github.com/ros2/rosidl/issues/898>`_)
 * Contributors: Michael Carlstrom, Tomoya Fujita

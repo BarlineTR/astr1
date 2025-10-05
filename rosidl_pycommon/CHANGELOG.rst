@@ -2,8 +2,8 @@
 Changelog for package rosidl_pycommon
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
-Forthcoming
------------
+5.1.0 (2025-10-05)
+------------------
 * Export typing Information (`#903 <https://github.com/ros2/rosidl/issues/903>`_)
 * Provide base classes in `rosidl_pycommon` (`#887 <https://github.com/ros2/rosidl/issues/887>`_)
 * Contributors: Michael Carlstrom

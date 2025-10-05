@@ -2,8 +2,8 @@
 Changelog for package rosidl_parser
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
-Forthcoming
------------
+5.1.0 (2025-10-05)
+------------------
 * Add Optional Parsing (`#883 <https://github.com/ros2/rosidl/issues/883>`_)
 * Contributors: Michael Carlstrom
 

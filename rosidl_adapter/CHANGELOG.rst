@@ -2,8 +2,8 @@
 Changelog for package rosidl_adapter
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
-Forthcoming
------------
+5.1.0 (2025-10-05)
+------------------
 * Fix @optional for string literals (`#905 <https://github.com/ros2/rosidl/issues/905>`_)
 * Export typing Information (`#903 <https://github.com/ros2/rosidl/issues/903>`_)
 * Add Optional Parsing (`#883 <https://github.com/ros2/rosidl/issues/883>`_)
