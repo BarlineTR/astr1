@@ -13,6 +13,9 @@
 // limitations under the License.
 
 #include "rosidl_buffer/c_helpers.h"
+
+#include <cstdint>
+
 #include "rosidl_buffer/buffer.hpp"
 
 extern "C" {
