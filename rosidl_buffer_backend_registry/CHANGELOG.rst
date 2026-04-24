@@ -2,6 +2,9 @@
 Changelog for package rosidl_buffer_backend_registry
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
+Forthcoming
+-----------
+
 5.1.5 (2026-04-24)
 ------------------
 * Add missing ament_cmake_gtest dep (`#960 <https://github.com/ros2/rosidl/issues/960>`_)

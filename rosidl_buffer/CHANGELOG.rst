@@ -2,6 +2,11 @@
 Changelog for package rosidl_buffer
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
+Forthcoming
+-----------
+* Add missing std::vector compatible APIs to rosidl::Buffer (`#959 <https://github.com/ros2/rosidl/issues/959>`_)
+* Contributors: CY Chen
+
 5.1.5 (2026-04-24)
 ------------------
 

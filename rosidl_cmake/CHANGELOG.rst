@@ -2,6 +2,9 @@
 Changelog for package rosidl_cmake
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
+Forthcoming
+-----------
+
 5.1.5 (2026-04-24)
 ------------------
 * Install interface files to same folder as idl (`#935 <https://github.com/ros2/rosidl/issues/935>`_)
