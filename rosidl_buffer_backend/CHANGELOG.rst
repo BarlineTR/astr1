@@ -2,6 +2,9 @@
 Changelog for package rosidl_buffer_backend
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
+Forthcoming
+-----------
+
 5.3.0 (2026-05-06)
 ------------------
 
