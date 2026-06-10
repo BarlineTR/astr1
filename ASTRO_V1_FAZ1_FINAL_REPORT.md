@@ -614,21 +614,9 @@ source install/setup.bash
 
 | Rol | İsim | Sorumluluk | İletişim |
 |-----|------|------------|----------|
-| **Yazılım Mühendisi / Lead Developer** | Barline | Firmware + ROS 2 + Test | barline@astro.dev |
-| **Proje Yöneticisi** | BARAN EREN | Proje koordinasyonu ve dokümantasyon | baran@example.com |
-
-### 9.2 Onay Geçmişi
-
-| Tarih | Aşama | Onaylayan | Durum | Notlar |
-|-------|-------|-----------|-------|--------|
-| 2026-06-10 19:24 | Kod Geliştirme (AŞAMA 1) | Barline | ✅ Onaylandı | İlk uygulama tamamlandı |
-| 2026-06-10 19:28 | Kod İnceleme (AŞAMA 2) | Barline | ⚠️ Düzeltme Gerekli | 20 sorun tespit edildi |
-| 2026-06-10 19:31 | Test Analizi (AŞAMA 3) | Barline | ✅ Onaylandı | 8 test senaryosu hazırlandı |
-| 2026-06-10 19:45 | Düzeltmeler Uygulandı | Barline | ✅ Tamamlandı | 5 kritik + 5 orta düzeltme |
-| 2026-06-10 19:50 | Final İnceleme | Barline & BARAN EREN | ✅ Onaylandı | Üretim hazır |
-| 2026-06-10 20:15 | Final Rapor | BARAN EREN | ✅ Tamamlandı | Bu dosya |
-
----
+| **Yazılım Mühendisi / Lead Developer** | Barline | Firmware + ROS 2 + Test
+| **Proje Yöneticisi** | BARAN EREN | Proje koordinasyonu ve dokümantasyon
+|
 
 ## 10. Sonuç ve Öneriler
 
@@ -742,13 +730,13 @@ ros2 topic pub -1 /head_cmd astro_base/msg/HeadCmd "{angle_deg: -90.0}"
 **Hazırlayan:**  
 BARAN EREN  
 Proje Yöneticisi  
-Tarih: 10 Haziran 2026  
+Tarih: 12 Haziran 2026  
 İmza: _____________________
 
 **Lead Developer:**  
 Barline  
 Yazılım Mühendisi  
-Tarih: 10 Haziran 2026  
+Tarih: 12 Haziran 2026  
 İmza: _____________________
 
 **Proje Durumu:** ✅ **FAZ 1 TAMAMLANDI - ÜRETİM HAZIR**
