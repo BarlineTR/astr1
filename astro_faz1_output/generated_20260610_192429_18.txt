@@ -1,0 +1,47 @@
+from launch import LaunchDescription
+from launch.actions import DeclareLaunchArgument
+from launch.substitutions import LaunchConfiguration, Command
+from launch_ros.actions import Node
+import os
+
+def generate_launch_description():
+    port_arg = DeclareLaunchArgument('port', default_value='/dev/ttyACM0')
+    baud_arg = DeclareLaunchArgument('baud', default_value='500000')
+
+    urdf = Command(['xacro ', 
+                    os.path.join(
+                        os.getenv('AMENT_PREFIX_PATH').split(':')[0],
+                        'share', 'astro_description', 'urdf', 'astro.urdf.xacro')])
+
+    rsp = Node(
+        package='robot_state_publisher',
+        executable='robot_state_publisher',
+        name='robot_state_publisher',
+        output='screen',
+        parameters=[{'robot_description': urdf}]
+    )
+
+    js = Node(
+        package='joint_state_publisher',
+        executable='joint_state_publisher',
+        name='joint_state_publisher',
+        output='screen'
+    )
+
+    serial = Node(
+        package='astro_base',
+        executable='serial_bridge',
+        name='serial_bridge',
+        output='screen',
+        parameters=[{
+            'port': LaunchConfiguration('port'),
+            'baud': LaunchConfiguration('baud'),
+            'frame_id_imu': 'imu_link',
+            'ticks_per_rev_left': 2048.0,
+            'ticks_per_rev_right': 2048.0,
+            'wheel_radius_left': 0.06,
+            'wheel_radius_right': 0.06
+        }]
+    )
+
+    return LaunchDescription([port_arg, baud_arg, rsp, js, serial])

@@ -1,0 +1,28 @@
+cmake_minimum_required(VERSION 3.10)
+project(astro_base)
+
+find_package(ament_cmake REQUIRED)
+find_package(ament_cmake_python REQUIRED)
+find_package(rosidl_default_generators REQUIRED)
+
+# Mesajlar
+set(MSG_FILES
+  "msg/WheelCmd.msg"
+  "msg/HeadCmd.msg"
+)
+rosidl_generate_interfaces(${PROJECT_NAME}
+  ${MSG_FILES}
+  DEPENDENCIES builtin_interfaces
+)
+
+# Python paketini kur
+ament_python_install_package(${PROJECT_NAME})
+
+# Python node kurulumu
+install(PROGRAMS
+  src/serial_bridge.py
+  DESTINATION lib/${PROJECT_NAME}
+)
+
+ament_export_dependencies(rosidl_default_runtime)
+ament_package()
