@@ -1,0 +1,82 @@
+// File: rosidl_buffer_backend/firmware/arduino/include/protocol.h
+// Amaç: Seri protokol tanımı, CRC16-CCITT hesaplama ve paketleme yardımcıları.
+// Notlar:
+// - Struct packing düzeltildi: <HhI> sıralaması (uint16_t, int16_t, uint32_t), 1 byte hizalama.
+// - CRC parser temizlendi: Gereksiz satırlar ve dallanmalar kaldırıldı, tek fonksiyon ile hesaplanıyor.
+// - Senkron kelimesi ve uzunluk alanı ile sağlam çerçeveleme.
+// - CRC, yalnızca payload (HhI) üstünden hesaplanır (binascii.crc_hqx ile uyumlu).
+
+#ifndef ROSIDL_BUFFER_BACKEND_PROTOCOL_H_
+#define ROSIDL_BUFFER_BACKEND_PROTOCOL_H_
+
+#include <stdint.h>
+#include <stddef.h>
+
+#ifdef __AVR__
+#include <avr/pgmspace.h>
+#endif
+
+// Çerçeve senkron kelimesi (LSB-first ile uyumlu)
+static const uint16_t PROTO_SYNC = 0x5AA5;
+
+// Payload formatı: HhI => uint16_t msg_id; int16_t value; uint32_t micros;
+// Küçük uçlu (little-endian) AVR ile uyumlu olacak şekilde paketlenir.
+#pragma pack(push, 1)
+typedef struct {
+  uint16_t msg_id;   // 'H'
+  int16_t value;     // 'h'
+  uint32_t micros;   // 'I' (cihaz zamanı, Arduino micros())
+} proto_payload_t;
+#pragma pack(pop)
+
+_Static_assert(sizeof(proto_payload_t) == 8, "proto_payload_t must be 8 bytes");
+
+// Çerçeve yapısı (kablo üstündeki sıralama):
+// [sync:2][len:2][payload:len bytes][crc:2]
+// crc = CRC-16/CCITT-FALSE (poly=0x1021, init=0xFFFF, final xor=0x0000) yalnızca payload üstünden.
+#pragma pack(push, 1)
+typedef struct {
+  uint16_t sync;
+  uint16_t len;
+  proto_payload_t payload;
+  uint16_t crc;
+} proto_frame_t;
+#pragma pack(pop)
+
+_Static_assert(sizeof(proto_frame_t) == 2 + 2 + 8 + 2, "proto_frame_t layout invalid");
+
+// CRC-16/CCITT-FALSE (0x1021, init=0xFFFF) hesaplayıcı.
+// Bit yansıma yok, final XOR yok. Python tarafında binascii.crc_hqx ile eşleşir.
+static inline uint16_t crc16_ccitt(const uint8_t* data, size_t len) {
+  uint16_t crc = 0xFFFF;
+  for (size_t i = 0; i < len; ++i) {
+    crc ^= (uint16_t)data[i] << 8;
+    for (uint8_t b = 0; b < 8; ++b) {
+      if (crc & 0x8000) {
+        crc = (crc << 1) ^ 0x1021;
+      } else {
+        crc = (crc << 1);
+      }
+    }
+  }
+  return crc;
+}
+
+// Çerçeveyi hazırla: payload doldurulmuş olmalı.
+static inline void proto_build_frame(proto_frame_t* f) {
+  f->sync = PROTO_SYNC;
+  f->len = sizeof(proto_payload_t);
+  const uint8_t* p = (const uint8_t*)&f->payload;
+  f->crc = crc16_ccitt(p, sizeof(proto_payload_t));
+}
+
+// Çerçeveyi doğrula: senkron, uzunluk ve CRC kontrolü.
+static inline int proto_validate_frame(const proto_frame_t* f) {
+  if (f->sync != PROTO_SYNC) return 0;
+  if (f->len != sizeof(proto_payload_t)) return 0;
+  const uint8_t* p = (const uint8_t*)&f->payload;
+  const uint16_t c = crc16_ccitt(p, sizeof(proto_payload_t));
+  return (c == f->crc);
+}
+
+#endif  // ROSIDL_BUFFER_BACKEND_PROTOCOL_H_

@@ -1,0 +1,143 @@
+# File: rosidl_buffer_backend/rosidl_buffer_backend/serial_bridge.py
+# Amaç: FAZ 1 düzeltmeleri:
+#  - Bulk read (in_waiting) ile seri okuma artırıldı.
+#  - Zaman senkronizasyonu: cihaz micros() -> ROS zaman offset hesaplandı.
+#  - Struct packing: <HhI formatı ile decode.
+#  - CRC doğrulama: binascii.crc_hqx (CRC-16/CCITT-FALSE) ile uyuşum.
+#  - QoS: Sensor verileri için BEST_EFFORT (qos_profile_sensor_data) kullanıldı.
+
+import binascii
+import struct
+import serial
+import rclpy
+from rclpy.node import Node
+from rclpy.qos import qos_profile_sensor_data, QoSProfile, QoSReliabilityPolicy
+from std_msgs.msg import Int16, Int64
+
+SYNC = 0x5AA5
+PAYLOAD_FMT = '<HhI'  # HhI: uint16_t, int16_t, uint32_t (little-endian)
+PAYLOAD_SIZE = struct.calcsize(PAYLOAD_FMT)
+FRAME_HDR_FMT = '<HH'  # sync(uint16), len(uint16)
+FRAME_CRC_FMT = '<H'
+FRAME_SIZE = struct.calcsize(FRAME_HDR_FMT) + PAYLOAD_SIZE + struct.calcsize(FRAME_CRC_FMT)
+
+class SerialBridge(Node):
+    def __init__(self, port: str, baud: int = 115200):
+        super().__init__('rosidl_buffer_serial_bridge')
+
+        # QoS: sensör verisi BEST_EFFORT
+        self.pub_encoder = self.create_publisher(Int16, 'encoder/value', qos_profile_sensor_data)
+        # Zaman ofsetini ns cinsinden yayınlayalım (tanılama)
+        qos_diag = QoSProfile(depth=10, reliability=QoSReliabilityPolicy.BEST_EFFORT)
+        self.pub_time_offset_ns = self.create_publisher(Int64, 'device_time_offset_ns', qos_diag)
+
+        self.ser = serial.Serial(port, baudrate=baud, timeout=0.001)
+        self.buffer = bytearray()
+
+        # Cihaz->ROS zaman ofseti (ns): ros_now_ns - device_micros*1e3
+        self.time_offset_ns = None
+        # Basit düşük geçiren filtre için alfa
+        self.offset_alpha = 0.1
+
+        # Okuma timer'ı
+        self.timer = self.create_timer(0.001, self.read_and_parse)  # 1 kHz okuma denemesi
+
+        self.get_logger().info(f'Opened serial {port} @ {baud} baud')
+
+    def read_and_parse(self):
+        try:
+            # Bulk read: in_waiting kadar oku
+            waiting = self.ser.in_waiting
+            if waiting > 0:
+                chunk = self.ser.read(waiting)
+                if chunk:
+                    self.buffer.extend(chunk)
+
+            # Çerçeve ayrıştırma
+            while True:
+                if len(self.buffer) < FRAME_SIZE:
+                    break
+
+                # Senkron kelimesini ara
+                # Sync iki byte olduğundan, hızlı arama için memoryview kullanabiliriz
+                sync_found = False
+                for i in range(0, len(self.buffer) - 1):
+                    sync = struct.unpack_from('<H', self.buffer, i)[0]
+                    if sync == SYNC:
+                        # Potansiyel çerçeve başlangıcı
+                        if len(self.buffer) - i < FRAME_SIZE:
+                            # Tam çerçeve gelmemiş, daha fazla veri bekle
+                            # Baştaki gereksiz veriyi at
+                            if i > 0:
+                                del self.buffer[:i]
+                            sync_found = True
+                            break
+                        # Aday çerçeveyi çöz
+                        hdr_sync, payload_len = struct.unpack_from(FRAME_HDR_FMT, self.buffer, i)
+                        if payload_len != PAYLOAD_SIZE:
+                            # Senkro yanıltıcı, pencereyi bir byte kaydır
+                            continue
+                        payload_off = i + struct.calcsize(FRAME_HDR_FMT)
+                        payload = self.buffer[payload_off:payload_off + PAYLOAD_SIZE]
+                        crc_recv = struct.unpack_from(FRAME_CRC_FMT, self.buffer, payload_off + PAYLOAD_SIZE)[0]
+                        crc_calc = binascii.crc_hqx(payload, 0xFFFF)
+                        if crc_calc != crc_recv:
+                            # CRC eşleşmiyor; bir byte kaydırarak tekrar dene
+                            continue
+
+                        # Geçerli çerçeve
+                        msg_id, value, device_micros = struct.unpack(PAYLOAD_FMT, payload)
+
+                        # Zaman ofseti hesapla: ros_now_ns - device_ns
+                        ros_now_ns = self.get_clock().now().nanoseconds
+                        device_ns = int(device_micros) * 1000
+                        offset = ros_now_ns - device_ns
+                        if self.time_offset_ns is None:
+                            self.time_offset_ns = offset
+                        else:
+                            # Düşük geçiren filtre
+                            self.time_offset_ns = int((1.0 - self.offset_alpha) * self.time_offset_ns +
+                                                      self.offset_alpha * offset)
+
+                        # Yayınla: encoder value (BEST_EFFORT)
+                        m = Int16()
+                        m.data = int(value)
+                        self.pub_encoder.publish(m)
+
+                        # Yayınla: zaman ofseti (tanılama)
+                        mo = Int64()
+                        mo.data = int(self.time_offset_ns)
+                        self.pub_time_offset_ns.publish(mo)
+
+                        # Tüketilen baytları tam kare kadar sil
+                        del self.buffer[:(i + FRAME_SIZE)]
+                        sync_found = True
+                        break
+
+                if not sync_found:
+                    # Sync bulunamadı, buffer'ı sınırlı temizle (çok büyümesini engelle)
+                    if len(self.buffer) > 4 * FRAME_SIZE:
+                        del self.buffer[:len(self.buffer) - 2 * FRAME_SIZE]
+                    break
+
+        except Exception as e:
+            self.get_logger().warn(f'serial read/parse error: {e}')
+
+def main():
+    rclpy.init()
+    # Port çevre değişkeninden veya default'tan gelebilir
+    import os
+    port = os.environ.get('ROSIDL_BUFFER_SERIAL_PORT', '/dev/ttyACM0')
+    baud = int(os.environ.get('ROSIDL_BUFFER_SERIAL_BAUD', '115200'))
+
+    node = SerialBridge(port, baud)
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
+
+if __name__ == '__main__':
+    main()
