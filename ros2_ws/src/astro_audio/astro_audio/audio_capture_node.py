@@ -86,18 +86,37 @@ class AudioCaptureNode(Node):
 
         if sd is not None and self.device_index is not None:
             try:
+                # ALSA Broken pipe (error -32) genellikle blocksize veya kanal uyumsuzluğundan kaynaklanır.
+                # blocksize=None ve channels=None yaparak ALSA'nın optimum değerleri seçmesine izin veriyoruz.
                 self.stream = sd.InputStream(
                     device=self.device_index,
-                    channels=self.channels,
+                    channels=None, # Cihazın desteklediği varsayılan kanal sayısını kullan
                     samplerate=self.sample_rate,
-                    blocksize=self.chunk_size,
+                    blocksize=None, # Optimum buffer boyutu
                     dtype="int16",
+                    latency="high", # Underrun (broken pipe) hatalarını önlemek için yüksek gecikme
                     callback=self._audio_callback,
                 )
                 self.stream.start()
                 self.get_logger().info("Audio capture başarıyla başlatıldı.")
             except Exception as exc:
-                self.get_logger().error(f"Stream hatası: {exc}")
+                self.get_logger().error(f"Stream hatası (channels=None): {exc}")
+                # Hata durumunda 1 kanallı (sadece işlenmiş mikrofon) açmayı dene
+                try:
+                    self.get_logger().info("Alternatif olarak 1 kanallı (mono) açılmaya çalışılıyor...")
+                    self.stream = sd.InputStream(
+                        device=self.device_index,
+                        channels=1,
+                        samplerate=self.sample_rate,
+                        blocksize=self.chunk_size,
+                        dtype="int16",
+                        latency="high",
+                        callback=self._audio_callback,
+                    )
+                    self.stream.start()
+                    self.get_logger().info("Audio capture (Mono) başarıyla başlatıldı.")
+                except Exception as exc2:
+                    self.get_logger().error(f"Mono stream de açılamadı: {exc2}")
 
         self.create_timer(0.02, self._publish_pending)
         self.create_timer(0.05, self._publish_hid)
