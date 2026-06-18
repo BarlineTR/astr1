@@ -64,12 +64,12 @@ inline void setMotorPWM(int pwm_fwd_pin, int pwm_rev_pin, int val) {
 inline void setLeftPWM(int v) { setMotorPWM(L_MOTOR_PWM_FWD, L_MOTOR_PWM_REV, v); }
 inline void setRightPWM(int v){ setMotorPWM(R_MOTOR_PWM_FWD, R_MOTOR_PWM_REV, v); }
 
-void IRAM_ATTR leftEncA() {
+void leftEncA() {
   // Quadrature yön tespiti
   bool b = digitalRead(L_ENC_B);
   g_left_ticks += b ? -1 : +1;
 }
-void IRAM_ATTR rightEncA() {
+void rightEncA() {
   bool b = digitalRead(R_ENC_B);
   g_right_ticks += b ? -1 : +1;
 }
