@@ -77,12 +77,13 @@ class AudioCaptureNode(Node):
         self.declare_parameter("device_name", "ReSpeaker")
         self.declare_parameter("device_index", -1)
         self.declare_parameter("sample_rate", 16000)
-        self.declare_parameter("channels", 6)
+        self.declare_parameter("channels", 1)
         self.declare_parameter("chunk_size", 1024)
         self.declare_parameter("vad_threshold", 0.6)
 
         self.device_name = self.get_parameter("device_name").value
-        self.device_index_param = int(self.get_parameter("device_index").value)
+        # self.device_index_param = int(self.get_parameter("device_index").value) # Bunu yorum satırı yap
+        self.device_index_param = 25 # Pulse üzerinden git
         self.sample_rate = int(self.get_parameter("sample_rate").value)
         self.requested_channels = int(self.get_parameter("channels").value)
         self.chunk_size = int(self.get_parameter("chunk_size").value)
