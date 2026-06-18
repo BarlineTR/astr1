@@ -177,13 +177,16 @@ class AudioCaptureNode(Node):
 
         with self._audio_lock:
             self._pending = (mono.tolist(), vad_active)
+            self.get_logger().info("SES VERISI ALINDI")
 
     def _publish_pending(self):
         with self._audio_lock:
             pending = self._pending
-            self._pending = None
+            # self._pending = None
 
         if pending is None:
+            # Buraya bir log ekleyelim ki çalışıp çalışmadığını görelim
+            self.get_logger().info("Bekleyen ses verisi yok!")
             return
 
         mono, vad_active = pending
