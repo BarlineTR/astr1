@@ -3,10 +3,11 @@ import json
 
 import cv2
 import rclpy
-from cv_bridge import CvBridge
 from rclpy.node import Node
 from sensor_msgs.msg import Image
 from std_msgs.msg import Bool, String
+
+from astro_vision.image_utils import bgr_to_imgmsg, imgmsg_to_bgr
 
 
 class FaceDetectorNode(Node):
@@ -27,7 +28,6 @@ class FaceDetectorNode(Node):
         if self.face_cascade.empty():
             self.get_logger().error(f"Failed to load cascade: {cascade_path}")
 
-        self.bridge = CvBridge()
         self.pub_faces = self.create_publisher(String, "/vision/faces", 10)
         self.pub_person = self.create_publisher(Bool, "/vision/person_detected", 10)
         self.pub_image = self.create_publisher(Image, "/vision/face_image", 10)
@@ -39,7 +39,7 @@ class FaceDetectorNode(Node):
 
     def image_callback(self, msg: Image):
         try:
-            frame = self.bridge.imgmsg_to_cv2(msg, desired_encoding="bgr8")
+            frame = imgmsg_to_bgr(msg)
         except Exception as e:
             self.get_logger().warn(f"Image conversion failed: {e}")
             return
@@ -73,12 +73,8 @@ class FaceDetectorNode(Node):
         person_msg.data = len(face_list) > 0
         self.pub_person.publish(person_msg)
 
-        try:
-            out_image = self.bridge.cv2_to_imgmsg(frame, encoding="bgr8")
-            out_image.header = msg.header
-            self.pub_image.publish(out_image)
-        except Exception as e:
-            self.get_logger().debug(f"Output image publish failed: {e}")
+        out_image = bgr_to_imgmsg(frame, msg.header)
+        self.pub_image.publish(out_image)
 
 
 def main():
@@ -88,8 +84,10 @@ def main():
         rclpy.spin(node)
     except KeyboardInterrupt:
         pass
-    node.destroy_node()
-    rclpy.shutdown()
+    finally:
+        node.destroy_node()
+        if rclpy.ok():
+            rclpy.shutdown()
 
 
 if __name__ == "__main__":

@@ -21,11 +21,11 @@ class SpeechRecognitionNode(Node):
         self.declare_parameter("model_path", "/opt/vosk/vosk-model-small-tr-0.3")
         self.declare_parameter("language", "tr")
         self.declare_parameter("partial_results", True)
-        self.declare_parameter("silence_chunks", 8)
+        self.declare_parameter("silence_timeout_s", 0.5)
 
         model_path = self.get_parameter("model_path").value
         self.partial_results = self.get_parameter("partial_results").value
-        self.silence_chunks = int(self.get_parameter("silence_chunks").value)
+        self.silence_timeout_s = float(self.get_parameter("silence_timeout_s").value)
 
         self.pub_text = self.create_publisher(String, "/speech/text", 10)
         self.sub = self.create_subscription(
@@ -34,7 +34,6 @@ class SpeechRecognitionNode(Node):
 
         self.buffer = []
         self.last_audio_time = None
-        self.silence_timeout_s = 0.5
         self.lock = threading.Lock()
 
         if Model is None:
@@ -53,6 +52,8 @@ class SpeechRecognitionNode(Node):
         except Exception as e:
             self.get_logger().error(f"Failed to load Vosk model: {e}")
             self.recognizer = None
+
+        self.create_timer(0.1, self._silence_tick)
 
     def audio_callback(self, msg: Int16MultiArray):
         if self.recognizer is None:
@@ -101,20 +102,18 @@ class SpeechRecognitionNode(Node):
                 return
         self._process_buffer()
 
-    def start_silence_timer(self):
-        self.create_timer(0.1, self._silence_tick)
-
 
 def main():
     rclpy.init()
     node = SpeechRecognitionNode()
-    node.start_silence_timer()
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
         pass
-    node.destroy_node()
-    rclpy.shutdown()
+    finally:
+        node.destroy_node()
+        if rclpy.ok():
+            rclpy.shutdown()
 
 
 if __name__ == "__main__":

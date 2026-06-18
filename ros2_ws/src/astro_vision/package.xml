@@ -12,7 +12,6 @@
   <depend>rclpy</depend>
   <depend>sensor_msgs</depend>
   <depend>std_msgs</depend>
-  <depend>cv_bridge</depend>
 
   <exec_depend>depthai_ros_driver</exec_depend>
 

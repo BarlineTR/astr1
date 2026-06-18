@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import struct
+import threading
 
 import numpy as np
 import rclpy
@@ -74,14 +75,16 @@ class AudioCaptureNode(Node):
     def __init__(self):
         super().__init__("audio_capture_node")
         self.declare_parameter("device_name", "ReSpeaker")
+        self.declare_parameter("device_index", -1)
         self.declare_parameter("sample_rate", 16000)
         self.declare_parameter("channels", 6)
         self.declare_parameter("chunk_size", 1024)
         self.declare_parameter("vad_threshold", 0.6)
 
         self.device_name = self.get_parameter("device_name").value
+        self.device_index_param = int(self.get_parameter("device_index").value)
         self.sample_rate = int(self.get_parameter("sample_rate").value)
-        self.channels = int(self.get_parameter("channels").value)
+        self.requested_channels = int(self.get_parameter("channels").value)
         self.chunk_size = int(self.get_parameter("chunk_size").value)
         self.vad_threshold = float(self.get_parameter("vad_threshold").value)
 
@@ -98,58 +101,95 @@ class AudioCaptureNode(Node):
                 "ReSpeaker HID not found — using energy-based VAD fallback"
             )
 
-        self.device_index = self._find_device()
+        self._audio_lock = threading.Lock()
+        self._pending = None
+        self.stream = None
+
         if sd is None:
-            self.get_logger().error("sounddevice not installed")
+            self.get_logger().error("sounddevice not installed — audio disabled")
             return
 
-        self.stream = sd.InputStream(
-            device=self.device_index,
-            channels=self.channels,
-            samplerate=self.sample_rate,
-            blocksize=self.chunk_size,
-            dtype="int16",
-            callback=self._audio_callback,
-        )
-        self.stream.start()
-        self.get_logger().info(
-            f"Audio capture started (device={self.device_index}, "
-            f"{self.sample_rate} Hz, {self.channels} ch)"
-        )
+        device_index, self.channels = self._resolve_device()
+        try:
+            self.stream = sd.InputStream(
+                device=device_index,
+                channels=self.channels,
+                samplerate=self.sample_rate,
+                blocksize=self.chunk_size,
+                dtype="int16",
+                callback=self._audio_callback,
+            )
+            self.stream.start()
+            self.get_logger().info(
+                f"Audio capture started (device={device_index}, "
+                f"{self.sample_rate} Hz, {self.channels} ch)"
+            )
+        except Exception as exc:
+            self.get_logger().error(f"Failed to start audio stream: {exc}")
 
-        self.hid_timer = self.create_timer(0.05, self._publish_hid)
+        self.create_timer(0.02, self._publish_pending)
+        self.create_timer(0.05, self._publish_hid)
 
-    def _find_device(self):
+    def _resolve_device(self):
         if sd is None:
-            return None
-        devices = sd.query_devices()
-        for i, dev in enumerate(devices):
+            return None, 1
+
+        if self.device_index_param >= 0:
+            dev = sd.query_devices(self.device_index_param)
+            channels = min(self.requested_channels, dev["max_input_channels"])
+            return self.device_index_param, max(1, channels)
+
+        for i, dev in enumerate(sd.query_devices()):
+            if dev["max_input_channels"] < 1:
+                continue
             if self.device_name.lower() in dev["name"].lower():
-                return i
+                channels = min(self.requested_channels, dev["max_input_channels"])
+                return i, max(1, channels)
+
+        default_in = sd.default.device[0]
+        dev = sd.query_devices(default_in)
+        channels = min(self.requested_channels, dev["max_input_channels"])
         self.get_logger().warn(
-            f"Device '{self.device_name}' not found, using default input"
+            f"Device '{self.device_name}' not found, using default input "
+            f"({dev['name']}, {channels} ch)"
         )
-        return None
+        return default_in, max(1, channels)
 
     def _energy_vad(self, mono: np.ndarray) -> bool:
-        rms = np.sqrt(np.mean(mono.astype(np.float32) ** 2))
-        normalized = rms / 32768.0
-        return normalized > self.vad_threshold
+        rms = float(np.sqrt(np.mean(mono.astype(np.float32) ** 2)))
+        return (rms / 32768.0) > self.vad_threshold
 
     def _audio_callback(self, indata, frames, time_info, status):
+        del frames, time_info
         if status:
             self.get_logger().debug(f"Audio status: {status}")
 
-        mono = indata[:, 0].copy()
-
-        raw_msg = Int16MultiArray()
-        raw_msg.data = mono.tolist()
-        self.pub_raw.publish(raw_msg)
+        if indata.ndim == 1:
+            mono = indata.copy()
+        else:
+            mono = indata[:, 0].copy()
 
         if self.respeaker.dev is not None:
-            vad_active = self.respeaker.speech_detected()
+            vad_active = bool(self.respeaker.speech_detected())
         else:
-            vad_active = self._energy_vad(mono)
+            vad_active = bool(self._energy_vad(mono))
+
+        with self._audio_lock:
+            self._pending = (mono.tolist(), vad_active)
+
+    def _publish_pending(self):
+        with self._audio_lock:
+            pending = self._pending
+            self._pending = None
+
+        if pending is None:
+            return
+
+        mono, vad_active = pending
+
+        raw_msg = Int16MultiArray()
+        raw_msg.data = mono
+        self.pub_raw.publish(raw_msg)
 
         vad_msg = Bool()
         vad_msg.data = vad_active
@@ -157,7 +197,7 @@ class AudioCaptureNode(Node):
 
         if vad_active:
             speech_msg = Int16MultiArray()
-            speech_msg.data = mono.tolist()
+            speech_msg.data = mono
             self.pub_speech.publish(speech_msg)
 
     def _publish_hid(self):
@@ -168,9 +208,10 @@ class AudioCaptureNode(Node):
         self.pub_doa.publish(doa_msg)
 
     def destroy_node(self):
-        if hasattr(self, "stream") and self.stream is not None:
+        if self.stream is not None:
             self.stream.stop()
             self.stream.close()
+            self.stream = None
         super().destroy_node()
 
 
@@ -181,8 +222,10 @@ def main():
         rclpy.spin(node)
     except KeyboardInterrupt:
         pass
-    node.destroy_node()
-    rclpy.shutdown()
+    finally:
+        node.destroy_node()
+        if rclpy.ok():
+            rclpy.shutdown()
 
 
 if __name__ == "__main__":

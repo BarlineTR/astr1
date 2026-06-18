@@ -2,6 +2,7 @@ serial_bridge:
   ros__parameters:
     port: "/dev/astro_arduino"
     baud: 500000
+    connect_retry_sec: 2.0
     frame_id_imu: "imu_link"
     ticks_per_rev_left: 2048.0
     ticks_per_rev_right: 2048.0
@@ -25,6 +26,7 @@ scan_filter_node:
 audio_capture_node:
   ros__parameters:
     device_name: "ReSpeaker"
+    device_index: -1
     sample_rate: 16000
     channels: 6
     chunk_size: 1024
@@ -35,6 +37,7 @@ speech_recognition_node:
     model_path: "/opt/vosk/vosk-model-small-tr-0.3"
     language: "tr"
     partial_results: true
+    silence_timeout_s: 0.5
 
 tts_node:
   ros__parameters:
