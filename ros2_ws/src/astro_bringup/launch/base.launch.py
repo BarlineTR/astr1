@@ -21,7 +21,7 @@ def generate_launch_description():
             ),
             Node(
                 package="astro_base",
-                executable="serial_bridge",
+                executable="serial_bridge.py",
                 name="serial_bridge",
                 output="screen",
                 parameters=[params_file, {"use_sim_time": use_sim_time}],
