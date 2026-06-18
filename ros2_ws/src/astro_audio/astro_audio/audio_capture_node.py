@@ -80,7 +80,7 @@ class AudioCaptureNode(Node):
         self.declare_parameter("channels", 1)
         self.declare_parameter("chunk_size", 1024)
         self.declare_parameter("vad_threshold", 0.6)
-
+        self.pub_raw.publish(Int16MultiArray())
         self.device_name = self.get_parameter("device_name").value
         # self.device_index_param = int(self.get_parameter("device_index").value) # Bunu yorum satırı yap
         self.device_index_param = 25 # Pulse üzerinden git
@@ -182,27 +182,22 @@ class AudioCaptureNode(Node):
     def _publish_pending(self):
         with self._audio_lock:
             pending = self._pending
-            # self._pending = None
-
+        
         if pending is None:
-            # Buraya bir log ekleyelim ki çalışıp çalışmadığını görelim
-            self.get_logger().info("Bekleyen ses verisi yok!")
             return
-
-        mono, vad_active = pending
-
-        raw_msg = Int16MultiArray()
-        raw_msg.data = mono
-        self.pub_raw.publish(raw_msg)
-
-        vad_msg = Bool()
-        vad_msg.data = vad_active
-        self.pub_vad.publish(vad_msg)
-
-        if vad_active:
-            speech_msg = Int16MultiArray()
-            speech_msg.data = mono
-            self.pub_speech.publish(speech_msg)
+            
+        # Sadece yayıncı aktifse gönder
+        if self.pub_raw is not None:
+            mono, vad_active = pending
+            raw_msg = Int16MultiArray()
+            raw_msg.data = mono
+            
+            try:
+                self.pub_raw.publish(raw_msg)
+                # Buraya bir log daha ekleyelim ki topic'e girdiğini anlayalım
+                # self.get_logger().info("TOPIC'E VERI BASILDI!") 
+            except Exception as e:
+                self.get_logger().error(f"Yayın hatası: {e}")
 
     def _publish_hid(self):
         if self.respeaker.dev is None:
