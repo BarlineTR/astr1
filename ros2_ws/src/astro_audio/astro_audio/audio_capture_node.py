@@ -4,7 +4,7 @@ import threading
 import numpy as np
 import rclpy
 from rclpy.node import Node
-from std_msgs.msg import Bool, Float32, Int16MultiArray
+from std_msgs.msg import Bool, Float32, Int16MultiArray, MultiArrayDimension
 
 try:
     import sounddevice as sd
@@ -53,7 +53,6 @@ class AudioCaptureNode(Node):
     def __init__(self):
         super().__init__("audio_capture_node")
         
-        # Parametreler
         self.declare_parameter("sample_rate", 16000)
         self.declare_parameter("channels", 1)
         self.declare_parameter("chunk_size", 1024)
@@ -63,36 +62,37 @@ class AudioCaptureNode(Node):
         self.channels = int(self.get_parameter("channels").value)
         self.chunk_size = int(self.get_parameter("chunk_size").value)
         self.vad_threshold = float(self.get_parameter("vad_threshold").value)
-        self.device_index_param = 25 # Pulse Audio sabitlendi
+        self.device_index_param = 25 
 
-        # Yayıncıları Tanımla (Sıralama çok önemli)
-        self.pub_raw = self.create_publisher(Int16MultiArray, "/audio_raw", 10)
-        self.pub_vad = self.create_publisher(Bool, "/audio/vad", 10)
-        self.pub_doa = self.create_publisher(Float32, "/audio/doa", 10)
-        self.pub_speech = self.create_publisher(Int16MultiArray, "/audio/speech_audio", 10)
+        # Publisher'lar
+        self.pub_raw = self.create_publisher(Int16MultiArray, "audio_raw", 10)
+        self.pub_vad = self.create_publisher(Bool, "audio/vad", 10)
+        self.pub_doa = self.create_publisher(Float32, "audio/doa", 10)
+        
+        # Topic'leri ROS 2 tablosuna kaydetmek için ilk boş mesajı gönder
+        empty_msg = Int16MultiArray()
+        empty_msg.layout.dim.append(MultiArrayDimension(label="audio", size=0, stride=0))
+        self.pub_raw.publish(empty_msg)
 
         self.respeaker = ReSpeakerHID()
         self._audio_lock = threading.Lock()
         self._pending = None
         self.stream = None
 
-        if sd is None:
-            self.get_logger().error("sounddevice not installed")
-            return
-
-        try:
-            self.stream = sd.InputStream(
-                device=self.device_index_param,
-                channels=self.channels,
-                samplerate=self.sample_rate,
-                blocksize=self.chunk_size,
-                dtype="int16",
-                callback=self._audio_callback,
-            )
-            self.stream.start()
-            self.get_logger().info(f"Audio capture started (device={self.device_index_param})")
-        except Exception as exc:
-            self.get_logger().error(f"Stream hatası: {exc}")
+        if sd is not None:
+            try:
+                self.stream = sd.InputStream(
+                    device=self.device_index_param,
+                    channels=self.channels,
+                    samplerate=self.sample_rate,
+                    blocksize=self.chunk_size,
+                    dtype="int16",
+                    callback=self._audio_callback,
+                )
+                self.stream.start()
+                self.get_logger().info(f"Audio capture started (device={self.device_index_param})")
+            except Exception as exc:
+                self.get_logger().error(f"Stream hatası: {exc}")
 
         self.create_timer(0.02, self._publish_pending)
         self.create_timer(0.05, self._publish_hid)
@@ -100,14 +100,12 @@ class AudioCaptureNode(Node):
     def _audio_callback(self, indata, frames, time_info, status):
         mono = indata[:, 0].copy() if indata.ndim > 1 else indata.copy()
         vad_active = bool(self.respeaker.speech_detected()) if self.respeaker.dev else self._energy_vad(mono)
-        
         with self._audio_lock:
             self._pending = (mono.tolist(), vad_active)
 
     def _publish_pending(self):
         with self._audio_lock:
             pending = self._pending
-        
         if pending is not None:
             mono, vad_active = pending
             raw_msg = Int16MultiArray()
