@@ -8,7 +8,7 @@
 #include "protocol.h"
 
 // ====== Parametreler ======
-static constexpr uint32_t SERIAL_BAUD = 500000; // 115200 alternatif
+static constexpr uint32_t SERIAL_BAUD = 115200; // 115200 alternatif
 static constexpr float CONTROL_HZ = 50.0f;
 static constexpr uint32_t CONTROL_DT_MS = (uint32_t)(1000.0f / CONTROL_HZ);
 

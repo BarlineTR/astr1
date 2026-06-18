@@ -41,7 +41,7 @@ class SerialBridge(Node):
     def __init__(self):
         super().__init__('serial_bridge')
         self.declare_parameter('port', '/dev/ttyCH341USB0')
-        self.declare_parameter('baud', 500000)
+        self.declare_parameter('baud', 115200)
         self.declare_parameter('frame_id_imu', 'imu_link')
         self.declare_parameter('ticks_per_rev_left', 2048.0)
         self.declare_parameter('ticks_per_rev_right', 2048.0)
