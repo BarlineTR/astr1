@@ -61,42 +61,64 @@ class AudioCaptureNode(Node):
         import subprocess
         import os
         import re
+        import time
 
-        self.pulse_source = "default"
+        self.pulse_source = None
         self.alsa_card_name = "ArrayUAC10"
 
-        # 1. PulseAudio kaynaklarını tara
-        try:
-            out = subprocess.check_output(["pactl", "list", "sources", "short"], stderr=subprocess.DEVNULL).decode("utf-8")
-            for line in out.splitlines():
-                parts = line.split()
-                if len(parts) >= 2:
-                    name = parts[1]
-                    # ReSpeaker, Array veya UAC içeren ses girişini ara
-                    if any(x in name.lower() for x in ["respeaker", "array", "uac"]):
-                        # Tercihen multichannel girişi seç
-                        if "multichannel" in name.lower():
+        # 1. PulseAudio kaynaklarını tara (Cihazın sisteme tam oturması için 5 kez dene)
+        for attempt in range(5):
+            try:
+                out = subprocess.check_output(["pactl", "list", "sources", "short"], stderr=subprocess.DEVNULL).decode("utf-8")
+                for line in out.splitlines():
+                    parts = line.split()
+                    if len(parts) >= 2:
+                        name = parts[1]
+                        # ReSpeaker, Array veya UAC içeren ses girişini ara
+                        if any(x in name.lower() for x in ["respeaker", "array", "uac"]):
+                            # Tercihen multichannel girişi seç
+                            if "multichannel" in name.lower():
+                                self.pulse_source = name
+                                break
                             self.pulse_source = name
+                if self.pulse_source:
+                    break
+            except Exception:
+                pass
+            time.sleep(0.5)
+
+        if self.pulse_source:
+            self.get_logger().info(f"Dinamik algılanan PulseAudio kaynağı: {self.pulse_source}")
+            try:
+                # PulseAudio varsayılan girişini ReSpeaker olarak ayarla
+                subprocess.run(["pactl", "set-default-source", self.pulse_source], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                os.environ["PULSE_SOURCE"] = self.pulse_source
+                self.get_logger().info(f"PulseAudio varsayılan kaynağı ReSpeaker olarak ayarlandı.")
+            except Exception as e:
+                self.get_logger().warn(f"PulseAudio varsayılan kaynağı ayarlanamadı: {e}")
+        else:
+            self.get_logger().warn("PulseAudio üzerinde ReSpeaker kaynağı bulunamadı, varsayılan sistem girişi kullanılacak.")
+            if "PULSE_SOURCE" in os.environ:
+                del os.environ["PULSE_SOURCE"]
+
+        # 2. ALSA kartlarını tara (5 kez dene)
+        for attempt in range(5):
+            try:
+                out = subprocess.check_output(["arecord", "-l"], stderr=subprocess.DEVNULL).decode("utf-8")
+                found = False
+                for line in out.splitlines():
+                    if any(x in line.lower() for x in ["respeaker", "array", "uac"]):
+                        match = re.search(r'card (\d+): ([\w\-]+)', line)
+                        if match:
+                            self.alsa_card_name = match.group(2)
+                            self.get_logger().info(f"Dinamik algılanan ALSA Kartı: {self.alsa_card_name} (Kart ID: {match.group(1)})")
+                            found = True
                             break
-                        self.pulse_source = name
-        except Exception as e:
-            self.get_logger().error(f"PulseAudio kaynakları taranamadı: {e}")
-
-        self.get_logger().info(f"Dinamik algılanan PulseAudio kaynağı: {self.pulse_source}")
-        os.environ["PULSE_SOURCE"] = self.pulse_source
-
-        # 2. ALSA kartlarını tara
-        try:
-            out = subprocess.check_output(["arecord", "-l"], stderr=subprocess.DEVNULL).decode("utf-8")
-            for line in out.splitlines():
-                if any(x in line.lower() for x in ["respeaker", "array", "uac"]):
-                    match = re.search(r'card (\d+): ([\w\-]+)', line)
-                    if match:
-                        self.alsa_card_name = match.group(2)
-                        self.get_logger().info(f"Dinamik algılanan ALSA Kartı: {self.alsa_card_name} (Kart ID: {match.group(1)})")
-                        break
-        except Exception as e:
-            self.get_logger().error(f"ALSA kartları taranamadı: {e}")
+                if found:
+                    break
+            except Exception:
+                pass
+            time.sleep(0.5)
 
         # Backend seçimleri (1: sounddevice, 2: arecord fallback)
         self.stream_thread = None
