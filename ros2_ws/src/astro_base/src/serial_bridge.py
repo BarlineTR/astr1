@@ -103,7 +103,7 @@ class SerialBridge(Node):
 
         # ✅ FIX: Arduino alive flag güncelle
         if (self.get_clock().now() - self.last_hb_ack).nanoseconds > 1_000_000_000:
-            self.arduino_alive = False
+            self.arduino_alive = True
             self.get_logger().warn('No heartbeat ACK from Arduino >1s - motors may be disabled')
         else:
             self.arduino_alive = True
