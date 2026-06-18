@@ -98,6 +98,7 @@ class AudioCaptureNode(Node):
         self.pub_doa = self.create_publisher(Float32, "audio/doa", 10)
         
         self.respeaker = ReSpeakerHID()
+        self.speech_detected_status = False
         self._audio_lock = threading.Lock()
         self._pending = None
         self.stream = None
@@ -196,7 +197,7 @@ class AudioCaptureNode(Node):
                         arr = np.frombuffer(data, dtype=np.int16).reshape(-1, ch)
                         mono = arr[:, 0].copy() # 0. kanal her zaman mevcuttur
                         
-                        vad_active = bool(self.respeaker.speech_detected()) if self.respeaker.dev else self._energy_vad(mono)
+                        vad_active = self.speech_detected_status if self.respeaker.dev else self._energy_vad(mono)
                         with self._audio_lock:
                             self._pending = (mono.tolist(), vad_active)
                             
@@ -222,7 +223,7 @@ class AudioCaptureNode(Node):
 
     def _audio_callback(self, indata, frames, time_info, status):
         mono = indata[:, 0].copy()
-        vad_active = bool(self.respeaker.speech_detected()) if self.respeaker.dev else self._energy_vad(mono)
+        vad_active = self.speech_detected_status if self.respeaker.dev else self._energy_vad(mono)
         with self._audio_lock:
             self._pending = (mono.tolist(), vad_active)
 
@@ -246,6 +247,9 @@ class AudioCaptureNode(Node):
 
     def _publish_hid(self):
         if self.respeaker.dev:
+            # USB/HID okumalarını ana iş parçacığı zamanlayıcısında (timer) yapalım
+            self.speech_detected_status = bool(self.respeaker.speech_detected())
+            
             msg = Float32()
             msg.data = self.respeaker.doa_angle()
             self.pub_doa.publish(msg)
