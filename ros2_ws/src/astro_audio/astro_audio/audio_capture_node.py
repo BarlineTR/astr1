@@ -54,7 +54,7 @@ class AudioCaptureNode(Node):
         super().__init__("audio_capture_node")
         
         self.declare_parameter("sample_rate", 16000)
-        self.declare_parameter("channels", 4)
+        self.declare_parameter("channels", 6)
         self.declare_parameter("chunk_size", 1024)
         self.declare_parameter("vad_threshold", 0.05)
 
@@ -103,7 +103,7 @@ class AudioCaptureNode(Node):
         self.create_timer(0.05, self._publish_hid)
 
     def _audio_callback(self, indata, frames, time_info, status):
-        mono = indata[:, 0].copy() 
+        mono = indata[:, 0].copy()
         vad_active = bool(self.respeaker.speech_detected()) if self.respeaker.dev else self._energy_vad(mono)
         with self._audio_lock:
             self._pending = (mono.tolist(), vad_active)
