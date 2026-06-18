@@ -63,25 +63,35 @@ class AudioCaptureNode(Node):
         self.chunk_size = int(self.get_parameter("chunk_size").value)
         self.vad_threshold = float(self.get_parameter("vad_threshold").value)
 
+        # PulseAudio için ReSpeaker kaynak adını çevre değişkeni olarak ayarla
+        import os
+        self.pulse_source = "alsa_input.usb-SEEED_ReSpeaker_4_Mic_Array__UAC1.0_-00.multichannel-input"
+        os.environ["PULSE_SOURCE"] = self.pulse_source
+
         # Backend seçimleri (1: sounddevice, 2: arecord fallback)
         self.stream_thread = None
         self._stop_event = threading.Event()
         
-        # Önce sounddevice ile ALSA'nın hw: yerine plughw: veya default arayüzünü bulmaya çalış
+        # PulseAudio aktif olduğu için sounddevice üzerinde doğrudan 'pulse' veya 'default' arayüzünü seçelim
         self.device_index = None
         if sd is not None:
             devices = sd.query_devices()
+            # Önce "pulse" cihazını ara
             for i, dev in enumerate(devices):
-                if "ReSpeaker" in dev['name'] or "Array" in dev['name']:
+                if dev['name'] == 'pulse':
                     self.device_index = i
-                    # Eğer hw: değilse (sysdefault vs) öncelik ver
-                    if "hw:" not in dev['name']:
+                    break
+            # Bulunamazsa "default" cihazını ara
+            if self.device_index is None:
+                for i, dev in enumerate(devices):
+                    if dev['name'] == 'default':
+                        self.device_index = i
                         break
             
             if self.device_index is not None:
-                self.get_logger().info(f"ReSpeaker SD İndeks: {self.device_index} - {devices[self.device_index]['name']}")
+                self.get_logger().info(f"sounddevice PulseAudio arayüzü seçildi. İndeks: {self.device_index} - {devices[self.device_index]['name']}")
             else:
-                self.get_logger().warn("sounddevice ReSpeaker'ı bulamadı. Fallback yöntemine geçilecek.")
+                self.get_logger().warn("sounddevice default/pulse cihazını bulamadı. Fallback yöntemine geçilecek.")
 
         self.pub_raw = self.create_publisher(Int16MultiArray, "audio_raw", 10)
         self.pub_vad = self.create_publisher(Bool, "audio/vad", 10)
@@ -95,24 +105,24 @@ class AudioCaptureNode(Node):
         sd_success = False
         if sd is not None and self.device_index is not None:
             try:
-                # 6 Kanal, 16000Hz, hw: cihazlarında ALSA uyumsuzluklarını aşmak için büyük blocksize
+                # Pulse üzerinden 6 kanal okuma (ReSpeaker 4-Mic Array için)
                 self.stream = sd.InputStream(
                     device=self.device_index,
                     channels=self.channels,
                     samplerate=self.sample_rate,
-                    blocksize=2048, # ALSA buffer underrun önlemek için büyük blok
+                    blocksize=2048,
                     dtype="int16",
                     callback=self._audio_callback,
                 )
                 self.stream.start()
                 sd_success = True
-                self.get_logger().info("Audio capture (sounddevice) başarıyla başlatıldı.")
+                self.get_logger().info("Audio capture (sounddevice PulseAudio) başarıyla başlatıldı.")
             except Exception as exc:
                 self.get_logger().error(f"sounddevice stream açılamadı: {exc}")
 
-        # EĞER SOUNDDEVICE ALSA ERROR -32 (BROKEN PIPE) VERİRSE, KESİN ÇÖZÜM OLARAK 'arecord' KULLAN
+        # Eğer sounddevice başarısız olursa arecord ile Pulse veya ALSA üzerinden bağlanmayı dene
         if not sd_success:
-            self.get_logger().warn("ALSA Broken Pipe hatası nedeniyle ALSA yerel arayüzüne (arecord) geçiliyor! Bu yöntem ReSpeaker ile %100 uyumludur.")
+            self.get_logger().warn("sounddevice başlatılamadı. arecord fallback moduna geçiliyor...")
             self.stream_thread = threading.Thread(target=self._arecord_capture_loop, daemon=True)
             self.stream_thread.start()
 
@@ -121,26 +131,28 @@ class AudioCaptureNode(Node):
 
     def _arecord_capture_loop(self):
         import subprocess
-        import re
+        import os
         
-        # sounddevice isim bilgisinden (örn: "USB Audio (hw:2,0)") ALSA kart idsini bul
-        alsa_devs = []
-        if sd is not None and self.device_index is not None:
-            dev_name = sd.query_devices()[self.device_index]['name']
-            match = re.search(r'hw:(\d+),(\d+)', dev_name)
-            if match:
-                card = match.group(1)
-                device = match.group(2)
-                # plug eklentileri kanal/oran dönüşümlerini kolaylaştırır, doğrudan hw da denenebilir
-                alsa_devs.append(f"plughw:{card},{device}")
-                alsa_devs.append(f"hw:{card},{device}")
+        # Arecord ile denenecek cihaz konfigürasyonları sırasıyla:
+        # 1. PulseAudio (PULSE_SOURCE ile yönlendirilmiş)
+        # 2. ALSA sysdefault (ArrayUAC10 kartına özel)
+        # 3. ALSA plughw (ArrayUAC10 kartına özel)
+        # 4. ALSA hw (ArrayUAC10 kartına özel)
+        # 5. default
+        alsa_devs = [
+            "pulse",
+            "sysdefault:CARD=ArrayUAC10",
+            "plughw:CARD=ArrayUAC10,DEV=0",
+            "hw:CARD=ArrayUAC10,DEV=0",
+            "default"
+        ]
         
-        # Her durumda default cihazını da fallback listesine ekle
-        alsa_devs.append("default")
-        
-        # ReSpeaker farklı firmware'lerde 6, 4, 2 veya 1 kanal destekleyebilir
         channel_attempts = [6, 4, 2, 1]
         process = None
+        
+        # Alt süreç için PulseAudio çevre değişkenini içeren ortamı hazırla
+        env = os.environ.copy()
+        env["PULSE_SOURCE"] = self.pulse_source
         
         for alsa_dev in alsa_devs:
             self.get_logger().info(f"arecord deneniyor. Cihaz: {alsa_dev}")
@@ -159,25 +171,28 @@ class AudioCaptureNode(Node):
                 ]
                 
                 try:
-                    process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                    process = subprocess.Popen(
+                        cmd, 
+                        stdout=subprocess.PIPE, 
+                        stderr=subprocess.PIPE,
+                        env=env
+                    )
                     self.get_logger().info(f"arecord komutu: {' '.join(cmd)}")
                     
                     chunk_bytes = self.chunk_size * ch * 2 # 16-bit = 2 byte
                     
-                    # İlk okuma testi (cihaz desteklemiyorsa arecord anında hata verir ve veri dönmez)
-                    # wait a little bit or read blocking
+                    # İlk okuma testi
                     data = process.stdout.read(chunk_bytes)
                     if not data:
                         stdout_val, stderr_val = process.communicate()
                         err_msg = stderr_val.decode('utf-8', errors='ignore').strip()
                         self.get_logger().warn(f"arecord {ch} kanallı okuma yapamadı (Cihaz: {alsa_dev}). Hata: {err_msg}")
-                        continue # Diğer kanalı veya cihazı dene
+                        continue
                     
                     self.get_logger().info(f"arecord başarıyla bağlandı! ({alsa_dev}, {ch} kanal modunda çalışıyor)")
                     
                     # Veri okuma döngüsü
                     while not self._stop_event.is_set():
-                        # Zaten ilk veriyi okumuştuk, onu işle
                         arr = np.frombuffer(data, dtype=np.int16).reshape(-1, ch)
                         mono = arr[:, 0].copy() # 0. kanal her zaman mevcuttur
                         
@@ -185,20 +200,17 @@ class AudioCaptureNode(Node):
                         with self._audio_lock:
                             self._pending = (mono.tolist(), vad_active)
                             
-                        # Sonraki döngü için yeni veri oku
                         data = process.stdout.read(chunk_bytes)
                         if not data:
-                            break # Cihaz bağlantısı koptu vs.
+                            break
                             
-                    break # Başarılı olduysa kanalları bitir
+                    break
                     
                 except Exception as e:
                     self.get_logger().error(f"arecord başlatma hatası: {e}")
                     if process:
                         process.terminate()
             
-            # Eğer içteki loop başarıyla çalıştı ve break ettiyse (yani veri okuyabildiysek), dıştaki loopu da sonlandır.
-            # Bunu anlamak için process'in hala aktif/çalışıyor olduğunu veya stop_event/data durumunu kontrol edebiliriz.
             if process and process.poll() is None and not self._stop_event.is_set():
                 break
                 
