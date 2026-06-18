@@ -54,16 +54,26 @@ class AudioCaptureNode(Node):
         super().__init__("audio_capture_node")
         
         self.declare_parameter("sample_rate", 16000)
-        self.declare_parameter("channels", 4) # ReSpeaker 4 Mic Array için 4 yapıldı
+        self.declare_parameter("channels", 4)
         self.declare_parameter("chunk_size", 1024)
-        self.declare_parameter("vad_threshold", 0.05) # Hassasiyet ayarı
-        self.declare_parameter("device_index", 2)      # Senin sisteminde 2 olarak doğrulandı
+        self.declare_parameter("vad_threshold", 0.05)
 
         self.sample_rate = int(self.get_parameter("sample_rate").value)
         self.channels = int(self.get_parameter("channels").value)
         self.chunk_size = int(self.get_parameter("chunk_size").value)
         self.vad_threshold = float(self.get_parameter("vad_threshold").value)
-        self.device_index = int(self.get_parameter("device_index").value)
+
+        # OTOMATİK CİHAZ BULMA
+        self.device_index = None
+        devices = sd.query_devices()
+        for i, dev in enumerate(devices):
+            if "ReSpeaker" in dev['name']:
+                self.device_index = i
+                self.get_logger().info(f"ReSpeaker bulundu: {dev['name']} (İndeks: {i})")
+                break
+        
+        if self.device_index is None:
+            self.get_logger().error("ReSpeaker bulunamadı! Lütfen USB bağlantısını kontrol edin.")
 
         self.pub_raw = self.create_publisher(Int16MultiArray, "audio_raw", 10)
         self.pub_vad = self.create_publisher(Bool, "audio/vad", 10)
@@ -74,7 +84,7 @@ class AudioCaptureNode(Node):
         self._pending = None
         self.stream = None
 
-        if sd is not None:
+        if sd is not None and self.device_index is not None:
             try:
                 self.stream = sd.InputStream(
                     device=self.device_index,
@@ -85,7 +95,7 @@ class AudioCaptureNode(Node):
                     callback=self._audio_callback,
                 )
                 self.stream.start()
-                self.get_logger().info(f"Audio capture started (device={self.device_index}, channels={self.channels})")
+                self.get_logger().info("Audio capture başarıyla başlatıldı.")
             except Exception as exc:
                 self.get_logger().error(f"Stream hatası: {exc}")
 
@@ -93,7 +103,6 @@ class AudioCaptureNode(Node):
         self.create_timer(0.05, self._publish_hid)
 
     def _audio_callback(self, indata, frames, time_info, status):
-        # 4 kanallı veriden ilk kanalı al (veya ihtiyacına göre karıştır)
         mono = indata[:, 0].copy() 
         vad_active = bool(self.respeaker.speech_detected()) if self.respeaker.dev else self._energy_vad(mono)
         with self._audio_lock:
