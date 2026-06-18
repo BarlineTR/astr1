@@ -121,49 +121,73 @@ class AudioCaptureNode(Node):
 
     def _arecord_capture_loop(self):
         import subprocess
-        # ALSA'nın hw: yerine plughw: arayüzü resample ve kanal dönüşümünü destekler, Broken Pipe vermez.
-        # hw: cihazını bul: arecord -l
-        cmd = [
-            'arecord',
-            '-D', 'plughw:CARD=Array,DEV=0', # ReSpeaker UAC1.0 genelde 'Array' kart ismini kullanır
-            '-f', 'S16_LE',
-            '-r', str(self.sample_rate),
-            '-c', str(self.channels),
-            '-t', 'raw',
-            '-q' # Sessiz mod
-        ]
+        import re
         
-        try:
-            process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            self.get_logger().info(f"arecord işlemi başlatıldı: {' '.join(cmd)}")
+        # sounddevice isim bilgisinden (örn: "USB Audio (hw:2,0)") ALSA kart idsini bul
+        alsa_dev = 'default'
+        if sd is not None and self.device_index is not None:
+            dev_name = sd.query_devices()[self.device_index]['name']
+            match = re.search(r'hw:(\d+),(\d+)', dev_name)
+            if match:
+                alsa_dev = f"plughw:{match.group(1)},{match.group(2)}"
+                
+        self.get_logger().info(f"arecord hedef cihazı: {alsa_dev}")
+
+        # ReSpeaker farklı firmware'lerde 6, 4, 2 veya 1 kanal destekleyebilir
+        channel_attempts = [6, 4, 2, 1]
+        process = None
+        
+        for ch in channel_attempts:
+            if self._stop_event.is_set():
+                break
+                
+            cmd = [
+                'arecord',
+                '-D', alsa_dev,
+                '-f', 'S16_LE',
+                '-r', str(self.sample_rate),
+                '-c', str(ch),
+                '-t', 'raw',
+                '-q'
+            ]
             
-            chunk_bytes = self.chunk_size * self.channels * 2 # 16-bit = 2 byte
-            
-            while not self._stop_event.is_set():
+            try:
+                process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                self.get_logger().info(f"arecord deneniyor: {' '.join(cmd)}")
+                
+                chunk_bytes = self.chunk_size * ch * 2 # 16-bit = 2 byte
+                
+                # İlk okuma testi (cihaz desteklemiyorsa arecord anında hata verir ve veri dönmez)
                 data = process.stdout.read(chunk_bytes)
                 if not data:
-                    # Belki 6 kanal desteklemiyordur, 4 kanalı dene
-                    self.get_logger().warn("arecord veri okuyamadı, 4 kanallı fallback deneniyor...")
+                    self.get_logger().warn(f"arecord {ch} kanallı okuma yapamadı, bir sonrakine geçiliyor...")
                     process.terminate()
-                    cmd[7] = '4' # -c 4
-                    process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-                    data = process.stdout.read(self.chunk_size * 4 * 2)
-                    if not data:
-                        break
-                        
-                # Raw byte array -> numpy array
-                arr = np.frombuffer(data, dtype=np.int16).reshape(-1, int(cmd[7]))
-                mono = arr[:, 0].copy() # 0. kanal (işlenmiş ses)
+                    continue # Diğer kanalı dene
                 
-                vad_active = bool(self.respeaker.speech_detected()) if self.respeaker.dev else self._energy_vad(mono)
-                with self._audio_lock:
-                    self._pending = (mono.tolist(), vad_active)
+                self.get_logger().info(f"arecord başarıyla bağlandı! ({ch} kanal modunda çalışıyor)")
+                
+                # Veri okuma döngüsü
+                while not self._stop_event.is_set():
+                    # Zaten ilk veriyi okumuştuk, onu işle
+                    arr = np.frombuffer(data, dtype=np.int16).reshape(-1, ch)
+                    mono = arr[:, 0].copy() # 0. kanal her zaman mevcuttur
                     
-        except Exception as e:
-            self.get_logger().error(f"arecord capture thread çöktü: {e}")
-        finally:
-            if 'process' in locals():
-                process.terminate()
+                    vad_active = bool(self.respeaker.speech_detected()) if self.respeaker.dev else self._energy_vad(mono)
+                    with self._audio_lock:
+                        self._pending = (mono.tolist(), vad_active)
+                        
+                    # Sonraki döngü için yeni veri oku
+                    data = process.stdout.read(chunk_bytes)
+                    if not data:
+                        break # Cihaz bağlantısı koptu vs.
+                        
+                break # Döngü başarıyla çalıştıysa dışarıdaki for döngüsünü bitir
+                
+            except Exception as e:
+                self.get_logger().error(f"arecord başlatma hatası: {e}")
+                if process: process.terminate()
+                
+        if process: process.terminate()
 
     def _audio_callback(self, indata, frames, time_info, status):
         mono = indata[:, 0].copy()
