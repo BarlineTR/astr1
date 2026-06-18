@@ -1,0 +1,21 @@
+/oak:
+  ros__parameters:
+    camera:
+      i_nn_type: "none"
+      i_enable_imu: false
+    i_pipeline_type: "RGBD"
+    rgb:
+      i_resolution: "720P"
+      i_fps: 30
+      i_publish_topic: true
+    stereo:
+      i_enabled: true
+      i_depth_filter_size: 5
+      i_lr_check: true
+
+face_detector_node:
+  ros__parameters:
+    input_topic: "/oak/rgb/image_raw"
+    scale_factor: 1.1
+    min_neighbors: 5
+    min_size: 30
