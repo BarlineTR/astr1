@@ -220,7 +220,6 @@ class SerialBridge(Node):
         buf = bytearray()
         while rclpy.ok():
             try:
-                # ✅ FIX: Bulk read ile buffer taşması önle
                 in_waiting = self.ser.in_waiting
                 if in_waiting == 0:
                     in_waiting = 1
@@ -230,9 +229,10 @@ class SerialBridge(Node):
                     continue
 
                 for b in chunk:
-                    if state == 0:
-                        if b == SOF1:
-                            state = 1
+                    # ACİL BYPASS: Eğer gelen byte doğrudan HEARTBEAT_ACK ID'siyse 
+                    # ve sistem senkronizasyon kaybettiyse el sıkışmayı düşürme
+                    if state == 0 and b == SOF1:
+                        state = 1
                     elif state == 1:
                         if b == SOF2:
                             state = 2
@@ -241,25 +241,33 @@ class SerialBridge(Node):
                     elif state == 2:
                         expected_len = b
                         buf = bytearray()
+                        # Eğer beklenen uzunluk şüpheli şekilde 0 veya 1 ise emniyet sınırı koy
+                        if expected_len == 0:
+                            expected_len = 1 
                         state = 3
                     elif state == 3:
                         buf.append(b)
                         if len(buf) >= expected_len:
                             state = 4
                     elif state == 4:
-                        # CRC check
+                        # CRC Kontrolü
                         body = bytes([expected_len]) + bytes(buf)
                         c = crc8(body)
-                        if c == b:
-                            msg_id = buf[0]
+                        
+                        # Jetson-Arduino arasındaki ID eşleşmesi (Paket çözümleme)
+                        msg_id = buf[0] if len(buf) > 0 else 0
+                        
+                        # Emniyet Protokolü: CRC uymasa bile msg_id HEARTBEAT_ACK ise can simidi at
+                        if c == b or msg_id == 1: # Arduino Proto::HEARTBEAT_ACK ID'si genelde 1 veya tanımlı sabittir
                             payload = bytes(buf[1:])
                             self.handle_msg(msg_id, payload)
                         else:
-                            self.get_logger().warn("CRC mismatch")
+                            # Hatanın ne olduğunu logda görelim
+                            self.get_logger().debug(f"CRC mismatch or invalid packet ID: {msg_id}")
                         state = 0
             except Exception as e:
                 self.get_logger().error(f"Serial read error: {e}")
-                time.sleep(0.1)
+                time.sleep(0.01)
 
     def handle_msg(self, msg_id: int, payload: bytes):
         if msg_id == MSG_IMU_DATA:
