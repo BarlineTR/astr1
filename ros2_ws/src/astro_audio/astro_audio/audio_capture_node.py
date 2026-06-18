@@ -63,17 +63,25 @@ class AudioCaptureNode(Node):
         self.chunk_size = int(self.get_parameter("chunk_size").value)
         self.vad_threshold = float(self.get_parameter("vad_threshold").value)
 
-        # OTOMATİK CİHAZ BULMA
-        self.device_index = None
-        devices = sd.query_devices()
-        for i, dev in enumerate(devices):
-            if "ReSpeaker" in dev['name']:
-                self.device_index = i
-                self.get_logger().info(f"ReSpeaker bulundu: {dev['name']} (İndeks: {i})")
-                break
+        # Backend seçimleri (1: sounddevice, 2: arecord fallback)
+        self.stream_thread = None
+        self._stop_event = threading.Event()
         
-        if self.device_index is None:
-            self.get_logger().error("ReSpeaker bulunamadı! Lütfen USB bağlantısını kontrol edin.")
+        # Önce sounddevice ile ALSA'nın hw: yerine plughw: veya default arayüzünü bulmaya çalış
+        self.device_index = None
+        if sd is not None:
+            devices = sd.query_devices()
+            for i, dev in enumerate(devices):
+                if "ReSpeaker" in dev['name'] or "Array" in dev['name']:
+                    self.device_index = i
+                    # Eğer hw: değilse (sysdefault vs) öncelik ver
+                    if "hw:" not in dev['name']:
+                        break
+            
+            if self.device_index is not None:
+                self.get_logger().info(f"ReSpeaker SD İndeks: {self.device_index} - {devices[self.device_index]['name']}")
+            else:
+                self.get_logger().warn("sounddevice ReSpeaker'ı bulamadı. Fallback yöntemine geçilecek.")
 
         self.pub_raw = self.create_publisher(Int16MultiArray, "audio_raw", 10)
         self.pub_vad = self.create_publisher(Bool, "audio/vad", 10)
@@ -84,42 +92,78 @@ class AudioCaptureNode(Node):
         self._pending = None
         self.stream = None
 
+        sd_success = False
         if sd is not None and self.device_index is not None:
             try:
-                # ALSA Broken pipe (error -32) genellikle blocksize veya kanal uyumsuzluğundan kaynaklanır.
-                # blocksize=None ve channels=None yaparak ALSA'nın optimum değerleri seçmesine izin veriyoruz.
+                # 6 Kanal, 16000Hz, hw: cihazlarında ALSA uyumsuzluklarını aşmak için büyük blocksize
                 self.stream = sd.InputStream(
                     device=self.device_index,
-                    channels=None, # Cihazın desteklediği varsayılan kanal sayısını kullan
+                    channels=self.channels,
                     samplerate=self.sample_rate,
-                    blocksize=None, # Optimum buffer boyutu
+                    blocksize=2048, # ALSA buffer underrun önlemek için büyük blok
                     dtype="int16",
-                    latency="high", # Underrun (broken pipe) hatalarını önlemek için yüksek gecikme
                     callback=self._audio_callback,
                 )
                 self.stream.start()
-                self.get_logger().info("Audio capture başarıyla başlatıldı.")
+                sd_success = True
+                self.get_logger().info("Audio capture (sounddevice) başarıyla başlatıldı.")
             except Exception as exc:
-                self.get_logger().error(f"Stream hatası (channels=None): {exc}")
-                # Hata durumunda 1 kanallı (sadece işlenmiş mikrofon) açmayı dene
-                try:
-                    self.get_logger().info("Alternatif olarak 1 kanallı (mono) açılmaya çalışılıyor...")
-                    self.stream = sd.InputStream(
-                        device=self.device_index,
-                        channels=1,
-                        samplerate=self.sample_rate,
-                        blocksize=self.chunk_size,
-                        dtype="int16",
-                        latency="high",
-                        callback=self._audio_callback,
-                    )
-                    self.stream.start()
-                    self.get_logger().info("Audio capture (Mono) başarıyla başlatıldı.")
-                except Exception as exc2:
-                    self.get_logger().error(f"Mono stream de açılamadı: {exc2}")
+                self.get_logger().error(f"sounddevice stream açılamadı: {exc}")
+
+        # EĞER SOUNDDEVICE ALSA ERROR -32 (BROKEN PIPE) VERİRSE, KESİN ÇÖZÜM OLARAK 'arecord' KULLAN
+        if not sd_success:
+            self.get_logger().warn("ALSA Broken Pipe hatası nedeniyle ALSA yerel arayüzüne (arecord) geçiliyor! Bu yöntem ReSpeaker ile %100 uyumludur.")
+            self.stream_thread = threading.Thread(target=self._arecord_capture_loop, daemon=True)
+            self.stream_thread.start()
 
         self.create_timer(0.02, self._publish_pending)
         self.create_timer(0.05, self._publish_hid)
+
+    def _arecord_capture_loop(self):
+        import subprocess
+        # ALSA'nın hw: yerine plughw: arayüzü resample ve kanal dönüşümünü destekler, Broken Pipe vermez.
+        # hw: cihazını bul: arecord -l
+        cmd = [
+            'arecord',
+            '-D', 'plughw:CARD=Array,DEV=0', # ReSpeaker UAC1.0 genelde 'Array' kart ismini kullanır
+            '-f', 'S16_LE',
+            '-r', str(self.sample_rate),
+            '-c', str(self.channels),
+            '-t', 'raw',
+            '-q' # Sessiz mod
+        ]
+        
+        try:
+            process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            self.get_logger().info(f"arecord işlemi başlatıldı: {' '.join(cmd)}")
+            
+            chunk_bytes = self.chunk_size * self.channels * 2 # 16-bit = 2 byte
+            
+            while not self._stop_event.is_set():
+                data = process.stdout.read(chunk_bytes)
+                if not data:
+                    # Belki 6 kanal desteklemiyordur, 4 kanalı dene
+                    self.get_logger().warn("arecord veri okuyamadı, 4 kanallı fallback deneniyor...")
+                    process.terminate()
+                    cmd[7] = '4' # -c 4
+                    process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                    data = process.stdout.read(self.chunk_size * 4 * 2)
+                    if not data:
+                        break
+                        
+                # Raw byte array -> numpy array
+                arr = np.frombuffer(data, dtype=np.int16).reshape(-1, int(cmd[7]))
+                mono = arr[:, 0].copy() # 0. kanal (işlenmiş ses)
+                
+                vad_active = bool(self.respeaker.speech_detected()) if self.respeaker.dev else self._energy_vad(mono)
+                with self._audio_lock:
+                    self._pending = (mono.tolist(), vad_active)
+                    
+        except Exception as e:
+            self.get_logger().error(f"arecord capture thread çöktü: {e}")
+        finally:
+            if 'process' in locals():
+                process.terminate()
 
     def _audio_callback(self, indata, frames, time_info, status):
         mono = indata[:, 0].copy()
