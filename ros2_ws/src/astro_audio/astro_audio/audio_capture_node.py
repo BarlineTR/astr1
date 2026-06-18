@@ -29,12 +29,6 @@ class ReSpeakerHID:
         self.dev = None
         if not HAS_USB: return
         self.dev = usb.core.find(idVendor=RESPEAKER_VID, idProduct=RESPEAKER_PID)
-        if self.dev is None: return
-        try:
-            if self.dev.is_kernel_driver_active(0): self.dev.detach_kernel_driver(0)
-        except (usb.core.USBError, NotImplementedError): pass
-        try: self.dev.set_configuration()
-        except usb.core.USBError: pass
 
     def _read_param(self, param_id: int) -> int:
         if self.dev is None: return 0
