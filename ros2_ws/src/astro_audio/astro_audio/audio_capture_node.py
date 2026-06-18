@@ -4,7 +4,7 @@ import threading
 import numpy as np
 import rclpy
 from rclpy.node import Node
-from std_msgs.msg import Bool, Float32, Int16MultiArray, MultiArrayDimension
+from std_msgs.msg import Bool, Float32, Int16MultiArray
 
 try:
     import sounddevice as sd
@@ -24,7 +24,7 @@ PARAM_SPEECH_DETECTED = 19
 PARAM_DOA_ANGLE = 21
 
 class ReSpeakerHID:
-    TIMEOUT_MS = 100000
+    TIMEOUT_MS = 1000
     def __init__(self):
         self.dev = None
         if not HAS_USB: return
@@ -54,17 +54,17 @@ class AudioCaptureNode(Node):
         super().__init__("audio_capture_node")
         
         self.declare_parameter("sample_rate", 16000)
-        self.declare_parameter("channels", 1)
+        self.declare_parameter("channels", 4) # ReSpeaker 4 Mic Array için 4 yapıldı
         self.declare_parameter("chunk_size", 1024)
-        self.declare_parameter("vad_threshold", 0.6)
+        self.declare_parameter("vad_threshold", 0.05) # Hassasiyet ayarı
+        self.declare_parameter("device_index", 2)      # Senin sisteminde 2 olarak doğrulandı
 
         self.sample_rate = int(self.get_parameter("sample_rate").value)
         self.channels = int(self.get_parameter("channels").value)
         self.chunk_size = int(self.get_parameter("chunk_size").value)
         self.vad_threshold = float(self.get_parameter("vad_threshold").value)
-        self.device_index_param = 25 
+        self.device_index = int(self.get_parameter("device_index").value)
 
-        # Yayıncıları Tanımla
         self.pub_raw = self.create_publisher(Int16MultiArray, "audio_raw", 10)
         self.pub_vad = self.create_publisher(Bool, "audio/vad", 10)
         self.pub_doa = self.create_publisher(Float32, "audio/doa", 10)
@@ -77,7 +77,7 @@ class AudioCaptureNode(Node):
         if sd is not None:
             try:
                 self.stream = sd.InputStream(
-                    device=self.device_index_param,
+                    device=self.device_index,
                     channels=self.channels,
                     samplerate=self.sample_rate,
                     blocksize=self.chunk_size,
@@ -85,7 +85,7 @@ class AudioCaptureNode(Node):
                     callback=self._audio_callback,
                 )
                 self.stream.start()
-                self.get_logger().info(f"Audio capture started (device={self.device_index_param})")
+                self.get_logger().info(f"Audio capture started (device={self.device_index}, channels={self.channels})")
             except Exception as exc:
                 self.get_logger().error(f"Stream hatası: {exc}")
 
@@ -93,7 +93,8 @@ class AudioCaptureNode(Node):
         self.create_timer(0.05, self._publish_hid)
 
     def _audio_callback(self, indata, frames, time_info, status):
-        mono = indata[:, 0].copy() if indata.ndim > 1 else indata.copy()
+        # 4 kanallı veriden ilk kanalı al (veya ihtiyacına göre karıştır)
+        mono = indata[:, 0].copy() 
         vad_active = bool(self.respeaker.speech_detected()) if self.respeaker.dev else self._energy_vad(mono)
         with self._audio_lock:
             self._pending = (mono.tolist(), vad_active)
@@ -101,19 +102,14 @@ class AudioCaptureNode(Node):
     def _publish_pending(self):
         with self._audio_lock:
             pending = self._pending
+            self._pending = None
         
         if pending is not None:
             mono, vad_active = pending
-            
-            # Mesajı manuel oluştur ve veri tipini zorla
             raw_msg = Int16MultiArray()
-            # Veri listesini int16 listesine çevir
-            raw_msg.data = [int(x) for x in mono]
-            
-            # Mesajı yayınla
+            raw_msg.data = mono
             self.pub_raw.publish(raw_msg)
             
-            # VAD yayını
             vad_msg = Bool()
             vad_msg.data = vad_active
             self.pub_vad.publish(vad_msg)
@@ -136,7 +132,7 @@ def main():
     node = AudioCaptureNode()
     try: rclpy.spin(node)
     except KeyboardInterrupt: pass
-    finally: rclpy.shutdown()
+    finally: node.destroy_node(); rclpy.shutdown()
 
 if __name__ == "__main__":
     main()
