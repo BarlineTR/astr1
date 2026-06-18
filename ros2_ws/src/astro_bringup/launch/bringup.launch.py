@@ -17,6 +17,7 @@ def generate_launch_description():
     enable_lidar = LaunchConfiguration("enable_lidar")
     enable_audio = LaunchConfiguration("enable_audio")
     enable_vision = LaunchConfiguration("enable_vision")
+    enable_ai = LaunchConfiguration("enable_ai")
 
     return LaunchDescription(
         [
@@ -50,6 +51,11 @@ def generate_launch_description():
                 default_value="true",
                 description="Start OAK-D camera and face detector",
             ),
+            DeclareLaunchArgument(
+                "enable_ai",
+                default_value="true",
+                description="Start AI Brain for NLP processing",
+            ),
             IncludeLaunchDescription(
                 PythonLaunchDescriptionSource(
                     os.path.join(description_pkg, "launch", "description.launch.py")
@@ -73,6 +79,7 @@ def generate_launch_description():
                     "enable_lidar": enable_lidar,
                     "enable_audio": enable_audio,
                     "enable_vision": enable_vision,
+                    "enable_ai": enable_ai,
                 }.items(),
             ),
         ]

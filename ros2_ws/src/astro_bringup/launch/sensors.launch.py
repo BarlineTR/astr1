@@ -12,10 +12,12 @@ def generate_launch_description():
     lidar_pkg = get_package_share_directory("astro_lidar")
     audio_pkg = get_package_share_directory("astro_audio")
     vision_pkg = get_package_share_directory("astro_vision")
+    ai_pkg = get_package_share_directory("astro_ai")
     use_sim_time = LaunchConfiguration("use_sim_time")
     enable_lidar = LaunchConfiguration("enable_lidar")
     enable_audio = LaunchConfiguration("enable_audio")
     enable_vision = LaunchConfiguration("enable_vision")
+    enable_ai = LaunchConfiguration("enable_ai")
 
     return LaunchDescription(
         [
@@ -39,6 +41,11 @@ def generate_launch_description():
                 default_value="true",
                 description="Start OAK-D camera and face detector",
             ),
+            DeclareLaunchArgument(
+                "enable_ai",
+                default_value="true",
+                description="Start AI Brain for NLP processing",
+            ),
             IncludeLaunchDescription(
                 PythonLaunchDescriptionSource(
                     os.path.join(lidar_pkg, "launch", "lidar.launch.py")
@@ -58,6 +65,13 @@ def generate_launch_description():
                     os.path.join(audio_pkg, "launch", "audio.launch.py")
                 ),
                 condition=IfCondition(enable_audio),
+                launch_arguments={"use_sim_time": use_sim_time}.items(),
+            ),
+            IncludeLaunchDescription(
+                PythonLaunchDescriptionSource(
+                    os.path.join(ai_pkg, "launch", "ai.launch.py")
+                ),
+                condition=IfCondition(enable_ai),
                 launch_arguments={"use_sim_time": use_sim_time}.items(),
             ),
         ]

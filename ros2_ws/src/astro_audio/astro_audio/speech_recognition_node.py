@@ -92,12 +92,26 @@ class SpeechRecognitionNode(Node):
             self.get_logger().info(f"Recognized: {text}")
 
     def _silence_tick(self):
+        # 1. Tamponda veri varsa isleyelim
         with self.lock:
-            if not self.buffer: # last_audio_time kontrolünü kaldırdık
-                return
+            has_data = len(self.buffer) > 0
+        if has_data:
+            self._process_buffer()
             
-            # Veri varsa işlemeye başla, 0.5 saniye bekleme zorunluluğunu kaldır
-            self._process_buffer() 
+        # 2. Eger VAD'den uzun suredir (0.5s) veri gelmediyse, konusma bitmistir
+        now = self.get_clock().now()
+        with self.lock:
+            if self.last_audio_time is not None:
+                elapsed = (now - self.last_audio_time).nanoseconds / 1e9
+                if elapsed > self.silence_timeout_s:
+                    # Konusma bitti, zorla sonucu alalim
+                    result = json.loads(self.recognizer.FinalResult())
+                    text = result.get("text", "").strip()
+                    if text:
+                        self._publish_text(text)
+                    self.last_audio_time = None
+                    # Modeli sifirlamak icin (yeni cumleye hazirlik)
+                    self.recognizer.Reset()
 
 
 def main():

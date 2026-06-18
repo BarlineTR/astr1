@@ -11,6 +11,7 @@ The system has been completely modularized into ROS 2 Humble packages:
 - `astro_lidar`: RPLIDAR A1 wrapper and NaN/Range filter node (`scan_filter_node`).
 - `astro_vision`: OAK-D Lite driver wrapper and OpenCV Face Detection node.
 - `astro_audio`: ReSpeaker array driver handling Audio Capture, Speech Recognition (Vosk), and TTS (pyttsx3/gTTS).
+- `astro_ai`: AI Brain Node managing LLM interactions and memory via OpenAI API standard.
 - `astro_bringup`: Centralized launch files and parameters for the whole system.
 - `astro_description`: URDF models and Robot State Publisher (tf2).
 
@@ -23,7 +24,7 @@ Make sure you have ROS 2 Humble installed on your Jetson Orin Nano / Ubuntu 22.0
 sudo apt update
 sudo apt install -y python3-rosdep python3-colcon-common-extensions
 sudo apt install -y ros-humble-rplidar-ros ros-humble-depthai-ros ros-humble-robot-state-publisher
-pip3 install pyusb sounddevice numpy vosk pyttsx3 opencv-python
+pip3 install pyusb sounddevice numpy vosk pyttsx3 opencv-python python-dotenv openai nltk
 ```
 
 ### 2. Build the Workspace
@@ -69,4 +70,4 @@ Centralized parameters are stored in `astro_bringup/config/astro_params.yaml`. Y
 - VAD thresholds and Audio settings
 - RPLIDAR ranges and baud rates
 
-> **Note:** For API Keys and sensitive information in the future (AI nodes), use `.env` files. Do not hardcode API keys in the source code!
+> **Note:** For AI API keys (`AI_API_KEY`), use the `.env` file at the root of the project (copy from `.env.example`). Do not hardcode API keys in the source code!
