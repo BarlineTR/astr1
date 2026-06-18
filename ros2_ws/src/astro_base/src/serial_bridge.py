@@ -112,7 +112,6 @@ class SerialBridge(Node):
         # ✅ FIX: Arduino alive değilse komut gönderme
         if not self.arduino_alive:
             self.get_logger().warn('Arduino not responding - skipping wheel command')
-            return
             
         payload = struct.pack('<ff', msg.left_rpm, msg.right_rpm)
         pkt = self.build_packet(MSG_WHEEL_CMD, payload)
