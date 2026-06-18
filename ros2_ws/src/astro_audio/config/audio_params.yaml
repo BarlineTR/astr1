@@ -1,0 +1,21 @@
+audio_capture_node:
+  ros__parameters:
+    device_name: "ReSpeaker"
+    sample_rate: 16000
+    channels: 6
+    chunk_size: 1024
+    vad_threshold: 0.6
+
+speech_recognition_node:
+  ros__parameters:
+    model_path: "/opt/vosk/vosk-model-small-tr-0.3"
+    language: "tr"
+    partial_results: true
+    silence_chunks: 8
+
+tts_node:
+  ros__parameters:
+    engine: "pyttsx3"
+    language: "tr"
+    rate: 150
+    volume: 0.8
