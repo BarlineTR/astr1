@@ -89,7 +89,7 @@ class AudioCaptureNode(Node):
         self.chunk_size = int(self.get_parameter("chunk_size").value)
         self.vad_threshold = float(self.get_parameter("vad_threshold").value)
 
-        self.pub_raw = self.create_publisher(Int16MultiArray, "/audio/raw", 10)
+        self.pub_raw = self.create_publisher(Int16MultiArray, "/audio_raw", 10)
         self.pub_vad = self.create_publisher(Bool, "/audio/vad", 10)
         self.pub_doa = self.create_publisher(Float32, "/audio/doa", 10)
         self.pub_speech = self.create_publisher(
