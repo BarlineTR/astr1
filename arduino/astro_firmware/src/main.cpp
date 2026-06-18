@@ -146,7 +146,7 @@ void tmcInit() {
   pinMode(HEAD_EN_PIN, OUTPUT);
   digitalWrite(HEAD_EN_PIN, LOW); // enable low active olabilir, donanıma göre ayarlayın
 
-  TMC2209_SERIAL.begin(115200);
+  TMC2209_SERIAL.begin(500000); // TMC2209 için yüksek baudrate önerilir
   delay(50);
   tmc2209.begin();
   tmc2209.pdn_disable(true);
