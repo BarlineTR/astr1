@@ -93,14 +93,11 @@ class SpeechRecognitionNode(Node):
 
     def _silence_tick(self):
         with self.lock:
-            if not self.buffer or self.last_audio_time is None:
+            if not self.buffer: # last_audio_time kontrolünü kaldırdık
                 return
-            elapsed = (
-                self.get_clock().now() - self.last_audio_time
-            ).nanoseconds / 1e9
-            if elapsed < self.silence_timeout_s:
-                return
-        self._process_buffer()
+            
+            # Veri varsa işlemeye başla, 0.5 saniye bekleme zorunluluğunu kaldır
+            self._process_buffer() 
 
 
 def main():
