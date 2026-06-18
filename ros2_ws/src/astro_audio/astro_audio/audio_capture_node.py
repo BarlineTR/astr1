@@ -64,16 +64,11 @@ class AudioCaptureNode(Node):
         self.vad_threshold = float(self.get_parameter("vad_threshold").value)
         self.device_index_param = 25 
 
-        # Publisher'lar
+        # Yayıncıları Tanımla
         self.pub_raw = self.create_publisher(Int16MultiArray, "audio_raw", 10)
         self.pub_vad = self.create_publisher(Bool, "audio/vad", 10)
         self.pub_doa = self.create_publisher(Float32, "audio/doa", 10)
         
-        # Topic'leri ROS 2 tablosuna kaydetmek için ilk boş mesajı gönder
-        empty_msg = Int16MultiArray()
-        empty_msg.layout.dim.append(MultiArrayDimension(label="audio", size=0, stride=0))
-        self.pub_raw.publish(empty_msg)
-
         self.respeaker = ReSpeakerHID()
         self._audio_lock = threading.Lock()
         self._pending = None
@@ -106,12 +101,19 @@ class AudioCaptureNode(Node):
     def _publish_pending(self):
         with self._audio_lock:
             pending = self._pending
+        
         if pending is not None:
             mono, vad_active = pending
+            
+            # Mesajı manuel oluştur ve veri tipini zorla
             raw_msg = Int16MultiArray()
-            raw_msg.data = mono
+            # Veri listesini int16 listesine çevir
+            raw_msg.data = [int(x) for x in mono]
+            
+            # Mesajı yayınla
             self.pub_raw.publish(raw_msg)
             
+            # VAD yayını
             vad_msg = Bool()
             vad_msg.data = vad_active
             self.pub_vad.publish(vad_msg)
