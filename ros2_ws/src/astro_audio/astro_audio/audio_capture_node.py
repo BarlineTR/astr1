@@ -147,6 +147,7 @@ class AudioCaptureNode(Node):
                 self.get_logger().warn("sounddevice default/pulse cihazını bulamadı. Fallback yöntemine geçilecek.")
 
         self.pub_raw = self.create_publisher(Int16MultiArray, "audio_raw", 10)
+        self.pub_speech = self.create_publisher(Int16MultiArray, "/audio/speech_audio", 10)
         self.pub_vad = self.create_publisher(Bool, "audio/vad", 10)
         self.pub_doa = self.create_publisher(Float32, "audio/doa", 10)
         
@@ -294,6 +295,11 @@ class AudioCaptureNode(Node):
             vad_msg = Bool()
             vad_msg.data = vad_active
             self.pub_vad.publish(vad_msg)
+            
+            if vad_active:
+                speech_msg = Int16MultiArray()
+                speech_msg.data = mono
+                self.pub_speech.publish(speech_msg)
 
     def _energy_vad(self, mono: np.ndarray) -> bool:
         return (float(np.sqrt(np.mean(mono.astype(np.float32) ** 2))) / 32768.0) > self.vad_threshold
