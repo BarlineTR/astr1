@@ -28,6 +28,7 @@ class SpeechRecognitionNode(Node):
         self.silence_timeout_s = float(self.get_parameter("silence_timeout_s").value)
 
         self.pub_text = self.create_publisher(String, "/speech/text", 10)
+        self.pub_partial = self.create_publisher(String, "/speech/partial_text", 10)
         self.sub_audio = self.create_subscription(
             Int16MultiArray, "/audio/speech_audio", self.audio_callback, 10
         )
@@ -93,10 +94,11 @@ class SpeechRecognitionNode(Node):
     def _publish_text(self, text: str, partial: bool = False):
         msg = String()
         msg.data = text
-        self.pub_text.publish(msg)
         if partial:
+            self.pub_partial.publish(msg)
             self.get_logger().debug(f"Partial: {text}")
         else:
+            self.pub_text.publish(msg)
             self.get_logger().info(f"🎤 [ReSpeaker] Duydu: {text}")
 
     def _silence_tick(self):

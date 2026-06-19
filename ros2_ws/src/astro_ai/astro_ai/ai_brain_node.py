@@ -39,6 +39,10 @@ class AiBrainNode(Node):
             {"role": "system", "content": self.system_prompt}
         ]
         self.max_history = 10 # Keep last 10 messages
+        
+        self.pending_user_text = ""
+        self.is_processing = False
+        self.brain_lock = threading.Lock()
 
         self.pub_tts = self.create_publisher(String, '/tts/say', 10)
         self.sub_speech = self.create_subscription(String, '/speech/text', self.speech_callback, 10)
@@ -56,45 +60,62 @@ class AiBrainNode(Node):
         if not user_text:
             return
             
-        self.get_logger().info(f"🚀 [AI] API'ye gönderiliyor...")
-        self.conversation_history.append({"role": "user", "content": user_text})
-        
-        # Keep history bounded
-        if len(self.conversation_history) > self.max_history:
-            # Keep system prompt at [0], and last N items
-            self.conversation_history = [self.conversation_history[0]] + self.conversation_history[-(self.max_history-1):]
+        with self.brain_lock:
+            # Eger AI zaten bir onceki cumleyi dusunuyorsa, yeni gelen cumleleri sonraya biriktirir (Batching)
+            if self.pending_user_text:
+                self.pending_user_text += " " + user_text
+            else:
+                self.pending_user_text = user_text
+                
+            if not self.is_processing:
+                if self.api_key:
+                    self.is_processing = True
+                    asyncio.run_coroutine_threadsafe(self.process_ai_queue(), self.ai_loop)
+                else:
+                    self.get_logger().error("API Key eksik, LLM cagirisi yapilamadi.")
 
-        if self.api_key:
-            # Asenkron LLM cagrisini baslat
-            asyncio.run_coroutine_threadsafe(self.process_ai_request(), self.ai_loop)
-        else:
-            self.get_logger().error("API Key eksik, LLM cagirisi yapilamadi.")
+    async def process_ai_queue(self):
+        while True:
+            with self.brain_lock:
+                if not self.pending_user_text:
+                    self.is_processing = False
+                    break
+                
+                current_text = self.pending_user_text
+                self.pending_user_text = ""
+            
+            self.get_logger().info(f"🚀 [AI] API'ye gönderiliyor: {current_text}")
+            self.conversation_history.append({"role": "user", "content": current_text})
+            
+            # Keep history bounded
+            if len(self.conversation_history) > self.max_history:
+                self.conversation_history = [self.conversation_history[0]] + self.conversation_history[-(self.max_history-1):]
 
-    async def process_ai_request(self):
-        try:
-            response = await self.client.chat.completions.create(
-                model=self.model_name,
-                messages=self.conversation_history,
-                temperature=0.7,
-                max_tokens=256
-            )
-            
-            ai_text = response.choices[0].message.content.strip()
-            self.get_logger().info(f"🧠 [AI] Cevap: {ai_text}")
-            
-            # Kaydet
-            self.conversation_history.append({"role": "assistant", "content": ai_text})
-            
-            # Cumle cumle ayirip TTS'e yolla (re modulu ile basitce ayiriyoruz, nltk scipy hatasini onlemek icin)
-            sentences = re.split(r'(?<=[.!?]) +', ai_text)
-            for sentence in sentences:
-                if sentence.strip():
-                    tts_msg = String()
-                    tts_msg.data = sentence.strip()
-                    self.pub_tts.publish(tts_msg)
-                    
-        except Exception as e:
-            self.get_logger().error(f"❌ [AI] LLM API Baglanti Hatasi! Lutfen API Key'i ve interneti kontrol edin. Hata Detayi: {e}")
+            try:
+                response = await self.client.chat.completions.create(
+                    model=self.model_name,
+                    messages=self.conversation_history,
+                    temperature=0.7,
+                    max_tokens=256
+                )
+                
+                ai_text = response.choices[0].message.content.strip()
+                self.get_logger().info(f"🧠 [AI] Cevap: {ai_text}")
+                
+                # Kaydet
+                self.conversation_history.append({"role": "assistant", "content": ai_text})
+                
+                # Cumle cumle ayirip TTS'e yolla
+                sentences = re.split(r'(?<=[.!?]) +', ai_text)
+                for sentence in sentences:
+                    if sentence.strip():
+                        tts_msg = String()
+                        tts_msg.data = sentence.strip()
+                        self.pub_tts.publish(tts_msg)
+                        
+            except Exception as e:
+                self.get_logger().error(f"❌ [AI] LLM API Baglanti Hatasi! Lutfen API Key'i ve interneti kontrol edin. Hata Detayi: {e}")
+                await asyncio.sleep(2) # Hata spamini onlemek icin bekle
 
 def main():
     rclpy.init()
