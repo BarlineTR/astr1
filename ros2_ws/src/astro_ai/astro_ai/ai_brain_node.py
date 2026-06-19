@@ -27,7 +27,7 @@ class AiBrainNode(Node):
             # Node'un calismasini durdurmayalim ama islem de yapmayacak
         else:
             self.client = AsyncOpenAI(api_key=self.api_key, base_url=self.base_url)
-            self.get_logger().info(f"AI Brain baslatildi. Model: {self.model_name}")
+            self.get_logger().info(f"✅ [AI] API Baglantisi Hazir. Model: {self.model_name}")
 
         self.system_prompt = (
             "Sen Astro adinda cana yakin, yardimsever ve cok akilli bir asistansin. "
@@ -68,7 +68,7 @@ class AiBrainNode(Node):
         if not user_text:
             return
             
-        self.get_logger().info(f"User: {user_text}")
+        self.get_logger().info(f"🚀 [AI] API'ye gönderiliyor...")
         self.conversation_history.append({"role": "user", "content": user_text})
         
         # Keep history bounded
@@ -92,7 +92,7 @@ class AiBrainNode(Node):
             )
             
             ai_text = response.choices[0].message.content.strip()
-            self.get_logger().info(f"Astro: {ai_text}")
+            self.get_logger().info(f"🧠 [AI] Cevap: {ai_text}")
             
             # Kaydet
             self.conversation_history.append({"role": "assistant", "content": ai_text})
@@ -106,7 +106,7 @@ class AiBrainNode(Node):
                     self.pub_tts.publish(tts_msg)
                     
         except Exception as e:
-            self.get_logger().error(f"LLM API Hatasi: {e}")
+            self.get_logger().error(f"❌ [AI] LLM API Baglanti Hatasi! Lutfen API Key'i ve interneti kontrol edin. Hata Detayi: {e}")
 
 def main():
     rclpy.init()

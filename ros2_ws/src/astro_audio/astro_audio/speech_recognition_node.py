@@ -89,7 +89,7 @@ class SpeechRecognitionNode(Node):
         if partial:
             self.get_logger().debug(f"Partial: {text}")
         else:
-            self.get_logger().info(f"Recognized: {text}")
+            self.get_logger().info(f"🎤 [ReSpeaker] Duydu: {text}")
 
     def _silence_tick(self):
         # 1. Tamponda veri varsa isleyelim

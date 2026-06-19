@@ -107,11 +107,12 @@ class AudioCaptureNode(Node):
                 out = subprocess.check_output(["arecord", "-l"], stderr=subprocess.DEVNULL).decode("utf-8")
                 found = False
                 for line in out.splitlines():
-                    if any(x in line.lower() for x in ["respeaker", "array", "uac"]):
+                    # 'respeaker', 'array', 'uac', 'seeed', 'usb audio' gibi her turlu olasi ismi kontrol et
+                    if any(x in line.lower() for x in ["respeaker", "array", "uac", "seeed", "usb audio"]):
                         match = re.search(r'card (\d+): ([\w\-]+)', line)
                         if match:
                             self.alsa_card_name = match.group(2)
-                            self.get_logger().info(f"Dinamik algılanan ALSA Kartı: {self.alsa_card_name} (Kart ID: {match.group(1)})")
+                            self.get_logger().info(f"✅ [ReSpeaker] ALSA Kartı Bulundu: {self.alsa_card_name} (Kart ID: {match.group(1)})")
                             found = True
                             break
                 if found:
@@ -169,7 +170,7 @@ class AudioCaptureNode(Node):
                 )
                 self.stream.start()
                 sd_success = True
-                self.get_logger().info("Audio capture (sounddevice PulseAudio) başarıyla başlatıldı.")
+                self.get_logger().info("✅ [ReSpeaker] Ses yakalama aktif ve dinliyor! (PulseAudio üzerinden)")
             except Exception as exc:
                 self.get_logger().error(f"sounddevice stream açılamadı: {exc}")
 
@@ -242,7 +243,7 @@ class AudioCaptureNode(Node):
                         self.get_logger().warn(f"arecord {ch} kanallı okuma yapamadı (Cihaz: {alsa_dev}). Hata: {err_msg}")
                         continue
                     
-                    self.get_logger().info(f"arecord başarıyla bağlandı! ({alsa_dev}, {ch} kanal modunda çalışıyor)")
+                    self.get_logger().info(f"✅ [ReSpeaker] Ses yakalama aktif ve dinliyor! (arecord {alsa_dev}, {ch} kanal)")
                     
                     # Veri okuma döngüsü
                     while not self._stop_event.is_set():

@@ -70,6 +70,7 @@ class TtsNode(Node):
     def _speak(self, text: str):
         with self.mute_lock:
             self._set_speaking(True)
+            self.get_logger().info(f"🔊 [TTS] Söyleniyor: {text}")
             try:
                 if self.engine_name == "pyttsx3" and self.tts_engine is not None:
                     self.tts_engine.say(text)
