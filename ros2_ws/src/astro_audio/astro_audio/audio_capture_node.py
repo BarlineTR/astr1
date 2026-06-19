@@ -51,11 +51,13 @@ class AudioCaptureNode(Node):
         self.declare_parameter("channels", 6)
         self.declare_parameter("chunk_size", 1024)
         self.declare_parameter("vad_threshold", 0.05)
+        self.declare_parameter("audio_gain", 3.0)
 
         self.sample_rate = int(self.get_parameter("sample_rate").value)
         self.channels = int(self.get_parameter("channels").value)
         self.chunk_size = int(self.get_parameter("chunk_size").value)
         self.vad_threshold = float(self.get_parameter("vad_threshold").value)
+        self.audio_gain = float(self.get_parameter("audio_gain").value)
 
         # PulseAudio kaynağını ve ALSA kart adını dinamik olarak bul
         import subprocess
@@ -251,6 +253,10 @@ class AudioCaptureNode(Node):
                         arr = np.frombuffer(data, dtype=np.int16).reshape(-1, ch)
                         mono = arr[:, 0].copy() # 0. kanal her zaman mevcuttur
                         
+                        # Uygulamaya dijital kazanc ekleyelim (Vosk'un kelimeleri daha iyi secebilmesi icin)
+                        if self.audio_gain != 1.0:
+                            mono = np.clip(mono.astype(np.float32) * self.audio_gain, -32768, 32767).astype(np.int16)
+                        
                         vad_active = self.speech_detected_status if self.respeaker.dev else self._energy_vad(mono)
                         with self._audio_lock:
                             self._pending = (mono.tolist(), vad_active)
@@ -277,6 +283,11 @@ class AudioCaptureNode(Node):
 
     def _audio_callback(self, indata, frames, time_info, status):
         mono = indata[:, 0].copy()
+        
+        # Uygulamaya dijital kazanc ekleyelim (Vosk'un kelimeleri daha iyi secebilmesi icin)
+        if self.audio_gain != 1.0:
+            mono = np.clip(mono.astype(np.float32) * self.audio_gain, -32768, 32767).astype(np.int16)
+            
         vad_active = self.speech_detected_status if self.respeaker.dev else self._energy_vad(mono)
         with self._audio_lock:
             self._pending = (mono.tolist(), vad_active)
