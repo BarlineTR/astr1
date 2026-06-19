@@ -14,6 +14,17 @@ except ImportError:
     Model = None
     SetLogLevel = None
 
+try:
+    from openai import AsyncOpenAI
+    from dotenv import load_dotenv
+    import os
+    import io
+    import wave
+    import asyncio
+except ImportError:
+    AsyncOpenAI = None
+    load_dotenv = None
+
 
 class SpeechRecognitionNode(Node):
     def __init__(self):
@@ -41,30 +52,63 @@ class SpeechRecognitionNode(Node):
         self.is_speaking = False
         self.lock = threading.Lock()
 
-        if Model is None:
-            self.get_logger().error("vosk not installed — speech recognition disabled")
-            self.recognizer = None
-            return
+        if load_dotenv:
+            load_dotenv(os.path.join(os.getcwd(), '.env'))
+            
+        self.stt_engine = os.getenv("STT_ENGINE", "vosk").lower()
+        
+        if self.stt_engine == "whisper":
+            if AsyncOpenAI is None or not os.getenv("STT_API_KEY"):
+                self.get_logger().error("Whisper icin openai paketi veya STT_API_KEY eksik! Vosk'a donuluyor.")
+                self.stt_engine = "vosk"
+            else:
+                self.client = AsyncOpenAI(
+                    api_key=os.getenv("STT_API_KEY"),
+                    base_url=os.getenv("STT_BASE_URL", "https://api.openai.com/v1")
+                )
+                self.whisper_model = os.getenv("STT_WHISPER_MODEL", "whisper-1")
+                self.ai_loop = asyncio.new_event_loop()
+                self.ai_thread = threading.Thread(target=self._run_async_loop, daemon=True)
+                self.ai_thread.start()
+                self.get_logger().info(f"STT Engine: Whisper API ({self.whisper_model})")
+                
+        if self.stt_engine == "vosk":
+            if Model is None:
+                self.get_logger().error("vosk not installed — speech recognition disabled")
+                self.recognizer = None
+                return
 
-        if SetLogLevel is not None:
-            SetLogLevel(-1)
+            if SetLogLevel is not None:
+                SetLogLevel(-1)
 
-        try:
-            self.model = Model(model_path)
-            self.recognizer = KaldiRecognizer(self.model, 16000)
-            self.recognizer.SetWords(True)
-            self.get_logger().info(f"Vosk model loaded: {model_path}")
-        except Exception as e:
-            self.get_logger().error(f"Failed to load Vosk model: {e}")
-            self.recognizer = None
+            try:
+                # Kullanici .env'den vosk yolunu da degistirebilsin
+                env_vosk_path = os.getenv("STT_VOSK_MODEL_PATH")
+                if env_vosk_path and os.path.exists(env_vosk_path):
+                    model_path = env_vosk_path
+                    
+                self.model = Model(model_path)
+                self.recognizer = KaldiRecognizer(self.model, 16000)
+                self.recognizer.SetWords(True)
+                self.get_logger().info(f"STT Engine: Vosk (Model: {model_path})")
+            except Exception as e:
+                self.get_logger().error(f"Failed to load Vosk model: {e}")
+                self.recognizer = None
 
         self.create_timer(0.1, self._silence_tick)
 
+    def _run_async_loop(self):
+        asyncio.set_event_loop(self.ai_loop)
+        self.ai_loop.run_forever()
+
     def audio_callback(self, msg: Int16MultiArray):
-        if self.recognizer is None:
+        if self.stt_engine == "vosk" and self.recognizer is None:
             return
 
         with self.lock:
+            # Whisper kullaniyorsak boslugu tampona eklemeye gerek yok, sadece ses varken ekle
+            if self.stt_engine == "whisper" and not self.is_speaking:
+                return
             self.buffer.extend(msg.data)
 
     def vad_callback(self, msg: Bool):
@@ -102,11 +146,11 @@ class SpeechRecognitionNode(Node):
             self.get_logger().info(f"🎤 [ReSpeaker] Duydu: {text}")
 
     def _silence_tick(self):
-        # 1. Tamponda veri varsa isleyelim
-        with self.lock:
-            has_data = len(self.buffer) > 0
-        if has_data:
-            self._process_buffer()
+        if self.stt_engine == "vosk":
+            with self.lock:
+                has_data = len(self.buffer) > 0
+            if has_data:
+                self._process_buffer()
             
         # 2. Eger VAD'den uzun suredir (0.5s) veri gelmediyse, konusma bitmistir
         now = self.get_clock().now()
@@ -114,16 +158,46 @@ class SpeechRecognitionNode(Node):
             if self.is_speaking and self.last_speech_time is not None:
                 elapsed = (now - self.last_speech_time).nanoseconds / 1e9
                 if elapsed > self.silence_timeout_s:
-                    # Konusma bitti, zorla sonucu alalim
-                    result = json.loads(self.recognizer.FinalResult())
-                    text = result.get("text", "").strip()
-                    if text:
-                        self._publish_text(text)
+                    if self.stt_engine == "vosk":
+                        result = json.loads(self.recognizer.FinalResult())
+                        text = result.get("text", "").strip()
+                        if text:
+                            self._publish_text(text)
+                        self.recognizer.Reset()
+                        
+                    elif self.stt_engine == "whisper":
+                        audio_bytes = np.array(self.buffer, dtype=np.int16).tobytes()
+                        self.buffer.clear()
+                        # En azindan 0.5 saniyelik ses varsa gonder (16000 byte)
+                        if len(audio_bytes) > 16000:
+                            asyncio.run_coroutine_threadsafe(self._transcribe_whisper(audio_bytes), self.ai_loop)
+
                     self.last_speech_time = None
                     self.is_speaking = False
-                    # Modeli sifirlamak icin (yeni cumleye hazirlik)
-                    self.recognizer.Reset()
 
+    async def _transcribe_whisper(self, audio_bytes):
+        wav_io = io.BytesIO()
+        with wave.open(wav_io, 'wb') as wav_file:
+            wav_file.setnchannels(1)
+            wav_file.setsampwidth(2)
+            wav_file.setframerate(16000)
+            wav_file.writeframes(audio_bytes)
+        
+        wav_io.name = "speech.wav"
+        wav_io.seek(0)
+        
+        try:
+            self.get_logger().info("☁️ [Whisper] Bulut API'ye ses gönderiliyor...")
+            response = await self.client.audio.transcriptions.create(
+                model=self.whisper_model,
+                file=wav_io,
+                language="tr"
+            )
+            text = response.text.strip()
+            if text:
+                self._publish_text(text)
+        except Exception as e:
+            self.get_logger().error(f"❌ [Whisper] API Hatasi: {e}")
 
 def main():
     rclpy.init()

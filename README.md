@@ -70,4 +70,27 @@ Centralized parameters are stored in `astro_bringup/config/astro_params.yaml`. Y
 - VAD thresholds and Audio settings
 - RPLIDAR ranges and baud rates
 
+### 4. Advanced STT (Ses Tanıma) Options
+You can change the STT engine via the `.env` file (`STT_ENGINE`).
+
+**Option 1: Vosk Large Model (Offline, 1GB)**
+For much better offline Turkish recognition, download the large model:
+```bash
+wget https://alphacephei.com/vosk/models/vosk-model-tr-0.3.zip
+unzip vosk-model-tr-0.3.zip
+sudo mv vosk-model-tr-0.3 /opt/vosk/
+```
+Then update your `.env` file:
+```ini
+STT_ENGINE="vosk"
+STT_VOSK_MODEL_PATH="/opt/vosk/vosk-model-tr-0.3"
+```
+
+**Option 2: Whisper API (Cloud)**
+If you want to use OpenAI or Groq Whisper for perfect STT:
+```ini
+STT_ENGINE="whisper"
+STT_API_KEY="sk-YOUR-KEY"
+```
+
 > **Note:** For AI API keys (`AI_API_KEY`), use the `.env` file at the root of the project (copy from `.env.example`). Do not hardcode API keys in the source code!
