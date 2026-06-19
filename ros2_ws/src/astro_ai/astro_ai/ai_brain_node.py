@@ -7,7 +7,6 @@ from rclpy.node import Node
 from std_msgs.msg import String
 
 from dotenv import load_dotenv
-from openai import AsyncOpenAI
 import re
 
 class AiBrainNode(Node):
@@ -18,16 +17,27 @@ class AiBrainNode(Node):
         env_path = os.path.join(os.getcwd(), '.env')
         load_dotenv(env_path)
         
+        # AI_MODE: "local" = sadece STT test (API cagirmaz), "api" = Gemini/OpenAI API kullanir
+        self.ai_mode = os.getenv("AI_MODE", "local").lower().strip()
+        
         self.api_key = os.getenv("AI_API_KEY")
         self.base_url = os.getenv("AI_BASE_URL", "https://api.openai.com/v1")
         self.model_name = os.getenv("AI_MODEL", "gpt-4o")
+        self.client = None
         
-        if not self.api_key:
-            self.get_logger().error("AI_API_KEY bulunamadi! Lutfen .env dosyasini kontrol edin.")
-            # Node'un calismasini durdurmayalim ama islem de yapmayacak
-        else:
-            self.client = AsyncOpenAI(api_key=self.api_key, base_url=self.base_url)
-            self.get_logger().info(f"✅ [AI] API Baglantisi Hazir. Model: {self.model_name}")
+        if self.ai_mode == "api":
+            if not self.api_key:
+                self.get_logger().error("❌ [AI] AI_MODE=api ama AI_API_KEY bulunamadi! Lutfen .env dosyasini kontrol edin.")
+                self.get_logger().warn("⚠️ [AI] Local moda dusuruldu.")
+                self.ai_mode = "local"
+            else:
+                from openai import AsyncOpenAI
+                self.client = AsyncOpenAI(api_key=self.api_key, base_url=self.base_url)
+                self.get_logger().info(f"✅ [AI] API Modu Aktif. Model: {self.model_name}")
+        
+        if self.ai_mode == "local":
+            self.get_logger().info("✅ [AI] Yerel Mod Aktif — API çağrısı yapılmayacak. STT test modunda.")
+            self.get_logger().info("💡 [AI] API moduna geçmek için .env dosyasında AI_MODE=\"api\" yapın.")
 
         self.system_prompt = (
             "Sen Astro adinda cana yakin, yardimsever ve cok akilli bir asistansin. "
@@ -47,9 +57,10 @@ class AiBrainNode(Node):
         self.pub_tts = self.create_publisher(String, '/tts/say', 10)
         self.sub_speech = self.create_subscription(String, '/speech/text', self.speech_callback, 10)
         
-        self.ai_loop = asyncio.new_event_loop()
-        self.ai_thread = threading.Thread(target=self._run_async_loop, daemon=True)
-        self.ai_thread.start()
+        if self.ai_mode == "api":
+            self.ai_loop = asyncio.new_event_loop()
+            self.ai_thread = threading.Thread(target=self._run_async_loop, daemon=True)
+            self.ai_thread.start()
 
     def _run_async_loop(self):
         asyncio.set_event_loop(self.ai_loop)
@@ -59,16 +70,24 @@ class AiBrainNode(Node):
         user_text = msg.data.strip()
         if not user_text:
             return
+        
+        # ===== YEREL MOD: Sadece logla, TTS ile geri bildir =====
+        if self.ai_mode == "local":
+            self.get_logger().info(f"🎤 [Yerel] Duyulan: \"{user_text}\"")
+            tts_msg = String()
+            tts_msg.data = f"{user_text} dedim, anladım."
+            self.pub_tts.publish(tts_msg)
+            return
             
+        # ===== API MOD: Gemini/OpenAI'ye gonder =====
         with self.brain_lock:
-            # Eger AI zaten bir onceki cumleyi dusunuyorsa, yeni gelen cumleleri sonraya biriktirir (Batching)
             if self.pending_user_text:
                 self.pending_user_text += " " + user_text
             else:
                 self.pending_user_text = user_text
                 
             if not self.is_processing:
-                if self.api_key:
+                if self.client:
                     self.is_processing = True
                     asyncio.run_coroutine_threadsafe(self.process_ai_queue(), self.ai_loop)
                 else:
