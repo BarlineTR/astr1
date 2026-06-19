@@ -24,7 +24,7 @@ Make sure you have ROS 2 Humble installed on your Jetson Orin Nano / Ubuntu 22.0
 sudo apt update
 sudo apt install -y python3-rosdep python3-colcon-common-extensions
 sudo apt install -y ros-humble-rplidar-ros ros-humble-depthai-ros ros-humble-robot-state-publisher
-pip3 install pyusb sounddevice numpy vosk pyttsx3 opencv-python python-dotenv openai nltk
+pip3 install pyusb sounddevice numpy vosk pyttsx3 opencv-python python-dotenv openai
 ```
 
 ### 2. Build the Workspace

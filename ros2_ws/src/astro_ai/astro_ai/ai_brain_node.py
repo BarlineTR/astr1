@@ -8,7 +8,7 @@ from std_msgs.msg import String
 
 from dotenv import load_dotenv
 from openai import AsyncOpenAI
-import nltk.data
+import re
 
 class AiBrainNode(Node):
     def __init__(self):
@@ -39,18 +39,6 @@ class AiBrainNode(Node):
             {"role": "system", "content": self.system_prompt}
         ]
         self.max_history = 10 # Keep last 10 messages
-        
-        # NLTK sentence tokenizer (lazy load to avoid startup delay if not available immediately)
-        try:
-            self.sent_detector = nltk.data.load('tokenizers/punkt/turkish.pickle')
-        except LookupError:
-            self.get_logger().warn("NLTK 'punkt' bulunamadi, indiriliyor...")
-            nltk.download('punkt')
-            try:
-                self.sent_detector = nltk.data.load('tokenizers/punkt/turkish.pickle')
-            except Exception:
-                # Fallback to english if turkish is not strictly available or just use split
-                self.sent_detector = nltk.data.load('tokenizers/punkt/english.pickle')
 
         self.pub_tts = self.create_publisher(String, '/tts/say', 10)
         self.sub_speech = self.create_subscription(String, '/speech/text', self.speech_callback, 10)
@@ -97,8 +85,8 @@ class AiBrainNode(Node):
             # Kaydet
             self.conversation_history.append({"role": "assistant", "content": ai_text})
             
-            # Cumle cumle ayirip TTS'e yolla
-            sentences = self.sent_detector.tokenize(ai_text)
+            # Cumle cumle ayirip TTS'e yolla (re modulu ile basitce ayiriyoruz, nltk scipy hatasini onlemek icin)
+            sentences = re.split(r'(?<=[.!?]) +', ai_text)
             for sentence in sentences:
                 if sentence.strip():
                     tts_msg = String()
