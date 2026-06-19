@@ -5,7 +5,7 @@ import threading
 import numpy as np
 import rclpy
 from rclpy.node import Node
-from std_msgs.msg import Int16MultiArray, String
+from std_msgs.msg import Int16MultiArray, String, Bool
 
 try:
     from vosk import KaldiRecognizer, Model, SetLogLevel
@@ -28,12 +28,16 @@ class SpeechRecognitionNode(Node):
         self.silence_timeout_s = float(self.get_parameter("silence_timeout_s").value)
 
         self.pub_text = self.create_publisher(String, "/speech/text", 10)
-        self.sub = self.create_subscription(
+        self.sub_audio = self.create_subscription(
             Int16MultiArray, "/audio/speech_audio", self.audio_callback, 10
+        )
+        self.sub_vad = self.create_subscription(
+            Bool, "/audio/vad", self.vad_callback, 10
         )
 
         self.buffer = []
-        self.last_audio_time = None
+        self.last_speech_time = None
+        self.is_speaking = False
         self.lock = threading.Lock()
 
         if Model is None:
@@ -61,7 +65,12 @@ class SpeechRecognitionNode(Node):
 
         with self.lock:
             self.buffer.extend(msg.data)
-            self.last_audio_time = self.get_clock().now()
+
+    def vad_callback(self, msg: Bool):
+        if msg.data:
+            with self.lock:
+                self.last_speech_time = self.get_clock().now()
+                self.is_speaking = True
 
     def _process_buffer(self):
         with self.lock:
@@ -69,7 +78,6 @@ class SpeechRecognitionNode(Node):
                 return
             audio_bytes = np.array(self.buffer, dtype=np.int16).tobytes()
             self.buffer.clear()
-            self.last_audio_time = None
 
         if self.recognizer.AcceptWaveform(audio_bytes):
             result = json.loads(self.recognizer.Result())
@@ -101,15 +109,16 @@ class SpeechRecognitionNode(Node):
         # 2. Eger VAD'den uzun suredir (0.5s) veri gelmediyse, konusma bitmistir
         now = self.get_clock().now()
         with self.lock:
-            if self.last_audio_time is not None:
-                elapsed = (now - self.last_audio_time).nanoseconds / 1e9
+            if self.is_speaking and self.last_speech_time is not None:
+                elapsed = (now - self.last_speech_time).nanoseconds / 1e9
                 if elapsed > self.silence_timeout_s:
                     # Konusma bitti, zorla sonucu alalim
                     result = json.loads(self.recognizer.FinalResult())
                     text = result.get("text", "").strip()
                     if text:
                         self._publish_text(text)
-                    self.last_audio_time = None
+                    self.last_speech_time = None
+                    self.is_speaking = False
                     # Modeli sifirlamak icin (yeni cumleye hazirlik)
                     self.recognizer.Reset()
 

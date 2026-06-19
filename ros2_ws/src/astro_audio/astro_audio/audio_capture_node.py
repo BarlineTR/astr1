@@ -296,10 +296,10 @@ class AudioCaptureNode(Node):
             vad_msg.data = vad_active
             self.pub_vad.publish(vad_msg)
             
-            if vad_active:
-                speech_msg = Int16MultiArray()
-                speech_msg.data = mono
-                self.pub_speech.publish(speech_msg)
+            # Her zaman kesintisiz gonder (Vosk ses kaybini engellemek icin)
+            speech_msg = Int16MultiArray()
+            speech_msg.data = mono
+            self.pub_speech.publish(speech_msg)
 
     def _energy_vad(self, mono: np.ndarray) -> bool:
         return (float(np.sqrt(np.mean(mono.astype(np.float32) ** 2))) / 32768.0) > self.vad_threshold
