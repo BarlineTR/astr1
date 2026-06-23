@@ -46,14 +46,19 @@ class SpeechRecognitionNode(Node):
         self.sub_vad = self.create_subscription(
             Bool, "/audio/vad", self.vad_callback, 10
         )
+        self.sub_tts_speaking = self.create_subscription(
+            Bool, "/tts/speaking", self.tts_speaking_callback, 10
+        )
 
         self.buffer = []
         self.last_speech_time = None
         self.is_speaking = False
+        self.tts_speaking = False
+        self.last_tts_speaking_time = None
         self.lock = threading.Lock()
 
         if load_dotenv:
-            load_dotenv(os.path.join(os.getcwd(), '.env'))
+            load_dotenv()
             
         self.stt_engine = os.getenv("STT_ENGINE", "vosk").lower()
         
@@ -101,11 +106,33 @@ class SpeechRecognitionNode(Node):
         asyncio.set_event_loop(self.ai_loop)
         self.ai_loop.run_forever()
 
+    def tts_speaking_callback(self, msg: Bool):
+        with self.lock:
+            was_speaking = self.tts_speaking
+            self.tts_speaking = msg.data
+            if self.tts_speaking:
+                self.buffer.clear()
+                self.is_speaking = False
+                self.last_speech_time = None
+                if self.stt_engine == "vosk" and self.recognizer is not None:
+                    self.recognizer.Reset()
+            elif was_speaking and not self.tts_speaking:
+                self.last_tts_speaking_time = self.get_clock().now()
+                self.buffer.clear()
+                self.is_speaking = False
+                self.last_speech_time = None
+
     def audio_callback(self, msg: Int16MultiArray):
         if self.stt_engine == "vosk" and self.recognizer is None:
             return
 
         with self.lock:
+            if self.tts_speaking:
+                return
+            if self.last_tts_speaking_time is not None:
+                elapsed = (self.get_clock().now() - self.last_tts_speaking_time).nanoseconds / 1e9
+                if elapsed < 0.8:
+                    return
             # Whisper kullaniyorsak boslugu tampona eklemeye gerek yok, sadece ses varken ekle
             if self.stt_engine == "whisper" and not self.is_speaking:
                 return
@@ -114,6 +141,12 @@ class SpeechRecognitionNode(Node):
     def vad_callback(self, msg: Bool):
         if msg.data:
             with self.lock:
+                if self.tts_speaking:
+                    return
+                if self.last_tts_speaking_time is not None:
+                    elapsed = (self.get_clock().now() - self.last_tts_speaking_time).nanoseconds / 1e9
+                    if elapsed < 0.8:
+                        return
                 self.last_speech_time = self.get_clock().now()
                 self.is_speaking = True
 

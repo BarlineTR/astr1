@@ -150,7 +150,7 @@ class AudioCaptureNode(Node):
 
         self.pub_raw = self.create_publisher(Int16MultiArray, "audio_raw", 10)
         self.pub_speech = self.create_publisher(Int16MultiArray, "/audio/speech_audio", 10)
-        self.pub_vad = self.create_publisher(Bool, "audio/vad", 10)
+        self.pub_vad = self.create_publisher(Bool, "/audio/vad", 10)
         self.pub_doa = self.create_publisher(Float32, "audio/doa", 10)
         
         self.respeaker = ReSpeakerHID()
