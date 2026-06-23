@@ -20,6 +20,12 @@ class AiBrainNode(Node):
         # AI_MODE: "local" = sadece STT test (API cagirmaz), "api" = Gemini/OpenAI API kullanir
         self.ai_mode = os.getenv("AI_MODE", "local").lower().strip()
         
+        # Wake Word and State Machine Settings
+        self.wake_word = os.getenv("WAKE_WORD", "hey astro").lower().strip()
+        self.conv_timeout = float(os.getenv("CONVERSATION_TIMEOUT", "15"))
+        self.state = "IDLE" # "IDLE" or "ACTIVE"
+        self.last_interaction_time = None
+        
         self.api_key = os.getenv("AI_API_KEY")
         self.base_url = os.getenv("AI_BASE_URL", "https://api.openai.com/v1")
         self.model_name = os.getenv("AI_MODEL", "gpt-4o")
@@ -70,17 +76,55 @@ class AiBrainNode(Node):
         user_text = msg.data.strip()
         if not user_text:
             return
-        
-        # ===== YEREL MOD: Sadece logla, TTS ile geri bildir =====
-        if self.ai_mode == "local":
-            self.get_logger().info(f"🎤 [Yerel] Duyulan: \"{user_text}\"")
-            tts_msg = String()
-            tts_msg.data = f"{user_text} dedim, anladım."
-            self.pub_tts.publish(tts_msg)
-            return
             
-        # ===== API MOD: Gemini/OpenAI'ye gonder =====
+        user_text_lower = user_text.lower()
+        now = self.get_clock().now()
+
         with self.brain_lock:
+            # Durum kontrolü: Zaman asimi var mi?
+            if self.state == "ACTIVE" and self.last_interaction_time is not None:
+                elapsed = (now - self.last_interaction_time).nanoseconds / 1e9
+                if elapsed > self.conv_timeout:
+                    self.state = "IDLE"
+                    self.get_logger().info("💤 [AI] Sohbet zaman aşımı. Uyku moduna (IDLE) dönüldü.")
+            
+            # IDLE Modu Mantigi: Sadece Wake Word bekleriz
+            if self.state == "IDLE":
+                idx = user_text_lower.find(self.wake_word)
+                if idx != -1:
+                    self.state = "ACTIVE"
+                    self.last_interaction_time = now
+                    
+                    # Wake word'den sonraki kismi al
+                    clean_text = user_text[idx + len(self.wake_word):].strip()
+                    
+                    self.get_logger().info(f"✨ [AI] Wake Word Algılandı! ACTIVE moduna geçildi. (Süre: {self.conv_timeout}sn)")
+                    
+                    if not clean_text:
+                        # Sadece "hey astro" dedi, "Efendim" diye seslen
+                        tts_msg = String()
+                        tts_msg.data = "Efendim?"
+                        self.pub_tts.publish(tts_msg)
+                        return
+                    else:
+                        user_text = clean_text # Gerisini dinlemeye devam et
+                else:
+                    # Uyandirma kelimesi gecmiyor, gormezden gel
+                    self.get_logger().debug(f"🔇 [Görmezden Gelindi]: {user_text}")
+                    return
+            
+            # Buraya gelindiyse ACTIVE durumundayiz
+            self.last_interaction_time = now
+        
+            # ===== YEREL MOD: Sadece logla, TTS ile geri bildir =====
+            if self.ai_mode == "local":
+                self.get_logger().info(f"🎤 [Yerel] Duyulan: \"{user_text}\"")
+                tts_msg = String()
+                tts_msg.data = f"{user_text} dedim, anladım."
+                self.pub_tts.publish(tts_msg)
+                return
+                
+            # ===== API MOD: Gemini/OpenAI'ye gonder =====
             if self.pending_user_text:
                 self.pending_user_text += " " + user_text
             else:

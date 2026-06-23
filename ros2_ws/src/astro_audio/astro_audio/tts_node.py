@@ -14,15 +14,24 @@ except ImportError:
     pyttsx3 = None
 
 
+from dotenv import load_dotenv
+
 class TtsNode(Node):
     def __init__(self):
         super().__init__("tts_node")
-        self.declare_parameter("engine", "pyttsx3")
+        
+        env_path = os.path.join(os.getcwd(), '.env')
+        load_dotenv(env_path)
+
+        # Default parameters
+        self.declare_parameter("engine", os.getenv("TTS_ENGINE", "edge-tts"))
+        self.declare_parameter("voice", os.getenv("TTS_VOICE", "tr-TR-AhmetNeural"))
         self.declare_parameter("language", "tr")
         self.declare_parameter("rate", 150)
         self.declare_parameter("volume", 0.8)
 
         self.engine_name = self.get_parameter("engine").value
+        self.voice_name = self.get_parameter("voice").value
         self.language = self.get_parameter("language").value
         self.rate = int(self.get_parameter("rate").value)
         self.volume = float(self.get_parameter("volume").value)
@@ -36,6 +45,8 @@ class TtsNode(Node):
 
         if self.engine_name == "pyttsx3":
             self._init_pyttsx3()
+        elif self.engine_name == "edge-tts":
+            self.get_logger().info(f"Using edge-tts engine (Voice: {self.voice_name})")
         elif self.engine_name == "gtts":
             self.get_logger().info("Using gTTS engine (requires internet)")
         else:
@@ -77,12 +88,36 @@ class TtsNode(Node):
                     self.tts_engine.runAndWait()
                 elif self.engine_name == "gtts":
                     self._speak_gtts(text)
+                elif self.engine_name == "edge-tts":
+                    self._speak_edge_tts(text)
                 else:
                     self.get_logger().warn("TTS engine not available")
             except Exception as e:
                 self.get_logger().error(f"TTS failed: {e}")
             finally:
                 self._set_speaking(False)
+
+    def _speak_edge_tts(self, text: str):
+        with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as f:
+            tmp_path = f.name
+        try:
+            # Sesi olustur
+            subprocess.run(
+                ["edge-tts", "--text", text, "--voice", self.voice_name, "--write-media", tmp_path],
+                check=True,
+                capture_output=True,
+            )
+            # Cal
+            subprocess.run(
+                ["mpg123", "-q", tmp_path],
+                check=True,
+                capture_output=True,
+            )
+        except Exception as e:
+            self.get_logger().error(f"edge-tts error: {e}")
+        finally:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
 
     def _speak_gtts(self, text: str):
         from gtts import gTTS
