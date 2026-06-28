@@ -1,0 +1,293 @@
+#!/usr/bin/env python3
+import json
+import threading
+
+import numpy as np
+import rclpy
+from rclpy.node import Node
+from std_msgs.msg import Int16MultiArray, String, Bool
+
+try:
+    from vosk import KaldiRecognizer, Model, SetLogLevel
+except ImportError:
+    KaldiRecognizer = None
+    Model = None
+    SetLogLevel = None
+
+try:
+    from openai import AsyncOpenAI
+    from dotenv import load_dotenv
+    import os
+    import io
+    import wave
+    import asyncio
+    from faster_whisper import WhisperModel
+except ImportError:
+    AsyncOpenAI = None
+    load_dotenv = None
+    WhisperModel = None
+
+
+class SpeechRecognitionNode(Node):
+    def __init__(self):
+        super().__init__("speech_recognition_node")
+        self.declare_parameter("model_path", "/opt/vosk/vosk-model-small-tr-0.3")
+        self.declare_parameter("language", "tr")
+        self.declare_parameter("partial_results", True)
+        self.declare_parameter("silence_timeout_s", 0.5)
+
+        model_path = self.get_parameter("model_path").value
+        self.partial_results = self.get_parameter("partial_results").value
+        self.silence_timeout_s = float(self.get_parameter("silence_timeout_s").value)
+
+        self.pub_text = self.create_publisher(String, "/speech/text", 10)
+        self.pub_partial = self.create_publisher(String, "/speech/partial_text", 10)
+        self.sub_audio = self.create_subscription(
+            Int16MultiArray, "/audio/speech_audio", self.audio_callback, 10
+        )
+        self.sub_vad = self.create_subscription(
+            Bool, "/audio/vad", self.vad_callback, 10
+        )
+        self.sub_tts_speaking = self.create_subscription(
+            Bool, "/tts/speaking", self.tts_speaking_callback, 10
+        )
+
+        self.buffer = []
+        self.last_speech_time = None
+        self.is_speaking = False
+        self.tts_speaking = False
+        self.last_tts_speaking_time = None
+        self.lock = threading.Lock()
+
+        if load_dotenv:
+            load_dotenv()
+            
+        self.stt_engine = os.getenv("STT_ENGINE", "vosk").lower()
+        
+        if self.stt_engine == "whisper":
+            if AsyncOpenAI is None or not os.getenv("STT_API_KEY"):
+                self.get_logger().error("Whisper icin openai paketi veya STT_API_KEY eksik! Vosk'a donuluyor.")
+                self.stt_engine = "vosk"
+            else:
+                self.client = AsyncOpenAI(
+                    api_key=os.getenv("STT_API_KEY"),
+                    base_url=os.getenv("STT_BASE_URL", "https://api.openai.com/v1")
+                )
+                self.whisper_model = os.getenv("STT_WHISPER_MODEL", "whisper-1")
+                self.ai_loop = asyncio.new_event_loop()
+                self.ai_thread = threading.Thread(target=self._run_async_loop, daemon=True)
+                self.ai_thread.start()
+                self.get_logger().info(f"STT Engine: Whisper API ({self.whisper_model})")
+
+        if self.stt_engine == "faster-whisper":
+            if WhisperModel is None:
+                self.get_logger().error("faster-whisper kütüphanesi kurulu değil! Vosk'a dönülüyor.")
+                self.stt_engine = "vosk"
+            else:
+                self.fw_model_name = os.getenv("STT_FW_MODEL", "distil-large-v3")
+                self.fw_device = os.getenv("STT_FW_DEVICE", "cuda")
+                self.fw_compute_type = os.getenv("STT_FW_COMPUTE_TYPE", "float16")
+                
+                try:
+                    self.get_logger().info(f"Yerele Yükleniyor: Faster-Whisper ({self.fw_model_name}) Cihaz: {self.fw_device} Hassasiyet: {self.fw_compute_type}...")
+                    self.fw_model = WhisperModel(
+                        self.fw_model_name,
+                        device=self.fw_device,
+                        compute_type=self.fw_compute_type
+                    )
+                    self.get_logger().info("✅ Faster-Whisper modeli başarıyla yüklendi.")
+                    self.ai_loop = asyncio.new_event_loop()
+                    self.ai_thread = threading.Thread(target=self._run_async_loop, daemon=True)
+                    self.ai_thread.start()
+                except Exception as e:
+                    self.get_logger().error(f"Faster-Whisper yükleme hatası: {e}. Vosk'a dönülüyor.")
+                    self.stt_engine = "vosk"
+                
+        if self.stt_engine == "vosk":
+            if Model is None:
+                self.get_logger().error("vosk not installed — speech recognition disabled")
+                self.recognizer = None
+                return
+
+            if SetLogLevel is not None:
+                SetLogLevel(-1)
+
+            try:
+                # Kullanici .env'den vosk yolunu da degistirebilsin
+                env_vosk_path = os.getenv("STT_VOSK_MODEL_PATH")
+                if env_vosk_path and os.path.exists(env_vosk_path):
+                    model_path = env_vosk_path
+                    
+                self.model = Model(model_path)
+                self.recognizer = KaldiRecognizer(self.model, 16000)
+                self.recognizer.SetWords(True)
+                self.get_logger().info(f"STT Engine: Vosk (Model: {model_path})")
+            except Exception as e:
+                self.get_logger().error(f"Failed to load Vosk model: {e}")
+                self.recognizer = None
+
+        self.create_timer(0.1, self._silence_tick)
+
+    def _run_async_loop(self):
+        asyncio.set_event_loop(self.ai_loop)
+        self.ai_loop.run_forever()
+
+    def tts_speaking_callback(self, msg: Bool):
+        with self.lock:
+            was_speaking = self.tts_speaking
+            self.tts_speaking = msg.data
+            if self.tts_speaking:
+                self.buffer.clear()
+                self.is_speaking = False
+                self.last_speech_time = None
+                if self.stt_engine == "vosk" and self.recognizer is not None:
+                    self.recognizer.Reset()
+            elif was_speaking and not self.tts_speaking:
+                self.last_tts_speaking_time = self.get_clock().now()
+                self.buffer.clear()
+                self.is_speaking = False
+                self.last_speech_time = None
+
+    def audio_callback(self, msg: Int16MultiArray):
+        if self.stt_engine == "vosk" and self.recognizer is None:
+            return
+
+        with self.lock:
+            if self.tts_speaking:
+                return
+            if self.last_tts_speaking_time is not None:
+                elapsed = (self.get_clock().now() - self.last_tts_speaking_time).nanoseconds / 1e9
+                if elapsed < 0.8:
+                    return
+            # Whisper veya Faster-Whisper kullanıyorsak boşluğu tampona eklemeye gerek yok, sadece ses varken ekle
+            if self.stt_engine in ["whisper", "faster-whisper"] and not self.is_speaking:
+                return
+            self.buffer.extend(msg.data)
+
+    def vad_callback(self, msg: Bool):
+        if msg.data:
+            with self.lock:
+                if self.tts_speaking:
+                    return
+                if self.last_tts_speaking_time is not None:
+                    elapsed = (self.get_clock().now() - self.last_tts_speaking_time).nanoseconds / 1e9
+                    if elapsed < 0.8:
+                        return
+                self.last_speech_time = self.get_clock().now()
+                self.is_speaking = True
+
+    def _process_buffer(self):
+        with self.lock:
+            if not self.buffer:
+                return
+            audio_bytes = np.array(self.buffer, dtype=np.int16).tobytes()
+            self.buffer.clear()
+
+        if self.recognizer.AcceptWaveform(audio_bytes):
+            result = json.loads(self.recognizer.Result())
+            text = result.get("text", "").strip()
+            if text:
+                self._publish_text(text)
+        elif self.partial_results:
+            partial = json.loads(self.recognizer.PartialResult())
+            text = partial.get("partial", "").strip()
+            if text:
+                self._publish_text(text, partial=True)
+
+    def _publish_text(self, text: str, partial: bool = False):
+        msg = String()
+        msg.data = text
+        if partial:
+            self.pub_partial.publish(msg)
+            self.get_logger().debug(f"Partial: {text}")
+        else:
+            self.pub_text.publish(msg)
+            self.get_logger().info(f"🎤 [ReSpeaker] Duydu: {text}")
+
+    def _silence_tick(self):
+        if self.stt_engine == "vosk":
+            with self.lock:
+                has_data = len(self.buffer) > 0
+            if has_data:
+                self._process_buffer()
+            
+        # 2. Eger VAD'den uzun suredir (0.5s) veri gelmediyse, konusma bitmistir
+        now = self.get_clock().now()
+        with self.lock:
+            if self.is_speaking and self.last_speech_time is not None:
+                elapsed = (now - self.last_speech_time).nanoseconds / 1e9
+                if elapsed > self.silence_timeout_s:
+                    if self.stt_engine == "vosk":
+                        result = json.loads(self.recognizer.FinalResult())
+                        text = result.get("text", "").strip()
+                        if text:
+                            self._publish_text(text)
+                        self.recognizer.Reset()
+                        
+                    elif self.stt_engine in ["whisper", "faster-whisper"]:
+                        audio_bytes = np.array(self.buffer, dtype=np.int16).tobytes()
+                        self.buffer.clear()
+                        # En azindan 0.5 saniyelik ses varsa gonder (16000 byte)
+                        if len(audio_bytes) > 16000:
+                            if self.stt_engine == "whisper":
+                                asyncio.run_coroutine_threadsafe(self._transcribe_whisper(audio_bytes), self.ai_loop)
+                            else:
+                                asyncio.run_coroutine_threadsafe(self._transcribe_faster_whisper(audio_bytes), self.ai_loop)
+
+                    self.last_speech_time = None
+                    self.is_speaking = False
+
+    async def _transcribe_faster_whisper(self, audio_bytes):
+        try:
+            self.get_logger().info("🎙️ [Faster-Whisper] Yerel model ile deşifre ediliyor...")
+            audio_data = np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32) / 32768.0
+            
+            loop = asyncio.get_running_loop()
+            segments, info = await loop.run_in_executor(
+                None, lambda: self.fw_model.transcribe(audio_data, beam_size=5, language="tr")
+            )
+            text = "".join([segment.text for segment in segments]).strip()
+            if text:
+                self._publish_text(text)
+        except Exception as e:
+            self.get_logger().error(f"❌ [Faster-Whisper] Deşifre Hatası: {e}")
+
+    async def _transcribe_whisper(self, audio_bytes):
+        wav_io = io.BytesIO()
+        with wave.open(wav_io, 'wb') as wav_file:
+            wav_file.setnchannels(1)
+            wav_file.setsampwidth(2)
+            wav_file.setframerate(16000)
+            wav_file.writeframes(audio_bytes)
+        
+        wav_io.name = "speech.wav"
+        wav_io.seek(0)
+        
+        try:
+            self.get_logger().info("☁️ [Whisper] Bulut API'ye ses gönderiliyor...")
+            response = await self.client.audio.transcriptions.create(
+                model=self.whisper_model,
+                file=wav_io,
+                language="tr"
+            )
+            text = response.text.strip()
+            if text:
+                self._publish_text(text)
+        except Exception as e:
+            self.get_logger().error(f"❌ [Whisper] API Hatasi: {e}")
+
+def main():
+    rclpy.init()
+    node = SpeechRecognitionNode()
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.destroy_node()
+        if rclpy.ok():
+            rclpy.shutdown()
+
+
+if __name__ == "__main__":
+    main()

@@ -1,29 +1,96 @@
-# rosidl
+# ASTRO V1
 
-```rosidl``` is one of the ros_core packages.
-See [documentation](https://docs.ros.org/en/rolling/Concepts/About-Internal-Interfaces.html#the-rosidl-repository) for details of this package.
+ASTRO V1 is a modular ROS 2 based robotics project containing drivers and launch files for base movement, LiDAR (RPLIDAR), Vision (OAK-D Lite), and Audio (ReSpeaker 4-Mic Array) systems.
 
-## Packages
+## 🚀 ROS 2 Architecture
 
-* [rosidl_adapter](./rosidl_adapter)
-  * API and scripts to parse `.msg`/`.srv`/`.action` files and convert them to `.idl`
-* [rosidl_cmake](./rosidl_cmake)
-  * CMake functionality to invoke code generation for ROS interface files
-* [rosidl_generator_c](./rosidl_generator_c)
-  * Generate the ROS interfaces in C
-* [rosidl_generator_cpp](./rosidl_generator_cpp)
-  * Generate the ROS interfaces in C++
-* [rosidl_generator_type_description](./rosidl_generator_type_description)
-  * Generate SHA256 hash values and ROS 2 interface descriptions for use by other generators
-* [rosidl_parser](./rosidl_parser)
-  * Parser for `.idl` ROS interface files
-* [rosidl_runtime_c](./rosidl_runtime_c)
-  * Provides definitions, initialization and finalization functions, and macros for getting and working with rosidl typesupport types in C
-* [rosidl_runtime_cpp](./rosidl_runtime_cpp)
-  * Provides definitions and templated functions for getting and working with rosidl typesupport types in C++
-* [rosidl_typesupport_interface](./rosidl_typesupport_interface)
-  * Interface for rosidl typesupport packages
-* [rosidl_typesupport_introspection_c](./rosidl_typesupport_introspection_c)
-  * Generate the message type support for dynamic message construction in C
-* [rosidl_typesupport_introspection_cpp](./rosidl_typesupport_introspection_cpp)
-  * Generate the message type support for dynamic message construction in C++
+The system has been completely modularized into ROS 2 Humble packages:
+
+### 📦 Packages
+- `astro_base`: Arduino Mega serial bridge for motor control and base sensors.
+- `astro_lidar`: RPLIDAR A1 wrapper and NaN/Range filter node (`scan_filter_node`).
+- `astro_vision`: OAK-D Lite driver wrapper and OpenCV Face Detection node.
+- `astro_audio`: ReSpeaker array driver handling Audio Capture, Speech Recognition (Vosk), and TTS (pyttsx3/gTTS).
+- `astro_ai`: AI Brain Node managing LLM interactions and memory via OpenAI API standard.
+- `astro_bringup`: Centralized launch files and parameters for the whole system.
+- `astro_description`: URDF models and Robot State Publisher (tf2).
+
+## 🛠️ Installation & Build
+
+Make sure you have ROS 2 Humble installed on your Jetson Orin Nano / Ubuntu 22.04 system.
+
+### 1. Install Dependencies
+```bash
+sudo apt update
+sudo apt install -y python3-rosdep python3-colcon-common-extensions
+sudo apt install -y ros-humble-rplidar-ros ros-humble-depthai-ros ros-humble-robot-state-publisher
+pip3 install pyusb sounddevice numpy vosk pyttsx3 opencv-python python-dotenv openai
+```
+
+### 2. Build the Workspace
+```bash
+cd ~/Desktop/astr1/ros2_ws
+colcon build --symlink-install
+source install/setup.bash
+```
+
+## 🚦 Usage
+
+With the new ROS 2 structure, you no longer need to run separate scripts. The entire system is managed via `astro_bringup`.
+
+### Launching the Entire Robot (All Sensors + Base)
+```bash
+ros2 launch astro_bringup robot.launch.py
+```
+*(This will launch the base, lidar, camera, and audio nodes all at once.)*
+
+### Launching Individual Subsystems
+If you want to test or launch sensors individually for debugging:
+
+**Vision (OAK-D + Face Detection):**
+```bash
+ros2 launch astro_vision camera.launch.py
+```
+
+**LiDAR (RPLIDAR + Filter):**
+```bash
+ros2 launch astro_lidar lidar.launch.py
+```
+
+**Audio (Mic Capture + STT + TTS):**
+```bash
+ros2 launch astro_audio audio.launch.py
+```
+
+## ⚙️ Configuration
+
+Centralized parameters are stored in `astro_bringup/config/astro_params.yaml`. You can modify:
+- Serial ports (e.g., `/dev/astro_lidar`, `/dev/astro_arduino`)
+- Camera resolution and FPS
+- VAD thresholds and Audio settings
+- RPLIDAR ranges and baud rates
+
+### 4. Advanced STT (Ses Tanıma) Options
+You can change the STT engine via the `.env` file (`STT_ENGINE`).
+
+**Option 1: Vosk Large Model (Offline, 1GB)**
+For much better offline Turkish recognition, download the large model:
+```bash
+wget https://alphacephei.com/vosk/models/vosk-model-tr-0.3.zip
+unzip vosk-model-tr-0.3.zip
+sudo mv vosk-model-tr-0.3 /opt/vosk/
+```
+Then update your `.env` file:
+```ini
+STT_ENGINE="vosk"
+STT_VOSK_MODEL_PATH="/opt/vosk/vosk-model-tr-0.3"
+```
+
+**Option 2: Whisper API (Cloud)**
+If you want to use OpenAI or Groq Whisper for perfect STT:
+```ini
+STT_ENGINE="whisper"
+STT_API_KEY="sk-YOUR-KEY"
+```
+
+> **Note:** For AI API keys (`AI_API_KEY`), use the `.env` file at the root of the project (copy from `.env.example`). Do not hardcode API keys in the source code!
