@@ -21,9 +21,11 @@ try:
     import io
     import wave
     import asyncio
+    from faster_whisper import WhisperModel
 except ImportError:
     AsyncOpenAI = None
     load_dotenv = None
+    WhisperModel = None
 
 
 class SpeechRecognitionNode(Node):
@@ -76,6 +78,30 @@ class SpeechRecognitionNode(Node):
                 self.ai_thread = threading.Thread(target=self._run_async_loop, daemon=True)
                 self.ai_thread.start()
                 self.get_logger().info(f"STT Engine: Whisper API ({self.whisper_model})")
+
+        if self.stt_engine == "faster-whisper":
+            if WhisperModel is None:
+                self.get_logger().error("faster-whisper kütüphanesi kurulu değil! Vosk'a dönülüyor.")
+                self.stt_engine = "vosk"
+            else:
+                self.fw_model_name = os.getenv("STT_FW_MODEL", "distil-large-v3")
+                self.fw_device = os.getenv("STT_FW_DEVICE", "cuda")
+                self.fw_compute_type = os.getenv("STT_FW_COMPUTE_TYPE", "float16")
+                
+                try:
+                    self.get_logger().info(f"Yerele Yükleniyor: Faster-Whisper ({self.fw_model_name}) Cihaz: {self.fw_device} Hassasiyet: {self.fw_compute_type}...")
+                    self.fw_model = WhisperModel(
+                        self.fw_model_name,
+                        device=self.fw_device,
+                        compute_type=self.fw_compute_type
+                    )
+                    self.get_logger().info("✅ Faster-Whisper modeli başarıyla yüklendi.")
+                    self.ai_loop = asyncio.new_event_loop()
+                    self.ai_thread = threading.Thread(target=self._run_async_loop, daemon=True)
+                    self.ai_thread.start()
+                except Exception as e:
+                    self.get_logger().error(f"Faster-Whisper yükleme hatası: {e}. Vosk'a dönülüyor.")
+                    self.stt_engine = "vosk"
                 
         if self.stt_engine == "vosk":
             if Model is None:
@@ -133,8 +159,8 @@ class SpeechRecognitionNode(Node):
                 elapsed = (self.get_clock().now() - self.last_tts_speaking_time).nanoseconds / 1e9
                 if elapsed < 0.8:
                     return
-            # Whisper kullaniyorsak boslugu tampona eklemeye gerek yok, sadece ses varken ekle
-            if self.stt_engine == "whisper" and not self.is_speaking:
+            # Whisper veya Faster-Whisper kullanıyorsak boşluğu tampona eklemeye gerek yok, sadece ses varken ekle
+            if self.stt_engine in ["whisper", "faster-whisper"] and not self.is_speaking:
                 return
             self.buffer.extend(msg.data)
 
@@ -198,15 +224,33 @@ class SpeechRecognitionNode(Node):
                             self._publish_text(text)
                         self.recognizer.Reset()
                         
-                    elif self.stt_engine == "whisper":
+                    elif self.stt_engine in ["whisper", "faster-whisper"]:
                         audio_bytes = np.array(self.buffer, dtype=np.int16).tobytes()
                         self.buffer.clear()
                         # En azindan 0.5 saniyelik ses varsa gonder (16000 byte)
                         if len(audio_bytes) > 16000:
-                            asyncio.run_coroutine_threadsafe(self._transcribe_whisper(audio_bytes), self.ai_loop)
+                            if self.stt_engine == "whisper":
+                                asyncio.run_coroutine_threadsafe(self._transcribe_whisper(audio_bytes), self.ai_loop)
+                            else:
+                                asyncio.run_coroutine_threadsafe(self._transcribe_faster_whisper(audio_bytes), self.ai_loop)
 
                     self.last_speech_time = None
                     self.is_speaking = False
+
+    async def _transcribe_faster_whisper(self, audio_bytes):
+        try:
+            self.get_logger().info("🎙️ [Faster-Whisper] Yerel model ile deşifre ediliyor...")
+            audio_data = np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32) / 32768.0
+            
+            loop = asyncio.get_running_loop()
+            segments, info = await loop.run_in_executor(
+                None, lambda: self.fw_model.transcribe(audio_data, beam_size=5, language="tr")
+            )
+            text = "".join([segment.text for segment in segments]).strip()
+            if text:
+                self._publish_text(text)
+        except Exception as e:
+            self.get_logger().error(f"❌ [Faster-Whisper] Deşifre Hatası: {e}")
 
     async def _transcribe_whisper(self, audio_bytes):
         wav_io = io.BytesIO()

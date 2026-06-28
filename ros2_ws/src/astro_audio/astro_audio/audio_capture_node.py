@@ -50,8 +50,8 @@ class AudioCaptureNode(Node):
         self.declare_parameter("sample_rate", 16000)
         self.declare_parameter("channels", 6)
         self.declare_parameter("chunk_size", 1024)
-        self.declare_parameter("vad_threshold", 0.05)
-        self.declare_parameter("audio_gain", 3.0)
+        self.declare_parameter("vad_threshold", float(os.getenv("VAD_THRESHOLD", "0.05")))
+        self.declare_parameter("audio_gain", float(os.getenv("AUDIO_GAIN", "3.0")))
 
         self.sample_rate = int(self.get_parameter("sample_rate").value)
         self.channels = int(self.get_parameter("channels").value)
@@ -313,7 +313,9 @@ class AudioCaptureNode(Node):
             self.pub_speech.publish(speech_msg)
 
     def _energy_vad(self, mono: np.ndarray) -> bool:
-        return (float(np.sqrt(np.mean(mono.astype(np.float32) ** 2))) / 32768.0) > self.vad_threshold
+        mono_clean = mono.astype(np.float32) - np.mean(mono)
+        rms = float(np.sqrt(np.mean(mono_clean ** 2))) / 32768.0
+        return rms > self.vad_threshold
 
     def _publish_hid(self):
         if self.respeaker.dev:

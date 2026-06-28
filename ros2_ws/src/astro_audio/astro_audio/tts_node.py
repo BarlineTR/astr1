@@ -46,6 +46,9 @@ class TtsNode(Node):
         self.declare_parameter("language", "tr")
         self.declare_parameter("rate", 150)
         self.declare_parameter("volume", 0.8)
+        self.declare_parameter("elevenlabs_api_key", os.getenv("ELEVENLABS_API_KEY", ""))
+        self.declare_parameter("elevenlabs_voice_id", os.getenv("ELEVENLABS_VOICE_ID", "21m00Tcm4TlvDq8ikWAM"))
+        self.declare_parameter("elevenlabs_model_id", os.getenv("ELEVENLABS_MODEL_ID", "eleven_multilingual_v2"))
 
         self.engine_name = self.get_parameter("engine").value
         self.voice_name = self.get_parameter("voice").value
@@ -62,7 +65,11 @@ class TtsNode(Node):
         self.tts_engine = None
 
         # Engine init
-        if self.engine_name == "edge-tts":
+        if self.engine_name == "elevenlabs":
+            self.get_logger().info(
+                f"✅ [TTS] ElevenLabs motoru seçildi (Ses: {self.get_parameter('elevenlabs_voice_id').value})"
+            )
+        elif self.engine_name == "edge-tts":
             if edge_tts is None:
                 self.get_logger().warn(
                     "edge-tts paketi kurulu değil, pyttsx3'e düşürülüyor. "
@@ -121,7 +128,9 @@ class TtsNode(Node):
             self._set_speaking(True)
             self.get_logger().info(f"🔊 [TTS] Söyleniyor: {text}")
             try:
-                if self.engine_name == "edge-tts":
+                if self.engine_name == "elevenlabs":
+                    self._speak_elevenlabs(text)
+                elif self.engine_name == "edge-tts":
                     self._speak_edge_tts(text)
                 elif self.engine_name == "pyttsx3" and self.tts_engine is not None:
                     self.tts_engine.say(text)
@@ -134,6 +143,59 @@ class TtsNode(Node):
                 self.get_logger().error(f"TTS hatası: {e}")
             finally:
                 self._set_speaking(False)
+
+    def _speak_elevenlabs(self, text: str):
+        api_key = self.get_parameter("elevenlabs_api_key").value
+        voice_id = self.get_parameter("elevenlabs_voice_id").value
+        model_id = self.get_parameter("elevenlabs_model_id").value
+
+        if not api_key:
+            self.get_logger().error("ElevenLabs API Key bulunamadı! Lütfen .env dosyasını kontrol edin.")
+            self._speak_edge_tts(text)
+            return
+
+        import requests
+        url = f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}"
+        headers = {
+            "Accept": "audio/mpeg",
+            "Content-Type": "application/json",
+            "xi-api-key": api_key
+        }
+        data = {
+            "text": text,
+            "model_id": model_id,
+            "voice_settings": {
+                "stability": 0.5,
+                "similarity_boost": 0.75
+            }
+        }
+
+        tmp_path = None
+        try:
+            response = requests.post(url, json=data, headers=headers)
+            if response.status_code != 200:
+                self.get_logger().error(f"ElevenLabs API Hatası ({response.status_code}): {response.text}")
+                self._speak_edge_tts(text)
+                return
+
+            with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as f:
+                tmp_path = f.name
+                f.write(response.content)
+
+            subprocess.run(
+                ["mpg123", "-q", tmp_path],
+                check=True,
+                capture_output=True,
+            )
+        except Exception as e:
+            self.get_logger().error(f"ElevenLabs konuşma hatası: {e}")
+            self._speak_edge_tts(text)
+        finally:
+            if tmp_path and os.path.exists(tmp_path):
+                try:
+                    os.remove(tmp_path)
+                except Exception:
+                    pass
 
     # ------------------------------------------------------------------
     # edge-tts — uses the Python API directly (no CLI dependency)
