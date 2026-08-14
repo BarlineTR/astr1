@@ -27,14 +27,14 @@ These cannot come from pip — ROS packages, and the native libraries that `soun
 sudo apt update
 sudo apt install -y python3-rosdep python3-colcon-common-extensions
 sudo apt install -y ros-humble-rplidar-ros ros-humble-depthai-ros ros-humble-robot-state-publisher
-sudo apt install -y libportaudio2 espeak-ng ffmpeg
+sudo apt install -y libportaudio2 espeak-ng mpg123
 ```
 
 | Package | Needed by |
 |---|---|
 | `libportaudio2` | `sounddevice` — without it `audio_capture_node` fails with `OSError: PortAudio library not found` |
 | `espeak-ng` | `pyttsx3` offline TTS engine |
-| `ffmpeg` | playback of `edge-tts` / `gTTS` / ElevenLabs audio |
+| `mpg123` | MP3 playback in `tts_node` — the `edge-tts`, `gTTS` and ElevenLabs engines all shell out to it, so without it TTS generates audio but plays nothing |
 
 ### 2. Python environment (uv)
 
@@ -129,6 +129,8 @@ Any model directory kept at the repository root (e.g. `vosk-model-small-tr-0.3/`
 
 **Option 2: Faster-Whisper (Recommended — full sentences, offline)**
 The `faster-whisper` package is already part of `requirements.txt`, so no extra install step is needed inside the venv. Just set it in `.env`:
+
+> ⚠️ **Do not use `distil-*` models for Turkish.** Every Distil-Whisper checkpoint (`distil-large-v3`, `distil-medium.en`, …) is an English-only distillation — it ignores `language="tr"` and returns English text. Use the multilingual `large-v3` (or `medium` / `small` on weaker GPUs).
 ```ini
 STT_ENGINE="faster-whisper"
 STT_FW_MODEL="distil-large-v3"

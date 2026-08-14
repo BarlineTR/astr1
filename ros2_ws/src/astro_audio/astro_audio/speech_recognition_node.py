@@ -100,7 +100,7 @@ class SpeechRecognitionNode(Node):
                 self.get_logger().error("faster-whisper kütüphanesi kurulu değil! Vosk'a dönülüyor.")
                 self.stt_engine = "vosk"
             else:
-                self.fw_model_name = os.getenv("STT_FW_MODEL", "distil-large-v3")
+                self.fw_model_name = os.getenv("STT_FW_MODEL", "large-v2")
                 self.fw_device = os.getenv("STT_FW_DEVICE", "cuda")
                 self.fw_compute_type = os.getenv("STT_FW_COMPUTE_TYPE", "float16")
                 
