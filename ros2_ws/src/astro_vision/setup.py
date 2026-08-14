@@ -21,7 +21,6 @@ setup(
     maintainer_email="baran@example.com",
     description="ASTRO V1 OAK-D Lite camera wrapper and face detection",
     license="Apache-2.0",
-    tests_require=["pytest"],
     entry_points={
         "console_scripts": [
             "face_detector_node = astro_vision.face_detector_node:main",

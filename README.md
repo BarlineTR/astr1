@@ -28,11 +28,17 @@ pip3 install pyusb sounddevice numpy vosk pyttsx3 opencv-python python-dotenv op
 ```
 
 ### 2. Build the Workspace
+If `colcon build --symlink-install` fails with `error: option --editable not recognized`, pin setuptools first:
+```bash
+bash ~/Desktop/astr1/scripts/ensure_ros_build_env.sh
+```
+Then build:
 ```bash
 cd ~/Desktop/astr1/ros2_ws
 colcon build --symlink-install
 source install/setup.bash
 ```
+Without symlinks (always works): `colcon build`
 
 ## 🚦 Usage
 

@@ -19,7 +19,6 @@ setup(
     maintainer_email='baran@example.com',
     description='ASTRO V1 control, face tracking and collision avoidance',
     license='Apache-2.0',
-    tests_require=['pytest'],
     entry_points={
         'console_scripts': [
             'navigation_node = astro_control.navigation_node:main',

@@ -21,7 +21,6 @@ setup(
     maintainer_email="baran@example.com",
     description="ASTRO V1 RPLIDAR A1 wrapper and scan filter",
     license="Apache-2.0",
-    tests_require=["pytest"],
     entry_points={
         "console_scripts": [
             "scan_filter_node = astro_lidar.scan_filter_node:main",

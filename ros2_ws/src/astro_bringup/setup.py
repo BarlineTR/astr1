@@ -25,5 +25,4 @@ setup(
     maintainer_email="baran@example.com",
     description="ASTRO V1 system launch files and configuration",
     license="Apache-2.0",
-    tests_require=["pytest"],
 )
