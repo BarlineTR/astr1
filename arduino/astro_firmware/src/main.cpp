@@ -8,19 +8,20 @@
 #include "protocol.h"
 
 // ====== Parametreler ======
-static constexpr uint32_t SERIAL_BAUD = 115200; // 115200 alternatif
+static constexpr uint32_t SERIAL_BAUD = 500000;
 static constexpr float CONTROL_HZ = 50.0f;
 static constexpr uint32_t CONTROL_DT_MS = (uint32_t)(1000.0f / CONTROL_HZ);
 
-static constexpr int32_t TICKS_PER_REV_L = 2048; // enkoder CPR*4 uygun biçimde ayarlayın
+static constexpr int32_t TICKS_PER_REV_L = 2048;
 static constexpr int32_t TICKS_PER_REV_R = 2048;
 
-static constexpr float WHEEL_R_L = 0.06f; // metre (örnek 60mm)
+static constexpr float WHEEL_R_L = 0.06f;
 static constexpr float WHEEL_R_R = 0.06f;
 
-static constexpr float KP = 0.6f, KI = 0.2f, KD = 0.0f; // 50 Hz PID için örnek
-static constexpr int PWM_MAX = 255;
-static constexpr float PID_INTEGRAL_LIMIT = 50.0f; // ✅ FIX: Daha dar anti-windup limit
+static constexpr float KP = 0.6f, KI = 0.2f, KD = 0.0f;
+static constexpr int PWM_MAX = 180;  // Limit max duty cycle to reduce stall current
+static constexpr float MAX_TARGET_RPM = 60.0f;
+static constexpr float PID_INTEGRAL_LIMIT = 50.0f;
 
 // ====== Global Durum ======
 volatile int32_t g_left_ticks = 0;
@@ -38,7 +39,7 @@ static float g_left_err_prev = 0.0f, g_right_err_prev = 0.0f;
 static uint32_t g_last_control_ms = 0;
 static uint32_t g_last_heartbeat_ms = 0;
 
-static bool g_motors_enabled = true;
+static bool g_motors_enabled = false;
 static uint32_t g_diag_flags = 0;
 
 // IMU ham değerleri -> m/s2, rad/s dönüştürülecek
@@ -288,9 +289,12 @@ void processPacket(uint8_t msg_id, const uint8_t* pl, uint8_t len) {
     } break;
     case Proto::WHEEL_CMD: {
       if (len < 8) break;
-      memcpy(&g_left_target_rpm, &pl[0], 4);
-      memcpy(&g_right_target_rpm, &pl[4], 4);
-      g_last_heartbeat_ms = millis(); // komut da heartbeat sayılır
+      float left_rpm, right_rpm;
+      memcpy(&left_rpm, &pl[0], 4);
+      memcpy(&right_rpm, &pl[4], 4);
+      g_left_target_rpm = constrain(left_rpm, -MAX_TARGET_RPM, MAX_TARGET_RPM);
+      g_right_target_rpm = constrain(right_rpm, -MAX_TARGET_RPM, MAX_TARGET_RPM);
+      g_last_heartbeat_ms = millis();
     } break;
     case Proto::HEAD_CMD: {
       if (len < 4) break;
@@ -309,14 +313,14 @@ void processPacket(uint8_t msg_id, const uint8_t* pl, uint8_t len) {
 
 void setup() {
   setupIO();
+  stopMotors();
   Serial.begin(SERIAL_BAUD);
   imuInit();
   tmcInit();
 
   g_last_control_ms = millis();
-  g_last_heartbeat_ms = millis();
+  g_last_heartbeat_ms = 0;  // require valid heartbeat before enabling motors
 
-  // ✅ FIX: Watchdog timeout 2s'ye çıkarıldı (güvenlik marjı)
   wdt_enable(WDTO_2S);
 }
 

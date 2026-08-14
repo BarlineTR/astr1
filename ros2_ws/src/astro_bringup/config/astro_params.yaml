@@ -3,6 +3,7 @@ serial_bridge:
     port: "/dev/astro_arduino"
     baud: 500000
     connect_retry_sec: 2.0
+    enable_wheel_self_test: false
     frame_id_imu: "imu_link"
     ticks_per_rev_left: 2048.0
     ticks_per_rev_right: 2048.0

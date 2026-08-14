@@ -59,6 +59,7 @@ class SerialBridge(Node):
         self.declare_parameter("port", "/dev/astro_arduino")
         self.declare_parameter("baud", 500000)
         self.declare_parameter("connect_retry_sec", 2.0)
+        self.declare_parameter("enable_wheel_self_test", False)
         self.declare_parameter("frame_id_imu", "imu_link")
         self.declare_parameter("ticks_per_rev_left", 2048.0)
         self.declare_parameter("ticks_per_rev_right", 2048.0)
@@ -68,6 +69,9 @@ class SerialBridge(Node):
         self.port_param = self.get_parameter("port").get_parameter_value().string_value
         self.baud = self.get_parameter("baud").get_parameter_value().integer_value
         self.connect_retry_sec = float(self.get_parameter("connect_retry_sec").value)
+        self.enable_wheel_self_test = bool(
+            self.get_parameter("enable_wheel_self_test").value
+        )
 
         self.frame_id_imu = (
             self.get_parameter("frame_id_imu").get_parameter_value().string_value
@@ -106,14 +110,24 @@ class SerialBridge(Node):
         self.time_offset_ns = None
         self.first_imu_sync = True
 
-        self.is_self_testing = True
+        self.is_self_testing = False
 
         self.connect_timer = self.create_timer(self.connect_retry_sec, self._try_connect)
         self.hb_timer = self.create_timer(0.1, self.send_heartbeat)
-        
-        # Start startup wheel self-test in a background thread
-        self.self_test_thread = threading.Thread(target=self._run_startup_self_test, daemon=True)
-        self.self_test_thread.start()
+
+        if self.enable_wheel_self_test:
+            self.is_self_testing = True
+            self.get_logger().warn(
+                "⚠️  [Self-Test] Wheel self-test ENABLED — robot must be lifted off ground!"
+            )
+            self.self_test_thread = threading.Thread(
+                target=self._run_startup_self_test, daemon=True
+            )
+            self.self_test_thread.start()
+        else:
+            self.get_logger().info(
+                "✅ [Safety] Wheel self-test disabled — motors idle until explicit commands"
+            )
 
         self._try_connect()
 
@@ -252,6 +266,8 @@ class SerialBridge(Node):
             self._mark_disconnected()
 
     def on_head_cmd(self, msg: HeadCmd):
+        if self.is_self_testing:
+            return
         if self.ser is None or not self.ser.is_open:
             return
 
@@ -356,7 +372,7 @@ class SerialBridge(Node):
                         body = bytes([expected_len]) + bytes(buf)
                         c = crc8(body)
                         msg_id = buf[0] if buf else 0
-                        if c == b or msg_id == MSG_HEARTBEAT_ACK:
+                        if c == b:
                             payload = bytes(buf[1:])
                             self.handle_msg(msg_id, payload)
                         state = 0

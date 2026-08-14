@@ -75,8 +75,8 @@ def generate_launch_description():
             ),
             DeclareLaunchArgument(
                 "enable_base",
-                default_value="true",
-                description="Start Arduino serial bridge",
+                default_value="false",
+                description="Start Arduino serial bridge (requires /dev/astro_arduino)",
             ),
             DeclareLaunchArgument(
                 "enable_lidar",

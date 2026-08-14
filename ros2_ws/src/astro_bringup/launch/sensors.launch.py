@@ -50,8 +50,8 @@ def generate_launch_description():
             ),
             DeclareLaunchArgument(
                 "enable_control",
-                default_value="true",
-                description="Start navigation controller for face tracking and obstacle avoidance",
+                default_value="false",
+                description="Start navigation controller (motor movement — enable only when safe)",
             ),
             IncludeLaunchDescription(
                 PythonLaunchDescriptionSource(
