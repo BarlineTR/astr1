@@ -1,0 +1,38 @@
+# ASTRO V1 — Python bağımlılıkları (üst seviye)
+#
+# Bu dosya elle düzenlenir. Sabitlenmiş sürümler için:
+#     uv pip compile requirements.in -o requirements.txt
+#
+# NOT: rclpy, sensor_msgs, std_msgs, diagnostic_msgs, launch, launch_ros ve
+# ament_index_python paketleri pip'te YOKTUR; /opt/ros/humble altından gelirler.
+# Bu yüzden venv --system-site-packages ile açılmalıdır.
+#
+# NOT: opencv-python 5.x KULLANILAMAZ. Sistemde (~/.local) 5.0.0.93 ön-sürümü
+# kurulu, ancak OpenCV 5 Haar cascade API'sini kaldırdı; face_detector_node
+# cv2.CascadeClassifier kullandığı için AttributeError veriyor. Venv 4.x'e
+# sabitleyerek sistemdeki 5.0.0'ı gölgeliyoruz.
+
+# ── AI / LLM ────────────────────────────────────────────────
+openai                  # ai_brain_node + Whisper API (OpenAI uyumlu her sağlayıcı)
+python-dotenv           # .env okuma (ai_brain, tts, stt, bringup)
+
+# ── Konuşma tanıma (STT) ────────────────────────────────────
+faster-whisper          # yerel STT (CUDA/CPU), varsayılan motor
+vosk                    # yerel çevrimdışı STT alternatifi
+
+# ── Konuşma sentezi (TTS) ───────────────────────────────────
+edge-tts                # Microsoft Neural sesler (internet gerekir)
+gTTS                    # Google TTS (internet gerekir)
+pyttsx3                 # çevrimdışı yedek
+requests                # ElevenLabs REST çağrıları
+
+# ── Ses yakalama ────────────────────────────────────────────
+sounddevice             # ReSpeaker mikrofon dizisi yakalama
+pyusb                   # ReSpeaker USB kontrol arayüzü
+
+# ── Donanım / sayısal ───────────────────────────────────────
+pyserial                # Arduino Mega seri köprüsü
+numpy==2.2.6            # sistem/ROS numpy sürümüyle aynı tutuluyor (ABI uyumu)
+
+# ── Görü ────────────────────────────────────────────────────
+opencv-python<5         # face_detector_node Haar cascade kullanıyor (bkz. yukarıdaki not)

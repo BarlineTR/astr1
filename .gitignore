@@ -1,2 +1,16 @@
 # .env file
 .env
+
+# Python sanal ortamı (uv ile yeniden üretilir — bkz. requirements.txt)
+.venv/
+
+# Python derleme çıktıları
+__pycache__/
+*.py[cod]
+
+# ROS 2 / colcon build çıktıları
+build/
+install/
+log/
+
+vosk-model-small-tr-0.3/

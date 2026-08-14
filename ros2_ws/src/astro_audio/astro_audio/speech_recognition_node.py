@@ -48,7 +48,7 @@ def _load_env():
 class SpeechRecognitionNode(Node):
     def __init__(self):
         super().__init__("speech_recognition_node")
-        self.declare_parameter("model_path", "/opt/vosk/vosk-model-small-tr-0.3")
+        self.declare_parameter("model_path", "vosk-model-small-tr-0.3")
         self.declare_parameter("language", "tr")
         self.declare_parameter("partial_results", True)
         self.declare_parameter("silence_timeout_s", 0.5)

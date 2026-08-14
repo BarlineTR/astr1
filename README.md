@@ -17,22 +17,62 @@ The system has been completely modularized into ROS 2 Humble packages:
 
 ## 🛠️ Installation & Build
 
-Make sure you have ROS 2 Humble installed on your Jetson Orin Nano / Ubuntu 22.04 system.
+**Prerequisites:** Ubuntu 22.04 with ROS 2 Humble and Python 3.10 (Jetson Orin Nano or an x86 dev machine).
 
-### 1. Install Dependencies
+### 1. System packages (apt)
+
+These cannot come from pip — ROS packages, and the native libraries that `sounddevice` / `pyttsx3` bind to:
+
 ```bash
 sudo apt update
 sudo apt install -y python3-rosdep python3-colcon-common-extensions
 sudo apt install -y ros-humble-rplidar-ros ros-humble-depthai-ros ros-humble-robot-state-publisher
-pip3 install pyusb sounddevice numpy vosk pyttsx3 opencv-python python-dotenv openai edge-tts requests faster-whisper
+sudo apt install -y libportaudio2 espeak-ng ffmpeg
 ```
 
-### 2. Build the Workspace
+| Package | Needed by |
+|---|---|
+| `libportaudio2` | `sounddevice` — without it `audio_capture_node` fails with `OSError: PortAudio library not found` |
+| `espeak-ng` | `pyttsx3` offline TTS engine |
+| `ffmpeg` | playback of `edge-tts` / `gTTS` / ElevenLabs audio |
+
+### 2. Python environment (uv)
+
+Python dependencies live in a project-local virtualenv so they never mix with system or `~/.local` packages. We use [uv](https://docs.astral.sh/uv/); install it once with `curl -LsSf https://astral.sh/uv/install.sh | sh`.
+
 ```bash
-cd ~/Desktop/astr1/ros2_ws
-colcon build --symlink-install
-source install/setup.bash
+cd <repo-root>
+uv venv --python 3.10 --system-site-packages .venv
+source .venv/bin/activate
+uv pip install -r requirements.txt
 ```
+
+> **`--system-site-packages` is mandatory.** `rclpy`, `sensor_msgs`, `std_msgs`, `diagnostic_msgs`, `launch`, `launch_ros` and `ament_index_python` are not on PyPI — they come from `/opt/ros/humble`. A fully isolated venv cannot import any node in this repo.
+
+**Dependency files.** `requirements.in` is the hand-edited list of direct dependencies; `requirements.txt` is the fully pinned lock file generated from it (73 packages including transitive ones). Never edit the lock by hand:
+
+```bash
+# after adding or removing a package in requirements.in
+uv pip compile requirements.in -o requirements.txt   # resolve + pin
+uv pip install -r requirements.txt                   # apply to the venv
+```
+
+Two pins are deliberate and must not be relaxed:
+
+- `numpy==2.2.6` — matches the system/ROS NumPy so the venv copy cannot break `rclpy`'s ABI.
+- `opencv-python<5` — OpenCV 5 removed the Haar cascade API, and `face_detector_node` uses `cv2.CascadeClassifier`. If a 5.x wheel is installed system-wide (`~/.local`), the venv shadows it; outside the venv the node raises `AttributeError: module 'cv2' has no attribute 'CascadeClassifier'`.
+
+### 3. Build the workspace
+
+Run `colcon` **from `ros2_ws/`**, not from the repository root — building at the root scatters `build/ install/ log/` next to the source tree.
+
+```bash
+cd <repo-root>/ros2_ws
+colcon build --symlink-install
+source install/setup.bash   # or setup.zsh
+```
+
+Expected result: 7 packages finished. Warnings about `tests_require` and CMake policy `CMP0148` are harmless.
 
 ## 🚦 Usage
 
@@ -85,15 +125,10 @@ Then update your `.env` file:
 STT_ENGINE="vosk"
 STT_VOSK_MODEL_PATH="/opt/vosk/vosk-model-tr-0.3"
 ```
+Any model directory kept at the repository root (e.g. `vosk-model-small-tr-0.3/`) is git-ignored — point `STT_VOSK_MODEL_PATH` at it with an absolute path instead of committing 57 MB+ of model files.
 
 **Option 2: Faster-Whisper (Recommended — full sentences, offline)**
-Install the Python package (once per machine):
-```bash
-bash ~/Desktop/astr1/scripts/install_stt_deps.sh
-# or manually:
-pip3 install faster-whisper
-```
-Then in `.env`:
+The `faster-whisper` package is already part of `requirements.txt`, so no extra install step is needed inside the venv. Just set it in `.env`:
 ```ini
 STT_ENGINE="faster-whisper"
 STT_FW_MODEL="distil-large-v3"

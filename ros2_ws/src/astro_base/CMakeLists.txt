@@ -23,7 +23,7 @@ rosidl_generate_interfaces(${PROJECT_NAME}
 
 # Install Python executables - Çalıştırılabilir scriptimizi hedefe kopyalıyoruz
 install(PROGRAMS
-  astro_base/serial_bridge.py
+  src/serial_bridge.py
   DESTINATION lib/${PROJECT_NAME}
 )
 
