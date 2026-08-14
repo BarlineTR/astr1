@@ -3,6 +3,10 @@ import struct
 import threading
 import numpy as np
 import rclpy
+import subprocess
+import os
+import re
+import time
 from rclpy.node import Node
 from std_msgs.msg import Bool, Float32, Int16MultiArray
 
@@ -60,10 +64,6 @@ class AudioCaptureNode(Node):
         self.audio_gain = float(self.get_parameter("audio_gain").value)
 
         # PulseAudio kaynağını ve ALSA kart adını dinamik olarak bul
-        import subprocess
-        import os
-        import re
-        import time
 
         self.pulse_source = None
         self.alsa_card_name = "ArrayUAC10"
