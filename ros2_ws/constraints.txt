@@ -1,0 +1,2 @@
+# colcon --symlink-install requires setuptools < 80 (see colcon/colcon-core#696)
+setuptools>=58,<80

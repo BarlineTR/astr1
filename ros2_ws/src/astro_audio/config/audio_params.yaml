@@ -1,0 +1,23 @@
+audio_capture_node:
+  ros__parameters:
+    device_name: "ReSpeaker"
+    device_index: -1
+    sample_rate: 16000
+    channels: 6
+    chunk_size: 1024
+    vad_threshold: 0.6
+
+speech_recognition_node:
+  ros__parameters:
+    model_path: "/opt/vosk/vosk-model-small-tr-0.3"
+    language: "tr"
+    # Vosk yedek modunda kelime kelime parçalamayı azaltır; asıl motor .env STT_ENGINE
+    partial_results: false
+    silence_timeout_s: 1.5
+
+tts_node:
+  ros__parameters:
+    # engine/voice/elevenlabs_* .env dosyasından okunur (TTS_ENGINE, ELEVENLABS_*)
+    language: "tr"
+    rate: 150
+    volume: 0.8

@@ -1,6 +1,8 @@
+import os
+from glob import glob
 from setuptools import setup
 
-package_name = 'astro_base'
+package_name = 'astro_control'
 
 setup(
     name=package_name,
@@ -15,11 +17,11 @@ setup(
     zip_safe=True,
     maintainer='Baran Eren',
     maintainer_email='baran@example.com',
-    description='ASTRO V1 base hardware interface',
+    description='ASTRO V1 control, face tracking and collision avoidance',
     license='Apache-2.0',
     entry_points={
         'console_scripts': [
-            'serial_bridge = astro_base.serial_bridge:main',
+            'navigation_node = astro_control.navigation_node:main',
         ],
     },
 )

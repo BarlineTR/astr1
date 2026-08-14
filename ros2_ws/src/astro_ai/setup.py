@@ -1,6 +1,8 @@
+import os
+from glob import glob
 from setuptools import setup
 
-package_name = 'astro_base'
+package_name = 'astro_ai'
 
 setup(
     name=package_name,
@@ -10,16 +12,17 @@ setup(
         ('share/ament_index/resource_index/packages',
             ['resource/' + package_name]),
         ('share/' + package_name, ['package.xml']),
+        (os.path.join('share', package_name, 'launch'), glob('launch/*.py')),
     ],
     install_requires=['setuptools'],
     zip_safe=True,
     maintainer='Baran Eren',
     maintainer_email='baran@example.com',
-    description='ASTRO V1 base hardware interface',
+    description='ASTRO V1 AI Brain for LLM interactions',
     license='Apache-2.0',
     entry_points={
         'console_scripts': [
-            'serial_bridge = astro_base.serial_bridge:main',
+            'ai_brain_node = astro_ai.ai_brain_node:main',
         ],
     },
 )
