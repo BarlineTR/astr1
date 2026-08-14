@@ -106,9 +106,60 @@ class SerialBridge(Node):
         self.time_offset_ns = None
         self.first_imu_sync = True
 
+        self.is_self_testing = True
+
         self.connect_timer = self.create_timer(self.connect_retry_sec, self._try_connect)
         self.hb_timer = self.create_timer(0.1, self.send_heartbeat)
+        
+        # Start startup wheel self-test in a background thread
+        self.self_test_thread = threading.Thread(target=self._run_startup_self_test, daemon=True)
+        self.self_test_thread.start()
+
         self._try_connect()
+
+    def _run_startup_self_test(self):
+        self.get_logger().info("⚙️ [Self-Test] Waiting for Arduino connection...")
+        while rclpy.ok():
+            if self.ser is not None and self.ser.is_open and self.arduino_alive:
+                break
+            time.sleep(0.1)
+
+        self.get_logger().info("⚙️ [Self-Test] Arduino connected. Starting wheel self-test...")
+
+        def send_wheel_speed(l_rpm: float, r_rpm: float):
+            if self.ser is None or not self.ser.is_open:
+                return
+            payload = struct.pack("<ff", l_rpm, r_rpm)
+            pkt = self.build_packet(MSG_WHEEL_CMD, payload)
+            try:
+                self.ser.write(pkt)
+            except Exception as e:
+                self.get_logger().error(f"[Self-Test] Failed to write serial packet: {e}")
+
+        # 1. Forward motion
+        self.get_logger().info("⚙️ [Self-Test] Wheels FORWARD")
+        for _ in range(20):  # 20 * 50ms = 1s duration
+            if not rclpy.ok() or not self.arduino_alive:
+                break
+            send_wheel_speed(30.0, 30.0)
+            time.sleep(0.05)
+
+        # Stop
+        send_wheel_speed(0.0, 0.0)
+        time.sleep(0.5)
+
+        # 2. Backward motion
+        self.get_logger().info("⚙️ [Self-Test] Wheels BACKWARD")
+        for _ in range(20):  # 20 * 50ms = 1s duration
+            if not rclpy.ok() or not self.arduino_alive:
+                break
+            send_wheel_speed(-30.0, -30.0)
+            time.sleep(0.05)
+
+        # Stop
+        send_wheel_speed(0.0, 0.0)
+        self.is_self_testing = False
+        self.get_logger().info("⚙️ [Self-Test] Wheel self-test COMPLETED.")
 
     def _try_connect(self):
         if self.ser is not None and self.ser.is_open:
@@ -184,6 +235,8 @@ class SerialBridge(Node):
         self.arduino_alive = False
 
     def on_wheel_cmd(self, msg: WheelCmd):
+        if self.is_self_testing:
+            return
         if self.ser is None or not self.ser.is_open:
             return
         if not self.arduino_alive:
