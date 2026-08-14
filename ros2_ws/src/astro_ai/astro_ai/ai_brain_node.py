@@ -15,9 +15,10 @@ from rclpy.node import Node
 from std_msgs.msg import String, Bool
 
 try:
-    from dotenv import load_dotenv
+    from dotenv import load_dotenv, find_dotenv
 except ImportError:
     load_dotenv = None
+    find_dotenv = None
 
 import re
 
@@ -26,9 +27,11 @@ class AiBrainNode(Node):
     def __init__(self):
         super().__init__("ai_brain_node")
 
-        # Load .env
+        # Load repo-root .env (works when launched from ros2_ws/)
         if load_dotenv is not None:
-            load_dotenv(os.path.join(os.getcwd(), ".env"))
+            env_path = find_dotenv(usecwd=True) if find_dotenv else None
+            if env_path:
+                load_dotenv(env_path, override=False)
 
         # ── AI Mode ──────────────────────────────────────────────
         self.ai_mode = os.getenv("AI_MODE", "local").lower().strip()

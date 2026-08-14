@@ -1,11 +1,21 @@
 #!/usr/bin/env python3
 import json
+import os
+import io
+import wave
+import asyncio
 import threading
 
 import numpy as np
 import rclpy
 from rclpy.node import Node
 from std_msgs.msg import Int16MultiArray, String, Bool
+
+try:
+    from dotenv import load_dotenv, find_dotenv
+except ImportError:
+    load_dotenv = None
+    find_dotenv = None
 
 try:
     from vosk import KaldiRecognizer, Model, SetLogLevel
@@ -16,16 +26,23 @@ except ImportError:
 
 try:
     from openai import AsyncOpenAI
-    from dotenv import load_dotenv
-    import os
-    import io
-    import wave
-    import asyncio
-    from faster_whisper import WhisperModel
 except ImportError:
     AsyncOpenAI = None
-    load_dotenv = None
+
+try:
+    from faster_whisper import WhisperModel
+except ImportError:
     WhisperModel = None
+
+
+def _load_env():
+    if load_dotenv is None:
+        return None
+    env_path = find_dotenv(usecwd=True) if find_dotenv else None
+    if env_path:
+        load_dotenv(env_path, override=False)
+        return env_path
+    return None
 
 
 class SpeechRecognitionNode(Node):
@@ -59,9 +76,8 @@ class SpeechRecognitionNode(Node):
         self.last_tts_speaking_time = None
         self.lock = threading.Lock()
 
-        if load_dotenv:
-            load_dotenv()
-            
+        _load_env()
+
         self.stt_engine = os.getenv("STT_ENGINE", "vosk").lower()
         
         if self.stt_engine == "whisper":
@@ -89,12 +105,11 @@ class SpeechRecognitionNode(Node):
                 self.fw_compute_type = os.getenv("STT_FW_COMPUTE_TYPE", "float16")
                 
                 try:
-                    self.get_logger().info(f"Yerele Yükleniyor: Faster-Whisper ({self.fw_model_name}) Cihaz: {self.fw_device} Hassasiyet: {self.fw_compute_type}...")
-                    self.fw_model = WhisperModel(
-                        self.fw_model_name,
-                        device=self.fw_device,
-                        compute_type=self.fw_compute_type
+                    self.get_logger().info(
+                        f"Yerele Yükleniyor: Faster-Whisper ({self.fw_model_name}) "
+                        f"Cihaz: {self.fw_device} Hassasiyet: {self.fw_compute_type}..."
                     )
+                    self.fw_model = self._load_faster_whisper_model()
                     self.get_logger().info("✅ Faster-Whisper modeli başarıyla yüklendi.")
                     self.ai_loop = asyncio.new_event_loop()
                     self.ai_thread = threading.Thread(target=self._run_async_loop, daemon=True)
@@ -127,6 +142,27 @@ class SpeechRecognitionNode(Node):
                 self.recognizer = None
 
         self.create_timer(0.1, self._silence_tick)
+
+    def _load_faster_whisper_model(self):
+        try:
+            return WhisperModel(
+                self.fw_model_name,
+                device=self.fw_device,
+                compute_type=self.fw_compute_type,
+            )
+        except Exception as exc:
+            if self.fw_device != "cuda":
+                raise
+            self.get_logger().warn(
+                f"CUDA ile Faster-Whisper yüklenemedi ({exc}). CPU moduna düşülüyor..."
+            )
+            self.fw_device = "cpu"
+            self.fw_compute_type = os.getenv("STT_FW_CPU_COMPUTE_TYPE", "int8")
+            return WhisperModel(
+                self.fw_model_name,
+                device="cpu",
+                compute_type=self.fw_compute_type,
+            )
 
     def _run_async_loop(self):
         asyncio.set_event_loop(self.ai_loop)

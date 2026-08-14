@@ -27,18 +27,21 @@ except ImportError:
     edge_tts = None
 
 try:
-    from dotenv import load_dotenv
+    from dotenv import load_dotenv, find_dotenv
 except ImportError:
     load_dotenv = None
+    find_dotenv = None
 
 
 class TtsNode(Node):
     def __init__(self):
         super().__init__("tts_node")
 
-        # Load .env (guard against missing dotenv)
+        # Load repo-root .env before reading TTS_ENGINE / ElevenLabs keys
         if load_dotenv is not None:
-            load_dotenv(os.path.join(os.getcwd(), ".env"))
+            env_path = find_dotenv(usecwd=True) if find_dotenv else None
+            if env_path:
+                load_dotenv(env_path, override=False)
 
         # ROS parameters — defaults pulled from environment
         self.declare_parameter("engine", os.getenv("TTS_ENGINE", "edge-tts"))
