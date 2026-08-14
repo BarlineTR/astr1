@@ -6,6 +6,7 @@ from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription
 from launch.conditions import IfCondition
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration
+from launch_ros.actions import Node
 
 
 def generate_launch_description():
@@ -13,11 +14,13 @@ def generate_launch_description():
     audio_pkg = get_package_share_directory("astro_audio")
     vision_pkg = get_package_share_directory("astro_vision")
     ai_pkg = get_package_share_directory("astro_ai")
+    control_pkg = get_package_share_directory("astro_control")
     use_sim_time = LaunchConfiguration("use_sim_time")
     enable_lidar = LaunchConfiguration("enable_lidar")
     enable_audio = LaunchConfiguration("enable_audio")
     enable_vision = LaunchConfiguration("enable_vision")
     enable_ai = LaunchConfiguration("enable_ai")
+    enable_control = LaunchConfiguration("enable_control")
 
     return LaunchDescription(
         [
@@ -46,6 +49,11 @@ def generate_launch_description():
                 default_value="true",
                 description="Start AI Brain for NLP processing",
             ),
+            DeclareLaunchArgument(
+                "enable_control",
+                default_value="true",
+                description="Start navigation controller for face tracking and obstacle avoidance",
+            ),
             IncludeLaunchDescription(
                 PythonLaunchDescriptionSource(
                     os.path.join(lidar_pkg, "launch", "lidar.launch.py")
@@ -73,6 +81,14 @@ def generate_launch_description():
                 ),
                 condition=IfCondition(enable_ai),
                 launch_arguments={"use_sim_time": use_sim_time}.items(),
+            ),
+            Node(
+                package="astro_control",
+                executable="navigation_node",
+                name="navigation_node",
+                output="screen",
+                condition=IfCondition(enable_control),
+                parameters=[{"use_sim_time": use_sim_time}],
             ),
         ]
     )
