@@ -24,7 +24,7 @@ Make sure you have ROS 2 Humble installed on your Jetson Orin Nano / Ubuntu 22.0
 sudo apt update
 sudo apt install -y python3-rosdep python3-colcon-common-extensions
 sudo apt install -y ros-humble-rplidar-ros ros-humble-depthai-ros ros-humble-robot-state-publisher
-pip3 install pyusb sounddevice numpy vosk pyttsx3 opencv-python python-dotenv openai
+pip3 install pyusb sounddevice numpy vosk pyttsx3 opencv-python python-dotenv openai edge-tts requests faster-whisper
 ```
 
 ### 2. Build the Workspace
@@ -86,7 +86,24 @@ STT_ENGINE="vosk"
 STT_VOSK_MODEL_PATH="/opt/vosk/vosk-model-tr-0.3"
 ```
 
-**Option 2: Whisper API (Cloud)**
+**Option 2: Faster-Whisper (Recommended — full sentences, offline)**
+Install the Python package (once per machine):
+```bash
+bash ~/Desktop/astr1/scripts/install_stt_deps.sh
+# or manually:
+pip3 install faster-whisper
+```
+Then in `.env`:
+```ini
+STT_ENGINE="faster-whisper"
+STT_FW_MODEL="distil-large-v3"
+STT_FW_DEVICE="cuda"          # use "cpu" if no NVIDIA GPU
+STT_FW_COMPUTE_TYPE="float16" # use "int8" on CPU
+```
+On first launch the model downloads (~800MB for distil-large-v3). Expect log:
+`✅ Faster-Whisper modeli başarıyla yüklendi.`
+
+**Option 3: Whisper API (Cloud)**
 If you want to use OpenAI or Groq Whisper for perfect STT:
 ```ini
 STT_ENGINE="whisper"
