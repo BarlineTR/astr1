@@ -14,7 +14,6 @@ def generate_launch_description():
     audio_pkg = get_package_share_directory("astro_audio")
     vision_pkg = get_package_share_directory("astro_vision")
     ai_pkg = get_package_share_directory("astro_ai")
-    control_pkg = get_package_share_directory("astro_control")
     use_sim_time = LaunchConfiguration("use_sim_time")
     enable_lidar = LaunchConfiguration("enable_lidar")
     enable_audio = LaunchConfiguration("enable_audio")
