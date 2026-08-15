@@ -229,10 +229,10 @@ class TtsNode(Node):
 
             played = False
             for player_cmd in [
+                ["mpg123", "-a", "pulse", "-q", tmp_path],
                 ["mpg123", "-q", tmp_path],
                 ["paplay", tmp_path],
-                ["aplay", "-q", tmp_path],
-                ["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet", tmp_path]
+                ["aplay", "-q", tmp_path]
             ]:
                 try:
                     res = subprocess.run(player_cmd, check=True, capture_output=True, text=True)
@@ -241,7 +241,7 @@ class TtsNode(Node):
                 except Exception as p_err:
                     continue
             if not played:
-                self.get_logger().error("❌ [TTS] Hiçbir ses oynatıcı ses çalmayı başaramadı! Lütfen: sudo apt install mpg123")
+                self.get_logger().error("❌ [TTS] Ses oynatılamadı!")
         except Exception as e:
             self.get_logger().error(f"edge-tts hatası: {e}")
         finally:
