@@ -184,6 +184,8 @@ class SpeechRecognitionNode(Node):
                 self.is_speaking = False
                 self.last_speech_time = None
 
+        self.ring_buffer = [] # Cümlenin başını kaçırmamak için 0.5 sn pre-roll tamponu
+
     def audio_callback(self, msg: Int16MultiArray):
         if self.stt_engine == "vosk" and self.recognizer is None:
             return
@@ -195,10 +197,14 @@ class SpeechRecognitionNode(Node):
                 elapsed = (self.get_clock().now() - self.last_tts_speaking_time).nanoseconds / 1e9
                 if elapsed < 0.8:
                     return
-            # Whisper veya Faster-Whisper kullanıyorsak boşluğu tampona eklemeye gerek yok, sadece ses varken ekle
-            if self.stt_engine in ["whisper", "faster-whisper"] and not self.is_speaking:
-                return
-            self.buffer.extend(msg.data)
+            
+            # Pre-roll ring buffer (Son ~0.4 saniyelik sese sürekli sahip olalım)
+            self.ring_buffer.extend(msg.data)
+            if len(self.ring_buffer) > 12800: # 16000Hz * 0.4s * 2byte
+                self.ring_buffer = self.ring_buffer[-12800:]
+
+            if self.is_speaking:
+                self.buffer.extend(msg.data)
 
     def vad_callback(self, msg: Bool):
         if msg.data:
@@ -209,8 +215,13 @@ class SpeechRecognitionNode(Node):
                     elapsed = (self.get_clock().now() - self.last_tts_speaking_time).nanoseconds / 1e9
                     if elapsed < 0.8:
                         return
+                
+                if not self.is_speaking:
+                    # Konuşma yeni başladı! Pre-roll buffer'daki ses başını da ana tampona aktar
+                    self.buffer = list(self.ring_buffer)
+                    self.is_speaking = True
+                
                 self.last_speech_time = self.get_clock().now()
-                self.is_speaking = True
 
     def _process_buffer(self):
         with self.lock:
@@ -277,6 +288,7 @@ class SpeechRecognitionNode(Node):
 
     async def _transcribe_faster_whisper(self, audio_bytes):
         try:
+            self.get_logger().info("🎙️ [Whisper] Ses alındı, deşifre ediliyor...")
             audio_data = np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32) / 32768.0
             
             loop = asyncio.get_running_loop()
