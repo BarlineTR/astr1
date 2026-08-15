@@ -247,24 +247,6 @@ class SpeechRecognitionNode(Node):
                 
                 self.last_speech_time = self.get_clock().now()
 
-    def _process_buffer(self):
-        with self.lock:
-            if not self.buffer:
-                return
-            audio_bytes = np.array(self.buffer, dtype=np.int16).tobytes()
-            self.buffer.clear()
-
-        if self.recognizer.AcceptWaveform(audio_bytes):
-            result = json.loads(self.recognizer.Result())
-            text = result.get("text", "").strip()
-            if text:
-                self._publish_text(text)
-        elif self.partial_results:
-            partial = json.loads(self.recognizer.PartialResult())
-            text = partial.get("partial", "").strip()
-            if text:
-                self._publish_text(text, partial=True)
-
     def _publish_text(self, text: str, partial: bool = False):
         msg = String()
         msg.data = text
@@ -276,24 +258,27 @@ class SpeechRecognitionNode(Node):
             self.get_logger().info(f"🎤 [ReSpeaker] Duydu: {text}")
 
     def _silence_tick(self):
-        if self.stt_engine == "vosk":
-            with self.lock:
-                has_data = len(self.buffer) > 0
-            if has_data:
-                self._process_buffer()
-            
-        # 2. Eger VAD'den uzun suredir (0.5s) veri gelmediyse, konusma bitmistir
         now = self.get_clock().now()
         with self.lock:
             if self.is_speaking and self.last_speech_time is not None:
                 elapsed = (now - self.last_speech_time).nanoseconds / 1e9
                 if elapsed > self.silence_timeout_s:
-                    if self.stt_engine == "vosk":
-                        result = json.loads(self.recognizer.FinalResult())
-                        text = result.get("text", "").strip()
-                        if text:
-                            self._publish_text(text)
-                        self.recognizer.Reset()
+                    if self.stt_engine == "vosk" and self.recognizer is not None:
+                        audio_bytes = np.array(self.buffer, dtype=np.int16).tobytes()
+                        self.buffer.clear()
+                        self.is_speaking = False
+                        self.last_speech_time = None
+                        
+                        if len(audio_bytes) > 8000:
+                            if self.recognizer.AcceptWaveform(audio_bytes):
+                                result = json.loads(self.recognizer.Result())
+                            else:
+                                result = json.loads(self.recognizer.FinalResult())
+                            
+                            text = result.get("text", "").strip()
+                            if text:
+                                self._publish_text(text)
+                            self.recognizer.Reset()
                         
                     elif self.stt_engine in ["whisper", "faster-whisper"]:
                         audio_bytes = np.array(self.buffer, dtype=np.int16).tobytes()
