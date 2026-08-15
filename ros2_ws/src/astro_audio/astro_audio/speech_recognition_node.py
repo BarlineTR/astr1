@@ -51,7 +51,7 @@ class SpeechRecognitionNode(Node):
         self.declare_parameter("model_path", "vosk-model-small-tr-0.3")
         self.declare_parameter("language", "tr")
         self.declare_parameter("partial_results", True)
-        self.declare_parameter("silence_timeout_s", 0.5)
+        self.declare_parameter("silence_timeout_s", 1.2)
 
         model_path = self.get_parameter("model_path").value
         self.partial_results = self.get_parameter("partial_results").value
