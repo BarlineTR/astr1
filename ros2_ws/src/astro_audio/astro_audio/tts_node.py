@@ -185,11 +185,21 @@ class TtsNode(Node):
                 tmp_path = f.name
                 f.write(response.content)
 
-            subprocess.run(
-                ["mpg123", "-q", tmp_path],
-                check=True,
-                capture_output=True,
-            )
+            played = False
+            for player_cmd in [
+                ["paplay", tmp_path],
+                ["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet", tmp_path],
+                ["mpg123", "-a", "pulse", "-q", tmp_path],
+                ["mpg123", "-q", tmp_path]
+            ]:
+                try:
+                    res = subprocess.run(player_cmd, check=True, capture_output=True)
+                    played = True
+                    break
+                except Exception:
+                    continue
+            if not played:
+                self.get_logger().error("Ses oynatılamadı! Lütfen mpg123 veya pulseaudio-utils kurun.")
         except Exception as e:
             self.get_logger().error(f"ElevenLabs konuşma hatası: {e}")
             self._speak_edge_tts(text)

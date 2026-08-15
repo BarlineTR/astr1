@@ -146,25 +146,27 @@ class AiBrainNode(Node):
                     "💤 [AI] Sohbet zaman aşımı — uyku moduna dönüldü."
                 )
 
-        # ── IDLE: only react to wake word ────────────────────────
+        # ── IDLE: react to wake word or any speech if wake word matches roughly ────────────────────────
         if self._state == "IDLE":
-            idx = text_lower.find(self.wake_word)
-            if idx == -1:
-                # Not for us — silently ignore
-                return
+            # "hey astro", "astro", "esmer", "hey" veya benzeri algılamalarda uyan
+            wake_triggers = [self.wake_word, "astro", "esmer", "hey", "merhaba"]
+            matched = any(w in text_lower for w in wake_triggers)
+            
+            if not matched:
+                # Doğrudan sohbet için yine de ACTIVE moda geç (kullanıcıyı engelleme)
+                self._state = "ACTIVE"
+            else:
+                self._state = "ACTIVE"
+                self.get_logger().info(f"✨ [AI] Wake word algılandı! ({user_text})")
 
-            self._state = "ACTIVE"
             self._last_interaction = now
-            self.get_logger().info(
-                f"✨ [AI] Wake word algılandı! ACTIVE moda geçildi."
-            )
-
-            # Extract the part after the wake word
-            clean_text = user_text[idx + len(self.wake_word) :].strip()
+            # Temizlenmiş metin veya doğrudan cümlenin kendisi
+            clean_text = user_text
+            for w in wake_triggers:
+                clean_text = clean_text.lower().replace(w, "").strip()
 
             if not clean_text:
-                # Just said "hey astro" with nothing after
-                self._publish_tts("Efendim?")
+                self._publish_tts("Efendim, dinliyorum?")
                 return
             else:
                 user_text = clean_text
