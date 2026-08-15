@@ -217,10 +217,10 @@ class TtsNode(Node):
     def _speak_edge_tts(self, text: str):
         tmp_path = None
         try:
-            with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as f:
+            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
                 tmp_path = f.name
 
-            # edge_tts is async; run in a temporary event loop
+            # edge_tts ile sesi olustur
             async def _generate():
                 communicate = edge_tts.Communicate(text, self.voice_name)
                 await communicate.save(tmp_path)
@@ -229,20 +229,19 @@ class TtsNode(Node):
 
             played = False
             for player_cmd in [
+                ["mpg123", "-q", tmp_path],
                 ["paplay", tmp_path],
-                ["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet", tmp_path],
-                ["mpg123", "-a", "pulse", "-q", tmp_path],
-                ["mpg123", "-q", tmp_path]
+                ["aplay", "-q", tmp_path],
+                ["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet", tmp_path]
             ]:
                 try:
                     res = subprocess.run(player_cmd, check=True, capture_output=True, text=True)
                     played = True
                     break
                 except Exception as p_err:
-                    self.get_logger().warn(f"Oynatıcı {player_cmd[0]} başarısız: {p_err}")
                     continue
             if not played:
-                self.get_logger().error("❌ [TTS] Hiçbir ses oynatıcı ses çalmayı başaramadı! Lütfen mpg123 veya pulseaudio-utils kurun.")
+                self.get_logger().error("❌ [TTS] Hiçbir ses oynatıcı ses çalmayı başaramadı! Lütfen: sudo apt install mpg123")
         except Exception as e:
             self.get_logger().error(f"edge-tts hatası: {e}")
         finally:
