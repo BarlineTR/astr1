@@ -257,7 +257,7 @@ class AudioCaptureNode(Node):
                         if self.audio_gain != 1.0:
                             mono = np.clip(mono.astype(np.float32) * self.audio_gain, -32768, 32767).astype(np.int16)
                         
-                        vad_active = self.speech_detected_status if self.respeaker.dev else self._energy_vad(mono)
+                        vad_active = self._energy_vad(mono)
                         with self._audio_lock:
                             self._pending = (mono.tolist(), vad_active)
                             
@@ -288,7 +288,7 @@ class AudioCaptureNode(Node):
         if self.audio_gain != 1.0:
             mono = np.clip(mono.astype(np.float32) * self.audio_gain, -32768, 32767).astype(np.int16)
             
-        vad_active = self.speech_detected_status if self.respeaker.dev else self._energy_vad(mono)
+        vad_active = self._energy_vad(mono)
         with self._audio_lock:
             self._pending = (mono.tolist(), vad_active)
 
