@@ -263,27 +263,39 @@ class SpeechRecognitionNode(Node):
                     elif self.stt_engine in ["whisper", "faster-whisper"]:
                         audio_bytes = np.array(self.buffer, dtype=np.int16).tobytes()
                         self.buffer.clear()
-                        # En azindan 0.5 saniyelik ses varsa gonder (16000 byte)
-                        if len(audio_bytes) > 16000:
+                        # En az 0.8 saniyelik ses varsa gonder (25600 byte)
+                        if len(audio_bytes) >= 25600:
                             if self.stt_engine == "whisper":
                                 asyncio.run_coroutine_threadsafe(self._transcribe_whisper(audio_bytes), self.ai_loop)
                             else:
                                 asyncio.run_coroutine_threadsafe(self._transcribe_faster_whisper(audio_bytes), self.ai_loop)
+                        else:
+                            self.buffer.clear()
 
                     self.last_speech_time = None
                     self.is_speaking = False
 
     async def _transcribe_faster_whisper(self, audio_bytes):
         try:
-            self.get_logger().info("🎙️ [Faster-Whisper] Yerel model ile deşifre ediliyor...")
             audio_data = np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32) / 32768.0
             
             loop = asyncio.get_running_loop()
+            # Halüsinasyon önleyici VAD filtresi ve sessizlik eşiği eklendi
             segments, info = await loop.run_in_executor(
-                None, lambda: self.fw_model.transcribe(audio_data, beam_size=5, language="tr")
+                None, lambda: self.fw_model.transcribe(
+                    audio_data,
+                    beam_size=5,
+                    language="tr",
+                    vad_filter=True,
+                    vad_parameters=dict(min_silence_duration_ms=500),
+                    no_speech_threshold=0.6,
+                    condition_on_previous_text=False
+                )
             )
             text = "".join([segment.text for segment in segments]).strip()
-            if text:
+            # Bilinen hallüsinasyon / anlamsız kısa çıktıları filtrele
+            junk_words = ["altyazı", "m.k", "izlediğiniz için teşekkürler", "abone ol", "teşekkürler"]
+            if text and not any(j in text.lower() for j in junk_words):
                 self._publish_text(text)
         except Exception as e:
             self.get_logger().error(f"❌ [Faster-Whisper] Deşifre Hatası: {e}")
