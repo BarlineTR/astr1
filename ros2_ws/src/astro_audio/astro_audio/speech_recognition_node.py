@@ -111,7 +111,8 @@ class SpeechRecognitionNode(Node):
                         f"Cihaz: {self.fw_device} Hassasiyet: {self.fw_compute_type}..."
                     )
                     self.fw_model = self._load_faster_whisper_model()
-                    self.get_logger().info("✅ Faster-Whisper modeli başarıyla yüklendi.")
+                    self.is_ready = True
+                    self.get_logger().info("🟢 [STT] Faster-Whisper modeli hazır! Sizi dinliyorum, şimdi konuşabilirsiniz.")
                     self.ai_loop = asyncio.new_event_loop()
                     self.ai_thread = threading.Thread(target=self._run_async_loop, daemon=True)
                     self.ai_thread.start()

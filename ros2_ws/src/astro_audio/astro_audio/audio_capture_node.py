@@ -339,8 +339,8 @@ class AudioCaptureNode(Node):
             if rms < self._noise_floor * 2.0:
                 self._noise_floor = 0.95 * self._noise_floor + 0.05 * rms
 
-        # Dinamik eşik: Gürültü seviyesinin 2.5 katı veya parametre eşiği (hangisi büyükse)
-        dynamic_threshold = max(self.vad_threshold, self._noise_floor * 2.5)
+        # Dinamik eşik: Gürültü seviyesinin 1.5 katı veya parametre eşiği
+        dynamic_threshold = max(self.vad_threshold, self._noise_floor * 1.5)
         is_speech = rms > dynamic_threshold
         
         # Her 2 saniyede bir hata ve durum diagnostik logu fırlat
