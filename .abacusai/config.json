@@ -1,9 +1,0 @@
-{
-  "permissions": {
-    "allow": [
-      "Bash(\"C:\\Program Files\\GitHub CLI\\gh.exe\" auth login --hostname github.com --git-protocol https --web)",
-      "Bash(\"C:\\Program Files\\GitHub CLI\\gh.exe\" auth status 2>&1 || echo not_authenticated)",
-      "Bash(\"C:\\Program Files\\GitHub CLI\\gh.exe\" auth login --hostname github.com --git-protocol https --web 2>&1)"
-    ]
-  }
-}
