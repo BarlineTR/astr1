@@ -5,7 +5,7 @@ audio_capture_node:
     sample_rate: 16000
     channels: 6
     chunk_size: 1024
-    vad_threshold: 0.6
+    vad_threshold: 0.015
 
 speech_recognition_node:
   ros__parameters:

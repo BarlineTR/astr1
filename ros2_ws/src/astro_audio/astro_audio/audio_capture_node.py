@@ -315,7 +315,28 @@ class AudioCaptureNode(Node):
     def _energy_vad(self, mono: np.ndarray) -> bool:
         mono_clean = mono.astype(np.float32) - np.mean(mono)
         rms = float(np.sqrt(np.mean(mono_clean ** 2))) / 32768.0
-        return rms > self.vad_threshold
+
+        # Dinamik gürültü tabanı (Noise Floor) takibi (Adaptif VAD)
+        if not hasattr(self, "_noise_floor"):
+            self._noise_floor = rms
+        else:
+            # Gürültü seviyesini yavaşça güncelle (Exponential moving average)
+            if rms < self._noise_floor * 2.0:
+                self._noise_floor = 0.95 * self._noise_floor + 0.05 * rms
+
+        # Dinamik eşik: Gürültü seviyesinin 2.5 katı veya parametre eşiği (hangisi büyükse)
+        dynamic_threshold = max(self.vad_threshold, self._noise_floor * 2.5)
+        is_speech = rms > dynamic_threshold
+        
+        # Her 2 saniyede bir hata ve durum diagnostik logu fırlat
+        now = time.time()
+        if not hasattr(self, "_last_diag_log") or (now - self._last_diag_log > 2.0):
+            self._last_diag_log = now
+            self.get_logger().info(
+                f"📊 [Audio Diag] RMS: {rms:.4f} | Noise Floor: {self._noise_floor:.4f} | Eşik: {dynamic_threshold:.4f} | VAD: {is_speech}"
+            )
+
+        return is_speech
 
     def _publish_hid(self):
         if self.respeaker.dev:
