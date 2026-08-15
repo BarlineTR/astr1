@@ -273,17 +273,15 @@ class SpeechRecognitionNode(Node):
                     elif self.stt_engine in ["whisper", "faster-whisper"]:
                         audio_bytes = np.array(self.buffer, dtype=np.int16).tobytes()
                         self.buffer.clear()
-                        # En az 0.8 saniyelik ses varsa gonder (25600 byte)
-                        if len(audio_bytes) >= 25600:
+                        self.is_speaking = False
+                        self.last_speech_time = None
+                        
+                        # En az 0.5 saniyelik ses varsa gonder (16000 byte)
+                        if len(audio_bytes) >= 16000:
                             if self.stt_engine == "whisper":
                                 asyncio.run_coroutine_threadsafe(self._transcribe_whisper(audio_bytes), self.ai_loop)
                             else:
                                 asyncio.run_coroutine_threadsafe(self._transcribe_faster_whisper(audio_bytes), self.ai_loop)
-                        else:
-                            self.buffer.clear()
-
-                    self.last_speech_time = None
-                    self.is_speaking = False
 
     async def _transcribe_faster_whisper(self, audio_bytes):
         try:
@@ -304,8 +302,10 @@ class SpeechRecognitionNode(Node):
                 )
             )
             text = "".join([segment.text for segment in segments]).strip()
+            self.get_logger().info(f"🔍 [Whisper Çıktı]: '{text}' (Olasılık: {info.language_probability:.2f})")
+            
             # Bilinen hallüsinasyon / anlamsız kısa çıktıları filtrele
-            junk_words = ["altyazı", "m.k", "izlediğiniz için teşekkürler", "abone ol", "teşekkürler"]
+            junk_words = ["altyazı", "m.k", "izlediğiniz için teşekkürler", "abone ol"]
             if text and not any(j in text.lower() for j in junk_words):
                 self._publish_text(text)
         except Exception as e:
