@@ -130,20 +130,23 @@ class SpeechRecognitionNode(Node):
                 SetLogLevel(-1)
 
             # Vosk model yolunu otomatik ara ve doğrula
+            cwd = os.getcwd()
             vosk_candidates = [
                 os.getenv("STT_VOSK_MODEL_PATH"),
                 "vosk-model-small-tr-0.3",
-                os.path.expanduser("~/vosk-model-small-tr-0.3"),
-                os.path.expanduser("~/Desktop/vosk-model-small-tr-0.3"),
+                os.path.join(cwd, "vosk-model-small-tr-0.3"),
+                os.path.abspath(os.path.join(cwd, "..", "vosk-model-small-tr-0.3")),
+                os.path.abspath(os.path.join(cwd, "..", "..", "vosk-model-small-tr-0.3")),
                 os.path.expanduser("~/Desktop/astr1/vosk-model-small-tr-0.3"),
+                os.path.expanduser("~/vosk-model-small-tr-0.3"),
                 "/opt/vosk/vosk-model-small-tr-0.3"
             ]
 
             valid_model_path = None
             for cand in vosk_candidates:
                 if cand and os.path.exists(cand) and os.path.isdir(cand):
-                    # Model klasörünün içi boş değil mi kontrol et
-                    if os.path.exists(os.path.join(cand, "am")) or os.path.exists(os.path.join(cand, "conf")):
+                    # Vosk klasörü mü kontrol et (am, conf veya graph dizinleri)
+                    if any(os.path.exists(os.path.join(cand, sub)) for sub in ["am", "conf", "graph", "ivector"]):
                         valid_model_path = cand
                         break
 
