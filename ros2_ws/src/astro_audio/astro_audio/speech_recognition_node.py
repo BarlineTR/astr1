@@ -70,6 +70,7 @@ class SpeechRecognitionNode(Node):
         )
 
         self.buffer = []
+        self.ring_buffer = [] # Cümlenin başını kaçırmamak için 0.4 sn pre-roll tamponu
         self.last_speech_time = None
         self.is_speaking = False
         self.tts_speaking = False
@@ -183,8 +184,6 @@ class SpeechRecognitionNode(Node):
                 self.buffer.clear()
                 self.is_speaking = False
                 self.last_speech_time = None
-
-        self.ring_buffer = [] # Cümlenin başını kaçırmamak için 0.5 sn pre-roll tamponu
 
     def audio_callback(self, msg: Int16MultiArray):
         if self.stt_engine == "vosk" and self.recognizer is None:
