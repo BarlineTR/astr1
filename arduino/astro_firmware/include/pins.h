@@ -1,11 +1,14 @@
 #pragma once
 
 // Motor sürücü BTS7960 pinleri (örnek):
-// Her motor için iki PWM: FWD ve REV. Enable pinleri opsiyonel.
+// Her motor için iki PWM: FWD ve REV. Enable pinleri (L_EN ve R_EN birleşik bağlanabilir).
 #define L_MOTOR_PWM_FWD   5
 #define L_MOTOR_PWM_REV   6
+#define L_MOTOR_EN        22   // Sol BTS7960 L_EN + R_EN pinleri
+
 #define R_MOTOR_PWM_FWD   7
 #define R_MOTOR_PWM_REV   8
+#define R_MOTOR_EN        23   // Sağ BTS7960 L_EN + R_EN pinleri
 
 // Enkoder pinleri (Mega dış kesme destekli A kanalları: 2,3,18,19,20,21)
 #define L_ENC_A 2     // INT0
