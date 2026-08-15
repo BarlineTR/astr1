@@ -193,13 +193,14 @@ class TtsNode(Node):
                 ["mpg123", "-q", tmp_path]
             ]:
                 try:
-                    res = subprocess.run(player_cmd, check=True, capture_output=True)
+                    res = subprocess.run(player_cmd, check=True, capture_output=True, text=True)
                     played = True
                     break
-                except Exception:
+                except Exception as p_err:
+                    self.get_logger().warn(f"Oynatıcı {player_cmd[0]} başarısız: {p_err}")
                     continue
             if not played:
-                self.get_logger().error("Ses oynatılamadı! Lütfen mpg123 veya pulseaudio-utils kurun.")
+                self.get_logger().error("❌ [TTS] Hiçbir ses oynatıcı ses çalmayı başaramadı! Lütfen mpg123 veya pulseaudio-utils kurun.")
         except Exception as e:
             self.get_logger().error(f"ElevenLabs konuşma hatası: {e}")
             self._speak_edge_tts(text)
@@ -226,7 +227,6 @@ class TtsNode(Node):
 
             asyncio.run(_generate())
 
-            # Sesi oynat (PulseAudio üzerinden varsayılan hoparlöre / ReSpeaker'a gönder)
             played = False
             for player_cmd in [
                 ["paplay", tmp_path],
@@ -235,13 +235,14 @@ class TtsNode(Node):
                 ["mpg123", "-q", tmp_path]
             ]:
                 try:
-                    res = subprocess.run(player_cmd, check=True, capture_output=True)
+                    res = subprocess.run(player_cmd, check=True, capture_output=True, text=True)
                     played = True
                     break
-                except Exception:
+                except Exception as p_err:
+                    self.get_logger().warn(f"Oynatıcı {player_cmd[0]} başarısız: {p_err}")
                     continue
             if not played:
-                self.get_logger().error("Ses oynatılamadı! Lütfen mpg123 veya pulseaudio-utils kurun.")
+                self.get_logger().error("❌ [TTS] Hiçbir ses oynatıcı ses çalmayı başaramadı! Lütfen mpg123 veya pulseaudio-utils kurun.")
         except Exception as e:
             self.get_logger().error(f"edge-tts hatası: {e}")
         finally:
