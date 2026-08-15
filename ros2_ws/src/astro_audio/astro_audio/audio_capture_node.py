@@ -55,7 +55,7 @@ class AudioCaptureNode(Node):
         self.declare_parameter("channels", 6)
         self.declare_parameter("chunk_size", 1024)
         self.declare_parameter("vad_threshold", float(os.getenv("VAD_THRESHOLD", "0.05")))
-        self.declare_parameter("audio_gain", float(os.getenv("AUDIO_GAIN", "3.0")))
+        self.declare_parameter("audio_gain", float(os.getenv("AUDIO_GAIN", "5.0")))
 
         self.sample_rate = int(self.get_parameter("sample_rate").value)
         self.channels = int(self.get_parameter("channels").value)
