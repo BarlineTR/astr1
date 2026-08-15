@@ -160,24 +160,35 @@ class AudioCaptureNode(Node):
         self.stream = None
 
         sd_success = False
-        if sd is not None and self.device_index is not None:
-            try:
-                # Pulse üzerinden 6 kanal okuma (ReSpeaker 4-Mic Array için)
-                self.stream = sd.InputStream(
-                    device=self.device_index,
-                    channels=self.channels,
-                    samplerate=self.sample_rate,
-                    blocksize=2048,
-                    dtype="int16",
-                    callback=self._audio_callback,
-                )
-                self.stream.start()
-                sd_success = True
-                self.get_logger().info("✅ [ReSpeaker] Ses yakalama aktif ve dinliyor! (PulseAudio üzerinden)")
-            except Exception as exc:
-                self.get_logger().error(f"sounddevice stream açılamadı: {exc}")
+        if sd is not None:
+            # 1. Önce doğrudan ReSpeaker ALSA cihazını dene, yoksa pulse/default dene
+            dev_to_try = []
+            if self.device_index is not None:
+                dev_to_try.append(self.device_index)
+            dev_to_try.append(None) # Default system device
 
-        # Eğer sounddevice başarısız olursa arecord ile Pulse veya ALSA üzerinden bağlanmayı dene
+            for d_idx in dev_to_try:
+                try:
+                    # Cihazın desteklediği maksimum kanal sayısını al
+                    dev_info = sd.query_devices(d_idx if d_idx is not None else sd.default.device[0], 'input')
+                    max_ch = int(dev_info.get('max_input_channels', 2))
+                    ch_to_use = min(self.channels, max_ch)
+
+                    self.stream = sd.InputStream(
+                        device=d_idx,
+                        channels=ch_to_use,
+                        samplerate=self.sample_rate,
+                        blocksize=2048,
+                        dtype="int16",
+                        callback=self._audio_callback,
+                    )
+                    self.stream.start()
+                    sd_success = True
+                    self.get_logger().info(f"✅ [ReSpeaker] Ses yakalama aktif! (Cihaz: {dev_info['name']}, Kanal: {ch_to_use})")
+                    break
+                except Exception as exc:
+                    self.get_logger().warn(f"sounddevice (cihaz {d_idx}) açılamadı: {exc}")
+
         if not sd_success:
             self.get_logger().warn("sounddevice başlatılamadı. arecord fallback moduna geçiliyor...")
             self.stream_thread = threading.Thread(target=self._arecord_capture_loop, daemon=True)
@@ -282,9 +293,13 @@ class AudioCaptureNode(Node):
                 pass
 
     def _audio_callback(self, indata, frames, time_info, status):
-        mono = indata[:, 0].copy()
+        # 1. Eğer çok kanallı ses geliyorsa, ilk kanalı al veya ortalamasını al
+        if indata.ndim > 1 and indata.shape[1] > 1:
+            mono = indata[:, 0].copy() # 1. mikrofon kanalı
+        else:
+            mono = indata.flatten().copy()
         
-        # Uygulamaya dijital kazanc ekleyelim (Vosk'un kelimeleri daha iyi secebilmesi icin)
+        # Uygulamaya dijital kazanç ekleyelim
         if self.audio_gain != 1.0:
             mono = np.clip(mono.astype(np.float32) * self.audio_gain, -32768, 32767).astype(np.int16)
             
