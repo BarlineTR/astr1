@@ -216,16 +216,22 @@ class TtsNode(Node):
 
             asyncio.run(_generate())
 
-            # Play the generated audio
-            subprocess.run(
-                ["mpg123", "-q", tmp_path],
-                check=True,
-                capture_output=True,
-            )
-        except FileNotFoundError:
-            self.get_logger().error(
-                "mpg123 bulunamadı. Kurmak için: sudo apt install mpg123"
-            )
+            # Sesi oynat (PulseAudio üzerinden varsayılan hoparlöre / ReSpeaker'a gönder)
+            played = False
+            for player_cmd in [
+                ["paplay", tmp_path],
+                ["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet", tmp_path],
+                ["mpg123", "-a", "pulse", "-q", tmp_path],
+                ["mpg123", "-q", tmp_path]
+            ]:
+                try:
+                    res = subprocess.run(player_cmd, check=True, capture_output=True)
+                    played = True
+                    break
+                except Exception:
+                    continue
+            if not played:
+                self.get_logger().error("Ses oynatılamadı! Lütfen mpg123 veya pulseaudio-utils kurun.")
         except Exception as e:
             self.get_logger().error(f"edge-tts hatası: {e}")
         finally:

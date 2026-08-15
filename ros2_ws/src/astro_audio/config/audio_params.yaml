@@ -9,7 +9,7 @@ audio_capture_node:
 
 speech_recognition_node:
   ros__parameters:
-    model_path: "/opt/vosk/vosk-model-small-tr-0.3"
+    model_path: "vosk-model-small-tr-0.3"
     language: "tr"
     # Vosk yedek modunda kelime kelime parçalamayı azaltır; asıl motor .env STT_ENGINE
     partial_results: false

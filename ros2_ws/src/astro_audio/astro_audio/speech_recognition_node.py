@@ -122,25 +122,46 @@ class SpeechRecognitionNode(Node):
                 
         if self.stt_engine == "vosk":
             if Model is None:
-                self.get_logger().error("vosk not installed — speech recognition disabled")
+                self.get_logger().error("vosk kurulu değil — STT devre dışı. Kurmak için: pip install vosk")
                 self.recognizer = None
                 return
 
             if SetLogLevel is not None:
                 SetLogLevel(-1)
 
+            # Vosk model yolunu otomatik ara ve doğrula
+            vosk_candidates = [
+                os.getenv("STT_VOSK_MODEL_PATH"),
+                "vosk-model-small-tr-0.3",
+                os.path.expanduser("~/vosk-model-small-tr-0.3"),
+                os.path.expanduser("~/Desktop/vosk-model-small-tr-0.3"),
+                os.path.expanduser("~/Desktop/astr1/vosk-model-small-tr-0.3"),
+                "/opt/vosk/vosk-model-small-tr-0.3"
+            ]
+
+            valid_model_path = None
+            for cand in vosk_candidates:
+                if cand and os.path.exists(cand) and os.path.isdir(cand):
+                    # Model klasörünün içi boş değil mi kontrol et
+                    if os.path.exists(os.path.join(cand, "am")) or os.path.exists(os.path.join(cand, "conf")):
+                        valid_model_path = cand
+                        break
+
+            if not valid_model_path:
+                self.get_logger().error(
+                    "❌ [Vosk] Türkçe model klasörü ('vosk-model-small-tr-0.3') bulunamadı!\n"
+                    "Lütfen modeli indirin: wget https://alphacephei.com/vosk/models/vosk-model-small-tr-0.3.zip && unzip vosk-model-small-tr-0.3.zip"
+                )
+                self.recognizer = None
+                return
+
             try:
-                # Kullanici .env'den vosk yolunu da degistirebilsin
-                env_vosk_path = os.getenv("STT_VOSK_MODEL_PATH")
-                if env_vosk_path and os.path.exists(env_vosk_path):
-                    model_path = env_vosk_path
-                    
-                self.model = Model(model_path)
+                self.model = Model(valid_model_path)
                 self.recognizer = KaldiRecognizer(self.model, 16000)
                 self.recognizer.SetWords(True)
-                self.get_logger().info(f"STT Engine: Vosk (Model: {model_path})")
+                self.get_logger().info(f"✅ [Vosk] Türkçe Model Başarıyla Yüklendi! (Konum: {valid_model_path})")
             except Exception as e:
-                self.get_logger().error(f"Failed to load Vosk model: {e}")
+                self.get_logger().error(f"Vosk model yükleme hatası: {e}")
                 self.recognizer = None
 
         self.create_timer(0.1, self._silence_tick)
