@@ -26,6 +26,7 @@ setup(
         "console_scripts": [
             "face_detector_node = astro_vision.face_detector_node:main",
             "oak_perception_node = astro_vision.oak_perception_node:main",
+            "oak_spatial_native_node = astro_vision.oak_spatial_native_node:main",
         ],
     },
 )

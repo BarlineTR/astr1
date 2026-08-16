@@ -9,13 +9,19 @@ from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node, SetRemap
 
 
+from launch.conditions import IfCondition, UnlessCondition
+
+
 def generate_launch_description():
     pkg_dir = get_package_share_directory("astro_vision")
     depthai_pkg = get_package_share_directory("depthai_ros_driver")
     params_file = os.path.join(pkg_dir, "config", "camera_params.yaml")
     use_sim_time = LaunchConfiguration("use_sim_time")
+    use_native_spatial = LaunchConfiguration("use_native_spatial")
 
+    # Standard ROS 2 Driver Group
     camera_group = GroupAction(
+        condition=UnlessCondition(use_native_spatial),
         actions=[
             SetRemap("/camera/color/image_raw", "/oak/rgb/image_raw"),
             SetRemap("/camera/color/camera_info", "/oak/rgb/camera_info"),
@@ -40,13 +46,29 @@ def generate_launch_description():
                 default_value="false",
                 description="Use simulation clock",
             ),
+            DeclareLaunchArgument(
+                "use_native_spatial",
+                default_value="false",
+                description="Use 100% Native DepthAI on-chip VPU spatial perception pipeline",
+            ),
             camera_group,
+            # Fallback / Standard vision node
             Node(
+                condition=UnlessCondition(use_native_spatial),
                 package="astro_vision",
                 executable="face_detector_node",
                 name="face_detector_node",
                 output="screen",
                 parameters=[params_file, {"use_sim_time": use_sim_time}],
+            ),
+            # 100% Native DepthAI On-Chip VPU Node
+            Node(
+                condition=IfCondition(use_native_spatial),
+                package="astro_vision",
+                executable="oak_spatial_native_node",
+                name="oak_spatial_native_node",
+                output="screen",
+                parameters=[{"use_sim_time": use_sim_time}],
             ),
         ]
     )
