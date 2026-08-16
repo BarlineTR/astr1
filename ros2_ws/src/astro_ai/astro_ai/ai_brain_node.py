@@ -939,11 +939,10 @@ class AiBrainNode(Node):
                 self._last_interaction = time.monotonic()
                 return
 
-            # 3. METİN SOHBETİ & TOOL USE (Adaptive Linguistic Style Matching)
+            # 3. METİN SOHBETİ & TOOL USE (With Safe Tool Error Recovery)
             context_prefix = ""
-            if self._person_detected:
-                gaze_status = "ve doğrudan sana (kameraya) bakıyor" if self._looking_at_robot else "ama başka yöne bakıyor"
-                context_prefix = f"[Kamerada karşında bir insan var {gaze_status}] "
+            if self._person_detected and self._looking_at_robot:
+                context_prefix = "[Karşında bir insan var ve sana bakıyor] "
             user_content = context_prefix + user_text
 
             self._messages.append({"role": "user", "content": user_content})
@@ -966,9 +965,23 @@ class AiBrainNode(Node):
                     )
                     break
                 except Exception as api_err:
-                    if "429" in str(api_err) or "rate_limit" in str(api_err).lower():
+                    err_str = str(api_err)
+                    if "429" in err_str or "rate_limit" in err_str.lower():
                         self.get_logger().warn(f"⚠️ Model {m} rate limite takıldı, yedek modele geçiliyor...")
                         continue
+                    elif "tool_use_failed" in err_str or "Failed to call a function" in err_str:
+                        self.get_logger().warn(f"⚠️ Tool çağrı hatası oluştu, doğrudan metin modunda yanıt üretiliyor...")
+                        try:
+                            response = self._groq.chat.completions.create(
+                                messages=self._messages,
+                                model=m,
+                                temperature=self._temperature,
+                                max_tokens=self._max_tokens,
+                                tools=None,
+                            )
+                            break
+                        except Exception:
+                            continue
                     else:
                         raise api_err
 
