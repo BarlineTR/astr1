@@ -243,13 +243,17 @@ class SpeechRecognitionNode(Node):
             text = str(result).strip()
             text_lower = text.lower().strip(" .,!?:;")
 
-            # Filter hallucination / empty / junk / phantom noise
+            # Exact match hallucination filter (Whisper often hallucinates these single words in silence)
+            exact_hallucinations = ["evet", "hayır", "tamam", "hı hı", "hı", "cık", "çık", "eee", "ııı", "hmm"]
+            if text_lower in exact_hallucinations:
+                return
+
+            # Filter empty / junk / phantom noise
             junk_filters = [
                 "altyazı", "abone ol", "izlediğiniz için", "www.", ".com",
-                "you", "thank you", "bye", "subtitles", "watching", "amara.org",
-                "hı hı", "hı", "cık", "çık", "eee", "ııı", "hmm"
+                "you", "thank you", "bye", "subtitles", "watching", "amara.org"
             ]
-            if any(junk == text_lower or junk in text_lower for junk in junk_filters):
+            if any(junk in text_lower for junk in junk_filters):
                 return
 
             if len(text_lower) < 3 and text_lower not in ["ne", "su", "al", "ev", "on"]:

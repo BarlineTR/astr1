@@ -188,7 +188,7 @@ class SpatialVisionNode(Node):
             user_distance = dist_m
 
             # 3. Direct Gaze
-            direct_gaze = abs(yaw) <= 18.0
+            direct_gaze = abs(yaw) <= 10.0
             if direct_gaze:
                 is_looking = True
 

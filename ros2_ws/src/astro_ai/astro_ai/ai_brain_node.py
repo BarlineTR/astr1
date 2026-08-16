@@ -467,7 +467,7 @@ class AiBrainNode(Node):
                     base64_img = frame_to_base64_jpeg(captured_frame, max_dim=512)
                     if base64_img:
                         self.get_logger().info("🕵️ [Idle Learning] Etraf sessiz, Astro etrafı inceliyor...")
-                        prompt = "Şu anda boşta bekliyorsun ve etrafı izliyorsun. Kamerada ne görüyorsun? Odada dikkat çekici bir durum, nesne veya insan var mı? Sadece ne gördüğünü 1 kısa cümleyle Türkçe not al."
+                        prompt = "Kameradaki görüntüyü Türkçe olarak tek bir kısa cümleyle açıkla. Açıklama harici hiçbir şey yazma. Örnek: 'Masada bir bilgisayar var.' veya 'Oda şu an aydınlık ve boş.'"
                         
                         try:
                             response = self._groq.chat.completions.create(
