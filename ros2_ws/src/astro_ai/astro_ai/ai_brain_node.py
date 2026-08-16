@@ -212,7 +212,7 @@ class AiBrainNode(Node):
         self.create_subscription(Image, "/oak/rgb/image_raw", self._on_camera_image, 10)
 
         # Timers
-        self.create_timer(0.4, self._check_proactive_gaze)
+        self.create_timer(0.15, self._check_proactive_gaze)
         self.create_timer(1.0, self._check_session_lifecycle)
 
         # Start Idle Learning
@@ -283,17 +283,20 @@ class AiBrainNode(Node):
             if not self._looking_at_robot:
                 self._looking_start_time = now
             self._looking_at_robot = True
+            self._last_gaze_seen_time = now
         else:
-            self._looking_at_robot = False
-            self._looking_start_time = None
+            # Gaze hysteresis: only drop gaze after 1.2 seconds of absence to prevent flicker resets
+            if hasattr(self, '_last_gaze_seen_time') and (now - self._last_gaze_seen_time) > 1.2:
+                self._looking_at_robot = False
+                self._looking_start_time = None
 
     def _check_proactive_gaze(self):
         if not self._looking_at_robot or self._looking_start_time is None or self._tts_speaking or self._is_processing:
             return
 
         now = time.monotonic()
-        if (now - self._looking_start_time) > 0.8:
-            if self.state_machine.is_idle() and (now - self._last_proactive_gaze_time) > 20.0:
+        if (now - self._looking_start_time) >= 0.4:
+            if self.state_machine.is_idle() and (now - self._last_proactive_gaze_time) > 15.0:
                 self._last_proactive_gaze_time = now
                 self.session.activate_session(reason="proactive_gaze")
                 self.state_machine.transition_to(RobotState.LISTENING)

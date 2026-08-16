@@ -159,9 +159,9 @@ class SpatialVisionNode(Node):
 
         detected_faces = self.face_cascade.detectMultiScale(
             small_gray,
-            scaleFactor=self.scale_factor,
-            minNeighbors=self.min_neighbors,
-            minSize=(int(self.min_size * scale_ratio), int(self.min_size * scale_ratio)),
+            scaleFactor=1.1,
+            minNeighbors=3,
+            minSize=(int(25 * scale_ratio), int(25 * scale_ratio)),
         )
 
         # Map bounding boxes back to original resolution
@@ -203,8 +203,8 @@ class SpatialVisionNode(Node):
             dist_m = self._estimate_distance(x, y, w, h, frame_w, frame_h)
             user_distance = dist_m
 
-            # 3. Direct Gaze (Natural Gaze Cone: <= 25 degrees)
-            direct_gaze = abs(yaw) <= 25.0
+            # 3. Direct Gaze (Wide Natural Gaze Cone: <= 30 degrees)
+            direct_gaze = abs(yaw) <= 30.0
             if direct_gaze:
                 is_looking = True
 
@@ -265,8 +265,20 @@ class SpatialVisionNode(Node):
         emotion_msg.data = smoothed_emotion
         self.pub_emotion.publish(emotion_msg)
 
-        out_image = bgr_to_imgmsg(frame, msg.header)
-        self.pub_image.publish(out_image)
+        # Diagnostic logger on gaze state change
+        if not hasattr(self, '_prev_looking_log'):
+            self._prev_looking_log = False
+        if is_looking != self._prev_looking_log:
+            self._prev_looking_log = is_looking
+            if is_looking:
+                self.get_logger().info(f"👀 [Göz Teması]: Kullanıcı algılandı! (Mesafe: {user_distance:.2f}m, Açı: {head_yaw:.1f}°)")
+
+        # Publish Images
+        try:
+            face_img_msg = bgr_to_imgmsg(frame, msg.header)
+            self.pub_image.publish(face_img_msg)
+        except Exception:
+            pass
 
 
 def main(args=None):
