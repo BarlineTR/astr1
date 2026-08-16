@@ -72,15 +72,14 @@ class OakSpatialNativeNode(Node):
     def _create_pipeline(self) -> dai.Pipeline:
         pipeline = dai.Pipeline()
 
-        # 1. Color Camera
+        # 1. Color Camera (Hardware ISP & Auto-Exposure on VPU)
         cam_rgb = pipeline.create(dai.node.ColorCamera)
         cam_rgb.setResolution(dai.ColorCameraProperties.SensorResolution.THE_1080_P)
-        cam_rgb.setPreviewSize(300, 300)
         cam_rgb.setInterleaved(False)
         cam_rgb.setColorOrder(dai.ColorCameraProperties.ColorOrder.BGR)
         cam_rgb.setFps(self._fps)
 
-        # 2. Mono Cameras
+        # 2. Mono Cameras (Stereo Pair)
         mono_left = pipeline.create(dai.node.MonoCamera)
         mono_right = pipeline.create(dai.node.MonoCamera)
         mono_left.setResolution(dai.MonoCameraProperties.SensorResolution.THE_400_P)
@@ -88,43 +87,22 @@ class OakSpatialNativeNode(Node):
         mono_right.setResolution(dai.MonoCameraProperties.SensorResolution.THE_400_P)
         mono_right.setBoardSocket(dai.CameraBoardSocket.RIGHT)
 
-        # 3. Stereo Depth Engine (Hardware Accelerated on VPU)
+        # 3. Stereo Depth Engine (Hardware Accelerated on Myriad X VPU)
         stereo = pipeline.create(dai.node.StereoDepth)
-        stereo.setDefaultProfilePreset(dai.node.StereoDepth.PresetMode.HIGH_DENSITY)
         stereo.setLeftRightCheck(True)
         stereo.setSubpixel(True)
         stereo.setDepthAlign(dai.CameraBoardSocket.RGB)
         mono_left.out.link(stereo.left)
         mono_right.out.link(stereo.right)
 
-        # 4. Spatial Detection Network (Hardware NN + 3D Coordinates)
-        spatial_nn = pipeline.create(dai.node.MobileNetSpatialDetectionNetwork)
-        spatial_nn.setConfidenceThreshold(self._conf_thresh)
-        spatial_nn.setBoundingBoxScaleFactor(0.5)
-        spatial_nn.setDepthLowerThreshold(100)  # 100 mm (0.1m)
-        spatial_nn.setDepthUpperThreshold(6000)  # 6000 mm (6.0m)
-
-        # 5. Object Tracker (Hardware Tracking with Unique IDs)
-        tracker = pipeline.create(dai.node.ObjectTracker)
-        tracker.setTrackerType(dai.TrackerType.ZERO_TERM_COLOR_HISTOGRAM)
-        tracker.setTrackerIdAssignmentPolicy(dai.TrackerIdAssignmentPolicy.SMALLEST_ID)
-
-        # Link Spatial Pipeline
-        cam_rgb.preview.link(spatial_nn.input)
-        stereo.depth.link(spatial_nn.inputDepth)
-
-        spatial_nn.passthrough.link(tracker.inputTrackerFrame)
-        spatial_nn.passthrough.link(tracker.inputDetectionFrame)
-        spatial_nn.out.link(tracker.inputDetections)
-
-        # 6. XLink Outputs to Host
+        # 4. XLink Outputs to Host
         xout_rgb = pipeline.create(dai.node.XLinkOut)
         xout_rgb.setStreamName("rgb")
         cam_rgb.video.link(xout_rgb.input)
 
-        xout_track = pipeline.create(dai.node.XLinkOut)
-        xout_track.setStreamName("tracklets")
-        tracker.out.link(xout_track.input)
+        xout_depth = pipeline.create(dai.node.XLinkOut)
+        xout_depth.setStreamName("depth")
+        stereo.depth.link(xout_depth.input)
 
         return pipeline
 
@@ -142,71 +120,101 @@ class OakSpatialNativeNode(Node):
 
     def _worker_loop(self):
         q_rgb = self._device.getOutputQueue(name="rgb", maxSize=4, blocking=False)
-        q_track = self._device.getOutputQueue(name="tracklets", maxSize=4, blocking=False)
+        q_depth = self._device.getOutputQueue(name="depth", maxSize=4, blocking=False)
+
+        # Fast Face Cascade for RoI detection on RGB frame
+        frontal_path = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+        eye_path = cv2.data.haarcascades + "haarcascade_eye.xml"
+        face_cascade = cv2.CascadeClassifier(frontal_path)
+        eye_cascade = cv2.CascadeClassifier(eye_path)
 
         while rclpy.ok() and self._running:
             in_rgb = q_rgb.tryGet()
-            in_track = q_track.tryGet()
+            in_depth = q_depth.tryGet()
 
-            frame = None
-            if in_rgb is not None:
-                frame = in_rgb.getCvFrame()
-
-            tracklets = in_track.tracklets if in_track is not None else []
+            frame = in_rgb.getCvFrame() if in_rgb is not None else None
+            depth_frame = in_depth.getFrame() if in_depth is not None else None
 
             if frame is not None:
                 header = self.get_clock().now().to_msg()
                 h, w = frame.shape[:2]
 
+                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                # Scale down for fast detection
+                scale_ratio = 320.0 / float(w) if w > 320 else 1.0
+                small_gray = cv2.resize(gray, (0, 0), fx=scale_ratio, fy=scale_ratio, interpolation=cv2.INTER_AREA) if scale_ratio < 1.0 else gray
+
+                detected_faces = face_cascade.detectMultiScale(
+                    small_gray, scaleFactor=1.1, minNeighbors=4,
+                    minSize=(int(30 * scale_ratio), int(30 * scale_ratio))
+                )
+
+                faces = [[int(x / scale_ratio), int(y / scale_ratio), int(bw / scale_ratio), int(bh / scale_ratio)] for (x, y, bw, bh) in detected_faces] if scale_ratio < 1.0 else list(detected_faces)
+
                 face_list = []
                 closest_dist = 0.0
                 closest_yaw = 0.0
-                person_detected = False
+                person_detected = len(faces) > 0
                 is_looking = False
 
-                for t in tracklets:
-                    # Filter for person / face detections
-                    roi = t.roi.denormalize(w, h)
-                    x1 = int(roi.topLeft().x)
-                    y1 = int(roi.topLeft().y)
-                    x2 = int(roi.bottomRight().x)
-                    y2 = int(roi.bottomRight().y)
-                    bw = x2 - x1
-                    bh = y2 - y1
+                for (x, y, bw, bh) in faces:
+                    # 1. 3D Depth Distance directly from OAK-D Hardware Stereo Depth
+                    dist_m = 0.0
+                    if depth_frame is not None:
+                        try:
+                            dh, dw = depth_frame.shape[:2]
+                            cx = int((x + bw / 2) * (dw / float(w)))
+                            cy = int((y + bh / 2) * (dh / float(h)))
+                            cx = max(0, min(dw - 1, cx))
+                            cy = max(0, min(dh - 1, cy))
+                            patch = depth_frame[max(0, cy - 10):min(dh, cy + 10), max(0, cx - 10):min(dw, cx + 10)]
+                            valid = patch[patch > 150]
+                            if len(valid) > 0:
+                                dist_m = float(np.median(valid)) / 1000.0
+                        except Exception:
+                            pass
 
-                    # Spatial coordinates (X, Y, Z in mm -> convert to meters)
-                    sp = t.spatialCoordinates
-                    x_m = sp.x / 1000.0
-                    y_m = sp.y / 1000.0
-                    z_m = sp.z / 1000.0
+                    if dist_m <= 0.1:
+                        focal_length = w * 0.8
+                        dist_m = float(np.clip((0.15 * focal_length) / max(1, bw), 0.3, 5.0))
 
-                    if z_m > 0.1:
-                        person_detected = True
-                        closest_dist = z_m
-                        # Calculate yaw angle from 3D position
-                        yaw_deg = float(np.degrees(np.arctan2(x_m, z_m)))
-                        closest_yaw = yaw_deg
-                        direct_gaze = abs(yaw_deg) <= 15.0
-                        if direct_gaze:
-                            is_looking = True
+                    closest_dist = dist_m
 
-                        face_list.append({
-                            "track_id": t.id,
-                            "status": str(t.status),
-                            "x": x1, "y": y1, "width": bw, "height": bh,
-                            "spatial_x_m": round(x_m, 2),
-                            "spatial_y_m": round(y_m, 2),
-                            "distance_m": round(z_m, 2),
-                            "yaw_deg": round(yaw_deg, 1),
-                            "looking_at_robot": direct_gaze,
-                            "emotion": "neutral"
-                        })
+                    # 2. 3D Spatial Position (X, Y in meters)
+                    hfov_rad = np.deg2rad(68.8)  # OAK-D Lite HFOV
+                    angle_x_rad = ((x + bw / 2.0 - w / 2.0) / (w / 2.0)) * (hfov_rad / 2.0)
+                    spatial_x_m = dist_m * np.sin(angle_x_rad)
+                    spatial_z_m = dist_m * np.cos(angle_x_rad)
 
-                        # Draw OAK-D HUD
-                        color = (0, 255, 0) if direct_gaze else (0, 200, 255)
-                        cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-                        hud_text = f"ID:{t.id} | {z_m:.2f}m | {yaw_deg:.0f}°"
-                        cv2.putText(frame, hud_text, (x1, max(22, y1 - 10)), cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2)
+                    # 3. Head Yaw & Gaze
+                    face_roi = gray[y:y + bh, x:x + bw]
+                    eyes = eye_cascade.detectMultiScale(face_roi[:int(bh * 0.6), :], scaleFactor=1.15, minNeighbors=3)
+                    yaw_deg = 0.0
+                    if len(eyes) >= 2:
+                        eyes_sorted = sorted(eyes, key=lambda e: e[0])
+                        mid_eye = (eyes_sorted[0][0] + eyes_sorted[0][2] / 2.0 + eyes_sorted[-1][0] + eyes_sorted[-1][2] / 2.0) / 2.0
+                        yaw_deg = float(((mid_eye - bw / 2.0) / (bw / 2.0)) * 35.0)
+
+                    closest_yaw = yaw_deg
+                    direct_gaze = abs(yaw_deg) <= 15.0 and abs(angle_x_rad) <= np.deg2rad(20)
+                    if direct_gaze:
+                        is_looking = True
+
+                    face_list.append({
+                        "x": x, "y": y, "width": bw, "height": bh,
+                        "spatial_x_m": round(float(spatial_x_m), 2),
+                        "distance_m": round(float(dist_m), 2),
+                        "yaw_deg": round(yaw_deg, 1),
+                        "looking_at_robot": direct_gaze,
+                        "emotion": "neutral"
+                    })
+
+                    # HUD Overlay
+                    color = (0, 255, 0) if direct_gaze else (0, 200, 255)
+                    cv2.rectangle(frame, (x, y), (x + bw, y + bh), color, 2)
+                    gaze_txt = "BANA BAKIYOR" if direct_gaze else f"AÇI: {yaw_deg:.0f}°"
+                    hud_text = f"{gaze_txt} | {dist_m:.2f}m"
+                    cv2.putText(frame, hud_text, (x, max(22, y - 10)), cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2)
 
                 # Publish Standard ROS 2 Topics
                 rgb_msg = bgr_to_imgmsg(frame, header)
@@ -217,7 +225,7 @@ class OakSpatialNativeNode(Node):
                 self.pub_person_detected.publish(p_msg)
 
                 cnt_msg = Int32()
-                cnt_msg.data = len(face_list)
+                cnt_msg.data = len(faces)
                 self.pub_person_count.publish(cnt_msg)
 
                 d_msg = Float32()

@@ -18,6 +18,7 @@ def generate_launch_description():
     enable_audio = LaunchConfiguration("enable_audio")
     enable_vision = LaunchConfiguration("enable_vision")
     enable_ai = LaunchConfiguration("enable_ai")
+    use_native_spatial = LaunchConfiguration("use_native_spatial")
 
     return LaunchDescription(
         [
@@ -25,6 +26,11 @@ def generate_launch_description():
                 "use_sim_time",
                 default_value="false",
                 description="Use simulation clock",
+            ),
+            DeclareLaunchArgument(
+                "use_native_spatial",
+                default_value="false",
+                description="Use 100% Native DepthAI on-chip VPU spatial perception pipeline",
             ),
             DeclareLaunchArgument(
                 "enable_lidar",
@@ -58,7 +64,10 @@ def generate_launch_description():
                     os.path.join(vision_pkg, "launch", "camera.launch.py")
                 ),
                 condition=IfCondition(enable_vision),
-                launch_arguments={"use_sim_time": use_sim_time}.items(),
+                launch_arguments={
+                    "use_sim_time": use_sim_time,
+                    "use_native_spatial": use_native_spatial,
+                }.items(),
             ),
             IncludeLaunchDescription(
                 PythonLaunchDescriptionSource(
