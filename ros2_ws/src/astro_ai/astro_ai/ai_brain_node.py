@@ -327,14 +327,15 @@ class AiBrainNode(Node):
 
         self.memory = AstroMemory()
 
-        self.declare_parameter("llm_model", os.getenv("LLM_MODEL", "llama-3.3-70b-versatile"))
+        self.declare_parameter("llm_model", os.getenv("LLM_MODEL", "llama-3.1-8b-instant"))
         self.declare_parameter("vision_model", os.getenv("VISION_MODEL", "qwen/qwen3.6-27b"))
         self.declare_parameter("llm_temperature", float(os.getenv("LLM_TEMPERATURE", "0.55")))
-        self.declare_parameter("llm_max_tokens", int(os.getenv("LLM_MAX_TOKENS", "300")))
+        self.declare_parameter("llm_max_tokens", int(os.getenv("LLM_MAX_TOKENS", "250")))
         self.declare_parameter("wake_word", os.getenv("WAKE_WORD", "hey astro"))
         self.declare_parameter("conversation_timeout", float(os.getenv("CONVERSATION_TIMEOUT", "15.0")))
 
         self._text_model = self.get_parameter("llm_model").value
+        self._fallback_models = ["llama-3.1-8b-instant", "llama-3.3-70b-versatile", "mixtral-8x7b-32768"]
         self._vision_model = self.get_parameter("vision_model").value
         self._temperature = float(self.get_parameter("llm_temperature").value)
         self._max_tokens = int(self.get_parameter("llm_max_tokens").value)
@@ -665,17 +666,25 @@ class AiBrainNode(Node):
                 "Varsa sadece kısa tek bir Türkçe cümle olarak yaz (örnek: 'Robotik ve yazılımla ilgileniyor'). "
                 "Yoksa sadece 'YOK' yaz."
             )
-            res = self._groq.chat.completions.create(
-                messages=[{"role": "user", "content": prompt}],
-                model=self._text_model,
-                temperature=0.2,
-                max_tokens=100
-            )
-            extracted = res.choices[0].message.content.strip()
-            if extracted and "YOK" not in extracted.upper() and len(extracted) > 5:
-                self.memory.add_fact(extracted)
-                self.get_logger().info(f"✨ [Otonom Hafıza Kazandı]: \"{extracted}\"")
-                self._messages[0]["content"] = self._build_system_prompt()
+            res = None
+            for m in self._fallback_models:
+                try:
+                    res = self._groq.chat.completions.create(
+                        messages=[{"role": "user", "content": prompt}],
+                        model=m,
+                        temperature=0.2,
+                        max_tokens=100
+                    )
+                    break
+                except Exception:
+                    continue
+
+            if res is not None:
+                extracted = res.choices[0].message.content.strip()
+                if extracted and "YOK" not in extracted.upper() and len(extracted) > 5:
+                    self.memory.add_fact(extracted)
+                    self.get_logger().info(f"✨ [Otonom Hafıza Kazandı]: \"{extracted}\"")
+                    self._messages[0]["content"] = self._build_system_prompt()
         except Exception as e:
             self.get_logger().warn(f"Reflection hatası: {e}")
 
@@ -736,7 +745,7 @@ class AiBrainNode(Node):
                 self._last_interaction = time.monotonic()
                 return
 
-            # 3. METİN SOHBETİ & TOOL USE (Function Calling: Hava durumu, Zamanlayıcı)
+            # 3. METİN SOHBETİ & TOOL USE (With Automatic Fallback on Rate Limit)
             context_prefix = ""
             if self._person_detected:
                 context_prefix = "[Kamerada karşında bir insan görüyorsun] "
@@ -747,15 +756,32 @@ class AiBrainNode(Node):
             if len(self._messages) > self._max_history:
                 self._messages = [self._messages[0]] + self._messages[-(self._max_history - 1):]
 
-            # Call with Tool Definitions
-            response = self._groq.chat.completions.create(
-                messages=self._messages,
-                model=self._text_model,
-                temperature=self._temperature,
-                max_tokens=self._max_tokens,
-                tools=ROBOT_TOOLS,
-                tool_choice="auto",
-            )
+            response = None
+            used_model = self._text_model
+            models_to_try = [self._text_model] + [m for m in self._fallback_models if m != self._text_model]
+
+            for m in models_to_try:
+                try:
+                    response = self._groq.chat.completions.create(
+                        messages=self._messages,
+                        model=m,
+                        temperature=self._temperature,
+                        max_tokens=self._max_tokens,
+                        tools=ROBOT_TOOLS,
+                        tool_choice="auto",
+                    )
+                    used_model = m
+                    break
+                except Exception as api_err:
+                    if "429" in str(api_err) or "rate_limit" in str(api_err).lower():
+                        self.get_logger().warn(f"⚠️ Model {m} rate limite takıldı, yedek modele geçiliyor...")
+                        continue
+                    else:
+                        raise api_err
+
+            if response is None:
+                self.get_logger().error("❌ Tüm modeller rate limite takıldı!")
+                return
 
             response_message = response.choices[0].message
             tool_calls = response_message.tool_calls
@@ -772,7 +798,12 @@ class AiBrainNode(Node):
                     
                     tool_result = self._execute_tool_call(fn_name, fn_args, frame)
                     
-                    # Second LLM call to explain tool result naturally
+                    # Direct speech of tool result for zero lag
+                    clean_ans = clean_tts_text(tool_result)
+                    self.get_logger().info(f"🤖 [Astro]: \"{clean_ans}\"")
+                    self._publish_tts(clean_ans)
+                    self._publish_emotion("happy")
+                    self._unprocessed_dialogue.append(f"Astro: {clean_ans}")
                     self._messages.append(response_message)
                     self._messages.append({
                         "role": "tool",
@@ -780,20 +811,6 @@ class AiBrainNode(Node):
                         "name": fn_name,
                         "content": tool_result
                     })
-
-                    second_res = self._groq.chat.completions.create(
-                        messages=self._messages,
-                        model=self._text_model,
-                        temperature=self._temperature,
-                        max_tokens=150,
-                    )
-                    final_text = second_res.choices[0].message.content.strip()
-                    clean_ans = clean_tts_text(final_text)
-                    self.get_logger().info(f"🤖 [Astro]: \"{clean_ans}\"")
-                    self._publish_tts(clean_ans)
-                    self._publish_emotion("happy")
-                    self._unprocessed_dialogue.append(f"Astro: {clean_ans}")
-                    self._messages.append({"role": "assistant", "content": clean_ans})
                     self._last_interaction = time.monotonic()
                     return
 
