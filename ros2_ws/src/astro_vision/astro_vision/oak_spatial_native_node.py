@@ -69,26 +69,52 @@ class OakSpatialNativeNode(Node):
 
         self._start_pipeline()
 
+    def _create_node(self, pipeline: dai.Pipeline, class_name: str):
+        """Universal node creator working across all DepthAI versions (v2.0 - v2.30+)."""
+        # 1. Try pipeline.create(dai.node.<Class>)
+        if hasattr(dai, "node") and hasattr(dai.node, class_name):
+            try:
+                return pipeline.create(getattr(dai.node, class_name))
+            except Exception:
+                pass
+
+        # 2. Try pipeline.create<Class>()
+        method_name = f"create{class_name}"
+        if hasattr(pipeline, method_name):
+            try:
+                return getattr(pipeline, method_name)()
+            except Exception:
+                pass
+
+        # 3. Try pipeline.create(getattr(dai, class_name))
+        if hasattr(dai, class_name):
+            try:
+                return pipeline.create(getattr(dai, class_name))
+            except Exception:
+                pass
+
+        raise AttributeError(f"DepthAI node '{class_name}' could not be created with installed depthai library.")
+
     def _create_pipeline(self) -> dai.Pipeline:
         pipeline = dai.Pipeline()
 
         # 1. Color Camera (Hardware ISP & Auto-Exposure on VPU)
-        cam_rgb = pipeline.create(dai.node.ColorCamera)
+        cam_rgb = self._create_node(pipeline, "ColorCamera")
         cam_rgb.setResolution(dai.ColorCameraProperties.SensorResolution.THE_1080_P)
         cam_rgb.setInterleaved(False)
         cam_rgb.setColorOrder(dai.ColorCameraProperties.ColorOrder.BGR)
         cam_rgb.setFps(self._fps)
 
         # 2. Mono Cameras (Stereo Pair)
-        mono_left = pipeline.create(dai.node.MonoCamera)
-        mono_right = pipeline.create(dai.node.MonoCamera)
+        mono_left = self._create_node(pipeline, "MonoCamera")
+        mono_right = self._create_node(pipeline, "MonoCamera")
         mono_left.setResolution(dai.MonoCameraProperties.SensorResolution.THE_400_P)
         mono_left.setBoardSocket(dai.CameraBoardSocket.LEFT)
         mono_right.setResolution(dai.MonoCameraProperties.SensorResolution.THE_400_P)
         mono_right.setBoardSocket(dai.CameraBoardSocket.RIGHT)
 
         # 3. Stereo Depth Engine (Hardware Accelerated on Myriad X VPU)
-        stereo = pipeline.create(dai.node.StereoDepth)
+        stereo = self._create_node(pipeline, "StereoDepth")
         stereo.setLeftRightCheck(True)
         stereo.setSubpixel(True)
         stereo.setDepthAlign(dai.CameraBoardSocket.RGB)
@@ -96,11 +122,11 @@ class OakSpatialNativeNode(Node):
         mono_right.out.link(stereo.right)
 
         # 4. XLink Outputs to Host
-        xout_rgb = pipeline.create(dai.node.XLinkOut)
+        xout_rgb = self._create_node(pipeline, "XLinkOut")
         xout_rgb.setStreamName("rgb")
         cam_rgb.video.link(xout_rgb.input)
 
-        xout_depth = pipeline.create(dai.node.XLinkOut)
+        xout_depth = self._create_node(pipeline, "XLinkOut")
         xout_depth.setStreamName("depth")
         stereo.depth.link(xout_depth.input)
 
