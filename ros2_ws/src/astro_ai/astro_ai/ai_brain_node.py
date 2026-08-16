@@ -639,7 +639,8 @@ class AiBrainNode(Node):
                 continue
 
             now = time.monotonic()
-            if (now - getattr(self, '_last_idle_learning_time', 0)) > 45.0:
+            # Relaxed 5-minute interval (300s) to protect token quota and prevent unnecessary API calls
+            if (now - getattr(self, '_last_idle_learning_time', 0)) > 300.0:
                 self._last_idle_learning_time = now
 
                 captured_frame = None
