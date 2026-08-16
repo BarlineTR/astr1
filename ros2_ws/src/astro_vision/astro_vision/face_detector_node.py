@@ -144,15 +144,38 @@ class SpatialVisionNode(Node):
             self.get_logger().warn(f"Image conversion failed: {e}")
             return
 
+        if not hasattr(self, '_frame_count'):
+            self._frame_count = 0
+        self._frame_count += 1
+
+        # Skip frames to reduce CPU load (Process 1 out of 3 frames ~ 10 FPS)
+        if self._frame_count % 3 != 0:
+            return
+
         frame_h, frame_w = frame.shape[:2]
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        
+        # Downscale for ultra-fast face detection (Jetson CPU Optimization)
+        scale_ratio = 320.0 / float(frame_w) if frame_w > 320 else 1.0
+        
+        if scale_ratio < 1.0:
+            small_gray = cv2.resize(gray, (0, 0), fx=scale_ratio, fy=scale_ratio, interpolation=cv2.INTER_AREA)
+        else:
+            small_gray = gray
 
-        faces = self.face_cascade.detectMultiScale(
-            gray,
+        detected_faces = self.face_cascade.detectMultiScale(
+            small_gray,
             scaleFactor=self.scale_factor,
             minNeighbors=self.min_neighbors,
-            minSize=(self.min_size, self.min_size),
+            minSize=(int(self.min_size * scale_ratio), int(self.min_size * scale_ratio)),
         )
+
+        # Map bounding boxes back to original resolution
+        if len(detected_faces) > 0 and scale_ratio < 1.0:
+            faces = [[int(x / scale_ratio), int(y / scale_ratio), int(w / scale_ratio), int(h / scale_ratio)] for (x, y, w, h) in detected_faces]
+        else:
+            faces = list(detected_faces)
+
 
         # Temporal smoothing for face detection dropouts
         if len(faces) == 0 and hasattr(self, '_last_known_face') and self._last_known_face is not None:
