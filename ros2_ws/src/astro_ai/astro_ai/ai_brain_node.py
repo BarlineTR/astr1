@@ -445,6 +445,8 @@ class AiBrainNode(Node):
         self._looking_start_time = None
         self._last_proactive_gaze_time = 0.0
         self._speaker_angle = 0.0
+        self._user_distance = 0.0
+        self._user_smiling = False
         self._latest_frame = None
         self._latest_frame_time = 0.0
         self._unprocessed_dialogue = []
@@ -467,6 +469,8 @@ class AiBrainNode(Node):
         self.sub_tts_status = self.create_subscription(Bool, "/tts/speaking", self._on_tts_speaking, 10)
         self.sub_vision_status = self.create_subscription(Bool, "/vision/person_detected", self._on_person_detected, 10)
         self.sub_looking = self.create_subscription(Bool, "/vision/looking_at_robot", self._on_looking_at_robot, 10)
+        self.sub_distance = self.create_subscription(Float32, "/vision/user_distance", self._on_user_distance, 10)
+        self.sub_smiling = self.create_subscription(Bool, "/vision/user_smiling", self._on_user_smiling, 10)
         self.sub_doa = self.create_subscription(Float32, "/audio/doa", self._on_doa, 10)
         self.sub_camera = self.create_subscription(Image, "/oak/rgb/image_raw", self._on_camera_image, 10)
 
@@ -533,6 +537,12 @@ class AiBrainNode(Node):
 
     def _on_person_detected(self, msg: Bool):
         self._person_detected = msg.data
+
+    def _on_user_distance(self, msg: Float32):
+        self._user_distance = float(msg.data)
+
+    def _on_user_smiling(self, msg: Bool):
+        self._user_smiling = msg.data
 
     def _on_looking_at_robot(self, msg: Bool):
         is_looking = msg.data
