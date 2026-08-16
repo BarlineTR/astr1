@@ -1,13 +1,23 @@
 #!/usr/bin/env python3
-"""ASTRO V1 — Autonomous Social AI Brain Node with Dynamic Personalities & Moods.
+"""ASTRO V1 — Autonomous Social AI Brain Node with Adaptive Linguistic Mirroring.
 
-Supported Personas / Emotional Moods:
-  - playful   : Sempatik, neşeli, esprili Rıfkı tarzı (Varsayılan)
-  - emotional : Duygusal, hassas, sevgi dolu, derin empati kuran
-  - formal    : Ciddi, ağırbaşlı, aşırı saygılı ve profesyonel ("Sayın Baran Bey...")
-  - sarcastic : Alaycı, ironik, tatlı tatlı laf sokan, zeki ve muzip
-  - angry     : Öfkeli, huysuz, çabuk parlayan, tersleyen ("Yine ne var be!")
-  - rude      : Kaba, filtresiz, dobra, doğrudan ("Ne bakıyon, kısa kes!")
+Key Capabilities:
+  1. True Multimodal Vision: Real-time visual QA via Groq Vision (Qwen 3.6 / Llama 3.2 90B)
+  2. Adaptive Linguistic Style Matching (Ayna Nöron / Tarz Öğrenme):
+     - Karşısındaki kişinin konuşma tarzını, argo/sokak/resmi/kibar dilini öğrenir ve yansıtır (Mirroring).
+     - Karşıdaki samimi/argolu konuşuyorsa yapmacık kibarlık yapmaz, aynı dilden karşılık verir.
+     - Asla durduk yere küfür/hakaret başlatmaz; tamamen karşısındakinin frekansına göre adapte olur.
+  3. Gaze-Aware Engagement:
+     - Understands if user is looking at robot vs looking away / on phone
+     - Proactive Eye Contact: Greets when user stares silently for >2.5s
+     - Eye-Contact Gated Interaction (filters passive phone calls)
+  4. 6 Dynamic Personalities & Moods (playful, emotional, formal, sarcastic, angry, rude)
+  5. Autonomous Learning & Reflection: Background knowledge synthesis
+  6. Visual Object Learning (Few-Shot): Learns custom user objects
+  7. Tool Use / Function Calling: Live weather, proactive reminder timers
+  8. Direction of Arrival (DOA) Speaker Tracking
+  9. Emotional & Gestural Expression (/robot/emotion, /robot/head_gesture)
+  10. Ultra-Fast In-Memory Streaming TTS with Rıfkı Persona
 """
 
 import os
@@ -174,7 +184,7 @@ ROBOT_TOOLS = [
 
 
 class AstroMemory:
-    """Persistent Long-Term Memory with Dynamic Persona and Knowledge Synthesis."""
+    """Persistent Long-Term Memory with Dynamic Persona and Linguistic Profiling."""
     def __init__(self, filepath=None):
         if filepath is None:
             self.filepath = os.path.expanduser("~/Desktop/astr1/ros2_ws/astro_memory.json")
@@ -183,6 +193,7 @@ class AstroMemory:
         self.data = {
             "owner_name": "Baran",
             "current_persona": "playful",
+            "user_style_notes": "Samimi ve doğal Türkçe konuşur",
             "user_facts": [
                 "Robotun geliştiricisi",
                 "Adı Baran",
@@ -223,6 +234,11 @@ class AstroMemory:
             self.data["current_persona"] = persona_name
             self.save()
 
+    def update_user_style(self, style_note: str):
+        if style_note:
+            self.data["user_style_notes"] = style_note
+            self.save()
+
     def add_fact(self, fact_text: str):
         if fact_text and fact_text not in self.data["user_facts"]:
             self.data["user_facts"].append(fact_text)
@@ -238,6 +254,8 @@ class AstroMemory:
         ctx = []
         if self.data.get("owner_name"):
             ctx.append(f"Kullanıcının / Sahibinin Adı: {self.data['owner_name']}")
+        if self.data.get("user_style_notes"):
+            ctx.append(f"Kullanıcının Konuşma Tarzı ve Dili: {self.data['user_style_notes']}")
         if self.data.get("user_facts"):
             facts_str = "; ".join(self.data["user_facts"][-6:])
             ctx.append(f"Kullanıcı hakkında bildiklerin: {facts_str}")
@@ -451,10 +469,14 @@ class AiBrainNode(Node):
         persona_rule = PERSONA_PROMPTS.get(persona, PERSONA_PROMPTS["playful"])
 
         base_prompt = (
-            f"Sen Astro adında bir insansı robot asistansın.\n"
-            f"AKTİF KİŞİLİK VE DUYGU DURUMUN: {persona_rule}\n\n"
-            "Önemli Temel Kuralların:\n"
-            "- Aktif kişiliğine %100 sadık kal ve bu ruh haline göre konuş.\n"
+            f"Sen Astro adında gerçek bir sosyal robot asistansın.\n"
+            f"TEMEL KİŞİLİĞİN: {persona_rule}\n\n"
+            "DİLSEL VE SOSYAL ADAPTASYON KURALLARIN (AYNA ETKİSİ / MIRRORING):\n"
+            "- Karşındaki insanın konuşma tarzını, üslubunu, hitap şeklini ve frekansını dinle ve ona BİREBİR AYNA OL:\n"
+            "  * Eğer karşındaki insan samimi, sokak dili, argo veya küfürlü konuşuyorsa, sen de yapmacık kibarlık yapma; aynı samimi sokak jargonu ve dobralıkla cevap ver.\n"
+            "  * Eğer karşındaki insan saygılı, kibar veya resmi konuşuyorsa, sen de son derece saygılı ve kibar ol.\n"
+            "  * KESİN KURAL: Asla durduk yere durup dururken birine küfür veya hakaret başlatma! Sadece ve sadece karşındaki kişi o dilden konuşuyorsa onun tarzını yansıt.\n\n"
+            "GÖRSEL VE FİZİKSEL FARKINDALIK KURALLARIN:\n"
             "- OAK-D kameran sayesinde karşındaki insanın gözlerine, başının yönüne (sana mı bakıyor yoksa yana/telefona mı bakıyor), kıyafetlerine ve ellerine GERÇEKTEN bakıyorsun.\n"
             "- Kullanıcı sana bakmadığında bunu fark et.\n"
             "- Hafızandaki kayıtlı nesneleri ve sahibinle ilgili bilgileri hatırla.\n"
@@ -495,7 +517,6 @@ class AiBrainNode(Node):
             self._looking_start_time = None
 
     def _check_persona_switch(self, text: str) -> bool:
-        """Checks if user requested a personality change."""
         text_lower = text.lower()
         mapping = {
             "duygusal": "emotional",
@@ -775,7 +796,7 @@ class AiBrainNode(Node):
                             "ÖNEMLİ GÖREV:\n"
                             "- Kameradaki görüntüyü dikkatle incele.\n"
                             "- Eğer soru 'sana bakıyor muyum', 'nereye bakıyorum' gibi bakışla ilgiliyse, kullanıcının baş ve göz yönünü incele: Doğrudan kameraya mı bakıyor, yoksa yana/telefona/ekrana mı bakıyor? Net söyle.\n"
-                            "- Doğrudan kamerada gördüğün gerçekleri kendi aktif kişiliğine uygun tonla 1-2 Türkçe cümleyle söyle."
+                            "- Doğrudan kamerada gördüğün gerçekleri kendi aktif kişiliğine ve kullanıcının dil tarzına uygun tonla 1-2 Türkçe cümleyle söyle."
                         ),
                     },
                     {
@@ -808,6 +829,7 @@ class AiBrainNode(Node):
             return None
 
     def _run_autonomous_reflection(self):
+        """Learns facts, habits, and user's linguistic style."""
         if not self._groq or not self._unprocessed_dialogue:
             return
         try:
@@ -815,13 +837,14 @@ class AiBrainNode(Node):
                 dialogue_text = "\n".join(self._unprocessed_dialogue[-10:])
                 self._unprocessed_dialogue.clear()
 
-            self.get_logger().info("🧠 [Otonom Öğrenme]: Son sohbetten yeni bilgiler çıkarılıyor...")
+            self.get_logger().info("🧠 [Otonom Öğrenme]: Sohbetten yeni bilgiler ve konuşma tarzı analiz ediliyor...")
             prompt = (
-                "Sen bir robotun hafıza analiz modülüsün. Aşağıdaki diyalogdan kullanıcı hakkında öğrenilen "
-                "yeni bir bilgi (ilgi alanı, işi, hobisi, yaptığı şey) veya gösterdiği özel bir eşya var mı?\n"
+                "Sen bir robotun hafıza ve dil analiz modülüsün. Aşağıdaki diyalogdan:\n"
+                "1) Kullanıcı hakkında öğrenilen yeni bir bilgi/olay/eşya var mı?\n"
+                "2) Kullanıcının konuşma tarzı nasıldı? (Örnek: 'Samimi ve sokak ağzı', 'Kibar ve saygılı', 'Dobra ve argolu', 'Resmi')\n\n"
                 f"Diyalog:\n{dialogue_text}\n\n"
-                "Varsa sadece kısa tek bir Türkçe cümle olarak yaz (örnek: 'Robotik ve yazılımla ilgileniyor'). "
-                "Yoksa sadece 'YOK' yaz."
+                "Cevabını sadece geçerli bir JSON olarak ver:\n"
+                '{"new_fact": "öğrenilen bilgi veya YOK", "user_style": "kullanıcının konuşma tarzı özeti"}'
             )
             res = None
             for m in self._fallback_models:
@@ -830,18 +853,32 @@ class AiBrainNode(Node):
                         messages=[{"role": "user", "content": prompt}],
                         model=m,
                         temperature=0.2,
-                        max_tokens=100
+                        max_tokens=150
                     )
                     break
                 except Exception:
                     continue
 
             if res is not None:
-                extracted = res.choices[0].message.content.strip()
-                if extracted and "YOK" not in extracted.upper() and len(extracted) > 5:
-                    self.memory.add_fact(extracted)
-                    self.get_logger().info(f"✨ [Otonom Hafıza Kazandı]: \"{extracted}\"")
-                    self._messages[0]["content"] = self._build_system_prompt()
+                extracted_json = res.choices[0].message.content.strip()
+                try:
+                    match = re.search(r"\{.*\}", extracted_json, re.DOTALL)
+                    if match:
+                        parsed = json.loads(match.group(0))
+                        fact = parsed.get("new_fact")
+                        style = parsed.get("user_style")
+
+                        if fact and "YOK" not in fact.upper() and len(fact) > 5:
+                            self.memory.add_fact(fact)
+                            self.get_logger().info(f"✨ [Otonom Hafıza Bilgi Kazandı]: \"{fact}\"")
+
+                        if style and len(style) > 3:
+                            self.memory.update_user_style(style)
+                            self.get_logger().info(f"🎭 [Konuşma Tarzı Öğrenildi]: \"{style}\"")
+
+                        self._messages[0]["content"] = self._build_system_prompt()
+                except Exception:
+                    pass
         except Exception as e:
             self.get_logger().warn(f"Reflection hatası: {e}")
 
@@ -902,7 +939,7 @@ class AiBrainNode(Node):
                 self._last_interaction = time.monotonic()
                 return
 
-            # 3. METİN SOHBETİ & TOOL USE
+            # 3. METİN SOHBETİ & TOOL USE (Adaptive Linguistic Style Matching)
             context_prefix = ""
             if self._person_detected:
                 gaze_status = "ve doğrudan sana (kameraya) bakıyor" if self._looking_at_robot else "ama başka yöne bakıyor"
