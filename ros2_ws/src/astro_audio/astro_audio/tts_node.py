@@ -1,28 +1,19 @@
 #!/usr/bin/env python3
-"""ASTRO V1 — High-Speed In-Memory Text-to-Speech Node (Edge-TTS + RAM streaming).
+"""ASTRO V1 — Real-Time Live Streaming Text-to-Speech Node.
 
-Subscribes to:
-  /tts/say       (String) — text to speak
-  /tts/interrupt  (Bool)  — cancel current playback
-
-Publishes:
-  /tts/speaking  (Bool)   — True while audio is playing (echo prevention)
-
-Performance Optimizations:
-  - Zero Disk I/O: Audio synthesized in-memory and piped directly
-  - Ultra-low latency playback queue
-  - Fallback audio players (sounddevice -> paplay -> aplay -> ffplay)
-  - Immediate interruption handling
+Features:
+  - Zero-Wait Chunk Streaming: Audio starts playing the millisecond first chunk arrives from Edge-TTS
+  - No disk I/O, no blocking for full sentence generation
+  - Dynamic Emotion-based speech rate (+5% to +35%)
+  - Immediate interruption handling via generation counter
 """
 
 import os
 import re
-import io
 import asyncio
 import subprocess
 import threading
 import queue
-import numpy as np
 
 import rclpy
 from rclpy.node import Node
@@ -37,11 +28,6 @@ try:
     import sounddevice as sd
 except ImportError:
     sd = None
-
-try:
-    import scipy.io.wavfile as wav
-except ImportError:
-    wav = None
 
 try:
     from dotenv import find_dotenv, load_dotenv
@@ -104,33 +90,6 @@ def clean_tts_text(text: str) -> str:
     return text.strip()
 
 
-def find_output_device() -> int | None:
-    if not sd:
-        return None
-    try:
-        devices = sd.query_devices()
-        for i, dev in enumerate(devices):
-            name = dev.get("name", "").lower()
-            if dev.get("max_output_channels", 0) > 0:
-                if any(k in name for k in ["respeaker", "uac1", "seeed", "arrayuac"]):
-                    return i
-        default_out = sd.default.device[1]
-        if default_out >= 0:
-            return default_out
-    except Exception:
-        pass
-    return None
-
-
-async def _async_synthesize_bytes(text: str, voice: str, rate: str) -> bytes:
-    communicate = edge_tts.Communicate(text, voice, rate=rate)
-    buffer = bytearray()
-    async for chunk in communicate.stream():
-        if chunk["type"] == "audio":
-            buffer.extend(chunk["data"])
-    return bytes(buffer)
-
-
 class TtsNode(Node):
     def __init__(self):
         super().__init__('tts_node')
@@ -139,8 +98,6 @@ class TtsNode(Node):
         self.tts_voice = os.getenv("TTS_VOICE", "tr-TR-AhmetNeural")
         self.tts_rate = os.getenv("TTS_RATE", "+25%")
         self.sample_rate = int(os.getenv("SAMPLE_RATE", "16000"))
-
-        self.out_device_id = find_output_device()
 
         if edge_tts is None:
             self.get_logger().error("❌ [TTS] edge_tts modülü kurulu değil!")
@@ -158,22 +115,16 @@ class TtsNode(Node):
         self._speak_queue = queue.Queue()
         self._generation = 0
         self._generation_lock = threading.Lock()
+        self._active_proc = None
 
         # Playback Thread
         self._playback_thread = threading.Thread(target=self._playback_loop, daemon=True)
         self._playback_thread.start()
 
-        out_name = "default"
-        if sd and self.out_device_id is not None:
-            try:
-                out_name = sd.query_devices(self.out_device_id)['name']
-            except Exception:
-                pass
-        self.get_logger().info(f"🔊 [TTS Node] Ultra Hızlı RAM Streaming Hazır! Ses: {self.tts_voice} | Çıkış: [{self.out_device_id}] {out_name}")
+        self.get_logger().info(f"🔊 [TTS Node] Canlı Sıfır Gecikmeli Streaming Hazır! Ses: {self.tts_voice}")
 
     def _on_emotion(self, msg: String):
         emotion = msg.data.lower().strip()
-        # Dynamic rate & modulation based on personality/emotion
         rate_map = {
             "angry": "+35%",
             "rude": "+30%",
@@ -199,9 +150,9 @@ class TtsNode(Node):
                     self._speak_queue.get_nowait()
                 except queue.Empty:
                     break
-            if sd is not None:
+            if self._active_proc:
                 try:
-                    sd.stop()
+                    self._active_proc.terminate()
                 except Exception:
                     pass
 
@@ -214,82 +165,55 @@ class TtsNode(Node):
         while rclpy.ok():
             try:
                 text = self._speak_queue.get(timeout=0.05)
-                self._synthesize_and_play_memory(text)
+                self._stream_and_play(text)
             except queue.Empty:
                 continue
             except Exception as e:
                 self.get_logger().error(f"Playback loop hatası: {e}")
 
-    def _synthesize_and_play_memory(self, text: str):
+    def _stream_and_play(self, text: str):
         with self._generation_lock:
             current_gen = self._generation
 
-        if edge_tts is None:
+        if edge_tts is None or not text:
             return
 
+        self.get_logger().info(f'🔊 [TTS Canlı Okuyor]: "{text}"')
+        self._set_speaking(True)
+
+        # Launch ffplay in streaming pipe mode (starts playing immediately on first byte)
         try:
-            self.get_logger().info(f'🔊 [TTS Okuyor]: "{text}"')
+            player_cmd = ["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet", "-i", "pipe:0"]
+            proc = subprocess.Popen(player_cmd, stdin=subprocess.PIPE, stderr=subprocess.DEVNULL)
+            self._active_proc = proc
 
-            # 1. In-Memory Synthesis (RAM) using dynamic rate
-            mp3_bytes = asyncio.run(_async_synthesize_bytes(text, self.tts_voice, self._current_rate))
-
-            with self._generation_lock:
-                if current_gen != self._generation:
-                    return
-
-            if not mp3_bytes:
-                return
-
-            # 2. In-Memory Pipe Decoding via FFmpeg to 16kHz Mono PCM
-            proc = subprocess.Popen(
-                ["ffmpeg", "-loglevel", "quiet", "-i", "pipe:0", "-f", "s16le", "-ar", str(self.sample_rate), "-ac", "1", "pipe:1"],
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL
-            )
-            pcm_data, _ = proc.communicate(input=mp3_bytes)
-
-            with self._generation_lock:
-                if current_gen != self._generation:
-                    return
-
-            if not pcm_data:
-                return
-
-            # 3. Fast Sounddevice RAM Playback
-            audio_array = np.frombuffer(pcm_data, dtype=np.int16)
-            played = False
-
-            if sd is not None:
-                try:
-                    self._set_speaking(True)
+            async def _pipe_stream():
+                communicate = edge_tts.Communicate(text, self.tts_voice, rate=self._current_rate)
+                async for chunk in communicate.stream():
                     with self._generation_lock:
                         if current_gen != self._generation:
-                            return
-                    try:
-                        sd.play(audio_array, samplerate=self.sample_rate, device=self.out_device_id, blocking=True)
-                        played = True
-                    except Exception:
-                        sd.play(audio_array, samplerate=self.sample_rate, device=None, blocking=True)
-                        played = True
-                except Exception as e:
-                    self.get_logger().warn(f"sounddevice oynatma hatası: {e}")
-                finally:
-                    self._set_speaking(False)
+                            break
+                    if chunk["type"] == "audio" and proc.stdin:
+                        try:
+                            proc.stdin.write(chunk["data"])
+                            proc.stdin.flush()
+                        except (BrokenPipeError, IOError):
+                            break
 
-            # 4. Fallback if sounddevice failed
-            if not played:
-                self._set_speaking(True)
+            asyncio.run(_pipe_stream())
+
+            if proc.stdin:
                 try:
-                    p = subprocess.Popen(["aplay", "-D", "default", "-f", "S16_LE", "-r", str(self.sample_rate), "-c", "1"], stdin=subprocess.PIPE)
-                    p.communicate(input=pcm_data)
+                    proc.stdin.close()
                 except Exception:
                     pass
-                finally:
-                    self._set_speaking(False)
+
+            proc.wait(timeout=10.0)
 
         except Exception as e:
-            self.get_logger().error(f"TTS In-Memory Sentez Hatası: {e}")
+            self.get_logger().warn(f"Streaming TTS Hatası: {e}")
+        finally:
+            self._active_proc = None
             self._set_speaking(False)
 
 
