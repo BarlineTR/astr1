@@ -60,6 +60,35 @@ def _load_env():
     return None
 
 
+def estimate_pitch_and_gender(audio_arr: np.ndarray, sample_rate: int = 16000) -> tuple[float, str]:
+    """Estimates fundamental frequency (F0) using autocorrelation to detect male vs female voice."""
+    if len(audio_arr) < sample_rate * 0.2:
+        return 0.0, "unknown"
+    try:
+        data = audio_arr.astype(np.float32)
+        data = data - np.mean(data)
+        if np.max(np.abs(data)) < 200:
+            return 0.0, "unknown"
+
+        corr = np.correlate(data, data, mode='full')
+        corr = corr[len(corr)//2:]
+
+        min_lag = int(sample_rate / 350)
+        max_lag = int(sample_rate / 75)
+
+        if len(corr) > max_lag:
+            peak_lag = min_lag + np.argmax(corr[min_lag:max_lag])
+            if peak_lag > 0:
+                pitch_hz = sample_rate / peak_lag
+                if pitch_hz >= 165.0:
+                    return float(pitch_hz), "female"
+                elif pitch_hz >= 75.0:
+                    return float(pitch_hz), "male"
+    except Exception:
+        pass
+    return 0.0, "unknown"
+
+
 class SpeechRecognitionNode(Node):
     def __init__(self):
         super().__init__('speech_recognition_node')
@@ -92,6 +121,7 @@ class SpeechRecognitionNode(Node):
 
         # Publishers
         self._text_pub = self.create_publisher(String, '/speech/text', 10)
+        self._gender_pub = self.create_publisher(String, '/audio/speaker_gender', 10)
 
         # Subscribers
         self.create_subscription(Int16MultiArray, '/audio/speech_audio', self._audio_cb, 10)
@@ -191,6 +221,12 @@ class SpeechRecognitionNode(Node):
                 wf.writeframes(arr.tobytes())
 
             wav_bytes = wav_io.getvalue()
+
+            # Estimate voice pitch and gender
+            _, gender = estimate_pitch_and_gender(arr, self._sample_rate)
+            gender_msg = String()
+            gender_msg.data = gender
+            self._gender_pub.publish(gender_msg)
 
             # Turkish whisper prompt hinting for accurate recognition
             whisper_prompt = "Astro, hey astro, robot, naber, nasılsın, ne haber, elinde ne var, beni görüyor musun, nasılsın iyi misin."

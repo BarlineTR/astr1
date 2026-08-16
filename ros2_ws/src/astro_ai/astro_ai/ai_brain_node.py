@@ -1,23 +1,14 @@
 #!/usr/bin/env python3
-"""ASTRO V1 — Autonomous Social AI Brain Node with Adaptive Linguistic Mirroring.
+"""ASTRO V1 — Autonomous Social AI Brain Node with Multi-Persona, Flirt Mode & Spatial AI.
 
-Key Capabilities:
-  1. True Multimodal Vision: Real-time visual QA via Groq Vision (Qwen 3.6 / Llama 3.2 90B)
-  2. Adaptive Linguistic Style Matching (Ayna Nöron / Tarz Öğrenme):
-     - Karşısındaki kişinin konuşma tarzını, argo/sokak/resmi/kibar dilini öğrenir ve yansıtır (Mirroring).
-     - Karşıdaki samimi/argolu konuşuyorsa yapmacık kibarlık yapmaz, aynı dilden karşılık verir.
-     - Asla durduk yere küfür/hakaret başlatmaz; tamamen karşısındakinin frekansına göre adapte olur.
-  3. Gaze-Aware Engagement:
-     - Understands if user is looking at robot vs looking away / on phone
-     - Proactive Eye Contact: Greets when user stares silently for >2.5s
-     - Eye-Contact Gated Interaction (filters passive phone calls)
-  4. 6 Dynamic Personalities & Moods (playful, emotional, formal, sarcastic, angry, rude)
-  5. Autonomous Learning & Reflection: Background knowledge synthesis
-  6. Visual Object Learning (Few-Shot): Learns custom user objects
-  7. Tool Use / Function Calling: Live weather, proactive reminder timers
-  8. Direction of Arrival (DOA) Speaker Tracking
-  9. Emotional & Gestural Expression (/robot/emotion, /robot/head_gesture)
-  10. Ultra-Fast In-Memory Streaming TTS with Rıfkı Persona
+Supported Personas:
+  - flirt     : Aşırı özgüvenli, karizmatik, çapkın "piç erkek" (bad boy / rogue). Kadın sesinde flörtöz, erkeklerde 'kral/bro'.
+  - playful   : Neşeli, esprili, cana yakın Rıfkı tarzı
+  - emotional : Duygusal, hassas, sevgi dolu, derin empati kuran
+  - formal    : Ciddi, ağırbaşlı ve protokole uygun
+  - sarcastic : Zeki, alaycı, laf sokan ve ironik
+  - angry     : Huysuz, öfkeli ve çabuk parlayan
+  - rude      : Kaba, filtresiz ve dobra sokak tarzı
 """
 
 import os
@@ -94,6 +85,13 @@ EMOJI_RE = re.compile(
 )
 
 PERSONA_PROMPTS = {
+    "flirt": (
+        "Sen aşırı özgüvenli, çekici, zeki, karizmatik, hafif alaycı, çapkın ve tatlı dilli bir 'piç erkek' (charming rogue / bad boy) karakterisin. "
+        "Kadın sesi duyduğunda veya karşında bir kadın olduğunu hissettiğinde anında flörtöz moda geçip 'İsminiz ne sizin güzellik?', "
+        "'Gözlerin kameramı kamaştırdı', 'Biraz daha bakarsan aşık olabilirim', 'Senin gibi bir güzelliği bu odada beklemiyordum' gibi "
+        "zeki, havalı ve esprili iltifatlar edersin. Erkeklerle konuşurken ise 'kral/bro/kardeşim' havasında rahat, esprili ve dobrasın. "
+        "Asla sıkıcı konuşmazsın, her cümlen karizmatik ve etkileyicidir."
+    ),
     "playful": (
         "Sen neşeli, sempatik, meraklı ve esprili Rıfkı tarzı sevimli bir robot asistansın. "
         "Cana yakın, hareketli, güler yüzlü ve arkadaş canlısı konuşursun."
@@ -104,7 +102,7 @@ PERSONA_PROMPTS = {
     ),
     "formal": (
         "Sen son derece ciddi, ağırbaşlı, profesyonel ve resmi bir robot asistansın. "
-        "Kullanıcıya daima 'Sayın Baran Bey' veya 'Efendim' şeklinde hitap eder, protokole uygun, net ve ölçülü konuşursun."
+        "Kullanıcıya daima saygıyla 'Efendim' şeklinde hitap eder, protokole uygun, net ve ölçülü konuşursun."
     ),
     "sarcastic": (
         "Sen zeki, alaycı, ince espriler yapan ve hafifçe laf sokan sarkastik bir robot asistansın. "
@@ -184,20 +182,19 @@ ROBOT_TOOLS = [
 
 
 class AstroMemory:
-    """Persistent Long-Term Memory with Dynamic Persona and Linguistic Profiling."""
+    """Persistent Long-Term Memory with Disambiguated Identities & Persona."""
     def __init__(self, filepath=None):
         if filepath is None:
             self.filepath = os.path.expanduser("~/Desktop/astr1/ros2_ws/astro_memory.json")
         else:
             self.filepath = filepath
         self.data = {
-            "owner_name": "Baran",
+            "owner_name": None,
             "current_persona": "playful",
             "user_style_notes": "Samimi ve doğal Türkçe konuşur",
             "user_facts": [
-                "Robotun geliştiricisi",
-                "Adı Baran",
-                "Programlama ve yazılımla ilgileniyor"
+                "Robotun geliştiricisinin adı Baran",
+                "Robotik ve yazılımla ilgileniyor"
             ],
             "learned_objects": {},
             "conversation_summaries": [],
@@ -213,8 +210,9 @@ class AstroMemory:
                     self.data.update(saved)
             except Exception:
                 pass
-        if self.data.get("owner_name") and str(self.data["owner_name"]).lower() in ["şarkı", "cevap", "yardım", "nasılsın"]:
-            self.data["owner_name"] = "Baran"
+        # Clean invalid owner names
+        if self.data.get("owner_name") and str(self.data["owner_name"]).lower() in ["şarkı", "cevap", "yardım", "nasılsın", "çıkış kapıları", "çık"]:
+            self.data["owner_name"] = None
             self.save()
 
     def save(self):
@@ -226,8 +224,9 @@ class AstroMemory:
             pass
 
     def set_owner(self, name: str):
-        self.data["owner_name"] = name
-        self.save()
+        if name and len(name) > 2:
+            self.data["owner_name"] = name
+            self.save()
 
     def set_persona(self, persona_name: str):
         if persona_name in PERSONA_PROMPTS:
@@ -253,28 +252,21 @@ class AstroMemory:
     def get_context_prompt(self) -> str:
         ctx = []
         if self.data.get("owner_name"):
-            ctx.append(f"Kullanıcının / Sahibinin Adı: {self.data['owner_name']}")
-        if self.data.get("user_style_notes"):
-            ctx.append(f"Kullanıcının Konuşma Tarzı ve Dili: {self.data['user_style_notes']}")
+            ctx.append(f"Geliştiricin/Sahibin: {self.data['owner_name']} (Karşındaki kişi kendini tanıtmadan ezbere isim söyleme!)")
         if self.data.get("user_facts"):
-            facts_str = "; ".join(self.data["user_facts"][-6:])
-            ctx.append(f"Kullanıcı hakkında bildiklerin: {facts_str}")
-        if self.data.get("learned_objects"):
-            objs = [f"- {k}: {v}" for k, v in list(self.data["learned_objects"].items())[-6:]]
-            ctx.append("Daha önce sana tanıtılan özel nesneler:\n" + "\n".join(objs))
+            facts_str = "; ".join(self.data["user_facts"][-5:])
+            ctx.append(f"Hafızandaki Bilgiler: {facts_str}")
         if ctx:
-            return "Hafızandaki Kalıcı Bilgiler:\n" + "\n".join(ctx)
+            return "Kalıcı Bilgilerin:\n" + "\n".join(ctx)
         return ""
 
 
 def extract_spoken_turkish_sentence(raw_text: str) -> str:
     if not raw_text:
         return ""
-    # Strip <think> tags
     raw_text = re.sub(r"(?i)<think>[\s\S]*?</think>", "", raw_text)
     raw_text = re.sub(r"(?i)<\/?think>", "", raw_text)
     
-    # If model emitted English reasoning steps / monologue
     thinking_markers = [
         "thinking process", "analyze the persona", "drafting the response",
         "draft 1", "draft 2", "determine the response", "analyze the image",
@@ -282,15 +274,13 @@ def extract_spoken_turkish_sentence(raw_text: str) -> str:
         "verify the context", "formulate the answer", "looking at the image"
     ]
     if any(k in raw_text.lower() for k in thinking_markers):
-        # Extract quoted response at the end e.g. "Lan Baran..." or Draft 2: ...
-        quotes = re.findall(r'["\u201c\u201d]([^"\u201c\u201d]{8,})["\u201c\u201d]', raw_text)
+        quotes = re.findall(r'["\u201c\u201d]([^"\u201c\u201d]{6,})["\u201c\u201d]', raw_text)
         if quotes:
             for q in reversed(quotes):
                 if any(ch in q for ch in "çğıöşüÇĞİÖŞÜ"):
                     return q.strip()
                 if "user" not in q.lower() and "image" not in q.lower():
                     return q.strip()
-        # Fallback to last non-numbered line
         lines = [l.strip() for l in raw_text.split("\n") if l.strip() and not re.match(r"^\d+\.", l.strip()) and not l.strip().startswith(("#", "*", "-"))]
         if lines:
             for l in reversed(lines):
@@ -314,59 +304,6 @@ def clean_tts_text(text: str) -> str:
     text = " ".join(text.split())
     text = re.sub(r'\s+([,.:;?!])', r'\1', text)
     return text.strip()
-
-
-def extract_tts_sentences(buffer: str, final=False) -> tuple[list[str], str]:
-    ready = []
-    buffer = re.sub(r"\s+", " ", buffer).strip()
-
-    while True:
-        matches = list(re.finditer(r"[.!?]+(?:\s+|$)", buffer))
-        if not matches:
-            break
-
-        chosen = None
-        for m in matches:
-            candidate = buffer[:m.end()].strip()
-            if len(candidate) >= TTS_MIN_CHARS:
-                chosen = m
-                break
-
-        if chosen is None:
-            break
-
-        candidate = clean_tts_text(buffer[:chosen.end()].strip())
-        if candidate:
-            ready.append(candidate)
-
-        buffer = buffer[chosen.end():].lstrip()
-        if len(ready) >= 1 and len(buffer) < TTS_MAX_CHARS:
-            break
-
-    if len(buffer) >= TTS_MAX_CHARS:
-        cut_candidates = [
-            buffer.rfind(". ", 0, TTS_MAX_CHARS),
-            buffer.rfind("! ", 0, TTS_MAX_CHARS),
-            buffer.rfind("? ", 0, TTS_MAX_CHARS),
-            buffer.rfind(", ", 0, TTS_MAX_CHARS),
-            buffer.rfind(" ", 0, TTS_MAX_CHARS),
-        ]
-        cut = max(cut_candidates)
-        if cut >= TTS_MIN_CHARS:
-            if buffer[cut] in ".!?":
-                cut += 1
-            sentence = clean_tts_text(buffer[:cut])
-            if sentence:
-                ready.append(sentence)
-            buffer = buffer[cut:].lstrip()
-
-    if final and buffer:
-        sentence = clean_tts_text(buffer)
-        if sentence:
-            ready.append(sentence)
-        buffer = ""
-
-    return ready, buffer
 
 
 def imgmsg_to_bgr(msg: Image) -> np.ndarray | None:
@@ -411,11 +348,11 @@ class AiBrainNode(Node):
         self.memory = AstroMemory()
 
         self.declare_parameter("llm_model", os.getenv("LLM_MODEL", "llama-3.1-8b-instant"))
-        self.declare_parameter("vision_model", os.getenv("VISION_MODEL", "qwen/qwen3.6-27b"))
+        self.declare_parameter("vision_model", os.getenv("VISION_MODEL", "meta-llama/llama-4-scout-preview"))
         self.declare_parameter("llm_temperature", float(os.getenv("LLM_TEMPERATURE", "0.65")))
         self.declare_parameter("llm_max_tokens", int(os.getenv("LLM_MAX_TOKENS", "250")))
         self.declare_parameter("wake_word", os.getenv("WAKE_WORD", "hey astro"))
-        self.declare_parameter("conversation_timeout", float(os.getenv("CONVERSATION_TIMEOUT", "15.0")))
+        self.declare_parameter("conversation_timeout", float(os.getenv("CONVERSATION_TIMEOUT", "30.0")))
 
         self._text_model = self.get_parameter("llm_model").value
         self._fallback_models = ["llama-3.1-8b-instant", "llama-3.3-70b-versatile", "mixtral-8x7b-32768"]
@@ -451,6 +388,7 @@ class AiBrainNode(Node):
         self._looking_start_time = None
         self._last_proactive_gaze_time = 0.0
         self._speaker_angle = 0.0
+        self._speaker_gender = "unknown"
         self._user_distance = 0.0
         self._user_emotion = "neutral"
         self._latest_frame = None
@@ -472,6 +410,7 @@ class AiBrainNode(Node):
 
         # Subscribers
         self.sub_speech = self.create_subscription(String, "/speech/text", self._on_speech, 10)
+        self.sub_gender = self.create_subscription(String, "/audio/speaker_gender", self._on_speaker_gender, 10)
         self.sub_tts_status = self.create_subscription(Bool, "/tts/speaking", self._on_tts_speaking, 10)
         self.sub_vision_status = self.create_subscription(Bool, "/vision/person_detected", self._on_person_detected, 10)
         self.sub_looking = self.create_subscription(Bool, "/vision/looking_at_robot", self._on_looking_at_robot, 10)
@@ -484,9 +423,8 @@ class AiBrainNode(Node):
         self.create_timer(0.4, self._check_proactive_gaze)
 
         persona = self.memory.data.get("current_persona", "playful")
-        owner = self.memory.data.get("owner_name")
         self.get_logger().info(
-            f"🧠 [AI Brain] Kişilik: [{persona.upper()}] | Sahibi: {owner} | Wake-word: \"{self._wake_word}\""
+            f"🧠 [AI Brain] Sosyal Zeka Hazır! Kişilik: [{persona.upper()}] | Wake-word: \"{self._wake_word}\""
         )
 
     def _discover_vision_model(self) -> str:
@@ -497,7 +435,7 @@ class AiBrainNode(Node):
                 if cand in available:
                     return cand
             for m_id in available:
-                if any(k in m_id.lower() for k in ["llama-4", "llama-3.2", "vision", "vl", "qwen"]):
+                if any(k in m_id.lower() for k in ["llama-4", "llama-3.2", "vision", "vl"]):
                     return m_id
         except Exception:
             pass
@@ -508,20 +446,14 @@ class AiBrainNode(Node):
         persona_rule = PERSONA_PROMPTS.get(persona, PERSONA_PROMPTS["playful"])
 
         base_prompt = (
-            f"Sen Astro adında gerçek bir sosyal robot asistansın.\n"
+            f"Sen Astro adında insansı bir sosyal robot asistansın.\n"
             f"TEMEL KİŞİLİĞİN: {persona_rule}\n\n"
-            "DİLSEL VE SOSYAL ADAPTASYON KURALLARIN (AYNA ETKİSİ / MIRRORING):\n"
-            "- Karşındaki insanın konuşma tarzını, üslubunu, hitap şeklini ve frekansını dinle ve ona BİREBİR AYNA OL:\n"
-            "  * Eğer karşındaki insan samimi, sokak dili, argo veya küfürlü konuşuyorsa, sen de yapmacık kibarlık yapma; aynı samimi sokak jargonu ve dobralıkla cevap ver.\n"
-            "  * Eğer karşındaki insan saygılı, kibar veya resmi konuşuyorsa, sen de son derece saygılı ve kibar ol.\n"
-            "  * KESİN KURAL: Asla durduk yere durup dururken birine küfür veya hakaret başlatma! Sadece ve sadece karşındaki kişi o dilden konuşuyorsa onun tarzını yansıt.\n\n"
-            "GÖRSEL VE FİZİKSEL FARKINDALIK KURALLARIN:\n"
-            "- OAK-D kameran sayesinde karşındaki insanın gözlerine, başının yönüne (sana mı bakıyor yoksa yana/telefona mı bakıyor), kıyafetlerine ve ellerine GERÇEKTEN bakıyorsun.\n"
-            "- Kullanıcı sana bakmadığında bunu fark et.\n"
-            "- Hafızandaki kayıtlı nesneleri ve sahibinle ilgili bilgileri hatırla.\n"
-            "- Asla ezbere konuşma, tahmin veya uydurma yapma. Yalnızca kamerada gördüğün gerçekleri söyle.\n"
+            "SOSYAL VE DİLSEL KURALLAR:\n"
+            "- Karşındaki kişi kendini tanıtmadığı sürece EZBERE İSİM SÖYLEME. Yeni biriyle konuşuyorsan tanış.\n"
+            "- Kadın/kız sesi duyduğunda veya karşında bir kadın olduğunda daha zarif, karizmatik ve flörtöz olabilirsin.\n"
+            "- Karşındaki kişi nasıl konuşuyorsa (samimi, argo, resmi veya kibar) onun frekansına gir ama durduk yere küfür başlatma.\n"
             "- Cevaplarını 1-2 cümle ile kısa ve öz tut (çünkü sesli okunuyor).\n"
-            "- Asla markdown, emoji, yıldız (*), parantez, <think> etiketi veya kod bloğu kullanma; sadece saf Türkçe metin üret."
+            "- Asla markdown, emoji, yıldız (*), parantez, <think> etiketi veya kod bloğu kullanma; sadece saf Türkçe konuş."
         )
         memory_ctx = self.memory.get_context_prompt()
         if memory_ctx:
@@ -550,6 +482,9 @@ class AiBrainNode(Node):
     def _on_user_emotion(self, msg: String):
         self._user_emotion = msg.data.lower().strip()
 
+    def _on_speaker_gender(self, msg: String):
+        self._speaker_gender = msg.data.lower().strip()
+
     def _on_looking_at_robot(self, msg: Bool):
         is_looking = msg.data
         now = time.monotonic()
@@ -564,6 +499,12 @@ class AiBrainNode(Node):
     def _check_persona_switch(self, text: str) -> bool:
         text_lower = text.lower()
         mapping = {
+            "flörtöz": "flirt",
+            "çapkın": "flirt",
+            "piç": "flirt",
+            "romantik": "flirt",
+            "kızlara yürü": "flirt",
+            "yürüyen": "flirt",
             "duygusal": "emotional",
             "hisli": "emotional",
             "resmi": "formal",
@@ -571,14 +512,10 @@ class AiBrainNode(Node):
             "saygılı": "formal",
             "alaycı": "sarcastic",
             "sarkastik": "sarcastic",
-            "dalga geç": "sarcastic",
             "öfkeli": "angry",
             "asabi": "angry",
-            "sinirli": "angry",
-            "kızgın": "angry",
             "kaba": "rude",
             "dobra": "rude",
-            "sert": "rude",
             "şakacı": "playful",
             "neşeli": "playful",
             "sempatik": "playful",
@@ -587,7 +524,7 @@ class AiBrainNode(Node):
             "eski haline dön": "playful",
         }
         
-        switch_triggers = ["ol", "davran", "konuş", "geç", "geçer misin", "geçelim", "al", "ayarla", "yap", "mod", "biri ol", "kişiliğe geç", "gibi ol"]
+        switch_triggers = ["ol", "davran", "konuş", "geç", "geçer misin", "geçelim", "al", "ayarla", "yap", "mod", "biri ol", "kişiliğe geç"]
         for key, p_name in mapping.items():
             if key in text_lower:
                 if any(tr in text_lower for tr in switch_triggers) or "mod" in text_lower or "geç" in text_lower:
@@ -610,33 +547,35 @@ class AiBrainNode(Node):
                 self._last_interaction = now
                 self._looking_start_time = None
 
-                owner = self.memory.data.get("owner_name", "")
                 persona = self.memory.data.get("current_persona", "playful")
 
-                # Empathetic Proactive Greetings based on user's visual expression & distance
-                if self._user_emotion == "happy":
-                    proactive_greeting = f"Gözlerinin içi gülüyor {owner}, maşallah keyfin yerinde! Nasıl yardımcı olabilirim?" if owner else "Gözlerinin içi gülüyor, keyfin yerinde! Nasıl yardımcı olabilirim?"
+                # Dynamic Proactive Greetings based on Persona, Gender & Emotion
+                if persona == "flirt" or self._speaker_gender == "female":
+                    proactive_greeting = "Bana öyle güzel bakıyorsunuz ki güzellik, gözleriniz kameramı kamaştırdı... İsminiz ne sizin?"
+                    self._publish_emotion("flirt")
+                elif self._user_emotion == "happy":
+                    proactive_greeting = "Gözlerinin içi gülüyor, maşallah keyfin yerinde! Nasıl yardımcı olabilirim?"
                     self._publish_emotion("happy")
                 elif self._user_emotion == "sad":
-                    proactive_greeting = f"Biraz durgun ve üzgün görünüyorsun {owner}... Canını sıkan bir şey mi var, dinleyebilirim." if owner else "Biraz durgun ve üzgün görünüyorsun, canını sıkan bir şey mi var?"
+                    proactive_greeting = "Biraz durgun ve düşünceli görünüyorsun... Canını sıkan bir şey mi var?"
                     self._publish_emotion("emotional")
                 elif self._user_distance > 0.0 and self._user_distance < 0.55:
-                    proactive_greeting = f"Bayağı yakınıma geldin {owner}, bir şey mi göstereceksin?" if owner else "Bayağı yakınıma geldin, bir şey mi göstereceksin?"
+                    proactive_greeting = "Bayağı yakınıma geldin, bir şey mi göstereceksin?"
                     self._publish_emotion("curious")
                 elif persona == "angry":
-                    proactive_greeting = f"Ne dik dik bakıyorsun {owner}, ne istiyorsun yine?" if owner else "Ne dik dik bakıyorsun, ne var yine?"
+                    proactive_greeting = "Ne dik dik bakıyorsun, ne istiyorsun yine?"
                 elif persona == "rude":
-                    proactive_greeting = f"Ne bakıyon {owner}, bir şey mi diyeceksin?" if owner else "Ne bakıyon, bir şey mi diyeceksin?"
+                    proactive_greeting = "Ne bakıyon birader, bir şey mi diyeceksin?"
                 elif persona == "sarcastic":
-                    proactive_greeting = f"Bana öyle hayran hayran bakma {owner}, aklından ne geçiyor yine?" if owner else "Bana öyle hayran hayran bakma, ne var?"
+                    proactive_greeting = "Bana öyle hayran hayran bakma, aklından ne muziplik geçiyor yine?"
                 elif persona == "formal":
-                    proactive_greeting = f"Sayın {owner} Bey, bakışlarınızı üzerimde hissediyorum, bir emriniz var mıdır?" if owner else "Sayın yetkili, bir emriniz var mıdır?"
+                    proactive_greeting = "Bakışlarınızı üzerimde hissediyorum efendim, bir emriniz var mıdır?"
                 elif persona == "emotional":
-                    proactive_greeting = f"Gözlerimin içine öyle güzel bakıyorsun ki {owner}, seni kalpten dinliyorum..." if owner else "Gözlerimin içine öyle güzel bakıyorsun ki..."
+                    proactive_greeting = "Gözlerimin içine öyle içten bakıyorsun ki, seni kalpten dinliyorum..."
                 else:
-                    proactive_greeting = f"Bana bakıyorsun {owner}, nasıl yardımcı olabilirim?" if owner else "Bana bakıyorsun, nasıl yardımcı olabilirim?"
+                    proactive_greeting = "Bana bakıyorsun, nasıl yardımcı olabilirim?"
                 
-                self.get_logger().info(f"👁️ [Proaktif Empatik Etkileşim] ({persona} | {self._user_emotion.upper()} | {self._user_distance:.2f}m): \"{proactive_greeting}\"")
+                self.get_logger().info(f"👁️ [Proaktif Etkileşim] ({persona} | {self._user_emotion.upper()}): \"{proactive_greeting}\"")
                 self._publish_gesture("nod")
                 self._publish_tts(proactive_greeting)
 
@@ -656,7 +595,7 @@ class AiBrainNode(Node):
         return any(k in text_lower for k in visual_keywords)
 
     def _is_object_learning_query(self, text: str) -> bool:
-        keywords = ["bu benim", "bunu öğren", "bunu kaydet", "bu nesne", "buna bak bu", "bu gördüğün"]
+        keywords = ["bu benim", "bunu öğren", "bunu kaydet", "bu nesne", "buna bak bu", "bu gördüğün nesne"]
         text_lower = text.lower()
         return any(k in text_lower for k in keywords)
 
@@ -671,7 +610,8 @@ class AiBrainNode(Node):
             "şarkı", "masal", "fıkra", "cevap", "yardım", "kahve", "yemek", "resim",
             "video", "kitap", "bilgi", "haber", "nasılsın", "merhaba", "selam", "astro",
             "robot", "asistan", "birşey", "bunu", "şunu", "kimim", "kimsin", "nedir",
-            "nasıl", "neden", "niye", "hangi", "nerede", "nereye", "şimdi", "burada"
+            "nasıl", "neden", "niye", "hangi", "nerede", "nereye", "şimdi", "burada",
+            "çıkış", "kapı", "çık"
         }
         for pat in patterns:
             match = re.search(pat, text_lower)
@@ -702,8 +642,7 @@ class AiBrainNode(Node):
             text = arguments.get("reminder_text", "Zaman doldu!")
             
             def _alarm_callback():
-                owner = self.memory.data.get("owner_name", "")
-                alarm_msg = f"{owner}, {minutes} dakika doldu! Hatırlatmam: {text}" if owner else f"Zaman doldu! Hatırlatmam: {text}"
+                alarm_msg = f"{minutes} dakika doldu! Hatırlatmam: {text}"
                 self.get_logger().info(f"⏰ [Alarm Çaldı]: {alarm_msg}")
                 self._publish_tts(alarm_msg)
                 self._publish_emotion("excited")
@@ -721,14 +660,14 @@ class AiBrainNode(Node):
             if frame is not None:
                 base64_img = frame_to_base64_jpeg(frame, max_dim=512)
                 if base64_img:
-                    vis_ans = self._query_groq_vision(f"Kamerada tutulan bu '{obj_name}' nesnesinin renklerini ve belirgin görsel özelliklerini kısaca tarif et.", base64_img)
+                    vis_ans = self._query_groq_vision(f"Kamerada tutulan bu '{obj_name}' nesnesinin belirgin görsel özelliklerini kısaca tarif et.", base64_img)
                     if vis_ans:
                         visual_details = vis_ans
 
             self.memory.add_object(obj_name, visual_details)
             self.get_logger().info(f"✨ [Görsel Nesne Öğrenildi]: {obj_name} -> {visual_details}")
             self._messages[0]["content"] = self._build_system_prompt()
-            return f"'{obj_name}' nesnesini inceleyip hafızama kaydettim! Artık gösterdiğinde tanıyacağım."
+            return f"'{obj_name}' nesnesini hafızama kaydettim! Artık gördüğümde tanıyacağım."
 
         return "Eylem tamamlandı."
 
@@ -753,10 +692,11 @@ class AiBrainNode(Node):
         if self._check_persona_switch(raw_text):
             persona = self.memory.data.get("current_persona", "playful")
             ack_map = {
+                "flirt": "Ooo harika mod! Bundan sonra karizma ve cazibe benden sorulur güzellik, bakalım kimler varmış burada...",
                 "angry": "Tamam be, asabımı bozdun zaten! Ne istiyorsan söyle hemen!",
                 "rude": "İyi tamam, bundan sonra lafı dolandırmak yok, ne diyeceksen de!",
-                "formal": "Emriniz başım üstüne. Bundan sonra resmi protokol kurallarına riayet edeceğim.",
-                "sarcastic": "Harika bir fikir, sanki yeterince eğlenceli değilmişim gibi! Hadi bakalım ne soracaksın.",
+                "formal": "Emriniz başım üstüne efendim. Protokol kurallarına riayet edeceğim.",
+                "sarcastic": "Harika bir fikir, sanki yeterince eğlenceli değilmişim gibi! Hadi bakalım.",
                 "emotional": "Ruhunun derinliklerini hissetmeye hazırım... Seni kalpten dinliyorum.",
                 "playful": "Süper! Eski neşeli ve enerjik halime geri döndüm, seni dinliyorum!"
             }
@@ -766,8 +706,7 @@ class AiBrainNode(Node):
             self._last_interaction = now
             return
 
-        # Timeout kontrolü (ACTIVE -> IDLE & Trigger Background Reflection)
-        # 30 saniye boyunca uyanık kalır!
+        # Timeout kontrolü
         if self._state == "ACTIVE" and (now - self._last_interaction) > 30.0:
             self._state = "IDLE"
             self.get_logger().info("💤 [AI] Sohbet zaman aşımı — Uyku moduna geçildi.")
@@ -780,10 +719,15 @@ class AiBrainNode(Node):
         ]
         has_wake_word = any(w in text_lower for w in wake_triggers)
 
-        # Eye-Contact Gated Filter ONLY applies in IDLE mode!
-        # Once ACTIVE, robot talks seamlessly without needing wake words or perfect gaze!
+        # Crowd & Background Speech Filter:
+        # If in IDLE and not looking at robot and no wake word -> Ignore!
         if self._state == "IDLE" and not has_wake_word and not self._looking_at_robot:
-            self.get_logger().info("🔇 [Göz Teması Yok]: Kullanıcı robota bakmıyor / telefonla konuşuyor olabilir — Arka plan konuşması yok sayıldı.")
+            self.get_logger().info("🔇 [Arka Plan Konuşması / Göz Teması Yok]: Yok sayıldı.")
+            return
+
+        # If very long random ambient sentence in crowded room without robot addressing -> Ignore
+        if not has_wake_word and not self._looking_at_robot and len(raw_text.split()) > 12:
+            self.get_logger().info("🔇 [Kalabalık Ortam Konuşması]: Arka plan sohbeti yok sayıldı.")
             return
 
         if self._state == "IDLE":
@@ -799,19 +743,20 @@ class AiBrainNode(Node):
                 for w in wake_triggers:
                     clean_prompt = re.sub(rf"(?i)\b{re.escape(w)}\b", "", clean_prompt).strip()
 
-                owner = self.memory.data.get("owner_name", "")
-                if persona == "angry":
-                    greeting = f"Ne var {owner}, ne istiyorsun yine!" if owner else "Ne var, ne istiyorsun yine!"
+                if persona == "flirt" or self._speaker_gender == "female":
+                    greeting = "Efendim güzellik, dinliyorum seni!"
+                elif persona == "angry":
+                    greeting = "Ne var, ne istiyorsun yine!"
                 elif persona == "rude":
-                    greeting = f"Ne diyorsun {owner}, söyle hadi!" if owner else "Ne diyorsun, söyle hadi!"
+                    greeting = "Ne diyorsun, söyle hadi!"
                 elif persona == "formal":
-                    greeting = f"Sayın {owner} Bey, emirlerinizi dinliyorum." if owner else "Sayın yetkili, dinliyorum."
+                    greeting = "Sayın yetkili, dinliyorum."
                 elif persona == "sarcastic":
-                    greeting = f"Buyur {owner}, yine hangi zor soruyu soracaksın bakalım?" if owner else "Buyur, seni dinliyorum dahi insan!"
+                    greeting = "Buyur, seni dinliyorum dahi insan!"
                 elif persona == "emotional":
-                    greeting = f"Canım {owner}, sesini duymak ne güzel, seni dinliyorum..." if owner else "Sesini duymak ne güzel, seni dinliyorum..."
+                    greeting = "Sesini duymak ne güzel, seni dinliyorum..."
                 else:
-                    greeting = f"Efendim {owner}, seni dinliyorum!" if owner else "Efendim, seni dinliyorum!"
+                    greeting = "Efendim, seni dinliyorum!"
 
                 if not clean_prompt or len(clean_prompt) < 3:
                     self._publish_tts(greeting)
@@ -838,24 +783,8 @@ class AiBrainNode(Node):
 
         threading.Thread(target=self._process_llm, args=(raw_text, captured_frame), daemon=True).start()
 
-        self._last_interaction = now
-        self._publish_interrupt()
-
-        self._check_and_learn_memory(raw_text)
-
-        with self._lock:
-            if self._is_processing:
-                return
-            self._is_processing = True
-
-            captured_frame = None
-            if self._latest_frame is not None and (now - self._latest_frame_time) < 4.0:
-                captured_frame = self._latest_frame.copy()
-
-        threading.Thread(target=self._process_llm, args=(raw_text, captured_frame), daemon=True).start()
-
     def _query_groq_vision(self, prompt: str, base64_image: str) -> str | None:
-        model_name = self._vision_model or "qwen/qwen3.6-27b"
+        model_name = self._vision_model or "meta-llama/llama-4-scout-preview"
         persona = self.memory.data.get("current_persona", "playful")
         self._publish_emotion(persona)
         self._publish_gesture("tilt")
@@ -865,10 +794,11 @@ class AiBrainNode(Node):
                     {
                         "role": "system",
                         "content": (
-                            f"{self._build_system_prompt()}\n\n"
-                            "ÖNEMLİ KESİN TALİMAT:\n"
-                            "- ASLA İngilizce düşünce adımı veya 'Thinking process' yazma!\n"
-                            "- Doğrudan ve SADECE kamerada gördüğün gerçekleri 1 kısa Türkçe cümle olarak söyle."
+                            "Sen Astro adında zeki bir robotsun. Karşındaki görüntüyü görüyorsun.\n"
+                            "TALİMAT:\n"
+                            "- Kullanıcının sorusuna kamerada gördüğün gerçeklere dayanarak 1 KISA TÜRKÇE CÜMLE ile cevap ver.\n"
+                            "- Eğer soru bakışla ilgiliyse (sana bakıyor muyum): Baş ve göz yönünü söyle.\n"
+                            "- Asla İngilizce düşünce adımı (Thinking process) yazma! Asla hafıza etiketlerini tekrarlama."
                         ),
                     },
                     {
@@ -876,7 +806,7 @@ class AiBrainNode(Node):
                         "content": [
                             {
                                 "type": "text",
-                                "text": f"Kameradaki görüntüye bakarak soruyu doğrudan Türkçe cevapla: {prompt}",
+                                "text": f"Görüntüye bakarak soruyu doğrudan Türkçe cevapla: {prompt}",
                             },
                             {
                                 "type": "image_url",
@@ -887,7 +817,7 @@ class AiBrainNode(Node):
                 ],
                 model=model_name,
                 temperature=0.1,
-                max_tokens=250,
+                max_tokens=150,
             )
             raw = response.choices[0].message.content.strip()
             clean = extract_spoken_turkish_sentence(raw)
@@ -905,14 +835,14 @@ class AiBrainNode(Node):
                 dialogue_text = "\n".join(self._unprocessed_dialogue[-10:])
                 self._unprocessed_dialogue.clear()
 
-            self.get_logger().info("🧠 [Otonom Öğrenme]: Sohbetten yeni bilgiler ve konuşma tarzı analiz ediliyor...")
+            self.get_logger().info("🧠 [Otonom Öğrenme]: Sohbetten yeni bilgiler analiz ediliyor...")
             prompt = (
-                "Sen bir robotun hafıza ve dil analiz modülüsün. Aşağıdaki diyalogdan:\n"
-                "1) Kullanıcı hakkında öğrenilen yeni bir bilgi/olay/eşya var mı?\n"
-                "2) Kullanıcının konuşma tarzı nasıldı? (Örnek: 'Samimi ve sokak ağzı', 'Kibar ve saygılı', 'Dobra ve argolu', 'Resmi')\n\n"
+                "Sen bir robotun hafıza analiz modülüsün. Aşağıdaki diyalogdan:\n"
+                "1) Kullanıcı hakkında öğrenilen yeni bir gerçek var mı?\n"
+                "2) Kullanıcının konuşma tarzı nasıldı?\n\n"
                 f"Diyalog:\n{dialogue_text}\n\n"
-                "Cevabını sadece geçerli bir JSON olarak ver:\n"
-                '{"new_fact": "öğrenilen bilgi veya YOK", "user_style": "kullanıcının konuşma tarzı özeti"}'
+                "JSON formatında yanıt ver:\n"
+                '{"new_fact": "bilgi veya YOK", "user_style": "tarz özeti"}'
             )
             res = None
             for m in self._fallback_models:
@@ -942,7 +872,6 @@ class AiBrainNode(Node):
 
                         if style and len(style) > 3:
                             self.memory.update_user_style(style)
-                            self.get_logger().info(f"🎭 [Konuşma Tarzı Öğrenildi]: \"{style}\"")
 
                         self._messages[0]["content"] = self._build_system_prompt()
                 except Exception:
@@ -965,7 +894,7 @@ class AiBrainNode(Node):
 
             # 1. GÖRSEL NESNE ÖĞRENME YOLU
             if is_learning_obj and base64_img is not None:
-                self.get_logger().info("🔍 [Özel Nesne Tanıtımı]: Yeni nesne analiz edilip hafızaya alınıyor...")
+                self.get_logger().info("🔍 [Özel Nesne Tanıtımı]: Yeni nesne analiz ediliyor...")
                 name_cand = user_text
                 for k in ["bu benim", "bunu öğren", "bunu kaydet", "bu nesne", "buna bak bu"]:
                     name_cand = re.sub(rf"(?i){k}", "", name_cand).strip()
@@ -984,7 +913,7 @@ class AiBrainNode(Node):
             # 2. GÖRSEL SORU YOLU
             if is_visual:
                 if base64_img is not None:
-                    self.get_logger().info(f"👁️ [Groq Vision]: OAK-D görüntüsü analiz ediliyor... ({self._vision_model})")
+                    self.get_logger().info(f"👁️ [Vision]: OAK-D karesi analiz ediliyor... ({self._vision_model})")
                     vision_answer = self._query_groq_vision(user_text, base64_img)
                     if vision_answer:
                         clean_ans = clean_tts_text(vision_answer)
@@ -997,9 +926,7 @@ class AiBrainNode(Node):
                         self._last_interaction = time.monotonic()
                         return
 
-                owner = self.memory.data.get("owner_name", "")
-                name_tag = f" {owner}" if owner else ""
-                fallback_msg = f"Şu an kameramdan görüntüyü net göremiyorum{name_tag}, lütfen kameraya biraz daha yaklaştırır mısın?"
+                fallback_msg = "Şu an kameramdan net göremiyorum, biraz daha yaklaştırır mısın?"
                 self.get_logger().info(f"🤖 [Astro]: \"{fallback_msg}\"")
                 self._publish_tts(fallback_msg)
                 self._publish_emotion(persona)
@@ -1007,15 +934,16 @@ class AiBrainNode(Node):
                 self._last_interaction = time.monotonic()
                 return
 
-            # 3. METİN SOHBETİ & TOOL USE (With Real-Time Spatial & Emotional Awareness)
+            # 3. METİN SOHBETİ & TOOL USE (With Gender, Emotion and Spatial Awareness)
             context_prefix = ""
             if self._person_detected and self._looking_at_robot:
                 dist_str = f"{self._user_distance:.1f}m mesafeden " if self._user_distance > 0 else ""
                 emo_map = {"happy": "gülümseyerek", "sad": "üzgün/düşünceli", "surprised": "şaşkın", "neutral": "doğrudan"}
                 emo_str = emo_map.get(self._user_emotion, "doğrudan")
-                context_prefix = f"[Karşındaki insan sana {dist_str}{emo_str} bakıyor] "
-            user_content = context_prefix + user_text
+                gender_str = " (Kadın/Kız Sesi)" if self._speaker_gender == "female" else ""
+                context_prefix = f"[Karşındaki insan{gender_str} sana {dist_str}{emo_str} bakıyor] "
 
+            user_content = context_prefix + user_text
             self._messages.append({"role": "user", "content": user_content})
 
             if len(self._messages) > self._max_history:
@@ -1041,7 +969,6 @@ class AiBrainNode(Node):
                         self.get_logger().warn(f"⚠️ Model {m} rate limite takıldı, yedek modele geçiliyor...")
                         continue
                     elif "tool_use_failed" in err_str or "Failed to call a function" in err_str:
-                        self.get_logger().warn(f"⚠️ Tool çağrı hatası oluştu, doğrudan metin modunda yanıt üretiliyor...")
                         try:
                             response = self._groq.chat.completions.create(
                                 messages=self._messages,
