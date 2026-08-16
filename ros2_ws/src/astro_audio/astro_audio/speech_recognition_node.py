@@ -138,8 +138,19 @@ class SpeechRecognitionNode(Node):
         self._is_speaking: bool = False
         self._last_speech_time: float | None = None
         self._tts_speaking: bool = False
+        self._tts_speaking_start_time: float | None = None   # When did TTS start?
         self._last_tts_end_time: float | None = None
         self._tts_vad_count: int = 0  # Debounce counter for barge-in while TTS speaking
+
+        # Barge-in echo protection parameters
+        # - TTS must have been playing for at least this long before barge-in is eligible
+        #   (prevents the first echo burst from triggering an immediate interrupt)
+        self._BARGEIN_TTS_MIN_PLAY_S = 0.8   # 800ms grace window
+        # - How many consecutive VAD-positive frames (each ~60ms) to require
+        #   Echo decays within 1-2 frames; real human speech sustains 6+ frames
+        self._BARGEIN_DEBOUNCE_FRAMES = 6    # ~360ms of sustained voice activity
+        # - After TTS ends, ignore VAD for this window to suppress trailing echo
+        self._TTS_END_ECHO_SUPPRESS_S = 0.40
 
         # Guards against concurrent / out-of-order transcription results
         # Only the highest sequence number wins; stale responses are discarded.
@@ -156,10 +167,14 @@ class SpeechRecognitionNode(Node):
             was_speaking = self._tts_speaking
             self._tts_speaking = msg.data
 
-            if was_speaking and not self._tts_speaking:
-                self._last_tts_end_time = time.monotonic()
+            if not was_speaking and self._tts_speaking:
+                # TTS just started — record when so we can enforce the minimum play window
+                self._tts_speaking_start_time = time.monotonic()
                 self._tts_vad_count = 0
-            elif not was_speaking and self._tts_speaking:
+            elif was_speaking and not self._tts_speaking:
+                # TTS just ended
+                self._last_tts_end_time = time.monotonic()
+                self._tts_speaking_start_time = None
                 self._tts_vad_count = 0
 
     def _audio_cb(self, msg: Int16MultiArray):
@@ -184,28 +199,41 @@ class SpeechRecognitionNode(Node):
             if msg.data:
                 now = time.monotonic()
 
-                # Barge-in: If user speaks while TTS is playing, fire immediate interrupt!
+                # ── Barge-in logic (user speaks while TTS is playing) ──────────────────────
                 if self._tts_speaking:
                     self._tts_vad_count += 1
-                    # Trigger barge-in after 2 consecutive VAD frames (~60ms) to filter clicks
-                    if self._tts_vad_count >= 2:
+
+                    # Guard 1: TTS must have been playing for at least _BARGEIN_TTS_MIN_PLAY_S
+                    # This suppresses the very first echo burst (robot's own voice on mic).
+                    tts_play_duration = (
+                        (now - self._tts_speaking_start_time)
+                        if self._tts_speaking_start_time is not None
+                        else 0.0
+                    )
+                    if tts_play_duration < self._BARGEIN_TTS_MIN_PLAY_S:
+                        return  # Still in echo suppression window — ignore
+
+                    # Guard 2: Require sustained voice activity over multiple frames.
+                    # Echo decays within 1-2 frames; human speech sustains 6+ consecutive frames.
+                    if self._tts_vad_count >= self._BARGEIN_DEBOUNCE_FRAMES:
                         self.get_logger().info("🛑 [Barge-In] Kullanıcı araya girdi — TTS kesiliyor!")
                         int_msg = Bool()
                         int_msg.data = True
                         self._interrupt_pub.publish(int_msg)
 
                         self._tts_speaking = False
+                        self._tts_speaking_start_time = None
                         self._buffer = list(self._ring_buffer)
                         self._is_speaking = True
                         self._last_speech_time = now
-                        return
                     return
                 else:
                     self._tts_vad_count = 0
 
-                # Prevent self-triggering right after TTS ends (echo delay)
-                if self._last_tts_end_time is not None and (now - self._last_tts_end_time) < 0.25:
-                    return
+                # ── Post-TTS echo suppression ────────────────────────────────────────────
+                if self._last_tts_end_time is not None:
+                    if (now - self._last_tts_end_time) < self._TTS_END_ECHO_SUPPRESS_S:
+                        return  # Trailing echo window — ignore VAD
 
                 if not self._is_speaking:
                     self._buffer = list(self._ring_buffer)
