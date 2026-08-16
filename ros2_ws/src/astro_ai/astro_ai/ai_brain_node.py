@@ -779,7 +779,7 @@ class AiBrainNode(Node):
             return
 
         # Timeout kontrolü
-        if self._state == "ACTIVE" and (now - self._last_interaction) > 30.0:
+        if self._state == "ACTIVE" and (now - self._last_interaction) > self._conv_timeout:
             self._state = "IDLE"
             self.get_logger().info("💤 [AI] Sohbet zaman aşımı — Uyku moduna geçildi.")
             threading.Thread(target=self._run_autonomous_reflection, daemon=True).start()
@@ -791,16 +791,17 @@ class AiBrainNode(Node):
         ]
         has_wake_word = any(w in text_lower for w in wake_triggers)
 
-        # Crowd & Background Speech Filter:
-        # If in IDLE and not looking at robot and no wake word -> Ignore!
-        if self._state == "IDLE" and not has_wake_word and not self._looking_at_robot:
-            self.get_logger().info("🔇 [Arka Plan Konuşması / Göz Teması Yok]: Yok sayıldı.")
-            return
+        # Crowd & Background Speech Filter
+        if self._state == "IDLE":
+            # If in IDLE and not looking at robot and no wake word -> Ignore!
+            if not has_wake_word and not self._looking_at_robot:
+                self.get_logger().info("🔇 [Arka Plan Konuşması / Göz Teması Yok]: Yok sayıldı.")
+                return
 
-        # If very long random ambient sentence in crowded room without robot addressing -> Ignore
-        if not has_wake_word and not self._looking_at_robot and len(raw_text.split()) > 12:
-            self.get_logger().info("🔇 [Kalabalık Ortam Konuşması]: Arka plan sohbeti yok sayıldı.")
-            return
+            # If very long random ambient sentence in crowded room without robot addressing -> Ignore
+            if not has_wake_word and not self._looking_at_robot and len(raw_text.split()) > 12:
+                self.get_logger().info("🔇 [Kalabalık Ortam Konuşması]: Arka plan sohbeti yok sayıldı.")
+                return
 
         if self._state == "IDLE":
             if has_wake_word or self._looking_at_robot:
