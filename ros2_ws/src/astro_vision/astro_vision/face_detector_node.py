@@ -46,12 +46,14 @@ class SpatialVisionNode(Node):
         self.min_neighbors = int(self.get_parameter("min_neighbors").value)
         self.min_size = int(self.get_parameter("min_size").value)
 
-        # Load Cascades
+        # Load Cascades (Default + Alt2 for maximum detection rate)
         frontal_path = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+        alt2_path = cv2.data.haarcascades + "haarcascade_frontalface_alt2.xml"
         smile_path = cv2.data.haarcascades + "haarcascade_smile.xml"
         eye_path = cv2.data.haarcascades + "haarcascade_eye.xml"
 
         self.face_cascade = cv2.CascadeClassifier(frontal_path)
+        self.face_alt_cascade = cv2.CascadeClassifier(alt2_path)
         self.smile_cascade = cv2.CascadeClassifier(smile_path)
         self.eye_cascade = cv2.CascadeClassifier(eye_path)
 
@@ -149,8 +151,8 @@ class SpatialVisionNode(Node):
         frame_h, frame_w = frame.shape[:2]
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         
-        # Downscale for ultra-fast face detection (Jetson CPU Optimization)
-        scale_ratio = 320.0 / float(frame_w) if frame_w > 320 else 1.0
+        # Scale to 640px for high detection accuracy on Jetson (preserving facial landmarks)
+        scale_ratio = 640.0 / float(frame_w) if frame_w > 640 else 1.0
         
         if scale_ratio < 1.0:
             small_gray = cv2.resize(gray, (0, 0), fx=scale_ratio, fy=scale_ratio, interpolation=cv2.INTER_AREA)
@@ -161,8 +163,16 @@ class SpatialVisionNode(Node):
             small_gray,
             scaleFactor=1.1,
             minNeighbors=3,
-            minSize=(int(25 * scale_ratio), int(25 * scale_ratio)),
+            minSize=(24, 24),
         )
+
+        if len(detected_faces) == 0 and hasattr(self, 'face_alt_cascade'):
+            detected_faces = self.face_alt_cascade.detectMultiScale(
+                small_gray,
+                scaleFactor=1.1,
+                minNeighbors=3,
+                minSize=(24, 24),
+            )
 
         # Map bounding boxes back to original resolution
         if len(detected_faces) > 0 and scale_ratio < 1.0:

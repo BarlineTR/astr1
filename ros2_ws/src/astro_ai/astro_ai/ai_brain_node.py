@@ -639,7 +639,7 @@ class AiBrainNode(Node):
                 continue
 
             now = time.monotonic()
-            if (now - getattr(self, '_last_idle_learning_time', 0)) > 120.0:
+            if (now - getattr(self, '_last_idle_learning_time', 0)) > 45.0:
                 self._last_idle_learning_time = now
 
                 captured_frame = None
@@ -656,6 +656,22 @@ class AiBrainNode(Node):
                         if obs:
                             self.memory.profile.add_observation(obs)
                             self.get_logger().info(f"🧠 [Hafıza Güncellendi - Gözlem]: {obs}")
+
+                            # If Gemini Vision observes a person looking at the robot or sitting in front of it
+                            obs_lower = obs.lower()
+                            person_gaze_keywords = ["bize bakıyor", "bana bakıyor", "kameraya bakıyor", "karşımda", "karşısında", "oturan bir", "biri var", "insan var", "beyefendi", "hanımefendi"]
+                            if any(kw in obs_lower for kw in person_gaze_keywords):
+                                if self.state_machine.is_idle() and not self._tts_speaking and not self._is_processing:
+                                    if (now - getattr(self, '_last_proactive_gaze_time', 0)) > 20.0:
+                                        self._last_proactive_gaze_time = now
+                                        self.session.activate_session(reason="gemini_scene_gaze")
+                                        self.state_machine.transition_to(RobotState.LISTENING)
+                                        persona = self.persona_engine.current_persona
+                                        greeting = "Hey! Seni gördüm, nasıl yardımcı olabilirim?"
+                                        self.get_logger().info(f"👁️ [Görsel Sahne Proaktif Etkileşim] ({persona}): \"{greeting}\"")
+                                        self._publish_tts(greeting)
+                                        self._publish_emotion(persona)
+                                        self._publish_gesture("nod")
 
     def _is_visual_query(self, text: str) -> bool:
         visual_keywords = [
