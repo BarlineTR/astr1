@@ -86,7 +86,11 @@ class PersistentProfile:
 
     def __init__(self, filepath: Optional[str] = None):
         if filepath is None:
-            self.filepath = os.path.expanduser("~/Desktop/astr1/ros2_ws/astro_memory.json")
+            env_path = os.getenv("MEMORY_FILE_PATH", "").strip()
+            if env_path:
+                self.filepath = os.path.expanduser(env_path)
+            else:
+                self.filepath = os.path.expanduser("~/Desktop/astr1/ros2_ws/astro_memory.json")
         else:
             self.filepath = filepath
 
@@ -191,10 +195,13 @@ class PersistentProfile:
     def add_observation(self, observation: str):
         with self._lock:
             if observation:
-                self.data.setdefault("environmental_observations", []).append(observation)
-                if len(self.data["environmental_observations"]) > 3:
-                    self.data["environmental_observations"] = self.data["environmental_observations"][-3:]
-                self.save()
+                obs_list = self.data.setdefault("environmental_observations", [])
+                # Avoid duplicate identical observations
+                if not obs_list or obs_list[-1] != observation:
+                    obs_list.append(observation)
+                    if len(obs_list) > 3:
+                        self.data["environmental_observations"] = obs_list[-3:]
+                    self.save()
 
     def set_persona(self, persona_name: str):
         with self._lock:

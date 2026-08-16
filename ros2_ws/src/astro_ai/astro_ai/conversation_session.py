@@ -131,10 +131,12 @@ class ConversationSession:
             return False
 
     def is_wake_word(self, text: str, wake_word: str = "hey astro") -> tuple[bool, str]:
-        """Detects wake words and returns (has_wake_word, clean_text_without_wake_word)."""
+        """Detects wake words with Turkish phonetic variations and returns (has_wake_word, clean_text)."""
         triggers = [
             wake_word.lower(),
-            "hey astro", "astro", "esmer", "hey groq", "grok", "merhaba", "asistan"
+            "hey astro", "hey astıro", "heyastro", "ey astro", "ey astıro",
+            "hay astro", "hey astor", "astro", "astıro", "astor",
+            "hey asistan", "merhaba astro", "selam astro"
         ]
         text_lower = text.lower()
         has_wake = any(w in text_lower for w in triggers)

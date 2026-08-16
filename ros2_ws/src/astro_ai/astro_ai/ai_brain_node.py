@@ -44,6 +44,7 @@ try:
         clean_tts_text, extract_spoken_turkish_sentence
     )
     from astro_ai.conversation_session import ConversationSession
+    from astro_ai.cloud_manager import CloudManager
 except ImportError:
     from state_machine import StateMachine, RobotState
     from memory_manager import MemoryManager
@@ -52,6 +53,7 @@ except ImportError:
         clean_tts_text, extract_spoken_turkish_sentence
     )
     from conversation_session import ConversationSession
+    from cloud_manager import CloudManager
 
 
 def _load_env():
@@ -112,6 +114,7 @@ class AiBrainNode(Node):
 
         # Core Modular Components
         self.memory = MemoryManager()
+        self.cloud_mgr = CloudManager()
         initial_persona = self.memory.profile.data.get("current_persona", "playful")
         self.persona_engine = PersonaEngine(initial_persona)
         self.state_machine = StateMachine(RobotState.IDLE)
@@ -279,18 +282,32 @@ class AiBrainNode(Node):
                 self._looking_start_time = None
 
                 persona = self.persona_engine.current_persona
-                if persona == "flirt" or self._speaker_gender == "female":
+                if persona == "flirt":
                     proactive_greeting = "Bana öyle güzel bakıyorsunuz ki güzellik, gözleriniz işlemcimi yaktı... İsminiz ne sizin, tanışalım mı?"
                     self._publish_emotion("flirt")
-                elif self._user_emotion == "happy":
-                    proactive_greeting = "Gözlerinin içi gülüyor, maşallah keyfin yerinde! Nasıl yardımcı olabilirim?"
-                    self._publish_emotion("happy")
+                elif persona == "playful":
+                    if self._user_emotion == "happy":
+                        proactive_greeting = "Gözlerinin içi gülüyor, süper! Nasıl yardımcı olabilirim?"
+                    else:
+                        proactive_greeting = "Hey, bana bakıyorsun! Nasıl yardımcı olabilirim?"
+                    self._publish_emotion("playful")
                 elif persona == "rude":
                     proactive_greeting = "Ne bakıyon birader, bir şey mi diyeceksin?"
+                    self._publish_emotion("rude")
                 elif persona == "formal":
                     proactive_greeting = "Bakışlarınızı üzerimde hissediyorum efendim, bir emriniz var mıdır?"
+                    self._publish_emotion("formal")
+                elif persona == "sarcastic":
+                    proactive_greeting = "Bana öyle derin derin bakınca bir şey isteyeceğini anladım. Buyur bakalım?"
+                    self._publish_emotion("sarcastic")
+                elif persona == "emotional":
+                    proactive_greeting = "Bana ne kadar içten bakıyorsun... Seni dinliyorum, ne düşünüyorsun?"
+                    self._publish_emotion("emotional")
+                elif persona == "angry":
+                    proactive_greeting = "Ne dik dik bakıyorsun yine, ne oldu?"
+                    self._publish_emotion("angry")
                 else:
-                    proactive_greeting = "Bana bakıyorsun, nasıl yardımcı olabilirim?"
+                    proactive_greeting = "Merhaba! Sana nasıl yardımcı olabilirim?"
 
                 self.get_logger().info(f"👁️ [Proaktif Etkileşim] ({persona}): \"{proactive_greeting}\"")
                 self._publish_gesture("nod")
@@ -356,7 +373,16 @@ class AiBrainNode(Node):
                 self._publish_emotion(persona)
                 self._publish_gesture("nod")
 
-                greeting = "Buyur güzellik, bütün algılarım seninle..." if (persona == "flirt" or self._speaker_gender == "female") else "Efendim, seni dinliyorum!"
+                greeting_map = {
+                    "flirt": "Buyur güzellik, bütün algılarım seninle..." if self._speaker_gender == "female" else "Söyle bakalım kral, seni dinliyorum!",
+                    "playful": "Efendim, seni dinliyorum!",
+                    "formal": "Buyrun efendim, sizi dinliyorum.",
+                    "sarcastic": "Buyrun, yine ne soracaksın bakalım?",
+                    "emotional": "Buradayım, can kulağıyla seni dinliyorum...",
+                    "angry": "Ne var, ne istiyorsun?",
+                    "rude": "Ne var birader, kısa kes!"
+                }
+                greeting = greeting_map.get(persona, "Efendim, seni dinliyorum!")
                 if not clean_prompt or len(clean_prompt) < 3:
                     self._publish_tts(greeting)
                     return
@@ -453,8 +479,13 @@ class AiBrainNode(Node):
                     continue
 
             if stream_resp is None:
-                self.get_logger().error("❌ Tüm LLM modelleri başarısız oldu!")
+                self.cloud_mgr.record_llm_failure("All cloud models failed")
+                self.get_logger().error("❌ Tüm LLM modelleri başarısız oldu! Yerel çevrimdışı moda geçiliyor.")
+                offline_msg = "Şu an internet bağlantımda bir sorun var ama seni dinliyorum!"
+                self._publish_tts(offline_msg)
                 return
+
+            self.cloud_mgr.record_llm_success()
 
             full_text = ""
             sentence_buffer = ""
@@ -510,12 +541,13 @@ class AiBrainNode(Node):
                 self._is_processing = False
 
     def _query_groq_vision(self, prompt: str, base64_image: str) -> str | None:
+        persona = self.persona_engine.current_persona
         try:
             response = self._groq.chat.completions.create(
                 messages=[
                     {
                         "role": "system",
-                        "content": "Sen Astro adında zeki bir robotsun. Karşındaki görüntüyü görüyorsun. Kullanıcının sorusunu doğrudan tek bir kısa Türkçe cümleyle açıkla."
+                        "content": f"Sen Astro adında {persona} karakterli akıllı ve sempatik bir sosyal robotsun. Karşındaki görüntüyü görüyorsun. Kullanıcının sorusunu kendi kişiliğinle tek bir kısa doğal Türkçe cümleyle yanıtla."
                     },
                     {
                         "role": "user",
@@ -530,8 +562,10 @@ class AiBrainNode(Node):
                 max_tokens=100
             )
             raw = response.choices[0].message.content.strip()
+            self.cloud_mgr.record_llm_success()
             return extract_spoken_turkish_sentence(raw)
         except Exception as e:
+            self.cloud_mgr.record_llm_failure(str(e))
             self.get_logger().error(f"❌ [Vision Hatası ({self._vision_model})]: {e}")
             return None
 
