@@ -71,14 +71,28 @@ class OakSpatialNativeNode(Node):
 
     def _create_node(self, pipeline: dai.Pipeline, class_name: str):
         """Universal node creator working across all DepthAI versions (v2.0 - v2.30+)."""
-        # 1. Try pipeline.create(dai.node.<Class>)
+        # 1. Try dai.node.<Class>
         if hasattr(dai, "node") and hasattr(dai.node, class_name):
             try:
                 return pipeline.create(getattr(dai.node, class_name))
             except Exception:
                 pass
 
-        # 2. Try pipeline.create<Class>()
+        # 2. Try dai.nodes.<Class>
+        if hasattr(dai, "nodes") and hasattr(dai.nodes, class_name):
+            try:
+                return pipeline.create(getattr(dai.nodes, class_name))
+            except Exception:
+                pass
+
+        # 3. Try dai.<Class>
+        if hasattr(dai, class_name):
+            try:
+                return pipeline.create(getattr(dai, class_name))
+            except Exception:
+                pass
+
+        # 4. Try pipeline.create<Class>()
         method_name = f"create{class_name}"
         if hasattr(pipeline, method_name):
             try:
@@ -86,14 +100,25 @@ class OakSpatialNativeNode(Node):
             except Exception:
                 pass
 
-        # 3. Try pipeline.create(getattr(dai, class_name))
-        if hasattr(dai, class_name):
-            try:
-                return pipeline.create(getattr(dai, class_name))
-            except Exception:
-                pass
+        # 5. Case-insensitive search across dai.node, dai.nodes, and dai
+        for container in [getattr(dai, "node", None), getattr(dai, "nodes", None), dai]:
+            if container is not None:
+                for attr in dir(container):
+                    if attr.lower() == class_name.lower():
+                        try:
+                            return pipeline.create(getattr(container, attr))
+                        except Exception:
+                            pass
 
-        raise AttributeError(f"DepthAI node '{class_name}' could not be created with installed depthai library.")
+        available_nodes = []
+        if hasattr(dai, "node"):
+            available_nodes.extend(dir(dai.node))
+        elif hasattr(dai, "nodes"):
+            available_nodes.extend(dir(dai.nodes))
+        else:
+            available_nodes.extend(dir(dai))
+
+        raise AttributeError(f"DepthAI node '{class_name}' could not be created. Available: {available_nodes[:15]}")
 
     def _create_pipeline(self) -> dai.Pipeline:
         pipeline = dai.Pipeline()
