@@ -39,12 +39,25 @@ except ImportError:
     def load_dotenv(*args, **kwargs): pass
 
 def _load_env():
+    candidates = [
+        os.path.abspath(".env"),
+        os.path.abspath(os.path.join(os.getcwd(), ".env")),
+        os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..", "..", ".env")),
+        os.path.expanduser("~/Desktop/astr1/.env"),
+        os.path.expanduser("~/.env")
+    ]
+    for c in candidates:
+        if os.path.exists(c):
+            load_dotenv(dotenv_path=c, override=False)
+            return c
     try:
         env_path = find_dotenv(usecwd=True)
         if env_path:
             load_dotenv(dotenv_path=env_path, override=False)
+            return env_path
     except Exception:
         pass
+    return None
 
 class SpeechRecognitionNode(Node):
     def __init__(self):
@@ -71,10 +84,10 @@ class SpeechRecognitionNode(Node):
             return
             
         # Parameters
-        self.declare_parameter('silence_timeout_s', 1.2)
+        self.declare_parameter('silence_timeout_s', 0.75)
         self.declare_parameter('sample_rate', 16000)
-        self._silence_timeout_s = self.get_parameter('silence_timeout_s').value
-        self._sample_rate = self.get_parameter('sample_rate').value
+        self._silence_timeout_s = float(self.get_parameter('silence_timeout_s').value)
+        self._sample_rate = int(self.get_parameter('sample_rate').value)
         
         # Publishers
         self._text_pub = self.create_publisher(String, '/speech/text', 10)
@@ -164,7 +177,7 @@ class SpeechRecognitionNode(Node):
                     self._is_speaking = False
                     self._last_speech_time = None
                     
-        if audio_data is not None and len(audio_data) >= 8000:
+        if audio_data is not None and len(audio_data) >= 4800:
             threading.Thread(target=self._transcribe, args=(audio_data,), daemon=True).start()
 
     def _transcribe(self, audio_data: list[int]):

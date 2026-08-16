@@ -328,21 +328,20 @@ class AudioCaptureNode(Node):
             self.pub_speech.publish(speech_msg)
 
     def _energy_vad(self, mono: np.ndarray) -> bool:
-        mono_clean = mono.astype(np.float32) - np.mean(mono)
-        rms = float(np.sqrt(np.mean(mono_clean ** 2))) / 32768.0
-
-        # Dinamik gürültü tabanı (Noise Floor) takibi (Adaptif VAD)
-        if not hasattr(self, "_noise_floor"):
-            self._noise_floor = rms
-        else:
-            # Gürültü seviyesini yavaşça güncelle (Exponential moving average)
-            if rms < self._noise_floor * 2.0:
-                self._noise_floor = 0.95 * self._noise_floor + 0.05 * rms
-
-        # Dinamik eşik: Gürültü seviyesinin 1.5 katı veya parametre eşiği
-        dynamic_threshold = max(self.vad_threshold, self._noise_floor * 1.5)
-        is_speech = rms > dynamic_threshold
+        if len(mono) == 0:
+            return False
+        rms = int(np.sqrt(np.mean(mono.astype(np.float32) ** 2)))
         
+        # Adaptive noise floor tracking
+        if not hasattr(self, "_noise_floor"):
+            self._noise_floor = float(rms)
+        else:
+            if rms < self._noise_floor * 2.0:
+                self._noise_floor = 0.95 * self._noise_floor + 0.05 * float(rms)
+                
+        # Speech is detected if RMS is above base threshold (500) or noise floor + 250
+        dynamic_threshold = max(500, int(self._noise_floor + 250))
+        is_speech = rms > dynamic_threshold
         return is_speech
 
     def _publish_hid(self):

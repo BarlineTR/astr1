@@ -46,10 +46,31 @@ except ImportError:
     wav = None
 
 try:
-    from dotenv import load_dotenv
-    load_dotenv()
+    from dotenv import find_dotenv, load_dotenv
 except ImportError:
-    pass
+    def find_dotenv(*args, **kwargs): return ""
+    def load_dotenv(*args, **kwargs): pass
+
+def _load_env():
+    candidates = [
+        os.path.abspath(".env"),
+        os.path.abspath(os.path.join(os.getcwd(), ".env")),
+        os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..", "..", ".env")),
+        os.path.expanduser("~/Desktop/astr1/.env"),
+        os.path.expanduser("~/.env")
+    ]
+    for c in candidates:
+        if os.path.exists(c):
+            load_dotenv(dotenv_path=c, override=False)
+            return c
+    try:
+        env_path = find_dotenv(usecwd=True)
+        if env_path:
+            load_dotenv(dotenv_path=env_path, override=False)
+            return env_path
+    except Exception:
+        pass
+    return None
 
 EMOJI_RE = re.compile(
     "["
@@ -104,6 +125,7 @@ def find_output_device() -> int | None:
 class TtsNode(Node):
     def __init__(self):
         super().__init__('tts_node')
+        _load_env()
         
         # Load params from env
         self.tts_voice = os.getenv("TTS_VOICE", "tr-TR-AhmetNeural")

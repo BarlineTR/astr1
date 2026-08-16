@@ -6,7 +6,7 @@
     i_pipeline_type: "RGBD"
     rgb:
       i_resolution: "720P"
-      i_fps: 30
+      i_fps: 30.0
       i_publish_topic: true
     stereo:
       i_enabled: true
