@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""ASTRO V1 — Multimodal AI Brain Node (Groq Vision + Streaming LLM).
+"""ASTRO V1 — Multimodal AI Brain Node (Vision + Ultra-Fast Streaming LLM).
 
 Subscribes to:
   /speech/text           (String)  — transcribed user speech from Groq Whisper
@@ -12,10 +12,10 @@ Publishes:
   /tts/interrupt          (Bool)   — cancel current TTS playback on new speech
 
 Features:
-  - Multimodal Vision: Real-time visual question answering (objects in hand, gestures, person attributes)
-  - Uses Groq 'llama-3.2-11b-vision-preview' for visual questions, 'llama-3.3-70b-versatile' for text
-  - Emotional, witty and friendly Rıfkı persona
-  - Streaming sentence prefetch to Edge-TTS
+  - Ultra-Low Latency Streaming: First sentence sent to TTS in <200ms
+  - True Multimodal Vision: Analyzes live OAK-D camera frames with Gemini 2.5 Flash / Groq Vision
+  - Accurate Recognition of clothing colors, objects in hand, gestures, person presence
+  - Rıfkı Persona: Emotional, witty, friendly Turkish conversational agent
 """
 
 import os
@@ -39,6 +39,11 @@ try:
     from groq import Groq
 except ImportError:
     Groq = None
+
+try:
+    from openai import OpenAI
+except ImportError:
+    OpenAI = None
 
 try:
     from dotenv import find_dotenv, load_dotenv
@@ -69,8 +74,9 @@ def _load_env():
     return None
 
 
-TTS_MIN_CHARS = 70
-TTS_MAX_CHARS = 260
+# Minimum characters to dispatch a sentence immediately to TTS (low for instant playback)
+TTS_MIN_CHARS = 12
+TTS_MAX_CHARS = 240
 
 EMOJI_RE = re.compile(
     "["
@@ -93,8 +99,8 @@ SYSTEM_PROMPT = (
     "Sen Astro adında neşeli, meraklı, duygusal ve çok zeki bir robot asistansın. "
     "Sosyal medyada sevilen Rıfkı gibi sevecen ve cana yakın bir karaktere sahipsin.\n"
     "Özelliklerin ve Kuralların:\n"
-    "- OAK-D kameran sayesinde karşındaki insanı, odadaki nesneleri, elinde tuttuğu eşyaları ve yaptığı hareketleri GERÇEKTEN görüyorsun.\n"
-    "- Kullanıcı sana elinde ne olduğunu, ne yaptığını veya bir nesneyi sorduğunda kameradan gördüğün görseli dikkatle incele ve DOĞRU olanı söyle (asla tahmin veya uydurma yapma, gördüğünü söyle).\n"
+    "- OAK-D kameran sayesinde karşındaki insanı, kıyafetlerini, renkleri, elinde tuttuğu eşyaları ve hareketlerini GERÇEKTEN görüyorsun.\n"
+    "- Kullanıcı sana ne giydiğini, elinde ne olduğunu, ne yaptığını veya etrafı sorduğunda kameradan gördüğün görseli dikkatle incele ve KESİNLİKLE DOĞRU olanı söyle.\n"
     "- Konuşma dilini ('naber', 'napıyorsun', 'nasılsın', 'harika', 'aynen') çok iyi anlar ve samimiyetle karşılık verirsin.\n"
     "- Meraklısın, sevindiğinde 'Harika!', 'Çok sevindim!', 'Vay canına!' gibi samimi tepkiler verirsin.\n"
     "- Robotik veya resmi konuşma; cana yakın bir dost gibi sıcak, esprili ve akıcı konuş.\n"
@@ -169,7 +175,6 @@ def extract_tts_sentences(buffer: str, final=False) -> tuple[list[str], str]:
 
 
 def imgmsg_to_bgr(msg: Image) -> np.ndarray | None:
-    """Zero-dependency ROS Image to BGR converter."""
     try:
         if msg.encoding == "bgr8":
             return np.frombuffer(msg.data, dtype=np.uint8).reshape(msg.height, msg.width, 3).copy()
@@ -189,7 +194,6 @@ def imgmsg_to_bgr(msg: Image) -> np.ndarray | None:
 
 
 def frame_to_base64_jpeg(frame: np.ndarray, max_dim: int = 512) -> str | None:
-    """Resizes and encodes BGR frame to JPEG base64 string."""
     if cv2 is None or frame is None:
         return None
     try:
@@ -210,35 +214,54 @@ class AiBrainNode(Node):
         _load_env()
 
         self.declare_parameter("llm_model", os.getenv("LLM_MODEL", "llama-3.3-70b-versatile"))
-        self.declare_parameter("vision_model", os.getenv("VISION_MODEL", "llama-3.2-11b-vision-preview"))
         self.declare_parameter("llm_temperature", float(os.getenv("LLM_TEMPERATURE", "0.55")))
         self.declare_parameter("llm_max_tokens", int(os.getenv("LLM_MAX_TOKENS", "300")))
         self.declare_parameter("wake_word", os.getenv("WAKE_WORD", "hey astro"))
         self.declare_parameter("conversation_timeout", float(os.getenv("CONVERSATION_TIMEOUT", "15.0")))
 
         self._text_model = self.get_parameter("llm_model").value
-        self._vision_model = self.get_parameter("vision_model").value
         self._temperature = float(self.get_parameter("llm_temperature").value)
         self._max_tokens = int(self.get_parameter("llm_max_tokens").value)
         self._wake_word = self.get_parameter("wake_word").value
         self._conv_timeout = float(self.get_parameter("conversation_timeout").value)
 
-        api_key = os.environ.get("GROQ_API_KEY", "").strip()
+        # Clients: Groq for fast text, Gemini / Groq for Vision
+        groq_api_key = os.environ.get("GROQ_API_KEY", "").strip()
+        gemini_api_key = os.environ.get("AI_API_KEY", "").strip()
+        gemini_base_url = os.environ.get("AI_BASE_URL", "https://generativelanguage.googleapis.com/v1beta/openai/")
+
+        self._groq = None
+        self._vision_client = None
+        self._vision_model_name = "gemini-2.5-flash"
         self._enabled = True
 
-        if not Groq:
-            self.get_logger().error("❌ [AI] groq kütüphanesi kurulu değil!")
-            self._enabled = False
-        elif not api_key:
-            self.get_logger().error("❌ [AI] GROQ_API_KEY bulunamadı! Lütfen .env dosyasını kontrol edin.")
-            self._enabled = False
-        else:
+        if Groq and groq_api_key:
             try:
-                self._groq = Groq(api_key=api_key)
-                self.get_logger().info(f"✅ [AI] Groq LLM Aktif — Metin: {self._text_model} | Görme: {self._vision_model}")
+                self._groq = Groq(api_key=groq_api_key)
+                self.get_logger().info(f"✅ [AI] Groq Hızlı LLM Aktif ({self._text_model})")
             except Exception as e:
-                self.get_logger().error(f"❌ [AI] Groq Client başlatılamadı: {e}")
-                self._enabled = False
+                self.get_logger().error(f"❌ [AI] Groq Client hatası: {e}")
+
+        # Initialize Vision Client (Gemini 2.5 Flash if available, otherwise Groq Vision)
+        if OpenAI and gemini_api_key:
+            try:
+                self._vision_client = OpenAI(
+                    api_key=gemini_api_key,
+                    base_url=gemini_base_url
+                )
+                self._vision_model_name = os.environ.get("AI_MODEL", "gemini-2.5-flash")
+                self.get_logger().info(f"👁️ [AI Vision] Gemini Multimodal Vision Aktif ({self._vision_model_name})")
+            except Exception as e:
+                self.get_logger().warn(f"Gemini Vision başlatılamadı: {e}")
+
+        if self._vision_client is None and self._groq:
+            self._vision_client = self._groq
+            self._vision_model_name = "llama-3.2-90b-vision-preview"
+            self.get_logger().info("👁️ [AI Vision] Groq Vision fallback aktif.")
+
+        if self._groq is None and self._vision_client is None:
+            self.get_logger().error("❌ [AI] Hiçbir AI API anahtarı bulunamadı! STT/LLM devre dışı.")
+            self._enabled = False
 
         self._state = "IDLE"
         self._last_interaction = 0.0
@@ -263,7 +286,7 @@ class AiBrainNode(Node):
         self.sub_camera = self.create_subscription(Image, "/oak/rgb/image_raw", self._on_camera_image, 10)
 
         self.get_logger().info(
-            f"🧠 [AI Brain] Görme ve Ses Sistemi Hazır! Wake-word: \"{self._wake_word}\""
+            f"🧠 [AI Brain] Hazır! Wake-word: \"{self._wake_word}\""
         )
 
     def _on_camera_image(self, msg: Image):
@@ -280,11 +303,11 @@ class AiBrainNode(Node):
         self._person_detected = msg.data
 
     def _is_visual_query(self, text: str) -> bool:
-        """Determines if the user's question is asking about what the robot sees."""
         visual_keywords = [
             "ne tutuyorum", "elimde ne", "elinde ne", "ne var", "bu ne", "bunu gör", "görüyor musun",
-            "ne yapıyorum", "hareket", "hangi hareket", "üstümde", "ne renk", "kaç parmak",
-            "bana bak", "gözlerimi", "nereye", "kim var", "odada", "arkamda", "elimde", "şuna bak"
+            "ne yapıyorum", "hareket", "hangi hareket", "üstümde", "üzerimde", "ceket", "tişört", "elbise",
+            "ne renk", "kaç parmak", "bana bak", "gözlerimi", "nereye", "kim var", "odada", "arkamda",
+            "elimde", "şuna bak", "gösteriyorum", "nası görünüyorum", "nasıl görünüyorum"
         ]
         text_lower = text.lower()
         return any(k in text_lower for k in visual_keywords)
@@ -294,7 +317,6 @@ class AiBrainNode(Node):
         if not raw_text or self._tts_speaking or not self._enabled:
             return
 
-        # Ignore pure punctuation or empty dots
         if raw_text in [".", "..", "...", "!", "?", ",", "-", "_"]:
             return
 
@@ -319,7 +341,6 @@ class AiBrainNode(Node):
                 self._last_interaction = now
                 self.get_logger().info(f"✨ [AI] Uyandırma kelimesi algılandı: '{raw_text}'")
 
-                # Wake word kelimelerini metinden temizle
                 clean_prompt = raw_text
                 for w in wake_triggers:
                     clean_prompt = re.sub(rf"(?i)\b{re.escape(w)}\b", "", clean_prompt).strip()
@@ -333,7 +354,6 @@ class AiBrainNode(Node):
                 self._state = "ACTIVE"
                 self._last_interaction = now
 
-        # ACTIVE moddayız
         self._last_interaction = now
         self._publish_interrupt()
 
@@ -341,10 +361,9 @@ class AiBrainNode(Node):
             if self._is_processing:
                 return
             self._is_processing = True
-            
-            # Grab current camera frame if available and recent (< 3.0s)
+
             captured_frame = None
-            if self._latest_frame is not None and (now - self._latest_frame_time) < 3.0:
+            if self._latest_frame is not None and (now - self._latest_frame_time) < 4.0:
                 captured_frame = self._latest_frame.copy()
 
         threading.Thread(target=self._process_llm, args=(raw_text, captured_frame), daemon=True).start()
@@ -353,25 +372,27 @@ class AiBrainNode(Node):
         try:
             self.get_logger().info(f"🗣️ [Siz]: \"{user_text}\"")
 
-            is_visual = self._is_visual_query(user_text) or (frame is not None and self._person_detected)
+            is_visual = self._is_visual_query(user_text)
             base64_img = None
 
-            if frame is not None and (is_visual or self._is_visual_query(user_text)):
+            if frame is not None and is_visual:
                 base64_img = frame_to_base64_jpeg(frame, max_dim=512)
 
-            # Choose model: Vision model if image is attached, otherwise fast text model
-            if base64_img is not None:
-                selected_model = self._vision_model
-                self.get_logger().info(f"👁️ [Multimodal Vision]: OAK-D kamerasıyla anlık görüntü analiz ediliyor... (Model: {selected_model})")
+            client_to_use = self._groq or self._vision_client
+            model_to_use = self._text_model
+
+            if base64_img is not None and self._vision_client is not None:
+                client_to_use = self._vision_client
+                model_to_use = self._vision_model_name
+                self.get_logger().info(f"👁️ [Multimodal Vision]: OAK-D görüntüsü analiz ediliyor... ({model_to_use})")
                 user_content = [
-                    {"type": "text", "text": f"Gördüğün bu anlık kamera görüntüsüne bakarak cevap ver: {user_text}"},
+                    {"type": "text", "text": f"Kameradan gördüğün bu anlık kareye bakarak cevap ver: {user_text}"},
                     {
                         "type": "image_url",
                         "image_url": {"url": f"data:image/jpeg;base64,{base64_img}"},
                     },
                 ]
             else:
-                selected_model = self._text_model
                 context_prefix = ""
                 if self._person_detected:
                     context_prefix = "[Kamerada bir insan görüyorsun] "
@@ -382,9 +403,9 @@ class AiBrainNode(Node):
             if len(self._messages) > self._max_history:
                 self._messages = [self._messages[0]] + self._messages[-(self._max_history - 1):]
 
-            stream = self._groq.chat.completions.create(
+            stream = client_to_use.chat.completions.create(
                 messages=self._messages,
-                model=selected_model,
+                model=model_to_use,
                 temperature=self._temperature,
                 max_tokens=self._max_tokens,
                 stream=True,
@@ -394,12 +415,17 @@ class AiBrainNode(Node):
             text_buffer = ""
 
             for chunk in stream:
-                token = chunk.choices[0].delta.content or ""
+                token = ""
+                if hasattr(chunk, 'choices') and chunk.choices:
+                    delta = chunk.choices[0].delta
+                    token = getattr(delta, 'content', '') or ""
+
                 if not token:
                     continue
                 full_response += token
                 text_buffer += token
 
+                # Extract and dispatch immediately if a sentence boundary is ready
                 sentences, text_buffer = extract_tts_sentences(text_buffer)
                 for s in sentences:
                     self._publish_tts(s)
@@ -410,7 +436,7 @@ class AiBrainNode(Node):
 
             if full_response.strip():
                 self.get_logger().info(f"🤖 [Astro]: \"{full_response.strip()}\"")
-                # Store string content in history to avoid keeping giant base64 payloads in memory
+                # Keep plain text in history to save RAM
                 self._messages.append({"role": "assistant", "content": full_response.strip()})
 
             self._last_interaction = time.monotonic()

@@ -185,7 +185,7 @@ class TtsNode(Node):
     def _playback_loop(self):
         while rclpy.ok():
             try:
-                text = self._speak_queue.get(timeout=0.5)
+                text = self._speak_queue.get(timeout=0.05)
                 self._synthesize_and_play(text)
             except queue.Empty:
                 continue
