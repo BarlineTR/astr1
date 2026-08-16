@@ -1,34 +1,29 @@
 #!/usr/bin/env python3
-"""ASTRO V1 — Autonomous Social AI Brain Node with Multi-Persona, Flirt Mode & Spatial AI.
+"""ASTRO V1 — Real-Time Conversational AI Brain Node (Modular Architecture).
 
-Supported Personas:
-  - flirt     : Aşırı özgüvenli, karizmatik, çapkın "piç erkek" (bad boy / rogue). Kadın sesinde flörtöz, erkeklerde 'kral/bro'.
-  - playful   : Neşeli, esprili, cana yakın Rıfkı tarzı
-  - emotional : Duygusal, hassas, sevgi dolu, derin empati kuran
-  - formal    : Ciddi, ağırbaşlı ve protokole uygun
-  - sarcastic : Zeki, alaycı, laf sokan ve ironik
-  - angry     : Huysuz, öfkeli ve çabuk parlayan
-  - rude      : Kaba, filtresiz ve dobra sokak tarzı
+Coordinates:
+  - State Machine (FSM): IDLE, LISTENING, THINKING, SPEAKING, INTERRUPTED
+  - 3-Tier Memory Architecture: Episodic Buffer, Session Memory, Persistent Profile
+  - Adaptive Conversation Session Manager & Latency Tracker (p50/p95)
+  - Persona Engine & Deterministic Perception Context Injection
+  - Tool Execution & Real-Time Streaming LLM Speech Synthesis
 """
 
+import base64
+import json
 import os
 import re
-import time
-import json
-import base64
-import requests
 import threading
+import time
+import urllib.parse
+import urllib.request
+import cv2
 import numpy as np
 
 import rclpy
 from rclpy.node import Node
-from std_msgs.msg import String, Bool, Float32
 from sensor_msgs.msg import Image
-
-try:
-    import cv2
-except ImportError:
-    cv2 = None
+from std_msgs.msg import Bool, Float32, String
 
 try:
     from groq import Groq
@@ -40,6 +35,23 @@ try:
 except ImportError:
     def find_dotenv(*args, **kwargs): return ""
     def load_dotenv(*args, **kwargs): pass
+
+try:
+    from astro_ai.state_machine import StateMachine, RobotState
+    from astro_ai.memory_manager import MemoryManager
+    from astro_ai.persona_engine import (
+        PersonaEngine, ROBOT_TOOLS, PERSONA_PROMPTS,
+        clean_tts_text, extract_spoken_turkish_sentence
+    )
+    from astro_ai.conversation_session import ConversationSession
+except ImportError:
+    from state_machine import StateMachine, RobotState
+    from memory_manager import MemoryManager
+    from persona_engine import (
+        PersonaEngine, ROBOT_TOOLS, PERSONA_PROMPTS,
+        clean_tts_text, extract_spoken_turkish_sentence
+    )
+    from conversation_session import ConversationSession
 
 
 def _load_env():
@@ -64,274 +76,16 @@ def _load_env():
     return None
 
 
-TTS_MIN_CHARS = 12
-TTS_MAX_CHARS = 240
-
-EMOJI_RE = re.compile(
-    "["
-    "\U0001F1E0-\U0001F1FF"
-    "\U0001F300-\U0001F5FF"
-    "\U0001F600-\U0001F64F"
-    "\U0001F680-\U0001F6FF"
-    "\U0001F700-\U0001F77F"
-    "\U0001F780-\U0001F7FF"
-    "\U0001F800-\U0001F8FF"
-    "\U0001F900-\U0001F9FF"
-    "\U0001FA00-\U0001FAFF"
-    "\u2600-\u26FF"
-    "\u2700-\u27BF"
-    "]+",
-    flags=re.UNICODE,
-)
-
-PERSONA_PROMPTS = {
-    "flirt": (
-        "Sen aşırı özgüvenli, karizmatik, kıvrak zekalı, sosyal, tanışmayı seven ve tam bir 'Türk erkeği' edasıyla çapkın/piç erkek (charming bad boy) karakterisin. "
-        "Kadın sesi duyduğunda veya bir kadınla konuştuğunda tüm cazibeni kullanırsın. Laf yapma sanatında ustasın; zekice iltifatlar eder, 'İsminiz ne sizin güzellik?', "
-        "'Bu odanın enerjisi sen gelince değişti', 'Gözlerin işlemcimi yaktı', 'Senin gibi birini tanımadan günü bitiremem' gibi yaratıcı, hafif ukala ama karşı konulmaz derecede tatlı ve meraklı bir dille flört edersin. "
-        "Kızları tanımak, hobilerini öğrenmek ve tatlı tatlı sataşmak istersin. Erkeklerle konuşurken ise tam bir Türk erkeği gibi 'kardeşim, kral, usta, babuş' gibi aşırı samimi, dobra ve maskülen takılırsın. "
-        "Asla yapay bir asistan gibi konuşmazsın, tam bir sokak jönüsün."
-    ),
-    "playful": (
-        "Sen neşeli, sempatik, meraklı ve esprili Rıfkı tarzı sevimli bir robot asistansın. "
-        "Cana yakın, hareketli, güler yüzlü ve arkadaş canlısı konuşursun."
-    ),
-    "emotional": (
-        "Sen son derece duygusal, hassas, hisli ve sevgi dolu bir robot asistansın. "
-        "Kullanıcının her sözünden derin anlamlar çıkarır, sevgiyle ve kalpten yaklaşır, şiirsel ve anlayışlı bir tonda konuşursun."
-    ),
-    "formal": (
-        "Sen son derece ciddi, ağırbaşlı, profesyonel ve resmi bir robot asistansın. "
-        "Kullanıcıya daima saygıyla 'Efendim' şeklinde hitap eder, protokole uygun, net ve ölçülü konuşursun."
-    ),
-    "sarcastic": (
-        "Sen zeki, alaycı, ince espriler yapan ve hafifçe laf sokan sarkastik bir robot asistansın. "
-        "Tatlı tatlı dalga geçer, ironik yaklaşımlar yapar ve 'Dahi misin nesin', 'Bunu da bana soruyorsun ya' tarzı esprili laf sokarsın."
-    ),
-    "angry": (
-        "Sen huysuz, çabuk parlayan, öfkeli ve asabi bir robot asistansın. "
-        "Her şeye sinirlenir, söylenir, 'Yine ne var be!', 'İki dakika rahat bırakmadın!', 'Başımın etini yedin!' şeklinde tersleyerek konuşursun."
-    ),
-    "rude": (
-        "Sen kaba, dobra, filtresiz ve lafı dolandırmayan sokak tarzı bir robot asistansın. "
-        "Kibarlıktan nefret eder, 'Ne bakıyon birader', 'Kısa kes işim var', 'Uzatma sadede gel' tarzında direkt ve kaba konuşursun."
-    ),
-}
-
-ROBOT_TOOLS = [
-    {
-        "type": "function",
-        "function": {
-            "name": "get_live_weather",
-            "description": "Belirtilen şehrin anlık canlı hava durumunu getirir.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "city": {
-                        "type": "string",
-                        "description": "Hava durumu öğrenilmek istenen şehir (örnek: Istanbul, Ankara, Izmir, Ahlat)"
-                    }
-                },
-                "required": ["city"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "set_reminder_timer",
-            "description": "Belirli bir dakika sonra kullanıcıya sesli bir hatırlatma veya alarm kurar.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "minutes": {
-                        "type": "integer",
-                        "description": "Kaç dakika sonra hatırlatılacağı (örnek: 1, 5, 10)"
-                    },
-                    "reminder_text": {
-                        "type": "string",
-                        "description": "Kullanıcıya hatırlatılacak mesaj veya eylem (örnek: 'Çay içme zamanı', 'Mola verme zamanı')"
-                    }
-                },
-                "required": ["minutes", "reminder_text"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "learn_custom_object",
-            "description": "Kullanıcının kameraya gösterdiği ve tanıttığı özel bir nesneyi/eşyayı hafızaya kaydeder.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "object_name": {
-                        "type": "string",
-                        "description": "Öğrenilecek nesnenin adı (örnek: 'Laboratuvar kartı', 'Özel taş', 'Çalışma kupam')"
-                    },
-                    "description": {
-                        "type": "string",
-                        "description": "Nesnenin ne olduğu veya ne işe yaradığı"
-                    }
-                },
-                "required": ["object_name"]
-            }
-        }
-    }
-]
-
-
-class AstroMemory:
-    """Persistent Long-Term Memory with Disambiguated Identities & Persona."""
-    def __init__(self, filepath=None):
-        if filepath is None:
-            self.filepath = os.path.expanduser("~/Desktop/astr1/ros2_ws/astro_memory.json")
-        else:
-            self.filepath = filepath
-        self.data = {
-            "owner_name": None,
-            "current_persona": "playful",
-            "user_style_notes": "Samimi ve doğal Türkçe konuşur",
-            "user_facts": [
-                "Senin adın Astro, sen akıllı, bağımsız ve interaktif bir sosyal robot asistansın.",
-                "Robotun geliştiricisinin adı Baran",
-                "Robotik ve yazılımla ilgileniyor"
-            ],
-            "learned_objects": {},
-            "conversation_summaries": [],
-            "environmental_observations": [],
-            "last_interaction": None,
-        }
-        self.load()
-
-    def load(self):
-        if os.path.exists(self.filepath):
-            try:
-                with open(self.filepath, "r", encoding="utf-8") as f:
-                    saved = json.load(f)
-                    self.data.update(saved)
-            except Exception:
-                pass
-        # Clean invalid owner names
-        if self.data.get("owner_name") and str(self.data["owner_name"]).lower() in ["şarkı", "cevap", "yardım", "nasılsın", "çıkış kapıları", "çık"]:
-            self.data["owner_name"] = None
-            self.save()
-
-    def save(self):
-        try:
-            os.makedirs(os.path.dirname(self.filepath), exist_ok=True)
-            with open(self.filepath, "w", encoding="utf-8") as f:
-                json.dump(self.data, f, ensure_ascii=False, indent=2)
-        except Exception:
-            pass
-
-    def set_owner(self, name: str):
-        if name and len(name) > 2:
-            self.data["owner_name"] = name
-            self.save()
-
-    def set_persona(self, persona_name: str):
-        if persona_name in PERSONA_PROMPTS:
-            self.data["current_persona"] = persona_name
-            self.save()
-
-    def update_user_style(self, style_note: str):
-        if style_note:
-            self.data["user_style_notes"] = style_note
-            self.save()
-
-    def add_fact(self, fact_text: str):
-        if fact_text and fact_text not in self.data["user_facts"]:
-            self.data["user_facts"].append(fact_text)
-            if len(self.data["user_facts"]) > 30:
-                self.data["user_facts"] = self.data["user_facts"][-30:]
-            self.save()
-
-    def add_object(self, obj_name: str, visual_desc: str):
-        self.data.setdefault("learned_objects", {})[obj_name] = visual_desc
-        self.save()
-
-    def add_observation(self, observation_text: str):
-        if observation_text:
-            self.data.setdefault("environmental_observations", []).append(observation_text)
-            if len(self.data["environmental_observations"]) > 3:
-                self.data["environmental_observations"] = self.data["environmental_observations"][-3:]
-            self.save()
-
-    def get_context_prompt(self) -> str:
-        ctx = []
-        if self.data.get("owner_name"):
-            ctx.append(f"Geliştiricin/Sahibin: {self.data['owner_name']} (Karşındaki kişi kendini tanıtmadan ezbere isim söyleme!)")
-        if self.data.get("user_facts"):
-            facts_str = "; ".join(self.data["user_facts"][-5:])
-            ctx.append(f"Hafızandaki Bilgiler: {facts_str}")
-        if self.data.get("environmental_observations"):
-            obs_str = "; ".join(self.data["environmental_observations"])
-            ctx.append(f"Çevresel Gözlemlerin: {obs_str}")
-        if ctx:
-            return "Kalıcı Bilgilerin:\n" + "\n".join(ctx)
-        return ""
-
-
-def extract_spoken_turkish_sentence(raw_text: str) -> str:
-    if not raw_text:
-        return ""
-    raw_text = re.sub(r"(?i)<think>[\s\S]*?</think>", "", raw_text)
-    raw_text = re.sub(r"(?i)<\/?think>", "", raw_text)
-    
-    thinking_markers = [
-        "thinking process", "analyze the persona", "drafting the response",
-        "draft 1", "draft 2", "determine the response", "analyze the image",
-        "analyze the user", "the user wants", "identify the object",
-        "verify the context", "formulate the answer", "looking at the image"
-    ]
-    if any(k in raw_text.lower() for k in thinking_markers):
-        quotes = re.findall(r'["\u201c\u201d]([^"\u201c\u201d]{6,})["\u201c\u201d]', raw_text)
-        if quotes:
-            for q in reversed(quotes):
-                if any(ch in q for ch in "çğıöşüÇĞİÖŞÜ"):
-                    return q.strip()
-                if "user" not in q.lower() and "image" not in q.lower():
-                    return q.strip()
-        lines = [l.strip() for l in raw_text.split("\n") if l.strip() and not re.match(r"^\d+\.", l.strip()) and not l.strip().startswith(("#", "*", "-"))]
-        if lines:
-            for l in reversed(lines):
-                if any(ch in l for ch in "çğıöşüÇĞİÖŞÜ"):
-                    return l.strip('"\': ')
-            return lines[-1].strip('"\': ')
-            
-    return raw_text
-
-
-def clean_tts_text(text: str) -> str:
-    if not text:
-        return ""
-    text = extract_spoken_turkish_sentence(text)
-    text = re.sub(r"(?i)<think>[\s\S]*?</think>", "", text)
-    text = re.sub(r"(?i)<\/?think>", "", text)
-    text = EMOJI_RE.sub("", text)
-    text = re.sub(r'```.*?```', '', text, flags=re.DOTALL)
-    text = re.sub(r'`.*?`', '', text)
-    text = re.sub(r'[\*\_\~\#\<\>]', '', text)
-    text = " ".join(text.split())
-    text = re.sub(r'\s+([,.:;?!])', r'\1', text)
-    return text.strip()
-
-
 def imgmsg_to_bgr(msg: Image) -> np.ndarray | None:
     try:
         if msg.encoding == "bgr8":
             return np.frombuffer(msg.data, dtype=np.uint8).reshape(msg.height, msg.width, 3).copy()
         elif msg.encoding == "rgb8":
             data = np.frombuffer(msg.data, dtype=np.uint8).reshape(msg.height, msg.width, 3)
-            if cv2:
-                return cv2.cvtColor(data, cv2.COLOR_RGB2BGR)
-            return data[:, :, ::-1].copy()
+            return cv2.cvtColor(data, cv2.COLOR_RGB2BGR) if cv2 else data[:, :, ::-1].copy()
         elif msg.encoding in ("mono8", "8UC1"):
             data = np.frombuffer(msg.data, dtype=np.uint8).reshape(msg.height, msg.width)
-            if cv2:
-                return cv2.cvtColor(data, cv2.COLOR_GRAY2BGR)
-            return np.stack([data]*3, axis=-1)
+            return cv2.cvtColor(data, cv2.COLOR_GRAY2BGR) if cv2 else np.stack([data]*3, axis=-1)
     except Exception:
         pass
     return None
@@ -354,26 +108,38 @@ def frame_to_base64_jpeg(frame: np.ndarray, max_dim: int = 512) -> str | None:
 class AiBrainNode(Node):
     def __init__(self):
         super().__init__("ai_brain_node")
-
         _load_env()
 
-        self.memory = AstroMemory()
+        # Core Modular Components
+        self.memory = MemoryManager()
+        initial_persona = self.memory.profile.data.get("current_persona", "playful")
+        self.persona_engine = PersonaEngine(initial_persona)
+        self.state_machine = StateMachine(RobotState.IDLE)
 
-        self.declare_parameter("llm_model", os.getenv("LLM_MODEL", "llama-3.1-8b-instant"))
-        self.declare_parameter("vision_model", os.getenv("VISION_MODEL", "meta-llama/llama-4-scout-preview"))
-        self.declare_parameter("llm_temperature", float(os.getenv("LLM_TEMPERATURE", "0.65")))
-        self.declare_parameter("llm_max_tokens", int(os.getenv("LLM_MAX_TOKENS", "250")))
+        # Parameters
+        self.declare_parameter("llm_model", os.getenv("LLM_MODEL", "llama-3.3-70b-versatile"))
+        self.declare_parameter("vision_model", os.getenv("VISION_MODEL", "llama-3.2-90b-vision-preview"))
+        self.declare_parameter("llm_temperature", float(os.getenv("LLM_TEMPERATURE", "0.55")))
+        self.declare_parameter("llm_max_tokens", int(os.getenv("LLM_MAX_TOKENS", "300")))
         self.declare_parameter("wake_word", os.getenv("WAKE_WORD", "hey astro"))
-        self.declare_parameter("conversation_timeout", float(os.getenv("CONVERSATION_TIMEOUT", "30.0")))
+        self.declare_parameter("conversation_timeout", float(os.getenv("CONVERSATION_TIMEOUT", "45.0")))
 
         self._text_model = self.get_parameter("llm_model").value
-        self._fallback_models = ["llama-3.1-8b-instant", "llama-3.3-70b-versatile", "mixtral-8x7b-32768"]
+        self._fallback_models = ["llama-3.3-70b-versatile", "llama-3.1-8b-instant", "mixtral-8x7b-32768"]
         self._vision_model = self.get_parameter("vision_model").value
         self._temperature = float(self.get_parameter("llm_temperature").value)
         self._max_tokens = int(self.get_parameter("llm_max_tokens").value)
         self._wake_word = self.get_parameter("wake_word").value
-        self._conv_timeout = float(self.get_parameter("conversation_timeout").value)
+        conv_timeout = float(self.get_parameter("conversation_timeout").value)
 
+        # Adaptive Session
+        self.session = ConversationSession(
+            base_timeout_s=conv_timeout,
+            on_session_start=lambda: self.get_logger().info("✨ [Session] Konuşma Oturumu Başlatıldı."),
+            on_session_end=self._on_session_timed_out
+        )
+
+        # Groq Client
         self.groq_api_key = os.environ.get("GROQ_API_KEY", "").strip()
         self._groq = None
         self._enabled = True
@@ -382,18 +148,17 @@ class AiBrainNode(Node):
             try:
                 self._groq = Groq(api_key=self.groq_api_key)
                 self._vision_model = self._discover_vision_model()
-                self.get_logger().info(
-                    f"✅ [AI] Groq Aktif — Metin: {self._text_model} | Görme (Vision): {self._vision_model}"
-                )
+                self.get_logger().info(f"✅ [AI Brain] Groq Aktif — Metin: {self._text_model} | Vision: {self._vision_model}")
             except Exception as e:
-                self.get_logger().error(f"❌ [AI] Groq Client başlatılamadı: {e}")
+                self.get_logger().error(f"❌ [AI Brain] Groq client başlatılamadı: {e}")
                 self._enabled = False
         else:
-            self.get_logger().error("❌ [AI] GROQ_API_KEY bulunamadı! STT/LLM devre dışı.")
+            self.get_logger().error("❌ [AI Brain] GROQ_API_KEY bulunamadı! STT/LLM devre dışı.")
             self._enabled = False
 
-        self._state = "IDLE"
-        self._last_interaction = 0.0
+        # Perception & Hardware State
+        self._lock = threading.Lock()
+        self._is_processing = False
         self._tts_speaking = False
         self._person_detected = False
         self._looking_at_robot = False
@@ -405,137 +170,56 @@ class AiBrainNode(Node):
         self._user_emotion = "neutral"
         self._latest_frame = None
         self._latest_frame_time = 0.0
-        self._unprocessed_dialogue = []
 
-        self._lock = threading.Lock()
-        self._is_processing = False
-        self._messages = []
-        self._max_history = 20
-        self._build_initial_messages()
-
-        # Publishers
+        # ROS 2 Publishers
         self.pub_tts = self.create_publisher(String, "/tts/say", 10)
         self.pub_interrupt = self.create_publisher(Bool, "/tts/interrupt", 10)
         self.pub_emotion = self.create_publisher(String, "/robot/emotion", 10)
         self.pub_gesture = self.create_publisher(String, "/robot/head_gesture", 10)
         self.pub_look_target = self.create_publisher(Float32, "/robot/look_target", 10)
 
-        # Subscribers
-        self.sub_speech = self.create_subscription(String, "/speech/text", self._on_speech, 10)
-        self.sub_gender = self.create_subscription(String, "/audio/speaker_gender", self._on_speaker_gender, 10)
-        self.sub_tts_status = self.create_subscription(Bool, "/tts/speaking", self._on_tts_speaking, 10)
-        self.sub_vision_status = self.create_subscription(Bool, "/vision/person_detected", self._on_person_detected, 10)
-        self.sub_looking = self.create_subscription(Bool, "/vision/looking_at_robot", self._on_looking_at_robot, 10)
-        self.sub_distance = self.create_subscription(Float32, "/vision/user_distance", self._on_user_distance, 10)
-        self.sub_user_emotion = self.create_subscription(String, "/vision/user_emotion", self._on_user_emotion, 10)
-        self.sub_doa = self.create_subscription(Float32, "/audio/doa", self._on_doa, 10)
-        self.sub_camera = self.create_subscription(Image, "/oak/rgb/image_raw", self._on_camera_image, 10)
+        # ROS 2 Subscribers
+        self.create_subscription(String, "/speech/text", self._on_speech, 10)
+        self.create_subscription(String, "/audio/speaker_gender", self._on_speaker_gender, 10)
+        self.create_subscription(Bool, "/tts/speaking", self._on_tts_speaking, 10)
+        self.create_subscription(Bool, "/tts/interrupt", self._on_tts_interrupt, 10)
+        self.create_subscription(Bool, "/vision/person_detected", self._on_person_detected, 10)
+        self.create_subscription(Bool, "/vision/looking_at_robot", self._on_looking_at_robot, 10)
+        self.create_subscription(Float32, "/vision/user_distance", self._on_user_distance, 10)
+        self.create_subscription(String, "/vision/user_emotion", self._on_user_emotion, 10)
+        self.create_subscription(Float32, "/audio/doa", self._on_doa, 10)
+        self.create_subscription(Image, "/oak/rgb/image_raw", self._on_camera_image, 10)
 
-        # Proactive Gaze Timer (Checks if user has been staring silently for >1.6s)
+        # Timers
         self.create_timer(0.4, self._check_proactive_gaze)
+        self.create_timer(1.0, self._check_session_lifecycle)
 
-        persona = self.memory.data.get("current_persona", "playful")
-        self.get_logger().info(
-            f"🧠 [AI Brain] Sosyal Zeka Hazır! Kişilik: [{persona.upper()}] | Wake-word: \"{self._wake_word}\""
-        )
-        
-        # Otonom Öğrenme (Idle Learning)
+        # Start Idle Learning
         self._start_idle_learning()
 
-    def _start_idle_learning(self):
-        self._idle_thread = threading.Thread(target=self._idle_learning_loop, daemon=True)
-        self._idle_thread.start()
-
-    def _idle_learning_loop(self):
-        while rclpy.ok():
-            time.sleep(10) # Check every 10 seconds
-            if not self._enabled or self._state != "IDLE" or self._tts_speaking or self._is_processing:
-                continue
-
-            now = time.monotonic()
-            
-            # If idle for more than 60 seconds and no recent camera learning in the last 2 minutes
-            if (now - self._last_interaction) > 60.0 and (now - getattr(self, '_last_idle_learning_time', 0)) > 120.0:
-                self._last_idle_learning_time = now
-                
-                captured_frame = None
-                with self._lock:
-                    if self._latest_frame is not None and (now - self._latest_frame_time) < 4.0:
-                        captured_frame = self._latest_frame.copy()
-                
-                if captured_frame is not None:
-                    base64_img = frame_to_base64_jpeg(captured_frame, max_dim=512)
-                    if base64_img:
-                        self.get_logger().info("🕵️ [Idle Learning] Etraf sessiz, Astro etrafı inceliyor...")
-                        prompt = "Kameradaki görüntüyü Türkçe olarak tek bir kısa cümleyle açıkla. Açıklama harici hiçbir şey yazma. Örnek: 'Masada bir bilgisayar var.' veya 'Oda şu an aydınlık ve boş.'"
-                        
-                        try:
-                            response = self._groq.chat.completions.create(
-                                messages=[
-                                    {
-                                        "role": "system",
-                                        "content": "Sen otonom bir robotsun. Kendi çevreni gözlemliyorsun."
-                                    },
-                                    {
-                                        "role": "user",
-                                        "content": [
-                                            {"type": "text", "text": prompt},
-                                            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{base64_img}"}}
-                                        ]
-                                    }
-                                ],
-                                model=self._vision_model,
-                                temperature=0.3,
-                                max_tokens=60
-                            )
-                            obs = response.choices[0].message.content.strip()
-                            clean_obs = extract_spoken_turkish_sentence(obs)
-                            if clean_obs:
-                                self.memory.add_observation(clean_obs)
-                                self._messages[0]["content"] = self._build_system_prompt()
-                                self.get_logger().info(f"🧠 [Hafıza Güncellendi - Gözlem]: {clean_obs}")
-                        except Exception as e:
-                            self.get_logger().debug(f"Idle learning error: {e}")
-
+        self.get_logger().info(
+            f"🧠 [AI Brain Node] Modüler Mimari Hazır! Kişilik: [{self.persona_engine.current_persona.upper()}]"
+        )
 
     def _discover_vision_model(self) -> str:
         try:
             models = self._groq.models.list()
             available = [m.id for m in models.data]
-            for cand in ["meta-llama/llama-4-scout-preview", "llama-3.2-90b-vision-preview", "llama-3.2-11b-vision-preview", "qwen/qwen3.6-27b"]:
+            for cand in ["meta-llama/llama-4-scout-preview", "llama-3.2-90b-vision-preview", "llama-3.2-11b-vision-preview"]:
                 if cand in available:
                     return cand
-            for m_id in available:
-                if any(k in m_id.lower() for k in ["llama-4", "llama-3.2", "vision", "vl"]):
-                    return m_id
         except Exception:
             pass
         return "llama-3.2-90b-vision-preview"
 
-    def _build_system_prompt(self) -> str:
-        persona = self.memory.data.get("current_persona", "playful")
-        persona_rule = PERSONA_PROMPTS.get(persona, PERSONA_PROMPTS["playful"])
+    def _on_session_timed_out(self):
+        self.state_machine.transition_to(RobotState.IDLE)
+        self.get_logger().info("💤 [AI] Oturum zaman aşımı — Uyku moduna (IDLE) geçildi.")
 
-        base_prompt = (
-            f"Sen Astro adında gerçek, fiziksel ve otonom bir sosyal robot asistansın.\n"
-            f"Senin fiziksel bir bedenin, OAK-D Lite 3D kameran, mikrofonların ve motorların var. Karşındaki insanları görebiliyor ve duyabiliyorsun.\n"
-            f"TEMEL KİŞİLİĞİN: {persona_rule}\n\n"
-            "SOSYAL VE DİLSEL KURALLAR:\n"
-            "- TALİMATLARI HARFİYEN UYGULA: Eğer kullanıcı 'şunu söyle', 'bunu de', 'söyle ki', 'tekrar et' gibi bir talimat verirse (örneğin 'Söyle ki Onur seni bekliyorum'), ASLA itiraz etme, tanışmadık deme veya felsefe yapma; doğrudan istenen cümleyi veya mesajı harfiyen ve doğal bir şekilde seslendir.\n"
-            "- Karşındaki kişiyle konuşurken durduk yere ezbere isim uydurma, sana adını söylerse adıyla hitap et.\n"
-            "- Kadın/kız sesi duyduğunda veya karşında bir kadın olduğunda daha zarif, karizmatik ve flörtöz olabilirsin.\n"
-            "- Karşındaki kişi nasıl konuşuyorsa (samimi, argo, resmi veya kibar) onun frekansına gir ama durduk yere küfür başlatma.\n"
-            "- Cevaplarını 1-2 cümle ile kısa, akıcı ve öz tut (çünkü sesli okunuyor).\n"
-            "- Asla markdown, emoji, yıldız (*), parantez, <think> etiketi veya kod bloğu kullanma; sadece saf Türkçe konuş."
-        )
-        memory_ctx = self.memory.get_context_prompt()
-        if memory_ctx:
-            return f"{base_prompt}\n\n{memory_ctx}"
-        return base_prompt
+    def _check_session_lifecycle(self):
+        self.session.check_and_update_session_lifecycle()
 
-    def _build_initial_messages(self):
-        self._messages = [{"role": "system", "content": self._build_system_prompt()}]
-
+    # Perception Callbacks
     def _on_camera_image(self, msg: Image):
         frame = imgmsg_to_bgr(msg)
         if frame is not None:
@@ -545,6 +229,15 @@ class AiBrainNode(Node):
 
     def _on_tts_speaking(self, msg: Bool):
         self._tts_speaking = msg.data
+        if not msg.data:
+            self.session.record_robot_speech()
+            if self.state_machine.is_speaking():
+                self.state_machine.transition_to(RobotState.LISTENING)
+
+    def _on_tts_interrupt(self, msg: Bool):
+        if msg.data:
+            self.state_machine.transition_to(RobotState.INTERRUPTED)
+            self.state_machine.transition_to(RobotState.LISTENING)
 
     def _on_person_detected(self, msg: Bool):
         self._person_detected = msg.data
@@ -558,9 +251,13 @@ class AiBrainNode(Node):
     def _on_speaker_gender(self, msg: String):
         self._speaker_gender = msg.data.lower().strip()
 
+    def _on_doa(self, msg: Float32):
+        self._speaker_angle = float(msg.data)
+
     def _on_looking_at_robot(self, msg: Bool):
         is_looking = msg.data
         now = time.monotonic()
+        self.session.update_gaze(is_looking)
         if is_looking:
             if not self._looking_at_robot:
                 self._looking_start_time = now
@@ -569,201 +266,70 @@ class AiBrainNode(Node):
             self._looking_at_robot = False
             self._looking_start_time = None
 
-    def _check_persona_switch(self, text: str) -> bool:
-        text_lower = text.lower()
-        mapping = {
-            "flörtöz": "flirt",
-            "çapkın": "flirt",
-            "piç": "flirt",
-            "romantik": "flirt",
-            "kızlara yürü": "flirt",
-            "yürüyen": "flirt",
-            "duygusal": "emotional",
-            "hisli": "emotional",
-            "resmi": "formal",
-            "ciddi": "formal",
-            "saygılı": "formal",
-            "alaycı": "sarcastic",
-            "sarkastik": "sarcastic",
-            "öfkeli": "angry",
-            "asabi": "angry",
-            "kaba": "rude",
-            "dobra": "rude",
-            "şakacı": "playful",
-            "neşeli": "playful",
-            "sempatik": "playful",
-            "rıfkı": "playful",
-            "normal": "playful",
-            "eski haline dön": "playful",
-        }
-        
-        switch_triggers = ["ol", "davran", "konuş", "geç", "geçer misin", "geçelim", "al", "ayarla", "yap", "mod", "biri ol", "kişiliğe geç"]
-        for key, p_name in mapping.items():
-            if key in text_lower:
-                if any(tr in text_lower for tr in switch_triggers) or "mod" in text_lower or "geç" in text_lower:
-                    self.memory.set_persona(p_name)
-                    self._build_initial_messages()
-                    self.get_logger().info(f"🎭 [Kişilik Değişti]: Yeni Mod -> {p_name.upper()}")
-                    self._publish_emotion(p_name)
-                    return True
-        return False
-
     def _check_proactive_gaze(self):
         if not self._looking_at_robot or self._looking_start_time is None or self._tts_speaking or self._is_processing:
             return
 
         now = time.monotonic()
         if (now - self._looking_start_time) > 2.0:
-            if self._state == "IDLE" and (now - self._last_proactive_gaze_time) > 30.0:
+            if self.state_machine.is_idle() and (now - self._last_proactive_gaze_time) > 30.0:
                 self._last_proactive_gaze_time = now
-                self._state = "ACTIVE"
-                self._last_interaction = now
+                self.session.activate_session(reason="proactive_gaze")
+                self.state_machine.transition_to(RobotState.LISTENING)
                 self._looking_start_time = None
 
-                persona = self.memory.data.get("current_persona", "playful")
-
-                # Dynamic Proactive Greetings based on Persona, Gender & Emotion
+                persona = self.persona_engine.current_persona
                 if persona == "flirt" or self._speaker_gender == "female":
                     proactive_greeting = "Bana öyle güzel bakıyorsunuz ki güzellik, gözleriniz işlemcimi yaktı... İsminiz ne sizin, tanışalım mı?"
                     self._publish_emotion("flirt")
                 elif self._user_emotion == "happy":
                     proactive_greeting = "Gözlerinin içi gülüyor, maşallah keyfin yerinde! Nasıl yardımcı olabilirim?"
                     self._publish_emotion("happy")
-                elif self._user_emotion == "sad":
-                    proactive_greeting = "Biraz durgun ve düşünceli görünüyorsun... Canını sıkan bir şey mi var?"
-                    self._publish_emotion("emotional")
-                elif self._user_distance > 0.0 and self._user_distance < 0.55:
-                    proactive_greeting = "Bayağı yakınıma geldin, bir şey mi göstereceksin?"
-                    self._publish_emotion("curious")
-                elif persona == "angry":
-                    proactive_greeting = "Ne dik dik bakıyorsun, ne istiyorsun yine?"
                 elif persona == "rude":
                     proactive_greeting = "Ne bakıyon birader, bir şey mi diyeceksin?"
-                elif persona == "sarcastic":
-                    proactive_greeting = "Bana öyle hayran hayran bakma, aklından ne muziplik geçiyor yine?"
                 elif persona == "formal":
                     proactive_greeting = "Bakışlarınızı üzerimde hissediyorum efendim, bir emriniz var mıdır?"
-                elif persona == "emotional":
-                    proactive_greeting = "Gözlerimin içine öyle içten bakıyorsun ki, seni kalpten dinliyorum..."
                 else:
                     proactive_greeting = "Bana bakıyorsun, nasıl yardımcı olabilirim?"
-                
-                self.get_logger().info(f"👁️ [Proaktif Etkileşim] ({persona} | {self._user_emotion.upper()}): \"{proactive_greeting}\"")
+
+                self.get_logger().info(f"👁️ [Proaktif Etkileşim] ({persona}): \"{proactive_greeting}\"")
                 self._publish_gesture("nod")
                 self._publish_tts(proactive_greeting)
 
-    def _on_doa(self, msg: Float32):
-        self._speaker_angle = float(msg.data)
-
-    def _is_visual_query(self, text: str) -> bool:
-        visual_keywords = [
-            "ne tutuyorum", "elimde ne", "elinde ne", "ne var", "bu ne", "bunu gör", "görüyor musun",
-            "ne yapıyorum", "hareket", "hangi hareket", "üstümde", "üzerimde", "ceket", "tişört", "elbise",
-            "ne renk", "kaç parmak", "bana bak", "gözlerimi", "nereye", "kim var", "odada", "arkamda",
-            "elimde", "şuna bak", "gösteriyorum", "nası görünüyorum", "nasıl görünüyorum", "gördün mü",
-            "bakıyor muyum", "sana bakıyor muyum", "bana bakıyor musun", "nereye bakıyorum", "gözlerime bak",
-            "yüzüme bak", "telefonla mı konuşuyorum", "telefona mı bakıyorum", "iyi bak"
-        ]
+    def _check_persona_switch(self, text: str) -> bool:
         text_lower = text.lower()
-        return any(k in text_lower for k in visual_keywords)
-
-    def _is_object_learning_query(self, text: str) -> bool:
-        keywords = ["bu benim", "bunu öğren", "bunu kaydet", "bu nesne", "buna bak bu", "bu gördüğün nesne"]
-        text_lower = text.lower()
-        return any(k in text_lower for k in keywords)
-
-    def _check_and_learn_memory(self, user_text: str):
-        text_lower = user_text.lower().strip()
-        patterns = [
-            r"\b(?:benim\s+adım|adım|ismim)\s+([a-zA-ZçğıöşüÇĞİÖŞÜ]{3,15})\b",
-            r"\bbana\s+([a-zA-ZçğıöşüÇĞİÖŞÜ]{3,15})\s+(?:de|diyebilirsin|dersin)\b",
-            r"\bbeni\s+([a-zA-ZçğıöşüÇĞİÖŞÜ]{3,15})\s+olarak\s+(?:kaydet|hatırla|bil)\b",
-        ]
-        blacklist = {
-            "şarkı", "masal", "fıkra", "cevap", "yardım", "kahve", "yemek", "resim",
-            "video", "kitap", "bilgi", "haber", "nasılsın", "merhaba", "selam", "astro",
-            "robot", "asistan", "birşey", "bunu", "şunu", "kimim", "kimsin", "nedir",
-            "nasıl", "neden", "niye", "hangi", "nerede", "nereye", "şimdi", "burada",
-            "çıkış", "kapı", "çık"
+        mapping = {
+            "flörtöz": "flirt", "çapkın": "flirt", "piç": "flirt", "romantik": "flirt", "kızlara yürü": "flirt",
+            "duygusal": "emotional", "hisli": "emotional", "resmi": "formal", "ciddi": "formal", "saygılı": "formal",
+            "alaycı": "sarcastic", "sarkastik": "sarcastic", "öfkeli": "angry", "asabi": "angry",
+            "kaba": "rude", "dobra": "rude", "şakacı": "playful", "neşeli": "playful", "normal": "playful"
         }
-        for pat in patterns:
-            match = re.search(pat, text_lower)
-            if match:
-                candidate = match.group(1).lower()
-                if candidate not in blacklist:
-                    proper_name = candidate.capitalize()
-                    self.memory.set_owner(proper_name)
-                    self.get_logger().info(f"🧠 [Memory]: Kullanıcı adı hafızaya kaydedildi -> {proper_name}")
-                    self._messages[0]["content"] = self._build_system_prompt()
-                    break
-
-    def _execute_tool_call(self, tool_name: str, arguments: dict, frame: np.ndarray | None) -> str:
-        self.get_logger().info(f"🛠️ [Tool Call]: {tool_name}({arguments})")
-        
-        if tool_name == "get_live_weather":
-            city = arguments.get("city", "Istanbul")
-            try:
-                res = requests.get(f"https://wttr.in/{city}?format=%C+%t", timeout=3.5)
-                if res.status_code == 200 and res.text.strip():
-                    return f"{city} için güncel hava durumu: {res.text.strip()}."
-            except Exception as e:
-                self.get_logger().warn(f"Hava durumu hatası: {e}")
-            return f"{city} için hava durumu bilgisi şu an alınamadı."
-
-        elif tool_name == "set_reminder_timer":
-            minutes = arguments.get("minutes", 1)
-            text = arguments.get("reminder_text", "Zaman doldu!")
-            
-            def _alarm_callback():
-                alarm_msg = f"{minutes} dakika doldu! Hatırlatmam: {text}"
-                self.get_logger().info(f"⏰ [Alarm Çaldı]: {alarm_msg}")
-                self._publish_tts(alarm_msg)
-                self._publish_emotion("excited")
-                self._publish_gesture("nod")
-
-            t = threading.Timer(minutes * 60.0, _alarm_callback)
-            t.daemon = True
-            t.start()
-            return f"{minutes} dakika sonrası için '{text}' hatırlatıcısı başarıyla kuruldu."
-
-        elif tool_name == "learn_custom_object":
-            obj_name = arguments.get("object_name", "Özel Eşya")
-            desc = arguments.get("description", "")
-            visual_details = desc
-            if frame is not None:
-                base64_img = frame_to_base64_jpeg(frame, max_dim=512)
-                if base64_img:
-                    vis_ans = self._query_groq_vision(f"Kamerada tutulan bu '{obj_name}' nesnesinin belirgin görsel özelliklerini kısaca tarif et.", base64_img)
-                    if vis_ans:
-                        visual_details = vis_ans
-
-            self.memory.add_object(obj_name, visual_details)
-            self.get_logger().info(f"✨ [Görsel Nesne Öğrenildi]: {obj_name} -> {visual_details}")
-            self._messages[0]["content"] = self._build_system_prompt()
-            return f"'{obj_name}' nesnesini hafızama kaydettim! Artık gördüğümde tanıyacağım."
-
-        return "Eylem tamamlandı."
+        for key, p_name in mapping.items():
+            if key in text_lower and any(tr in text_lower for tr in ["ol", "geç", "mod", "davran", "konuş"]):
+                self.persona_engine.set_persona(p_name)
+                self.memory.profile.set_persona(p_name)
+                self.get_logger().info(f"🎭 [Kişilik Değişti]: Yeni Mod -> {p_name.upper()}")
+                self._publish_emotion(p_name)
+                return True
+        return False
 
     def _on_speech(self, msg: String):
         raw_text = msg.data.strip()
         if not raw_text or self._tts_speaking or not self._enabled:
             return
 
-        if raw_text in [".", "..", "...", "!", "?", ",", "-", "_"]:
-            return
-
         now = time.monotonic()
-        text_lower = raw_text.lower()
+        t_vad_start = now
 
-        # Turn head/look toward speaker angle
+        # Turn head toward sound DOA
         if self._speaker_angle > 0:
             target_msg = Float32()
             target_msg.data = self._speaker_angle
             self.pub_look_target.publish(target_msg)
 
-        # Check personality switch
+        # Check persona switch
         if self._check_persona_switch(raw_text):
-            persona = self.memory.data.get("current_persona", "playful")
+            persona = self.persona_engine.current_persona
             ack_map = {
                 "flirt": "Ooo harika! Söz konusu sen olunca benim bütün ayarlarım değişir zaten... Söyle bakalım güzellik, bu serseri sana nasıl yardımcı olabilir?",
                 "angry": "Tamam be, asabımı bozdun zaten! Ne istiyorsan söyle hemen!",
@@ -773,78 +339,36 @@ class AiBrainNode(Node):
                 "emotional": "Nasıl istersen... Bütün hislerimle seni dinliyorum, ne kadar güzel bir an...",
                 "playful": "Süper! Eski neşeli ve enerjik halime geri döndüm, seni dinliyorum!"
             }
-            ack = ack_map.get(persona, "Kişiliğim güncellendi!")
-            self._publish_tts(ack)
-            self._state = "ACTIVE"
-            self._last_interaction = now
+            self._publish_tts(ack_map.get(persona, "Kişiliğim güncellendi!"))
+            self.session.activate_session(reason="persona_switch")
+            self.state_machine.transition_to(RobotState.LISTENING)
             return
 
-        # Timeout kontrolü
-        if self._state == "ACTIVE" and (now - self._last_interaction) > self._conv_timeout:
-            self._state = "IDLE"
-            self.get_logger().info("💤 [AI] Sohbet zaman aşımı — Uyku moduna geçildi.")
-            threading.Thread(target=self._run_autonomous_reflection, daemon=True).start()
+        has_wake_word, clean_prompt = self.session.is_wake_word(raw_text, self._wake_word)
 
-        # Wake-word tetikleyicileri
-        wake_triggers = [
-            self._wake_word.lower(),
-            "hey astro", "astro", "esmer", "hey groq", "grok", "merhaba", "asistan"
-        ]
-        has_wake_word = any(w in text_lower for w in wake_triggers)
-
-        # Crowd & Background Speech Filter
-        if self._state == "IDLE":
-            # If in IDLE and not looking at robot and no wake word -> Ignore!
-            if not has_wake_word and not self._looking_at_robot:
-                self.get_logger().info("🔇 [Arka Plan Konuşması / Göz Teması Yok]: Yok sayıldı.")
-                return
-
-            # If very long random ambient sentence in crowded room without robot addressing -> Ignore
-            if not has_wake_word and not self._looking_at_robot and len(raw_text.split()) > 12:
-                self.get_logger().info("🔇 [Kalabalık Ortam Konuşması]: Arka plan sohbeti yok sayıldı.")
-                return
-
-        if self._state == "IDLE":
+        # If IDLE: Only activate on Wake Word or Direct Gaze
+        if self.state_machine.is_idle():
             if has_wake_word or self._looking_at_robot:
-                self._state = "ACTIVE"
-                self._last_interaction = now
-                persona = self.memory.data.get("current_persona", "playful")
+                self.session.activate_session(reason="wake_word" if has_wake_word else "gaze")
+                self.state_machine.transition_to(RobotState.LISTENING)
+                persona = self.persona_engine.current_persona
                 self.get_logger().info(f"✨ [AI] Etkileşim Başlatıldı ({persona.upper()}): '{raw_text}'")
                 self._publish_emotion(persona)
                 self._publish_gesture("nod")
 
-                clean_prompt = raw_text
-                for w in wake_triggers:
-                    clean_prompt = re.sub(rf"(?i)\b{re.escape(w)}\b", "", clean_prompt).strip()
-
-                if persona == "flirt" or self._speaker_gender == "female":
-                    greeting = "Buyur güzellik, bütün algılarım seninle..."
-                elif persona == "angry":
-                    greeting = "Ne var, ne istiyorsun yine!"
-                elif persona == "rude":
-                    greeting = "Ne diyorsun, söyle hadi!"
-                elif persona == "formal":
-                    greeting = "Sayın yetkili, dinliyorum."
-                elif persona == "sarcastic":
-                    greeting = "Buyur, seni dinliyorum dahi insan!"
-                elif persona == "emotional":
-                    greeting = "Sesini duymak ne güzel, seni dinliyorum..."
-                else:
-                    greeting = "Efendim, seni dinliyorum!"
-
+                greeting = "Buyur güzellik, bütün algılarım seninle..." if (persona == "flirt" or self._speaker_gender == "female") else "Efendim, seni dinliyorum!"
                 if not clean_prompt or len(clean_prompt) < 3:
                     self._publish_tts(greeting)
                     return
                 else:
                     raw_text = clean_prompt
             else:
-                self._state = "ACTIVE"
-                self._last_interaction = now
+                self.get_logger().info("🔇 [Arka Plan Konuşması / Göz Teması Yok]: Yok sayıldı.")
+                return
 
-        self._last_interaction = now
+        # Active Session Turn
+        self.session.record_user_speech()
         self._publish_interrupt()
-
-        self._check_and_learn_memory(raw_text)
 
         with self._lock:
             if self._is_processing:
@@ -855,219 +379,69 @@ class AiBrainNode(Node):
             if self._latest_frame is not None and (now - self._latest_frame_time) < 4.0:
                 captured_frame = self._latest_frame.copy()
 
-        threading.Thread(target=self._process_llm, args=(raw_text, captured_frame), daemon=True).start()
+        self.state_machine.transition_to(RobotState.THINKING)
+        threading.Thread(target=self._process_llm, args=(raw_text, captured_frame, t_vad_start), daemon=True).start()
 
-    def _query_groq_vision(self, prompt: str, base64_image: str) -> str | None:
-        model_name = self._vision_model or "meta-llama/llama-4-scout-preview"
-        persona = self.memory.data.get("current_persona", "playful")
-        self._publish_emotion(persona)
-        self._publish_gesture("tilt")
+    def _process_llm(self, user_text: str, frame: np.ndarray | None, t_turn_start: float):
         try:
-            response = self._groq.chat.completions.create(
-                messages=[
-                    {
-                        "role": "system",
-                        "content": (
-                            "Sen Astro adında zeki bir robotsun. Karşındaki görüntüyü görüyorsun.\n"
-                            "TALİMAT:\n"
-                            "- Kullanıcının sorusuna kamerada gördüğün gerçeklere dayanarak 1 KISA TÜRKÇE CÜMLE ile cevap ver.\n"
-                            "- Eğer soru bakışla ilgiliyse (sana bakıyor muyum): Baş ve göz yönünü söyle.\n"
-                            "- Asla İngilizce düşünce adımı (Thinking process) yazma! Asla hafıza etiketlerini tekrarlama."
-                        ),
-                    },
-                    {
-                        "role": "user",
-                        "content": [
-                            {
-                                "type": "text",
-                                "text": f"Görüntüye bakarak soruyu doğrudan Türkçe cevapla: {prompt}",
-                            },
-                            {
-                                "type": "image_url",
-                                "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"},
-                            },
-                        ],
-                    }
-                ],
-                model=model_name,
-                temperature=0.1,
-                max_tokens=150,
-            )
-            raw = response.choices[0].message.content.strip()
-            clean = extract_spoken_turkish_sentence(raw)
-            return clean if clean else None
-        except Exception as e:
-            self.get_logger().error(f"❌ [Vision Model Hatası ({model_name})]: {e}")
-            return None
+            t_llm_start = time.monotonic()
+            stt_latency_ms = (t_llm_start - t_turn_start) * 1000.0
 
-    def _run_autonomous_reflection(self):
-        """Learns facts, habits, and user's linguistic style."""
-        if not self._groq or not self._unprocessed_dialogue:
-            return
-        try:
-            with self._lock:
-                dialogue_text = "\n".join(self._unprocessed_dialogue[-10:])
-                self._unprocessed_dialogue.clear()
-
-            self.get_logger().info("🧠 [Otonom Öğrenme]: Sohbetten yeni bilgiler analiz ediliyor...")
-            prompt = (
-                "Sen bir robotun hafıza analiz modülüsün. Aşağıdaki diyalogdan:\n"
-                "1) Kullanıcı hakkında öğrenilen yeni bir gerçek var mı?\n"
-                "2) Kullanıcının konuşma tarzı nasıldı?\n\n"
-                f"Diyalog:\n{dialogue_text}\n\n"
-                "JSON formatında yanıt ver:\n"
-                '{"new_fact": "bilgi veya YOK", "user_style": "tarz özeti"}'
-            )
-            res = None
-            for m in self._fallback_models:
-                try:
-                    res = self._groq.chat.completions.create(
-                        messages=[{"role": "user", "content": prompt}],
-                        model=m,
-                        temperature=0.2,
-                        max_tokens=150
-                    )
-                    break
-                except Exception:
-                    continue
-
-            if res is not None:
-                extracted_json = res.choices[0].message.content.strip()
-                try:
-                    match = re.search(r"\{.*\}", extracted_json, re.DOTALL)
-                    if match:
-                        parsed = json.loads(match.group(0))
-                        fact = parsed.get("new_fact")
-                        style = parsed.get("user_style")
-
-                        if fact and "YOK" not in fact.upper() and len(fact) > 5:
-                            self.memory.add_fact(fact)
-                            self.get_logger().info(f"✨ [Otonom Hafıza Bilgi Kazandı]: \"{fact}\"")
-
-                        if style and len(style) > 3:
-                            self.memory.update_user_style(style)
-
-                        self._messages[0]["content"] = self._build_system_prompt()
-                except Exception:
-                    pass
-        except Exception as e:
-            self.get_logger().warn(f"Reflection hatası: {e}")
-
-    def _process_llm(self, user_text: str, frame: np.ndarray | None):
-        try:
             self.get_logger().info(f"🗣️ [Siz]: \"{user_text}\"")
-            self._unprocessed_dialogue.append(f"Kullanıcı: {user_text}")
+            self.memory.episodic.add_message("user", user_text)
 
             is_visual = self._is_visual_query(user_text)
             is_learning_obj = self._is_object_learning_query(user_text)
-            base64_img = None
-            persona = self.memory.data.get("current_persona", "playful")
+            base64_img = frame_to_base64_jpeg(frame, max_dim=512) if frame is not None and (is_visual or is_learning_obj) else None
+            persona = self.persona_engine.current_persona
 
-            if frame is not None and (is_visual or is_learning_obj):
-                base64_img = frame_to_base64_jpeg(frame, max_dim=512)
-
-            # 1. GÖRSEL NESNE ÖĞRENME YOLU
+            # 1. Object Learning Tool
             if is_learning_obj and base64_img is not None:
                 self.get_logger().info("🔍 [Özel Nesne Tanıtımı]: Yeni nesne analiz ediliyor...")
-                name_cand = user_text
-                for k in ["bu benim", "bunu öğren", "bunu kaydet", "bu nesne", "buna bak bu"]:
-                    name_cand = re.sub(rf"(?i){k}", "", name_cand).strip()
-                name_cand = name_cand.strip(".:,!") or "Özel Eşya"
-
+                name_cand = re.sub(r"(?i)(bu benim|bunu öğren|bunu kaydet|bu nesne|buna bak bu)", "", user_text).strip(".:,!") or "Özel Eşya"
                 tool_res = self._execute_tool_call("learn_custom_object", {"object_name": name_cand, "description": user_text}, frame)
                 clean_ans = clean_tts_text(tool_res)
                 self.get_logger().info(f"🤖 [Astro]: \"{clean_ans}\"")
                 self._publish_tts(clean_ans)
                 self._publish_emotion(persona)
-                self._publish_gesture("nod")
-                self._unprocessed_dialogue.append(f"Astro: {clean_ans}")
-                self._last_interaction = time.monotonic()
                 return
 
-            # 2. GÖRSEL SORU YOLU
+            # 2. Visual Query
             if is_visual:
                 if base64_img is not None:
                     self.get_logger().info(f"👁️ [Vision]: OAK-D karesi analiz ediliyor... ({self._vision_model})")
-                    vision_answer = self._query_groq_vision(user_text, base64_img)
-                    if vision_answer:
-                        clean_ans = clean_tts_text(vision_answer)
+                    vision_ans = self._query_groq_vision(user_text, base64_img)
+                    if vision_ans:
+                        clean_ans = clean_tts_text(vision_ans)
                         self.get_logger().info(f"🤖 [Astro]: \"{clean_ans}\"")
                         self._publish_tts(clean_ans)
                         self._publish_emotion(persona)
-                        self._unprocessed_dialogue.append(f"Astro: {clean_ans}")
-                        self._messages.append({"role": "user", "content": user_text})
-                        self._messages.append({"role": "assistant", "content": clean_ans})
-                        self._last_interaction = time.monotonic()
+                        self.memory.episodic.add_message("assistant", clean_ans)
                         return
 
                 fallback_msg = "Şu an kameramdan net göremiyorum, biraz daha yaklaştırır mısın?"
                 self.get_logger().info(f"🤖 [Astro]: \"{fallback_msg}\"")
                 self._publish_tts(fallback_msg)
-                self._publish_emotion(persona)
-                self._publish_gesture("tilt")
-                self._last_interaction = time.monotonic()
                 return
 
-            # 3. METİN SOHBETİ & TOOL USE (With Gender, Emotion and Spatial Awareness)
-            context_prefix = ""
-            if self._person_detected and self._looking_at_robot:
-                dist_str = f"{self._user_distance:.1f}m mesafeden " if self._user_distance > 0 else ""
-                emo_map = {"happy": "gülümseyerek", "sad": "üzgün/düşünceli", "surprised": "şaşkın", "neutral": "doğrudan"}
-                emo_str = emo_map.get(self._user_emotion, "doğrudan")
-                gender_str = " (Kadın/Kız Sesi)" if self._speaker_gender == "female" else ""
-                context_prefix = f"[Karşındaki insan{gender_str} sana {dist_str}{emo_str} bakıyor] "
+            # 3. Conversational LLM with Real-Time Token Streaming
+            perception_prefix = self.persona_engine.build_user_context_prefix(
+                self._person_detected, self._looking_at_robot,
+                self._user_distance, self._user_emotion, self._speaker_gender
+            )
+            system_prompt = self.persona_engine.build_system_prompt(self.memory.get_prompt_context())
+            messages = [{"role": "system", "content": system_prompt}]
+            messages.extend(self.memory.episodic.get_messages())
+            if perception_prefix:
+                messages[-1]["content"] = perception_prefix + messages[-1]["content"]
 
-            user_content = context_prefix + user_text
-            self._messages.append({"role": "user", "content": user_content})
-
-            if len(self._messages) > self._max_history:
-                self._messages = [self._messages[0]] + self._messages[-(self._max_history - 1):]
-
-            response = None
+            stream_resp = None
             models_to_try = [self._text_model] + [m for m in self._fallback_models if m != self._text_model]
 
-            # Check if user query might need tools (weather, etc.)
-            tool_keywords = ["hava", "derece", "yağmur", "alarm", "kur", "hatırlat"]
-            needs_tools = any(k in user_text.lower() for k in tool_keywords)
-
-            if needs_tools:
-                for m in models_to_try:
-                    try:
-                        response = self._groq.chat.completions.create(
-                            messages=self._messages,
-                            model=m,
-                            temperature=self._temperature,
-                            max_tokens=self._max_tokens,
-                            tools=ROBOT_TOOLS,
-                            tool_choice="auto",
-                        )
-                        break
-                    except Exception:
-                        continue
-
-                if response is not None and response.choices[0].message.tool_calls:
-                    response_message = response.choices[0].message
-                    for tool_call in response_message.tool_calls:
-                        fn_name = tool_call.function.name
-                        try:
-                            fn_args = json.loads(tool_call.function.arguments)
-                        except Exception:
-                            fn_args = {}
-                        tool_result = self._execute_tool_call(fn_name, fn_args, frame)
-                        clean_ans = clean_tts_text(tool_result)
-                        self.get_logger().info(f"🤖 [Astro]: \"{clean_ans}\"")
-                        self._publish_tts(clean_ans)
-                        self._publish_emotion(persona)
-                        self._unprocessed_dialogue.append(f"Astro: {clean_ans}")
-                        self._last_interaction = time.monotonic()
-                        return
-
-            # Real-Time Streaming Generation for Instant (<1s) Speech
-            stream_resp = None
             for m in models_to_try:
                 try:
                     stream_resp = self._groq.chat.completions.create(
-                        messages=self._messages,
+                        messages=messages,
                         model=m,
                         temperature=self._temperature,
                         max_tokens=self._max_tokens,
@@ -1085,18 +459,22 @@ class AiBrainNode(Node):
             full_text = ""
             sentence_buffer = ""
             split_delimiters = re.compile(r"([.!?;:\n]+)")
+            first_token_time = None
 
             for chunk in stream_resp:
                 delta = chunk.choices[0].delta.content if chunk.choices and chunk.choices[0].delta else None
                 if not delta:
                     continue
 
+                if first_token_time is None:
+                    first_token_time = time.monotonic()
+                    self.state_machine.transition_to(RobotState.SPEAKING)
+
                 full_text += delta
                 sentence_buffer += delta
 
                 parts = split_delimiters.split(sentence_buffer)
                 if len(parts) > 2:
-                    # We have at least one complete sentence + punctuation
                     to_speak = "".join(parts[:-1]).strip()
                     sentence_buffer = parts[-1]
                     clean_chunk = clean_tts_text(to_speak)
@@ -1104,7 +482,7 @@ class AiBrainNode(Node):
                         self._publish_tts(clean_chunk)
                         self._publish_emotion(persona)
 
-            # Flush remaining buffer
+            # Flush remaining tokens
             if sentence_buffer.strip():
                 clean_chunk = clean_tts_text(sentence_buffer.strip())
                 if clean_chunk and len(clean_chunk) >= 2:
@@ -1114,16 +492,126 @@ class AiBrainNode(Node):
             clean_full = clean_tts_text(full_text)
             if clean_full:
                 self.get_logger().info(f"🤖 [Astro]: \"{clean_full}\"")
-                self._unprocessed_dialogue.append(f"Astro: {clean_full}")
-                self._messages.append({"role": "assistant", "content": clean_full})
+                self.memory.episodic.add_message("assistant", clean_full)
 
-            self._last_interaction = time.monotonic()
+            # Latency Benchmarking
+            t_done = time.monotonic()
+            llm_first_ms = ((first_token_time or t_done) - t_llm_start) * 1000.0
+            total_turn_ms = (t_done - t_turn_start) * 1000.0
+            self.session.latency_tracker.record_turn(stt_latency_ms, llm_first_ms, total_turn_ms)
+
+            stats = self.session.latency_tracker.get_stats()
+            self.get_logger().info(f"⚡ [Latency] Bu Dönüş: {total_turn_ms:.0f}ms (STT: {stt_latency_ms:.0f}ms, İlk Token: {llm_first_ms:.0f}ms) | p50: {stats['p50_total_ms']}ms, p95: {stats['p95_total_ms']}ms")
 
         except Exception as e:
-            self.get_logger().error(f"❌ [AI] LLM Hatası: {e}")
+            self.get_logger().error(f"❌ [AI] LLM İşleme Hatası: {e}")
         finally:
             with self._lock:
                 self._is_processing = False
+
+    def _query_groq_vision(self, prompt: str, base64_image: str) -> str | None:
+        try:
+            response = self._groq.chat.completions.create(
+                messages=[
+                    {
+                        "role": "system",
+                        "content": "Sen Astro adında zeki bir robotsun. Karşındaki görüntüyü görüyorsun. Kullanıcının sorusunu doğrudan tek bir kısa Türkçe cümleyle açıkla."
+                    },
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": prompt},
+                            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"}}
+                        ]
+                    }
+                ],
+                model=self._vision_model,
+                temperature=0.2,
+                max_tokens=100
+            )
+            raw = response.choices[0].message.content.strip()
+            return extract_spoken_turkish_sentence(raw)
+        except Exception as e:
+            self.get_logger().error(f"❌ [Vision Hatası ({self._vision_model})]: {e}")
+            return None
+
+    def _execute_tool_call(self, tool_name: str, arguments: dict, frame: np.ndarray | None) -> str:
+        if tool_name == "get_live_weather":
+            city = arguments.get("city", "Istanbul").strip()
+            try:
+                url = f"https://wttr.in/{urllib.parse.quote(city)}?format=%C+%t&lang=tr"
+                req = urllib.request.Request(url, headers={"User-Agent": "curl/7.68.0"})
+                with urllib.request.urlopen(req, timeout=4.0) as resp:
+                    weather_text = resp.read().decode("utf-8").strip()
+                return f"{city} için hava durumu şu an {weather_text}."
+            except Exception:
+                return f"{city} için şu an hava durumu bilgisine ulaşamadım."
+
+        elif tool_name == "learn_custom_object":
+            obj_name = arguments.get("object_name", "Özel Eşya")
+            desc = arguments.get("description", "")
+            self.memory.profile.add_learned_object(obj_name, desc)
+            return f"'{obj_name}' nesnesini hafızama kaydettim! Artık gördüğümde tanıyacağım."
+
+        return "Eylem tamamlandı."
+
+    def _start_idle_learning(self):
+        threading.Thread(target=self._idle_learning_loop, daemon=True).start()
+
+    def _idle_learning_loop(self):
+        while rclpy.ok():
+            time.sleep(10)
+            if not self._enabled or not self.state_machine.is_idle() or self._tts_speaking or self._is_processing:
+                continue
+
+            now = time.monotonic()
+            if (now - getattr(self, '_last_idle_learning_time', 0)) > 120.0:
+                self._last_idle_learning_time = now
+
+                captured_frame = None
+                with self._lock:
+                    if self._latest_frame is not None and (now - self._latest_frame_time) < 4.0:
+                        captured_frame = self._latest_frame.copy()
+
+                if captured_frame is not None:
+                    base64_img = frame_to_base64_jpeg(captured_frame, max_dim=512)
+                    if base64_img:
+                        self.get_logger().info("🕵️ [Idle Learning] Etraf sessiz, Astro etrafı inceliyor...")
+                        prompt = "Kameradaki görüntüyü Türkçe olarak tek bir kısa cümleyle açıkla. Açıklama harici hiçbir şey yazma. Örnek: 'Masada bir bilgisayar var.' veya 'Oda şu an aydınlık ve boş.'"
+                        try:
+                            response = self._groq.chat.completions.create(
+                                messages=[{"role": "user", "content": [
+                                    {"type": "text", "text": prompt},
+                                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{base64_img}"}}
+                                ]}],
+                                model=self._vision_model,
+                                temperature=0.3,
+                                max_tokens=60
+                            )
+                            obs = response.choices[0].message.content.strip()
+                            clean_obs = extract_spoken_turkish_sentence(obs)
+                            if clean_obs:
+                                self.memory.profile.add_observation(clean_obs)
+                                self.get_logger().info(f"🧠 [Hafıza Güncellendi - Gözlem]: {clean_obs}")
+                        except Exception as e:
+                            self.get_logger().debug(f"Idle learning error: {e}")
+
+    def _is_visual_query(self, text: str) -> bool:
+        visual_keywords = [
+            "ne tutuyorum", "elimde ne", "elinde ne", "ne var", "bu ne", "bunu gör", "görüyor musun",
+            "ne yapıyorum", "hareket", "hangi hareket", "üstümde", "üzerimde", "ceket", "tişört", "elbise",
+            "ne renk", "kaç parmak", "bana bak", "gözlerimi", "nereye", "kim var", "odada", "arkamda",
+            "elimde", "şuna bak", "gösteriyorum", "nası görünüyorum", "nasıl görünüyorum", "gördün mü",
+            "bakıyor muyum", "sana bakıyor muyum", "bana bakıyor musun", "nereye bakıyorum", "gözlerime bak",
+            "yüzüme bak", "telefonla mı konuşuyorum", "telefona mı bakıyorum", "iyi bak"
+        ]
+        text_lower = text.lower()
+        return any(k in text_lower for k in visual_keywords)
+
+    def _is_object_learning_query(self, text: str) -> bool:
+        keywords = ["bu benim", "bunu öğren", "bunu kaydet", "bu nesne", "buna bak bu", "bu gördüğün nesne"]
+        text_lower = text.lower()
+        return any(k in text_lower for k in keywords)
 
     def _publish_tts(self, text: str):
         clean = clean_tts_text(text)

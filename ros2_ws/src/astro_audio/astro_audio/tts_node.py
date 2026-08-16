@@ -183,6 +183,7 @@ class TtsNode(Node):
                     self._current_process.terminate()
                 except Exception:
                     pass
+            self._set_speaking(False)
 
     def _set_speaking(self, state: bool):
         msg = Bool()

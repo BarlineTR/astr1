@@ -124,6 +124,7 @@ class SpeechRecognitionNode(Node):
         # Publishers
         self._text_pub = self.create_publisher(String, '/speech/text', 10)
         self._gender_pub = self.create_publisher(String, '/audio/speaker_gender', 10)
+        self._interrupt_pub = self.create_publisher(Bool, '/tts/interrupt', 10)
 
         # Subscribers
         self.create_subscription(Int16MultiArray, '/audio/speech_audio', self._audio_cb, 10)
@@ -138,11 +139,12 @@ class SpeechRecognitionNode(Node):
         self._last_speech_time: float | None = None
         self._tts_speaking: bool = False
         self._last_tts_end_time: float | None = None
+        self._tts_vad_count: int = 0  # Debounce counter for barge-in while TTS speaking
 
         # Timer (0.05s resolution)
         self.create_timer(0.05, self._silence_tick)
 
-        self.get_logger().info("✅ [STT] Groq Whisper-large-v3 Hazır ve Dinliyor.")
+        self.get_logger().info("✅ [STT] Groq Whisper-large-v3 + Hardware Barge-In Hazır.")
 
     def _tts_speaking_cb(self, msg: Bool):
         with self._lock:
@@ -151,29 +153,21 @@ class SpeechRecognitionNode(Node):
 
             if was_speaking and not self._tts_speaking:
                 self._last_tts_end_time = time.monotonic()
-                self._buffer.clear()
-                self._is_speaking = False
-                self._last_speech_time = None
+                self._tts_vad_count = 0
             elif not was_speaking and self._tts_speaking:
-                self._buffer.clear()
-                self._is_speaking = False
-                self._last_speech_time = None
+                self._tts_vad_count = 0
 
     def _audio_cb(self, msg: Int16MultiArray):
         if not self.enabled:
             return
 
         with self._lock:
-            if self._tts_speaking:
-                return
-            if self._last_tts_end_time is not None and (time.monotonic() - self._last_tts_end_time) < 0.6:
-                return
-
             data = list(msg.data)
             self._ring_buffer.extend(data)
             if len(self._ring_buffer) > 6400:
                 self._ring_buffer = self._ring_buffer[-6400:]
 
+            # If speaking, record to speech buffer
             if self._is_speaking:
                 self._buffer.extend(data)
 
@@ -182,17 +176,38 @@ class SpeechRecognitionNode(Node):
             return
 
         with self._lock:
-            if self._tts_speaking:
-                return
-            if self._last_tts_end_time is not None and (time.monotonic() - self._last_tts_end_time) < 0.6:
-                return
-
             if msg.data:
+                now = time.monotonic()
+
+                # Barge-in: If user speaks while TTS is playing, fire immediate interrupt!
+                if self._tts_speaking:
+                    self._tts_vad_count += 1
+                    # Trigger barge-in after 2 consecutive VAD frames (~60ms) to filter clicks
+                    if self._tts_vad_count >= 2:
+                        self.get_logger().info("🛑 [Barge-In] Kullanıcı araya girdi — TTS kesiliyor!")
+                        int_msg = Bool()
+                        int_msg.data = True
+                        self._interrupt_pub.publish(int_msg)
+
+                        self._tts_speaking = False
+                        self._buffer = list(self._ring_buffer)
+                        self._is_speaking = True
+                        self._last_speech_time = now
+                        return
+                    return
+                else:
+                    self._tts_vad_count = 0
+
+                # Prevent self-triggering right after TTS ends (echo delay)
+                if self._last_tts_end_time is not None and (now - self._last_tts_end_time) < 0.25:
+                    return
+
                 if not self._is_speaking:
-                    # Speech started: include pre-roll ring buffer so start of word is intact
                     self._buffer = list(self._ring_buffer)
                     self._is_speaking = True
-                self._last_speech_time = time.monotonic()
+                self._last_speech_time = now
+            else:
+                self._tts_vad_count = 0
 
     def _silence_tick(self):
         if not self.enabled:
