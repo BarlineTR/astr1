@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""ASTRO V1 — Multimodal AI Brain Node with Groq Vision (90B) & Long-Term Memory.
+"""ASTRO V1 — Multimodal AI Brain Node with Dynamic Vision Discovery & Long-Term Memory.
 
 Features:
-  - True Multimodal Vision via Groq 'llama-3.2-90b-vision-preview'
-  - Zero Hallucination: Strict visual grounding (says what it truly sees, no guessing)
+  - Dynamic Vision Model Discovery: Automatically selects the active vision model from Groq API (e.g. qwen/qwen3.6-27b, etc.)
+  - True Multimodal Vision: Real-time OAK-D camera image analysis
+  - Zero Hallucination: Strict visual grounding (speaks only what it truly sees)
   - Long-Term Memory (astro_memory.json): Remembers user names and facts
   - Ultra-Fast Streaming TTS: First sentence spoken in <150ms
   - Rıfkı Persona: Emotional, witty, friendly Turkish conversational agent
@@ -236,14 +237,12 @@ class AiBrainNode(Node):
         self.memory = AstroMemory()
 
         self.declare_parameter("llm_model", os.getenv("LLM_MODEL", "llama-3.3-70b-versatile"))
-        self.declare_parameter("vision_model", os.getenv("VISION_MODEL", "llama-3.2-90b-vision-preview"))
         self.declare_parameter("llm_temperature", float(os.getenv("LLM_TEMPERATURE", "0.55")))
         self.declare_parameter("llm_max_tokens", int(os.getenv("LLM_MAX_TOKENS", "300")))
         self.declare_parameter("wake_word", os.getenv("WAKE_WORD", "hey astro"))
         self.declare_parameter("conversation_timeout", float(os.getenv("CONVERSATION_TIMEOUT", "15.0")))
 
         self._text_model = self.get_parameter("llm_model").value
-        self._vision_model = self.get_parameter("vision_model").value
         self._temperature = float(self.get_parameter("llm_temperature").value)
         self._max_tokens = int(self.get_parameter("llm_max_tokens").value)
         self._wake_word = self.get_parameter("wake_word").value
@@ -251,12 +250,16 @@ class AiBrainNode(Node):
 
         self.groq_api_key = os.environ.get("GROQ_API_KEY", "").strip()
         self._groq = None
+        self._vision_model = None
         self._enabled = True
 
         if Groq and self.groq_api_key:
             try:
                 self._groq = Groq(api_key=self.groq_api_key)
-                self.get_logger().info(f"✅ [AI] Groq Aktif — Metin: {self._text_model} | Görme: {self._vision_model}")
+                self._vision_model = self._discover_vision_model()
+                self.get_logger().info(
+                    f"✅ [AI] Groq Aktif — Metin: {self._text_model} | Görme (Vision): {self._vision_model}"
+                )
             except Exception as e:
                 self.get_logger().error(f"❌ [AI] Groq Client başlatılamadı: {e}")
                 self._enabled = False
@@ -292,6 +295,26 @@ class AiBrainNode(Node):
         self.get_logger().info(
             f"🧠 [AI Brain] Görme, Hafıza ve Ses Sistemi Hazır! Wake-word: \"{self._wake_word}\"{owner_info}"
         )
+
+    def _discover_vision_model(self) -> str:
+        """Queries Groq API to discover active multimodal vision model."""
+        try:
+            models = self._groq.models.list()
+            available = [m.id for m in models.data]
+            
+            # Look for vision-capable models in priority order
+            for cand in ["qwen/qwen3.6-27b", "meta-llama/llama-4-scout-preview", "llama-3.2-90b-vision-preview"]:
+                if cand in available:
+                    return cand
+            
+            # Find any active model with vision/multimodal/qwen keyword
+            for m_id in available:
+                if any(k in m_id.lower() for k in ["vision", "vl", "multimodal", "qwen3"]):
+                    return m_id
+        except Exception as e:
+            self.get_logger().warn(f"Vision model discovery failed ({e}), using default qwen/qwen3.6-27b")
+        
+        return "qwen/qwen3.6-27b"
 
     def _build_system_prompt(self) -> str:
         base_prompt = (
@@ -410,7 +433,8 @@ class AiBrainNode(Node):
         threading.Thread(target=self._process_llm, args=(raw_text, captured_frame), daemon=True).start()
 
     def _query_groq_vision(self, prompt: str, base64_image: str) -> str | None:
-        """Queries Groq llama-3.2-90b-vision-preview for true visual question answering."""
+        """Queries active multimodal vision model with fallback."""
+        model_name = self._vision_model or "qwen/qwen3.6-27b"
         try:
             response = self._groq.chat.completions.create(
                 messages=[
@@ -435,13 +459,35 @@ class AiBrainNode(Node):
                         ],
                     }
                 ],
-                model=self._vision_model,
+                model=model_name,
                 temperature=0.1,  # Strict factual grounding (zero hallucination)
                 max_tokens=150,
             )
             return response.choices[0].message.content.strip()
         except Exception as e:
-            self.get_logger().error(f"❌ [Groq Vision Hatası]: {e}")
+            self.get_logger().error(f"❌ [Vision Model Hatası ({model_name})]: {e}")
+            # Try fallback to qwen/qwen3.6-27b if not already tried
+            if model_name != "qwen/qwen3.6-27b":
+                try:
+                    self.get_logger().info("🔄 Qwen multimodal fallback deneniyor...")
+                    res = self._groq.chat.completions.create(
+                        messages=[
+                            {
+                                "role": "user",
+                                "content": [
+                                    {"type": "text", "text": f"{self._build_system_prompt()}\nSoru: {prompt}"},
+                                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"}},
+                                ],
+                            }
+                        ],
+                        model="qwen/qwen3.6-27b",
+                        temperature=0.1,
+                        max_tokens=150,
+                    )
+                    self._vision_model = "qwen/qwen3.6-27b"
+                    return res.choices[0].message.content.strip()
+                except Exception as e2:
+                    self.get_logger().error(f"❌ [Qwen Fallback Hatası]: {e2}")
             return None
 
     def _process_llm(self, user_text: str, frame: np.ndarray | None):
@@ -454,7 +500,7 @@ class AiBrainNode(Node):
             if frame is not None and is_visual:
                 base64_img = frame_to_base64_jpeg(frame, max_dim=512)
 
-            # 1. GÖRSEL SORU YOLU (Groq 90B Multimodal Vision)
+            # 1. GÖRSEL SORU YOLU (Multimodal Vision)
             if is_visual:
                 if base64_img is not None:
                     self.get_logger().info(f"👁️ [Groq Vision]: OAK-D kamerasıyla anlık görüntü analiz ediliyor... ({self._vision_model})")
