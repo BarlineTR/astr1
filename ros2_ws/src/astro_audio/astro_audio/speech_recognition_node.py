@@ -115,8 +115,8 @@ class SpeechRecognitionNode(Node):
             self.enabled = False
             return
 
-        # Parameters (Ultra-Fast Turn-Taking: 0.28s silence timeout)
-        self.declare_parameter('silence_timeout_s', 0.28)
+        # Parameters (Natural conversational turn-taking: 0.65s silence pause tolerance)
+        self.declare_parameter('silence_timeout_s', 0.65)
         self.declare_parameter('sample_rate', 16000)
         self._silence_timeout_s = float(self.get_parameter('silence_timeout_s').value)
         self._sample_rate = int(self.get_parameter('sample_rate').value)
@@ -138,29 +138,17 @@ class SpeechRecognitionNode(Node):
         self._is_speaking: bool = False
         self._last_speech_time: float | None = None
         self._tts_speaking: bool = False
-        self._tts_speaking_start_time: float | None = None   # When did TTS start?
+        self._tts_speaking_start_time: float | None = None
         self._last_tts_end_time: float | None = None
-        self._tts_vad_count: int = 0  # Debounce counter for barge-in while TTS speaking
-
-        # Barge-in echo protection parameters
-        # - TTS must have been playing for at least this long before barge-in is eligible
-        #   (prevents the first echo burst from triggering an immediate interrupt)
-        self._BARGEIN_TTS_MIN_PLAY_S = 0.8   # 800ms grace window
-        # - How many consecutive VAD-positive frames (each ~60ms) to require
-        #   Echo decays within 1-2 frames; real human speech sustains 6+ frames
-        self._BARGEIN_DEBOUNCE_FRAMES = 6    # ~360ms of sustained voice activity
-        # - After TTS ends, ignore VAD for this window to suppress trailing echo
-        self._TTS_END_ECHO_SUPPRESS_S = 0.40
 
         # Guards against concurrent / out-of-order transcription results
-        # Only the highest sequence number wins; stale responses are discarded.
         self._transcribe_lock = threading.Lock()
         self._stt_sequence: int = 0
 
         # Timer (0.05s resolution)
         self.create_timer(0.05, self._silence_tick)
 
-        self.get_logger().info("✅ [STT] Groq Whisper-large-v3 + Hardware Barge-In Hazır.")
+        self.get_logger().info("✅ [STT] Groq Whisper-large-v3 + Intent-Driven Barge-In Hazır.")
 
     def _tts_speaking_cb(self, msg: Bool):
         with self._lock:
@@ -168,14 +156,10 @@ class SpeechRecognitionNode(Node):
             self._tts_speaking = msg.data
 
             if not was_speaking and self._tts_speaking:
-                # TTS just started — record when so we can enforce the minimum play window
                 self._tts_speaking_start_time = time.monotonic()
-                self._tts_vad_count = 0
             elif was_speaking and not self._tts_speaking:
-                # TTS just ended
                 self._last_tts_end_time = time.monotonic()
                 self._tts_speaking_start_time = None
-                self._tts_vad_count = 0
 
     def _audio_cb(self, msg: Int16MultiArray):
         if not self.enabled:
@@ -199,48 +183,14 @@ class SpeechRecognitionNode(Node):
             if msg.data:
                 now = time.monotonic()
 
-                # ── Barge-in logic (user speaks while TTS is playing) ──────────────────────
-                if self._tts_speaking:
-                    self._tts_vad_count += 1
-
-                    # Guard 1: TTS must have been playing for at least _BARGEIN_TTS_MIN_PLAY_S
-                    # This suppresses the very first echo burst (robot's own voice on mic).
-                    tts_play_duration = (
-                        (now - self._tts_speaking_start_time)
-                        if self._tts_speaking_start_time is not None
-                        else 0.0
-                    )
-                    if tts_play_duration < self._BARGEIN_TTS_MIN_PLAY_S:
-                        return  # Still in echo suppression window — ignore
-
-                    # Guard 2: Require sustained voice activity over multiple frames.
-                    # Echo decays within 1-2 frames; human speech sustains 6+ consecutive frames.
-                    if self._tts_vad_count >= self._BARGEIN_DEBOUNCE_FRAMES:
-                        self.get_logger().info("🛑 [Barge-In] Kullanıcı araya girdi — TTS kesiliyor!")
-                        int_msg = Bool()
-                        int_msg.data = True
-                        self._interrupt_pub.publish(int_msg)
-
-                        self._tts_speaking = False
-                        self._tts_speaking_start_time = None
-                        self._buffer = list(self._ring_buffer)
-                        self._is_speaking = True
-                        self._last_speech_time = now
+                # Post-TTS echo suppression (ignore room echo right after TTS ends)
+                if self._last_tts_end_time is not None and (now - self._last_tts_end_time) < 0.35:
                     return
-                else:
-                    self._tts_vad_count = 0
-
-                # ── Post-TTS echo suppression ────────────────────────────────────────────
-                if self._last_tts_end_time is not None:
-                    if (now - self._last_tts_end_time) < self._TTS_END_ECHO_SUPPRESS_S:
-                        return  # Trailing echo window — ignore VAD
 
                 if not self._is_speaking:
                     self._buffer = list(self._ring_buffer)
                     self._is_speaking = True
                 self._last_speech_time = now
-            else:
-                self._tts_vad_count = 0
 
     def _silence_tick(self):
         if not self.enabled:
@@ -296,7 +246,7 @@ class SpeechRecognitionNode(Node):
             text = str(result).strip()
             text_lower = text.lower().strip(" .,!?:;")
 
-            # Exact match hallucination filter (Whisper often hallucinates these single words in silence)
+            # Exact match hallucination filter
             exact_hallucinations = ["evet", "hayır", "tamam", "hı hı", "hı", "cık", "çık", "eee", "ııı", "hmm"]
             if text_lower in exact_hallucinations:
                 return
@@ -313,11 +263,35 @@ class SpeechRecognitionNode(Node):
                 return
 
             if text and text not in [".", "...", ",", "!", "?"]:
-                # Discard stale results — if a newer transcription was already kicked off,
-                # our result is obsolete (prevents out-of-order double-response).
+                # Discard stale results
                 with self._transcribe_lock:
                     if seq != self._stt_sequence:
                         return
+
+                # If robot was speaking when this speech was uttered:
+                # ONLY interrupt TTS if the speech is verified as an intentional command or query!
+                with self._lock:
+                    is_tts_active = self._tts_speaking
+
+                if is_tts_active:
+                    interrupt_keywords = [
+                        "astro", "hey", "dur", "sus", "kes", "bekle", "bir dakika",
+                        "tamam", "yeter", "sessiz", "dinle", "bakar mısın", "bana bak"
+                    ]
+                    has_intent = (
+                        any(kw in text_lower for kw in interrupt_keywords)
+                        or len(text_lower.split()) >= 3
+                    )
+                    if has_intent:
+                        self.get_logger().info(f'🛑 [Barge-In Doğrulandı]: "{text}" — TTS kesiliyor!')
+                        int_msg = Bool()
+                        int_msg.data = True
+                        self._interrupt_pub.publish(int_msg)
+                    else:
+                        # Ambient background chatter during TTS — do not cut off robot
+                        self.get_logger().info(f'🔇 [Arka Plan Konuşması Yok Sayıldı]: "{text}"')
+                        return
+
                 self.get_logger().info(f'🎤 [Duyulan]: "{text}"')
                 msg = String()
                 msg.data = text

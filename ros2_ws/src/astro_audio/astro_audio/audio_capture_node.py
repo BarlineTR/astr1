@@ -110,7 +110,7 @@ class AudioCaptureNode(Node):
 
         self.declare_parameter("sample_rate", 16000)
         self.declare_parameter("chunk_size", 960)  # 60ms chunk (0.06s * 16000 = 960)
-        self.declare_parameter("vad_threshold", 450.0)
+        self.declare_parameter("vad_threshold", 550.0)
 
         self.sample_rate = int(self.get_parameter("sample_rate").value)
         self.chunk_size = int(self.get_parameter("chunk_size").value)
