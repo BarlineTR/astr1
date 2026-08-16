@@ -142,12 +142,19 @@ class PersistentProfile:
         self.save()
 
     def save(self):
+        """Atomically persist data to disk using write-then-rename to prevent corruption."""
+        tmp_path = self.filepath + ".tmp"
         try:
             os.makedirs(os.path.dirname(self.filepath), exist_ok=True)
-            with open(self.filepath, "w", encoding="utf-8") as f:
+            with open(tmp_path, "w", encoding="utf-8") as f:
                 json.dump(self.data, f, ensure_ascii=False, indent=2)
+            os.replace(tmp_path, self.filepath)
         except Exception:
-            pass
+            try:
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+            except Exception:
+                pass
 
     def add_verified_fact(self, fact: str) -> bool:
         """Adds a fact only if it passes strict validation against hallucinations."""

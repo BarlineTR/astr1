@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""ASTRO V1 — Ultra-Fast In-Memory Real-Time Text-to-Speech Node.
+"""ASTRO V1 — In-Memory Text-to-Speech Node.
 
 Features:
-  - In-Memory RAM Synthesis: Edge-TTS converted directly via FFmpeg pipe
+  - In-Memory RAM Synthesis: Edge-TTS converted via FFmpeg pipe
   - Robust ALSA/ReSpeaker Playback via aplay / sounddevice fallback
   - Dynamic Emotion-based speech rate (+5% to +35%)
-  - Zero underrun, zero delay
+  - Hardware barge-in interrupt with immediate process termination
 """
 
 import os
@@ -143,7 +143,8 @@ class TtsNode(Node):
         self._speak_queue = queue.Queue()
         self._generation = 0
         self._generation_lock = threading.Lock()
-        self._current_process = None
+        self._current_process = None   # aplay process
+        self._current_ffmpeg = None    # ffmpeg decode process
 
         # Playback Thread
         self._playback_thread = threading.Thread(target=self._playback_loop, daemon=True)
@@ -178,11 +179,15 @@ class TtsNode(Node):
                     self._speak_queue.get_nowait()
                 except queue.Empty:
                     break
-            if self._current_process:
-                try:
-                    self._current_process.terminate()
-                except Exception:
-                    pass
+            # Kill both FFmpeg decode and aplay playback to prevent zombie processes
+            for proc in (self._current_ffmpeg, self._current_process):
+                if proc is not None:
+                    try:
+                        proc.terminate()
+                    except Exception:
+                        pass
+            self._current_ffmpeg = None
+            self._current_process = None
             self._set_speaking(False)
 
     def _set_speaking(self, state: bool):
@@ -222,12 +227,15 @@ class TtsNode(Node):
 
             # 2. Decode MP3 to WAV in memory via FFmpeg
             ffmpeg_proc = subprocess.Popen(
-                ["ffmpeg", "-loglevel", "quiet", "-i", "pipe:0", "-f", "wav", "-ar", str(self.sample_rate), "-ac", "1", "pipe:1"],
+                ["ffmpeg", "-loglevel", "quiet", "-i", "pipe:0", "-f", "wav",
+                 "-ar", str(self.sample_rate), "-ac", "1", "pipe:1"],
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL
             )
+            self._current_ffmpeg = ffmpeg_proc
             wav_data, _ = ffmpeg_proc.communicate(input=mp3_bytes)
+            self._current_ffmpeg = None
 
             with self._generation_lock:
                 if current_gen != self._generation:
@@ -252,6 +260,7 @@ class TtsNode(Node):
                     sd.wait()
             finally:
                 self._current_process = None
+                self._current_ffmpeg = None
                 self._set_speaking(False)
 
         except Exception as e:

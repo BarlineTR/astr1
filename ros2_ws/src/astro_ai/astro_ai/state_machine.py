@@ -51,17 +51,19 @@ class StateMachine:
             old_state = self._state
             if old_state == new_state:
                 return False
-
             self._state = new_state
             self._last_transition_time = time.monotonic()
+            # Snapshot listeners under lock, then call them OUTSIDE the lock
+            # to prevent deadlocks if any listener blocks on another lock.
+            listeners_snapshot = list(self._listeners)
 
-            for listener in list(self._listeners):
-                try:
-                    listener(old_state, new_state)
-                except Exception:
-                    pass
+        for listener in listeners_snapshot:
+            try:
+                listener(old_state, new_state)
+            except Exception:
+                pass
 
-            return True
+        return True
 
     def is_idle(self) -> bool:
         return self.current_state == RobotState.IDLE

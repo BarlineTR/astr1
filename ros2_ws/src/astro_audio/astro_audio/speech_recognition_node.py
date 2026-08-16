@@ -141,6 +141,11 @@ class SpeechRecognitionNode(Node):
         self._last_tts_end_time: float | None = None
         self._tts_vad_count: int = 0  # Debounce counter for barge-in while TTS speaking
 
+        # Guards against concurrent / out-of-order transcription results
+        # Only the highest sequence number wins; stale responses are discarded.
+        self._transcribe_lock = threading.Lock()
+        self._stt_sequence: int = 0
+
         # Timer (0.05s resolution)
         self.create_timer(0.05, self._silence_tick)
 
@@ -224,9 +229,12 @@ class SpeechRecognitionNode(Node):
                     self._last_speech_time = None
 
         if audio_data is not None and len(audio_data) >= 4800:  # at least 0.3s
-            threading.Thread(target=self._transcribe, args=(audio_data,), daemon=True).start()
+            with self._transcribe_lock:
+                self._stt_sequence += 1
+                my_seq = self._stt_sequence
+            threading.Thread(target=self._transcribe, args=(audio_data, my_seq), daemon=True).start()
 
-    def _transcribe(self, audio_data: list[int]):
+    def _transcribe(self, audio_data: list[int], seq: int):
         try:
             arr = np.array(audio_data, dtype=np.int16)
 
@@ -277,6 +285,11 @@ class SpeechRecognitionNode(Node):
                 return
 
             if text and text not in [".", "...", ",", "!", "?"]:
+                # Discard stale results — if a newer transcription was already kicked off,
+                # our result is obsolete (prevents out-of-order double-response).
+                with self._transcribe_lock:
+                    if seq != self._stt_sequence:
+                        return
                 self.get_logger().info(f'🎤 [Duyulan]: "{text}"')
                 msg = String()
                 msg.data = text

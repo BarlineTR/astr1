@@ -35,14 +35,16 @@ class LatencyTracker:
             if not self._total_turn_latencies:
                 return {"p50_total_ms": 0.0, "p95_total_ms": 0.0, "samples": 0}
 
-            totals = sorted(list(self._total_turn_latencies))
-            p50_idx = int(len(totals) * 0.50)
-            p95_idx = min(len(totals) - 1, int(len(totals) * 0.95))
+            totals = sorted(self._total_turn_latencies)
+            n = len(totals)
+            # Clamp both indexes to valid range to handle small sample sizes correctly
+            p50_idx = min(n - 1, int(n * 0.50))
+            p95_idx = min(n - 1, int(n * 0.95))
 
             return {
                 "p50_total_ms": round(totals[p50_idx], 1),
                 "p95_total_ms": round(totals[p95_idx], 1),
-                "samples": len(totals)
+                "samples": n
             }
 
 
