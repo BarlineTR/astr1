@@ -278,18 +278,24 @@ def extract_spoken_turkish_sentence(raw_text: str) -> str:
     thinking_markers = [
         "thinking process", "analyze the persona", "drafting the response",
         "draft 1", "draft 2", "determine the response", "analyze the image",
-        "analyze the user"
+        "analyze the user", "the user wants", "identify the object",
+        "verify the context", "formulate the answer", "looking at the image"
     ]
     if any(k in raw_text.lower() for k in thinking_markers):
         # Extract quoted response at the end e.g. "Lan Baran..." or Draft 2: ...
         quotes = re.findall(r'["\u201c\u201d]([^"\u201c\u201d]{8,})["\u201c\u201d]', raw_text)
         if quotes:
             for q in reversed(quotes):
-                if any(ch in q for ch in "çğıöşüÇĞİÖŞÜabcde"):
+                if any(ch in q for ch in "çğıöşüÇĞİÖŞÜ"):
+                    return q.strip()
+                if "user" not in q.lower() and "image" not in q.lower():
                     return q.strip()
         # Fallback to last non-numbered line
         lines = [l.strip() for l in raw_text.split("\n") if l.strip() and not re.match(r"^\d+\.", l.strip()) and not l.strip().startswith(("#", "*", "-"))]
         if lines:
+            for l in reversed(lines):
+                if any(ch in l for ch in "çğıöşüÇĞİÖŞÜ"):
+                    return l.strip('"\': ')
             return lines[-1].strip('"\': ')
             
     return raw_text
@@ -487,15 +493,15 @@ class AiBrainNode(Node):
         try:
             models = self._groq.models.list()
             available = [m.id for m in models.data]
-            for cand in ["qwen/qwen3.6-27b", "meta-llama/llama-4-scout-preview", "llama-3.2-90b-vision-preview"]:
+            for cand in ["meta-llama/llama-4-scout-preview", "llama-3.2-90b-vision-preview", "llama-3.2-11b-vision-preview", "qwen/qwen3.6-27b"]:
                 if cand in available:
                     return cand
             for m_id in available:
-                if any(k in m_id.lower() for k in ["vision", "vl", "multimodal", "qwen3"]):
+                if any(k in m_id.lower() for k in ["llama-4", "llama-3.2", "vision", "vl", "qwen"]):
                     return m_id
         except Exception:
             pass
-        return "qwen/qwen3.6-27b"
+        return "llama-3.2-90b-vision-preview"
 
     def _build_system_prompt(self) -> str:
         persona = self.memory.data.get("current_persona", "playful")

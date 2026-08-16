@@ -205,11 +205,18 @@ class SpeechRecognitionNode(Node):
             )
 
             text = str(result).strip()
-            text_lower = text.lower()
+            text_lower = text.lower().strip(" .,!?:;")
 
-            # Filter hallucination / empty / junk
-            junk_filters = ["altyazı", "abone ol", "izlediğiniz için", "www.", ".com", "m.k"]
-            if any(junk in text_lower for junk in junk_filters):
+            # Filter hallucination / empty / junk / phantom noise
+            junk_filters = [
+                "altyazı", "abone ol", "izlediğiniz için", "www.", ".com",
+                "you", "thank you", "bye", "subtitles", "watching", "amara.org",
+                "hı hı", "hı", "cık", "çık", "eee", "ııı", "hmm"
+            ]
+            if any(junk == text_lower or junk in text_lower for junk in junk_filters):
+                return
+
+            if len(text_lower) < 3 and text_lower not in ["ne", "su", "al", "ev", "on"]:
                 return
 
             if text and text not in [".", "...", ",", "!", "?"]:
