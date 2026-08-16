@@ -31,6 +31,11 @@ except ImportError:
     Groq = None
 
 try:
+    from openai import OpenAI
+except ImportError:
+    OpenAI = None
+
+try:
     from dotenv import find_dotenv, load_dotenv
 except ImportError:
     def find_dotenv(*args, **kwargs): return ""
@@ -159,6 +164,18 @@ class AiBrainNode(Node):
             self.get_logger().error("❌ [AI Brain] GROQ_API_KEY bulunamadı! STT/LLM devre dışı.")
             self._enabled = False
 
+        # Secondary / Vision Fallback Client (Gemini / OpenAI API)
+        self._ai_api_key = os.environ.get("AI_API_KEY", "").strip()
+        self._ai_base_url = os.environ.get("AI_BASE_URL", "https://generativelanguage.googleapis.com/v1beta/openai/").strip()
+        self._ai_model = os.environ.get("AI_MODEL", "gemini-2.5-flash").strip()
+        self._fallback_vision_client = None
+        if OpenAI and self._ai_api_key:
+            try:
+                self._fallback_vision_client = OpenAI(api_key=self._ai_api_key, base_url=self._ai_base_url)
+                self.get_logger().info(f"✅ [AI Brain] Gemini/OpenAI Vision Yedek İstemcisi Hazır ({self._ai_model})")
+            except Exception as e:
+                self.get_logger().debug(f"OpenAI fallback client notice: {e}")
+
         # Perception & Hardware State
         self._lock = threading.Lock()
         self._is_processing = False
@@ -208,12 +225,12 @@ class AiBrainNode(Node):
         try:
             models = self._groq.models.list()
             available = [m.id for m in models.data]
-            for cand in ["meta-llama/llama-4-scout-preview", "llama-3.2-90b-vision-preview", "llama-3.2-11b-vision-preview"]:
-                if cand in available:
+            for cand in available:
+                if any(v_kw in cand.lower() for v_kw in ["vision", "scout", "vl"]):
                     return cand
         except Exception:
             pass
-        return "llama-3.2-90b-vision-preview"
+        return "meta-llama/llama-4-scout-preview"
 
     def _on_session_timed_out(self):
         self.state_machine.transition_to(RobotState.IDLE)
@@ -525,32 +542,54 @@ class AiBrainNode(Node):
 
     def _query_groq_vision(self, prompt: str, base64_image: str) -> str | None:
         persona = self.persona_engine.current_persona
-        try:
-            response = self._groq.chat.completions.create(
-                messages=[
-                    {
-                        "role": "system",
-                        "content": f"Sen Astro adında {persona} karakterli akıllı ve sempatik bir sosyal robotsun. Karşındaki görüntüyü görüyorsun. Kullanıcının sorusunu kendi kişiliğinle tek bir kısa doğal Türkçe cümleyle yanıtla."
-                    },
-                    {
-                        "role": "user",
-                        "content": [
+        system_instruction = f"Sen Astro adında {persona} karakterli akıllı ve sempatik bir sosyal robotsun. Karşındaki görüntüyü görüyorsun. Kullanıcının sorusunu kendi kişiliğinle tek bir kısa doğal Türkçe cümleyle yanıtla."
+
+        # 1. Try Primary Groq Vision
+        if self._groq:
+            try:
+                response = self._groq.chat.completions.create(
+                    messages=[
+                        {"role": "system", "content": system_instruction},
+                        {"role": "user", "content": [
                             {"type": "text", "text": prompt},
                             {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"}}
-                        ]
-                    }
-                ],
-                model=self._vision_model,
-                temperature=0.2,
-                max_tokens=100
-            )
-            raw = response.choices[0].message.content.strip()
-            self.cloud_mgr.record_llm_success()
-            return extract_spoken_turkish_sentence(raw)
-        except Exception as e:
-            self.cloud_mgr.record_llm_failure(str(e))
-            self.get_logger().error(f"❌ [Vision Hatası ({self._vision_model})]: {e}")
-            return None
+                        ]}
+                    ],
+                    model=self._vision_model,
+                    temperature=0.2,
+                    max_tokens=100
+                )
+                raw = response.choices[0].message.content.strip()
+                self.cloud_mgr.record_llm_success()
+                return extract_spoken_turkish_sentence(raw)
+            except Exception as e:
+                self.get_logger().warn(f"⚠️ [Groq Vision] Başarısız ({e}), Gemini Vision yedeğe geçiliyor...")
+
+        # 2. Try Fallback Gemini Vision
+        if self._fallback_vision_client:
+            for m_cand in [self._ai_model, "gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash"]:
+                try:
+                    response = self._fallback_vision_client.chat.completions.create(
+                        messages=[
+                            {"role": "system", "content": system_instruction},
+                            {"role": "user", "content": [
+                                {"type": "text", "text": prompt},
+                                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"}}
+                            ]}
+                        ],
+                        model=m_cand,
+                        temperature=0.2,
+                        max_tokens=100
+                    )
+                    raw = response.choices[0].message.content.strip()
+                    self.cloud_mgr.record_llm_success()
+                    self.get_logger().info(f"✨ [Gemini Vision] Görsel başarıyla yanıtlandı ({m_cand})")
+                    return extract_spoken_turkish_sentence(raw)
+                except Exception as e2:
+                    self.get_logger().debug(f"Gemini model {m_cand} notice: {e2}")
+
+        self.cloud_mgr.record_llm_failure("All vision models failed")
+        return None
 
     def _execute_tool_call(self, tool_name: str, arguments: dict, frame: np.ndarray | None) -> str:
         if tool_name == "get_live_weather":
@@ -595,23 +634,10 @@ class AiBrainNode(Node):
                     if base64_img:
                         self.get_logger().info("🕵️ [Idle Learning] Etraf sessiz, Astro etrafı inceliyor...")
                         prompt = "Kameradaki görüntüyü Türkçe olarak tek bir kısa cümleyle açıkla. Açıklama harici hiçbir şey yazma. Örnek: 'Masada bir bilgisayar var.' veya 'Oda şu an aydınlık ve boş.'"
-                        try:
-                            response = self._groq.chat.completions.create(
-                                messages=[{"role": "user", "content": [
-                                    {"type": "text", "text": prompt},
-                                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{base64_img}"}}
-                                ]}],
-                                model=self._vision_model,
-                                temperature=0.3,
-                                max_tokens=60
-                            )
-                            obs = response.choices[0].message.content.strip()
-                            clean_obs = extract_spoken_turkish_sentence(obs)
-                            if clean_obs:
-                                self.memory.profile.add_observation(clean_obs)
-                                self.get_logger().info(f"🧠 [Hafıza Güncellendi - Gözlem]: {clean_obs}")
-                        except Exception as e:
-                            self.get_logger().debug(f"Idle learning error: {e}")
+                        obs = self._query_groq_vision(prompt, base64_img)
+                        if obs:
+                            self.memory.profile.add_observation(obs)
+                            self.get_logger().info(f"🧠 [Hafıza Güncellendi - Gözlem]: {obs}")
 
     def _is_visual_query(self, text: str) -> bool:
         visual_keywords = [
