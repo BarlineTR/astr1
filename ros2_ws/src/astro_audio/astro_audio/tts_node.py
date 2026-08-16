@@ -151,8 +151,10 @@ class TtsNode(Node):
         # Subscribers
         self.sub_say = self.create_subscription(String, '/tts/say', self._on_say, 10)
         self.sub_interrupt = self.create_subscription(Bool, '/tts/interrupt', self._on_interrupt, 10)
+        self.sub_emotion = self.create_subscription(String, '/robot/emotion', self._on_emotion, 10)
 
         # Internal state
+        self._current_rate = self.tts_rate
         self._speak_queue = queue.Queue()
         self._generation = 0
         self._generation_lock = threading.Lock()
@@ -168,6 +170,20 @@ class TtsNode(Node):
             except Exception:
                 pass
         self.get_logger().info(f"🔊 [TTS Node] Ultra Hızlı RAM Streaming Hazır! Ses: {self.tts_voice} | Çıkış: [{self.out_device_id}] {out_name}")
+
+    def _on_emotion(self, msg: String):
+        emotion = msg.data.lower().strip()
+        # Dynamic rate & modulation based on personality/emotion
+        rate_map = {
+            "angry": "+35%",
+            "rude": "+30%",
+            "sarcastic": "+25%",
+            "playful": "+25%",
+            "formal": "+15%",
+            "emotional": "+5%",
+        }
+        if emotion in rate_map:
+            self._current_rate = rate_map[emotion]
 
     def _on_say(self, msg: String):
         text = clean_tts_text(msg.data)
@@ -214,8 +230,8 @@ class TtsNode(Node):
         try:
             self.get_logger().info(f'🔊 [TTS Okuyor]: "{text}"')
 
-            # 1. In-Memory Synthesis (RAM)
-            mp3_bytes = asyncio.run(_async_synthesize_bytes(text, self.tts_voice, self.tts_rate))
+            # 1. In-Memory Synthesis (RAM) using dynamic rate
+            mp3_bytes = asyncio.run(_async_synthesize_bytes(text, self.tts_voice, self._current_rate))
 
             with self._generation_lock:
                 if current_gen != self._generation:

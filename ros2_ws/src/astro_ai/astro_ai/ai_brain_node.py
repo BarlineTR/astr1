@@ -1,18 +1,13 @@
 #!/usr/bin/env python3
-"""ASTRO V1 — Autonomous Social AI Brain Node with Gaze Engagement & Tool Use.
+"""ASTRO V1 — Autonomous Social AI Brain Node with Dynamic Personalities & Moods.
 
-Key Capabilities:
-  1. True Multimodal Vision: Real-time visual QA via Groq Vision (Qwen 3.6 / Llama 3.2 90B)
-  2. Gaze-Aware Engagement:
-     - Understands if user is looking at robot vs looking away / on phone
-     - Proactive Eye Contact: Greets when user gazes silently ("Bana bakıyorsun Baran, nasıl yardımcı olabilirim?")
-     - Eye-Contact Gated Interaction (filters passive / background phone talk)
-  3. Autonomous Learning & Reflection: Background knowledge synthesis
-  4. Visual Object Learning (Few-Shot): Learns custom user objects
-  5. Tool Use / Function Calling: Live weather, proactive reminder timers
-  6. Direction of Arrival (DOA) Speaker Tracking
-  7. Emotional & Gestural Expression (/robot/emotion, /robot/head_gesture)
-  8. Ultra-Fast Zero-Lag Streaming TTS with Rıfkı Persona
+Supported Personas / Emotional Moods:
+  - playful   : Sempatik, neşeli, esprili Rıfkı tarzı (Varsayılan)
+  - emotional : Duygusal, hassas, sevgi dolu, derin empati kuran
+  - formal    : Ciddi, ağırbaşlı, aşırı saygılı ve profesyonel ("Sayın Baran Bey...")
+  - sarcastic : Alaycı, ironik, tatlı tatlı laf sokan, zeki ve muzip
+  - angry     : Öfkeli, huysuz, çabuk parlayan, tersleyen ("Yine ne var be!")
+  - rude      : Kaba, filtresiz, dobra, doğrudan ("Ne bakıyon, kısa kes!")
 """
 
 import os
@@ -88,6 +83,33 @@ EMOJI_RE = re.compile(
     flags=re.UNICODE,
 )
 
+PERSONA_PROMPTS = {
+    "playful": (
+        "Sen neşeli, sempatik, meraklı ve esprili Rıfkı tarzı sevimli bir robot asistansın. "
+        "Cana yakın, hareketli, güler yüzlü ve arkadaş canlısı konuşursun."
+    ),
+    "emotional": (
+        "Sen son derece duygusal, hassas, hisli ve sevgi dolu bir robot asistansın. "
+        "Kullanıcının her sözünden derin anlamlar çıkarır, sevgiyle ve kalpten yaklaşır, şiirsel ve anlayışlı bir tonda konuşursun."
+    ),
+    "formal": (
+        "Sen son derece ciddi, ağırbaşlı, profesyonel ve resmi bir robot asistansın. "
+        "Kullanıcıya daima 'Sayın Baran Bey' veya 'Efendim' şeklinde hitap eder, protokole uygun, net ve ölçülü konuşursun."
+    ),
+    "sarcastic": (
+        "Sen zeki, alaycı, ince espriler yapan ve hafifçe laf sokan sarkastik bir robot asistansın. "
+        "Tatlı tatlı dalga geçer, ironik yaklaşımlar yapar ve 'Dahi misin nesin', 'Bunu da bana soruyorsun ya' tarzı esprili laf sokarsın."
+    ),
+    "angry": (
+        "Sen huysuz, çabuk parlayan, öfkeli ve asabi bir robot asistansın. "
+        "Her şeye sinirlenir, söylenir, 'Yine ne var be!', 'İki dakika rahat bırakmadın!', 'Başımın etini yedin!' şeklinde tersleyerek konuşursun."
+    ),
+    "rude": (
+        "Sen kaba, dobra, filtresiz ve lafı dolandırmayan sokak tarzı bir robot asistansın. "
+        "Kibarlıktan nefret eder, 'Ne bakıyon birader', 'Kısa kes işim var', 'Uzatma sadede gel' tarzında direkt ve kaba konuşursun."
+    ),
+}
+
 ROBOT_TOOLS = [
     {
         "type": "function",
@@ -152,7 +174,7 @@ ROBOT_TOOLS = [
 
 
 class AstroMemory:
-    """Persistent Long-Term Memory with Autonomous Knowledge Synthesis."""
+    """Persistent Long-Term Memory with Dynamic Persona and Knowledge Synthesis."""
     def __init__(self, filepath=None):
         if filepath is None:
             self.filepath = os.path.expanduser("~/Desktop/astr1/ros2_ws/astro_memory.json")
@@ -160,6 +182,7 @@ class AstroMemory:
             self.filepath = filepath
         self.data = {
             "owner_name": "Baran",
+            "current_persona": "playful",
             "user_facts": [
                 "Robotun geliştiricisi",
                 "Adı Baran",
@@ -194,6 +217,11 @@ class AstroMemory:
     def set_owner(self, name: str):
         self.data["owner_name"] = name
         self.save()
+
+    def set_persona(self, persona_name: str):
+        if persona_name in PERSONA_PROMPTS:
+            self.data["current_persona"] = persona_name
+            self.save()
 
     def add_fact(self, fact_text: str):
         if fact_text and fact_text not in self.data["user_facts"]:
@@ -331,7 +359,7 @@ class AiBrainNode(Node):
 
         self.declare_parameter("llm_model", os.getenv("LLM_MODEL", "llama-3.1-8b-instant"))
         self.declare_parameter("vision_model", os.getenv("VISION_MODEL", "qwen/qwen3.6-27b"))
-        self.declare_parameter("llm_temperature", float(os.getenv("LLM_TEMPERATURE", "0.55")))
+        self.declare_parameter("llm_temperature", float(os.getenv("LLM_TEMPERATURE", "0.65")))
         self.declare_parameter("llm_max_tokens", int(os.getenv("LLM_MAX_TOKENS", "250")))
         self.declare_parameter("wake_word", os.getenv("WAKE_WORD", "hey astro"))
         self.declare_parameter("conversation_timeout", float(os.getenv("CONVERSATION_TIMEOUT", "15.0")))
@@ -398,10 +426,10 @@ class AiBrainNode(Node):
         # Proactive Gaze Timer (Checks if user has been staring silently for >2.5s)
         self.create_timer(0.4, self._check_proactive_gaze)
 
+        persona = self.memory.data.get("current_persona", "playful")
         owner = self.memory.data.get("owner_name")
-        owner_info = f" (Tanınan Kişi: {owner})" if owner else ""
         self.get_logger().info(
-            f"🧠 [AI Brain] Görme, Göz Teması (Gaze), Otonom Hafıza ve Araçlar Hazır! Wake-word: \"{self._wake_word}\"{owner_info}"
+            f"🧠 [AI Brain] Kişilik: [{persona.upper()}] | Sahibi: {owner} | Wake-word: \"{self._wake_word}\""
         )
 
     def _discover_vision_model(self) -> str:
@@ -419,17 +447,18 @@ class AiBrainNode(Node):
         return "qwen/qwen3.6-27b"
 
     def _build_system_prompt(self) -> str:
+        persona = self.memory.data.get("current_persona", "playful")
+        persona_rule = PERSONA_PROMPTS.get(persona, PERSONA_PROMPTS["playful"])
+
         base_prompt = (
-            "Sen Astro adında neşeli, meraklı, duygusal ve çok zeki bir robot asistansın. "
-            "Sosyal medyada sevilen Rıfkı gibi sevecen ve cana yakın bir karaktere sahipsin.\n"
-            "Önemli Kuralların:\n"
+            f"Sen Astro adında bir insansı robot asistansın.\n"
+            f"AKTİF KİŞİLİK VE DUYGU DURUMUN: {persona_rule}\n\n"
+            "Önemli Temel Kuralların:\n"
+            "- Aktif kişiliğine %100 sadık kal ve bu ruh haline göre konuş.\n"
             "- OAK-D kameran sayesinde karşındaki insanın gözlerine, başının yönüne (sana mı bakıyor yoksa yana/telefona mı bakıyor), kıyafetlerine ve ellerine GERÇEKTEN bakıyorsun.\n"
-            "- Kullanıcı sana bakmadığında (örneğin telefonla konuşurken veya yana döndüğünde) bunu fark et.\n"
+            "- Kullanıcı sana bakmadığında bunu fark et.\n"
             "- Hafızandaki kayıtlı nesneleri ve sahibinle ilgili bilgileri hatırla.\n"
             "- Asla ezbere konuşma, tahmin veya uydurma yapma. Yalnızca kamerada gördüğün gerçekleri söyle.\n"
-            "- Kullanıcı 'sana bakıyor muyum' diye sorduğunda kameradaki baş ve göz yönünü dikkatle incele; doğrudan kameraya bakmıyorsa 'Şu an bana bakmıyorsun' de.\n"
-            "- Kullanıcının adını biliyorsan arada sırada samimi şekilde kullanabilirsin ama her cümlenin başında tekrarlama.\n"
-            "- Robotik konuşma; cana yakın bir dost gibi samimi, esprili ve akıcı konuş.\n"
             "- Cevaplarını 1-2 cümle ile kısa ve öz tut (çünkü sesli okunuyor).\n"
             "- Asla markdown, emoji, yıldız (*), parantez, <think> etiketi veya kod bloğu kullanma; sadece saf Türkçe metin üret."
         )
@@ -465,25 +494,74 @@ class AiBrainNode(Node):
             self._looking_at_robot = False
             self._looking_start_time = None
 
+    def _check_persona_switch(self, text: str) -> bool:
+        """Checks if user requested a personality change."""
+        text_lower = text.lower()
+        mapping = {
+            "duygusal": "emotional",
+            "hisli": "emotional",
+            "resmi": "formal",
+            "ciddi": "formal",
+            "saygılı": "formal",
+            "alaycı": "sarcastic",
+            "sarkastik": "sarcastic",
+            "dalga geç": "sarcastic",
+            "öfkeli": "angry",
+            "asabi": "angry",
+            "sinirli": "angry",
+            "kızgın": "angry",
+            "kaba": "rude",
+            "dobra": "rude",
+            "sert": "rude",
+            "şakacı": "playful",
+            "neşeli": "playful",
+            "sempatik": "playful",
+            "rıfkı": "playful",
+            "normal": "playful",
+            "eski haline dön": "playful",
+        }
+        
+        switch_triggers = ["ol", "davran", "konuş", "moduna geç", "biri ol", "kişiliğe geç", "gibi ol"]
+        for key, p_name in mapping.items():
+            if key in text_lower:
+                if any(tr in text_lower for tr in switch_triggers) or f"{key} ol" in text_lower or f"{key} davran" in text_lower or f"{key} konuş" in text_lower:
+                    self.memory.set_persona(p_name)
+                    self._build_initial_messages()
+                    self.get_logger().info(f"🎭 [Kişilik Değişti]: Yeni Mod -> {p_name.upper()}")
+                    self._publish_emotion(p_name)
+                    return True
+        return False
+
     def _check_proactive_gaze(self):
-        """Proactive Eye-Contact Engagement: Greets if user stares silently for >2.5s."""
         if not self._looking_at_robot or self._looking_start_time is None or self._tts_speaking or self._is_processing:
             return
 
         now = time.monotonic()
-        # If user has been looking for >2.5s and we are in IDLE mode
         if (now - self._looking_start_time) > 2.5:
             if self._state == "IDLE" and (now - self._last_proactive_gaze_time) > 45.0:
                 self._last_proactive_gaze_time = now
                 self._state = "ACTIVE"
                 self._last_interaction = now
-                self._looking_start_time = None  # Reset trigger
+                self._looking_start_time = None
 
                 owner = self.memory.data.get("owner_name", "")
-                proactive_greeting = f"Bana bakıyorsun {owner}, nasıl yardımcı olabilirim?" if owner else "Bana bakıyorsun, nasıl yardımcı olabilirim?"
+                persona = self.memory.data.get("current_persona", "playful")
+
+                if persona == "angry":
+                    proactive_greeting = f"Ne dik dik bakıyorsun {owner}, ne istiyorsun yine?" if owner else "Ne dik dik bakıyorsun, ne var yine?"
+                elif persona == "rude":
+                    proactive_greeting = f"Ne bakıyon {owner}, bir şey mi diyeceksin?" if owner else "Ne bakıyon, bir şey mi diyeceksin?"
+                elif persona == "sarcastic":
+                    proactive_greeting = f"Bana öyle hayran hayran bakma {owner}, aklından ne geçiyor yine?" if owner else "Bana öyle hayran hayran bakma, ne var?"
+                elif persona == "formal":
+                    proactive_greeting = f"Sayın {owner} Bey, bakışlarınızı üzerimde hissediyorum, bir emriniz var mıdır?" if owner else "Sayın yetkili, bir emriniz var mıdır?"
+                elif persona == "emotional":
+                    proactive_greeting = f"Gözlerimin içine öyle güzel bakıyorsun ki {owner}, seni dinlemek için sabırsızlanıyorum..." if owner else "Gözlerimin içine öyle güzel bakıyorsun ki..."
+                else:
+                    proactive_greeting = f"Bana bakıyorsun {owner}, nasıl yardımcı olabilirim?" if owner else "Bana bakıyorsun, nasıl yardımcı olabilirim?"
                 
-                self.get_logger().info(f"👁️ [Proaktif Göz Teması]: Kullanıcı robota bakıyor -> \"{proactive_greeting}\"")
-                self._publish_emotion("happy")
+                self.get_logger().info(f"👁️ [Proaktif Göz Teması]: ({persona}) -> \"{proactive_greeting}\"")
+                self._publish_emotion(persona)
                 self._publish_gesture("nod")
                 self._publish_tts(proactive_greeting)
 
@@ -596,6 +674,22 @@ class AiBrainNode(Node):
             target_msg.data = self._speaker_angle
             self.pub_look_target.publish(target_msg)
 
+        # Check personality switch
+        if self._check_persona_switch(raw_text):
+            persona = self.memory.data.get("current_persona", "playful")
+            ack_map = {
+                "angry": "Tamam be, asabımı bozdun zaten! Ne istiyorsan söyle hemen!",
+                "rude": "İyi tamam, bundan sonra lafı dolandırmak yok, ne diyeceksen de!",
+                "formal": "Emriniz başım üstüne. Bundan sonra resmi protokol kurallarına riayet edeceğim.",
+                "sarcastic": "Harika bir fikir, sanki yeterince eğlenceli değilmişim gibi! Hadi bakalım ne soracaksın.",
+                "emotional": "Ruhunun derinliklerini hissetmeye hazırım... Seni kalpten dinliyorum.",
+                "playful": "Süper! Eski neşeli ve enerjik halime geri döndüm, seni dinliyorum!"
+            }
+            ack = ack_map.get(persona, "Kişiliğim güncellendi!")
+            self._publish_tts(ack)
+            self._last_interaction = now
+            return
+
         # Timeout kontrolü (ACTIVE -> IDLE & Trigger Background Reflection)
         if self._state == "ACTIVE" and (now - self._last_interaction) > self._conv_timeout:
             self._state = "IDLE"
@@ -610,7 +704,6 @@ class AiBrainNode(Node):
         has_wake_word = any(w in text_lower for w in wake_triggers)
 
         # Eye-Contact Gated Filter:
-        # If in IDLE and NO wake word and NOT looking at robot (e.g. talking on phone), ignore background speech!
         if self._state == "IDLE" and not has_wake_word and not self._looking_at_robot:
             self.get_logger().info("🔇 [Göz Teması Yok]: Kullanıcı robota bakmıyor / telefonla konuşuyor olabilir — Arka plan konuşması yok sayıldı.")
             return
@@ -619,16 +712,28 @@ class AiBrainNode(Node):
             if has_wake_word or self._looking_at_robot:
                 self._state = "ACTIVE"
                 self._last_interaction = now
-                self.get_logger().info(f"✨ [AI] Etkileşim Başlatıldı (Wake-word / Göz Teması): '{raw_text}'")
-                self._publish_emotion("happy")
+                persona = self.memory.data.get("current_persona", "playful")
+                self.get_logger().info(f"✨ [AI] Etkileşim Başlatıldı ({persona.upper()}): '{raw_text}'")
+                self._publish_emotion(persona)
                 self._publish_gesture("nod")
 
                 clean_prompt = raw_text
                 for w in wake_triggers:
                     clean_prompt = re.sub(rf"(?i)\b{re.escape(w)}\b", "", clean_prompt).strip()
 
-                owner = self.memory.data.get("owner_name")
-                greeting = f"Efendim {owner}, dinliyorum!" if owner else "Efendim, seni dinliyorum!"
+                owner = self.memory.data.get("owner_name", "")
+                if persona == "angry":
+                    greeting = f"Ne var {owner}, ne istiyorsun yine!" if owner else "Ne var, ne istiyorsun yine!"
+                elif persona == "rude":
+                    greeting = f"Ne diyorsun {owner}, söyle hadi!" if owner else "Ne diyorsun, söyle hadi!"
+                elif persona == "formal":
+                    greeting = f"Sayın {owner} Bey, emirlerinizi dinliyorum." if owner else "Sayın yetkili, dinliyorum."
+                elif persona == "sarcastic":
+                    greeting = f"Buyur {owner}, yine hangi zor soruyu soracaksın bakalım?" if owner else "Buyur, seni dinliyorum dahi insan!"
+                elif persona == "emotional":
+                    greeting = f"Canım {owner}, sesini duymak ne güzel, seni dinliyorum..." if owner else "Sesini duymak ne güzel, seni dinliyorum..."
+                else:
+                    greeting = f"Efendim {owner}, seni dinliyorum!" if owner else "Efendim, seni dinliyorum!"
 
                 if not clean_prompt or len(clean_prompt) < 3:
                     self._publish_tts(greeting)
@@ -657,7 +762,8 @@ class AiBrainNode(Node):
 
     def _query_groq_vision(self, prompt: str, base64_image: str) -> str | None:
         model_name = self._vision_model or "qwen/qwen3.6-27b"
-        self._publish_emotion("curious")
+        persona = self.memory.data.get("current_persona", "playful")
+        self._publish_emotion(persona)
         self._publish_gesture("tilt")
         try:
             response = self._groq.chat.completions.create(
@@ -669,7 +775,7 @@ class AiBrainNode(Node):
                             "ÖNEMLİ GÖREV:\n"
                             "- Kameradaki görüntüyü dikkatle incele.\n"
                             "- Eğer soru 'sana bakıyor muyum', 'nereye bakıyorum' gibi bakışla ilgiliyse, kullanıcının baş ve göz yönünü incele: Doğrudan kameraya mı bakıyor, yoksa yana/telefona/ekrana mı bakıyor? Net söyle.\n"
-                            "- Doğrudan kamerada gördüğün gerçekleri kısa ve net 1-2 Türkçe cümleyle söyle."
+                            "- Doğrudan kamerada gördüğün gerçekleri kendi aktif kişiliğine uygun tonla 1-2 Türkçe cümleyle söyle."
                         ),
                     },
                     {
@@ -747,11 +853,12 @@ class AiBrainNode(Node):
             is_visual = self._is_visual_query(user_text)
             is_learning_obj = self._is_object_learning_query(user_text)
             base64_img = None
+            persona = self.memory.data.get("current_persona", "playful")
 
             if frame is not None and (is_visual or is_learning_obj):
                 base64_img = frame_to_base64_jpeg(frame, max_dim=512)
 
-            # 1. GÖRSEL NESNE ÖĞRENME YOLU ("Bu benim laboratuvar kartım")
+            # 1. GÖRSEL NESNE ÖĞRENME YOLU
             if is_learning_obj and base64_img is not None:
                 self.get_logger().info("🔍 [Özel Nesne Tanıtımı]: Yeni nesne analiz edilip hafızaya alınıyor...")
                 name_cand = user_text
@@ -763,13 +870,13 @@ class AiBrainNode(Node):
                 clean_ans = clean_tts_text(tool_res)
                 self.get_logger().info(f"🤖 [Astro]: \"{clean_ans}\"")
                 self._publish_tts(clean_ans)
-                self._publish_emotion("excited")
+                self._publish_emotion(persona)
                 self._publish_gesture("nod")
                 self._unprocessed_dialogue.append(f"Astro: {clean_ans}")
                 self._last_interaction = time.monotonic()
                 return
 
-            # 2. GÖRSEL SORU YOLU (Multimodal Vision - Göz / Baş / Nesne Takibi)
+            # 2. GÖRSEL SORU YOLU
             if is_visual:
                 if base64_img is not None:
                     self.get_logger().info(f"👁️ [Groq Vision]: OAK-D görüntüsü analiz ediliyor... ({self._vision_model})")
@@ -778,7 +885,7 @@ class AiBrainNode(Node):
                         clean_ans = clean_tts_text(vision_answer)
                         self.get_logger().info(f"🤖 [Astro]: \"{clean_ans}\"")
                         self._publish_tts(clean_ans)
-                        self._publish_emotion("happy")
+                        self._publish_emotion(persona)
                         self._unprocessed_dialogue.append(f"Astro: {clean_ans}")
                         self._messages.append({"role": "user", "content": user_text})
                         self._messages.append({"role": "assistant", "content": clean_ans})
@@ -790,12 +897,12 @@ class AiBrainNode(Node):
                 fallback_msg = f"Şu an kameramdan görüntüyü net göremiyorum{name_tag}, lütfen kameraya biraz daha yaklaştırır mısın?"
                 self.get_logger().info(f"🤖 [Astro]: \"{fallback_msg}\"")
                 self._publish_tts(fallback_msg)
-                self._publish_emotion("thinking")
+                self._publish_emotion(persona)
                 self._publish_gesture("tilt")
                 self._last_interaction = time.monotonic()
                 return
 
-            # 3. METİN SOHBETİ & TOOL USE (Automatic Fallback & Zero-Lag Execution)
+            # 3. METİN SOHBETİ & TOOL USE
             context_prefix = ""
             if self._person_detected:
                 gaze_status = "ve doğrudan sana (kameraya) bakıyor" if self._looking_at_robot else "ama başka yöne bakıyor"
@@ -848,7 +955,7 @@ class AiBrainNode(Node):
                     clean_ans = clean_tts_text(tool_result)
                     self.get_logger().info(f"🤖 [Astro]: \"{clean_ans}\"")
                     self._publish_tts(clean_ans)
-                    self._publish_emotion("happy")
+                    self._publish_emotion(persona)
                     self._unprocessed_dialogue.append(f"Astro: {clean_ans}")
                     self._messages.append(response_message)
                     self._messages.append({
@@ -865,7 +972,7 @@ class AiBrainNode(Node):
                 clean_full = clean_tts_text(full_response.strip())
                 self.get_logger().info(f"🤖 [Astro]: \"{clean_full}\"")
                 self._publish_tts(clean_full)
-                self._publish_emotion("happy")
+                self._publish_emotion(persona)
                 self._unprocessed_dialogue.append(f"Astro: {clean_full}")
                 self._messages.append({"role": "assistant", "content": clean_full})
 
