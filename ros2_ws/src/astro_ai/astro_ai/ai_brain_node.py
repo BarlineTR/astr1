@@ -215,8 +215,10 @@ class AiBrainNode(Node):
         self.create_timer(0.15, self._check_proactive_gaze)
         self.create_timer(1.0, self._check_session_lifecycle)
 
-        # Start Idle Learning
-        self._start_idle_learning()
+        # Idle Learning (Opt-in to prevent token burn)
+        self._enable_idle_vision = bool(os.getenv("ENABLE_IDLE_VISION", "false").lower() == "true")
+        if self._enable_idle_vision:
+            self._start_idle_learning()
 
         self.get_logger().info(
             f"🧠 [AI Brain Node] Modüler Mimari Hazır! Kişilik: [{self.persona_engine.current_persona.upper()}]"
@@ -550,7 +552,7 @@ class AiBrainNode(Node):
 
         # 1. Try Direct Google Gemini REST Endpoint (Ultra-Fast, Zero-Dependency, Direct Key)
         if self._ai_api_key:
-            for g_model in ["gemini-2.5-flash", "gemini-2.5-pro", "gemini-1.5-flash-latest"]:
+            for g_model in ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-pro", "gemini-1.5-flash-8b"]:
                 try:
                     url = f"https://generativelanguage.googleapis.com/v1beta/models/{g_model}:generateContent?key={self._ai_api_key}"
                     payload = {
