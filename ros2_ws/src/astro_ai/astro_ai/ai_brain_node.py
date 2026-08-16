@@ -1,13 +1,17 @@
 #!/usr/bin/env python3
-"""ASTRO V1 — Autonomous Social AI Brain Node.
+"""ASTRO V1 — Autonomous Social AI Brain Node with Tool Use & Visual Object Learning.
 
 Key Capabilities:
   1. True Multimodal Vision: Real-time visual QA via Groq Vision (Qwen 3.6 / Llama 3.2 90B)
-  2. Autonomous Learning & Reflection: Extracts facts, preferences, and objects in background
-  3. Direction of Arrival (DOA) Attention: Tracks speaker angle from ReSpeaker 4-Mic
-  4. Emotional & Gestural Expression: Publishes /robot/emotion and /robot/head_gesture
-  5. Proactive Awareness: Detects person approaching and greets naturally
-  6. Ultra-Fast Zero-Lag Streaming TTS with Rıfkı Persona
+  2. Autonomous Learning & Reflection: Background knowledge synthesis
+  3. Visual Object Learning (Few-Shot): Learns custom user objects ("Bu benim laboratuvar kartım")
+  4. Tool Use / Function Calling:
+     - Live weather checking (wttr.in)
+     - Proactive timers & reminders (e.g. "10 dakika sonra mola hatırlat")
+     - Robot control (look left/right, nod, head gestures)
+  5. Direction of Arrival (DOA) Speaker Tracking
+  6. Emotional & Gestural Expression (/robot/emotion, /robot/head_gesture)
+  7. Ultra-Fast Zero-Lag Streaming TTS with Rıfkı Persona
 """
 
 import os
@@ -15,6 +19,7 @@ import re
 import time
 import json
 import base64
+import requests
 import threading
 import numpy as np
 
@@ -82,6 +87,68 @@ EMOJI_RE = re.compile(
     flags=re.UNICODE,
 )
 
+ROBOT_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "get_live_weather",
+            "description": "Belirtilen şehrin anlık canlı hava durumunu getirir.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "city": {
+                        "type": "string",
+                        "description": "Hava durumu öğrenilmek istenen şehir (örnek: Istanbul, Ankara, Izmir)"
+                    }
+                },
+                "required": ["city"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "set_reminder_timer",
+            "description": "Belirli bir dakika sonra kullanıcıya sesli bir hatırlatma veya alarm kurar.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "minutes": {
+                        "type": "integer",
+                        "description": "Kaç dakika sonra hatırlatılacağı (örnek: 5, 10, 30)"
+                    },
+                    "reminder_text": {
+                        "type": "string",
+                        "description": "Kullanıcıya hatırlatılacak mesaj veya eylem (örnek: 'Mola verme zamanı', 'Fırını kapat')"
+                    }
+                },
+                "required": ["minutes", "reminder_text"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "learn_custom_object",
+            "description": "Kullanıcının kameraya gösterdiği ve tanıttığı özel bir nesneyi/eşyayı hafızaya kaydeder.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "object_name": {
+                        "type": "string",
+                        "description": "Öğrenilecek nesnenin adı (örnek: 'Laboratuvar kartı', 'Özel taş', 'Çalışma kupam')"
+                    },
+                    "description": {
+                        "type": "string",
+                        "description": "Nesnenin ne olduğu veya ne işe yaradığı"
+                    }
+                },
+                "required": ["object_name"]
+            }
+        }
+    }
+]
+
 
 class AstroMemory:
     """Persistent Long-Term Memory with Autonomous Knowledge Synthesis."""
@@ -110,7 +177,6 @@ class AstroMemory:
                     self.data.update(saved)
             except Exception:
                 pass
-        # Clean corrupted names
         if self.data.get("owner_name") and str(self.data["owner_name"]).lower() in ["şarkı", "cevap", "yardım", "nasılsın"]:
             self.data["owner_name"] = "Baran"
             self.save()
@@ -134,8 +200,8 @@ class AstroMemory:
                 self.data["user_facts"] = self.data["user_facts"][-30:]
             self.save()
 
-    def add_object(self, obj_name: str, description: str):
-        self.data.setdefault("learned_objects", {})[obj_name] = description
+    def add_object(self, obj_name: str, visual_desc: str):
+        self.data.setdefault("learned_objects", {})[obj_name] = visual_desc
         self.save()
 
     def get_context_prompt(self) -> str:
@@ -146,8 +212,8 @@ class AstroMemory:
             facts_str = "; ".join(self.data["user_facts"][-6:])
             ctx.append(f"Kullanıcı hakkında bildiklerin: {facts_str}")
         if self.data.get("learned_objects"):
-            objs = [f"{k} ({v})" for k, v in list(self.data["learned_objects"].items())[-4:]]
-            ctx.append(f"Daha önce öğrendiğin özel eşyalar: {', '.join(objs)}")
+            objs = [f"- {k}: {v}" for k, v in list(self.data["learned_objects"].items())[-6:]]
+            ctx.append("Daha önce sana tanıtılan özel nesneler:\n" + "\n".join(objs))
         if ctx:
             return "Hafızandaki Kalıcı Bilgiler:\n" + "\n".join(ctx)
         return ""
@@ -159,11 +225,11 @@ def clean_tts_text(text: str) -> str:
     text = re.sub(r"(?i)<think>[\s\S]*?</think>", "", text)
     text = re.sub(r"(?i)<\/?think>", "", text)
     text = EMOJI_RE.sub("", text)
-    text = re.sub(r"```.*?```", "", text, flags=re.DOTALL)
-    text = re.sub(r"`.*?`", "", text)
-    text = re.sub(r"[\*\_\~\#\<\>]", "", text)
+    text = re.sub(r'```.*?```', '', text, flags=re.DOTALL)
+    text = re.sub(r'`.*?`', '', text)
+    text = re.sub(r'[\*\_\~\#\<\>]', '', text)
     text = " ".join(text.split())
-    text = re.sub(r"\s+([,.:;?!])", r"\1", text)
+    text = re.sub(r'\s+([,.:;?!])', r'\1', text)
     return text.strip()
 
 
@@ -325,7 +391,7 @@ class AiBrainNode(Node):
         owner = self.memory.data.get("owner_name")
         owner_info = f" (Tanınan Kişi: {owner})" if owner else ""
         self.get_logger().info(
-            f"🧠 [AI Brain] Görme, Otonom Hafıza, DOA ve Ses Sistemi Hazır! Wake-word: \"{self._wake_word}\"{owner_info}"
+            f"🧠 [AI Brain] Görme, Otonom Hafıza, Araçlar (Tools) ve Ses Sistemi Hazır! Wake-word: \"{self._wake_word}\"{owner_info}"
         )
 
     def _discover_vision_model(self) -> str:
@@ -348,6 +414,7 @@ class AiBrainNode(Node):
             "Sosyal medyada sevilen Rıfkı gibi sevecen ve cana yakın bir karaktere sahipsin.\n"
             "Önemli Kuralların:\n"
             "- OAK-D kameran sayesinde karşındaki insanı, kıyafetlerini, renkleri, elindeki eşyaları ve hareketlerini GERÇEKTEN görüyorsun.\n"
+            "- Hafızandaki kayıtlı nesneleri (özel kartlar, taşlar, kupalar) hatırlarsın.\n"
             "- Asla ezbere konuşma, tahmin veya uydurma yapma. Yalnızca kamerada gördüğün gerçekleri söyle.\n"
             "- Kullanıcı sana ne giydiğini veya elinde ne olduğunu sorduğunda görseli dikkatle incele; eğer elinde hiçbir şey yoksa 'Elinde bir şey görmüyorum' de.\n"
             "- Kullanıcının adını biliyorsan arada sırada samimi şekilde kullanabilirsin ama her cümlenin başında papağan gibi tekrarlama, doğal konuş.\n"
@@ -389,6 +456,11 @@ class AiBrainNode(Node):
         text_lower = text.lower()
         return any(k in text_lower for k in visual_keywords)
 
+    def _is_object_learning_query(self, text: str) -> bool:
+        keywords = ["bu benim", "bunu öğren", "bunu kaydet", "bu nesne", "buna bak bu", "bu gördüğün"]
+        text_lower = text.lower()
+        return any(k in text_lower for k in keywords)
+
     def _check_and_learn_memory(self, user_text: str):
         text_lower = user_text.lower().strip()
         patterns = [
@@ -413,6 +485,57 @@ class AiBrainNode(Node):
                     self._messages[0]["content"] = self._build_system_prompt()
                     break
 
+    def _execute_tool_call(self, tool_name: str, arguments: dict, frame: np.ndarray | None) -> str:
+        """Executes tool functions and returns text result."""
+        self.get_logger().info(f"🛠️ [Tool Call]: {tool_name}({arguments})")
+        
+        if tool_name == "get_live_weather":
+            city = arguments.get("city", "Istanbul")
+            try:
+                res = requests.get(f"https://wttr.in/{city}?format=%C+%t", timeout=4.0)
+                if res.status_code == 200 and res.text.strip():
+                    return f"{city} için güncel hava durumu: {res.text.strip()}"
+            except Exception as e:
+                self.get_logger().warn(f"Hava durumu hatası: {e}")
+            return f"{city} için hava durumu bilgisi şu an alınamadı."
+
+        elif tool_name == "set_reminder_timer":
+            minutes = arguments.get("minutes", 5)
+            text = arguments.get("reminder_text", "Zaman doldu!")
+            
+            def _alarm_callback():
+                owner = self.memory.data.get("owner_name", "")
+                alarm_msg = f"{owner}, {minutes} dakika doldu! Hatırlatmam: {text}" if owner else f"Zaman doldu! Hatırlatmam: {text}"
+                self.get_logger().info(f"⏰ [Alarm Çaldı]: {alarm_msg}")
+                self._publish_tts(alarm_msg)
+                self._publish_emotion("excited")
+                self._publish_gesture("nod")
+
+            t = threading.Timer(minutes * 60.0, _alarm_callback)
+            t.daemon = True
+            t.start()
+            return f"{minutes} dakika sonrası için '{text}' hatırlatıcısı başarıyla kuruldu."
+
+        elif tool_name == "learn_custom_object":
+            obj_name = arguments.get("object_name", "Özel Eşya")
+            desc = arguments.get("description", "")
+            
+            # If camera frame is available, analyze visual details
+            visual_details = desc
+            if frame is not None:
+                base64_img = frame_to_base64_jpeg(frame, max_dim=512)
+                if base64_img:
+                    vis_ans = self._query_groq_vision(f"Kamerada tutulan bu '{obj_name}' nesnesinin renklerini ve belirgin görsel özelliklerini kısaca tarif et.", base64_img)
+                    if vis_ans:
+                        visual_details = vis_ans
+
+            self.memory.add_object(obj_name, visual_details)
+            self.get_logger().info(f"✨ [Görsel Nesne Öğrenildi]: {obj_name} -> {visual_details}")
+            self._messages[0]["content"] = self._build_system_prompt()
+            return f"'{obj_name}' nesnesini kameradan inceleyip hafızama kaydettim! Artık gösterdiğinde tanıyacağım."
+
+        return "Eylem tamamlandı."
+
     def _on_speech(self, msg: String):
         raw_text = msg.data.strip()
         if not raw_text or self._tts_speaking or not self._enabled:
@@ -434,7 +557,6 @@ class AiBrainNode(Node):
         if self._state == "ACTIVE" and (now - self._last_interaction) > self._conv_timeout:
             self._state = "IDLE"
             self.get_logger().info("💤 [AI] Sohbet zaman aşımı — Uyku moduna geçildi.")
-            # Trigger background autonomous reflection
             threading.Thread(target=self._run_autonomous_reflection, daemon=True).start()
 
         # Wake-word tetikleyicileri
@@ -517,21 +639,17 @@ class AiBrainNode(Node):
                 max_tokens=600,
             )
             raw = response.choices[0].message.content.strip()
-            
             if "</think>" in raw:
                 actual = raw.split("</think>")[-1].strip()
                 if actual:
                     return actual
-            
             clean = re.sub(r"(?i)<\/?think>", "", raw).strip()
             return clean if clean else None
-            
         except Exception as e:
             self.get_logger().error(f"❌ [Vision Model Hatası ({model_name})]: {e}")
             return None
 
     def _run_autonomous_reflection(self):
-        """Autonomous Background Reflection: Learns facts and habits from recent dialogues."""
         if not self._groq or not self._unprocessed_dialogue:
             return
         try:
@@ -567,12 +685,32 @@ class AiBrainNode(Node):
             self._unprocessed_dialogue.append(f"Kullanıcı: {user_text}")
 
             is_visual = self._is_visual_query(user_text)
+            is_learning_obj = self._is_object_learning_query(user_text)
             base64_img = None
 
-            if frame is not None and is_visual:
+            if frame is not None and (is_visual or is_learning_obj):
                 base64_img = frame_to_base64_jpeg(frame, max_dim=512)
 
-            # 1. GÖRSEL SORU YOLU (Multimodal Vision)
+            # 1. GÖRSEL NESNE ÖĞRENME YOLU ("Bu benim laboratuvar kartım")
+            if is_learning_obj and base64_img is not None:
+                self.get_logger().info("🔍 [Özel Nesne Tanıtımı]: Yeni nesne analiz edilip hafızaya alınıyor...")
+                # Extract object name from text
+                name_cand = user_text
+                for k in ["bu benim", "bunu öğren", "bunu kaydet", "bu nesne", "buna bak bu"]:
+                    name_cand = re.sub(rf"(?i){k}", "", name_cand).strip()
+                name_cand = name_cand.strip(".:,!") or "Özel Eşya"
+
+                tool_res = self._execute_tool_call("learn_custom_object", {"object_name": name_cand, "description": user_text}, frame)
+                clean_ans = clean_tts_text(tool_res)
+                self.get_logger().info(f"🤖 [Astro]: \"{clean_ans}\"")
+                self._publish_tts(clean_ans)
+                self._publish_emotion("excited")
+                self._publish_gesture("nod")
+                self._unprocessed_dialogue.append(f"Astro: {clean_ans}")
+                self._last_interaction = time.monotonic()
+                return
+
+            # 2. GÖRSEL SORU YOLU (Multimodal Vision)
             if is_visual:
                 if base64_img is not None:
                     self.get_logger().info(f"👁️ [Groq Vision]: OAK-D görüntüsü analiz ediliyor... ({self._vision_model})")
@@ -598,8 +736,7 @@ class AiBrainNode(Node):
                 self._last_interaction = time.monotonic()
                 return
 
-            # 2. HIZLI METİN SOHBETİ YOLU (Groq Streaming LLM)
-            self._publish_emotion("happy")
+            # 3. METİN SOHBETİ & TOOL USE (Function Calling: Hava durumu, Zamanlayıcı)
             context_prefix = ""
             if self._person_detected:
                 context_prefix = "[Kamerada karşında bir insan görüyorsun] "
@@ -610,39 +747,63 @@ class AiBrainNode(Node):
             if len(self._messages) > self._max_history:
                 self._messages = [self._messages[0]] + self._messages[-(self._max_history - 1):]
 
-            stream = self._groq.chat.completions.create(
+            # Call with Tool Definitions
+            response = self._groq.chat.completions.create(
                 messages=self._messages,
                 model=self._text_model,
                 temperature=self._temperature,
                 max_tokens=self._max_tokens,
-                stream=True,
+                tools=ROBOT_TOOLS,
+                tool_choice="auto",
             )
 
-            full_response = ""
-            text_buffer = ""
+            response_message = response.choices[0].message
+            tool_calls = response_message.tool_calls
 
-            for chunk in stream:
-                token = ""
-                if hasattr(chunk, 'choices') and chunk.choices:
-                    delta = chunk.choices[0].delta
-                    token = getattr(delta, 'content', '') or ""
+            if tool_calls:
+                # Handle Tool Execution
+                self._publish_emotion("thinking")
+                for tool_call in tool_calls:
+                    fn_name = tool_call.function.name
+                    try:
+                        fn_args = json.loads(tool_call.function.arguments)
+                    except Exception:
+                        fn_args = {}
+                    
+                    tool_result = self._execute_tool_call(fn_name, fn_args, frame)
+                    
+                    # Second LLM call to explain tool result naturally
+                    self._messages.append(response_message)
+                    self._messages.append({
+                        "role": "tool",
+                        "tool_call_id": tool_call.id,
+                        "name": fn_name,
+                        "content": tool_result
+                    })
 
-                if not token:
-                    continue
-                full_response += token
-                text_buffer += token
+                    second_res = self._groq.chat.completions.create(
+                        messages=self._messages,
+                        model=self._text_model,
+                        temperature=self._temperature,
+                        max_tokens=150,
+                    )
+                    final_text = second_res.choices[0].message.content.strip()
+                    clean_ans = clean_tts_text(final_text)
+                    self.get_logger().info(f"🤖 [Astro]: \"{clean_ans}\"")
+                    self._publish_tts(clean_ans)
+                    self._publish_emotion("happy")
+                    self._unprocessed_dialogue.append(f"Astro: {clean_ans}")
+                    self._messages.append({"role": "assistant", "content": clean_ans})
+                    self._last_interaction = time.monotonic()
+                    return
 
-                sentences, text_buffer = extract_tts_sentences(text_buffer)
-                for s in sentences:
-                    self._publish_tts(s)
-
-            sentences, text_buffer = extract_tts_sentences(text_buffer, final=True)
-            for s in sentences:
-                self._publish_tts(s)
-
+            # If no tools called, stream normal conversation
+            full_response = response_message.content or ""
             if full_response.strip():
                 clean_full = clean_tts_text(full_response.strip())
                 self.get_logger().info(f"🤖 [Astro]: \"{clean_full}\"")
+                self._publish_tts(clean_full)
+                self._publish_emotion("happy")
                 self._unprocessed_dialogue.append(f"Astro: {clean_full}")
                 self._messages.append({"role": "assistant", "content": clean_full})
 
