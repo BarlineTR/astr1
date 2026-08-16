@@ -130,7 +130,7 @@ class AiBrainNode(Node):
         self.declare_parameter("llm_temperature", float(os.getenv("LLM_TEMPERATURE", "0.55")))
         self.declare_parameter("llm_max_tokens", int(os.getenv("LLM_MAX_TOKENS", "300")))
         self.declare_parameter("wake_word", os.getenv("WAKE_WORD", "hey astro"))
-        self.declare_parameter("conversation_timeout", float(os.getenv("CONVERSATION_TIMEOUT", "45.0")))
+        self.declare_parameter("conversation_timeout", float(os.getenv("CONVERSATION_TIMEOUT", "8.0")))
 
         self._text_model = self.get_parameter("llm_model").value
         self._fallback_models = ["llama-3.3-70b-versatile", "llama-3.1-8b-instant", "mixtral-8x7b-32768"]
@@ -295,8 +295,8 @@ class AiBrainNode(Node):
             return
 
         now = time.monotonic()
-        if (now - self._looking_start_time) >= 0.4:
-            if self.state_machine.is_idle() and (now - self._last_proactive_gaze_time) > 15.0:
+        if (now - self._looking_start_time) >= 0.3:
+            if self.state_machine.is_idle() and (now - self._last_proactive_gaze_time) > 8.0:
                 self._last_proactive_gaze_time = now
                 self.session.activate_session(reason="proactive_gaze")
                 self.state_machine.transition_to(RobotState.LISTENING)
