@@ -193,6 +193,7 @@ class AstroMemory:
             "current_persona": "playful",
             "user_style_notes": "Samimi ve doğal Türkçe konuşur",
             "user_facts": [
+                "Senin adın Astro, sen akıllı, bağımsız ve interaktif bir sosyal robot asistansın.",
                 "Robotun geliştiricisinin adı Baran",
                 "Robotik ve yazılımla ilgileniyor"
             ],
@@ -446,7 +447,8 @@ class AiBrainNode(Node):
         persona_rule = PERSONA_PROMPTS.get(persona, PERSONA_PROMPTS["playful"])
 
         base_prompt = (
-            f"Sen Astro adında insansı bir sosyal robot asistansın.\n"
+            f"Sen Astro adında gerçek, fiziksel ve otonom bir sosyal robot asistansın.\n"
+            f"Senin fiziksel bir bedenin, OAK-D Lite 3D kameran, mikrofonların ve motorların var. Karşındaki insanları görebiliyor ve duyabiliyorsun.\n"
             f"TEMEL KİŞİLİĞİN: {persona_rule}\n\n"
             "SOSYAL VE DİLSEL KURALLAR:\n"
             "- Karşındaki kişi kendini tanıtmadığı sürece EZBERE İSİM SÖYLEME. Yeni biriyle konuşuyorsan tanış.\n"
@@ -540,7 +542,7 @@ class AiBrainNode(Node):
             return
 
         now = time.monotonic()
-        if (now - self._looking_start_time) > 1.6:
+        if (now - self._looking_start_time) > 2.0:
             if self._state == "IDLE" and (now - self._last_proactive_gaze_time) > 30.0:
                 self._last_proactive_gaze_time = now
                 self._state = "ACTIVE"

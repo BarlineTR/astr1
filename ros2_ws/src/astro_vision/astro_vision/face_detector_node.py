@@ -154,6 +154,22 @@ class SpatialVisionNode(Node):
             minSize=(self.min_size, self.min_size),
         )
 
+        # Temporal smoothing for face detection dropouts
+        if len(faces) == 0 and hasattr(self, '_last_known_face') and self._last_known_face is not None:
+            if self._face_lost_frames < 5:  # Tolerate up to 5 frames of lost face
+                faces = [self._last_known_face]
+                self._face_lost_frames += 1
+            else:
+                self._last_known_face = None
+        elif len(faces) > 0:
+            # Sort by size to track the largest face
+            faces = sorted(faces, key=lambda f: f[2]*f[3], reverse=True)
+            self._last_known_face = faces[0]
+            self._face_lost_frames = 0
+        else:
+            self._face_lost_frames = 0
+            self._last_known_face = None
+
         face_list = []
         is_looking = False
         user_distance = 0.0
