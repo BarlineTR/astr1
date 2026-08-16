@@ -595,13 +595,13 @@ class AiBrainNode(Node):
                     clean_ans = extract_spoken_turkish_sentence(raw)
                     if clean_ans:
                         self.cloud_mgr.record_llm_success()
-                        self.get_logger().info(f"✨ [Vision İstemcisi] Görsel başarıyla yanıtlandı ({m_cand})")
+                        self.get_logger().info(f"✨ [Vision İstemcisi] Görsel başarıyla yanıtlandı ({m_cand}): '{clean_ans}'")
                         return clean_ans
                 except Exception as e2:
-                    self.get_logger().debug(f"Vision fallback {m_cand} notice: {e2}")
+                    self.get_logger().warn(f"⚠️ [Vision İstemcisi ({m_cand}) Hatası]: {e2}")
 
-        # 3. Try Direct Google Gemini REST Endpoint (Zero-SDK Fallback)
-        if self._ai_api_key and self._ai_api_key.startswith("AIza"):
+        # 3. Try Direct Google Gemini REST Endpoint (Zero-SDK Direct Call)
+        if self._ai_api_key:
             for g_model in ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash"]:
                 try:
                     url = f"https://generativelanguage.googleapis.com/v1beta/models/{g_model}:generateContent?key={self._ai_api_key}"
@@ -609,14 +609,14 @@ class AiBrainNode(Node):
                         "contents": [{
                             "parts": [
                                 {"text": f"{system_instruction}\n\nKullanıcı: {prompt}"},
-                                {"inline_data": {"mime_type": "image/jpeg", "data": base64_image}}
+                                {"inlineData": {"mimeType": "image/jpeg", "data": base64_image}}
                             ]
                         }],
                         "generationConfig": {"temperature": 0.2, "maxOutputTokens": 100}
                     }
                     data_bytes = json.dumps(payload).encode("utf-8")
                     req = urllib.request.Request(url, data=data_bytes, headers={"Content-Type": "application/json"})
-                    with urllib.request.urlopen(req, timeout=4.0) as resp:
+                    with urllib.request.urlopen(req, timeout=5.0) as resp:
                         res_json = json.loads(resp.read().decode("utf-8"))
                         text = res_json["candidates"][0]["content"]["parts"][0]["text"].strip()
                         clean_ans = extract_spoken_turkish_sentence(text)
@@ -625,7 +625,7 @@ class AiBrainNode(Node):
                             self.get_logger().info(f"✨ [Gemini Direct REST] Görsel başarıyla yanıtlandı ({g_model}): '{clean_ans}'")
                             return clean_ans
                 except Exception as e3:
-                    self.get_logger().debug(f"Direct Gemini REST {g_model} notice: {e3}")
+                    self.get_logger().warn(f"⚠️ [Gemini REST ({g_model}) Hatası]: {e3}")
 
         self.cloud_mgr.record_llm_failure("All vision models failed")
         return None
