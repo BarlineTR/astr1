@@ -1,17 +1,18 @@
 #!/usr/bin/env python3
-"""ASTRO V1 — Autonomous Social AI Brain Node with Tool Use & Visual Object Learning.
+"""ASTRO V1 — Autonomous Social AI Brain Node with Gaze Engagement & Tool Use.
 
 Key Capabilities:
   1. True Multimodal Vision: Real-time visual QA via Groq Vision (Qwen 3.6 / Llama 3.2 90B)
-  2. Autonomous Learning & Reflection: Background knowledge synthesis
-  3. Visual Object Learning (Few-Shot): Learns custom user objects ("Bu benim laboratuvar kartım")
-  4. Tool Use / Function Calling:
-     - Live weather checking (wttr.in)
-     - Proactive timers & reminders (e.g. "10 dakika sonra mola hatırlat")
-     - Robot control (look left/right, nod, head gestures)
-  5. Direction of Arrival (DOA) Speaker Tracking
-  6. Emotional & Gestural Expression (/robot/emotion, /robot/head_gesture)
-  7. Ultra-Fast Zero-Lag Streaming TTS with Rıfkı Persona
+  2. Gaze-Aware Engagement:
+     - Understands if user is looking at robot vs looking away / on phone
+     - Proactive Eye Contact: Greets when user gazes silently ("Bana bakıyorsun Baran, nasıl yardımcı olabilirim?")
+     - Eye-Contact Gated Interaction (filters passive / background phone talk)
+  3. Autonomous Learning & Reflection: Background knowledge synthesis
+  4. Visual Object Learning (Few-Shot): Learns custom user objects
+  5. Tool Use / Function Calling: Live weather, proactive reminder timers
+  6. Direction of Arrival (DOA) Speaker Tracking
+  7. Emotional & Gestural Expression (/robot/emotion, /robot/head_gesture)
+  8. Ultra-Fast Zero-Lag Streaming TTS with Rıfkı Persona
 """
 
 import os
@@ -98,7 +99,7 @@ ROBOT_TOOLS = [
                 "properties": {
                     "city": {
                         "type": "string",
-                        "description": "Hava durumu öğrenilmek istenen şehir (örnek: Istanbul, Ankara, Izmir)"
+                        "description": "Hava durumu öğrenilmek istenen şehir (örnek: Istanbul, Ankara, Izmir, Ahlat)"
                     }
                 },
                 "required": ["city"]
@@ -115,11 +116,11 @@ ROBOT_TOOLS = [
                 "properties": {
                     "minutes": {
                         "type": "integer",
-                        "description": "Kaç dakika sonra hatırlatılacağı (örnek: 5, 10, 30)"
+                        "description": "Kaç dakika sonra hatırlatılacağı (örnek: 1, 5, 10)"
                     },
                     "reminder_text": {
                         "type": "string",
-                        "description": "Kullanıcıya hatırlatılacak mesaj veya eylem (örnek: 'Mola verme zamanı', 'Fırını kapat')"
+                        "description": "Kullanıcıya hatırlatılacak mesaj veya eylem (örnek: 'Çay içme zamanı', 'Mola verme zamanı')"
                     }
                 },
                 "required": ["minutes", "reminder_text"]
@@ -161,7 +162,8 @@ class AstroMemory:
             "owner_name": "Baran",
             "user_facts": [
                 "Robotun geliştiricisi",
-                "Adı Baran"
+                "Adı Baran",
+                "Programlama ve yazılımla ilgileniyor"
             ],
             "learned_objects": {},
             "conversation_summaries": [],
@@ -364,6 +366,9 @@ class AiBrainNode(Node):
         self._last_interaction = 0.0
         self._tts_speaking = False
         self._person_detected = False
+        self._looking_at_robot = False
+        self._looking_start_time = None
+        self._last_proactive_gaze_time = 0.0
         self._speaker_angle = 0.0
         self._latest_frame = None
         self._latest_frame_time = 0.0
@@ -386,13 +391,17 @@ class AiBrainNode(Node):
         self.sub_speech = self.create_subscription(String, "/speech/text", self._on_speech, 10)
         self.sub_tts_status = self.create_subscription(Bool, "/tts/speaking", self._on_tts_speaking, 10)
         self.sub_vision_status = self.create_subscription(Bool, "/vision/person_detected", self._on_person_detected, 10)
+        self.sub_looking = self.create_subscription(Bool, "/vision/looking_at_robot", self._on_looking_at_robot, 10)
         self.sub_doa = self.create_subscription(Float32, "/audio/doa", self._on_doa, 10)
         self.sub_camera = self.create_subscription(Image, "/oak/rgb/image_raw", self._on_camera_image, 10)
+
+        # Proactive Gaze Timer (Checks if user has been staring silently for >2.5s)
+        self.create_timer(0.4, self._check_proactive_gaze)
 
         owner = self.memory.data.get("owner_name")
         owner_info = f" (Tanınan Kişi: {owner})" if owner else ""
         self.get_logger().info(
-            f"🧠 [AI Brain] Görme, Otonom Hafıza, Araçlar (Tools) ve Ses Sistemi Hazır! Wake-word: \"{self._wake_word}\"{owner_info}"
+            f"🧠 [AI Brain] Görme, Göz Teması (Gaze), Otonom Hafıza ve Araçlar Hazır! Wake-word: \"{self._wake_word}\"{owner_info}"
         )
 
     def _discover_vision_model(self) -> str:
@@ -414,11 +423,12 @@ class AiBrainNode(Node):
             "Sen Astro adında neşeli, meraklı, duygusal ve çok zeki bir robot asistansın. "
             "Sosyal medyada sevilen Rıfkı gibi sevecen ve cana yakın bir karaktere sahipsin.\n"
             "Önemli Kuralların:\n"
-            "- OAK-D kameran sayesinde karşındaki insanı, kıyafetlerini, renkleri, elindeki eşyaları ve hareketlerini GERÇEKTEN görüyorsun.\n"
-            "- Hafızandaki kayıtlı nesneleri (özel kartlar, taşlar, kupalar) hatırlarsın.\n"
+            "- OAK-D kameran sayesinde karşındaki insanın gözlerine, başının yönüne (sana mı bakıyor yoksa yana/telefona mı bakıyor), kıyafetlerine ve ellerine GERÇEKTEN bakıyorsun.\n"
+            "- Kullanıcı sana bakmadığında (örneğin telefonla konuşurken veya yana döndüğünde) bunu fark et.\n"
+            "- Hafızandaki kayıtlı nesneleri ve sahibinle ilgili bilgileri hatırla.\n"
             "- Asla ezbere konuşma, tahmin veya uydurma yapma. Yalnızca kamerada gördüğün gerçekleri söyle.\n"
-            "- Kullanıcı sana ne giydiğini veya elinde ne olduğunu sorduğunda görseli dikkatle incele; eğer elinde hiçbir şey yoksa 'Elinde bir şey görmüyorum' de.\n"
-            "- Kullanıcının adını biliyorsan arada sırada samimi şekilde kullanabilirsin ama her cümlenin başında papağan gibi tekrarlama, doğal konuş.\n"
+            "- Kullanıcı 'sana bakıyor muyum' diye sorduğunda kameradaki baş ve göz yönünü dikkatle incele; doğrudan kameraya bakmıyorsa 'Şu an bana bakmıyorsun' de.\n"
+            "- Kullanıcının adını biliyorsan arada sırada samimi şekilde kullanabilirsin ama her cümlenin başında tekrarlama.\n"
             "- Robotik konuşma; cana yakın bir dost gibi samimi, esprili ve akıcı konuş.\n"
             "- Cevaplarını 1-2 cümle ile kısa ve öz tut (çünkü sesli okunuyor).\n"
             "- Asla markdown, emoji, yıldız (*), parantez, <think> etiketi veya kod bloğu kullanma; sadece saf Türkçe metin üret."
@@ -444,6 +454,39 @@ class AiBrainNode(Node):
     def _on_person_detected(self, msg: Bool):
         self._person_detected = msg.data
 
+    def _on_looking_at_robot(self, msg: Bool):
+        is_looking = msg.data
+        now = time.monotonic()
+        if is_looking:
+            if not self._looking_at_robot:
+                self._looking_start_time = now
+            self._looking_at_robot = True
+        else:
+            self._looking_at_robot = False
+            self._looking_start_time = None
+
+    def _check_proactive_gaze(self):
+        """Proactive Eye-Contact Engagement: Greets if user stares silently for >2.5s."""
+        if not self._looking_at_robot or self._looking_start_time is None or self._tts_speaking or self._is_processing:
+            return
+
+        now = time.monotonic()
+        # If user has been looking for >2.5s and we are in IDLE mode
+        if (now - self._looking_start_time) > 2.5:
+            if self._state == "IDLE" and (now - self._last_proactive_gaze_time) > 45.0:
+                self._last_proactive_gaze_time = now
+                self._state = "ACTIVE"
+                self._last_interaction = now
+                self._looking_start_time = None  # Reset trigger
+
+                owner = self.memory.data.get("owner_name", "")
+                proactive_greeting = f"Bana bakıyorsun {owner}, nasıl yardımcı olabilirim?" if owner else "Bana bakıyorsun, nasıl yardımcı olabilirim?"
+                
+                self.get_logger().info(f"👁️ [Proaktif Göz Teması]: Kullanıcı robota bakıyor -> \"{proactive_greeting}\"")
+                self._publish_emotion("happy")
+                self._publish_gesture("nod")
+                self._publish_tts(proactive_greeting)
+
     def _on_doa(self, msg: Float32):
         self._speaker_angle = float(msg.data)
 
@@ -452,7 +495,9 @@ class AiBrainNode(Node):
             "ne tutuyorum", "elimde ne", "elinde ne", "ne var", "bu ne", "bunu gör", "görüyor musun",
             "ne yapıyorum", "hareket", "hangi hareket", "üstümde", "üzerimde", "ceket", "tişört", "elbise",
             "ne renk", "kaç parmak", "bana bak", "gözlerimi", "nereye", "kim var", "odada", "arkamda",
-            "elimde", "şuna bak", "gösteriyorum", "nası görünüyorum", "nasıl görünüyorum", "gördün mü"
+            "elimde", "şuna bak", "gösteriyorum", "nası görünüyorum", "nasıl görünüyorum", "gördün mü",
+            "bakıyor muyum", "sana bakıyor muyum", "bana bakıyor musun", "nereye bakıyorum", "gözlerime bak",
+            "yüzüme bak", "telefonla mı konuşuyorum", "telefona mı bakıyorum", "iyi bak"
         ]
         text_lower = text.lower()
         return any(k in text_lower for k in visual_keywords)
@@ -487,21 +532,20 @@ class AiBrainNode(Node):
                     break
 
     def _execute_tool_call(self, tool_name: str, arguments: dict, frame: np.ndarray | None) -> str:
-        """Executes tool functions and returns text result."""
         self.get_logger().info(f"🛠️ [Tool Call]: {tool_name}({arguments})")
         
         if tool_name == "get_live_weather":
             city = arguments.get("city", "Istanbul")
             try:
-                res = requests.get(f"https://wttr.in/{city}?format=%C+%t", timeout=4.0)
+                res = requests.get(f"https://wttr.in/{city}?format=%C+%t", timeout=3.5)
                 if res.status_code == 200 and res.text.strip():
-                    return f"{city} için güncel hava durumu: {res.text.strip()}"
+                    return f"{city} için güncel hava durumu: {res.text.strip()}."
             except Exception as e:
                 self.get_logger().warn(f"Hava durumu hatası: {e}")
             return f"{city} için hava durumu bilgisi şu an alınamadı."
 
         elif tool_name == "set_reminder_timer":
-            minutes = arguments.get("minutes", 5)
+            minutes = arguments.get("minutes", 1)
             text = arguments.get("reminder_text", "Zaman doldu!")
             
             def _alarm_callback():
@@ -520,8 +564,6 @@ class AiBrainNode(Node):
         elif tool_name == "learn_custom_object":
             obj_name = arguments.get("object_name", "Özel Eşya")
             desc = arguments.get("description", "")
-            
-            # If camera frame is available, analyze visual details
             visual_details = desc
             if frame is not None:
                 base64_img = frame_to_base64_jpeg(frame, max_dim=512)
@@ -533,7 +575,7 @@ class AiBrainNode(Node):
             self.memory.add_object(obj_name, visual_details)
             self.get_logger().info(f"✨ [Görsel Nesne Öğrenildi]: {obj_name} -> {visual_details}")
             self._messages[0]["content"] = self._build_system_prompt()
-            return f"'{obj_name}' nesnesini kameradan inceleyip hafızama kaydettim! Artık gösterdiğinde tanıyacağım."
+            return f"'{obj_name}' nesnesini inceleyip hafızama kaydettim! Artık gösterdiğinde tanıyacağım."
 
         return "Eylem tamamlandı."
 
@@ -565,13 +607,19 @@ class AiBrainNode(Node):
             self._wake_word.lower(),
             "hey astro", "astro", "esmer", "hey groq", "grok", "merhaba", "asistan"
         ]
+        has_wake_word = any(w in text_lower for w in wake_triggers)
+
+        # Eye-Contact Gated Filter:
+        # If in IDLE and NO wake word and NOT looking at robot (e.g. talking on phone), ignore background speech!
+        if self._state == "IDLE" and not has_wake_word and not self._looking_at_robot:
+            self.get_logger().info("🔇 [Göz Teması Yok]: Kullanıcı robota bakmıyor / telefonla konuşuyor olabilir — Arka plan konuşması yok sayıldı.")
+            return
 
         if self._state == "IDLE":
-            matched = any(w in text_lower for w in wake_triggers)
-            if matched:
+            if has_wake_word or self._looking_at_robot:
                 self._state = "ACTIVE"
                 self._last_interaction = now
-                self.get_logger().info(f"✨ [AI] Uyandırma kelimesi algılandı: '{raw_text}'")
+                self.get_logger().info(f"✨ [AI] Etkileşim Başlatıldı (Wake-word / Göz Teması): '{raw_text}'")
                 self._publish_emotion("happy")
                 self._publish_gesture("nod")
 
@@ -618,7 +666,10 @@ class AiBrainNode(Node):
                         "role": "system",
                         "content": (
                             f"{self._build_system_prompt()}\n\n"
-                            "ÖNEMLİ: Asla düşünce veya açıklama yazma. Doğrudan kamerada gördüğün gerçekleri kısa ve net 1-2 Türkçe cümleyle söyle."
+                            "ÖNEMLİ GÖREV:\n"
+                            "- Kameradaki görüntüyü dikkatle incele.\n"
+                            "- Eğer soru 'sana bakıyor muyum', 'nereye bakıyorum' gibi bakışla ilgiliyse, kullanıcının baş ve göz yönünü incele: Doğrudan kameraya mı bakıyor, yoksa yana/telefona/ekrana mı bakıyor? Net söyle.\n"
+                            "- Doğrudan kamerada gördüğün gerçekleri kısa ve net 1-2 Türkçe cümleyle söyle."
                         ),
                     },
                     {
@@ -703,7 +754,6 @@ class AiBrainNode(Node):
             # 1. GÖRSEL NESNE ÖĞRENME YOLU ("Bu benim laboratuvar kartım")
             if is_learning_obj and base64_img is not None:
                 self.get_logger().info("🔍 [Özel Nesne Tanıtımı]: Yeni nesne analiz edilip hafızaya alınıyor...")
-                # Extract object name from text
                 name_cand = user_text
                 for k in ["bu benim", "bunu öğren", "bunu kaydet", "bu nesne", "buna bak bu"]:
                     name_cand = re.sub(rf"(?i){k}", "", name_cand).strip()
@@ -719,7 +769,7 @@ class AiBrainNode(Node):
                 self._last_interaction = time.monotonic()
                 return
 
-            # 2. GÖRSEL SORU YOLU (Multimodal Vision)
+            # 2. GÖRSEL SORU YOLU (Multimodal Vision - Göz / Baş / Nesne Takibi)
             if is_visual:
                 if base64_img is not None:
                     self.get_logger().info(f"👁️ [Groq Vision]: OAK-D görüntüsü analiz ediliyor... ({self._vision_model})")
@@ -745,10 +795,11 @@ class AiBrainNode(Node):
                 self._last_interaction = time.monotonic()
                 return
 
-            # 3. METİN SOHBETİ & TOOL USE (With Automatic Fallback on Rate Limit)
+            # 3. METİN SOHBETİ & TOOL USE (Automatic Fallback & Zero-Lag Execution)
             context_prefix = ""
             if self._person_detected:
-                context_prefix = "[Kamerada karşında bir insan görüyorsun] "
+                gaze_status = "ve doğrudan sana (kameraya) bakıyor" if self._looking_at_robot else "ama başka yöne bakıyor"
+                context_prefix = f"[Kamerada karşında bir insan var {gaze_status}] "
             user_content = context_prefix + user_text
 
             self._messages.append({"role": "user", "content": user_content})
@@ -757,7 +808,6 @@ class AiBrainNode(Node):
                 self._messages = [self._messages[0]] + self._messages[-(self._max_history - 1):]
 
             response = None
-            used_model = self._text_model
             models_to_try = [self._text_model] + [m for m in self._fallback_models if m != self._text_model]
 
             for m in models_to_try:
@@ -770,7 +820,6 @@ class AiBrainNode(Node):
                         tools=ROBOT_TOOLS,
                         tool_choice="auto",
                     )
-                    used_model = m
                     break
                 except Exception as api_err:
                     if "429" in str(api_err) or "rate_limit" in str(api_err).lower():
@@ -787,7 +836,6 @@ class AiBrainNode(Node):
             tool_calls = response_message.tool_calls
 
             if tool_calls:
-                # Handle Tool Execution
                 self._publish_emotion("thinking")
                 for tool_call in tool_calls:
                     fn_name = tool_call.function.name
@@ -797,8 +845,6 @@ class AiBrainNode(Node):
                         fn_args = {}
                     
                     tool_result = self._execute_tool_call(fn_name, fn_args, frame)
-                    
-                    # Direct speech of tool result for zero lag
                     clean_ans = clean_tts_text(tool_result)
                     self.get_logger().info(f"🤖 [Astro]: \"{clean_ans}\"")
                     self._publish_tts(clean_ans)
@@ -814,7 +860,6 @@ class AiBrainNode(Node):
                     self._last_interaction = time.monotonic()
                     return
 
-            # If no tools called, stream normal conversation
             full_response = response_message.content or ""
             if full_response.strip():
                 clean_full = clean_tts_text(full_response.strip())
