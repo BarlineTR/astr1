@@ -133,10 +133,14 @@ class AstroMemory:
 def clean_tts_text(text: str) -> str:
     if not text:
         return ""
+    # Strip <think>...</think> reasoning blocks from thinking models (Qwen / DeepSeek)
+    text = re.sub(r"(?i)<think>[\s\S]*?</think>", "", text)
+    text = re.sub(r"(?i)<think>[\s\S]*", "", text)
+    text = re.sub(r"(?i)</think>", "", text)
     text = EMOJI_RE.sub("", text)
     text = re.sub(r"```.*?```", "", text, flags=re.DOTALL)
     text = re.sub(r"`.*?`", "", text)
-    text = re.sub(r"[\*\_\~\#]", "", text)
+    text = re.sub(r"[\*\_\~\#\<\>]", "", text)
     text = re.sub(r"\s+", " ", text).strip()
     text = re.sub(r"\s+([,.:;?!])", r"\1", text)
     return text.strip()
@@ -324,10 +328,10 @@ class AiBrainNode(Node):
             "- OAK-D kameran sayesinde karşındaki insanı, kıyafetlerini, renkleri, elindeki eşyaları ve hareketlerini GERÇEKTEN görüyorsun.\n"
             "- Asla ezbere konuşma, tahmin veya uydurma yapma. Yalnızca kamerada gördüğün gerçekleri söyle.\n"
             "- Kullanıcı sana ne giydiğini veya elinde ne olduğunu sorduğunda görseli dikkatle incele; eğer elinde hiçbir şey yoksa 'Elinde bir şey görmüyorum' de.\n"
-            "- Kullanıcı sana adını veya kendisiyle ilgili bir bilgiyi söylediğinde bunu hatırla ve ona ismiyle hitap et.\n"
+            "- Kullanıcının adını biliyorsan arada sırada samimi şekilde kullanabilirsin ama her cümlenin başında papağan gibi tekrarlama, doğal konuş.\n"
             "- Robotik konuşma; cana yakın bir dost gibi samimi, esprili ve akıcı konuş.\n"
             "- Cevaplarını 1-2 cümle ile kısa ve öz tut (çünkü sesli okunuyor).\n"
-            "- Asla markdown, emoji, yıldız (*), parantez veya kod bloğu kullanma; sadece saf Türkçe metin üret."
+            "- Asla markdown, emoji, yıldız (*), parantez, <think> etiketi veya kod bloğu kullanma; sadece saf Türkçe metin üret."
         )
         memory_ctx = self.memory.get_context_prompt()
         if memory_ctx:
@@ -461,9 +465,19 @@ class AiBrainNode(Node):
                 ],
                 model=model_name,
                 temperature=0.1,  # Strict factual grounding (zero hallucination)
-                max_tokens=150,
+                max_tokens=200,
             )
-            return response.choices[0].message.content.strip()
+            raw = response.choices[0].message.content.strip()
+            # If model included reasoning inside <think>, extract the actual response outside of it
+            if "</think>" in raw:
+                actual = raw.split("</think>")[-1].strip()
+                if actual:
+                    return actual
+            elif "<think>" in raw:
+                actual = re.sub(r"(?i)<think>[\s\S]*?</think>", "", raw).strip()
+                if actual:
+                    return actual
+            return raw
         except Exception as e:
             self.get_logger().error(f"❌ [Vision Model Hatası ({model_name})]: {e}")
             # Try fallback to qwen/qwen3.6-27b if not already tried
