@@ -365,14 +365,33 @@ class AiBrainNode(Node):
         return any(k in text_lower for k in visual_keywords)
 
     def _check_and_learn_memory(self, user_text: str):
-        text_lower = user_text.lower()
-        match = re.search(r"(?:adım|benim adım|bana)\s+([a-zA-ZçğıöşüÇĞİÖŞÜ]+)\s*(?:de|derler|olarak|diyebilirsin)?", text_lower)
-        if match:
-            name = match.group(1).capitalize()
-            if name not in ["Astro", "Robot", "Asistan", "Bir", "Bu", "Ne", "Nasılsın"]:
-                self.memory.set_owner(name)
-                self.get_logger().info(f"🧠 [Memory]: Kullanıcı adı hafızaya kaydedildi -> {name}")
-                self._messages[0]["content"] = self._build_system_prompt()
+        text_lower = user_text.lower().strip()
+        
+        # Strict explicit name introduction patterns
+        patterns = [
+            r"\b(?:benim\s+adım|adım|ismim)\s+([a-zA-ZçğıöşüÇĞİÖŞÜ]{3,15})\b",
+            r"\bbana\s+([a-zA-ZçğıöşüÇĞİÖŞÜ]{3,15})\s+(?:de|diyebilirsin|dersin)\b",
+            r"\bbeni\s+([a-zA-ZçğıöşüÇĞİÖŞÜ]{3,15})\s+olarak\s+(?:kaydet|hatırla|bil)\b",
+        ]
+        
+        # Blacklist of common non-name words
+        blacklist = {
+            "şarkı", "masal", "fıkra", "cevap", "yardım", "kahve", "yemek", "resim",
+            "video", "kitap", "bilgi", "haber", "nasılsın", "merhaba", "selam", "astro",
+            "robot", "asistan", "birşey", "bunu", "şunu", "kimim", "kimsin", "nedir",
+            "nasıl", "neden", "niye", "hangi", "nerede", "nereye", "şimdi", "burada"
+        }
+        
+        for pat in patterns:
+            match = re.search(pat, text_lower)
+            if match:
+                candidate = match.group(1).lower()
+                if candidate not in blacklist:
+                    proper_name = candidate.capitalize()
+                    self.memory.set_owner(proper_name)
+                    self.get_logger().info(f"🧠 [Memory]: Kullanıcı adı hafızaya kaydedildi -> {proper_name}")
+                    self._messages[0]["content"] = self._build_system_prompt()
+                    break
 
     def _on_speech(self, msg: String):
         raw_text = msg.data.strip()
