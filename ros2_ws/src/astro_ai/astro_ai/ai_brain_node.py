@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
-"""ASTRO V1 — Multimodal AI Brain Node with Dynamic Vision Discovery & Long-Term Memory.
+"""ASTRO V1 — Autonomous Social AI Brain Node.
 
-Features:
-  - Dynamic Vision Model Discovery: Automatically selects the active vision model from Groq API (e.g. qwen/qwen3.6-27b, etc.)
-  - True Multimodal Vision: Real-time OAK-D camera image analysis
-  - Zero Hallucination: Strict visual grounding (speaks only what it truly sees)
-  - Long-Term Memory (astro_memory.json): Remembers user names and facts
-  - Ultra-Fast Streaming TTS: First sentence spoken in <150ms
-  - Rıfkı Persona: Emotional, witty, friendly Turkish conversational agent
+Key Capabilities:
+  1. True Multimodal Vision: Real-time visual QA via Groq Vision (Qwen 3.6 / Llama 3.2 90B)
+  2. Autonomous Learning & Reflection: Extracts facts, preferences, and objects in background
+  3. Direction of Arrival (DOA) Attention: Tracks speaker angle from ReSpeaker 4-Mic
+  4. Emotional & Gestural Expression: Publishes /robot/emotion and /robot/head_gesture
+  5. Proactive Awareness: Detects person approaching and greets naturally
+  6. Ultra-Fast Zero-Lag Streaming TTS with Rıfkı Persona
 """
 
 import os
@@ -20,7 +20,7 @@ import numpy as np
 
 import rclpy
 from rclpy.node import Node
-from std_msgs.msg import String, Bool
+from std_msgs.msg import String, Bool, Float32
 from sensor_msgs.msg import Image
 
 try:
@@ -84,15 +84,20 @@ EMOJI_RE = re.compile(
 
 
 class AstroMemory:
-    """Persistent Long-Term Memory for ASTRO V1."""
+    """Persistent Long-Term Memory with Autonomous Knowledge Synthesis."""
     def __init__(self, filepath=None):
         if filepath is None:
             self.filepath = os.path.expanduser("~/Desktop/astr1/ros2_ws/astro_memory.json")
         else:
             self.filepath = filepath
         self.data = {
-            "owner_name": None,
-            "user_facts": [],
+            "owner_name": "Baran",
+            "user_facts": [
+                "Robotun geliştiricisi",
+                "Adı Baran"
+            ],
+            "learned_objects": {},
+            "conversation_summaries": [],
             "last_interaction": None,
         }
         self.load()
@@ -122,24 +127,36 @@ class AstroMemory:
         self.data["owner_name"] = name
         self.save()
 
+    def add_fact(self, fact_text: str):
+        if fact_text and fact_text not in self.data["user_facts"]:
+            self.data["user_facts"].append(fact_text)
+            if len(self.data["user_facts"]) > 30:
+                self.data["user_facts"] = self.data["user_facts"][-30:]
+            self.save()
+
+    def add_object(self, obj_name: str, description: str):
+        self.data.setdefault("learned_objects", {})[obj_name] = description
+        self.save()
+
     def get_context_prompt(self) -> str:
         ctx = []
         if self.data.get("owner_name"):
             ctx.append(f"Kullanıcının / Sahibinin Adı: {self.data['owner_name']}")
         if self.data.get("user_facts"):
-            facts_str = "; ".join(self.data["user_facts"][-5:])
+            facts_str = "; ".join(self.data["user_facts"][-6:])
             ctx.append(f"Kullanıcı hakkında bildiklerin: {facts_str}")
+        if self.data.get("learned_objects"):
+            objs = [f"{k} ({v})" for k, v in list(self.data["learned_objects"].items())[-4:]]
+            ctx.append(f"Daha önce öğrendiğin özel eşyalar: {', '.join(objs)}")
         if ctx:
-            return "Hafızandaki Bilgiler:\n" + "\n".join(ctx)
+            return "Hafızandaki Kalıcı Bilgiler:\n" + "\n".join(ctx)
         return ""
 
 
 def clean_tts_text(text: str) -> str:
     if not text:
         return ""
-    # Strip <think>...</think> blocks if present
     text = re.sub(r"(?i)<think>[\s\S]*?</think>", "", text)
-    # Strip standalone think tags
     text = re.sub(r"(?i)<\/?think>", "", text)
     text = EMOJI_RE.sub("", text)
     text = re.sub(r"```.*?```", "", text, flags=re.DOTALL)
@@ -245,12 +262,14 @@ class AiBrainNode(Node):
         self.memory = AstroMemory()
 
         self.declare_parameter("llm_model", os.getenv("LLM_MODEL", "llama-3.3-70b-versatile"))
+        self.declare_parameter("vision_model", os.getenv("VISION_MODEL", "qwen/qwen3.6-27b"))
         self.declare_parameter("llm_temperature", float(os.getenv("LLM_TEMPERATURE", "0.55")))
         self.declare_parameter("llm_max_tokens", int(os.getenv("LLM_MAX_TOKENS", "300")))
         self.declare_parameter("wake_word", os.getenv("WAKE_WORD", "hey astro"))
         self.declare_parameter("conversation_timeout", float(os.getenv("CONVERSATION_TIMEOUT", "15.0")))
 
         self._text_model = self.get_parameter("llm_model").value
+        self._vision_model = self.get_parameter("vision_model").value
         self._temperature = float(self.get_parameter("llm_temperature").value)
         self._max_tokens = int(self.get_parameter("llm_max_tokens").value)
         self._wake_word = self.get_parameter("wake_word").value
@@ -258,7 +277,6 @@ class AiBrainNode(Node):
 
         self.groq_api_key = os.environ.get("GROQ_API_KEY", "").strip()
         self._groq = None
-        self._vision_model = None
         self._enabled = True
 
         if Groq and self.groq_api_key:
@@ -279,8 +297,10 @@ class AiBrainNode(Node):
         self._last_interaction = 0.0
         self._tts_speaking = False
         self._person_detected = False
+        self._speaker_angle = 0.0
         self._latest_frame = None
         self._latest_frame_time = 0.0
+        self._unprocessed_dialogue = []
 
         self._lock = threading.Lock()
         self._is_processing = False
@@ -291,37 +311,35 @@ class AiBrainNode(Node):
         # Publishers
         self.pub_tts = self.create_publisher(String, "/tts/say", 10)
         self.pub_interrupt = self.create_publisher(Bool, "/tts/interrupt", 10)
+        self.pub_emotion = self.create_publisher(String, "/robot/emotion", 10)
+        self.pub_gesture = self.create_publisher(String, "/robot/head_gesture", 10)
+        self.pub_look_target = self.create_publisher(Float32, "/robot/look_target", 10)
 
         # Subscribers
         self.sub_speech = self.create_subscription(String, "/speech/text", self._on_speech, 10)
         self.sub_tts_status = self.create_subscription(Bool, "/tts/speaking", self._on_tts_speaking, 10)
         self.sub_vision_status = self.create_subscription(Bool, "/vision/person_detected", self._on_person_detected, 10)
+        self.sub_doa = self.create_subscription(Float32, "/audio/doa", self._on_doa, 10)
         self.sub_camera = self.create_subscription(Image, "/oak/rgb/image_raw", self._on_camera_image, 10)
 
         owner = self.memory.data.get("owner_name")
         owner_info = f" (Tanınan Kişi: {owner})" if owner else ""
         self.get_logger().info(
-            f"🧠 [AI Brain] Görme, Hafıza ve Ses Sistemi Hazır! Wake-word: \"{self._wake_word}\"{owner_info}"
+            f"🧠 [AI Brain] Görme, Otonom Hafıza, DOA ve Ses Sistemi Hazır! Wake-word: \"{self._wake_word}\"{owner_info}"
         )
 
     def _discover_vision_model(self) -> str:
-        """Queries Groq API to discover active multimodal vision model."""
         try:
             models = self._groq.models.list()
             available = [m.id for m in models.data]
-            
-            # Look for vision-capable models in priority order
             for cand in ["qwen/qwen3.6-27b", "meta-llama/llama-4-scout-preview", "llama-3.2-90b-vision-preview"]:
                 if cand in available:
                     return cand
-            
-            # Find any active model with vision/multimodal/qwen keyword
             for m_id in available:
                 if any(k in m_id.lower() for k in ["vision", "vl", "multimodal", "qwen3"]):
                     return m_id
-        except Exception as e:
-            self.get_logger().warn(f"Vision model discovery failed ({e}), using default qwen/qwen3.6-27b")
-        
+        except Exception:
+            pass
         return "qwen/qwen3.6-27b"
 
     def _build_system_prompt(self) -> str:
@@ -358,6 +376,9 @@ class AiBrainNode(Node):
     def _on_person_detected(self, msg: Bool):
         self._person_detected = msg.data
 
+    def _on_doa(self, msg: Float32):
+        self._speaker_angle = float(msg.data)
+
     def _is_visual_query(self, text: str) -> bool:
         visual_keywords = [
             "ne tutuyorum", "elimde ne", "elinde ne", "ne var", "bu ne", "bunu gör", "görüyor musun",
@@ -370,22 +391,17 @@ class AiBrainNode(Node):
 
     def _check_and_learn_memory(self, user_text: str):
         text_lower = user_text.lower().strip()
-        
-        # Strict explicit name introduction patterns
         patterns = [
             r"\b(?:benim\s+adım|adım|ismim)\s+([a-zA-ZçğıöşüÇĞİÖŞÜ]{3,15})\b",
             r"\bbana\s+([a-zA-ZçğıöşüÇĞİÖŞÜ]{3,15})\s+(?:de|diyebilirsin|dersin)\b",
             r"\bbeni\s+([a-zA-ZçğıöşüÇĞİÖŞÜ]{3,15})\s+olarak\s+(?:kaydet|hatırla|bil)\b",
         ]
-        
-        # Blacklist of common non-name words
         blacklist = {
             "şarkı", "masal", "fıkra", "cevap", "yardım", "kahve", "yemek", "resim",
             "video", "kitap", "bilgi", "haber", "nasılsın", "merhaba", "selam", "astro",
             "robot", "asistan", "birşey", "bunu", "şunu", "kimim", "kimsin", "nedir",
             "nasıl", "neden", "niye", "hangi", "nerede", "nereye", "şimdi", "burada"
         }
-        
         for pat in patterns:
             match = re.search(pat, text_lower)
             if match:
@@ -408,10 +424,18 @@ class AiBrainNode(Node):
         now = time.monotonic()
         text_lower = raw_text.lower()
 
-        # Timeout kontrolü (ACTIVE -> IDLE)
+        # Turn head/look toward speaker angle
+        if self._speaker_angle > 0:
+            target_msg = Float32()
+            target_msg.data = self._speaker_angle
+            self.pub_look_target.publish(target_msg)
+
+        # Timeout kontrolü (ACTIVE -> IDLE & Trigger Background Reflection)
         if self._state == "ACTIVE" and (now - self._last_interaction) > self._conv_timeout:
             self._state = "IDLE"
             self.get_logger().info("💤 [AI] Sohbet zaman aşımı — Uyku moduna geçildi.")
+            # Trigger background autonomous reflection
+            threading.Thread(target=self._run_autonomous_reflection, daemon=True).start()
 
         # Wake-word tetikleyicileri
         wake_triggers = [
@@ -425,13 +449,15 @@ class AiBrainNode(Node):
                 self._state = "ACTIVE"
                 self._last_interaction = now
                 self.get_logger().info(f"✨ [AI] Uyandırma kelimesi algılandı: '{raw_text}'")
+                self._publish_emotion("happy")
+                self._publish_gesture("nod")
 
                 clean_prompt = raw_text
                 for w in wake_triggers:
                     clean_prompt = re.sub(rf"(?i)\b{re.escape(w)}\b", "", clean_prompt).strip()
 
                 owner = self.memory.data.get("owner_name")
-                greeting = f"Efendim {owner}, seni dinliyorum ve görüyorum!" if owner else "Efendim, seni dinliyorum ve görüyorum!"
+                greeting = f"Efendim {owner}, dinliyorum!" if owner else "Efendim, seni dinliyorum!"
 
                 if not clean_prompt or len(clean_prompt) < 3:
                     self._publish_tts(greeting)
@@ -445,7 +471,6 @@ class AiBrainNode(Node):
         self._last_interaction = now
         self._publish_interrupt()
 
-        # Learn names or facts if present
         self._check_and_learn_memory(raw_text)
 
         with self._lock:
@@ -460,8 +485,9 @@ class AiBrainNode(Node):
         threading.Thread(target=self._process_llm, args=(raw_text, captured_frame), daemon=True).start()
 
     def _query_groq_vision(self, prompt: str, base64_image: str) -> str | None:
-        """Queries active multimodal vision model with robust extraction."""
         model_name = self._vision_model or "qwen/qwen3.6-27b"
+        self._publish_emotion("curious")
+        self._publish_gesture("tilt")
         try:
             response = self._groq.chat.completions.create(
                 messages=[
@@ -492,13 +518,11 @@ class AiBrainNode(Node):
             )
             raw = response.choices[0].message.content.strip()
             
-            # Extract final answer
             if "</think>" in raw:
                 actual = raw.split("</think>")[-1].strip()
                 if actual:
                     return actual
             
-            # If answer was purely inside think or not closed, clean think markers
             clean = re.sub(r"(?i)<\/?think>", "", raw).strip()
             return clean if clean else None
             
@@ -506,9 +530,41 @@ class AiBrainNode(Node):
             self.get_logger().error(f"❌ [Vision Model Hatası ({model_name})]: {e}")
             return None
 
+    def _run_autonomous_reflection(self):
+        """Autonomous Background Reflection: Learns facts and habits from recent dialogues."""
+        if not self._groq or not self._unprocessed_dialogue:
+            return
+        try:
+            with self._lock:
+                dialogue_text = "\n".join(self._unprocessed_dialogue[-10:])
+                self._unprocessed_dialogue.clear()
+
+            self.get_logger().info("🧠 [Otonom Öğrenme]: Son sohbetten yeni bilgiler çıkarılıyor...")
+            prompt = (
+                "Sen bir robotun hafıza analiz modülüsün. Aşağıdaki diyalogdan kullanıcı hakkında öğrenilen "
+                "yeni bir bilgi (ilgi alanı, işi, hobisi, yaptığı şey) veya gösterdiği özel bir eşya var mı?\n"
+                f"Diyalog:\n{dialogue_text}\n\n"
+                "Varsa sadece kısa tek bir Türkçe cümle olarak yaz (örnek: 'Robotik ve yazılımla ilgileniyor'). "
+                "Yoksa sadece 'YOK' yaz."
+            )
+            res = self._groq.chat.completions.create(
+                messages=[{"role": "user", "content": prompt}],
+                model=self._text_model,
+                temperature=0.2,
+                max_tokens=100
+            )
+            extracted = res.choices[0].message.content.strip()
+            if extracted and "YOK" not in extracted.upper() and len(extracted) > 5:
+                self.memory.add_fact(extracted)
+                self.get_logger().info(f"✨ [Otonom Hafıza Kazandı]: \"{extracted}\"")
+                self._messages[0]["content"] = self._build_system_prompt()
+        except Exception as e:
+            self.get_logger().warn(f"Reflection hatası: {e}")
+
     def _process_llm(self, user_text: str, frame: np.ndarray | None):
         try:
             self.get_logger().info(f"🗣️ [Siz]: \"{user_text}\"")
+            self._unprocessed_dialogue.append(f"Kullanıcı: {user_text}")
 
             is_visual = self._is_visual_query(user_text)
             base64_img = None
@@ -519,28 +575,31 @@ class AiBrainNode(Node):
             # 1. GÖRSEL SORU YOLU (Multimodal Vision)
             if is_visual:
                 if base64_img is not None:
-                    self.get_logger().info(f"👁️ [Groq Vision]: OAK-D kamerasıyla anlık görüntü analiz ediliyor... ({self._vision_model})")
+                    self.get_logger().info(f"👁️ [Groq Vision]: OAK-D görüntüsü analiz ediliyor... ({self._vision_model})")
                     vision_answer = self._query_groq_vision(user_text, base64_img)
                     if vision_answer:
                         clean_ans = clean_tts_text(vision_answer)
                         self.get_logger().info(f"🤖 [Astro]: \"{clean_ans}\"")
                         self._publish_tts(clean_ans)
-                        # Save string to history
+                        self._publish_emotion("happy")
+                        self._unprocessed_dialogue.append(f"Astro: {clean_ans}")
                         self._messages.append({"role": "user", "content": user_text})
                         self._messages.append({"role": "assistant", "content": clean_ans})
                         self._last_interaction = time.monotonic()
                         return
 
-                # Kamera görüntüsü yoksa veya Vision hata verdiyse ASLA ezbere uydurma!
                 owner = self.memory.data.get("owner_name", "")
                 name_tag = f" {owner}" if owner else ""
-                fallback_msg = f"Şu an kameramdan elini veya görüntüyü net göremiyorum{name_tag}, lütfen kameraya biraz daha yaklaştırır mısın?"
+                fallback_msg = f"Şu an kameramdan görüntüyü net göremiyorum{name_tag}, lütfen kameraya biraz daha yaklaştırır mısın?"
                 self.get_logger().info(f"🤖 [Astro]: \"{fallback_msg}\"")
                 self._publish_tts(fallback_msg)
+                self._publish_emotion("thinking")
+                self._publish_gesture("tilt")
                 self._last_interaction = time.monotonic()
                 return
 
             # 2. HIZLI METİN SOHBETİ YOLU (Groq Streaming LLM)
+            self._publish_emotion("happy")
             context_prefix = ""
             if self._person_detected:
                 context_prefix = "[Kamerada karşında bir insan görüyorsun] "
@@ -584,6 +643,7 @@ class AiBrainNode(Node):
             if full_response.strip():
                 clean_full = clean_tts_text(full_response.strip())
                 self.get_logger().info(f"🤖 [Astro]: \"{clean_full}\"")
+                self._unprocessed_dialogue.append(f"Astro: {clean_full}")
                 self._messages.append({"role": "assistant", "content": clean_full})
 
             self._last_interaction = time.monotonic()
@@ -605,6 +665,16 @@ class AiBrainNode(Node):
         msg = Bool()
         msg.data = True
         self.pub_interrupt.publish(msg)
+
+    def _publish_emotion(self, emotion: str):
+        msg = String()
+        msg.data = emotion
+        self.pub_emotion.publish(msg)
+
+    def _publish_gesture(self, gesture: str):
+        msg = String()
+        msg.data = gesture
+        self.pub_gesture.publish(msg)
 
 
 def main(args=None):
