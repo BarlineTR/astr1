@@ -84,8 +84,8 @@ class SpeechRecognitionNode(Node):
             self.enabled = False
             return
 
-        # Parameters
-        self.declare_parameter('silence_timeout_s', 0.75)
+        # Parameters (Fast Turn-Taking: 0.40s silence timeout)
+        self.declare_parameter('silence_timeout_s', 0.40)
         self.declare_parameter('sample_rate', 16000)
         self._silence_timeout_s = float(self.get_parameter('silence_timeout_s').value)
         self._sample_rate = int(self.get_parameter('sample_rate').value)

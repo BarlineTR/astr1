@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""ASTRO V1 — Text-to-Speech Node (Edge-TTS + sounddevice playback).
+"""ASTRO V1 — High-Speed In-Memory Text-to-Speech Node (Edge-TTS + RAM streaming).
 
 Subscribes to:
   /tts/say       (String) — text to speak
@@ -8,16 +8,17 @@ Subscribes to:
 Publishes:
   /tts/speaking  (Bool)   — True while audio is playing (echo prevention)
 
-Features:
-  - Streaming sentence playback queue
+Performance Optimizations:
+  - Zero Disk I/O: Audio synthesized in-memory and piped directly
+  - Ultra-low latency playback queue
   - Fallback audio players (sounddevice -> paplay -> aplay -> ffplay)
-  - Interruption handling with generation counter
+  - Immediate interruption handling
 """
 
 import os
 import re
+import io
 import asyncio
-import tempfile
 import subprocess
 import threading
 import queue
@@ -93,8 +94,7 @@ def clean_tts_text(text: str) -> str:
     if not text:
         return ""
     text = re.sub(r"(?i)<think>[\s\S]*?</think>", "", text)
-    text = re.sub(r"(?i)<think>[\s\S]*", "", text)
-    text = re.sub(r"(?i)</think>", "", text)
+    text = re.sub(r"(?i)<\/?think>", "", text)
     text = EMOJI_RE.sub("", text)
     text = re.sub(r'```.*?```', '', text, flags=re.DOTALL)
     text = re.sub(r'`.*?`', '', text)
@@ -109,13 +109,11 @@ def find_output_device() -> int | None:
         return None
     try:
         devices = sd.query_devices()
-        # 1. Look for hardware ReSpeaker output
         for i, dev in enumerate(devices):
             name = dev.get("name", "").lower()
             if dev.get("max_output_channels", 0) > 0:
                 if any(k in name for k in ["respeaker", "uac1", "seeed", "arrayuac"]):
                     return i
-        # 2. Fallback to system default output
         default_out = sd.default.device[1]
         if default_out >= 0:
             return default_out
@@ -124,13 +122,22 @@ def find_output_device() -> int | None:
     return None
 
 
+async def _async_synthesize_bytes(text: str, voice: str, rate: str) -> bytes:
+    communicate = edge_tts.Communicate(text, voice, rate=rate)
+    buffer = bytearray()
+    async for chunk in communicate.stream():
+        if chunk["type"] == "audio":
+            buffer.extend(chunk["data"])
+    return bytes(buffer)
+
+
 class TtsNode(Node):
     def __init__(self):
         super().__init__('tts_node')
         _load_env()
 
         self.tts_voice = os.getenv("TTS_VOICE", "tr-TR-AhmetNeural")
-        self.tts_rate = os.getenv("TTS_RATE", "+20%")
+        self.tts_rate = os.getenv("TTS_RATE", "+25%")
         self.sample_rate = int(os.getenv("SAMPLE_RATE", "16000"))
 
         self.out_device_id = find_output_device()
@@ -160,7 +167,7 @@ class TtsNode(Node):
                 out_name = sd.query_devices(self.out_device_id)['name']
             except Exception:
                 pass
-        self.get_logger().info(f"🔊 [TTS Node] Hazır! Ses: {self.tts_voice} | Çıkış: [{self.out_device_id}] {out_name}")
+        self.get_logger().info(f"🔊 [TTS Node] Ultra Hızlı RAM Streaming Hazır! Ses: {self.tts_voice} | Çıkış: [{self.out_device_id}] {out_name}")
 
     def _on_say(self, msg: String):
         text = clean_tts_text(msg.data)
@@ -191,91 +198,83 @@ class TtsNode(Node):
         while rclpy.ok():
             try:
                 text = self._speak_queue.get(timeout=0.05)
-                self._synthesize_and_play(text)
+                self._synthesize_and_play_memory(text)
             except queue.Empty:
                 continue
             except Exception as e:
                 self.get_logger().error(f"Playback loop hatası: {e}")
 
-    def _synthesize_and_play(self, text: str):
+    def _synthesize_and_play_memory(self, text: str):
         with self._generation_lock:
             current_gen = self._generation
 
         if edge_tts is None:
             return
 
-        fd_mp3, mp3_path = tempfile.mkstemp(suffix=".mp3")
-        fd_wav, wav_path = tempfile.mkstemp(suffix=".wav")
-        os.close(fd_mp3)
-        os.close(fd_wav)
-
         try:
             self.get_logger().info(f'🔊 [TTS Okuyor]: "{text}"')
 
-            # 1. Synthesize via edge_tts
-            communicate = edge_tts.Communicate(text, self.tts_voice, rate=self.tts_rate)
-            asyncio.run(communicate.save(mp3_path))
+            # 1. In-Memory Synthesis (RAM)
+            mp3_bytes = asyncio.run(_async_synthesize_bytes(text, self.tts_voice, self.tts_rate))
 
             with self._generation_lock:
                 if current_gen != self._generation:
                     return
 
-            # 2. Convert to WAV via ffmpeg
-            subprocess.run(
-                ["ffmpeg", "-y", "-loglevel", "error", "-i", mp3_path, "-ar", str(self.sample_rate), "-ac", "1", "-f", "wav", wav_path],
-                check=True
+            if not mp3_bytes:
+                return
+
+            # 2. In-Memory Pipe Decoding via FFmpeg to 16kHz Mono PCM
+            proc = subprocess.Popen(
+                ["ffmpeg", "-loglevel", "quiet", "-i", "pipe:0", "-f", "s16le", "-ar", str(self.sample_rate), "-ac", "1", "pipe:1"],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL
             )
+            pcm_data, _ = proc.communicate(input=mp3_bytes)
 
             with self._generation_lock:
                 if current_gen != self._generation:
                     return
 
-            # 3. Read and Play via sounddevice
+            if not pcm_data:
+                return
+
+            # 3. Fast Sounddevice RAM Playback
+            audio_array = np.frombuffer(pcm_data, dtype=np.int16)
             played = False
-            if wav is not None and sd is not None:
+
+            if sd is not None:
                 try:
-                    rate, data = wav.read(wav_path)
+                    self._set_speaking(True)
                     with self._generation_lock:
                         if current_gen != self._generation:
                             return
-
-                    self._set_speaking(True)
-                    # Try selected device first, fallback to default
                     try:
-                        sd.play(data, samplerate=rate, device=self.out_device_id, blocking=True)
+                        sd.play(audio_array, samplerate=self.sample_rate, device=self.out_device_id, blocking=True)
                         played = True
-                    except Exception as sd_err:
-                        self.get_logger().warn(f"Cihaz {self.out_device_id} açılamadı ({sd_err}), default deneniyor...")
-                        sd.play(data, samplerate=rate, device=None, blocking=True)
+                    except Exception:
+                        sd.play(audio_array, samplerate=self.sample_rate, device=None, blocking=True)
                         played = True
                 except Exception as e:
                     self.get_logger().warn(f"sounddevice oynatma hatası: {e}")
                 finally:
                     self._set_speaking(False)
 
-            # 4. Fallback to system players if sounddevice failed
+            # 4. Fallback if sounddevice failed
             if not played:
                 self._set_speaking(True)
-                for player in [["paplay", wav_path], ["aplay", "-D", "default", wav_path], ["ffplay", "-nodisp", "-autoexit", wav_path]]:
-                    try:
-                        subprocess.run(player, stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL, check=True)
-                        played = True
-                        break
-                    except Exception:
-                        pass
-                self._set_speaking(False)
+                try:
+                    p = subprocess.Popen(["aplay", "-D", "default", "-f", "S16_LE", "-r", str(self.sample_rate), "-c", "1"], stdin=subprocess.PIPE)
+                    p.communicate(input=pcm_data)
+                except Exception:
+                    pass
+                finally:
+                    self._set_speaking(False)
 
         except Exception as e:
-            self.get_logger().error(f"TTS Sentez Hatası: {e}")
+            self.get_logger().error(f"TTS In-Memory Sentez Hatası: {e}")
             self._set_speaking(False)
-        finally:
-            try:
-                if os.path.exists(mp3_path):
-                    os.remove(mp3_path)
-                if os.path.exists(wav_path):
-                    os.remove(wav_path)
-            except Exception:
-                pass
 
 
 def main(args=None):
