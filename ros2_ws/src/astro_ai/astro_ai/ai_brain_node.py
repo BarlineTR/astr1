@@ -571,10 +571,10 @@ class AiBrainNode(Node):
             "eski haline dön": "playful",
         }
         
-        switch_triggers = ["ol", "davran", "konuş", "moduna geç", "biri ol", "kişiliğe geç", "gibi ol"]
+        switch_triggers = ["ol", "davran", "konuş", "geç", "geçer misin", "geçelim", "al", "ayarla", "yap", "mod", "biri ol", "kişiliğe geç", "gibi ol"]
         for key, p_name in mapping.items():
             if key in text_lower:
-                if any(tr in text_lower for tr in switch_triggers) or f"{key} ol" in text_lower or f"{key} davran" in text_lower or f"{key} konuş" in text_lower:
+                if any(tr in text_lower for tr in switch_triggers) or "mod" in text_lower or "geç" in text_lower:
                     self.memory.set_persona(p_name)
                     self._build_initial_messages()
                     self.get_logger().info(f"🎭 [Kişilik Değişti]: Yeni Mod -> {p_name.upper()}")
@@ -737,11 +737,13 @@ class AiBrainNode(Node):
             }
             ack = ack_map.get(persona, "Kişiliğim güncellendi!")
             self._publish_tts(ack)
+            self._state = "ACTIVE"
             self._last_interaction = now
             return
 
         # Timeout kontrolü (ACTIVE -> IDLE & Trigger Background Reflection)
-        if self._state == "ACTIVE" and (now - self._last_interaction) > self._conv_timeout:
+        # 30 saniye boyunca uyanık kalır!
+        if self._state == "ACTIVE" and (now - self._last_interaction) > 30.0:
             self._state = "IDLE"
             self.get_logger().info("💤 [AI] Sohbet zaman aşımı — Uyku moduna geçildi.")
             threading.Thread(target=self._run_autonomous_reflection, daemon=True).start()
@@ -753,7 +755,8 @@ class AiBrainNode(Node):
         ]
         has_wake_word = any(w in text_lower for w in wake_triggers)
 
-        # Eye-Contact Gated Filter:
+        # Eye-Contact Gated Filter ONLY applies in IDLE mode!
+        # Once ACTIVE, robot talks seamlessly without needing wake words or perfect gaze!
         if self._state == "IDLE" and not has_wake_word and not self._looking_at_robot:
             self.get_logger().info("🔇 [Göz Teması Yok]: Kullanıcı robota bakmıyor / telefonla konuşuyor olabilir — Arka plan konuşması yok sayıldı.")
             return
@@ -793,6 +796,22 @@ class AiBrainNode(Node):
             else:
                 self._state = "ACTIVE"
                 self._last_interaction = now
+
+        self._last_interaction = now
+        self._publish_interrupt()
+
+        self._check_and_learn_memory(raw_text)
+
+        with self._lock:
+            if self._is_processing:
+                return
+            self._is_processing = True
+
+            captured_frame = None
+            if self._latest_frame is not None and (now - self._latest_frame_time) < 4.0:
+                captured_frame = self._latest_frame.copy()
+
+        threading.Thread(target=self._process_llm, args=(raw_text, captured_frame), daemon=True).start()
 
         self._last_interaction = now
         self._publish_interrupt()

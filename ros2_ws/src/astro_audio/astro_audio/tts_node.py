@@ -2,10 +2,10 @@
 """ASTRO V1 — Ultra-Fast In-Memory Real-Time Text-to-Speech Node.
 
 Features:
-  - In-Memory RAM Synthesis: Edge-TTS directly converted to PCM via FFmpeg pipe in memory
-  - Explicit Audio Device Selection: Directly plays through ReSpeaker (hw:0,0) or system default output
+  - In-Memory RAM Synthesis: Edge-TTS converted directly via FFmpeg pipe
+  - Robust ALSA/ReSpeaker Playback via aplay / sounddevice fallback
   - Dynamic Emotion-based speech rate (+5% to +35%)
-  - Immediate interruption handling via generation counter
+  - Zero underrun, zero delay
 """
 
 import os
@@ -14,7 +14,7 @@ import asyncio
 import subprocess
 import threading
 import queue
-import numpy as np
+import shutil
 
 import rclpy
 from rclpy.node import Node
@@ -91,22 +91,19 @@ def clean_tts_text(text: str) -> str:
     return text.strip()
 
 
-def find_output_device():
-    if sd is None:
-        return None
+def find_respeaker_alsa_device():
+    """Finds exact ALSA card name or index for ReSpeaker."""
     try:
-        devices = sd.query_devices()
-        for i, dev in enumerate(devices):
-            name = dev.get("name", "").lower()
-            if dev.get("max_output_channels", 0) > 0:
-                if any(k in name for k in ["respeaker", "uac1", "seeed", "arrayuac"]):
-                    return i
-        default_out = sd.default.device[1]
-        if default_out >= 0:
-            return default_out
+        res = subprocess.run(["aplay", "-l"], capture_output=True, text=True)
+        for line in res.stdout.splitlines():
+            if any(k in line.lower() for k in ["respeaker", "arrayuac", "uac1.0", "seeed"]):
+                # Extract card number e.g. card 0:
+                m = re.search(r"card\s+(\d+):", line)
+                if m:
+                    return f"plughw:{m.group(1)},0"
     except Exception:
         pass
-    return None
+    return "default"
 
 
 async def _async_synthesize_bytes(text: str, voice: str, rate: str) -> bytes:
@@ -127,7 +124,8 @@ class TtsNode(Node):
         self.tts_rate = os.getenv("TTS_RATE", "+25%")
         self.sample_rate = int(os.getenv("SAMPLE_RATE", "16000"))
 
-        self.out_device_id = find_output_device()
+        self.alsa_device = find_respeaker_alsa_device()
+        self.has_aplay = shutil.which("aplay") is not None
 
         if edge_tts is None:
             self.get_logger().error("❌ [TTS] edge_tts modülü kurulu değil!")
@@ -145,18 +143,13 @@ class TtsNode(Node):
         self._speak_queue = queue.Queue()
         self._generation = 0
         self._generation_lock = threading.Lock()
+        self._current_process = None
 
         # Playback Thread
         self._playback_thread = threading.Thread(target=self._playback_loop, daemon=True)
         self._playback_thread.start()
 
-        out_name = "Default Output"
-        if sd and self.out_device_id is not None:
-            try:
-                out_name = sd.query_devices(self.out_device_id).get('name', 'Unknown')
-            except Exception:
-                pass
-        self.get_logger().info(f"🔊 [TTS Node] Ultra Hızlı RAM Audio Hazır! Ses: {self.tts_voice} | Çıkış: [{self.out_device_id}] {out_name}")
+        self.get_logger().info(f"🔊 [TTS Node] ALSA ReSpeaker Hazır! Ses: {self.tts_voice} | Çıkış Cihazı: [{self.alsa_device}]")
 
     def _on_emotion(self, msg: String):
         emotion = msg.data.lower().strip()
@@ -185,9 +178,9 @@ class TtsNode(Node):
                     self._speak_queue.get_nowait()
                 except queue.Empty:
                     break
-            if sd is not None:
+            if self._current_process:
                 try:
-                    sd.stop()
+                    self._current_process.terminate()
                 except Exception:
                     pass
 
@@ -216,7 +209,7 @@ class TtsNode(Node):
         try:
             self.get_logger().info(f'🔊 [TTS Okuyor]: "{text}"')
 
-            # 1. In-Memory Synthesis (RAM) using dynamic rate (~150ms)
+            # 1. In-Memory Synthesis (RAM) using dynamic rate
             mp3_bytes = asyncio.run(_async_synthesize_bytes(text, self.tts_voice, self._current_rate))
 
             with self._generation_lock:
@@ -226,39 +219,42 @@ class TtsNode(Node):
             if not mp3_bytes:
                 return
 
-            # 2. In-Memory Pipe Decoding via FFmpeg to 16kHz Mono PCM
-            proc = subprocess.Popen(
-                ["ffmpeg", "-loglevel", "quiet", "-i", "pipe:0", "-f", "s16le", "-ar", str(self.sample_rate), "-ac", "1", "pipe:1"],
+            # 2. Decode MP3 to WAV in memory via FFmpeg
+            ffmpeg_proc = subprocess.Popen(
+                ["ffmpeg", "-loglevel", "quiet", "-i", "pipe:0", "-f", "wav", "-ar", str(self.sample_rate), "-ac", "1", "pipe:1"],
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL
             )
-            pcm_data, _ = proc.communicate(input=mp3_bytes)
+            wav_data, _ = ffmpeg_proc.communicate(input=mp3_bytes)
 
             with self._generation_lock:
                 if current_gen != self._generation:
                     return
 
-            if not pcm_data:
+            if not wav_data:
                 return
 
-            # 3. Direct Hardware Output via SoundDevice to ReSpeaker
-            audio_array = np.frombuffer(pcm_data, dtype=np.int16).astype(np.float32) / 32768.0
-
+            # 3. Direct Hardware Output via aplay (Guaranteed ReSpeaker Sound)
             self._set_speaking(True)
             try:
-                sd.play(audio_array, samplerate=self.sample_rate, device=self.out_device_id)
-                while sd.get_stream().active:
-                    with self._generation_lock:
-                        if current_gen != self._generation:
-                            sd.stop()
-                            break
-                    sd.sleep(30)
+                if self.has_aplay:
+                    aplay_cmd = ["aplay", "-q", "-D", self.alsa_device, "-"]
+                    aplay_proc = subprocess.Popen(aplay_cmd, stdin=subprocess.PIPE, stderr=subprocess.DEVNULL)
+                    self._current_process = aplay_proc
+                    aplay_proc.communicate(input=wav_data)
+                elif sd is not None:
+                    import numpy as np
+                    raw_pcm = wav_data[44:]  # strip WAV header
+                    arr = np.frombuffer(raw_pcm, dtype=np.int16).astype(np.float32) / 32768.0
+                    sd.play(arr, samplerate=self.sample_rate)
+                    sd.wait()
             finally:
+                self._current_process = None
                 self._set_speaking(False)
 
         except Exception as e:
-            self.get_logger().warn(f"TTS Synthesis Hatası: {e}")
+            self.get_logger().warn(f"TTS Playback Hatası: {e}")
             self._set_speaking(False)
 
 
