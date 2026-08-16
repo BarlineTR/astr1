@@ -587,8 +587,8 @@ class AiBrainNode(Node):
             return
 
         now = time.monotonic()
-        if (now - self._looking_start_time) > 2.5:
-            if self._state == "IDLE" and (now - self._last_proactive_gaze_time) > 45.0:
+        if (now - self._looking_start_time) > 1.6:
+            if self._state == "IDLE" and (now - self._last_proactive_gaze_time) > 30.0:
                 self._last_proactive_gaze_time = now
                 self._state = "ACTIVE"
                 self._last_interaction = now

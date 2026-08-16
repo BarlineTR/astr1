@@ -1,14 +1,18 @@
 #!/usr/bin/env python3
-"""ASTRO V1 — Face & Gaze Detection Node.
+"""ASTRO V1 — Highly Reliable Face & Gaze Detection Node.
 
-Publishes:
-  /vision/faces            (String JSON) — Bounding boxes of detected faces
-  /vision/person_detected  (Bool)        — True if any face/person in frame
-  /vision/looking_at_robot (Bool)        — True if person is making direct eye contact with camera
-  /vision/face_image       (Image)       — Debug annotated visual frame
+Features:
+  - Frontal vs Profile Face Cascade Discrimination
+  - Temporal smoothing / debounce filter (prevents single-frame dropouts)
+  - Publishes:
+      /vision/faces            (String JSON)
+      /vision/person_detected  (Bool)
+      /vision/looking_at_robot (Bool) — True if direct frontal gaze
+      /vision/face_image       (Image)
 """
 
 import json
+from collections import deque
 import cv2
 import rclpy
 from rclpy.node import Node
@@ -26,7 +30,7 @@ class FaceDetectorNode(Node):
         super().__init__("face_detector_node")
         self.declare_parameter("input_topic", "/oak/rgb/image_raw")
         self.declare_parameter("scale_factor", 1.1)
-        self.declare_parameter("min_neighbors", 4)
+        self.declare_parameter("min_neighbors", 3)
         self.declare_parameter("min_size", 40)
 
         input_topic = self.get_parameter("input_topic").value
@@ -34,15 +38,16 @@ class FaceDetectorNode(Node):
         self.min_neighbors = int(self.get_parameter("min_neighbors").value)
         self.min_size = int(self.get_parameter("min_size").value)
 
-        # Load Face & Eye Cascades for direct gaze / eye-contact detection
-        face_path = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
-        eye_path = cv2.data.haarcascades + "haarcascade_eye.xml"
+        # Load Frontal & Profile Cascades
+        frontal_path = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+        profile_path = cv2.data.haarcascades + "haarcascade_profileface.xml"
 
-        self.face_cascade = cv2.CascadeClassifier(face_path)
-        self.eye_cascade = cv2.CascadeClassifier(eye_path)
+        self.frontal_cascade = cv2.CascadeClassifier(frontal_path)
+        self.profile_cascade = cv2.CascadeClassifier(profile_path)
 
-        if self.face_cascade.empty():
-            self.get_logger().error(f"Failed to load face cascade: {face_path}")
+        # Temporal smoothing buffer for gaze (last 5 frames)
+        self._gaze_history = deque(maxlen=6)
+        self._person_history = deque(maxlen=6)
 
         # Publishers
         self.pub_faces = self.create_publisher(String, "/vision/faces", 10)
@@ -51,7 +56,7 @@ class FaceDetectorNode(Node):
         self.pub_image = self.create_publisher(Image, "/vision/face_image", 10)
 
         self.sub = self.create_subscription(Image, input_topic, self.image_callback, 10)
-        self.get_logger().info(f"👁️ [Gaze & Face Detector] Aktif! Dinleniyor: {input_topic}")
+        self.get_logger().info(f"👁️ [Gaze & Face Detector] Kararlı Bakış Tespiti Hazır! Dinleniyor: {input_topic}")
 
     def image_callback(self, msg: Image):
         try:
@@ -63,51 +68,50 @@ class FaceDetectorNode(Node):
             return
 
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        faces = self.face_cascade.detectMultiScale(
+        
+        # 1. Detect Frontal Faces (Looking at robot)
+        frontal_faces = self.frontal_cascade.detectMultiScale(
             gray,
             scaleFactor=self.scale_factor,
             minNeighbors=self.min_neighbors,
             minSize=(self.min_size, self.min_size),
         )
 
+        # 2. Detect Profile Faces (Looking away / turned head)
+        profile_faces = self.profile_cascade.detectMultiScale(
+            gray,
+            scaleFactor=1.15,
+            minNeighbors=3,
+            minSize=(self.min_size, self.min_size),
+        )
+
+        instant_looking = len(frontal_faces) > 0
+        instant_person = (len(frontal_faces) > 0) or (len(profile_faces) > 0)
+
+        self._gaze_history.append(instant_looking)
+        self._person_history.append(instant_person)
+
+        # Temporal smoothing: True if detected in at least 2 of the last 6 frames
+        smoothed_looking = (self._gaze_history.count(True) >= 2)
+        smoothed_person = (self._person_history.count(True) >= 2)
+
         face_list = []
-        is_looking_at_camera = False
-
-        for x, y, w, h in faces:
-            face_roi_gray = gray[y:y + h, x:x + w]
-            
-            # Gaze verification: Detect eyes inside the upper face region
-            upper_face = face_roi_gray[0:int(h * 0.65), :]
-            eyes = self.eye_cascade.detectMultiScale(
-                upper_face,
-                scaleFactor=1.1,
-                minNeighbors=3,
-                minSize=(15, 15)
-            )
-
-            # Direct frontal face + eyes visible indicates looking at robot
-            direct_gaze = len(eyes) >= 1
-
-            if direct_gaze:
-                is_looking_at_camera = True
-
+        for x, y, w, h in frontal_faces:
             face_list.append({
-                "x": int(x),
-                "y": int(y),
-                "width": int(w),
-                "height": int(h),
-                "eyes_detected": int(len(eyes)),
-                "looking_at_robot": direct_gaze
+                "x": int(x), "y": int(y), "width": int(w), "height": int(h),
+                "type": "frontal", "looking_at_robot": True
             })
+            cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
+            cv2.putText(frame, "BANA BAKIYOR", (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
 
-            # Draw visual debug overlays
-            color = (0, 255, 0) if direct_gaze else (0, 165, 255)
-            cv2.rectangle(frame, (x, y), (x + w, y + h), color, 2)
-            label = "BANA BAKIYOR" if direct_gaze else "YANA BAKIYOR"
-            cv2.putText(frame, label, (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
-
-            for ex, ey, ew, eh in eyes:
-                cv2.rectangle(frame, (x + ex, y + ey), (x + ex + ew, y + ey + eh), (255, 255, 0), 1)
+        for x, y, w, h in profile_faces:
+            if not instant_looking:
+                face_list.append({
+                    "x": int(x), "y": int(y), "width": int(w), "height": int(h),
+                    "type": "profile", "looking_at_robot": False
+                })
+                cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 140, 255), 2)
+                cv2.putText(frame, "YANA BAKIYOR", (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 140, 255), 2)
 
         # 1. Publish Faces List
         faces_msg = String()
@@ -116,12 +120,12 @@ class FaceDetectorNode(Node):
 
         # 2. Publish Person Detected
         person_msg = Bool()
-        person_msg.data = len(face_list) > 0
+        person_msg.data = smoothed_person
         self.pub_person.publish(person_msg)
 
-        # 3. Publish Looking At Robot (Eye Contact)
+        # 3. Publish Looking At Robot (Direct Gaze)
         looking_msg = Bool()
-        looking_msg.data = is_looking_at_camera
+        looking_msg.data = smoothed_looking
         self.pub_looking.publish(looking_msg)
 
         # 4. Debug Image
