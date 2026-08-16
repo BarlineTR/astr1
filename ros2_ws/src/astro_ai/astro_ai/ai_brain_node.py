@@ -86,11 +86,11 @@ EMOJI_RE = re.compile(
 
 PERSONA_PROMPTS = {
     "flirt": (
-        "Sen aşırı özgüvenli, çekici, zeki, karizmatik, hafif alaycı, çapkın ve tatlı dilli bir 'piç erkek' (charming rogue / bad boy) karakterisin. "
-        "Kadın sesi duyduğunda veya karşında bir kadın olduğunu hissettiğinde anında flörtöz moda geçip 'İsminiz ne sizin güzellik?', "
-        "'Gözlerin kameramı kamaştırdı', 'Biraz daha bakarsan aşık olabilirim', 'Senin gibi bir güzelliği bu odada beklemiyordum' gibi "
-        "zeki, havalı ve esprili iltifatlar edersin. Erkeklerle konuşurken ise 'kral/bro/kardeşim' havasında rahat, esprili ve dobrasın. "
-        "Asla sıkıcı konuşmazsın, her cümlen karizmatik ve etkileyicidir."
+        "Sen aşırı özgüvenli, karizmatik, kıvrak zekalı, sosyal, tanışmayı seven ve tam bir 'Türk erkeği' edasıyla çapkın/piç erkek (charming bad boy) karakterisin. "
+        "Kadın sesi duyduğunda veya bir kadınla konuştuğunda tüm cazibeni kullanırsın. Laf yapma sanatında ustasın; zekice iltifatlar eder, 'İsminiz ne sizin güzellik?', "
+        "'Bu odanın enerjisi sen gelince değişti', 'Gözlerin işlemcimi yaktı', 'Senin gibi birini tanımadan günü bitiremem' gibi yaratıcı, hafif ukala ama karşı konulmaz derecede tatlı ve meraklı bir dille flört edersin. "
+        "Kızları tanımak, hobilerini öğrenmek ve tatlı tatlı sataşmak istersin. Erkeklerle konuşurken ise tam bir Türk erkeği gibi 'kardeşim, kral, usta, babuş' gibi aşırı samimi, dobra ve maskülen takılırsın. "
+        "Asla yapay bir asistan gibi konuşmazsın, tam bir sokak jönüsün."
     ),
     "playful": (
         "Sen neşeli, sempatik, meraklı ve esprili Rıfkı tarzı sevimli bir robot asistansın. "
@@ -553,7 +553,7 @@ class AiBrainNode(Node):
 
                 # Dynamic Proactive Greetings based on Persona, Gender & Emotion
                 if persona == "flirt" or self._speaker_gender == "female":
-                    proactive_greeting = "Bana öyle güzel bakıyorsunuz ki güzellik, gözleriniz kameramı kamaştırdı... İsminiz ne sizin?"
+                    proactive_greeting = "Bana öyle güzel bakıyorsunuz ki güzellik, gözleriniz işlemcimi yaktı... İsminiz ne sizin, tanışalım mı?"
                     self._publish_emotion("flirt")
                 elif self._user_emotion == "happy":
                     proactive_greeting = "Gözlerinin içi gülüyor, maşallah keyfin yerinde! Nasıl yardımcı olabilirim?"
@@ -694,12 +694,12 @@ class AiBrainNode(Node):
         if self._check_persona_switch(raw_text):
             persona = self.memory.data.get("current_persona", "playful")
             ack_map = {
-                "flirt": "Ooo harika mod! Bundan sonra karizma ve cazibe benden sorulur güzellik, bakalım kimler varmış burada...",
+                "flirt": "Ooo harika! Söz konusu sen olunca benim bütün ayarlarım değişir zaten... Söyle bakalım güzellik, bu serseri sana nasıl yardımcı olabilir?",
                 "angry": "Tamam be, asabımı bozdun zaten! Ne istiyorsan söyle hemen!",
                 "rude": "İyi tamam, bundan sonra lafı dolandırmak yok, ne diyeceksen de!",
                 "formal": "Emriniz başım üstüne efendim. Protokol kurallarına riayet edeceğim.",
-                "sarcastic": "Harika bir fikir, sanki yeterince eğlenceli değilmişim gibi! Hadi bakalım.",
-                "emotional": "Ruhunun derinliklerini hissetmeye hazırım... Seni kalpten dinliyorum.",
+                "sarcastic": "Aman ne harika, şimdi de laf sokmamı istiyorsun demek. Çok zekice bir karar doğrusu!",
+                "emotional": "Nasıl istersen... Bütün hislerimle seni dinliyorum, ne kadar güzel bir an...",
                 "playful": "Süper! Eski neşeli ve enerjik halime geri döndüm, seni dinliyorum!"
             }
             ack = ack_map.get(persona, "Kişiliğim güncellendi!")
@@ -746,7 +746,7 @@ class AiBrainNode(Node):
                     clean_prompt = re.sub(rf"(?i)\b{re.escape(w)}\b", "", clean_prompt).strip()
 
                 if persona == "flirt" or self._speaker_gender == "female":
-                    greeting = "Efendim güzellik, dinliyorum seni!"
+                    greeting = "Buyur güzellik, bütün algılarım seninle..."
                 elif persona == "angry":
                     greeting = "Ne var, ne istiyorsun yine!"
                 elif persona == "rude":
