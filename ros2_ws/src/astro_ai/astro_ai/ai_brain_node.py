@@ -199,6 +199,7 @@ class AstroMemory:
             ],
             "learned_objects": {},
             "conversation_summaries": [],
+            "environmental_observations": [],
             "last_interaction": None,
         }
         self.load()
@@ -250,6 +251,13 @@ class AstroMemory:
         self.data.setdefault("learned_objects", {})[obj_name] = visual_desc
         self.save()
 
+    def add_observation(self, observation_text: str):
+        if observation_text:
+            self.data.setdefault("environmental_observations", []).append(observation_text)
+            if len(self.data["environmental_observations"]) > 3:
+                self.data["environmental_observations"] = self.data["environmental_observations"][-3:]
+            self.save()
+
     def get_context_prompt(self) -> str:
         ctx = []
         if self.data.get("owner_name"):
@@ -257,6 +265,9 @@ class AstroMemory:
         if self.data.get("user_facts"):
             facts_str = "; ".join(self.data["user_facts"][-5:])
             ctx.append(f"Hafızandaki Bilgiler: {facts_str}")
+        if self.data.get("environmental_observations"):
+            obs_str = "; ".join(self.data["environmental_observations"])
+            ctx.append(f"Çevresel Gözlemlerin: {obs_str}")
         if ctx:
             return "Kalıcı Bilgilerin:\n" + "\n".join(ctx)
         return ""
@@ -427,6 +438,65 @@ class AiBrainNode(Node):
         self.get_logger().info(
             f"🧠 [AI Brain] Sosyal Zeka Hazır! Kişilik: [{persona.upper()}] | Wake-word: \"{self._wake_word}\""
         )
+        
+        # Otonom Öğrenme (Idle Learning)
+        self._start_idle_learning()
+
+    def _start_idle_learning(self):
+        self._idle_thread = threading.Thread(target=self._idle_learning_loop, daemon=True)
+        self._idle_thread.start()
+
+    def _idle_learning_loop(self):
+        while rclpy.ok():
+            time.sleep(10) # Check every 10 seconds
+            if not self._enabled or self._state != "IDLE" or self._tts_speaking or self._is_processing:
+                continue
+
+            now = time.monotonic()
+            
+            # If idle for more than 60 seconds and no recent camera learning in the last 2 minutes
+            if (now - self._last_interaction) > 60.0 and (now - getattr(self, '_last_idle_learning_time', 0)) > 120.0:
+                self._last_idle_learning_time = now
+                
+                captured_frame = None
+                with self._lock:
+                    if self._latest_frame is not None and (now - self._latest_frame_time) < 4.0:
+                        captured_frame = self._latest_frame.copy()
+                
+                if captured_frame is not None:
+                    base64_img = frame_to_base64_jpeg(captured_frame, max_dim=512)
+                    if base64_img:
+                        self.get_logger().info("🕵️ [Idle Learning] Etraf sessiz, Astro etrafı inceliyor...")
+                        prompt = "Şu anda boşta bekliyorsun ve etrafı izliyorsun. Kamerada ne görüyorsun? Odada dikkat çekici bir durum, nesne veya insan var mı? Sadece ne gördüğünü 1 kısa cümleyle Türkçe not al."
+                        
+                        try:
+                            response = self._groq.chat.completions.create(
+                                messages=[
+                                    {
+                                        "role": "system",
+                                        "content": "Sen otonom bir robotsun. Kendi çevreni gözlemliyorsun."
+                                    },
+                                    {
+                                        "role": "user",
+                                        "content": [
+                                            {"type": "text", "text": prompt},
+                                            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{base64_img}"}}
+                                        ]
+                                    }
+                                ],
+                                model=self._vision_model,
+                                temperature=0.3,
+                                max_tokens=60
+                            )
+                            obs = response.choices[0].message.content.strip()
+                            clean_obs = extract_spoken_turkish_sentence(obs)
+                            if clean_obs:
+                                self.memory.add_observation(clean_obs)
+                                self._messages[0]["content"] = self._build_system_prompt()
+                                self.get_logger().info(f"🧠 [Hafıza Güncellendi - Gözlem]: {clean_obs}")
+                        except Exception as e:
+                            self.get_logger().debug(f"Idle learning error: {e}")
+
 
     def _discover_vision_model(self) -> str:
         try:
