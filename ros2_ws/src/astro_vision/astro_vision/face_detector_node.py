@@ -57,6 +57,15 @@ class SpatialVisionNode(Node):
         self.smile_cascade = cv2.CascadeClassifier(smile_path)
         self.eye_cascade = cv2.CascadeClassifier(eye_path)
 
+        # Check GPU / CUDA Acceleration on Jetson
+        self.gpu_accelerated = False
+        try:
+            if hasattr(cv2, 'cuda') and cv2.cuda.getCudaEnabledDeviceCount() > 0:
+                self.gpu_accelerated = True
+                self.get_logger().info(f"🚀 [Spatial Vision] Jetson Orin Nano GPU / CUDA Hızlandırma Aktif!")
+        except Exception:
+            pass
+
         # Internal Buffers
         self._latest_depth = None
         self._gaze_history = deque(maxlen=5)
@@ -106,7 +115,8 @@ class SpatialVisionNode(Node):
         distance = (0.15 * focal_length) / max(1, w)
         return float(np.clip(distance, 0.3, 4.0))
 
-    def _estimate_head_yaw(self, face_roi_gray, w, h) -> float:
+    def _estimate_head_yaw(self, face_roi_gray, w, h) -> tuple[float, bool]:
+        """Calculates yaw angle and strictly verifies eye visibility to reject back-of-head false detections."""
         roi = cv2.resize(face_roi_gray[:int(h * 0.6), :], (96, 54), interpolation=cv2.INTER_AREA) if w > 96 else face_roi_gray[:int(h * 0.6), :]
         rw = roi.shape[1]
         eyes = self.eye_cascade.detectMultiScale(roi, scaleFactor=1.15, minNeighbors=3, minSize=(10, 10))
@@ -117,11 +127,13 @@ class SpatialVisionNode(Node):
             eye_midpoint = (left_eye_center + right_eye_center) / 2.0
             face_center = rw / 2.0
             yaw_deg = float(((eye_midpoint - face_center) / face_center) * 35.0)
-            return yaw_deg
+            return yaw_deg, True
         elif len(eyes) == 1:
             eye_x = eyes[0][0] + eyes[0][2] / 2.0
-            return -25.0 if eye_x < rw / 2.0 else 25.0
-        return 0.0
+            yaw_deg = -25.0 if eye_x < rw / 2.0 else 25.0
+            return yaw_deg, True
+        # If ZERO eyes found, the face is turned away / back of the head — NOT looking at robot!
+        return 90.0, False
 
     def _detect_facial_emotion(self, face_roi_gray, w, h) -> str:
         """Determines emotion (happy/smiling, surprised, sad/neutral) based on mouth and eyes geometry."""
@@ -205,16 +217,16 @@ class SpatialVisionNode(Node):
         for x, y, w, h in faces:
             face_roi_gray = gray[y:y + h, x:x + w]
             
-            # 1. 3D Head Yaw
-            yaw = self._estimate_head_yaw(face_roi_gray, w, h)
+            # 1. 3D Head Yaw & Eye Verification
+            yaw, eyes_found = self._estimate_head_yaw(face_roi_gray, w, h)
             head_yaw = yaw
 
             # 2. 3D Distance
             dist_m = self._estimate_distance(x, y, w, h, frame_w, frame_h)
             user_distance = dist_m
 
-            # 3. Direct Gaze (Wide Natural Gaze Cone: <= 30 degrees)
-            direct_gaze = abs(yaw) <= 30.0
+            # 3. Direct Gaze: Eyes MUST be visible AND yaw <= 30 degrees AND within 3.0 meters
+            direct_gaze = eyes_found and (abs(yaw) <= 30.0) and (dist_m <= 3.0)
             if direct_gaze:
                 is_looking = True
 
@@ -239,7 +251,7 @@ class SpatialVisionNode(Node):
             box_color = color_map.get(detected_emotion, (0, 255, 0))
             cv2.rectangle(frame, (x, y), (x + w, y + h), box_color, 2)
             
-            gaze_txt = "BANA BAKIYOR" if direct_gaze else f"YANA ({yaw:.0f}°)"
+            gaze_txt = "BANA BAKIYOR" if direct_gaze else (f"YANA ({yaw:.0f}°)" if eyes_found else "BAKMIYOR (GÖZ YOK)")
             hud_text = f"{gaze_txt} | {dist_m:.2f}m | {detected_emotion.upper()}"
             cv2.putText(frame, hud_text, (x, max(22, y - 10)), cv2.FONT_HERSHEY_SIMPLEX, 0.55, box_color, 2)
 

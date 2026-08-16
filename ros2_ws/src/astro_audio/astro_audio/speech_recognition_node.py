@@ -248,6 +248,14 @@ class SpeechRecognitionNode(Node):
     def _transcribe(self, audio_data: list[int], seq: int):
         try:
             arr = np.array(audio_data, dtype=np.int16)
+            if len(arr) == 0:
+                return
+
+            # Compute audio RMS energy (Gating against background silence & mic breathing)
+            rms = float(np.sqrt(np.mean(arr.astype(np.float32)**2)))
+            if rms < 220.0:
+                # Ambient silence / background noise — skip to eliminate ghost hallucinations
+                return
 
             wav_io = io.BytesIO()
             with wave.open(wav_io, 'wb') as wf:
@@ -264,8 +272,8 @@ class SpeechRecognitionNode(Node):
             gender_msg.data = gender
             self._gender_pub.publish(gender_msg)
 
-            # Turkish whisper prompt hinting for accurate recognition
-            whisper_prompt = "Astro, hey astro, robot, naber, nasılsın, ne haber, elinde ne var, beni görüyor musun, nasılsın iyi misin."
+            # Clean Whisper prompt (Neutral robot hints, no hallucination-inducing questions)
+            whisper_prompt = "Astro, hey astro, robot, merhaba."
 
             result = self.groq_client.audio.transcriptions.create(
                 file=("speech.wav", wav_bytes),
@@ -278,6 +286,11 @@ class SpeechRecognitionNode(Node):
 
             text = str(result).strip()
             text_lower = text.lower().strip(" .,!?:;")
+
+            # Hallucination Filter: Ignore known Whisper silence phantom phrases on low-energy chunks
+            silence_hallucinations = ["iyi misin", "teşekkür ederim", "teşekkürler", "altyazı", "abone ol", "görüşmek üzere", "hoşça kalın", "sağ olun"]
+            if text_lower in silence_hallucinations and rms < 350.0:
+                return
 
             # Exact match hallucination filter
             exact_hallucinations = ["evet", "hayır", "tamam", "hı hı", "hı", "cık", "çık", "eee", "ııı", "hmm"]
