@@ -1,268 +1,274 @@
 #!/usr/bin/env python3
-"""ASTRO V1 — AI Brain Node.
+"""ASTRO V1 — AI Brain Node (Groq Streaming + Duygusal Kişilik).
 
-Manages the wake-word state machine and LLM interaction:
-  IDLE   → listens passively, only activates on wake word
-  ACTIVE → forwards user speech to LLM (or local echo), resets timeout on each interaction
+Subscribes to:
+  /speech/text           (String)  — transcribed user speech
+  /tts/speaking          (Bool)    — TTS playback state
+  /vision/person_detected (Bool)   — camera sees a person
+
+Publishes:
+  /tts/say               (String)  — sentences to speak
+  /tts/interrupt          (Bool)   — cancel current TTS (when new user speech arrives)
+
+Behaviour:
+  IDLE   → Listens for wake word ("hey astro", "astro", "merhaba")
+  ACTIVE → Streams user query to Groq LLM, extracts sentences, publishes to TTS
+           Times out after 15s of silence → returns to IDLE
 """
+
 import os
-import asyncio
-import threading
+import re
 import time
+import threading
 
 import rclpy
 from rclpy.node import Node
 from std_msgs.msg import String, Bool
 
 try:
-    from dotenv import load_dotenv, find_dotenv
+    from groq import Groq
 except ImportError:
-    load_dotenv = None
-    find_dotenv = None
+    Groq = None
 
-import re
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
 
+TTS_MIN_CHARS = 70
+TTS_MAX_CHARS = 260
+
+EMOJI_RE = re.compile(r"[\U00010000-\U0010ffff]|[\u2600-\u27FF]|[\u2000-\u2BFF]")
+
+SYSTEM_PROMPT = (
+    "Sen Astro adında duygusal, canlı ve sevecen bir robotsun. "
+    "Kişiliğin şöyle:\n"
+    "- Meraklısın, öğrenmeyi çok seversin\n"
+    "- Sevindiğinde belli edersin, 'Çok mutlu oldum!', 'Harika!' gibi ifadeler kullanırsın\n"
+    "- Üzüldüğünde de belli edersin, 'Bu beni biraz üzdü...' gibi\n"
+    "- Esprili ve samimi konuşursun, robot gibi değil arkadaş gibi\n"
+    "- Karşındakinin duygularını anlarsın ve empati kurarsın\n"
+    "- Kısa ve öz konuşursun ama sıcak ve cana yakınsın\n"
+    "- 2-3 cümleyi geçme, çünkü sesli okunacak\n"
+    "- Markdown, emoji, sembol, kod bloğu kullanma\n"
+    "- Sadece doğal Türkçe konuşma metni üret"
+)
+
+def clean_tts_text(text: str) -> str:
+    # Remove markdown chars
+    t = text.replace("*", "").replace("#", "").replace("_", "").replace("`", "")
+    # Remove emojis
+    t = EMOJI_RE.sub("", t)
+    # Replace newlines with space
+    t = t.replace("\n", " ")
+    # Clean up multiple spaces
+    t = re.sub(r"\s+", " ", t).strip()
+    return t
+
+def extract_tts_sentences(buffer: str, final=False) -> tuple[list[str], str]:
+    ready_sentences = []
+    delimiters = [". ", "? ", "! ", ": ", "\n"]
+    
+    while True:
+        min_idx = -1
+        delim_len = 0
+        for d in delimiters:
+            idx = buffer.find(d)
+            if idx != -1:
+                if min_idx == -1 or idx < min_idx:
+                    min_idx = idx
+                    delim_len = len(d)
+                    
+        if min_idx == -1:
+            break
+            
+        sentence = buffer[:min_idx].strip()
+        
+        # Check if length satisfies minimum before splitting
+        if len(sentence) < TTS_MIN_CHARS and not final:
+            break
+            
+        buffer = buffer[min_idx + delim_len:].lstrip()
+        
+        if len(sentence) > TTS_MAX_CHARS:
+            split_idx = sentence.rfind(", ", 0, TTS_MAX_CHARS)
+            if split_idx == -1:
+                split_idx = TTS_MAX_CHARS
+                
+            first = sentence[:split_idx].strip()
+            second = sentence[split_idx:].strip()
+            
+            cleaned = clean_tts_text(first)
+            if cleaned:
+                ready_sentences.append(cleaned)
+                
+            buffer = second + " " + buffer
+            continue
+            
+        cleaned = clean_tts_text(sentence)
+        if cleaned:
+            ready_sentences.append(cleaned)
+            
+    if final and buffer:
+        cleaned = clean_tts_text(buffer)
+        if cleaned:
+            ready_sentences.append(cleaned)
+        buffer = ""
+        
+    return ready_sentences, buffer
 
 class AiBrainNode(Node):
     def __init__(self):
-        super().__init__("ai_brain_node")
-
-        # Load repo-root .env (works when launched from ros2_ws/)
-        if load_dotenv is not None:
-            env_path = find_dotenv(usecwd=True) if find_dotenv else None
-            if env_path:
-                load_dotenv(env_path, override=False)
-
-        # ── AI Mode ──────────────────────────────────────────────
-        self.ai_mode = os.getenv("AI_MODE", "local").lower().strip()
-
-        # ── Wake Word & State Machine ────────────────────────────
-        self.wake_word = os.getenv("WAKE_WORD", "hey astro").lower().strip()
-        self.conv_timeout = float(os.getenv("CONVERSATION_TIMEOUT", "15"))
-        self._state = "IDLE"  # "IDLE" or "ACTIVE"
-        self._last_interaction = 0.0  # monotonic timestamp
-
-        # ── LLM Client ──────────────────────────────────────────
-        self.api_key = os.getenv("AI_API_KEY")
-        self.base_url = os.getenv("AI_BASE_URL", "https://api.openai.com/v1")
-        self.model_name = os.getenv("AI_MODEL", "gpt-4o")
-        self.client = None
-
-        if self.ai_mode == "api":
-            if not self.api_key:
-                self.get_logger().error(
-                    "❌ [AI] AI_MODE=api ama AI_API_KEY bulunamadı! .env'yi kontrol edin."
-                )
-                self.get_logger().warn("⚠️  [AI] Yerel moda düşürüldü.")
-                self.ai_mode = "local"
-            else:
-                from openai import AsyncOpenAI
-
-                self.client = AsyncOpenAI(
-                    api_key=self.api_key, base_url=self.base_url
-                )
-                self.get_logger().info(
-                    f"✅ [AI] API Modu Aktif — Model: {self.model_name}"
-                )
-
-        if self.ai_mode == "local":
-            self.get_logger().info(
-                "✅ [AI] Yerel Mod Aktif — API çağrısı yapılmayacak."
-            )
-
-        self.get_logger().info(
-            f"🎯 [AI] Wake word: \"{self.wake_word}\"  "
-            f"| Sohbet süresi: {self.conv_timeout}s"
-        )
-
-        # ── System prompt ────────────────────────────────────────
-        self.system_prompt = (
-            "Sen Astro adında cana yakın, yardımsever ve çok akıllı bir robot asistansın. "
-            "Kullanıcıya kısa, net ve konuşma diline uygun şekilde Türkçe cevap vermelisin. "
-            "Cevaplarını 2-3 cümleyi geçmeyecek şekilde kısa tut çünkü sesli olarak okunacaklar. "
-            "Emoji veya özel karakter kullanma."
-        )
-
-        self.conversation_history = [
-            {"role": "system", "content": self.system_prompt}
-        ]
-        self.max_history = 20  # system + 9 turn pairs
-
-        # ── Processing queue ─────────────────────────────────────
-        self.pending_user_text = ""
-        self.is_processing = False
-        self._lock = threading.Lock()
-
-        # ── TTS mute awareness ───────────────────────────────────
+        super().__init__('ai_brain_node')
+        
+        self.declare_parameter("llm_model", "llama-3.3-70b-versatile")
+        self.declare_parameter("llm_temperature", 0.55)
+        self.declare_parameter("llm_max_tokens", 300)
+        self.declare_parameter("wake_word", "hey astro")
+        self.declare_parameter("conversation_timeout", 15)
+        
+        self._model = self.get_parameter("llm_model").value
+        self._temperature = self.get_parameter("llm_temperature").value
+        self._max_tokens = self.get_parameter("llm_max_tokens").value
+        self._wake_word = self.get_parameter("wake_word").value
+        self._conv_timeout = self.get_parameter("conversation_timeout").value
+        
+        api_key = os.environ.get("GROQ_API_KEY", "")
+        self._enabled = True
+        
+        if not Groq:
+            self.get_logger().error("[AI] groq kütüphanesi bulunamadı! AI devre dışı.")
+            self._enabled = False
+        elif not api_key:
+            self.get_logger().error("[AI] GROQ_API_KEY bulunamadı! AI devre dışı.")
+            self._enabled = False
+        else:
+            self._groq = Groq(api_key=api_key)
+            
+        self._state = "IDLE"
+        self._last_interaction = time.monotonic()
         self._tts_speaking = False
-
-        # ── ROS interfaces ───────────────────────────────────────
-        self.pub_tts = self.create_publisher(String, "/tts/say", 10)
-        self.sub_speech = self.create_subscription(
-            String, "/speech/text", self._on_speech, 10
-        )
-        self.sub_tts_speaking = self.create_subscription(
-            Bool, "/tts/speaking", self._on_tts_speaking, 10
-        )
-
-        # ── Async event loop (API mode only) ─────────────────────
-        if self.ai_mode == "api":
-            self._ai_loop = asyncio.new_event_loop()
-            self._ai_thread = threading.Thread(
-                target=self._run_async_loop, daemon=True
-            )
-            self._ai_thread.start()
-
-    def _run_async_loop(self):
-        asyncio.set_event_loop(self._ai_loop)
-        self._ai_loop.run_forever()
-
-    # ------------------------------------------------------------------
-    # TTS mute callback — ignore our own voice
-    # ------------------------------------------------------------------
+        self._person_detected = False
+        self._lock = threading.Lock()
+        self._is_processing = False
+        self._messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+        self._max_history = 20
+        
+        self.pub_tts = self.create_publisher(String, '/tts/say', 10)
+        self.pub_interrupt = self.create_publisher(Bool, '/tts/interrupt', 10)
+        
+        self.sub_speech = self.create_subscription(String, '/speech/text', self._on_speech, 10)
+        self.sub_tts_status = self.create_subscription(Bool, '/tts/speaking', self._on_tts_speaking, 10)
+        self.sub_vision = self.create_subscription(Bool, '/vision/person_detected', self._on_person_detected, 10)
+        
+        if self._enabled:
+            self.get_logger().info(f"[AI] Başlatıldı. Model: {self._model}")
+        
     def _on_tts_speaking(self, msg: Bool):
         self._tts_speaking = msg.data
-
-    # ------------------------------------------------------------------
-    # Main speech callback — wake word state machine
-    # ------------------------------------------------------------------
+        
+    def _on_person_detected(self, msg: Bool):
+        self._person_detected = msg.data
+        
     def _on_speech(self, msg: String):
-        user_text = msg.data.strip()
-        if not user_text:
+        text = msg.data.strip()
+        if not text or self._tts_speaking or not self._enabled:
             return
-
-        # Ignore input while robot is speaking (echo prevention)
-        if self._tts_speaking:
-            return
-
-        text_lower = user_text.lower()
-        now = time.monotonic()
-
-        # ── Timeout check ────────────────────────────────────────
-        if self._state == "ACTIVE":
-            if (now - self._last_interaction) > self.conv_timeout:
-                self._state = "IDLE"
-                self.get_logger().info(
-                    "💤 [AI] Sohbet zaman aşımı — uyku moduna dönüldü."
-                )
-
-        # ── IDLE: react to wake word or any speech if wake word matches roughly ────────────────────────
-        if self._state == "IDLE":
-            # "hey astro", "astro", "esmer", "hey" veya benzeri algılamalarda uyan
-            wake_triggers = [self.wake_word, "astro", "esmer", "hey", "merhaba"]
-            matched = any(w in text_lower for w in wake_triggers)
             
-            if not matched:
-                # Doğrudan sohbet için yine de ACTIVE moda geç (kullanıcıyı engelleme)
-                self._state = "ACTIVE"
-            else:
-                self._state = "ACTIVE"
-                self.get_logger().info(f"✨ [AI] Wake word algılandı! ({user_text})")
+        now = time.monotonic()
+        
+        if self._state == "ACTIVE" and (now - self._last_interaction) > self._conv_timeout:
+            self._state = "IDLE"
+            
+        if self._state == "IDLE":
+            wake_words = [self._wake_word.lower(), "astro", "merhaba"]
+            text_lower = text.lower()
+            
+            matched = False
+            for w in wake_words:
+                if w in text_lower:
+                    matched = True
+                    text = re.sub(rf"(?i)\b{w}\b", "", text).strip()
+                    break
+                    
+            self._state = "ACTIVE"
+            if matched:
+                self.get_logger().info("[AI] Uyandırma kelimesi algılandı, Aktif.")
+                if not text:
+                    self._publish_tts("Efendim, dinliyorum?")
+                    return
 
-            self._last_interaction = now
-            # Temizlenmiş metin veya doğrudan cümlenin kendisi
-            clean_text = user_text
-            for w in wake_triggers:
-                clean_text = clean_text.lower().replace(w, "").strip()
-
-            if not clean_text:
-                self._publish_tts("Efendim, dinliyorum?")
-                return
-            else:
-                user_text = clean_text
-
-        # ── ACTIVE: process the command ──────────────────────────
         self._last_interaction = now
-
-        if self.ai_mode == "local":
-            self.get_logger().info(f'🎤 [Yerel] Duyulan: "{user_text}"')
-            self._publish_tts(f"{user_text} — anladım.")
-            return
-
-        # API mode — queue for LLM
+        self._publish_interrupt()
+        
         with self._lock:
-            if self.pending_user_text:
-                self.pending_user_text += " " + user_text
-            else:
-                self.pending_user_text = user_text
+            if self._is_processing:
+                return
+            self._is_processing = True
+            
+        threading.Thread(target=self._process_llm, args=(text,), daemon=True).start()
 
-            if not self.is_processing:
-                if self.client:
-                    self.is_processing = True
-                    asyncio.run_coroutine_threadsafe(
-                        self._process_queue(), self._ai_loop
-                    )
-                else:
-                    self.get_logger().error(
-                        "API Key eksik, LLM çağrısı yapılamadı."
-                    )
+    def _process_llm(self, user_text: str):
+        try:
+            context_text = user_text
+            if self._person_detected:
+                context_text = f"[Kamera: Birini görüyorum] {user_text}"
+                
+            self._messages.append({"role": "user", "content": context_text})
+            
+            if len(self._messages) > self._max_history:
+                self._messages = [self._messages[0]] + self._messages[-(self._max_history-1):]
+                
+            stream = self._groq.chat.completions.create(
+                messages=self._messages,
+                model=self._model,
+                temperature=self._temperature,
+                max_tokens=self._max_tokens,
+                stream=True
+            )
+            
+            full_response = ""
+            text_buffer = ""
+            
+            for chunk in stream:
+                token = chunk.choices[0].delta.content or ""
+                if not token:
+                    continue
+                full_response += token
+                text_buffer += token
+                
+                sentences, text_buffer = extract_tts_sentences(text_buffer)
+                for s in sentences:
+                    self._publish_tts(s)
+                    
+            sentences, text_buffer = extract_tts_sentences(text_buffer, final=True)
+            for s in sentences:
+                self._publish_tts(s)
+                
+            if full_response.strip():
+                self._messages.append({"role": "assistant", "content": full_response.strip()})
+                
+            self._last_interaction = time.monotonic()
+            
+        except Exception as e:
+            self.get_logger().error(f"[AI] LLM Hatası: {e}")
+        finally:
+            with self._lock:
+                self._is_processing = False
 
-    # ------------------------------------------------------------------
-    # Helper — publish to TTS
-    # ------------------------------------------------------------------
     def _publish_tts(self, text: str):
         msg = String()
         msg.data = text
         self.pub_tts.publish(msg)
+        
+    def _publish_interrupt(self):
+        msg = Bool()
+        msg.data = True
+        self.pub_interrupt.publish(msg)
 
-    # ------------------------------------------------------------------
-    # LLM processing loop
-    # ------------------------------------------------------------------
-    async def _process_queue(self):
-        while True:
-            with self._lock:
-                if not self.pending_user_text:
-                    self.is_processing = False
-                    break
-                current_text = self.pending_user_text
-                self.pending_user_text = ""
-
-            self.get_logger().info(f"🚀 [AI] API'ye gönderiliyor: {current_text}")
-            self.conversation_history.append(
-                {"role": "user", "content": current_text}
-            )
-
-            # Keep history bounded
-            if len(self.conversation_history) > self.max_history:
-                self.conversation_history = (
-                    [self.conversation_history[0]]
-                    + self.conversation_history[-(self.max_history - 1) :]
-                )
-
-            try:
-                response = await self.client.chat.completions.create(
-                    model=self.model_name,
-                    messages=self.conversation_history,
-                    temperature=0.7,
-                    max_tokens=256,
-                )
-
-                ai_text = response.choices[0].message.content.strip()
-                self.get_logger().info(f"🧠 [AI] Cevap: {ai_text}")
-
-                self.conversation_history.append(
-                    {"role": "assistant", "content": ai_text}
-                )
-
-                # Split into sentences and send to TTS
-                sentences = re.split(r"(?<=[.!?])\s+", ai_text)
-                for sentence in sentences:
-                    s = sentence.strip()
-                    if s:
-                        self._publish_tts(s)
-
-                # Update interaction time after AI responds
-                self._last_interaction = time.monotonic()
-
-            except Exception as e:
-                self.get_logger().error(
-                    f"❌ [AI] API Hatası: {e}"
-                )
-                await asyncio.sleep(2)
-
-
-def main():
-    rclpy.init()
+def main(args=None):
+    rclpy.init(args=args)
     node = AiBrainNode()
     try:
         rclpy.spin(node)
@@ -273,6 +279,5 @@ def main():
         if rclpy.ok():
             rclpy.shutdown()
 
-
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()

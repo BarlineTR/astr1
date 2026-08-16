@@ -1,287 +1,265 @@
 #!/usr/bin/env python3
-"""ASTRO V1 — Text-to-Speech Node.
+"""ASTRO V1 — Text-to-Speech Node (Edge-TTS + sounddevice).
 
-Supports three engines selectable via TTS_ENGINE env var:
-  * edge-tts  — High-quality Microsoft Neural voices (requires internet)
-  * pyttsx3   — Offline robotic fallback
-  * gtts      — Google TTS (requires internet)
+Subscribes to:
+  /tts/say       (String) — text to speak
+  /tts/interrupt  (Bool)  — cancel current playback
+
+Publishes:
+  /tts/speaking  (Bool)   — True while audio is playing (echo prevention)
+
+Pipeline:
+  1. Receives text on /tts/say
+  2. Cleans text (emoji, markdown removal)
+  3. Synthesizes via Edge-TTS (tr-TR-AhmetNeural, +20% rate)
+  4. Converts MP3→WAV via ffmpeg
+  5. Plays via sounddevice on ReSpeaker output
+  6. Manages a queue for sequential playback with prefetch
 """
+
 import os
-import subprocess
+import re
+import asyncio
 import tempfile
+import subprocess
 import threading
+import queue
+import numpy as np
 
 import rclpy
 from rclpy.node import Node
-from std_msgs.msg import Bool, String
-
-try:
-    import pyttsx3
-except ImportError:
-    pyttsx3 = None
+from std_msgs.msg import String, Bool
 
 try:
     import edge_tts
-    import asyncio
 except ImportError:
     edge_tts = None
 
 try:
-    from dotenv import load_dotenv, find_dotenv
+    import sounddevice as sd
 except ImportError:
-    load_dotenv = None
-    find_dotenv = None
+    sd = None
+
+try:
+    import scipy.io.wavfile as wav
+except ImportError:
+    wav = None
+
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+
+EMOJI_RE = re.compile(
+    "["
+    "\U0001F1E0-\U0001F1FF"
+    "\U0001F300-\U0001F5FF"
+    "\U0001F600-\U0001F64F"
+    "\U0001F680-\U0001F6FF"
+    "\U0001F700-\U0001F77F"
+    "\U0001F780-\U0001F7FF"
+    "\U0001F800-\U0001F8FF"
+    "\U0001F900-\U0001F9FF"
+    "\U0001FA00-\U0001FAFF"
+    "\u2600-\u26FF"
+    "\u2700-\u27BF"
+    "]+",
+    flags=re.UNICODE
+)
+
+def clean_tts_text(text: str) -> str:
+    """Emoji ve markdown temizler."""
+    if not text:
+        return ""
+    # Emojileri temizle
+    text = EMOJI_RE.sub("", text)
+    # Markdown kod bloklarını temizle
+    text = re.sub(r'```.*?```', '', text, flags=re.DOTALL)
+    text = re.sub(r'`.*?`', '', text)
+    # Kalın, italik vs
+    text = re.sub(r'[\*\_\~\#]', '', text)
+    # Fazla boşlukları temizle
+    text = " ".join(text.split())
+    # Noktalama hatalarını düzelt
+    text = re.sub(r'\s+([,.:;?!])', r'\1', text)
+    return text.strip()
+
+def find_output_device() -> int | None:
+    """ReSpeaker çıkış cihazını bulur, bulamazsa varsayılanı kullanır."""
+    if not sd:
+        return None
+    try:
+        devices = sd.query_devices()
+        for i, dev in enumerate(devices):
+            name = dev.get("name", "").lower()
+            if dev.get("max_output_channels", 0) > 0:
+                if "respeaker" in name or "uac1" in name or "seeed" in name:
+                    return i
+        return None  # Fallback to default
+    except Exception:
+        return None
 
 
 class TtsNode(Node):
     def __init__(self):
-        super().__init__("tts_node")
+        super().__init__('tts_node')
+        
+        # Load params from env
+        self.tts_voice = os.getenv("TTS_VOICE", "tr-TR-AhmetNeural")
+        self.tts_rate = os.getenv("TTS_RATE", "+20%")
+        self.sample_rate = int(os.getenv("SAMPLE_RATE", "16000"))
+        
+        self.out_device_id = find_output_device()
+        
+        if edge_tts is None:
+            self.get_logger().error("edge_tts modülü bulunamadı, sentezleme yapılamayacak.")
+            
+        if sd is None:
+            self.get_logger().error("sounddevice modülü bulunamadı, oynatma yapılamayacak.")
+        
+        # Publishers & Subscribers
+        self.pub_speaking = self.create_publisher(Bool, '/tts/speaking', 10)
+        self.sub_say = self.create_subscription(String, '/tts/say', self._on_say, 10)
+        self.sub_interrupt = self.create_subscription(Bool, '/tts/interrupt', self._on_interrupt, 10)
+        
+        # Internal state
+        self._speak_queue = queue.Queue()
+        self._generation = 0
+        self._generation_lock = threading.Lock()
+        
+        # Thread
+        self._playback_thread = threading.Thread(target=self._playback_loop, daemon=True)
+        self._playback_thread.start()
+        
+        self.get_logger().info(f"TTS Node başlatıldı. Ses: {self.tts_voice}, Hız: {self.tts_rate}")
 
-        # Load repo-root .env before reading TTS_ENGINE / ElevenLabs keys
-        if load_dotenv is not None:
-            env_path = find_dotenv(usecwd=True) if find_dotenv else None
-            if env_path:
-                load_dotenv(env_path, override=False)
+    def _on_say(self, msg: String):
+        text = clean_tts_text(msg.data)
+        if text:
+            self._speak_queue.put(text)
 
-        # ROS parameters — defaults pulled from environment
-        self.declare_parameter("engine", os.getenv("TTS_ENGINE", "edge-tts"))
-        self.declare_parameter("voice", os.getenv("TTS_VOICE", "tr-TR-AhmetNeural"))
-        self.declare_parameter("language", "tr")
-        self.declare_parameter("rate", 150)
-        self.declare_parameter("volume", 0.8)
-        self.declare_parameter("elevenlabs_api_key", os.getenv("ELEVENLABS_API_KEY", ""))
-        self.declare_parameter("elevenlabs_voice_id", os.getenv("ELEVENLABS_VOICE_ID", "21m00Tcm4TlvDq8ikWAM"))
-        self.declare_parameter("elevenlabs_model_id", os.getenv("ELEVENLABS_MODEL_ID", "eleven_multilingual_v2"))
+    def _on_interrupt(self, msg: Bool):
+        if msg.data:
+            with self._generation_lock:
+                self._generation += 1
+            # Drain queue
+            while not self._speak_queue.empty():
+                try:
+                    self._speak_queue.get_nowait()
+                except queue.Empty:
+                    break
+            if sd is not None:
+                try:
+                    sd.stop()
+                except Exception as e:
+                    self.get_logger().error(f"sd.stop() hatası: {e}")
 
-        self.engine_name = self.get_parameter("engine").value
-        self.voice_name = self.get_parameter("voice").value
-        self.language = self.get_parameter("language").value
-        self.rate = int(self.get_parameter("rate").value)
-        self.volume = float(self.get_parameter("volume").value)
-
-        # Publishers / subscribers
-        self.pub_speaking = self.create_publisher(Bool, "/tts/speaking", 10)
-        self.sub = self.create_subscription(String, "/tts/say", self._say_callback, 10)
-
-        self.speaking = False
-        self._speak_lock = threading.Lock()
-        self.tts_engine = None
-
-        # Engine init
-        if self.engine_name == "elevenlabs":
-            self.get_logger().info(
-                f"✅ [TTS] ElevenLabs motoru seçildi (Ses: {self.get_parameter('elevenlabs_voice_id').value})"
-            )
-        elif self.engine_name == "edge-tts":
-            if edge_tts is None:
-                self.get_logger().warn(
-                    "edge-tts paketi kurulu değil, pyttsx3'e düşürülüyor. "
-                    "Kurmak için: pip3 install edge-tts"
-                )
-                self.engine_name = "pyttsx3"
-                self._init_pyttsx3()
-            else:
-                self.get_logger().info(
-                    f"✅ [TTS] edge-tts hazır (Ses: {self.voice_name})"
-                )
-        elif self.engine_name == "pyttsx3":
-            self._init_pyttsx3()
-        elif self.engine_name == "gtts":
-            self.get_logger().info("✅ [TTS] gTTS motoru seçildi (internet gerekli)")
-        else:
-            self.get_logger().error(f"Bilinmeyen TTS motoru: {self.engine_name}")
-
-    # ------------------------------------------------------------------
-    # pyttsx3 setup
-    # ------------------------------------------------------------------
-    def _init_pyttsx3(self):
-        if pyttsx3 is None:
-            self.get_logger().error("pyttsx3 kurulu değil — TTS devre dışı")
-            return
-        self.tts_engine = pyttsx3.init()
-        self.tts_engine.setProperty("rate", self.rate)
-        self.tts_engine.setProperty("volume", self.volume)
-        for voice in self.tts_engine.getProperty("voices"):
-            if self.language in voice.id.lower() or self.language in voice.name.lower():
-                self.tts_engine.setProperty("voice", voice.id)
-                break
-        self.get_logger().info("✅ [TTS] pyttsx3 hazır")
-
-    # ------------------------------------------------------------------
-    # Speaking state management
-    # ------------------------------------------------------------------
     def _set_speaking(self, state: bool):
-        self.speaking = state
         msg = Bool()
         msg.data = state
         self.pub_speaking.publish(msg)
 
-    # ------------------------------------------------------------------
-    # Callback — spawn a thread so ROS spin is not blocked
-    # ------------------------------------------------------------------
-    def _say_callback(self, msg: String):
-        text = msg.data.strip()
-        if not text:
-            return
-        thread = threading.Thread(target=self._speak, args=(text,), daemon=True)
-        thread.start()
-
-    def _speak(self, text: str):
-        with self._speak_lock:
-            self._set_speaking(True)
-            self.get_logger().info(f"🔊 [TTS] Söyleniyor: {text}")
+    def _playback_loop(self):
+        while rclpy.ok():
             try:
-                if self.engine_name == "elevenlabs":
-                    self._speak_elevenlabs(text)
-                elif self.engine_name == "edge-tts":
-                    self._speak_edge_tts(text)
-                elif self.engine_name == "pyttsx3" and self.tts_engine is not None:
-                    self.tts_engine.say(text)
-                    self.tts_engine.runAndWait()
-                elif self.engine_name == "gtts":
-                    self._speak_gtts(text)
-                else:
-                    self.get_logger().warn("Aktif TTS motoru yok")
+                text = self._speak_queue.get(timeout=0.5)
+                self._synthesize_and_play(text)
+            except queue.Empty:
+                continue
             except Exception as e:
-                self.get_logger().error(f"TTS hatası: {e}")
+                self.get_logger().error(f"Playback loop hatası: {e}")
+
+    def _synthesize_and_play(self, text: str):
+        with self._generation_lock:
+            current_gen = self._generation
+            
+        if edge_tts is None:
+            return
+
+        fd_mp3, mp3_path = tempfile.mkstemp(suffix=".mp3")
+        fd_wav, wav_path = tempfile.mkstemp(suffix=".wav")
+        os.close(fd_mp3)
+        os.close(fd_wav)
+
+        try:
+            # 1. Synthesize via edge_tts (async to sync wrapper)
+            communicate = edge_tts.Communicate(text, self.tts_voice, rate=self.tts_rate)
+            asyncio.run(communicate.save(mp3_path))
+            
+            with self._generation_lock:
+                if current_gen != self._generation:
+                    return
+
+            # 2. Convert to WAV via ffmpeg
+            try:
+                subprocess.run(
+                    ["ffmpeg", "-y", "-loglevel", "error", "-i", mp3_path, "-ar", str(self.sample_rate), "-ac", "1", "-f", "wav", wav_path],
+                    check=True
+                )
+            except subprocess.CalledProcessError as e:
+                self.get_logger().error(f"FFmpeg çevirme hatası: {e}")
+                return
+
+            with self._generation_lock:
+                if current_gen != self._generation:
+                    return
+
+            # 3. Read and Play
+            if wav is None or sd is None:
+                # Fallback to shell command if sounddevice missing
+                self._set_speaking(True)
+                try:
+                    subprocess.run(["ffplay", "-nodisp", "-autoexit", wav_path], stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
+                except Exception as e:
+                    self.get_logger().error(f"ffplay fallback hatası: {e}")
+                finally:
+                    self._set_speaking(False)
+                return
+
+            try:
+                rate, data = wav.read(wav_path)
+            except Exception as e:
+                self.get_logger().error(f"WAV okuma hatası: {e}")
+                return
+
+            with self._generation_lock:
+                if current_gen != self._generation:
+                    return
+
+            try:
+                self._set_speaking(True)
+                sd.play(data, samplerate=rate, device=self.out_device_id, blocking=True)
+            except Exception as e:
+                self.get_logger().error(f"sounddevice oynatma hatası: {e}")
             finally:
                 self._set_speaking(False)
 
-    def _speak_elevenlabs(self, text: str):
-        api_key = self.get_parameter("elevenlabs_api_key").value
-        voice_id = self.get_parameter("elevenlabs_voice_id").value
-        model_id = self.get_parameter("elevenlabs_model_id").value
-
-        if not api_key:
-            self.get_logger().error("ElevenLabs API Key bulunamadı! Lütfen .env dosyasını kontrol edin.")
-            self._speak_edge_tts(text)
-            return
-
-        import requests
-        url = f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}"
-        headers = {
-            "Accept": "audio/mpeg",
-            "Content-Type": "application/json",
-            "xi-api-key": api_key
-        }
-        data = {
-            "text": text,
-            "model_id": model_id,
-            "voice_settings": {
-                "stability": 0.5,
-                "similarity_boost": 0.75
-            }
-        }
-
-        tmp_path = None
-        try:
-            response = requests.post(url, json=data, headers=headers)
-            if response.status_code != 200:
-                self.get_logger().error(f"ElevenLabs API Hatası ({response.status_code}): {response.text}")
-                self._speak_edge_tts(text)
-                return
-
-            with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as f:
-                tmp_path = f.name
-                f.write(response.content)
-
-            played = False
-            for player_cmd in [
-                ["paplay", tmp_path],
-                ["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet", tmp_path],
-                ["mpg123", "-a", "pulse", "-q", tmp_path],
-                ["mpg123", "-q", tmp_path]
-            ]:
-                try:
-                    res = subprocess.run(player_cmd, check=True, capture_output=True, text=True)
-                    played = True
-                    break
-                except Exception as p_err:
-                    self.get_logger().warn(f"Oynatıcı {player_cmd[0]} başarısız: {p_err}")
-                    continue
-            if not played:
-                self.get_logger().error("❌ [TTS] Hiçbir ses oynatıcı ses çalmayı başaramadı! Lütfen mpg123 veya pulseaudio-utils kurun.")
         except Exception as e:
-            self.get_logger().error(f"ElevenLabs konuşma hatası: {e}")
-            self._speak_edge_tts(text)
+            self.get_logger().error(f"Synthesize error: {e}")
+            self._set_speaking(False)
         finally:
-            if tmp_path and os.path.exists(tmp_path):
-                try:
-                    os.remove(tmp_path)
-                except Exception:
-                    pass
+            # Cleanup temp files
+            try:
+                if os.path.exists(mp3_path):
+                    os.remove(mp3_path)
+                if os.path.exists(wav_path):
+                    os.remove(wav_path)
+            except Exception as e:
+                self.get_logger().error(f"Temp dosya silme hatası: {e}")
 
-    # ------------------------------------------------------------------
-    # edge-tts — uses the Python API directly (no CLI dependency)
-    # ------------------------------------------------------------------
-    def _speak_edge_tts(self, text: str):
-        tmp_path = None
-        try:
-            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
-                tmp_path = f.name
-
-            # edge_tts ile sesi olustur
-            async def _generate():
-                communicate = edge_tts.Communicate(text, self.voice_name)
-                await communicate.save(tmp_path)
-
-            asyncio.run(_generate())
-
-            played = False
-            for player_cmd in [
-                ["mpg123", "-a", "pulse", "-q", tmp_path],
-                ["mpg123", "-q", tmp_path],
-                ["paplay", tmp_path],
-                ["aplay", "-q", tmp_path]
-            ]:
-                try:
-                    res = subprocess.run(player_cmd, check=True, capture_output=True, text=True)
-                    played = True
-                    break
-                except Exception as p_err:
-                    continue
-            if not played:
-                self.get_logger().error("❌ [TTS] Ses oynatılamadı!")
-        except Exception as e:
-            self.get_logger().error(f"edge-tts hatası: {e}")
-        finally:
-            if tmp_path and os.path.exists(tmp_path):
-                os.remove(tmp_path)
-
-    # ------------------------------------------------------------------
-    # gTTS fallback
-    # ------------------------------------------------------------------
-    def _speak_gtts(self, text: str):
-        from gtts import gTTS
-
-        tmp_path = None
-        try:
-            with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as f:
-                tmp_path = f.name
-            tts = gTTS(text=text, lang=self.language)
-            tts.save(tmp_path)
-            subprocess.run(
-                ["mpg123", "-q", tmp_path],
-                check=True,
-                capture_output=True,
-            )
-        finally:
-            if tmp_path and os.path.exists(tmp_path):
-                os.remove(tmp_path)
-
-
-def main():
-    rclpy.init()
+def main(args=None):
+    rclpy.init(args=args)
     node = TtsNode()
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
         pass
     finally:
+        with node._generation_lock:
+            node._generation += 1
         node.destroy_node()
-        if rclpy.ok():
-            rclpy.shutdown()
+        rclpy.shutdown()
 
-
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()

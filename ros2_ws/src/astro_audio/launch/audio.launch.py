@@ -40,11 +40,5 @@ def generate_launch_description():
                 output="screen",
                 parameters=[params_file, {"use_sim_time": use_sim_time}],
             ),
-            Node(
-                package="astro_ai",
-                executable="ai_brain_node",
-                name="ai_brain_node",
-                output="screen",
-            ),
         ]
     )

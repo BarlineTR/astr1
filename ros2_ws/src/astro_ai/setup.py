@@ -14,7 +14,7 @@ setup(
         ('share/' + package_name, ['package.xml']),
         (os.path.join('share', package_name, 'launch'), glob('launch/*.py')),
     ],
-    install_requires=['setuptools'],
+    install_requires=['setuptools', 'groq'],
     zip_safe=True,
     maintainer='Baran Eren',
     maintainer_email='baran@example.com',

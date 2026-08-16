@@ -343,14 +343,6 @@ class AudioCaptureNode(Node):
         dynamic_threshold = max(self.vad_threshold, self._noise_floor * 1.5)
         is_speech = rms > dynamic_threshold
         
-        # Her 2 saniyede bir hata ve durum diagnostik logu fırlat
-        now = time.time()
-        if not hasattr(self, "_last_diag_log") or (now - self._last_diag_log > 2.0):
-            self._last_diag_log = now
-            self.get_logger().info(
-                f"📊 [Audio Diag] RMS: {rms:.4f} | Noise Floor: {self._noise_floor:.4f} | Eşik: {dynamic_threshold:.4f} | VAD: {is_speech}"
-            )
-
         return is_speech
 
     def _publish_hid(self):
