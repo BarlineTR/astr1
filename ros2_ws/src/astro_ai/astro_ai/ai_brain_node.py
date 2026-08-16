@@ -488,8 +488,6 @@ class AiBrainNode(Node):
             self.cloud_mgr.record_llm_success()
 
             full_text = ""
-            sentence_buffer = ""
-            split_delimiters = re.compile(r"([.!?;:\n]+)")
             first_token_time = None
 
             for chunk in stream_resp:
@@ -502,28 +500,13 @@ class AiBrainNode(Node):
                     self.state_machine.transition_to(RobotState.SPEAKING)
 
                 full_text += delta
-                sentence_buffer += delta
-
-                parts = split_delimiters.split(sentence_buffer)
-                if len(parts) > 2:
-                    to_speak = "".join(parts[:-1]).strip()
-                    sentence_buffer = parts[-1]
-                    clean_chunk = clean_tts_text(to_speak)
-                    if clean_chunk and len(clean_chunk) >= 2:
-                        self._publish_tts(clean_chunk)
-                        self._publish_emotion(persona)
-
-            # Flush remaining tokens
-            if sentence_buffer.strip():
-                clean_chunk = clean_tts_text(sentence_buffer.strip())
-                if clean_chunk and len(clean_chunk) >= 2:
-                    self._publish_tts(clean_chunk)
-                    self._publish_emotion(persona)
 
             clean_full = clean_tts_text(full_text)
-            if clean_full:
+            if clean_full and len(clean_full) >= 2:
                 self.get_logger().info(f"🤖 [Astro]: \"{clean_full}\"")
                 self.memory.episodic.add_message("assistant", clean_full)
+                self._publish_tts(clean_full)
+                self._publish_emotion(persona)
 
             # Latency Benchmarking
             t_done = time.monotonic()

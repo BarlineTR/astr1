@@ -130,6 +130,7 @@ class SpeechRecognitionNode(Node):
         self.create_subscription(Int16MultiArray, '/audio/speech_audio', self._audio_cb, 10)
         self.create_subscription(Bool, '/audio/vad', self._vad_cb, 10)
         self.create_subscription(Bool, '/tts/speaking', self._tts_speaking_cb, 10)
+        self.create_subscription(String, '/tts/say', self._tts_say_cb, 10)
 
         # Internal state
         self._lock = threading.Lock()
@@ -140,6 +141,7 @@ class SpeechRecognitionNode(Node):
         self._tts_speaking: bool = False
         self._tts_speaking_start_time: float | None = None
         self._last_tts_end_time: float | None = None
+        self._recent_tts_phrases: list[tuple[str, float]] = []  # (phrase_lower, timestamp)
 
         # Guards against concurrent / out-of-order transcription results
         self._transcribe_lock = threading.Lock()
@@ -148,7 +150,17 @@ class SpeechRecognitionNode(Node):
         # Timer (0.05s resolution)
         self.create_timer(0.05, self._silence_tick)
 
-        self.get_logger().info("✅ [STT] Groq Whisper-large-v3 + Intent-Driven Barge-In Hazır.")
+        self.get_logger().info("✅ [STT] Groq Whisper-large-v3 + Self-Echo Immunity Hazır.")
+
+    def _tts_say_cb(self, msg: String):
+        phrase = msg.data.lower().strip(" .,!?:;")
+        if phrase:
+            with self._lock:
+                now = time.monotonic()
+                self._recent_tts_phrases.append((phrase, now))
+                # Keep only last 10 phrases
+                if len(self._recent_tts_phrases) > 10:
+                    self._recent_tts_phrases = self._recent_tts_phrases[-10:]
 
     def _tts_speaking_cb(self, msg: Bool):
         with self._lock:
@@ -156,16 +168,30 @@ class SpeechRecognitionNode(Node):
             self._tts_speaking = msg.data
 
             if not was_speaking and self._tts_speaking:
+                # TTS just started speaking — purge any buffered audio so robot does NOT record itself!
                 self._tts_speaking_start_time = time.monotonic()
+                self._is_speaking = False
+                self._buffer.clear()
+                self._ring_buffer.clear()
+                self._last_speech_time = None
             elif was_speaking and not self._tts_speaking:
+                # TTS just ended
                 self._last_tts_end_time = time.monotonic()
                 self._tts_speaking_start_time = None
+                self._is_speaking = False
+                self._buffer.clear()
+                self._ring_buffer.clear()
+                self._last_speech_time = None
 
     def _audio_cb(self, msg: Int16MultiArray):
         if not self.enabled:
             return
 
         with self._lock:
+            # While robot is speaking, do NOT record speaker audio into buffer!
+            if self._tts_speaking:
+                return
+
             data = list(msg.data)
             self._ring_buffer.extend(data)
             if len(self._ring_buffer) > 6400:
@@ -180,11 +206,15 @@ class SpeechRecognitionNode(Node):
             return
 
         with self._lock:
+            # Ignore VAD while robot is actively speaking to prevent echolalia
+            if self._tts_speaking:
+                return
+
             if msg.data:
                 now = time.monotonic()
 
-                # Post-TTS echo suppression (ignore room echo right after TTS ends)
-                if self._last_tts_end_time is not None and (now - self._last_tts_end_time) < 0.35:
+                # Post-TTS echo suppression (0.60s room reverberation cooldown)
+                if self._last_tts_end_time is not None and (now - self._last_tts_end_time) < 0.60:
                     return
 
                 if not self._is_speaking:
@@ -198,6 +228,9 @@ class SpeechRecognitionNode(Node):
 
         audio_data = None
         with self._lock:
+            if self._tts_speaking:
+                return
+
             if self._is_speaking and self._last_speech_time is not None:
                 elapsed = time.monotonic() - self._last_speech_time
                 if elapsed > self._silence_timeout_s:
@@ -262,34 +295,26 @@ class SpeechRecognitionNode(Node):
             if len(text_lower) < 3 and text_lower not in ["ne", "su", "al", "ev", "on"]:
                 return
 
+            # ── Self-Echo Immunity Check ──────────────────────────────────────────
+            # If the transcribed text matches something Astro itself said in the last 8s, DISCARD IT!
+            now = time.monotonic()
+            with self._lock:
+                for past_phrase, past_time in self._recent_tts_phrases:
+                    if (now - past_time) < 8.0:
+                        if text_lower in past_phrase or past_phrase in text_lower:
+                            self.get_logger().info(f'🔇 [Yankı / Robot Kendi Sesini Duydu — Filtrelendi]: "{text}"')
+                            return
+                        # Check word overlap
+                        words_heard = set(text_lower.split())
+                        words_spoken = set(past_phrase.split())
+                        if len(words_heard) >= 2 and len(words_heard.intersection(words_spoken)) >= len(words_heard) * 0.75:
+                            self.get_logger().info(f'🔇 [Yankı / Robot Kendi Sesini Duydu — Filtrelendi]: "{text}"')
+                            return
+
             if text and text not in [".", "...", ",", "!", "?"]:
                 # Discard stale results
                 with self._transcribe_lock:
                     if seq != self._stt_sequence:
-                        return
-
-                # If robot was speaking when this speech was uttered:
-                # ONLY interrupt TTS if the speech is verified as an intentional command or query!
-                with self._lock:
-                    is_tts_active = self._tts_speaking
-
-                if is_tts_active:
-                    interrupt_keywords = [
-                        "astro", "hey", "dur", "sus", "kes", "bekle", "bir dakika",
-                        "tamam", "yeter", "sessiz", "dinle", "bakar mısın", "bana bak"
-                    ]
-                    has_intent = (
-                        any(kw in text_lower for kw in interrupt_keywords)
-                        or len(text_lower.split()) >= 3
-                    )
-                    if has_intent:
-                        self.get_logger().info(f'🛑 [Barge-In Doğrulandı]: "{text}" — TTS kesiliyor!')
-                        int_msg = Bool()
-                        int_msg.data = True
-                        self._interrupt_pub.publish(int_msg)
-                    else:
-                        # Ambient background chatter during TTS — do not cut off robot
-                        self.get_logger().info(f'🔇 [Arka Plan Konuşması Yok Sayıldı]: "{text}"')
                         return
 
                 self.get_logger().info(f'🎤 [Duyulan]: "{text}"')
