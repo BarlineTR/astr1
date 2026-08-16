@@ -142,8 +142,8 @@ class SpatialVisionNode(Node):
             self._frame_count = 0
         self._frame_count += 1
 
-        # Skip frames to reduce CPU load (Process 1 out of 4 frames ~ 7.5 FPS)
-        if self._frame_count % 4 != 0:
+        # Process every 2nd frame (~15 FPS for responsive tracking)
+        if self._frame_count % 2 != 0:
             return
 
         frame_h, frame_w = frame.shape[:2]
@@ -170,10 +170,9 @@ class SpatialVisionNode(Node):
         else:
             faces = list(detected_faces)
 
-
         # Temporal smoothing for face detection dropouts
         if len(faces) == 0 and hasattr(self, '_last_known_face') and self._last_known_face is not None:
-            if self._face_lost_frames < 5:  # Tolerate up to 5 frames of lost face
+            if self._face_lost_frames < 8:  # Tolerate up to 8 frames of lost face
                 faces = [self._last_known_face]
                 self._face_lost_frames += 1
             else:
@@ -204,8 +203,8 @@ class SpatialVisionNode(Node):
             dist_m = self._estimate_distance(x, y, w, h, frame_w, frame_h)
             user_distance = dist_m
 
-            # 3. Direct Gaze
-            direct_gaze = abs(yaw) <= 10.0
+            # 3. Direct Gaze (Natural Gaze Cone: <= 25 degrees)
+            direct_gaze = abs(yaw) <= 25.0
             if direct_gaze:
                 is_looking = True
 
