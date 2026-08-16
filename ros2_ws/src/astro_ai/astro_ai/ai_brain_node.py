@@ -137,15 +137,15 @@ class AstroMemory:
 def clean_tts_text(text: str) -> str:
     if not text:
         return ""
-    # Strip <think>...</think> reasoning blocks from thinking models (Qwen / DeepSeek)
+    # Strip <think>...</think> blocks if present
     text = re.sub(r"(?i)<think>[\s\S]*?</think>", "", text)
-    text = re.sub(r"(?i)<think>[\s\S]*", "", text)
-    text = re.sub(r"(?i)</think>", "", text)
+    # Strip standalone think tags
+    text = re.sub(r"(?i)<\/?think>", "", text)
     text = EMOJI_RE.sub("", text)
     text = re.sub(r"```.*?```", "", text, flags=re.DOTALL)
     text = re.sub(r"`.*?`", "", text)
     text = re.sub(r"[\*\_\~\#\<\>]", "", text)
-    text = re.sub(r"\s+", " ", text).strip()
+    text = " ".join(text.split())
     text = re.sub(r"\s+([,.:;?!])", r"\1", text)
     return text.strip()
 
@@ -460,24 +460,24 @@ class AiBrainNode(Node):
         threading.Thread(target=self._process_llm, args=(raw_text, captured_frame), daemon=True).start()
 
     def _query_groq_vision(self, prompt: str, base64_image: str) -> str | None:
-        """Queries active multimodal vision model with fallback."""
+        """Queries active multimodal vision model with robust extraction."""
         model_name = self._vision_model or "qwen/qwen3.6-27b"
         try:
             response = self._groq.chat.completions.create(
                 messages=[
                     {
+                        "role": "system",
+                        "content": (
+                            f"{self._build_system_prompt()}\n\n"
+                            "ÖNEMLİ: Asla düşünce veya açıklama yazma. Doğrudan kamerada gördüğün gerçekleri kısa ve net 1-2 Türkçe cümleyle söyle."
+                        ),
+                    },
+                    {
                         "role": "user",
                         "content": [
                             {
                                 "type": "text",
-                                "text": (
-                                    f"{self._build_system_prompt()}\n\n"
-                                    "GÖREV: Bu OAK-D kamera görüntüsünü dikkatle incele.\n"
-                                    f"Kullanıcının sorusu: '{prompt}'.\n"
-                                    "Kamerada gördüğün gerçekleri (kıyafet rengi, elindeki eşya, nesne, hareket) 1-2 cümleyle açık ve net söyle.\n"
-                                    "KESİN KURAL: Asla tahmin yapma veya ezbere konuşma. Eğer elinde hiçbir şey yoksa açıkça 'Elinde bir şey göremiyorum' de. "
-                                    "Eğer kameranın açısından görünmüyorsa 'Kameraya biraz daha yaklaştırır mısın' de."
-                                ),
+                                "text": f"Kameradaki bu anlık görüntüye bakarak cevap ver: {prompt}",
                             },
                             {
                                 "type": "image_url",
@@ -487,44 +487,23 @@ class AiBrainNode(Node):
                     }
                 ],
                 model=model_name,
-                temperature=0.1,  # Strict factual grounding (zero hallucination)
-                max_tokens=200,
+                temperature=0.1,
+                max_tokens=600,
             )
             raw = response.choices[0].message.content.strip()
-            # If model included reasoning inside <think>, extract the actual response outside of it
+            
+            # Extract final answer
             if "</think>" in raw:
                 actual = raw.split("</think>")[-1].strip()
                 if actual:
                     return actual
-            elif "<think>" in raw:
-                actual = re.sub(r"(?i)<think>[\s\S]*?</think>", "", raw).strip()
-                if actual:
-                    return actual
-            return raw
+            
+            # If answer was purely inside think or not closed, clean think markers
+            clean = re.sub(r"(?i)<\/?think>", "", raw).strip()
+            return clean if clean else None
+            
         except Exception as e:
             self.get_logger().error(f"❌ [Vision Model Hatası ({model_name})]: {e}")
-            # Try fallback to qwen/qwen3.6-27b if not already tried
-            if model_name != "qwen/qwen3.6-27b":
-                try:
-                    self.get_logger().info("🔄 Qwen multimodal fallback deneniyor...")
-                    res = self._groq.chat.completions.create(
-                        messages=[
-                            {
-                                "role": "user",
-                                "content": [
-                                    {"type": "text", "text": f"{self._build_system_prompt()}\nSoru: {prompt}"},
-                                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"}},
-                                ],
-                            }
-                        ],
-                        model="qwen/qwen3.6-27b",
-                        temperature=0.1,
-                        max_tokens=150,
-                    )
-                    self._vision_model = "qwen/qwen3.6-27b"
-                    return res.choices[0].message.content.strip()
-                except Exception as e2:
-                    self.get_logger().error(f"❌ [Qwen Fallback Hatası]: {e2}")
             return None
 
     def _process_llm(self, user_text: str, frame: np.ndarray | None):
