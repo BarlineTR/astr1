@@ -156,7 +156,8 @@ class AiBrainNode(Node):
             try:
                 self._groq = Groq(api_key=self.groq_api_key)
                 self._vision_model = self._discover_vision_model()
-                self.get_logger().info(f"✅ [AI Brain] Groq Aktif — Metin: {self._text_model} | Vision: {self._vision_model}")
+                v_name = self._vision_model if self._vision_model else "Gemini Flash (Direct REST)"
+                self.get_logger().info(f"✅ [AI Brain] LLM Aktif — Metin: {self._text_model} | Vision: {v_name}")
             except Exception as e:
                 self.get_logger().error(f"❌ [AI Brain] Groq client başlatılamadı: {e}")
                 self._enabled = False
@@ -221,7 +222,7 @@ class AiBrainNode(Node):
             f"🧠 [AI Brain Node] Modüler Mimari Hazır! Kişilik: [{self.persona_engine.current_persona.upper()}]"
         )
 
-    def _discover_vision_model(self) -> str:
+    def _discover_vision_model(self) -> str | None:
         try:
             models = self._groq.models.list()
             available = [m.id for m in models.data]
@@ -230,7 +231,7 @@ class AiBrainNode(Node):
                     return cand
         except Exception:
             pass
-        return "meta-llama/llama-4-scout-preview"
+        return None
 
     def _on_session_timed_out(self):
         self.state_machine.transition_to(RobotState.IDLE)
@@ -544,8 +545,8 @@ class AiBrainNode(Node):
         persona = self.persona_engine.current_persona
         system_instruction = f"Sen Astro adında {persona} karakterli akıllı ve sempatik bir sosyal robotsun. Karşındaki görüntüyü görüyorsun. Kullanıcının sorusunu kendi kişiliğinle tek bir kısa doğal Türkçe cümleyle yanıtla."
 
-        # 1. Try Primary Groq Vision
-        if self._groq:
+        # 1. Try Primary Groq Vision (if available)
+        if self._groq and self._vision_model:
             try:
                 response = self._groq.chat.completions.create(
                     messages=[
