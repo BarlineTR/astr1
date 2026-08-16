@@ -550,7 +550,7 @@ class AiBrainNode(Node):
 
         # 1. Try Direct Google Gemini REST Endpoint (Ultra-Fast, Zero-Dependency, Direct Key)
         if self._ai_api_key:
-            for g_model in ["gemini-1.5-flash", "gemini-2.0-flash", "gemini-2.5-flash", "gemini-1.5-flash-8b"]:
+            for g_model in ["gemini-2.5-flash", "gemini-2.5-pro", "gemini-1.5-flash-latest"]:
                 try:
                     url = f"https://generativelanguage.googleapis.com/v1beta/models/{g_model}:generateContent?key={self._ai_api_key}"
                     payload = {
@@ -562,7 +562,10 @@ class AiBrainNode(Node):
                         }],
                         "generationConfig": {
                             "temperature": 0.2,
-                            "maxOutputTokens": 300
+                            "maxOutputTokens": 1024,
+                            "thinkingConfig": {
+                                "thinkingBudget": 0
+                            }
                         }
                     }
                     data_bytes = json.dumps(payload).encode("utf-8")
