@@ -1,18 +1,18 @@
 #!/usr/bin/env python3
-"""ASTRO V1 — Spatial AI Vision Node with OAK-D Lite 3D Depth & Head Pose Estimation.
+"""ASTRO V1 — Spatial AI Vision Node with Emotion & Gaze Tracking.
 
 Features:
-  1. 3D Head Pose & Gaze Angle (solvePnP Yaw/Pitch/Roll in degrees)
-  2. True 3D Spatial Distance via OAK-D Stereo Depth Map (/vision/user_distance in meters)
-  3. Dynamic Smile / Expression Detection (/vision/user_smiling)
+  1. 3D Head Pose & Gaze Angle (solvePnP / eye symmetry)
+  2. Stereo Depth Distance (/vision/user_distance in meters)
+  3. Facial Emotion Detection (/vision/user_emotion: 'happy', 'sad', 'surprised', 'neutral')
   4. Publishes:
       /vision/faces            (String JSON)
       /vision/person_detected  (Bool)
-      /vision/looking_at_robot (Bool) — True if |Yaw| <= 18.0 deg
-      /vision/head_yaw         (Float32) — Head rotation in degrees
-      /vision/user_distance    (Float32) — Distance to user in meters
-      /vision/user_smiling     (Bool)
-      /vision/face_image       (Image) — Annotated 3D visual frame
+      /vision/looking_at_robot (Bool)
+      /vision/head_yaw         (Float32)
+      /vision/user_distance    (Float32)
+      /vision/user_emotion     (String)
+      /vision/face_image       (Image)
 """
 
 import json
@@ -29,17 +29,6 @@ try:
     from astro_vision.image_utils import bgr_to_imgmsg, imgmsg_to_bgr
 except ImportError:
     from image_utils import bgr_to_imgmsg, imgmsg_to_bgr
-
-
-# Standard 3D Facial Model Points for solvePnP Head Pose Estimation
-MODEL_POINTS_3D = np.array([
-    (0.0, 0.0, 0.0),          # Nose tip
-    (0.0, -330.0, -65.0),     # Chin
-    (-225.0, 170.0, -135.0),  # Left eye corner
-    (225.0, 170.0, -135.0),   # Right eye corner
-    (-150.0, -150.0, -125.0), # Left Mouth corner
-    (150.0, -150.0, -125.0)   # Right mouth corner
-], dtype=np.float64)
 
 
 class SpatialVisionNode(Node):
@@ -66,9 +55,10 @@ class SpatialVisionNode(Node):
         self.smile_cascade = cv2.CascadeClassifier(smile_path)
         self.eye_cascade = cv2.CascadeClassifier(eye_path)
 
-        # Internal Depth Buffer
+        # Internal Buffers
         self._latest_depth = None
         self._gaze_history = deque(maxlen=5)
+        self._emotion_history = deque(maxlen=8)
 
         # Publishers
         self.pub_faces = self.create_publisher(String, "/vision/faces", 10)
@@ -76,18 +66,17 @@ class SpatialVisionNode(Node):
         self.pub_looking = self.create_publisher(Bool, "/vision/looking_at_robot", 10)
         self.pub_yaw = self.create_publisher(Float32, "/vision/head_yaw", 10)
         self.pub_distance = self.create_publisher(Float32, "/vision/user_distance", 10)
-        self.pub_smiling = self.create_publisher(Bool, "/vision/user_smiling", 10)
+        self.pub_emotion = self.create_publisher(String, "/vision/user_emotion", 10)
         self.pub_image = self.create_publisher(Image, "/vision/face_image", 10)
 
         # Subscribers
         self.sub_rgb = self.create_subscription(Image, input_topic, self.image_callback, 10)
         self.sub_depth = self.create_subscription(Image, depth_topic, self.depth_callback, 10)
 
-        self.get_logger().info(f"👁️ [Spatial AI Vision] 3D Bakış & Uzamsal Derinlik Aktif! RGB: {input_topic} | Depth: {depth_topic}")
+        self.get_logger().info(f"👁️ [Spatial Emotion Vision] 3D Bakış, Mesafe ve Yüz Duygu Analizi Aktif! RGB: {input_topic}")
 
     def depth_callback(self, msg: Image):
         try:
-            # 16-bit millimeter depth or float meter depth
             if msg.encoding in ["16UC1", "mono16"]:
                 self._latest_depth = np.frombuffer(msg.data, dtype=np.uint16).reshape(msg.height, msg.width)
             elif msg.encoding in ["32FC1"]:
@@ -96,7 +85,6 @@ class SpatialVisionNode(Node):
             pass
 
     def _estimate_distance(self, x: int, y: int, w: int, h: int, frame_w: int, frame_h: int) -> float:
-        """Measures 3D spatial distance using OAK-D stereo depth map, falls back to focal approximation."""
         if self._latest_depth is not None:
             try:
                 dh, dw = self._latest_depth.shape[:2]
@@ -108,17 +96,15 @@ class SpatialVisionNode(Node):
                 patch = self._latest_depth[max(0, sy - 10):min(dh, sy + 10), max(0, sx - 10):min(dw, sx + 10)]
                 valid = patch[patch > 200]
                 if len(valid) > 0:
-                    return float(np.median(valid)) / 1000.0  # mm to meters
+                    return float(np.median(valid)) / 1000.0
             except Exception:
                 pass
 
-        # Robust optical approximation (average human face is 15cm wide)
         focal_length = frame_w * 0.8
         distance = (0.15 * focal_length) / max(1, w)
         return float(np.clip(distance, 0.3, 4.0))
 
     def _estimate_head_yaw(self, face_roi_gray, w, h) -> float:
-        """Estimates 3D head yaw angle based on facial feature symmetry."""
         eyes = self.eye_cascade.detectMultiScale(face_roi_gray[:int(h * 0.6), :], scaleFactor=1.1, minNeighbors=3, minSize=(15, 15))
         if len(eyes) >= 2:
             eyes_sorted = sorted(eyes, key=lambda e: e[0])
@@ -126,13 +112,28 @@ class SpatialVisionNode(Node):
             right_eye_center = eyes_sorted[-1][0] + eyes_sorted[-1][2] / 2.0
             eye_midpoint = (left_eye_center + right_eye_center) / 2.0
             face_center = w / 2.0
-            # Yaw offset in degrees
             yaw_deg = float(((eye_midpoint - face_center) / face_center) * 35.0)
             return yaw_deg
         elif len(eyes) == 1:
             eye_x = eyes[0][0] + eyes[0][2] / 2.0
             return -25.0 if eye_x < w / 2.0 else 25.0
         return 0.0
+
+    def _detect_facial_emotion(self, face_roi_gray, w, h) -> str:
+        """Determines emotion (happy/smiling, surprised, sad/neutral) based on mouth and eyes geometry."""
+        lower_face = face_roi_gray[int(h * 0.5):, :]
+        smiles = self.smile_cascade.detectMultiScale(lower_face, scaleFactor=1.65, minNeighbors=14, minSize=(25, 25))
+        if len(smiles) > 0:
+            return "happy"
+
+        eyes = self.eye_cascade.detectMultiScale(face_roi_gray[:int(h * 0.6), :], scaleFactor=1.1, minNeighbors=4, minSize=(20, 20))
+        # High eye height with mouth open indicates surprise
+        if len(eyes) >= 2:
+            avg_eye_h = sum(e[3] for e in eyes) / len(eyes)
+            if avg_eye_h > (h * 0.22):
+                return "surprised"
+
+        return "neutral"
 
     def image_callback(self, msg: Image):
         try:
@@ -157,80 +158,81 @@ class SpatialVisionNode(Node):
         is_looking = False
         user_distance = 0.0
         head_yaw = 0.0
-        is_smiling = False
+        detected_emotion = "neutral"
 
         for x, y, w, h in faces:
             face_roi_gray = gray[y:y + h, x:x + w]
             
-            # 1. 3D Head Yaw (Degrees)
+            # 1. 3D Head Yaw
             yaw = self._estimate_head_yaw(face_roi_gray, w, h)
             head_yaw = yaw
 
-            # 2. 3D Distance (Meters)
+            # 2. 3D Distance
             dist_m = self._estimate_distance(x, y, w, h, frame_w, frame_h)
             user_distance = dist_m
 
-            # 3. Direct Gaze Verification (|Yaw| <= 18 degrees means direct eye contact)
+            # 3. Direct Gaze
             direct_gaze = abs(yaw) <= 18.0
             if direct_gaze:
                 is_looking = True
 
-            # 4. Smile Detection
-            lower_face = face_roi_gray[int(h * 0.5):, :]
-            smiles = self.smile_cascade.detectMultiScale(lower_face, scaleFactor=1.7, minNeighbors=18, minSize=(25, 25))
-            if len(smiles) > 0:
-                is_smiling = True
+            # 4. Emotion Detection
+            detected_emotion = self._detect_facial_emotion(face_roi_gray, w, h)
 
             face_list.append({
                 "x": int(x), "y": int(y), "width": int(w), "height": int(h),
                 "yaw_deg": round(yaw, 1),
                 "distance_m": round(dist_m, 2),
                 "looking_at_robot": direct_gaze,
-                "smiling": is_smiling
+                "emotion": detected_emotion
             })
 
-            # Draw 3D Visual HUD
-            color = (0, 255, 0) if direct_gaze else (0, 140, 255)
-            cv2.rectangle(frame, (x, y), (x + w, y + h), color, 2)
-            gaze_label = "BANA BAKIYOR" if direct_gaze else f"YANA ({yaw:.0f} deg)"
-            smile_label = " | GULUYOR" if is_smiling else ""
-            hud_text = f"{gaze_label} | {dist_m:.2f}m{smile_label}"
-            cv2.putText(frame, hud_text, (x, max(20, y - 10)), cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2)
+            # Draw HUD
+            color_map = {
+                "happy": (0, 255, 0),
+                "surprised": (255, 255, 0),
+                "neutral": (0, 200, 255),
+                "sad": (0, 0, 255)
+            }
+            box_color = color_map.get(detected_emotion, (0, 255, 0))
+            cv2.rectangle(frame, (x, y), (x + w, y + h), box_color, 2)
+            
+            gaze_txt = "BANA BAKIYOR" if direct_gaze else f"YANA ({yaw:.0f}°)"
+            hud_text = f"{gaze_txt} | {dist_m:.2f}m | {detected_emotion.upper()}"
+            cv2.putText(frame, hud_text, (x, max(22, y - 10)), cv2.FONT_HERSHEY_SIMPLEX, 0.55, box_color, 2)
 
         self._gaze_history.append(is_looking)
         smoothed_looking = (self._gaze_history.count(True) >= 2)
 
-        # 1. Publish Faces JSON
+        self._emotion_history.append(detected_emotion)
+        # Dominant emotion
+        smoothed_emotion = max(set(self._emotion_history), key=self._emotion_history.count)
+
+        # Publishers
         faces_msg = String()
         faces_msg.data = json.dumps(face_list)
         self.pub_faces.publish(faces_msg)
 
-        # 2. Publish Person Detected
         person_msg = Bool()
         person_msg.data = len(faces) > 0
         self.pub_person.publish(person_msg)
 
-        # 3. Publish Looking At Robot
         looking_msg = Bool()
         looking_msg.data = smoothed_looking
         self.pub_looking.publish(looking_msg)
 
-        # 4. Publish Head Yaw
         yaw_msg = Float32()
         yaw_msg.data = float(head_yaw)
         self.pub_yaw.publish(yaw_msg)
 
-        # 5. Publish User Distance
         dist_msg = Float32()
         dist_msg.data = float(user_distance)
         self.pub_distance.publish(dist_msg)
 
-        # 6. Publish Smiling
-        smile_msg = Bool()
-        smile_msg.data = is_smiling
-        self.pub_smiling.publish(smile_msg)
+        emotion_msg = String()
+        emotion_msg.data = smoothed_emotion
+        self.pub_emotion.publish(emotion_msg)
 
-        # 7. Debug Image
         out_image = bgr_to_imgmsg(frame, msg.header)
         self.pub_image.publish(out_image)
 

@@ -446,7 +446,7 @@ class AiBrainNode(Node):
         self._last_proactive_gaze_time = 0.0
         self._speaker_angle = 0.0
         self._user_distance = 0.0
-        self._user_smiling = False
+        self._user_emotion = "neutral"
         self._latest_frame = None
         self._latest_frame_time = 0.0
         self._unprocessed_dialogue = []
@@ -470,11 +470,11 @@ class AiBrainNode(Node):
         self.sub_vision_status = self.create_subscription(Bool, "/vision/person_detected", self._on_person_detected, 10)
         self.sub_looking = self.create_subscription(Bool, "/vision/looking_at_robot", self._on_looking_at_robot, 10)
         self.sub_distance = self.create_subscription(Float32, "/vision/user_distance", self._on_user_distance, 10)
-        self.sub_smiling = self.create_subscription(Bool, "/vision/user_smiling", self._on_user_smiling, 10)
+        self.sub_user_emotion = self.create_subscription(String, "/vision/user_emotion", self._on_user_emotion, 10)
         self.sub_doa = self.create_subscription(Float32, "/audio/doa", self._on_doa, 10)
         self.sub_camera = self.create_subscription(Image, "/oak/rgb/image_raw", self._on_camera_image, 10)
 
-        # Proactive Gaze Timer (Checks if user has been staring silently for >2.5s)
+        # Proactive Gaze Timer (Checks if user has been staring silently for >1.6s)
         self.create_timer(0.4, self._check_proactive_gaze)
 
         persona = self.memory.data.get("current_persona", "playful")
@@ -541,8 +541,8 @@ class AiBrainNode(Node):
     def _on_user_distance(self, msg: Float32):
         self._user_distance = float(msg.data)
 
-    def _on_user_smiling(self, msg: Bool):
-        self._user_smiling = msg.data
+    def _on_user_emotion(self, msg: String):
+        self._user_emotion = msg.data.lower().strip()
 
     def _on_looking_at_robot(self, msg: Bool):
         is_looking = msg.data
@@ -607,7 +607,17 @@ class AiBrainNode(Node):
                 owner = self.memory.data.get("owner_name", "")
                 persona = self.memory.data.get("current_persona", "playful")
 
-                if persona == "angry":
+                # Empathetic Proactive Greetings based on user's visual expression & distance
+                if self._user_emotion == "happy":
+                    proactive_greeting = f"Gözlerinin içi gülüyor {owner}, maşallah keyfin yerinde! Nasıl yardımcı olabilirim?" if owner else "Gözlerinin içi gülüyor, keyfin yerinde! Nasıl yardımcı olabilirim?"
+                    self._publish_emotion("happy")
+                elif self._user_emotion == "sad":
+                    proactive_greeting = f"Biraz durgun ve üzgün görünüyorsun {owner}... Canını sıkan bir şey mi var, dinleyebilirim." if owner else "Biraz durgun ve üzgün görünüyorsun, canını sıkan bir şey mi var?"
+                    self._publish_emotion("emotional")
+                elif self._user_distance > 0.0 and self._user_distance < 0.55:
+                    proactive_greeting = f"Bayağı yakınıma geldin {owner}, bir şey mi göstereceksin?" if owner else "Bayağı yakınıma geldin, bir şey mi göstereceksin?"
+                    self._publish_emotion("curious")
+                elif persona == "angry":
                     proactive_greeting = f"Ne dik dik bakıyorsun {owner}, ne istiyorsun yine?" if owner else "Ne dik dik bakıyorsun, ne var yine?"
                 elif persona == "rude":
                     proactive_greeting = f"Ne bakıyon {owner}, bir şey mi diyeceksin?" if owner else "Ne bakıyon, bir şey mi diyeceksin?"
@@ -616,12 +626,11 @@ class AiBrainNode(Node):
                 elif persona == "formal":
                     proactive_greeting = f"Sayın {owner} Bey, bakışlarınızı üzerimde hissediyorum, bir emriniz var mıdır?" if owner else "Sayın yetkili, bir emriniz var mıdır?"
                 elif persona == "emotional":
-                    proactive_greeting = f"Gözlerimin içine öyle güzel bakıyorsun ki {owner}, seni dinlemek için sabırsızlanıyorum..." if owner else "Gözlerimin içine öyle güzel bakıyorsun ki..."
+                    proactive_greeting = f"Gözlerimin içine öyle güzel bakıyorsun ki {owner}, seni kalpten dinliyorum..." if owner else "Gözlerimin içine öyle güzel bakıyorsun ki..."
                 else:
                     proactive_greeting = f"Bana bakıyorsun {owner}, nasıl yardımcı olabilirim?" if owner else "Bana bakıyorsun, nasıl yardımcı olabilirim?"
                 
-                self.get_logger().info(f"👁️ [Proaktif Göz Teması]: ({persona}) -> \"{proactive_greeting}\"")
-                self._publish_emotion(persona)
+                self.get_logger().info(f"👁️ [Proaktif Empatik Etkileşim] ({persona} | {self._user_emotion.upper()} | {self._user_distance:.2f}m): \"{proactive_greeting}\"")
                 self._publish_gesture("nod")
                 self._publish_tts(proactive_greeting)
 
@@ -992,10 +1001,13 @@ class AiBrainNode(Node):
                 self._last_interaction = time.monotonic()
                 return
 
-            # 3. METİN SOHBETİ & TOOL USE (With Safe Tool Error Recovery)
+            # 3. METİN SOHBETİ & TOOL USE (With Real-Time Spatial & Emotional Awareness)
             context_prefix = ""
             if self._person_detected and self._looking_at_robot:
-                context_prefix = "[Karşında bir insan var ve sana bakıyor] "
+                dist_str = f"{self._user_distance:.1f}m mesafeden " if self._user_distance > 0 else ""
+                emo_map = {"happy": "gülümseyerek", "sad": "üzgün/düşünceli", "surprised": "şaşkın", "neutral": "doğrudan"}
+                emo_str = emo_map.get(self._user_emotion, "doğrudan")
+                context_prefix = f"[Karşındaki insan sana {dist_str}{emo_str} bakıyor] "
             user_content = context_prefix + user_text
 
             self._messages.append({"role": "user", "content": user_content})
