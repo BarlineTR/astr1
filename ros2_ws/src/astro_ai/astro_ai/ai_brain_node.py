@@ -105,6 +105,10 @@ class AstroMemory:
                     self.data.update(saved)
             except Exception:
                 pass
+        # Clean corrupted names
+        if self.data.get("owner_name") and str(self.data["owner_name"]).lower() in ["şarkı", "cevap", "yardım", "nasılsın"]:
+            self.data["owner_name"] = "Baran"
+            self.save()
 
     def save(self):
         try:
