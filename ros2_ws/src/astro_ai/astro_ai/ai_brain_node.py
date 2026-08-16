@@ -267,9 +267,38 @@ class AstroMemory:
         return ""
 
 
+def extract_spoken_turkish_sentence(raw_text: str) -> str:
+    if not raw_text:
+        return ""
+    # Strip <think> tags
+    raw_text = re.sub(r"(?i)<think>[\s\S]*?</think>", "", raw_text)
+    raw_text = re.sub(r"(?i)<\/?think>", "", raw_text)
+    
+    # If model emitted English reasoning steps / monologue
+    thinking_markers = [
+        "thinking process", "analyze the persona", "drafting the response",
+        "draft 1", "draft 2", "determine the response", "analyze the image",
+        "analyze the user"
+    ]
+    if any(k in raw_text.lower() for k in thinking_markers):
+        # Extract quoted response at the end e.g. "Lan Baran..." or Draft 2: ...
+        quotes = re.findall(r'["\u201c\u201d]([^"\u201c\u201d]{8,})["\u201c\u201d]', raw_text)
+        if quotes:
+            for q in reversed(quotes):
+                if any(ch in q for ch in "çğıöşüÇĞİÖŞÜabcde"):
+                    return q.strip()
+        # Fallback to last non-numbered line
+        lines = [l.strip() for l in raw_text.split("\n") if l.strip() and not re.match(r"^\d+\.", l.strip()) and not l.strip().startswith(("#", "*", "-"))]
+        if lines:
+            return lines[-1].strip('"\': ')
+            
+    return raw_text
+
+
 def clean_tts_text(text: str) -> str:
     if not text:
         return ""
+    text = extract_spoken_turkish_sentence(text)
     text = re.sub(r"(?i)<think>[\s\S]*?</think>", "", text)
     text = re.sub(r"(?i)<\/?think>", "", text)
     text = EMOJI_RE.sub("", text)
@@ -793,10 +822,9 @@ class AiBrainNode(Node):
                         "role": "system",
                         "content": (
                             f"{self._build_system_prompt()}\n\n"
-                            "ÖNEMLİ GÖREV:\n"
-                            "- Kameradaki görüntüyü dikkatle incele.\n"
-                            "- Eğer soru 'sana bakıyor muyum', 'nereye bakıyorum' gibi bakışla ilgiliyse, kullanıcının baş ve göz yönünü incele: Doğrudan kameraya mı bakıyor, yoksa yana/telefona/ekrana mı bakıyor? Net söyle.\n"
-                            "- Doğrudan kamerada gördüğün gerçekleri kendi aktif kişiliğine ve kullanıcının dil tarzına uygun tonla 1-2 Türkçe cümleyle söyle."
+                            "ÖNEMLİ KESİN TALİMAT:\n"
+                            "- ASLA İngilizce düşünce adımı veya 'Thinking process' yazma!\n"
+                            "- Doğrudan ve SADECE kamerada gördüğün gerçekleri 1 kısa Türkçe cümle olarak söyle."
                         ),
                     },
                     {
@@ -804,7 +832,7 @@ class AiBrainNode(Node):
                         "content": [
                             {
                                 "type": "text",
-                                "text": f"Kameradaki bu anlık görüntüye bakarak cevap ver: {prompt}",
+                                "text": f"Kameradaki görüntüye bakarak soruyu doğrudan Türkçe cevapla: {prompt}",
                             },
                             {
                                 "type": "image_url",
@@ -815,14 +843,10 @@ class AiBrainNode(Node):
                 ],
                 model=model_name,
                 temperature=0.1,
-                max_tokens=600,
+                max_tokens=250,
             )
             raw = response.choices[0].message.content.strip()
-            if "</think>" in raw:
-                actual = raw.split("</think>")[-1].strip()
-                if actual:
-                    return actual
-            clean = re.sub(r"(?i)<\/?think>", "", raw).strip()
+            clean = extract_spoken_turkish_sentence(raw)
             return clean if clean else None
         except Exception as e:
             self.get_logger().error(f"❌ [Vision Model Hatası ({model_name})]: {e}")
