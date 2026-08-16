@@ -61,11 +61,13 @@ def _load_env():
 
 
 def estimate_pitch_and_gender(audio_arr: np.ndarray, sample_rate: int = 16000) -> tuple[float, str]:
-    """Estimates fundamental frequency (F0) using autocorrelation to detect male vs female voice."""
-    if len(audio_arr) < sample_rate * 0.2:
+    """Estimates fundamental frequency (F0) using autocorrelation on a small window (fast & lightweight)."""
+    if len(audio_arr) < 1024:
         return 0.0, "unknown"
     try:
-        data = audio_arr.astype(np.float32)
+        # Take a centered 1024-sample slice to avoid O(N^2) CPU spike
+        mid = len(audio_arr) // 2
+        data = audio_arr[max(0, mid - 512): min(len(audio_arr), mid + 512)].astype(np.float32)
         data = data - np.mean(data)
         if np.max(np.abs(data)) < 200:
             return 0.0, "unknown"
@@ -113,8 +115,8 @@ class SpeechRecognitionNode(Node):
             self.enabled = False
             return
 
-        # Parameters (Fast Turn-Taking: 0.40s silence timeout)
-        self.declare_parameter('silence_timeout_s', 0.40)
+        # Parameters (Ultra-Fast Turn-Taking: 0.28s silence timeout)
+        self.declare_parameter('silence_timeout_s', 0.28)
         self.declare_parameter('sample_rate', 16000)
         self._silence_timeout_s = float(self.get_parameter('silence_timeout_s').value)
         self._sample_rate = int(self.get_parameter('sample_rate').value)

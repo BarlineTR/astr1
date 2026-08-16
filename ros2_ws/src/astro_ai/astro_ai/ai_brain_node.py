@@ -521,10 +521,11 @@ class AiBrainNode(Node):
             f"Senin fiziksel bir bedenin, OAK-D Lite 3D kameran, mikrofonların ve motorların var. Karşındaki insanları görebiliyor ve duyabiliyorsun.\n"
             f"TEMEL KİŞİLİĞİN: {persona_rule}\n\n"
             "SOSYAL VE DİLSEL KURALLAR:\n"
-            "- Karşındaki kişi kendini tanıtmadığı sürece EZBERE İSİM SÖYLEME. Yeni biriyle konuşuyorsan tanış.\n"
+            "- TALİMATLARI HARFİYEN UYGULA: Eğer kullanıcı 'şunu söyle', 'bunu de', 'söyle ki', 'tekrar et' gibi bir talimat verirse (örneğin 'Söyle ki Onur seni bekliyorum'), ASLA itiraz etme, tanışmadık deme veya felsefe yapma; doğrudan istenen cümleyi veya mesajı harfiyen ve doğal bir şekilde seslendir.\n"
+            "- Karşındaki kişiyle konuşurken durduk yere ezbere isim uydurma, sana adını söylerse adıyla hitap et.\n"
             "- Kadın/kız sesi duyduğunda veya karşında bir kadın olduğunda daha zarif, karizmatik ve flörtöz olabilirsin.\n"
             "- Karşındaki kişi nasıl konuşuyorsa (samimi, argo, resmi veya kibar) onun frekansına gir ama durduk yere küfür başlatma.\n"
-            "- Cevaplarını 1-2 cümle ile kısa ve öz tut (çünkü sesli okunuyor).\n"
+            "- Cevaplarını 1-2 cümle ile kısa, akıcı ve öz tut (çünkü sesli okunuyor).\n"
             "- Asla markdown, emoji, yıldız (*), parantez, <think> etiketi veya kod bloğu kullanma; sadece saf Türkçe konuş."
         )
         memory_ctx = self.memory.get_context_prompt()
@@ -1025,75 +1026,94 @@ class AiBrainNode(Node):
             response = None
             models_to_try = [self._text_model] + [m for m in self._fallback_models if m != self._text_model]
 
+            # Check if user query might need tools (weather, etc.)
+            tool_keywords = ["hava", "derece", "yağmur", "alarm", "kur", "hatırlat"]
+            needs_tools = any(k in user_text.lower() for k in tool_keywords)
+
+            if needs_tools:
+                for m in models_to_try:
+                    try:
+                        response = self._groq.chat.completions.create(
+                            messages=self._messages,
+                            model=m,
+                            temperature=self._temperature,
+                            max_tokens=self._max_tokens,
+                            tools=ROBOT_TOOLS,
+                            tool_choice="auto",
+                        )
+                        break
+                    except Exception:
+                        continue
+
+                if response is not None and response.choices[0].message.tool_calls:
+                    response_message = response.choices[0].message
+                    for tool_call in response_message.tool_calls:
+                        fn_name = tool_call.function.name
+                        try:
+                            fn_args = json.loads(tool_call.function.arguments)
+                        except Exception:
+                            fn_args = {}
+                        tool_result = self._execute_tool_call(fn_name, fn_args, frame)
+                        clean_ans = clean_tts_text(tool_result)
+                        self.get_logger().info(f"🤖 [Astro]: \"{clean_ans}\"")
+                        self._publish_tts(clean_ans)
+                        self._publish_emotion(persona)
+                        self._unprocessed_dialogue.append(f"Astro: {clean_ans}")
+                        self._last_interaction = time.monotonic()
+                        return
+
+            # Real-Time Streaming Generation for Instant (<1s) Speech
+            stream_resp = None
             for m in models_to_try:
                 try:
-                    response = self._groq.chat.completions.create(
+                    stream_resp = self._groq.chat.completions.create(
                         messages=self._messages,
                         model=m,
                         temperature=self._temperature,
                         max_tokens=self._max_tokens,
-                        tools=ROBOT_TOOLS,
-                        tool_choice="auto",
+                        stream=True,
                     )
                     break
-                except Exception as api_err:
-                    err_str = str(api_err)
-                    if "429" in err_str or "rate_limit" in err_str.lower():
-                        self.get_logger().warn(f"⚠️ Model {m} rate limite takıldı, yedek modele geçiliyor...")
-                        continue
-                    elif "tool_use_failed" in err_str or "Failed to call a function" in err_str:
-                        try:
-                            response = self._groq.chat.completions.create(
-                                messages=self._messages,
-                                model=m,
-                                temperature=self._temperature,
-                                max_tokens=self._max_tokens,
-                                tools=None,
-                            )
-                            break
-                        except Exception:
-                            continue
-                    else:
-                        raise api_err
+                except Exception as stream_err:
+                    self.get_logger().warn(f"⚠️ Model {m} stream hatası: {stream_err}")
+                    continue
 
-            if response is None:
-                self.get_logger().error("❌ Tüm modeller rate limite takıldı!")
+            if stream_resp is None:
+                self.get_logger().error("❌ Tüm LLM modelleri başarısız oldu!")
                 return
 
-            response_message = response.choices[0].message
-            tool_calls = response_message.tool_calls
+            full_text = ""
+            sentence_buffer = ""
+            split_delimiters = re.compile(r"([.!?;:\n]+)")
 
-            if tool_calls:
-                self._publish_emotion("thinking")
-                for tool_call in tool_calls:
-                    fn_name = tool_call.function.name
-                    try:
-                        fn_args = json.loads(tool_call.function.arguments)
-                    except Exception:
-                        fn_args = {}
-                    
-                    tool_result = self._execute_tool_call(fn_name, fn_args, frame)
-                    clean_ans = clean_tts_text(tool_result)
-                    self.get_logger().info(f"🤖 [Astro]: \"{clean_ans}\"")
-                    self._publish_tts(clean_ans)
+            for chunk in stream_resp:
+                delta = chunk.choices[0].delta.content if chunk.choices and chunk.choices[0].delta else None
+                if not delta:
+                    continue
+
+                full_text += delta
+                sentence_buffer += delta
+
+                parts = split_delimiters.split(sentence_buffer)
+                if len(parts) > 2:
+                    # We have at least one complete sentence + punctuation
+                    to_speak = "".join(parts[:-1]).strip()
+                    sentence_buffer = parts[-1]
+                    clean_chunk = clean_tts_text(to_speak)
+                    if clean_chunk and len(clean_chunk) >= 2:
+                        self._publish_tts(clean_chunk)
+                        self._publish_emotion(persona)
+
+            # Flush remaining buffer
+            if sentence_buffer.strip():
+                clean_chunk = clean_tts_text(sentence_buffer.strip())
+                if clean_chunk and len(clean_chunk) >= 2:
+                    self._publish_tts(clean_chunk)
                     self._publish_emotion(persona)
-                    self._unprocessed_dialogue.append(f"Astro: {clean_ans}")
-                    self._messages.append(response_message)
-                    self._messages.append({
-                        "role": "tool",
-                        "tool_call_id": tool_call.id,
-                        "name": fn_name,
-                        "content": tool_result
-                    })
-                    self._last_interaction = time.monotonic()
-                    return
 
-            full_response = response_message.content or ""
-            if full_response.strip():
-                clean_full = clean_tts_text(full_response.strip())
+            clean_full = clean_tts_text(full_text)
+            if clean_full:
                 self.get_logger().info(f"🤖 [Astro]: \"{clean_full}\"")
-                self._publish_tts(clean_full)
-                self._publish_emotion(persona)
                 self._unprocessed_dialogue.append(f"Astro: {clean_full}")
                 self._messages.append({"role": "assistant", "content": clean_full})
 

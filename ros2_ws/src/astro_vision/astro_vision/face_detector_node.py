@@ -105,34 +105,28 @@ class SpatialVisionNode(Node):
         return float(np.clip(distance, 0.3, 4.0))
 
     def _estimate_head_yaw(self, face_roi_gray, w, h) -> float:
-        eyes = self.eye_cascade.detectMultiScale(face_roi_gray[:int(h * 0.6), :], scaleFactor=1.1, minNeighbors=3, minSize=(15, 15))
+        roi = cv2.resize(face_roi_gray[:int(h * 0.6), :], (96, 54), interpolation=cv2.INTER_AREA) if w > 96 else face_roi_gray[:int(h * 0.6), :]
+        rw = roi.shape[1]
+        eyes = self.eye_cascade.detectMultiScale(roi, scaleFactor=1.15, minNeighbors=3, minSize=(10, 10))
         if len(eyes) >= 2:
             eyes_sorted = sorted(eyes, key=lambda e: e[0])
             left_eye_center = eyes_sorted[0][0] + eyes_sorted[0][2] / 2.0
             right_eye_center = eyes_sorted[-1][0] + eyes_sorted[-1][2] / 2.0
             eye_midpoint = (left_eye_center + right_eye_center) / 2.0
-            face_center = w / 2.0
+            face_center = rw / 2.0
             yaw_deg = float(((eye_midpoint - face_center) / face_center) * 35.0)
             return yaw_deg
         elif len(eyes) == 1:
             eye_x = eyes[0][0] + eyes[0][2] / 2.0
-            return -25.0 if eye_x < w / 2.0 else 25.0
+            return -25.0 if eye_x < rw / 2.0 else 25.0
         return 0.0
 
     def _detect_facial_emotion(self, face_roi_gray, w, h) -> str:
         """Determines emotion (happy/smiling, surprised, sad/neutral) based on mouth and eyes geometry."""
-        lower_face = face_roi_gray[int(h * 0.5):, :]
-        smiles = self.smile_cascade.detectMultiScale(lower_face, scaleFactor=1.65, minNeighbors=14, minSize=(25, 25))
+        lower_face = cv2.resize(face_roi_gray[int(h * 0.5):, :], (96, 48), interpolation=cv2.INTER_AREA) if w > 96 else face_roi_gray[int(h * 0.5):, :]
+        smiles = self.smile_cascade.detectMultiScale(lower_face, scaleFactor=1.65, minNeighbors=10, minSize=(15, 15))
         if len(smiles) > 0:
             return "happy"
-
-        eyes = self.eye_cascade.detectMultiScale(face_roi_gray[:int(h * 0.6), :], scaleFactor=1.1, minNeighbors=4, minSize=(20, 20))
-        # High eye height with mouth open indicates surprise
-        if len(eyes) >= 2:
-            avg_eye_h = sum(e[3] for e in eyes) / len(eyes)
-            if avg_eye_h > (h * 0.22):
-                return "surprised"
-
         return "neutral"
 
     def image_callback(self, msg: Image):
@@ -148,8 +142,8 @@ class SpatialVisionNode(Node):
             self._frame_count = 0
         self._frame_count += 1
 
-        # Skip frames to reduce CPU load (Process 1 out of 3 frames ~ 10 FPS)
-        if self._frame_count % 3 != 0:
+        # Skip frames to reduce CPU load (Process 1 out of 4 frames ~ 7.5 FPS)
+        if self._frame_count % 4 != 0:
             return
 
         frame_h, frame_w = frame.shape[:2]
