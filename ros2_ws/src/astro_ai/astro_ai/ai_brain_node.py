@@ -158,14 +158,18 @@ class AiBrainNode(Node):
         if Groq and self.groq_api_key:
             try:
                 self._groq = Groq(api_key=self.groq_api_key)
+                self._active_groq_models = self._discover_active_groq_models()
                 self._vision_model = self._discover_vision_model()
                 v_name = self._vision_model if self._vision_model else "Gemini Flash (Direct REST)"
-                self.get_logger().info(f"✅ [AI Brain] LLM Aktif — Metin: {self._text_model} | Vision: {v_name}")
+                t_name = self._active_groq_models[0] if self._active_groq_models else self._text_model
+                self.get_logger().info(f"✅ [AI Brain] LLM Aktif — Metin: {t_name} (Toplam {len(self._active_groq_models)} Groq Modeli) | Vision: {v_name}")
             except Exception as e:
                 self.get_logger().error(f"❌ [AI Brain] Groq client başlatılamadı: {e}")
+                self._active_groq_models = []
                 self._enabled = False
         else:
             self.get_logger().error("❌ [AI Brain] GROQ_API_KEY bulunamadı! STT/LLM devre dışı.")
+            self._active_groq_models = []
             self._enabled = False
 
         # Secondary / Vision Fallback Client (Gemini / OpenAI API)
@@ -230,6 +234,33 @@ class AiBrainNode(Node):
         self.get_logger().info(
             f"🧠 [AI Brain Node] Modüler Mimari Hazır! Kişilik: [{self.persona_engine.current_persona.upper()}]"
         )
+
+    def _discover_active_groq_models(self) -> List[str]:
+        """Dynamically queries Groq API to get real, active, non-deprecated model IDs."""
+        if not self._groq:
+            return []
+        try:
+            models = self._groq.models.list()
+            active_ids = [m.id for m in models.data]
+            chat_models = []
+            for mid in active_ids:
+                mid_l = mid.lower()
+                if any(x in mid_l for x in ["whisper", "embedding", "guard", "moderation", "tts"]):
+                    continue
+                chat_models.append(mid)
+
+            def score(m):
+                ml = m.lower()
+                if "120b" in ml or "70b" in ml or "large" in ml: return 3
+                if "32b" in ml or "27b" in ml or "20b" in ml or "8x7b" in ml: return 2
+                if "8b" in ml or "mini" in ml or "flash" in ml: return 1
+                return 0
+
+            chat_models.sort(key=score, reverse=True)
+            return chat_models
+        except Exception as e:
+            self.get_logger().warn(f"⚠️ Groq aktif model keşfi başarısız: {e}")
+            return []
 
     def _discover_vision_model(self) -> str | None:
         try:
@@ -575,7 +606,10 @@ class AiBrainNode(Node):
                 messages[-1]["content"] = perception_prefix + messages[-1]["content"]
 
             stream_resp = None
-            models_to_try = [self._text_model] + [m for m in self._fallback_models if m != self._text_model]
+            models_to_try = list(self._active_groq_models) if self._active_groq_models else [self._text_model]
+            if self._text_model in models_to_try:
+                models_to_try.remove(self._text_model)
+                models_to_try.insert(0, self._text_model)
 
             for m in models_to_try:
                 try:
@@ -591,7 +625,18 @@ class AiBrainNode(Node):
                     self.get_logger().warn(f"⚠️ Model {m} stream hatası: {stream_err}")
                     continue
 
+            # Fallback to Direct Google Gemini REST Text Generation
             if stream_resp is None:
+                self.get_logger().warn("⚠️ Groq modelleri yanıt veremedi, Google Gemini REST metin motoruna geçiliyor...")
+                gemini_text = self._query_gemini_text_rest(system_prompt, user_text, self.memory.episodic.get_messages())
+                if gemini_text:
+                    self.cloud_mgr.record_llm_success()
+                    self.get_logger().info(f"🤖 [Astro (Gemini)]: \"{gemini_text}\"")
+                    self.memory.episodic.add_message("assistant", gemini_text)
+                    self._publish_tts(gemini_text)
+                    self._publish_emotion(persona)
+                    return
+
                 self.cloud_mgr.record_llm_failure("All cloud models failed")
                 self.get_logger().error("❌ Tüm LLM modelleri başarısız oldu! Yerel çevrimdışı moda geçiliyor.")
                 offline_msg = "Şu an internet bağlantımda bir sorun var ama seni dinliyorum!"
@@ -722,6 +767,43 @@ class AiBrainNode(Node):
                     self.get_logger().warn(f"⚠️ [OpenAI Vision ({m_cand}) Hatası]: {e2}")
 
         self.cloud_mgr.record_llm_failure("All vision models failed")
+        return None
+
+    def _query_gemini_text_rest(self, system_instruction: str, user_text: str, history_messages: List[Dict[str, Any]]) -> Optional[str]:
+        """Zero-dependency direct Google Gemini REST text conversation engine."""
+        if not self._ai_api_key:
+            return None
+
+        for g_model in ["gemini-2.0-flash", "gemini-1.5-flash", "gemini-2.5-flash", "gemini-1.5-flash-8b"]:
+            try:
+                url = f"https://generativelanguage.googleapis.com/v1beta/models/{g_model}:generateContent?key={self._ai_api_key}"
+                contents = []
+                for msg in history_messages[-6:]:
+                    r = "user" if msg.get("role") == "user" else "model"
+                    contents.append({"role": r, "parts": [{"text": msg.get("content", "")}]})
+
+                if not contents or contents[-1]["role"] != "user":
+                    contents.append({"role": "user", "parts": [{"text": user_text}]})
+
+                payload = {
+                    "systemInstruction": {"parts": [{"text": system_instruction}]},
+                    "contents": contents,
+                    "generationConfig": {
+                        "temperature": 0.5,
+                        "maxOutputTokens": 300,
+                        "thinkingConfig": {"thinkingBudget": 0}
+                    }
+                }
+                data_bytes = json.dumps(payload).encode("utf-8")
+                req = urllib.request.Request(url, data=data_bytes, headers={"Content-Type": "application/json"})
+                with urllib.request.urlopen(req, timeout=4.5) as resp:
+                    res_json = json.loads(resp.read().decode("utf-8"))
+                    text = res_json["candidates"][0]["content"]["parts"][0]["text"].strip()
+                    clean = clean_tts_text(text)
+                    if clean:
+                        return clean
+            except Exception as e:
+                self.get_logger().warn(f"⚠️ [Gemini Text REST ({g_model}) Hatası]: {e}")
         return None
 
     def _execute_tool_call(self, tool_name: str, arguments: dict, frame: np.ndarray | None) -> str:
