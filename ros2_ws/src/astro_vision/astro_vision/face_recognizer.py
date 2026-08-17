@@ -154,22 +154,24 @@ class FaceRecognizer:
                     for f in os.listdir(entry_path):
                         if f.lower().endswith((".jpg", ".jpeg", ".png", ".bmp")):
                             img_p = os.path.join(entry_path, f)
-                            img = cv2.imread(img_p)
-                            if img is not None:
-                                emb = self.extract_embedding(img)
-                                if emb is not None:
-                                    self._known_embeddings.setdefault(person_norm, []).append(emb)
-                                    indexed_count += 1
+                            if cv2 is not None:
+                                img = cv2.imread(img_p)
+                                if img is not None:
+                                    emb = self.extract_embedding(img)
+                                    if emb is not None:
+                                        self._known_embeddings.setdefault(person_norm, []).append(emb)
+                                        indexed_count += 1
                 elif entry.lower().endswith((".jpg", ".jpeg", ".png")):
                     # Single image named Person_Name.jpg
                     person_name = os.path.splitext(entry)[0]
                     person_norm = self._normalize_name(person_name)
-                    img = cv2.imread(entry_path)
-                    if img is not None:
-                        emb = self.extract_embedding(img)
-                        if emb is not None:
-                            self._known_embeddings.setdefault(person_norm, []).append(emb)
-                            indexed_count += 1
+                    if cv2 is not None:
+                        img = cv2.imread(entry_path)
+                        if img is not None:
+                            emb = self.extract_embedding(img)
+                            if emb is not None:
+                                self._known_embeddings.setdefault(person_norm, []).append(emb)
+                                indexed_count += 1
 
     def enroll_face(self, name: str, face_bgr: np.ndarray, title: Optional[str] = None) -> bool:
         """Dynamically learns and saves a new face to disk and memory."""

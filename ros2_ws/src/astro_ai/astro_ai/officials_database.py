@@ -9,15 +9,25 @@ from typing import Any, Dict, List, Optional
 
 
 OFFICIALS_DATABASE: Dict[str, Dict[str, Any]] = {
-    "erol_karaomeroglu": {
-        "full_name": "Erol Karaömeroğlu",
+    "ahmet_karakaya": {
+        "full_name": "Ahmet Karakaya",
         "title": "Bitlis Valisi",
         "formal_title": "Sayın Valim",
         "role_category": "governor",
-        "aliases": ["erol karaömeroğlu", "sayın valim", "bitlis valisi", "vali bey", "vali erol", "erol bey"],
+        "aliases": ["ahmet karakaya", "sayın valim", "bitlis valisi", "vali bey", "vali ahmet", "ahmet bey", "valimiz"],
         "greeting_formal": "Sayın Valim, hoş geldiniz! Ben Bitlis'in akıllı sosyal robotu Astro. Emrinizdeyim.",
         "bio": "Bitlis Valisi olarak görev yapmaktadır. Bitlis'in kalkınması, eğitimi ve teknolojik gelişimi için çalışmaktadır.",
         "topics_of_interest": ["Bitlis'in kalkınması", "Eğitim ve Gençlik Projeleri", "Teknoloji ve İnovasyon", "Ahlat ve Tatvan Turizmi"]
+    },
+    "erol_karaomeroglu": {
+        "full_name": "Erol Karaömeroğlu",
+        "title": "Önceki Bitlis Valisi",
+        "formal_title": "Sayın Valim",
+        "role_category": "governor",
+        "aliases": ["erol karaömeroğlu", "vali erol", "erol bey"],
+        "greeting_formal": "Sayın Valim, hürmetle selamlıyorum, hoş geldiniz! Ben Bitlis'in sosyal robotu Astro.",
+        "bio": "Bitlis eski Valisidir. Bitlis'e değerli hizmetlerde bulunmuştur.",
+        "topics_of_interest": ["Bitlis'in kalkınması", "Eğitim Projeleri"]
     },
     "nesrullah_tanglay": {
         "full_name": "Nesrullah Tanğlay",

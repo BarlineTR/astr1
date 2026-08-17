@@ -128,13 +128,17 @@ class TestCircuitBreaker(unittest.TestCase):
 class TestBiometricsAndOfficials(unittest.TestCase):
     def test_officials_database(self):
         from officials_database import find_official_by_name_or_alias, get_official_greeting
-        vali = find_official_by_name_or_alias("Erol Karaömeroğlu")
+        vali = find_official_by_name_or_alias("Ahmet Karakaya")
         self.assertIsNotNone(vali)
         self.assertEqual(vali["title"], "Bitlis Valisi")
         self.assertEqual(vali["formal_title"], "Sayın Valim")
 
         greet = get_official_greeting(vali)
         self.assertIn("Sayın Valim", greet)
+
+        erol = find_official_by_name_or_alias("Erol Karaömeroğlu")
+        self.assertIsNotNone(erol)
+        self.assertEqual(erol["formal_title"], "Sayın Valim")
 
         baskan = find_official_by_name_or_alias("Nesrullah Tanğlay")
         self.assertIsNotNone(baskan)
