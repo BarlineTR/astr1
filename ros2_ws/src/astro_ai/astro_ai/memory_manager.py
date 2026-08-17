@@ -208,13 +208,23 @@ class PersistentProfile:
         with self._lock:
             people = self.data.setdefault("known_people", {})
             norm = name.strip().lower()
-            people[norm] = {
-                "name": name.strip(),
-                "title": title.strip(),
-                "formal_title": formal_title.strip() or name.strip(),
-                "notes": notes.strip(),
-                "learned_at": time.time()
-            }
+            if norm not in people:
+                people[norm] = {
+                    "name": name.strip(),
+                    "title": title.strip(),
+                    "formal_title": formal_title.strip() or name.strip(),
+                    "notes": notes.strip(),
+                    "learned_facts": [],
+                    "preferences": {},
+                    "session_summaries": [],
+                    "learned_at": time.time()
+                }
+            else:
+                people[norm]["title"] = title.strip()
+                if formal_title:
+                    people[norm]["formal_title"] = formal_title.strip()
+                if notes:
+                    people[norm]["notes"] = notes.strip()
             self.save()
 
     def get_known_person(self, name: str) -> Optional[Dict[str, Any]]:
@@ -223,6 +233,68 @@ class PersistentProfile:
             people = self.data.get("known_people", {})
             norm = name.strip().lower()
             return people.get(norm)
+
+    def add_person_fact(self, name: str, fact: str) -> bool:
+        """Adds a verified learned fact specifically to a known person's profile."""
+        if not name or not fact or len(fact) < 4:
+            return False
+        with self._lock:
+            people = self.data.setdefault("known_people", {})
+            norm = name.strip().lower()
+            if norm not in people:
+                self.add_known_person(name)
+            
+            p_facts = people[norm].setdefault("learned_facts", [])
+            if fact not in p_facts:
+                p_facts.append(fact)
+                if len(p_facts) > 20:
+                    people[norm]["learned_facts"] = p_facts[-20:]
+                self.save()
+            return True
+
+    def add_person_preference(self, name: str, key: str, value: str):
+        """Stores a specific preference (e.g. coffee: unsweetened) for a known person."""
+        if not name or not key:
+            return
+        with self._lock:
+            people = self.data.setdefault("known_people", {})
+            norm = name.strip().lower()
+            if norm not in people:
+                self.add_known_person(name)
+            
+            people[norm].setdefault("preferences", {})[key.lower().strip()] = str(value).strip()
+            self.save()
+
+    def add_person_session_summary(self, name: str, summary: str):
+        """Records an episodic summary of a past conversation with this person."""
+        if not name or not summary or len(summary) < 5:
+            return
+        with self._lock:
+            people = self.data.setdefault("known_people", {})
+            norm = name.strip().lower()
+            if norm not in people:
+                self.add_known_person(name)
+            
+            now_ts = time.time()
+            time_str = time.strftime("%d %B %H:%M", time.localtime(now_ts))
+            summaries = people[norm].setdefault("session_summaries", [])
+            summaries.append({
+                "time_str": time_str,
+                "timestamp": now_ts,
+                "summary": summary.strip()
+            })
+            if len(summaries) > 10:
+                people[norm]["session_summaries"] = summaries[-10:]
+            self.save()
+
+    def get_person_recent_sessions(self, name: str, limit: int = 3) -> List[Dict[str, Any]]:
+        """Returns the most recent conversation summaries for a specific person."""
+        with self._lock:
+            people = self.data.get("known_people", {})
+            norm = name.strip().lower()
+            if norm in people:
+                return list(people[norm].get("session_summaries", []))[-limit:]
+            return []
 
     def set_persona(self, persona_name: str):
         with self._lock:
@@ -279,7 +351,7 @@ class MemoryManager:
         self.session = SessionMemory()
         self.profile = PersistentProfile(filepath=storage_path)
 
-    def get_prompt_context(self) -> str:
+    def get_prompt_context(self, recognized_person: Optional[Dict[str, Any]] = None) -> str:
         """Builds clean, structured context to inject into LLM system prompt."""
         ctx_parts = []
 
@@ -302,9 +374,30 @@ class MemoryManager:
             obs_str = "; ".join(observations)
             ctx_parts.append(f"Çevresel Gözlemlerin: {obs_str}")
 
+        # Person-Specific Memory (Kişiye Özel Hafıza & Geçmiş Konuşmalar)
+        if recognized_person and recognized_person.get("is_known"):
+            p_name = recognized_person.get("name", "")
+            p_profile = self.profile.get_known_person(p_name)
+            if p_profile:
+                p_facts = p_profile.get("learned_facts", [])
+                if p_facts:
+                    ctx_parts.append(f"{p_name} Hakkında Bildiklerin: {'; '.join(p_facts[-5:])}")
+
+                p_prefs = p_profile.get("preferences", {})
+                if p_prefs:
+                    prefs_str = "; ".join([f"{k}: {v}" for k, v in p_prefs.items()])
+                    ctx_parts.append(f"{p_name}'in Tercihleri ve Zevkleri: {prefs_str}")
+
+                p_summaries = p_profile.get("session_summaries", [])
+                if p_summaries:
+                    last_sess = p_summaries[-3:]
+                    sess_lines = [f"- ({s.get('time_str')}): {s.get('summary')}" for s in last_sess]
+                    ctx_parts.append(f"{p_name} İle Geçmiş Konuşmaların:\n" + "\n".join(sess_lines))
+
         # Tier 2: Active Session Context
         session_summary = self.session.get_summary()
         if session_summary:
             ctx_parts.append(session_summary)
 
         return "\n".join(ctx_parts)
+

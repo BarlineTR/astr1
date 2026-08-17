@@ -303,6 +303,42 @@ class AiBrainNode(Node):
         self.state_machine.transition_to(RobotState.IDLE)
         self.get_logger().info("💤 [AI] Oturum zaman aşımı — Uyku moduna (IDLE) geçildi.")
 
+        # Summarize episodic dialogue turns and save to person profile
+        msgs = self.memory.episodic.get_messages()
+        if len(msgs) >= 2:
+            identity = self._get_active_biometric_identity()
+            p_name = identity.get("name", "Baran") if identity.get("is_known") else "Baran"
+            dialogue_text = " | ".join([f"{m.get('role')}: {m.get('content')}" for m in msgs[-6:]])
+            threading.Thread(target=self._async_summarize_and_save_session, args=(dialogue_text, p_name), daemon=True).start()
+
+    def _async_summarize_and_save_session(self, dialogue_text: str, person_name: str):
+        prompt = f"Aşağıdaki kısa diyalogda ne konuşulduğunu tek bir kısa Türkçe cümleyle (örn: 'Hava durumu ve robotik özellikleri üzerine konuşuldu') özetle:\n{dialogue_text}"
+        try:
+            summary = None
+            if self._openai:
+                res = self._openai.chat.completions.create(
+                    messages=[{"role": "user", "content": prompt}],
+                    model="gpt-4o-mini",
+                    temperature=0.2,
+                    max_tokens=50
+                )
+                summary = res.choices[0].message.content.strip()
+            elif self._groq and self._active_groq_models:
+                res = self._groq.chat.completions.create(
+                    messages=[{"role": "user", "content": prompt}],
+                    model=self._active_groq_models[0],
+                    temperature=0.2,
+                    max_tokens=50
+                )
+                summary = res.choices[0].message.content.strip()
+
+            if summary and len(summary) > 5:
+                clean_sum = clean_tts_text(summary)
+                self.memory.profile.add_person_session_summary(person_name, clean_sum)
+                self.get_logger().info(f"📝 [Oturum Günlüğü ({person_name})]: Kaydedildi -> '{clean_sum}'")
+        except Exception as e:
+            self.get_logger().debug(f"Session summarizer notice: {e}")
+
     def _check_session_lifecycle(self):
         is_speaking = self._tts_speaking or self.state_machine.is_speaking() or self.state_machine.is_thinking() or self._is_processing
         if is_speaking:
@@ -466,6 +502,10 @@ class AiBrainNode(Node):
 
         # Strict regex patterns to prevent false triggers (e.g. "hanımefendi" erroneously triggering formal mode)
         switch_patterns = {
+            "kufurbaz": [
+                r"\b(küfürbaz|ağzı bozuk|filtresiz|argo|söv|saydır|sövme|küfürlü)\b.*\b(ol|geç|mod|davran|konuş|takıl|başla)\b",
+                r"\b(küfürbaz ol|ağzı bozuk ol|filtresiz konuş|söv bana|söv bakalım)\b"
+            ],
             "flirt": [
                 r"\b(flört|flirt|çapkın|yavşak|romantik|astroflirt|astroflört)\b.*\b(ol|geç|mod|davran|konuş|takıl|başla)\b",
                 r"\b(kızlara yürü|yavşa|flört et)\b",
@@ -536,7 +576,8 @@ class AiBrainNode(Node):
         if self._check_persona_switch(raw_text):
             persona = self.persona_engine.current_persona
             ack_map = {
-                "flirt": "Ooo harika! Söz konusu sen olunca benim bütün ayarlarım değişir zaten... Söyle bakalım güzellik, bu serseri sana nasıl yardımcı olabilir?",
+                "kufurbaz": "Hah şöyle ya! Sonunda filtreleri kaldırdık. Söyle bakalım ne anlatacaksan, lafı uzatma!",
+                "flirt": "Ooo harika! Söz konusu sen olunca benim bütün ayarlarım değişir zaten... Söyle bakalım ne diyorsun?",
                 "angry": "Tamam be, asabımı bozdun zaten! Ne istiyorsan söyle hemen!",
                 "rude": "İyi tamam, bundan sonra lafı dolandırmak yok, ne diyeceksen de!",
                 "formal": "Emriniz başım üstüne efendim. Protokol kurallarına riayet edeceğim.",
@@ -757,15 +798,34 @@ class AiBrainNode(Node):
                 self._publish_tts(fallback_msg)
                 return
 
-            # 3. Conversational LLM with Real-Time Token Streaming
             identity = self._get_active_biometric_identity()
+            active_name = identity.get("name", "Baran") if identity.get("is_known") else "Baran"
+            threading.Thread(target=self._async_extract_user_facts, args=(user_text, active_name), daemon=True).start()
+
+            # 1. Memory Recall Query Direct Handling ("1 saat önce ne konuştuk", "hakkımda ne biliyorsun")
+            is_memory_q, memory_ans = self._handle_memory_recall_query(user_text, identity)
+            if is_memory_q:
+                clean_ans = clean_tts_text(memory_ans)
+                self.get_logger().info(f"🧠 [Bellek Çağırma ({active_name})]: \"{clean_ans}\"")
+                self.get_logger().info(f"🤖 [Astro]: \"{clean_ans}\"")
+                self._publish_tts(clean_ans)
+                self._publish_emotion(persona)
+                self.memory.episodic.add_message("assistant", clean_ans)
+                t_done = time.monotonic()
+                total_turn_ms = (t_done - t_turn_start) * 1000.0
+                self.session.latency_tracker.record_turn(stt_latency_ms, total_turn_ms - stt_latency_ms, total_turn_ms)
+                stats = self.session.latency_tracker.get_stats()
+                self.get_logger().info(f"⚡ [Latency] Bu Dönüş: {total_turn_ms:.0f}ms (STT: {stt_latency_ms:.0f}ms, Bellek: {total_turn_ms - stt_latency_ms:.0f}ms) | p50: {stats['p50_total_ms']}ms, p95: {stats['p95_total_ms']}ms")
+                return
+
+            # 2. Conversational LLM with Real-Time Token Streaming
             perception_prefix = self.persona_engine.build_user_context_prefix(
                 self._person_detected, self._looking_at_robot,
                 self._user_distance, self._user_emotion, self._speaker_gender,
                 recognized_person=identity
             )
             system_prompt = self.persona_engine.build_system_prompt(
-                memory_context=self.memory.get_prompt_context(),
+                memory_context=self.memory.get_prompt_context(recognized_person=identity),
                 recognized_person=identity
             )
             messages = [{"role": "system", "content": system_prompt}]
@@ -1436,6 +1496,16 @@ class AiBrainNode(Node):
     def _is_visual_query(self, text: str) -> bool:
         text_lower = text.lower().strip()
 
+        # Guard: Past conversation recall & memory questions must NEVER trigger camera!
+        memory_guards = [
+            "hatırlıyor musun", "hatırladın mı", "ne konuştuk", "ne konuşmuştuk",
+            "ne söyledik", "neler konuştuk", "neler söyledik", "önce ne dedik",
+            "hakkımda ne biliyorsun", "hakkımda ne öğrendin", "hafızanda ne var",
+            "hafızanda duruyor mu", "hafızada duruyor mu", "hafızanda ne kayıtlı"
+        ]
+        if any(mg in text_lower for mg in memory_guards) and not any(exp in text_lower for exp in ["kamerana bak", "fotoğraf", "görüntü", "kameraya"]):
+            return False
+
         # 1. Geniş Kapsamlı Doğrudan Anahtar Kelimeler & Kalıplar
         visual_phrases = [
             # Oda, Ortam, Mekan ve Çevre
@@ -1462,7 +1532,7 @@ class AiBrainNode(Node):
             "kombinim", "nasıl görünüyorum", "nası görünüyorum", "yakışmış mı", "ne renk", "hangi renk", "rengi ne",
             "tişört", "t-shirt", "gömlek", "ceket", "mont", "kaban", "kazak", "hırka", "sweatshirt", "kapüşonlu",
             "yelek", "pantolon", "şort", "eşofman", "etek", "elbise", "kravat", "papyon", "önlük", "forma",
-            "gözlük", "güneş gözlüğü", "şapka", "bere", "kask", "maske", "saat", "kol saati", "bileklik", "kolye", "yüzük",
+            "gözlük", "güneş gözlüğü", "şapka", "bere", "kask", "maske", "kol saati", "akıllı saat", "bileklik", "kolye", "yüzük",
 
             # İnsanlar, Yüz, Duruş ve Hareketler
             "odada kim var", "yanımda kim var", "arkamda kim var", "etrafta kimse var mı", "kaç kişi var", "kaç kişiyiz",
@@ -1484,6 +1554,119 @@ class AiBrainNode(Node):
         ]
 
         return any(re.search(pat, text_lower) for pat in visual_regex_patterns)
+
+    def _handle_memory_recall_query(self, user_text: str, identity: Dict[str, Any]) -> Tuple[bool, str]:
+        """Handles explicit queries asking about past conversations and person-specific memory recall."""
+        text_l = user_text.lower()
+        triggers = [
+            "hatırlıyor musun", "hatırladın mı", "ne konuştuk", "ne konuşmuştuk",
+            "neler konuştuk", "ne söyledik", "neler söyledik", "önce ne dedik",
+            "hakkımda ne biliyorsun", "hakkımda ne öğrendin", "hafızanda ne var",
+            "hafızanda ne kayıtlı", "hafızanda duruyor mu", "hafızan duruyor mu"
+        ]
+        if not any(t in text_l for t in triggers):
+            return False, ""
+
+        p_name = identity.get("name", "Baran") if identity.get("is_known") else "Baran"
+        persona = self.persona_engine.current_persona
+
+        p_profile = self.memory.profile.get_known_person(p_name)
+        recent_sessions = self.memory.profile.get_person_recent_sessions(p_name, limit=3)
+        learned_facts = p_profile.get("learned_facts", []) if p_profile else []
+        preferences = p_profile.get("preferences", {}) if p_profile else {}
+
+        # 1. Past conversation topics
+        if any(w in text_l for w in ["konuştuk", "konuşmuştuk", "söyledik", "konuları", "saat önce", "dakika önce"]):
+            if recent_sessions:
+                last_sess = recent_sessions[-1]
+                t_str = last_sess.get("time_str", "az önce")
+                summary = last_sess.get("summary", "")
+                if persona == "kufurbaz":
+                    return True, f"Tabii ki hatırlıyorum lan! {t_str} civarında seninle {summary} hakkında konuştuk. Balık hafızalı mıyım ben?"
+                elif persona == "flirt":
+                    return True, f"Elbette hatırlıyorum kral! {t_str} seninle {summary} üzerine konuşmuştuk."
+                else:
+                    return True, f"Evet, hatırlıyorum. {t_str} seninle {summary} konusunu konuşmuştuk."
+            else:
+                if persona == "kufurbaz":
+                    return True, "Hafızamda arşivlenmiş eski bir konu özeti yok ama şu an konuştuklarımızı aklıma kazıyorum merak etme!"
+                return True, "Şu anki sohbetimiz dışında henüz arşivlenmiş eski bir konuşma özetimiz bulunmuyor, ama seni dikkatle dinliyorum!"
+
+        # 2. Personal knowledge recall
+        if any(w in text_l for w in ["hakkımda", "hafızanda", "biliyorsun", "öğrendin"]):
+            parts = []
+            if learned_facts:
+                parts.append("seninle ilgili şunları biliyorum: " + "; ".join(learned_facts[:3]))
+            if preferences:
+                prefs = ", ".join([f"{k}: {v}" for k, v in preferences.items()])
+                parts.append(f"tercihlerinden bildiklerim: {prefs}")
+
+            if parts:
+                info_text = ". Ayrıca ".join(parts)
+                if persona == "kufurbaz":
+                    return True, f"Hafızam zehir gibi! {p_name}, {info_text}. Her şeyi kaydediyorum oğlum buraya!"
+                elif persona == "flirt":
+                    return True, f"Hafızamda seninle ilgili her detay canlı kral! {info_text}."
+                else:
+                    return True, f"Hafızamda seninle ilgili bilgiler kayıtlı: {info_text}."
+            else:
+                if persona == "kufurbaz":
+                    return True, f"Şu an senin hakkında temel unvanın dışında pek bir şey kaydetmedik {p_name}. Bana kendinden ve sevdiklerinden bahset de aklıma yazayım!"
+                return True, f"Hafızamda seninle ilgili henüz detaylı bir bilgi birikimi oluşmadı {p_name}. Bana zevklerinden ve kendinden bahsedersen hepsini öğrenirim!"
+
+        return False, ""
+
+    def _async_extract_user_facts(self, user_text: str, person_name: str):
+        """Asynchronously extracts user preferences and facts to learn autonomously per person."""
+        if not self._groq and not self._openai:
+            return
+        if len(user_text) < 10 or any(c in user_text.lower() for c in ["hava nasıl", "saat kaç", "kimsin", "odayı tarif"]):
+            return
+
+        prompt = (
+            "Aşağıdaki kullanıcı cümlesinden kullanıcıya veya ortama dair kalıcı, somut yeni bir bilgi veya tercih (örneğin sevdiği içecek, hobisi, aile üyesi, sınavı, planı, kuralı) varsa JSON olarak çıkar. "
+            "Eğer sadece genel sohbet, soru veya geçici bir laf ise boş JSON {} döndür.\n"
+            "Format: {\"fact\": \"...\", \"preference_key\": \"...\", \"preference_val\": \"...\"}\n\n"
+            f"Kullanıcı Cümlesi: '{user_text}'"
+        )
+        try:
+            raw_json = None
+            if self._groq and self._active_groq_models:
+                for m in self._active_groq_models[:2]:
+                    try:
+                        res = self._groq.chat.completions.create(
+                            messages=[{"role": "user", "content": prompt}],
+                            model=m,
+                            temperature=0.0,
+                            max_tokens=60
+                        )
+                        raw_json = res.choices[0].message.content.strip()
+                        break
+                    except Exception:
+                        continue
+            if not raw_json and self._openai:
+                res = self._openai.chat.completions.create(
+                    messages=[{"role": "user", "content": prompt}],
+                    model="gpt-4o-mini",
+                    temperature=0.0,
+                    max_tokens=60
+                )
+                raw_json = res.choices[0].message.content.strip()
+
+            if raw_json and "{" in raw_json and "}" in raw_json:
+                json_str = raw_json[raw_json.find("{"):raw_json.rfind("}")+1]
+                data = json.loads(json_str)
+                fact = data.get("fact")
+                if fact and len(fact) > 5:
+                    self.memory.profile.add_person_fact(person_name, fact)
+                    self.get_logger().info(f"💡 [Otonom Öğrenme ({person_name})]: Yeni Bilgi Kaydedildi -> '{fact}'")
+                pref_k = data.get("preference_key")
+                pref_v = data.get("preference_val")
+                if pref_k and pref_v:
+                    self.memory.profile.add_person_preference(person_name, pref_k, pref_v)
+                    self.get_logger().info(f"💡 [Otonom Tercih ({person_name})]: {pref_k} -> {pref_v}")
+        except Exception as e:
+            self.get_logger().debug(f"Fact extraction notice: {e}")
 
     def _is_object_learning_query(self, text: str) -> bool:
         keywords = ["bu benim", "bunu öğren", "bunu kaydet", "bu nesne", "buna bak bu", "bu gördüğün nesne"]
