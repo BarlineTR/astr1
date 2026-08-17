@@ -269,10 +269,24 @@ class AiBrainNode(Node):
         )
 
     def _discover_active_groq_models(self) -> List[str]:
-        """Returns a static list of verified active Groq models to prevent 404 errors and API latency."""
+        """Dynamically queries active, non-deprecated chat models from Groq with safe fallbacks."""
         if not self._groq:
             return []
-        return ["llama-3.3-70b-versatile", "llama3-70b-8192", "llama3-8b-8192"]
+        try:
+            models = self._groq.models.list()
+            chat_models = []
+            for m in models.data:
+                mid = m.id
+                mid_l = mid.lower()
+                if any(x in mid_l for x in ["whisper", "embedding", "guard", "moderation", "tts", "distill"]):
+                    continue
+                chat_models.append(mid)
+            if chat_models:
+                return chat_models
+        except Exception as e:
+            self.get_logger().debug(f"Groq dynamic model discovery notice: {e}")
+        return ["llama-3.3-70b-versatile", "openai/gpt-oss-20b", "llama3-70b-8192"]
+
 
     def _discover_vision_model(self) -> str | None:
         try:
@@ -569,30 +583,14 @@ class AiBrainNode(Node):
                 else:
                     raw_text = clean_prompt
             else:
-                if self._groq:
-                    self.get_logger().info(f"🕵️ [Arka Plan]: '{raw_text}' sosyal filtrede inceleniyor...")
-                    prompt = f"Sen Astro'sun, akıllı bir ev robotusun. Odadaki insanlar şu an kendi aralarında şunu konuşuyor: '{raw_text}'. Bu konuşmada doğrudan sana yöneltilen bir soru var mı, veya dahil olup kesin yardımcı olabileceğin bariz bir fırsat var mı? Sadece EVET veya HAYIR yaz."
-                    try:
-                        res = self._groq.chat.completions.create(
-                            messages=[{"role": "user", "content": prompt}],
-                            model="llama3-8b-8192",
-                            temperature=0.0,
-                            max_tokens=10
-                        )
-                        ans = res.choices[0].message.content.strip().lower()
-                        if "evet" in ans:
-                            self.get_logger().info("🎯 [Sosyal Fırsat]: Arka plan konuşmasına dâhil olunuyor!")
-                            self.session.activate_session(reason="social_barge_in")
-                            self.session.metadata["tts_engine"] = "edge-tts"
-                            self.state_machine.transition_to(RobotState.LISTENING)
-                        else:
-                            self.get_logger().info(f"🔇 [Arka Plan]: '{raw_text}' yok sayıldı (İlgisiz).")
-                            return
-                    except Exception as e:
-                        self.get_logger().warn(f"Sosyal filtre hatası: {e}")
-                        return
+                self.get_logger().info(f"🕵️ [Arka Plan]: '{raw_text}' sosyal filtrede inceleniyor...")
+                if self._evaluate_social_barge_in(raw_text):
+                    self.get_logger().info("🎯 [Sosyal Fırsat]: Arka plan konuşmasına dâhil olunuyor!")
+                    self.session.activate_session(reason="social_barge_in")
+                    self.session.metadata["tts_engine"] = "edge-tts"
+                    self.state_machine.transition_to(RobotState.LISTENING)
                 else:
-                    self.get_logger().info(f"🔇 [Arka Plan Konuşması / Göz Teması Yok]: '{raw_text}' yok sayıldı.")
+                    self.get_logger().info(f"🔇 [Arka Plan]: '{raw_text}' yok sayıldı (İlgisiz).")
                     return
 
         # Active Session Turn
@@ -866,6 +864,62 @@ class AiBrainNode(Node):
         finally:
             with self._lock:
                 self._is_processing = False
+
+    def _evaluate_social_barge_in(self, raw_text: str) -> bool:
+        """Evaluates whether Astro should autonomously join background conversation (Barge-in)."""
+        prompt = (
+            "Sen Astro'sun, sempatik ve akıllı bir sosyal robotsun. "
+            f"Odadaki insanlar kendi aralarında şunu konuşuyor: '{raw_text}'. "
+            "Bu konuşmada sana sorulmuş bir soru var mı, veya doğrudan yardım edebileceğin bariz bir bilgi/durum var mı? "
+            "Sadece tek kelime EVET veya HAYIR yaz."
+        )
+
+        # 1. Try Groq with discovered active chat models
+        if self._groq and self._active_groq_models:
+            for g_model in self._active_groq_models[:3]:
+                try:
+                    res = self._groq.chat.completions.create(
+                        messages=[{"role": "user", "content": prompt}],
+                        model=g_model,
+                        temperature=0.0,
+                        max_tokens=10,
+                        timeout=1.5
+                    )
+                    ans = res.choices[0].message.content.strip().lower()
+                    return "evet" in ans
+                except Exception as ge:
+                    self.get_logger().debug(f"Groq social filter ({g_model}) failed: {ge}")
+                    continue
+
+        # 2. Fallback to OpenAI gpt-4o-mini (Super fast ~100ms, ultra-cheap 1 token)
+        if self._openai:
+            try:
+                res = self._openai.chat.completions.create(
+                    messages=[{"role": "user", "content": prompt}],
+                    model="gpt-4o-mini",
+                    temperature=0.0,
+                    max_tokens=10,
+                    timeout=1.5
+                )
+                ans = res.choices[0].message.content.strip().lower()
+                return "evet" in ans
+            except Exception as oe:
+                self.get_logger().debug(f"OpenAI social filter failed: {oe}")
+
+        # 3. Fallback to Gemini REST if available
+        if self._ai_api_key:
+            try:
+                g_res = self._query_gemini_text_rest(
+                    system_instruction="Sadece tek kelime EVET veya HAYIR yaz.",
+                    user_text=prompt,
+                    history_messages=[]
+                )
+                if g_res:
+                    return "evet" in g_res.lower()
+            except Exception:
+                pass
+
+        return False
 
     def _query_vision(self, prompt: str, base64_image: str) -> str | None:
         persona = self.persona_engine.current_persona
