@@ -16,6 +16,37 @@ import numpy as np
 from typing import Any, Dict, List, Optional, Tuple
 
 
+try:
+    from astro_audio.speaker_db import SpeakerEngine, SpeakerEngineUnavailable
+except ImportError:  # paket kaynaktan çalıştırılıyorsa
+    try:
+        from speaker_db import SpeakerEngine, SpeakerEngineUnavailable
+    except ImportError:
+        SpeakerEngine = None
+
+        class SpeakerEngineUnavailable(RuntimeError):
+            pass
+
+# Ölçüm: aynı kişi 0.46-0.81, farklı kişi 0.16-0.33 -> 0.40 ikisinin arasında.
+VOICE_MATCH_THRESHOLD = float(os.getenv("SPEAKER_MATCH_THRESHOLD", "0.40"))
+
+_ENGINE = None
+_ENGINE_TRIED = False
+
+
+def _get_engine():
+    """WeSpeaker ONNX motorunu bir kez yükler; model yoksa None döner."""
+    global _ENGINE, _ENGINE_TRIED
+    if not _ENGINE_TRIED:
+        _ENGINE_TRIED = True
+        if SpeakerEngine is not None:
+            try:
+                _ENGINE = SpeakerEngine()
+            except SpeakerEngineUnavailable as exc:
+                print(f"[VoiceRecognizer] Konuşmacı modeli yüklenemedi: {exc}")
+    return _ENGINE
+
+
 class VoiceRecognizer:
     """Manages acoustic voiceprints, speaker profiles, and real-time voice identification."""
 
@@ -63,98 +94,20 @@ class VoiceRecognizer:
         return clean or "unknown"
 
     def extract_voiceprint(self, audio_arr: np.ndarray, sample_rate: int = 16000) -> Optional[np.ndarray]:
-        """Extracts a normalized 48-D acoustic voiceprint from raw PCM audio."""
-        if audio_arr is None or len(audio_arr) < 3200:  # at least 0.2s
+        """Sesten L2-normalize edilmiş WeSpeaker (VoxCeleb) vektörü çıkarır.
+
+        Eskiden spektral centroid gibi elle yazılmış istatistikler kullanılıyordu;
+        bunlar konuşmacıdan çok kanal/gürültü karakterini yakalıyordu. Derin
+        gömmeyle ölçülen ayrım: aynı kişi 0.46-0.81, farklı kişi 0.16-0.33.
+        """
+        if audio_arr is None or len(audio_arr) == 0:
+            return None
+
+        engine = _get_engine()
+        if engine is None:
             return None
         try:
-            arr = audio_arr.astype(np.float32)
-            arr = arr - np.mean(arr)
-            # Pre-emphasis
-            arr = np.append(arr[0], arr[1:] - 0.97 * arr[:-1])
-
-            frame_len = int(sample_rate * 0.025)  # 25ms
-            hop_len = int(sample_rate * 0.010)    # 10ms
-            num_frames = max(1, (len(arr) - frame_len) // hop_len)
-
-            features = []
-            f0_list = []
-            spectral_centroids = []
-
-            window = np.hamming(frame_len)
-            fft_size = 512
-            freqs = np.fft.rfftfreq(fft_size, d=1.0/sample_rate)
-
-            # Triangular Mel-Scale Filterbank (16 filters)
-            mel_low = 1125 * np.log(1 + 100 / 700.0)
-            mel_high = 1125 * np.log(1 + (sample_rate / 2) / 700.0)
-            mel_points = np.linspace(mel_low, mel_high, 18)
-            hz_points = 700 * (np.exp(mel_points / 1125.0) - 1)
-            bin_points = np.floor((fft_size + 1) * hz_points / sample_rate).astype(int)
-
-            filterbank = np.zeros((16, fft_size // 2 + 1))
-            for m in range(1, 17):
-                f_m_minus = bin_points[m - 1]
-                f_m = bin_points[m]
-                f_m_plus = bin_points[m + 1]
-                for k in range(f_m_minus, f_m):
-                    if (f_m - f_m_minus) > 0:
-                        filterbank[m - 1, k] = (k - bin_points[m - 1]) / (f_m - f_m_minus)
-                for k in range(f_m, f_m_plus):
-                    if (f_m_plus - f_m) > 0:
-                        filterbank[m - 1, k] = (bin_points[m + 1] - k) / (f_m_plus - f_m)
-
-            mel_energies = []
-            for n in range(min(num_frames, 60)):
-                start = n * hop_len
-                end = start + frame_len
-                if end > len(arr):
-                    break
-                frame = arr[start:end] * window
-                mag = np.abs(np.fft.rfft(frame, n=fft_size))
-                spec_sum = np.sum(mag)
-                if spec_sum > 1e-5:
-                    sc = np.sum(freqs * mag) / spec_sum
-                    spectral_centroids.append(sc)
-
-                # Filterbank energies
-                fb_e = np.dot(filterbank, mag)
-                fb_e = np.where(fb_e == 0, np.finfo(float).eps, fb_e)
-                mel_energies.append(np.log(fb_e))
-
-                # Pitch F0 by autocorrelation
-                corr = np.correlate(frame, frame, mode='full')
-                corr = corr[len(corr)//2:]
-                min_lag = int(sample_rate / 350)
-                max_lag = int(sample_rate / 75)
-                if len(corr) > max_lag:
-                    peak_lag = min_lag + np.argmax(corr[min_lag:max_lag])
-                    if peak_lag > 0:
-                        f0_list.append(sample_rate / peak_lag)
-
-            if not mel_energies:
-                return None
-
-            mel_mat = np.array(mel_energies)  # (N, 16)
-            # 16-band Mean & Variance
-            features.extend(list(np.mean(mel_mat, axis=0)))
-            features.extend(list(np.std(mel_mat, axis=0)))
-
-            # Pitch statistics (mean, std, median)
-            f0_arr = np.array(f0_list) if f0_list else np.array([120.0])
-            features.append(float(np.mean(f0_arr)))
-            features.append(float(np.std(f0_arr)))
-            features.append(float(np.median(f0_arr)))
-
-            # Spectral Centroid moments
-            sc_arr = np.array(spectral_centroids) if spectral_centroids else np.array([1500.0])
-            features.append(float(np.mean(sc_arr)))
-            features.append(float(np.std(sc_arr)))
-
-            feat_vec = np.array(features, dtype=np.float32)
-            norm = np.linalg.norm(feat_vec)
-            if norm > 1e-6:
-                feat_vec = feat_vec / norm
-            return feat_vec
+            return engine.embed(np.asarray(audio_arr), sample_rate)
         except Exception:
             return None
 
@@ -202,7 +155,7 @@ class VoiceRecognizer:
             except Exception:
                 return True
 
-    def recognize_voice(self, audio_arr: np.ndarray, sample_rate: int = 16000, threshold: float = 0.74) -> Tuple[Optional[str], float, Dict[str, Any]]:
+    def recognize_voice(self, audio_arr: np.ndarray, sample_rate: int = 16000, threshold: float = VOICE_MATCH_THRESHOLD) -> Tuple[Optional[str], float, Dict[str, Any]]:
         """Matches audio array against known voiceprints. Returns (name, confidence, metadata)."""
         emb = self.extract_voiceprint(audio_arr, sample_rate)
         if emb is None:
