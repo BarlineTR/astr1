@@ -38,6 +38,11 @@ def main() -> int:
     parser.add_argument("--speaker-wav", required=True, help="Ses klonlama referans dosyası")
     parser.add_argument("--language", default="tr")
     parser.add_argument("--model", default="tts_models/multilingual/multi-dataset/xtts_v2")
+    # Kendi eğitilmiş modeliniz — verilirse hazır xtts_v2 indirilmez, bu dosyalar yüklenir.
+    parser.add_argument("--checkpoint", help="model.pth")
+    parser.add_argument("--config", dest="config_path", help="config.json")
+    parser.add_argument("--vocab", help="vocab.json")
+    parser.add_argument("--speakers", help="speakers_xtts.pth (isteğe bağlı)")
     parser.add_argument("--device", default="auto", choices=["auto", "cuda", "cpu"])
     parser.add_argument("--half", default="1", help="1 = fp16 (yalnızca CUDA'da)")
     parser.add_argument("--batch-size", type=int, default=4)
@@ -64,8 +69,28 @@ def main() -> int:
         device = "cuda" if torch.cuda.is_available() else "cpu"
 
     try:
-        tts = TTS(args.model).to(device)
-        model = tts.synthesizer.tts_model
+        if args.checkpoint:
+            # Kendi eğitilmiş XTTS modeli: kontrol noktası + config + vocab (+ speakers)
+            from TTS.tts.configs.xtts_config import XttsConfig
+            from TTS.tts.models.xtts import Xtts
+
+            config = XttsConfig()
+            config.load_json(args.config_path)
+            model = Xtts.init_from_config(config)
+            model.load_checkpoint(
+                config,
+                checkpoint_path=args.checkpoint,
+                vocab_path=args.vocab,
+                speaker_file_path=args.speakers,
+                eval=True,          # use_half_precision() değerlendirme kipi ister
+                use_deepspeed=False,
+            )
+            model.to(device)
+            model_label = args.checkpoint
+        else:
+            tts = TTS(args.model).to(device)
+            model = tts.synthesizer.tts_model
+            model_label = args.model
         sample_rate = model.config.audio.output_sample_rate
 
         # fp16 yalnızca GPU'da anlamlı; CPU'da yarı hassasiyet yavaşlatır.
@@ -92,6 +117,8 @@ def main() -> int:
             "device": device,
             "half": half,
             "sample_rate": sample_rate,
+            "model": model_label,
+            "custom_model": bool(args.checkpoint),
             "gpu": torch.cuda.get_device_name(0) if device == "cuda" else None,
         }
     )

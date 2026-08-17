@@ -75,6 +75,12 @@ class TtsNode(Node):
         self.declare_parameter("xtts_batch_size", int(os.getenv("TTS_XTTS_BATCH_SIZE", "4")))
         self.declare_parameter("xtts_startup_timeout_s", 300.0)
         self.declare_parameter("xtts_timeout_s", 120.0)
+        # Kendi eğittiğiniz XTTS modeli — boş bırakılırsa hazır xtts_v2 indirilir
+        self.declare_parameter("xtts_model_dir", os.getenv("TTS_XTTS_MODEL_DIR", ""))
+        self.declare_parameter("xtts_checkpoint", os.getenv("TTS_XTTS_CHECKPOINT", ""))
+        self.declare_parameter("xtts_config", os.getenv("TTS_XTTS_CONFIG", ""))
+        self.declare_parameter("xtts_vocab", os.getenv("TTS_XTTS_VOCAB", ""))
+        self.declare_parameter("xtts_speakers", os.getenv("TTS_XTTS_SPEAKERS", ""))
 
         self.engine_name = self.get_parameter("engine").value
         self.voice_name = self.get_parameter("voice").value
@@ -173,6 +179,11 @@ class TtsNode(Node):
             device=self.get_parameter("xtts_device").value,
             half=bool(self.get_parameter("xtts_half").value),
             batch_size=int(self.get_parameter("xtts_batch_size").value),
+            model_dir=self.get_parameter("xtts_model_dir").value or None,
+            checkpoint=self.get_parameter("xtts_checkpoint").value or None,
+            config=self.get_parameter("xtts_config").value or None,
+            vocab=self.get_parameter("xtts_vocab").value or None,
+            speakers=self.get_parameter("xtts_speakers").value or None,
             logger=self._xtts_log,
         )
 
@@ -191,10 +202,18 @@ class TtsNode(Node):
             self._downgrade_to_edge()
             return
 
-        self.get_logger().info(
-            f"⏳ [TTS] XTTS yükleniyor (referans ses: {os.path.basename(speaker_wav)}) — "
-            "model ilk çalıştırmada indirilirse birkaç dakika sürebilir"
-        )
+        if self.xtts.custom_model:
+            self.get_logger().info(
+                f"⏳ [TTS] XTTS yükleniyor — kendi modeliniz: "
+                f"{self.xtts.custom_model['checkpoint']} "
+                f"(referans ses: {os.path.basename(speaker_wav)})"
+            )
+        else:
+            self.get_logger().info(
+                f"⏳ [TTS] XTTS yükleniyor (hazır xtts_v2, referans ses: "
+                f"{os.path.basename(speaker_wav)}) — model ilk çalıştırmada "
+                "indirilirse birkaç dakika sürebilir"
+            )
         # Model yüklemesi uzun sürüyor; düğüm bu sırada spin edebilmeli.
         threading.Thread(target=self._await_xtts_ready, daemon=True).start()
 
@@ -205,8 +224,9 @@ class TtsNode(Node):
             self.get_logger().error(f"XTTS hazır değil: {exc} — konuşmalar edge-tts ile yapılacak")
             self.xtts = None
             return
+        model_label = "kendi modeliniz" if info.get("custom_model") else "hazır xtts_v2"
         self.get_logger().info(
-            f"✅ [TTS] XTTS hazır (cihaz: {info.get('device')}"
+            f"✅ [TTS] XTTS hazır ({model_label}, cihaz: {info.get('device')}"
             f"{', fp16' if info.get('half') else ''}"
             f"{', ' + info['gpu'] if info.get('gpu') else ''})"
         )

@@ -19,6 +19,15 @@ PREFIX = "@@XTTS@@ "
 
 DEFAULT_HOME = os.path.expanduser("~/.astro/tts")
 
+# Kendi eğitilmiş bir XTTS modeli klasöründe beklenen dosya adları
+CUSTOM_MODEL_FILES = {
+    "checkpoint": "model.pth",
+    "config": "config.json",
+    "vocab": "vocab.json",
+    "speakers": "speakers_xtts.pth",   # isteğe bağlı
+}
+OPTIONAL_MODEL_FILES = ("speakers",)
+
 
 class XttsError(RuntimeError):
     """İşçi başlatılamadı ya da sentez başarısız oldu."""
@@ -40,6 +49,11 @@ class XttsClient:
         half=True,
         batch_size=4,
         model="tts_models/multilingual/multi-dataset/xtts_v2",
+        model_dir=None,
+        checkpoint=None,
+        config=None,
+        vocab=None,
+        speakers=None,
         logger=None,
     ):
         self.home = Path(os.path.expanduser(home or os.getenv("TTS_XTTS_HOME") or DEFAULT_HOME))
@@ -52,6 +66,10 @@ class XttsClient:
         self.model = model
         self._log = logger or (lambda level, msg: None)
 
+        # Kendi modeliniz: klasör verilirse dosya adları ondan türetilir, tek tek
+        # verilen yollar klasörden gelenleri ezer. Hiçbiri yoksa hazır xtts_v2 kullanılır.
+        self.custom_model = self._resolve_custom_model(model_dir, checkpoint, config, vocab, speakers)
+
         self.proc = None
         self.info = {}
         self._responses = queue.Queue()
@@ -59,6 +77,46 @@ class XttsClient:
         self._startup_error = None
         self._req_lock = threading.Lock()
         self._req_id = 0
+
+    # --------------------------------------------------------- kendi modeliniz
+    @staticmethod
+    def _resolve_custom_model(model_dir, checkpoint, config, vocab, speakers):
+        """Verilen klasör/yollardan model dosyalarını çözer; hiçbiri yoksa None."""
+        explicit = {"checkpoint": checkpoint, "config": config, "vocab": vocab, "speakers": speakers}
+        if not model_dir and not any(explicit.values()):
+            return None
+
+        resolved = {}
+        base = Path(os.path.expanduser(model_dir)) if model_dir else None
+        for key, filename in CUSTOM_MODEL_FILES.items():
+            given = explicit.get(key)
+            if given:
+                # Elle verilen yol yoksa sessizce yutulmaz; doğrulama hata döndürür.
+                resolved[key] = os.path.abspath(os.path.expanduser(given))
+            elif base is not None:
+                path = str((base / filename).absolute())
+                # speakers_xtts.pth her eğitimde üretilmez: klasörden türetilmiş ve
+                # yoksa isteğe bağlı sayılır, model onsuz da klonlama yapar.
+                resolved[key] = None if (key in OPTIONAL_MODEL_FILES and not os.path.exists(path)) else path
+            else:
+                resolved[key] = None
+        return resolved
+
+    def _check_custom_model(self):
+        """Kendi modeliniz seçiliyse dosyaları doğrular; sorun varsa mesaj döndürür."""
+        if not self.custom_model:
+            return None
+        for key, path in self.custom_model.items():
+            if not path:
+                if key in OPTIONAL_MODEL_FILES:
+                    continue
+                return (
+                    f"Özel XTTS modeli eksik: {key} yolu verilmedi "
+                    f"(TTS_XTTS_MODEL_DIR ya da TTS_XTTS_{key.upper()} ayarlayın)"
+                )
+            if not os.path.exists(path):
+                return f"Özel XTTS modeli dosyası bulunamadı: {path}"
+        return None
 
     # ------------------------------------------------------------------ yollar
     @property
@@ -80,7 +138,7 @@ class XttsClient:
             return f"Referans ses dosyası yok: {self.speaker_wav}"
         if not self.worker_path.exists():
             return f"İşçi betiği bulunamadı: {self.worker_path}"
-        return None
+        return self._check_custom_model()
 
     # ------------------------------------------------------------------ yaşam döngüsü
     def start(self):
@@ -99,6 +157,12 @@ class XttsClient:
             "--batch-size", str(self.batch_size),
             "--model", self.model,
         ]
+
+        if self.custom_model:
+            for key, flag in (("checkpoint", "--checkpoint"), ("config", "--config"),
+                              ("vocab", "--vocab"), ("speakers", "--speakers")):
+                if self.custom_model.get(key):
+                    cmd += [flag, self.custom_model[key]]
 
         env = os.environ.copy()
         # Kabuk profili ROS Humble'ı source ettiğinde PYTHONPATH venv'in içine sızar

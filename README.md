@@ -235,6 +235,23 @@ TTS_XTTS_BATCH_SIZE=4        # batch sentence decoding on long text
 
 **Changing the robot's voice.** The reference clip ships with the package at `ros2_ws/src/astro_audio/voices/astro.wav` (~9 s). Replace that file, or point `TTS_XTTS_SPEAKER_WAV` at an absolute path. Use 6–30 s of clean, single-speaker audio.
 
+**Using your own fine-tuned XTTS model.** If you trained or downloaded an XTTS checkpoint, point the node at it and the stock `xtts_v2` is never downloaded:
+
+```ini
+TTS_XTTS_MODEL_DIR="/home/user/Downloads/optimized_model"
+```
+
+The directory is expected to hold `model.pth`, `config.json`, `vocab.json` and — optionally — `speakers_xtts.pth`. A missing `speakers_xtts.pth` is fine: it only carries the built-in speaker table, and reference-clip cloning does not use it. If your files sit elsewhere or have different names, set them one by one; these override anything derived from the directory:
+
+```ini
+TTS_XTTS_CHECKPOINT="/path/to/model.pth"
+TTS_XTTS_CONFIG="/path/to/config.json"
+TTS_XTTS_VOCAB="/path/to/vocab.json"
+TTS_XTTS_SPEAKERS="/path/to/speakers_xtts.pth"
+```
+
+Paths are checked before the worker starts, so a typo is reported as `Özel XTTS modeli dosyası bulunamadı: <path>` and the node falls back to edge-tts instead of hanging. The startup log tells you which model is live — `kendi modeliniz` versus `hazır xtts_v2`. Voice cloning, fp16 and batching work identically on a custom checkpoint.
+
 **Behaviour and expectations.**
 - Startup takes ~10–30 s (model load + warm-up) and much longer on the first run if the checkpoint still has to download. The node does not block: sentences arriving before XTTS is ready are spoken by `edge-tts` instead, and `✅ [TTS] XTTS hazır` is logged when the worker is warm.
 - If the install is missing, the worker fails to start, or it dies mid-run, `tts_node` logs the reason and falls back to `edge-tts` (or `pyttsx3` when there is no internet package) — the robot never goes silent.
