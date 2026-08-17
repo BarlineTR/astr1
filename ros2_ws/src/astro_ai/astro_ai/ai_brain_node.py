@@ -174,39 +174,38 @@ class AiBrainNode(Node):
             on_session_end=self._on_session_timed_out
         )
 
-        # Groq Client
+        # 1. OpenAI Client (Primary High-Performance LLM & Vision Engine)
+        self.openai_api_key = os.environ.get("OPENAI_API_KEY", "").strip() or os.environ.get("AI_API_KEY", "").strip()
+        self._openai = None
+        self._enabled = False
+
+        if OpenAI and self.openai_api_key and self.openai_api_key.startswith("sk-"):
+            try:
+                self._openai = OpenAI(api_key=self.openai_api_key)
+                self._enabled = True
+                self.get_logger().info(f"🚀 [AI Brain] OpenAI GPT-4o-mini Birincil LLM & Vision Motoru Aktif! (Model: {self._text_model})")
+            except Exception as e:
+                self.get_logger().error(f"❌ [AI Brain] OpenAI client başlatılamadı: {e}")
+
+        # 2. Groq Client (Secondary / Fallback Engine)
         self.groq_api_key = os.environ.get("GROQ_API_KEY", "").strip()
         self._groq = None
-        self._enabled = True
+        self._active_groq_models = []
 
         if Groq and self.groq_api_key:
             try:
                 self._groq = Groq(api_key=self.groq_api_key)
                 self._active_groq_models = self._discover_active_groq_models()
-                self._vision_model = self._discover_vision_model()
-                v_name = self._vision_model if self._vision_model else "Gemini Flash (Direct REST)"
-                t_name = self._active_groq_models[0] if self._active_groq_models else self._text_model
-                self.get_logger().info(f"✅ [AI Brain] LLM Aktif — Metin: {t_name} (Toplam {len(self._active_groq_models)} Groq Modeli) | Vision: {v_name}")
+                self._enabled = True
+                self.get_logger().info(f"✅ [AI Brain] Groq Yedek Motoru Hazır (Toplam {len(self._active_groq_models)} Model)")
             except Exception as e:
-                self.get_logger().error(f"❌ [AI Brain] Groq client başlatılamadı: {e}")
-                self._active_groq_models = []
-                self._enabled = False
-        else:
-            self.get_logger().error("❌ [AI Brain] GROQ_API_KEY bulunamadı! STT/LLM devre dışı.")
-            self._active_groq_models = []
-            self._enabled = False
+                self.get_logger().debug(f"Groq client notice: {e}")
 
-        # Secondary / Vision Fallback Client (Gemini / OpenAI API)
+        if not self._openai and not self._groq:
+            self.get_logger().error("❌ [AI Brain] Ne OPENAI_API_KEY ne de GROQ_API_KEY bulunamadı! LLM devre dışı.")
+
+        # 3. Gemini REST API Key (Tertiary Fallback)
         self._ai_api_key = os.environ.get("AI_API_KEY", "").strip()
-        self._ai_base_url = os.environ.get("AI_BASE_URL", "https://generativelanguage.googleapis.com/v1beta/openai/").strip()
-        self._ai_model = os.environ.get("AI_MODEL", "gemini-2.5-flash").strip()
-        self._fallback_vision_client = None
-        if OpenAI and self._ai_api_key:
-            try:
-                self._fallback_vision_client = OpenAI(api_key=self._ai_api_key, base_url=self._ai_base_url)
-                self.get_logger().info(f"✅ [AI Brain] Gemini/OpenAI Vision Yedek İstemcisi Hazır ({self._ai_model})")
-            except Exception as e:
-                self.get_logger().debug(f"OpenAI fallback client notice: {e}")
 
         # Perception & Hardware State
         self._lock = threading.Lock()
@@ -710,7 +709,7 @@ class AiBrainNode(Node):
             if is_visual:
                 if base64_img is not None:
                     self.get_logger().info(f"👁️ [Vision]: OAK-D karesi analiz ediliyor... ({self._vision_model})")
-                    vision_ans = self._query_groq_vision(user_text, base64_img)
+                    vision_ans = self._query_vision(user_text, base64_img)
                     if vision_ans:
                         clean_ans = clean_tts_text(vision_ans)
                         self.get_logger().info(f"🤖 [Astro]: \"{clean_ans}\"")
@@ -741,24 +740,36 @@ class AiBrainNode(Node):
                 messages[-1]["content"] = perception_prefix + messages[-1]["content"]
 
             stream_resp = None
-            models_to_try = list(self._active_groq_models) if self._active_groq_models else [self._text_model]
-            if self._text_model in models_to_try:
-                models_to_try.remove(self._text_model)
-                models_to_try.insert(0, self._text_model)
 
-            for m in models_to_try:
+            # 1. Try Primary OpenAI Client (gpt-4o-mini)
+            if self._openai:
                 try:
-                    stream_resp = self._groq.chat.completions.create(
+                    stream_resp = self._openai.chat.completions.create(
                         messages=messages,
-                        model=m,
+                        model=self._text_model,
                         temperature=self._temperature,
                         max_tokens=self._max_tokens,
                         stream=True,
                     )
-                    break
-                except Exception as stream_err:
-                    self.get_logger().warn(f"⚠️ Model {m} stream hatası: {stream_err}")
-                    continue
+                except Exception as oai_err:
+                    self.get_logger().warn(f"⚠️ [OpenAI GPT Stream Hatası] ({oai_err}), Groq yedeğe geçiliyor...")
+
+            # 2. Try Secondary Groq Client (Llama 3.3 70B)
+            if stream_resp is None and self._groq:
+                models_to_try = list(self._active_groq_models) if self._active_groq_models else [self._text_model]
+                for m in models_to_try:
+                    try:
+                        stream_resp = self._groq.chat.completions.create(
+                            messages=messages,
+                            model=m,
+                            temperature=self._temperature,
+                            max_tokens=self._max_tokens,
+                            stream=True,
+                        )
+                        break
+                    except Exception as stream_err:
+                        self.get_logger().warn(f"⚠️ [Groq Stream Hatası] Model {m}: {stream_err}")
+                        continue
 
             # Fallback to Direct Google Gemini REST Text Generation
             if stream_resp is None:
@@ -836,69 +847,15 @@ class AiBrainNode(Node):
             with self._lock:
                 self._is_processing = False
 
-    def _query_groq_vision(self, prompt: str, base64_image: str) -> str | None:
+    def _query_vision(self, prompt: str, base64_image: str) -> str | None:
         persona = self.persona_engine.current_persona
         system_instruction = f"Sen Astro adında {persona} karakterli akıllı ve sempatik bir sosyal robotsun. Karşındaki kameradan çekilen görüntüyü görüyorsun. Kullanıcının sorusunu (örneğin elinde ne tuttuğunu veya odada ne olduğunu) dikkatle incele ve kendi kişiliğinle tek bir eksiksiz doğal Türkçe cümleyle yanıtla."
 
-        # 1. Try Primary Groq Vision (if available)
-        if self._groq and self._vision_model:
-            try:
-                response = self._groq.chat.completions.create(
-                    messages=[
-                        {"role": "system", "content": system_instruction},
-                        {"role": "user", "content": [
-                            {"type": "text", "text": prompt},
-                            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"}}
-                        ]}
-                    ],
-                    model=self._vision_model,
-                    temperature=0.2,
-                    max_tokens=300
-                )
-                raw = response.choices[0].message.content.strip()
-                clean = extract_spoken_turkish_sentence(raw)
-                if clean:
-                    self.cloud_mgr.record_llm_success()
-                    return clean
-            except Exception as e:
-                self.get_logger().warn(f"⚠️ [Groq Vision] Başarısız ({e}), Gemini Vision yedeğe geçiliyor...")
-
-        # 2. Try Direct Google Gemini REST Endpoint (Ultra-Fast, Zero-Dependency)
-        if self._ai_api_key:
-            gemini_vision_models = ["gemini-flash-latest", "gemini-flash-lite-latest", "gemini-2.5-flash-lite", "gemini-2.5-flash", "gemini-pro-latest"]
-            for g_model in gemini_vision_models:
+        # 1. Try Primary OpenAI Vision Client (gpt-4o-mini / gpt-4o)
+        if self._openai:
+            for m_cand in [self._vision_model, "gpt-4o-mini", "gpt-4o"]:
                 try:
-                    url = f"https://generativelanguage.googleapis.com/v1beta/models/{g_model}:generateContent?key={self._ai_api_key}"
-                    payload = {
-                        "contents": [{
-                            "parts": [
-                                {"text": f"{system_instruction}\n\nKullanıcı: {prompt}"},
-                                {"inlineData": {"mimeType": "image/jpeg", "data": base64_image}}
-                            ]
-                        }],
-                        "generationConfig": {
-                            "temperature": 0.2,
-                            "maxOutputTokens": 1024
-                        }
-                    }
-                    data_bytes = json.dumps(payload).encode("utf-8")
-                    req = urllib.request.Request(url, data=data_bytes, headers={"Content-Type": "application/json"})
-                    with urllib.request.urlopen(req, timeout=5.0) as resp:
-                        res_json = json.loads(resp.read().decode("utf-8"))
-                        text = res_json["candidates"][0]["content"]["parts"][0]["text"].strip()
-                        clean_ans = clean_tts_text(text)
-                        if clean_ans and len(clean_ans) >= 3:
-                            self.cloud_mgr.record_llm_success()
-                            self.get_logger().info(f"✨ [Gemini Vision REST] Görsel başarıyla yanıtlandı ({g_model}): '{clean_ans}'")
-                            return clean_ans
-                except Exception as e:
-                    self.get_logger().warn(f"⚠️ [Gemini REST ({g_model}) Hatası]: {e}")
-
-        # 3. Try Fallback OpenAI Client (if OpenAI key)
-        if self._fallback_vision_client and self._ai_api_key.startswith("sk-"):
-            for m_cand in ["gpt-4o-mini", "gpt-4o"]:
-                try:
-                    response = self._fallback_vision_client.chat.completions.create(
+                    response = self._openai.chat.completions.create(
                         messages=[
                             {"role": "system", "content": system_instruction},
                             {"role": "user", "content": [
@@ -916,8 +873,41 @@ class AiBrainNode(Node):
                         self.cloud_mgr.record_llm_success()
                         self.get_logger().info(f"✨ [OpenAI Vision] Görsel başarıyla yanıtlandı ({m_cand}): '{clean_ans}'")
                         return clean_ans
-                except Exception as e2:
-                    self.get_logger().warn(f"⚠️ [OpenAI Vision ({m_cand}) Hatası]: {e2}")
+                except Exception as e:
+                    self.get_logger().warn(f"⚠️ [OpenAI Vision ({m_cand}) Hatası]: {e}")
+
+        # 2. Try Secondary Google Gemini REST Endpoint
+        if self._ai_api_key and self._ai_api_key.startswith("AIza"):
+            gemini_vision_models = ["gemini-2.0-flash", "gemini-1.5-flash", "gemini-flash-latest"]
+            for g_model in gemini_vision_models:
+                try:
+                    url = f"https://generativelanguage.googleapis.com/v1beta/models/{g_model}:generateContent?key={self._ai_api_key}"
+                    payload = {
+                        "contents": [{
+                            "parts": [
+                                {"text": f"{system_instruction}\n\nKullanıcı: {prompt}"},
+                                {"inlineData": {"mimeType": "image/jpeg", "data": base64_image}}
+                            ]
+                        }],
+                        "generationConfig": {
+                            "temperature": 0.2,
+                            "maxOutputTokens": 512
+                        }
+                    }
+                    data_bytes = json.dumps(payload).encode("utf-8")
+                    req = urllib.request.Request(url, data=data_bytes, headers={"Content-Type": "application/json"})
+                    with urllib.request.urlopen(req, timeout=5.0) as resp:
+                        res_json = json.loads(resp.read().decode("utf-8"))
+                        text = res_json["candidates"][0]["content"]["parts"][0]["text"].strip()
+                        clean_ans = clean_tts_text(text)
+                        if clean_ans and len(clean_ans) >= 3:
+                            self.cloud_mgr.record_llm_success()
+                            self.get_logger().info(f"✨ [Gemini Vision REST] Görsel başarıyla yanıtlandı ({g_model}): '{clean_ans}'")
+                            return clean_ans
+                except Exception as e:
+                    self.get_logger().warn(f"⚠️ [Gemini REST ({g_model}) Hatası]: {e}")
+
+        return None
 
         self.cloud_mgr.record_llm_failure("All vision models failed")
         return "Şu an kameramdan net göremiyorum, biraz daha yaklaştırır mısın?"
@@ -1150,7 +1140,7 @@ class AiBrainNode(Node):
                     if base64_img:
                         self.get_logger().info("🕵️ [Idle Learning] Etraf sessiz, Astro etrafı inceliyor...")
                         prompt = "Kameradaki görüntüyü Türkçe olarak tek bir kısa cümleyle açıkla. Açıklama harici hiçbir şey yazma. Örnek: 'Masada bir bilgisayar var.' veya 'Oda şu an aydınlık ve boş.'"
-                        obs = self._query_groq_vision(prompt, base64_img)
+                        obs = self._query_vision(prompt, base64_img)
                         if obs:
                             self.memory.profile.add_observation(obs)
                             self.get_logger().info(f"🧠 [Hafıza Güncellendi - Gözlem]: {obs}")

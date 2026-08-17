@@ -38,6 +38,11 @@ except ImportError:
     Groq = None
 
 try:
+    from openai import OpenAI
+except ImportError:
+    OpenAI = None
+
+try:
     from dotenv import find_dotenv, load_dotenv
 except ImportError:
     def find_dotenv(*args, **kwargs): return ""
@@ -101,23 +106,29 @@ class SpeechRecognitionNode(Node):
     def __init__(self):
         super().__init__('speech_recognition_node')
 
-        self.enabled = True
-        if Groq is None:
-            self.get_logger().error("❌ [STT] groq kütüphanesi kurulu değil!")
-            self.enabled = False
-            return
-
         _load_env()
-        api_key = os.environ.get("GROQ_API_KEY", "").strip()
-        if not api_key:
-            self.get_logger().error("❌ [STT] GROQ_API_KEY bulunamadı! STT devre dışı.")
-            self.enabled = False
-            return
+        self.openai_api_key = os.environ.get("OPENAI_API_KEY", "").strip() or os.environ.get("AI_API_KEY", "").strip()
+        self.groq_api_key = os.environ.get("GROQ_API_KEY", "").strip()
+        
+        self.openai_client = None
+        self.groq_client = None
 
-        try:
-            self.groq_client = Groq(api_key=api_key)
-        except Exception as e:
-            self.get_logger().error(f"❌ [STT] Groq client başlatılamadı: {e}")
+        if OpenAI and self.openai_api_key and self.openai_api_key.startswith("sk-"):
+            try:
+                self.openai_client = OpenAI(api_key=self.openai_api_key)
+                self.get_logger().info("🚀 [STT] OpenAI Whisper-1 Birincil STT Motoru Aktif!")
+            except Exception as e:
+                self.get_logger().error(f"❌ [STT] OpenAI client başlatılamadı: {e}")
+
+        if Groq and self.groq_api_key:
+            try:
+                self.groq_client = Groq(api_key=self.groq_api_key)
+                self.get_logger().info("✅ [STT] Groq Whisper-large-v3 Yedek Motoru Hazır.")
+            except Exception as e:
+                self.get_logger().debug(f"Groq client notice: {e}")
+
+        if not self.openai_client and not self.groq_client:
+            self.get_logger().error("❌ [STT] Ne OPENAI_API_KEY ne de GROQ_API_KEY bulunamadı! STT devre dışı.")
             self.enabled = False
             return
 
@@ -349,16 +360,35 @@ class SpeechRecognitionNode(Node):
             if is_known_spk:
                 self.get_logger().info(f"🎙️ [Ses Tanıma]: {spk_name} ({spk_meta.get('formal_title', '')}) (Güven: {spk_conf:.2f})")
 
-            # Whisper Transcription without prompt seeding (completely eliminates hallucinated completions)
-            result = self.groq_client.audio.transcriptions.create(
-                file=("speech.wav", wav_bytes),
-                model="whisper-large-v3",
-                language="tr",
-                temperature=0.0,
-                response_format="text"
-            )
+            text = None
+            if self.openai_client:
+                try:
+                    res = self.openai_client.audio.transcriptions.create(
+                        model="whisper-1",
+                        file=("speech.wav", wav_bytes),
+                        language="tr",
+                        temperature=0.0,
+                        response_format="text"
+                    )
+                    text = str(res).strip()
+                except Exception as oe:
+                    self.get_logger().warn(f"⚠️ [OpenAI Whisper] Hatası ({oe}), Groq Whisper yedeğe geçiliyor...")
 
-            text = str(result).strip()
+            if not text and self.groq_client:
+                try:
+                    result = self.groq_client.audio.transcriptions.create(
+                        file=("speech.wav", wav_bytes),
+                        model="whisper-large-v3",
+                        language="tr",
+                        temperature=0.0,
+                        response_format="text"
+                    )
+                    text = str(result).strip()
+                except Exception as ge:
+                    self.get_logger().warn(f"⚠️ [Groq Whisper] Hatası: {ge}")
+
+            if not text:
+                return
             text_lower = text.lower().strip(" .,!?:;")
 
             # Hallucination Filter: Ignore known Whisper silence phantom phrases
