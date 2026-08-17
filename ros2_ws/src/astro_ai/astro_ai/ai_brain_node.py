@@ -154,6 +154,7 @@ class AiBrainNode(Node):
         self.declare_parameter("gaze_cooldown_s", float(os.getenv("GAZE_COOLDOWN_S", "45.0")))
         self.declare_parameter("gaze_startup_grace_s", float(os.getenv("GAZE_STARTUP_GRACE_S", "15.0")))
         self.declare_parameter("default_user_name", os.getenv("DEFAULT_USER_NAME", "Misafir"))
+        self.declare_parameter("enable_idle_learning", os.getenv("ENABLE_IDLE_LEARNING", "false").lower() == "true")
 
         self._text_model = self.get_parameter("llm_model").value
         self._fallback_models = ["llama-3.3-70b-versatile", "llama-3.1-8b-instant", "mixtral-8x7b-32768"]
@@ -166,6 +167,7 @@ class AiBrainNode(Node):
         self._gaze_cooldown_s = float(self.get_parameter("gaze_cooldown_s").value)
         self._gaze_startup_grace_s = float(self.get_parameter("gaze_startup_grace_s").value)
         self._default_user_name = str(self.get_parameter("default_user_name").value)
+        self._enable_idle_learning = bool(self.get_parameter("enable_idle_learning").value)
 
         # Adaptive Session
         self.session = ConversationSession(
@@ -509,11 +511,22 @@ class AiBrainNode(Node):
         return False
 
     def _on_speech(self, msg: String):
-        raw_text = msg.data.strip()
-        if not raw_text or self._tts_speaking or not self._enabled:
+        if not self._enabled:
+            return
+
+        user_text = msg.data.strip()
+        if not user_text:
             return
 
         now = time.monotonic()
+        if (now - getattr(self, '_last_llm_turn_time', 0.0)) < 0.35:
+            self.get_logger().debug("Debouncing rapid speech message")
+            return
+        self._last_llm_turn_time = now
+
+        if self._tts_speaking:
+            return
+
         t_vad_start = now
 
         # Turn head toward sound DOA
@@ -851,7 +864,7 @@ class AiBrainNode(Node):
         persona = self.persona_engine.current_persona
         system_instruction = f"Sen Astro adında {persona} karakterli akıllı ve sempatik bir sosyal robotsun. Karşındaki kameradan çekilen görüntüyü görüyorsun. Kullanıcının sorusunu (örneğin elinde ne tuttuğunu veya odada ne olduğunu) dikkatle incele ve kendi kişiliğinle tek bir eksiksiz doğal Türkçe cümleyle yanıtla."
 
-        # 1. Try Primary OpenAI Vision Client (gpt-4o-mini / gpt-4o)
+        # 1. Try Primary OpenAI Vision Client (gpt-4o-mini / gpt-4o) with low-detail token optimization
         if self._openai:
             for m_cand in [self._vision_model, "gpt-4o-mini", "gpt-4o"]:
                 try:
@@ -860,7 +873,10 @@ class AiBrainNode(Node):
                             {"role": "system", "content": system_instruction},
                             {"role": "user", "content": [
                                 {"type": "text", "text": prompt},
-                                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"}}
+                                {"type": "image_url", "image_url": {
+                                    "url": f"data:image/jpeg;base64,{base64_image}",
+                                    "detail": "low"  # Ultra-efficient: 85 tokens instead of 1000+
+                                }}
                             ]}
                         ],
                         model=m_cand,
@@ -1121,8 +1137,10 @@ class AiBrainNode(Node):
 
     def _idle_learning_loop(self):
         while rclpy.ok():
-            time.sleep(10)
-            if not self._enabled or not self.state_machine.is_idle() or self._tts_speaking or self._is_processing:
+            time.sleep(15)
+            if not self._enable_idle_learning or not self._enabled:
+                continue
+            if not self.state_machine.is_idle() or self._tts_speaking or self._is_processing or not self._person_detected:
                 continue
 
             now = time.monotonic()

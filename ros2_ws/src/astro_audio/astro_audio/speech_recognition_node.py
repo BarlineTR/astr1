@@ -282,7 +282,12 @@ class SpeechRecognitionNode(Node):
                     self._is_speaking = False
                     self._last_speech_time = None
 
-        if audio_data is not None and len(audio_data) >= 4800:  # at least 0.3s
+        if audio_data is not None and len(audio_data) >= 5600:  # at least 0.35s of sound
+            now = time.monotonic()
+            if (now - getattr(self, '_last_transcribe_dispatch_time', 0.0)) < 0.45:
+                return  # Protect against rapid duplicate triggers
+            self._last_transcribe_dispatch_time = now
+
             with self._transcribe_lock:
                 self._stt_sequence += 1
                 my_seq = self._stt_sequence
