@@ -23,9 +23,15 @@ DEFAULT_DB_PATH = Path(os.path.expanduser(os.getenv("FACE_DB_PATH", "~/.astro/fa
 YUNET_FILE = "yunet.onnx"
 SFACE_FILE = "sface.onnx"
 
-# OpenCV'nin SFace için belgelediği eşik: kosinüs benzerliği >= 0.363 ise aynı kişi.
-# Yükseltmek "tanımıyorum" demesini sıklaştırır (yanlış tanımayı azaltır).
-DEFAULT_COSINE_THRESHOLD = float(os.getenv("FACE_MATCH_THRESHOLD", "0.363"))
+# OpenCV'nin SFace için belgelediği eşik 0.363'tür. Ancak known_faces galerisinde
+# kişi başına tek fotoğraf olduğu için ölçtük: farklı kişilerin en yüksek benzerliği
+# 0.414 (ali_yerlikaya ↔ hakan_fidan). 0.45, o yanlış eşleşmenin üstünde kalır.
+# Asıl çözüm kişi başına 2-3 fotoğraf eklemektir; sonra 0.40'a indirilebilir.
+DEFAULT_COSINE_THRESHOLD = float(os.getenv("FACE_MATCH_THRESHOLD", "0.45"))
+
+# YuNet çok büyük girdilerde yüz kaçırıyor; algılama bu kenar uzunluğuna
+# küçültülmüş kopyada yapılır (koordinatlar sonra geri ölçeklenir).
+MAX_DETECT_SIDE = 1024
 
 
 class FaceEngineUnavailable(RuntimeError):
@@ -67,9 +73,26 @@ class FaceEngine:
 
     # ------------------------------------------------------------------ algılama
     def detect(self, frame) -> np.ndarray:
-        """Karedeki yüzleri döndürür (Nx15: kutu, 5 nokta, skor)."""
+        """Karedeki yüzleri döndürür (Nx15: kutu, 5 nokta, skor).
+
+        Çok büyük görsellerde (örn. 3000 px'lik portreler) YuNet yüzü hiç
+        bulamıyor; galeri fotoğraflarının 9/25'i bu yüzden kaçıyordu. Algılama
+        küçültülmüş kopyada yapılıp koordinatlar orijinale geri ölçeklenir —
+        hizalama (alignCrop) yine tam çözünürlüklü kareden yapılır.
+        """
         height, width = frame.shape[:2]
-        # YuNet giriş boyutunu önceden bilmek ister; kare boyutu değişebilir.
+        scale = min(1.0, MAX_DETECT_SIDE / max(height, width))
+
+        if scale < 1.0:
+            small = cv2.resize(frame, (int(width * scale), int(height * scale)))
+            self._detector.setInputSize((small.shape[1], small.shape[0]))
+            _retval, faces = self._detector.detect(small)
+            if faces is None:
+                return np.empty((0, 15), dtype=np.float32)
+            faces = faces.copy()
+            faces[:, :14] /= scale       # ilk 14 sütun koordinat, 15. skor
+            return faces
+
         self._detector.setInputSize((width, height))
         _retval, faces = self._detector.detect(frame)
         return faces if faces is not None else np.empty((0, 15), dtype=np.float32)
@@ -78,6 +101,10 @@ class FaceEngine:
         """Bir yüzü hizalayıp 128 boyutlu vektörünü çıkarır."""
         aligned = self._recognizer.alignCrop(frame, face_row)
         return self._recognizer.feature(aligned)
+
+    def feature(self, aligned_face) -> np.ndarray:
+        """Zaten 112x112'ye hizalanmış bir yüzden vektör çıkarır (hizalama yapmaz)."""
+        return self._recognizer.feature(aligned_face)
 
     def embed_largest(self, frame):
         """Karedeki en büyük yüzün vektörünü döndürür; yüz yoksa None."""
