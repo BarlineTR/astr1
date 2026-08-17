@@ -136,10 +136,10 @@ class SpatialVisionNode(Node):
             return yaw_deg, True
         elif len(eyes) == 1:
             eye_x = eyes[0][0] + eyes[0][2] / 2.0
-            yaw_deg = -25.0 if eye_x < rw / 2.0 else 25.0
+            yaw_deg = -20.0 if eye_x < rw / 2.0 else 20.0
             return yaw_deg, True
-        # If ZERO eyes found, the face is turned away / back of the head — NOT looking at robot!
-        return 90.0, False
+        # Frontal face cascade already confirms a frontal face ROI; default to facing forward (yaw=0°)
+        return 0.0, True
 
     def _detect_facial_emotion(self, face_roi_gray, w, h) -> str:
         """Determines emotion (happy/smiling, surprised, sad/neutral) based on mouth and eyes geometry."""

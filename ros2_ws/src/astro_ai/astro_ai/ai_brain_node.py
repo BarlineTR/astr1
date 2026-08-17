@@ -302,6 +302,8 @@ class AiBrainNode(Node):
 
     def _on_person_detected(self, msg: Bool):
         self._person_detected = msg.data
+        if msg.data:
+            self._last_person_seen_time = time.monotonic()
 
     def _on_user_distance(self, msg: Float32):
         self._user_distance = float(msg.data)
@@ -488,34 +490,39 @@ class AiBrainNode(Node):
             return
 
         has_wake_word, clean_prompt = self.session.is_wake_word(raw_text, self._wake_word)
+        recent_person = (self._person_detected or (hasattr(self, '_last_person_seen_time') and (now - self._last_person_seen_time) < 4.0))
 
-        # If IDLE: Only activate on Wake Word or Direct Gaze
+        # If IDLE: Activate on Wake Word / Greetings, Direct Gaze, or Person Presence
         if self.state_machine.is_idle():
-            if has_wake_word or self._looking_at_robot:
-                self.session.activate_session(reason="wake_word" if has_wake_word else "gaze")
+            if has_wake_word or self._looking_at_robot or recent_person:
+                activation_reason = "wake_word" if has_wake_word else ("gaze" if self._looking_at_robot else "person_presence")
+                self.session.activate_session(reason=activation_reason)
                 self.state_machine.transition_to(RobotState.LISTENING)
                 persona = self.persona_engine.current_persona
-                self.get_logger().info(f"✨ [AI] Etkileşim Başlatıldı ({persona.upper()}): '{raw_text}'")
+                self.get_logger().info(f"✨ [AI] Etkileşim Başlatıldı ({persona.upper()} - {activation_reason}): '{raw_text}'")
                 self._publish_emotion(persona)
                 self._publish_gesture("nod")
 
                 greeting_map = {
                     "flirt": "Buyur güzellik, bütün algılarım seninle..." if self._speaker_gender == "female" else "Söyle bakalım kral, seni dinliyorum!",
-                    "playful": "Efendim, seni dinliyorum!",
+                    "playful": "Merhaba! Seni dinliyorum, nasıl yardımcı olabilirim?",
                     "formal": "Buyrun efendim, sizi dinliyorum.",
-                    "sarcastic": "Buyrun, yine ne soracaksın bakalım?",
-                    "emotional": "Buradayım, can kulağıyla seni dinliyorum...",
+                    "sarcastic": "Merhaba, yine ne soracaksın bakalım?",
+                    "emotional": "Merhaba, can kulağıyla seni dinliyorum...",
                     "angry": "Ne var, ne istiyorsun?",
                     "rude": "Ne var birader, kısa kes!"
                 }
-                greeting = greeting_map.get(persona, "Efendim, seni dinliyorum!")
-                if not clean_prompt or len(clean_prompt) < 3:
+                greeting = greeting_map.get(persona, "Merhaba! Seni dinliyorum, nasıl yardımcı olabilirim?")
+                pure_greetings = ["merhaba", "merhabalar", "selam", "selamlar", "günaydın", "iyi günler", "iyi akşamlar", "efendim", "hoş bulduk", "hoş geldiniz", "selamün aleyküm", "selamun aleykum", "hey"]
+                is_pure_greeting = (raw_text.lower().strip(" .,!?:;") in pure_greetings) or (not clean_prompt) or (len(clean_prompt) < 3)
+
+                if is_pure_greeting:
                     self._publish_tts(greeting)
                     return
                 else:
                     raw_text = clean_prompt
             else:
-                self.get_logger().info("🔇 [Arka Plan Konuşması / Göz Teması Yok]: Yok sayıldı.")
+                self.get_logger().info(f"🔇 [Arka Plan Konuşması / Göz Teması Yok]: '{raw_text}' yok sayıldı.")
                 return
 
         # Active Session Turn
