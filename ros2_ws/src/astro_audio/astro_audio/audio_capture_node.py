@@ -110,7 +110,7 @@ class AudioCaptureNode(Node):
 
         self.declare_parameter("sample_rate", 16000)
         self.declare_parameter("chunk_size", 960)  # 60ms chunk (0.06s * 16000 = 960)
-        self.declare_parameter("vad_threshold", 550.0)
+        self.declare_parameter("vad_threshold", 750.0)
 
         self.sample_rate = int(self.get_parameter("sample_rate").value)
         self.chunk_size = int(self.get_parameter("chunk_size").value)
@@ -171,14 +171,15 @@ class AudioCaptureNode(Node):
 
         # Calculate exact int16 RMS (same as hey_groq_assistant.py)
         rms = int(np.sqrt(np.mean(mono.astype(np.float32) ** 2)))
+        peak = int(np.max(np.abs(mono))) if len(mono) > 0 else 0
 
         # Adaptive noise floor tracking
         if rms < self._noise_floor * 2.0:
             self._noise_floor = 0.95 * self._noise_floor + 0.05 * float(rms)
 
-        # Dynamic VAD threshold
-        dynamic_thresh = max(self.vad_threshold, self._noise_floor + 200.0)
-        is_speech = rms > dynamic_thresh
+        # Dynamic VAD threshold with peak amplitude check (Real voice has peak > 1100)
+        dynamic_thresh = max(self.vad_threshold, self._noise_floor + 300.0)
+        is_speech = (rms > dynamic_thresh) and (peak > 1100)
 
         with self._audio_lock:
             self._pending = (mono.tolist(), is_speech)

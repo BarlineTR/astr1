@@ -261,12 +261,33 @@ class SpeechRecognitionNode(Node):
             if len(arr) == 0:
                 return
 
-            # Compute audio RMS energy and Peak Amplitude (Gating against background silence & mic breathing)
+            # 1. Compute audio Peak Amplitude & RMS energy
             max_amp = float(np.max(np.abs(arr)))
-            rms = float(np.sqrt(np.mean(arr.astype(np.float32)**2)))
+            total_rms = float(np.sqrt(np.mean(arr.astype(np.float32)**2)))
             
-            # Reject ambient floor noise and breathing (ReSpeaker ambient noise is ~150-250 RMS, peaks < 900)
-            if max_amp < 950.0 or rms < 260.0:
+            # Reject ambient floor noise and breathing
+            if max_amp < 1200.0 or total_rms < 300.0:
+                return
+
+            # 2. Acoustic Speech Density Verification (20ms frames)
+            chunk_size = int(self._sample_rate * 0.02)
+            num_chunks = len(arr) // chunk_size
+            if num_chunks < 15:  # Less than 0.30s
+                return
+
+            voice_chunks = 0
+            for i in range(num_chunks):
+                c = arr[i * chunk_size : (i + 1) * chunk_size]
+                c_rms = np.sqrt(np.mean(c.astype(np.float32)**2))
+                c_peak = np.max(np.abs(c))
+                if c_rms > 420.0 and c_peak > 1050:
+                    voice_chunks += 1
+
+            voice_ratio = voice_chunks / num_chunks
+            total_voice_duration = voice_chunks * 0.02
+
+            # Real human speech must occupy >= 18% of buffer and have at least 0.20s continuous voice energy
+            if total_voice_duration < 0.20 or voice_ratio < 0.18:
                 return
 
             wav_io = io.BytesIO()
@@ -302,14 +323,11 @@ class SpeechRecognitionNode(Node):
             if is_known_spk:
                 self.get_logger().info(f"🎙️ [Ses Tanıma]: {spk_name} ({spk_meta.get('formal_title', '')}) (Güven: {spk_conf:.2f})")
 
-            # Neutral prompt (Strictly prevents Whisper from hallucinating seeded words like 'merhaba')
-            whisper_prompt = "Türkçe sosyal robot konuşması."
-
+            # Whisper Transcription without prompt seeding (completely eliminates hallucinated completions)
             result = self.groq_client.audio.transcriptions.create(
                 file=("speech.wav", wav_bytes),
                 model="whisper-large-v3",
                 language="tr",
-                prompt=whisper_prompt,
                 temperature=0.0,
                 response_format="text"
             )
@@ -317,17 +335,18 @@ class SpeechRecognitionNode(Node):
             text = str(result).strip()
             text_lower = text.lower().strip(" .,!?:;")
 
-            # Hallucination Filter: Ignore known Whisper silence phantom phrases on low/medium energy
+            # Hallucination Filter: Ignore known Whisper silence phantom phrases
             silence_hallucinations = [
                 "iyi misin", "teşekkür ederim", "teşekkürler", "altyazı", "abone ol",
-                "görüşmek üzere", "hoşça kalın", "sağ olun", "kalbimde sizle geldim",
-                "merhaba, kalbimde sizle geldim", "sizle geldim"
+                "görüşmek üzere", "hoşça kalın", "hoşçakalın", "sağ olun", "kalbimde sizle geldim",
+                "merhaba, kalbimde sizle geldim", "sizle geldim", "ben ali", "merhaba, ben ali",
+                "sıfır tutu", "gizletme üzerime", "yanıldım gözlerimde"
             ]
-            if any(sh in text_lower for sh in silence_hallucinations) and rms < 450.0:
+            if any(sh in text_lower for sh in silence_hallucinations) and (total_rms < 500.0 or voice_ratio < 0.35):
                 return
 
-            # Reject isolated 'merhaba' if voice energy is low or duration is under 0.6s
-            if text_lower in ["merhaba", "merhabalar"] and (rms < 380.0 or len(arr) < int(self._sample_rate * 0.6)):
+            # Reject isolated 'merhaba' if voice energy is low or voice duration under 0.5s
+            if text_lower in ["merhaba", "merhabalar"] and (total_rms < 480.0 or total_voice_duration < 0.45):
                 return
 
             # Exact match single-word hallucination filter
@@ -339,7 +358,7 @@ class SpeechRecognitionNode(Node):
             junk_filters = [
                 "altyazı", "abone ol", "izlediğiniz için", "www.", ".com",
                 "you", "thank you", "bye", "subtitles", "watching", "amara.org",
-                "kalbimde", "sizle geldim"
+                "kalbimde", "sizle geldim", "sıfır tutu", "gizletme üzerime"
             ]
             if any(junk in text_lower for junk in junk_filters):
                 return
