@@ -17,7 +17,12 @@ speech_recognition_node:
 
 tts_node:
   ros__parameters:
-    # engine/voice/elevenlabs_* .env dosyasından okunur (TTS_ENGINE, ELEVENLABS_*)
+    # engine/voice/elevenlabs_*/xtts_* .env dosyasından okunur
+    # (TTS_ENGINE, ELEVENLABS_*, TTS_XTTS_*)
     language: "tr"
     rate: 150
     volume: 0.8
+    # XTTS (TTS_ENGINE="xtts") — ayrı venv'de çalışan yerel ses klonlama.
+    # Kurulum: ./scripts/install_xtts.sh
+    xtts_startup_timeout_s: 300.0   # ilk açılışta model indirilebilir
+    xtts_timeout_s: 120.0           # tek cümle sentez üst sınırı

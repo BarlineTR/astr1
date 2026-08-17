@@ -10,14 +10,49 @@ The system has been completely modularized into ROS 2 Humble packages:
 - `astro_base`: Arduino Mega serial bridge for motor control and base sensors.
 - `astro_lidar`: RPLIDAR A1 wrapper and NaN/Range filter node (`scan_filter_node`).
 - `astro_vision`: OAK-D Lite driver wrapper and OpenCV Face Detection node.
-- `astro_audio`: ReSpeaker array driver handling Audio Capture, Speech Recognition (Vosk), and TTS (pyttsx3/gTTS).
+- `astro_audio`: ReSpeaker array driver handling Audio Capture, Speech Recognition (Vosk/Faster-Whisper), and TTS (ElevenLabs/edge-tts/XTTS/pyttsx3/gTTS).
 - `astro_ai`: AI Brain Node managing LLM interactions and memory via OpenAI API standard.
 - `astro_bringup`: Centralized launch files and parameters for the whole system.
 - `astro_description`: URDF models and Robot State Publisher (tf2).
 
 ## 🛠️ Installation & Build
 
-**Prerequisites:** Ubuntu 22.04 with ROS 2 Humble and Python 3.10 (Jetson Orin Nano or an x86 dev machine).
+**Prerequisites:** Ubuntu 22.04 with ROS 2 Humble and Python 3.10 (Jetson Orin Nano or an x86 dev machine). Everything else the installer handles.
+
+### Quick install (one command)
+
+```bash
+git clone <this-repo> astr1 && cd astr1
+./scripts/install.sh                 # apt packages + venv + build + verification
+./scripts/install.sh --with-xtts     # also install local XTTS voice cloning (~5 GB)
+```
+
+The script is re-runnable — it completes what is missing and never overwrites an existing `.env`. Flags:
+
+| Flag | Effect |
+|---|---|
+| `--with-xtts` | Also run `scripts/install_xtts.sh` (local XTTS voice cloning) |
+| `--skip-apt` | Skip the apt step (no sudo, or packages already present) |
+| `--skip-build` | Skip `colcon build` |
+| `--clean` | Delete `build/ install/ log/` and rebuild from scratch |
+
+It ends with a verification pass — 7 ROS packages present, every node importable, `serial_bridge.py` executable, entry points pointing at the venv — and exits non-zero if any check fails. Missing apt packages are reported as warnings with the exact `sudo apt install` line, since apt needs a terminal for the password.
+
+Then:
+
+```bash
+source .venv/bin/activate
+source ros2_ws/install/setup.bash
+ros2 launch astro_bringup robot.launch.py
+```
+
+| Script | Purpose |
+|---|---|
+| `scripts/install.sh` | Full install: apt packages, uv, venv, `.env`, workspace build, verification |
+| `scripts/install_xtts.sh` | XTTS voice cloning only — clones the TTS fork from GitHub into its own venv |
+| `scripts/install_stt_deps.sh` | Legacy: `pip3 install`s the STT/TTS packages system-wide. Superseded by `requirements.txt` + the venv; kept only for machines set up before the venv layout |
+
+The sections below document what the installer does, in case you want to run the steps by hand or debug one of them.
 
 ### 1. System packages (apt)
 
@@ -27,14 +62,15 @@ These cannot come from pip — ROS packages, and the native libraries that `soun
 sudo apt update
 sudo apt install -y python3-rosdep python3-colcon-common-extensions
 sudo apt install -y ros-humble-rplidar-ros ros-humble-depthai-ros ros-humble-robot-state-publisher
-sudo apt install -y libportaudio2 espeak-ng mpg123
+sudo apt install -y libportaudio2 espeak-ng mpg123 alsa-utils
 ```
 
 | Package | Needed by |
 |---|---|
 | `libportaudio2` | `sounddevice` — without it `audio_capture_node` fails with `OSError: PortAudio library not found` |
-| `espeak-ng` | `pyttsx3` offline TTS engine |
+| `espeak-ng` | `pyttsx3` offline TTS engine, and XTTS phonemisation |
 | `mpg123` | MP3 playback in `tts_node` — the `edge-tts`, `gTTS` and ElevenLabs engines all shell out to it, so without it TTS generates audio but plays nothing |
+| `alsa-utils` | WAV playback in `tts_node` — XTTS produces WAV, which `mpg123` cannot play |
 
 ### 2. Python environment (uv)
 
@@ -64,15 +100,26 @@ Two pins are deliberate and must not be relaxed:
 
 ### 3. Build the workspace
 
-Run `colcon` **from `ros2_ws/`**, not from the repository root — building at the root scatters `build/ install/ log/` next to the source tree.
+Run `colcon` **from `ros2_ws/`**, not from the repository root — building at the root scatters `build/ install/ log/` next to the source tree. And run it **through the venv's Python**:
 
 ```bash
 cd <repo-root>/ros2_ws
-colcon build --symlink-install
+../.venv/bin/python -m colcon build --symlink-install
 source install/setup.bash   # or setup.zsh
 ```
 
+> **Why `python -m colcon` instead of plain `colcon`?** setuptools writes the shebang of each generated entry point (`install/astro_audio/lib/astro_audio/tts_node`, …) from the interpreter that runs the build. `/usr/bin/colcon` runs under the system Python, so the entry points get `#!/usr/bin/python3` and `ros2 run` then cannot see any venv package — `edge-tts`, `faster-whisper` and `sounddevice` all silently appear "not installed" and the nodes fall back or fail. Building with the venv's Python makes the entry points point at `.venv/bin/python`, and `ros2 run` / `ros2 launch` work without activating anything. (`colcon` itself stays importable because the venv is created with `--system-site-packages`.) `scripts/install.sh` does this for you.
+
 Expected result: 7 packages finished. Warnings about `tests_require` and CMake policy `CMP0148` are harmless.
+
+**Verify the build:**
+
+```bash
+ros2 pkg list | grep astro                 # 7 packages
+ros2 pkg executables | grep astro          # 7 executables
+```
+
+Or just re-run `./scripts/install.sh --skip-apt`, which performs the same checks and prints a pass/fail line per node.
 
 ## 🚦 Usage
 
@@ -146,5 +193,40 @@ If you want to use OpenAI or Groq Whisper for perfect STT:
 STT_ENGINE="whisper"
 STT_API_KEY="sk-YOUR-KEY"
 ```
+
+### 5. Advanced TTS (Ses Sentezi) Options
+
+`TTS_ENGINE` in `.env` selects the engine: `elevenlabs`, `edge-tts` (default), `xtts`, `pyttsx3`, `gtts`. The first two and `gtts` need internet; `xtts` and `pyttsx3` are fully offline.
+
+**XTTS v2 — local voice cloning (offline, GPU recommended)**
+
+`xtts` speaks with a cloned voice taken from a short reference recording, with no internet and no API key. It is **not** installed from PyPI: `pip install TTS` resolves Coqui TTS 0.22.0 against today's package versions and produces an environment that imports but does not work. Instead a dedicated script clones the maintained fork and pins the version set that is known to work:
+
+```bash
+./scripts/install_xtts.sh
+```
+
+The script clones <https://github.com/yunusemretom/TTS.git> into `~/.astro/tts` (override with `TTS_XTTS_HOME`), creates a Python 3.10 venv there, installs the repo with `uv pip install -e .`, picks the torch CUDA build matching your driver, pins `librosa`/`transformers`/`numpy`/`scipy`, symlinks `espeak` → `espeak-ng`, and pre-downloads the ~1.8 GB XTTS v2 checkpoint (skip with `XTTS_SKIP_DOWNLOAD=1`). It is re-runnable: an existing clone is updated instead of re-cloned.
+
+> **Why a second virtualenv?** XTTS needs `numpy==1.26.4` — its compiled `monotonic_align` Cython extension is built against the NumPy 1.x ABI — while this repo pins `numpy==2.2.6` to match `rclpy`. The two cannot share an interpreter. So `tts_node` never imports XTTS: it launches `xtts_worker.py` with the XTTS venv's Python as a long-lived child process and talks to it over line-based JSON on stdin/stdout (`xtts_client.py`). The model and speaker latents are loaded once at node start, so each sentence pays only inference cost.
+
+Enable it in `.env`:
+
+```ini
+TTS_ENGINE="xtts"
+TTS_XTTS_HOME="$HOME/.astro/tts"
+TTS_XTTS_SPEAKER_WAV=""      # empty → packaged voices/astro.wav
+TTS_XTTS_DEVICE="auto"       # "auto" | "cuda" | "cpu"
+TTS_XTTS_HALF=1              # fp16, CUDA only
+TTS_XTTS_BATCH_SIZE=4        # batch sentence decoding on long text
+```
+
+**Changing the robot's voice.** The reference clip ships with the package at `ros2_ws/src/astro_audio/voices/astro.wav` (~9 s). Replace that file, or point `TTS_XTTS_SPEAKER_WAV` at an absolute path. Use 6–30 s of clean, single-speaker audio.
+
+**Behaviour and expectations.**
+- Startup takes ~10–30 s (model load + warm-up) and much longer on the first run if the checkpoint still has to download. The node does not block: sentences arriving before XTTS is ready are spoken by `edge-tts` instead, and `✅ [TTS] XTTS hazır` is logged when the worker is warm.
+- If the install is missing, the worker fails to start, or it dies mid-run, `tts_node` logs the reason and falls back to `edge-tts` (or `pyttsx3` when there is no internet package) — the robot never goes silent.
+- XTTS emits WAV, so playback uses `paplay`/`aplay`/`ffplay`, not `mpg123`. Install `alsa-utils` if none is present.
+- On CPU XTTS is very slow (RTF > 1, i.e. slower than real time). On an RTX 4050 Laptop with fp16 + batch=4 a paragraph runs at RTF ≈ 0.09 using ~1.5 GB VRAM.
 
 > **Note:** For AI API keys (`AI_API_KEY`), use the `.env` file at the root of the project (copy from `.env.example`). Do not hardcode API keys in the source code!
