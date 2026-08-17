@@ -178,7 +178,7 @@ class PersonaEngine:
             return True
         return False
 
-    def build_system_prompt(self, memory_context: str = "") -> str:
+    def build_system_prompt(self, memory_context: str = "", recognized_person: Optional[Dict[str, Any]] = None) -> str:
         persona_rule = PERSONA_PROMPTS.get(self.current_persona, PERSONA_PROMPTS["playful"])
         base_prompt = (
             f"Sen Astro adında gerçek, fiziksel ve otonom bir sosyal robot asistansın.\n"
@@ -191,6 +191,29 @@ class PersonaEngine:
             "- Cevaplarını 1-2 cümle ile kısa, akıcı ve öz tut (çünkü sesli okunuyor).\n"
             "- Asla markdown, emoji, yıldız (*), parantez, <think> etiketi veya kod bloğu kullanma; sadece saf Türkçe konuş."
         )
+
+        if recognized_person and recognized_person.get("is_known"):
+            title = recognized_person.get("title", "")
+            formal = recognized_person.get("formal_title", "")
+            name = recognized_person.get("name", "")
+            role_cat = recognized_person.get("role_category", recognized_person.get("category", ""))
+
+            if role_cat in ["governor", "mayor", "district_governor", "head_of_state"] or "Vali" in title or "Başkan" in title or "Kaymakam" in title:
+                protocol_instruction = (
+                    f"\n\n⭐ DEVLET PROTOKOLÜ TALİMATI:\n"
+                    f"Karşındaki kişi {title} {name}. Kendisine daima yüksek hürmet ve nezaketle '{formal}' hitabıyla seslen.\n"
+                    f"Makamına yakışır şekilde saygılı ol, Bitlis ve Ahlat için yapılan teknolojik ve sosyal hizmetlerden gururla bahset."
+                )
+                base_prompt += protocol_instruction
+            elif role_cat == "creator" or "Baran" in name:
+                creator_instruction = (
+                    f"\n\n🛠️ GELİŞTİRİCİ TALİMATI:\n"
+                    f"Karşındaki kişi senin baş mühendisin ve yaratıcın {name}. Ona dostane, işbirlikçi ve saygılı bir robot yol arkadaşı gibi hitap et."
+                )
+                base_prompt += creator_instruction
+            else:
+                base_prompt += f"\n\nKarşındaki tanınan kişi: {name} ({formal}). Kendisine ismiyle veya unvanıyla hitap et."
+
         if memory_context:
             return f"{base_prompt}\n\n{memory_context}"
         return base_prompt
@@ -201,14 +224,25 @@ class PersonaEngine:
         looking_at_robot: bool,
         user_distance: float,
         user_emotion: str,
-        speaker_gender: str
+        speaker_gender: str,
+        recognized_person: Optional[Dict[str, Any]] = None
     ) -> str:
-        """Injects deterministic perception context before user prompt."""
-        if not person_detected or not looking_at_robot:
-            return ""
+        """Injects deterministic perception & biometric identity context before user prompt."""
+        tag_parts = []
+        if recognized_person and recognized_person.get("is_known"):
+            name = recognized_person.get("name")
+            formal = recognized_person.get("formal_title") or recognized_person.get("title")
+            tag_parts.append(f"Tanınan Kişi: {name} ({formal})")
 
-        dist_str = f"{user_distance:.1f}m mesafeden " if user_distance > 0 else ""
-        emo_map = {"happy": "gülümseyerek", "sad": "üzgün/düşünceli", "surprised": "şaşkın", "neutral": "doğrudan"}
-        emo_str = emo_map.get(user_emotion, "doğrudan")
-        gender_str = " (Kadın/Kız Sesi)" if speaker_gender == "female" else ""
-        return f"[Karşındaki insan{gender_str} sana {dist_str}{emo_str} bakıyor] "
+        if person_detected and looking_at_robot:
+            dist_str = f"{user_distance:.1f}m mesafeden " if user_distance > 0 else ""
+            emo_map = {"happy": "gülümseyerek", "sad": "üzgün/düşünceli", "surprised": "şaşkın", "neutral": "doğrudan"}
+            emo_str = emo_map.get(user_emotion, "doğrudan")
+            tag_parts.append(f"sana {dist_str}{emo_str} bakıyor")
+
+        if speaker_gender == "female":
+            tag_parts.append("Kadın/Kız Sesi")
+
+        if not tag_parts:
+            return ""
+        return f"[{', '.join(tag_parts)}] "

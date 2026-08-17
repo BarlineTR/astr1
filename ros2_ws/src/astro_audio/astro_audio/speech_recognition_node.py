@@ -22,9 +22,15 @@ import wave
 import threading
 import numpy as np
 
+import json
 import rclpy
 from rclpy.node import Node
 from std_msgs.msg import Int16MultiArray, String, Bool
+
+try:
+    from astro_audio.voice_recognizer import VoiceRecognizer
+except ImportError:
+    from voice_recognizer import VoiceRecognizer
 
 try:
     from groq import Groq
@@ -121,9 +127,13 @@ class SpeechRecognitionNode(Node):
         self._silence_timeout_s = float(self.get_parameter('silence_timeout_s').value)
         self._sample_rate = int(self.get_parameter('sample_rate').value)
 
+        # Voice Recognition Engine
+        self.voice_recognizer = VoiceRecognizer()
+
         # Publishers
         self._text_pub = self.create_publisher(String, '/speech/text', 10)
         self._gender_pub = self.create_publisher(String, '/audio/speaker_gender', 10)
+        self._speaker_pub = self.create_publisher(String, '/audio/speaker_id', 10)
         self._interrupt_pub = self.create_publisher(Bool, '/tts/interrupt', 10)
 
         # Subscribers
@@ -271,6 +281,24 @@ class SpeechRecognitionNode(Node):
             gender_msg = String()
             gender_msg.data = gender
             self._gender_pub.publish(gender_msg)
+
+            # Acoustic Speaker Identification (Voiceprint Matching)
+            spk_name, spk_conf, spk_meta = self.voice_recognizer.recognize_voice(arr, self._sample_rate)
+            is_known_spk = (spk_name is not None and spk_conf >= 0.70)
+            spk_info = {
+                "name": spk_name if is_known_spk else "Misafir",
+                "title": spk_meta.get("title", "Konuşmacı"),
+                "formal_title": spk_meta.get("formal_title", "Misafir"),
+                "confidence": spk_conf,
+                "is_known": is_known_spk,
+                "gender": gender
+            }
+            spk_msg = String()
+            spk_msg.data = json.dumps(spk_info)
+            self._speaker_pub.publish(spk_msg)
+
+            if is_known_spk:
+                self.get_logger().info(f"🎙️ [Ses Tanıma]: {spk_name} ({spk_meta.get('formal_title', '')}) (Güven: {spk_conf:.2f})")
 
             # Clean Whisper prompt (Neutral robot hints, no hallucination-inducing questions)
             whisper_prompt = "Astro, hey astro, robot, merhaba."

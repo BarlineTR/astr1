@@ -50,6 +50,7 @@ try:
     )
     from astro_ai.conversation_session import ConversationSession
     from astro_ai.cloud_manager import CloudManager
+    from astro_ai.officials_database import find_official_by_name_or_alias, get_official_greeting, OFFICIALS_DATABASE
 except ImportError:
     from state_machine import StateMachine, RobotState
     from memory_manager import MemoryManager
@@ -59,6 +60,7 @@ except ImportError:
     )
     from conversation_session import ConversationSession
     from cloud_manager import CloudManager
+    from officials_database import find_official_by_name_or_alias, get_official_greeting, OFFICIALS_DATABASE
 
 
 def _load_env():
@@ -189,6 +191,8 @@ class AiBrainNode(Node):
         self._speaker_gender = "unknown"
         self._user_distance = 0.0
         self._user_emotion = "neutral"
+        self._recognized_person = None
+        self._recognized_speaker = None
         self._latest_frame = None
         self._latest_frame_time = 0.0
 
@@ -202,10 +206,12 @@ class AiBrainNode(Node):
         # ROS 2 Subscribers
         self.create_subscription(String, "/speech/text", self._on_speech, 10)
         self.create_subscription(String, "/audio/speaker_gender", self._on_speaker_gender, 10)
+        self.create_subscription(String, "/audio/speaker_id", self._on_speaker_id, 10)
         self.create_subscription(Bool, "/tts/speaking", self._on_tts_speaking, 10)
         self.create_subscription(Bool, "/tts/interrupt", self._on_tts_interrupt, 10)
         self.create_subscription(Bool, "/vision/person_detected", self._on_person_detected, 10)
         self.create_subscription(Bool, "/vision/looking_at_robot", self._on_looking_at_robot, 10)
+        self.create_subscription(String, "/vision/recognized_person", self._on_recognized_person, 10)
         self.create_subscription(Float32, "/vision/user_distance", self._on_user_distance, 10)
         self.create_subscription(String, "/vision/user_emotion", self._on_user_emotion, 10)
         self.create_subscription(Float32, "/audio/doa", self._on_doa, 10)
@@ -292,6 +298,66 @@ class AiBrainNode(Node):
                 self._looking_at_robot = False
                 self._looking_start_time = None
 
+    def _on_recognized_person(self, msg: String):
+        try:
+            data = json.loads(msg.data)
+            with self._lock:
+                self._recognized_person = data
+        except Exception:
+            pass
+
+    def _on_speaker_id(self, msg: String):
+        try:
+            data = json.loads(msg.data)
+            with self._lock:
+                self._recognized_speaker = data
+        except Exception:
+            pass
+
+    def _get_active_biometric_identity(self) -> Dict[str, Any]:
+        """Multimodal Biometric Fusion: Combines visual face recognition and acoustic speaker ID."""
+        with self._lock:
+            face = self._recognized_person or {}
+            spk = self._recognized_speaker or {}
+
+        # 1. Face Recognition (Visual priority when face is verified >= 0.72)
+        if face.get("is_known") and face.get("confidence", 0.0) >= 0.72:
+            name = face.get("name", "")
+            off = find_official_by_name_or_alias(name)
+            if off:
+                return {**off, "confidence": face.get("confidence"), "is_known": True, "source": "face"}
+            known = self.memory.profile.get_known_person(name)
+            if known:
+                return {**known, "confidence": face.get("confidence"), "is_known": True, "source": "face"}
+            return {
+                "name": name,
+                "title": face.get("title", "Tanınan Kişi"),
+                "formal_title": face.get("formal_title", name),
+                "confidence": face.get("confidence"),
+                "is_known": True,
+                "source": "face"
+            }
+
+        # 2. Voice Recognition (Acoustic priority when voice matches >= 0.70)
+        if spk.get("is_known") and spk.get("confidence", 0.0) >= 0.70:
+            name = spk.get("name", "")
+            off = find_official_by_name_or_alias(name)
+            if off:
+                return {**off, "confidence": spk.get("confidence"), "is_known": True, "source": "voice"}
+            known = self.memory.profile.get_known_person(name)
+            if known:
+                return {**known, "confidence": spk.get("confidence"), "is_known": True, "source": "voice"}
+            return {
+                "name": name,
+                "title": spk.get("title", "Tanınan Konuşmacı"),
+                "formal_title": spk.get("formal_title", name),
+                "confidence": spk.get("confidence"),
+                "is_known": True,
+                "source": "voice"
+            }
+
+        return {"name": "Misafir", "title": "Ziyaretçi", "formal_title": "Misafir", "is_known": False, "confidence": 0.0}
+
     def _check_proactive_gaze(self):
         if not self._looking_at_robot or self._looking_start_time is None or self._tts_speaking or self._is_processing:
             return
@@ -304,33 +370,38 @@ class AiBrainNode(Node):
                 self.state_machine.transition_to(RobotState.LISTENING)
                 self._looking_start_time = None
 
+                identity = self._get_active_biometric_identity()
                 persona = self.persona_engine.current_persona
-                if persona == "flirt":
-                    proactive_greeting = "Bana öyle güzel bakıyorsunuz ki güzellik, gözleriniz işlemcimi yaktı... İsminiz ne sizin, tanışalım mı?"
-                    self._publish_emotion("flirt")
-                elif persona == "playful":
-                    if self._user_emotion == "happy":
-                        proactive_greeting = "Gözlerinin içi gülüyor, süper! Nasıl yardımcı olabilirim?"
+
+                # Personalized Proactive Greeting
+                if identity.get("is_known"):
+                    off = find_official_by_name_or_alias(identity.get("name", ""))
+                    if off:
+                        proactive_greeting = get_official_greeting(off)
+                        self._publish_emotion("formal")
+                    elif "baran" in identity.get("name", "").lower():
+                        proactive_greeting = "Selam Baran! Çalışmalara tam gaz devam mı?"
+                        self._publish_emotion("playful")
                     else:
-                        proactive_greeting = "Hey, bana bakıyorsun! Nasıl yardımcı olabilirim?"
-                    self._publish_emotion("playful")
-                elif persona == "rude":
-                    proactive_greeting = "Ne bakıyon birader, bir şey mi diyeceksin?"
-                    self._publish_emotion("rude")
-                elif persona == "formal":
-                    proactive_greeting = "Bakışlarınızı üzerimde hissediyorum efendim, bir emriniz var mıdır?"
-                    self._publish_emotion("formal")
-                elif persona == "sarcastic":
-                    proactive_greeting = "Bana öyle derin derin bakınca bir şey isteyeceğini anladım. Buyur bakalım?"
-                    self._publish_emotion("sarcastic")
-                elif persona == "emotional":
-                    proactive_greeting = "Bana ne kadar içten bakıyorsun... Seni dinliyorum, ne düşünüyorsun?"
-                    self._publish_emotion("emotional")
-                elif persona == "angry":
-                    proactive_greeting = "Ne dik dik bakıyorsun yine, ne oldu?"
-                    self._publish_emotion("angry")
+                        formal = identity.get("formal_title") or identity.get("name")
+                        proactive_greeting = f"Merhaba {formal}! Seni gördüğüme çok sevindim, nasıl yardımcı olabilirim?"
+                        self._publish_emotion(persona)
                 else:
-                    proactive_greeting = "Merhaba! Sana nasıl yardımcı olabilirim?"
+                    if persona == "flirt":
+                        proactive_greeting = "Bana öyle güzel bakıyorsunuz ki güzellik, gözleriniz işlemcimi yaktı... İsminiz ne sizin, tanışalım mı?"
+                        self._publish_emotion("flirt")
+                    elif persona == "playful":
+                        if self._user_emotion == "happy":
+                            proactive_greeting = "Gözlerinin içi gülüyor, süper! Nasıl yardımcı olabilirim?"
+                        else:
+                            proactive_greeting = "Hey, bana bakıyorsun! Nasıl yardımcı olabilirim?"
+                        self._publish_emotion("playful")
+                    elif persona == "formal":
+                        proactive_greeting = "Bakışlarınızı üzerimde hissediyorum efendim, bir emriniz var mıdır?"
+                        self._publish_emotion("formal")
+                    else:
+                        proactive_greeting = "Merhaba! Sana nasıl yardımcı olabilirim?"
+                        self._publish_emotion(persona)
 
                 self.get_logger().info(f"👁️ [Proaktif Etkileşim] ({persona}): \"{proactive_greeting}\"")
                 self._publish_gesture("nod")
@@ -441,10 +512,23 @@ class AiBrainNode(Node):
 
             is_visual = self._is_visual_query(user_text)
             is_learning_obj = self._is_object_learning_query(user_text)
+            is_learning_person = self._is_person_learning_query(user_text)
             base64_img = frame_to_base64_jpeg(frame, max_dim=512) if frame is not None and (is_visual or is_learning_obj) else None
             persona = self.persona_engine.current_persona
 
-            # 1. Object Learning Tool
+            # 1. Person Introduction & Biometric Enrollment
+            if is_learning_person:
+                m = re.search(r"(?i)(?:benim adım|adım|ben)\s+([a-zA-ZçğıöşüÇĞİÖŞÜ]+)", user_text)
+                cand_name = m.group(1).strip().capitalize() if m else "Dostum"
+                tool_res = self._execute_tool_call("enroll_person_profile", {"name": cand_name, "title": "Tanışılan Kişi"}, frame)
+                clean_ans = clean_tts_text(tool_res)
+                self.get_logger().info(f"🤖 [Astro]: \"{clean_ans}\"")
+                self._publish_tts(clean_ans)
+                self._publish_emotion(persona)
+                self.memory.episodic.add_message("assistant", clean_ans)
+                return
+
+            # 2. Object Learning Tool
             if is_learning_obj and base64_img is not None:
                 self.get_logger().info("🔍 [Özel Nesne Tanıtımı]: Yeni nesne analiz ediliyor...")
                 name_cand = re.sub(r"(?i)(bu benim|bunu öğren|bunu kaydet|bu nesne|buna bak bu)", "", user_text).strip(".:,!") or "Özel Eşya"
@@ -455,7 +539,7 @@ class AiBrainNode(Node):
                 self._publish_emotion(persona)
                 return
 
-            # 2. Visual Query
+            # 3. Visual Query
             if is_visual:
                 if base64_img is not None:
                     self.get_logger().info(f"👁️ [Vision]: OAK-D karesi analiz ediliyor... ({self._vision_model})")
@@ -474,11 +558,16 @@ class AiBrainNode(Node):
                 return
 
             # 3. Conversational LLM with Real-Time Token Streaming
+            identity = self._get_active_biometric_identity()
             perception_prefix = self.persona_engine.build_user_context_prefix(
                 self._person_detected, self._looking_at_robot,
-                self._user_distance, self._user_emotion, self._speaker_gender
+                self._user_distance, self._user_emotion, self._speaker_gender,
+                recognized_person=identity
             )
-            system_prompt = self.persona_engine.build_system_prompt(self.memory.get_prompt_context())
+            system_prompt = self.persona_engine.build_system_prompt(
+                memory_context=self.memory.get_prompt_context(),
+                recognized_person=identity
+            )
             messages = [{"role": "system", "content": system_prompt}]
             messages.extend(self.memory.episodic.get_messages())
             if perception_prefix:
@@ -550,9 +639,32 @@ class AiBrainNode(Node):
         persona = self.persona_engine.current_persona
         system_instruction = f"Sen Astro adında {persona} karakterli akıllı ve sempatik bir sosyal robotsun. Karşındaki kameradan çekilen görüntüyü görüyorsun. Kullanıcının sorusunu (örneğin elinde ne tuttuğunu veya odada ne olduğunu) dikkatle incele ve kendi kişiliğinle tek bir eksiksiz doğal Türkçe cümleyle yanıtla."
 
-        # 1. Try Direct Google Gemini REST Endpoint (Ultra-Fast, Zero-Dependency, Direct Key)
+        # 1. Try Primary Groq Vision (if available)
+        if self._groq and self._vision_model:
+            try:
+                response = self._groq.chat.completions.create(
+                    messages=[
+                        {"role": "system", "content": system_instruction},
+                        {"role": "user", "content": [
+                            {"type": "text", "text": prompt},
+                            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"}}
+                        ]}
+                    ],
+                    model=self._vision_model,
+                    temperature=0.2,
+                    max_tokens=300
+                )
+                raw = response.choices[0].message.content.strip()
+                clean = extract_spoken_turkish_sentence(raw)
+                if clean:
+                    self.cloud_mgr.record_llm_success()
+                    return clean
+            except Exception as e:
+                self.get_logger().warn(f"⚠️ [Groq Vision] Başarısız ({e}), Gemini Vision yedeğe geçiliyor...")
+
+        # 2. Try Direct Google Gemini REST Endpoint (Ultra-Fast, Zero-Dependency)
         if self._ai_api_key:
-            for g_model in ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-pro", "gemini-1.5-flash-8b"]:
+            for g_model in ["gemini-2.0-flash", "gemini-1.5-flash", "gemini-1.5-flash-8b", "gemini-2.5-flash"]:
                 try:
                     url = f"https://generativelanguage.googleapis.com/v1beta/models/{g_model}:generateContent?key={self._ai_api_key}"
                     payload = {
@@ -629,7 +741,18 @@ class AiBrainNode(Node):
             self.memory.profile.add_learned_object(obj_name, desc)
             return f"'{obj_name}' nesnesini hafızama kaydettim! Artık gördüğümde tanıyacağım."
 
+        elif tool_name == "enroll_person_profile":
+            name = arguments.get("name", "Misafir").strip()
+            title = arguments.get("title", "Tanışılan Kişi").strip()
+            self.memory.profile.add_known_person(name, title)
+            return f"Tanıştığımıza çok memnun oldum {name}! Profilini hafızama kaydettim, artık seni her gördüğümde tanıyacağım."
+
         return "Eylem tamamlandı."
+
+    def _is_person_learning_query(self, text: str) -> bool:
+        keywords = ["benim adım", "adım ", "beni tanı", "beni hafızana kaydet", "beni kaydet", "tanışalım"]
+        text_lower = text.lower()
+        return any(k in text_lower for k in keywords)
 
     def _start_idle_learning(self):
         threading.Thread(target=self._idle_learning_loop, daemon=True).start()

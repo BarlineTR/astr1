@@ -23,12 +23,16 @@ import numpy as np
 import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import Image
-from std_msgs.msg import Bool, String, Float32
+from std_msgs.msg import String, Bool, Float32
 
 try:
     from astro_vision.image_utils import bgr_to_imgmsg, imgmsg_to_bgr
+    from astro_vision.face_recognizer import FaceRecognizer
 except ImportError:
     from image_utils import bgr_to_imgmsg, imgmsg_to_bgr
+    class FaceRecognizer:
+        def identify(self, frame, x, y, w, h):
+            return {"name": "Misafir", "title": "Ziyaretçi", "confidence": 0.0, "is_known": False}
 
 
 class SpatialVisionNode(Node):
@@ -70,6 +74,7 @@ class SpatialVisionNode(Node):
         self._latest_depth = None
         self._gaze_history = deque(maxlen=5)
         self._emotion_history = deque(maxlen=8)
+        self.face_recognizer = FaceRecognizer()
 
         # Publishers
         self.pub_faces = self.create_publisher(String, "/vision/faces", 10)
@@ -78,6 +83,7 @@ class SpatialVisionNode(Node):
         self.pub_yaw = self.create_publisher(Float32, "/vision/head_yaw", 10)
         self.pub_distance = self.create_publisher(Float32, "/vision/user_distance", 10)
         self.pub_emotion = self.create_publisher(String, "/vision/user_emotion", 10)
+        self.pub_recognized_person = self.create_publisher(String, "/vision/recognized_person", 10)
         self.pub_image = self.create_publisher(Image, "/vision/face_image", 10)
 
         # Subscribers
@@ -213,9 +219,11 @@ class SpatialVisionNode(Node):
         user_distance = 0.0
         head_yaw = 0.0
         detected_emotion = "neutral"
+        top_recognized_person = {"name": "Misafir", "title": "Ziyaretçi", "formal_title": "Misafir", "confidence": 0.0, "is_known": False}
 
         for x, y, w, h in faces:
             face_roi_gray = gray[y:y + h, x:x + w]
+            face_roi_bgr = frame[y:y + h, x:x + w]
             
             # 1. 3D Head Yaw & Eye Verification
             yaw, eyes_found = self._estimate_head_yaw(face_roi_gray, w, h)
@@ -225,12 +233,25 @@ class SpatialVisionNode(Node):
             dist_m = self._estimate_distance(x, y, w, h, frame_w, frame_h)
             user_distance = dist_m
 
-            # 3. Direct Gaze: Eyes MUST be visible AND yaw <= 30 degrees AND within 3.0 meters
-            direct_gaze = eyes_found and (abs(yaw) <= 30.0) and (dist_m <= 3.0)
+            # 3. Direct Gaze: Eyes MUST be visible AND yaw <= 30 degrees AND strictly in Social Zone (0.35m - 2.50m)
+            direct_gaze = eyes_found and (abs(yaw) <= 30.0) and (0.35 <= dist_m <= 2.50)
             if direct_gaze:
                 is_looking = True
 
-            # 4. Emotion Detection
+            # 4. Face Recognition Matching
+            recog_name, recog_conf, recog_meta = self.face_recognizer.recognize_face(face_roi_bgr)
+            is_known = (recog_name is not None and recog_conf >= 0.72)
+            if is_known and recog_conf > top_recognized_person["confidence"]:
+                top_recognized_person = {
+                    "name": recog_name,
+                    "title": recog_meta.get("title", "Tanınan Kişi"),
+                    "formal_title": recog_meta.get("formal_title", recog_name),
+                    "confidence": recog_conf,
+                    "is_known": True,
+                    "distance_m": round(dist_m, 2)
+                }
+
+            # 5. Emotion Detection
             detected_emotion = self._detect_facial_emotion(face_roi_gray, w, h)
 
             face_list.append({
@@ -238,7 +259,9 @@ class SpatialVisionNode(Node):
                 "yaw_deg": round(yaw, 1),
                 "distance_m": round(dist_m, 2),
                 "looking_at_robot": direct_gaze,
-                "emotion": detected_emotion
+                "emotion": detected_emotion,
+                "recognized_name": recog_name if is_known else None,
+                "recognized_title": recog_meta.get("formal_title") if is_known else None
             })
 
             # Draw HUD
@@ -248,11 +271,12 @@ class SpatialVisionNode(Node):
                 "neutral": (0, 200, 255),
                 "sad": (0, 0, 255)
             }
-            box_color = color_map.get(detected_emotion, (0, 255, 0))
+            box_color = (0, 215, 255) if is_known else color_map.get(detected_emotion, (0, 255, 0))
             cv2.rectangle(frame, (x, y), (x + w, y + h), box_color, 2)
             
+            tag_name = f"★ {recog_name} ({recog_meta.get('formal_title', '')})" if is_known else detected_emotion.upper()
             gaze_txt = "BANA BAKIYOR" if direct_gaze else (f"YANA ({yaw:.0f}°)" if eyes_found else "BAKMIYOR (GÖZ YOK)")
-            hud_text = f"{gaze_txt} | {dist_m:.2f}m | {detected_emotion.upper()}"
+            hud_text = f"{tag_name} | {gaze_txt} | {dist_m:.2f}m"
             cv2.putText(frame, hud_text, (x, max(22, y - 10)), cv2.FONT_HERSHEY_SIMPLEX, 0.55, box_color, 2)
 
         self._gaze_history.append(is_looking)
@@ -287,13 +311,18 @@ class SpatialVisionNode(Node):
         emotion_msg.data = smoothed_emotion
         self.pub_emotion.publish(emotion_msg)
 
+        recog_msg = String()
+        recog_msg.data = json.dumps(top_recognized_person)
+        self.pub_recognized_person.publish(recog_msg)
+
         # Diagnostic logger on gaze state change
         if not hasattr(self, '_prev_looking_log'):
             self._prev_looking_log = False
         if is_looking != self._prev_looking_log:
             self._prev_looking_log = is_looking
-            if is_looking:
-                self.get_logger().info(f"👀 [Göz Teması]: Kullanıcı algılandı! (Mesafe: {user_distance:.2f}m, Açı: {head_yaw:.1f}°)")
+            if is_looking and (0.35 <= user_distance <= 2.50):
+                known_tag = f" — [{top_recognized_person['formal_title']}]" if top_recognized_person["is_known"] else ""
+                self.get_logger().info(f"👀 [Göz Teması]: Kullanıcı algılandı! (Mesafe: {user_distance:.2f}m, Açı: {head_yaw:.1f}°){known_tag}")
 
         # Publish Images
         try:

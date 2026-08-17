@@ -125,6 +125,70 @@ class TestCircuitBreaker(unittest.TestCase):
         self.assertEqual(cb.state, CircuitState.CLOSED)
 
 
+class TestBiometricsAndOfficials(unittest.TestCase):
+    def test_officials_database(self):
+        from officials_database import find_official_by_name_or_alias, get_official_greeting
+        vali = find_official_by_name_or_alias("Erol Karaömeroğlu")
+        self.assertIsNotNone(vali)
+        self.assertEqual(vali["title"], "Bitlis Valisi")
+        self.assertEqual(vali["formal_title"], "Sayın Valim")
+
+        greet = get_official_greeting(vali)
+        self.assertIn("Sayın Valim", greet)
+
+        baskan = find_official_by_name_or_alias("Nesrullah Tanğlay")
+        self.assertIsNotNone(baskan)
+        self.assertEqual(baskan["title"], "Bitlis Belediye Başkanı")
+
+        kaymakam = find_official_by_name_or_alias("Batuhan Bingöl")
+        self.assertIsNotNone(kaymakam)
+        self.assertEqual(kaymakam["title"], "Ahlat Kaymakamı")
+
+        cb = find_official_by_name_or_alias("Recep Tayyip Erdoğan")
+        self.assertIsNotNone(cb)
+        self.assertEqual(cb["formal_title"], "Sayın Cumhurbaşkanım")
+
+        creator = find_official_by_name_or_alias("Baran")
+        self.assertIsNotNone(creator)
+
+    def test_protocol_prompt_synthesis(self):
+        engine = PersonaEngine("formal")
+        vali_meta = {
+            "name": "Erol Karaömeroğlu",
+            "title": "Bitlis Valisi",
+            "formal_title": "Sayın Valim",
+            "role_category": "governor",
+            "is_known": True
+        }
+        prompt = engine.build_system_prompt("Hafıza", recognized_person=vali_meta)
+        self.assertIn("DEVLET PROTOKOLÜ TALİMATI", prompt)
+        self.assertIn("Sayın Valim", prompt)
+        self.assertIn("Bitlis Valisi", prompt)
+
+    def test_face_and_voice_recognizers(self):
+        import numpy as np
+        sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "astro_vision", "astro_vision")))
+        sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "astro_audio", "astro_audio")))
+
+        from face_recognizer import FaceRecognizer
+        from voice_recognizer import VoiceRecognizer
+
+        # Face Recognizer test
+        fr = FaceRecognizer()
+        dummy_face = np.full((120, 120, 3), 128, dtype=np.uint8)
+        emb = fr.extract_embedding(dummy_face)
+        self.assertIsNotNone(emb)
+        self.assertEqual(len(emb), 192)
+
+        # Voice Recognizer test
+        vr = VoiceRecognizer()
+        t = np.linspace(0, 0.5, 8000)
+        dummy_pcm = (np.sin(2 * np.pi * 200 * t) * 10000).astype(np.int16)
+        vp = vr.extract_voiceprint(dummy_pcm, sample_rate=16000)
+        self.assertIsNotNone(vp)
+        self.assertEqual(len(vp), 37)
+
+
 if __name__ == "__main__":
     unittest.main()
 

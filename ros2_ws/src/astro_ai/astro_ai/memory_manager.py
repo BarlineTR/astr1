@@ -203,6 +203,27 @@ class PersistentProfile:
                         self.data["environmental_observations"] = obs_list[-3:]
                     self.save()
 
+    def add_known_person(self, name: str, title: str = "Tanışılan Kişi", formal_title: str = "", notes: str = ""):
+        """Stores a learned person profile in persistent memory."""
+        with self._lock:
+            people = self.data.setdefault("known_people", {})
+            norm = name.strip().lower()
+            people[norm] = {
+                "name": name.strip(),
+                "title": title.strip(),
+                "formal_title": formal_title.strip() or name.strip(),
+                "notes": notes.strip(),
+                "learned_at": time.time()
+            }
+            self.save()
+
+    def get_known_person(self, name: str) -> Optional[Dict[str, Any]]:
+        """Retrieves a known person profile by name."""
+        with self._lock:
+            people = self.data.get("known_people", {})
+            norm = name.strip().lower()
+            return people.get(norm)
+
     def set_persona(self, persona_name: str):
         with self._lock:
             self.data["current_persona"] = persona_name
