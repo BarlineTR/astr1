@@ -514,8 +514,8 @@ class AiBrainNode(Node):
         if not self._enabled:
             return
 
-        user_text = msg.data.strip()
-        if not user_text:
+        raw_text = msg.data.strip()
+        if not raw_text:
             return
 
         now = time.monotonic()
