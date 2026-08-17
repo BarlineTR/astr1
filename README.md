@@ -9,11 +9,64 @@ The system has been completely modularized into ROS 2 Humble packages:
 ### 📦 Packages
 - `astro_base`: Arduino Mega serial bridge for motor control and base sensors.
 - `astro_lidar`: RPLIDAR A1 wrapper and NaN/Range filter node (`scan_filter_node`).
-- `astro_vision`: OAK-D Lite driver wrapper and OpenCV Face Detection node.
-- `astro_audio`: ReSpeaker array driver handling Audio Capture, Speech Recognition (Vosk/Faster-Whisper), and TTS (ElevenLabs/edge-tts/XTTS/pyttsx3/gTTS).
-- `astro_ai`: AI Brain Node managing LLM interactions and memory via OpenAI API standard.
+- `astro_vision`: OAK-D Lite driver (plus a USB-webcam publisher), face **detection and recognition** (`face_detector_node`), and the on-chip spatial pipeline (`oak_spatial_native_node`).
+- `astro_audio`: ReSpeaker capture, Speech Recognition (local Faster-Whisper or cloud Whisper), **speaker recognition**, and TTS (local XTTS voice cloning, OpenAI, edge-tts).
+- `astro_ai`: AI Brain — LLM engines, persona, long-term memory, conversation state machine.
 - `astro_bringup`: Centralized launch files and parameters for the whole system.
 - `astro_description`: URDF models and Robot State Publisher (tf2).
+
+### 🧠 Who does what — engine matrix
+
+Every engine is chosen in `.env`; each has a working fallback, so a missing key or a
+dead network degrades the robot instead of stopping it.
+
+| Job | Default | Alternatives | Local? |
+|---|---|---|---|
+| LLM (chat) | Groq LPU | Gemini (`LLM_PROVIDER="gemini"`), OpenAI | cloud |
+| Speech → text | Faster-Whisper (`STT_ENGINE="faster-whisper"`) | Groq Whisper, OpenAI Whisper | **yes**, GPU |
+| Text → speech | XTTS (`TTS_ENGINE="xtts"`) | OpenAI TTS, edge-tts | **yes**, GPU |
+| Who is this face? | SFace embeddings (OpenCV ONNX) | — | **yes**, CPU |
+| Who is speaking? | WeSpeaker ResNet34 (ONNX) | — | **yes**, CPU |
+
+Face and speaker recognition need no extra pip package — they run on `opencv-python`
+and `onnxruntime`, which are already installed. Only the model files are downloaded:
+
+```bash
+./scripts/install_face_models.sh     # YuNet + SFace + WeSpeaker (~63 MB total)
+```
+
+### 👥 Teaching the robot who people are
+
+Faces and voices are enrolled separately but should use **the same name**, so the
+brain can fuse "the person I see" with "the person who is talking".
+
+```bash
+# Faces — from photos, or live from the camera
+./scripts/enroll_face.py --name Yunus --photos faces/Yunus
+./scripts/enroll_face.py --name Yunus --capture --count 5
+./scripts/enroll_face.py --list
+./scripts/enroll_face.py --test some_photo.jpg     # who is this?
+
+# Voices — from WAV files, or live from the microphone
+./scripts/enroll_speaker.py --name Yunus --audio voices/Yunus
+./scripts/enroll_speaker.py --name Yunus --record --count 3 --seconds 5
+./scripts/enroll_speaker.py --list
+```
+
+The curated gallery of public officials lives in
+`ros2_ws/src/astro_vision/data/known_faces/<person>/*.jpg` and is indexed automatically
+at startup, together with their titles (`Sayın Valim`, `Sayın Başkanım`, …).
+
+**Accuracy notes, measured on this repo's data:**
+
+- Faces: same person 0.74–0.95, different people 0.10–0.41 cosine. Default threshold
+  `FACE_MATCH_THRESHOLD=0.45`. With only one photo per person, two officials in the
+  gallery reach 0.414 — adding 2–3 photos per person is what actually fixes that, and
+  then the threshold can go back down to 0.40.
+- Voices: same person 0.46–0.81, different people 0.16–0.33. Default
+  `SPEAKER_MATCH_THRESHOLD=0.40`. Enroll 3–5 recordings of at least 3 seconds each.
+- Large gallery photos (≥1500 px) used to fail detection entirely; detection now runs on
+  a downscaled copy, which took undetected gallery faces from 9/25 down to 1/25.
 
 ## 🛠️ Installation & Build
 
@@ -146,10 +199,17 @@ ros2 launch astro_bringup robot.launch.py
 ### Launching Individual Subsystems
 If you want to test or launch sensors individually for debugging:
 
-**Vision (OAK-D + Face Detection):**
+**Vision (camera + face recognition):**
 ```bash
-ros2 launch astro_vision camera.launch.py
+ros2 launch astro_vision camera.launch.py                      # OAK-D driver
+ros2 launch astro_vision camera.launch.py source:=webcam       # USB webcam instead
+ros2 launch astro_vision camera.launch.py use_native_spatial:=true   # on-chip OAK-D pipeline
 ```
+
+All sources publish to the same topic (`/oak/rgb/image_raw`), so the vision nodes do not
+care which one is running. `source:=webcam` is what makes the stack testable on a laptop
+with no OAK-D attached. `face_detector_node` publishes `/vision/person_name` with the
+recognized person, plus `/vision/faces` (JSON with names, similarity and boxes).
 
 **LiDAR (RPLIDAR + Filter):**
 ```bash
@@ -170,41 +230,35 @@ Centralized parameters are stored in `astro_bringup/config/astro_params.yaml`. Y
 - RPLIDAR ranges and baud rates
 
 ### 4. Advanced STT (Ses Tanıma) Options
-You can change the STT engine via the `.env` file (`STT_ENGINE`).
 
-**Option 1: Vosk Large Model (Offline, 1GB)**
-For much better offline Turkish recognition, download the large model:
-```bash
-wget https://alphacephei.com/vosk/models/vosk-model-tr-0.3.zip
-unzip vosk-model-tr-0.3.zip
-sudo mv vosk-model-tr-0.3 /opt/vosk/
-```
-Then update your `.env` file:
-```ini
-STT_ENGINE="vosk"
-STT_VOSK_MODEL_PATH="/opt/vosk/vosk-model-tr-0.3"
-```
-Any model directory kept at the repository root (e.g. `vosk-model-small-tr-0.3/`) is git-ignored — point `STT_VOSK_MODEL_PATH` at it with an absolute path instead of committing 57 MB+ of model files.
+`STT_ENGINE` in `.env` picks the engine. The node tries them in order and keeps the first
+that works, so a missing key never leaves the robot deaf.
 
-**Option 2: Faster-Whisper (Recommended — full sentences, offline)**
-The `faster-whisper` package is already part of `requirements.txt`, so no extra install step is needed inside the venv. Just set it in `.env`:
+**Faster-Whisper (default, local, no internet)**
 
-> ⚠️ **Do not use `distil-*` models for Turkish.** Every Distil-Whisper checkpoint (`distil-large-v3`, `distil-medium.en`, …) is an English-only distillation — it ignores `language="tr"` and returns English text. Use the multilingual `large-v3` (or `medium` / `small` on weaker GPUs).
 ```ini
 STT_ENGINE="faster-whisper"
-STT_FW_MODEL="distil-large-v3"
-STT_FW_DEVICE="cuda"          # use "cpu" if no NVIDIA GPU
-STT_FW_COMPUTE_TYPE="float16" # use "int8" on CPU
+STT_FW_MODEL="large-v2"        # "turbo", "medium", "small" on weaker GPUs
+STT_FW_DEVICE="cuda"           # falls back to CPU automatically if CUDA fails
+STT_FW_COMPUTE_TYPE="float16"  # "int8" on CPU
+STT_FW_CPU_COMPUTE_TYPE="int8"
 ```
-On first launch the model downloads (~800MB for distil-large-v3). Expect log:
-`✅ Faster-Whisper modeli başarıyla yüklendi.`
 
-**Option 3: Whisper API (Cloud)**
-If you want to use OpenAI or Groq Whisper for perfect STT:
+> ⚠️ **Never use `distil-*` models for Turkish.** Every Distil-Whisper checkpoint is an
+> English-only distillation — it ignores `language="tr"` and returns English text.
+
+**Cloud Whisper (Groq / OpenAI)**
+
 ```ini
-STT_ENGINE="whisper"
-STT_API_KEY="sk-YOUR-KEY"
+STT_ENGINE="groq"      # or "openai"
+GROQ_API_KEY="gsk-..."
 ```
+
+Groq's `whisper-large-v3` is the fastest of the three; it needs internet and a key.
+
+**Who is speaking.** Every transcription also runs speaker recognition and publishes the
+result on `/audio/speaker_name`, alongside the plain text on `/speech/text` (kept separate
+so wake-word matching is not disturbed). Turn it off with `SPEAKER_ID_ENABLED=0`.
 
 ### 5. Advanced TTS (Ses Sentezi) Options
 
