@@ -45,19 +45,23 @@ except ImportError:
 def _load_env():
     candidates = [
         os.path.abspath(".env"),
+        os.path.abspath(".env.production"),
         os.path.abspath(os.path.join(os.getcwd(), ".env")),
+        os.path.abspath(os.path.join(os.getcwd(), ".env.production")),
         os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..", "..", ".env")),
+        os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..", "..", ".env.production")),
         os.path.expanduser("~/Desktop/astr1/.env"),
+        os.path.expanduser("~/Desktop/astr1/.env.production"),
         os.path.expanduser("~/.env")
     ]
     for c in candidates:
         if os.path.exists(c):
-            load_dotenv(dotenv_path=c, override=False)
+            load_dotenv(dotenv_path=c, override=True)
             return c
     try:
         env_path = find_dotenv(usecwd=True)
         if env_path:
-            load_dotenv(dotenv_path=env_path, override=False)
+            load_dotenv(dotenv_path=env_path, override=True)
             return env_path
     except Exception:
         pass
