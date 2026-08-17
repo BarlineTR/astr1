@@ -240,7 +240,7 @@ class SpatialVisionNode(Node):
 
             # 4. Face Recognition Matching
             recog_name, recog_conf, recog_meta = self.face_recognizer.recognize_face(face_roi_bgr)
-            is_known = (recog_name is not None and recog_conf >= 0.72)
+            is_known = (recog_name is not None and recog_conf >= 0.84)
             if is_known and recog_conf > top_recognized_person["confidence"]:
                 top_recognized_person = {
                     "name": recog_name,

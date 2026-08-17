@@ -273,22 +273,24 @@ class AiBrainNode(Node):
             chat_models = []
             for mid in active_ids:
                 mid_l = mid.lower()
-                # Exclude embedding, audio, guardrails, reasoning/thinking models (deepseek, r1, qwq) and openai moderation
-                if any(x in mid_l for x in ["whisper", "embedding", "guard", "moderation", "tts", "gpt-oss", "openai", "deepseek", "r1", "qwq", "distill"]):
+                # Exclude embedding, audio, guardrails, reasoning models (deepseek, r1, qwq, qwen, distill) and openai moderation
+                if any(x in mid_l for x in ["whisper", "embedding", "guard", "moderation", "tts", "gpt-oss", "openai", "deepseek", "r1", "qwq", "qwen", "distill"]):
                     continue
                 chat_models.append(mid)
 
             def score(m):
                 ml = m.lower()
-                if "llama-3.3-70b" in ml: return 10
-                if "llama-3.1-70b" in ml: return 9
-                if "llama-3-70b" in ml: return 8
-                if "qwen" in ml: return 7
-                if "llama-3.3" in ml or "llama-3.1-8b" in ml: return 6
-                if "mixtral" in ml: return 5
-                if "70b" in ml: return 4
-                if "8b" in ml: return 3
-                return 1
+                if "llama-3.3-70b-versatile" in ml: return 10
+                if "llama-3.1-70b-versatile" in ml: return 9
+                if "llama-3.1-8b-instant" in ml: return 8
+                if "llama3-70b" in ml: return 7
+                if "llama3-8b" in ml: return 6
+                if "llama-3.3" in ml or "llama-3.1" in ml: return 5
+                if "mixtral-8x7b" in ml: return 4
+                if "gemma" in ml: return 3
+                if "70b" in ml: return 2
+                if "8b" in ml: return 1
+                return 0
 
             chat_models.sort(key=score, reverse=True)
             return chat_models
@@ -794,16 +796,17 @@ class AiBrainNode(Node):
 
             clean_full = clean_tts_text(full_text)
 
-            # Refusal Detection & In-Character Recovery
-            if is_canned_refusal(clean_full):
-                self.get_logger().warn(f"⚠️ [AI Brain] Model ret/güvenlik cevabı verdi: \"{clean_full}\". Hafızaya kaydedilmiyor, kurtarma yanıtı oluşturuluyor.")
+            # Refusal or Empty Output Detection & In-Character Fallback
+            if not clean_full or len(clean_full) < 2 or is_canned_refusal(clean_full):
+                reason = "ret cevabı" if is_canned_refusal(clean_full) else "boş/düşünce zinciri"
+                self.get_logger().warn(f"⚠️ [AI Brain] Model {reason} verdi: \"{clean_full}\". Gemini REST / Karakter yedeğine geçiliyor.")
                 # Try fallback to Gemini REST first
                 gemini_text = self._query_gemini_text_rest(system_prompt, user_text, self.memory.episodic.get_messages())
-                if gemini_text and not is_canned_refusal(gemini_text):
+                if gemini_text and not is_canned_refusal(gemini_text) and len(gemini_text) >= 2:
                     clean_full = gemini_text
                 else:
                     persona_recovery = {
-                        "flirt": "Ooo hızlısın! Lafı dolandırma bakalım, ne diyorsun sen?",
+                        "flirt": "Ooo harika! Bütün algılarımla seninleyim, söyle bakalım güzellik ne diyorsun?",
                         "rude": "Ne diyon birader, ne geveliyorsun?",
                         "angry": "Bana böyle boş yapma, sadede gel!",
                         "sarcastic": "Aman ne derin bir konu, cevabı bulmaya işlemcim yetmedi doğrusu!",
@@ -813,11 +816,10 @@ class AiBrainNode(Node):
                     }
                     clean_full = persona_recovery.get(persona, "Seni dinliyorum, devam et bakalım!")
 
-            if clean_full and len(clean_full) >= 2:
-                self.get_logger().info(f"🤖 [Astro]: \"{clean_full}\"")
-                self.memory.episodic.add_message("assistant", clean_full)
-                self._publish_tts(clean_full)
-                self._publish_emotion(persona)
+            self.get_logger().info(f"🤖 [Astro]: \"{clean_full}\"")
+            self.memory.episodic.add_message("assistant", clean_full)
+            self._publish_tts(clean_full)
+            self._publish_emotion(persona)
 
             # Latency Benchmarking
             t_done = time.monotonic()

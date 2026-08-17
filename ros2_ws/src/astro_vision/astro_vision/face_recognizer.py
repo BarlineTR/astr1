@@ -204,7 +204,7 @@ class FaceRecognizer:
             except Exception:
                 return True
 
-    def recognize_face(self, face_bgr: np.ndarray, threshold: float = 0.78) -> Tuple[Optional[str], float, Dict[str, Any]]:
+    def recognize_face(self, face_bgr: np.ndarray, threshold: float = 0.84) -> Tuple[Optional[str], float, Dict[str, Any]]:
         """Matches a face ROI against the known gallery. Returns (name, confidence, metadata)."""
         emb = self.extract_embedding(face_bgr)
         if emb is None:
