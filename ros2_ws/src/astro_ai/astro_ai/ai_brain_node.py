@@ -1380,30 +1380,30 @@ class AiBrainNode(Node):
         threading.Thread(target=self._idle_learning_loop, daemon=True).start()
 
     def _query_groq_vision_for_idle(self, prompt: str, base64_image: str) -> str | None:
-        """Free background room observation using Groq Vision or Gemini REST (Zero OpenAI token cost)."""
-        # 1. Try Groq Vision
-        if self._groq:
-            for gv_model in ["llama-3.2-11b-vision-preview", "llama-3.2-90b-vision-preview"]:
-                try:
-                    response = self._groq.chat.completions.create(
-                        messages=[
-                            {"role": "user", "content": [
-                                {"type": "text", "text": prompt},
-                                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"}}
-                            ]}
-                        ],
-                        model=gv_model,
-                        temperature=0.2,
-                        max_tokens=150
-                    )
-                    raw = response.choices[0].message.content.strip()
-                    clean = extract_spoken_turkish_sentence(raw)
-                    if clean:
-                        return clean
-                except Exception as ge:
-                    self.get_logger().debug(f"Groq Vision {gv_model} notice: {ge}")
+        """Background room observation using OpenAI GPT-4o-mini, Groq Vision, or Gemini REST."""
+        # 1. Try OpenAI Vision (fast & reliable)
+        if self._openai:
+            try:
+                res = self._openai.chat.completions.create(
+                    model="gpt-4o-mini",
+                    messages=[
+                        {"role": "user", "content": [
+                            {"type": "text", "text": prompt},
+                            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"}}
+                        ]}
+                    ],
+                    temperature=0.2,
+                    max_tokens=100,
+                    timeout=5.0
+                )
+                raw = res.choices[0].message.content.strip()
+                clean = extract_spoken_turkish_sentence(raw)
+                if clean:
+                    return clean
+            except Exception as oe:
+                self.get_logger().debug(f"OpenAI Idle Vision notice: {oe}")
 
-        # 2. Try Free Gemini REST
+        # 2. Try Gemini REST
         if self._ai_api_key and self._ai_api_key.startswith("AIza"):
             for g_model in ["gemini-2.0-flash", "gemini-1.5-flash"]:
                 try:
@@ -1429,8 +1429,8 @@ class AiBrainNode(Node):
         return None
 
     def _idle_memory_reflection(self):
-        """Uses Groq Llama 3.3 70B to summarize conversations into long-term profile knowledge for free."""
-        if not self._groq or len(self.memory.episodic.get_messages()) < 4:
+        """Uses fast LLM to summarize recent interactions into long-term profile knowledge."""
+        if len(self.memory.episodic.get_messages()) < 2:
             return
         try:
             recent_conv = self.memory.episodic.get_messages()[-6:]
@@ -1440,37 +1440,48 @@ class AiBrainNode(Node):
                 f"(örnek: hobisi, mesleği, tercih ettiği hitap, adı veya beğendiği bir şey) tek bir kısa Türkçe cümle olarak özetle. "
                 f"Yeni veya kayda değer bir bilgi yoksa sadece 'YOK' yaz.\n\nKonuşma:\n{conv_str}"
             )
-            resp = self._groq.chat.completions.create(
-                messages=[{"role": "user", "content": prompt}],
-                model="llama-3.3-70b-versatile",
-                temperature=0.1,
-                max_tokens=60
-            )
-            ans = resp.choices[0].message.content.strip()
+            ans = None
+            if self._openai:
+                res = self._openai.chat.completions.create(
+                    messages=[{"role": "user", "content": prompt}],
+                    model="gpt-4o-mini",
+                    temperature=0.1,
+                    max_tokens=60
+                )
+                ans = res.choices[0].message.content.strip()
+            elif self._groq and self._active_groq_models:
+                res = self._groq.chat.completions.create(
+                    messages=[{"role": "user", "content": prompt}],
+                    model=self._active_groq_models[0],
+                    temperature=0.1,
+                    max_tokens=60
+                )
+                ans = res.choices[0].message.content.strip()
+
             if ans and "YOK" not in ans.upper() and len(ans) >= 5:
                 clean_fact = clean_tts_text(ans)
                 self.memory.profile.add_observation(f"Kullanıcı Bilgisi: {clean_fact}")
-                self.get_logger().info(f"🧠 [Groq Otonom Öğrenme - Hafıza]: {clean_fact}")
+                self.get_logger().info(f"🧠 [Otonom Hafıza Yansıtması]: {clean_fact}")
         except Exception as e:
-            self.get_logger().debug(f"Groq reflection notice: {e}")
+            self.get_logger().debug(f"Memory reflection notice: {e}")
 
     def _idle_learning_loop(self):
         while rclpy.ok():
-            time.sleep(15)
+            time.sleep(5)
             if not self._enable_idle_learning:
                 continue
             if not self.state_machine.is_idle() or self._tts_speaking or self._is_processing:
                 continue
 
             now = time.monotonic()
-            # 3-minute interval (180s) powered 100% by Groq (Zero OpenAI cost)
-            if (now - getattr(self, '_last_idle_learning_time', 0)) > 180.0:
+            # 35-second interval for responsive room observation
+            if (now - getattr(self, '_last_idle_learning_time', 0)) > 35.0:
                 self._last_idle_learning_time = now
 
                 # 1. Background Cognitive Memory Reflection
                 self._idle_memory_reflection()
 
-                # 2. Background Room Scene Observation via Groq Vision
+                # 2. Background Room Scene Observation via Vision
                 captured_frame = None
                 with self._lock:
                     if self._latest_frame is not None and (now - self._latest_frame_time) < 4.0:
@@ -1479,14 +1490,14 @@ class AiBrainNode(Node):
                 if captured_frame is not None:
                     base64_img = frame_to_base64_jpeg(captured_frame, max_dim=512)
                     if base64_img:
-                        self.get_logger().info("🕵️ [Groq Idle Learning] Etraf sessiz, Astro odayı inceliyor (Groq Vision)...")
+                        self.get_logger().info("🕵️ [Otonom Boşta Öğrenme] Etraf sessiz, Astro odayı inceliyor...")
                         prompt = "Kameradaki odayı, ortamı veya nesneleri Türkçe olarak tek bir kısa cümleyle açıkla. Açıklama harici hiçbir şey yazma. Örnek: 'Masada bir bilgisayar var.' veya 'Oda aydınlık ve sakin.'"
                         obs = self._query_groq_vision_for_idle(prompt, base64_img)
                         if obs:
                             self.memory.profile.add_observation(obs)
-                            self.get_logger().info(f"🧠 [Groq Otonom Hafıza - Gözlem]: {obs}")
+                            self.get_logger().info(f"🧠 [Otonom Boşta Gözlem]: {obs}")
 
-                            # If Groq Vision observes a person looking at the robot
+                            # If Vision observes a person looking at the robot
                             obs_lower = obs.lower()
                             person_gaze_keywords = ["bize bakıyor", "bana bakıyor", "kameraya bakıyor", "karşımda", "karşısında", "oturan bir", "biri var", "insan var", "beyefendi", "hanımefendi"]
                             if any(kw in obs_lower for kw in person_gaze_keywords):
