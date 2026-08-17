@@ -627,7 +627,7 @@ class AiBrainNode(Node):
             is_learning_person = self._is_person_learning_query(user_text)
             is_identity = self._is_identity_query(user_text)
             is_weather, weather_city = self._is_weather_query(user_text)
-            base64_img = frame_to_base64_jpeg(frame, max_dim=512) if frame is not None and (is_visual or is_learning_obj) else None
+            base64_img = frame_to_base64_jpeg(frame, max_dim=768) if frame is not None and (is_visual or is_learning_obj) else None
             persona = self.persona_engine.current_persona
 
             # 1. Live Weather Tool Direct Handling
@@ -872,9 +872,17 @@ class AiBrainNode(Node):
 
     def _query_vision(self, prompt: str, base64_image: str) -> str | None:
         persona = self.persona_engine.current_persona
-        system_instruction = f"Sen Astro adında {persona} karakterli akıllı ve sempatik bir sosyal robotsun. Karşındaki kameradan çekilen görüntüyü görüyorsun. Kullanıcının sorusunu (örneğin elinde ne tuttuğunu veya odada ne olduğunu) dikkatle incele ve kendi kişiliğinle tek bir eksiksiz doğal Türkçe cümleyle yanıtla."
+        system_instruction = (
+            f"Sen Astro adında {persona} karakterli akıllı ve sempatik bir sosyal robotsun. "
+            "Sana kullanıcının tam karşısındaki OAK-D kamerasından anlık bir fotoğraf karesi iletilmiştir. "
+            "Görüntüyü dikkatle incele: kullanıcının üzerindeki kıyafetleri (renk, tişört/gömlek/ceket), "
+            "elinde tuttuğu nesneleri, yaptığı hareketleri ve odayı detaylarıyla analiz et. "
+            "Kullanıcının sorusuna doğrudan fotoğrafta gördüklerini anlatacak şekilde, kendi tarzınla "
+            "samimi ve net 1-2 Türkçe cümleyle cevap ver. Kesinlikle 'göremiyorum' veya 'resim yok' deme; "
+            "kameranın yakaladığı görsel detayları açıkça ifade et."
+        )
 
-        # 1. Try Primary OpenAI Vision Client (gpt-4o-mini / gpt-4o) with low-detail token optimization
+        # 1. Try Primary OpenAI Vision Client (gpt-4o-mini / gpt-4o) with auto detail for high clarity
         if self._openai:
             for m_cand in [self._vision_model, "gpt-4o-mini", "gpt-4o"]:
                 try:
@@ -885,7 +893,7 @@ class AiBrainNode(Node):
                                 {"type": "text", "text": prompt},
                                 {"type": "image_url", "image_url": {
                                     "url": f"data:image/jpeg;base64,{base64_image}",
-                                    "detail": "low"  # Ultra-efficient: 85 tokens instead of 1000+
+                                    "detail": "auto"
                                 }}
                             ]}
                         ],
