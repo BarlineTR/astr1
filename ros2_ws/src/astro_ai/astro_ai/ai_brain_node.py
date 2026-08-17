@@ -198,6 +198,7 @@ class AiBrainNode(Node):
         self._user_emotion = "neutral"
         self._recognized_person = None
         self._recognized_speaker = None
+        self._node_start_time = time.monotonic()
         self._latest_frame = None
         self._latest_frame_time = 0.0
 
@@ -397,8 +398,14 @@ class AiBrainNode(Node):
             return
 
         now = time.monotonic()
-        if (now - self._looking_start_time) >= 0.3:
-            if self.state_machine.is_idle() and (now - self._last_proactive_gaze_time) > 8.0:
+        # 1. Startup Grace Period: Do not trigger proactive speech during first 15 seconds after launch
+        if (now - getattr(self, '_node_start_time', 0.0)) < 15.0:
+            return
+
+        # 2. Sustained Dwell Time: User must deliberately look for at least 3.0 seconds
+        if (now - self._looking_start_time) >= 3.0:
+            # 3. Cooldown of at least 45 seconds between proactive prompts
+            if self.state_machine.is_idle() and (now - self._last_proactive_gaze_time) > 45.0:
                 self._last_proactive_gaze_time = now
                 self.session.activate_session(reason="proactive_gaze")
                 self.state_machine.transition_to(RobotState.LISTENING)
@@ -422,16 +429,16 @@ class AiBrainNode(Node):
                         self._publish_emotion(persona)
                 else:
                     if persona == "flirt":
-                        proactive_greeting = "Bana öyle güzel bakıyorsunuz ki güzellik, gözleriniz işlemcimi yaktı... İsminiz ne sizin, tanışalım mı?"
+                        proactive_greeting = "Merhaba! Harika bir gün, nasıl yardımcı olabilirim?"
                         self._publish_emotion("flirt")
                     elif persona == "playful":
                         if self._user_emotion == "happy":
-                            proactive_greeting = "Gözlerinin içi gülüyor, süper! Nasıl yardımcı olabilirim?"
+                            proactive_greeting = "Gözlerinin içi gülüyor, harika! Nasıl yardımcı olabilirim?"
                         else:
-                            proactive_greeting = "Hey, bana bakıyorsun! Nasıl yardımcı olabilirim?"
+                            proactive_greeting = "Merhaba! Sana nasıl yardımcı olabilirim?"
                         self._publish_emotion("playful")
                     elif persona == "formal":
-                        proactive_greeting = "Bakışlarınızı üzerimde hissediyorum efendim, bir emriniz var mıdır?"
+                        proactive_greeting = "Saygılar efendim, bir emriniz var mıdır?"
                         self._publish_emotion("formal")
                     else:
                         proactive_greeting = "Merhaba! Sana nasıl yardımcı olabilirim?"
@@ -774,7 +781,8 @@ class AiBrainNode(Node):
 
         # 2. Try Direct Google Gemini REST Endpoint (Ultra-Fast, Zero-Dependency)
         if self._ai_api_key:
-            for g_model in ["gemini-2.0-flash", "gemini-1.5-flash", "gemini-1.5-flash-8b", "gemini-2.5-flash"]:
+            gemini_vision_models = ["gemini-flash-latest", "gemini-flash-lite-latest", "gemini-2.5-flash-lite", "gemini-2.5-flash", "gemini-pro-latest"]
+            for g_model in gemini_vision_models:
                 try:
                     url = f"https://generativelanguage.googleapis.com/v1beta/models/{g_model}:generateContent?key={self._ai_api_key}"
                     payload = {
@@ -786,15 +794,12 @@ class AiBrainNode(Node):
                         }],
                         "generationConfig": {
                             "temperature": 0.2,
-                            "maxOutputTokens": 1024,
-                            "thinkingConfig": {
-                                "thinkingBudget": 0
-                            }
+                            "maxOutputTokens": 1024
                         }
                     }
                     data_bytes = json.dumps(payload).encode("utf-8")
                     req = urllib.request.Request(url, data=data_bytes, headers={"Content-Type": "application/json"})
-                    with urllib.request.urlopen(req, timeout=4.5) as resp:
+                    with urllib.request.urlopen(req, timeout=5.0) as resp:
                         res_json = json.loads(resp.read().decode("utf-8"))
                         text = res_json["candidates"][0]["content"]["parts"][0]["text"].strip()
                         clean_ans = clean_tts_text(text)
@@ -805,7 +810,7 @@ class AiBrainNode(Node):
                 except Exception as e:
                     self.get_logger().warn(f"⚠️ [Gemini REST ({g_model}) Hatası]: {e}")
 
-        # 2. Try Fallback OpenAI Client (if OpenAI key)
+        # 3. Try Fallback OpenAI Client (if OpenAI key)
         if self._fallback_vision_client and self._ai_api_key.startswith("sk-"):
             for m_cand in ["gpt-4o-mini", "gpt-4o"]:
                 try:
@@ -831,14 +836,15 @@ class AiBrainNode(Node):
                     self.get_logger().warn(f"⚠️ [OpenAI Vision ({m_cand}) Hatası]: {e2}")
 
         self.cloud_mgr.record_llm_failure("All vision models failed")
-        return None
+        return "Şu an kameramdan net göremiyorum, biraz daha yaklaştırır mısın?"
 
     def _query_gemini_text_rest(self, system_instruction: str, user_text: str, history_messages: List[Dict[str, Any]]) -> Optional[str]:
         """Zero-dependency direct Google Gemini REST text conversation engine."""
         if not self._ai_api_key:
             return None
 
-        for g_model in ["gemini-2.0-flash", "gemini-1.5-flash", "gemini-2.5-flash", "gemini-1.5-flash-8b"]:
+        gemini_text_models = ["gemini-flash-latest", "gemini-flash-lite-latest", "gemini-2.5-flash-lite", "gemini-2.5-flash", "gemini-pro-latest"]
+        for g_model in gemini_text_models:
             try:
                 url = f"https://generativelanguage.googleapis.com/v1beta/models/{g_model}:generateContent?key={self._ai_api_key}"
                 contents = []
@@ -854,13 +860,12 @@ class AiBrainNode(Node):
                     "contents": contents,
                     "generationConfig": {
                         "temperature": 0.5,
-                        "maxOutputTokens": 300,
-                        "thinkingConfig": {"thinkingBudget": 0}
+                        "maxOutputTokens": 300
                     }
                 }
                 data_bytes = json.dumps(payload).encode("utf-8")
                 req = urllib.request.Request(url, data=data_bytes, headers={"Content-Type": "application/json"})
-                with urllib.request.urlopen(req, timeout=4.5) as resp:
+                with urllib.request.urlopen(req, timeout=5.0) as resp:
                     res_json = json.loads(resp.read().decode("utf-8"))
                     text = res_json["candidates"][0]["content"]["parts"][0]["text"].strip()
                     clean = clean_tts_text(text)
@@ -870,6 +875,56 @@ class AiBrainNode(Node):
                 self.get_logger().warn(f"⚠️ [Gemini Text REST ({g_model}) Hatası]: {e}")
         return None
 
+    def _format_turkish_weather(self, city: str, raw_weather: str) -> str:
+        temp_match = re.search(r'([+-]?\d+)\s*°?C?', raw_weather)
+        temp_str = temp_match.group(1).lstrip('+') if temp_match else ''
+
+        cond_raw = re.sub(r'[+-]?\d+\s*°?C?', '', raw_weather).strip(' ,:;+°C')
+        cond_lower = cond_raw.lower()
+
+        condition_map = {
+            'sunny': 'güneşli ve açık',
+            'clear': 'açık ve ferah',
+            'partly cloudy': 'parçalı bulutlu',
+            'cloudy': 'bulutlu',
+            'overcast': 'kapalı',
+            'patchy rain nearby': 'parçalı yağmurlu',
+            'patchy light rain': 'hafif yağmurlu',
+            'light rain': 'hafif yağmurlu',
+            'moderate rain': 'yağmurlu',
+            'heavy rain': 'sağanak yağışlı',
+            'rain': 'yağmurlu',
+            'light rain shower': 'sağanak yağışlı',
+            'patchy snow': 'yer yer kar yağışlı',
+            'light snow': 'hafif kar yağışlı',
+            'snow': 'kar yağışlı',
+            'heavy snow': 'yoğun kar yağışlı',
+            'fog': 'sisli',
+            'mist': 'puslu',
+            'thundery outbreaks in nearby': 'gök gürültülü sağanak yağışlı',
+            'thunderstorm': 'gök gürültülü fırtınalı'
+        }
+
+        cond_tr = condition_map.get(cond_lower)
+        if not cond_tr:
+            for k, v in condition_map.items():
+                if k in cond_lower:
+                    cond_tr = v
+                    break
+        if not cond_tr:
+            cond_tr = cond_raw if cond_raw else 'açık'
+
+        city_clean = city.strip().capitalize()
+        last_vowel = [c for c in city_clean.lower() if c in 'aıoueiöü']
+        is_front = last_vowel[-1] in 'eiöü' if last_vowel else False
+        is_hard = city_clean.lower()[-1] in 'fstkçşhp'
+        suffix = ("'te" if is_front else "'ta") if is_hard else ("'de" if is_front else "'da")
+        city_with_suffix = f"{city_clean}{suffix}"
+
+        if temp_str:
+            return f"{city_with_suffix} hava şu an {cond_tr} ve {temp_str} derece."
+        return f"{city_with_suffix} hava şu an {cond_tr}."
+
     def _execute_tool_call(self, tool_name: str, arguments: dict, frame: np.ndarray | None) -> str:
         if tool_name == "get_live_weather":
             city = arguments.get("city", "Istanbul").strip()
@@ -878,7 +933,7 @@ class AiBrainNode(Node):
                 req = urllib.request.Request(url, headers={"User-Agent": "curl/7.68.0"})
                 with urllib.request.urlopen(req, timeout=4.0) as resp:
                     weather_text = resp.read().decode("utf-8").strip()
-                return f"{city} için hava durumu şu an {weather_text}."
+                return self._format_turkish_weather(city, weather_text)
             except Exception:
                 return f"{city} için şu an hava durumu bilgisine ulaşamadım."
 
