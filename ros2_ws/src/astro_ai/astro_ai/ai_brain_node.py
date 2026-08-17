@@ -516,6 +516,11 @@ class AiBrainNode(Node):
                 is_pure_greeting = (raw_text.lower().strip(" .,!?:;") in pure_greetings) or (not clean_prompt) or (len(clean_prompt) < 3)
 
                 if is_pure_greeting:
+                    t_done = time.monotonic()
+                    turn_ms = (t_done - t_vad_start) * 1000.0
+                    self.session.latency_tracker.record_turn(0.0, turn_ms, turn_ms)
+                    stats = self.session.latency_tracker.get_stats()
+                    self.get_logger().info(f"⚡ [Latency] Hızlı Yanıt: {turn_ms:.0f}ms (Doğrudan Selamlama) | p50: {stats['p50_total_ms']}ms, p95: {stats['p95_total_ms']}ms")
                     self._publish_tts(greeting)
                     return
                 else:
@@ -565,6 +570,11 @@ class AiBrainNode(Node):
                 self._publish_tts(clean_ans)
                 self._publish_emotion(persona)
                 self.memory.episodic.add_message("assistant", clean_ans)
+                t_done = time.monotonic()
+                total_turn_ms = (t_done - t_turn_start) * 1000.0
+                self.session.latency_tracker.record_turn(stt_latency_ms, total_turn_ms - stt_latency_ms, total_turn_ms)
+                stats = self.session.latency_tracker.get_stats()
+                self.get_logger().info(f"⚡ [Latency] Bu Dönüş: {total_turn_ms:.0f}ms (STT: {stt_latency_ms:.0f}ms, Hava API: {total_turn_ms - stt_latency_ms:.0f}ms) | p50: {stats['p50_total_ms']}ms, p95: {stats['p95_total_ms']}ms")
                 return
 
             # 2. Identity Query ("Ben kimim? / Beni tanıyor musun?")
@@ -583,6 +593,11 @@ class AiBrainNode(Node):
                 self._publish_tts(ans)
                 self._publish_emotion(persona)
                 self.memory.episodic.add_message("assistant", ans)
+                t_done = time.monotonic()
+                total_turn_ms = (t_done - t_turn_start) * 1000.0
+                self.session.latency_tracker.record_turn(stt_latency_ms, total_turn_ms - stt_latency_ms, total_turn_ms)
+                stats = self.session.latency_tracker.get_stats()
+                self.get_logger().info(f"⚡ [Latency] Bu Dönüş: {total_turn_ms:.0f}ms (STT: {stt_latency_ms:.0f}ms, Biyometri: {total_turn_ms - stt_latency_ms:.0f}ms) | p50: {stats['p50_total_ms']}ms, p95: {stats['p95_total_ms']}ms")
                 return
 
             # 3. Person Introduction & Biometric Enrollment
@@ -602,6 +617,11 @@ class AiBrainNode(Node):
                 self._publish_tts(clean_ans)
                 self._publish_emotion(persona)
                 self.memory.episodic.add_message("assistant", clean_ans)
+                t_done = time.monotonic()
+                total_turn_ms = (t_done - t_turn_start) * 1000.0
+                self.session.latency_tracker.record_turn(stt_latency_ms, total_turn_ms - stt_latency_ms, total_turn_ms)
+                stats = self.session.latency_tracker.get_stats()
+                self.get_logger().info(f"⚡ [Latency] Bu Dönüş: {total_turn_ms:.0f}ms (STT: {stt_latency_ms:.0f}ms, Profil Kayıt: {total_turn_ms - stt_latency_ms:.0f}ms) | p50: {stats['p50_total_ms']}ms, p95: {stats['p95_total_ms']}ms")
                 return
 
             # 4. Object Learning Tool

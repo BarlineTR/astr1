@@ -244,20 +244,48 @@ class TtsNode(Node):
             if not wav_data:
                 return
 
-            # 3. Direct Hardware Output via aplay (Guaranteed ReSpeaker Sound)
+            # 3. Direct Hardware Output with Cascading Fallbacks
             self._set_speaking(True)
             try:
+                played = False
                 if self.has_aplay:
-                    aplay_cmd = ["aplay", "-q", "-D", self.alsa_device, "-"]
-                    aplay_proc = subprocess.Popen(aplay_cmd, stdin=subprocess.PIPE, stderr=subprocess.DEVNULL)
-                    self._current_process = aplay_proc
-                    aplay_proc.communicate(input=wav_data)
-                elif sd is not None:
-                    import numpy as np
-                    raw_pcm = wav_data[44:]  # strip WAV header
-                    arr = np.frombuffer(raw_pcm, dtype=np.int16).astype(np.float32) / 32768.0
-                    sd.play(arr, samplerate=self.sample_rate)
-                    sd.wait()
+                    devices_to_try = [self.alsa_device]
+                    for d in ["default", "pulse", "sysdefault"]:
+                        if d not in devices_to_try:
+                            devices_to_try.append(d)
+
+                    for dev in devices_to_try:
+                        try:
+                            aplay_proc = subprocess.Popen(
+                                ["aplay", "-q", "-D", dev, "-"],
+                                stdin=subprocess.PIPE,
+                                stderr=subprocess.PIPE
+                            )
+                            self._current_process = aplay_proc
+                            _, stderr_data = aplay_proc.communicate(input=wav_data)
+                            if aplay_proc.returncode == 0:
+                                played = True
+                                break
+                            else:
+                                err_txt = stderr_data.decode('utf-8', errors='ignore') if stderr_data else ""
+                                self.get_logger().debug(f"aplay -D {dev} çıkış hatası ({aplay_proc.returncode}): {err_txt}")
+                        except Exception as pe:
+                            self.get_logger().debug(f"aplay {dev} istisnası: {pe}")
+
+                if not played and sd is not None:
+                    try:
+                        import numpy as np
+                        raw_pcm = wav_data[44:]  # strip WAV header
+                        arr = np.frombuffer(raw_pcm, dtype=np.int16).astype(np.float32) / 32768.0
+                        sd.play(arr, samplerate=self.sample_rate)
+                        sd.wait()
+                        played = True
+                    except Exception as sde:
+                        self.get_logger().warn(f"SoundDevice çalma hatası: {sde}")
+
+                if not played:
+                    self.get_logger().warn("⚠️ [TTS] Hiçbir ses çıkış aygıtına ulaşılamadı (aplay/sounddevice başarısız)!")
+
             finally:
                 self._current_process = None
                 self._current_ffmpeg = None
