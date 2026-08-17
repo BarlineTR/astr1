@@ -116,7 +116,7 @@ def frame_to_base64_jpeg(frame: np.ndarray, max_dim: int = 512) -> str | None:
 
 
 def is_canned_refusal(text: str) -> bool:
-    """Detects standard LLM safety refusal boilerplate phrases in Turkish & English."""
+    """Detects standard LLM safety refusal boilerplate phrases and English reasoning leaks."""
     if not text:
         return False
     t_lower = text.lower().strip()
@@ -125,7 +125,8 @@ def is_canned_refusal(text: str) -> bool:
         "isteğinize yardımcı olamam", "yardımcı olamam maalesef", "üzgünüm, ancak",
         "üzgünüm, ama lütfen", "daha saygılı bir dil", "bir yapay zeka olarak",
         "yapay zeka olarak", "uygunsuz içerik", "as an ai", "i cannot assist",
-        "i cannot fulfill", "i am unable to"
+        "i cannot fulfill", "i am unable to", "here's a thinking process",
+        "thinking process", "let's think"
     ]
     return any(p in t_lower for p in refusal_patterns)
 
@@ -272,8 +273,8 @@ class AiBrainNode(Node):
             chat_models = []
             for mid in active_ids:
                 mid_l = mid.lower()
-                # Exclude embedding, audio, guardrails, and overly censored moderation models
-                if any(x in mid_l for x in ["whisper", "embedding", "guard", "moderation", "tts", "gpt-oss", "openai"]):
+                # Exclude embedding, audio, guardrails, reasoning/thinking models (deepseek, r1, qwq) and openai moderation
+                if any(x in mid_l for x in ["whisper", "embedding", "guard", "moderation", "tts", "gpt-oss", "openai", "deepseek", "r1", "qwq", "distill"]):
                     continue
                 chat_models.append(mid)
 

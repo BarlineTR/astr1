@@ -124,30 +124,48 @@ def extract_spoken_turkish_sentence(raw_text: str) -> str:
     """Aggressively strips English reasoning chains, thought tags, and quotes."""
     if not raw_text:
         return ""
+    # Strip <think>...</think> blocks
     text = re.sub(r"(?i)<think>[\s\S]*?</think>", "", raw_text)
     text = re.sub(r"(?i)<\/?think>", "", text)
+    # Strip "Here's a thinking process..." and thought prefixes
+    text = re.sub(r"(?i)Here'?s a thinking process[\s\S]*?(?:\n\n|\n[A-ZÇĞİÖŞÜ]|$)", "", text)
+    text = re.sub(r"(?i)Thinking Process:?[\s\S]*?(?:\n\n|\n[A-ZÇĞİÖŞÜ]|$)", "", text)
+    text = re.sub(r"(?i)Here'?s a thought.*", "", text)
+    text = re.sub(r"(?i)Here'?s how to respond.*", "", text)
 
     lines = [line.strip() for line in text.split("\n") if line.strip()]
     if not lines:
         return ""
 
+    # Filter out reasoning/meta lines
+    clean_lines = []
+    for l in lines:
+        l_lower = l.lower()
+        if any(p in l_lower for p in ["thinking process", "here's a", "let's think", "analysis:", "thought:"]):
+            continue
+        if l.startswith(("*", "-", "#", "1.", "2.", "3.", ">")):
+            continue
+        clean_lines.append(l)
+
+    if not clean_lines:
+        return ""
+
     turkish_chars = set("çğıöşüÇĞİÖŞÜ")
-    for l in reversed(lines):
+    for l in reversed(clean_lines):
         if any(c in l for c in turkish_chars) or any(
             w in l.lower()
             for w in [
                 "sen", "ben", "merhaba", "selam", "evet", "hayır", "nasıl", "neden", "kim",
                 "nerede", "burada", "görüyorum", "bakıyorsun", "tamam", "güzel", "efendim",
-                "kral", "kardeşim", "hocam", "abi", "abla", "usta", "güzellik"
+                "kral", "kardeşim", "hocam", "abi", "abla", "usta", "güzellik", "bir", "ve", "ile", "için", "çok", "var", "yok"
             ]
         ):
-            if not l.startswith(("*", "-", "#", "1.", "2.", "Thinking", "Thought")):
-                return l.strip('"\': ')
-
-    for l in reversed(lines):
-        if not l.startswith(("*", "-", "#", "1.", "2.", "Thinking", "Thought")):
             return l.strip('"\': ')
-    return lines[-1].strip('"\': ')
+
+    last_line = clean_lines[-1].strip('"\': ')
+    if any(p in last_line.lower() for p in ["thinking", "process", "here's", "thought", "analysis"]):
+        return ""
+    return last_line
 
 
 def clean_tts_text(text: str) -> str:
