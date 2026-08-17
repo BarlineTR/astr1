@@ -14,6 +14,7 @@ import os
 import re
 import time
 import json
+import codecs
 import base64
 import threading
 import numpy as np
@@ -32,6 +33,22 @@ try:
     from groq import Groq
 except ImportError:
     Groq = None
+
+try:
+    import requests
+except ImportError:
+    requests = None
+
+# Google Gemini — REST üzerinden konuşulur (SDK bağımlılığı yok, requests yeter).
+GEMINI_API_ROOT = "https://generativelanguage.googleapis.com/v1beta"
+# "gemini-3.7-flash" gibi sürümlü, genel kullanıma açık flash modelleri yakalar.
+# preview/lite/image/tts türevleri bilinçli olarak dışarıda: robot sohbeti için
+# düşük gecikmeli ama tam yetenekli, kararlı bir model isteniyor.
+GEMINI_FLASH_RE = re.compile(r"^gemini-(\d+)(?:\.(\d+))?-flash$")
+# ListModels çağrısı başarısız olursa bu sırayla denenir. "-latest" takma adı
+# Google tarafından güncel flash modele yönlendirilir; sürüm sabitlemekten daha
+# dayanıklıdır (örn. gemini-2.5-flash artık yeni anahtarlara 404 dönüyor).
+GEMINI_MODEL_FALLBACKS = ("gemini-flash-latest",)
 
 try:
     from dotenv import find_dotenv, load_dotenv
@@ -244,9 +261,16 @@ class AiBrainNode(Node):
 
         self.memory = AstroMemory()
 
-        self.declare_parameter("llm_model", os.getenv("LLM_MODEL", "llama-3.3-70b-versatile"))
+        # Sağlayıcı seçimi: sohbet ve görme ayrı ayrı yönlendirilebilir.
+        # VISION_PROVIDER verilmezse LLM_PROVIDER neyse görme de oraya gider.
+        self.provider = os.getenv("LLM_PROVIDER", "gemini").strip().lower()
+        self.vision_provider = (os.getenv("VISION_PROVIDER", "").strip() or self.provider).lower()
+
+        self.declare_parameter("llm_model", os.getenv("LLM_MODEL", ""))
         self.declare_parameter("llm_temperature", float(os.getenv("LLM_TEMPERATURE", "0.55")))
-        self.declare_parameter("llm_max_tokens", int(os.getenv("LLM_MAX_TOKENS", "300")))
+        # Gemini 3.x'te düşünme tokenları da bu bütçeden düşülür: 300 token, cevabın
+        # kendisine sıra gelmeden tükenip cümleyi ortasından kesiyordu.
+        self.declare_parameter("llm_max_tokens", int(os.getenv("LLM_MAX_TOKENS", "1000")))
         self.declare_parameter("wake_word", os.getenv("WAKE_WORD", "hey astro"))
         self.declare_parameter("conversation_timeout", float(os.getenv("CONVERSATION_TIMEOUT", "15.0")))
 
@@ -255,25 +279,31 @@ class AiBrainNode(Node):
         self._max_tokens = int(self.get_parameter("llm_max_tokens").value)
         self._wake_word = self.get_parameter("wake_word").value
         self._conv_timeout = float(self.get_parameter("conversation_timeout").value)
+        # "low" (varsayılan, hızlı) | "high" (daha iyi akıl yürütme, yavaş) | "off"
+        self._thinking = os.getenv("LLM_THINKING", "low").strip().lower()
 
         self.groq_api_key = os.environ.get("GROQ_API_KEY", "").strip()
+        self.gemini_api_key = (
+            os.environ.get("GEMINI_API_KEY", "")
+            or os.environ.get("GOOGLE_API_KEY", "")
+        ).strip()
         self._groq = None
         self._vision_model = None
-        self._enabled = True
+        self._enabled = False
+        self._last_finish_reason = None
 
-        if Groq and self.groq_api_key:
-            try:
-                self._groq = Groq(api_key=self.groq_api_key)
-                self._vision_model = self._discover_vision_model()
-                self.get_logger().info(
-                    f"✅ [AI] Groq Aktif — Metin: {self._text_model} | Görme (Vision): {self._vision_model}"
-                )
-            except Exception as e:
-                self.get_logger().error(f"❌ [AI] Groq Client başlatılamadı: {e}")
-                self._enabled = False
+        if self.provider == "gemini":
+            self._init_gemini()
+        elif self.provider == "groq":
+            self._init_groq()
         else:
-            self.get_logger().error("❌ [AI] GROQ_API_KEY bulunamadı! STT/LLM devre dışı.")
-            self._enabled = False
+            self.get_logger().error(
+                f"❌ [AI] Bilinmeyen LLM_PROVIDER: \"{self.provider}\" — \"gemini\" veya \"groq\" olmalı"
+            )
+
+        # Görme farklı bir sağlayıcıdan isteniyorsa onun istemcisi de hazırlanmalı.
+        if self._enabled and self.vision_provider == "groq" and self._groq is None:
+            self._init_groq(as_vision_only=True)
 
         self._state = "IDLE"
         self._last_interaction = 0.0
@@ -300,9 +330,100 @@ class AiBrainNode(Node):
 
         owner = self.memory.data.get("owner_name")
         owner_info = f" (Tanınan Kişi: {owner})" if owner else ""
+        if self._enabled:
+            self.get_logger().info(
+                f"🧠 [AI Brain] Görme, Hafıza ve Ses Sistemi Hazır! Wake-word: \"{self._wake_word}\"{owner_info}"
+            )
+        else:
+            self.get_logger().error(
+                "🧠 [AI Brain] LLM devre dışı — düğüm ayakta ama konuşulanlara cevap veremez. "
+                "Yukarıdaki hatayı giderip yeniden başlatın."
+            )
+
+    # ------------------------------------------------------------------
+    # Sağlayıcı kurulumu
+    # ------------------------------------------------------------------
+    def _init_gemini(self):
+        """Google Gemini (REST) — sohbet için varsayılan sağlayıcı."""
+        if requests is None:
+            self.get_logger().error("❌ [AI] requests paketi yok — Gemini kullanılamaz")
+            return
+        if not self.gemini_api_key:
+            self.get_logger().error(
+                "❌ [AI] GEMINI_API_KEY bulunamadı! .env dosyanıza ekleyin "
+                "(anahtar: https://aistudio.google.com/apikey)"
+            )
+            return
+
+        self._text_model = self._text_model or self._discover_gemini_model()
+        if self.vision_provider == "gemini":
+            self._vision_model = self._text_model
+        self._enabled = True
         self.get_logger().info(
-            f"🧠 [AI Brain] Görme, Hafıza ve Ses Sistemi Hazır! Wake-word: \"{self._wake_word}\"{owner_info}"
+            f"✅ [AI] Google Gemini aktif — Metin: {self._text_model} | Görme: "
+            f"{self._vision_model if self.vision_provider == 'gemini' else self.vision_provider}"
         )
+
+    def _init_groq(self, as_vision_only: bool = False):
+        """Groq — LLM_PROVIDER=\"groq\" ile seçilir, ayrıca görme için kullanılabilir."""
+        if Groq is None or not self.groq_api_key:
+            msg = "❌ [AI] GROQ_API_KEY bulunamadı veya groq paketi kurulu değil"
+            if as_vision_only:
+                self.get_logger().warn(f"{msg} — görsel sorular yanıtlanamayacak")
+            else:
+                self.get_logger().error(f"{msg}! LLM devre dışı.")
+            return
+        try:
+            self._groq = Groq(api_key=self.groq_api_key)
+            self._vision_model = self._discover_vision_model()
+            if as_vision_only:
+                self.get_logger().info(f"✅ [AI] Groq görme için hazır: {self._vision_model}")
+                return
+            self._text_model = self._text_model or "llama-3.3-70b-versatile"
+            self._enabled = True
+            self.get_logger().info(
+                f"✅ [AI] Groq aktif — Metin: {self._text_model} | Görme: {self._vision_model}"
+            )
+        except Exception as e:
+            self.get_logger().error(f"❌ [AI] Groq Client başlatılamadı: {e}")
+
+    def _discover_gemini_model(self) -> str:
+        """Anahtarın erişebildiği en güncel kararlı flash modelini seçer.
+
+        Model adları hızla değişiyor (gemini-2.5 → 3.x → …); sabit bir ada bağlanmak
+        yerine API'ye sormak, kod eskidiğinde bile güncel modeli bulmayı sağlar.
+        Sürümler metin olarak değil sayı olarak karşılaştırılır: 3.10 > 3.7.
+        """
+        try:
+            res = requests.get(
+                f"{GEMINI_API_ROOT}/models",
+                headers={"x-goog-api-key": self.gemini_api_key},
+                timeout=10.0,
+            )
+            res.raise_for_status()
+            available = [
+                m["name"].split("/", 1)[-1]
+                for m in res.json().get("models", [])
+                if "generateContent" in m.get("supportedGenerationMethods", [])
+            ]
+
+            versioned = []
+            for name in available:
+                match = GEMINI_FLASH_RE.match(name)
+                if match:
+                    major, minor = match.groups()
+                    versioned.append(((int(major), int(minor or 0)), name))
+            if versioned:
+                return max(versioned)[1]
+
+            for fallback in GEMINI_MODEL_FALLBACKS:
+                if fallback in available:
+                    return fallback
+            if available:
+                return available[0]
+        except Exception as e:
+            self.get_logger().warn(f"Gemini model listesi alınamadı ({e}) — varsayılana düşülüyor")
+        return GEMINI_MODEL_FALLBACKS[0]
 
     def _discover_vision_model(self) -> str:
         """Queries Groq API to discover active multimodal vision model."""
@@ -459,6 +580,186 @@ class AiBrainNode(Node):
 
         threading.Thread(target=self._process_llm, args=(raw_text, captured_frame), daemon=True).start()
 
+    # ------------------------------------------------------------------
+    # Google Gemini — REST çağrıları
+    # ------------------------------------------------------------------
+    def _gemini_url(self, method: str) -> str:
+        return f"{GEMINI_API_ROOT}/models/{self._text_model}:{method}"
+
+    @staticmethod
+    def _to_gemini_contents(messages):
+        """OpenAI biçimli geçmişi Gemini'nin contents + systemInstruction yapısına çevirir.
+
+        Gemini'de sistem istemi ayrı bir alandır ve asistan rolünün adı "model"dir.
+        """
+        system_parts = []
+        contents = []
+        for m in messages:
+            role, content = m.get("role"), m.get("content", "")
+            if not content:
+                continue
+            if role == "system":
+                system_parts.append(content)
+            else:
+                contents.append({
+                    "role": "model" if role == "assistant" else "user",
+                    "parts": [{"text": content}],
+                })
+        system_instruction = {"parts": [{"text": "\n\n".join(system_parts)}]} if system_parts else None
+        return contents, system_instruction
+
+    def _gemini_generation_config(self, temperature=None, max_tokens=None) -> dict:
+        config = {
+            "temperature": self._temperature if temperature is None else temperature,
+            "maxOutputTokens": self._max_tokens if max_tokens is None else max_tokens,
+        }
+        # Gemini 3.x'te "düşünme" tokenları maxOutputTokens bütçesinden harcanır:
+        # varsayılan ayarla 300 tokenin 287'si düşünmeye gidip cevap yarıda kesiliyordu.
+        # Robot sohbetinde düşük gecikme istediğimiz için düşünme kısılır.
+        if self._thinking != "off":
+            config["thinkingConfig"] = {"thinkingLevel": self._thinking}
+        return config
+
+    def _gemini_post(self, url: str, payload: dict, timeout: float, stream: bool = False):
+        """Gemini'ye POST atar; geçici hatalarda tekrar dener.
+
+        - 503/429: sunucu yoğun ya da kota — kısa beklemeyle yeniden denenir.
+        - 400 + thinkingConfig: model bu parametreyi tanımıyor (eski nesil) — parametre
+          çıkarılıp bir kez daha denenir.
+        """
+        headers = {"x-goog-api-key": self.gemini_api_key, "Content-Type": "application/json"}
+        for attempt in range(3):
+            res = requests.post(url, headers=headers, json=payload, timeout=timeout, stream=stream)
+            if res.status_code in (429, 503) and attempt < 2:
+                if stream:
+                    res.close()
+                reason = "kota doldu (429)" if res.status_code == 429 else "sunucu meşgul (503)"
+                self.get_logger().warn(f"Gemini {reason} — yeniden deneniyor")
+                time.sleep(1.5 * (attempt + 1))
+                continue
+            if res.status_code == 429:
+                self.get_logger().error(
+                    "❌ [AI] Gemini kotası doldu (429). Ücretsiz katmanda dakika/gün başına "
+                    "istek sınırı vardır — biraz bekleyin veya faturalandırmayı açın."
+                )
+            if res.status_code == 400 and "thinkingConfig" in payload.get("generationConfig", {}):
+                if "thinking" in res.text.lower():
+                    if stream:
+                        res.close()
+                    self.get_logger().warn("Model thinkingConfig desteklemiyor — parametresiz denenecek")
+                    payload["generationConfig"].pop("thinkingConfig", None)
+                    continue
+            return res
+        return res
+
+    def _stream_gemini(self, messages):
+        """Yanıtı parça parça üretir — ilk cümle tamamlanır tamamlanmaz TTS'e gider."""
+        contents, system_instruction = self._to_gemini_contents(messages)
+        payload = {"contents": contents, "generationConfig": self._gemini_generation_config()}
+        if system_instruction:
+            payload["systemInstruction"] = system_instruction
+
+        # alt=sse olmadan API tek parça JSON dizisi döndürür ve akış avantajı kaybolur.
+        with self._gemini_post(
+            self._gemini_url("streamGenerateContent") + "?alt=sse",
+            payload,
+            timeout=60.0,
+            stream=True,
+        ) as res:
+            if res.status_code != 200:
+                raise RuntimeError(f"Gemini HTTP {res.status_code}: {res.text[:300]}")
+            yield from self._parse_sse(res)
+
+    def _parse_sse(self, res):
+        """SSE akışını satır satır çözer ve metin parçalarını üretir.
+
+        `requests.iter_lines()` kullanılmıyor: charset başlıkta gelmediğinde ISO-8859-1
+        varsayıp Türkçe karakterleri bozuyor ("gören" -> "gÃ¶ren") ve çok baytlı bir
+        karakter iki TCP parçasına bölündüğünde satırı sakatlayabiliyor. Artımlı UTF-8
+        çözücü + elle satır tamponu ikisini de kökten çözer.
+        """
+        decoder = codecs.getincrementaldecoder("utf-8")()
+        buffer = ""
+
+        def handle(line: str):
+            line = line.strip()
+            if not line.startswith("data:"):
+                return None
+            chunk = line[len("data:"):].strip()
+            if not chunk or chunk == "[DONE]":
+                return None
+            try:
+                return json.loads(chunk)
+            except json.JSONDecodeError:
+                self.get_logger().warn(f"Gemini akışında çözülemeyen olay: {chunk[:120]}")
+                return None
+
+        def emit(data):
+            for candidate in data.get("candidates", []):
+                if candidate.get("finishReason"):
+                    self._last_finish_reason = candidate["finishReason"]
+                for part in candidate.get("content", {}).get("parts", []):
+                    text = part.get("text")
+                    if text:
+                        yield text
+
+        for chunk in res.iter_content(chunk_size=None):
+            buffer += decoder.decode(chunk)
+            while "\n" in buffer:
+                line, buffer = buffer.split("\n", 1)
+                data = handle(line)
+                if data:
+                    yield from emit(data)
+
+        buffer += decoder.decode(b"", True)   # yarım kalan çok baytlı karakteri bitir
+        if buffer.strip():
+            data = handle(buffer)
+            if data:
+                yield from emit(data)
+
+    def _query_gemini_vision(self, prompt: str, base64_image: str) -> str | None:
+        """Anlık kamera karesini Gemini'ye sorar (tek parça yanıt)."""
+        try:
+            payload = {
+                "contents": [{
+                    "role": "user",
+                    "parts": [
+                        {"text": f"Kameradaki bu anlık görüntüye bakarak cevap ver: {prompt}"},
+                        {"inline_data": {"mime_type": "image/jpeg", "data": base64_image}},
+                    ],
+                }],
+                "systemInstruction": {"parts": [{
+                    "text": (
+                        f"{self._build_system_prompt()}\n\n"
+                        "ÖNEMLİ: Sadece görüntüde gerçekten gördüğünü söyle, uydurma. "
+                        "Kısa ve net 1-2 Türkçe cümle kur."
+                    )
+                }]},
+                # Görmede düşük sıcaklık: uydurmayı azaltır.
+                "generationConfig": self._gemini_generation_config(temperature=0.1, max_tokens=600),
+            }
+            res = self._gemini_post(self._gemini_url("generateContent"), payload, timeout=30.0)
+            if res.status_code != 200:
+                self.get_logger().error(f"❌ [Gemini Vision] HTTP {res.status_code}: {res.text[:300]}")
+                return None
+            parts = res.json()["candidates"][0]["content"]["parts"]
+            text = "".join(p.get("text", "") for p in parts).strip()
+            return text or None
+        except Exception as e:
+            self.get_logger().error(f"❌ [Gemini Vision Hatası]: {e}")
+            return None
+
+    def _query_vision(self, prompt: str, base64_image: str) -> str | None:
+        """Görsel soruyu seçili görme sağlayıcısına yönlendirir."""
+        if self.vision_provider == "gemini":
+            return self._query_gemini_vision(prompt, base64_image)
+        if self._groq is not None:
+            return self._query_groq_vision(prompt, base64_image)
+        self.get_logger().warn(
+            f"Görme sağlayıcısı \"{self.vision_provider}\" hazır değil — görsel soru yanıtlanamıyor"
+        )
+        return None
+
     def _query_groq_vision(self, prompt: str, base64_image: str) -> str | None:
         """Queries active multimodal vision model with robust extraction."""
         model_name = self._vision_model or "qwen/qwen3.6-27b"
@@ -506,6 +807,23 @@ class AiBrainNode(Node):
             self.get_logger().error(f"❌ [Vision Model Hatası ({model_name})]: {e}")
             return None
 
+    def _stream_llm(self, messages):
+        """Seçili sağlayıcıdan yanıtı parça parça üretir."""
+        if self.provider == "gemini":
+            yield from self._stream_gemini(messages)
+            return
+
+        stream = self._groq.chat.completions.create(
+            messages=messages,
+            model=self._text_model,
+            temperature=self._temperature,
+            max_tokens=self._max_tokens,
+            stream=True,
+        )
+        for chunk in stream:
+            if getattr(chunk, "choices", None):
+                yield getattr(chunk.choices[0].delta, "content", "") or ""
+
     def _process_llm(self, user_text: str, frame: np.ndarray | None):
         try:
             self.get_logger().info(f"🗣️ [Siz]: \"{user_text}\"")
@@ -519,8 +837,11 @@ class AiBrainNode(Node):
             # 1. GÖRSEL SORU YOLU (Multimodal Vision)
             if is_visual:
                 if base64_img is not None:
-                    self.get_logger().info(f"👁️ [Groq Vision]: OAK-D kamerasıyla anlık görüntü analiz ediliyor... ({self._vision_model})")
-                    vision_answer = self._query_groq_vision(user_text, base64_img)
+                    self.get_logger().info(
+                        f"👁️ [{self.vision_provider} Vision]: OAK-D kamerasıyla anlık görüntü "
+                        f"analiz ediliyor... ({self._vision_model})"
+                    )
+                    vision_answer = self._query_vision(user_text, base64_img)
                     if vision_answer:
                         clean_ans = clean_tts_text(vision_answer)
                         self.get_logger().info(f"🤖 [Astro]: \"{clean_ans}\"")
@@ -540,7 +861,7 @@ class AiBrainNode(Node):
                 self._last_interaction = time.monotonic()
                 return
 
-            # 2. HIZLI METİN SOHBETİ YOLU (Groq Streaming LLM)
+            # 2. HIZLI METİN SOHBETİ YOLU (akışlı LLM — Gemini veya Groq)
             context_prefix = ""
             if self._person_detected:
                 context_prefix = "[Kamerada karşında bir insan görüyorsun] "
@@ -551,23 +872,11 @@ class AiBrainNode(Node):
             if len(self._messages) > self._max_history:
                 self._messages = [self._messages[0]] + self._messages[-(self._max_history - 1):]
 
-            stream = self._groq.chat.completions.create(
-                messages=self._messages,
-                model=self._text_model,
-                temperature=self._temperature,
-                max_tokens=self._max_tokens,
-                stream=True,
-            )
-
             full_response = ""
             text_buffer = ""
+            self._last_finish_reason = None
 
-            for chunk in stream:
-                token = ""
-                if hasattr(chunk, 'choices') and chunk.choices:
-                    delta = chunk.choices[0].delta
-                    token = getattr(delta, 'content', '') or ""
-
+            for token in self._stream_llm(self._messages):
                 if not token:
                     continue
                 full_response += token
@@ -580,6 +889,13 @@ class AiBrainNode(Node):
             sentences, text_buffer = extract_tts_sentences(text_buffer, final=True)
             for s in sentences:
                 self._publish_tts(s)
+
+            if self._last_finish_reason == "MAX_TOKENS":
+                # Sessizce yarım cümle söylemek yerine sebebini bildir.
+                self.get_logger().warn(
+                    f"Cevap token sınırında kesildi (LLM_MAX_TOKENS={self._max_tokens}). "
+                    "Değeri artırın ya da LLM_THINKING=\"off\" deneyin."
+                )
 
             if full_response.strip():
                 clean_full = clean_tts_text(full_response.strip())

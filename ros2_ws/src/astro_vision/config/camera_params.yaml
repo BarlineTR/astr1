@@ -13,9 +13,25 @@
       i_depth_filter_size: 5
       i_lr_check: true
 
+webcam_publisher_node:
+  ros__parameters:
+    # OAK-D yokken USB kamerayı aynı konuya yayınlar (source:=webcam)
+    device: 0
+    output_topic: "/oak/rgb/image_raw"
+    width: 640
+    height: 480
+    fps: 15.0
+
 face_detector_node:
   ros__parameters:
     input_topic: "/oak/rgb/image_raw"
+    # Her kareyi tanımaya gerek yok; 3 = her 3. kare (30 FPS'te ~10 Hz)
+    process_every_n: 3
+    # SFace kosinüs eşiği: yükseltmek yanlış tanımayı azaltır, tanımayı zorlaştırır
+    match_threshold: 0.363
+    # İsim yayınlanmadan önce üst üste kaç karede aynı çıkmalı (titremeyi önler)
+    stable_frames: 3
+    # Aşağıdakiler yalnızca yüz modelleri yoksa (Haar yedeği) kullanılır
     scale_factor: 1.1
     min_neighbors: 5
     min_size: 30

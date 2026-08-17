@@ -73,35 +73,68 @@ class ReSpeakerHID:
         return float(self._read_param(PARAM_DOA_ANGLE))
 
 
-def find_respeaker_device() -> tuple[int | None, str]:
-    """Finds the hardware ReSpeaker device index directly from sounddevice."""
+RESPEAKER_NAME_HINTS = ("respeaker", "uac1", "seeed", "arrayuac")
+
+
+def list_input_devices() -> list[tuple[int, str]]:
+    """Giriş yapabilen (kanal sayısı > 0) tüm ses cihazlarını döndürür."""
     if sd is None:
-        return None, "sounddevice_not_found"
+        return []
+    try:
+        return [
+            (i, dev.get("name", "?"))
+            for i, dev in enumerate(sd.query_devices())
+            if dev.get("max_input_channels", 0) > 0
+        ]
+    except Exception:
+        return []
 
-    devices = sd.query_devices()
-    respeaker_in = None
-    respeaker_name = "default"
 
-    # 1. Look for hardware ReSpeaker / Seeed / UAC directly
-    for i, dev in enumerate(devices):
-        name = dev.get("name", "").lower()
-        if any(k in name for k in ["respeaker", "uac1", "seeed", "arrayuac"]):
-            if dev.get("max_input_channels", 0) > 0:
-                respeaker_in = i
-                respeaker_name = dev.get("name", "")
-                break
+def find_input_device(preferred: str = "") -> tuple[int | None, str, str]:
+    """Kullanılacak mikrofonu seçer.
 
-    # 2. Fallback to default system input if not found
-    if respeaker_in is None:
-        try:
-            default_in = sd.default.device[0]
-            if default_in >= 0:
-                respeaker_in = default_in
-                respeaker_name = devices[default_in].get("name", "default")
-        except Exception:
-            pass
+    Sıra: elle verilen cihaz → ReSpeaker → sistem varsayılanı.
+    Dönen üçüncü değer seçimin nedenidir; log bunu olduğu gibi yazar ki
+    ReSpeaker takılı değilken "ReSpeaker aktif" gibi yanıltıcı satır çıkmasın.
+    """
+    if sd is None:
+        return None, "sounddevice kurulu değil", "none"
 
-    return respeaker_in, respeaker_name
+    inputs = list_input_devices()
+    if not inputs:
+        return None, "giriş yapabilen cihaz yok", "none"
+
+    # 1. Elle seçim: indeks ("12") ya da ad parçası ("ReSpeaker", "HDA Intel")
+    if preferred:
+        if preferred.strip().lstrip("-").isdigit():
+            index = int(preferred)
+            for i, name in inputs:
+                if i == index:
+                    return i, name, "override"
+        else:
+            needle = preferred.strip().lower()
+            for i, name in inputs:
+                if needle in name.lower():
+                    return i, name, "override"
+        # Eşleşme yoksa çağıran uyarır ve otomatik seçime devam edilir.
+
+    # 2. ReSpeaker dizisi
+    for i, name in inputs:
+        if any(hint in name.lower() for hint in RESPEAKER_NAME_HINTS):
+            return i, name, "respeaker"
+
+    # 3. Sistem varsayılanı (PulseAudio/PipeWire "default" da buraya düşer)
+    try:
+        default_in = sd.default.device[0]
+        if default_in is not None and default_in >= 0:
+            for i, name in inputs:
+                if i == default_in:
+                    return i, name, "default"
+    except Exception:
+        pass
+
+    # 4. Varsayılan da yoksa ilk giriş cihazı
+    return inputs[0][0], inputs[0][1], "first"
 
 
 class AudioCaptureNode(Node):
@@ -111,10 +144,22 @@ class AudioCaptureNode(Node):
         self.declare_parameter("sample_rate", 16000)
         self.declare_parameter("chunk_size", 960)  # 60ms chunk (0.06s * 16000 = 960)
         self.declare_parameter("vad_threshold", 450.0)
+        # Mikrofonu elle sabitlemek için: indeks ("12") veya ad parçası ("ReSpeaker").
+        # Boşsa ReSpeaker aranır, bulunamazsa sistem varsayılanına düşülür.
+        self.declare_parameter("input_device", os.getenv("AUDIO_INPUT_DEVICE", ""))
 
         self.sample_rate = int(self.get_parameter("sample_rate").value)
         self.chunk_size = int(self.get_parameter("chunk_size").value)
         self.vad_threshold = float(self.get_parameter("vad_threshold").value)
+
+        # Eşik int16 RMS ölçeğindedir (~450). Eski sürümlerdeki 0-1 arası enerji
+        # oranı değerleri buraya düşerse VAD sürekli tetiklenir; erken uyar.
+        if 0.0 < self.vad_threshold < 1.0:
+            self.get_logger().warn(
+                f"vad_threshold={self.vad_threshold} çok küçük — bu düğüm int16 RMS "
+                f"ölçeği kullanıyor (tipik: 300-600). Varsayılan 450'ye çekiliyor."
+            )
+            self.vad_threshold = 450.0
 
         # Publishers
         self.pub_raw = self.create_publisher(Int16MultiArray, "audio_raw", 10)
@@ -127,41 +172,98 @@ class AudioCaptureNode(Node):
         self._pending = None
         self._noise_floor = 150.0
 
-        # Find Hardware Device
-        dev_id, dev_name = find_respeaker_device()
-        self.get_logger().info(f"🎤 [Audio Capture] Cihaz: [{dev_id}] - {dev_name} (Mono 16kHz)")
+        # Mikrofon seçimi
+        preferred = str(self.get_parameter("input_device").value or "")
+        dev_id, dev_name, source = find_input_device(preferred)
+
+        if preferred and source != "override":
+            self.get_logger().warn(
+                f"İstenen mikrofon bulunamadı: \"{preferred}\" — otomatik seçime geçiliyor"
+            )
+
+        reason = {
+            "override": "elle seçildi",
+            "respeaker": "ReSpeaker dizisi bulundu",
+            "default": "ReSpeaker yok, sistem varsayılan mikrofonu",
+            "first": "ReSpeaker ve varsayılan yok, ilk giriş cihazı",
+            "none": "kullanılabilir mikrofon yok",
+        }[source]
+
+        if dev_id is None:
+            self.get_logger().error(f"❌ [Mikrofon] {reason} — ses yakalama devre dışı")
+            for i, name in list_input_devices():
+                self.get_logger().info(f"    [{i}] {name}")
+        else:
+            self.get_logger().info(
+                f"🎤 [Mikrofon] [{dev_id}] {dev_name} — {reason} (Mono {self.sample_rate} Hz)"
+            )
+            self.get_logger().debug(
+                "Başka bir mikrofon için: AUDIO_INPUT_DEVICE=\"<indeks veya ad>\" | "
+                f"Mevcut girişler: {list_input_devices()}"
+            )
 
         self.stream = None
         if sd is not None and dev_id is not None:
+            opened = self._open_stream(dev_id, dev_name)
+
+            # Seçilen cihaz açılamadıysa (örn. ham ALSA cihazı 16 kHz'i reddediyor)
+            # sistem varsayılanına düş: PulseAudio/PipeWire hız ve kanal dönüşümünü
+            # kendisi yapar, böylece mikrofon tamamen sessiz kalmaz.
+            if not opened and source != "default":
+                fallback = self._default_device()
+                if fallback and fallback[0] != dev_id:
+                    self.get_logger().warn(
+                        f"{dev_name} açılamadı — sistem varsayılanına geçiliyor: {fallback[1]}"
+                    )
+                    opened = self._open_stream(*fallback)
+
+            if not opened:
+                self.get_logger().error(
+                    "❌ [Mikrofon] Hiçbir giriş cihazı açılamadı. Kullanılabilir cihazlar:"
+                )
+                for i, name in list_input_devices():
+                    self.get_logger().error(f"    [{i}] {name}")
+
+        self.create_timer(0.02, self._publish_pending)
+        self.create_timer(0.1, self._publish_hid)
+
+    @staticmethod
+    def _default_device() -> tuple[int, str] | None:
+        """Sistemin varsayılan giriş cihazını (indeks, ad) olarak döndürür."""
+        try:
+            default_in = sd.default.device[0]
+            for i, name in list_input_devices():
+                if i == default_in:
+                    return i, name
+        except Exception:
+            pass
+        return None
+
+    def _open_stream(self, dev_id: int, dev_name: str) -> bool:
+        """Cihazı açmayı dener; mono olmazsa 2 kanal dener. Başarıyı döndürür.
+
+        ReSpeaker'ın mono kanalı zaten işlenmiş (AEC + beamform) sesi verir; sıradan
+        mikrofonlar mono açılmayı reddederse 2 kanala düşülür.
+        """
+        for channels in (1, 2):
             try:
                 self.stream = sd.InputStream(
                     device=dev_id,
-                    channels=1,  # 1-channel mono directly gives clean AEC beamformed audio
+                    channels=channels,
                     samplerate=self.sample_rate,
                     blocksize=self.chunk_size,
                     dtype="int16",
                     callback=self._audio_callback,
                 )
                 self.stream.start()
-                self.get_logger().info(f"✅ [ReSpeaker] Ses akışı başlatıldı! (Cihaz ID: {dev_id})")
+                self.get_logger().info(
+                    f"✅ [Mikrofon] Ses yakalama aktif ve dinliyor! ({dev_name}, {channels} kanal)"
+                )
+                return True
             except Exception as e:
-                self.get_logger().warn(f"sounddevice mono açamadı ({e}). 2-kanal deneniyor...")
-                try:
-                    self.stream = sd.InputStream(
-                        device=dev_id,
-                        channels=2,
-                        samplerate=self.sample_rate,
-                        blocksize=self.chunk_size,
-                        dtype="int16",
-                        callback=self._audio_callback,
-                    )
-                    self.stream.start()
-                    self.get_logger().info(f"✅ [ReSpeaker] 2-kanal ses akışı başlatıldı!")
-                except Exception as e2:
-                    self.get_logger().error(f"❌ [ReSpeaker] Ses girişi açılamadı: {e2}")
-
-        self.create_timer(0.02, self._publish_pending)
-        self.create_timer(0.1, self._publish_hid)
+                self.stream = None
+                self.get_logger().warn(f"{dev_name} {channels} kanalda açılamadı: {e}")
+        return False
 
     def _audio_callback(self, indata, frames, time_info, status):
         if indata.ndim > 1 and indata.shape[1] > 1:

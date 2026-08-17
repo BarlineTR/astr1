@@ -25,6 +25,7 @@ setup(
     entry_points={
         "console_scripts": [
             "face_detector_node = astro_vision.face_detector_node:main",
+            "webcam_publisher_node = astro_vision.webcam_publisher_node:main",
         ],
     },
 )
