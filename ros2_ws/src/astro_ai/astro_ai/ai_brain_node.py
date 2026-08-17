@@ -758,22 +758,9 @@ class AiBrainNode(Node):
 
             stream_resp = None
 
-            # 1. Try Primary OpenAI Client (gpt-4o-mini)
-            if self._openai:
-                try:
-                    stream_resp = self._openai.chat.completions.create(
-                        messages=messages,
-                        model=self._text_model,
-                        temperature=self._temperature,
-                        max_tokens=self._max_tokens,
-                        stream=True,
-                    )
-                except Exception as oai_err:
-                    self.get_logger().warn(f"⚠️ [OpenAI GPT Stream Hatası] ({oai_err}), Groq yedeğe geçiliyor...")
-
-            # 2. Try Secondary Groq Client (Llama 3.3 70B)
-            if stream_resp is None and self._groq:
-                models_to_try = list(self._active_groq_models) if self._active_groq_models else [self._text_model]
+            # 1. Try Ultra-Fast Groq LPU Client (120ms First-Token Latency)
+            if self._groq:
+                models_to_try = list(self._active_groq_models) if self._active_groq_models else ["llama-3.3-70b-versatile", "llama-3.1-8b-instant"]
                 for m in models_to_try:
                     try:
                         stream_resp = self._groq.chat.completions.create(
@@ -787,6 +774,19 @@ class AiBrainNode(Node):
                     except Exception as stream_err:
                         self.get_logger().warn(f"⚠️ [Groq Stream Hatası] Model {m}: {stream_err}")
                         continue
+
+            # 2. Try OpenAI Client (gpt-4o-mini)
+            if stream_resp is None and self._openai:
+                try:
+                    stream_resp = self._openai.chat.completions.create(
+                        messages=messages,
+                        model=self._text_model,
+                        temperature=self._temperature,
+                        max_tokens=self._max_tokens,
+                        stream=True,
+                    )
+                except Exception as oai_err:
+                    self.get_logger().warn(f"⚠️ [OpenAI GPT Stream Hatası] ({oai_err}), Gemini yedeğe geçiliyor...")
 
             # Fallback to Direct Google Gemini REST Text Generation
             if stream_resp is None:

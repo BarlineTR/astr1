@@ -371,20 +371,8 @@ class SpeechRecognitionNode(Node):
                 self.get_logger().info(f"🎙️ [Ses Tanıma]: {spk_name} ({spk_meta.get('formal_title', '')}) (Güven: {spk_conf:.2f})")
 
             text = None
-            if self.openai_client:
-                try:
-                    res = self.openai_client.audio.transcriptions.create(
-                        model="whisper-1",
-                        file=("speech.wav", wav_bytes),
-                        language="tr",
-                        temperature=0.0,
-                        response_format="text"
-                    )
-                    text = str(res).strip()
-                except Exception as oe:
-                    self.get_logger().warn(f"⚠️ [OpenAI Whisper] Hatası ({oe}), Groq Whisper yedeğe geçiliyor...")
-
-            if not text and self.groq_client:
+            # 1. Ultra-Fast Groq Whisper Large V3 (80ms Latency)
+            if self.groq_client:
                 try:
                     result = self.groq_client.audio.transcriptions.create(
                         file=("speech.wav", wav_bytes),
@@ -395,7 +383,21 @@ class SpeechRecognitionNode(Node):
                     )
                     text = str(result).strip()
                 except Exception as ge:
-                    self.get_logger().warn(f"⚠️ [Groq Whisper] Hatası: {ge}")
+                    self.get_logger().warn(f"⚠️ [Groq Whisper] Hatası ({ge}), OpenAI Whisper yedeğe geçiliyor...")
+
+            # 2. OpenAI Whisper-1 Fallback
+            if not text and self.openai_client:
+                try:
+                    res = self.openai_client.audio.transcriptions.create(
+                        model="whisper-1",
+                        file=("speech.wav", wav_bytes),
+                        language="tr",
+                        temperature=0.0,
+                        response_format="text"
+                    )
+                    text = str(res).strip()
+                except Exception as oe:
+                    self.get_logger().warn(f"⚠️ [OpenAI Whisper] Hatası: {oe}")
 
             if not text:
                 return
