@@ -648,15 +648,27 @@ class AiBrainNode(Node):
             is_reminder, reminder_mins, reminder_topic = self._is_reminder_query(user_text)
             if is_reminder:
                 user_name = self._add_reminder(reminder_mins, reminder_topic)
+                friendly_name = user_name if user_name != "Misafir" else ("kral" if persona == "flirt" else "dostum")
+                
+                topic_speech = reminder_topic
+                if "vakti" in topic_speech.lower():
+                    topic_str = f"{topic_speech.lower()}ni"
+                else:
+                    topic_str = f"{topic_speech} konusunu"
+
                 if reminder_mins < 1.0:
                     secs = int(reminder_mins * 60.0)
-                    ans = f"Tamamdır {user_name}! {secs} saniye sonra sana {reminder_topic} konusunu hatırlatacağım."
+                    ans = f"Tamamdır {friendly_name}! {secs} saniye sonra sana {topic_str} hatırlatacağım."
                     self.get_logger().info(f"⏰ [Hatırlatıcı Kuruldu]: {secs} sn sonra -> '{reminder_topic}'")
                 elif int(reminder_mins) == 1:
-                    ans = f"Tamamdır {user_name}! 1 dakika sonra sana {reminder_topic} konusunu hatırlatacağım."
+                    ans = f"Tamamdır {friendly_name}! 1 dakika sonra sana {topic_str} hatırlatacağım."
                     self.get_logger().info(f"⏰ [Hatırlatıcı Kuruldu]: 1 dk sonra -> '{reminder_topic}'")
+                elif int(reminder_mins) >= 60 and int(reminder_mins) % 60 == 0:
+                    hrs = int(reminder_mins // 60)
+                    ans = f"Anlaşıldı {friendly_name}! {hrs} saat sonra sana {topic_str} hatırlatacağım."
+                    self.get_logger().info(f"⏰ [Hatırlatıcı Kuruldu]: {hrs} saat sonra -> '{reminder_topic}'")
                 else:
-                    ans = f"Anlaşıldı {user_name}! {int(reminder_mins)} dakika sonra sana {reminder_topic} konusunu hatırlatacağım."
+                    ans = f"Anlaşıldı {friendly_name}! {int(reminder_mins)} dakika sonra sana {topic_str} hatırlatacağım."
                     self.get_logger().info(f"⏰ [Hatırlatıcı Kuruldu]: {int(reminder_mins)} dk sonra -> '{reminder_topic}'")
                 self.get_logger().info(f"🤖 [Astro]: \"{ans}\"")
                 self._publish_tts(ans)
@@ -1173,44 +1185,93 @@ class AiBrainNode(Node):
 
     def _is_reminder_query(self, text: str) -> Tuple[bool, float, str]:
         text_l = text.lower()
-        if any(w in text_l for w in ["hatırlat", "alarm kur", "zamanlayıcı kur", "haber ver", "uyar"]):
-            # Extract duration: seconds, minutes, hours
-            mins = 5.0
-            sec_m = re.search(r'(\d+)\s*(?:saniye|sn|sec)', text_l)
-            min_m = re.search(r'(\d+)\s*(?:dakika|dk|min)', text_l)
-            hr_m = re.search(r'(\d+)\s*(?:saat|hour)', text_l)
+        reminder_triggers = ["hatırlat", "alarm kur", "zamanlayıcı kur", "haber ver", "uyar", "bana söyle", "hatırlatıcı"]
+        if not any(w in text_l for w in reminder_triggers):
+            return False, 0.0, ""
 
-            if sec_m:
-                mins = float(sec_m.group(1)) / 60.0
-            elif min_m:
-                mins = float(min_m.group(1))
-            elif hr_m:
-                mins = float(hr_m.group(1)) * 60.0
+        # 1. Parse Duration (Minutes/Seconds/Hours with both digits and Turkish word numbers)
+        num_map = {
+            "yarım": 0.5, "yarim": 0.5, "buçuk": 0.5, "çeyrek": 0.25, "ceyrek": 0.25,
+            "bir": 1.0, "1": 1.0, "iki": 2.0, "2": 2.0, "üç": 3.0, "uc": 3.0, "3": 3.0,
+            "dört": 4.0, "dort": 4.0, "4": 4.0, "beş": 5.0, "bes": 5.0, "5": 5.0,
+            "altı": 6.0, "alti": 6.0, "6": 6.0, "yedi": 7.0, "7": 7.0, "sekiz": 8.0, "8": 8.0,
+            "dokuz": 9.0, "9": 9.0, "on": 10.0, "10": 10.0, "on beş": 15.0, "15": 15.0,
+            "yirmi": 20.0, "20": 20.0, "yirmi beş": 25.0, "25": 25.0,
+            "otuz": 30.0, "30": 30.0, "kırk": 40.0, "kirk": 40.0, "40": 40.0,
+            "elli": 50.0, "50": 50.0, "altmış": 60.0, "altmis": 60.0, "60": 60.0
+        }
 
-            # Extract topic cleanly
-            clean_topic = re.sub(
-                r'(?i)(hey\s*astro|astro|bana|\d+\s*(?:dakika|dk|saniye|sn|saat)\s*sonra|hatırlatabilir\s*misin|hatırlatır\s*mısın|hatırlat.*|alarm\s*kur.*|haber\s*ver.*|uyar.*|içeceğim|içecegim|yapacağım|yapacağımı|gerektiğini|lütfen|abilir\s*misin|misin|mısın)',
-                '', text
-            ).strip(' .:;,?')
+        mins = 1.0
+        time_pattern = r'(\d+|yarım|yarim|çeyrek|ceyrek|on\s+beş|on\s+iki|bir|iki|üç|uc|dört|dort|beş|bes|altı|alti|yedi|sekiz|dokuz|on|yirmi|otuz|kırk|elli|altmış)\s*(dakika|dk|saniye|sn|saat|hour|min|sec)'
+        m = re.search(time_pattern, text_l)
 
-            if not clean_topic or len(clean_topic) < 2:
-                if "çay" in text_l:
-                    clean_topic = "Çay içme vakti"
-                elif "su" in text_l:
-                    clean_topic = "Su içme vakti"
-                elif "ilaç" in text_l:
-                    clean_topic = "İlaç vakti"
-                elif "toplantı" in text_l:
-                    clean_topic = "Toplantı vakti"
-                else:
-                    clean_topic = "Hatırlatma"
+        if m:
+            val_str = m.group(1).strip()
+            unit_str = m.group(2).strip()
+            val = float(num_map.get(val_str, float(val_str) if val_str.isdigit() else 1.0))
+
+            if any(u in unit_str for u in ["saniye", "sn", "sec"]):
+                mins = val / 60.0
+            elif any(u in unit_str for u in ["saat", "hour"]):
+                mins = val * 60.0
             else:
-                if "çay" in text_l and "çay" not in clean_topic.lower():
-                    clean_topic = f"Çay ({clean_topic})"
-                clean_topic = clean_topic.capitalize()
+                mins = val
+        else:
+            if "saniye sonra" in text_l:
+                mins = 0.5
+            elif "saat sonra" in text_l:
+                mins = 60.0
+            elif "dakika sonra" in text_l:
+                mins = 1.0
+            else:
+                mins = 5.0
 
-            return True, mins, clean_topic
-        return False, 0.0, ""
+        # 2. Extract Topic Cleanly
+        # Remove conversational chatter / greetings / polite phrases
+        clean = re.sub(r'(?i)\b(iyiyim|ben de iyiyim|harikayım|süperim|ben|de|teşekkür\s*ederim|teşekkürler|sağ\s*ol|sağol|merhaba|selam|günaydın|lütfen|bana|hey\s*astro|astro)\b', '', text)
+        
+        # Remove time expressions
+        clean = re.sub(r'(?i)\b(\d+|yarım|yarim|çeyrek|ceyrek|on\s+beş|on\s+iki|bir|iki|üç|uc|dört|dort|beş|bes|altı|alti|yedi|sekiz|dokuz|on|yirmi|otuz|kırk|elli|altmış)\s*(dakika|dk|saniye|sn|saat)\s*(sonra)?\b', '', clean)
+        clean = re.sub(r'(?i)\b(dakika|saniye|saat)\s*sonra\b', '', clean)
+
+        # Remove trigger suffixes and verbs
+        clean = re.sub(r'(?i)\b(hatırlatabilir\s*misin|hatırlatır\s*mısın|hatırlatırsa[nm]|hatırlat|alarm\s*kur|zamanlayıcı\s*kur|haber\s*ver|uyar|söyler\s*misin|kurar\s*mısın)\b', '', clean)
+        clean = re.sub(r'(?i)\b(içeceğim|içecegim|içmem\s*lazım|yapacağım|yapmam\s*gerek|gideceğim|alacağım|kapatacağım|edeceğim|edecegim|olacağım)\b', '', clean)
+        clean = re.sub(r'[^\w\s]', '', clean).strip()
+        clean = " ".join(clean.split())
+
+        # Fallback to smart semantic keywords
+        if not clean or len(clean) < 3:
+            if "çay" in text_l:
+                topic = "Çay içme vakti"
+            elif "kahve" in text_l:
+                topic = "Kahve içme vakti"
+            elif "su" in text_l:
+                topic = "Su içme vakti"
+            elif "ilaç" in text_l:
+                topic = "İlaç alma vakti"
+            elif "yemek" in text_l or "fırın" in text_l:
+                topic = "Yemek vakti"
+            elif "toplantı" in text_l:
+                topic = "Toplantı vakti"
+            elif "ders" in text_l or "çalış" in text_l:
+                topic = "Ders çalışma vakti"
+            else:
+                topic = "Hatırlatma"
+        else:
+            if "çay" in clean.lower():
+                topic = "Çay içme vakti"
+            elif "kahve" in clean.lower():
+                topic = "Kahve içme vakti"
+            elif "su" in clean.lower():
+                topic = "Su içme vakti"
+            elif "ilaç" in clean.lower():
+                topic = "İlaç alma vakti"
+            else:
+                topic = clean.capitalize()
+
+        return True, mins, topic
+
 
     def _is_weather_query(self, text: str) -> Tuple[bool, str]:
         text_l = text.lower()
