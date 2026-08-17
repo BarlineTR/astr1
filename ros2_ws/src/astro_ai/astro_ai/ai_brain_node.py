@@ -351,11 +351,17 @@ class AiBrainNode(Node):
 
     # Perception Callbacks
     def _on_camera_image(self, msg: Image):
+        # Throttle camera frame decoding to max 2 FPS to prevent CPU starvation and event loop choking
+        now = time.monotonic()
+        if (now - getattr(self, '_last_img_decode_time', 0.0)) < 0.5:
+            return
+        self._last_img_decode_time = now
+
         frame = imgmsg_to_bgr(msg)
         if frame is not None:
             with self._lock:
                 self._latest_frame = frame
-                self._latest_frame_time = time.monotonic()
+                self._latest_frame_time = now
 
     def _on_tts_speaking(self, msg: Bool):
         self._tts_speaking = msg.data
@@ -551,9 +557,10 @@ class AiBrainNode(Node):
         if not self._enabled:
             return
 
-        raw_text = msg.data.strip()
+        raw_text = re.sub(r"^['\"`´“”‘’]+|['\"`´“”‘’]+$", "", msg.data.strip()).strip()
         if not raw_text:
             return
+
 
         now = time.monotonic()
         if (now - getattr(self, '_last_llm_turn_time', 0.0)) < 0.35:
@@ -1705,14 +1712,18 @@ class AiBrainNode(Node):
 def main(args=None):
     rclpy.init(args=args)
     node = AiBrainNode()
+    from rclpy.executors import MultiThreadedExecutor
+    executor = MultiThreadedExecutor(num_threads=4)
+    executor.add_node(node)
     try:
-        rclpy.spin(node)
+        executor.spin()
     except KeyboardInterrupt:
         pass
     finally:
         node.destroy_node()
         if rclpy.ok():
             rclpy.shutdown()
+
 
 
 if __name__ == "__main__":
