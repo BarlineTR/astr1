@@ -153,9 +153,9 @@ class AiBrainNode(Node):
         self.declare_parameter("llm_temperature", float(os.getenv("LLM_TEMPERATURE", "0.55")))
         self.declare_parameter("llm_max_tokens", int(os.getenv("LLM_MAX_TOKENS", "300")))
         self.declare_parameter("wake_word", os.getenv("WAKE_WORD", "hey astro"))
-        self.declare_parameter("conversation_timeout", float(os.getenv("CONVERSATION_TIMEOUT", "8.0")))
-        self.declare_parameter("gaze_dwell_s", float(os.getenv("GAZE_DWELL_S", "3.0")))
-        self.declare_parameter("gaze_cooldown_s", float(os.getenv("GAZE_COOLDOWN_S", "45.0")))
+        self.declare_parameter("conversation_timeout", float(os.getenv("CONVERSATION_TIMEOUT", "16.0")))
+        self.declare_parameter("gaze_dwell_s", float(os.getenv("GAZE_DWELL_S", "4.0")))
+        self.declare_parameter("gaze_cooldown_s", float(os.getenv("GAZE_COOLDOWN_S", "60.0")))
         self.declare_parameter("gaze_startup_grace_s", float(os.getenv("GAZE_STARTUP_GRACE_S", "15.0")))
         self.declare_parameter("default_user_name", os.getenv("DEFAULT_USER_NAME", "Misafir"))
         self.declare_parameter("enable_idle_learning", os.getenv("ENABLE_IDLE_LEARNING", "true").lower() == "true")
@@ -475,43 +475,48 @@ class AiBrainNode(Node):
 
     def _check_persona_switch(self, text: str) -> bool:
         text_lower = text.lower()
-        persona_keywords = {
+
+        # Strict regex patterns to prevent false triggers (e.g. "hanımefendi" erroneously triggering formal mode)
+        switch_patterns = {
             "flirt": [
-                "flört", "flirt", "flörtöz", "çapkın", "yavşak", "yavsak", "yapışak", "yapisak",
-                "yavuşak", "yavus", "yavşar", "kızlara yürü", "çapkınlık", "romantik", "piç",
-                "astroflirt", "astroflört"
+                r"\b(flört|flirt|çapkın|yavşak|romantik|astroflirt|astroflört)\b.*\b(ol|geç|mod|davran|konuş|takıl|başla)\b",
+                r"\b(kızlara yürü|yavşa|flört et)\b",
+                r"\b(flört|çapkın)\s+moduna\b"
             ],
             "rude": [
-                "kaba", "dobra", "sert", "ters", "küfürlü", "kaba saba", "saygısız"
+                r"\b(kaba|ters|küfürlü|saygısız|dobra)\b.*\b(ol|geç|mod|davran|konuş|takıl)\b",
+                r"\b(kaba)\s+moduna\b"
             ],
             "angry": [
-                "öfkeli", "asabi", "kızgın", "sinirli", "agresif", "öfke", "hırçın"
+                r"\b(öfkeli|asabi|kızgın|sinirli|agresif)\b.*\b(ol|geç|mod|davran|konuş|takıl)\b",
+                r"\b(asabi|sinirli|kızgın)\s+moduna\b"
             ],
             "playful": [
-                "şakacı", "neşeli", "normal", "sempatik", "standart", "varsayılan", "tatlı",
-                "oyuncu", "dostane", "eski haline", "eski mod"
+                r"\b(şakacı|neşeli|normal|sempatik|tatlı|oyuncu|dostane)\b.*\b(ol|geç|mod|davran|konuş|takıl)\b",
+                r"\b(eski haline dön|eski moduna geç|varsayılan moda geç|normal ol|şakacı ol)\b"
             ],
             "formal": [
-                "resmi", "ciddi", "saygılı", "protokol", "efendi", "kibar", "resmiyet"
+                r"\b(resmi|protokol|ciddi)\b.*\b(ol|geç|mod|davran|konuş|takıl)\b",
+                r"\b(resmi moda geç|protokol moduna geç|ciddi ol)\b"
             ],
             "sarcastic": [
-                "alaycı", "sarkastik", "ironik", "iğneleyici", "gıcık", "laf sok"
+                r"\b(alaycı|sarkastik|ironik|iğneleyici|gıcık)\b.*\b(ol|geç|mod|davran|konuş|takıl)\b",
+                r"\b(laf sok|alaycı ol|sarkastik ol)\b"
             ],
             "emotional": [
-                "duygusal", "hisli", "duygulu", "romantizm", "aşık", "duygu"
+                r"\b(duygusal|hisli|duygulu|romantizm)\b.*\b(ol|geç|mod|davran|konuş|takıl)\b",
+                r"\b(duygusal ol|duygusal moda geç)\b"
             ]
         }
-        verbs = ["ol", "geç", "mod", "davran", "konuş", "takıl", "aç", "başla", "geçiş", "moduna", "gibi", "misin", "eder misin", "yapar mısın", "et"]
 
-        for p_name, keywords in persona_keywords.items():
-            for kw in keywords:
-                if kw in text_lower:
-                    if any(v in text_lower for v in verbs) or kw in ["astroflirt", "astroflört", "yavşar", "kızlara yürü", "laf sok"]:
-                        self.persona_engine.set_persona(p_name)
-                        self.memory.profile.set_persona(p_name)
-                        self.get_logger().info(f"🎭 [Kişilik Değişti]: Yeni Mod -> {p_name.upper()} ('{kw}' algılandı)")
-                        self._publish_emotion(p_name)
-                        return True
+        for p_name, patterns in switch_patterns.items():
+            for pat in patterns:
+                if re.search(pat, text_lower):
+                    self.persona_engine.set_persona(p_name)
+                    self.memory.profile.set_persona(p_name)
+                    self.get_logger().info(f"🎭 [Kişilik Değişti]: Yeni Mod -> {p_name.upper()} ('{pat}' eşleşti)")
+                    self._publish_emotion(p_name)
+                    return True
         return False
 
     def _on_speech(self, msg: String):
@@ -648,11 +653,16 @@ class AiBrainNode(Node):
             is_reminder, reminder_mins, reminder_topic = self._is_reminder_query(user_text)
             if is_reminder:
                 user_name = self._add_reminder(reminder_mins, reminder_topic)
-                if int(reminder_mins) <= 1:
+                if reminder_mins < 1.0:
+                    secs = int(reminder_mins * 60.0)
+                    ans = f"Tamamdır {user_name}! {secs} saniye sonra sana {reminder_topic} konusunu hatırlatacağım."
+                    self.get_logger().info(f"⏰ [Hatırlatıcı Kuruldu]: {secs} sn sonra -> '{reminder_topic}'")
+                elif int(reminder_mins) == 1:
                     ans = f"Tamamdır {user_name}! 1 dakika sonra sana {reminder_topic} konusunu hatırlatacağım."
+                    self.get_logger().info(f"⏰ [Hatırlatıcı Kuruldu]: 1 dk sonra -> '{reminder_topic}'")
                 else:
                     ans = f"Anlaşıldı {user_name}! {int(reminder_mins)} dakika sonra sana {reminder_topic} konusunu hatırlatacağım."
-                self.get_logger().info(f"⏰ [Hatırlatıcı Kuruldu]: {int(reminder_mins)} dk sonra -> '{reminder_topic}'")
+                    self.get_logger().info(f"⏰ [Hatırlatıcı Kuruldu]: {int(reminder_mins)} dk sonra -> '{reminder_topic}'")
                 self.get_logger().info(f"🤖 [Astro]: \"{ans}\"")
                 self._publish_tts(ans)
                 self._publish_emotion(persona)
@@ -1083,22 +1093,42 @@ class AiBrainNode(Node):
 
     def _is_reminder_query(self, text: str) -> Tuple[bool, float, str]:
         text_l = text.lower()
-        if any(w in text_l for w in ["hatırlat", "alarm kur", "zamanlayıcı kur", "haber ver", "uyar", "çay içmem"]):
-            # Extract minutes
-            m = re.search(r'(\d+)\s*(?:dakika|dk)', text_l)
-            mins = float(m.group(1)) if m else 5.0
+        if any(w in text_l for w in ["hatırlat", "alarm kur", "zamanlayıcı kur", "haber ver", "uyar"]):
+            # Extract duration: seconds, minutes, hours
+            mins = 5.0
+            sec_m = re.search(r'(\d+)\s*(?:saniye|sn|sec)', text_l)
+            min_m = re.search(r'(\d+)\s*(?:dakika|dk|min)', text_l)
+            hr_m = re.search(r'(\d+)\s*(?:saat|hour)', text_l)
 
-            # Extract topic
-            clean_topic = re.sub(r'(?i)(bana|\d+\s*(?:dakika|dk)\s*sonra|hatırlat|alarm kur|haber ver|uyar|gerektiğini|içmem|içmeyi)', '', text).strip(' .:;,')
-            if not clean_topic:
+            if sec_m:
+                mins = float(sec_m.group(1)) / 60.0
+            elif min_m:
+                mins = float(min_m.group(1))
+            elif hr_m:
+                mins = float(hr_m.group(1)) * 60.0
+
+            # Extract topic cleanly
+            clean_topic = re.sub(
+                r'(?i)(hey\s*astro|astro|bana|\d+\s*(?:dakika|dk|saniye|sn|saat)\s*sonra|hatırlatabilir\s*misin|hatırlatır\s*mısın|hatırlat.*|alarm\s*kur.*|haber\s*ver.*|uyar.*|içeceğim|içecegim|yapacağım|yapacağımı|gerektiğini|lütfen|abilir\s*misin|misin|mısın)',
+                '', text
+            ).strip(' .:;,?')
+
+            if not clean_topic or len(clean_topic) < 2:
                 if "çay" in text_l:
                     clean_topic = "Çay içme vakti"
                 elif "su" in text_l:
                     clean_topic = "Su içme vakti"
+                elif "ilaç" in text_l:
+                    clean_topic = "İlaç vakti"
                 elif "toplantı" in text_l:
                     clean_topic = "Toplantı vakti"
                 else:
                     clean_topic = "Hatırlatma"
+            else:
+                if "çay" in text_l and "çay" not in clean_topic.lower():
+                    clean_topic = f"Çay ({clean_topic})"
+                clean_topic = clean_topic.capitalize()
+
             return True, mins, clean_topic
         return False, 0.0, ""
 
