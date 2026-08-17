@@ -490,12 +490,11 @@ class AiBrainNode(Node):
             return
 
         has_wake_word, clean_prompt = self.session.is_wake_word(raw_text, self._wake_word)
-        recent_person = (self._person_detected or (hasattr(self, '_last_person_seen_time') and (now - self._last_person_seen_time) < 4.0))
 
-        # If IDLE: Activate on Wake Word / Greetings, Direct Gaze, or Person Presence
+        # If IDLE: Only activate on Explicit Wake Word ("Hey Astro") OR Direct Gaze (Looking at Robot)
         if self.state_machine.is_idle():
-            if has_wake_word or self._looking_at_robot or recent_person:
-                activation_reason = "wake_word" if has_wake_word else ("gaze" if self._looking_at_robot else "person_presence")
+            if has_wake_word or self._looking_at_robot:
+                activation_reason = "wake_word" if has_wake_word else "gaze"
                 self.session.activate_session(reason=activation_reason)
                 self.state_machine.transition_to(RobotState.LISTENING)
                 persona = self.persona_engine.current_persona

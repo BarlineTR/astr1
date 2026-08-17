@@ -131,37 +131,20 @@ class ConversationSession:
             return False
 
     def is_wake_word(self, text: str, wake_word: str = "hey astro") -> tuple[bool, str]:
-        """Detects wake words and common Turkish greeting starters, returning (has_wake_word, clean_text)."""
-        wake_triggers = [
+        """Detects explicit robot wake words with Turkish phonetic variations, returning (has_wake_word, clean_text)."""
+        triggers = [
             wake_word.lower(),
             "hey astro", "hey astıro", "heyastro", "ey astro", "ey astıro",
             "hay astro", "hey astor", "astro", "astıro", "astor",
             "hey asistan", "merhaba astro", "selam astro", "robot astro"
         ]
-        greeting_triggers = [
-            "merhaba", "merhabalar", "selam", "selamlar", "selamunaleykum",
-            "selamun aleykum", "selamünaleyküm", "selamün aleyküm",
-            "günaydın", "iyi günler", "iyi akşamlar", "hayırlı günler",
-            "kolay gelsin", "hoş geldin", "hoş geldiniz", "efendim",
-            "bakar mısın", "bak buraya", "bana bak", "dinle beni", "hey", "alo",
-            "nasılsın", "naber", "ne haber", "ne yapıyorsun", "kimsin"
-        ]
         text_lower = text.lower().strip()
-        has_wake = False
-        for w in wake_triggers:
-            if w in text_lower:
-                has_wake = True
-                break
-        if not has_wake:
-            for g in greeting_triggers:
-                if re.search(rf"(?i)\b{re.escape(g)}\b", text_lower) or text_lower.startswith(g):
-                    has_wake = True
-                    break
+        has_wake = any(w in text_lower for w in triggers)
 
         clean = text
-        # Only strip direct wake words from prompt so questions ("nasılsın", "hava nasıl") are preserved
-        for w in wake_triggers:
-            clean = re.sub(rf"(?i)\b{re.escape(w)}\b", "", clean).strip()
-        clean = re.sub(r"\s+", " ", clean).strip(" ,.!?:;")
+        if has_wake:
+            for w in triggers:
+                clean = re.sub(rf"(?i)\b{re.escape(w)}\b", "", clean).strip()
+            clean = re.sub(r"\s+", " ", clean).strip(" ,.!?:;")
 
         return has_wake, clean
