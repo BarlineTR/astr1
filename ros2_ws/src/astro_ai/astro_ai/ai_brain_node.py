@@ -17,6 +17,7 @@ import threading
 import time
 import urllib.parse
 import urllib.request
+from typing import Any, Dict, List, Optional, Tuple
 import cv2
 import numpy as np
 
