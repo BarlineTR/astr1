@@ -261,10 +261,12 @@ class SpeechRecognitionNode(Node):
             if len(arr) == 0:
                 return
 
-            # Compute audio RMS energy (Gating against background silence & mic breathing)
+            # Compute audio RMS energy and Peak Amplitude (Gating against background silence & mic breathing)
+            max_amp = float(np.max(np.abs(arr)))
             rms = float(np.sqrt(np.mean(arr.astype(np.float32)**2)))
-            if rms < 220.0:
-                # Ambient silence / background noise — skip to eliminate ghost hallucinations
+            
+            # Reject ambient floor noise and breathing (ReSpeaker ambient noise is ~150-250 RMS, peaks < 900)
+            if max_amp < 950.0 or rms < 260.0:
                 return
 
             wav_io = io.BytesIO()
@@ -300,8 +302,8 @@ class SpeechRecognitionNode(Node):
             if is_known_spk:
                 self.get_logger().info(f"🎙️ [Ses Tanıma]: {spk_name} ({spk_meta.get('formal_title', '')}) (Güven: {spk_conf:.2f})")
 
-            # Clean Whisper prompt (Neutral robot hints, no hallucination-inducing questions)
-            whisper_prompt = "Astro, hey astro, robot, merhaba."
+            # Neutral prompt (Strictly prevents Whisper from hallucinating seeded words like 'merhaba')
+            whisper_prompt = "Türkçe sosyal robot konuşması."
 
             result = self.groq_client.audio.transcriptions.create(
                 file=("speech.wav", wav_bytes),
@@ -315,12 +317,20 @@ class SpeechRecognitionNode(Node):
             text = str(result).strip()
             text_lower = text.lower().strip(" .,!?:;")
 
-            # Hallucination Filter: Ignore known Whisper silence phantom phrases on low-energy chunks
-            silence_hallucinations = ["iyi misin", "teşekkür ederim", "teşekkürler", "altyazı", "abone ol", "görüşmek üzere", "hoşça kalın", "sağ olun"]
-            if text_lower in silence_hallucinations and rms < 350.0:
+            # Hallucination Filter: Ignore known Whisper silence phantom phrases on low/medium energy
+            silence_hallucinations = [
+                "iyi misin", "teşekkür ederim", "teşekkürler", "altyazı", "abone ol",
+                "görüşmek üzere", "hoşça kalın", "sağ olun", "kalbimde sizle geldim",
+                "merhaba, kalbimde sizle geldim", "sizle geldim"
+            ]
+            if any(sh in text_lower for sh in silence_hallucinations) and rms < 450.0:
                 return
 
-            # Exact match hallucination filter
+            # Reject isolated 'merhaba' if voice energy is low or duration is under 0.6s
+            if text_lower in ["merhaba", "merhabalar"] and (rms < 380.0 or len(arr) < int(self._sample_rate * 0.6)):
+                return
+
+            # Exact match single-word hallucination filter
             exact_hallucinations = ["evet", "hayır", "tamam", "hı hı", "hı", "cık", "çık", "eee", "ııı", "hmm"]
             if text_lower in exact_hallucinations:
                 return
@@ -328,7 +338,8 @@ class SpeechRecognitionNode(Node):
             # Filter empty / junk / phantom noise
             junk_filters = [
                 "altyazı", "abone ol", "izlediğiniz için", "www.", ".com",
-                "you", "thank you", "bye", "subtitles", "watching", "amara.org"
+                "you", "thank you", "bye", "subtitles", "watching", "amara.org",
+                "kalbimde", "sizle geldim"
             ]
             if any(junk in text_lower for junk in junk_filters):
                 return

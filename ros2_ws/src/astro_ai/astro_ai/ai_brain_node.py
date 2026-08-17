@@ -224,8 +224,11 @@ class AiBrainNode(Node):
         self.create_subscription(Image, "/oak/rgb/image_raw", self._on_camera_image, 10)
 
         # Timers
+        self._reminder_lock = threading.Lock()
+        self._active_reminders: list[dict] = []
         self.create_timer(0.15, self._check_proactive_gaze)
         self.create_timer(1.0, self._check_session_lifecycle)
+        self.create_timer(1.0, self._check_reminders)
 
         # Idle Learning (Opt-in to prevent token burn)
         self._enable_idle_vision = bool(os.getenv("ENABLE_IDLE_VISION", "false").lower() == "true")
@@ -584,7 +587,36 @@ class AiBrainNode(Node):
                 self.get_logger().info(f"⚡ [Latency] Bu Dönüş: {total_turn_ms:.0f}ms (STT: {stt_latency_ms:.0f}ms, Hava API: {total_turn_ms - stt_latency_ms:.0f}ms) | p50: {stats['p50_total_ms']}ms, p95: {stats['p95_total_ms']}ms")
                 return
 
-            # 2. Identity Query ("Ben kimim? / Beni tanıyor musun?")
+            # 2. Reminder & Alarm Direct Intent
+            is_reminder, reminder_mins, reminder_topic = self._is_reminder_query(user_text)
+            if is_reminder:
+                target_t = time.monotonic() + (reminder_mins * 60.0)
+                identity = self._get_active_biometric_identity()
+                user_name = identity.get("name") if identity.get("is_known") else "Baran"
+                with self._reminder_lock:
+                    self._active_reminders.append({
+                        "target_time": target_t,
+                        "reminder_text": reminder_topic,
+                        "user_name": user_name
+                    })
+                self.memory.profile.add_memory(f"Hatırlatıcı: {reminder_topic} ({int(reminder_mins)} dk sonra)")
+                if int(reminder_mins) <= 1:
+                    ans = f"Tamamdır {user_name}! 1 dakika sonra sana {reminder_topic} konusunu hatırlatacağım."
+                else:
+                    ans = f"Anlaşıldı {user_name}! {int(reminder_mins)} dakika sonra sana {reminder_topic} konusunu hatırlatacağım."
+                self.get_logger().info(f"⏰ [Hatırlatıcı Kuruldu]: {int(reminder_mins)} dk sonra -> '{reminder_topic}'")
+                self.get_logger().info(f"🤖 [Astro]: \"{ans}\"")
+                self._publish_tts(ans)
+                self._publish_emotion(persona)
+                self.memory.episodic.add_message("assistant", ans)
+                t_done = time.monotonic()
+                total_turn_ms = (t_done - t_turn_start) * 1000.0
+                self.session.latency_tracker.record_turn(stt_latency_ms, total_turn_ms - stt_latency_ms, total_turn_ms)
+                stats = self.session.latency_tracker.get_stats()
+                self.get_logger().info(f"⚡ [Latency] Bu Dönüş: {total_turn_ms:.0f}ms (STT: {stt_latency_ms:.0f}ms, Hatırlatıcı: {total_turn_ms - stt_latency_ms:.0f}ms) | p50: {stats['p50_total_ms']}ms, p95: {stats['p95_total_ms']}ms")
+                return
+
+            # 3. Identity Query ("Ben kimim? / Beni tanıyor musun?")
             if is_identity and not is_learning_person:
                 identity = self._get_active_biometric_identity()
                 if identity.get("is_known"):
@@ -607,7 +639,7 @@ class AiBrainNode(Node):
                 self.get_logger().info(f"⚡ [Latency] Bu Dönüş: {total_turn_ms:.0f}ms (STT: {stt_latency_ms:.0f}ms, Biyometri: {total_turn_ms - stt_latency_ms:.0f}ms) | p50: {stats['p50_total_ms']}ms, p95: {stats['p95_total_ms']}ms")
                 return
 
-            # 3. Person Introduction & Biometric Enrollment
+            # 4. Person Introduction & Biometric Enrollment
             if is_learning_person:
                 text_lower = user_text.lower()
                 if "baran" in text_lower or "geliştirici" in text_lower:
@@ -937,6 +969,21 @@ class AiBrainNode(Node):
             except Exception:
                 return f"{city} için şu an hava durumu bilgisine ulaşamadım."
 
+        elif tool_name == "set_timer_alarm":
+            mins = float(arguments.get("minutes", 5.0))
+            rem_text = arguments.get("reminder_text", "Zaman doldu!")
+            target_t = time.monotonic() + (mins * 60.0)
+            identity = self._get_active_biometric_identity()
+            u_name = identity.get("name") if identity.get("is_known") else "Baran"
+            with self._reminder_lock:
+                self._active_reminders.append({
+                    "target_time": target_t,
+                    "reminder_text": rem_text,
+                    "user_name": u_name
+                })
+            self.memory.profile.add_memory(f"Hatırlatıcı: {rem_text} ({int(mins)} dk sonra)")
+            return f"{int(mins)} dakika sonraya hatırlatıcıyı kurdum! Vakti geldiğinde sana sesleneceğim."
+
         elif tool_name == "learn_custom_object":
             obj_name = arguments.get("object_name", "Özel Eşya")
             desc = arguments.get("description", "")
@@ -950,6 +997,57 @@ class AiBrainNode(Node):
             return f"Tanıştığımıza çok memnun oldum {name}! Profilini hafızama kaydettim, artık seni her gördüğümde tanıyacağım."
 
         return "Eylem tamamlandı."
+
+    def _check_reminders(self):
+        """Active scheduler loop ticking every second to trigger due reminders."""
+        now = time.monotonic()
+        due_reminders = []
+        with self._reminder_lock:
+            remaining = []
+            for r in self._active_reminders:
+                if now >= r["target_time"]:
+                    due_reminders.append(r)
+                else:
+                    remaining.append(r)
+            self._active_reminders = remaining
+
+        for r in due_reminders:
+            txt = r["reminder_text"]
+            name = r.get("user_name", "Baran")
+            if "çay" in txt.lower():
+                msg = f"Hey {name}! Hatırlatmamı istediğin vakit geldi: Çay içme zamanı! Sıcak bir çay iyi gelir, afiyet olsun."
+            elif "su" in txt.lower():
+                msg = f"Hey {name}! Su içme vaktin geldi, sağlığın için bir bardak su içmeyi unutma."
+            else:
+                msg = f"Hey {name}! Hatırlatmamı istediğin vakit geldi: {txt}!"
+
+            self.get_logger().info(f"⏰ [Hatırlatıcı Çaldı]: \"{msg}\"")
+            self.session.activate_session(reason="reminder")
+            self.state_machine.transition_to(RobotState.SPEAKING)
+            self._publish_gesture("nod")
+            self._publish_emotion("playful")
+            self._publish_tts(msg)
+
+    def _is_reminder_query(self, text: str) -> Tuple[bool, float, str]:
+        text_l = text.lower()
+        if any(w in text_l for w in ["hatırlat", "alarm kur", "zamanlayıcı kur", "haber ver", "uyar", "çay içmem"]):
+            # Extract minutes
+            m = re.search(r'(\d+)\s*(?:dakika|dk)', text_l)
+            mins = float(m.group(1)) if m else 5.0
+
+            # Extract topic
+            clean_topic = re.sub(r'(?i)(bana|\d+\s*(?:dakika|dk)\s*sonra|hatırlat|alarm kur|haber ver|uyar|gerektiğini|içmem|içmeyi)', '', text).strip(' .:;,')
+            if not clean_topic:
+                if "çay" in text_l:
+                    clean_topic = "Çay içme vakti"
+                elif "su" in text_l:
+                    clean_topic = "Su içme vakti"
+                elif "toplantı" in text_l:
+                    clean_topic = "Toplantı vakti"
+                else:
+                    clean_topic = "Hatırlatma"
+            return True, mins, clean_topic
+        return False, 0.0, ""
 
     def _is_weather_query(self, text: str) -> Tuple[bool, str]:
         text_l = text.lower()
