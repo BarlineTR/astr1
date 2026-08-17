@@ -1,0 +1,8 @@
+# Bu dosya, colcon depo KÖKÜNDEN çalıştırıldığında paketleri taramasını engeller.
+#
+# Kökten `colcon build` çalıştırmak ros2_ws/install ile çakışan ikinci bir install/
+# ağacı üretiyordu; sistem colcon'u kullandığı için giriş noktalarının shebang'i
+# /usr/bin/python3 oluyor ve düğümler venv paketlerini (edge-tts, faster-whisper,
+# sounddevice, vosk) göremiyordu. Doğru komut:
+#
+#     ./scripts/build.sh          # veya: cd ros2_ws && ../.venv/bin/python -m colcon build --symlink-install

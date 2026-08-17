@@ -207,9 +207,13 @@ class AudioCaptureNode(Node):
         channel_attempts = [6, 4, 2, 1]
         process = None
         
-        # Alt süreç için PulseAudio çevre değişkenini içeren ortamı hazırla
+        # Alt süreç için PulseAudio çevre değişkenini içeren ortamı hazırla.
+        # ReSpeaker yoksa pulse_source None kalır; None'ı env'e koymak Popen'i
+        # "expected str, bytes or os.PathLike object, not NoneType" ile düşürür —
+        # o durumda değişkeni hiç vermeyip PulseAudio'nun varsayılanını kullanırız.
         env = os.environ.copy()
-        env["PULSE_SOURCE"] = self.pulse_source
+        if self.pulse_source:
+            env["PULSE_SOURCE"] = self.pulse_source
         
         for alsa_dev in alsa_devs:
             self.get_logger().info(f"arecord deneniyor. Cihaz: {alsa_dev}")
@@ -333,9 +337,16 @@ class AudioCaptureNode(Node):
 def main():
     rclpy.init()
     node = AudioCaptureNode()
-    try: rclpy.spin(node)
-    except KeyboardInterrupt: pass
-    finally: node.destroy_node(); rclpy.shutdown()
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.destroy_node()
+        # Ctrl-C'de rclpy bağlamı zaten kapatılmış olur; ikinci shutdown
+        # RCLError fırlatır ve düğüm 1 koduyla "process has died" olarak görünür.
+        if rclpy.ok():
+            rclpy.shutdown()
 
 if __name__ == "__main__":
     main()

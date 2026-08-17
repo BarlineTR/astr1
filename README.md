@@ -49,6 +49,7 @@ ros2 launch astro_bringup robot.launch.py
 | Script | Purpose |
 |---|---|
 | `scripts/install.sh` | Full install: apt packages, uv, venv, `.env`, workspace build, verification |
+| `scripts/build.sh` | Rebuild the workspace correctly (right directory, right interpreter) |
 | `scripts/install_xtts.sh` | XTTS voice cloning only — clones the TTS fork from GitHub into its own venv |
 | `scripts/install_stt_deps.sh` | Legacy: `pip3 install`s the STT/TTS packages system-wide. Superseded by `requirements.txt` + the venv; kept only for machines set up before the venv layout |
 
@@ -100,15 +101,26 @@ Two pins are deliberate and must not be relaxed:
 
 ### 3. Build the workspace
 
-Run `colcon` **from `ros2_ws/`**, not from the repository root — building at the root scatters `build/ install/ log/` next to the source tree. And run it **through the venv's Python**:
-
 ```bash
-cd <repo-root>/ros2_ws
-../.venv/bin/python -m colcon build --symlink-install
-source install/setup.bash   # or setup.zsh
+./scripts/build.sh                 # everything
+./scripts/build.sh astro_audio     # one package
+./scripts/build.sh --clean         # wipe build/ install/ log/ first
 ```
 
-> **Why `python -m colcon` instead of plain `colcon`?** setuptools writes the shebang of each generated entry point (`install/astro_audio/lib/astro_audio/tts_node`, …) from the interpreter that runs the build. `/usr/bin/colcon` runs under the system Python, so the entry points get `#!/usr/bin/python3` and `ros2 run` then cannot see any venv package — `edge-tts`, `faster-whisper` and `sounddevice` all silently appear "not installed" and the nodes fall back or fail. Building with the venv's Python makes the entry points point at `.venv/bin/python`, and `ros2 run` / `ros2 launch` work without activating anything. (`colcon` itself stays importable because the venv is created with `--system-site-packages`.) `scripts/install.sh` does this for you.
+**Do not run bare `colcon build`.** Two things about this workspace make the plain command produce a broken system, and the wrapper handles both:
+
+1. **Build from `ros2_ws/`, never from the repository root.** A root build creates a *second* `install/` tree next to the source, and `ros2 launch` then runs whichever one your shell happens to have sourced — usually the stale one. The repo root carries a `COLCON_IGNORE` file so an accidental root build finds 0 packages instead of silently shadowing the real tree.
+2. **Build with the venv's Python** (`../.venv/bin/python -m colcon build --symlink-install`). setuptools writes the shebang of every generated entry point (`install/astro_audio/lib/astro_audio/tts_node`, …) from the interpreter that runs the build. `/usr/bin/colcon` runs under the system Python, so the entry points get `#!/usr/bin/python3` — and then `ros2 run` cannot see a single venv package. The symptom is a launch full of lines like:
+
+   ```text
+   [tts_node] edge-tts paketi kurulu değil, pyttsx3'e düşürülüyor
+   [speech_recognition_node] faster-whisper kütüphanesi kurulu değil! Vosk'a dönülüyor
+   [audio_capture_node] sounddevice başlatılamadı. arecord fallback moduna geçiliyor...
+   ```
+
+   Those messages are lying: the packages are installed, just not visible to `/usr/bin/python3`. Building through the venv points the entry points at `.venv/bin/python`, and `ros2 run` / `ros2 launch` then work whether or not the venv is activated. (`colcon` stays importable inside the venv because it was created with `--system-site-packages`.)
+
+To check which tree a running node came from, look at the path in the launch output: it must start with `<repo-root>/ros2_ws/install/`, not `<repo-root>/install/`. If your shell still has a deleted tree sourced, open a new shell and `source ros2_ws/install/setup.bash`.
 
 Expected result: 7 packages finished. Warnings about `tests_require` and CMake policy `CMP0148` are harmless.
 

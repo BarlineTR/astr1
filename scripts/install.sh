@@ -171,31 +171,12 @@ step "7/7  ROS 2 çalışma alanı derleniyor"
 if [ "$SKIP_BUILD" = "1" ]; then
   ok "atlandı (--skip-build)"
 else
-  if [ "$CLEAN" = "1" ]; then
-    rm -rf "$WS/build" "$WS/install" "$WS/log"
-    ok "build/ install/ log/ silindi"
-  fi
-
-  set +u                      # ROS setup betikleri tanımsız değişken kullanır
-  # shellcheck disable=SC1090
-  source "$ROS_SETUP"
-  set -u
-
-  cd "$WS"
-  # colcon'u venv'in Python'uyla çalıştırmak KRİTİK: setuptools, giriş noktası
-  # betiklerinin shebang'ini kendisini çalıştıran yorumlayıcıdan üretir. Sistem
-  # colcon'u (/usr/bin/colcon) ile derlenirse shebang /usr/bin/python3 olur ve
-  # `ros2 run` edge-tts, faster-whisper, sounddevice gibi venv paketlerini görmez.
-  if "$VPY" -c "import colcon_core" >/dev/null 2>&1; then
-    "$VPY" -m colcon build --symlink-install
-    ok "derleme tamam (venv Python'u ile — giriş noktaları venv'i kullanır)"
-  else
-    warn "colcon venv'den import edilemedi; sistem colcon'u kullanılıyor.
-        Düğümler venv paketlerini görmeyebilir; şununla çalıştırın:
-        PYTHONPATH=\"$VENV/lib/python3.10/site-packages:\$PYTHONPATH\" ros2 launch ..."
-    colcon build --symlink-install
-  fi
-  cd "$ROOT"
+  # Derleme mantığı tek yerde: doğru dizin (ros2_ws) + doğru yorumlayıcı (venv).
+  # Bkz. scripts/build.sh içindeki açıklama.
+  BUILD_ARGS=()
+  [ "$CLEAN" = "1" ] && BUILD_ARGS+=("--clean")
+  "$ROOT/scripts/build.sh" ${BUILD_ARGS[@]+"${BUILD_ARGS[@]}"}
+  ok "derleme tamam (venv Python'u ile — giriş noktaları venv'i kullanır)"
 fi
 
 # --------------------------------------------------------------- doğrulama
@@ -203,7 +184,9 @@ step "Doğrulama"
 VERIFY_FAILED=0
 
 if [ -f "$WS/install/setup.bash" ]; then
-  set +u
+  set +u                      # ROS setup betikleri tanımsız değişken kullanır
+  # shellcheck disable=SC1090
+  source "$ROS_SETUP"
   # shellcheck disable=SC1091
   source "$WS/install/setup.bash"
   set -u
