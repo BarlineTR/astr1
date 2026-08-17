@@ -199,9 +199,21 @@ class TtsNode(Node):
             self._current_speed = speed_map.get(emotion, 1.05)
 
     def _on_say(self, msg: String):
-        text = clean_tts_text(msg.data)
+        import json
+        text_data = msg.data
+        use_edge_tts = False
+        try:
+            parsed = json.loads(text_data)
+            if isinstance(parsed, dict) and "text" in parsed:
+                text_data = parsed.get("text", "")
+                if parsed.get("engine") == "edge-tts":
+                    use_edge_tts = True
+        except Exception:
+            pass
+            
+        text = clean_tts_text(text_data)
         if text:
-            self._speak_queue.put(text)
+            self._speak_queue.put({"text": text, "use_edge_tts": use_edge_tts})
 
     def _on_interrupt(self, msg: Bool):
         if msg.data:
@@ -231,26 +243,34 @@ class TtsNode(Node):
     def _playback_loop(self):
         while rclpy.ok():
             try:
-                text = self._speak_queue.get(timeout=0.05)
-                self._synthesize_and_play_memory(text)
+                item = self._speak_queue.get(timeout=0.05)
+                self._synthesize_and_play_memory(item)
             except queue.Empty:
                 continue
             except Exception as e:
                 self.get_logger().error(f"Playback loop hatası: {e}")
 
-    def _synthesize_and_play_memory(self, text: str):
+    def _synthesize_and_play_memory(self, item):
         with self._generation_lock:
             current_gen = self._generation
+
+        if isinstance(item, dict):
+            text = item.get("text", "")
+            force_edge = item.get("use_edge_tts", False)
+        else:
+            text = str(item)
+            force_edge = False
 
         if not text:
             return
 
         try:
-            self.get_logger().info(f'🔊 [TTS Okuyor]: "{text}"')
+            engine_str = "Edge-TTS" if force_edge else "Varsayılan"
+            self.get_logger().info(f'🔊 [TTS Okuyor] ({engine_str}): "{text}"')
             wav_data = None
 
             # 1. Try Primary OpenAI TTS-1 (Natural Human Inflection & Direct WAV)
-            if self.tts_engine == "openai" and self._openai_client:
+            if not force_edge and self.tts_engine == "openai" and self._openai_client:
                 try:
                     resp = self._openai_client.audio.speech.create(
                         model="tts-1",

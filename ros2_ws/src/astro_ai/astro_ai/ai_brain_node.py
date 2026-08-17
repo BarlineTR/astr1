@@ -269,36 +269,10 @@ class AiBrainNode(Node):
         )
 
     def _discover_active_groq_models(self) -> List[str]:
-        """Dynamically queries Groq API to get real, active, non-deprecated model IDs."""
+        """Returns a static list of verified active Groq models to prevent 404 errors and API latency."""
         if not self._groq:
             return []
-        try:
-            models = self._groq.models.list()
-            active_ids = [m.id for m in models.data]
-            chat_models = []
-            for mid in active_ids:
-                mid_l = mid.lower()
-                # Exclude embedding, audio, guardrails, reasoning models (deepseek, r1, qwq, qwen, distill) and openai moderation
-                if any(x in mid_l for x in ["whisper", "embedding", "guard", "moderation", "tts", "gpt-oss", "openai", "deepseek", "r1", "qwq", "qwen", "distill"]):
-                    continue
-                chat_models.append(mid)
-
-            def score(m):
-                ml = m.lower()
-                if "llama-3.3-70b-versatile" in ml: return 10
-                if "llama-3.1-70b-versatile" in ml: return 9
-                if "llama-3.1-8b-instant" in ml: return 8
-                if "llama3-70b" in ml: return 7
-                if "llama3-8b" in ml: return 6
-                if "llama-3.3" in ml or "llama-3.1" in ml: return 5
-                return 0
-
-            chat_models = [m for m in chat_models if score(m) >= 5]
-            chat_models.sort(key=score, reverse=True)
-            return chat_models
-        except Exception as e:
-            self.get_logger().warn(f"⚠️ Groq aktif model keşfi başarısız: {e}")
-            return []
+        return ["llama-3.3-70b-versatile", "llama-3.1-8b-instant"]
 
     def _discover_vision_model(self) -> str | None:
         try:
@@ -595,8 +569,31 @@ class AiBrainNode(Node):
                 else:
                     raw_text = clean_prompt
             else:
-                self.get_logger().info(f"🔇 [Arka Plan Konuşması / Göz Teması Yok]: '{raw_text}' yok sayıldı.")
-                return
+                if self._groq:
+                    self.get_logger().info(f"🕵️ [Arka Plan]: '{raw_text}' sosyal filtrede inceleniyor...")
+                    prompt = f"Sen Astro'sun, akıllı bir ev robotusun. Odadaki insanlar şu an kendi aralarında şunu konuşuyor: '{raw_text}'. Bu konuşmada doğrudan sana yöneltilen bir soru var mı, veya dahil olup kesin yardımcı olabileceğin bariz bir fırsat var mı? Sadece EVET veya HAYIR yaz."
+                    try:
+                        res = self._groq.chat.completions.create(
+                            messages=[{"role": "user", "content": prompt}],
+                            model="llama-3.1-8b-instant",
+                            temperature=0.0,
+                            max_tokens=10
+                        )
+                        ans = res.choices[0].message.content.strip().lower()
+                        if "evet" in ans:
+                            self.get_logger().info("🎯 [Sosyal Fırsat]: Arka plan konuşmasına dâhil olunuyor!")
+                            self.session.activate_session(reason="social_barge_in")
+                            self.session.metadata["tts_engine"] = "edge-tts"
+                            self.state_machine.transition_to(RobotState.LISTENING)
+                        else:
+                            self.get_logger().info(f"🔇 [Arka Plan]: '{raw_text}' yok sayıldı (İlgisiz).")
+                            return
+                    except Exception as e:
+                        self.get_logger().warn(f"Sosyal filtre hatası: {e}")
+                        return
+                else:
+                    self.get_logger().info(f"🔇 [Arka Plan Konuşması / Göz Teması Yok]: '{raw_text}' yok sayıldı.")
+                    return
 
         # Active Session Turn
         self.session.record_user_speech()
@@ -1314,10 +1311,15 @@ class AiBrainNode(Node):
         return any(k in text_lower for k in keywords)
 
     def _publish_tts(self, text: str):
+        import json
         clean = clean_tts_text(text)
         if clean:
             msg = String()
-            msg.data = clean
+            if self.session.metadata.get("tts_engine") == "edge-tts":
+                payload = {"text": clean, "engine": "edge-tts"}
+                msg.data = json.dumps(payload)
+            else:
+                msg.data = clean
             self.pub_tts.publish(msg)
 
     def _publish_interrupt(self):

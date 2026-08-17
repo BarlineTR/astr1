@@ -69,6 +69,8 @@ class ConversationSession:
         self._last_gaze_time: float = 0.0
         self._is_gaze_active: bool = False
         self._lock = threading.RLock()
+        
+        self.metadata: dict = {}
 
         self.latency_tracker = LatencyTracker()
 
@@ -87,11 +89,13 @@ class ConversationSession:
             self._is_active = True
             now = time.monotonic()
             self._last_user_speech_time = now
-            if not was_active and self.on_session_start:
-                try:
-                    self.on_session_start()
-                except Exception:
-                    pass
+            if not was_active:
+                self.metadata.clear()
+                if self.on_session_start:
+                    try:
+                        self.on_session_start()
+                    except Exception:
+                        pass
 
     def record_user_speech(self):
         with self._lock:
