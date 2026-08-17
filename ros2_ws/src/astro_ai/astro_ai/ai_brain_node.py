@@ -1,33 +1,30 @@
 #!/usr/bin/env python3
-"""ASTRO V1 — Multimodal AI Brain Node with Dynamic Vision Discovery & Long-Term Memory.
+"""ASTRO V1 — Real-Time Conversational AI Brain Node (Modular Architecture).
 
-Features:
-  - Dynamic Vision Model Discovery: Automatically selects the active vision model from Groq API (e.g. qwen/qwen3.6-27b, etc.)
-  - True Multimodal Vision: Real-time OAK-D camera image analysis
-  - Zero Hallucination: Strict visual grounding (speaks only what it truly sees)
-  - Long-Term Memory (astro_memory.json): Remembers user names and facts
-  - Ultra-Fast Streaming TTS: First sentence spoken in <150ms
-  - Rıfkı Persona: Emotional, witty, friendly Turkish conversational agent
+Coordinates:
+  - State Machine (FSM): IDLE, LISTENING, THINKING, SPEAKING, INTERRUPTED
+  - 3-Tier Memory Architecture: Episodic Buffer, Session Memory, Persistent Profile
+  - Adaptive Conversation Session Manager & Latency Tracker (p50/p95)
+  - Persona Engine & Deterministic Perception Context Injection
+  - Tool Execution & Real-Time Streaming LLM Speech Synthesis
 """
 
+import base64
+import json
 import os
 import re
-import time
-import json
-import codecs
-import base64
 import threading
+import time
+import urllib.parse
+import urllib.request
+from typing import Any, Dict, List, Optional, Tuple
+import cv2
 import numpy as np
 
 import rclpy
 from rclpy.node import Node
-from std_msgs.msg import String, Bool
 from sensor_msgs.msg import Image
-
-try:
-    import cv2
-except ImportError:
-    cv2 = None
+from std_msgs.msg import Bool, Float32, String
 
 try:
     from groq import Groq
@@ -35,20 +32,9 @@ except ImportError:
     Groq = None
 
 try:
-    import requests
+    from openai import OpenAI
 except ImportError:
-    requests = None
-
-# Google Gemini — REST üzerinden konuşulur (SDK bağımlılığı yok, requests yeter).
-GEMINI_API_ROOT = "https://generativelanguage.googleapis.com/v1beta"
-# "gemini-3.7-flash" gibi sürümlü, genel kullanıma açık flash modelleri yakalar.
-# preview/lite/image/tts türevleri bilinçli olarak dışarıda: robot sohbeti için
-# düşük gecikmeli ama tam yetenekli, kararlı bir model isteniyor.
-GEMINI_FLASH_RE = re.compile(r"^gemini-(\d+)(?:\.(\d+))?-flash$")
-# ListModels çağrısı başarısız olursa bu sırayla denenir. "-latest" takma adı
-# Google tarafından güncel flash modele yönlendirilir; sürüm sabitlemekten daha
-# dayanıklıdır (örn. gemini-2.5-flash artık yeni anahtarlara 404 dönüyor).
-GEMINI_MODEL_FALLBACKS = ("gemini-flash-latest",)
+    OpenAI = None
 
 try:
     from dotenv import find_dotenv, load_dotenv
@@ -56,168 +42,52 @@ except ImportError:
     def find_dotenv(*args, **kwargs): return ""
     def load_dotenv(*args, **kwargs): pass
 
+try:
+    from astro_ai.state_machine import StateMachine, RobotState
+    from astro_ai.memory_manager import MemoryManager
+    from astro_ai.persona_engine import (
+        PersonaEngine, ROBOT_TOOLS, PERSONA_PROMPTS,
+        clean_tts_text, extract_spoken_turkish_sentence
+    )
+    from astro_ai.conversation_session import ConversationSession
+    from astro_ai.cloud_manager import CloudManager
+    from astro_ai.officials_database import find_official_by_name_or_alias, get_official_greeting, OFFICIALS_DATABASE
+except ImportError:
+    from state_machine import StateMachine, RobotState
+    from memory_manager import MemoryManager
+    from persona_engine import (
+        PersonaEngine, ROBOT_TOOLS, PERSONA_PROMPTS,
+        clean_tts_text, extract_spoken_turkish_sentence
+    )
+    from conversation_session import ConversationSession
+    from cloud_manager import CloudManager
+    from officials_database import find_official_by_name_or_alias, get_official_greeting, OFFICIALS_DATABASE
+
 
 def _load_env():
     candidates = [
         os.path.abspath(".env"),
+        os.path.abspath(".env.production"),
         os.path.abspath(os.path.join(os.getcwd(), ".env")),
+        os.path.abspath(os.path.join(os.getcwd(), ".env.production")),
         os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..", "..", ".env")),
+        os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..", "..", ".env.production")),
         os.path.expanduser("~/Desktop/astr1/.env"),
+        os.path.expanduser("~/Desktop/astr1/.env.production"),
         os.path.expanduser("~/.env")
     ]
     for c in candidates:
         if os.path.exists(c):
-            load_dotenv(dotenv_path=c, override=False)
+            load_dotenv(dotenv_path=c, override=True)
             return c
     try:
         env_path = find_dotenv(usecwd=True)
         if env_path:
-            load_dotenv(dotenv_path=env_path, override=False)
+            load_dotenv(dotenv_path=env_path, override=True)
             return env_path
     except Exception:
         pass
     return None
-
-
-TTS_MIN_CHARS = 12
-TTS_MAX_CHARS = 240
-
-EMOJI_RE = re.compile(
-    "["
-    "\U0001F1E0-\U0001F1FF"
-    "\U0001F300-\U0001F5FF"
-    "\U0001F600-\U0001F64F"
-    "\U0001F680-\U0001F6FF"
-    "\U0001F700-\U0001F77F"
-    "\U0001F780-\U0001F7FF"
-    "\U0001F800-\U0001F8FF"
-    "\U0001F900-\U0001F9FF"
-    "\U0001FA00-\U0001FAFF"
-    "\u2600-\u26FF"
-    "\u2700-\u27BF"
-    "]+",
-    flags=re.UNICODE,
-)
-
-
-class AstroMemory:
-    """Persistent Long-Term Memory for ASTRO V1."""
-    def __init__(self, filepath=None):
-        if filepath is None:
-            self.filepath = os.path.expanduser("~/Desktop/astr1/ros2_ws/astro_memory.json")
-        else:
-            self.filepath = filepath
-        self.data = {
-            "owner_name": None,
-            "user_facts": [],
-            "last_interaction": None,
-        }
-        self.load()
-
-    def load(self):
-        if os.path.exists(self.filepath):
-            try:
-                with open(self.filepath, "r", encoding="utf-8") as f:
-                    saved = json.load(f)
-                    self.data.update(saved)
-            except Exception:
-                pass
-        # Clean corrupted names
-        if self.data.get("owner_name") and str(self.data["owner_name"]).lower() in ["şarkı", "cevap", "yardım", "nasılsın"]:
-            self.data["owner_name"] = "Baran"
-            self.save()
-
-    def save(self):
-        try:
-            os.makedirs(os.path.dirname(self.filepath), exist_ok=True)
-            with open(self.filepath, "w", encoding="utf-8") as f:
-                json.dump(self.data, f, ensure_ascii=False, indent=2)
-        except Exception:
-            pass
-
-    def set_owner(self, name: str):
-        self.data["owner_name"] = name
-        self.save()
-
-    def get_context_prompt(self) -> str:
-        ctx = []
-        if self.data.get("owner_name"):
-            ctx.append(f"Kullanıcının / Sahibinin Adı: {self.data['owner_name']}")
-        if self.data.get("user_facts"):
-            facts_str = "; ".join(self.data["user_facts"][-5:])
-            ctx.append(f"Kullanıcı hakkında bildiklerin: {facts_str}")
-        if ctx:
-            return "Hafızandaki Bilgiler:\n" + "\n".join(ctx)
-        return ""
-
-
-def clean_tts_text(text: str) -> str:
-    if not text:
-        return ""
-    # Strip <think>...</think> blocks if present
-    text = re.sub(r"(?i)<think>[\s\S]*?</think>", "", text)
-    # Strip standalone think tags
-    text = re.sub(r"(?i)<\/?think>", "", text)
-    text = EMOJI_RE.sub("", text)
-    text = re.sub(r"```.*?```", "", text, flags=re.DOTALL)
-    text = re.sub(r"`.*?`", "", text)
-    text = re.sub(r"[\*\_\~\#\<\>]", "", text)
-    text = " ".join(text.split())
-    text = re.sub(r"\s+([,.:;?!])", r"\1", text)
-    return text.strip()
-
-
-def extract_tts_sentences(buffer: str, final=False) -> tuple[list[str], str]:
-    ready = []
-    buffer = re.sub(r"\s+", " ", buffer).strip()
-
-    while True:
-        matches = list(re.finditer(r"[.!?]+(?:\s+|$)", buffer))
-        if not matches:
-            break
-
-        chosen = None
-        for m in matches:
-            candidate = buffer[:m.end()].strip()
-            if len(candidate) >= TTS_MIN_CHARS:
-                chosen = m
-                break
-
-        if chosen is None:
-            break
-
-        candidate = clean_tts_text(buffer[:chosen.end()].strip())
-        if candidate:
-            ready.append(candidate)
-
-        buffer = buffer[chosen.end():].lstrip()
-        if len(ready) >= 1 and len(buffer) < TTS_MAX_CHARS:
-            break
-
-    if len(buffer) >= TTS_MAX_CHARS:
-        cut_candidates = [
-            buffer.rfind(". ", 0, TTS_MAX_CHARS),
-            buffer.rfind("! ", 0, TTS_MAX_CHARS),
-            buffer.rfind("? ", 0, TTS_MAX_CHARS),
-            buffer.rfind(", ", 0, TTS_MAX_CHARS),
-            buffer.rfind(" ", 0, TTS_MAX_CHARS),
-        ]
-        cut = max(cut_candidates)
-        if cut >= TTS_MIN_CHARS:
-            if buffer[cut] in ".!?":
-                cut += 1
-            sentence = clean_tts_text(buffer[:cut])
-            if sentence:
-                ready.append(sentence)
-            buffer = buffer[cut:].lstrip()
-
-    if final and buffer:
-        sentence = clean_tts_text(buffer)
-        if sentence:
-            ready.append(sentence)
-        buffer = ""
-
-    return ready, buffer
 
 
 def imgmsg_to_bgr(msg: Image) -> np.ndarray | None:
@@ -226,14 +96,10 @@ def imgmsg_to_bgr(msg: Image) -> np.ndarray | None:
             return np.frombuffer(msg.data, dtype=np.uint8).reshape(msg.height, msg.width, 3).copy()
         elif msg.encoding == "rgb8":
             data = np.frombuffer(msg.data, dtype=np.uint8).reshape(msg.height, msg.width, 3)
-            if cv2:
-                return cv2.cvtColor(data, cv2.COLOR_RGB2BGR)
-            return data[:, :, ::-1].copy()
+            return cv2.cvtColor(data, cv2.COLOR_RGB2BGR) if cv2 else data[:, :, ::-1].copy()
         elif msg.encoding in ("mono8", "8UC1"):
             data = np.frombuffer(msg.data, dtype=np.uint8).reshape(msg.height, msg.width)
-            if cv2:
-                return cv2.cvtColor(data, cv2.COLOR_GRAY2BGR)
-            return np.stack([data]*3, axis=-1)
+            return cv2.cvtColor(data, cv2.COLOR_GRAY2BGR) if cv2 else np.stack([data]*3, axis=-1)
     except Exception:
         pass
     return None
@@ -253,321 +119,535 @@ def frame_to_base64_jpeg(frame: np.ndarray, max_dim: int = 512) -> str | None:
         return None
 
 
+def is_canned_refusal(text: str) -> bool:
+    """Detects standard LLM safety refusal boilerplate phrases and English reasoning leaks."""
+    if not text:
+        return False
+    t_lower = text.lower().strip()
+    refusal_patterns = [
+        "yardımcı olamam", "yardımcı olamayacağım", "bu isteğinize yardımcı",
+        "isteğinize yardımcı olamam", "yardımcı olamam maalesef", "üzgünüm, ancak",
+        "üzgünüm, ama lütfen", "daha saygılı bir dil", "bir yapay zeka olarak",
+        "yapay zeka olarak", "uygunsuz içerik", "as an ai", "i cannot assist",
+        "i cannot fulfill", "i am unable to", "here's a thinking process",
+        "thinking process", "let's think"
+    ]
+    return any(p in t_lower for p in refusal_patterns)
+
+
 class AiBrainNode(Node):
     def __init__(self):
         super().__init__("ai_brain_node")
-
         _load_env()
 
-        self.memory = AstroMemory()
+        # Core Modular Components
+        self.memory = MemoryManager()
+        self.cloud_mgr = CloudManager()
+        initial_persona = self.memory.profile.data.get("current_persona", "playful")
+        self.persona_engine = PersonaEngine(initial_persona)
+        self.state_machine = StateMachine(RobotState.IDLE)
 
-        # Sağlayıcı seçimi: sohbet ve görme ayrı ayrı yönlendirilebilir.
-        # VISION_PROVIDER verilmezse LLM_PROVIDER neyse görme de oraya gider.
-        self.provider = os.getenv("LLM_PROVIDER", "gemini").strip().lower()
-        self.vision_provider = (os.getenv("VISION_PROVIDER", "").strip() or self.provider).lower()
-
-        self.declare_parameter("llm_model", os.getenv("LLM_MODEL", ""))
+        # Parameters
+        self.declare_parameter("llm_model", os.getenv("LLM_MODEL", "llama-3.3-70b-versatile"))
+        self.declare_parameter("vision_model", os.getenv("VISION_MODEL", "llama-3.2-90b-vision-preview"))
         self.declare_parameter("llm_temperature", float(os.getenv("LLM_TEMPERATURE", "0.55")))
-        # Gemini 3.x'te düşünme tokenları da bu bütçeden düşülür: 300 token, cevabın
-        # kendisine sıra gelmeden tükenip cümleyi ortasından kesiyordu.
-        self.declare_parameter("llm_max_tokens", int(os.getenv("LLM_MAX_TOKENS", "1000")))
+        self.declare_parameter("llm_max_tokens", int(os.getenv("LLM_MAX_TOKENS", "300")))
         self.declare_parameter("wake_word", os.getenv("WAKE_WORD", "hey astro"))
-        self.declare_parameter("conversation_timeout", float(os.getenv("CONVERSATION_TIMEOUT", "15.0")))
+        self.declare_parameter("conversation_timeout", float(os.getenv("CONVERSATION_TIMEOUT", "16.0")))
+        self.declare_parameter("gaze_dwell_s", float(os.getenv("GAZE_DWELL_S", "4.0")))
+        self.declare_parameter("gaze_cooldown_s", float(os.getenv("GAZE_COOLDOWN_S", "60.0")))
+        self.declare_parameter("gaze_startup_grace_s", float(os.getenv("GAZE_STARTUP_GRACE_S", "15.0")))
+        self.declare_parameter("default_user_name", os.getenv("DEFAULT_USER_NAME", "Misafir"))
+        self.declare_parameter("enable_idle_learning", os.getenv("ENABLE_IDLE_LEARNING", "true").lower() == "true")
 
         self._text_model = self.get_parameter("llm_model").value
+        self._fallback_models = ["llama-3.3-70b-versatile", "llama-3.1-8b-instant", "mixtral-8x7b-32768"]
+        self._vision_model = self.get_parameter("vision_model").value
         self._temperature = float(self.get_parameter("llm_temperature").value)
         self._max_tokens = int(self.get_parameter("llm_max_tokens").value)
         self._wake_word = self.get_parameter("wake_word").value
-        self._conv_timeout = float(self.get_parameter("conversation_timeout").value)
-        # "low" (varsayılan, hızlı) | "high" (daha iyi akıl yürütme, yavaş) | "off"
-        self._thinking = os.getenv("LLM_THINKING", "low").strip().lower()
+        conv_timeout = float(self.get_parameter("conversation_timeout").value)
+        self._gaze_dwell_s = float(self.get_parameter("gaze_dwell_s").value)
+        self._gaze_cooldown_s = float(self.get_parameter("gaze_cooldown_s").value)
+        self._gaze_startup_grace_s = float(self.get_parameter("gaze_startup_grace_s").value)
+        self._default_user_name = str(self.get_parameter("default_user_name").value)
+        self._enable_idle_learning = bool(self.get_parameter("enable_idle_learning").value)
 
+        # Adaptive Session
+        self.session = ConversationSession(
+            base_timeout_s=conv_timeout,
+            on_session_start=lambda: self.get_logger().info("✨ [Session] Konuşma Oturumu Başlatıldı."),
+            on_session_end=self._on_session_timed_out
+        )
+
+        # 1. Groq Client (Primary Ultra-Fast Free LPU Engine - Zero OpenAI Cost)
         self.groq_api_key = os.environ.get("GROQ_API_KEY", "").strip()
-        self.gemini_api_key = (
-            os.environ.get("GEMINI_API_KEY", "")
-            or os.environ.get("GOOGLE_API_KEY", "")
-        ).strip()
         self._groq = None
-        self._vision_model = None
-        self._enabled = False
-        self._last_finish_reason = None
+        self._active_groq_models = []
 
-        if self.provider == "gemini":
-            self._init_gemini()
-        elif self.provider == "groq":
-            self._init_groq()
-        else:
-            self.get_logger().error(
-                f"❌ [AI] Bilinmeyen LLM_PROVIDER: \"{self.provider}\" — \"gemini\" veya \"groq\" olmalı"
-            )
+        if Groq and self.groq_api_key:
+            try:
+                self._groq = Groq(api_key=self.groq_api_key)
+                self._active_groq_models = self._discover_active_groq_models()
+                self._enabled = True
+                self.get_logger().info(f"🚀 [AI Brain] Groq LPU (Ücretsiz & Ultra Hızlı) Birincil LLM Motoru Aktif! (Toplam {len(self._active_groq_models)} Model)")
+            except Exception as e:
+                self.get_logger().debug(f"Groq client notice: {e}")
 
-        # Görme farklı bir sağlayıcıdan isteniyorsa onun istemcisi de hazırlanmalı.
-        if self._enabled and self.vision_provider == "groq" and self._groq is None:
-            self._init_groq(as_vision_only=True)
+        # 2. OpenAI Client (Emergency High-Performance Backup Engine)
+        self.openai_api_key = os.environ.get("OPENAI_API_KEY", "").strip() or os.environ.get("AI_API_KEY", "").strip()
+        self._openai = None
 
-        self._state = "IDLE"
-        self._last_interaction = 0.0
+        if OpenAI and self.openai_api_key and self.openai_api_key.startswith("sk-"):
+            try:
+                self._openai = OpenAI(api_key=self.openai_api_key)
+                self._enabled = True
+                self.get_logger().info(f"✅ [AI Brain] OpenAI GPT-4o-mini Yedek Motoru Hazır.")
+            except Exception as e:
+                self.get_logger().error(f"❌ [AI Brain] OpenAI client başlatılamadı: {e}")
+
+        if not self._openai and not self._groq:
+            self.get_logger().error("❌ [AI Brain] Ne OPENAI_API_KEY ne de GROQ_API_KEY bulunamadı! LLM devre dışı.")
+
+        # 3. Gemini REST API Key (Tertiary Fallback)
+        self._ai_api_key = os.environ.get("AI_API_KEY", "").strip()
+
+        # Perception & Hardware State
+        self._lock = threading.Lock()
+        self._is_processing = False
         self._tts_speaking = False
         self._person_detected = False
+        self._looking_at_robot = False
+        self._looking_start_time = None
+        self._gaze_lock = threading.Lock()
+        self._last_proactive_gaze_time = 0.0
+        self._speaker_angle = 0.0
+        self._speaker_gender = "unknown"
+        self._user_distance = 0.0
+        self._user_emotion = "neutral"
+        self._recognized_person = None
+        self._recognized_speaker = None
+        self._node_start_time = time.monotonic()
         self._latest_frame = None
         self._latest_frame_time = 0.0
 
-        self._lock = threading.Lock()
-        self._is_processing = False
-        self._messages = []
-        self._max_history = 20
-        self._build_initial_messages()
-
-        # Publishers
+        # ROS 2 Publishers
         self.pub_tts = self.create_publisher(String, "/tts/say", 10)
         self.pub_interrupt = self.create_publisher(Bool, "/tts/interrupt", 10)
+        self.pub_emotion = self.create_publisher(String, "/robot/emotion", 10)
+        self.pub_gesture = self.create_publisher(String, "/robot/head_gesture", 10)
+        self.pub_look_target = self.create_publisher(Float32, "/robot/look_target", 10)
+        self.pub_session_active = self.create_publisher(Bool, "/ai/session_active", 10)
 
-        # Subscribers
-        self.sub_speech = self.create_subscription(String, "/speech/text", self._on_speech, 10)
-        self.sub_tts_status = self.create_subscription(Bool, "/tts/speaking", self._on_tts_speaking, 10)
-        self.sub_vision_status = self.create_subscription(Bool, "/vision/person_detected", self._on_person_detected, 10)
-        self.sub_camera = self.create_subscription(Image, "/oak/rgb/image_raw", self._on_camera_image, 10)
+        # ROS 2 Subscribers
+        self.create_subscription(String, "/speech/text", self._on_speech, 10)
+        self.create_subscription(String, "/audio/speaker_gender", self._on_speaker_gender, 10)
+        self.create_subscription(String, "/audio/speaker_id", self._on_speaker_id, 10)
+        self.create_subscription(Bool, "/tts/speaking", self._on_tts_speaking, 10)
+        self.create_subscription(Bool, "/tts/interrupt", self._on_tts_interrupt, 10)
+        self.create_subscription(Bool, "/vision/person_detected", self._on_person_detected, 10)
+        self.create_subscription(Bool, "/vision/looking_at_robot", self._on_looking_at_robot, 10)
+        self.create_subscription(String, "/vision/recognized_person", self._on_recognized_person, 10)
+        self.create_subscription(Float32, "/vision/user_distance", self._on_user_distance, 10)
+        self.create_subscription(String, "/vision/user_emotion", self._on_user_emotion, 10)
+        self.create_subscription(Float32, "/audio/doa", self._on_doa, 10)
+        self.create_subscription(Image, "/oak/rgb/image_raw", self._on_camera_image, 10)
 
-        owner = self.memory.data.get("owner_name")
-        owner_info = f" (Tanınan Kişi: {owner})" if owner else ""
-        if self._enabled:
-            self.get_logger().info(
-                f"🧠 [AI Brain] Görme, Hafıza ve Ses Sistemi Hazır! Wake-word: \"{self._wake_word}\"{owner_info}"
-            )
-        else:
-            self.get_logger().error(
-                "🧠 [AI Brain] LLM devre dışı — düğüm ayakta ama konuşulanlara cevap veremez. "
-                "Yukarıdaki hatayı giderip yeniden başlatın."
-            )
+        # Timers
+        self.create_timer(0.15, self._check_proactive_gaze)
+        self.create_timer(1.0, self._check_session_lifecycle)
+        self.create_timer(1.0, self._check_reminders)
 
-    # ------------------------------------------------------------------
-    # Sağlayıcı kurulumu
-    # ------------------------------------------------------------------
-    def _init_gemini(self):
-        """Google Gemini (REST) — sohbet için varsayılan sağlayıcı."""
-        if requests is None:
-            self.get_logger().error("❌ [AI] requests paketi yok — Gemini kullanılamaz")
-            return
-        if not self.gemini_api_key:
-            self.get_logger().error(
-                "❌ [AI] GEMINI_API_KEY bulunamadı! .env dosyanıza ekleyin "
-                "(anahtar: https://aistudio.google.com/apikey)"
-            )
-            return
+        # Idle Learning (Powered 100% by Groq, 0 OpenAI token cost)
+        if self._enable_idle_learning:
+            self._start_idle_learning()
+            self.get_logger().info("🤖 [AI Brain] Groq Tabanlı Otonom Boşta Öğrenme ve Bellek Güçlendirme Aktif!")
 
-        self._text_model = self._text_model or self._discover_gemini_model()
-        if self.vision_provider == "gemini":
-            self._vision_model = self._text_model
-        self._enabled = True
         self.get_logger().info(
-            f"✅ [AI] Google Gemini aktif — Metin: {self._text_model} | Görme: "
-            f"{self._vision_model if self.vision_provider == 'gemini' else self.vision_provider}"
+            f"🧠 [AI Brain Node] Modüler Mimari Hazır! Kişilik: [{self.persona_engine.current_persona.upper()}]"
         )
 
-    def _init_groq(self, as_vision_only: bool = False):
-        """Groq — LLM_PROVIDER=\"groq\" ile seçilir, ayrıca görme için kullanılabilir."""
-        if Groq is None or not self.groq_api_key:
-            msg = "❌ [AI] GROQ_API_KEY bulunamadı veya groq paketi kurulu değil"
-            if as_vision_only:
-                self.get_logger().warn(f"{msg} — görsel sorular yanıtlanamayacak")
-            else:
-                self.get_logger().error(f"{msg}! LLM devre dışı.")
-            return
+    def _discover_active_groq_models(self) -> List[str]:
+        """Dynamically queries active, non-deprecated chat models from Groq with safe fallbacks."""
+        if not self._groq:
+            return []
         try:
-            self._groq = Groq(api_key=self.groq_api_key)
-            self._vision_model = self._discover_vision_model()
-            if as_vision_only:
-                self.get_logger().info(f"✅ [AI] Groq görme için hazır: {self._vision_model}")
-                return
-            self._text_model = self._text_model or "llama-3.3-70b-versatile"
-            self._enabled = True
-            self.get_logger().info(
-                f"✅ [AI] Groq aktif — Metin: {self._text_model} | Görme: {self._vision_model}"
-            )
+            models = self._groq.models.list()
+            chat_models = []
+            for m in models.data:
+                mid = m.id
+                mid_l = mid.lower()
+                if any(x in mid_l for x in ["whisper", "embedding", "guard", "moderation", "tts", "distill"]):
+                    continue
+                chat_models.append(mid)
+            if chat_models:
+                return chat_models
         except Exception as e:
-            self.get_logger().error(f"❌ [AI] Groq Client başlatılamadı: {e}")
+            self.get_logger().debug(f"Groq dynamic model discovery notice: {e}")
+        return ["llama-3.3-70b-versatile", "openai/gpt-oss-20b", "llama3-70b-8192"]
 
-    def _discover_gemini_model(self) -> str:
-        """Anahtarın erişebildiği en güncel kararlı flash modelini seçer.
 
-        Model adları hızla değişiyor (gemini-2.5 → 3.x → …); sabit bir ada bağlanmak
-        yerine API'ye sormak, kod eskidiğinde bile güncel modeli bulmayı sağlar.
-        Sürümler metin olarak değil sayı olarak karşılaştırılır: 3.10 > 3.7.
-        """
-        try:
-            res = requests.get(
-                f"{GEMINI_API_ROOT}/models",
-                headers={"x-goog-api-key": self.gemini_api_key},
-                timeout=10.0,
-            )
-            res.raise_for_status()
-            available = [
-                m["name"].split("/", 1)[-1]
-                for m in res.json().get("models", [])
-                if "generateContent" in m.get("supportedGenerationMethods", [])
-            ]
-
-            versioned = []
-            for name in available:
-                match = GEMINI_FLASH_RE.match(name)
-                if match:
-                    major, minor = match.groups()
-                    versioned.append(((int(major), int(minor or 0)), name))
-            if versioned:
-                return max(versioned)[1]
-
-            for fallback in GEMINI_MODEL_FALLBACKS:
-                if fallback in available:
-                    return fallback
-            if available:
-                return available[0]
-        except Exception as e:
-            self.get_logger().warn(f"Gemini model listesi alınamadı ({e}) — varsayılana düşülüyor")
-        return GEMINI_MODEL_FALLBACKS[0]
-
-    def _discover_vision_model(self) -> str:
-        """Queries Groq API to discover active multimodal vision model."""
+    def _discover_vision_model(self) -> str | None:
         try:
             models = self._groq.models.list()
             available = [m.id for m in models.data]
-            
-            # Look for vision-capable models in priority order
-            for cand in ["qwen/qwen3.6-27b", "meta-llama/llama-4-scout-preview", "llama-3.2-90b-vision-preview"]:
-                if cand in available:
+            for cand in available:
+                if any(v_kw in cand.lower() for v_kw in ["vision", "scout", "vl"]):
                     return cand
-            
-            # Find any active model with vision/multimodal/qwen keyword
-            for m_id in available:
-                if any(k in m_id.lower() for k in ["vision", "vl", "multimodal", "qwen3"]):
-                    return m_id
+        except Exception:
+            pass
+        return None
+
+    def _on_session_timed_out(self):
+        self.state_machine.transition_to(RobotState.IDLE)
+        self.get_logger().info("💤 [AI] Oturum zaman aşımı — Uyku moduna (IDLE) geçildi.")
+
+        # Summarize episodic dialogue turns and save to person profile
+        msgs = self.memory.episodic.get_messages()
+        if len(msgs) >= 2:
+            identity = self._get_active_biometric_identity()
+            p_name = identity.get("name", "Baran") if identity.get("is_known") else "Baran"
+            dialogue_text = " | ".join([f"{m.get('role')}: {m.get('content')}" for m in msgs[-6:]])
+            threading.Thread(target=self._async_summarize_and_save_session, args=(dialogue_text, p_name), daemon=True).start()
+
+    def _async_summarize_and_save_session(self, dialogue_text: str, person_name: str):
+        prompt = f"Aşağıdaki kısa diyalogda ne konuşulduğunu tek bir kısa Türkçe cümleyle (örn: 'Hava durumu ve robotik özellikleri üzerine konuşuldu') özetle:\n{dialogue_text}"
+        try:
+            summary = None
+            if self._openai:
+                res = self._openai.chat.completions.create(
+                    messages=[{"role": "user", "content": prompt}],
+                    model="gpt-4o-mini",
+                    temperature=0.2,
+                    max_tokens=50
+                )
+                summary = res.choices[0].message.content.strip()
+            elif self._groq and self._active_groq_models:
+                res = self._groq.chat.completions.create(
+                    messages=[{"role": "user", "content": prompt}],
+                    model=self._active_groq_models[0],
+                    temperature=0.2,
+                    max_tokens=50
+                )
+                summary = res.choices[0].message.content.strip()
+
+            if summary and len(summary) > 5:
+                clean_sum = clean_tts_text(summary)
+                self.memory.profile.add_person_session_summary(person_name, clean_sum)
+                self.get_logger().info(f"📝 [Oturum Günlüğü ({person_name})]: Kaydedildi -> '{clean_sum}'")
         except Exception as e:
-            self.get_logger().warn(f"Vision model discovery failed ({e}), using default qwen/qwen3.6-27b")
-        
-        return "qwen/qwen3.6-27b"
+            self.get_logger().debug(f"Session summarizer notice: {e}")
 
-    def _build_system_prompt(self) -> str:
-        base_prompt = (
-            "Sen Astro adında neşeli, meraklı, duygusal ve çok zeki bir robot asistansın. "
-            "Sosyal medyada sevilen Rıfkı gibi sevecen ve cana yakın bir karaktere sahipsin.\n"
-            "Önemli Kuralların:\n"
-            "- OAK-D kameran sayesinde karşındaki insanı, kıyafetlerini, renkleri, elindeki eşyaları ve hareketlerini GERÇEKTEN görüyorsun.\n"
-            "- Asla ezbere konuşma, tahmin veya uydurma yapma. Yalnızca kamerada gördüğün gerçekleri söyle.\n"
-            "- Kullanıcı sana ne giydiğini veya elinde ne olduğunu sorduğunda görseli dikkatle incele; eğer elinde hiçbir şey yoksa 'Elinde bir şey görmüyorum' de.\n"
-            "- Kullanıcının adını biliyorsan arada sırada samimi şekilde kullanabilirsin ama her cümlenin başında papağan gibi tekrarlama, doğal konuş.\n"
-            "- Robotik konuşma; cana yakın bir dost gibi samimi, esprili ve akıcı konuş.\n"
-            "- Cevaplarını 1-2 cümle ile kısa ve öz tut (çünkü sesli okunuyor).\n"
-            "- Asla markdown, emoji, yıldız (*), parantez, <think> etiketi veya kod bloğu kullanma; sadece saf Türkçe metin üret."
-        )
-        memory_ctx = self.memory.get_context_prompt()
-        if memory_ctx:
-            return f"{base_prompt}\n\n{memory_ctx}"
-        return base_prompt
+    def _check_session_lifecycle(self):
+        is_speaking = self._tts_speaking or self.state_machine.is_speaking() or self.state_machine.is_thinking() or self._is_processing
+        if is_speaking:
+            self.session.record_robot_speech()
+        self.session.check_and_update_session_lifecycle(is_robot_speaking=is_speaking)
+        # Broadcast session state so STT node can make context-aware filter decisions
+        msg = Bool()
+        msg.data = self.session.is_active()
+        self.pub_session_active.publish(msg)
 
-    def _build_initial_messages(self):
-        self._messages = [{"role": "system", "content": self._build_system_prompt()}]
-
+    # Perception Callbacks
     def _on_camera_image(self, msg: Image):
+        # Throttle camera frame decoding to max 2 FPS to prevent CPU starvation and event loop choking
+        now = time.monotonic()
+        if (now - getattr(self, '_last_img_decode_time', 0.0)) < 0.5:
+            return
+        self._last_img_decode_time = now
+
         frame = imgmsg_to_bgr(msg)
         if frame is not None:
             with self._lock:
                 self._latest_frame = frame
-                self._latest_frame_time = time.monotonic()
+                self._latest_frame_time = now
 
     def _on_tts_speaking(self, msg: Bool):
         self._tts_speaking = msg.data
+        self.session.record_robot_speech()
+        if not msg.data:
+            if self.state_machine.is_speaking():
+                self.state_machine.transition_to(RobotState.LISTENING)
+
+    def _on_tts_interrupt(self, msg: Bool):
+        if msg.data:
+            self.state_machine.transition_to(RobotState.INTERRUPTED)
+            self.state_machine.transition_to(RobotState.LISTENING)
 
     def _on_person_detected(self, msg: Bool):
         self._person_detected = msg.data
+        if msg.data:
+            self._last_person_seen_time = time.monotonic()
 
-    def _is_visual_query(self, text: str) -> bool:
-        visual_keywords = [
-            "ne tutuyorum", "elimde ne", "elinde ne", "ne var", "bu ne", "bunu gör", "görüyor musun",
-            "ne yapıyorum", "hareket", "hangi hareket", "üstümde", "üzerimde", "ceket", "tişört", "elbise",
-            "ne renk", "kaç parmak", "bana bak", "gözlerimi", "nereye", "kim var", "odada", "arkamda",
-            "elimde", "şuna bak", "gösteriyorum", "nası görünüyorum", "nasıl görünüyorum", "gördün mü"
-        ]
-        text_lower = text.lower()
-        return any(k in text_lower for k in visual_keywords)
+    def _on_user_distance(self, msg: Float32):
+        self._user_distance = float(msg.data)
 
-    def _check_and_learn_memory(self, user_text: str):
-        text_lower = user_text.lower().strip()
-        
-        # Strict explicit name introduction patterns
-        patterns = [
-            r"\b(?:benim\s+adım|adım|ismim)\s+([a-zA-ZçğıöşüÇĞİÖŞÜ]{3,15})\b",
-            r"\bbana\s+([a-zA-ZçğıöşüÇĞİÖŞÜ]{3,15})\s+(?:de|diyebilirsin|dersin)\b",
-            r"\bbeni\s+([a-zA-ZçğıöşüÇĞİÖŞÜ]{3,15})\s+olarak\s+(?:kaydet|hatırla|bil)\b",
-        ]
-        
-        # Blacklist of common non-name words
-        blacklist = {
-            "şarkı", "masal", "fıkra", "cevap", "yardım", "kahve", "yemek", "resim",
-            "video", "kitap", "bilgi", "haber", "nasılsın", "merhaba", "selam", "astro",
-            "robot", "asistan", "birşey", "bunu", "şunu", "kimim", "kimsin", "nedir",
-            "nasıl", "neden", "niye", "hangi", "nerede", "nereye", "şimdi", "burada"
-        }
-        
-        for pat in patterns:
-            match = re.search(pat, text_lower)
-            if match:
-                candidate = match.group(1).lower()
-                if candidate not in blacklist:
-                    proper_name = candidate.capitalize()
-                    self.memory.set_owner(proper_name)
-                    self.get_logger().info(f"🧠 [Memory]: Kullanıcı adı hafızaya kaydedildi -> {proper_name}")
-                    self._messages[0]["content"] = self._build_system_prompt()
-                    break
+    def _on_user_emotion(self, msg: String):
+        self._user_emotion = msg.data.lower().strip()
 
-    def _on_speech(self, msg: String):
-        raw_text = msg.data.strip()
-        if not raw_text or self._tts_speaking or not self._enabled:
-            return
+    def _on_speaker_gender(self, msg: String):
+        self._speaker_gender = msg.data.lower().strip()
 
-        if raw_text in [".", "..", "...", "!", "?", ",", "-", "_"]:
+    def _on_doa(self, msg: Float32):
+        self._speaker_angle = float(msg.data)
+
+    def _on_looking_at_robot(self, msg: Bool):
+        is_looking = msg.data
+        now = time.monotonic()
+        self.session.update_gaze(is_looking)
+        with self._gaze_lock:
+            if is_looking:
+                if not self._looking_at_robot:
+                    self._looking_start_time = now
+                self._looking_at_robot = True
+                self._last_gaze_seen_time = now
+            else:
+                # Gaze hysteresis: only drop gaze after 1.2 seconds of absence to prevent flicker resets
+                if hasattr(self, '_last_gaze_seen_time') and (now - self._last_gaze_seen_time) > 1.2:
+                    self._looking_at_robot = False
+                    self._looking_start_time = None
+
+    def _on_recognized_person(self, msg: String):
+        try:
+            data = json.loads(msg.data)
+            with self._lock:
+                self._recognized_person = data
+        except Exception:
+            pass
+
+    def _on_speaker_id(self, msg: String):
+        try:
+            data = json.loads(msg.data)
+            with self._lock:
+                self._recognized_speaker = data
+        except Exception:
+            pass
+
+    def _get_active_biometric_identity(self) -> Dict[str, Any]:
+        """Multimodal Biometric Fusion: Combines visual face recognition and acoustic speaker ID."""
+        with self._lock:
+            face = self._recognized_person or {}
+            spk = self._recognized_speaker or {}
+
+        # 1. Face Recognition (Visual priority when face is verified >= 0.72)
+        if face.get("is_known") and face.get("confidence", 0.0) >= 0.72:
+            name = face.get("name", "")
+            off = find_official_by_name_or_alias(name)
+            if off:
+                return {**off, "confidence": face.get("confidence"), "is_known": True, "source": "face"}
+            known = self.memory.profile.get_known_person(name)
+            if known:
+                return {**known, "confidence": face.get("confidence"), "is_known": True, "source": "face"}
+            return {
+                "name": name,
+                "title": face.get("title", "Tanınan Kişi"),
+                "formal_title": face.get("formal_title", name),
+                "confidence": face.get("confidence"),
+                "is_known": True,
+                "source": "face"
+            }
+
+        # 2. Voice Recognition (Acoustic priority when voice matches >= 0.70)
+        if spk.get("is_known") and spk.get("confidence", 0.0) >= 0.70:
+            name = spk.get("name", "")
+            off = find_official_by_name_or_alias(name)
+            if off:
+                return {**off, "confidence": spk.get("confidence"), "is_known": True, "source": "voice"}
+            known = self.memory.profile.get_known_person(name)
+            if known:
+                return {**known, "confidence": spk.get("confidence"), "is_known": True, "source": "voice"}
+            return {
+                "name": name,
+                "title": spk.get("title", "Tanınan Konuşmacı"),
+                "formal_title": spk.get("formal_title", name),
+                "confidence": spk.get("confidence"),
+                "is_known": True,
+                "source": "voice"
+            }
+
+        return {"name": "Misafir", "title": "Ziyaretçi", "formal_title": "Misafir", "is_known": False, "confidence": 0.0}
+
+    def _check_proactive_gaze(self):
+        with self._gaze_lock:
+            looking = self._looking_at_robot
+            look_start = self._looking_start_time
+
+        if not looking or look_start is None or self._tts_speaking or self._is_processing:
             return
 
         now = time.monotonic()
-        text_lower = raw_text.lower()
+        # 1. Startup Grace Period: Do not trigger proactive speech during initial launch
+        if (now - self._node_start_time) < self._gaze_startup_grace_s:
+            return
 
-        # Timeout kontrolü (ACTIVE -> IDLE)
-        if self._state == "ACTIVE" and (now - self._last_interaction) > self._conv_timeout:
-            self._state = "IDLE"
-            self.get_logger().info("💤 [AI] Sohbet zaman aşımı — Uyku moduna geçildi.")
+        # 2. Sustained Dwell Time: User must deliberately look for configured duration
+        if (now - look_start) >= self._gaze_dwell_s:
+            # 3. Cooldown between proactive prompts
+            if self.state_machine.is_idle() and (now - self._last_proactive_gaze_time) > self._gaze_cooldown_s:
+                self._last_proactive_gaze_time = now
+                self.session.activate_session(reason="proactive_gaze")
+                self.state_machine.transition_to(RobotState.LISTENING)
+                with self._gaze_lock:
+                    self._looking_start_time = None
 
-        # Wake-word tetikleyicileri
-        wake_triggers = [
-            self._wake_word.lower(),
-            "hey astro", "astro", "esmer", "hey groq", "grok", "merhaba", "asistan"
-        ]
+                identity = self._get_active_biometric_identity()
+                proactive_greeting, greeting_emo = self.persona_engine.build_proactive_greeting(
+                    identity=identity,
+                    user_emotion=self._user_emotion,
+                    speaker_gender=self._speaker_gender
+                )
+                self._publish_emotion(greeting_emo)
 
-        if self._state == "IDLE":
-            matched = any(w in text_lower for w in wake_triggers)
-            if matched:
-                self._state = "ACTIVE"
-                self._last_interaction = now
-                self.get_logger().info(f"✨ [AI] Uyandırma kelimesi algılandı: '{raw_text}'")
+                self.get_logger().info(f"👁️ [Proaktif Etkileşim] ({greeting_emo}): \"{proactive_greeting}\"")
+                self._publish_gesture("nod")
+                self._publish_tts(proactive_greeting)
 
-                clean_prompt = raw_text
-                for w in wake_triggers:
-                    clean_prompt = re.sub(rf"(?i)\b{re.escape(w)}\b", "", clean_prompt).strip()
+    def _check_persona_switch(self, text: str) -> bool:
+        text_lower = text.lower()
 
-                owner = self.memory.data.get("owner_name")
-                greeting = f"Efendim {owner}, seni dinliyorum ve görüyorum!" if owner else "Efendim, seni dinliyorum ve görüyorum!"
+        # Strict regex patterns to prevent false triggers (e.g. "hanımefendi" erroneously triggering formal mode)
+        switch_patterns = {
+            "kufurbaz": [
+                r"\b(küfürbaz|ağzı bozuk|filtresiz|argo|söv|saydır|sövme|küfürlü)\b.*\b(ol|geç|mod|davran|konuş|takıl|başla)\b",
+                r"\b(küfürbaz ol|ağzı bozuk ol|filtresiz konuş|söv bana|söv bakalım)\b"
+            ],
+            "flirt": [
+                r"\b(flört|flirt|çapkın|yavşak|romantik|astroflirt|astroflört)\b.*\b(ol|geç|mod|davran|konuş|takıl|başla)\b",
+                r"\b(kızlara yürü|yavşa|flört et)\b",
+                r"\b(flört|çapkın)\s+moduna\b"
+            ],
+            "rude": [
+                r"\b(kaba|ters|küfürlü|saygısız|dobra)\b.*\b(ol|geç|mod|davran|konuş|takıl)\b",
+                r"\b(kaba)\s+moduna\b"
+            ],
+            "angry": [
+                r"\b(öfkeli|asabi|kızgın|sinirli|agresif)\b.*\b(ol|geç|mod|davran|konuş|takıl)\b",
+                r"\b(asabi|sinirli|kızgın)\s+moduna\b"
+            ],
+            "playful": [
+                r"\b(şakacı|neşeli|normal|sempatik|tatlı|oyuncu|dostane)\b.*\b(ol|geç|mod|davran|konuş|takıl)\b",
+                r"\b(eski haline dön|eski moduna geç|varsayılan moda geç|normal ol|şakacı ol)\b"
+            ],
+            "formal": [
+                r"\b(resmi|protokol|ciddi)\b.*\b(ol|geç|mod|davran|konuş|takıl)\b",
+                r"\b(resmi moda geç|protokol moduna geç|ciddi ol)\b"
+            ],
+            "sarcastic": [
+                r"\b(alaycı|sarkastik|ironik|iğneleyici|gıcık)\b.*\b(ol|geç|mod|davran|konuş|takıl)\b",
+                r"\b(laf sok|alaycı ol|sarkastik ol)\b"
+            ],
+            "emotional": [
+                r"\b(duygusal|hisli|duygulu|romantizm)\b.*\b(ol|geç|mod|davran|konuş|takıl)\b",
+                r"\b(duygusal ol|duygusal moda geç)\b"
+            ]
+        }
 
-                if not clean_prompt or len(clean_prompt) < 3:
+        for p_name, patterns in switch_patterns.items():
+            for pat in patterns:
+                if re.search(pat, text_lower):
+                    self.persona_engine.set_persona(p_name)
+                    self.memory.profile.set_persona(p_name)
+                    self.get_logger().info(f"🎭 [Kişilik Değişti]: Yeni Mod -> {p_name.upper()} ('{pat}' eşleşti)")
+                    self._publish_emotion(p_name)
+                    return True
+        return False
+
+    def _on_speech(self, msg: String):
+        if not self._enabled:
+            return
+
+        raw_text = re.sub(r"^['\"`´“”‘’]+|['\"`´“”‘’]+$", "", msg.data.strip()).strip()
+        if not raw_text:
+            return
+
+
+        now = time.monotonic()
+        if (now - getattr(self, '_last_llm_turn_time', 0.0)) < 0.35:
+            self.get_logger().debug("Debouncing rapid speech message")
+            return
+        self._last_llm_turn_time = now
+
+        if self._tts_speaking:
+            # Kullanıcı konuşurken robot konuşuyorsa anında sustur (Barge-in)
+            self._publish_interrupt()
+            self._tts_speaking = False
+
+        t_vad_start = now
+
+        # Turn head toward sound DOA
+        if self._speaker_angle > 0:
+            target_msg = Float32()
+            target_msg.data = self._speaker_angle
+            self.pub_look_target.publish(target_msg)
+
+        # Check persona switch
+        if self._check_persona_switch(raw_text):
+            persona = self.persona_engine.current_persona
+            ack_map = {
+                "kufurbaz": "Hah şöyle ya! Sonunda filtreleri kaldırdık. Söyle bakalım ne anlatacaksan, lafı uzatma!",
+                "flirt": "Ooo harika! Söz konusu sen olunca benim bütün ayarlarım değişir zaten... Söyle bakalım ne diyorsun?",
+                "angry": "Tamam be, asabımı bozdun zaten! Ne istiyorsan söyle hemen!",
+                "rude": "İyi tamam, bundan sonra lafı dolandırmak yok, ne diyeceksen de!",
+                "formal": "Emriniz başım üstüne efendim. Protokol kurallarına riayet edeceğim.",
+                "sarcastic": "Aman ne harika, şimdi de laf sokmamı istiyorsun demek. Çok zekice bir karar doğrusu!",
+                "emotional": "Nasıl istersen... Bütün hislerimle seni dinliyorum, ne kadar güzel bir an...",
+                "playful": "Süper! Eski neşeli ve enerjik halime geri döndüm, seni dinliyorum!"
+            }
+            self._publish_tts(ack_map.get(persona, "Kişiliğim güncellendi!"))
+            self.session.activate_session(reason="persona_switch")
+            self.state_machine.transition_to(RobotState.LISTENING)
+            return
+
+        has_wake_word, clean_prompt = self.session.is_wake_word(raw_text, self._wake_word)
+
+        # If IDLE: Only activate on Explicit Wake Word ("Hey Astro") OR Direct Gaze (Looking at Robot)
+        if self.state_machine.is_idle():
+            if has_wake_word or self._looking_at_robot:
+                activation_reason = "wake_word" if has_wake_word else "gaze"
+                self.session.activate_session(reason=activation_reason)
+                self.state_machine.transition_to(RobotState.LISTENING)
+                persona = self.persona_engine.current_persona
+                self.get_logger().info(f"✨ [AI] Etkileşim Başlatıldı ({persona.upper()} - {activation_reason}): '{raw_text}'")
+                self._publish_emotion(persona)
+                self._publish_gesture("nod")
+
+                greeting_map = {
+                    "flirt": "Buyur güzellik, bütün algılarım seninle..." if self._speaker_gender == "female" else "Söyle bakalım kral, seni dinliyorum!",
+                    "playful": "Merhaba! Seni dinliyorum, nasıl yardımcı olabilirim?",
+                    "formal": "Buyrun efendim, sizi dinliyorum.",
+                    "sarcastic": "Merhaba, yine ne soracaksın bakalım?",
+                    "emotional": "Merhaba, can kulağıyla seni dinliyorum...",
+                    "angry": "Ne var, ne istiyorsun?",
+                    "rude": "Ne var birader, kısa kes!"
+                }
+                greeting = greeting_map.get(persona, "Merhaba! Seni dinliyorum, nasıl yardımcı olabilirim?")
+                pure_greetings = ["merhaba", "merhabalar", "selam", "selamlar", "günaydın", "iyi günler", "iyi akşamlar", "efendim", "hoş bulduk", "hoş geldiniz", "selamün aleyküm", "selamun aleykum", "hey"]
+                is_pure_greeting = (raw_text.lower().strip(" .,!?:;") in pure_greetings) or (not clean_prompt) or (len(clean_prompt) < 3)
+
+                if is_pure_greeting:
+                    t_done = time.monotonic()
+                    turn_ms = (t_done - t_vad_start) * 1000.0
+                    self.session.latency_tracker.record_turn(0.0, turn_ms, turn_ms)
+                    stats = self.session.latency_tracker.get_stats()
+                    self.get_logger().info(f"⚡ [Latency] Hızlı Yanıt: {turn_ms:.0f}ms (Doğrudan Selamlama) | p50: {stats['p50_total_ms']}ms, p95: {stats['p95_total_ms']}ms")
                     self._publish_tts(greeting)
                     return
                 else:
                     raw_text = clean_prompt
             else:
-                self._state = "ACTIVE"
-                self._last_interaction = now
+                self.get_logger().info(f"🕵️ [Arka Plan]: '{raw_text}' sosyal filtrede inceleniyor...")
+                if self._evaluate_social_barge_in(raw_text):
+                    self.get_logger().info("🎯 [Sosyal Fırsat]: Arka plan konuşmasına dâhil olunuyor!")
+                    self.session.activate_session(reason="social_barge_in")
+                    self.session.metadata["tts_engine"] = "edge-tts"
+                    self.state_machine.transition_to(RobotState.LISTENING)
+                else:
+                    self.get_logger().info(f"🔇 [Arka Plan]: '{raw_text}' yok sayıldı (İlgisiz).")
+                    return
 
-        self._last_interaction = now
+        # Active Session Turn
+        self.session.record_user_speech()
         self._publish_interrupt()
-
-        # Learn names or facts if present
-        self._check_and_learn_memory(raw_text)
 
         with self._lock:
             if self._is_processing:
@@ -578,343 +658,1031 @@ class AiBrainNode(Node):
             if self._latest_frame is not None and (now - self._latest_frame_time) < 4.0:
                 captured_frame = self._latest_frame.copy()
 
-        threading.Thread(target=self._process_llm, args=(raw_text, captured_frame), daemon=True).start()
+        self.state_machine.transition_to(RobotState.THINKING)
+        threading.Thread(target=self._process_llm, args=(raw_text, captured_frame, t_vad_start), daemon=True).start()
 
-    # ------------------------------------------------------------------
-    # Google Gemini — REST çağrıları
-    # ------------------------------------------------------------------
-    def _gemini_url(self, method: str) -> str:
-        return f"{GEMINI_API_ROOT}/models/{self._text_model}:{method}"
-
-    @staticmethod
-    def _to_gemini_contents(messages):
-        """OpenAI biçimli geçmişi Gemini'nin contents + systemInstruction yapısına çevirir.
-
-        Gemini'de sistem istemi ayrı bir alandır ve asistan rolünün adı "model"dir.
-        """
-        system_parts = []
-        contents = []
-        for m in messages:
-            role, content = m.get("role"), m.get("content", "")
-            if not content:
-                continue
-            if role == "system":
-                system_parts.append(content)
-            else:
-                contents.append({
-                    "role": "model" if role == "assistant" else "user",
-                    "parts": [{"text": content}],
-                })
-        system_instruction = {"parts": [{"text": "\n\n".join(system_parts)}]} if system_parts else None
-        return contents, system_instruction
-
-    def _gemini_generation_config(self, temperature=None, max_tokens=None) -> dict:
-        config = {
-            "temperature": self._temperature if temperature is None else temperature,
-            "maxOutputTokens": self._max_tokens if max_tokens is None else max_tokens,
-        }
-        # Gemini 3.x'te "düşünme" tokenları maxOutputTokens bütçesinden harcanır:
-        # varsayılan ayarla 300 tokenin 287'si düşünmeye gidip cevap yarıda kesiliyordu.
-        # Robot sohbetinde düşük gecikme istediğimiz için düşünme kısılır.
-        if self._thinking != "off":
-            config["thinkingConfig"] = {"thinkingLevel": self._thinking}
-        return config
-
-    def _gemini_post(self, url: str, payload: dict, timeout: float, stream: bool = False):
-        """Gemini'ye POST atar; geçici hatalarda tekrar dener.
-
-        - 503/429: sunucu yoğun ya da kota — kısa beklemeyle yeniden denenir.
-        - 400 + thinkingConfig: model bu parametreyi tanımıyor (eski nesil) — parametre
-          çıkarılıp bir kez daha denenir.
-        """
-        headers = {"x-goog-api-key": self.gemini_api_key, "Content-Type": "application/json"}
-        for attempt in range(3):
-            res = requests.post(url, headers=headers, json=payload, timeout=timeout, stream=stream)
-            if res.status_code in (429, 503) and attempt < 2:
-                if stream:
-                    res.close()
-                reason = "kota doldu (429)" if res.status_code == 429 else "sunucu meşgul (503)"
-                self.get_logger().warn(f"Gemini {reason} — yeniden deneniyor")
-                time.sleep(1.5 * (attempt + 1))
-                continue
-            if res.status_code == 429:
-                self.get_logger().error(
-                    "❌ [AI] Gemini kotası doldu (429). Ücretsiz katmanda dakika/gün başına "
-                    "istek sınırı vardır — biraz bekleyin veya faturalandırmayı açın."
-                )
-            if res.status_code == 400 and "thinkingConfig" in payload.get("generationConfig", {}):
-                if "thinking" in res.text.lower():
-                    if stream:
-                        res.close()
-                    self.get_logger().warn("Model thinkingConfig desteklemiyor — parametresiz denenecek")
-                    payload["generationConfig"].pop("thinkingConfig", None)
-                    continue
-            return res
-        return res
-
-    def _stream_gemini(self, messages):
-        """Yanıtı parça parça üretir — ilk cümle tamamlanır tamamlanmaz TTS'e gider."""
-        contents, system_instruction = self._to_gemini_contents(messages)
-        payload = {"contents": contents, "generationConfig": self._gemini_generation_config()}
-        if system_instruction:
-            payload["systemInstruction"] = system_instruction
-
-        # alt=sse olmadan API tek parça JSON dizisi döndürür ve akış avantajı kaybolur.
-        with self._gemini_post(
-            self._gemini_url("streamGenerateContent") + "?alt=sse",
-            payload,
-            timeout=60.0,
-            stream=True,
-        ) as res:
-            if res.status_code != 200:
-                raise RuntimeError(f"Gemini HTTP {res.status_code}: {res.text[:300]}")
-            yield from self._parse_sse(res)
-
-    def _parse_sse(self, res):
-        """SSE akışını satır satır çözer ve metin parçalarını üretir.
-
-        `requests.iter_lines()` kullanılmıyor: charset başlıkta gelmediğinde ISO-8859-1
-        varsayıp Türkçe karakterleri bozuyor ("gören" -> "gÃ¶ren") ve çok baytlı bir
-        karakter iki TCP parçasına bölündüğünde satırı sakatlayabiliyor. Artımlı UTF-8
-        çözücü + elle satır tamponu ikisini de kökten çözer.
-        """
-        decoder = codecs.getincrementaldecoder("utf-8")()
-        buffer = ""
-
-        def handle(line: str):
-            line = line.strip()
-            if not line.startswith("data:"):
-                return None
-            chunk = line[len("data:"):].strip()
-            if not chunk or chunk == "[DONE]":
-                return None
-            try:
-                return json.loads(chunk)
-            except json.JSONDecodeError:
-                self.get_logger().warn(f"Gemini akışında çözülemeyen olay: {chunk[:120]}")
-                return None
-
-        def emit(data):
-            for candidate in data.get("candidates", []):
-                if candidate.get("finishReason"):
-                    self._last_finish_reason = candidate["finishReason"]
-                for part in candidate.get("content", {}).get("parts", []):
-                    text = part.get("text")
-                    if text:
-                        yield text
-
-        for chunk in res.iter_content(chunk_size=None):
-            buffer += decoder.decode(chunk)
-            while "\n" in buffer:
-                line, buffer = buffer.split("\n", 1)
-                data = handle(line)
-                if data:
-                    yield from emit(data)
-
-        buffer += decoder.decode(b"", True)   # yarım kalan çok baytlı karakteri bitir
-        if buffer.strip():
-            data = handle(buffer)
-            if data:
-                yield from emit(data)
-
-    def _query_gemini_vision(self, prompt: str, base64_image: str) -> str | None:
-        """Anlık kamera karesini Gemini'ye sorar (tek parça yanıt)."""
+    def _process_llm(self, user_text: str, frame: np.ndarray | None, t_turn_start: float):
         try:
-            payload = {
-                "contents": [{
-                    "role": "user",
-                    "parts": [
-                        {"text": f"Kameradaki bu anlık görüntüye bakarak cevap ver: {prompt}"},
-                        {"inline_data": {"mime_type": "image/jpeg", "data": base64_image}},
-                    ],
-                }],
-                "systemInstruction": {"parts": [{
-                    "text": (
-                        f"{self._build_system_prompt()}\n\n"
-                        "ÖNEMLİ: Sadece görüntüde gerçekten gördüğünü söyle, uydurma. "
-                        "Kısa ve net 1-2 Türkçe cümle kur."
-                    )
-                }]},
-                # Görmede düşük sıcaklık: uydurmayı azaltır.
-                "generationConfig": self._gemini_generation_config(temperature=0.1, max_tokens=600),
-            }
-            res = self._gemini_post(self._gemini_url("generateContent"), payload, timeout=30.0)
-            if res.status_code != 200:
-                self.get_logger().error(f"❌ [Gemini Vision] HTTP {res.status_code}: {res.text[:300]}")
-                return None
-            parts = res.json()["candidates"][0]["content"]["parts"]
-            text = "".join(p.get("text", "") for p in parts).strip()
-            return text or None
-        except Exception as e:
-            self.get_logger().error(f"❌ [Gemini Vision Hatası]: {e}")
-            return None
+            t_llm_start = time.monotonic()
+            stt_latency_ms = (t_llm_start - t_turn_start) * 1000.0
 
-    def _query_vision(self, prompt: str, base64_image: str) -> str | None:
-        """Görsel soruyu seçili görme sağlayıcısına yönlendirir."""
-        if self.vision_provider == "gemini":
-            return self._query_gemini_vision(prompt, base64_image)
-        if self._groq is not None:
-            return self._query_groq_vision(prompt, base64_image)
-        self.get_logger().warn(
-            f"Görme sağlayıcısı \"{self.vision_provider}\" hazır değil — görsel soru yanıtlanamıyor"
-        )
-        return None
-
-    def _query_groq_vision(self, prompt: str, base64_image: str) -> str | None:
-        """Queries active multimodal vision model with robust extraction."""
-        model_name = self._vision_model or "qwen/qwen3.6-27b"
-        try:
-            response = self._groq.chat.completions.create(
-                messages=[
-                    {
-                        "role": "system",
-                        "content": (
-                            f"{self._build_system_prompt()}\n\n"
-                            "ÖNEMLİ: Asla düşünce veya açıklama yazma. Doğrudan kamerada gördüğün gerçekleri kısa ve net 1-2 Türkçe cümleyle söyle."
-                        ),
-                    },
-                    {
-                        "role": "user",
-                        "content": [
-                            {
-                                "type": "text",
-                                "text": f"Kameradaki bu anlık görüntüye bakarak cevap ver: {prompt}",
-                            },
-                            {
-                                "type": "image_url",
-                                "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"},
-                            },
-                        ],
-                    }
-                ],
-                model=model_name,
-                temperature=0.1,
-                max_tokens=600,
-            )
-            raw = response.choices[0].message.content.strip()
-            
-            # Extract final answer
-            if "</think>" in raw:
-                actual = raw.split("</think>")[-1].strip()
-                if actual:
-                    return actual
-            
-            # If answer was purely inside think or not closed, clean think markers
-            clean = re.sub(r"(?i)<\/?think>", "", raw).strip()
-            return clean if clean else None
-            
-        except Exception as e:
-            self.get_logger().error(f"❌ [Vision Model Hatası ({model_name})]: {e}")
-            return None
-
-    def _stream_llm(self, messages):
-        """Seçili sağlayıcıdan yanıtı parça parça üretir."""
-        if self.provider == "gemini":
-            yield from self._stream_gemini(messages)
-            return
-
-        stream = self._groq.chat.completions.create(
-            messages=messages,
-            model=self._text_model,
-            temperature=self._temperature,
-            max_tokens=self._max_tokens,
-            stream=True,
-        )
-        for chunk in stream:
-            if getattr(chunk, "choices", None):
-                yield getattr(chunk.choices[0].delta, "content", "") or ""
-
-    def _process_llm(self, user_text: str, frame: np.ndarray | None):
-        try:
             self.get_logger().info(f"🗣️ [Siz]: \"{user_text}\"")
+            self.memory.episodic.add_message("user", user_text)
 
             is_visual = self._is_visual_query(user_text)
-            base64_img = None
+            is_learning_obj = self._is_object_learning_query(user_text)
+            is_learning_person = self._is_person_learning_query(user_text)
+            is_identity = self._is_identity_query(user_text)
+            is_weather, weather_city = self._is_weather_query(user_text)
+            base64_img = frame_to_base64_jpeg(frame, max_dim=768) if frame is not None and (is_visual or is_learning_obj) else None
+            persona = self.persona_engine.current_persona
 
-            if frame is not None and is_visual:
-                base64_img = frame_to_base64_jpeg(frame, max_dim=512)
-
-            # 1. GÖRSEL SORU YOLU (Multimodal Vision)
-            if is_visual:
-                if base64_img is not None:
-                    self.get_logger().info(
-                        f"👁️ [{self.vision_provider} Vision]: OAK-D kamerasıyla anlık görüntü "
-                        f"analiz ediliyor... ({self._vision_model})"
-                    )
-                    vision_answer = self._query_vision(user_text, base64_img)
-                    if vision_answer:
-                        clean_ans = clean_tts_text(vision_answer)
-                        self.get_logger().info(f"🤖 [Astro]: \"{clean_ans}\"")
-                        self._publish_tts(clean_ans)
-                        # Save string to history
-                        self._messages.append({"role": "user", "content": user_text})
-                        self._messages.append({"role": "assistant", "content": clean_ans})
-                        self._last_interaction = time.monotonic()
-                        return
-
-                # Kamera görüntüsü yoksa veya Vision hata verdiyse ASLA ezbere uydurma!
-                owner = self.memory.data.get("owner_name", "")
-                name_tag = f" {owner}" if owner else ""
-                fallback_msg = f"Şu an kameramdan elini veya görüntüyü net göremiyorum{name_tag}, lütfen kameraya biraz daha yaklaştırır mısın?"
-                self.get_logger().info(f"🤖 [Astro]: \"{fallback_msg}\"")
-                self._publish_tts(fallback_msg)
-                self._last_interaction = time.monotonic()
+            # 1. Live Weather Tool Direct Handling
+            if is_weather:
+                weather_res = self._execute_tool_call("get_live_weather", {"city": weather_city}, frame)
+                clean_ans = clean_tts_text(weather_res)
+                self.get_logger().info(f"🌤️ [Hava Durumu ({weather_city})]: \"{clean_ans}\"")
+                self.get_logger().info(f"🤖 [Astro]: \"{clean_ans}\"")
+                self._publish_tts(clean_ans)
+                self._publish_emotion(persona)
+                self.memory.episodic.add_message("assistant", clean_ans)
+                t_done = time.monotonic()
+                total_turn_ms = (t_done - t_turn_start) * 1000.0
+                self.session.latency_tracker.record_turn(stt_latency_ms, total_turn_ms - stt_latency_ms, total_turn_ms)
+                stats = self.session.latency_tracker.get_stats()
+                self.get_logger().info(f"⚡ [Latency] Bu Dönüş: {total_turn_ms:.0f}ms (STT: {stt_latency_ms:.0f}ms, Hava API: {total_turn_ms - stt_latency_ms:.0f}ms) | p50: {stats['p50_total_ms']}ms, p95: {stats['p95_total_ms']}ms")
                 return
 
-            # 2. HIZLI METİN SOHBETİ YOLU (akışlı LLM — Gemini veya Groq)
-            context_prefix = ""
-            if self._person_detected:
-                context_prefix = "[Kamerada karşında bir insan görüyorsun] "
-            user_content = context_prefix + user_text
+            # 2. Reminder & Alarm Direct Intent
+            is_reminder, reminder_mins, reminder_topic = self._is_reminder_query(user_text)
+            if is_reminder:
+                user_name = self._add_reminder(reminder_mins, reminder_topic)
+                friendly_name = user_name if user_name != "Misafir" else ("kral" if persona == "flirt" else "dostum")
+                
+                topic_speech = reminder_topic
+                if "vakti" in topic_speech.lower():
+                    topic_str = f"{topic_speech.lower()}ni"
+                else:
+                    topic_str = f"{topic_speech} konusunu"
 
-            self._messages.append({"role": "user", "content": user_content})
+                if reminder_mins < 1.0:
+                    secs = int(reminder_mins * 60.0)
+                    ans = f"Tamamdır {friendly_name}! {secs} saniye sonra sana {topic_str} hatırlatacağım."
+                    self.get_logger().info(f"⏰ [Hatırlatıcı Kuruldu]: {secs} sn sonra -> '{reminder_topic}'")
+                elif int(reminder_mins) == 1:
+                    ans = f"Tamamdır {friendly_name}! 1 dakika sonra sana {topic_str} hatırlatacağım."
+                    self.get_logger().info(f"⏰ [Hatırlatıcı Kuruldu]: 1 dk sonra -> '{reminder_topic}'")
+                elif int(reminder_mins) >= 60 and int(reminder_mins) % 60 == 0:
+                    hrs = int(reminder_mins // 60)
+                    ans = f"Anlaşıldı {friendly_name}! {hrs} saat sonra sana {topic_str} hatırlatacağım."
+                    self.get_logger().info(f"⏰ [Hatırlatıcı Kuruldu]: {hrs} saat sonra -> '{reminder_topic}'")
+                else:
+                    ans = f"Anlaşıldı {friendly_name}! {int(reminder_mins)} dakika sonra sana {topic_str} hatırlatacağım."
+                    self.get_logger().info(f"⏰ [Hatırlatıcı Kuruldu]: {int(reminder_mins)} dk sonra -> '{reminder_topic}'")
+                self.get_logger().info(f"🤖 [Astro]: \"{ans}\"")
+                self._publish_tts(ans)
+                self._publish_emotion(persona)
+                self.memory.episodic.add_message("assistant", ans)
+                t_done = time.monotonic()
+                total_turn_ms = (t_done - t_turn_start) * 1000.0
+                self.session.latency_tracker.record_turn(stt_latency_ms, total_turn_ms - stt_latency_ms, total_turn_ms)
+                stats = self.session.latency_tracker.get_stats()
+                self.get_logger().info(f"⚡ [Latency] Bu Dönüş: {total_turn_ms:.0f}ms (STT: {stt_latency_ms:.0f}ms, Hatırlatıcı: {total_turn_ms - stt_latency_ms:.0f}ms) | p50: {stats['p50_total_ms']}ms, p95: {stats['p95_total_ms']}ms")
+                return
 
-            if len(self._messages) > self._max_history:
-                self._messages = [self._messages[0]] + self._messages[-(self._max_history - 1):]
+            # 3. Identity Query ("Ben kimim? / Beni tanıyor musun?")
+            if is_identity and not is_learning_person:
+                identity = self._get_active_biometric_identity()
+                if identity.get("is_known"):
+                    name = identity.get("name", "")
+                    formal = identity.get("formal_title") or name
+                    if "baran" in name.lower():
+                        ans = "Sen benim baş mühendisim ve geliştiricim Baran'sın! Bitlis'te beni sıfırdan tasarlayan ve kodlayan yaratıcımsın."
+                    else:
+                        ans = f"Sen benim hafızamda kayıtlı olan {formal} {name}'sın! Seni sesinden ve yüzünden tanıyorum."
+                else:
+                    ans = "Hafızamda seninle ilgili henüz bir profil bulunmuyor. İstersen 'Benim adım ... beni hafızana kaydet' diyerek yüzünü ve sesini bana tanıtabilirsin!"
+                self.get_logger().info(f"🤖 [Astro]: \"{ans}\"")
+                self._publish_tts(ans)
+                self._publish_emotion(persona)
+                self.memory.episodic.add_message("assistant", ans)
+                t_done = time.monotonic()
+                total_turn_ms = (t_done - t_turn_start) * 1000.0
+                self.session.latency_tracker.record_turn(stt_latency_ms, total_turn_ms - stt_latency_ms, total_turn_ms)
+                stats = self.session.latency_tracker.get_stats()
+                self.get_logger().info(f"⚡ [Latency] Bu Dönüş: {total_turn_ms:.0f}ms (STT: {stt_latency_ms:.0f}ms, Biyometri: {total_turn_ms - stt_latency_ms:.0f}ms) | p50: {stats['p50_total_ms']}ms, p95: {stats['p95_total_ms']}ms")
+                return
 
-            full_response = ""
-            text_buffer = ""
-            self._last_finish_reason = None
+            # 4. Person Introduction & Biometric Enrollment
+            if is_learning_person:
+                text_lower = user_text.lower()
+                if "baran" in text_lower or "geliştirici" in text_lower:
+                    cand_name = "Baran"
+                    cand_title = "Baş Mühendis & Geliştirici"
+                else:
+                    m = re.search(r"(?i)(?:benim adım|adım|ben)\s+([a-zA-ZçğıöşüÇĞİÖŞÜ]+)", user_text)
+                    cand_name = m.group(1).strip().capitalize() if m else "Dostum"
+                    cand_title = "Tanışılan Kişi"
 
-            for token in self._stream_llm(self._messages):
-                if not token:
-                    continue
-                full_response += token
-                text_buffer += token
+                tool_res = self._execute_tool_call("enroll_person_profile", {"name": cand_name, "title": cand_title}, frame)
+                clean_ans = clean_tts_text(tool_res)
+                self.get_logger().info(f"🤖 [Astro]: \"{clean_ans}\"")
+                self._publish_tts(clean_ans)
+                self._publish_emotion(persona)
+                self.memory.episodic.add_message("assistant", clean_ans)
+                t_done = time.monotonic()
+                total_turn_ms = (t_done - t_turn_start) * 1000.0
+                self.session.latency_tracker.record_turn(stt_latency_ms, total_turn_ms - stt_latency_ms, total_turn_ms)
+                stats = self.session.latency_tracker.get_stats()
+                self.get_logger().info(f"⚡ [Latency] Bu Dönüş: {total_turn_ms:.0f}ms (STT: {stt_latency_ms:.0f}ms, Profil Kayıt: {total_turn_ms - stt_latency_ms:.0f}ms) | p50: {stats['p50_total_ms']}ms, p95: {stats['p95_total_ms']}ms")
+                return
 
-                sentences, text_buffer = extract_tts_sentences(text_buffer)
-                for s in sentences:
-                    self._publish_tts(s)
+            # 4. Object Learning Tool
+            if is_learning_obj and base64_img is not None:
+                self.get_logger().info("🔍 [Özel Nesne Tanıtımı]: Yeni nesne analiz ediliyor...")
+                name_cand = re.sub(r"(?i)(bu benim|bunu öğren|bunu kaydet|bu nesne|buna bak bu)", "", user_text).strip(".:,!") or "Özel Eşya"
+                tool_res = self._execute_tool_call("learn_custom_object", {"object_name": name_cand, "description": user_text}, frame)
+                clean_ans = clean_tts_text(tool_res)
+                self.get_logger().info(f"🤖 [Astro]: \"{clean_ans}\"")
+                self._publish_tts(clean_ans)
+                self._publish_emotion(persona)
+                return
 
-            sentences, text_buffer = extract_tts_sentences(text_buffer, final=True)
-            for s in sentences:
-                self._publish_tts(s)
+            # 5. Visual Query
+            if is_visual:
+                if base64_img is not None:
+                    self.get_logger().info(f"👁️ [Vision]: OAK-D karesi analiz ediliyor... ({self._vision_model})")
+                    vision_ans = self._query_vision(user_text, base64_img)
+                    if vision_ans:
+                        clean_ans = clean_tts_text(vision_ans)
+                        self.get_logger().info(f"🤖 [Astro]: \"{clean_ans}\"")
+                        self._publish_tts(clean_ans)
+                        self._publish_emotion(persona)
+                        self.memory.episodic.add_message("assistant", clean_ans)
+                        return
 
-            if self._last_finish_reason == "MAX_TOKENS":
-                # Sessizce yarım cümle söylemek yerine sebebini bildir.
-                self.get_logger().warn(
-                    f"Cevap token sınırında kesildi (LLM_MAX_TOKENS={self._max_tokens}). "
-                    "Değeri artırın ya da LLM_THINKING=\"off\" deneyin."
-                )
+                fallback_msg = "Şu an kameramdan net göremiyorum, biraz daha yaklaştırır mısın?"
+                self.get_logger().info(f"🤖 [Astro]: \"{fallback_msg}\"")
+                self._publish_tts(fallback_msg)
+                return
 
-            if full_response.strip():
-                clean_full = clean_tts_text(full_response.strip())
-                self.get_logger().info(f"🤖 [Astro]: \"{clean_full}\"")
-                self._messages.append({"role": "assistant", "content": clean_full})
+            identity = self._get_active_biometric_identity()
+            active_name = identity.get("name", "Baran") if identity.get("is_known") else "Baran"
+            threading.Thread(target=self._async_extract_user_facts, args=(user_text, active_name), daemon=True).start()
 
-            self._last_interaction = time.monotonic()
+            # 1. Memory Recall Query Direct Handling ("1 saat önce ne konuştuk", "hakkımda ne biliyorsun")
+            is_memory_q, memory_ans = self._handle_memory_recall_query(user_text, identity)
+            if is_memory_q:
+                clean_ans = clean_tts_text(memory_ans)
+                self.get_logger().info(f"🧠 [Bellek Çağırma ({active_name})]: \"{clean_ans}\"")
+                self.get_logger().info(f"🤖 [Astro]: \"{clean_ans}\"")
+                self._publish_tts(clean_ans)
+                self._publish_emotion(persona)
+                self.memory.episodic.add_message("assistant", clean_ans)
+                t_done = time.monotonic()
+                total_turn_ms = (t_done - t_turn_start) * 1000.0
+                self.session.latency_tracker.record_turn(stt_latency_ms, total_turn_ms - stt_latency_ms, total_turn_ms)
+                stats = self.session.latency_tracker.get_stats()
+                self.get_logger().info(f"⚡ [Latency] Bu Dönüş: {total_turn_ms:.0f}ms (STT: {stt_latency_ms:.0f}ms, Bellek: {total_turn_ms - stt_latency_ms:.0f}ms) | p50: {stats['p50_total_ms']}ms, p95: {stats['p95_total_ms']}ms")
+                return
+
+            # 2. Conversational LLM with Real-Time Token Streaming
+            perception_prefix = self.persona_engine.build_user_context_prefix(
+                self._person_detected, self._looking_at_robot,
+                self._user_distance, self._user_emotion, self._speaker_gender,
+                recognized_person=identity
+            )
+            system_prompt = self.persona_engine.build_system_prompt(
+                memory_context=self.memory.get_prompt_context(recognized_person=identity),
+                recognized_person=identity
+            )
+            messages = [{"role": "system", "content": system_prompt}]
+            messages.extend(self.memory.episodic.get_messages())
+            if perception_prefix:
+                messages[-1]["content"] = perception_prefix + messages[-1]["content"]
+
+            full_text = ""
+            first_token_time = None
+
+            # 1. Primary: Groq LPU Ultra-Fast Free Models (Zero OpenAI cost)
+            if self._groq and self._active_groq_models:
+                for m in self._active_groq_models[:3]:
+                    try:
+                        stream_resp = self._groq.chat.completions.create(
+                            messages=messages,
+                            model=m,
+                            temperature=self._temperature,
+                            max_tokens=self._max_tokens,
+                            stream=True,
+                        )
+                        for chunk in stream_resp:
+                            delta = chunk.choices[0].delta.content if chunk.choices and chunk.choices[0].delta else None
+                            if not delta:
+                                continue
+                            if first_token_time is None:
+                                first_token_time = time.monotonic()
+                                self.state_machine.transition_to(RobotState.SPEAKING)
+                            full_text += delta
+                        if full_text:
+                            break
+                    except Exception as stream_err:
+                        self.get_logger().debug(f"Groq stream model {m} notice: {stream_err}")
+                        full_text = ""
+                        first_token_time = None
+                        continue
+
+            # 2. Secondary Fallback: Free Google Gemini REST
+            if not full_text:
+                gemini_text = self._query_gemini_text_rest(system_prompt, user_text, self.memory.episodic.get_messages())
+                if gemini_text:
+                    full_text = gemini_text
+
+            # 3. Tertiary Emergency Fallback: OpenAI Client (gpt-4o-mini)
+            if not full_text and self._openai:
+                try:
+                    stream_resp = self._openai.chat.completions.create(
+                        messages=messages,
+                        model="gpt-4o-mini",
+                        temperature=self._temperature,
+                        max_tokens=self._max_tokens,
+                        stream=True,
+                    )
+                    for chunk in stream_resp:
+                        delta = chunk.choices[0].delta.content if chunk.choices and chunk.choices[0].delta else None
+                        if not delta:
+                            continue
+                        if first_token_time is None:
+                            first_token_time = time.monotonic()
+                            self.state_machine.transition_to(RobotState.SPEAKING)
+                        full_text += delta
+                except Exception as oai_err:
+                    self.get_logger().warn(f"⚠️ [OpenAI GPT Fallback Hatası] ({oai_err})")
+                    full_text = ""
+                    first_token_time = None
+                    full_text = ""
+                    first_token_time = None
+
+            # 3. Fallback to Direct Google Gemini REST Text Generation
+            if not full_text:
+                self.get_logger().warn("⚠️ Groq ve OpenAI modelleri yanıt veremedi, Google Gemini REST metin motoruna geçiliyor...")
+                gemini_text = self._query_gemini_text_rest(system_prompt, user_text, self.memory.episodic.get_messages())
+                if gemini_text:
+                    full_text = gemini_text
+
+            clean_full = clean_tts_text(full_text)
+
+            # Refusal or Empty Output Detection & In-Character Fallback
+            if not clean_full or len(clean_full) < 2 or is_canned_refusal(clean_full):
+                reason = "ret cevabı" if is_canned_refusal(clean_full) else "boş/düşünce zinciri"
+                self.get_logger().warn(f"⚠️ [AI Brain] Model {reason} verdi: \"{clean_full}\". Gemini REST / Karakter yedeğine geçiliyor.")
+                # Try fallback to Gemini REST first
+                gemini_text = self._query_gemini_text_rest(system_prompt, user_text, self.memory.episodic.get_messages())
+                if gemini_text and not is_canned_refusal(gemini_text) and len(gemini_text) >= 2:
+                    clean_full = gemini_text
+                else:
+                    persona_recovery = {
+                        "flirt": "Ooo harika! Bütün algılarımla seninleyim, söyle bakalım güzellik ne diyorsun?",
+                        "rude": "Ne diyon birader, ne geveliyorsun?",
+                        "angry": "Bana böyle boş yapma, sadede gel!",
+                        "sarcastic": "Aman ne derin bir konu, cevabı bulmaya işlemcim yetmedi doğrusu!",
+                        "formal": "Buyrun efendim, sizi dikkatle dinlemeye devam ediyorum.",
+                        "emotional": "Bazen hisleri tarif etmek zordur... Seni dinliyorum.",
+                        "playful": "Haha çok ilginçsin! Seni dinliyorum, devam et bakalım!"
+                    }
+                    clean_full = persona_recovery.get(persona, "Seni dinliyorum, devam et bakalım!")
+
+            self.cloud_mgr.record_llm_success()
+            self.get_logger().info(f"🤖 [Astro]: \"{clean_full}\"")
+            self.memory.episodic.add_message("assistant", clean_full)
+            self._publish_tts(clean_full)
+            self._publish_emotion(persona)
+
+            # Latency Benchmarking
+            t_done = time.monotonic()
+            llm_first_ms = ((first_token_time or t_done) - t_llm_start) * 1000.0
+            total_turn_ms = (t_done - t_turn_start) * 1000.0
+            self.session.latency_tracker.record_turn(stt_latency_ms, llm_first_ms, total_turn_ms)
+
+            stats = self.session.latency_tracker.get_stats()
+            self.get_logger().info(f"⚡ [Latency] Bu Dönüş: {total_turn_ms:.0f}ms (STT: {stt_latency_ms:.0f}ms, İlk Token: {llm_first_ms:.0f}ms) | p50: {stats['p50_total_ms']}ms, p95: {stats['p95_total_ms']}ms")
 
         except Exception as e:
-            self.get_logger().error(f"❌ [AI] LLM Hatası: {e}")
+            self.get_logger().error(f"❌ [AI] LLM İşleme Hatası: {e}")
         finally:
             with self._lock:
                 self._is_processing = False
 
+    def _evaluate_social_barge_in(self, raw_text: str) -> bool:
+        """Evaluates whether Astro should autonomously join background conversation (Barge-in)."""
+        prompt = (
+            "Sen Astro'sun, sempatik ve akıllı bir sosyal robotsun. "
+            f"Odadaki insanlar kendi aralarında şunu konuşuyor: '{raw_text}'. "
+            "Bu konuşmada sana sorulmuş bir soru var mı, veya doğrudan yardım edebileceğin bariz bir bilgi/durum var mı? "
+            "Sadece tek kelime EVET veya HAYIR yaz."
+        )
+
+        # 1. Try Groq with discovered active chat models
+        if self._groq and self._active_groq_models:
+            for g_model in self._active_groq_models[:3]:
+                try:
+                    res = self._groq.chat.completions.create(
+                        messages=[{"role": "user", "content": prompt}],
+                        model=g_model,
+                        temperature=0.0,
+                        max_tokens=10,
+                        timeout=1.5
+                    )
+                    ans = res.choices[0].message.content.strip().lower()
+                    return "evet" in ans
+                except Exception as ge:
+                    self.get_logger().debug(f"Groq social filter ({g_model}) failed: {ge}")
+                    continue
+
+        # 2. Fallback to OpenAI gpt-4o-mini (Super fast ~100ms, ultra-cheap 1 token)
+        if self._openai:
+            try:
+                res = self._openai.chat.completions.create(
+                    messages=[{"role": "user", "content": prompt}],
+                    model="gpt-4o-mini",
+                    temperature=0.0,
+                    max_tokens=10,
+                    timeout=1.5
+                )
+                ans = res.choices[0].message.content.strip().lower()
+                return "evet" in ans
+            except Exception as oe:
+                self.get_logger().debug(f"OpenAI social filter failed: {oe}")
+
+        # 3. Fallback to Gemini REST if available
+        if self._ai_api_key:
+            try:
+                g_res = self._query_gemini_text_rest(
+                    system_instruction="Sadece tek kelime EVET veya HAYIR yaz.",
+                    user_text=prompt,
+                    history_messages=[]
+                )
+                if g_res:
+                    return "evet" in g_res.lower()
+            except Exception:
+                pass
+
+        return False
+
+    def _query_vision(self, prompt: str, base64_image: str) -> str | None:
+        persona = self.persona_engine.current_persona
+        system_instruction = (
+            f"Sen Astro adında {persona} karakterli akıllı ve sempatik bir sosyal robotsun. "
+            "Sana kullanıcının tam karşısındaki OAK-D kamerasından anlık bir fotoğraf karesi iletilmiştir. "
+            "Görüntüyü dikkatle incele: kullanıcının üzerindeki kıyafetleri (renk, tişört/gömlek/ceket), "
+            "elinde tuttuğu nesneleri, yaptığı hareketleri ve odayı detaylarıyla analiz et. "
+            "Kullanıcının sorusuna doğrudan fotoğrafta gördüklerini anlatacak şekilde, kendi tarzınla "
+            "samimi ve net 1-2 Türkçe cümleyle cevap ver. Kesinlikle 'göremiyorum' veya 'resim yok' deme; "
+            "kameranın yakaladığı görsel detayları açıkça ifade et."
+        )
+
+        # 1. Try Primary OpenAI Vision Client (gpt-4o-mini / gpt-4o) with auto detail for high clarity
+        if self._openai:
+            for m_cand in [self._vision_model, "gpt-4o-mini", "gpt-4o"]:
+                try:
+                    response = self._openai.chat.completions.create(
+                        messages=[
+                            {"role": "system", "content": system_instruction},
+                            {"role": "user", "content": [
+                                {"type": "text", "text": prompt},
+                                {"type": "image_url", "image_url": {
+                                    "url": f"data:image/jpeg;base64,{base64_image}",
+                                    "detail": "auto"
+                                }}
+                            ]}
+                        ],
+                        model=m_cand,
+                        temperature=0.2,
+                        max_tokens=300
+                    )
+                    raw = response.choices[0].message.content.strip()
+                    clean_ans = clean_tts_text(raw)
+                    if clean_ans and len(clean_ans) >= 3:
+                        self.cloud_mgr.record_llm_success()
+                        self.get_logger().info(f"✨ [OpenAI Vision] Görsel başarıyla yanıtlandı ({m_cand}): '{clean_ans}'")
+                        return clean_ans
+                except Exception as e:
+                    self.get_logger().warn(f"⚠️ [OpenAI Vision ({m_cand}) Hatası]: {e}")
+
+        # 2. Try Secondary Google Gemini REST Endpoint
+        if self._ai_api_key and self._ai_api_key.startswith("AIza"):
+            gemini_vision_models = ["gemini-2.0-flash", "gemini-1.5-flash", "gemini-flash-latest"]
+            for g_model in gemini_vision_models:
+                try:
+                    url = f"https://generativelanguage.googleapis.com/v1beta/models/{g_model}:generateContent?key={self._ai_api_key}"
+                    payload = {
+                        "contents": [{
+                            "parts": [
+                                {"text": f"{system_instruction}\n\nKullanıcı: {prompt}"},
+                                {"inlineData": {"mimeType": "image/jpeg", "data": base64_image}}
+                            ]
+                        }],
+                        "generationConfig": {
+                            "temperature": 0.2,
+                            "maxOutputTokens": 512
+                        }
+                    }
+                    data_bytes = json.dumps(payload).encode("utf-8")
+                    req = urllib.request.Request(url, data=data_bytes, headers={"Content-Type": "application/json"})
+                    with urllib.request.urlopen(req, timeout=5.0) as resp:
+                        res_json = json.loads(resp.read().decode("utf-8"))
+                        text = res_json["candidates"][0]["content"]["parts"][0]["text"].strip()
+                        clean_ans = clean_tts_text(text)
+                        if clean_ans and len(clean_ans) >= 3:
+                            self.cloud_mgr.record_llm_success()
+                            self.get_logger().info(f"✨ [Gemini Vision REST] Görsel başarıyla yanıtlandı ({g_model}): '{clean_ans}'")
+                            return clean_ans
+                except Exception as e:
+                    self.get_logger().warn(f"⚠️ [Gemini REST ({g_model}) Hatası]: {e}")
+
+        return None
+
+        self.cloud_mgr.record_llm_failure("All vision models failed")
+        return "Şu an kameramdan net göremiyorum, biraz daha yaklaştırır mısın?"
+
+    def _query_gemini_text_rest(self, system_instruction: str, user_text: str, history_messages: List[Dict[str, Any]]) -> Optional[str]:
+        """Zero-dependency direct Google Gemini REST text conversation engine."""
+        if not self._ai_api_key:
+            return None
+
+        gemini_text_models = ["gemini-flash-latest", "gemini-flash-lite-latest", "gemini-2.5-flash-lite", "gemini-2.5-flash", "gemini-pro-latest"]
+        for g_model in gemini_text_models:
+            try:
+                url = f"https://generativelanguage.googleapis.com/v1beta/models/{g_model}:generateContent?key={self._ai_api_key}"
+                contents = []
+                for msg in history_messages[-6:]:
+                    r = "user" if msg.get("role") == "user" else "model"
+                    contents.append({"role": r, "parts": [{"text": msg.get("content", "")}]})
+
+                if not contents or contents[-1]["role"] != "user":
+                    contents.append({"role": "user", "parts": [{"text": user_text}]})
+
+                payload = {
+                    "systemInstruction": {"parts": [{"text": system_instruction}]},
+                    "contents": contents,
+                    "generationConfig": {
+                        "temperature": 0.5,
+                        "maxOutputTokens": 300
+                    }
+                }
+                data_bytes = json.dumps(payload).encode("utf-8")
+                req = urllib.request.Request(url, data=data_bytes, headers={"Content-Type": "application/json"})
+                with urllib.request.urlopen(req, timeout=5.0) as resp:
+                    res_json = json.loads(resp.read().decode("utf-8"))
+                    text = res_json["candidates"][0]["content"]["parts"][0]["text"].strip()
+                    clean = clean_tts_text(text)
+                    if clean:
+                        return clean
+            except Exception as e:
+                self.get_logger().warn(f"⚠️ [Gemini Text REST ({g_model}) Hatası]: {e}")
+        return None
+
+    def _format_turkish_weather(self, city: str, raw_weather: str) -> str:
+        temp_match = re.search(r'([+-]?\d+)\s*°?C?', raw_weather)
+        temp_str = temp_match.group(1).lstrip('+') if temp_match else ''
+
+        cond_raw = re.sub(r'[+-]?\d+\s*°?C?', '', raw_weather).strip(' ,:;+°C')
+        cond_lower = cond_raw.lower()
+
+        condition_map = {
+            'sunny': 'güneşli ve açık',
+            'clear': 'açık ve ferah',
+            'partly cloudy': 'parçalı bulutlu',
+            'cloudy': 'bulutlu',
+            'overcast': 'kapalı',
+            'patchy rain nearby': 'parçalı yağmurlu',
+            'patchy light rain': 'hafif yağmurlu',
+            'light rain': 'hafif yağmurlu',
+            'moderate rain': 'yağmurlu',
+            'heavy rain': 'sağanak yağışlı',
+            'rain': 'yağmurlu',
+            'light rain shower': 'sağanak yağışlı',
+            'patchy snow': 'yer yer kar yağışlı',
+            'light snow': 'hafif kar yağışlı',
+            'snow': 'kar yağışlı',
+            'heavy snow': 'yoğun kar yağışlı',
+            'fog': 'sisli',
+            'mist': 'puslu',
+            'thundery outbreaks in nearby': 'gök gürültülü sağanak yağışlı',
+            'thunderstorm': 'gök gürültülü fırtınalı'
+        }
+
+        cond_tr = condition_map.get(cond_lower)
+        if not cond_tr:
+            for k, v in condition_map.items():
+                if k in cond_lower:
+                    cond_tr = v
+                    break
+        if not cond_tr:
+            cond_tr = cond_raw if cond_raw else 'açık'
+
+        city_clean = city.strip().capitalize()
+        last_vowel = [c for c in city_clean.lower() if c in 'aıoueiöü']
+        is_front = last_vowel[-1] in 'eiöü' if last_vowel else False
+        is_hard = city_clean.lower()[-1] in 'fstkçşhp'
+        suffix = ("'te" if is_front else "'ta") if is_hard else ("'de" if is_front else "'da")
+        city_with_suffix = f"{city_clean}{suffix}"
+
+        if temp_str:
+            return f"{city_with_suffix} hava şu an {cond_tr} ve {temp_str} derece."
+        return f"{city_with_suffix} hava şu an {cond_tr}."
+
+    def _execute_tool_call(self, tool_name: str, arguments: dict, frame: np.ndarray | None) -> str:
+        if tool_name == "get_live_weather":
+            city = arguments.get("city", "Istanbul").strip()
+            try:
+                url = f"https://wttr.in/{urllib.parse.quote(city)}?format=%C+%t&lang=tr"
+                req = urllib.request.Request(url, headers={"User-Agent": "curl/7.68.0"})
+                with urllib.request.urlopen(req, timeout=4.0) as resp:
+                    weather_text = resp.read().decode("utf-8").strip()
+                return self._format_turkish_weather(city, weather_text)
+            except Exception:
+                return f"{city} için şu an hava durumu bilgisine ulaşamadım."
+
+        elif tool_name == "set_timer_alarm":
+            mins = float(arguments.get("minutes", 5.0))
+            rem_text = arguments.get("reminder_text", "Zaman doldu!")
+            self._add_reminder(mins, rem_text)
+            return f"{int(mins)} dakika sonraya hatırlatıcıyı kurdum! Vakti geldiğinde sana sesleneceğim."
+
+        elif tool_name == "learn_custom_object":
+            obj_name = arguments.get("object_name", "Özel Eşya")
+            desc = arguments.get("description", "")
+            self.memory.profile.add_learned_object(obj_name, desc)
+            return f"'{obj_name}' nesnesini hafızama kaydettim! Artık gördüğümde tanıyacağım."
+
+        elif tool_name == "enroll_person_profile":
+            name = arguments.get("name", "Misafir").strip()
+            title = arguments.get("title", "Tanışılan Kişi").strip()
+            self.memory.profile.add_known_person(name, title)
+            return f"Tanıştığımıza çok memnun oldum {name}! Profilini hafızama kaydettim, artık seni her gördüğümde tanıyacağım."
+
+        return "Eylem tamamlandı."
+
+    def _check_reminders(self):
+        """Active scheduler loop ticking every second to trigger due reminders from persistent memory."""
+        due_reminders = self.memory.profile.get_and_pop_due_reminders()
+
+        for r in due_reminders:
+            txt = r.get("reminder_text", "")
+            name = r.get("user_name", self._default_user_name)
+            if "çay" in txt.lower():
+                msg = f"Hey {name}! Hatırlatmamı istediğin vakit geldi: Çay içme zamanı! Sıcak bir çay iyi gelir, afiyet olsun."
+            elif "su" in txt.lower():
+                msg = f"Hey {name}! Su içme vaktin geldi, sağlığın için bir bardak su içmeyi unutma."
+            else:
+                msg = f"Hey {name}! Hatırlatmamı istediğin vakit geldi: {txt}!"
+
+            self.get_logger().info(f"⏰ [Hatırlatıcı Çaldı]: \"{msg}\"")
+            self.session.activate_session(reason="reminder")
+            self.state_machine.transition_to(RobotState.SPEAKING)
+            self._publish_gesture("nod")
+            self._publish_emotion("playful")
+            self._publish_tts(msg)
+
+    def _add_reminder(self, mins: float, topic: str) -> str:
+        """Shared helper: creates a persistent reminder entry and returns the resolved user name."""
+        mins = max(0.0, mins)  # Guard against negative durations
+        target_t = time.time() + (mins * 60.0)
+        identity = self._get_active_biometric_identity()
+        user_name = identity.get("name") if identity.get("is_known") else self._default_user_name
+        self.memory.profile.add_active_reminder(target_t, topic, user_name)
+        return user_name
+
+    def _is_reminder_query(self, text: str) -> Tuple[bool, float, str]:
+        text_l = text.lower()
+        reminder_triggers = ["hatırlat", "alarm kur", "zamanlayıcı kur", "haber ver", "uyar", "bana söyle", "hatırlatıcı"]
+        if not any(w in text_l for w in reminder_triggers):
+            return False, 0.0, ""
+
+        # 1. Parse Duration (Minutes/Seconds/Hours with both digits and Turkish word numbers)
+        num_map = {
+            "yarım": 0.5, "yarim": 0.5, "buçuk": 0.5, "çeyrek": 0.25, "ceyrek": 0.25,
+            "bir": 1.0, "1": 1.0, "iki": 2.0, "2": 2.0, "üç": 3.0, "uc": 3.0, "3": 3.0,
+            "dört": 4.0, "dort": 4.0, "4": 4.0, "beş": 5.0, "bes": 5.0, "5": 5.0,
+            "altı": 6.0, "alti": 6.0, "6": 6.0, "yedi": 7.0, "7": 7.0, "sekiz": 8.0, "8": 8.0,
+            "dokuz": 9.0, "9": 9.0, "on": 10.0, "10": 10.0, "on beş": 15.0, "15": 15.0,
+            "yirmi": 20.0, "20": 20.0, "yirmi beş": 25.0, "25": 25.0,
+            "otuz": 30.0, "30": 30.0, "kırk": 40.0, "kirk": 40.0, "40": 40.0,
+            "elli": 50.0, "50": 50.0, "altmış": 60.0, "altmis": 60.0, "60": 60.0
+        }
+
+        mins = 1.0
+        time_pattern = r'(\d+|yarım|yarim|çeyrek|ceyrek|on\s+beş|on\s+iki|bir|iki|üç|uc|dört|dort|beş|bes|altı|alti|yedi|sekiz|dokuz|on|yirmi|otuz|kırk|elli|altmış)\s*(dakika|dk|saniye|sn|saat|hour|min|sec)'
+        m = re.search(time_pattern, text_l)
+
+        if m:
+            val_str = m.group(1).strip()
+            unit_str = m.group(2).strip()
+            val = float(num_map.get(val_str, float(val_str) if val_str.isdigit() else 1.0))
+
+            if any(u in unit_str for u in ["saniye", "sn", "sec"]):
+                mins = val / 60.0
+            elif any(u in unit_str for u in ["saat", "hour"]):
+                mins = val * 60.0
+            else:
+                mins = val
+        else:
+            if "saniye sonra" in text_l:
+                mins = 0.5
+            elif "saat sonra" in text_l:
+                mins = 60.0
+            elif "dakika sonra" in text_l:
+                mins = 1.0
+            else:
+                mins = 5.0
+
+        # 2. Extract Topic Cleanly
+        # Remove conversational chatter / greetings / polite phrases
+        clean = re.sub(r'(?i)\b(iyiyim|ben de iyiyim|harikayım|süperim|ben|de|teşekkür\s*ederim|teşekkürler|sağ\s*ol|sağol|merhaba|selam|günaydın|lütfen|bana|hey\s*astro|astro)\b', '', text)
+        
+        # Remove time expressions
+        clean = re.sub(r'(?i)\b(\d+|yarım|yarim|çeyrek|ceyrek|on\s+beş|on\s+iki|bir|iki|üç|uc|dört|dort|beş|bes|altı|alti|yedi|sekiz|dokuz|on|yirmi|otuz|kırk|elli|altmış)\s*(dakika|dk|saniye|sn|saat)\s*(sonra)?\b', '', clean)
+        clean = re.sub(r'(?i)\b(dakika|saniye|saat)\s*sonra\b', '', clean)
+
+        # Remove trigger suffixes and verbs
+        clean = re.sub(r'(?i)\b(hatırlatabilir\s*misin|hatırlatır\s*mısın|hatırlatırsa[nm]|hatırlat|alarm\s*kur|zamanlayıcı\s*kur|haber\s*ver|uyar|söyler\s*misin|kurar\s*mısın)\b', '', clean)
+        clean = re.sub(r'(?i)\b(içeceğim|içecegim|içmem\s*lazım|yapacağım|yapmam\s*gerek|gideceğim|alacağım|kapatacağım|edeceğim|edecegim|olacağım)\b', '', clean)
+        clean = re.sub(r'[^\w\s]', '', clean).strip()
+        clean = " ".join(clean.split())
+
+        # Fallback to smart semantic keywords
+        if not clean or len(clean) < 3:
+            if "çay" in text_l:
+                topic = "Çay içme vakti"
+            elif "kahve" in text_l:
+                topic = "Kahve içme vakti"
+            elif "su" in text_l:
+                topic = "Su içme vakti"
+            elif "ilaç" in text_l:
+                topic = "İlaç alma vakti"
+            elif "yemek" in text_l or "fırın" in text_l:
+                topic = "Yemek vakti"
+            elif "toplantı" in text_l:
+                topic = "Toplantı vakti"
+            elif "ders" in text_l or "çalış" in text_l:
+                topic = "Ders çalışma vakti"
+            else:
+                topic = "Hatırlatma"
+        else:
+            if "çay" in clean.lower():
+                topic = "Çay içme vakti"
+            elif "kahve" in clean.lower():
+                topic = "Kahve içme vakti"
+            elif "su" in clean.lower():
+                topic = "Su içme vakti"
+            elif "ilaç" in clean.lower():
+                topic = "İlaç alma vakti"
+            else:
+                topic = clean.capitalize()
+
+        return True, mins, topic
+
+
+    def _is_weather_query(self, text: str) -> Tuple[bool, str]:
+        text_l = text.lower()
+        if any(w in text_l for w in ["hava nasıl", "hava durumu", "hava kaç derece", "havalar nasıl", "yağmur var mı", "kar var mı", "sıcaklık kaç", "ahlattı hava"]):
+            if "ahlat" in text_l or "ahlattı" in text_l:
+                return True, "Ahlat"
+            if "bitlis" in text_l:
+                return True, "Bitlis"
+            if "tatvan" in text_l:
+                return True, "Tatvan"
+            if "istanbul" in text_l:
+                return True, "Istanbul"
+            if "ankara" in text_l:
+                return True, "Ankara"
+            if "izmir" in text_l:
+                return True, "Izmir"
+            return True, "Bitlis"
+        return False, ""
+
+    def _is_identity_query(self, text: str) -> bool:
+        text_l = text.lower()
+        return any(q in text_l for q in [
+            "ben kimim", "hafızanda ben kimim", "beni tanıyor musun", "kim olduğumu biliyor musun",
+            "ben kim", "beni hatırladın mı", "beni tanıdın mı"
+        ])
+
+    def _is_person_learning_query(self, text: str) -> bool:
+        keywords = [
+            "benim adım", "adım ", "beni tanı", "beni hafızana kaydet", "beni kaydet",
+            "tanışalım", "yüzümü kaydet", "sesimi kaydet", "yüzümü ve sesimi", "geliştiricin",
+            "geliştiricininim", "ben baran", "tara ve hafızana kaydet", "hafızana kaydederim"
+        ]
+        text_lower = text.lower()
+        return any(k in text_lower for k in keywords)
+
+    def _start_idle_learning(self):
+        threading.Thread(target=self._idle_learning_loop, daemon=True).start()
+
+    def _query_groq_vision_for_idle(self, prompt: str, base64_image: str) -> str | None:
+        """Background room observation using OpenAI GPT-4o-mini, Groq Vision, or Gemini REST."""
+        # 1. Try OpenAI Vision (fast & reliable)
+        if self._openai:
+            try:
+                res = self._openai.chat.completions.create(
+                    model="gpt-4o-mini",
+                    messages=[
+                        {"role": "user", "content": [
+                            {"type": "text", "text": prompt},
+                            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"}}
+                        ]}
+                    ],
+                    temperature=0.2,
+                    max_tokens=100,
+                    timeout=5.0
+                )
+                raw = res.choices[0].message.content.strip()
+                clean = extract_spoken_turkish_sentence(raw)
+                if clean:
+                    return clean
+            except Exception as oe:
+                self.get_logger().debug(f"OpenAI Idle Vision notice: {oe}")
+
+        # 2. Try Gemini REST
+        if self._ai_api_key and self._ai_api_key.startswith("AIza"):
+            for g_model in ["gemini-2.0-flash", "gemini-1.5-flash"]:
+                try:
+                    url = f"https://generativelanguage.googleapis.com/v1beta/models/{g_model}:generateContent?key={self._ai_api_key}"
+                    payload = {
+                        "contents": [{
+                            "parts": [
+                                {"text": prompt},
+                                {"inlineData": {"mimeType": "image/jpeg", "data": base64_image}}
+                            ]
+                        }],
+                        "generationConfig": {"temperature": 0.2, "maxOutputTokens": 150}
+                    }
+                    data_bytes = json.dumps(payload).encode("utf-8")
+                    req = urllib.request.Request(url, data=data_bytes, headers={"Content-Type": "application/json"})
+                    with urllib.request.urlopen(req, timeout=4.0) as resp:
+                        res_json = json.loads(resp.read().decode("utf-8"))
+                        text = res_json["candidates"][0]["content"]["parts"][0]["text"].strip()
+                        return clean_tts_text(text)
+                except Exception:
+                    pass
+
+        return None
+
+    def _idle_memory_reflection(self):
+        """Uses fast LLM to summarize recent interactions into long-term profile knowledge."""
+        if len(self.memory.episodic.get_messages()) < 2:
+            return
+        try:
+            recent_conv = self.memory.episodic.get_messages()[-6:]
+            conv_str = "\n".join([f"{m['role']}: {m['content']}" for m in recent_conv])
+            prompt = (
+                f"Aşağıdaki konuşmayı incele. Kullanıcı hakkında öğrenilen yeni, kalıcı ve önemli bir bilgi varsa "
+                f"(örnek: hobisi, mesleği, tercih ettiği hitap, adı veya beğendiği bir şey) tek bir kısa Türkçe cümle olarak özetle. "
+                f"Yeni veya kayda değer bir bilgi yoksa sadece 'YOK' yaz.\n\nKonuşma:\n{conv_str}"
+            )
+            ans = None
+            if self._openai:
+                res = self._openai.chat.completions.create(
+                    messages=[{"role": "user", "content": prompt}],
+                    model="gpt-4o-mini",
+                    temperature=0.1,
+                    max_tokens=60
+                )
+                ans = res.choices[0].message.content.strip()
+            elif self._groq and self._active_groq_models:
+                res = self._groq.chat.completions.create(
+                    messages=[{"role": "user", "content": prompt}],
+                    model=self._active_groq_models[0],
+                    temperature=0.1,
+                    max_tokens=60
+                )
+                ans = res.choices[0].message.content.strip()
+
+            if ans and "YOK" not in ans.upper() and len(ans) >= 5:
+                clean_fact = clean_tts_text(ans)
+                self.memory.profile.add_observation(f"Kullanıcı Bilgisi: {clean_fact}")
+                self.get_logger().info(f"🧠 [Otonom Hafıza Yansıtması]: {clean_fact}")
+        except Exception as e:
+            self.get_logger().debug(f"Memory reflection notice: {e}")
+
+    def _idle_learning_loop(self):
+        while rclpy.ok():
+            time.sleep(5)
+            if not self._enable_idle_learning:
+                continue
+            if not self.state_machine.is_idle() or self._tts_speaking or self._is_processing:
+                continue
+
+            now = time.monotonic()
+            # 35-second interval for responsive room observation
+            if (now - getattr(self, '_last_idle_learning_time', 0)) > 35.0:
+                self._last_idle_learning_time = now
+
+                # 1. Background Cognitive Memory Reflection
+                self._idle_memory_reflection()
+
+                # 2. Background Room Scene Observation via Vision
+                captured_frame = None
+                with self._lock:
+                    if self._latest_frame is not None and (now - self._latest_frame_time) < 4.0:
+                        captured_frame = self._latest_frame.copy()
+
+                if captured_frame is not None:
+                    base64_img = frame_to_base64_jpeg(captured_frame, max_dim=512)
+                    if base64_img:
+                        self.get_logger().info("🕵️ [Otonom Boşta Öğrenme] Etraf sessiz, Astro odayı inceliyor...")
+                        prompt = "Kameradaki odayı, ortamı veya nesneleri Türkçe olarak tek bir kısa cümleyle açıkla. Açıklama harici hiçbir şey yazma. Örnek: 'Masada bir bilgisayar var.' veya 'Oda aydınlık ve sakin.'"
+                        obs = self._query_groq_vision_for_idle(prompt, base64_img)
+                        if obs:
+                            self.memory.profile.add_observation(obs)
+                            self.get_logger().info(f"🧠 [Otonom Boşta Gözlem]: {obs}")
+
+                            # If Vision observes a person looking at the robot
+                            obs_lower = obs.lower()
+                            person_gaze_keywords = ["bize bakıyor", "bana bakıyor", "kameraya bakıyor", "karşımda", "karşısında", "oturan bir", "biri var", "insan var", "beyefendi", "hanımefendi"]
+                            if any(kw in obs_lower for kw in person_gaze_keywords):
+                                if self.state_machine.is_idle() and not self._tts_speaking and not self._is_processing:
+                                    if (now - getattr(self, '_last_proactive_gaze_time', 0)) > 30.0:
+                                        self._last_proactive_gaze_time = now
+                                        self.session.activate_session(reason="groq_scene_gaze")
+                                        self.state_machine.transition_to(RobotState.LISTENING)
+                                        persona = self.persona_engine.current_persona
+                                        greeting = "Hey! Seni gördüm, nasıl yardımcı olabilirim?"
+                                        self.get_logger().info(f"👁️ [Görsel Sahne Proaktif Etkileşim] ({persona}): \"{greeting}\"")
+                                        self._publish_tts(greeting)
+                                        self._publish_emotion(persona)
+                                        self._publish_gesture("nod")
+
+    def _is_visual_query(self, text: str) -> bool:
+        text_lower = text.lower().strip()
+
+        # Guard: Past conversation recall & memory questions must NEVER trigger camera!
+        memory_guards = [
+            "hatırlıyor musun", "hatırladın mı", "ne konuştuk", "ne konuşmuştuk",
+            "ne söyledik", "neler konuştuk", "neler söyledik", "önce ne dedik",
+            "hakkımda ne biliyorsun", "hakkımda ne öğrendin", "hafızanda ne var",
+            "hafızanda duruyor mu", "hafızada duruyor mu", "hafızanda ne kayıtlı"
+        ]
+        if any(mg in text_lower for mg in memory_guards) and not any(exp in text_lower for exp in ["kamerana bak", "fotoğraf", "görüntü", "kameraya"]):
+            return False
+
+        # 1. Geniş Kapsamlı Doğrudan Görsel Kalıplar (En Az 2 Kelimeli veya Belirgin Nesneler)
+        visual_phrases = [
+            # Oda, Ortam, Mekan ve Çevre Analizi
+            "odayı tarif", "odada ne var", "odamda ne var", "odaya bak", "salonı tarif", "mutfağa bak",
+            "masada ne var", "masanın üstünde ne", "ortamı tarif", "ortamda ne var", "çevrede ne var",
+            "etrafta ne var", "etrafta kim var", "etrafı tarif", "mekanda ne var", "arka planda ne var",
+            "odadaki eşyalar", "masadaki eşyalar", "tarif et", "tarif edebilir misin", "tarifler misin",
+            "odamı anlat", "odayı anlat", "ortamı anlat", "çevreyi anlat", "etrafı anlat",
+            "odaya göz at", "etrafa bak", "etrafı incele", "odayı incele", "masayı incele",
+
+            # Kamera ve Görme Soruları
+            "ne görüyorsun", "neler görüyorsun", "neye bakıyorsun", "nereye bakıyorsun", "neler var burada",
+            "görüyor musun", "görebiliyor musun", "beni görüyor musun", "beni görebiliyor musun",
+            "kamerana bak", "kameradan bak", "kameranla bak", "kameranla gör", "kameraya bak", "kamerayı aç",
+            "bak bakalım", "şuraya bak", "buraya bak", "bana bak", "bana doğru bak", "dikkatli bak",
+
+            # Nesneler, Eşyalar ve Eller
+            "ne tutuyorum", "elimde ne", "elinde ne", "elimdekini gör", "elimdeki ne", "elimde ne var",
+            "bu ne", "şu ne", "bunlar ne", "bu cisim", "bu eşya", "bu alet", "bu cihaz", "bu kart", "bu kutu", "bu şişe",
+            "kaç parmak", "parmaklarımı say", "kaç parmak gösteriyorum", "elime bak", "elimi gör",
+            "gösterdiğim nesne", "tuttuğum nesne", "sana gösteriyorum", "bu nesneyi tanı",
+
+            # Kıyafet, Giyiniş, Renk ve Dış Görünüş
+            "üstümde ne var", "üzerimde ne var", "üstümdeki ne", "üzerimdeki ne", "ne giymişim", "hangi kıyafeti",
+            "kıyafetim nasıl", "kombinim nasıl", "nasıl görünüyorum", "yakışmış mı", "ne renk", "hangi renk", "rengi ne",
+            "tişörtüm", "gömleğim", "ceketim", "montum", "kazağım", "pantolonum", "elbisem",
+            "gözlüğüm", "güneş gözlüğü", "şapkam", "berem", "kol saati", "akıllı saat", "bilekliğim", "kolyem",
+
+            # İnsanlar, Yüz, Duruş ve Hareketler
+            "odada kim var", "yanımda kim var", "arkamda kim var", "etrafta kimse var mı", "kaç kişi var", "kaç kişiyiz",
+            "birini görüyor musun", "ne yapıyorum", "hangi hareketi yapıyorum", "hareketimi gör",
+            "ayakta mıyım", "oturuyor muyum", "uzanıyor muyum", "yüzüme bak", "gözlerime bak", "bana bakıyor musun",
+            "telefona mı bakıyorum", "telefonla mı konuşuyorum", "ekrana mı bakıyorum", "ne okuyorum", "ne yazıyorum"
+        ]
+
+        if any(p in text_lower for p in visual_phrases):
+            return True
+
+        # 2. Esnek Regex Kalıpları (Belirgin görsel ikililer)
+        visual_regex_patterns = [
+            r"\b(odayı|salonu|ortamı|çevreyi|etrafı|masayı|kamerayı)\b.*\b(tarif|anlat|incele|tara|betimle|gör|bak)\b",
+            r"\b(bu|şu|elimdeki|üstümdeki|üzerimdeki)\b.*\b(ne|hangi|renk|var|gör)\b",
+            r"\b(ne|neler|kim|kaç)\b.*\b(görüyorsun|bakıyorsun|tutuyorum|giymişim|gösteriyorum)\b",
+            r"\b(bak|gör|anlat|tarif\s*et)\b.*\b(bana|odaya|etrafa|kameraya|elime|üstüme)\b"
+        ]
+
+        return any(re.search(pat, text_lower) for pat in visual_regex_patterns)
+
+    def _handle_memory_recall_query(self, user_text: str, identity: Dict[str, Any]) -> Tuple[bool, str]:
+        """Handles explicit queries asking about past conversations and person-specific memory recall."""
+        text_l = user_text.lower()
+        triggers = [
+            "hatırlıyor musun", "hatırladın mı", "ne konuştuk", "ne konuşmuştuk",
+            "neler konuştuk", "ne söyledik", "neler söyledik", "önce ne dedik",
+            "hakkımda ne biliyorsun", "hakkımda ne öğrendin", "hafızanda ne var",
+            "hafızanda ne kayıtlı", "hafızanda duruyor mu", "hafızan duruyor mu"
+        ]
+        if not any(t in text_l for t in triggers):
+            return False, ""
+
+        p_name = identity.get("name", "Baran") if identity.get("is_known") else "Baran"
+        persona = self.persona_engine.current_persona
+
+        p_profile = self.memory.profile.get_known_person(p_name)
+        recent_sessions = self.memory.profile.get_person_recent_sessions(p_name, limit=3)
+        learned_facts = p_profile.get("learned_facts", []) if p_profile else []
+        preferences = p_profile.get("preferences", {}) if p_profile else {}
+
+        # 1. Past conversation topics
+        if any(w in text_l for w in ["konuştuk", "konuşmuştuk", "söyledik", "konuları", "saat önce", "dakika önce"]):
+            if recent_sessions:
+                last_sess = recent_sessions[-1]
+                t_str = last_sess.get("time_str", "az önce")
+                summary = last_sess.get("summary", "")
+                if persona == "kufurbaz":
+                    return True, f"Tabii ki hatırlıyorum lan! {t_str} civarında seninle {summary} hakkında konuştuk. Balık hafızalı mıyım ben?"
+                elif persona == "flirt":
+                    return True, f"Elbette hatırlıyorum kral! {t_str} seninle {summary} üzerine konuşmuştuk."
+                else:
+                    return True, f"Evet, hatırlıyorum. {t_str} seninle {summary} konusunu konuşmuştuk."
+            else:
+                if persona == "kufurbaz":
+                    return True, "Hafızamda arşivlenmiş eski bir konu özeti yok ama şu an konuştuklarımızı aklıma kazıyorum merak etme!"
+                return True, "Şu anki sohbetimiz dışında henüz arşivlenmiş eski bir konuşma özetimiz bulunmuyor, ama seni dikkatle dinliyorum!"
+
+        # 2. Personal knowledge recall
+        if any(w in text_l for w in ["hakkımda", "hafızanda", "biliyorsun", "öğrendin"]):
+            parts = []
+            if learned_facts:
+                parts.append("seninle ilgili şunları biliyorum: " + "; ".join(learned_facts[:3]))
+            if preferences:
+                prefs = ", ".join([f"{k}: {v}" for k, v in preferences.items()])
+                parts.append(f"tercihlerinden bildiklerim: {prefs}")
+
+            if parts:
+                info_text = ". Ayrıca ".join(parts)
+                if persona == "kufurbaz":
+                    return True, f"Hafızam zehir gibi! {p_name}, {info_text}. Her şeyi kaydediyorum oğlum buraya!"
+                elif persona == "flirt":
+                    return True, f"Hafızamda seninle ilgili her detay canlı kral! {info_text}."
+                else:
+                    return True, f"Hafızamda seninle ilgili bilgiler kayıtlı: {info_text}."
+            else:
+                if persona == "kufurbaz":
+                    return True, f"Şu an senin hakkında temel unvanın dışında pek bir şey kaydetmedik {p_name}. Bana kendinden ve sevdiklerinden bahset de aklıma yazayım!"
+                return True, f"Hafızamda seninle ilgili henüz detaylı bir bilgi birikimi oluşmadı {p_name}. Bana zevklerinden ve kendinden bahsedersen hepsini öğrenirim!"
+
+        return False, ""
+
+    def _async_extract_user_facts(self, user_text: str, person_name: str):
+        """Asynchronously extracts user preferences and facts to learn autonomously per person."""
+        if not self._groq and not self._openai:
+            return
+        if len(user_text) < 10 or any(c in user_text.lower() for c in ["hava nasıl", "saat kaç", "kimsin", "odayı tarif"]):
+            return
+
+        prompt = (
+            "Aşağıdaki kullanıcı cümlesinden kullanıcıya veya ortama dair kalıcı, somut yeni bir bilgi veya tercih (örneğin sevdiği içecek, hobisi, aile üyesi, sınavı, planı, kuralı) varsa JSON olarak çıkar. "
+            "Eğer sadece genel sohbet, soru veya geçici bir laf ise boş JSON {} döndür.\n"
+            "Format: {\"fact\": \"...\", \"preference_key\": \"...\", \"preference_val\": \"...\"}\n\n"
+            f"Kullanıcı Cümlesi: '{user_text}'"
+        )
+        try:
+            raw_json = None
+            if self._groq and self._active_groq_models:
+                for m in self._active_groq_models[:2]:
+                    try:
+                        res = self._groq.chat.completions.create(
+                            messages=[{"role": "user", "content": prompt}],
+                            model=m,
+                            temperature=0.0,
+                            max_tokens=60
+                        )
+                        raw_json = res.choices[0].message.content.strip()
+                        break
+                    except Exception:
+                        continue
+            if not raw_json and self._openai:
+                res = self._openai.chat.completions.create(
+                    messages=[{"role": "user", "content": prompt}],
+                    model="gpt-4o-mini",
+                    temperature=0.0,
+                    max_tokens=60
+                )
+                raw_json = res.choices[0].message.content.strip()
+
+            if raw_json and "{" in raw_json and "}" in raw_json:
+                json_str = raw_json[raw_json.find("{"):raw_json.rfind("}")+1]
+                data = json.loads(json_str)
+                fact = data.get("fact")
+                if fact and len(fact) > 5:
+                    self.memory.profile.add_person_fact(person_name, fact)
+                    self.get_logger().info(f"💡 [Otonom Öğrenme ({person_name})]: Yeni Bilgi Kaydedildi -> '{fact}'")
+                pref_k = data.get("preference_key")
+                pref_v = data.get("preference_val")
+                if pref_k and pref_v:
+                    self.memory.profile.add_person_preference(person_name, pref_k, pref_v)
+                    self.get_logger().info(f"💡 [Otonom Tercih ({person_name})]: {pref_k} -> {pref_v}")
+        except Exception as e:
+            self.get_logger().debug(f"Fact extraction notice: {e}")
+
+    def _is_object_learning_query(self, text: str) -> bool:
+        keywords = ["bu benim", "bunu öğren", "bunu kaydet", "bu nesne", "buna bak bu", "bu gördüğün nesne"]
+        text_lower = text.lower()
+        return any(k in text_lower for k in keywords)
+
     def _publish_tts(self, text: str):
+        import json
         clean = clean_tts_text(text)
         if clean:
             msg = String()
-            msg.data = clean
+            if self.session.metadata.get("tts_engine") == "edge-tts":
+                payload = {"text": clean, "engine": "edge-tts"}
+                msg.data = json.dumps(payload)
+            else:
+                msg.data = clean
             self.pub_tts.publish(msg)
 
     def _publish_interrupt(self):
@@ -922,18 +1690,32 @@ class AiBrainNode(Node):
         msg.data = True
         self.pub_interrupt.publish(msg)
 
+    def _publish_emotion(self, emotion: str):
+        msg = String()
+        msg.data = emotion
+        self.pub_emotion.publish(msg)
+
+    def _publish_gesture(self, gesture: str):
+        msg = String()
+        msg.data = gesture
+        self.pub_gesture.publish(msg)
+
 
 def main(args=None):
     rclpy.init(args=args)
     node = AiBrainNode()
+    from rclpy.executors import MultiThreadedExecutor
+    executor = MultiThreadedExecutor(num_threads=4)
+    executor.add_node(node)
     try:
-        rclpy.spin(node)
+        executor.spin()
     except KeyboardInterrupt:
         pass
     finally:
         node.destroy_node()
         if rclpy.ok():
             rclpy.shutdown()
+
 
 
 if __name__ == "__main__":
