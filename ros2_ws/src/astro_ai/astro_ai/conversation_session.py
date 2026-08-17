@@ -113,13 +113,17 @@ class ConversationSession:
             if looking_at_robot:
                 self._last_gaze_time = time.monotonic()
 
-    def check_and_update_session_lifecycle(self) -> bool:
+    def check_and_update_session_lifecycle(self, is_robot_speaking: bool = False) -> bool:
         """Periodic check to determine if the active session should time out."""
         with self._lock:
             if not self._is_active:
                 return False
 
             now = time.monotonic()
+            if is_robot_speaking:
+                self._last_robot_speech_time = now
+                return False
+
             time_since_user = now - self._last_user_speech_time
             time_since_robot = now - self._last_robot_speech_time
 

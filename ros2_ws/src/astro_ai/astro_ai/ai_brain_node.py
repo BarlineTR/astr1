@@ -304,7 +304,10 @@ class AiBrainNode(Node):
         self.get_logger().info("💤 [AI] Oturum zaman aşımı — Uyku moduna (IDLE) geçildi.")
 
     def _check_session_lifecycle(self):
-        self.session.check_and_update_session_lifecycle()
+        is_speaking = self._tts_speaking or self.state_machine.is_speaking() or self.state_machine.is_thinking() or self._is_processing
+        if is_speaking:
+            self.session.record_robot_speech()
+        self.session.check_and_update_session_lifecycle(is_robot_speaking=is_speaking)
         # Broadcast session state so STT node can make context-aware filter decisions
         msg = Bool()
         msg.data = self.session.is_active()
@@ -320,8 +323,8 @@ class AiBrainNode(Node):
 
     def _on_tts_speaking(self, msg: Bool):
         self._tts_speaking = msg.data
+        self.session.record_robot_speech()
         if not msg.data:
-            self.session.record_robot_speech()
             if self.state_machine.is_speaking():
                 self.state_machine.transition_to(RobotState.LISTENING)
 
@@ -761,13 +764,35 @@ class AiBrainNode(Node):
             full_text = ""
             first_token_time = None
 
-            # 1. Try Ultra-Fast Groq LPU Models (Llama 3.3 70B / 8B)
-            if self._groq:
-                groq_candidates = [m for m in self._active_groq_models if any(k in m.lower() for k in ["llama-3.3-70b", "llama-3.1-8b", "llama3-70b", "llama3-8b"])]
-                if not groq_candidates:
-                    groq_candidates = ["llama-3.3-70b-versatile", "llama-3.1-8b-instant"]
+            # 1. Primary LLM Provider (Check if OpenAI is primary or Groq is primary)
+            prefer_openai = self._openai and (self._text_model.startswith("gpt") or not self._groq)
 
-                for m in groq_candidates:
+            if prefer_openai:
+                # 1.A. Primary: OpenAI Client (gpt-4o-mini / gpt-4o)
+                try:
+                    stream_resp = self._openai.chat.completions.create(
+                        messages=messages,
+                        model=self._text_model,
+                        temperature=self._temperature,
+                        max_tokens=self._max_tokens,
+                        stream=True,
+                    )
+                    for chunk in stream_resp:
+                        delta = chunk.choices[0].delta.content if chunk.choices and chunk.choices[0].delta else None
+                        if not delta:
+                            continue
+                        if first_token_time is None:
+                            first_token_time = time.monotonic()
+                            self.state_machine.transition_to(RobotState.SPEAKING)
+                        full_text += delta
+                except Exception as oai_err:
+                    self.get_logger().warn(f"⚠️ [OpenAI GPT Stream Hatası] ({oai_err}), Groq yedeğe geçiliyor...")
+                    full_text = ""
+                    first_token_time = None
+
+            # 1.B. Groq LPU Models (Try discovered active models)
+            if not full_text and self._groq and self._active_groq_models:
+                for m in self._active_groq_models[:3]:
                     try:
                         stream_resp = self._groq.chat.completions.create(
                             messages=messages,
@@ -787,17 +812,17 @@ class AiBrainNode(Node):
                         if full_text:
                             break
                     except Exception as stream_err:
-                        self.get_logger().warn(f"⚠️ [Groq Stream Hatası] Model {m}: {stream_err}")
+                        self.get_logger().debug(f"Groq stream model {m} notice: {stream_err}")
                         full_text = ""
                         first_token_time = None
                         continue
 
-            # 2. Try OpenAI Client (gpt-4o-mini) if Groq failed or not available
-            if not full_text and self._openai:
+            # 1.C. Secondary OpenAI fallback if Groq was primary and failed
+            if not full_text and not prefer_openai and self._openai:
                 try:
                     stream_resp = self._openai.chat.completions.create(
                         messages=messages,
-                        model=self._text_model,
+                        model="gpt-4o-mini",
                         temperature=self._temperature,
                         max_tokens=self._max_tokens,
                         stream=True,
@@ -811,7 +836,7 @@ class AiBrainNode(Node):
                             self.state_machine.transition_to(RobotState.SPEAKING)
                         full_text += delta
                 except Exception as oai_err:
-                    self.get_logger().warn(f"⚠️ [OpenAI GPT Stream Hatası] ({oai_err}), Gemini yedeğe geçiliyor...")
+                    self.get_logger().warn(f"⚠️ [OpenAI GPT Fallback Hatası] ({oai_err})")
                     full_text = ""
                     first_token_time = None
 
