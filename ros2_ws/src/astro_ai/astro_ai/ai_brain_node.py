@@ -272,7 +272,7 @@ class AiBrainNode(Node):
         """Returns a static list of verified active Groq models to prevent 404 errors and API latency."""
         if not self._groq:
             return []
-        return ["llama-3.3-70b-versatile", "llama-3.1-8b-instant"]
+        return ["llama-3.3-70b-versatile", "llama3-70b-8192", "llama3-8b-8192"]
 
     def _discover_vision_model(self) -> str | None:
         try:
@@ -575,7 +575,7 @@ class AiBrainNode(Node):
                     try:
                         res = self._groq.chat.completions.create(
                             messages=[{"role": "user", "content": prompt}],
-                            model="llama-3.1-8b-instant",
+                            model="llama3-8b-8192",
                             temperature=0.0,
                             max_tokens=10
                         )
