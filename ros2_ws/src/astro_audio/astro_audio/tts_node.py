@@ -12,6 +12,7 @@ import os
 import re
 import asyncio
 import subprocess
+import tempfile
 import threading
 import queue
 import shutil
@@ -24,6 +25,14 @@ try:
     import edge_tts
 except ImportError:
     edge_tts = None
+
+try:
+    from astro_audio.xtts_client import XttsClient, XttsError
+except ImportError:  # paket kaynaktan çalıştırılıyorsa
+    XttsClient = None
+
+    class XttsError(RuntimeError):
+        pass
 
 try:
     from openai import OpenAI
@@ -138,6 +147,12 @@ class TtsNode(Node):
         self.alsa_device = find_respeaker_alsa_device()
         self.has_aplay = shutil.which("aplay") is not None
 
+        # XTTS (yerel ses klonlama) — ayrı venv'de kalıcı işçi süreci
+        self.xtts = None
+        self.xtts_timeout = float(os.getenv("TTS_XTTS_TIMEOUT_S", "120"))
+        if self.tts_engine == "xtts":
+            self._init_xtts()
+
         # OpenAI TTS Client
         self.openai_api_key = os.environ.get("OPENAI_API_KEY", "").strip() or os.environ.get("AI_API_KEY", "").strip()
         self._openai_client = None
@@ -250,6 +265,96 @@ class TtsNode(Node):
             except Exception as e:
                 self.get_logger().error(f"Playback loop hatası: {e}")
 
+    # ------------------------------------------------------------------
+    # XTTS — yerel ses klonlama (bkz. xtts_client.py, scripts/install_xtts.sh)
+    # ------------------------------------------------------------------
+    def _resolve_speaker_wav(self, xtts_home: str) -> str:
+        configured = os.getenv("TTS_XTTS_SPEAKER_WAV", "")
+        if configured and os.path.exists(configured):
+            return configured
+        try:
+            from ament_index_python.packages import get_package_share_directory
+
+            packaged = os.path.join(get_package_share_directory("astro_audio"), "voices", "astro.wav")
+            if os.path.exists(packaged):
+                return packaged
+        except Exception:
+            pass
+        return os.path.join(xtts_home, "Recording.wav") if xtts_home else ""
+
+    def _init_xtts(self):
+        if XttsClient is None:
+            self.get_logger().error("xtts_client yüklenemedi — bulut motorlara düşülüyor")
+            return
+
+        xtts_home = os.getenv("TTS_XTTS_HOME", "") or os.path.expanduser("~/.astro/tts")
+        speaker_wav = self._resolve_speaker_wav(xtts_home)
+        self.xtts = XttsClient(
+            speaker_wav=speaker_wav,
+            home=xtts_home,
+            language=os.getenv("TTS_LANGUAGE", "tr"),
+            device=os.getenv("TTS_XTTS_DEVICE", "auto"),
+            half=os.getenv("TTS_XTTS_HALF", "1") not in ("0", "false", "False"),
+            batch_size=int(os.getenv("TTS_XTTS_BATCH_SIZE", "4")),
+            model_dir=os.getenv("TTS_XTTS_MODEL_DIR", "") or None,
+            checkpoint=os.getenv("TTS_XTTS_CHECKPOINT", "") or None,
+            config=os.getenv("TTS_XTTS_CONFIG", "") or None,
+            vocab=os.getenv("TTS_XTTS_VOCAB", "") or None,
+            speakers=os.getenv("TTS_XTTS_SPEAKERS", "") or None,
+            logger=lambda lvl, msg: getattr(self.get_logger(), lvl, self.get_logger().debug)(msg),
+        )
+
+        problem = self.xtts.check_install()
+        if problem:
+            self.get_logger().error(f"XTTS kullanılamıyor — {problem}")
+            self.xtts = None
+            return
+        try:
+            self.xtts.start()
+        except XttsError as exc:
+            self.get_logger().error(f"XTTS başlatılamadı: {exc}")
+            self.xtts = None
+            return
+
+        self.get_logger().info("⏳ [TTS] XTTS yükleniyor — hazır olana kadar bulut motorlar kullanılacak")
+        threading.Thread(target=self._await_xtts_ready, daemon=True).start()
+
+    def _await_xtts_ready(self):
+        try:
+            info = self.xtts.wait_ready(float(os.getenv("TTS_XTTS_STARTUP_TIMEOUT_S", "300")))
+        except XttsError as exc:
+            self.get_logger().error(f"XTTS hazır değil: {exc}")
+            self.xtts = None
+            return
+        model_label = "kendi modeliniz" if info.get("custom_model") else "hazır xtts_v2"
+        self.get_logger().info(
+            f"✅ [TTS] XTTS hazır ({model_label}, cihaz: {info.get('device')}"
+            f"{', fp16' if info.get('half') else ''})"
+        )
+
+    def _synthesize_xtts(self, text: str):
+        """XTTS ile sentezleyip WAV baytlarını döndürür; hata olursa None."""
+        if self.xtts is not None and self.xtts.info and not self.xtts.is_alive:
+            self.get_logger().error(
+                f"XTTS süreci sonlandı (kod {self.xtts.returncode}) — bulut motorlara geçiliyor"
+            )
+            self.xtts = None
+            return None
+
+        tmp_path = None
+        try:
+            fd, tmp_path = tempfile.mkstemp(suffix=".wav")
+            os.close(fd)
+            self.xtts.synthesize(text, tmp_path, timeout=self.xtts_timeout)
+            with open(tmp_path, "rb") as f:
+                return f.read()
+        except XttsError as exc:
+            self.get_logger().error(f"XTTS hatası: {exc}")
+            return None
+        finally:
+            if tmp_path and os.path.exists(tmp_path):
+                os.remove(tmp_path)
+
     def _synthesize_and_play_memory(self, item):
         with self._generation_lock:
             current_gen = self._generation
@@ -269,8 +374,12 @@ class TtsNode(Node):
             self.get_logger().info(f'🔊 [TTS Okuyor] ({engine_str}): "{text}"')
             wav_data = None
 
+            # 0. Yerel XTTS (internet gerekmez, klonlanmış ses)
+            if not force_edge and self.xtts is not None and self.xtts.is_ready:
+                wav_data = self._synthesize_xtts(text)
+
             # 1. Try Primary OpenAI TTS-1 (Natural Human Inflection & Direct WAV)
-            if not force_edge and self.tts_engine == "openai" and self._openai_client:
+            if not wav_data and not force_edge and self.tts_engine == "openai" and self._openai_client:
                 try:
                     resp = self._openai_client.audio.speech.create(
                         model="tts-1",

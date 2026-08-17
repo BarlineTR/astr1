@@ -33,6 +33,11 @@ except ImportError:
     from voice_recognizer import VoiceRecognizer
 
 try:
+    from faster_whisper import WhisperModel
+except ImportError:
+    WhisperModel = None
+
+try:
     from groq import Groq
 except ImportError:
     Groq = None
@@ -132,7 +137,14 @@ class SpeechRecognitionNode(Node):
             except Exception as e:
                 self.get_logger().debug(f"Groq client notice: {e}")
 
-        if not self.openai_client and not self.groq_client:
+        # Yerel motor (varsayılan): internet ve API anahtarı gerektirmez.
+        # .env -> STT_ENGINE="faster-whisper" | "groq" | "openai"
+        self.stt_engine = os.getenv("STT_ENGINE", "faster-whisper").strip().lower()
+        self.fw_model = None
+        if self.stt_engine in ("faster-whisper", "faster_whisper"):
+            self._init_faster_whisper()
+
+        if not self.fw_model and not self.openai_client and not self.groq_client:
             self.get_logger().error("❌ [STT] Ne OPENAI_API_KEY ne de GROQ_API_KEY bulunamadı! STT devre dışı.")
             self.enabled = False
             return
@@ -298,6 +310,34 @@ class SpeechRecognitionNode(Node):
                 my_seq = self._stt_sequence
             threading.Thread(target=self._transcribe, args=(audio_data, my_seq), daemon=True).start()
 
+    def _init_faster_whisper(self) -> bool:
+        """Yerel faster-whisper modelini yükler; CUDA yoksa CPU'ya düşer."""
+        if WhisperModel is None:
+            self.get_logger().warn("faster-whisper kurulu değil — bulut motorlar denenecek")
+            return False
+
+        name = os.getenv("STT_FW_MODEL", "large-v2")
+        device = os.getenv("STT_FW_DEVICE", "cuda")
+        compute = os.getenv("STT_FW_COMPUTE_TYPE", "float16")
+        try:
+            self.get_logger().info(f"Yerele yükleniyor: Faster-Whisper ({name}, {device}, {compute})...")
+            try:
+                self.fw_model = WhisperModel(name, device=device, compute_type=compute)
+            except Exception as exc:
+                if device != "cuda":
+                    raise
+                compute = os.getenv("STT_FW_CPU_COMPUTE_TYPE", "int8")
+                self.get_logger().warn(f"CUDA ile yüklenemedi ({exc}) — CPU moduna düşülüyor")
+                device = "cpu"
+                self.fw_model = WhisperModel(name, device="cpu", compute_type=compute)
+        except Exception as e:
+            self.get_logger().error(f"❌ [STT] Faster-Whisper yüklenemedi: {e}")
+            self.fw_model = None
+            return False
+
+        self.get_logger().info(f"✅ [STT] Faster-Whisper hazır (model: {name}, cihaz: {device})")
+        return True
+
     def _transcribe(self, audio_data: list[int], seq: int):
         try:
             arr = np.array(audio_data, dtype=np.int16)
@@ -371,8 +411,19 @@ class SpeechRecognitionNode(Node):
                 self.get_logger().info(f"🎙️ [Ses Tanıma]: {spk_name} ({spk_meta.get('formal_title', '')}) (Güven: {spk_conf:.2f})")
 
             text = None
+            # 0. Yerel Faster-Whisper (internet gerekmez, GPU'da hızlı)
+            if self.fw_model is not None:
+                try:
+                    audio_f32 = arr.astype(np.float32) / 32768.0
+                    segments, _info = self.fw_model.transcribe(
+                        audio_f32, beam_size=5, language="tr"
+                    )
+                    text = "".join(seg.text for seg in segments).strip()
+                except Exception as fe:
+                    self.get_logger().warn(f"⚠️ [Faster-Whisper] Hatası ({fe}), bulut motorlara geçiliyor...")
+
             # 1. Ultra-Fast Groq Whisper Large V3 (80ms Latency)
-            if self.groq_client:
+            if not text and self.groq_client:
                 try:
                     result = self.groq_client.audio.transcriptions.create(
                         file=("speech.wav", wav_bytes),
