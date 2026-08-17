@@ -106,6 +106,7 @@ class SpeechRecognitionNode(Node):
     def __init__(self):
         super().__init__('speech_recognition_node')
 
+        self.enabled = True
         _load_env()
         self.openai_api_key = os.environ.get("OPENAI_API_KEY", "").strip() or os.environ.get("AI_API_KEY", "").strip()
         self.groq_api_key = os.environ.get("GROQ_API_KEY", "").strip()

@@ -1132,6 +1132,9 @@ class AiBrainNode(Node):
         text_lower = text.lower()
         return any(k in text_lower for k in keywords)
 
+    def _start_idle_learning(self):
+        threading.Thread(target=self._idle_learning_loop, daemon=True).start()
+
     def _query_groq_vision_for_idle(self, prompt: str, base64_image: str) -> str | None:
         """Free background room observation using Groq Vision or Gemini REST (Zero OpenAI token cost)."""
         # 1. Try Groq Vision

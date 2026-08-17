@@ -122,24 +122,24 @@ class SpatialVisionNode(Node):
         return float(np.clip(distance, 0.3, 4.0))
 
     def _estimate_head_yaw(self, face_roi_gray, w, h) -> tuple[float, bool]:
-        """Calculates yaw angle and strictly verifies eye visibility to reject back-of-head false detections."""
+        """Calculates yaw angle and strictly verifies eye visibility to reject side/back-of-head false detections."""
         roi = cv2.resize(face_roi_gray[:int(h * 0.6), :], (96, 54), interpolation=cv2.INTER_AREA) if w > 96 else face_roi_gray[:int(h * 0.6), :]
         rw = roi.shape[1]
-        eyes = self.eye_cascade.detectMultiScale(roi, scaleFactor=1.15, minNeighbors=3, minSize=(10, 10))
+        eyes = self.eye_cascade.detectMultiScale(roi, scaleFactor=1.12, minNeighbors=3, minSize=(10, 10))
         if len(eyes) >= 2:
             eyes_sorted = sorted(eyes, key=lambda e: e[0])
             left_eye_center = eyes_sorted[0][0] + eyes_sorted[0][2] / 2.0
             right_eye_center = eyes_sorted[-1][0] + eyes_sorted[-1][2] / 2.0
             eye_midpoint = (left_eye_center + right_eye_center) / 2.0
             face_center = rw / 2.0
-            yaw_deg = float(((eye_midpoint - face_center) / face_center) * 35.0)
+            yaw_deg = float(((eye_midpoint - face_center) / face_center) * 40.0)
             return yaw_deg, True
         elif len(eyes) == 1:
             eye_x = eyes[0][0] + eyes[0][2] / 2.0
-            yaw_deg = -20.0 if eye_x < rw / 2.0 else 20.0
+            yaw_deg = -25.0 if eye_x < rw / 2.0 else 25.0
             return yaw_deg, True
-        # Frontal face cascade already confirms a frontal face ROI; default to facing forward (yaw=0°)
-        return 0.0, True
+        # If no eyes are detected, user is NOT looking at the robot!
+        return 45.0, False
 
     def _detect_facial_emotion(self, face_roi_gray, w, h) -> str:
         """Determines emotion (happy/smiling, surprised, sad/neutral) based on mouth and eyes geometry."""
@@ -179,17 +179,17 @@ class SpatialVisionNode(Node):
 
         detected_faces = self.face_cascade.detectMultiScale(
             small_gray,
-            scaleFactor=1.1,
-            minNeighbors=3,
-            minSize=(24, 24),
+            scaleFactor=1.12,
+            minNeighbors=5,
+            minSize=(36, 36),
         )
 
         if len(detected_faces) == 0 and hasattr(self, 'face_alt_cascade'):
             detected_faces = self.face_alt_cascade.detectMultiScale(
                 small_gray,
-                scaleFactor=1.1,
-                minNeighbors=3,
-                minSize=(24, 24),
+                scaleFactor=1.12,
+                minNeighbors=5,
+                minSize=(36, 36),
             )
 
         # Map bounding boxes back to original resolution
@@ -200,13 +200,12 @@ class SpatialVisionNode(Node):
 
         # Temporal smoothing for face detection dropouts
         if len(faces) == 0 and hasattr(self, '_last_known_face') and self._last_known_face is not None:
-            if self._face_lost_frames < 8:  # Tolerate up to 8 frames of lost face
+            if self._face_lost_frames < 6:
                 faces = [self._last_known_face]
                 self._face_lost_frames += 1
             else:
                 self._last_known_face = None
         elif len(faces) > 0:
-            # Sort by size to track the largest face
             faces = sorted(faces, key=lambda f: f[2]*f[3], reverse=True)
             self._last_known_face = faces[0]
             self._face_lost_frames = 0
@@ -233,8 +232,8 @@ class SpatialVisionNode(Node):
             dist_m = self._estimate_distance(x, y, w, h, frame_w, frame_h)
             user_distance = dist_m
 
-            # 3. Direct Gaze: Eyes MUST be visible AND yaw <= 30 degrees AND strictly in Social Zone (0.35m - 2.50m)
-            direct_gaze = eyes_found and (abs(yaw) <= 30.0) and (0.35 <= dist_m <= 2.50)
+            # 3. Direct Gaze: Eyes MUST be visible AND yaw <= 22 degrees AND strictly in Social Zone (0.40m - 2.20m)
+            direct_gaze = eyes_found and (abs(yaw) <= 22.0) and (0.40 <= dist_m <= 2.20)
             if direct_gaze:
                 is_looking = True
 
