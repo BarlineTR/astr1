@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import os
 import sys
+import time
 import unittest
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "astro_ai")))
@@ -58,6 +59,15 @@ class TestMemoryManager(unittest.TestCase):
         self.assertIn("Astro", prompt_ctx)
         self.assertIn("Baran", prompt_ctx)
 
+        # Persistent Reminders
+        mem.profile.add_active_reminder(target_time=time.time() - 10.0, reminder_text="Çay iç", user_name="Baran")
+        mem.profile.add_active_reminder(target_time=time.time() + 600.0, reminder_text="Gelecek Hatırlatıcı", user_name="Baran")
+        self.assertEqual(len(mem.profile.get_active_reminders()), 2)
+        due = mem.profile.get_and_pop_due_reminders()
+        self.assertEqual(len(due), 1)
+        self.assertEqual(due[0]["reminder_text"], "Çay iç")
+        self.assertEqual(len(mem.profile.get_active_reminders()), 1)
+
 
 class TestPersonaAndSession(unittest.TestCase):
     def test_persona_engine(self):
@@ -73,6 +83,14 @@ class TestPersonaAndSession(unittest.TestCase):
         self.assertNotIn("flörtöz", playful_prompt)
         self.assertNotIn("çapkın", playful_prompt)
 
+        # Proactive Greeting Synthesis
+        greeting, emo = engine_playful.build_proactive_greeting(
+            identity={"name": "Baran", "is_known": True, "role_category": "creator"},
+            user_emotion="happy"
+        )
+        self.assertIn("Baran", greeting)
+        self.assertEqual(emo, "playful")
+
         # TTS Cleaning
         cleaned = clean_tts_text("<think>reasoning</think> Merhaba dostum! 😄")
         self.assertEqual(cleaned, "Merhaba dostum!")
@@ -80,7 +98,8 @@ class TestPersonaAndSession(unittest.TestCase):
     def test_session_lifecycle_and_fuzzy_wake(self):
         session = ConversationSession(base_timeout_s=0.1)
         session.activate_session()
-        self.assertTrue(session.is_active)
+        self.assertTrue(session.is_active())
+        self.assertTrue(session.active)
 
         # Exact wake word
         has_wake, clean = session.is_wake_word("Hey Astro nasılsın?")

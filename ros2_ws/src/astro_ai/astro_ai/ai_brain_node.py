@@ -234,8 +234,6 @@ class AiBrainNode(Node):
         self.create_subscription(Image, "/oak/rgb/image_raw", self._on_camera_image, 10)
 
         # Timers
-        self._reminder_lock = threading.Lock()
-        self._active_reminders: list[dict] = []
         self.create_timer(0.15, self._check_proactive_gaze)
         self.create_timer(1.0, self._check_session_lifecycle)
         self.create_timer(1.0, self._check_reminders)
@@ -435,39 +433,14 @@ class AiBrainNode(Node):
                     self._looking_start_time = None
 
                 identity = self._get_active_biometric_identity()
-                persona = self.persona_engine.current_persona
+                proactive_greeting, greeting_emo = self.persona_engine.build_proactive_greeting(
+                    identity=identity,
+                    user_emotion=self._user_emotion,
+                    speaker_gender=self._speaker_gender
+                )
+                self._publish_emotion(greeting_emo)
 
-                # Personalized Proactive Greeting
-                if identity.get("is_known"):
-                    off = find_official_by_name_or_alias(identity.get("name", ""))
-                    if off:
-                        proactive_greeting = get_official_greeting(off)
-                        self._publish_emotion("formal")
-                    elif "baran" in identity.get("name", "").lower():
-                        proactive_greeting = "Selam Baran! Çalışmalara tam gaz devam mı?"
-                        self._publish_emotion("playful")
-                    else:
-                        formal = identity.get("formal_title") or identity.get("name")
-                        proactive_greeting = f"Merhaba {formal}! Seni gördüğüme çok sevindim, nasıl yardımcı olabilirim?"
-                        self._publish_emotion(persona)
-                else:
-                    if persona == "flirt":
-                        proactive_greeting = "Merhaba! Harika bir gün, nasıl yardımcı olabilirim?"
-                        self._publish_emotion("flirt")
-                    elif persona == "playful":
-                        if self._user_emotion == "happy":
-                            proactive_greeting = "Gözlerinin içi gülüyor, harika! Nasıl yardımcı olabilirim?"
-                        else:
-                            proactive_greeting = "Merhaba! Sana nasıl yardımcı olabilirim?"
-                        self._publish_emotion("playful")
-                    elif persona == "formal":
-                        proactive_greeting = "Saygılar efendim, bir emriniz var mıdır?"
-                        self._publish_emotion("formal")
-                    else:
-                        proactive_greeting = "Merhaba! Sana nasıl yardımcı olabilirim?"
-                        self._publish_emotion(persona)
-
-                self.get_logger().info(f"👁️ [Proaktif Etkileşim] ({persona}): \"{proactive_greeting}\"")
+                self.get_logger().info(f"👁️ [Proaktif Etkileşim] ({greeting_emo}): \"{proactive_greeting}\"")
                 self._publish_gesture("nod")
                 self._publish_tts(proactive_greeting)
 
@@ -1001,20 +974,11 @@ class AiBrainNode(Node):
         return "Eylem tamamlandı."
 
     def _check_reminders(self):
-        """Active scheduler loop ticking every second to trigger due reminders."""
-        now = time.monotonic()
-        due_reminders = []
-        with self._reminder_lock:
-            remaining = []
-            for r in self._active_reminders:
-                if now >= r["target_time"]:
-                    due_reminders.append(r)
-                else:
-                    remaining.append(r)
-            self._active_reminders = remaining
+        """Active scheduler loop ticking every second to trigger due reminders from persistent memory."""
+        due_reminders = self.memory.profile.get_and_pop_due_reminders()
 
         for r in due_reminders:
-            txt = r["reminder_text"]
+            txt = r.get("reminder_text", "")
             name = r.get("user_name", self._default_user_name)
             if "çay" in txt.lower():
                 msg = f"Hey {name}! Hatırlatmamı istediğin vakit geldi: Çay içme zamanı! Sıcak bir çay iyi gelir, afiyet olsun."
@@ -1031,18 +995,12 @@ class AiBrainNode(Node):
             self._publish_tts(msg)
 
     def _add_reminder(self, mins: float, topic: str) -> str:
-        """Shared helper: creates a reminder entry and returns the resolved user name."""
+        """Shared helper: creates a persistent reminder entry and returns the resolved user name."""
         mins = max(0.0, mins)  # Guard against negative durations
-        target_t = time.monotonic() + (mins * 60.0)
+        target_t = time.time() + (mins * 60.0)
         identity = self._get_active_biometric_identity()
         user_name = identity.get("name") if identity.get("is_known") else self._default_user_name
-        with self._reminder_lock:
-            self._active_reminders.append({
-                "target_time": target_t,
-                "reminder_text": topic,
-                "user_name": user_name
-            })
-        self.memory.profile.add_memory(f"Hatırlatıcı: {topic} ({int(mins)} dk sonra)")
+        self.memory.profile.add_active_reminder(target_t, topic, user_name)
         return user_name
 
     def _is_reminder_query(self, text: str) -> Tuple[bool, float, str]:

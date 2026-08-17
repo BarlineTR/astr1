@@ -72,8 +72,12 @@ class ConversationSession:
 
         self.latency_tracker = LatencyTracker()
 
-    @property
     def is_active(self) -> bool:
+        with self._lock:
+            return self._is_active
+
+    @property
+    def active(self) -> bool:
         with self._lock:
             return self._is_active
 

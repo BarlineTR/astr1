@@ -163,6 +163,7 @@ class SpeechRecognitionNode(Node):
         self._tts_speaking_start_time: float | None = None
         self._last_tts_end_time: float | None = None
         self._session_active: bool = False
+        self._ambient_rms: float = 100.0
         self._recent_tts_phrases: list[tuple[str, float]] = []  # (phrase_lower, timestamp)
 
         # Guards against concurrent / out-of-order transcription results
@@ -225,6 +226,12 @@ class SpeechRecognitionNode(Node):
             # If speaking, record to speech buffer
             if self._is_speaking:
                 self._buffer.extend(data)
+            elif len(data) >= 320:
+                # Track ambient noise floor during non-speech frames
+                chunk_arr = np.array(data, dtype=np.int16)
+                c_rms = float(np.sqrt(np.mean(chunk_arr.astype(np.float32)**2)))
+                if c_rms < 1500.0:
+                    self._ambient_rms = 0.95 * self._ambient_rms + 0.05 * c_rms
 
     def _vad_cb(self, msg: Bool):
         if not self.enabled:
@@ -280,8 +287,12 @@ class SpeechRecognitionNode(Node):
             max_amp = float(np.max(np.abs(arr)))
             total_rms = float(np.sqrt(np.mean(arr.astype(np.float32)**2)))
             
+            # Dynamic thresholding based on ambient noise floor
+            dynamic_min_rms = max(self._min_rms, self._ambient_rms * 1.4)
+            dynamic_chunk_rms = max(self._chunk_rms, self._ambient_rms * 1.6)
+
             # Reject ambient floor noise and breathing
-            if max_amp < self._min_peak or total_rms < self._min_rms:
+            if max_amp < self._min_peak or total_rms < dynamic_min_rms:
                 return
 
             # 2. Acoustic Speech Density Verification (20ms frames)
@@ -295,7 +306,7 @@ class SpeechRecognitionNode(Node):
                 c = arr[i * chunk_size : (i + 1) * chunk_size]
                 c_rms = np.sqrt(np.mean(c.astype(np.float32)**2))
                 c_peak = np.max(np.abs(c))
-                if c_rms > self._chunk_rms and c_peak > self._chunk_peak:
+                if c_rms > dynamic_chunk_rms and c_peak > self._chunk_peak:
                     voice_chunks += 1
 
             voice_ratio = voice_chunks / num_chunks

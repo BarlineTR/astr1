@@ -248,3 +248,52 @@ class PersonaEngine:
         if not tag_parts:
             return ""
         return f"[{', '.join(tag_parts)}] "
+
+    def build_proactive_greeting(
+        self,
+        identity: Optional[Dict[str, Any]] = None,
+        user_emotion: str = "neutral",
+        speaker_gender: str = "unknown"
+    ) -> tuple[str, str]:
+        """Synthesizes an appropriate proactive greeting based on recognized identity and persona.
+        Returns: (greeting_text, emotion_name)
+        """
+        identity = identity or {}
+        persona = self.current_persona
+
+        if identity.get("is_known"):
+            name = identity.get("name", "")
+            title = identity.get("title", "")
+            role_cat = identity.get("role_category", identity.get("category", ""))
+            
+            # Government / Protocol greeting
+            if role_cat in ["governor", "mayor", "district_governor", "head_of_state"] or "Vali" in title or "Başkan" in title or "Kaymakam" in title:
+                formal = identity.get("formal_title") or title or name
+                return f"Sayın {formal}, hoş geldiniz! Sizi gördüğüme çok sevindim, emrinizdeyim.", "formal"
+            elif role_cat == "creator" or "baran" in name.lower():
+                return f"Selam {name}! Çalışmalara tam gaz devam mı?", "playful"
+            else:
+                formal = identity.get("formal_title") or name
+                return f"Merhaba {formal}! Seni gördüğüme çok sevindim, nasıl yardımcı olabilirim?", persona
+
+        # Unknown Person / Guest
+        if persona == "flirt":
+            if speaker_gender == "female":
+                return "Merhaba güzellik! Harika bir gün, sana nasıl yardımcı olabilirim?", "flirt"
+            return "Merhaba kral! Nasıl yardımcı olabilirim?", "flirt"
+        elif persona == "playful":
+            if user_emotion == "happy":
+                return "Gözlerinin içi gülüyor, harika! Nasıl yardımcı olabilirim?", "playful"
+            return "Merhaba! Sana nasıl yardımcı olabilirim?", "playful"
+        elif persona == "formal":
+            return "Saygılar efendim, bir emriniz var mıdır?", "formal"
+        elif persona == "sarcastic":
+            return "Vay, kimleri görüyorum! Yine ne yardım istiyorsun bakalım?", "sarcastic"
+        elif persona == "emotional":
+            return "Merhaba, seni görmek içimi ısıttı. Nasıl yardımcı olabilirim?", "emotional"
+        elif persona == "angry":
+            return "Ne bakıyorsun öyle? Ne istiyorsun?", "angry"
+        elif persona == "rude":
+            return "Ne var birader, ne dik dik bakıyorsun?", "rude"
+
+        return "Merhaba! Sana nasıl yardımcı olabilirim?", persona

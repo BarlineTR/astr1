@@ -235,6 +235,41 @@ class PersistentProfile:
                 self.data["user_style_notes"] = style_note
                 self.save()
 
+    def add_active_reminder(self, target_time: float, reminder_text: str, user_name: str):
+        """Persistently saves an active reminder (wall-clock timestamp)."""
+        with self._lock:
+            reminders = self.data.setdefault("active_reminders", [])
+            reminders.append({
+                "target_time": target_time,
+                "reminder_text": reminder_text,
+                "user_name": user_name,
+                "created_at": time.time()
+            })
+            self.save()
+
+    def get_and_pop_due_reminders(self, now: Optional[float] = None) -> List[Dict[str, Any]]:
+        """Atomically retrieves and removes due reminders from persistent storage."""
+        if now is None:
+            now = time.time()
+        due = []
+        with self._lock:
+            reminders = self.data.get("active_reminders", [])
+            remaining = []
+            for r in reminders:
+                if now >= float(r.get("target_time", 0.0)):
+                    due.append(r)
+                else:
+                    remaining.append(r)
+            self.data["active_reminders"] = remaining
+            if due:
+                self.save()
+        return due
+
+    def get_active_reminders(self) -> List[Dict[str, Any]]:
+        with self._lock:
+            return list(self.data.get("active_reminders", []))
+
+
 
 class MemoryManager:
     """Unified coordinator for 3-tier memory."""
