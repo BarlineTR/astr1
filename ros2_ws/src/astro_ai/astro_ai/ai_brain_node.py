@@ -545,14 +545,52 @@ class AiBrainNode(Node):
             is_visual = self._is_visual_query(user_text)
             is_learning_obj = self._is_object_learning_query(user_text)
             is_learning_person = self._is_person_learning_query(user_text)
+            is_identity = self._is_identity_query(user_text)
+            is_weather, weather_city = self._is_weather_query(user_text)
             base64_img = frame_to_base64_jpeg(frame, max_dim=512) if frame is not None and (is_visual or is_learning_obj) else None
             persona = self.persona_engine.current_persona
 
-            # 1. Person Introduction & Biometric Enrollment
+            # 1. Live Weather Tool Direct Handling
+            if is_weather:
+                weather_res = self._execute_tool_call("get_live_weather", {"city": weather_city}, frame)
+                clean_ans = clean_tts_text(weather_res)
+                self.get_logger().info(f"🌤️ [Hava Durumu ({weather_city})]: \"{clean_ans}\"")
+                self.get_logger().info(f"🤖 [Astro]: \"{clean_ans}\"")
+                self._publish_tts(clean_ans)
+                self._publish_emotion(persona)
+                self.memory.episodic.add_message("assistant", clean_ans)
+                return
+
+            # 2. Identity Query ("Ben kimim? / Beni tanıyor musun?")
+            if is_identity and not is_learning_person:
+                identity = self._get_active_biometric_identity()
+                if identity.get("is_known"):
+                    name = identity.get("name", "")
+                    formal = identity.get("formal_title") or name
+                    if "baran" in name.lower():
+                        ans = "Sen benim baş mühendisim ve geliştiricim Baran'sın! Bitlis'te beni sıfırdan tasarlayan ve kodlayan yaratıcımsın."
+                    else:
+                        ans = f"Sen benim hafızamda kayıtlı olan {formal} {name}'sın! Seni sesinden ve yüzünden tanıyorum."
+                else:
+                    ans = "Hafızamda seninle ilgili henüz bir profil bulunmuyor. İstersen 'Benim adım ... beni hafızana kaydet' diyerek yüzünü ve sesini bana tanıtabilirsin!"
+                self.get_logger().info(f"🤖 [Astro]: \"{ans}\"")
+                self._publish_tts(ans)
+                self._publish_emotion(persona)
+                self.memory.episodic.add_message("assistant", ans)
+                return
+
+            # 3. Person Introduction & Biometric Enrollment
             if is_learning_person:
-                m = re.search(r"(?i)(?:benim adım|adım|ben)\s+([a-zA-ZçğıöşüÇĞİÖŞÜ]+)", user_text)
-                cand_name = m.group(1).strip().capitalize() if m else "Dostum"
-                tool_res = self._execute_tool_call("enroll_person_profile", {"name": cand_name, "title": "Tanışılan Kişi"}, frame)
+                text_lower = user_text.lower()
+                if "baran" in text_lower or "geliştirici" in text_lower:
+                    cand_name = "Baran"
+                    cand_title = "Baş Mühendis & Geliştirici"
+                else:
+                    m = re.search(r"(?i)(?:benim adım|adım|ben)\s+([a-zA-ZçğıöşüÇĞİÖŞÜ]+)", user_text)
+                    cand_name = m.group(1).strip().capitalize() if m else "Dostum"
+                    cand_title = "Tanışılan Kişi"
+
+                tool_res = self._execute_tool_call("enroll_person_profile", {"name": cand_name, "title": cand_title}, frame)
                 clean_ans = clean_tts_text(tool_res)
                 self.get_logger().info(f"🤖 [Astro]: \"{clean_ans}\"")
                 self._publish_tts(clean_ans)
@@ -560,7 +598,7 @@ class AiBrainNode(Node):
                 self.memory.episodic.add_message("assistant", clean_ans)
                 return
 
-            # 2. Object Learning Tool
+            # 4. Object Learning Tool
             if is_learning_obj and base64_img is not None:
                 self.get_logger().info("🔍 [Özel Nesne Tanıtımı]: Yeni nesne analiz ediliyor...")
                 name_cand = re.sub(r"(?i)(bu benim|bunu öğren|bunu kaydet|bu nesne|buna bak bu)", "", user_text).strip(".:,!") or "Özel Eşya"
@@ -571,7 +609,7 @@ class AiBrainNode(Node):
                 self._publish_emotion(persona)
                 return
 
-            # 3. Visual Query
+            # 5. Visual Query
             if is_visual:
                 if base64_img is not None:
                     self.get_logger().info(f"👁️ [Vision]: OAK-D karesi analiz ediliyor... ({self._vision_model})")
@@ -832,8 +870,37 @@ class AiBrainNode(Node):
 
         return "Eylem tamamlandı."
 
+    def _is_weather_query(self, text: str) -> Tuple[bool, str]:
+        text_l = text.lower()
+        if any(w in text_l for w in ["hava nasıl", "hava durumu", "hava kaç derece", "havalar nasıl", "yağmur var mı", "kar var mı", "sıcaklık kaç", "ahlattı hava"]):
+            if "ahlat" in text_l or "ahlattı" in text_l:
+                return True, "Ahlat"
+            if "bitlis" in text_l:
+                return True, "Bitlis"
+            if "tatvan" in text_l:
+                return True, "Tatvan"
+            if "istanbul" in text_l:
+                return True, "Istanbul"
+            if "ankara" in text_l:
+                return True, "Ankara"
+            if "izmir" in text_l:
+                return True, "Izmir"
+            return True, "Bitlis"
+        return False, ""
+
+    def _is_identity_query(self, text: str) -> bool:
+        text_l = text.lower()
+        return any(q in text_l for q in [
+            "ben kimim", "hafızanda ben kimim", "beni tanıyor musun", "kim olduğumu biliyor musun",
+            "ben kim", "beni hatırladın mı", "beni tanıdın mı"
+        ])
+
     def _is_person_learning_query(self, text: str) -> bool:
-        keywords = ["benim adım", "adım ", "beni tanı", "beni hafızana kaydet", "beni kaydet", "tanışalım"]
+        keywords = [
+            "benim adım", "adım ", "beni tanı", "beni hafızana kaydet", "beni kaydet",
+            "tanışalım", "yüzümü kaydet", "sesimi kaydet", "yüzümü ve sesimi", "geliştiricin",
+            "geliştiricininim", "ben baran", "tara ve hafızana kaydet", "hafızana kaydederim"
+        ]
         text_lower = text.lower()
         return any(k in text_lower for k in keywords)
 
