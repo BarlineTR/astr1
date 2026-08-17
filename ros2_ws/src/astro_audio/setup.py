@@ -17,7 +17,7 @@ setup(
         # XTTS ses klonlaması için referans ses(ler)i
         (os.path.join("share", package_name, "voices"), glob("voices/*.wav")),
     ],
-    install_requires=["setuptools", "edge-tts", "faster-whisper", "requests"],
+    install_requires=["setuptools", "edge-tts", "groq", "sounddevice", "scipy"],
     zip_safe=True,
     maintainer="Baran Eren",
     maintainer_email="baran@example.com",

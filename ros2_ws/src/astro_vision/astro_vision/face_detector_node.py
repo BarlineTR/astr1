@@ -7,7 +7,10 @@ from rclpy.node import Node
 from sensor_msgs.msg import Image
 from std_msgs.msg import Bool, String
 
-from astro_vision.image_utils import bgr_to_imgmsg, imgmsg_to_bgr
+try:
+    from astro_vision.image_utils import bgr_to_imgmsg, imgmsg_to_bgr
+except ImportError:
+    from image_utils import bgr_to_imgmsg, imgmsg_to_bgr
 
 
 class FaceDetectorNode(Node):

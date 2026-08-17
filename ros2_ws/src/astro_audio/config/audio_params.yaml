@@ -5,24 +5,19 @@ audio_capture_node:
     sample_rate: 16000
     channels: 6
     chunk_size: 1024
-    vad_threshold: 0.6
+    vad_threshold: 0.015
 
 speech_recognition_node:
   ros__parameters:
-    model_path: "/opt/vosk/vosk-model-small-tr-0.3"
+    model_path: "vosk-model-small-tr-0.3"
     language: "tr"
     # Vosk yedek modunda kelime kelime parçalamayı azaltır; asıl motor .env STT_ENGINE
     partial_results: false
     silence_timeout_s: 1.5
 
-tts_node:
-  ros__parameters:
-    # engine/voice/elevenlabs_*/xtts_* .env dosyasından okunur
-    # (TTS_ENGINE, ELEVENLABS_*, TTS_XTTS_*)
-    language: "tr"
-    rate: 150
-    volume: 0.8
-    # XTTS (TTS_ENGINE="xtts") — ayrı venv'de çalışan yerel ses klonlama.
-    # Kurulum: ./scripts/install_xtts.sh
-    xtts_startup_timeout_s: 300.0   # ilk açılışta model indirilebilir
-    xtts_timeout_s: 120.0           # tek cümle sentez üst sınırı
+# tts_node burada bilerek yok: ROS parametresi okumaz, tüm ayarları .env'den alır.
+#   TTS_ENGINE ("edge-tts" | "xtts"), TTS_VOICE, TTS_RATE, SAMPLE_RATE
+#   XTTS için: TTS_XTTS_HOME, TTS_XTTS_SPEAKER_WAV, TTS_XTTS_MODEL_DIR,
+#              TTS_XTTS_DEVICE, TTS_XTTS_HALF, TTS_XTTS_BATCH_SIZE,
+#              TTS_XTTS_TIMEOUT_S, TTS_XTTS_STARTUP_TIMEOUT_S
+# Kurulum: ./scripts/install_xtts.sh — bkz. README "Advanced TTS Options"
