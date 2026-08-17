@@ -26,6 +26,11 @@ except ImportError:
     edge_tts = None
 
 try:
+    from openai import OpenAI
+except ImportError:
+    OpenAI = None
+
+try:
     import sounddevice as sd
 except ImportError:
     sd = None
@@ -120,6 +125,8 @@ class TtsNode(Node):
         super().__init__('tts_node')
         _load_env()
 
+        self.tts_engine = os.getenv("TTS_ENGINE", "openai").lower()
+        self.openai_voice = os.getenv("OPENAI_TTS_VOICE", "onyx")
         self.tts_voice = os.getenv("TTS_VOICE", "tr-TR-AhmetNeural")
         self.tts_rate = os.getenv("TTS_RATE", "+25%")
         self.sample_rate = int(os.getenv("SAMPLE_RATE", "16000"))
@@ -127,8 +134,19 @@ class TtsNode(Node):
         self.alsa_device = find_respeaker_alsa_device()
         self.has_aplay = shutil.which("aplay") is not None
 
-        if edge_tts is None:
-            self.get_logger().error("❌ [TTS] edge_tts modülü kurulu değil!")
+        # OpenAI TTS Client
+        self.openai_api_key = os.environ.get("OPENAI_API_KEY", "").strip() or os.environ.get("AI_API_KEY", "").strip()
+        self._openai_client = None
+        if OpenAI and self.openai_api_key and self.openai_api_key.startswith("sk-"):
+            try:
+                self._openai_client = OpenAI(api_key=self.openai_api_key)
+                if self.tts_engine == "openai":
+                    self.get_logger().info(f"🚀 [TTS Node] OpenAI TTS-1 Motoru Aktif! Ses: [{self.openai_voice}] (HD İnsansı Vurgu)")
+            except Exception as e:
+                self.get_logger().error(f"❌ [TTS Node] OpenAI client başlatılamadı: {e}")
+
+        if edge_tts is None and self._openai_client is None:
+            self.get_logger().error("❌ [TTS] Ne OpenAI ne de edge_tts modülü kullanılamıyor!")
 
         # Publishers
         self.pub_speaking = self.create_publisher(Bool, '/tts/speaking', 10)
@@ -140,6 +158,7 @@ class TtsNode(Node):
 
         # Internal state
         self._current_rate = self.tts_rate
+        self._current_speed = 1.05
         self._speak_queue = queue.Queue()
         self._generation = 0
         self._generation_lock = threading.Lock()
@@ -150,7 +169,8 @@ class TtsNode(Node):
         self._playback_thread = threading.Thread(target=self._playback_loop, daemon=True)
         self._playback_thread.start()
 
-        self.get_logger().info(f"🔊 [TTS Node] ALSA ReSpeaker Hazır! Ses: {self.tts_voice} | Çıkış Cihazı: [{self.alsa_device}]")
+        engine_name = f"OpenAI TTS-1 ({self.openai_voice})" if self.tts_engine == "openai" and self._openai_client else f"Edge-TTS ({self.tts_voice})"
+        self.get_logger().info(f"🔊 [TTS Node] ALSA ReSpeaker Hazır! Motor: {engine_name} | Çıkış: [{self.alsa_device}]")
 
     def _on_emotion(self, msg: String):
         emotion = msg.data.lower().strip()
@@ -162,8 +182,17 @@ class TtsNode(Node):
             "formal": "+15%",
             "emotional": "+5%",
         }
+        speed_map = {
+            "angry": 1.20,
+            "rude": 1.15,
+            "sarcastic": 1.10,
+            "playful": 1.08,
+            "formal": 1.00,
+            "emotional": 0.95,
+        }
         if emotion in rate_map:
             self._current_rate = rate_map[emotion]
+            self._current_speed = speed_map.get(emotion, 1.05)
 
     def _on_say(self, msg: String):
         text = clean_tts_text(msg.data)
@@ -209,33 +238,52 @@ class TtsNode(Node):
         with self._generation_lock:
             current_gen = self._generation
 
-        if edge_tts is None or not text:
+        if not text:
             return
 
         try:
             self.get_logger().info(f'🔊 [TTS Okuyor]: "{text}"')
+            wav_data = None
 
-            # 1. In-Memory Synthesis (RAM) using dynamic rate
-            mp3_bytes = asyncio.run(_async_synthesize_bytes(text, self.tts_voice, self._current_rate))
+            # 1. Try Primary OpenAI TTS-1 (Natural Human Inflection & Direct WAV)
+            if self.tts_engine == "openai" and self._openai_client:
+                try:
+                    resp = self._openai_client.audio.speech.create(
+                        model="tts-1",
+                        voice=self.openai_voice,
+                        input=text,
+                        response_format="wav",
+                        speed=self._current_speed
+                    )
+                    wav_data = resp.content
+                except Exception as oai_err:
+                    self.get_logger().warn(f"⚠️ [OpenAI TTS Hatası] ({oai_err}), Edge-TTS yedeğe geçiliyor...")
 
             with self._generation_lock:
                 if current_gen != self._generation:
                     return
 
-            if not mp3_bytes:
-                return
+            # 2. Fallback to Edge-TTS In-Memory Synthesis via FFmpeg
+            if not wav_data and edge_tts is not None:
+                try:
+                    mp3_bytes = asyncio.run(_async_synthesize_bytes(text, self.tts_voice, self._current_rate))
+                    with self._generation_lock:
+                        if current_gen != self._generation:
+                            return
 
-            # 2. Decode MP3 to WAV in memory via FFmpeg
-            ffmpeg_proc = subprocess.Popen(
-                ["ffmpeg", "-loglevel", "quiet", "-i", "pipe:0", "-f", "wav",
-                 "-ar", str(self.sample_rate), "-ac", "1", "pipe:1"],
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL
-            )
-            self._current_ffmpeg = ffmpeg_proc
-            wav_data, _ = ffmpeg_proc.communicate(input=mp3_bytes)
-            self._current_ffmpeg = None
+                    if mp3_bytes:
+                        ffmpeg_proc = subprocess.Popen(
+                            ["ffmpeg", "-loglevel", "quiet", "-i", "pipe:0", "-f", "wav",
+                             "-ar", str(self.sample_rate), "-ac", "1", "pipe:1"],
+                            stdin=subprocess.PIPE,
+                            stdout=subprocess.PIPE,
+                            stderr=subprocess.DEVNULL
+                        )
+                        self._current_ffmpeg = ffmpeg_proc
+                        wav_data, _ = ffmpeg_proc.communicate(input=mp3_bytes)
+                        self._current_ffmpeg = None
+                except Exception as edge_err:
+                    self.get_logger().warn(f"⚠️ [Edge-TTS Hatası]: {edge_err}")
 
             with self._generation_lock:
                 if current_gen != self._generation:
