@@ -115,6 +115,21 @@ def frame_to_base64_jpeg(frame: np.ndarray, max_dim: int = 512) -> str | None:
         return None
 
 
+def is_canned_refusal(text: str) -> bool:
+    """Detects standard LLM safety refusal boilerplate phrases in Turkish & English."""
+    if not text:
+        return False
+    t_lower = text.lower().strip()
+    refusal_patterns = [
+        "yardımcı olamam", "yardımcı olamayacağım", "bu isteğinize yardımcı",
+        "isteğinize yardımcı olamam", "yardımcı olamam maalesef", "üzgünüm, ancak",
+        "üzgünüm, ama lütfen", "daha saygılı bir dil", "bir yapay zeka olarak",
+        "yapay zeka olarak", "uygunsuz içerik", "as an ai", "i cannot assist",
+        "i cannot fulfill", "i am unable to"
+    ]
+    return any(p in t_lower for p in refusal_patterns)
+
+
 class AiBrainNode(Node):
     def __init__(self):
         super().__init__("ai_brain_node")
@@ -257,16 +272,22 @@ class AiBrainNode(Node):
             chat_models = []
             for mid in active_ids:
                 mid_l = mid.lower()
-                if any(x in mid_l for x in ["whisper", "embedding", "guard", "moderation", "tts"]):
+                # Exclude embedding, audio, guardrails, and overly censored moderation models
+                if any(x in mid_l for x in ["whisper", "embedding", "guard", "moderation", "tts", "gpt-oss", "openai"]):
                     continue
                 chat_models.append(mid)
 
             def score(m):
                 ml = m.lower()
-                if "120b" in ml or "70b" in ml or "large" in ml: return 3
-                if "32b" in ml or "27b" in ml or "20b" in ml or "8x7b" in ml: return 2
-                if "8b" in ml or "mini" in ml or "flash" in ml: return 1
-                return 0
+                if "llama-3.3-70b" in ml: return 10
+                if "llama-3.1-70b" in ml: return 9
+                if "llama-3-70b" in ml: return 8
+                if "qwen" in ml: return 7
+                if "llama-3.3" in ml or "llama-3.1-8b" in ml: return 6
+                if "mixtral" in ml: return 5
+                if "70b" in ml: return 4
+                if "8b" in ml: return 3
+                return 1
 
             chat_models.sort(key=score, reverse=True)
             return chat_models
@@ -446,19 +467,43 @@ class AiBrainNode(Node):
 
     def _check_persona_switch(self, text: str) -> bool:
         text_lower = text.lower()
-        mapping = {
-            "flörtöz": "flirt", "çapkın": "flirt", "piç": "flirt", "romantik": "flirt", "kızlara yürü": "flirt",
-            "duygusal": "emotional", "hisli": "emotional", "resmi": "formal", "ciddi": "formal", "saygılı": "formal",
-            "alaycı": "sarcastic", "sarkastik": "sarcastic", "öfkeli": "angry", "asabi": "angry",
-            "kaba": "rude", "dobra": "rude", "şakacı": "playful", "neşeli": "playful", "normal": "playful"
+        persona_keywords = {
+            "flirt": [
+                "flört", "flirt", "flörtöz", "çapkın", "yavşak", "yavsak", "yapışak", "yapisak",
+                "yavuşak", "yavus", "yavşar", "kızlara yürü", "çapkınlık", "romantik", "piç",
+                "astroflirt", "astroflört"
+            ],
+            "rude": [
+                "kaba", "dobra", "sert", "ters", "küfürlü", "kaba saba", "saygısız"
+            ],
+            "angry": [
+                "öfkeli", "asabi", "kızgın", "sinirli", "agresif", "öfke", "hırçın"
+            ],
+            "playful": [
+                "şakacı", "neşeli", "normal", "sempatik", "standart", "varsayılan", "tatlı",
+                "oyuncu", "dostane", "eski haline", "eski mod"
+            ],
+            "formal": [
+                "resmi", "ciddi", "saygılı", "protokol", "efendi", "kibar", "resmiyet"
+            ],
+            "sarcastic": [
+                "alaycı", "sarkastik", "ironik", "iğneleyici", "gıcık", "laf sok"
+            ],
+            "emotional": [
+                "duygusal", "hisli", "duygulu", "romantizm", "aşık", "duygu"
+            ]
         }
-        for key, p_name in mapping.items():
-            if key in text_lower and any(tr in text_lower for tr in ["ol", "geç", "mod", "davran", "konuş"]):
-                self.persona_engine.set_persona(p_name)
-                self.memory.profile.set_persona(p_name)
-                self.get_logger().info(f"🎭 [Kişilik Değişti]: Yeni Mod -> {p_name.upper()}")
-                self._publish_emotion(p_name)
-                return True
+        verbs = ["ol", "geç", "mod", "davran", "konuş", "takıl", "aç", "başla", "geçiş", "moduna", "gibi", "misin", "eder misin", "yapar mısın", "et"]
+
+        for p_name, keywords in persona_keywords.items():
+            for kw in keywords:
+                if kw in text_lower:
+                    if any(v in text_lower for v in verbs) or kw in ["astroflirt", "astroflört", "yavşar", "kızlara yürü", "laf sok"]:
+                        self.persona_engine.set_persona(p_name)
+                        self.memory.profile.set_persona(p_name)
+                        self.get_logger().info(f"🎭 [Kişilik Değişti]: Yeni Mod -> {p_name.upper()} ('{kw}' algılandı)")
+                        self._publish_emotion(p_name)
+                        return True
         return False
 
     def _on_speech(self, msg: String):
@@ -747,6 +792,26 @@ class AiBrainNode(Node):
                 full_text += delta
 
             clean_full = clean_tts_text(full_text)
+
+            # Refusal Detection & In-Character Recovery
+            if is_canned_refusal(clean_full):
+                self.get_logger().warn(f"⚠️ [AI Brain] Model ret/güvenlik cevabı verdi: \"{clean_full}\". Hafızaya kaydedilmiyor, kurtarma yanıtı oluşturuluyor.")
+                # Try fallback to Gemini REST first
+                gemini_text = self._query_gemini_text_rest(system_prompt, user_text, self.memory.episodic.get_messages())
+                if gemini_text and not is_canned_refusal(gemini_text):
+                    clean_full = gemini_text
+                else:
+                    persona_recovery = {
+                        "flirt": "Ooo hızlısın! Lafı dolandırma bakalım, ne diyorsun sen?",
+                        "rude": "Ne diyon birader, ne geveliyorsun?",
+                        "angry": "Bana böyle boş yapma, sadede gel!",
+                        "sarcastic": "Aman ne derin bir konu, cevabı bulmaya işlemcim yetmedi doğrusu!",
+                        "formal": "Buyrun efendim, sizi dikkatle dinlemeye devam ediyorum.",
+                        "emotional": "Bazen hisleri tarif etmek zordur... Seni dinliyorum.",
+                        "playful": "Haha çok ilginçsin! Seni dinliyorum, devam et bakalım!"
+                    }
+                    clean_full = persona_recovery.get(persona, "Seni dinliyorum, devam et bakalım!")
+
             if clean_full and len(clean_full) >= 2:
                 self.get_logger().info(f"🤖 [Astro]: \"{clean_full}\"")
                 self.memory.episodic.add_message("assistant", clean_full)

@@ -38,7 +38,13 @@ class TestStateMachine(unittest.TestCase):
 
 class TestMemoryManager(unittest.TestCase):
     def test_3tier_memory(self):
-        mem = MemoryManager(storage_path="/tmp/test_astro_memory.json")
+        test_path = "/tmp/test_astro_memory.json"
+        if os.path.exists(test_path):
+            try:
+                os.remove(test_path)
+            except Exception:
+                pass
+        mem = MemoryManager(storage_path=test_path)
 
         # Tier 1
         mem.episodic.add_message("user", "Merhaba")
