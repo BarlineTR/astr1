@@ -180,20 +180,7 @@ class AiBrainNode(Node):
             on_session_end=self._on_session_timed_out
         )
 
-        # 1. OpenAI Client (Primary High-Performance LLM & Vision Engine)
-        self.openai_api_key = os.environ.get("OPENAI_API_KEY", "").strip() or os.environ.get("AI_API_KEY", "").strip()
-        self._openai = None
-        self._enabled = False
-
-        if OpenAI and self.openai_api_key and self.openai_api_key.startswith("sk-"):
-            try:
-                self._openai = OpenAI(api_key=self.openai_api_key)
-                self._enabled = True
-                self.get_logger().info(f"🚀 [AI Brain] OpenAI GPT-4o-mini Birincil LLM & Vision Motoru Aktif! (Model: {self._text_model})")
-            except Exception as e:
-                self.get_logger().error(f"❌ [AI Brain] OpenAI client başlatılamadı: {e}")
-
-        # 2. Groq Client (Secondary / Fallback Engine)
+        # 1. Groq Client (Primary Ultra-Fast Free LPU Engine - Zero OpenAI Cost)
         self.groq_api_key = os.environ.get("GROQ_API_KEY", "").strip()
         self._groq = None
         self._active_groq_models = []
@@ -203,9 +190,21 @@ class AiBrainNode(Node):
                 self._groq = Groq(api_key=self.groq_api_key)
                 self._active_groq_models = self._discover_active_groq_models()
                 self._enabled = True
-                self.get_logger().info(f"✅ [AI Brain] Groq Yedek Motoru Hazır (Toplam {len(self._active_groq_models)} Model)")
+                self.get_logger().info(f"🚀 [AI Brain] Groq LPU (Ücretsiz & Ultra Hızlı) Birincil LLM Motoru Aktif! (Toplam {len(self._active_groq_models)} Model)")
             except Exception as e:
                 self.get_logger().debug(f"Groq client notice: {e}")
+
+        # 2. OpenAI Client (Emergency High-Performance Backup Engine)
+        self.openai_api_key = os.environ.get("OPENAI_API_KEY", "").strip() or os.environ.get("AI_API_KEY", "").strip()
+        self._openai = None
+
+        if OpenAI and self.openai_api_key and self.openai_api_key.startswith("sk-"):
+            try:
+                self._openai = OpenAI(api_key=self.openai_api_key)
+                self._enabled = True
+                self.get_logger().info(f"✅ [AI Brain] OpenAI GPT-4o-mini Yedek Motoru Hazır.")
+            except Exception as e:
+                self.get_logger().error(f"❌ [AI Brain] OpenAI client başlatılamadı: {e}")
 
         if not self._openai and not self._groq:
             self.get_logger().error("❌ [AI Brain] Ne OPENAI_API_KEY ne de GROQ_API_KEY bulunamadı! LLM devre dışı.")
@@ -845,34 +844,8 @@ class AiBrainNode(Node):
             full_text = ""
             first_token_time = None
 
-            # 1. Primary LLM Provider (Check if OpenAI is primary or Groq is primary)
-            prefer_openai = self._openai and (self._text_model.startswith("gpt") or not self._groq)
-
-            if prefer_openai:
-                # 1.A. Primary: OpenAI Client (gpt-4o-mini / gpt-4o)
-                try:
-                    stream_resp = self._openai.chat.completions.create(
-                        messages=messages,
-                        model=self._text_model,
-                        temperature=self._temperature,
-                        max_tokens=self._max_tokens,
-                        stream=True,
-                    )
-                    for chunk in stream_resp:
-                        delta = chunk.choices[0].delta.content if chunk.choices and chunk.choices[0].delta else None
-                        if not delta:
-                            continue
-                        if first_token_time is None:
-                            first_token_time = time.monotonic()
-                            self.state_machine.transition_to(RobotState.SPEAKING)
-                        full_text += delta
-                except Exception as oai_err:
-                    self.get_logger().warn(f"⚠️ [OpenAI GPT Stream Hatası] ({oai_err}), Groq yedeğe geçiliyor...")
-                    full_text = ""
-                    first_token_time = None
-
-            # 1.B. Groq LPU Models (Try discovered active models)
-            if not full_text and self._groq and self._active_groq_models:
+            # 1. Primary: Groq LPU Ultra-Fast Free Models (Zero OpenAI cost)
+            if self._groq and self._active_groq_models:
                 for m in self._active_groq_models[:3]:
                     try:
                         stream_resp = self._groq.chat.completions.create(
@@ -898,8 +871,14 @@ class AiBrainNode(Node):
                         first_token_time = None
                         continue
 
-            # 1.C. Secondary OpenAI fallback if Groq was primary and failed
-            if not full_text and not prefer_openai and self._openai:
+            # 2. Secondary Fallback: Free Google Gemini REST
+            if not full_text:
+                gemini_text = self._query_gemini_text_rest(system_prompt, user_text, self.memory.episodic.get_messages())
+                if gemini_text:
+                    full_text = gemini_text
+
+            # 3. Tertiary Emergency Fallback: OpenAI Client (gpt-4o-mini)
+            if not full_text and self._openai:
                 try:
                     stream_resp = self._openai.chat.completions.create(
                         messages=messages,
@@ -918,6 +897,8 @@ class AiBrainNode(Node):
                         full_text += delta
                 except Exception as oai_err:
                     self.get_logger().warn(f"⚠️ [OpenAI GPT Fallback Hatası] ({oai_err})")
+                    full_text = ""
+                    first_token_time = None
                     full_text = ""
                     first_token_time = None
 
