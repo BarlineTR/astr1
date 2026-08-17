@@ -291,12 +291,9 @@ class AiBrainNode(Node):
                 if "llama3-70b" in ml: return 7
                 if "llama3-8b" in ml: return 6
                 if "llama-3.3" in ml or "llama-3.1" in ml: return 5
-                if "mixtral-8x7b" in ml: return 4
-                if "gemma" in ml: return 3
-                if "70b" in ml: return 2
-                if "8b" in ml: return 1
                 return 0
 
+            chat_models = [m for m in chat_models if score(m) >= 5]
             chat_models.sort(key=score, reverse=True)
             return chat_models
         except Exception as e:
@@ -766,12 +763,16 @@ class AiBrainNode(Node):
             if perception_prefix:
                 messages[-1]["content"] = perception_prefix + messages[-1]["content"]
 
-            stream_resp = None
+            full_text = ""
+            first_token_time = None
 
-            # 1. Try Ultra-Fast Groq LPU Client (120ms First-Token Latency)
+            # 1. Try Ultra-Fast Groq LPU Models (Llama 3.3 70B / 8B)
             if self._groq:
-                models_to_try = list(self._active_groq_models) if self._active_groq_models else ["llama-3.3-70b-versatile", "llama-3.1-8b-instant"]
-                for m in models_to_try:
+                groq_candidates = [m for m in self._active_groq_models if any(k in m.lower() for k in ["llama-3.3-70b", "llama-3.1-8b", "llama3-70b", "llama3-8b"])]
+                if not groq_candidates:
+                    groq_candidates = ["llama-3.3-70b-versatile", "llama-3.1-8b-instant"]
+
+                for m in groq_candidates:
                     try:
                         stream_resp = self._groq.chat.completions.create(
                             messages=messages,
@@ -780,13 +781,24 @@ class AiBrainNode(Node):
                             max_tokens=self._max_tokens,
                             stream=True,
                         )
-                        break
+                        for chunk in stream_resp:
+                            delta = chunk.choices[0].delta.content if chunk.choices and chunk.choices[0].delta else None
+                            if not delta:
+                                continue
+                            if first_token_time is None:
+                                first_token_time = time.monotonic()
+                                self.state_machine.transition_to(RobotState.SPEAKING)
+                            full_text += delta
+                        if full_text:
+                            break
                     except Exception as stream_err:
                         self.get_logger().warn(f"⚠️ [Groq Stream Hatası] Model {m}: {stream_err}")
+                        full_text = ""
+                        first_token_time = None
                         continue
 
-            # 2. Try OpenAI Client (gpt-4o-mini)
-            if stream_resp is None and self._openai:
+            # 2. Try OpenAI Client (gpt-4o-mini) if Groq failed or not available
+            if not full_text and self._openai:
                 try:
                     stream_resp = self._openai.chat.completions.create(
                         messages=messages,
@@ -795,42 +807,25 @@ class AiBrainNode(Node):
                         max_tokens=self._max_tokens,
                         stream=True,
                     )
+                    for chunk in stream_resp:
+                        delta = chunk.choices[0].delta.content if chunk.choices and chunk.choices[0].delta else None
+                        if not delta:
+                            continue
+                        if first_token_time is None:
+                            first_token_time = time.monotonic()
+                            self.state_machine.transition_to(RobotState.SPEAKING)
+                        full_text += delta
                 except Exception as oai_err:
                     self.get_logger().warn(f"⚠️ [OpenAI GPT Stream Hatası] ({oai_err}), Gemini yedeğe geçiliyor...")
+                    full_text = ""
+                    first_token_time = None
 
-            # Fallback to Direct Google Gemini REST Text Generation
-            if stream_resp is None:
-                self.get_logger().warn("⚠️ Groq modelleri yanıt veremedi, Google Gemini REST metin motoruna geçiliyor...")
+            # 3. Fallback to Direct Google Gemini REST Text Generation
+            if not full_text:
+                self.get_logger().warn("⚠️ Groq ve OpenAI modelleri yanıt veremedi, Google Gemini REST metin motoruna geçiliyor...")
                 gemini_text = self._query_gemini_text_rest(system_prompt, user_text, self.memory.episodic.get_messages())
                 if gemini_text:
-                    self.cloud_mgr.record_llm_success()
-                    self.get_logger().info(f"🤖 [Astro (Gemini)]: \"{gemini_text}\"")
-                    self.memory.episodic.add_message("assistant", gemini_text)
-                    self._publish_tts(gemini_text)
-                    self._publish_emotion(persona)
-                    return
-
-                self.cloud_mgr.record_llm_failure("All cloud models failed")
-                self.get_logger().error("❌ Tüm LLM modelleri başarısız oldu! Yerel çevrimdışı moda geçiliyor.")
-                offline_msg = "Şu an internet bağlantımda bir sorun var ama seni dinliyorum!"
-                self._publish_tts(offline_msg)
-                return
-
-            self.cloud_mgr.record_llm_success()
-
-            full_text = ""
-            first_token_time = None
-
-            for chunk in stream_resp:
-                delta = chunk.choices[0].delta.content if chunk.choices and chunk.choices[0].delta else None
-                if not delta:
-                    continue
-
-                if first_token_time is None:
-                    first_token_time = time.monotonic()
-                    self.state_machine.transition_to(RobotState.SPEAKING)
-
-                full_text += delta
+                    full_text = gemini_text
 
             clean_full = clean_tts_text(full_text)
 
@@ -854,6 +849,7 @@ class AiBrainNode(Node):
                     }
                     clean_full = persona_recovery.get(persona, "Seni dinliyorum, devam et bakalım!")
 
+            self.cloud_mgr.record_llm_success()
             self.get_logger().info(f"🤖 [Astro]: \"{clean_full}\"")
             self.memory.episodic.add_message("assistant", clean_full)
             self._publish_tts(clean_full)
