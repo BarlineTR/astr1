@@ -124,8 +124,18 @@ class SpeechRecognitionNode(Node):
         # Parameters (Natural conversational turn-taking: 0.65s silence pause tolerance)
         self.declare_parameter('silence_timeout_s', 0.65)
         self.declare_parameter('sample_rate', 16000)
+        self.declare_parameter('stt_min_peak', 1200.0)
+        self.declare_parameter('stt_min_rms', 300.0)
+        self.declare_parameter('stt_chunk_rms', 420.0)
+        self.declare_parameter('stt_chunk_peak', 1050.0)
+        self.declare_parameter('stt_voice_ratio_min', 0.18)
         self._silence_timeout_s = float(self.get_parameter('silence_timeout_s').value)
         self._sample_rate = int(self.get_parameter('sample_rate').value)
+        self._min_peak = float(self.get_parameter('stt_min_peak').value)
+        self._min_rms = float(self.get_parameter('stt_min_rms').value)
+        self._chunk_rms = float(self.get_parameter('stt_chunk_rms').value)
+        self._chunk_peak = float(self.get_parameter('stt_chunk_peak').value)
+        self._voice_ratio_min = float(self.get_parameter('stt_voice_ratio_min').value)
 
         # Voice Recognition Engine
         self.voice_recognizer = VoiceRecognizer()
@@ -141,6 +151,7 @@ class SpeechRecognitionNode(Node):
         self.create_subscription(Bool, '/audio/vad', self._vad_cb, 10)
         self.create_subscription(Bool, '/tts/speaking', self._tts_speaking_cb, 10)
         self.create_subscription(String, '/tts/say', self._tts_say_cb, 10)
+        self.create_subscription(Bool, '/ai/session_active', self._session_active_cb, 10)
 
         # Internal state
         self._lock = threading.Lock()
@@ -151,6 +162,7 @@ class SpeechRecognitionNode(Node):
         self._tts_speaking: bool = False
         self._tts_speaking_start_time: float | None = None
         self._last_tts_end_time: float | None = None
+        self._session_active: bool = False
         self._recent_tts_phrases: list[tuple[str, float]] = []  # (phrase_lower, timestamp)
 
         # Guards against concurrent / out-of-order transcription results
@@ -160,7 +172,10 @@ class SpeechRecognitionNode(Node):
         # Timer (0.05s resolution)
         self.create_timer(0.05, self._silence_tick)
 
-        self.get_logger().info("✅ [STT] Groq Whisper-large-v3 + Self-Echo Immunity Hazır.")
+        self.get_logger().info("✅ [STT] Groq Whisper-large-v3 + Self-Echo Immunity + Bağlam Duyarlı Filtre Hazır.")
+
+    def _session_active_cb(self, msg: Bool):
+        self._session_active = msg.data
 
     def _tts_say_cb(self, msg: String):
         phrase = msg.data.lower().strip(" .,!?:;")
@@ -266,7 +281,7 @@ class SpeechRecognitionNode(Node):
             total_rms = float(np.sqrt(np.mean(arr.astype(np.float32)**2)))
             
             # Reject ambient floor noise and breathing
-            if max_amp < 1200.0 or total_rms < 300.0:
+            if max_amp < self._min_peak or total_rms < self._min_rms:
                 return
 
             # 2. Acoustic Speech Density Verification (20ms frames)
@@ -280,14 +295,14 @@ class SpeechRecognitionNode(Node):
                 c = arr[i * chunk_size : (i + 1) * chunk_size]
                 c_rms = np.sqrt(np.mean(c.astype(np.float32)**2))
                 c_peak = np.max(np.abs(c))
-                if c_rms > 420.0 and c_peak > 1050:
+                if c_rms > self._chunk_rms and c_peak > self._chunk_peak:
                     voice_chunks += 1
 
             voice_ratio = voice_chunks / num_chunks
             total_voice_duration = voice_chunks * 0.02
 
             # Real human speech must occupy >= 18% of buffer and have at least 0.20s continuous voice energy
-            if total_voice_duration < 0.20 or voice_ratio < 0.18:
+            if total_voice_duration < 0.20 or voice_ratio < self._voice_ratio_min:
                 return
 
             wav_io = io.BytesIO()
@@ -349,9 +364,13 @@ class SpeechRecognitionNode(Node):
             if text_lower in ["merhaba", "merhabalar"] and (total_rms < 480.0 or total_voice_duration < 0.45):
                 return
 
-            # Exact match single-word hallucination filter
-            exact_hallucinations = ["evet", "hayır", "tamam", "hı hı", "hı", "cık", "çık", "eee", "ııı", "hmm"]
-            if text_lower in exact_hallucinations:
+            # Context-aware single-word filter: Only reject when NO active conversation session
+            # During active session, "evet"/"hayır"/"tamam" are legitimate user responses
+            always_hallucinations = ["hı hı", "hı", "cık", "çık", "eee", "ııı", "hmm"]
+            session_dependent = ["evet", "hayır", "tamam"]
+            if text_lower in always_hallucinations:
+                return
+            if text_lower in session_dependent and not self._session_active:
                 return
 
             # Filter empty / junk / phantom noise

@@ -274,10 +274,15 @@ class TtsNode(Node):
 
                 if not played and sd is not None:
                     try:
+                        import io
+                        import wave
                         import numpy as np
-                        raw_pcm = wav_data[44:]  # strip WAV header
+                        wav_io = io.BytesIO(wav_data)
+                        with wave.open(wav_io, 'rb') as wf:
+                            raw_pcm = wf.readframes(wf.getnframes())
+                            actual_sr = wf.getframerate()
                         arr = np.frombuffer(raw_pcm, dtype=np.int16).astype(np.float32) / 32768.0
-                        sd.play(arr, samplerate=self.sample_rate)
+                        sd.play(arr, samplerate=actual_sr)
                         sd.wait()
                         played = True
                     except Exception as sde:

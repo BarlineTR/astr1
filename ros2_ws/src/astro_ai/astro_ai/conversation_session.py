@@ -132,19 +132,21 @@ class ConversationSession:
 
     def is_wake_word(self, text: str, wake_word: str = "hey astro") -> tuple[bool, str]:
         """Detects explicit robot wake words with Turkish phonetic variations, returning (has_wake_word, clean_text)."""
-        triggers = [
-            wake_word.lower(),
-            "hey astro", "hey astıro", "heyastro", "ey astro", "ey astıro",
-            "hay astro", "hey astor", "astro", "astıro", "astor",
-            "hey asistan", "merhaba astro", "selam astro", "robot astro"
-        ]
         text_lower = text.lower().strip()
-        has_wake = any(w in text_lower for w in triggers)
+
+        # Regex pattern captures Turkish phonetic variations: astro, astıro, astor, etc.
+        wake_pattern = re.compile(
+            r'(?:h[ea]y\s*|merhaba\s+|selam\s+|robot\s+)?'  # optional prefix
+            r'(?:ast[ıi]?ro|astor|asistan)',                   # core robot name
+            re.IGNORECASE
+        )
+        # Also check the configurable wake_word directly
+        has_wake = bool(wake_pattern.search(text_lower)) or wake_word.lower() in text_lower
 
         clean = text
         if has_wake:
-            for w in triggers:
-                clean = re.sub(rf"(?i)\b{re.escape(w)}\b", "", clean).strip()
+            clean = wake_pattern.sub('', clean)
+            clean = re.sub(rf"(?i)\b{re.escape(wake_word)}\b", "", clean)
             clean = re.sub(r"\s+", " ", clean).strip(" ,.!?:;")
 
         return has_wake, clean

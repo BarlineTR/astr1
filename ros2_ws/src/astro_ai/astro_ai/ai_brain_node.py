@@ -134,6 +134,10 @@ class AiBrainNode(Node):
         self.declare_parameter("llm_max_tokens", int(os.getenv("LLM_MAX_TOKENS", "300")))
         self.declare_parameter("wake_word", os.getenv("WAKE_WORD", "hey astro"))
         self.declare_parameter("conversation_timeout", float(os.getenv("CONVERSATION_TIMEOUT", "8.0")))
+        self.declare_parameter("gaze_dwell_s", float(os.getenv("GAZE_DWELL_S", "3.0")))
+        self.declare_parameter("gaze_cooldown_s", float(os.getenv("GAZE_COOLDOWN_S", "45.0")))
+        self.declare_parameter("gaze_startup_grace_s", float(os.getenv("GAZE_STARTUP_GRACE_S", "15.0")))
+        self.declare_parameter("default_user_name", os.getenv("DEFAULT_USER_NAME", "Misafir"))
 
         self._text_model = self.get_parameter("llm_model").value
         self._fallback_models = ["llama-3.3-70b-versatile", "llama-3.1-8b-instant", "mixtral-8x7b-32768"]
@@ -142,6 +146,10 @@ class AiBrainNode(Node):
         self._max_tokens = int(self.get_parameter("llm_max_tokens").value)
         self._wake_word = self.get_parameter("wake_word").value
         conv_timeout = float(self.get_parameter("conversation_timeout").value)
+        self._gaze_dwell_s = float(self.get_parameter("gaze_dwell_s").value)
+        self._gaze_cooldown_s = float(self.get_parameter("gaze_cooldown_s").value)
+        self._gaze_startup_grace_s = float(self.get_parameter("gaze_startup_grace_s").value)
+        self._default_user_name = str(self.get_parameter("default_user_name").value)
 
         # Adaptive Session
         self.session = ConversationSession(
@@ -191,6 +199,7 @@ class AiBrainNode(Node):
         self._person_detected = False
         self._looking_at_robot = False
         self._looking_start_time = None
+        self._gaze_lock = threading.Lock()
         self._last_proactive_gaze_time = 0.0
         self._speaker_angle = 0.0
         self._speaker_gender = "unknown"
@@ -208,6 +217,7 @@ class AiBrainNode(Node):
         self.pub_emotion = self.create_publisher(String, "/robot/emotion", 10)
         self.pub_gesture = self.create_publisher(String, "/robot/head_gesture", 10)
         self.pub_look_target = self.create_publisher(Float32, "/robot/look_target", 10)
+        self.pub_session_active = self.create_publisher(Bool, "/ai/session_active", 10)
 
         # ROS 2 Subscribers
         self.create_subscription(String, "/speech/text", self._on_speech, 10)
@@ -283,6 +293,10 @@ class AiBrainNode(Node):
 
     def _check_session_lifecycle(self):
         self.session.check_and_update_session_lifecycle()
+        # Broadcast session state so STT node can make context-aware filter decisions
+        msg = Bool()
+        msg.data = self.session.is_active()
+        self.pub_session_active.publish(msg)
 
     # Perception Callbacks
     def _on_camera_image(self, msg: Image):
@@ -325,16 +339,17 @@ class AiBrainNode(Node):
         is_looking = msg.data
         now = time.monotonic()
         self.session.update_gaze(is_looking)
-        if is_looking:
-            if not self._looking_at_robot:
-                self._looking_start_time = now
-            self._looking_at_robot = True
-            self._last_gaze_seen_time = now
-        else:
-            # Gaze hysteresis: only drop gaze after 1.2 seconds of absence to prevent flicker resets
-            if hasattr(self, '_last_gaze_seen_time') and (now - self._last_gaze_seen_time) > 1.2:
-                self._looking_at_robot = False
-                self._looking_start_time = None
+        with self._gaze_lock:
+            if is_looking:
+                if not self._looking_at_robot:
+                    self._looking_start_time = now
+                self._looking_at_robot = True
+                self._last_gaze_seen_time = now
+            else:
+                # Gaze hysteresis: only drop gaze after 1.2 seconds of absence to prevent flicker resets
+                if hasattr(self, '_last_gaze_seen_time') and (now - self._last_gaze_seen_time) > 1.2:
+                    self._looking_at_robot = False
+                    self._looking_start_time = None
 
     def _on_recognized_person(self, msg: String):
         try:
@@ -397,22 +412,27 @@ class AiBrainNode(Node):
         return {"name": "Misafir", "title": "Ziyaretçi", "formal_title": "Misafir", "is_known": False, "confidence": 0.0}
 
     def _check_proactive_gaze(self):
-        if not self._looking_at_robot or self._looking_start_time is None or self._tts_speaking or self._is_processing:
+        with self._gaze_lock:
+            looking = self._looking_at_robot
+            look_start = self._looking_start_time
+
+        if not looking or look_start is None or self._tts_speaking or self._is_processing:
             return
 
         now = time.monotonic()
-        # 1. Startup Grace Period: Do not trigger proactive speech during first 15 seconds after launch
-        if (now - getattr(self, '_node_start_time', 0.0)) < 15.0:
+        # 1. Startup Grace Period: Do not trigger proactive speech during initial launch
+        if (now - self._node_start_time) < self._gaze_startup_grace_s:
             return
 
-        # 2. Sustained Dwell Time: User must deliberately look for at least 3.0 seconds
-        if (now - self._looking_start_time) >= 3.0:
-            # 3. Cooldown of at least 45 seconds between proactive prompts
-            if self.state_machine.is_idle() and (now - self._last_proactive_gaze_time) > 45.0:
+        # 2. Sustained Dwell Time: User must deliberately look for configured duration
+        if (now - look_start) >= self._gaze_dwell_s:
+            # 3. Cooldown between proactive prompts
+            if self.state_machine.is_idle() and (now - self._last_proactive_gaze_time) > self._gaze_cooldown_s:
                 self._last_proactive_gaze_time = now
                 self.session.activate_session(reason="proactive_gaze")
                 self.state_machine.transition_to(RobotState.LISTENING)
-                self._looking_start_time = None
+                with self._gaze_lock:
+                    self._looking_start_time = None
 
                 identity = self._get_active_biometric_identity()
                 persona = self.persona_engine.current_persona
@@ -590,16 +610,7 @@ class AiBrainNode(Node):
             # 2. Reminder & Alarm Direct Intent
             is_reminder, reminder_mins, reminder_topic = self._is_reminder_query(user_text)
             if is_reminder:
-                target_t = time.monotonic() + (reminder_mins * 60.0)
-                identity = self._get_active_biometric_identity()
-                user_name = identity.get("name") if identity.get("is_known") else "Baran"
-                with self._reminder_lock:
-                    self._active_reminders.append({
-                        "target_time": target_t,
-                        "reminder_text": reminder_topic,
-                        "user_name": user_name
-                    })
-                self.memory.profile.add_memory(f"Hatırlatıcı: {reminder_topic} ({int(reminder_mins)} dk sonra)")
+                user_name = self._add_reminder(reminder_mins, reminder_topic)
                 if int(reminder_mins) <= 1:
                     ans = f"Tamamdır {user_name}! 1 dakika sonra sana {reminder_topic} konusunu hatırlatacağım."
                 else:
@@ -972,16 +983,7 @@ class AiBrainNode(Node):
         elif tool_name == "set_timer_alarm":
             mins = float(arguments.get("minutes", 5.0))
             rem_text = arguments.get("reminder_text", "Zaman doldu!")
-            target_t = time.monotonic() + (mins * 60.0)
-            identity = self._get_active_biometric_identity()
-            u_name = identity.get("name") if identity.get("is_known") else "Baran"
-            with self._reminder_lock:
-                self._active_reminders.append({
-                    "target_time": target_t,
-                    "reminder_text": rem_text,
-                    "user_name": u_name
-                })
-            self.memory.profile.add_memory(f"Hatırlatıcı: {rem_text} ({int(mins)} dk sonra)")
+            self._add_reminder(mins, rem_text)
             return f"{int(mins)} dakika sonraya hatırlatıcıyı kurdum! Vakti geldiğinde sana sesleneceğim."
 
         elif tool_name == "learn_custom_object":
@@ -1013,7 +1015,7 @@ class AiBrainNode(Node):
 
         for r in due_reminders:
             txt = r["reminder_text"]
-            name = r.get("user_name", "Baran")
+            name = r.get("user_name", self._default_user_name)
             if "çay" in txt.lower():
                 msg = f"Hey {name}! Hatırlatmamı istediğin vakit geldi: Çay içme zamanı! Sıcak bir çay iyi gelir, afiyet olsun."
             elif "su" in txt.lower():
@@ -1027,6 +1029,21 @@ class AiBrainNode(Node):
             self._publish_gesture("nod")
             self._publish_emotion("playful")
             self._publish_tts(msg)
+
+    def _add_reminder(self, mins: float, topic: str) -> str:
+        """Shared helper: creates a reminder entry and returns the resolved user name."""
+        mins = max(0.0, mins)  # Guard against negative durations
+        target_t = time.monotonic() + (mins * 60.0)
+        identity = self._get_active_biometric_identity()
+        user_name = identity.get("name") if identity.get("is_known") else self._default_user_name
+        with self._reminder_lock:
+            self._active_reminders.append({
+                "target_time": target_t,
+                "reminder_text": topic,
+                "user_name": user_name
+            })
+        self.memory.profile.add_memory(f"Hatırlatıcı: {topic} ({int(mins)} dk sonra)")
+        return user_name
 
     def _is_reminder_query(self, text: str) -> Tuple[bool, float, str]:
         text_l = text.lower()
