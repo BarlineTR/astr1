@@ -130,7 +130,7 @@ class TtsNode(Node):
         _load_env()
 
         self.tts_engine = os.getenv("TTS_ENGINE", "openai").lower()
-        self.openai_voice = os.getenv("OPENAI_TTS_VOICE", "onyx")
+        self.openai_voice = os.getenv("OPENAI_TTS_VOICE", "echo")
         self.tts_voice = os.getenv("TTS_VOICE", "tr-TR-AhmetNeural")
         self.tts_rate = os.getenv("TTS_RATE", "+25%")
         self.sample_rate = int(os.getenv("SAMPLE_RATE", "16000"))

@@ -809,7 +809,9 @@ class AiBrainNode(Node):
             self.cloud_mgr.record_llm_success()
 
             full_text = ""
+            sentence_buffer = ""
             first_token_time = None
+            published_chunks = []
 
             for chunk in stream_resp:
                 delta = chunk.choices[0].delta.content if chunk.choices and chunk.choices[0].delta else None
@@ -821,18 +823,30 @@ class AiBrainNode(Node):
                     self.state_machine.transition_to(RobotState.SPEAKING)
 
                 full_text += delta
+                sentence_buffer += delta
+
+                # Detect early sentence boundaries (. ! ? \n) and dispatch immediately to TTS
+                while True:
+                    m = re.search(r"^(.*?[.!?\n])(?:\s+|$)", sentence_buffer)
+                    if not m:
+                        break
+                    sentence = m.group(1).strip()
+                    sentence_buffer = sentence_buffer[m.end():].lstrip()
+                    clean_seg = clean_tts_text(sentence)
+                    if clean_seg and len(clean_seg) >= 2 and not is_canned_refusal(clean_seg):
+                        self._publish_tts(clean_seg)
+                        published_chunks.append(clean_seg)
+
+            # Flush remaining buffer at stream end
+            if sentence_buffer:
+                clean_rem = clean_tts_text(sentence_buffer)
+                if clean_rem and len(clean_rem) >= 2 and not is_canned_refusal(clean_rem):
+                    self._publish_tts(clean_rem)
+                    published_chunks.append(clean_rem)
 
             clean_full = clean_tts_text(full_text)
-
-            # Refusal or Empty Output Detection & In-Character Fallback
-            if not clean_full or len(clean_full) < 2 or is_canned_refusal(clean_full):
-                reason = "ret cevabı" if is_canned_refusal(clean_full) else "boş/düşünce zinciri"
-                self.get_logger().warn(f"⚠️ [AI Brain] Model {reason} verdi: \"{clean_full}\". Gemini REST / Karakter yedeğine geçiliyor.")
-                # Try fallback to Gemini REST first
-                gemini_text = self._query_gemini_text_rest(system_prompt, user_text, self.memory.episodic.get_messages())
-                if gemini_text and not is_canned_refusal(gemini_text) and len(gemini_text) >= 2:
-                    clean_full = gemini_text
-                else:
+            if not published_chunks:
+                if not clean_full or len(clean_full) < 2 or is_canned_refusal(clean_full):
                     persona_recovery = {
                         "flirt": "Ooo harika! Bütün algılarımla seninleyim, söyle bakalım güzellik ne diyorsun?",
                         "rude": "Ne diyon birader, ne geveliyorsun?",
@@ -843,10 +857,10 @@ class AiBrainNode(Node):
                         "playful": "Haha çok ilginçsin! Seni dinliyorum, devam et bakalım!"
                     }
                     clean_full = persona_recovery.get(persona, "Seni dinliyorum, devam et bakalım!")
+                self._publish_tts(clean_full)
 
             self.get_logger().info(f"🤖 [Astro]: \"{clean_full}\"")
             self.memory.episodic.add_message("assistant", clean_full)
-            self._publish_tts(clean_full)
             self._publish_emotion(persona)
 
             # Latency Benchmarking

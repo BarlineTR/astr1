@@ -137,8 +137,8 @@ class SpeechRecognitionNode(Node):
             self.enabled = False
             return
 
-        # Parameters (Natural conversational turn-taking: 0.65s silence pause tolerance)
-        self.declare_parameter('silence_timeout_s', 0.65)
+        # Parameters (Ultra-fast responsive conversational turn-taking: 0.38s silence pause tolerance)
+        self.declare_parameter('silence_timeout_s', 0.38)
         self.declare_parameter('sample_rate', 16000)
         self.declare_parameter('stt_min_peak', 1200.0)
         self.declare_parameter('stt_min_rms', 300.0)
