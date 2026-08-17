@@ -1435,12 +1435,20 @@ class AiBrainNode(Node):
 
     def _is_visual_query(self, text: str) -> bool:
         visual_keywords = [
-            "ne tutuyorum", "elimde ne", "elinde ne", "ne var", "bu ne", "bunu gör", "görüyor musun",
-            "ne yapıyorum", "hareket", "hangi hareket", "üstümde", "üzerimde", "ceket", "tişört", "elbise",
-            "ne renk", "kaç parmak", "bana bak", "gözlerimi", "nereye", "kim var", "odada", "arkamda",
-            "elimde", "şuna bak", "gösteriyorum", "nası görünüyorum", "nasıl görünüyorum", "gördün mü",
-            "bakıyor muyum", "sana bakıyor muyum", "bana bakıyor musun", "nereye bakıyorum", "gözlerime bak",
-            "yüzüme bak", "telefonla mı konuşuyorum", "telefona mı bakıyorum", "iyi bak"
+            # Oda, Ortam ve Çevre Analizi
+            "odayı", "odada", "odam", "ortamı", "ortamda", "çevreyi", "çevrede", "etrafta", "etrafı",
+            "tarif et", "tarif edebilir", "anlat", "betimle", "ne görüyorsun", "neler görüyorsun",
+            "görüyor musun", "görebiliyor musun", "kameran", "kamerana bak", "kameradan", "bak bakalım",
+            # Nesneler ve Eller
+            "ne tutuyorum", "elimde ne", "elinde ne", "ne var", "bu ne", "bunu gör", "şu ne",
+            "şuna bak", "buna bak", "gösteriyorum", "elime bak", "elimdekini", "elimdeki",
+            # Kıyafet ve Görünüş
+            "üstümde", "üzerimde", "giymişim", "kıyafet", "ceket", "tişört", "gömlek", "kazak", "pantolon",
+            "elbise", "ne renk", "hangi renk", "kaç parmak", "bana bak", "nası görünüyorum", "nasıl görünüyorum",
+            # Yüz, Göz Teması ve Hareket
+            "gözlerimi", "gözlerime bak", "yüzüme bak", "bana bakıyor musun", "bakıyor muyum", "nereye bakıyorum",
+            "telefona mı bakıyorum", "telefonla mı", "gözlük", "şapka", "kim var", "arkamda", "yanımda",
+            "iyi bak", "dikkatli bak", "gördün mü", "gördünmü", "ne yapıyorum", "hareket"
         ]
         text_lower = text.lower()
         return any(k in text_lower for k in visual_keywords)
