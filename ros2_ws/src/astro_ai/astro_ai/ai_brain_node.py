@@ -562,7 +562,9 @@ class AiBrainNode(Node):
         self._last_llm_turn_time = now
 
         if self._tts_speaking:
-            return
+            # Kullanıcı konuşurken robot konuşuyorsa anında sustur (Barge-in)
+            self._publish_interrupt()
+            self._tts_speaking = False
 
         t_vad_start = now
 
@@ -1506,50 +1508,49 @@ class AiBrainNode(Node):
         if any(mg in text_lower for mg in memory_guards) and not any(exp in text_lower for exp in ["kamerana bak", "fotoğraf", "görüntü", "kameraya"]):
             return False
 
-        # 1. Geniş Kapsamlı Doğrudan Anahtar Kelimeler & Kalıplar
+        # 1. Geniş Kapsamlı Doğrudan Görsel Kalıplar (En Az 2 Kelimeli veya Belirgin Nesneler)
         visual_phrases = [
-            # Oda, Ortam, Mekan ve Çevre
-            "odayı", "odada", "odam", "oda", "salon", "mutfak", "atölye", "laboratuvar", "ofis", "masa", "masada",
-            "ortamı", "ortamda", "ortam", "çevreyi", "çevrede", "çevre", "etrafta", "etrafı", "etraf", "mekan", "mekanda",
-            "arka plan", "arkada", "çevremde", "etrafımda", "odadaki", "ortamdaki", "masadaki", "masanın üstü",
-            "tarif et", "tarif edebilir", "tarifler misin", "betimle", "tasvir et", "anlat", "bahset", "özetle",
-            "incele", "tara", "analiz et", "gözlemle", "etrafa bak", "odaya bak", "ortama bak", "masaya bak",
+            # Oda, Ortam, Mekan ve Çevre Analizi
+            "odayı tarif", "odada ne var", "odamda ne var", "odaya bak", "salonı tarif", "mutfağa bak",
+            "masada ne var", "masanın üstünde ne", "ortamı tarif", "ortamda ne var", "çevrede ne var",
+            "etrafta ne var", "etrafta kim var", "etrafı tarif", "mekanda ne var", "arka planda ne var",
+            "odadaki eşyalar", "masadaki eşyalar", "tarif et", "tarif edebilir misin", "tarifler misin",
+            "odamı anlat", "odayı anlat", "ortamı anlat", "çevreyi anlat", "etrafı anlat",
+            "odaya göz at", "etrafa bak", "etrafı incele", "odayı incele", "masayı incele",
 
             # Kamera ve Görme Soruları
-            "ne görüyorsun", "neler görüyorsun", "neye bakıyorsun", "nereye bakıyorsun", "ne var", "neler var",
-            "görüyor musun", "görebiliyor musun", "gördün mü", "gördünmü", "beni görüyor musun", "beni görebiliyor musun",
-            "kameran", "kamerana bak", "kameradan bak", "kameranla bak", "kameranla gör", "kameraya bak", "kamerayı aç",
-            "bak bakalım", "baksana", "şuraya bak", "buraya bak", "bana bak", "bana doğru bak", "iyi bak", "dikkatli bak",
+            "ne görüyorsun", "neler görüyorsun", "neye bakıyorsun", "nereye bakıyorsun", "neler var burada",
+            "görüyor musun", "görebiliyor musun", "beni görüyor musun", "beni görebiliyor musun",
+            "kamerana bak", "kameradan bak", "kameranla bak", "kameranla gör", "kameraya bak", "kamerayı aç",
+            "bak bakalım", "şuraya bak", "buraya bak", "bana bak", "bana doğru bak", "dikkatli bak",
 
             # Nesneler, Eşyalar ve Eller
-            "ne tutuyorum", "elimde ne", "elinde ne", "elimdekini", "elimdeki", "elimde ne var", "elimde hangi",
-            "bu ne", "şu ne", "bunlar ne", "bu cisim", "bu eşya", "bu alet", "bu cihaz", "bu kart", "bu kutu", "bu şişe", "bu telefon",
-            "kaç parmak", "kaç tane", "say bakalım", "parmaklarımı say", "kaç parmak gösteriyorum", "elime bak", "elimi gör",
-            "gösterdiğim", "gösterdiğimi", "tuttuğum", "tuttuğumu", "gösteriyorum", "sana gösteriyorum", "bu nesneyi",
+            "ne tutuyorum", "elimde ne", "elinde ne", "elimdekini gör", "elimdeki ne", "elimde ne var",
+            "bu ne", "şu ne", "bunlar ne", "bu cisim", "bu eşya", "bu alet", "bu cihaz", "bu kart", "bu kutu", "bu şişe",
+            "kaç parmak", "parmaklarımı say", "kaç parmak gösteriyorum", "elime bak", "elimi gör",
+            "gösterdiğim nesne", "tuttuğum nesne", "sana gösteriyorum", "bu nesneyi tanı",
 
             # Kıyafet, Giyiniş, Renk ve Dış Görünüş
-            "üstümde", "üzerimde", "üstümdeki", "üzerimdeki", "ne giymişim", "hangi kıyafeti", "kıyafetim", "kıyafetimi",
-            "kombinim", "nasıl görünüyorum", "nası görünüyorum", "yakışmış mı", "ne renk", "hangi renk", "rengi ne",
-            "tişört", "t-shirt", "gömlek", "ceket", "mont", "kaban", "kazak", "hırka", "sweatshirt", "kapüşonlu",
-            "yelek", "pantolon", "şort", "eşofman", "etek", "elbise", "kravat", "papyon", "önlük", "forma",
-            "gözlük", "güneş gözlüğü", "şapka", "bere", "kask", "maske", "kol saati", "akıllı saat", "bileklik", "kolye", "yüzük",
+            "üstümde ne var", "üzerimde ne var", "üstümdeki ne", "üzerimdeki ne", "ne giymişim", "hangi kıyafeti",
+            "kıyafetim nasıl", "kombinim nasıl", "nasıl görünüyorum", "yakışmış mı", "ne renk", "hangi renk", "rengi ne",
+            "tişörtüm", "gömleğim", "ceketim", "montum", "kazağım", "pantolonum", "elbisem",
+            "gözlüğüm", "güneş gözlüğü", "şapkam", "berem", "kol saati", "akıllı saat", "bilekliğim", "kolyem",
 
             # İnsanlar, Yüz, Duruş ve Hareketler
             "odada kim var", "yanımda kim var", "arkamda kim var", "etrafta kimse var mı", "kaç kişi var", "kaç kişiyiz",
-            "birini görüyor musun", "ne yapıyorum", "hangi hareketi yapıyorum", "hareketimi gör", "hareketim",
+            "birini görüyor musun", "ne yapıyorum", "hangi hareketi yapıyorum", "hareketimi gör",
             "ayakta mıyım", "oturuyor muyum", "uzanıyor muyum", "yüzüme bak", "gözlerime bak", "bana bakıyor musun",
-            "bakıyor muyum", "nereye bakıyorum", "gülümsüyor muyum", "üzgün müyüm", "kızgın mıyım", "mimiklerim",
-            "telefonla mı", "telefona mı", "bilgisayara mı", "ekrana mı", "ne okuyorum", "ne yazıyorum"
+            "telefona mı bakıyorum", "telefonla mı konuşuyorum", "ekrana mı bakıyorum", "ne okuyorum", "ne yazıyorum"
         ]
 
         if any(p in text_lower for p in visual_phrases):
             return True
 
-        # 2. Esnek Regex Kalıpları (Farklı Kelime Dizilimleri İçin)
+        # 2. Esnek Regex Kalıpları (Belirgin görsel ikililer)
         visual_regex_patterns = [
-            r"\b(oda|ortam|çevre|etraf|mekan|masa|kamera|kıyafet|nesne|eşya|el|yüz|göz)\b.*\b(nasıl|ne|kim|kaç|tarif|anlat|gör|bak|incele|tara|renk)\b",
-            r"\b(bu|şu|elimde|üstümde|üzerimde|arkamda|yanımda)\b.*\b(ne|kim|hangi|nasıl|gör|bak|var)\b",
-            r"\b(ne|neler|kim|kaç|nereye)\b.*\b(görüyorsun|bakıyorsun|var|yapıyorum|tutuyorum|giymişim)\b",
+            r"\b(odayı|salonu|ortamı|çevreyi|etrafı|masayı|kamerayı)\b.*\b(tarif|anlat|incele|tara|betimle|gör|bak)\b",
+            r"\b(bu|şu|elimdeki|üstümdeki|üzerimdeki)\b.*\b(ne|hangi|renk|var|gör)\b",
+            r"\b(ne|neler|kim|kaç)\b.*\b(görüyorsun|bakıyorsun|tutuyorum|giymişim|gösteriyorum)\b",
             r"\b(bak|gör|anlat|tarif\s*et)\b.*\b(bana|odaya|etrafa|kameraya|elime|üstüme)\b"
         ]
 
