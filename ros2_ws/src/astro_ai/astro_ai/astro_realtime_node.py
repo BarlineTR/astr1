@@ -670,9 +670,13 @@ class AstroRealtimeNode(Node):
                 else:
                     self.get_logger().info(f"🎙️ [Ses Tanıma]: Bilinmeyen Ses / Tanınmadı (Güven: {spk_conf:.2f})")
                     with self._lock:
-                        self._recognized_speaker = {"name": "Misafir", "confidence": spk_conf, "is_known": False}
+                        self._recognized_speaker = {"name": "Misafir", "confidence": spk_conf, "is_known": False, "source": "unknown_voice"}
+                        self._active_person_name = "Misafir"
+                        self._person_hold_until = 0.0
+                    self._sync_perception_to_session()
         except Exception as e:
             self.get_logger().debug(f"Voice id notice: {e}")
+
 
     def _enroll_user_biometrics(self, name: str, formal_title: str = "") -> Dict[str, Any]:
         """Enrolls user face and voice into biometric databases."""
@@ -1171,23 +1175,27 @@ class AstroRealtimeNode(Node):
             held_name = getattr(self, "_active_person_name", "Misafir")
             hold_until = getattr(self, "_person_hold_until", 0.0)
 
-        if face.get("is_known") and face.get("confidence", 0.0) >= 0.45:
-            return {**face, "source": "face"}
+        # 1. Unknown Voice Priority: If active voice is analyzed and is UNKNOWN, it MUST be treated as guest
+        if spk and not spk.get("is_known", False):
+            return {"name": "Misafir", "title": "Ziyaretçi", "formal_title": "Misafir", "is_known": False, "source": "unknown_voice"}
+
+        # 2. Known Active Voice
         if spk.get("is_known") and spk.get("confidence", 0.0) >= 0.40:
             return {**spk, "source": "voice"}
+
+        # 3. Known Active Face
+        if face.get("is_known") and face.get("confidence", 0.0) >= 0.45:
+            return {**face, "source": "face"}
+
+        # 4. Memory Hold
         if now < hold_until and held_name != "Misafir":
             return {"name": held_name, "title": held_name, "formal_title": held_name, "is_known": True, "source": "memory_hold"}
 
         return {"name": "Misafir", "title": "Ziyaretçi", "formal_title": "Misafir", "is_known": False}
 
-
     def _sync_perception_to_session(self):
         """Dynamically syncs persona & recognized identity to the active OpenAI Realtime session ONLY when identity changes."""
         if not self._ws or not self._loop or not self._is_connected:
-            return
-
-        # Do NOT interrupt active response generation or speaking
-        if getattr(self, "_is_responding", False) or getattr(self, "_is_playback_active", False):
             return
 
         now = time.monotonic()
@@ -1201,6 +1209,7 @@ class AstroRealtimeNode(Node):
 
         self._last_synced_identity = identity_name
         self._last_sync_time = now
+
 
         system_prompt = self._build_current_system_prompt()
         update_event = {
