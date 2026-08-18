@@ -211,6 +211,7 @@ class AstroRealtimeNode(Node):
         session_config = {
             "type": "session.update",
             "session": {
+                "type": "realtime",
                 "modalities": ["text", "audio"],
                 "instructions": system_prompt,
                 "voice": self.realtime_voice,
@@ -219,6 +220,7 @@ class AstroRealtimeNode(Node):
                 "input_audio_transcription": {
                     "model": "whisper-1"
                 },
+
                 "turn_detection": {
                     "type": "server_vad",
                     "threshold": 0.5,
@@ -344,7 +346,9 @@ class AstroRealtimeNode(Node):
         # 7. Error Handling
         elif event_type == "error":
             err = event.get("error", {})
-            self.get_logger().error(f"❌ [Realtime WS Hatası]: {err.get('message')}")
+            msg = err.get("message", "")
+            if "no active response found" not in msg:
+                self.get_logger().error(f"❌ [Realtime WS Hatası]: {msg}")
 
     def _execute_realtime_tool(self, name: str, args: Dict[str, Any]) -> Dict[str, Any]:
         """Executes integrated robot tools in real time."""
@@ -457,6 +461,7 @@ class AstroRealtimeNode(Node):
         update_event = {
             "type": "session.update",
             "session": {
+                "type": "realtime",
                 "instructions": system_prompt
             }
         }
@@ -464,6 +469,7 @@ class AstroRealtimeNode(Node):
             asyncio.run_coroutine_threadsafe(self._ws.send(json.dumps(update_event)), self._loop)
         except Exception:
             pass
+
 
 
 def main(args=None):
