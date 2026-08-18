@@ -461,11 +461,24 @@ class AstroRealtimeNode(Node):
         return {"name": "Misafir", "title": "Ziyaretçi", "formal_title": "Misafir", "is_known": False}
 
     def _sync_perception_to_session(self):
-        """Dynamically syncs persona & recognized identity to the active OpenAI Realtime session."""
+        """Dynamically syncs persona & recognized identity to the active OpenAI Realtime session with cooldown."""
         if not self._ws or not self._loop or not self._is_connected:
             return
 
+        now = time.monotonic()
         identity = self._get_active_biometric_identity()
+        identity_name = identity.get("name", "Misafir")
+
+        # Do NOT flood session.update: Only sync if identity actually changed, with min 20s cooldown
+        last_id = getattr(self, "_last_synced_identity", "")
+        last_time = getattr(self, "_last_sync_time", 0.0)
+
+        if identity_name == last_id and (now - last_time) < 20.0:
+            return
+
+        self._last_synced_identity = identity_name
+        self._last_sync_time = now
+
         system_prompt = self.persona_engine.build_system_prompt(
             memory_context=self.memory.get_prompt_context(recognized_person=identity),
             recognized_person=identity
@@ -479,8 +492,10 @@ class AstroRealtimeNode(Node):
         }
         try:
             asyncio.run_coroutine_threadsafe(self._ws.send(json.dumps(update_event)), self._loop)
+            self.get_logger().info(f"👤 [Realtime Biyometri]: Oturum kimliği güncellendi -> {identity_name}")
         except Exception:
             pass
+
 
 
 

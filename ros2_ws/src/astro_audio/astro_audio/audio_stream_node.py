@@ -222,7 +222,7 @@ class AudioStreamNode(Node):
         try:
             out_stream = sd.RawOutputStream(
                 samplerate=HW_SAMPLE_RATE,
-                blocksize=HW_BLOCK_SIZE,
+                blocksize=0,
                 device=self._out_dev_idx,
                 channels=CHANNELS,
                 dtype=DTYPE,
@@ -232,6 +232,7 @@ class AudioStreamNode(Node):
         except Exception as e:
             self.get_logger().error(f"❌ [Realtime Audio] Çıkış akışı başlatılamadı: {e}")
             return
+
 
         while not self._stop_event.is_set():
             try:
