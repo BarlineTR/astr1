@@ -370,13 +370,15 @@ class AstroRealtimeNode(Node):
                             "type": "server_vad",
                             "threshold": 0.65,
                             "prefix_padding_ms": 300,
-                            "silence_duration_ms": 600
+                            "silence_duration_ms": 600,
+                            "create_response": False
                         }
                     },
                     "output": {
                         "voice": self.realtime_voice
                     }
                 },
+
 
                 "tools": [
                     {
@@ -507,8 +509,20 @@ class AstroRealtimeNode(Node):
 
         # 3b. User Speech Stopped
         elif event_type == "input_audio_buffer.speech_stopped":
-            self.get_logger().info("🤫 [Realtime] Cümle bitti, Astro yanıt hazırlıyor...")
+            self.get_logger().info("🤫 [Realtime] Cümle bitti, biyometri doğrulanıyor ve yanıt üretiliyor...")
             self._run_voice_identification()
+            current_prompt = self._build_current_system_prompt()
+            resp_event = {
+                "type": "response.create",
+                "response": {
+                    "instructions": current_prompt
+                }
+            }
+            try:
+                await ws.send(json.dumps(resp_event))
+            except Exception as se:
+                self.get_logger().error(f"Response create notice: {se}")
+
 
         # 3c. Response Created
         elif event_type == "response.created":
