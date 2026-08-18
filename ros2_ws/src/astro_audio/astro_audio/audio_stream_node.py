@@ -129,6 +129,7 @@ class AudioStreamNode(Node):
         # Playback Queue & Thread
         self._play_queue: queue.Queue[bytes] = queue.Queue(maxsize=500)
         self._is_playing = False
+        self._last_playback_time = 0.0
         self._playback_lock = threading.Lock()
         self._stop_event = threading.Event()
 
@@ -180,6 +181,20 @@ class AudioStreamNode(Node):
             rms = float(np.sqrt(np.mean(arr.astype(np.float32) ** 2)))
         except Exception:
             rms = 0.0
+
+        # Software Acoustic Echo Suppression / Smart Gating:
+        # If Astro is currently speaking out of the hardware loudspeaker,
+        # suppress microphone leakage so OpenAI doesn't hear Astro's own voice and self-interrupt.
+        # Only pass loud speech (RMS > 950) if user intentionally interrupts (Barge-In).
+        is_active_playback = self._is_playing or (time.monotonic() - self._last_playback_time < 0.25)
+        if is_active_playback:
+            if rms < 950.0:
+                return
+
+        # Publish mic level
+        lvl_msg = Float32()
+        lvl_msg.data = float(rms)
+        self.pub_input_level.publish(lvl_msg)
 
         # Resample 16kHz -> 24kHz for OpenAI Realtime API
         pcm_24k = resample_16k_to_24k(raw_bytes)
@@ -233,18 +248,21 @@ class AudioStreamNode(Node):
             self.get_logger().error(f"❌ [Realtime Audio] Çıkış akışı başlatılamadı: {e}")
             return
 
-
         while not self._stop_event.is_set():
             try:
                 chunk = self._play_queue.get(timeout=0.05)
                 self._is_playing = True
+                self._last_playback_time = time.monotonic()
                 with self._playback_lock:
                     out_stream.write(chunk)
+                self._last_playback_time = time.monotonic()
             except queue.Empty:
-                self._is_playing = False
+                if (time.monotonic() - self._last_playback_time) > 0.25:
+                    self._is_playing = False
             except Exception as e:
                 self._is_playing = False
                 self.get_logger().debug(f"Playback write notice: {e}")
+
 
     def _publish_status(self):
         msg = Bool()

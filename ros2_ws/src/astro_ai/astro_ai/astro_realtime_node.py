@@ -220,19 +220,21 @@ class AstroRealtimeNode(Node):
                 "audio": {
                     "input": {
                         "transcription": {
-                            "model": "whisper-1"
+                            "model": "whisper-1",
+                            "language": "tr"
                         },
                         "turn_detection": {
                             "type": "server_vad",
-                            "threshold": 0.5,
+                            "threshold": 0.65,
                             "prefix_padding_ms": 300,
-                            "silence_duration_ms": 350
+                            "silence_duration_ms": 600
                         }
                     },
                     "output": {
                         "voice": self.realtime_voice
                     }
                 },
+
                 "tools": [
                     {
                         "type": "function",
