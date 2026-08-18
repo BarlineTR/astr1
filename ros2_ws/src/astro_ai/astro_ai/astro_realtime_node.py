@@ -519,8 +519,6 @@ class AstroRealtimeNode(Node):
 
         # 3. User Speech Started
         elif event_type == "input_audio_buffer.speech_started":
-            if (time.monotonic() - getattr(self, "_node_start_time", 0.0)) > 3.0:
-                self._wake_up()
             # ONLY trigger barge-in interruption if Astro was ACTUALLY playing audio or generating a response
             if self._is_responding or self._is_playback_active:
                 self.get_logger().info("⚡ [Realtime Barge-In] Kullanıcı lafa girdi — Çalma anında durduruluyor...")
@@ -538,6 +536,8 @@ class AstroRealtimeNode(Node):
 
         # 3b. User Speech Stopped
         elif event_type == "input_audio_buffer.speech_stopped":
+            if self._is_sleeping:
+                return
             self.get_logger().info("🤫 [Realtime] Cümle bitti, biyometri doğrulanıyor ve yanıt üretiliyor...")
             self._run_voice_identification()
             current_prompt = self._build_current_system_prompt()
@@ -1170,12 +1170,22 @@ class AstroRealtimeNode(Node):
             self._is_sleeping = False
             self.get_logger().info("⏰ [Astro Uyandı]: Kullanıcı sesi algılandı — Astro uykudan uyandı ve dinliyor!")
 
-            # 1. Restore persona emotion
+            # 1. Clear any stale audio in OpenAI buffer
+            if self._ws and self._loop and self._is_connected:
+                try:
+                    asyncio.run_coroutine_threadsafe(
+                        self._ws.send(json.dumps({"type": "input_audio_buffer.clear"})),
+                        self._loop
+                    )
+                except Exception:
+                    pass
+
+            # 2. Restore persona emotion
             emo_msg = String()
             emo_msg.data = self.persona_name
             self.pub_emotion.publish(emo_msg)
 
-            # 2. Publish wake gesture
+            # 3. Publish wake gesture
             gest_msg = String()
             gest_msg.data = "wake"
             self.pub_gesture.publish(gest_msg)
@@ -1586,22 +1596,27 @@ class AstroRealtimeNode(Node):
         except Exception:
             pass
 
-        # Acoustic presence / wake-up (requires sustained human voice > 200 RMS across >=4 consecutive frames)
+        # Acoustic presence / wake-up (requires sustained human voice > 280 RMS across >=5 consecutive frames)
         if raw_16k:
             try:
                 arr = np.frombuffer(raw_16k, dtype=np.int16)
                 local_rms = float(np.sqrt(np.mean(arr.astype(np.float32) ** 2)))
-                if local_rms > 200.0:
+                if local_rms > 280.0:
                     self._consecutive_loud_frames += 1
                 else:
                     self._consecutive_loud_frames = max(0, self._consecutive_loud_frames - 1)
 
-                if self._consecutive_loud_frames >= 4 and (now - getattr(self, "_node_start_time", 0.0)) > 3.0:
+                if self._consecutive_loud_frames >= 5 and (now - getattr(self, "_node_start_time", 0.0)) > 3.0:
                     self._last_interaction_time = now
                     if self._is_sleeping:
                         self._wake_up()
             except Exception:
                 pass
+
+        # IMPORTANT: While Astro is sleeping, DO NOT stream audio to OpenAI Realtime!
+        # This completely guarantees Astro remains 100% silent and consumes 0 OpenAI tokens in sleep mode.
+        if self._is_sleeping:
+            return
 
         payload = {
             "type": "input_audio_buffer.append",
