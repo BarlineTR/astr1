@@ -327,9 +327,12 @@ class SpeechRecognitionNode(Node):
                 if device != "cuda":
                     raise
                 compute = os.getenv("STT_FW_CPU_COMPUTE_TYPE", "int8")
-                self.get_logger().warn(f"CUDA ile yüklenemedi ({exc}) — CPU moduna düşülüyor")
+                cpu_model = os.getenv("STT_FW_CPU_MODEL", "base")
+                self.get_logger().warn(f"CUDA ile yüklenemedi ({exc}) — CPU moduna ve hafif modele ({cpu_model}) geçiliyor")
                 device = "cpu"
+                name = cpu_model
                 self.fw_model = WhisperModel(name, device="cpu", compute_type=compute)
+
         except Exception as e:
             self.get_logger().error(f"❌ [STT] Faster-Whisper yüklenemedi: {e}")
             self.fw_model = None
@@ -412,19 +415,9 @@ class SpeechRecognitionNode(Node):
                 self.get_logger().info(f"🎙️ [Ses Tanıma]: {spk_name} ({spk_meta.get('formal_title', '')}) (Güven: {spk_conf:.2f})")
 
             text = None
-            # 0. Yerel Faster-Whisper (internet gerekmez, GPU'da hızlı)
-            if self.fw_model is not None:
-                try:
-                    audio_f32 = arr.astype(np.float32) / 32768.0
-                    segments, _info = self.fw_model.transcribe(
-                        audio_f32, beam_size=5, language="tr"
-                    )
-                    text = "".join(seg.text for seg in segments).strip()
-                except Exception as fe:
-                    self.get_logger().warn(f"⚠️ [Faster-Whisper] Hatası ({fe}), bulut motorlara geçiliyor...")
 
-            # 1. Ultra-Fast Groq Whisper Large V3 (80ms Latency)
-            if not text and self.groq_client:
+            # 1. Ultra-Fast Groq Whisper Large V3 (80ms Latency - Primary Free STT)
+            if self.groq_client:
                 try:
                     result = self.groq_client.audio.transcriptions.create(
                         file=("speech.wav", wav_bytes),
@@ -435,7 +428,7 @@ class SpeechRecognitionNode(Node):
                     )
                     text = str(result).strip()
                 except Exception as ge:
-                    self.get_logger().warn(f"⚠️ [Groq Whisper] Hatası ({ge}), OpenAI Whisper yedeğe geçiliyor...")
+                    self.get_logger().warn(f"⚠️ [Groq Whisper] Hatası ({ge}), yedek motorlara geçiliyor...")
 
             # 2. OpenAI Whisper-1 Fallback
             if not text and self.openai_client:
@@ -450,6 +443,18 @@ class SpeechRecognitionNode(Node):
                     text = str(res).strip()
                 except Exception as oe:
                     self.get_logger().warn(f"⚠️ [OpenAI Whisper] Hatası: {oe}")
+
+            # 3. Yerel Faster-Whisper (Yalnızca bulut motorlar başarısız olursa)
+            if not text and self.fw_model is not None:
+                try:
+                    audio_f32 = arr.astype(np.float32) / 32768.0
+                    segments, _info = self.fw_model.transcribe(
+                        audio_f32, beam_size=1, language="tr"
+                    )
+                    text = "".join(seg.text for seg in segments).strip()
+                except Exception as fe:
+                    self.get_logger().warn(f"⚠️ [Faster-Whisper] Hatası ({fe})")
+
 
             if not text:
                 return
