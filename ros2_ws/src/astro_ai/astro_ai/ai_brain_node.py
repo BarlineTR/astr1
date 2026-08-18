@@ -1204,7 +1204,7 @@ class AiBrainNode(Node):
 
         # 2. Try Secondary Google Gemini REST Endpoint
         if self._ai_api_key and self._ai_api_key.startswith("AIza"):
-            gemini_vision_models = ["gemini-2.0-flash", "gemini-1.5-flash", "gemini-flash-latest"]
+            gemini_vision_models = ["gemini-3.6-flash", "gemini-2.5-flash", "gemini-flash-latest"]
             for g_model in gemini_vision_models:
                 try:
                     url = f"https://generativelanguage.googleapis.com/v1beta/models/{g_model}:generateContent?key={self._ai_api_key}"
@@ -1220,8 +1220,8 @@ class AiBrainNode(Node):
                             "max_output_tokens": 512
                         }
                     }
-                    data_bytes = json.dumps(payload).encode("utf-8")
-                    req = urllib.request.Request(url, data=data_bytes, headers={"Content-Type": "application/json"})
+                    data_bytes = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+                    req = urllib.request.Request(url, data=data_bytes, headers={"Content-Type": "application/json", "User-Agent": "Mozilla/5.0"})
                     with urllib.request.urlopen(req, timeout=5.0) as resp:
                         res_json = json.loads(resp.read().decode("utf-8"))
                         text = res_json["candidates"][0]["content"]["parts"][0]["text"].strip()
@@ -1243,7 +1243,7 @@ class AiBrainNode(Node):
         if not self._ai_api_key:
             return None
 
-        gemini_text_models = ["gemini-2.0-flash", "gemini-1.5-flash", "gemini-1.5-pro"]
+        gemini_text_models = ["gemini-3.6-flash", "gemini-2.5-flash", "gemini-flash-latest"]
         for g_model in gemini_text_models:
             try:
                 url = f"https://generativelanguage.googleapis.com/v1beta/models/{g_model}:generateContent?key={self._ai_api_key}"

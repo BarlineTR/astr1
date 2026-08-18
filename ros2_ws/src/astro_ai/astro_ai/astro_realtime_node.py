@@ -1020,9 +1020,9 @@ class AstroRealtimeNode(Node):
         refusal_kws = ["üzgünüm", "yardımcı olamam", "açıklayamıyorum", "cannot assist", "i am sorry", "i'm sorry", "doğrudan açıklayamıyorum"]
         obs = None
 
-        # 1. Primary: Google Gemini 2.0 Flash / 1.5 Flash REST (0 Token Cost, Blazing Fast)
+        # 1. Primary: Google Gemini 3.6 Flash / 2.5 Flash REST (0 Token Cost, Blazing Fast)
         if self.gemini_api_key:
-            for g_mod in ["gemini-2.0-flash", "gemini-1.5-flash"]:
+            for g_mod in ["gemini-3.6-flash", "gemini-2.5-flash", "gemini-flash-latest"]:
                 try:
                     import urllib.request
                     import urllib.error
@@ -1271,7 +1271,7 @@ class AstroRealtimeNode(Node):
 
             # 2. Try Gemini REST (0 Token Cost fallback)
             if not ans and self.gemini_api_key:
-                for g_mod in ["gemini-2.0-flash", "gemini-1.5-flash"]:
+                for g_mod in ["gemini-3.6-flash", "gemini-2.5-flash", "gemini-flash-latest"]:
                     try:
                         url = f"https://generativelanguage.googleapis.com/v1beta/models/{g_mod}:generateContent?key={self.gemini_api_key}"
                         payload = {"contents": [{"parts": [{"text": prompt}]}], "generation_config": {"temperature": 0.1, "max_output_tokens": 60}}
@@ -1321,9 +1321,9 @@ class AstroRealtimeNode(Node):
             obs = None
             provider_name = ""
 
-            # 1. Primary: Google Gemini 2.0 Flash / 1.5 Flash REST (0 Token Cost, Blazing Fast)
+            # 1. Primary: Google Gemini 3.6 Flash / 2.5 Flash REST (0 Token Cost, Blazing Fast)
             if self.gemini_api_key:
-                for g_mod in ["gemini-2.0-flash", "gemini-1.5-flash"]:
+                for g_mod in ["gemini-3.6-flash", "gemini-2.5-flash", "gemini-flash-latest"]:
                     try:
                         import urllib.request
                         import urllib.error
