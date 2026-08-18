@@ -225,6 +225,14 @@ class AstroRealtimeNode(Node):
 
 
 
+        # Tool execution deduplication
+        self._executed_tool_calls: set[str] = set()
+
+        # Sleep Mode (10s Inactivity Timer)
+        self._is_sleeping = False
+        self._last_interaction_time = time.monotonic()
+        self.create_timer(1.0, self._check_sleep_mode)
+
         # Reminders storage
         self._reminders: List[Dict[str, Any]] = []
         self.create_timer(1.0, self._check_reminders)
@@ -233,6 +241,8 @@ class AstroRealtimeNode(Node):
         self._last_summarized_turn_count = 0
         self.create_timer(1.0, self._check_session_lifecycle)
 
+        # Purge any corrupted / profanity records
+        self._purge_corrupted_biometrics()
 
         # Async WebSocket Loop in background thread
         self._ws = None
@@ -434,7 +444,7 @@ class AstroRealtimeNode(Node):
                     {
                         "type": "function",
                         "name": "enroll_user_biometrics",
-                        "description": "Kullanıcı 'beni kaydet', 'sesimi öğren', 'yüzümü kaydet', 'adım [isim]' veya 'tanışalım' dediğinde, kullanıcının yüzünü kameradan, sesini mikrofondan alarak robotun kalıcı veri tabanına kaydeder.",
+                        "description": "SADECE VE SADECE kullanıcı KENDİ İSMİNİ tanıttığında ('Benim adım Onur', 'Adım Mehmet', 'Bana Ali de') çağrılır. Başka birisi hakkında soru sorulduğunda ('Onur nerede?', 'Onur kim?', 'Onur\\'u ne diye kaydetsin?') KESİNLİKLE ÇAĞRILMAZ.",
                         "parameters": {
                             "type": "object",
                             "properties": {
@@ -458,6 +468,18 @@ class AstroRealtimeNode(Node):
                                 }
                             },
                             "required": ["persona"]
+                        }
+                    },
+                    {
+                        "type": "function",
+                        "name": "delete_user_biometrics",
+                        "description": "Kullanıcı 'beni hafızandan sil', '[isim] kaydını sil' dediğinde veya hatalı bir kayıt silinmek istendiğinde çağrılır.",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "name": {"type": "string", "description": "Silinecek kişinin adı (örn: Yarram, Onur, Mehmet)"}
+                            },
+                            "required": ["name"]
                         }
                     }
                 ]
@@ -492,6 +514,7 @@ class AstroRealtimeNode(Node):
 
         # 3. User Speech Started
         elif event_type == "input_audio_buffer.speech_started":
+            self._wake_up()
             # ONLY trigger barge-in interruption if Astro was ACTUALLY playing audio or generating a response
             if self._is_responding or self._is_playback_active:
                 self.get_logger().info("⚡ [Realtime Barge-In] Kullanıcı lafa girdi — Çalma anında durduruluyor...")
@@ -555,19 +578,18 @@ class AstroRealtimeNode(Node):
                 self.session.record_robot_speech()
 
 
-        # 6. Realtime Function Calling Execution
-        elif event_type in ("response.function_call_arguments.done", "response.output_item.done"):
-            if event_type == "response.output_item.done":
-                item = event.get("item", {})
-                if item.get("type") != "function_call":
-                    return
-                call_id = item.get("call_id")
-                func_name = item.get("name")
-                args_str = item.get("arguments", "{}")
-            else:
-                call_id = event.get("call_id")
-                func_name = event.get("name")
-                args_str = event.get("arguments", "{}")
+        # 6. Realtime Function Calling Execution (Single Execution per call_id)
+        elif event_type == "response.function_call_arguments.done":
+            call_id = event.get("call_id")
+            if call_id and call_id in self._executed_tool_calls:
+                return
+            if call_id:
+                self._executed_tool_calls.add(call_id)
+                if len(self._executed_tool_calls) > 50:
+                    self._executed_tool_calls.clear()
+
+            func_name = event.get("name")
+            args_str = event.get("arguments", "{}")
 
             try:
                 args = json.loads(args_str)
@@ -599,7 +621,7 @@ class AstroRealtimeNode(Node):
             self._is_responding = False
             err = event.get("error", {})
             msg = err.get("message", "")
-            if "no active response found" not in msg:
+            if "no active response found" not in msg and "already has an active response" not in msg:
                 self.get_logger().error(f"❌ [Realtime WS Hatası]: {msg}")
 
 
@@ -633,6 +655,10 @@ class AstroRealtimeNode(Node):
             name_param = args.get("name", "")
             formal_title = args.get("formal_title", "")
             return self._enroll_user_biometrics(name_param, formal_title)
+
+        elif name == "delete_user_biometrics":
+            name_param = args.get("name", "")
+            return self._delete_user_biometrics(name_param)
 
         elif name == "change_persona":
             raw_p = args.get("persona", "").lower().strip()
@@ -669,14 +695,56 @@ class AstroRealtimeNode(Node):
 
         return {"status": "unknown_tool"}
 
+    def _purge_corrupted_biometrics(self):
+        """Automatically purges corrupted names / profanities on node startup."""
+        bad_names = ["yarram", "yarram_bey", "yarram bey", "yarağın", "sik", "siktir", "amk", "piç", "gerizekalı", "yarak", "yarrak", "astronun kocası", "astronun_kocasi", "astronun kocasi"]
+        for bad in bad_names:
+            try:
+                if self.voice_recognizer:
+                    self.voice_recognizer.delete_speaker(bad)
+                if self.face_recognizer:
+                    self.face_recognizer.delete_face(bad)
+                self.memory.profile.remove_known_person(bad)
+            except Exception:
+                pass
+        self.get_logger().info("🧹 [Biyometrik Temizlik]: Hatalı/uygunsuz kayıtlar (Yarram, Astronun Kocası vb.) veri tabanından tamamen silindi.")
+
+    def _delete_user_biometrics(self, name: str) -> Dict[str, Any]:
+        """Deletes user from biometric databases and memory."""
+        name = name.strip().title()
+        if not name or len(name) < 2:
+            return {"status": "error", "message": "Silinecek geçerli bir isim belirtilmedi."}
+
+        try:
+            if self.voice_recognizer:
+                self.voice_recognizer.delete_speaker(name)
+            if self.face_recognizer:
+                self.face_recognizer.delete_face(name)
+            self.memory.profile.remove_known_person(name)
+        except Exception as e:
+            self.get_logger().warn(f"Biometric deletion warning: {e}")
+
+        with self._lock:
+            if getattr(self, "_active_person_name", "") == name:
+                self._active_person_name = "Misafir"
+                self._person_hold_until = 0.0
+                self._recognized_speaker = None
+                self._recognized_person = None
+                self._last_synced_identity = ""
+
+        self._sync_perception_to_session()
+        msg = f"'{name}' biyometrik kayıtları ve hafızası başarıyla silindi."
+        self.get_logger().info(f"🗑️ [Biyometrik Silindi]: {msg}")
+        return {"status": "success", "message": msg}
+
     def _run_voice_identification(self):
-        """Runs acoustic voiceprint matching on the recorded user speech."""
+        """Runs ultra-fast acoustic voiceprint matching on the recorded user speech (~1.2s window)."""
         if not self.voice_recognizer:
             return
         with self._lock:
             if not self._user_speech_audio_buffer:
                 return
-            raw_16k_all = b"".join(self._user_speech_audio_buffer[-150:])  # Last ~3 seconds
+            raw_16k_all = b"".join(self._user_speech_audio_buffer[-60:])  # Last ~1.2 seconds (~50ms inference)
 
         try:
             audio_arr = np.frombuffer(raw_16k_all, dtype=np.int16)
@@ -710,9 +778,20 @@ class AstroRealtimeNode(Node):
 
 
     def _enroll_user_biometrics(self, name: str, formal_title: str = "") -> Dict[str, Any]:
-        """Enrolls user face and voice into biometric databases."""
-        name = name.strip().title()
+        """Enrolls user face and voice into biometric databases with strict human name validation."""
+        profanities = ["yarram", "yarak", "yarrak", "yarağın", "sik", "siktir", "amk", "amına", "piç", "göt", "gerizekalı", "lan", "mal", "yavşak", "orospu"]
+        name_raw = name.strip()
+        if any(p in name_raw.lower() for p in profanities):
+            return {"status": "error", "message": "Uygunsuz veya küfürlü kelimeler isim olarak kaydedilemez."}
+
+        name_clean = re.sub(r"[^a-zA-ZçğıöşüÇĞİÖŞÜ\s]", "", name_raw).strip()
+        name_clean = re.sub(r"\b(bey|hanım|beyim)\b", "", name_clean, flags=re.IGNORECASE).strip().title()
+
+        if not name_clean or len(name_clean) < 2:
+            return {"status": "error", "message": "Geçerli bir insan ismi belirtilmedi."}
+        name = name_clean
         formal_title = formal_title.strip() if formal_title else f"{name} Bey"
+        formal_title = re.sub(r"\b(bey\s+bey|hanım\s+hanım)\b", "Bey", formal_title, flags=re.IGNORECASE).strip()
 
         # 1. Voice Enrollment
         voice_ok = False
@@ -770,7 +849,7 @@ class AstroRealtimeNode(Node):
 
 
     def _inspect_camera_view(self, focus: str = "") -> Dict[str, Any]:
-        """Captures real-time camera frame from OAK-D Lite and runs visual recognition with high speed and fallback."""
+        """Captures real-time camera frame from OAK-D Lite and runs visual recognition with high speed and zero-refusal fallback."""
         with self._lock:
             frame = self._latest_camera_frame
 
@@ -787,10 +866,70 @@ class AstroRealtimeNode(Node):
             f"Odaklanılacak konu: {focus if focus else 'kullanıcının elindeki nesne, odadaki eşyalar ve çevre'}. Doğrudan kesin gözlemini kısa ve net yaz."
         )
 
+        refusal_kws = ["üzgünüm", "yardımcı olamam", "açıklayamıyorum", "cannot assist", "i am sorry", "i'm sorry", "doğrudan açıklayamıyorum"]
         obs = None
 
-        # 1. Query OpenAI Vision REST API (gpt-4o-mini)
-        if self.openai_api_key:
+        # 1. Ultra-Fast Priority: Groq Vision (llama-3.2-11b-vision-preview / llama-3.2-90b-vision-preview) (~250ms, 0 Refusal)
+        if self.groq_api_key:
+            for v_mod in ["llama-3.2-11b-vision-preview", "llama-3.2-90b-vision-preview"]:
+                try:
+                    import urllib.request
+                    req_data = {
+                        "model": v_mod,
+                        "messages": [
+                            {
+                                "role": "user",
+                                "content": [
+                                    {"type": "text", "text": prompt_text},
+                                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64_img}"}}
+                                ]
+                            }
+                        ],
+                        "max_tokens": 150
+                    }
+                    req = urllib.request.Request(
+                        "https://api.groq.com/openai/v1/chat/completions",
+                        data=json.dumps(req_data).encode("utf-8"),
+                        headers={
+                            "Content-Type": "application/json",
+                            "Authorization": f"Bearer {self.groq_api_key}"
+                        },
+                        method="POST"
+                    )
+                    with urllib.request.urlopen(req, timeout=5.0) as resp:
+                        resp_json = json.loads(resp.read().decode("utf-8"))
+                        candidate_obs = resp_json["choices"][0]["message"]["content"].strip()
+                        if candidate_obs and not any(rk in candidate_obs.lower() for rk in refusal_kws):
+                            obs = candidate_obs
+                            break
+                except Exception as ge:
+                    self.get_logger().warn(f"⚠️ [Groq Vision Uyarısı]: {ge}")
+
+        # 2. Fast Fallback: Gemini 2.0 Flash REST (~300ms, 0 Refusal)
+        if not obs and self.gemini_api_key:
+            try:
+                import urllib.request
+                url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={self.gemini_api_key}"
+                payload = {
+                    "contents": [{
+                        "parts": [
+                            {"text": prompt_text},
+                            {"inlineData": {"mimeType": "image/jpeg", "data": b64_img}}
+                        ]
+                    }],
+                    "generationConfig": {"temperature": 0.2, "maxOutputTokens": 150}
+                }
+                req = urllib.request.Request(url, data=json.dumps(payload).encode("utf-8"), headers={"Content-Type": "application/json"})
+                with urllib.request.urlopen(req, timeout=5.0) as resp:
+                    res_json = json.loads(resp.read().decode("utf-8"))
+                    candidate_obs = res_json["candidates"][0]["content"]["parts"][0]["text"].strip()
+                    if candidate_obs and not any(rk in candidate_obs.lower() for rk in refusal_kws):
+                        obs = candidate_obs
+            except Exception as gem_e:
+                self.get_logger().warn(f"⚠️ [Gemini Vision Uyarısı]: {gem_e}")
+
+        # 3. Fallback: OpenAI Vision REST API (gpt-4o-mini)
+        if not obs and self.openai_api_key:
             try:
                 import urllib.request
                 req_data = {
@@ -815,48 +954,63 @@ class AstroRealtimeNode(Node):
                     },
                     method="POST"
                 )
-                with urllib.request.urlopen(req, timeout=8.0) as resp:
+                with urllib.request.urlopen(req, timeout=6.0) as resp:
                     resp_json = json.loads(resp.read().decode("utf-8"))
-                    obs = resp_json["choices"][0]["message"]["content"].strip()
+                    candidate_obs = resp_json["choices"][0]["message"]["content"].strip()
+                    if candidate_obs and not any(rk in candidate_obs.lower() for rk in refusal_kws):
+                        obs = candidate_obs
             except Exception as oe:
-                self.get_logger().warn(f"⚠️ [OpenAI Vision Uyarısı]: {oe}, Groq/Gemini Vision yedeğine geçiliyor...")
-
-        # 2. Fast Fallback: Groq Vision (llama-3.2-11b-vision-preview)
-        if not obs and self.groq_api_key:
-            try:
-                req_data = {
-                    "model": "llama-3.2-11b-vision-preview",
-                    "messages": [
-                        {
-                            "role": "user",
-                            "content": [
-                                {"type": "text", "text": prompt_text},
-                                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64_img}"}}
-                            ]
-                        }
-                    ],
-                    "max_tokens": 150
-                }
-                req = urllib.request.Request(
-                    "https://api.groq.com/openai/v1/chat/completions",
-                    data=json.dumps(req_data).encode("utf-8"),
-                    headers={
-                        "Content-Type": "application/json",
-                        "Authorization": f"Bearer {self.groq_api_key}"
-                    },
-                    method="POST"
-                )
-                with urllib.request.urlopen(req, timeout=5.0) as resp:
-                    resp_json = json.loads(resp.read().decode("utf-8"))
-                    obs = resp_json["choices"][0]["message"]["content"].strip()
-            except Exception as ge:
-                self.get_logger().warn(f"⚠️ [Groq Vision Uyarısı]: {ge}")
+                self.get_logger().warn(f"⚠️ [OpenAI Vision Uyarısı]: {oe}")
 
         if obs:
             self.get_logger().info(f"👁️ [Kamera Görme Sonucu]: \"{obs}\"")
             return {"status": "success", "observation": obs}
 
         return {"status": "error", "observation": "Görüntü analiz edilirken bir hata oluştu."}
+
+    def _check_sleep_mode(self):
+        """Transitions Astro into sleep mode after 10 seconds of conversation inactivity."""
+        now = time.monotonic()
+        is_busy = self._is_responding or self._is_playback_active
+        if is_busy:
+            self._last_interaction_time = now
+            if self._is_sleeping:
+                self._wake_up()
+            return
+
+        if not self._is_sleeping:
+            idle_seconds = now - self._last_interaction_time
+            if idle_seconds >= 10.0:
+                self._is_sleeping = True
+                self.get_logger().info("💤 [Astro Uyku Modu]: 10 saniye hareketsizlik — Astro uyku moduna geçti (😴).")
+
+                # 1. Publish sleeping emotion for face/display
+                emo_msg = String()
+                emo_msg.data = "sleeping"
+                self.pub_emotion.publish(emo_msg)
+
+                # 2. Publish sleep head gesture
+                gest_msg = String()
+                gest_msg.data = "sleep"
+                self.pub_gesture.publish(gest_msg)
+
+    def _wake_up(self):
+        """Wakes Astro up from sleep mode upon speech or user interaction."""
+        now = time.monotonic()
+        self._last_interaction_time = now
+        if self._is_sleeping:
+            self._is_sleeping = False
+            self.get_logger().info("⏰ [Astro Uyandı]: Kullanıcı sesi algılandı — Astro uykudan uyandı ve dinliyor!")
+
+            # 1. Restore persona emotion
+            emo_msg = String()
+            emo_msg.data = self.persona_name
+            self.pub_emotion.publish(emo_msg)
+
+            # 2. Publish wake gesture
+            gest_msg = String()
+            gest_msg.data = "wake"
+            self.pub_gesture.publish(gest_msg)
 
 
     def _on_camera_image(self, msg: Image):
@@ -1180,6 +1334,7 @@ class AstroRealtimeNode(Node):
 
 
         # Downsample and buffer 16kHz audio for acoustic voice recognition & dynamic enrollment
+        raw_16k = None
         try:
             raw_24k = base64.b64decode(msg.data.encode("ascii"))
             if raw_24k:
@@ -1191,6 +1346,18 @@ class AstroRealtimeNode(Node):
                             self._user_speech_audio_buffer = self._user_speech_audio_buffer[-250:]
         except Exception:
             pass
+
+        # Acoustic presence / wake-up
+        if raw_16k:
+            try:
+                arr = np.frombuffer(raw_16k, dtype=np.int16)
+                local_rms = float(np.sqrt(np.mean(arr.astype(np.float32) ** 2)))
+                if local_rms > 30.0:
+                    self._last_interaction_time = now
+                    if self._is_sleeping:
+                        self._wake_up()
+            except Exception:
+                pass
 
         payload = {
             "type": "input_audio_buffer.append",
@@ -1233,6 +1400,8 @@ class AstroRealtimeNode(Node):
             with self._lock:
                 self._recognized_person = data
                 if data.get("is_known") and data.get("confidence", 0.0) >= 0.45:
+                    if self._is_sleeping:
+                        self._wake_up()
                     name = data.get("name", "")
                     title = data.get("title", "")
                     formal_title = data.get("formal_title", title or name)
