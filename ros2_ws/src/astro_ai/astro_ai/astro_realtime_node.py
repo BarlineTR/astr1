@@ -39,13 +39,14 @@ except ImportError:
 try:
     from astro_ai.conversation_session import ConversationSession
     from astro_ai.memory_manager import MemoryManager
-    from astro_ai.persona_engine import PersonaEngine
+    from astro_ai.persona_engine import PersonaEngine, PERSONA_PROMPTS
     from astro_ai.state_machine import RobotState, StateMachine
 except ImportError:
     from conversation_session import ConversationSession
     from memory_manager import MemoryManager
-    from persona_engine import PersonaEngine
+    from persona_engine import PersonaEngine, PERSONA_PROMPTS
     from state_machine import RobotState, StateMachine
+
 
 
 try:
@@ -427,10 +428,27 @@ class AstroRealtimeNode(Node):
                             },
                             "required": ["name"]
                         }
+                    },
+                    {
+                        "type": "function",
+                        "name": "change_persona",
+                        "description": "Kullanıcı robotun kişiliğini veya konuşma modunu değiştirmek istediğinde çağrılır (Örn: 'kaba moda geç', 'küfürbaz moda geç', 'neşeli moda geç', 'resmi moda geç', 'flört moduna geç', 'sarkastik moda geç', 'sinirli moda geç', 'duygusal moda geç').",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "persona": {
+                                    "type": "string",
+                                    "enum": ["kufurbaz", "flirt", "playful", "emotional", "formal", "sarcastic", "angry", "rude"],
+                                    "description": "Hedef kişilik modu: kufurbaz, flirt, playful, emotional, formal, sarcastic, angry, rude"
+                                }
+                            },
+                            "required": ["persona"]
+                        }
                     }
                 ]
             }
         }
+
 
         await ws.send(json.dumps(session_config))
         self.get_logger().info(f"✨ [Realtime WS] Oturum Yapılandırıldı. Kişilik: [{self.persona_name.upper()}], Ses: [{self.realtime_voice}], Kimlik: [{identity.get('name')}]")
@@ -585,6 +603,39 @@ class AstroRealtimeNode(Node):
             formal_title = args.get("formal_title", "")
             return self._enroll_user_biometrics(name_param, formal_title)
 
+        elif name == "change_persona":
+            raw_p = args.get("persona", "").lower().strip()
+            p_map = {
+                "kufurbaz": "kufurbaz", "küfürbaz": "kufurbaz", "kufur": "kufurbaz", "küfür": "kufurbaz",
+                "kaba": "rude", "rude": "rude",
+                "flort": "flirt", "flört": "flirt", "flirt": "flirt", "capkin": "flirt", "çapkın": "flirt",
+                "neseli": "playful", "neşeli": "playful", "playful": "playful", "sakaci": "playful", "şakacı": "playful",
+                "resmi": "formal", "formal": "formal", "ciddi": "formal",
+                "sarkastik": "sarcastic", "sarcastic": "sarcastic", "alayci": "sarcastic", "alaycı": "sarcastic",
+                "sinirli": "angry", "angry": "angry", "asabi": "angry", "ofkeli": "angry", "öfkeli": "angry",
+                "duygusal": "emotional", "emotional": "emotional"
+            }
+            target = p_map.get(raw_p, raw_p)
+            if target in PERSONA_PROMPTS:
+                self.persona_name = target
+                self.persona_engine.set_persona(target)
+                self.memory.profile.set_persona(target)
+                self._last_synced_identity = ""  # Force immediate session update
+
+                # Publish emotion for face screen
+                emo_msg = String()
+                emo_msg.data = target
+                self.pub_emotion.publish(emo_msg)
+
+                self.get_logger().info(f"🎭 [Kişilik Değiştirildi]: Yeni kişilik modu -> '{target.upper()}'")
+                self._sync_perception_to_session()
+                return {
+                    "status": "success",
+                    "persona": target,
+                    "message": f"Kişilik modu başarıyla '{target}' olarak değiştirildi. Artık tamamen bu yeni kişiliğin kurallarıyla konuş."
+                }
+            return {"status": "error", "message": f"'{raw_p}' geçerli bir kişilik modu değil."}
+
         return {"status": "unknown_tool"}
 
     def _run_voice_identification(self):
@@ -684,58 +735,94 @@ class AstroRealtimeNode(Node):
 
 
     def _inspect_camera_view(self, focus: str = "") -> Dict[str, Any]:
-        """Captures real-time camera frame from OAK-D Lite and runs visual recognition."""
+        """Captures real-time camera frame from OAK-D Lite and runs visual recognition with high speed and fallback."""
         with self._lock:
             frame = self._latest_camera_frame
 
         if frame is None:
             return {"status": "no_camera_frame", "observation": "Kamera görüntüsü şu an alınamadı."}
 
-        b64_img = frame_to_base64_jpeg(frame, max_dim=640)
+        b64_img = frame_to_base64_jpeg(frame, max_dim=512)
         if not b64_img:
             return {"status": "encode_error", "observation": "Görüntü işlenemedi."}
 
-        # Query OpenAI Vision REST API (gpt-4o-mini)
-        try:
-            import urllib.request
-            req_data = {
-                "model": "gpt-4o-mini",
-                "messages": [
-                    {
-                        "role": "user",
-                        "content": [
-                            {
-                                "type": "text",
-                                "text": f"Sen Astro adlı sosyal robotun gözüsün. Bu fotoğrafta kullanıcının elinde tuttuğu nesneyi, rengini, materyalini, kullanıcının duruşunu ve çevreyi çok detaylı ve %100 doğru şekilde Türkçe açıkla. Odaklanılacak konu: {focus if focus else 'kullanıcının elindeki nesne ve detayları'}. Doğrudan kesin gözlemini kısa ve net yaz."
-                            },
-                            {
-                                "type": "image_url",
-                                "image_url": {
-                                    "url": f"data:image/jpeg;base64,{b64_img}"
-                                }
-                            }
-                        ]
-                    }
-                ],
-                "max_tokens": 150
-            }
-            req = urllib.request.Request(
-                "https://api.openai.com/v1/chat/completions",
-                data=json.dumps(req_data).encode("utf-8"),
-                headers={
-                    "Content-Type": "application/json",
-                    "Authorization": f"Bearer {self.openai_api_key}"
-                },
-                method="POST"
-            )
-            with urllib.request.urlopen(req, timeout=4.0) as resp:
-                resp_json = json.loads(resp.read().decode("utf-8"))
-                obs = resp_json["choices"][0]["message"]["content"].strip()
-                self.get_logger().info(f"👁️ [Kamera Görme Sonucu]: \"{obs}\"")
-                return {"status": "success", "observation": obs}
-        except Exception as e:
-            self.get_logger().error(f"❌ [Vision Hatası]: {e}")
-            return {"status": "error", "observation": "Görüntü analiz edilirken bir hata oluştu."}
+        prompt_text = (
+            f"Sen Astro adlı sosyal robotun gözüsün. Bu fotoğrafta karşındaki odayı, ortamı, insanların duruşunu, "
+            f"masadaki eşyaları ve kullanıcının elinde tuttuğu nesneyi çok detaylı ve %100 doğru şekilde Türkçe açıkla. "
+            f"Odaklanılacak konu: {focus if focus else 'kullanıcının elindeki nesne, odadaki eşyalar ve çevre'}. Doğrudan kesin gözlemini kısa ve net yaz."
+        )
+
+        obs = None
+
+        # 1. Query OpenAI Vision REST API (gpt-4o-mini)
+        if self.openai_api_key:
+            try:
+                import urllib.request
+                req_data = {
+                    "model": "gpt-4o-mini",
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": [
+                                {"type": "text", "text": prompt_text},
+                                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64_img}"}}
+                            ]
+                        }
+                    ],
+                    "max_tokens": 150
+                }
+                req = urllib.request.Request(
+                    "https://api.openai.com/v1/chat/completions",
+                    data=json.dumps(req_data).encode("utf-8"),
+                    headers={
+                        "Content-Type": "application/json",
+                        "Authorization": f"Bearer {self.openai_api_key}"
+                    },
+                    method="POST"
+                )
+                with urllib.request.urlopen(req, timeout=8.0) as resp:
+                    resp_json = json.loads(resp.read().decode("utf-8"))
+                    obs = resp_json["choices"][0]["message"]["content"].strip()
+            except Exception as oe:
+                self.get_logger().warn(f"⚠️ [OpenAI Vision Uyarısı]: {oe}, Groq/Gemini Vision yedeğine geçiliyor...")
+
+        # 2. Fast Fallback: Groq Vision (llama-3.2-11b-vision-preview)
+        if not obs and self.groq_api_key:
+            try:
+                req_data = {
+                    "model": "llama-3.2-11b-vision-preview",
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": [
+                                {"type": "text", "text": prompt_text},
+                                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64_img}"}}
+                            ]
+                        }
+                    ],
+                    "max_tokens": 150
+                }
+                req = urllib.request.Request(
+                    "https://api.groq.com/openai/v1/chat/completions",
+                    data=json.dumps(req_data).encode("utf-8"),
+                    headers={
+                        "Content-Type": "application/json",
+                        "Authorization": f"Bearer {self.groq_api_key}"
+                    },
+                    method="POST"
+                )
+                with urllib.request.urlopen(req, timeout=5.0) as resp:
+                    resp_json = json.loads(resp.read().decode("utf-8"))
+                    obs = resp_json["choices"][0]["message"]["content"].strip()
+            except Exception as ge:
+                self.get_logger().warn(f"⚠️ [Groq Vision Uyarısı]: {ge}")
+
+        if obs:
+            self.get_logger().info(f"👁️ [Kamera Görme Sonucu]: \"{obs}\"")
+            return {"status": "success", "observation": obs}
+
+        return {"status": "error", "observation": "Görüntü analiz edilirken bir hata oluştu."}
+
 
     def _on_camera_image(self, msg: Image):
         now = time.monotonic()
