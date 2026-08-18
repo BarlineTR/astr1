@@ -265,11 +265,10 @@ class AstroRealtimeNode(Node):
                             "required": ["key", "value"]
                         }
                     }
-                ],
-                "tool_choice": "auto",
-                "temperature": 0.6
+                ]
             }
         }
+
 
         await ws.send(json.dumps(session_config))
         self.get_logger().info(f"✨ [Realtime WS] Oturum Yapılandırıldı. Kişilik: [{self.persona_name.upper()}], Ses: [{self.realtime_voice}]")
@@ -278,8 +277,12 @@ class AstroRealtimeNode(Node):
         """Dispatches Realtime WebSocket server events."""
         event_type = event.get("type", "")
 
+        # 0. Session Update Acknowledged
+        if event_type == "session.updated":
+            self.get_logger().info("✅ [Realtime WS] Oturum OpenAI tarafından başarıyla onaylandı ve hazır!")
+
         # 1. Real-Time Streaming Audio Output
-        if event_type == "response.audio.delta":
+        elif event_type == "response.audio.delta":
             delta_b64 = event.get("delta", "")
             if delta_b64:
                 out_msg = String()
@@ -300,6 +303,14 @@ class AstroRealtimeNode(Node):
             # Cancel ongoing OpenAI response generation
             await ws.send(json.dumps({"type": "response.cancel"}))
 
+        # 3b. User Speech Stopped
+        elif event_type == "input_audio_buffer.speech_stopped":
+            self.get_logger().info("🤫 [Realtime] Cümle bitti, Astro yanıt hazırlıyor...")
+
+        # 3c. Response Created
+        elif event_type == "response.created":
+            self.get_logger().info("🎙️ [Realtime] Astro sesli yanıt üretmeye başladı...")
+
         # 4. User Speech Transcription Completed
         elif event_type == "conversation.item.input_audio_transcription.completed":
             user_transcript = event.get("transcript", "").strip()
@@ -316,6 +327,7 @@ class AstroRealtimeNode(Node):
             if assistant_transcript:
                 self.get_logger().info(f"🤖 [Astro Realtime]: \"{assistant_transcript}\"")
                 self.memory.episodic.add_message("assistant", assistant_transcript)
+
 
         # 6. Realtime Function Calling Execution
         elif event_type == "response.function_call_arguments.done":
