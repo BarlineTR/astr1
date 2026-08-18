@@ -103,7 +103,7 @@ def frame_to_base64_jpeg(frame: np.ndarray, max_dim: int = 640) -> Optional[str]
             scale = max_dim / float(max(h, w))
             frame = cv2.resize(frame, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
         _, buffer = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
-        return base64.b64encode(buffer).decode("utf-8")
+        return base64.b64encode(buffer).decode("utf-8").replace("\n", "").replace("\r", "").strip()
     except Exception:
         return None
 
@@ -152,10 +152,10 @@ class AstroRealtimeNode(Node):
     def __init__(self):
         super().__init__("astro_realtime_node")
 
-        # Load environment variables
-        self.openai_api_key = os.environ.get("OPENAI_API_KEY", "").strip()
-        self.groq_api_key = os.environ.get("GROQ_API_KEY", "").strip()
-        self.gemini_api_key = os.environ.get("GEMINI_API_KEY", os.environ.get("AI_API_KEY", "")).strip()
+        # Load environment variables (sanitized of quotes/whitespace)
+        self.openai_api_key = os.environ.get("OPENAI_API_KEY", "").strip("\"' \t\n\r")
+        self.groq_api_key = os.environ.get("GROQ_API_KEY", "").strip("\"' \t\n\r")
+        self.gemini_api_key = os.environ.get("GEMINI_API_KEY", os.environ.get("AI_API_KEY", "")).strip("\"' \t\n\r")
         self.realtime_model = os.environ.get("REALTIME_MODEL", "gpt-4o-realtime-preview").strip()
         raw_voice = os.environ.get("REALTIME_VOICE", os.environ.get("TTS_VOICE", "echo")).strip().lower()
         self.realtime_voice = raw_voice if raw_voice in VALID_REALTIME_VOICES else "echo"
@@ -1006,6 +1006,11 @@ class AstroRealtimeNode(Node):
         if not b64_img:
             return {"status": "encode_error", "observation": "Görüntü işlenemedi."}
 
+        # Base64 sanitization: strip any URI prefix and whitespace/newlines
+        if "," in b64_img:
+            b64_img = b64_img.split(",")[-1]
+        b64_img = b64_img.replace("\n", "").replace("\r", "").strip()
+
         prompt_text = (
             f"Sen Astro adlı sosyal robotun gözüsün. Bu fotoğrafta karşındaki odayı, ortamı, insanların duruşunu, "
             f"masadaki eşyaları ve kullanıcının elinde tuttuğu nesneyi çok detaylı ve %100 doğru şekilde Türkçe açıkla. "
@@ -1040,9 +1045,9 @@ class AstroRealtimeNode(Node):
                 except Exception as gem_e:
                     self.get_logger().warn(f"⚠️ [Gemini Vision ({g_mod}) Uyarısı]: {gem_e}")
 
-        # 2. Fallback: Groq Vision (qwen/qwen3.6-27b) (0 Token Cost)
+        # 2. Fallback: Groq Vision (qwen-2.5-72b) (0 Token Cost)
         if not obs and self.groq_api_key:
-            for v_mod in ["qwen/qwen3.6-27b", "llama-3.2-11b-vision-preview"]:
+            for v_mod in ["qwen-2.5-72b", "llama-3.2-11b-vision-preview"]:
                 try:
                     import urllib.request
                     req_data = {
@@ -1242,6 +1247,11 @@ class AstroRealtimeNode(Node):
         if not b64_img:
             return
 
+        # Base64 sanitization: strip any URI prefix and whitespace/newlines
+        if "," in b64_img:
+            b64_img = b64_img.split(",")[-1]
+        b64_img = b64_img.replace("\n", "").replace("\r", "").strip()
+
         try:
             import urllib.request
             prompt = (
@@ -1276,9 +1286,9 @@ class AstroRealtimeNode(Node):
                     except Exception as gem_e:
                         self.get_logger().debug(f"Idle Gemini Vision ({g_mod}) notice: {gem_e}")
 
-            # 2. Fallback: Groq Vision (qwen/qwen3.6-27b) (0 Token Cost)
+            # 2. Fallback: Groq Vision (qwen-2.5-72b) (0 Token Cost)
             if not obs and self.groq_api_key:
-                for v_mod in ["qwen/qwen3.6-27b", "llama-3.2-11b-vision-preview"]:
+                for v_mod in ["qwen-2.5-72b", "llama-3.2-11b-vision-preview"]:
                     try:
                         req_data = {
                             "model": v_mod,
