@@ -1068,23 +1068,23 @@ class AstroRealtimeNode(Node):
     def _idle_learning_loop(self):
         """Continuous background loop for autonomous room exploration and cognitive memory consolidation."""
         while rclpy.ok():
-            time.sleep(5)
+            time.sleep(3)
             if not self._enable_idle_learning:
                 continue
 
-            # Only run when robot is completely idle and not speaking
+            # Only run when robot is idle and not actively speaking or responding
             if self._is_responding or self._is_playback_active:
                 continue
 
             now = time.monotonic()
-            if (now - self._last_idle_learning_time) > 35.0:
+            if (now - self._last_idle_learning_time) > 20.0:
                 self._last_idle_learning_time = now
 
-                # 1. Background Cognitive Memory Reflection
-                self._idle_memory_reflection()
-
-                # 2. Background Room Scene & Object Observation via Camera
+                # 1. Background Room Scene & Object Observation via Camera (Groq Vision)
                 self._idle_room_observation(now)
+
+                # 2. Background Cognitive Memory Reflection
+                self._idle_memory_reflection()
 
     def _idle_memory_reflection(self):
         """Extracts user preferences and facts from recent dialogue into long-term profile using FREE Groq/Gemini."""
@@ -1226,7 +1226,7 @@ class AstroRealtimeNode(Node):
 
             if obs and len(obs) > 4:
                 self.memory.profile.add_observation(f"Görsel Çevre: {obs}")
-                self.get_logger().info(f"🧠 [Otonom Boşta Gözlem (Groq/Gemini)]: {obs}")
+                self.get_logger().info(f"👁️🧠 [Otonom Görsel Öğrenme (Groq Vision)]: Astro kameradan gördü ve hafızasına kaydetti -> \"{obs}\"")
 
                 # If vision observes a person looking or sitting in front of robot, proactively initiate greeting
                 obs_l = obs.lower()
