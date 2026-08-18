@@ -124,10 +124,13 @@ class AstroRealtimeNode(Node):
 
         # Load environment variables
         self.openai_api_key = os.environ.get("OPENAI_API_KEY", "").strip()
+        self.groq_api_key = os.environ.get("GROQ_API_KEY", "").strip()
+        self.gemini_api_key = os.environ.get("GEMINI_API_KEY", os.environ.get("AI_API_KEY", "")).strip()
         self.realtime_model = os.environ.get("REALTIME_MODEL", "gpt-4o-realtime-preview").strip()
         raw_voice = os.environ.get("REALTIME_VOICE", os.environ.get("TTS_VOICE", "echo")).strip().lower()
         self.realtime_voice = raw_voice if raw_voice in VALID_REALTIME_VOICES else "echo"
         self.persona_name = os.environ.get("PERSONA", "kufurbaz").strip().lower()
+
 
         # Modular Cognitive Subsystems
         self.memory = MemoryManager()
@@ -579,7 +582,7 @@ class AstroRealtimeNode(Node):
                 self._idle_room_observation(now)
 
     def _idle_memory_reflection(self):
-        """Extracts user preferences and facts from recent dialogue into long-term profile."""
+        """Extracts user preferences and facts from recent dialogue into long-term profile using FREE Groq/Gemini."""
         messages = self.memory.episodic.get_messages()
         if len(messages) < 2:
             return
@@ -592,36 +595,56 @@ class AstroRealtimeNode(Node):
                 f"Yeni veya kayda değer bir bilgi yoksa sadece 'YOK' yaz.\n\nKonuşma:\n{conv_str}"
             )
             import urllib.request
-            req_data = {
-                "model": "gpt-4o-mini",
-                "messages": [{"role": "user", "content": prompt}],
-                "temperature": 0.1,
-                "max_tokens": 60
-            }
-            req = urllib.request.Request(
-                "https://api.openai.com/v1/chat/completions",
-                data=json.dumps(req_data).encode("utf-8"),
-                headers={
-                    "Content-Type": "application/json",
-                    "Authorization": f"Bearer {self.openai_api_key}"
-                },
-                method="POST"
-            )
-            with urllib.request.urlopen(req, timeout=4.0) as resp:
-                resp_json = json.loads(resp.read().decode("utf-8"))
-                ans = resp_json["choices"][0]["message"]["content"].strip()
-                if ans and "YOK" not in ans.upper() and len(ans) >= 5:
-                    identity = self._get_active_biometric_identity()
-                    name = identity.get("name", "Misafir")
-                    self.memory.profile.add_observation(f"Kullanıcı Bilgisi ({name}): {ans}")
-                    self.get_logger().info(f"🧠 [Otonom Hafıza Yansıtması]: {ans}")
-                    # Sync to session so Realtime AI immediately knows this new fact
-                    self._sync_perception_to_session()
+            ans = None
+
+            # 1. Try Groq (0 Token Cost)
+            if self.groq_api_key:
+                try:
+                    req_data = {
+                        "model": "llama-3.3-70b-versatile",
+                        "messages": [{"role": "user", "content": prompt}],
+                        "temperature": 0.1,
+                        "max_tokens": 60
+                    }
+                    req = urllib.request.Request(
+                        "https://api.groq.com/openai/v1/chat/completions",
+                        data=json.dumps(req_data).encode("utf-8"),
+                        headers={
+                            "Content-Type": "application/json",
+                            "Authorization": f"Bearer {self.groq_api_key}"
+                        },
+                        method="POST"
+                    )
+                    with urllib.request.urlopen(req, timeout=4.0) as resp:
+                        resp_json = json.loads(resp.read().decode("utf-8"))
+                        ans = resp_json["choices"][0]["message"]["content"].strip()
+                except Exception:
+                    pass
+
+            # 2. Try Gemini REST (0 Token Cost fallback)
+            if not ans and self.gemini_api_key:
+                try:
+                    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={self.gemini_api_key}"
+                    payload = {"contents": [{"parts": [{"text": prompt}]}], "generationConfig": {"temperature": 0.1, "maxOutputTokens": 60}}
+                    req = urllib.request.Request(url, data=json.dumps(payload).encode("utf-8"), headers={"Content-Type": "application/json"})
+                    with urllib.request.urlopen(req, timeout=4.0) as resp:
+                        res_json = json.loads(resp.read().decode("utf-8"))
+                        ans = res_json["candidates"][0]["content"]["parts"][0]["text"].strip()
+                except Exception:
+                    pass
+
+            if ans and "YOK" not in ans.upper() and len(ans) >= 5:
+                identity = self._get_active_biometric_identity()
+                name = identity.get("name", "Misafir")
+                self.memory.profile.add_observation(f"Kullanıcı Bilgisi ({name}): {ans}")
+                self.get_logger().info(f"🧠 [Otonom Hafıza Yansıtması (Groq)]: {ans}")
+                # Sync to session so Realtime AI immediately knows this new fact
+                self._sync_perception_to_session()
         except Exception as e:
             self.get_logger().debug(f"Memory reflection notice: {e}")
 
     def _idle_room_observation(self, now: float):
-        """Captures camera view in idle and saves visual environment observations to memory."""
+        """Captures camera view in idle and saves visual environment observations to memory using FREE Groq/Gemini."""
         with self._lock:
             frame = self._latest_camera_frame
 
@@ -639,57 +662,88 @@ class AstroRealtimeNode(Node):
                 "tek bir kısa ve net Türkçe cümleyle açıkla (Örn: 'Masada dizüstü bilgisayar ve kahve fincanı duruyor.' "
                 "veya 'Oda aydınlık, masada çakmak ve telefon var.'). Başka hiçbir şey yazma."
             )
-            req_data = {
-                "model": "gpt-4o-mini",
-                "messages": [
-                    {
-                        "role": "user",
-                        "content": [
-                            {"type": "text", "text": prompt},
-                            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64_img}"}}
-                        ]
-                    }
-                ],
-                "temperature": 0.2,
-                "max_tokens": 80
-            }
-            req = urllib.request.Request(
-                "https://api.openai.com/v1/chat/completions",
-                data=json.dumps(req_data).encode("utf-8"),
-                headers={
-                    "Content-Type": "application/json",
-                    "Authorization": f"Bearer {self.openai_api_key}"
-                },
-                method="POST"
-            )
-            self.get_logger().info("🕵️ [Otonom Boşta Öğrenme] Etraf sessiz, Astro odayı ve çevreyi inceliyor...")
-            with urllib.request.urlopen(req, timeout=4.0) as resp:
-                resp_json = json.loads(resp.read().decode("utf-8"))
-                obs = resp_json["choices"][0]["message"]["content"].strip()
-                if obs and len(obs) > 4:
-                    self.memory.profile.add_observation(f"Görsel Çevre: {obs}")
-                    self.get_logger().info(f"🧠 [Otonom Boşta Gözlem]: {obs}")
+            obs = None
 
-                    # If vision observes a person looking or sitting in front of robot, proactively initiate greeting
-                    obs_l = obs.lower()
-                    if any(kw in obs_l for kw in ["bana bakıyor", "kameraya bakıyor", "karşımda oturan", "biri var", "insan var"]):
-                        if not self._is_responding and not self._is_playback_active:
-                            if (now - self._last_proactive_gaze_time) > 45.0:
-                                self._last_proactive_gaze_time = now
-                                self.get_logger().info(f"👁️ [Görsel Sahne Proaktif Etkileşim]: Astro karşısındaki kişiyi fark etti!")
-                                if self._ws and self._loop and self._is_connected:
-                                    gaze_event = {
-                                        "type": "conversation.item.create",
-                                        "item": {
-                                            "type": "message",
-                                            "role": "user",
-                                            "content": [{"type": "input_text", "text": f"[Sistem Olayı]: Karşındaki kişiyi veya odayı fark ettin ({obs}). Seçili kişiliğinle kısa, doğal ve esprili bir şekilde laf at veya selam ver!"}]
-                                        }
+            # 1. Try Groq Vision (0 Token Cost)
+            if self.groq_api_key:
+                for v_mod in ["llama-3.2-11b-vision-preview", "llama-3.2-90b-vision-preview"]:
+                    try:
+                        req_data = {
+                            "model": v_mod,
+                            "messages": [
+                                {
+                                    "role": "user",
+                                    "content": [
+                                        {"type": "text", "text": prompt},
+                                        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64_img}"}}
+                                    ]
+                                }
+                            ],
+                            "temperature": 0.2,
+                            "max_tokens": 80
+                        }
+                        req = urllib.request.Request(
+                            "https://api.groq.com/openai/v1/chat/completions",
+                            data=json.dumps(req_data).encode("utf-8"),
+                            headers={
+                                "Content-Type": "application/json",
+                                "Authorization": f"Bearer {self.groq_api_key}"
+                            },
+                            method="POST"
+                        )
+                        with urllib.request.urlopen(req, timeout=4.0) as resp:
+                            resp_json = json.loads(resp.read().decode("utf-8"))
+                            obs = resp_json["choices"][0]["message"]["content"].strip()
+                            if obs:
+                                break
+                    except Exception:
+                        pass
+
+            # 2. Try Gemini REST (0 Token Cost fallback)
+            if not obs and self.gemini_api_key:
+                try:
+                    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={self.gemini_api_key}"
+                    payload = {
+                        "contents": [{
+                            "parts": [
+                                {"text": prompt},
+                                {"inlineData": {"mimeType": "image/jpeg", "data": b64_img}}
+                            ]
+                        }],
+                        "generationConfig": {"temperature": 0.2, "maxOutputTokens": 80}
+                    }
+                    req = urllib.request.Request(url, data=json.dumps(payload).encode("utf-8"), headers={"Content-Type": "application/json"})
+                    with urllib.request.urlopen(req, timeout=4.0) as resp:
+                        res_json = json.loads(resp.read().decode("utf-8"))
+                        obs = res_json["candidates"][0]["content"]["parts"][0]["text"].strip()
+                except Exception:
+                    pass
+
+            if obs and len(obs) > 4:
+                self.memory.profile.add_observation(f"Görsel Çevre: {obs}")
+                self.get_logger().info(f"🧠 [Otonom Boşta Gözlem (Groq/Gemini)]: {obs}")
+
+                # If vision observes a person looking or sitting in front of robot, proactively initiate greeting
+                obs_l = obs.lower()
+                if any(kw in obs_l for kw in ["bana bakıyor", "kameraya bakıyor", "karşımda oturan", "biri var", "insan var"]):
+                    if not self._is_responding and not self._is_playback_active:
+                        if (now - self._last_proactive_gaze_time) > 45.0:
+                            self._last_proactive_gaze_time = now
+                            self.get_logger().info(f"👁️ [Görsel Sahne Proaktif Etkileşim]: Astro karşısındaki kişiyi fark etti!")
+                            if self._ws and self._loop and self._is_connected:
+                                gaze_event = {
+                                    "type": "conversation.item.create",
+                                    "item": {
+                                        "type": "message",
+                                        "role": "user",
+                                        "content": [{"type": "input_text", "text": f"[Sistem Olayı]: Karşındaki kişiyi veya odayı fark ettin ({obs}). Seçili kişiliğinle kısa, doğal ve esprili bir şekilde laf at veya selam ver!"}]
                                     }
-                                    asyncio.run_coroutine_threadsafe(self._ws.send(json.dumps(gaze_event)), self._loop)
-                                    asyncio.run_coroutine_threadsafe(self._ws.send(json.dumps({"type": "response.create"})), self._loop)
+                                }
+                                asyncio.run_coroutine_threadsafe(self._ws.send(json.dumps(gaze_event)), self._loop)
+                                asyncio.run_coroutine_threadsafe(self._ws.send(json.dumps({"type": "response.create"})), self._loop)
         except Exception as e:
             self.get_logger().debug(f"Idle vision observation notice: {e}")
+
 
 
     def _check_reminders(self):
