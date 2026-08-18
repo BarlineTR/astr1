@@ -96,7 +96,7 @@ class AstroRealtimeNode(Node):
         self.state_machine = StateMachine(RobotState.IDLE)
         self.session = ConversationSession(base_timeout_s=16.0)
 
-        # Perception Cache
+        # State
         self._lock = threading.RLock()
         self._recognized_person: Optional[Dict[str, Any]] = None
         self._recognized_speaker: Optional[Dict[str, Any]] = None
@@ -105,6 +105,10 @@ class AstroRealtimeNode(Node):
         self._user_distance = 0.0
         self._speaker_gender = "unknown"
         self._speaker_angle = 0.0
+        self._is_responding = False
+        self._last_synced_identity = "Misafir"
+        self._last_sync_time = time.monotonic()
+
 
         # ROS 2 Publishers
         self.pub_output_pcm = self.create_publisher(String, "/audio/realtime_output_pcm", 50)
@@ -215,6 +219,9 @@ class AstroRealtimeNode(Node):
                 "instructions": system_prompt,
                 "audio": {
                     "input": {
+                        "transcription": {
+                            "model": "whisper-1"
+                        },
                         "turn_detection": {
                             "type": "server_vad",
                             "threshold": 0.5,
@@ -269,7 +276,6 @@ class AstroRealtimeNode(Node):
             }
         }
 
-
         await ws.send(json.dumps(session_config))
         self.get_logger().info(f"✨ [Realtime WS] Oturum Yapılandırıldı. Kişilik: [{self.persona_name.upper()}], Ses: [{self.realtime_voice}]")
 
@@ -281,8 +287,8 @@ class AstroRealtimeNode(Node):
         if event_type == "session.updated":
             self.get_logger().info("✅ [Realtime WS] Oturum OpenAI tarafından başarıyla onaylandı ve hazır!")
 
-        # 1. Real-Time Streaming Audio Output
-        elif event_type == "response.audio.delta":
+        # 1. Real-Time Streaming Audio Output (GA & Preview names)
+        elif event_type in ("response.audio.delta", "response.output_audio.delta"):
             delta_b64 = event.get("delta", "")
             if delta_b64:
                 out_msg = String()
@@ -290,13 +296,14 @@ class AstroRealtimeNode(Node):
                 self.pub_output_pcm.publish(out_msg)
 
         # 2. Real-Time Streaming Audio Transcript
-        elif event_type == "response.audio_transcript.delta":
+        elif event_type in ("response.audio_transcript.delta", "response.output_audio_transcript.delta", "response.text.delta"):
             text_delta = event.get("delta", "")
             # Streaming token
 
         # 3. User Speech Started (Barge-In Interruption)
         elif event_type == "input_audio_buffer.speech_started":
             self.get_logger().info("⚡ [Realtime Barge-In] Kullanıcı konuşmaya başladı — Çalma anında durduruluyor...")
+            self._is_responding = False
             intr_msg = Bool()
             intr_msg.data = True
             self.pub_interrupt.publish(intr_msg)
@@ -309,10 +316,15 @@ class AstroRealtimeNode(Node):
 
         # 3c. Response Created
         elif event_type == "response.created":
+            self._is_responding = True
             self.get_logger().info("🎙️ [Realtime] Astro sesli yanıt üretmeye başladı...")
 
+        # 3d. Response Done
+        elif event_type == "response.done":
+            self._is_responding = False
+
         # 4. User Speech Transcription Completed
-        elif event_type == "conversation.item.input_audio_transcription.completed":
+        elif event_type in ("conversation.item.input_audio_transcription.completed", "conversation.item.input_audio_transcription.done"):
             user_transcript = event.get("transcript", "").strip()
             if user_transcript:
                 self.get_logger().info(f"🗣️ [Siz]: \"{user_transcript}\"")
@@ -322,18 +334,26 @@ class AstroRealtimeNode(Node):
                 self.pub_transcript.publish(t_msg)
 
         # 5. Assistant Response Completed
-        elif event_type == "response.audio_transcript.done":
-            assistant_transcript = event.get("transcript", "").strip()
+        elif event_type in ("response.audio_transcript.done", "response.output_audio_transcript.done", "response.text.done"):
+            assistant_transcript = (event.get("transcript") or event.get("text") or "").strip()
             if assistant_transcript:
                 self.get_logger().info(f"🤖 [Astro Realtime]: \"{assistant_transcript}\"")
                 self.memory.episodic.add_message("assistant", assistant_transcript)
 
-
         # 6. Realtime Function Calling Execution
-        elif event_type == "response.function_call_arguments.done":
-            call_id = event.get("call_id")
-            func_name = event.get("name")
-            args_str = event.get("arguments", "{}")
+        elif event_type in ("response.function_call_arguments.done", "response.output_item.done"):
+            if event_type == "response.output_item.done":
+                item = event.get("item", {})
+                if item.get("type") != "function_call":
+                    return
+                call_id = item.get("call_id")
+                func_name = item.get("name")
+                args_str = item.get("arguments", "{}")
+            else:
+                call_id = event.get("call_id")
+                func_name = event.get("name")
+                args_str = event.get("arguments", "{}")
+
             try:
                 args = json.loads(args_str)
             except Exception:
@@ -361,6 +381,7 @@ class AstroRealtimeNode(Node):
             msg = err.get("message", "")
             if "no active response found" not in msg:
                 self.get_logger().error(f"❌ [Realtime WS Hatası]: {msg}")
+
 
     def _execute_realtime_tool(self, name: str, args: Dict[str, Any]) -> Dict[str, Any]:
         """Executes integrated robot tools in real time."""
@@ -465,9 +486,14 @@ class AstroRealtimeNode(Node):
         if not self._ws or not self._loop or not self._is_connected:
             return
 
+        # Do NOT interrupt active response generation or speaking
+        if getattr(self, "_is_responding", False):
+            return
+
         now = time.monotonic()
         identity = self._get_active_biometric_identity()
         identity_name = identity.get("name", "Misafir")
+
 
         # Do NOT flood session.update: Only sync if identity actually changed, with min 20s cooldown
         last_id = getattr(self, "_last_synced_identity", "")
