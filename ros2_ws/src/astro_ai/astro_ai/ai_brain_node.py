@@ -732,18 +732,26 @@ class AiBrainNode(Node):
                 self.get_logger().info(f"⚡ [Latency] Bu Dönüş: {total_turn_ms:.0f}ms (STT: {stt_latency_ms:.0f}ms, Hatırlatıcı: {total_turn_ms - stt_latency_ms:.0f}ms) | p50: {stats['p50_total_ms']}ms, p95: {stats['p95_total_ms']}ms")
                 return
 
-            # 3. Identity Query ("Ben kimim? / Beni tanıyor musun?")
+            # 3. Identity Query ("Ben kimim? / Beni tanıdın mı? / Sesimi tanıdın mı?")
             if is_identity and not is_learning_person:
                 identity = self._get_active_biometric_identity()
                 if identity.get("is_known"):
                     name = identity.get("name", "")
                     formal = identity.get("formal_title") or name
+                    source = identity.get("source", "biyometri")
+                    src_tr = "sesinden" if source == "voice" else ("yüzünden" if source == "face" else "yüzünden ve sesinden")
+                    
                     if "baran" in name.lower():
-                        ans = "Sen benim baş mühendisim ve geliştiricim Baran'sın! Bitlis'te beni sıfırdan tasarlayan ve kodlayan yaratıcımsın."
+                        ans = f"Tabii ki tanıdım! Seni {src_tr} hemen bildim; sen benim baş mühendisim ve geliştiricim Baran'sın!"
+                    elif "erdoğan" in name.lower():
+                        ans = f"Elbette tanıdım Sayın Cumhurbaşkanım! Sizi {src_tr} tanıdım, saygılarımı ve hürmetlerimi sunarım efendim."
+                    elif "vali" in identity.get("title", "").lower() or "karaömeroğlu" in name.lower():
+                        ans = f"Elbette tanıdım Sayın Valim! Sizi {src_tr} tanıdım, hürmet ederim efendim."
                     else:
-                        ans = f"Sen benim hafızamda kayıtlı olan {formal} {name}'sın! Seni sesinden ve yüzünden tanıyorum."
+                        ans = f"Tabii ki tanıdım! Seni {src_tr} hemen bildim, sen {formal} ({name})'sın!"
                 else:
-                    ans = "Hafızamda seninle ilgili henüz bir profil bulunmuyor. İstersen 'Benim adım ... beni hafızana kaydet' diyerek yüzünü ve sesini bana tanıtabilirsin!"
+                    ans = "Sesin veya yüzün henüz kayıtlı kişilerle tam eşleşmedi. İstersen 'Benim adım ... beni hafızana kaydet' diyerek yüzünü ve sesini bana tanıtabilirsin!"
+
                 self.get_logger().info(f"🤖 [Astro]: \"{ans}\"")
                 self._publish_tts(ans)
                 self._publish_emotion(persona)
@@ -1347,17 +1355,19 @@ class AiBrainNode(Node):
         text_l = text.lower()
         return any(q in text_l for q in [
             "ben kimim", "hafızanda ben kimim", "beni tanıyor musun", "kim olduğumu biliyor musun",
-            "ben kim", "beni hatırladın mı", "beni tanıdın mı"
+            "ben kim", "beni hatırladın mı", "beni tanıdın mı", "sesimi tanıdın mı", "beni sesimden tanıdın mı",
+            "sesimden tanıdın mı", "tanıdın mı beni", "kimim ben"
         ])
 
     def _is_person_learning_query(self, text: str) -> bool:
         keywords = [
-            "benim adım", "adım ", "beni tanı", "beni hafızana kaydet", "beni kaydet",
-            "tanışalım", "yüzümü kaydet", "sesimi kaydet", "yüzümü ve sesimi", "geliştiricin",
-            "geliştiricininim", "ben baran", "tara ve hafızana kaydet", "hafızana kaydederim"
+            "benim adım", "adım ", "beni hafızana kaydet", "beni kaydet",
+            "tanışalım", "yüzümü kaydet", "sesimi kaydet", "yüzümü ve sesimi kaydet",
+            "tara ve hafızana kaydet", "hafızana kaydet"
         ]
         text_lower = text.lower()
         return any(k in text_lower for k in keywords)
+
 
     def _start_idle_learning(self):
         threading.Thread(target=self._idle_learning_loop, daemon=True).start()
