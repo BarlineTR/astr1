@@ -280,6 +280,8 @@ class AstroRealtimeNode(Node):
                 async with websockets.connect(ws_url, **connect_kwargs) as ws:
                     self._ws = ws
                     self._is_connected = True
+                    self._is_responding = False
+                    self._is_playback_active = False
                     self.get_logger().info(f"✅ [Realtime WS] Bağlantı Başarılı ({current_model})! Oturum parametreleri gönderiliyor...")
 
                     # Send Initial Session Update
@@ -292,6 +294,8 @@ class AstroRealtimeNode(Node):
             except Exception as e:
                 self._is_connected = False
                 self._ws = None
+                self._is_responding = False
+                self._is_playback_active = False
                 err_str = str(e)
                 if "4004" in err_str or "model_not_found" in err_str:
                     self.get_logger().warn(f"⚠️ [Realtime Model Bulunamadı] '{current_model}' modeline erişilemedi, bir sonraki modele geçiliyor...")
@@ -300,6 +304,7 @@ class AstroRealtimeNode(Node):
                 else:
                     self.get_logger().warn(f"⚠️ [Realtime WS] Bağlantı koptu ({e}), 3 saniye sonra yeniden bağlanılacak...")
                     await asyncio.sleep(3.0)
+
 
 
     async def _send_session_update(self, ws):
@@ -467,11 +472,11 @@ class AstroRealtimeNode(Node):
         # 3c. Response Created
         elif event_type == "response.created":
             self._is_responding = True
+            self._response_start_time = time.monotonic()
             self.get_logger().info("🎙️ [Realtime] Astro sesli yanıt üretmeye başladı...")
 
-
-        # 3d. Response Done
-        elif event_type == "response.done":
+        # 3d. Response Done / Cancelled
+        elif event_type in ("response.done", "response.cancelled"):
             self._is_responding = False
 
         # 4. User Speech Transcription Completed
@@ -511,7 +516,11 @@ class AstroRealtimeNode(Node):
                 args = {}
 
             self.get_logger().info(f"🛠️ [Realtime Tool]: {func_name}({args}) çalıştırılıyor...")
-            tool_result = self._execute_realtime_tool(func_name, args)
+            try:
+                tool_result = self._execute_realtime_tool(func_name, args)
+            except Exception as te:
+                self.get_logger().error(f"❌ [Tool Hatası]: {te}")
+                tool_result = {"status": "error", "message": str(te)}
 
             # Send tool response back to OpenAI
             tool_output_event = {
@@ -528,10 +537,12 @@ class AstroRealtimeNode(Node):
 
         # 7. Error Handling
         elif event_type == "error":
+            self._is_responding = False
             err = event.get("error", {})
             msg = err.get("message", "")
             if "no active response found" not in msg:
                 self.get_logger().error(f"❌ [Realtime WS Hatası]: {msg}")
+
 
 
     def _execute_realtime_tool(self, name: str, args: Dict[str, Any]) -> Dict[str, Any]:
@@ -937,6 +948,7 @@ class AstroRealtimeNode(Node):
         self._is_playback_active = bool(msg.data)
         if was_active and not self._is_playback_active:
             self._playback_end_time = time.monotonic()
+            self._is_responding = False
             # Clear OpenAI input audio buffer so trailing room reverberation doesn't trigger VAD
             if self._ws and self._loop and self._is_connected:
                 try:
@@ -950,10 +962,17 @@ class AstroRealtimeNode(Node):
         if not msg.data or not self._is_connected or not self._ws or not self._loop:
             return
 
+        now = time.monotonic()
+        # Watchdog: Auto-reset responding flag if stuck > 6.0s without speaker playback
+        if self._is_responding and not self._is_playback_active:
+            if (now - getattr(self, "_response_start_time", now)) > 6.0:
+                self._is_responding = False
+
         # Zero Self-Hearing Protection:
-        # Do not stream mic audio while Astro is generating or speaking, or within 300ms of playback finish
-        if self._is_playback_active or self._is_responding or (time.monotonic() - getattr(self, "_playback_end_time", 0.0) < 0.30):
+        # Do not stream mic audio while Astro is actively playing out of the speaker
+        if self._is_playback_active or self._is_responding or (now - getattr(self, "_playback_end_time", 0.0) < 0.25):
             return
+
 
         # Downsample and buffer 16kHz audio for acoustic voice recognition & dynamic enrollment
         try:
