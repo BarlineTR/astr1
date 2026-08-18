@@ -43,6 +43,38 @@ except ImportError:
 
 REALTIME_WS_URL = "wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview"
 VALID_REALTIME_VOICES = {"alloy", "ash", "ballad", "coral", "echo", "sage", "shimmer", "verse", "fable", "onyx"}
+def discover_realtime_models(api_key: str, preferred: str = "") -> list[str]:
+    candidates = []
+    if preferred:
+        candidates.append(preferred)
+
+    standard_models = [
+        "gpt-4o-realtime-preview",
+        "gpt-4o-mini-realtime-preview",
+        "gpt-4o-realtime-preview-2024-10-01",
+        "gpt-4o-realtime-preview-2024-12-17",
+        "gpt-realtime",
+        "gpt-realtime-mini"
+    ]
+    for m in standard_models:
+        if m not in candidates:
+            candidates.append(m)
+
+    try:
+        import urllib.request
+        req = urllib.request.Request("https://api.openai.com/v1/models", headers={"Authorization": f"Bearer {api_key}"})
+        with urllib.request.urlopen(req, timeout=4) as resp:
+            data = json.loads(resp.read().decode())
+            avail_ids = [m["id"] for m in data.get("data", []) if "realtime" in m.get("id", "")]
+            if avail_ids:
+                for mid in reversed(avail_ids):
+                    if mid in candidates:
+                        candidates.remove(mid)
+                    candidates.insert(0, mid)
+    except Exception:
+        pass
+
+    return candidates
 
 
 class AstroRealtimeNode(Node):
@@ -53,7 +85,7 @@ class AstroRealtimeNode(Node):
 
         # Load environment variables
         self.openai_api_key = os.environ.get("OPENAI_API_KEY", "").strip()
-        self.realtime_model = os.environ.get("REALTIME_MODEL", "gpt-4o-realtime-preview-2024-12-17").strip()
+        self.realtime_model = os.environ.get("REALTIME_MODEL", "gpt-4o-realtime-preview").strip()
         raw_voice = os.environ.get("REALTIME_VOICE", os.environ.get("TTS_VOICE", "echo")).strip().lower()
         self.realtime_voice = raw_voice if raw_voice in VALID_REALTIME_VOICES else "echo"
         self.persona_name = os.environ.get("PERSONA", "kufurbaz").strip().lower()
@@ -101,7 +133,7 @@ class AstroRealtimeNode(Node):
         self._ws_thread = threading.Thread(target=self._run_async_loop, daemon=True)
         self._ws_thread.start()
 
-        self.get_logger().info(f"🚀 [Astro Realtime Node] OpenAI Realtime WebSocket Başlatılıyor... Model: [{self.realtime_model}], Ses: [{self.realtime_voice}], Kişilik: [{self.persona_name.upper()}]")
+        self.get_logger().info(f"🚀 [Astro Realtime Node] OpenAI Realtime WebSocket Başlatılıyor... Ses: [{self.realtime_voice}], Kişilik: [{self.persona_name.upper()}]")
 
     def _run_async_loop(self):
         self._loop = asyncio.new_event_loop()
@@ -109,7 +141,7 @@ class AstroRealtimeNode(Node):
         self._loop.run_until_complete(self._websocket_worker())
 
     async def _websocket_worker(self):
-        """Persistent WebSocket connection loop with auto-reconnect."""
+        """Persistent WebSocket connection loop with auto-reconnect and model fallback."""
         if not self.openai_api_key:
             self.get_logger().error("❌ OPENAI_API_KEY eksik! Realtime WebSocket bağlanamıyor.")
             return
@@ -118,12 +150,10 @@ class AstroRealtimeNode(Node):
             self.get_logger().error("❌ websockets kütüphanesi eksik! (pip install websockets)")
             return
 
-        # GA Realtime API: Authorization only (Do NOT include OpenAI-Beta header)
         headers = {
             "Authorization": f"Bearer {self.openai_api_key}"
         }
 
-        # Inspect websockets.connect parameter compatibility across versions
         connect_kwargs = {"ping_interval": 20, "ping_timeout": 20}
         try:
             sig = inspect.signature(websockets.connect)
@@ -136,16 +166,19 @@ class AstroRealtimeNode(Node):
         except Exception:
             connect_kwargs["extra_headers"] = headers
 
-        ws_url = f"wss://api.openai.com/v1/realtime?model={self.realtime_model}"
+        candidate_models = discover_realtime_models(self.openai_api_key, self.realtime_model)
+        self.get_logger().info(f"📋 [Realtime Modelleri]: Kullanılabilir modeller: {candidate_models}")
+        model_idx = 0
 
         while rclpy.ok():
+            current_model = candidate_models[model_idx % len(candidate_models)]
+            ws_url = f"wss://api.openai.com/v1/realtime?model={current_model}"
             try:
                 self.get_logger().info(f"🌐 [Realtime WS] OpenAI Realtime API'ye bağlanılıyor: {ws_url}")
                 async with websockets.connect(ws_url, **connect_kwargs) as ws:
-
                     self._ws = ws
                     self._is_connected = True
-                    self.get_logger().info("✅ [Realtime WS] Bağlantı Başarılı! Oturum parametreleri gönderiliyor...")
+                    self.get_logger().info(f"✅ [Realtime WS] Bağlantı Başarılı ({current_model})! Oturum parametreleri gönderiliyor...")
 
                     # Send Initial Session Update
                     await self._send_session_update(ws)
@@ -157,8 +190,15 @@ class AstroRealtimeNode(Node):
             except Exception as e:
                 self._is_connected = False
                 self._ws = None
-                self.get_logger().warn(f"⚠️ [Realtime WS] Bağlantı koptu ({e}), 3 saniye sonra yeniden bağlanılacak...")
-                await asyncio.sleep(3.0)
+                err_str = str(e)
+                if "4004" in err_str or "model_not_found" in err_str:
+                    self.get_logger().warn(f"⚠️ [Realtime Model Bulunamadı] '{current_model}' modeline erişilemedi, bir sonraki modele geçiliyor...")
+                    model_idx += 1
+                    await asyncio.sleep(1.0)
+                else:
+                    self.get_logger().warn(f"⚠️ [Realtime WS] Bağlantı koptu ({e}), 3 saniye sonra yeniden bağlanılacak...")
+                    await asyncio.sleep(3.0)
+
 
     async def _send_session_update(self, ws):
         """Sends comprehensive session configuration with persona prompt, tools, and turn detection."""
