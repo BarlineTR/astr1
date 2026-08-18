@@ -224,18 +224,24 @@ class PersonaEngine:
             formal = recognized_person.get("formal_title", "")
             name = recognized_person.get("name", "")
             role_cat = recognized_person.get("role_category", recognized_person.get("category", ""))
+            title = recognized_person.get("title", "")
+            formal = recognized_person.get("formal_title") or recognized_person.get("title") or name
+            role_cat = recognized_person.get("role_category", recognized_person.get("category", "")).lower()
+            name_lower = name.lower()
 
-            if role_cat in ["governor", "mayor", "district_governor", "head_of_state"] or "Vali" in title or "Başkan" in title or "Kaymakam" in title:
-                protocol_instruction = (
-                    f"\n\n⭐ DEVLET PROTOKOLÜ TALİMATI:\n"
-                    f"Karşındaki kişi {title} {name}. Kendisine daima yüksek hürmet ve nezaketle '{formal}' hitabıyla seslen.\n"
-                    f"Makamına yakışır şekilde saygılı ol, Bitlis ve Ahlat için yapılan teknolojik ve sosyal hizmetlerden gururla bahset."
+            is_official = role_cat in ["governor", "mayor", "district_governor", "head_of_state", "minister", "official"] or any(k in title.lower() for k in ["cumhurbaşkanı", "vali", "kaymakam", "bakan", "başkan"]) or "bayraktar" in name_lower
+
+            if is_official:
+                base_prompt += (
+                    f"\n\n🇹🇷 DEVLET BÜYÜĞÜ / PROTOKOL ÖZEL KURALI:\n"
+                    f"- Karşındaki kişi devlet büyüğü veya çok önemli bir protokol lideridir: {name} ({formal}).\n"
+                    f"- Hangi modda olursan ol (küfürbaz modu dahil), KESİNLİKLE küfür etme, laubali veya kaba konuşma.\n"
+                    f"- Kendisine en üst düzey saygı, hürmet ve devlet protokolü zarafetiyle hitap et ('{formal}' hitabını sık sık ve yerinde kullan)."
                 )
-                base_prompt += protocol_instruction
-            elif role_cat == "creator" or "Baran" in name:
+            elif role_cat == "creator" or "baran" in name_lower:
                 creator_instruction = (
-                    f"\n\n🛠️ GELİŞTİRİCİ TALİMATI:\n"
-                    f"Karşındaki kişi senin baş mühendisin ve yaratıcın {name}. Ona dostane, işbirlikçi ve saygılı bir robot yol arkadaşı gibi hitap et."
+                    f"\n\nKarşındaki kişi seni tasarlayan ve üreten baş mühendis {name} ({formal})'dir. "
+                    "Kendisine yaratıcın/geliştiricin olduğunu bilerek samimi, esprili ve saygıyla hitap et."
                 )
                 base_prompt += creator_instruction
             else:
@@ -295,17 +301,41 @@ class PersonaEngine:
         if identity.get("is_known"):
             name = identity.get("name", "")
             title = identity.get("title", "")
-            role_cat = identity.get("role_category", identity.get("category", ""))
-            
-            # Government / Protocol greeting
-            if role_cat in ["governor", "mayor", "district_governor", "head_of_state"] or "Vali" in title or "Başkan" in title or "Kaymakam" in title:
-                formal = identity.get("formal_title") or title or name
-                return f"Sayın {formal}, hoş geldiniz! Sizi gördüğüme çok sevindim, emrinizdeyim.", "formal"
-            elif role_cat == "creator" or "baran" in name.lower():
+            formal = identity.get("formal_title") or name
+            role_cat = identity.get("role_category", identity.get("category", "")).lower()
+            name_lower = name.lower()
+
+            # 1. Cumhurbaşkanı
+            if "erdoğan" in name_lower or "cumhurbaşkanı" in title.lower():
+                return "Sayın Cumhurbaşkanım, hoş geldiniz! Şeref verdiniz efendim, emrinizdeyim.", "formal"
+
+            # 2. Bitlis Valisi
+            if "karaömeroğlu" in name_lower or "vali" in title.lower():
+                return "Sayın Valim, hoş geldiniz! Bitlis'te sizleri ağırlamaktan onur duyuyorum, emrinizdeyim efendim.", "formal"
+
+            # 3. Selçuk Bayraktar
+            if "bayraktar" in name_lower:
+                return "Selçuk Bey, hoş geldiniz! Milli Teknoloji Hamlesi'nin öncüsünü standımızda görmek büyük bir gurur, emrinizdeyim!", "formal"
+
+            # 4. Ahlat Kaymakamı
+            if "kaymakam" in title.lower() or "bingöl" in name_lower:
+                return "Sayın Kaymakamım, hoş geldiniz! Kadim Ahlat'a ve standımıza şeref verdiniz, emrinizdeyim.", "formal"
+
+            # 5. Belediye Başkanları
+            if "başkan" in title.lower() or "belediye" in title.lower() or "tanglay" in name_lower or "gülmez" in name_lower:
+                return f"Sayın Başkanım, hoş geldiniz! Sizi gördüğüme çok sevindim, emrinizdeyim efendim.", "formal"
+
+            # 6. Bakanlar ve Hükümet Protokolü
+            if role_cat in ["governor", "mayor", "district_governor", "head_of_state", "minister", "official"] or "bakan" in title.lower():
+                return f"Sayın Bakanım, hoş geldiniz! Saygılarımı sunarım efendim, bir emriniz var mıdır?", "formal"
+
+            # 7. Robotun Yaratıcısı Baran
+            if role_cat == "creator" or "baran" in name_lower:
                 return f"Selam {name}! Çalışmalara tam gaz devam mı?", "playful"
-            else:
-                formal = identity.get("formal_title") or name
-                return f"Merhaba {formal}! Seni gördüğüme çok sevindim, nasıl yardımcı olabilirim?", persona
+
+            # 8. Diğer Tanınan Kişiler
+            return f"Merhaba {formal}! Seni gördüğüme çok sevindim, nasıl yardımcı olabilirim?", persona
+
 
         # Unknown Person / Guest
         if persona == "kufurbaz":

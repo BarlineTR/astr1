@@ -83,6 +83,18 @@ def enroll_from_mic(engine: SpeakerEngine, name: str, count: int, seconds: float
         print("❌ sounddevice kurulu değil — dosyadan kayıt kullanın (--audio)")
         return 0
 
+    if device is None:
+        try:
+            for idx, dev in enumerate(sd.query_devices()):
+                if dev.get("max_input_channels", 0) > 0:
+                    d_name = dev.get("name", "").lower()
+                    if any(h in d_name for h in ["respeaker", "uac1", "seeed", "arrayuac", "usb audio"]):
+                        device = idx
+                        print(f"   🎤 ReSpeaker mikrofon seçildi: [{idx}] {dev.get('name')}")
+                        break
+        except Exception:
+            pass
+
     embeddings = []
     print(f"🎙️  {count} kayıt alınacak, her biri {seconds:g} saniye.")
     for i in range(1, count + 1):
@@ -97,7 +109,7 @@ def enroll_from_mic(engine: SpeakerEngine, name: str, count: int, seconds: float
 
         audio = audio.flatten()
         level = int(np.sqrt(np.mean(audio.astype(np.float32) ** 2)))
-        if level < 150:
+        if level < 40:
             print(f"   ⚠  ses çok kısık (RMS {level}) — mikrofona yaklaşıp tekrar deneyin")
             continue
         embedding = engine.embed(audio)
@@ -106,6 +118,7 @@ def enroll_from_mic(engine: SpeakerEngine, name: str, count: int, seconds: float
             continue
         embeddings.append(embedding)
         print(f"   ✓ kayıt {len(embeddings)} alındı (RMS {level})")
+
 
     if embeddings:
         engine.add_person(name, embeddings, replace=replace)
