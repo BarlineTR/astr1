@@ -1212,12 +1212,12 @@ class AiBrainNode(Node):
                         "contents": [{
                             "parts": [
                                 {"text": f"{system_instruction}\n\nKullanıcı: {prompt}"},
-                                {"inlineData": {"mimeType": "image/jpeg", "data": base64_image}}
+                                {"inline_data": {"mime_type": "image/jpeg", "data": base64_image}}
                             ]
                         }],
-                        "generationConfig": {
+                        "generation_config": {
                             "temperature": 0.2,
-                            "maxOutputTokens": 512
+                            "max_output_tokens": 512
                         }
                     }
                     data_bytes = json.dumps(payload).encode("utf-8")
@@ -1551,10 +1551,10 @@ class AiBrainNode(Node):
                         "contents": [{
                             "parts": [
                                 {"text": prompt},
-                                {"inlineData": {"mimeType": "image/jpeg", "data": base64_image}}
+                                {"inline_data": {"mime_type": "image/jpeg", "data": base64_image}}
                             ]
                         }],
-                        "generationConfig": {"temperature": 0.2, "maxOutputTokens": 150}
+                        "generation_config": {"temperature": 0.2, "max_output_tokens": 150}
                     }
                     data_bytes = json.dumps(payload).encode("utf-8")
                     req = urllib.request.Request(url, data=data_bytes, headers={"Content-Type": "application/json"})

@@ -229,8 +229,10 @@ class AstroRealtimeNode(Node):
         self._executed_tool_calls: set[str] = set()
 
         # Sleep Mode (Default: Start in Sleeping State)
+        self._node_start_time = time.monotonic()
         self._is_sleeping = True
         self._last_interaction_time = time.monotonic() - 20.0
+        self._consecutive_loud_frames = 0
         self.create_timer(1.0, self._check_sleep_mode)
 
         # Reminders storage
@@ -517,7 +519,8 @@ class AstroRealtimeNode(Node):
 
         # 3. User Speech Started
         elif event_type == "input_audio_buffer.speech_started":
-            self._wake_up()
+            if (time.monotonic() - getattr(self, "_node_start_time", 0.0)) > 3.0:
+                self._wake_up()
             # ONLY trigger barge-in interruption if Astro was ACTUALLY playing audio or generating a response
             if self._is_responding or self._is_playback_active:
                 self.get_logger().info("⚡ [Realtime Barge-In] Kullanıcı lafa girdi — Çalma anında durduruluyor...")
@@ -1012,8 +1015,31 @@ class AstroRealtimeNode(Node):
         refusal_kws = ["üzgünüm", "yardımcı olamam", "açıklayamıyorum", "cannot assist", "i am sorry", "i'm sorry", "doğrudan açıklayamıyorum"]
         obs = None
 
-        # 1. Ultra-Fast Priority: Groq Vision (llama-3.2-11b-vision-preview / llama-3.2-90b-vision-preview) (~250ms, 0 Refusal)
-        if self.groq_api_key:
+        # 1. Fast Priority: Gemini 2.0 Flash REST (~300ms, Free)
+        if self.gemini_api_key:
+            try:
+                import urllib.request
+                url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={self.gemini_api_key}"
+                payload = {
+                    "contents": [{
+                        "parts": [
+                            {"text": prompt_text},
+                            {"inline_data": {"mime_type": "image/jpeg", "data": b64_img}}
+                        ]
+                    }],
+                    "generation_config": {"temperature": 0.2, "max_output_tokens": 150}
+                }
+                req = urllib.request.Request(url, data=json.dumps(payload).encode("utf-8"), headers={"Content-Type": "application/json"})
+                with urllib.request.urlopen(req, timeout=5.0) as resp:
+                    res_json = json.loads(resp.read().decode("utf-8"))
+                    candidate_obs = res_json["candidates"][0]["content"]["parts"][0]["text"].strip()
+                    if candidate_obs and not any(rk in candidate_obs.lower() for rk in refusal_kws):
+                        obs = candidate_obs
+            except Exception as gem_e:
+                self.get_logger().warn(f"⚠️ [Gemini Vision Uyarısı]: {gem_e}")
+
+        # 2. Fast Fallback: Groq Vision (llama-3.2-11b-vision-preview)
+        if not obs and self.groq_api_key:
             for v_mod in ["llama-3.2-11b-vision-preview", "llama-3.2-90b-vision-preview"]:
                 try:
                     import urllib.request
@@ -1047,29 +1073,6 @@ class AstroRealtimeNode(Node):
                             break
                 except Exception as ge:
                     self.get_logger().warn(f"⚠️ [Groq Vision Uyarısı]: {ge}")
-
-        # 2. Fast Fallback: Gemini 2.0 Flash REST (~300ms, 0 Refusal)
-        if not obs and self.gemini_api_key:
-            try:
-                import urllib.request
-                url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={self.gemini_api_key}"
-                payload = {
-                    "contents": [{
-                        "parts": [
-                            {"text": prompt_text},
-                            {"inlineData": {"mimeType": "image/jpeg", "data": b64_img}}
-                        ]
-                    }],
-                    "generationConfig": {"temperature": 0.2, "maxOutputTokens": 150}
-                }
-                req = urllib.request.Request(url, data=json.dumps(payload).encode("utf-8"), headers={"Content-Type": "application/json"})
-                with urllib.request.urlopen(req, timeout=5.0) as resp:
-                    res_json = json.loads(resp.read().decode("utf-8"))
-                    candidate_obs = res_json["candidates"][0]["content"]["parts"][0]["text"].strip()
-                    if candidate_obs and not any(rk in candidate_obs.lower() for rk in refusal_kws):
-                        obs = candidate_obs
-            except Exception as gem_e:
-                self.get_logger().warn(f"⚠️ [Gemini Vision Uyarısı]: {gem_e}")
 
         # 3. Fallback: OpenAI Vision REST API (gpt-4o-mini)
         if not obs and self.openai_api_key:
@@ -1257,7 +1260,7 @@ class AstroRealtimeNode(Node):
             self.get_logger().debug(f"Memory reflection notice: {e}")
 
     def _idle_room_observation(self, now: float):
-        """Captures camera view in idle and saves visual environment observations to memory using FREE Groq/Gemini."""
+        """Captures camera view in idle/sleep and saves visual environment observations to memory."""
         with self._lock:
             frame = self._latest_camera_frame
 
@@ -1276,9 +1279,32 @@ class AstroRealtimeNode(Node):
                 "veya 'Oda aydınlık, masada çakmak ve telefon var.'). Başka hiçbir şey yazma."
             )
             obs = None
+            provider_name = ""
 
-            # 1. Try Groq Vision (0 Token Cost)
-            if self.groq_api_key:
+            # 1. Primary: Gemini 2.0 Flash REST (~300ms, Free)
+            if self.gemini_api_key:
+                try:
+                    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={self.gemini_api_key}"
+                    payload = {
+                        "contents": [{
+                            "parts": [
+                                {"text": prompt},
+                                {"inline_data": {"mime_type": "image/jpeg", "data": b64_img}}
+                            ]
+                        }],
+                        "generation_config": {"temperature": 0.2, "max_output_tokens": 80}
+                    }
+                    req = urllib.request.Request(url, data=json.dumps(payload).encode("utf-8"), headers={"Content-Type": "application/json"})
+                    with urllib.request.urlopen(req, timeout=5.0) as resp:
+                        res_json = json.loads(resp.read().decode("utf-8"))
+                        obs = res_json["candidates"][0]["content"]["parts"][0]["text"].strip()
+                        if obs:
+                            provider_name = "Gemini Flash"
+                except Exception as gem_e:
+                    self.get_logger().debug(f"Idle Gemini Vision notice: {gem_e}")
+
+            # 2. Fallback: Groq Vision (llama-3.2-11b-vision-preview)
+            if not obs and self.groq_api_key:
                 for v_mod in ["llama-3.2-11b-vision-preview", "llama-3.2-90b-vision-preview"]:
                     try:
                         req_data = {
@@ -1304,37 +1330,52 @@ class AstroRealtimeNode(Node):
                             },
                             method="POST"
                         )
-                        with urllib.request.urlopen(req, timeout=4.0) as resp:
+                        with urllib.request.urlopen(req, timeout=5.0) as resp:
                             resp_json = json.loads(resp.read().decode("utf-8"))
                             obs = resp_json["choices"][0]["message"]["content"].strip()
                             if obs:
+                                provider_name = "Groq Vision"
                                 break
-                    except Exception:
-                        pass
+                    except Exception as ge:
+                        self.get_logger().debug(f"Idle Groq Vision notice: {ge}")
 
-            # 2. Try Gemini REST (0 Token Cost fallback)
-            if not obs and self.gemini_api_key:
+            # 3. Fallback: OpenAI Vision REST (gpt-4o-mini)
+            if not obs and self.openai_api_key:
                 try:
-                    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={self.gemini_api_key}"
-                    payload = {
-                        "contents": [{
-                            "parts": [
-                                {"text": prompt},
-                                {"inlineData": {"mimeType": "image/jpeg", "data": b64_img}}
-                            ]
-                        }],
-                        "generationConfig": {"temperature": 0.2, "maxOutputTokens": 80}
+                    req_data = {
+                        "model": "gpt-4o-mini",
+                        "messages": [
+                            {
+                                "role": "user",
+                                "content": [
+                                    {"type": "text", "text": prompt},
+                                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64_img}"}}
+                                ]
+                            }
+                        ],
+                        "max_tokens": 80
                     }
-                    req = urllib.request.Request(url, data=json.dumps(payload).encode("utf-8"), headers={"Content-Type": "application/json"})
-                    with urllib.request.urlopen(req, timeout=4.0) as resp:
-                        res_json = json.loads(resp.read().decode("utf-8"))
-                        obs = res_json["candidates"][0]["content"]["parts"][0]["text"].strip()
-                except Exception:
-                    pass
+                    req = urllib.request.Request(
+                        "https://api.openai.com/v1/chat/completions",
+                        data=json.dumps(req_data).encode("utf-8"),
+                        headers={
+                            "Content-Type": "application/json",
+                            "Authorization": f"Bearer {self.openai_api_key}"
+                        },
+                        method="POST"
+                    )
+                    with urllib.request.urlopen(req, timeout=6.0) as resp:
+                        resp_json = json.loads(resp.read().decode("utf-8"))
+                        obs = resp_json["choices"][0]["message"]["content"].strip()
+                        if obs:
+                            provider_name = "OpenAI Vision"
+                except Exception as oe:
+                    self.get_logger().debug(f"Idle OpenAI Vision notice: {oe}")
 
             if obs and len(obs) > 4:
                 self.memory.profile.add_observation(f"Görsel Çevre: {obs}")
-                self.get_logger().info(f"👁️🧠 [Otonom Görsel Öğrenme (Groq Vision)]: Astro kameradan gördü ve hafızasına kaydetti -> \"{obs}\"")
+                sleep_tag = " [UYKU MODU]" if self._is_sleeping else ""
+                self.get_logger().info(f"👁️🧠 [Otonom Görsel Öğrenme ({provider_name}){sleep_tag}]: Astro kameradan gördü ve hafızasına kaydetti -> \"{obs}\"")
 
                 # If vision observes a person looking or sitting in front of robot, proactively initiate greeting
                 obs_l = obs.lower()
@@ -1354,8 +1395,10 @@ class AstroRealtimeNode(Node):
                                 }
                                 asyncio.run_coroutine_threadsafe(self._ws.send(json.dumps(gaze_event)), self._loop)
                                 asyncio.run_coroutine_threadsafe(self._ws.send(json.dumps({"type": "response.create"})), self._loop)
+            else:
+                self.get_logger().warn("⚠️ [Otonom Görsel Öğrenme]: Görüntü analiz edilemedi (tüm Vision servisleri yanıt vermedi).")
         except Exception as e:
-            self.get_logger().debug(f"Idle vision observation notice: {e}")
+            self.get_logger().warn(f"⚠️ [Otonom Görsel Öğrenme Hatası]: {e}")
 
 
 
@@ -1497,12 +1540,17 @@ class AstroRealtimeNode(Node):
         except Exception:
             pass
 
-        # Acoustic presence / wake-up (requires clear human voice > 120.0 RMS to ignore faint whisper/noise)
+        # Acoustic presence / wake-up (requires sustained human voice > 200 RMS across >=4 consecutive frames)
         if raw_16k:
             try:
                 arr = np.frombuffer(raw_16k, dtype=np.int16)
                 local_rms = float(np.sqrt(np.mean(arr.astype(np.float32) ** 2)))
-                if local_rms > 120.0:
+                if local_rms > 200.0:
+                    self._consecutive_loud_frames += 1
+                else:
+                    self._consecutive_loud_frames = max(0, self._consecutive_loud_frames - 1)
+
+                if self._consecutive_loud_frames >= 4 and (now - getattr(self, "_node_start_time", 0.0)) > 3.0:
                     self._last_interaction_time = now
                     if self._is_sleeping:
                         self._wake_up()
