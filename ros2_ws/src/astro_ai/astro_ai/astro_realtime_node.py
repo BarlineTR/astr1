@@ -307,8 +307,8 @@ class AstroRealtimeNode(Node):
 
 
 
-    async def _send_session_update(self, ws):
-        """Sends comprehensive session configuration with persona prompt, tools, and turn detection."""
+    def _build_current_system_prompt(self) -> str:
+        """Builds system instructions with memory, identity, persona, and onboarding behavior."""
         identity = self._get_active_biometric_identity()
         is_known = identity.get("is_known", False)
         if is_known:
@@ -316,20 +316,30 @@ class AstroRealtimeNode(Node):
             title_val = identity.get("formal_title", identity.get("title", name_val))
             bio_status = (
                 f"\n[GÜNCEL BİYOMETRİK KİMLİK]: Karşındaki kişi %100 tanındı -> İsim: {name_val}, Hitap: {title_val}.\n"
-                f"Kural: Kendisine doğrudan ismiyle ({name_val} veya {title_val}) hitap et."
+                f"Kural: Kendisine doğrudan ismiyle/hitabıyla ({title_val}) hitap et."
             )
         else:
             bio_status = (
-                "\n[GÜNCEL BİYOMETRİK KİMLİK]: Karşındaki kişi henüz TANINMIYOR (Bilinmeyen Kişi / Misafir).\n"
-                "KRİTİK KURAL: Kullanıcı 'beni tanıdın mı?', 'sesimden tanıdın mı?', 'ismim ne?', 'kimim ben?' diye sorduğunda "
-                "ASLA 'tanıdım' deme ve asla isim uydurma! Açık ve net şekilde 'Hayır, henüz sesini ve yüzünü tanımıyorum. İstersen beni kaydet de, sesini ve yüzünü hafızama kaydedeyim!' de.\n"
-                "Kullanıcı 'beni kaydet', 'sesimi öğren', 'adım [isim]' veya 'tanışalım' dediğinde HEMEN 'enroll_user_biometrics' aracını çağır!"
+                f"\n[GÜNCEL BİYOMETRİK DURUM]: Karşındaki kişi HENÜZ TANINMIYOR (Bilinmeyen Ses & Yüz / Yeni Kullanıcı).\n"
+                f"DAVRANIŞ KURALLARI:\n"
+                f"1. Tanışma & Öğrenme: Karşındaki kişi seninle konuştuğunda veya 'beni tanıdın mı / sesimden tanıdın mı?' dediğinde, "
+                f"seçili kişiliğinle ({self.persona_name}) sesini/yüzünü ilk defa duyduğunu belirt ve adını sorarak tanışmak ve kaydetmek istediğini söyle "
+                f"(Örn: 'Sesini ilk kez duyuyorum, henüz tanışmadık! Adın ne senin, tanışalım mı?' veya Küfürbaz modundaysan 'Ulan sesini ilk defa duyuyorum, kimsin sen? Adını söyle de kaydedeyim koçum!').\n"
+                f"2. Biyometrik Kayıt: Kullanıcı adını söylediğinde (örn: 'Adım Ahmet', 'Mehmet ben', 'Beni kaydet', 'Tanışalım') "
+                f"VAKİT KAYBETMEDEN 'enroll_user_biometrics' fonksiyon aracını çağırarak sesini ve yüzünü sisteme kaydet!\n"
+                f"3. Dürüstlük: Asla 'tanıdım' diyerek yalan söyleme veya uydurma."
             )
 
-        system_prompt = self.persona_engine.build_system_prompt(
+        return self.persona_engine.build_system_prompt(
             memory_context=self.memory.get_prompt_context(recognized_person=identity) + bio_status,
             recognized_person=identity
         )
+
+    async def _send_session_update(self, ws):
+        """Sends comprehensive session configuration with persona prompt, tools, and turn detection."""
+        identity = self._get_active_biometric_identity()
+        system_prompt = self._build_current_system_prompt()
+
 
         session_config = {
             "type": "session.update",
@@ -1105,10 +1115,7 @@ class AstroRealtimeNode(Node):
         self._last_synced_identity = identity_name
         self._last_sync_time = now
 
-        system_prompt = self.persona_engine.build_system_prompt(
-            memory_context=self.memory.get_prompt_context(recognized_person=identity),
-            recognized_person=identity
-        )
+        system_prompt = self._build_current_system_prompt()
         update_event = {
             "type": "session.update",
             "session": {
@@ -1116,6 +1123,7 @@ class AstroRealtimeNode(Node):
                 "instructions": system_prompt
             }
         }
+
         try:
             asyncio.run_coroutine_threadsafe(self._ws.send(json.dumps(update_event)), self._loop)
             self.get_logger().info(f"👤 [Realtime Biyometri]: Oturum kimliği güncellendi -> {identity_name}")
