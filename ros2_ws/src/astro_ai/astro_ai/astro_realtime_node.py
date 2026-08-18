@@ -750,41 +750,131 @@ class AstroRealtimeNode(Node):
         return {"status": "success", "message": msg}
 
     def _run_voice_identification(self):
-        """Runs ultra-fast acoustic voiceprint matching on the recorded user speech (~1.8s window)."""
+        """Robust multi-window voice identification with majority voting, margin control, and streak tracking.
+
+        Engineering approach (eliminates single-sample threshold fragility):
+        - Splits audio buffer into 3 independent windows
+        - Runs WeSpeaker on each window independently
+        - A person is ONLY confirmed if ALL three conditions are met:
+            1. Majority win (>=2/3 windows vote for same person)
+            2. Best window confidence >= 0.42
+            3. Margin over runner-up >= 0.07 (prevents weak ties passing through)
+        - Streak counter tracks consecutive identifications per person for debugging
+        """
         if not self.voice_recognizer:
             return
         with self._lock:
             if not self._user_speech_audio_buffer:
                 return
-            raw_16k_all = b"".join(self._user_speech_audio_buffer[-90:])  # Last ~1.8 seconds (~50ms inference)
+            buffer_copy = list(self._user_speech_audio_buffer)
+
+        if len(buffer_copy) < 30:  # Less than ~0.6s -- too short to analyze reliably
+            return
 
         try:
-            audio_arr = np.frombuffer(raw_16k_all, dtype=np.int16)
-            if len(audio_arr) >= 16000 * 0.4:
-                spk_name, spk_conf, spk_meta = self.voice_recognizer.recognize_voice(audio_arr, sample_rate=16000, threshold=0.42)
-                is_known_spk = (spk_name is not None and spk_conf >= 0.42)
-                now = time.monotonic()
-                if is_known_spk:
-                    self.get_logger().info(f"🎙️ [Ses Tanıma]: {spk_name} ({spk_meta.get('formal_title', '')}) — Güven: %{int(spk_conf*100)}")
-                    with self._lock:
-                        self._recognized_speaker = {
-                            "name": spk_name,
-                            "title": spk_meta.get("title", ""),
-                            "formal_title": spk_meta.get("formal_title", spk_name),
-                            "confidence": spk_conf,
-                            "is_known": True,
-                            "source": "voice"
-                        }
-                        self._active_person_name = spk_name
-                        self._person_hold_until = now + 45.0
-                    self._sync_perception_to_session()
-                else:
-                    self.get_logger().info(f"🎙️ [Ses Tanıma]: Bilinmeyen Ses / Tanınmadı (En Yakın: '{spk_name}', Güven: {spk_conf:.2f})")
-                    with self._lock:
-                        self._recognized_speaker = {"name": "Misafir", "confidence": spk_conf, "is_known": False, "source": "unknown_voice"}
-                        self._active_person_name = "Misafir"
-                        self._person_hold_until = 0.0
-                    self._sync_perception_to_session()
+            from collections import Counter
+            n = len(buffer_copy)
+            third = max(n // 3, 20)
+            windows = [
+                buffer_copy[-third:],
+                buffer_copy[max(0, n - third * 2): n - third] if n >= third * 2 else buffer_copy[:third],
+                buffer_copy[:third],
+            ]
+
+            window_results = []
+            for win in windows:
+                raw = b"".join(win)
+                arr = np.frombuffer(raw, dtype=np.int16)
+                if len(arr) < int(16000 * 0.4):
+                    continue
+                spk_name, spk_conf, spk_meta = self.voice_recognizer.recognize_voice(
+                    arr, sample_rate=16000, threshold=0.42
+                )
+                window_results.append((spk_name, spk_conf, spk_meta))
+
+            if not window_results:
+                return
+
+            votes: Counter = Counter()
+            best_conf: dict = {}
+            best_meta: dict = {}
+
+            for spk_name, spk_conf, spk_meta in window_results:
+                if spk_name is not None:
+                    votes[spk_name] += 1
+                    if spk_conf > best_conf.get(spk_name, 0.0):
+                        best_conf[spk_name] = spk_conf
+                        best_meta[spk_name] = spk_meta
+
+            now = time.monotonic()
+
+            if not votes:
+                self.get_logger().info("🎙️ [Ses Tanıma]: Bilinmeyen Ses — hiçbir pencerede eşleşme bulunamadı")
+                with self._lock:
+                    self._recognized_speaker = {"name": "Misafir", "confidence": 0.0, "is_known": False, "source": "unknown_voice"}
+                    self._active_person_name = "Misafir"
+                    self._person_hold_until = 0.0
+                    self._voice_id_streak = {}
+                self._sync_perception_to_session()
+                return
+
+            ranked = votes.most_common()
+            winner_name, winner_votes = ranked[0]
+            winner_conf = best_conf[winner_name]
+            winner_meta = best_meta[winner_name]
+
+            runner_up_conf = best_conf.get(ranked[1][0], 0.0) if len(ranked) > 1 else 0.0
+            margin = winner_conf - runner_up_conf
+            total_windows = len(window_results)
+            majority_threshold = max(2, total_windows // 2 + 1) if total_windows >= 2 else 1
+
+            is_majority = winner_votes >= majority_threshold
+            is_confident = winner_conf >= 0.42
+            is_clear_winner = (margin > 0.07) or (total_windows <= 1)
+
+            with self._lock:
+                streak_map = getattr(self, "_voice_id_streak", {})
+
+            if is_majority and is_confident and is_clear_winner:
+                streak_count = streak_map.get(winner_name, 0) + 1
+                streak_map[winner_name] = streak_count
+                self.get_logger().info(
+                    f"🎙️ [Ses Tanıma]: {winner_name} ({winner_meta.get('formal_title', '')}) "
+                    f"— Güven: %{int(winner_conf*100)}, Oy: {winner_votes}/{total_windows}, "
+                    f"Margin: {margin:.2f}, Streak: {streak_count}"
+                )
+                with self._lock:
+                    self._recognized_speaker = {
+                        "name": winner_name,
+                        "title": winner_meta.get("title", ""),
+                        "formal_title": winner_meta.get("formal_title", winner_name),
+                        "confidence": winner_conf,
+                        "is_known": True,
+                        "source": "voice"
+                    }
+                    self._active_person_name = winner_name
+                    self._person_hold_until = now + 45.0
+                    self._voice_id_streak = streak_map
+                self._sync_perception_to_session()
+            else:
+                reason = []
+                if not is_majority:
+                    reason.append(f"oy yetersiz ({winner_votes}/{total_windows})")
+                if not is_confident:
+                    reason.append(f"güven düşük ({winner_conf:.2f})")
+                if not is_clear_winner:
+                    reason.append(f"margin yetersiz ({margin:.2f})")
+                self.get_logger().info(
+                    f"🎙️ [Ses Tanıma]: Bilinmeyen Ses / Tanınmadı "
+                    f"(En Yakın: '{winner_name}', Güven: {winner_conf:.2f}, {', '.join(reason)})"
+                )
+                with self._lock:
+                    self._recognized_speaker = {"name": "Misafir", "confidence": winner_conf, "is_known": False, "source": "unknown_voice"}
+                    self._active_person_name = "Misafir"
+                    self._person_hold_until = 0.0
+                    streak_map[winner_name] = 0
+                    self._voice_id_streak = streak_map
+                self._sync_perception_to_session()
         except Exception as e:
             self.get_logger().debug(f"Voice id notice: {e}")
 
@@ -1077,19 +1167,26 @@ class AstroRealtimeNode(Node):
                 self._latest_camera_frame = frame
 
     def _idle_learning_loop(self):
-        """Continuous background loop for autonomous room exploration and cognitive memory consolidation."""
+        """Continuous background loop for autonomous room exploration and cognitive memory consolidation.
+
+        Runs every 20s when idle OR sleeping — sleep mode is ideal for learning since the robot
+        has idle CPU and a clear unobstructed camera view of the environment.
+        Only pauses when actively speaking or playing audio.
+        """
         while rclpy.ok():
             time.sleep(3)
             if not self._enable_idle_learning:
                 continue
 
-            # Only run when robot is idle and not actively speaking or responding
+            # Run during both awake+idle AND sleep mode — skip only when actively speaking
             if self._is_responding or self._is_playback_active:
                 continue
 
             now = time.monotonic()
             if (now - self._last_idle_learning_time) > 20.0:
                 self._last_idle_learning_time = now
+                sleep_tag = " [UYKU MODU]" if self._is_sleeping else ""
+                self.get_logger().info(f"👁️🧠 [Otonom Öğrenme{sleep_tag}]: Astro kamerayı ve hafızayı inceliyor...")
 
                 # 1. Background Room Scene & Object Observation via Camera (Groq Vision)
                 self._idle_room_observation(now)

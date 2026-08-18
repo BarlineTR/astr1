@@ -185,53 +185,61 @@ class VoiceRecognizer:
             return True
 
     def recognize_voice(self, audio_arr: np.ndarray, sample_rate: int = 16000, threshold: float = VOICE_MATCH_THRESHOLD) -> Tuple[Optional[str], float, Dict[str, Any]]:
-        """Matches audio array against known voiceprints. Returns (name, confidence, metadata)."""
+        """Matches audio array against known voiceprints. Returns (name, best_score, metadata).
+
+        IMPORTANT: This method always returns the BEST candidate and their score, even below threshold.
+        Threshold enforcement and margin-based accept/reject logic is handled by the caller
+        (_run_voice_identification multi-window voter). This enables proper margin calculation.
+        """
         emb = self.extract_voiceprint(audio_arr, sample_rate)
         if emb is None:
             return None, 0.0, {}
 
-        # 1. First try SpeakerEngine directly (which loads ~/.astro/voices/speakers.json)
+        # Collect all speaker scores in one pass for margin calculation
+        all_scores: list = []  # list of (norm_name, sim, meta)
+
+        # 1. In-memory embeddings (primary — fastest path)
+        with self._lock:
+            known_vp = dict(self._known_voiceprints)
+            known_meta = dict(self._speaker_metadata)
+
+        for spk_norm, emb_list in known_vp.items():
+            best_sim = max(float(np.dot(emb, kn_emb)) for kn_emb in emb_list) if emb_list else -1.0
+            meta = known_meta.get(spk_norm, {
+                "name": spk_norm.replace("_", " ").title(),
+                "title": "Tanınan Konuşmacı",
+                "formal_title": spk_norm.replace("_", " ").title()
+            })
+            all_scores.append((spk_norm, best_sim, meta))
+
+        # 2. Also query SpeakerEngine (may have additional speakers from speakers.json)
         engine = _get_engine()
         if engine is not None:
             try:
                 engine.load()
                 matched_name, sim = engine.identify(emb)
-                if matched_name is not None and sim >= threshold:
+                if matched_name is not None:
+                    # Check if this engine result is already covered by in-memory scores
                     norm = self._normalize_name(matched_name)
-                    meta = self._speaker_metadata.get(norm, {
-                        "name": matched_name,
-                        "title": "Tanınan Konuşmacı",
-                        "formal_title": matched_name
-                    })
-                    return meta["name"], round(float(sim), 2), meta
+                    if not any(s[0] == norm for s in all_scores):
+                        eng_meta = known_meta.get(norm, {
+                            "name": matched_name,
+                            "title": "Tanınan Konuşmacı",
+                            "formal_title": matched_name
+                        })
+                        all_scores.append((norm, float(sim), eng_meta))
             except Exception:
                 pass
 
-        # 2. Match against in-memory embeddings & .npy files
-        with self._lock:
-            if not self._known_voiceprints:
-                return None, 0.0, {}
+        if not all_scores:
+            return None, 0.0, {}
 
-            best_match = None
-            highest_sim = -1.0
+        # Sort by similarity descending
+        all_scores.sort(key=lambda x: x[1], reverse=True)
+        best_norm, best_sim, best_meta = all_scores[0]
 
-            for spk_norm, emb_list in self._known_voiceprints.items():
-                for known_emb in emb_list:
-                    sim = float(np.dot(emb, known_emb))
-                    if sim > highest_sim:
-                        highest_sim = sim
-                        best_match = spk_norm
-
-            if best_match is not None and highest_sim >= threshold:
-                meta = self._speaker_metadata.get(best_match, {
-                    "name": best_match.replace("_", " ").title(),
-                    "title": "Tanınan Konuşmacı",
-                    "formal_title": best_match.replace("_", " ").title()
-                })
-                return meta["name"], round(highest_sim, 2), meta
-
-            fallback_name = best_match.replace("_", " ").title() if best_match else None
-            return fallback_name, max(0.0, round(highest_sim, 2)), {}
+        # Always return best candidate — let caller decide accept/reject via margin
+        return best_meta.get("name", best_norm.replace("_", " ").title()), round(max(0.0, best_sim), 4), best_meta
 
     def delete_speaker(self, name: str) -> bool:
         """Deletes speaker from memory, .npy files, and speakers.json."""
