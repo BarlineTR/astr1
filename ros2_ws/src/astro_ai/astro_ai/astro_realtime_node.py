@@ -228,9 +228,9 @@ class AstroRealtimeNode(Node):
         # Tool execution deduplication
         self._executed_tool_calls: set[str] = set()
 
-        # Sleep Mode (10s Inactivity Timer)
-        self._is_sleeping = False
-        self._last_interaction_time = time.monotonic()
+        # Sleep Mode (Default: Start in Sleeping State)
+        self._is_sleeping = True
+        self._last_interaction_time = time.monotonic() - 20.0
         self.create_timer(1.0, self._check_sleep_mode)
 
         # Reminders storage
@@ -252,6 +252,7 @@ class AstroRealtimeNode(Node):
         self._ws_thread.start()
 
         self.get_logger().info(f"🚀 [Astro Realtime Node] OpenAI Realtime WebSocket Başlatılıyor... Ses: [{self.realtime_voice}], Kişilik: [{self.persona_name.upper()}]")
+        self.get_logger().info("💤 [Astro Uyku Modu]: Düğüm başlatıldı — Astro uyku modunda (😴). Belirgin bir insan sesi algılandığında uyanacak.")
 
     def _run_async_loop(self):
         self._loop = asyncio.new_event_loop()
@@ -332,14 +333,17 @@ class AstroRealtimeNode(Node):
             title_val = identity.get("formal_title", identity.get("title", name_val))
             bio_status = (
                 f"\n[GÜNCEL BİYOMETRİK KİMLİK]: Karşındaki kişi %100 tanındı -> İsim: {name_val}, Hitap: {title_val}.\n"
-                f"Kural: Kendisine doğrudan ismiyle/hitabıyla ({title_val}) hitap et."
+                f"ÇOKLU KONUŞMACI & ÖNCELİK KURALI:\n"
+                f"1. Karşında {name_val} ({title_val}) var. Kendisine doğrudan ismiyle/hitabıyla hitap et.\n"
+                f"2. Eğer odada 2 kişi aynı anda konuşursa veya arkadan başka bir ses gelirse, DAİMA ÖNCELİĞİ TANIDIĞIN KİŞİYE ({name_val}) VER ve ona yanıt ver.\n"
+                f"3. Tanıdığın kişi ({name_val}) karşındayken araya giren bilinmeyen sesleri kaydetmeye çalışma veya asıl kişiyi bırakma."
             )
         else:
             bio_status = (
                 f"\n[GÜNCEL BİYOMETRİK DURUM]: Karşındaki kişi HENÜZ TANINMIYOR (Bilinmeyen Ses & Yüz / Yeni Kullanıcı / Misafir).\n"
                 f"KRİTİK DAVRANIŞ KURALLARI:\n"
                 f"1. Karşındaki kişi az önceki kişi DEĞİLDİR (veya sesi tanınmayan farklı biridir). Karşındaki kişiye ASLA önceki isimlerle (Oktay, Baran vb.) hitap etme!\n"
-                f"2. Tanışma & Öğrenme: Karşındaki kişi 'beni tanıdın mı / sesimden tanıdın mı / ben kimim?' dediğinde, seçili kişiliğinle ({self.persona_name}) sesini ilk defa duyduğunu, hafızandaki kayıtlara uymadığını belirt ve adını sor (Örn: 'Sesini ilk kez duyuyorum, tanıyamadım! Adın ne senin?' veya Küfürbaz modundaysan 'Ulan sesini çıkaramadım, kimsin sen? Adını söyle de kaydedeyim koçum!').\n"
+                f"2. Tanışma & Öğrenme: Ortamda tanıdığın hiç kimse yoksa ve SADECE bu bilinmeyen kişi seninle konuşuyorsa, seçili kişiliğinle ({self.persona_name}) sesini ilk defa duyduğunu, hafızandaki kayıtlara uymadığını belirt ve adını sor (Örn: 'Sesini ilk kez duyuyorum, tanıyamadım! Adın ne senin?' veya Küfürbaz modundaysan 'Ulan sesini çıkaramadım, kimsin sen? Adını söyle de kaydedeyim koçum!').\n"
                 f"3. Biyometrik Kayıt: SADECE VE SADECE kullanıcı AÇIKÇA kendi adını söylediğinde (örn: 'Adım Ahmet', 'Mehmet ben', 'Bana Ali de') 'enroll_user_biometrics' fonksiyonunu çağır! Kullanıcı adını açıkça söylemediyse ASLA kafandan rastgele isim uydurarak bu fonksiyonu çağırma.\n"
                 f"4. Dürüstlük: Asla 'tanıdım' diyerek yalan söyleme veya tanınmayan kişiye ezbere önceki isimleri yapıştırma."
             )
@@ -376,7 +380,7 @@ class AstroRealtimeNode(Node):
                         },
                         "turn_detection": {
                             "type": "server_vad",
-                            "threshold": 0.65,
+                            "threshold": 0.72,
                             "prefix_padding_ms": 300,
                             "silence_duration_ms": 600,
                             "create_response": False
@@ -1395,12 +1399,12 @@ class AstroRealtimeNode(Node):
         except Exception:
             pass
 
-        # Acoustic presence / wake-up
+        # Acoustic presence / wake-up (requires clear human voice > 120.0 RMS to ignore faint whisper/noise)
         if raw_16k:
             try:
                 arr = np.frombuffer(raw_16k, dtype=np.int16)
                 local_rms = float(np.sqrt(np.mean(arr.astype(np.float32) ** 2)))
-                if local_rms > 30.0:
+                if local_rms > 120.0:
                     self._last_interaction_time = now
                     if self._is_sleeping:
                         self._wake_up()

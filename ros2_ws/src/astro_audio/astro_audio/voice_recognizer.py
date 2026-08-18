@@ -186,12 +186,16 @@ class VoiceRecognizer:
 
     def recognize_voice(self, audio_arr: np.ndarray, sample_rate: int = 16000, threshold: float = VOICE_MATCH_THRESHOLD) -> Tuple[Optional[str], float, Dict[str, Any]]:
         """Matches audio array against known voiceprints. Returns (name, confidence, metadata)."""
+        emb = self.extract_voiceprint(audio_arr, sample_rate)
+        if emb is None:
+            return None, 0.0, {}
+
         # 1. First try SpeakerEngine directly (which loads ~/.astro/voices/speakers.json)
         engine = _get_engine()
         if engine is not None:
             try:
                 engine.load()
-                matched_name, sim = engine.identify(audio_arr, sample_rate)
+                matched_name, sim = engine.identify(emb)
                 if matched_name is not None and sim >= threshold:
                     norm = self._normalize_name(matched_name)
                     meta = self._speaker_metadata.get(norm, {
@@ -200,16 +204,10 @@ class VoiceRecognizer:
                         "formal_title": matched_name
                     })
                     return meta["name"], round(float(sim), 2), meta
-                elif sim is not None and sim > 0:
-                    return None, round(float(sim), 2), {}
             except Exception:
                 pass
 
-        # 2. Fallback to in-memory matching
-        emb = self.extract_voiceprint(audio_arr, sample_rate)
-        if emb is None:
-            return None, 0.0, {}
-
+        # 2. Match against in-memory embeddings & .npy files
         with self._lock:
             if not self._known_voiceprints:
                 return None, 0.0, {}
@@ -232,5 +230,29 @@ class VoiceRecognizer:
                 })
                 return meta["name"], round(highest_sim, 2), meta
 
-            return None, max(0.0, round(highest_sim, 2)), {}
+            fallback_name = best_match.replace("_", " ").title() if best_match else None
+            return fallback_name, max(0.0, round(highest_sim, 2)), {}
+
+    def delete_speaker(self, name: str) -> bool:
+        """Deletes speaker from memory, .npy files, and speakers.json."""
+        norm_name = self._normalize_name(name)
+        with self._lock:
+            self._known_voiceprints.pop(norm_name, None)
+            self._speaker_metadata.pop(norm_name, None)
+
+        try:
+            npy_path = os.path.join(self.data_dir, f"{norm_name}.npy")
+            if os.path.exists(npy_path):
+                os.remove(npy_path)
+        except Exception:
+            pass
+
+        engine = _get_engine()
+        if engine is not None:
+            try:
+                engine.remove_person(name)
+                engine.save()
+            except Exception:
+                pass
+        return True
 
