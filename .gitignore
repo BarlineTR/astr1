@@ -14,3 +14,6 @@ install/
 log/
 
 vosk-model-small-tr-0.3/
+# Yüz tanıma: kişilerin fotoğrafları (kişisel veri — depoya girmez)
+faces/
+Persons/

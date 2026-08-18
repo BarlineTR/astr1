@@ -9,6 +9,21 @@ from launch.substitutions import LaunchConfiguration
 
 
 def generate_launch_description():
+    try:
+        from dotenv import load_dotenv
+        for env_path in [
+            os.path.abspath(".env"),
+            os.path.abspath(".env.production"),
+            os.path.expanduser("~/Desktop/astr1/.env"),
+            os.path.expanduser("~/Desktop/astr1/.env.production"),
+            os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..", "..", ".env")),
+            os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..", "..", ".env.production")),
+        ]:
+            if os.path.exists(env_path):
+                load_dotenv(env_path, override=True)
+    except Exception:
+        pass
+
     lidar_pkg = get_package_share_directory("astro_lidar")
     audio_pkg = get_package_share_directory("astro_audio")
     vision_pkg = get_package_share_directory("astro_vision")
@@ -18,6 +33,7 @@ def generate_launch_description():
     enable_audio = LaunchConfiguration("enable_audio")
     enable_vision = LaunchConfiguration("enable_vision")
     enable_ai = LaunchConfiguration("enable_ai")
+    use_native_spatial = LaunchConfiguration("use_native_spatial")
 
     return LaunchDescription(
         [
@@ -25,6 +41,11 @@ def generate_launch_description():
                 "use_sim_time",
                 default_value="false",
                 description="Use simulation clock",
+            ),
+            DeclareLaunchArgument(
+                "use_native_spatial",
+                default_value="false",
+                description="Use 100% Native DepthAI on-chip VPU spatial perception pipeline",
             ),
             DeclareLaunchArgument(
                 "enable_lidar",
@@ -58,7 +79,10 @@ def generate_launch_description():
                     os.path.join(vision_pkg, "launch", "camera.launch.py")
                 ),
                 condition=IfCondition(enable_vision),
-                launch_arguments={"use_sim_time": use_sim_time}.items(),
+                launch_arguments={
+                    "use_sim_time": use_sim_time,
+                    "use_native_spatial": use_native_spatial,
+                }.items(),
             ),
             IncludeLaunchDescription(
                 PythonLaunchDescriptionSource(

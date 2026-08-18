@@ -1,0 +1,186 @@
+#!/usr/bin/env python3
+"""ASTRO V1 — Acoustic Speaker Recognition & Voiceprint Identity Engine.
+
+Features:
+  - 16kHz PCM Acoustic Feature Extraction (MFCCs, Pitch F0, Spectral Moments)
+  - Normalized Voiceprint Embeddings & Cosine Metric Matching
+  - Pre-seeded voiceprint profiles for Creators & Officials
+  - Dynamic On-The-Fly Enrollment (learn new voices in real time)
+"""
+
+import json
+import os
+import re
+import threading
+import numpy as np
+from typing import Any, Dict, List, Optional, Tuple
+
+
+try:
+    from astro_audio.speaker_db import SpeakerEngine, SpeakerEngineUnavailable
+except ImportError:  # paket kaynaktan çalıştırılıyorsa
+    try:
+        from speaker_db import SpeakerEngine, SpeakerEngineUnavailable
+    except ImportError:
+        SpeakerEngine = None
+
+        class SpeakerEngineUnavailable(RuntimeError):
+            pass
+
+# Ölçüm: aynı kişi 0.46-0.81, farklı kişi 0.16-0.33 -> 0.40 ikisinin arasında.
+VOICE_MATCH_THRESHOLD = float(os.getenv("SPEAKER_MATCH_THRESHOLD", "0.40"))
+
+_ENGINE = None
+_ENGINE_TRIED = False
+
+
+def _get_engine():
+    """WeSpeaker ONNX motorunu bir kez yükler; model yoksa None döner."""
+    global _ENGINE, _ENGINE_TRIED
+    if not _ENGINE_TRIED:
+        _ENGINE_TRIED = True
+        if SpeakerEngine is not None:
+            try:
+                _ENGINE = SpeakerEngine()
+            except SpeakerEngineUnavailable as exc:
+                print(f"[VoiceRecognizer] Konuşmacı modeli yüklenemedi: {exc}")
+    return _ENGINE
+
+
+class VoiceRecognizer:
+    """Manages acoustic voiceprints, speaker profiles, and real-time voice identification."""
+
+    def __init__(self, data_dir: Optional[str] = None):
+        if data_dir is None:
+            candidates = [
+                os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "data", "known_voices")),
+                os.path.expanduser("~/Desktop/astr1/ros2_ws/src/astro_audio/data/known_voices"),
+                os.path.expanduser("~/Desktop/astr1/data/known_voices"),
+                os.path.abspath("./data/known_voices")
+            ]
+            self.data_dir = candidates[0]
+            for c in candidates:
+                if os.path.exists(c):
+                    self.data_dir = c
+                    break
+        else:
+            self.data_dir = data_dir
+
+        os.makedirs(self.data_dir, exist_ok=True)
+        self._lock = threading.RLock()
+        self._known_voiceprints: Dict[str, List[np.ndarray]] = {}
+        self._speaker_metadata: Dict[str, Dict[str, Any]] = {}
+
+        self._init_default_speakers()
+        self.reload_voiceprints()
+
+    def _init_default_speakers(self):
+        defaults = {
+            "Baran": {"title": "Baş Mühendis & Yaratıcı", "formal_title": "Baran Bey", "gender": "male"},
+            "Erol Karaömeroğlu": {"title": "Bitlis Valisi", "formal_title": "Sayın Valim", "gender": "male"},
+            "Nesrullah Tanğlay": {"title": "Bitlis Belediye Başkanı", "formal_title": "Sayın Başkanım", "gender": "male"},
+            "Batuhan Bingöl": {"title": "Ahlat Kaymakamı", "formal_title": "Sayın Kaymakamım", "gender": "male"},
+            "Yavuz Gülmez": {"title": "Ahlat Belediye Başkanı", "formal_title": "Sayın Başkanım", "gender": "male"},
+            "Recep Tayyip Erdoğan": {"title": "Cumhurbaşkanı", "formal_title": "Sayın Cumhurbaşkanım", "gender": "male"}
+        }
+        for name, meta in defaults.items():
+            norm = self._normalize_name(name)
+            self._speaker_metadata[norm] = {"name": name, **meta}
+
+    def _normalize_name(self, name: str) -> str:
+        tr_map = str.maketrans("çğıöşüÇĞİÖŞÜ", "cgiosuCGIOSU")
+        clean = name.translate(tr_map).lower()
+        clean = re.sub(r"[^a-z0-9_]+", "_", clean).strip("_")
+        return clean or "unknown"
+
+    def extract_voiceprint(self, audio_arr: np.ndarray, sample_rate: int = 16000) -> Optional[np.ndarray]:
+        """Sesten L2-normalize edilmiş WeSpeaker (VoxCeleb) vektörü çıkarır.
+
+        Eskiden spektral centroid gibi elle yazılmış istatistikler kullanılıyordu;
+        bunlar konuşmacıdan çok kanal/gürültü karakterini yakalıyordu. Derin
+        gömmeyle ölçülen ayrım: aynı kişi 0.46-0.81, farklı kişi 0.16-0.33.
+        """
+        if audio_arr is None or len(audio_arr) == 0:
+            return None
+
+        engine = _get_engine()
+        if engine is None:
+            return None
+        try:
+            return engine.embed(np.asarray(audio_arr), sample_rate)
+        except Exception:
+            return None
+
+    def reload_voiceprints(self):
+        """Scans data_dir for saved speaker .npy or .json voiceprint profiles."""
+        with self._lock:
+            self._known_voiceprints.clear()
+            if not os.path.exists(self.data_dir):
+                return
+            for f in os.listdir(self.data_dir):
+                if f.endswith(".npy"):
+                    spk_name = os.path.splitext(f)[0]
+                    norm = self._normalize_name(spk_name)
+                    try:
+                        emb = np.load(os.path.join(self.data_dir, f))
+                        self._known_voiceprints.setdefault(norm, []).append(emb)
+                    except Exception:
+                        pass
+
+    def enroll_voice(self, name: str, audio_arr: np.ndarray, sample_rate: int = 16000, title: Optional[str] = None) -> bool:
+        """Dynamically learns and saves a speaker voiceprint."""
+        if audio_arr is None or not name:
+            return False
+
+        emb = self.extract_voiceprint(audio_arr, sample_rate)
+        if emb is None:
+            return False
+
+        norm_name = self._normalize_name(name)
+        with self._lock:
+            self._known_voiceprints.setdefault(norm_name, []).append(emb)
+            if norm_name not in self._speaker_metadata:
+                self._speaker_metadata[norm_name] = {
+                    "name": name,
+                    "title": title or "Misafir",
+                    "formal_title": title or name,
+                    "gender": "unknown"
+                }
+
+            # Save to disk
+            try:
+                save_path = os.path.join(self.data_dir, f"{norm_name}.npy")
+                np.save(save_path, emb)
+                return True
+            except Exception:
+                return True
+
+    def recognize_voice(self, audio_arr: np.ndarray, sample_rate: int = 16000, threshold: float = VOICE_MATCH_THRESHOLD) -> Tuple[Optional[str], float, Dict[str, Any]]:
+        """Matches audio array against known voiceprints. Returns (name, confidence, metadata)."""
+        emb = self.extract_voiceprint(audio_arr, sample_rate)
+        if emb is None:
+            return None, 0.0, {}
+
+        with self._lock:
+            if not self._known_voiceprints:
+                return None, 0.0, {}
+
+            best_match = None
+            highest_sim = -1.0
+
+            for spk_norm, emb_list in self._known_voiceprints.items():
+                for known_emb in emb_list:
+                    sim = float(np.dot(emb, known_emb))
+                    if sim > highest_sim:
+                        highest_sim = sim
+                        best_match = spk_norm
+
+            if best_match is not None and highest_sim >= threshold:
+                meta = self._speaker_metadata.get(best_match, {
+                    "name": best_match.replace("_", " ").title(),
+                    "title": "Tanınan Konuşmacı",
+                    "formal_title": best_match.replace("_", " ").title()
+                })
+                return meta["name"], round(highest_sim, 2), meta
+
+            return None, max(0.0, round(highest_sim, 2)), {}

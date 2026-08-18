@@ -9,15 +9,104 @@ The system has been completely modularized into ROS 2 Humble packages:
 ### 📦 Packages
 - `astro_base`: Arduino Mega serial bridge for motor control and base sensors.
 - `astro_lidar`: RPLIDAR A1 wrapper and NaN/Range filter node (`scan_filter_node`).
-- `astro_vision`: OAK-D Lite driver wrapper and OpenCV Face Detection node.
-- `astro_audio`: ReSpeaker array driver handling Audio Capture, Speech Recognition (Vosk), and TTS (pyttsx3/gTTS).
-- `astro_ai`: AI Brain Node managing LLM interactions and memory via OpenAI API standard.
+- `astro_vision`: OAK-D Lite driver (plus a USB-webcam publisher), face **detection and recognition** (`face_detector_node`), and the on-chip spatial pipeline (`oak_spatial_native_node`).
+- `astro_audio`: ReSpeaker capture, Speech Recognition (local Faster-Whisper or cloud Whisper), **speaker recognition**, and TTS (local XTTS voice cloning, OpenAI, edge-tts).
+- `astro_ai`: AI Brain — LLM engines, persona, long-term memory, conversation state machine.
 - `astro_bringup`: Centralized launch files and parameters for the whole system.
 - `astro_description`: URDF models and Robot State Publisher (tf2).
 
+### 🧠 Who does what — engine matrix
+
+Every engine is chosen in `.env`; each has a working fallback, so a missing key or a
+dead network degrades the robot instead of stopping it.
+
+| Job | Default | Alternatives | Local? |
+|---|---|---|---|
+| LLM (chat) | Groq LPU | Gemini (`LLM_PROVIDER="gemini"`), OpenAI | cloud |
+| Speech → text | Faster-Whisper (`STT_ENGINE="faster-whisper"`) | Groq Whisper, OpenAI Whisper | **yes**, GPU |
+| Text → speech | XTTS (`TTS_ENGINE="xtts"`) | OpenAI TTS, edge-tts | **yes**, GPU |
+| Who is this face? | SFace embeddings (OpenCV ONNX) | — | **yes**, CPU |
+| Who is speaking? | WeSpeaker ResNet34 (ONNX) | — | **yes**, CPU |
+
+Face and speaker recognition need no extra pip package — they run on `opencv-python`
+and `onnxruntime`, which are already installed. Only the model files are downloaded:
+
+```bash
+./scripts/install_face_models.sh     # YuNet + SFace + WeSpeaker (~63 MB total)
+```
+
+### 👥 Teaching the robot who people are
+
+Faces and voices are enrolled separately but should use **the same name**, so the
+brain can fuse "the person I see" with "the person who is talking".
+
+```bash
+# Faces — from photos, or live from the camera
+./scripts/enroll_face.py --name Yunus --photos faces/Yunus
+./scripts/enroll_face.py --name Yunus --capture --count 5
+./scripts/enroll_face.py --list
+./scripts/enroll_face.py --test some_photo.jpg     # who is this?
+
+# Voices — from WAV files, or live from the microphone
+./scripts/enroll_speaker.py --name Yunus --audio voices/Yunus
+./scripts/enroll_speaker.py --name Yunus --record --count 3 --seconds 5
+./scripts/enroll_speaker.py --list
+```
+
+The curated gallery of public officials lives in
+`ros2_ws/src/astro_vision/data/known_faces/<person>/*.jpg` and is indexed automatically
+at startup, together with their titles (`Sayın Valim`, `Sayın Başkanım`, …).
+
+**Accuracy notes, measured on this repo's data:**
+
+- Faces: same person 0.74–0.95, different people 0.10–0.41 cosine. Default threshold
+  `FACE_MATCH_THRESHOLD=0.45`. With only one photo per person, two officials in the
+  gallery reach 0.414 — adding 2–3 photos per person is what actually fixes that, and
+  then the threshold can go back down to 0.40.
+- Voices: same person 0.46–0.81, different people 0.16–0.33. Default
+  `SPEAKER_MATCH_THRESHOLD=0.40`. Enroll 3–5 recordings of at least 3 seconds each.
+- Large gallery photos (≥1500 px) used to fail detection entirely; detection now runs on
+  a downscaled copy, which took undetected gallery faces from 9/25 down to 1/25.
+
 ## 🛠️ Installation & Build
 
-**Prerequisites:** Ubuntu 22.04 with ROS 2 Humble and Python 3.10 (Jetson Orin Nano or an x86 dev machine).
+**Prerequisites:** Ubuntu 22.04 with ROS 2 Humble and Python 3.10 (Jetson Orin Nano or an x86 dev machine). Everything else the installer handles.
+
+### Quick install (one command)
+
+```bash
+git clone <this-repo> astr1 && cd astr1
+./scripts/install.sh                 # apt packages + venv + build + verification
+./scripts/install.sh --with-xtts     # also install local XTTS voice cloning (~5 GB)
+```
+
+The script is re-runnable — it completes what is missing and never overwrites an existing `.env`. Flags:
+
+| Flag | Effect |
+|---|---|
+| `--with-xtts` | Also run `scripts/install_xtts.sh` (local XTTS voice cloning) |
+| `--skip-apt` | Skip the apt step (no sudo, or packages already present) |
+| `--skip-build` | Skip `colcon build` |
+| `--clean` | Delete `build/ install/ log/` and rebuild from scratch |
+
+It ends with a verification pass — 7 ROS packages present, every node importable, `serial_bridge.py` executable, entry points pointing at the venv — and exits non-zero if any check fails. Missing apt packages are reported as warnings with the exact `sudo apt install` line, since apt needs a terminal for the password.
+
+Then:
+
+```bash
+source .venv/bin/activate
+source ros2_ws/install/setup.bash
+ros2 launch astro_bringup robot.launch.py
+```
+
+| Script | Purpose |
+|---|---|
+| `scripts/install.sh` | Full install: apt packages, uv, venv, `.env`, workspace build, verification |
+| `scripts/build.sh` | Rebuild the workspace correctly (right directory, right interpreter) |
+| `scripts/install_xtts.sh` | XTTS voice cloning only — clones the TTS fork from GitHub into its own venv |
+| `scripts/install_stt_deps.sh` | Legacy: `pip3 install`s the STT/TTS packages system-wide. Superseded by `requirements.txt` + the venv; kept only for machines set up before the venv layout |
+
+The sections below document what the installer does, in case you want to run the steps by hand or debug one of them.
 
 ### 1. System packages (apt)
 
@@ -27,14 +116,15 @@ These cannot come from pip — ROS packages, and the native libraries that `soun
 sudo apt update
 sudo apt install -y python3-rosdep python3-colcon-common-extensions
 sudo apt install -y ros-humble-rplidar-ros ros-humble-depthai-ros ros-humble-robot-state-publisher
-sudo apt install -y libportaudio2 espeak-ng mpg123
+sudo apt install -y libportaudio2 espeak-ng mpg123 alsa-utils
 ```
 
 | Package | Needed by |
 |---|---|
 | `libportaudio2` | `sounddevice` — without it `audio_capture_node` fails with `OSError: PortAudio library not found` |
-| `espeak-ng` | `pyttsx3` offline TTS engine |
+| `espeak-ng` | `pyttsx3` offline TTS engine, and XTTS phonemisation |
 | `mpg123` | MP3 playback in `tts_node` — the `edge-tts`, `gTTS` and ElevenLabs engines all shell out to it, so without it TTS generates audio but plays nothing |
+| `alsa-utils` | WAV playback in `tts_node` — XTTS produces WAV, which `mpg123` cannot play |
 
 ### 2. Python environment (uv)
 
@@ -64,15 +154,37 @@ Two pins are deliberate and must not be relaxed:
 
 ### 3. Build the workspace
 
-Run `colcon` **from `ros2_ws/`**, not from the repository root — building at the root scatters `build/ install/ log/` next to the source tree.
-
 ```bash
-cd <repo-root>/ros2_ws
-colcon build --symlink-install
-source install/setup.bash   # or setup.zsh
+./scripts/build.sh                 # everything
+./scripts/build.sh astro_audio     # one package
+./scripts/build.sh --clean         # wipe build/ install/ log/ first
 ```
 
+**Do not run bare `colcon build`.** Two things about this workspace make the plain command produce a broken system, and the wrapper handles both:
+
+1. **Build from `ros2_ws/`, never from the repository root.** A root build creates a *second* `install/` tree next to the source, and `ros2 launch` then runs whichever one your shell happens to have sourced — usually the stale one. The repo root carries a `COLCON_IGNORE` file so an accidental root build finds 0 packages instead of silently shadowing the real tree.
+2. **Build with the venv's Python** (`../.venv/bin/python -m colcon build --symlink-install`). setuptools writes the shebang of every generated entry point (`install/astro_audio/lib/astro_audio/tts_node`, …) from the interpreter that runs the build. `/usr/bin/colcon` runs under the system Python, so the entry points get `#!/usr/bin/python3` — and then `ros2 run` cannot see a single venv package. The symptom is a launch full of lines like:
+
+   ```text
+   [tts_node] edge-tts paketi kurulu değil, pyttsx3'e düşürülüyor
+   [speech_recognition_node] faster-whisper kütüphanesi kurulu değil! Vosk'a dönülüyor
+   [audio_capture_node] sounddevice başlatılamadı. arecord fallback moduna geçiliyor...
+   ```
+
+   Those messages are lying: the packages are installed, just not visible to `/usr/bin/python3`. Building through the venv points the entry points at `.venv/bin/python`, and `ros2 run` / `ros2 launch` then work whether or not the venv is activated. (`colcon` stays importable inside the venv because it was created with `--system-site-packages`.)
+
+To check which tree a running node came from, look at the path in the launch output: it must start with `<repo-root>/ros2_ws/install/`, not `<repo-root>/install/`. If your shell still has a deleted tree sourced, open a new shell and `source ros2_ws/install/setup.bash`.
+
 Expected result: 7 packages finished. Warnings about `tests_require` and CMake policy `CMP0148` are harmless.
+
+**Verify the build:**
+
+```bash
+ros2 pkg list | grep astro                 # 7 packages
+ros2 pkg executables | grep astro          # 7 executables
+```
+
+Or just re-run `./scripts/install.sh --skip-apt`, which performs the same checks and prints a pass/fail line per node.
 
 ## 🚦 Usage
 
@@ -87,10 +199,17 @@ ros2 launch astro_bringup robot.launch.py
 ### Launching Individual Subsystems
 If you want to test or launch sensors individually for debugging:
 
-**Vision (OAK-D + Face Detection):**
+**Vision (camera + face recognition):**
 ```bash
-ros2 launch astro_vision camera.launch.py
+ros2 launch astro_vision camera.launch.py                      # OAK-D driver
+ros2 launch astro_vision camera.launch.py source:=webcam       # USB webcam instead
+ros2 launch astro_vision camera.launch.py use_native_spatial:=true   # on-chip OAK-D pipeline
 ```
+
+All sources publish to the same topic (`/oak/rgb/image_raw`), so the vision nodes do not
+care which one is running. `source:=webcam` is what makes the stack testable on a laptop
+with no OAK-D attached. `face_detector_node` publishes `/vision/person_name` with the
+recognized person, plus `/vision/faces` (JSON with names, similarity and boxes).
 
 **LiDAR (RPLIDAR + Filter):**
 ```bash
@@ -111,40 +230,86 @@ Centralized parameters are stored in `astro_bringup/config/astro_params.yaml`. Y
 - RPLIDAR ranges and baud rates
 
 ### 4. Advanced STT (Ses Tanıma) Options
-You can change the STT engine via the `.env` file (`STT_ENGINE`).
 
-**Option 1: Vosk Large Model (Offline, 1GB)**
-For much better offline Turkish recognition, download the large model:
-```bash
-wget https://alphacephei.com/vosk/models/vosk-model-tr-0.3.zip
-unzip vosk-model-tr-0.3.zip
-sudo mv vosk-model-tr-0.3 /opt/vosk/
-```
-Then update your `.env` file:
-```ini
-STT_ENGINE="vosk"
-STT_VOSK_MODEL_PATH="/opt/vosk/vosk-model-tr-0.3"
-```
-Any model directory kept at the repository root (e.g. `vosk-model-small-tr-0.3/`) is git-ignored — point `STT_VOSK_MODEL_PATH` at it with an absolute path instead of committing 57 MB+ of model files.
+`STT_ENGINE` in `.env` picks the engine. The node tries them in order and keeps the first
+that works, so a missing key never leaves the robot deaf.
 
-**Option 2: Faster-Whisper (Recommended — full sentences, offline)**
-The `faster-whisper` package is already part of `requirements.txt`, so no extra install step is needed inside the venv. Just set it in `.env`:
+**Faster-Whisper (default, local, no internet)**
 
-> ⚠️ **Do not use `distil-*` models for Turkish.** Every Distil-Whisper checkpoint (`distil-large-v3`, `distil-medium.en`, …) is an English-only distillation — it ignores `language="tr"` and returns English text. Use the multilingual `large-v3` (or `medium` / `small` on weaker GPUs).
 ```ini
 STT_ENGINE="faster-whisper"
-STT_FW_MODEL="distil-large-v3"
-STT_FW_DEVICE="cuda"          # use "cpu" if no NVIDIA GPU
-STT_FW_COMPUTE_TYPE="float16" # use "int8" on CPU
+STT_FW_MODEL="large-v2"        # "turbo", "medium", "small" on weaker GPUs
+STT_FW_DEVICE="cuda"           # falls back to CPU automatically if CUDA fails
+STT_FW_COMPUTE_TYPE="float16"  # "int8" on CPU
+STT_FW_CPU_COMPUTE_TYPE="int8"
 ```
-On first launch the model downloads (~800MB for distil-large-v3). Expect log:
-`✅ Faster-Whisper modeli başarıyla yüklendi.`
 
-**Option 3: Whisper API (Cloud)**
-If you want to use OpenAI or Groq Whisper for perfect STT:
+> ⚠️ **Never use `distil-*` models for Turkish.** Every Distil-Whisper checkpoint is an
+> English-only distillation — it ignores `language="tr"` and returns English text.
+
+**Cloud Whisper (Groq / OpenAI)**
+
 ```ini
-STT_ENGINE="whisper"
-STT_API_KEY="sk-YOUR-KEY"
+STT_ENGINE="groq"      # or "openai"
+GROQ_API_KEY="gsk-..."
 ```
+
+Groq's `whisper-large-v3` is the fastest of the three; it needs internet and a key.
+
+**Who is speaking.** Every transcription also runs speaker recognition and publishes the
+result on `/audio/speaker_name`, alongside the plain text on `/speech/text` (kept separate
+so wake-word matching is not disturbed). Turn it off with `SPEAKER_ID_ENABLED=0`.
+
+### 5. Advanced TTS (Ses Sentezi) Options
+
+`TTS_ENGINE` in `.env` selects the engine: `elevenlabs`, `edge-tts` (default), `xtts`, `pyttsx3`, `gtts`. The first two and `gtts` need internet; `xtts` and `pyttsx3` are fully offline.
+
+**XTTS v2 — local voice cloning (offline, GPU recommended)**
+
+`xtts` speaks with a cloned voice taken from a short reference recording, with no internet and no API key. It is **not** installed from PyPI: `pip install TTS` resolves Coqui TTS 0.22.0 against today's package versions and produces an environment that imports but does not work. Instead a dedicated script clones the maintained fork and pins the version set that is known to work:
+
+```bash
+./scripts/install_xtts.sh
+```
+
+The script clones <https://github.com/yunusemretom/TTS.git> into `~/.astro/tts` (override with `TTS_XTTS_HOME`), creates a Python 3.10 venv there, installs the repo with `uv pip install -e .`, picks the torch CUDA build matching your driver, pins `librosa`/`transformers`/`numpy`/`scipy`, symlinks `espeak` → `espeak-ng`, and pre-downloads the ~1.8 GB XTTS v2 checkpoint (skip with `XTTS_SKIP_DOWNLOAD=1`). It is re-runnable: an existing clone is updated instead of re-cloned.
+
+> **Why a second virtualenv?** XTTS needs `numpy==1.26.4` — its compiled `monotonic_align` Cython extension is built against the NumPy 1.x ABI — while this repo pins `numpy==2.2.6` to match `rclpy`. The two cannot share an interpreter. So `tts_node` never imports XTTS: it launches `xtts_worker.py` with the XTTS venv's Python as a long-lived child process and talks to it over line-based JSON on stdin/stdout (`xtts_client.py`). The model and speaker latents are loaded once at node start, so each sentence pays only inference cost.
+
+Enable it in `.env`:
+
+```ini
+TTS_ENGINE="xtts"
+TTS_XTTS_HOME="$HOME/.astro/tts"
+TTS_XTTS_SPEAKER_WAV=""      # empty → packaged voices/astro.wav
+TTS_XTTS_DEVICE="auto"       # "auto" | "cuda" | "cpu"
+TTS_XTTS_HALF=1              # fp16, CUDA only
+TTS_XTTS_BATCH_SIZE=4        # batch sentence decoding on long text
+```
+
+**Changing the robot's voice.** The reference clip ships with the package at `ros2_ws/src/astro_audio/voices/astro.wav` (~9 s). Replace that file, or point `TTS_XTTS_SPEAKER_WAV` at an absolute path. Use 6–30 s of clean, single-speaker audio.
+
+**Using your own fine-tuned XTTS model.** If you trained or downloaded an XTTS checkpoint, point the node at it and the stock `xtts_v2` is never downloaded:
+
+```ini
+TTS_XTTS_MODEL_DIR="/home/user/Downloads/optimized_model"
+```
+
+The directory is expected to hold `model.pth`, `config.json`, `vocab.json` and — optionally — `speakers_xtts.pth`. A missing `speakers_xtts.pth` is fine: it only carries the built-in speaker table, and reference-clip cloning does not use it. If your files sit elsewhere or have different names, set them one by one; these override anything derived from the directory:
+
+```ini
+TTS_XTTS_CHECKPOINT="/path/to/model.pth"
+TTS_XTTS_CONFIG="/path/to/config.json"
+TTS_XTTS_VOCAB="/path/to/vocab.json"
+TTS_XTTS_SPEAKERS="/path/to/speakers_xtts.pth"
+```
+
+Paths are checked before the worker starts, so a typo is reported as `Özel XTTS modeli dosyası bulunamadı: <path>` and the node falls back to edge-tts instead of hanging. The startup log tells you which model is live — `kendi modeliniz` versus `hazır xtts_v2`. Voice cloning, fp16 and batching work identically on a custom checkpoint.
+
+**Behaviour and expectations.**
+- Startup takes ~10–30 s (model load + warm-up) and much longer on the first run if the checkpoint still has to download. The node does not block: sentences arriving before XTTS is ready are spoken by `edge-tts` instead, and `✅ [TTS] XTTS hazır` is logged when the worker is warm.
+- If the install is missing, the worker fails to start, or it dies mid-run, `tts_node` logs the reason and falls back to `edge-tts` (or `pyttsx3` when there is no internet package) — the robot never goes silent.
+- XTTS emits WAV, so playback uses `paplay`/`aplay`/`ffplay`, not `mpg123`. Install `alsa-utils` if none is present.
+- On CPU XTTS is very slow (RTF > 1, i.e. slower than real time). On an RTX 4050 Laptop with fp16 + batch=4 a paragraph runs at RTF ≈ 0.09 using ~1.5 GB VRAM.
 
 > **Note:** For AI API keys (`AI_API_KEY`), use the `.env` file at the root of the project (copy from `.env.example`). Do not hardcode API keys in the source code!

@@ -1,23 +1,26 @@
 audio_capture_node:
   ros__parameters:
-    device_name: "ReSpeaker"
-    device_index: -1
+    # Mikrofon otomatik seçilir: önce ReSpeaker aranır, bulunamazsa sistemin
+    # varsayılan girişi kullanılır. Sabitlemek için indeks ("12") veya ad parçası
+    # ("ReSpeaker", "HDA Intel") yazın; .env'de AUDIO_INPUT_DEVICE de aynı işi görür.
+    input_device: ""
     sample_rate: 16000
-    channels: 6
-    chunk_size: 1024
-    vad_threshold: 0.015
+    chunk_size: 960          # 60 ms (0.06 * 16000)
+    # int16 RMS ölçeği — tipik 300-600. (Eski 0-1 arası enerji oranı DEĞİL.)
+    vad_threshold: 450.0
 
 speech_recognition_node:
   ros__parameters:
-    model_path: "vosk-model-small-tr-0.3"
-    language: "tr"
-    # Vosk yedek modunda kelime kelime parçalamayı azaltır; asıl motor .env STT_ENGINE
-    partial_results: false
-    silence_timeout_s: 1.5
+    # Motor seçimi .env'den: STT_ENGINE="faster-whisper" (yerel, varsayılan) | "groq"
+    # Model/cihaz ayarları da .env'de: STT_FW_MODEL, STT_FW_DEVICE, STT_FW_COMPUTE_TYPE
+    sample_rate: 16000
+    # Konuşma bitti sayılmadan önce beklenen sessizlik. Düşük değer daha hızlı
+    # cevap, çok düşük olursa cümlenin ortasında kesip deşifreye gönderir.
+    silence_timeout_s: 0.75
 
-tts_node:
-  ros__parameters:
-    # engine/voice/elevenlabs_* .env dosyasından okunur (TTS_ENGINE, ELEVENLABS_*)
-    language: "tr"
-    rate: 150
-    volume: 0.8
+# tts_node burada bilerek yok: ROS parametresi okumaz, tüm ayarları .env'den alır.
+#   TTS_ENGINE ("edge-tts" | "xtts"), TTS_VOICE, TTS_RATE, SAMPLE_RATE
+#   XTTS için: TTS_XTTS_HOME, TTS_XTTS_SPEAKER_WAV, TTS_XTTS_MODEL_DIR,
+#              TTS_XTTS_DEVICE, TTS_XTTS_HALF, TTS_XTTS_BATCH_SIZE,
+#              TTS_XTTS_TIMEOUT_S, TTS_XTTS_STARTUP_TIMEOUT_S
+# Kurulum: ./scripts/install_xtts.sh — bkz. README "Advanced TTS Options"
