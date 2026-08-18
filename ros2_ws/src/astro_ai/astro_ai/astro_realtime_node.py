@@ -53,6 +53,7 @@ class AstroRealtimeNode(Node):
 
         # Load environment variables
         self.openai_api_key = os.environ.get("OPENAI_API_KEY", "").strip()
+        self.realtime_model = os.environ.get("REALTIME_MODEL", "gpt-4o-realtime-preview-2024-12-17").strip()
         raw_voice = os.environ.get("REALTIME_VOICE", os.environ.get("TTS_VOICE", "echo")).strip().lower()
         self.realtime_voice = raw_voice if raw_voice in VALID_REALTIME_VOICES else "echo"
         self.persona_name = os.environ.get("PERSONA", "kufurbaz").strip().lower()
@@ -100,7 +101,7 @@ class AstroRealtimeNode(Node):
         self._ws_thread = threading.Thread(target=self._run_async_loop, daemon=True)
         self._ws_thread.start()
 
-        self.get_logger().info(f"🚀 [Astro Realtime Node] OpenAI Realtime WebSocket Başlatılıyor... Ses: [{self.realtime_voice}], Kişilik: [{self.persona_name.upper()}]")
+        self.get_logger().info(f"🚀 [Astro Realtime Node] OpenAI Realtime WebSocket Başlatılıyor... Model: [{self.realtime_model}], Ses: [{self.realtime_voice}], Kişilik: [{self.persona_name.upper()}]")
 
     def _run_async_loop(self):
         self._loop = asyncio.new_event_loop()
@@ -117,9 +118,9 @@ class AstroRealtimeNode(Node):
             self.get_logger().error("❌ websockets kütüphanesi eksik! (pip install websockets)")
             return
 
+        # GA Realtime API: Authorization only (Do NOT include OpenAI-Beta header)
         headers = {
-            "Authorization": f"Bearer {self.openai_api_key}",
-            "OpenAI-Beta": "realtime=v1"
+            "Authorization": f"Bearer {self.openai_api_key}"
         }
 
         # Inspect websockets.connect parameter compatibility across versions
@@ -135,10 +136,13 @@ class AstroRealtimeNode(Node):
         except Exception:
             connect_kwargs["extra_headers"] = headers
 
+        ws_url = f"wss://api.openai.com/v1/realtime?model={self.realtime_model}"
+
         while rclpy.ok():
             try:
-                self.get_logger().info(f"🌐 [Realtime WS] OpenAI Realtime API'ye bağlanılıyor: {REALTIME_WS_URL}")
-                async with websockets.connect(REALTIME_WS_URL, **connect_kwargs) as ws:
+                self.get_logger().info(f"🌐 [Realtime WS] OpenAI Realtime API'ye bağlanılıyor: {ws_url}")
+                async with websockets.connect(ws_url, **connect_kwargs) as ws:
+
                     self._ws = ws
                     self._is_connected = True
                     self.get_logger().info("✅ [Realtime WS] Bağlantı Başarılı! Oturum parametreleri gönderiliyor...")
