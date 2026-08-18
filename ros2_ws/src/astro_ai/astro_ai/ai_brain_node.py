@@ -268,23 +268,26 @@ class AiBrainNode(Node):
         )
 
     def _discover_active_groq_models(self) -> List[str]:
-        """Dynamically queries active, non-deprecated chat models from Groq with safe fallbacks."""
+        """Dynamically queries active chat models from Groq, prioritizing top conversational models and excluding reasoning models."""
+        preferred = ["llama-3.3-70b-versatile", "llama-3.1-70b-versatile", "llama3-70b-8192", "llama-3.1-8b-instant"]
         if not self._groq:
-            return []
+            return preferred
         try:
             models = self._groq.models.list()
-            chat_models = []
-            for m in models.data:
-                mid = m.id
-                mid_l = mid.lower()
-                if any(x in mid_l for x in ["whisper", "embedding", "guard", "moderation", "tts", "distill"]):
+            available = [m.id for m in models.data]
+            chat_models = [m for m in preferred if m in available]
+            for m in available:
+                mid_l = m.lower()
+                if any(x in mid_l for x in ["whisper", "embedding", "guard", "moderation", "tts", "distill", "r1", "deepseek", "qwen"]):
                     continue
-                chat_models.append(mid)
+                if m not in chat_models:
+                    chat_models.append(m)
             if chat_models:
                 return chat_models
         except Exception as e:
             self.get_logger().debug(f"Groq dynamic model discovery notice: {e}")
-        return ["llama-3.3-70b-versatile", "openai/gpt-oss-20b", "llama3-70b-8192"]
+        return preferred
+
 
 
     def _discover_vision_model(self) -> str | None:
@@ -412,6 +415,26 @@ class AiBrainNode(Node):
             data = json.loads(msg.data)
             with self._lock:
                 self._recognized_person = data
+
+            if data.get("is_known") and data.get("confidence", 0.0) >= 0.45:
+                now = time.monotonic()
+                p_name = data.get("name", "")
+                if self.state_machine.is_idle() and not self._tts_speaking and not self._is_processing:
+                    # Greet VIPs or known persons proactively if not greeted in the last 40 seconds
+                    if (now - getattr(self, "_last_vip_greet_time", 0.0)) > 40.0:
+                        self._last_vip_greet_time = now
+                        self.session.activate_session(reason="vip_vision")
+                        self.state_machine.transition_to(RobotState.LISTENING)
+                        identity = self._get_active_biometric_identity()
+                        proactive_greeting, greeting_emo = self.persona_engine.build_proactive_greeting(
+                            identity=identity,
+                            user_emotion=self._user_emotion,
+                            speaker_gender=self._speaker_gender
+                        )
+                        self._publish_emotion(greeting_emo)
+                        self.get_logger().info(f"👤 [Proaktif Yüz Karşılama] ({p_name}): \"{proactive_greeting}\"")
+                        self._publish_gesture("nod")
+                        self._publish_tts(proactive_greeting)
         except Exception:
             pass
 
@@ -422,6 +445,7 @@ class AiBrainNode(Node):
                 self._recognized_speaker = data
         except Exception:
             pass
+
 
     def _get_active_biometric_identity(self) -> Dict[str, Any]:
         """Multimodal Biometric Fusion: Combines visual face recognition and acoustic speaker ID."""
@@ -770,7 +794,7 @@ class AiBrainNode(Node):
                     cand_name = "Baran"
                     cand_title = "Baş Mühendis & Geliştirici"
                 else:
-                    m = re.search(r"(?i)(?:benim adım|adım|ben)\s+([a-zA-ZçğıöşüÇĞİÖŞÜ]+)", user_text)
+                    m = re.search(r"(?i)\b(?:benim adım|adım)\s+([a-zA-ZçğıöşüÇĞİÖŞÜ]+)\b", user_text)
                     cand_name = m.group(1).strip().capitalize() if m else "Dostum"
                     cand_title = "Tanışılan Kişi"
 
@@ -778,6 +802,7 @@ class AiBrainNode(Node):
                 clean_ans = clean_tts_text(tool_res)
                 self.get_logger().info(f"🤖 [Astro]: \"{clean_ans}\"")
                 self._publish_tts(clean_ans)
+
                 self._publish_emotion(persona)
                 self.memory.episodic.add_message("assistant", clean_ans)
                 t_done = time.monotonic()
@@ -1102,7 +1127,7 @@ class AiBrainNode(Node):
         if not self._ai_api_key:
             return None
 
-        gemini_text_models = ["gemini-flash-latest", "gemini-flash-lite-latest", "gemini-2.5-flash-lite", "gemini-2.5-flash", "gemini-pro-latest"]
+        gemini_text_models = ["gemini-2.0-flash", "gemini-1.5-flash", "gemini-1.5-pro"]
         for g_model in gemini_text_models:
             try:
                 url = f"https://generativelanguage.googleapis.com/v1beta/models/{g_model}:generateContent?key={self._ai_api_key}"
@@ -1115,7 +1140,7 @@ class AiBrainNode(Node):
                     contents.append({"role": "user", "parts": [{"text": user_text}]})
 
                 payload = {
-                    "systemInstruction": {"parts": [{"text": system_instruction}]},
+                    "system_instruction": {"parts": [{"text": system_instruction}]},
                     "contents": contents,
                     "generationConfig": {
                         "temperature": 0.5,
@@ -1133,6 +1158,7 @@ class AiBrainNode(Node):
             except Exception as e:
                 self.get_logger().warn(f"⚠️ [Gemini Text REST ({g_model}) Hatası]: {e}")
         return None
+
 
     def _format_turkish_weather(self, city: str, raw_weather: str) -> str:
         temp_match = re.search(r'([+-]?\d+)\s*°?C?', raw_weather)
@@ -1364,12 +1390,13 @@ class AiBrainNode(Node):
 
     def _is_person_learning_query(self, text: str) -> bool:
         keywords = [
-            "benim adım", "adım ", "beni hafızana kaydet", "beni kaydet",
-            "tanışalım", "yüzümü kaydet", "sesimi kaydet", "yüzümü ve sesimi kaydet",
-            "tara ve hafızana kaydet", "hafızana kaydet"
+            r"\bbenim adım\b", r"\badım\s+[a-zA-ZçğıöşüÇĞİÖŞÜ]+\b", r"\bbeni hafızana kaydet\b",
+            r"\bbeni kaydet\b", r"\btanışalım\b", r"\byüzümü kaydet\b", r"\bsesimi kaydet\b",
+            r"\byüzümü ve sesimi kaydet\b", r"\bhafızana kaydet\b"
         ]
         text_lower = text.lower()
-        return any(k in text_lower for k in keywords)
+        return any(re.search(k, text_lower) for k in keywords)
+
 
 
     def _start_idle_learning(self):
