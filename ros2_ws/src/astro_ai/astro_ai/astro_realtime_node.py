@@ -305,15 +305,22 @@ class AstroRealtimeNode(Node):
             text_delta = event.get("delta", "")
             # Streaming token
 
-        # 3. User Speech Started (Barge-In Interruption)
+        # 3. User Speech Started
         elif event_type == "input_audio_buffer.speech_started":
-            self.get_logger().info("⚡ [Realtime Barge-In] Kullanıcı konuşmaya başladı — Çalma anında durduruluyor...")
-            self._is_responding = False
-            intr_msg = Bool()
-            intr_msg.data = True
-            self.pub_interrupt.publish(intr_msg)
-            # Cancel ongoing OpenAI response generation
-            await ws.send(json.dumps({"type": "response.cancel"}))
+            # ONLY trigger barge-in interruption if Astro was ACTUALLY playing audio or generating a response
+            if self._is_responding or self._is_playback_active:
+                self.get_logger().info("⚡ [Realtime Barge-In] Kullanıcı lafa girdi — Çalma anında durduruluyor...")
+                self._is_responding = False
+                intr_msg = Bool()
+                intr_msg.data = True
+                self.pub_interrupt.publish(intr_msg)
+                # Cancel ongoing OpenAI response generation
+                try:
+                    await ws.send(json.dumps({"type": "response.cancel"}))
+                except Exception:
+                    pass
+            else:
+                self.get_logger().debug("🎤 [Realtime] Kullanıcı konuşmaya başladı...")
 
         # 3b. User Speech Stopped
         elif event_type == "input_audio_buffer.speech_stopped":
@@ -323,6 +330,7 @@ class AstroRealtimeNode(Node):
         elif event_type == "response.created":
             self._is_responding = True
             self.get_logger().info("🎙️ [Realtime] Astro sesli yanıt üretmeye başladı...")
+
 
         # 3d. Response Done
         elif event_type == "response.done":
@@ -506,24 +514,21 @@ class AstroRealtimeNode(Node):
         return {"name": "Misafir", "title": "Ziyaretçi", "formal_title": "Misafir", "is_known": False}
 
     def _sync_perception_to_session(self):
-        """Dynamically syncs persona & recognized identity to the active OpenAI Realtime session with cooldown."""
+        """Dynamically syncs persona & recognized identity to the active OpenAI Realtime session ONLY when identity changes."""
         if not self._ws or not self._loop or not self._is_connected:
             return
 
         # Do NOT interrupt active response generation or speaking
-        if getattr(self, "_is_responding", False):
+        if getattr(self, "_is_responding", False) or getattr(self, "_is_playback_active", False):
             return
 
         now = time.monotonic()
         identity = self._get_active_biometric_identity()
         identity_name = identity.get("name", "Misafir")
 
-
-        # Do NOT flood session.update: Only sync if identity actually changed, with min 20s cooldown
+        # Strictly require identity change: If it is still the same person/guest, NEVER resync
         last_id = getattr(self, "_last_synced_identity", "")
-        last_time = getattr(self, "_last_sync_time", 0.0)
-
-        if identity_name == last_id and (now - last_time) < 20.0:
+        if identity_name == last_id:
             return
 
         self._last_synced_identity = identity_name
@@ -545,6 +550,7 @@ class AstroRealtimeNode(Node):
             self.get_logger().info(f"👤 [Realtime Biyometri]: Oturum kimliği güncellendi -> {identity_name}")
         except Exception:
             pass
+
 
 
 
