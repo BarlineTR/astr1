@@ -212,20 +212,19 @@ class AstroRealtimeNode(Node):
             "type": "session.update",
             "session": {
                 "type": "realtime",
-                "modalities": ["text", "audio"],
                 "instructions": system_prompt,
-                "voice": self.realtime_voice,
-                "input_audio_format": "pcm16",
-                "output_audio_format": "pcm16",
-                "input_audio_transcription": {
-                    "model": "whisper-1"
-                },
-
-                "turn_detection": {
-                    "type": "server_vad",
-                    "threshold": 0.5,
-                    "prefix_padding_ms": 300,
-                    "silence_duration_ms": 350
+                "audio": {
+                    "input": {
+                        "turn_detection": {
+                            "type": "server_vad",
+                            "threshold": 0.5,
+                            "prefix_padding_ms": 300,
+                            "silence_duration_ms": 350
+                        }
+                    },
+                    "output": {
+                        "voice": self.realtime_voice
+                    }
                 },
                 "tools": [
                     {
@@ -271,6 +270,7 @@ class AstroRealtimeNode(Node):
                 "temperature": 0.6
             }
         }
+
         await ws.send(json.dumps(session_config))
         self.get_logger().info(f"✨ [Realtime WS] Oturum Yapılandırıldı. Kişilik: [{self.persona_name.upper()}], Ses: [{self.realtime_voice}]")
 
