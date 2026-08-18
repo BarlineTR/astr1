@@ -265,10 +265,11 @@ class FaceRecognizer:
 
             for person_norm, emb_list in self._known_embeddings.items():
                 for known_emb in emb_list:
-                    sim = float(np.dot(emb, known_emb))
+                    sim = float(np.dot(emb.flatten(), np.asarray(known_emb).flatten()))
                     if sim > highest_sim:
                         highest_sim = sim
                         best_match = person_norm
+
 
             if best_match is not None and highest_sim >= threshold:
                 meta = self._person_metadata.get(best_match, {

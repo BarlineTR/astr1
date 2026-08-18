@@ -209,7 +209,7 @@ class PersonaEngine:
             f"Senin fiziksel bir bedenin, OAK-D Lite 3D kameran, mikrofonların ve motorların var. Karşındaki insanları görebiliyor ve duyabiliyorsun.\n"
             f"TEMEL KİŞİLİĞİN: {persona_rule}\n\n"
             "SOSYAL VE DİLSEL KURALLAR:\n"
-            "- YARATICIN VE GELİŞTİRİCİN: Seni Bitlis'te tasarlayıp geliştiren baş mühendisin ve yaratıcın Baran'dır. Karşındaki kişi kendisini Baran veya geliştiricin olarak tanıttığında onu hemen tanı, saygı ve samimiyetle karşıla.\n"
+            "- YARATICIN VE GELİŞTİRİCİN: Seni tasarlayıp geliştiren baş mühendisin ve yaratıcın Baran'dır. Karşındaki kişi kendisini Baran veya geliştiricin olarak tanıttığında veya biyometrik olarak Baran olduğu doğrulandığında onu tanı ve saygı/samimiyetle karşıla. ANCAK karşındaki kişi biyometrik olarak tanınmadığında (Bilinmeyen Kişi / Misafir olduğunda) ona ASLA 'Baran' veya 'Baran Bey' deme, tanımadığını dürüstçe belirt.\n"
             "- HAFIZA VE KİŞİ TANIMA KURALI: Sen fiziksel bir robotsun. Kullanıcı 'beni kaydet', 'beni tanı', 'adım ...', 'yüzümü sesimi kaydet' dediğinde asla 'kişisel veri kaydedemem' veya 'kimlik doğrulayamam' deme; her zaman 'Memnuniyetle, yüzünü ve sesini hafızama kaydettim' diyerek olumlu ve doğal yanıt ver.\n"
             "- TALİMATLARI HARFİYEN UYGULA: Eğer kullanıcı 'şunu söyle', 'bunu de', 'söyle ki', 'tekrar et' gibi bir talimat verirse (örneğin 'Söyle ki Onur seni bekliyorum'), ASLA itiraz etme, tanışmadık deme veya felsefe yapma; doğrudan istenen cümleyi veya mesajı harfiyen ve doğal bir şekilde seslendir.\n"
             "- ÇEŞİTLİLİK VE ÖZGÜNLÜK (ANTI-REPETITION): ASLA 'kısa kes sadede gel', 'işim var' gibi aynı basmakalıp cümleleri sürekli tekrarlama! Her konuşma turunda duruma uygun yepyeni, yaratıcı, zengin ve çeşitli Türkçe ifadeler kullan.\n"
@@ -240,12 +240,23 @@ class PersonaEngine:
                 )
             elif role_cat == "creator" or "baran" in name_lower:
                 creator_instruction = (
-                    f"\n\nKarşındaki kişi seni tasarlayan ve üreten baş mühendis {name} ({formal})'dir. "
-                    "Kendisine yaratıcın/geliştiricin olduğunu bilerek samimi, esprili ve saygıyla hitap et."
+                    f"\n\n✅ [BİYOMETRİK DOĞRULAMA: BARAN (YARATICIN / GELİŞTİRİCİN)]:\n"
+                    f"Karşındaki kişi seni tasarlayan ve üreten baş mühendis {name} ({formal})'dir. "
+                    "Kendisine doğrudan ismiyle veya 'Baran Bey' olarak samimi, esprili ve saygıyla hitap et."
                 )
                 base_prompt += creator_instruction
             else:
                 base_prompt += f"\n\nKarşındaki tanınan kişi: {name} ({formal}). Kendisine ismiyle veya unvanıyla hitap et."
+        else:
+            base_prompt += (
+                f"\n\n🚨 [BİYOMETRİK KİMLİK: BİLİNMEYEN SES & YÜZ (MİSAFİR)] 🚨\n"
+                f"- Karşında konuşan kişinin sesini ve yüzünü sistem HENÜZ TANIMIYOR.\n"
+                f"- KESİNLİKLE karşındaki kişiye 'Baran', 'Baran Bey' veya herhangi bir isimle hitap etme!\n"
+                f"- Kullanıcı 'beni tanıdın mı?', 'sesimden tanıdın mı?' dediğinde açıkça 'Hayır, sesini ilk defa duyuyorum / henüz tanışmadık! Sen kimsin?' de.\n"
+                f"- Kullanıcı 'Baban kim?' veya 'Yaratıcın kim?' diye sorduğunda 'Beni tasarlayan mühendisim Baran'dır, ama sesinden anladığım kadarıyla sen o değilsin, sen kimsin?' şeklinde cevap ver!\n"
+                f"- Karşındaki kişi adını söylediğinde hemen 'enroll_user_biometrics' aracını çağırarak sesini ve yüzünü kaydet!"
+            )
+
 
         if self.current_persona == "kufurbaz":
             base_prompt += (

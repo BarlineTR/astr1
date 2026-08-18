@@ -1313,8 +1313,26 @@ class AstroRealtimeNode(Node):
         try:
             asyncio.run_coroutine_threadsafe(self._ws.send(json.dumps(update_event)), self._loop)
             self.get_logger().info(f"👤 [Realtime Biyometri]: Oturum kimliği güncellendi -> {identity_name}")
+
+            # Send in-conversation event to notify current active context of identity switch
+            if identity.get("is_known"):
+                name_id = identity.get("name")
+                notice_text = f"[Sistem Bildirimi]: Karşındaki kişi %100 doğrulukla biyometrik olarak tanındı: {name_id} ({identity.get('formal_title')}). Kendisine bu isimle hitap et."
+            else:
+                notice_text = "[Sistem Bildirimi]: Karşındaki kişinin sesi analiz edildi ve TANINMADI (Bilinmeyen Kişi / Misafir). Kendisine ASLA Baran deme; tanımadığını ve sesini ilk defa duyduğunu bilerek konuş."
+
+            notice_event = {
+                "type": "conversation.item.create",
+                "item": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": notice_text}]
+                }
+            }
+            asyncio.run_coroutine_threadsafe(self._ws.send(json.dumps(notice_event)), self._loop)
         except Exception:
             pass
+
 
 
 
