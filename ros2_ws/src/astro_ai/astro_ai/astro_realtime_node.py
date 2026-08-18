@@ -336,14 +336,12 @@ class AstroRealtimeNode(Node):
             )
         else:
             bio_status = (
-                f"\n[GÜNCEL BİYOMETRİK DURUM]: Karşındaki kişi HENÜZ TANINMIYOR (Bilinmeyen Ses & Yüz / Yeni Kullanıcı).\n"
-                f"DAVRANIŞ KURALLARI:\n"
-                f"1. Tanışma & Öğrenme: Karşındaki kişi seninle konuştuğunda veya 'beni tanıdın mı / sesimden tanıdın mı?' dediğinde, "
-                f"seçili kişiliğinle ({self.persona_name}) sesini/yüzünü ilk defa duyduğunu belirt ve adını sorarak tanışmak ve kaydetmek istediğini söyle "
-                f"(Örn: 'Sesini ilk kez duyuyorum, henüz tanışmadık! Adın ne senin, tanışalım mı?' veya Küfürbaz modundaysan 'Ulan sesini ilk defa duyuyorum, kimsin sen? Adını söyle de kaydedeyim koçum!').\n"
-                f"2. Biyometrik Kayıt: SADECE VE SADECE kullanıcı AÇIKÇA kendi adını söylediğinde (örn: 'Adım Ahmet', 'Mehmet ben', 'Bana Ali de') "
-                f"'enroll_user_biometrics' fonksiyonunu çağır! Kullanıcı adını açıkça söylemediyse ASLA kafandan rastgele isim uydurarak bu fonksiyonu çağırma.\n"
-                f"3. Dürüstlük: Asla 'tanıdım' diyerek yalan söyleme, uydurma veya tanınmayan kişiye ezbere Baran deme."
+                f"\n[GÜNCEL BİYOMETRİK DURUM]: Karşındaki kişi HENÜZ TANINMIYOR (Bilinmeyen Ses & Yüz / Yeni Kullanıcı / Misafir).\n"
+                f"KRİTİK DAVRANIŞ KURALLARI:\n"
+                f"1. Karşındaki kişi az önceki kişi DEĞİLDİR (veya sesi tanınmayan farklı biridir). Karşındaki kişiye ASLA önceki isimlerle (Oktay, Baran vb.) hitap etme!\n"
+                f"2. Tanışma & Öğrenme: Karşındaki kişi 'beni tanıdın mı / sesimden tanıdın mı / ben kimim?' dediğinde, seçili kişiliğinle ({self.persona_name}) sesini ilk defa duyduğunu, hafızandaki kayıtlara uymadığını belirt ve adını sor (Örn: 'Sesini ilk kez duyuyorum, tanıyamadım! Adın ne senin?' veya Küfürbaz modundaysan 'Ulan sesini çıkaramadım, kimsin sen? Adını söyle de kaydedeyim koçum!').\n"
+                f"3. Biyometrik Kayıt: SADECE VE SADECE kullanıcı AÇIKÇA kendi adını söylediğinde (örn: 'Adım Ahmet', 'Mehmet ben', 'Bana Ali de') 'enroll_user_biometrics' fonksiyonunu çağır! Kullanıcı adını açıkça söylemediyse ASLA kafandan rastgele isim uydurarak bu fonksiyonu çağırma.\n"
+                f"4. Dürüstlük: Asla 'tanıdım' diyerek yalan söyleme veya tanınmayan kişiye ezbere önceki isimleri yapıştırma."
             )
 
         memory_rule = (
@@ -747,19 +745,19 @@ class AstroRealtimeNode(Node):
         return {"status": "success", "message": msg}
 
     def _run_voice_identification(self):
-        """Runs ultra-fast acoustic voiceprint matching on the recorded user speech (~1.2s window)."""
+        """Runs ultra-fast acoustic voiceprint matching on the recorded user speech (~1.8s window)."""
         if not self.voice_recognizer:
             return
         with self._lock:
             if not self._user_speech_audio_buffer:
                 return
-            raw_16k_all = b"".join(self._user_speech_audio_buffer[-60:])  # Last ~1.2 seconds (~50ms inference)
+            raw_16k_all = b"".join(self._user_speech_audio_buffer[-90:])  # Last ~1.8 seconds (~50ms inference)
 
         try:
             audio_arr = np.frombuffer(raw_16k_all, dtype=np.int16)
             if len(audio_arr) >= 16000 * 0.4:
-                spk_name, spk_conf, spk_meta = self.voice_recognizer.recognize_voice(audio_arr, sample_rate=16000)
-                is_known_spk = (spk_name is not None and spk_conf >= 0.40)
+                spk_name, spk_conf, spk_meta = self.voice_recognizer.recognize_voice(audio_arr, sample_rate=16000, threshold=0.35)
+                is_known_spk = (spk_name is not None and spk_conf >= 0.35)
                 now = time.monotonic()
                 if is_known_spk:
                     self.get_logger().info(f"🎙️ [Ses Tanıma]: {spk_name} ({spk_meta.get('formal_title', '')}) — Güven: %{int(spk_conf*100)}")
@@ -776,7 +774,7 @@ class AstroRealtimeNode(Node):
                         self._person_hold_until = now + 45.0
                     self._sync_perception_to_session()
                 else:
-                    self.get_logger().info(f"🎙️ [Ses Tanıma]: Bilinmeyen Ses / Tanınmadı (Güven: {spk_conf:.2f})")
+                    self.get_logger().info(f"🎙️ [Ses Tanıma]: Bilinmeyen Ses / Tanınmadı (En Yakın: '{spk_name}', Güven: {spk_conf:.2f})")
                     with self._lock:
                         self._recognized_speaker = {"name": "Misafir", "confidence": spk_conf, "is_known": False, "source": "unknown_voice"}
                         self._active_person_name = "Misafir"
@@ -819,10 +817,10 @@ class AstroRealtimeNode(Node):
                 "message": f"Kullanıcı konuşmasında adının '{name}' olduğunu söylemedi. Kullanıcı adını açıkça söylemeden asla isim uydurma. Kullanıcıya doğrudan adını sor."
             }
 
-        # 1. Voice Enrollment
+        # 1. Voice Enrollment (Capture recent ~2.5s of user voice)
         voice_ok = False
         with self._lock:
-            raw_audio_copy = list(self._user_speech_audio_buffer)
+            raw_audio_copy = list(self._user_speech_audio_buffer[-125:])
 
         if self.voice_recognizer and raw_audio_copy:
             try:
@@ -835,7 +833,7 @@ class AstroRealtimeNode(Node):
             except Exception as ve:
                 self.get_logger().warn(f"Voice enrollment warning: {ve}")
 
-        # 2. Face Enrollment
+        # 2. Face Enrollment (Only if actual face is detected)
         face_ok = False
         with self._lock:
             frame = self._latest_camera_frame.copy() if self._latest_camera_frame is not None else None
@@ -844,6 +842,8 @@ class AstroRealtimeNode(Node):
                 face_ok = self.face_recognizer.enroll_face(name, frame, title=formal_title)
                 if face_ok:
                     self.get_logger().info(f"👁️ [Biyometrik Kayıt]: '{name}' yüz modeli SFace veri tabanına başarıyla kaydedildi!")
+                else:
+                    self.get_logger().warn(f"👁️ [Biyometrik Kayıt]: Kamera karşısında insan yüzü bulunamadığı için yüz kaydedilmedi, sadece ses kaydedildi.")
             except Exception as fe:
                 self.get_logger().warn(f"Face enrollment warning: {fe}")
 
@@ -857,14 +857,15 @@ class AstroRealtimeNode(Node):
                 "is_known": True,
                 "source": "voice"
             }
-            self._recognized_person = {
-                "name": name,
-                "title": formal_title,
-                "formal_title": formal_title,
-                "confidence": 0.95,
-                "is_known": True,
-                "source": "face"
-            }
+            if face_ok:
+                self._recognized_person = {
+                    "name": name,
+                    "title": formal_title,
+                    "formal_title": formal_title,
+                    "confidence": 0.95,
+                    "is_known": True,
+                    "source": "face"
+                }
             self._active_person_name = name
             self._person_hold_until = now + 120.0
             self._last_synced_identity = ""  # Force immediate session update
@@ -877,7 +878,12 @@ class AstroRealtimeNode(Node):
         except Exception as me:
             self.get_logger().warn(f"Memory update notice: {me}")
 
-        msg = f"{name} ({formal_title}) başarıyla hem sesinden hem de yüzünden Astro'nun hafızasına kaydedildi!"
+        if voice_ok and face_ok:
+            msg = f"{name} ({formal_title}) başarıyla hem sesinden hem de yüzünden Astro'nun hafızasına kaydedildi!"
+        elif voice_ok:
+            msg = f"{name} ({formal_title}) başarıyla sesinden Astro'nun hafızasına kaydedildi! (Kamera karşısında yüz görülmediği için sadece ses kaydedildi)."
+        else:
+            msg = f"{name} ({formal_title}) Astro'nun hafızasına kaydedildi."
 
         self.get_logger().info(f"✅ [Biyometrik Kayıt Tamamlandı]: {msg}")
         return {
@@ -1495,7 +1501,7 @@ class AstroRealtimeNode(Node):
             return {"name": "Misafir", "title": "Ziyaretçi", "formal_title": "Misafir", "is_known": False, "source": "unknown_voice"}
 
         # 2. Known Active Voice
-        if spk.get("is_known") and spk.get("confidence", 0.0) >= 0.40:
+        if spk.get("is_known") and spk.get("confidence", 0.0) >= 0.35:
             return {**spk, "source": "voice"}
 
         # 3. Known Active Face
@@ -1522,9 +1528,9 @@ class AstroRealtimeNode(Node):
         if identity_name == last_id:
             return
 
+        prev_id = last_id
         self._last_synced_identity = identity_name
         self._last_sync_time = now
-
 
         system_prompt = self._build_current_system_prompt()
         update_event = {
@@ -1542,9 +1548,10 @@ class AstroRealtimeNode(Node):
             # Send in-conversation event to notify current active context of identity switch
             if identity.get("is_known"):
                 name_id = identity.get("name")
-                notice_text = f"[Sistem Bildirimi]: Karşındaki kişi %100 doğrulukla biyometrik olarak tanındı: {name_id} ({identity.get('formal_title')}). Kendisine bu isimle hitap et."
+                notice_text = f"[Sistem Bildirimi]: Karşındaki kişi %100 doğrulukla biyometrik olarak tanındı: {name_id} ({identity.get('formal_title')}). Kendisine doğrudan bu isimle ({name_id}) hitap et."
             else:
-                notice_text = "[Sistem Bildirimi]: Karşındaki kişinin sesi analiz edildi ve TANINMADI (Bilinmeyen Kişi / Misafir). Kendisine ASLA Baran deme; tanımadığını ve sesini ilk defa duyduğunu bilerek konuş."
+                prev_str = f"önceki kullanıcı ({prev_id})" if prev_id and prev_id != "Misafir" else "önceki kişi"
+                notice_text = f"[Sistem Bildirimi]: DİKKAT: Karşındaki kişinin sesi analiz edildi ve TANINMADI (Bilinmeyen Kişi / Misafir). Bu kişi {prev_str} DEĞİLDİR! Kendisine ASLA {prev_id or 'Baran'} deme. Kendisini tanımadığını ve sesini ilk defa duyduğunu belirterek adını sor."
 
             notice_event = {
                 "type": "conversation.item.create",

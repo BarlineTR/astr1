@@ -127,8 +127,13 @@ class FaceRecognizer:
                 largest = max(faces, key=lambda f: float(f[2]) * float(f[3]))
                 feature = engine.embed(face_bgr, largest)
             else:
-                aligned = cv2.resize(face_bgr, (112, 112))
-                feature = engine.feature(aligned)
+                h, w = face_bgr.shape[:2]
+                if h <= 250 and w <= 250:
+                    aligned = cv2.resize(face_bgr, (112, 112))
+                    feature = engine.feature(aligned)
+                else:
+                    # Full frame with no face detected
+                    return None
         except Exception:
             return None
 
