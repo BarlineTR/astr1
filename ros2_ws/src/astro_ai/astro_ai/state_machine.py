@@ -13,6 +13,8 @@ class RobotState(enum.Enum):
     THINKING = "THINKING"
     SPEAKING = "SPEAKING"
     INTERRUPTED = "INTERRUPTED"
+    ENROLLING = "ENROLLING"
+
 
 
 class StateMachine:

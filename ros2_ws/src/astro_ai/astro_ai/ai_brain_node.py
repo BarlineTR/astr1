@@ -227,9 +227,21 @@ class AiBrainNode(Node):
         self._user_emotion = "neutral"
         self._recognized_person = None
         self._recognized_speaker = None
+        self._last_speaker_embedding = None
+        self._enrollment_session = {
+            "active": False,
+            "name": "",
+            "title": "",
+            "turn": 0,
+            "max_turns": 3,
+            "embeddings": [],
+            "last_frame": None,
+            "start_time": 0.0
+        }
         self._node_start_time = time.monotonic()
         self._latest_frame = None
         self._latest_frame_time = 0.0
+
 
         # ROS 2 Publishers
         self.pub_tts = self.create_publisher(String, "/tts/say", 10)
@@ -419,22 +431,26 @@ class AiBrainNode(Node):
             if data.get("is_known") and data.get("confidence", 0.0) >= 0.45:
                 now = time.monotonic()
                 p_name = data.get("name", "")
+                dist = self._user_distance
+                is_looking = self._looking_at_robot
+
+                # Frontal Angle & Distance Gating: Must be looking at robot, within 1.8m, and directly in front
                 if self.state_machine.is_idle() and not self._tts_speaking and not self._is_processing:
-                    # Greet VIPs or known persons proactively if not greeted in the last 40 seconds
-                    if (now - getattr(self, "_last_vip_greet_time", 0.0)) > 40.0:
-                        self._last_vip_greet_time = now
-                        self.session.activate_session(reason="vip_vision")
-                        self.state_machine.transition_to(RobotState.LISTENING)
-                        identity = self._get_active_biometric_identity()
-                        proactive_greeting, greeting_emo = self.persona_engine.build_proactive_greeting(
-                            identity=identity,
-                            user_emotion=self._user_emotion,
-                            speaker_gender=self._speaker_gender
-                        )
-                        self._publish_emotion(greeting_emo)
-                        self.get_logger().info(f"👤 [Proaktif Yüz Karşılama] ({p_name}): \"{proactive_greeting}\"")
-                        self._publish_gesture("nod")
-                        self._publish_tts(proactive_greeting)
+                    if is_looking and (dist <= 0.0 or dist <= 1.80) and abs(self._speaker_angle) <= 25.0:
+                        if (now - getattr(self, "_last_vip_greet_time", 0.0)) > 40.0:
+                            self._last_vip_greet_time = now
+                            self.session.activate_session(reason="vip_vision")
+                            self.state_machine.transition_to(RobotState.LISTENING)
+                            identity = self._get_active_biometric_identity()
+                            proactive_greeting, greeting_emo = self.persona_engine.build_proactive_greeting(
+                                identity=identity,
+                                user_emotion=self._user_emotion,
+                                speaker_gender=self._speaker_gender
+                            )
+                            self._publish_emotion(greeting_emo)
+                            self.get_logger().info(f"👤 [Proaktif Yüz Karşılama] ({p_name}): \"{proactive_greeting}\"")
+                            self._publish_gesture("nod")
+                            self._publish_tts(proactive_greeting)
         except Exception:
             pass
 
@@ -443,8 +459,12 @@ class AiBrainNode(Node):
             data = json.loads(msg.data)
             with self._lock:
                 self._recognized_speaker = data
+                raw_emb = data.get("embedding")
+                if raw_emb and len(raw_emb) > 0:
+                    self._last_speaker_embedding = np.array(raw_emb, dtype=np.float32)
         except Exception:
             pass
+
 
 
     def _get_active_biometric_identity(self) -> Dict[str, Any]:
@@ -624,6 +644,22 @@ class AiBrainNode(Node):
             self.state_machine.transition_to(RobotState.LISTENING)
             return
 
+        # Handle ongoing interactive multi-turn biometric enrollment
+        if self._enrollment_session.get("active"):
+            self.session.record_user_speech()
+            self._publish_interrupt()
+            with self._lock:
+                if self._is_processing:
+                    return
+                self._is_processing = True
+                captured_frame = None
+                if self._latest_frame is not None and (now - self._latest_frame_time) < 4.0:
+                    captured_frame = self._latest_frame.copy()
+            self.state_machine.transition_to(RobotState.THINKING)
+            threading.Thread(target=self._process_llm, args=(raw_text, captured_frame, t_vad_start), daemon=True).start()
+            return
+
+
         has_wake_word, clean_prompt = self.session.is_wake_word(raw_text, self._wake_word)
 
         # If IDLE: Only activate on Explicit Wake Word ("Hey Astro") OR Direct Gaze (Looking at Robot)
@@ -702,6 +738,73 @@ class AiBrainNode(Node):
             is_weather, weather_city = self._is_weather_query(user_text)
             base64_img = frame_to_base64_jpeg(frame, max_dim=768) if frame is not None and (is_visual or is_learning_obj) else None
             persona = self.persona_engine.current_persona
+
+            # 0. Active Multi-Turn Biometric Enrollment Dialog
+            if self._enrollment_session.get("active"):
+                self._enrollment_session["turn"] += 1
+                turn_num = self._enrollment_session["turn"]
+                cand_name = self._enrollment_session["name"]
+                formal_name = self._enrollment_session["title"] or cand_name
+
+                # Grab latest speaker embedding if available
+                if getattr(self, "_last_speaker_embedding", None) is not None and len(self._last_speaker_embedding) > 0:
+                    self._enrollment_session["embeddings"].append(self._last_speaker_embedding.copy())
+
+                # If camera frame available, keep latest face crop
+                if frame is not None:
+                    self._enrollment_session["last_frame"] = frame.copy()
+
+                if turn_num == 1:
+                    ans = f"Harika, ilk ses kaydınızı aldım (1/3). Lütfen ikinci cümlenizi söyleyin {cand_name}..."
+                    self.get_logger().info(f"🎙️ [Biyometrik Kayıt ({cand_name})]: 1. ses kaydı başarıyla alındı.")
+                elif turn_num == 2:
+                    ans = f"Çok iyi gidiyoruz (2/3). Şimdi lütfen son cümlenizi söyleyin..."
+                    self.get_logger().info(f"🎙️ [Biyometrik Kayıt ({cand_name})]: 2. ses kaydı başarıyla alındı.")
+                else:
+                    # Final turn (3/3): Save everything to databases!
+                    self.get_logger().info(f"🎙️ [Biyometrik Kayıt ({cand_name})]: 3. ses kaydı tamamlandı. Veritabanına kaydediliyor...")
+                    
+                    # 1. Save voice embeddings to SpeakerEngine
+                    embs = self._enrollment_session["embeddings"]
+                    if not embs and getattr(self, "_last_speaker_embedding", None) is not None:
+                        embs = [self._last_speaker_embedding]
+                    
+                    if embs:
+                        try:
+                            from astro_audio.voice_recognizer import _get_engine as _get_spk_engine
+                            spk_engine = _get_spk_engine()
+                            if spk_engine:
+                                spk_engine.add_person(cand_name, embs, replace=True)
+                                spk_engine.save()
+                                self.get_logger().info(f"✅ [WeSpeaker DB]: {cand_name} için {len(embs)} ses izi kaydedildi.")
+                        except Exception as e:
+                            self.get_logger().warn(f"Voice enrollment save notice: {e}")
+
+                    # 2. Save face to FaceEngine
+                    saved_frame = self._enrollment_session.get("last_frame", frame)
+                    if saved_frame is not None:
+                        try:
+                            from astro_vision.face_recognizer import FaceRecognizer
+                            face_rec = FaceRecognizer()
+                            face_rec.enroll_face(cand_name, saved_frame, title=formal_name)
+                            self.get_logger().info(f"✅ [SFace DB]: {cand_name} için yüz modeli kaydedildi.")
+                        except Exception as e:
+                            self.get_logger().warn(f"Face enrollment save notice: {e}")
+
+                    # 3. Save to profile
+                    self.memory.profile.save_known_person(cand_name, formal_name)
+                    self._enrollment_session = {"active": False, "name": "", "title": "", "turn": 0, "embeddings": []}
+                    self.state_machine.transition_to(RobotState.IDLE)
+                    ans = f"Tebrikler {cand_name}! Sesinizi ve yüzünüzü başarıyla kaydettim. Artık seni her gördüğümde ve duyduğumda tanıyacağım!"
+
+                self.get_logger().info(f"🤖 [Astro]: \"{ans}\"")
+                self._publish_tts(ans)
+                self._publish_emotion("playful")
+                self.memory.episodic.add_message("assistant", ans)
+                t_done = time.monotonic()
+                total_turn_ms = (t_done - t_turn_start) * 1000.0
+                self.session.latency_tracker.record_turn(stt_latency_ms, total_turn_ms - stt_latency_ms, total_turn_ms)
+                return
 
             # 1. Live Weather Tool Direct Handling
             if is_weather:
@@ -787,7 +890,7 @@ class AiBrainNode(Node):
                 self.get_logger().info(f"⚡ [Latency] Bu Dönüş: {total_turn_ms:.0f}ms (STT: {stt_latency_ms:.0f}ms, Biyometri: {total_turn_ms - stt_latency_ms:.0f}ms) | p50: {stats['p50_total_ms']}ms, p95: {stats['p95_total_ms']}ms")
                 return
 
-            # 4. Person Introduction & Biometric Enrollment
+            # 4. Initiate Conversational Biometric Enrollment
             if is_learning_person:
                 text_lower = user_text.lower()
                 if "baran" in text_lower or "geliştirici" in text_lower:
@@ -798,19 +901,32 @@ class AiBrainNode(Node):
                     cand_name = m.group(1).strip().capitalize() if m else "Dostum"
                     cand_title = "Tanışılan Kişi"
 
-                tool_res = self._execute_tool_call("enroll_person_profile", {"name": cand_name, "title": cand_title}, frame)
-                clean_ans = clean_tts_text(tool_res)
-                self.get_logger().info(f"🤖 [Astro]: \"{clean_ans}\"")
-                self._publish_tts(clean_ans)
+                self._enrollment_session = {
+                    "active": True,
+                    "name": cand_name,
+                    "title": cand_title,
+                    "turn": 0,
+                    "max_turns": 3,
+                    "embeddings": [],
+                    "last_frame": frame.copy() if frame is not None else None,
+                    "start_time": time.monotonic()
+                }
+                if getattr(self, "_last_speaker_embedding", None) is not None:
+                    self._enrollment_session["embeddings"].append(self._last_speaker_embedding.copy())
 
-                self._publish_emotion(persona)
-                self.memory.episodic.add_message("assistant", clean_ans)
+                self.state_machine.transition_to(RobotState.ENROLLING)
+                ans = f"Memnuniyetle {cand_name}! Sesinizi ve yüzünüzü hafızama kaydetmek için lütfen bana doğru bakarak 3 kısa cümle söyleyin. Hazırsanız ilk cümlenizi dinliyorum..."
+                self.get_logger().info(f"🤖 [Astro (Kayıt Başlatıldı)]: \"{ans}\"")
+                self._publish_tts(ans)
+                self._publish_emotion("playful")
+                self.memory.episodic.add_message("assistant", ans)
                 t_done = time.monotonic()
                 total_turn_ms = (t_done - t_turn_start) * 1000.0
                 self.session.latency_tracker.record_turn(stt_latency_ms, total_turn_ms - stt_latency_ms, total_turn_ms)
                 stats = self.session.latency_tracker.get_stats()
-                self.get_logger().info(f"⚡ [Latency] Bu Dönüş: {total_turn_ms:.0f}ms (STT: {stt_latency_ms:.0f}ms, Profil Kayıt: {total_turn_ms - stt_latency_ms:.0f}ms) | p50: {stats['p50_total_ms']}ms, p95: {stats['p95_total_ms']}ms")
+                self.get_logger().info(f"⚡ [Latency] Bu Dönüş: {total_turn_ms:.0f}ms (STT: {stt_latency_ms:.0f}ms, Kayıt Başlatma: {total_turn_ms - stt_latency_ms:.0f}ms) | p50: {stats['p50_total_ms']}ms, p95: {stats['p95_total_ms']}ms")
                 return
+
 
             # 4. Object Learning Tool
             if is_learning_obj and base64_img is not None:

@@ -396,20 +396,22 @@ class SpeechRecognitionNode(Node):
             self._gender_pub.publish(gender_msg)
 
             # Acoustic Speaker Identification (Voiceprint Matching)
+            spk_emb = self.voice_recognizer.extract_voiceprint(arr, self._sample_rate)
             spk_name, spk_conf, spk_meta = self.voice_recognizer.recognize_voice(arr, self._sample_rate)
             is_known_spk = (spk_name is not None and spk_conf >= 0.40)
             spk_info = {
-
                 "name": spk_name if is_known_spk else "Misafir",
                 "title": spk_meta.get("title", "Konuşmacı"),
                 "formal_title": spk_meta.get("formal_title", "Misafir"),
                 "confidence": spk_conf,
                 "is_known": is_known_spk,
-                "gender": gender
+                "gender": gender,
+                "embedding": spk_emb.tolist() if spk_emb is not None else []
             }
             spk_msg = String()
             spk_msg.data = json.dumps(spk_info)
             self._speaker_pub.publish(spk_msg)
+
 
             if is_known_spk:
                 self.get_logger().info(f"🎙️ [Ses Tanıma]: {spk_name} ({spk_meta.get('formal_title', '')}) (Güven: {spk_conf:.2f})")
