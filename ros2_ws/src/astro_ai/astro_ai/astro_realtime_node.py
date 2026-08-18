@@ -333,10 +333,11 @@ class AstroRealtimeNode(Node):
             title_val = identity.get("formal_title", identity.get("title", name_val))
             bio_status = (
                 f"\n[GÜNCEL BİYOMETRİK KİMLİK]: Karşındaki kişi %100 tanındı -> İsim: {name_val}, Hitap: {title_val}.\n"
-                f"ÇOKLU KONUŞMACI & ÖNCELİK KURALI:\n"
-                f"1. Karşında {name_val} ({title_val}) var. Kendisine doğrudan ismiyle/hitabıyla hitap et.\n"
-                f"2. Eğer odada 2 kişi aynı anda konuşursa veya arkadan başka bir ses gelirse, DAİMA ÖNCELİĞİ TANIDIĞIN KİŞİYE ({name_val}) VER ve ona yanıt ver.\n"
-                f"3. Tanıdığın kişi ({name_val}) karşındayken araya giren bilinmeyen sesleri kaydetmeye çalışma veya asıl kişiyi bırakma."
+                f"KİMLİK DOĞRULAMA & ÇOKLU KONUŞMACI KURALI:\n"
+                f"1. Karşında {name_val} ({title_val}) var. Kullanıcı 'ben kimim?', 'beni tanıdın mı?', 'sesimi bildin mi?' diye sorduğunda kesinlikle 'Sen {name_val}'sın, sesinden ve yüzünden tanıdım!' diyerek adını söyle!\n"
+                f"2. Kendisine doğrudan ismiyle/hitabıyla ({title_val}) hitap et.\n"
+                f"3. Eğer odada 2 kişi aynı anda konuşursa veya arkadan başka bir ses gelirse, DAİMA ÖNCELİĞİ TANIDIĞIN KİŞİYE ({name_val}) VER ve ona yanıt ver.\n"
+                f"4. Tanıdığın kişi ({name_val}) karşındayken araya giren bilinmeyen sesleri kaydetmeye çalışma veya asıl kişiyi bırakma."
             )
         else:
             bio_status = (
@@ -760,8 +761,8 @@ class AstroRealtimeNode(Node):
         try:
             audio_arr = np.frombuffer(raw_16k_all, dtype=np.int16)
             if len(audio_arr) >= 16000 * 0.4:
-                spk_name, spk_conf, spk_meta = self.voice_recognizer.recognize_voice(audio_arr, sample_rate=16000, threshold=0.35)
-                is_known_spk = (spk_name is not None and spk_conf >= 0.35)
+                spk_name, spk_conf, spk_meta = self.voice_recognizer.recognize_voice(audio_arr, sample_rate=16000, threshold=0.42)
+                is_known_spk = (spk_name is not None and spk_conf >= 0.42)
                 now = time.monotonic()
                 if is_known_spk:
                     self.get_logger().info(f"🎙️ [Ses Tanıma]: {spk_name} ({spk_meta.get('formal_title', '')}) — Güven: %{int(spk_conf*100)}")
@@ -1505,7 +1506,7 @@ class AstroRealtimeNode(Node):
             return {"name": "Misafir", "title": "Ziyaretçi", "formal_title": "Misafir", "is_known": False, "source": "unknown_voice"}
 
         # 2. Known Active Voice
-        if spk.get("is_known") and spk.get("confidence", 0.0) >= 0.35:
+        if spk.get("is_known") and spk.get("confidence", 0.0) >= 0.42:
             return {**spk, "source": "voice"}
 
         # 3. Known Active Face

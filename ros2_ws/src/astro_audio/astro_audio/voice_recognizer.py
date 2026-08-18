@@ -27,8 +27,8 @@ except ImportError:  # paket kaynaktan çalıştırılıyorsa
         class SpeakerEngineUnavailable(RuntimeError):
             pass
 
-# Ölçüm: aynı kişi 0.46-0.81, farklı kişi 0.16-0.33 -> 0.40 ikisinin arasında.
-VOICE_MATCH_THRESHOLD = float(os.getenv("SPEAKER_MATCH_THRESHOLD", "0.40"))
+# Ölçüm: aynı kişi 0.46-0.81, farklı kişi 0.16-0.34 -> 0.42 ikisinin arasında.
+VOICE_MATCH_THRESHOLD = float(os.getenv("SPEAKER_MATCH_THRESHOLD", "0.42"))
 
 _ENGINE = None
 _ENGINE_TRIED = False

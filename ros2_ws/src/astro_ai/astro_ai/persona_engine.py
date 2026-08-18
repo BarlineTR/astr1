@@ -241,12 +241,18 @@ class PersonaEngine:
             elif role_cat == "creator" or "baran" in name_lower:
                 creator_instruction = (
                     f"\n\n✅ [BİYOMETRİK DOĞRULAMA: BARAN (YARATICIN / GELİŞTİRİCİN)]:\n"
-                    f"Karşındaki kişi seni tasarlayan ve üreten baş mühendis {name} ({formal})'dir. "
-                    "Kendisine doğrudan ismiyle veya 'Baran Bey' olarak samimi, esprili ve saygıyla hitap et."
+                    f"Karşındaki kişi seni tasarlayan ve üreten baş mühendis {name} ({formal})'dir.\n"
+                    f"- Kullanıcı 'ben kimim?', 'beni tanıdın mı?', 'sesimi bildin mi?' diye sorduğunda, doğrudan baş mühendisin ve yaratıcın Baran ({formal}) olduğunu sesinden/yüzünden tanıdığını belirt!\n"
+                    f"- Kendisine doğrudan ismiyle veya 'Baran Bey' olarak samimi, esprili ve saygıyla hitap et."
                 )
                 base_prompt += creator_instruction
             else:
-                base_prompt += f"\n\nKarşındaki tanınan kişi: {name} ({formal}). Kendisine ismiyle veya unvanıyla hitap et."
+                base_prompt += (
+                    f"\n\n✅ [BİYOMETRİK DOĞRULAMA: {name.upper()} ({formal})]:\n"
+                    f"- Karşındaki kişi %100 doğrulukla biyometrik olarak tanındı: {name} ({formal}).\n"
+                    f"- Kullanıcı 'ben kimim?', 'beni tanıdın mı?', 'sesimi bildin mi?' diye sorduğunda, kesinlikle 'Sen {name}'sın ({formal}), sesinden ve yüzünden tanıdım!' diyerek adını söyle!\n"
+                    f"- Asla 'seni tanımadım' veya 'sen kimsin' deme; kendisine doğrudan ismiyle ({name} / {formal}) hitap et."
+                )
         else:
             base_prompt += (
                 f"\n\n🚨 [BİYOMETRİK KİMLİK: BİLİNMEYEN SES & YÜZ (MİSAFİR)] 🚨\n"
