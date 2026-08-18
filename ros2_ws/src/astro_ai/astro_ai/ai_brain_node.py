@@ -429,10 +429,11 @@ class AiBrainNode(Node):
             face = self._recognized_person or {}
             spk = self._recognized_speaker or {}
 
-        # 1. Face Recognition (Visual priority when face is verified >= 0.72)
-        if face.get("is_known") and face.get("confidence", 0.0) >= 0.72:
+        # 1. Face Recognition (Visual priority when face is verified >= 0.42)
+        if face.get("is_known") and face.get("confidence", 0.0) >= 0.42:
             name = face.get("name", "")
             off = find_official_by_name_or_alias(name)
+
             if off:
                 return {**off, "confidence": face.get("confidence"), "is_known": True, "source": "face"}
             known = self.memory.profile.get_known_person(name)
@@ -447,10 +448,11 @@ class AiBrainNode(Node):
                 "source": "face"
             }
 
-        # 2. Voice Recognition (Acoustic priority when voice matches >= 0.70)
-        if spk.get("is_known") and spk.get("confidence", 0.0) >= 0.70:
+        # 2. Voice Recognition (Acoustic priority when voice matches >= 0.40)
+        if spk.get("is_known") and spk.get("confidence", 0.0) >= 0.40:
             name = spk.get("name", "")
             off = find_official_by_name_or_alias(name)
+
             if off:
                 return {**off, "confidence": spk.get("confidence"), "is_known": True, "source": "voice"}
             known = self.memory.profile.get_known_person(name)

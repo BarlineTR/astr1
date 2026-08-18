@@ -239,7 +239,7 @@ class SpatialVisionNode(Node):
 
             # 4. Face Recognition Matching
             recog_name, recog_conf, recog_meta = self.face_recognizer.recognize_face(face_roi_bgr)
-            is_known = (recog_name is not None and recog_conf >= 0.84)
+            is_known = (recog_name is not None and recog_conf >= 0.45)
             if is_known and recog_conf > top_recognized_person["confidence"]:
                 top_recognized_person = {
                     "name": recog_name,
@@ -249,6 +249,7 @@ class SpatialVisionNode(Node):
                     "is_known": True,
                     "distance_m": round(dist_m, 2)
                 }
+
 
             # 5. Emotion Detection
             detected_emotion = self._detect_facial_emotion(face_roi_gray, w, h)
@@ -314,6 +315,19 @@ class SpatialVisionNode(Node):
         recog_msg.data = json.dumps(top_recognized_person)
         self.pub_recognized_person.publish(recog_msg)
 
+        # Diagnostic logger on recognized person
+        if not hasattr(self, '_last_recog_logged_name'):
+            self._last_recog_logged_name = None
+            self._last_recog_logged_time = 0.0
+
+        now_t = self.get_clock().now().nanoseconds / 1e9
+        if top_recognized_person["is_known"]:
+            recog_p_name = top_recognized_person["name"]
+            if (recog_p_name != self._last_recog_logged_name) or (now_t - self._last_recog_logged_time > 10.0):
+                self._last_recog_logged_name = recog_p_name
+                self._last_recog_logged_time = now_t
+                self.get_logger().info(f"👤 [Yüz Tanındı]: {recog_p_name} ({top_recognized_person['formal_title']}) — Güven: %{int(top_recognized_person['confidence']*100)}, Mesafe: {user_distance:.2f}m")
+
         # Diagnostic logger on gaze state change
         if not hasattr(self, '_prev_looking_log'):
             self._prev_looking_log = False
@@ -322,6 +336,7 @@ class SpatialVisionNode(Node):
             if is_looking and (0.35 <= user_distance <= 2.50):
                 known_tag = f" — [{top_recognized_person['formal_title']}]" if top_recognized_person["is_known"] else ""
                 self.get_logger().info(f"👀 [Göz Teması]: Kullanıcı algılandı! (Mesafe: {user_distance:.2f}m, Açı: {head_yaw:.1f}°){known_tag}")
+
 
         # Publish Images
         try:

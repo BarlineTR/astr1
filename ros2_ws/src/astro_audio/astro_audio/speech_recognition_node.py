@@ -394,8 +394,9 @@ class SpeechRecognitionNode(Node):
 
             # Acoustic Speaker Identification (Voiceprint Matching)
             spk_name, spk_conf, spk_meta = self.voice_recognizer.recognize_voice(arr, self._sample_rate)
-            is_known_spk = (spk_name is not None and spk_conf >= 0.70)
+            is_known_spk = (spk_name is not None and spk_conf >= 0.40)
             spk_info = {
+
                 "name": spk_name if is_known_spk else "Misafir",
                 "title": spk_meta.get("title", "Konuşmacı"),
                 "formal_title": spk_meta.get("formal_title", "Misafir"),
