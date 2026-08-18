@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""ASTRO V1 — Real-Time 24kHz Audio Streaming & Playback Engine for OpenAI Realtime API.
+"""ASTRO V1 — Real-Time Audio Streaming & Playback Engine for OpenAI Realtime API.
 
 Features:
-  - 24,000 Hz, 16-bit Mono PCM raw stream capture from ReSpeaker 4-Mic USB Array (20ms chunks)
-  - Zero-latency non-blocking streaming playback of OpenAI response.audio.delta PCM chunks
+  - 16kHz hardware native capture (ReSpeaker 4-Mic USB Array) with 24kHz upsampling for OpenAI
+  - Zero-latency non-blocking streaming playback of OpenAI response.audio.delta (24kHz -> 16kHz DAC)
   - Sub-millisecond queue flush & output stream abort on user barge-in (/tts/interrupt)
   - Real-time RMS acoustic monitoring & hardware auto-selection
 """
@@ -29,11 +29,34 @@ except ImportError:
 
 
 RESPEAKER_NAME_HINTS = ("respeaker", "uac1", "seeed", "arrayuac", "usb audio")
-SAMPLE_RATE = 24000  # OpenAI Realtime standard
+HW_SAMPLE_RATE = 16000  # ReSpeaker native hardware rate
+TARGET_SAMPLE_RATE = 24000  # OpenAI Realtime standard
 CHANNELS = 1
 DTYPE = "int16"
-CHUNK_MS = 20  # 20ms chunks = 480 samples @ 24kHz
-BLOCK_SIZE = int(SAMPLE_RATE * (CHUNK_MS / 1000.0))  # 480
+CHUNK_MS = 20  # 20ms chunks = 320 samples @ 16kHz
+HW_BLOCK_SIZE = int(HW_SAMPLE_RATE * (CHUNK_MS / 1000.0))  # 320
+
+
+def resample_16k_to_24k(raw_16k_bytes: bytes) -> bytes:
+    """Ultra-fast 16kHz -> 24kHz int16 PCM interpolation (320 -> 480 samples)."""
+    arr_16k = np.frombuffer(raw_16k_bytes, dtype=np.int16)
+    if len(arr_16k) == 0:
+        return b""
+    n_out = int(len(arr_16k) * 1.5)
+    indices = np.linspace(0, len(arr_16k) - 1, n_out)
+    arr_24k = np.interp(indices, np.arange(len(arr_16k)), arr_16k.astype(np.float32)).astype(np.int16)
+    return arr_24k.tobytes()
+
+
+def resample_24k_to_16k(raw_24k_bytes: bytes) -> bytes:
+    """Ultra-fast 24kHz -> 16kHz int16 PCM downsampling (480 -> 320 samples)."""
+    arr_24k = np.frombuffer(raw_24k_bytes, dtype=np.int16)
+    if len(arr_24k) == 0:
+        return b""
+    n_out = int(len(arr_24k) * (2.0 / 3.0))
+    indices = np.linspace(0, len(arr_24k) - 1, n_out)
+    arr_16k = np.interp(indices, np.arange(len(arr_24k)), arr_24k.astype(np.float32)).astype(np.int16)
+    return arr_16k.tobytes()
 
 
 def list_devices():
@@ -80,7 +103,7 @@ def find_audio_device(is_input: bool = True, preferred: str = "") -> tuple[Optio
 
 
 class AudioStreamNode(Node):
-    """ROS 2 Node managing real-time bidirectional 24kHz PCM audio for OpenAI Realtime WebSocket."""
+    """ROS 2 Node managing real-time bidirectional audio for OpenAI Realtime WebSocket."""
 
     def __init__(self):
         super().__init__("audio_stream_node")
@@ -100,8 +123,8 @@ class AudioStreamNode(Node):
         self._in_dev_idx, in_name = find_audio_device(is_input=True, preferred=pref_in)
         self._out_dev_idx, out_name = find_audio_device(is_input=False, preferred=pref_out)
 
-        self.get_logger().info(f"🎤 [Realtime Audio] Giriş Cihazı: [{self._in_dev_idx}] {in_name} (24kHz Mono)")
-        self.get_logger().info(f"🔊 [Realtime Audio] Çıkış Cihazı: [{self._out_dev_idx}] {out_name} (24kHz Mono)")
+        self.get_logger().info(f"🎤 [Realtime Audio] Giriş Cihazı: [{self._in_dev_idx}] {in_name} (16kHz Native -> 24kHz Stream)")
+        self.get_logger().info(f"🔊 [Realtime Audio] Çıkış Cihazı: [{self._out_dev_idx}] {out_name} (24kHz Stream -> 16kHz DAC)")
 
         # Playback Queue & Thread
         self._play_queue: queue.Queue[bytes] = queue.Queue(maxsize=500)
@@ -109,7 +132,7 @@ class AudioStreamNode(Node):
         self._playback_lock = threading.Lock()
         self._stop_event = threading.Event()
 
-        # Capture Stream
+        # Streams
         self._input_stream = None
         self._output_stream = None
 
@@ -130,20 +153,20 @@ class AudioStreamNode(Node):
 
         try:
             self._input_stream = sd.RawInputStream(
-                samplerate=SAMPLE_RATE,
-                blocksize=BLOCK_SIZE,
+                samplerate=HW_SAMPLE_RATE,
+                blocksize=HW_BLOCK_SIZE,
                 device=self._in_dev_idx,
                 channels=CHANNELS,
                 dtype=DTYPE,
                 callback=self._input_callback,
             )
             self._input_stream.start()
-            self.get_logger().info("✅ [Realtime Audio] 24kHz Canlı Mikrofon Akışı Başlatıldı (20ms/blok).")
+            self.get_logger().info("✅ [Realtime Audio] 16kHz Canlı Mikrofon Akışı Başlatıldı (20ms/blok).")
         except Exception as e:
             self.get_logger().error(f"❌ [Realtime Audio] Giriş akışı başlatılamadı: {e}")
 
     def _input_callback(self, indata, frames, time_info, status):
-        """Audio hardware callback triggered every 20ms with 480 16-bit PCM samples."""
+        """Audio hardware callback triggered every 20ms with 320 16-bit PCM samples."""
         if status:
             pass
 
@@ -158,8 +181,11 @@ class AudioStreamNode(Node):
         except Exception:
             rms = 0.0
 
-        # Encode to base64 and publish to ROS 2 topic for Realtime WebSocket node
-        b64_str = base64.b64encode(raw_bytes).decode("ascii")
+        # Resample 16kHz -> 24kHz for OpenAI Realtime API
+        pcm_24k = resample_16k_to_24k(raw_bytes)
+
+        # Encode to base64 and publish to ROS 2 topic
+        b64_str = base64.b64encode(pcm_24k).decode("ascii")
         msg = String()
         msg.data = b64_str
         self.pub_input_pcm.publish(msg)
@@ -169,9 +195,11 @@ class AudioStreamNode(Node):
         if not msg.data:
             return
         try:
-            raw_pcm = base64.b64decode(msg.data.encode("ascii"))
-            if raw_pcm:
-                self._play_queue.put_nowait(raw_pcm)
+            raw_24k = base64.b64decode(msg.data.encode("ascii"))
+            if raw_24k:
+                # Resample 24kHz -> 16kHz for hardware ReSpeaker DAC
+                raw_16k = resample_24k_to_16k(raw_24k)
+                self._play_queue.put_nowait(raw_16k)
         except (queue.Full, Exception) as e:
             self.get_logger().debug(f"PCM enqueue notice: {e}")
 
@@ -179,7 +207,6 @@ class AudioStreamNode(Node):
         """Zero-latency barge-in signal: instantly flush playback buffer queue."""
         if msg.data:
             with self._playback_lock:
-                # Clear all buffered PCM chunks immediately
                 while not self._play_queue.empty():
                     try:
                         self._play_queue.get_nowait()
@@ -194,8 +221,8 @@ class AudioStreamNode(Node):
 
         try:
             out_stream = sd.RawOutputStream(
-                samplerate=SAMPLE_RATE,
-                blocksize=BLOCK_SIZE,
+                samplerate=HW_SAMPLE_RATE,
+                blocksize=HW_BLOCK_SIZE,
                 device=self._out_dev_idx,
                 channels=CHANNELS,
                 dtype=DTYPE,

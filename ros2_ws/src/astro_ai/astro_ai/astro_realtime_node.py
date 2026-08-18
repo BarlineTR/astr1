@@ -11,6 +11,7 @@ Features:
 
 import asyncio
 import base64
+import inspect
 import json
 import os
 import re
@@ -23,7 +24,6 @@ import rclpy
 from rclpy.node import Node
 from std_msgs.msg import Bool, Float32, String
 
-# Safe import of websockets or aiohttp
 try:
     import websockets
 except ImportError:
@@ -42,6 +42,7 @@ except ImportError:
 
 
 REALTIME_WS_URL = "wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview"
+VALID_REALTIME_VOICES = {"alloy", "ash", "ballad", "coral", "echo", "sage", "shimmer", "verse", "fable", "onyx"}
 
 
 class AstroRealtimeNode(Node):
@@ -52,7 +53,8 @@ class AstroRealtimeNode(Node):
 
         # Load environment variables
         self.openai_api_key = os.environ.get("OPENAI_API_KEY", "").strip()
-        self.realtime_voice = os.environ.get("REALTIME_VOICE", os.environ.get("TTS_VOICE", "echo")).strip()
+        raw_voice = os.environ.get("REALTIME_VOICE", os.environ.get("TTS_VOICE", "echo")).strip().lower()
+        self.realtime_voice = raw_voice if raw_voice in VALID_REALTIME_VOICES else "echo"
         self.persona_name = os.environ.get("PERSONA", "kufurbaz").strip().lower()
 
         # Modular Cognitive Subsystems
@@ -120,10 +122,23 @@ class AstroRealtimeNode(Node):
             "OpenAI-Beta": "realtime=v1"
         }
 
+        # Inspect websockets.connect parameter compatibility across versions
+        connect_kwargs = {"ping_interval": 20, "ping_timeout": 20}
+        try:
+            sig = inspect.signature(websockets.connect)
+            if "additional_headers" in sig.parameters:
+                connect_kwargs["additional_headers"] = headers
+            elif "extra_headers" in sig.parameters:
+                connect_kwargs["extra_headers"] = headers
+            else:
+                connect_kwargs["extra_headers"] = headers
+        except Exception:
+            connect_kwargs["extra_headers"] = headers
+
         while rclpy.ok():
             try:
                 self.get_logger().info(f"🌐 [Realtime WS] OpenAI Realtime API'ye bağlanılıyor: {REALTIME_WS_URL}")
-                async with websockets.connect(REALTIME_WS_URL, extra_headers=headers, ping_interval=20, ping_timeout=20) as ws:
+                async with websockets.connect(REALTIME_WS_URL, **connect_kwargs) as ws:
                     self._ws = ws
                     self._is_connected = True
                     self.get_logger().info("✅ [Realtime WS] Bağlantı Başarılı! Oturum parametreleri gönderiliyor...")
@@ -228,11 +243,11 @@ class AstroRealtimeNode(Node):
         # 2. Real-Time Streaming Audio Transcript
         elif event_type == "response.audio_transcript.delta":
             text_delta = event.get("delta", "")
-            # Optionally print streaming characters
+            # Streaming token
 
         # 3. User Speech Started (Barge-In Interruption)
         elif event_type == "input_audio_buffer.speech_started":
-            self.get_logger().info("⚡ [Realtime Barge-In] Kullanıcı konuşmaya başladı — Çalma durduruluyor...")
+            self.get_logger().info("⚡ [Realtime Barge-In] Kullanıcı konuşmaya başladı — Çalma anında durduruluyor...")
             intr_msg = Bool()
             intr_msg.data = True
             self.pub_interrupt.publish(intr_msg)
