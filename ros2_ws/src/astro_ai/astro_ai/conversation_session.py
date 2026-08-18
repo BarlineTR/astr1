@@ -147,10 +147,10 @@ class ConversationSession:
         clean_input = re.sub(r"^['\"`´“”‘’]+|['\"`´“”‘’]+$", "", text.strip())
         text_lower = clean_input.lower().strip()
 
-        # Regex pattern captures Turkish phonetic variations: astro, astıro, astor, astrocum, astro'cum, etc.
+        # Regex pattern captures Turkish phonetic variations: astro, astıro, astor, asro, asu, astrocum, astro'cum, etc.
         wake_pattern = re.compile(
             r'(?:h[ea]y\s*|merhaba\s+|selam\s+|robot\s+)?'  # optional prefix
-            r'(?:ast[ıi]?ro[\'’]?\w*|astor[\'’]?\w*|asistan\w*)', # core robot name + suffixes
+            r'(?:ast[ıi]?ro[\'’]?\w*|astor[\'’]?\w*|asro[\'’]?\w*|asu[\'’]?\w*|asistan\w*)', # core robot name + suffixes
             re.IGNORECASE
         )
         has_wake = bool(wake_pattern.search(text_lower)) or wake_word.lower() in text_lower

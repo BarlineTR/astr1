@@ -641,6 +641,7 @@ class AiBrainNode(Node):
                 if self._evaluate_social_barge_in(raw_text):
                     self.get_logger().info("🎯 [Sosyal Fırsat]: Arka plan konuşmasına dâhil olunuyor!")
                     self.session.activate_session(reason="social_barge_in")
+                    self.session.metadata["tts_engine"] = "edge-tts"
                     self.state_machine.transition_to(RobotState.LISTENING)
                 else:
                     self.get_logger().info(f"🔇 [Arka Plan]: '{raw_text}' yok sayıldı (İlgisiz).")
