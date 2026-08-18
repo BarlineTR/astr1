@@ -641,11 +641,16 @@ class AstroRealtimeNode(Node):
             self._person_hold_until = now + 90.0
             self._last_synced_identity = ""  # Force immediate session update
 
-        self.memory.profile.set_user_fact(name, "Ad", name)
-        self.memory.profile.set_user_fact(name, "Hitap", formal_title)
-        self._sync_perception_to_session()
+        try:
+            self.memory.profile.add_known_person(name, title=formal_title, formal_title=formal_title)
+            self.memory.profile.set_user_fact(name, "Ad", name)
+            self.memory.profile.set_user_fact(name, "Hitap", formal_title)
+            self._sync_perception_to_session()
+        except Exception as me:
+            self.get_logger().warn(f"Memory update notice: {me}")
 
         msg = f"{name} ({formal_title}) başarıyla hem sesinden hem de yüzünden Astro'nun hafızasına kaydedildi!"
+
         self.get_logger().info(f"✅ [Biyometrik Kayıt Tamamlandı]: {msg}")
         return {
             "status": "success",

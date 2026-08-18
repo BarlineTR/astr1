@@ -252,8 +252,14 @@ class PersistentProfile:
                 self.save()
             return True
 
+    def set_user_fact(self, name: str, key: str, value: str):
+        """Sets or updates a specific fact / preference for a known user."""
+        self.add_person_preference(name, key, value)
+        self.add_person_fact(name, f"{key}: {value}")
+
     def add_person_preference(self, name: str, key: str, value: str):
         """Stores a specific preference (e.g. coffee: unsweetened) for a known person."""
+
         if not name or not key:
             return
         with self._lock:
