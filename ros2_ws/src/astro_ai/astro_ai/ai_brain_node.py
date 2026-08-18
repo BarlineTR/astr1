@@ -641,7 +641,6 @@ class AiBrainNode(Node):
                 if self._evaluate_social_barge_in(raw_text):
                     self.get_logger().info("🎯 [Sosyal Fırsat]: Arka plan konuşmasına dâhil olunuyor!")
                     self.session.activate_session(reason="social_barge_in")
-                    self.session.metadata["tts_engine"] = "edge-tts"
                     self.state_machine.transition_to(RobotState.LISTENING)
                 else:
                     self.get_logger().info(f"🔇 [Arka Plan]: '{raw_text}' yok sayıldı (İlgisiz).")
@@ -736,19 +735,19 @@ class AiBrainNode(Node):
             if is_identity and not is_learning_person:
                 identity = self._get_active_biometric_identity()
                 if identity.get("is_known"):
-                    name = identity.get("name", "")
+                    name = identity.get("name") or identity.get("formal_title") or "Baran"
                     formal = identity.get("formal_title") or name
                     source = identity.get("source", "biyometri")
                     src_tr = "sesinden" if source == "voice" else ("yüzünden" if source == "face" else "yüzünden ve sesinden")
                     
-                    if "baran" in name.lower():
+                    if "baran" in str(name).lower() or "baran" in str(formal).lower():
                         ans = f"Tabii ki tanıdım! Seni {src_tr} hemen bildim; sen benim baş mühendisim ve geliştiricim Baran'sın!"
-                    elif "erdoğan" in name.lower():
+                    elif "erdoğan" in str(name).lower() or "erdoğan" in str(formal).lower():
                         ans = f"Elbette tanıdım Sayın Cumhurbaşkanım! Sizi {src_tr} tanıdım, saygılarımı ve hürmetlerimi sunarım efendim."
-                    elif "vali" in identity.get("title", "").lower() or "karaömeroğlu" in name.lower():
+                    elif "vali" in identity.get("title", "").lower() or "karaömeroğlu" in str(name).lower():
                         ans = f"Elbette tanıdım Sayın Valim! Sizi {src_tr} tanıdım, hürmet ederim efendim."
                     else:
-                        ans = f"Tabii ki tanıdım! Seni {src_tr} hemen bildim, sen {formal} ({name})'sın!"
+                        ans = f"Tabii ki tanıdım! Seni {src_tr} hemen bildim, sen {formal}'sın!"
                 else:
                     ans = "Sesin veya yüzün henüz kayıtlı kişilerle tam eşleşmedi. İstersen 'Benim adım ... beni hafızana kaydet' diyerek yüzünü ve sesini bana tanıtabilirsin!"
 
@@ -847,8 +846,11 @@ class AiBrainNode(Node):
                 recognized_person=identity
             )
             messages = [{"role": "system", "content": system_prompt}]
-            messages.extend(self.memory.episodic.get_messages())
-            if perception_prefix:
+            # Deep copy episodic history so modifying user turn never corrupts stored messages
+            for m in self.memory.episodic.get_messages():
+                messages.append({"role": m["role"], "content": m["content"]})
+
+            if perception_prefix and messages and messages[-1]["role"] == "user":
                 messages[-1]["content"] = perception_prefix + messages[-1]["content"]
 
             full_text = ""

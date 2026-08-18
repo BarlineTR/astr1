@@ -274,7 +274,10 @@ class PersonaEngine:
         if recognized_person and recognized_person.get("is_known"):
             name = recognized_person.get("name")
             formal = recognized_person.get("formal_title") or recognized_person.get("title")
-            tag_parts.append(f"Tanınan Kişi: {name} ({formal})")
+            if name and str(name).lower() != "none" and str(name) != "Misafir":
+                formal_str = f" ({formal})" if formal and formal != name else ""
+                tag_parts.append(f"Karşındaki Tanınan Kişi: {name}{formal_str}")
+
 
         if person_detected and looking_at_robot:
             dist_str = f"{user_distance:.1f}m mesafeden " if user_distance > 0 else ""
