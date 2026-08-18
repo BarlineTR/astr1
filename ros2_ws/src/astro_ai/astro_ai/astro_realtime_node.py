@@ -1392,6 +1392,12 @@ class AstroRealtimeNode(Node):
                             if obs:
                                 provider_name = f"Groq ({v_mod})"
                                 break
+                    except urllib.error.HTTPError as http_e:
+                        error_body = http_e.read().decode("utf-8", errors="ignore")
+                        self.get_logger().warn(f"⚠️ [Idle Groq API Hatası ({v_mod})]: {http_e.code} - {error_body}")
+                    except Exception as ge:
+                        self.get_logger().debug(f"Idle Groq Vision ({v_mod}) notice: {ge}")
+
             # 3. Emergency Safety Fallback: OpenAI Vision REST (gpt-4o-mini)
             # (Only used if Gemini & Groq keys are invalid/failed, so robot never goes blind)
             if not obs and self.openai_api_key:
