@@ -1025,6 +1025,7 @@ class AstroRealtimeNode(Node):
             for g_mod in ["gemini-2.0-flash", "gemini-1.5-flash"]:
                 try:
                     import urllib.request
+                    import urllib.error
                     url = f"https://generativelanguage.googleapis.com/v1beta/models/{g_mod}:generateContent?key={self.gemini_api_key}"
                     payload = {
                         "contents": [{
@@ -1035,21 +1036,30 @@ class AstroRealtimeNode(Node):
                         }],
                         "generation_config": {"temperature": 0.2, "max_output_tokens": 150}
                     }
-                    req = urllib.request.Request(url, data=json.dumps(payload).encode("utf-8"), headers={"Content-Type": "application/json"})
+                    data_bytes = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+                    req = urllib.request.Request(
+                        url,
+                        data=data_bytes,
+                        headers={"Content-Type": "application/json", "User-Agent": "Mozilla/5.0"}
+                    )
                     with urllib.request.urlopen(req, timeout=5.0) as resp:
                         res_json = json.loads(resp.read().decode("utf-8"))
                         candidate_obs = res_json["candidates"][0]["content"]["parts"][0]["text"].strip()
                         if candidate_obs and not any(rk in candidate_obs.lower() for rk in refusal_kws):
                             obs = candidate_obs
                             break
+                except urllib.error.HTTPError as http_e:
+                    error_body = http_e.read().decode("utf-8", errors="ignore")
+                    self.get_logger().warn(f"⚠️ [Gemini API Hatası ({g_mod})]: {http_e.code} - {error_body}")
                 except Exception as gem_e:
-                    self.get_logger().warn(f"⚠️ [Gemini Vision ({g_mod}) Uyarısı]: {gem_e}")
+                    self.get_logger().warn(f"⚠️ [Gemini Genel Uyarısı ({g_mod})]: {gem_e}")
 
         # 2. Fallback: Groq Vision (qwen-2.5-72b) (0 Token Cost)
         if not obs and self.groq_api_key:
             for v_mod in ["qwen-2.5-72b", "llama-3.2-11b-vision-preview"]:
                 try:
                     import urllib.request
+                    import urllib.error
                     req_data = {
                         "model": v_mod,
                         "messages": [
@@ -1063,12 +1073,14 @@ class AstroRealtimeNode(Node):
                         ],
                         "max_tokens": 150
                     }
+                    data_bytes = json.dumps(req_data, ensure_ascii=False).encode("utf-8")
                     req = urllib.request.Request(
                         "https://api.groq.com/openai/v1/chat/completions",
-                        data=json.dumps(req_data).encode("utf-8"),
+                        data=data_bytes,
                         headers={
                             "Content-Type": "application/json",
-                            "Authorization": f"Bearer {self.groq_api_key}"
+                            "Authorization": f"Bearer {self.groq_api_key}",
+                            "User-Agent": "Mozilla/5.0"
                         },
                         method="POST"
                     )
@@ -1078,8 +1090,11 @@ class AstroRealtimeNode(Node):
                         if candidate_obs and not any(rk in candidate_obs.lower() for rk in refusal_kws):
                             obs = candidate_obs
                             break
+                except urllib.error.HTTPError as http_e:
+                    error_body = http_e.read().decode("utf-8", errors="ignore")
+                    self.get_logger().warn(f"⚠️ [Groq API Hatası ({v_mod})]: {http_e.code} - {error_body}")
                 except Exception as ge:
-                    self.get_logger().warn(f"⚠️ [Groq Vision ({v_mod}) Uyarısı]: {ge}")
+                    self.get_logger().warn(f"⚠️ [Groq Genel Uyarısı ({v_mod})]: {ge}")
 
         if obs:
             self.get_logger().info(f"👁️ [Kamera Görme Sonucu]: \"{obs}\"")
@@ -1266,6 +1281,8 @@ class AstroRealtimeNode(Node):
             if self.gemini_api_key:
                 for g_mod in ["gemini-2.0-flash", "gemini-1.5-flash"]:
                     try:
+                        import urllib.request
+                        import urllib.error
                         url = f"https://generativelanguage.googleapis.com/v1beta/models/{g_mod}:generateContent?key={self.gemini_api_key}"
                         payload = {
                             "contents": [{
@@ -1276,13 +1293,21 @@ class AstroRealtimeNode(Node):
                             }],
                             "generation_config": {"temperature": 0.2, "max_output_tokens": 80}
                         }
-                        req = urllib.request.Request(url, data=json.dumps(payload).encode("utf-8"), headers={"Content-Type": "application/json"})
+                        data_bytes = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+                        req = urllib.request.Request(
+                            url,
+                            data=data_bytes,
+                            headers={"Content-Type": "application/json", "User-Agent": "Mozilla/5.0"}
+                        )
                         with urllib.request.urlopen(req, timeout=5.0) as resp:
                             res_json = json.loads(resp.read().decode("utf-8"))
                             obs = res_json["candidates"][0]["content"]["parts"][0]["text"].strip()
                             if obs:
                                 provider_name = f"Gemini ({g_mod})"
                                 break
+                    except urllib.error.HTTPError as http_e:
+                        error_body = http_e.read().decode("utf-8", errors="ignore")
+                        self.get_logger().warn(f"⚠️ [Idle Gemini API Hatası ({g_mod})]: {http_e.code} - {error_body}")
                     except Exception as gem_e:
                         self.get_logger().debug(f"Idle Gemini Vision ({g_mod}) notice: {gem_e}")
 
@@ -1290,6 +1315,8 @@ class AstroRealtimeNode(Node):
             if not obs and self.groq_api_key:
                 for v_mod in ["qwen-2.5-72b", "llama-3.2-11b-vision-preview"]:
                     try:
+                        import urllib.request
+                        import urllib.error
                         req_data = {
                             "model": v_mod,
                             "messages": [
@@ -1304,12 +1331,14 @@ class AstroRealtimeNode(Node):
                             "temperature": 0.2,
                             "max_tokens": 80
                         }
+                        data_bytes = json.dumps(req_data, ensure_ascii=False).encode("utf-8")
                         req = urllib.request.Request(
                             "https://api.groq.com/openai/v1/chat/completions",
-                            data=json.dumps(req_data).encode("utf-8"),
+                            data=data_bytes,
                             headers={
                                 "Content-Type": "application/json",
-                                "Authorization": f"Bearer {self.groq_api_key}"
+                                "Authorization": f"Bearer {self.groq_api_key}",
+                                "User-Agent": "Mozilla/5.0"
                             },
                             method="POST"
                         )
@@ -1319,6 +1348,9 @@ class AstroRealtimeNode(Node):
                             if obs:
                                 provider_name = f"Groq ({v_mod})"
                                 break
+                    except urllib.error.HTTPError as http_e:
+                        error_body = http_e.read().decode("utf-8", errors="ignore")
+                        self.get_logger().warn(f"⚠️ [Idle Groq API Hatası ({v_mod})]: {http_e.code} - {error_body}")
                     except Exception as ge:
                         self.get_logger().debug(f"Idle Groq Vision ({v_mod}) notice: {ge}")
 
