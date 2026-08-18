@@ -106,9 +106,10 @@ class AstroRealtimeNode(Node):
         self._speaker_gender = "unknown"
         self._speaker_angle = 0.0
         self._is_responding = False
+        self._is_playback_active = False
+        self._playback_end_time = 0.0
         self._last_synced_identity = "Misafir"
         self._last_sync_time = time.monotonic()
-
 
         # ROS 2 Publishers
         self.pub_output_pcm = self.create_publisher(String, "/audio/realtime_output_pcm", 50)
@@ -119,12 +120,14 @@ class AstroRealtimeNode(Node):
 
         # ROS 2 Subscribers
         self.create_subscription(String, "/audio/realtime_input_pcm", self._on_input_pcm, 50)
+        self.create_subscription(Bool, "/audio/playback_active", self._on_playback_active, 10)
         self.create_subscription(String, "/vision/recognized_person", self._on_recognized_person, 10)
         self.create_subscription(String, "/audio/speaker_id", self._on_speaker_id, 10)
         self.create_subscription(String, "/vision/user_emotion", self._on_user_emotion, 10)
         self.create_subscription(Bool, "/vision/looking_at_robot", self._on_looking_at_robot, 10)
         self.create_subscription(Float32, "/vision/user_distance", self._on_user_distance, 10)
         self.create_subscription(Float32, "/audio/doa", self._on_doa, 10)
+
 
         # Reminders storage
         self._reminders: List[Dict[str, Any]] = []
@@ -428,9 +431,27 @@ class AstroRealtimeNode(Node):
                 asyncio.run_coroutine_threadsafe(self._ws.send(json.dumps(alarm_event)), self._loop)
                 asyncio.run_coroutine_threadsafe(self._ws.send(json.dumps({"type": "response.create"})), self._loop)
 
+    def _on_playback_active(self, msg: Bool):
+        was_active = self._is_playback_active
+        self._is_playback_active = bool(msg.data)
+        if was_active and not self._is_playback_active:
+            self._playback_end_time = time.monotonic()
+            # Clear OpenAI input audio buffer so trailing room reverberation doesn't trigger VAD
+            if self._ws and self._loop and self._is_connected:
+                try:
+                    asyncio.run_coroutine_threadsafe(self._ws.send(json.dumps({"type": "input_audio_buffer.clear"})), self._loop)
+                except Exception:
+                    pass
+            self.get_logger().info("👂 [Astro Dinliyor]: Mikrofon aktif, sizi dinliyor...")
+
     def _on_input_pcm(self, msg: String):
         """Sends incoming microphone 24kHz PCM chunk directly to OpenAI Realtime WebSocket."""
         if not msg.data or not self._is_connected or not self._ws or not self._loop:
+            return
+
+        # Zero Self-Hearing Protection:
+        # Do not stream mic audio while Astro is generating or speaking, or within 300ms of playback finish
+        if self._is_playback_active or self._is_responding or (time.monotonic() - getattr(self, "_playback_end_time", 0.0) < 0.30):
             return
 
         payload = {
@@ -441,6 +462,7 @@ class AstroRealtimeNode(Node):
             asyncio.run_coroutine_threadsafe(self._ws.send(json.dumps(payload)), self._loop)
         except Exception:
             pass
+
 
     def _on_recognized_person(self, msg: String):
         try:
