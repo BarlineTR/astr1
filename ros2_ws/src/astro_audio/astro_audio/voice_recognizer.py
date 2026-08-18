@@ -112,20 +112,40 @@ class VoiceRecognizer:
             return None
 
     def reload_voiceprints(self):
-        """Scans data_dir for saved speaker .npy or .json voiceprint profiles."""
+        """Scans data_dir for saved speaker .npy and loads SpeakerEngine database (~/.astro/voices/speakers.json)."""
+        engine = _get_engine()
+        if engine is not None:
+            try:
+                engine.load()
+            except Exception:
+                pass
+
         with self._lock:
             self._known_voiceprints.clear()
-            if not os.path.exists(self.data_dir):
-                return
-            for f in os.listdir(self.data_dir):
-                if f.endswith(".npy"):
-                    spk_name = os.path.splitext(f)[0]
-                    norm = self._normalize_name(spk_name)
-                    try:
-                        emb = np.load(os.path.join(self.data_dir, f))
-                        self._known_voiceprints.setdefault(norm, []).append(emb)
-                    except Exception:
-                        pass
+            # 1. Load from SpeakerEngine (~/.astro/voices/speakers.json)
+            if engine is not None and getattr(engine, "people", None):
+                for person_name, vectors in engine.people.items():
+                    norm = self._normalize_name(person_name)
+                    self._known_voiceprints.setdefault(norm, []).extend(vectors)
+                    if norm not in self._speaker_metadata:
+                        self._speaker_metadata[norm] = {
+                            "name": person_name,
+                            "title": "Tanınan Konuşmacı",
+                            "formal_title": person_name,
+                            "gender": "unknown"
+                        }
+
+            # 2. Load from .npy files in data_dir
+            if os.path.exists(self.data_dir):
+                for f in os.listdir(self.data_dir):
+                    if f.endswith(".npy"):
+                        spk_name = os.path.splitext(f)[0]
+                        norm = self._normalize_name(spk_name)
+                        try:
+                            emb = np.load(os.path.join(self.data_dir, f))
+                            self._known_voiceprints.setdefault(norm, []).append(emb)
+                        except Exception:
+                            pass
 
     def enroll_voice(self, name: str, audio_arr: np.ndarray, sample_rate: int = 16000, title: Optional[str] = None) -> bool:
         """Dynamically learns and saves a speaker voiceprint."""
@@ -147,16 +167,45 @@ class VoiceRecognizer:
                     "gender": "unknown"
                 }
 
-            # Save to disk
+            # Save to disk as .npy
             try:
                 save_path = os.path.join(self.data_dir, f"{norm_name}.npy")
                 np.save(save_path, emb)
-                return True
             except Exception:
-                return True
+                pass
+
+            # Save to SpeakerEngine database
+            engine = _get_engine()
+            if engine is not None:
+                try:
+                    engine.add_person(name, [emb])
+                    engine.save()
+                except Exception:
+                    pass
+            return True
 
     def recognize_voice(self, audio_arr: np.ndarray, sample_rate: int = 16000, threshold: float = VOICE_MATCH_THRESHOLD) -> Tuple[Optional[str], float, Dict[str, Any]]:
         """Matches audio array against known voiceprints. Returns (name, confidence, metadata)."""
+        # 1. First try SpeakerEngine directly (which loads ~/.astro/voices/speakers.json)
+        engine = _get_engine()
+        if engine is not None:
+            try:
+                engine.load()
+                matched_name, sim = engine.identify(audio_arr, sample_rate)
+                if matched_name is not None and sim >= threshold:
+                    norm = self._normalize_name(matched_name)
+                    meta = self._speaker_metadata.get(norm, {
+                        "name": matched_name,
+                        "title": "Tanınan Konuşmacı",
+                        "formal_title": matched_name
+                    })
+                    return meta["name"], round(float(sim), 2), meta
+                elif sim is not None and sim > 0:
+                    return None, round(float(sim), 2), {}
+            except Exception:
+                pass
+
+        # 2. Fallback to in-memory matching
         emb = self.extract_voiceprint(audio_arr, sample_rate)
         if emb is None:
             return None, 0.0, {}
@@ -184,3 +233,4 @@ class VoiceRecognizer:
                 return meta["name"], round(highest_sim, 2), meta
 
             return None, max(0.0, round(highest_sim, 2)), {}
+

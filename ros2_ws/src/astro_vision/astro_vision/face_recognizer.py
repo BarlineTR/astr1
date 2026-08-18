@@ -139,38 +139,56 @@ class FaceRecognizer:
         return vector / norm if norm > 1e-6 else None
 
     def reload_gallery(self):
-        """Scans data_dir for person directories and indexes face images."""
+        """Scans data_dir for person directories and indexes face images + ~/.astro/faces/faces.json."""
+        engine = _get_engine()
+        if engine is not None:
+            try:
+                engine.load()
+            except Exception:
+                pass
+
         with self._lock:
             self._known_embeddings.clear()
-            if not os.path.exists(self.data_dir):
-                return
+            # 1. Load from FaceEngine database if available
+            if engine is not None and getattr(engine, "people", None):
+                for person_name, vectors in engine.people.items():
+                    norm = self._normalize_name(person_name)
+                    self._known_embeddings.setdefault(norm, []).extend(vectors)
+                    if norm not in self._person_metadata:
+                        self._person_metadata[norm] = {
+                            "name": person_name,
+                            "title": "Tanınan Kişi",
+                            "formal_title": person_name,
+                            "category": "guest"
+                        }
 
-            indexed_count = 0
-            for entry in os.listdir(self.data_dir):
-                entry_path = os.path.join(self.data_dir, entry)
-                if os.path.isdir(entry_path):
-                    person_norm = self._normalize_name(entry)
-                    for f in os.listdir(entry_path):
-                        if f.lower().endswith((".jpg", ".jpeg", ".png", ".bmp")):
-                            img_p = os.path.join(entry_path, f)
-                            if cv2 is not None:
-                                img = cv2.imread(img_p)
-                                if img is not None:
-                                    emb = self.extract_embedding(img)
-                                    if emb is not None:
-                                        self._known_embeddings.setdefault(person_norm, []).append(emb)
-                                        indexed_count += 1
-                elif entry.lower().endswith((".jpg", ".jpeg", ".png")):
-                    # Single image named Person_Name.jpg
-                    person_name = os.path.splitext(entry)[0]
-                    person_norm = self._normalize_name(person_name)
-                    if cv2 is not None:
-                        img = cv2.imread(entry_path)
-                        if img is not None:
-                            emb = self.extract_embedding(img)
-                            if emb is not None:
-                                self._known_embeddings.setdefault(person_norm, []).append(emb)
-                                indexed_count += 1
+            # 2. Load from data_dir image files
+            if os.path.exists(self.data_dir):
+                indexed_count = 0
+                for entry in os.listdir(self.data_dir):
+                    entry_path = os.path.join(self.data_dir, entry)
+                    if os.path.isdir(entry_path):
+                        person_norm = self._normalize_name(entry)
+                        for f in os.listdir(entry_path):
+                            if f.lower().endswith((".jpg", ".jpeg", ".png", ".bmp")):
+                                img_p = os.path.join(entry_path, f)
+                                if cv2 is not None:
+                                    img = cv2.imread(img_p)
+                                    if img is not None:
+                                        emb = self.extract_embedding(img)
+                                        if emb is not None:
+                                            self._known_embeddings.setdefault(person_norm, []).append(emb)
+                                            indexed_count += 1
+                    elif entry.lower().endswith((".jpg", ".jpeg", ".png")):
+                        person_name = os.path.splitext(entry)[0]
+                        person_norm = self._normalize_name(person_name)
+                        if cv2 is not None:
+                            img = cv2.imread(entry_path)
+                            if img is not None:
+                                emb = self.extract_embedding(img)
+                                if emb is not None:
+                                    self._known_embeddings.setdefault(person_norm, []).append(emb)
+                                    indexed_count += 1
 
     def enroll_face(self, name: str, face_bgr: np.ndarray, title: Optional[str] = None) -> bool:
         """Dynamically learns and saves a new face to disk and memory."""
@@ -199,12 +217,41 @@ class FaceRecognizer:
                 os.makedirs(person_dir, exist_ok=True)
                 filename = f"face_{int(np.random.randint(1000, 9999))}.jpg"
                 cv2.imwrite(os.path.join(person_dir, filename), face_bgr)
-                return True
             except Exception:
-                return True
+                pass
+
+            # Save to FaceEngine database
+            engine = _get_engine()
+            if engine is not None:
+                try:
+                    engine.add_person(name, [emb])
+                    engine.save()
+                except Exception:
+                    pass
+            return True
 
     def recognize_face(self, face_bgr: np.ndarray, threshold: float = FACE_MATCH_THRESHOLD) -> Tuple[Optional[str], float, Dict[str, Any]]:
         """Matches a face ROI against the known gallery. Returns (name, confidence, metadata)."""
+        # 1. First try FaceEngine directly (loads ~/.astro/faces/faces.json)
+        engine = _get_engine()
+        if engine is not None:
+            try:
+                engine.load()
+                matched_name, sim = engine.identify(face_bgr)
+                if matched_name is not None and sim >= threshold:
+                    norm = self._normalize_name(matched_name)
+                    meta = self._person_metadata.get(norm, {
+                        "name": matched_name,
+                        "title": "Tanınan Kişi",
+                        "formal_title": matched_name
+                    })
+                    return meta["name"], round(float(sim), 2), meta
+                elif sim is not None and sim > 0:
+                    return None, round(float(sim), 2), {}
+            except Exception:
+                pass
+
+        # 2. Fallback to in-memory matching
         emb = self.extract_embedding(face_bgr)
         if emb is None:
             return None, 0.0, {}
@@ -218,7 +265,6 @@ class FaceRecognizer:
 
             for person_norm, emb_list in self._known_embeddings.items():
                 for known_emb in emb_list:
-                    # Cosine Similarity (vectors are already L2 normalized: dot product = cosine sim)
                     sim = float(np.dot(emb, known_emb))
                     if sim > highest_sim:
                         highest_sim = sim
@@ -233,3 +279,4 @@ class FaceRecognizer:
                 return meta["name"], round(highest_sim, 2), meta
 
             return None, max(0.0, round(highest_sim, 2)), {}
+
