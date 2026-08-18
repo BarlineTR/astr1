@@ -48,6 +48,34 @@ except ImportError:
     from state_machine import RobotState, StateMachine
 
 
+try:
+    from astro_audio.voice_recognizer import VoiceRecognizer
+except ImportError:
+    try:
+        from voice_recognizer import VoiceRecognizer
+    except ImportError:
+        VoiceRecognizer = None
+
+try:
+    from astro_vision.face_recognizer import FaceRecognizer
+except ImportError:
+    try:
+        from face_recognizer import FaceRecognizer
+    except ImportError:
+        FaceRecognizer = None
+
+
+def resample_24k_to_16k(raw_24k_bytes: bytes) -> bytes:
+    """Ultra-fast 24kHz -> 16kHz int16 PCM downsampling (480 -> 320 samples)."""
+    arr_24k = np.frombuffer(raw_24k_bytes, dtype=np.int16)
+    if len(arr_24k) == 0:
+        return b""
+    n_out = int(len(arr_24k) * (2.0 / 3.0))
+    indices = np.linspace(0, len(arr_24k) - 1, n_out)
+    arr_16k = np.interp(indices, np.arange(len(arr_24k)), arr_24k.astype(np.float32)).astype(np.int16)
+    return arr_16k.tobytes()
+
+
 def imgmsg_to_bgr(msg: Image) -> Optional[np.ndarray]:
     if cv2 is None or msg is None or not msg.data:
         return None
@@ -77,6 +105,7 @@ def frame_to_base64_jpeg(frame: np.ndarray, max_dim: int = 640) -> Optional[str]
         return base64.b64encode(buffer).decode("utf-8")
     except Exception:
         return None
+
 
 
 
@@ -156,17 +185,23 @@ class AstroRealtimeNode(Node):
         self._person_hold_until = 0.0
         self._greeted_people: Dict[str, float] = {}
 
+        # Biometric Voice & Face Engines
+        self.voice_recognizer = VoiceRecognizer() if VoiceRecognizer else None
+        self.face_recognizer = FaceRecognizer() if FaceRecognizer else None
+        self._user_speech_audio_buffer: List[bytes] = []
+
         # Camera Perception Frame Cache
         self._latest_camera_frame: Optional[np.ndarray] = None
         self._last_img_time = 0.0
 
-        # Autonomous Idle Learning & Environmental Observation
+        # Autonomous Idle Learning & Environmental Observation (0 OpenAI Cost)
         self._enable_idle_learning = os.environ.get("ENABLE_IDLE_LEARNING", "true").lower() == "true"
         self._last_idle_learning_time = 0.0
         self._last_proactive_gaze_time = 0.0
         if self._enable_idle_learning:
             threading.Thread(target=self._idle_learning_loop, daemon=True).start()
-            self.get_logger().info("🤖 [Astro Realtime] Otonom Boşta Öğrenme ve Çevre Gözlem Motoru Aktif!")
+            self.get_logger().info("🤖 [Astro Realtime] Otonom Boşta Öğrenme ve Çevre Gözlem Motoru Aktif (Groq/Gemini 0-Token)!")
+
 
         # ROS 2 Publishers
         self.pub_output_pcm = self.create_publisher(String, "/audio/realtime_output_pcm", 50)
@@ -270,8 +305,24 @@ class AstroRealtimeNode(Node):
     async def _send_session_update(self, ws):
         """Sends comprehensive session configuration with persona prompt, tools, and turn detection."""
         identity = self._get_active_biometric_identity()
+        is_known = identity.get("is_known", False)
+        if is_known:
+            name_val = identity.get("name", "Misafir")
+            title_val = identity.get("formal_title", identity.get("title", name_val))
+            bio_status = (
+                f"\n[GÜNCEL BİYOMETRİK KİMLİK]: Karşındaki kişi %100 tanındı -> İsim: {name_val}, Hitap: {title_val}.\n"
+                f"Kural: Kendisine doğrudan ismiyle ({name_val} veya {title_val}) hitap et."
+            )
+        else:
+            bio_status = (
+                "\n[GÜNCEL BİYOMETRİK KİMLİK]: Karşındaki kişi henüz TANINMIYOR (Bilinmeyen Kişi / Misafir).\n"
+                "KRİTİK KURAL: Kullanıcı 'beni tanıdın mı?', 'sesimden tanıdın mı?', 'ismim ne?', 'kimim ben?' diye sorduğunda "
+                "ASLA 'tanıdım' deme ve asla isim uydurma! Açık ve net şekilde 'Hayır, henüz sesini ve yüzünü tanımıyorum. İstersen beni kaydet de, sesini ve yüzünü hafızama kaydedeyim!' de.\n"
+                "Kullanıcı 'beni kaydet', 'sesimi öğren', 'adım [isim]' veya 'tanışalım' dediğinde HEMEN 'enroll_user_biometrics' aracını çağır!"
+            )
+
         system_prompt = self.persona_engine.build_system_prompt(
-            memory_context=self.memory.get_prompt_context(recognized_person=identity),
+            memory_context=self.memory.get_prompt_context(recognized_person=identity) + bio_status,
             recognized_person=identity
         )
 
@@ -348,14 +399,27 @@ class AstroRealtimeNode(Node):
                             },
                             "required": ["focus"]
                         }
+                    },
+                    {
+                        "type": "function",
+                        "name": "enroll_user_biometrics",
+                        "description": "Kullanıcı 'beni kaydet', 'sesimi öğren', 'yüzümü kaydet', 'adım [isim]' veya 'tanışalım' dediğinde, kullanıcının yüzünü kameradan, sesini mikrofondan alarak robotun kalıcı veri tabanına kaydeder.",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "name": {"type": "string", "description": "Kullanıcının adı (örn: Baran, Batuhan, Mehmet)"},
+                                "formal_title": {"type": "string", "description": "Kullanıcıya hitap şekli (örn: Baran Bey, Sayın Müdürüm)"}
+                            },
+                            "required": ["name"]
+                        }
                     }
                 ]
             }
         }
 
-
         await ws.send(json.dumps(session_config))
-        self.get_logger().info(f"✨ [Realtime WS] Oturum Yapılandırıldı. Kişilik: [{self.persona_name.upper()}], Ses: [{self.realtime_voice}]")
+        self.get_logger().info(f"✨ [Realtime WS] Oturum Yapılandırıldı. Kişilik: [{self.persona_name.upper()}], Ses: [{self.realtime_voice}], Kimlik: [{identity.get('name')}]")
+
 
     async def _handle_realtime_event(self, ws, event: Dict[str, Any]):
         """Dispatches Realtime WebSocket server events."""
@@ -398,6 +462,7 @@ class AstroRealtimeNode(Node):
         # 3b. User Speech Stopped
         elif event_type == "input_audio_buffer.speech_stopped":
             self.get_logger().info("🤫 [Realtime] Cümle bitti, Astro yanıt hazırlıyor...")
+            self._run_voice_identification()
 
         # 3c. Response Created
         elif event_type == "response.created":
@@ -494,7 +559,103 @@ class AstroRealtimeNode(Node):
             focus = args.get("focus", "kullanıcının elindeki nesne, rengi ve çevre")
             return self._inspect_camera_view(focus)
 
+        elif name == "enroll_user_biometrics":
+            name_param = args.get("name", "")
+            formal_title = args.get("formal_title", "")
+            return self._enroll_user_biometrics(name_param, formal_title)
+
         return {"status": "unknown_tool"}
+
+    def _run_voice_identification(self):
+        """Runs acoustic voiceprint matching on the recorded user speech."""
+        if not self.voice_recognizer:
+            return
+        with self._lock:
+            if not self._user_speech_audio_buffer:
+                return
+            raw_16k_all = b"".join(self._user_speech_audio_buffer[-150:])  # Last ~3 seconds
+
+        try:
+            audio_arr = np.frombuffer(raw_16k_all, dtype=np.int16)
+            if len(audio_arr) >= 16000 * 0.4:
+                spk_name, spk_conf, spk_meta = self.voice_recognizer.recognize_voice(audio_arr, sample_rate=16000)
+                is_known_spk = (spk_name is not None and spk_conf >= 0.40)
+                now = time.monotonic()
+                if is_known_spk:
+                    self.get_logger().info(f"🎙️ [Ses Tanıma]: {spk_name} ({spk_meta.get('formal_title', '')}) — Güven: %{int(spk_conf*100)}")
+                    with self._lock:
+                        self._recognized_speaker = {
+                            "name": spk_name,
+                            "title": spk_meta.get("title", ""),
+                            "formal_title": spk_meta.get("formal_title", spk_name),
+                            "confidence": spk_conf,
+                            "is_known": True,
+                            "source": "voice"
+                        }
+                        self._active_person_name = spk_name
+                        self._person_hold_until = now + 45.0
+                    self._sync_perception_to_session()
+                else:
+                    self.get_logger().info(f"🎙️ [Ses Tanıma]: Bilinmeyen Ses / Tanınmadı (Güven: {spk_conf:.2f})")
+                    with self._lock:
+                        self._recognized_speaker = {"name": "Misafir", "confidence": spk_conf, "is_known": False}
+        except Exception as e:
+            self.get_logger().debug(f"Voice id notice: {e}")
+
+    def _enroll_user_biometrics(self, name: str, formal_title: str = "") -> Dict[str, Any]:
+        """Enrolls user face and voice into biometric databases."""
+        name = name.strip().title()
+        formal_title = formal_title.strip() if formal_title else f"{name} Bey"
+
+        # 1. Voice Enrollment
+        voice_ok = False
+        with self._lock:
+            raw_audio_copy = list(self._user_speech_audio_buffer)
+
+        if self.voice_recognizer and raw_audio_copy:
+            try:
+                raw_16k_all = b"".join(raw_audio_copy)
+                audio_arr = np.frombuffer(raw_16k_all, dtype=np.int16)
+                if len(audio_arr) >= 16000 * 0.4:
+                    voice_ok = self.voice_recognizer.enroll_voice(name, audio_arr, sample_rate=16000, title=formal_title)
+                    if voice_ok:
+                        self.get_logger().info(f"🎙️ [Biyometrik Kayıt]: '{name}' ses izi WeSpeaker veri tabanına başarıyla kaydedildi!")
+            except Exception as ve:
+                self.get_logger().warn(f"Voice enrollment warning: {ve}")
+
+        # 2. Face Enrollment
+        face_ok = False
+        with self._lock:
+            frame = self._latest_camera_frame.copy() if self._latest_camera_frame is not None else None
+        if self.face_recognizer and frame is not None:
+            try:
+                face_ok = self.face_recognizer.enroll_face(name, frame, title=formal_title)
+                if face_ok:
+                    self.get_logger().info(f"👁️ [Biyometrik Kayıt]: '{name}' yüz modeli SFace veri tabanına başarıyla kaydedildi!")
+            except Exception as fe:
+                self.get_logger().warn(f"Face enrollment warning: {fe}")
+
+        now = time.monotonic()
+        with self._lock:
+            self._active_person_name = name
+            self._person_hold_until = now + 90.0
+            self._last_synced_identity = ""  # Force immediate session update
+
+        self.memory.profile.set_user_fact(name, "Ad", name)
+        self.memory.profile.set_user_fact(name, "Hitap", formal_title)
+        self._sync_perception_to_session()
+
+        msg = f"{name} ({formal_title}) başarıyla hem sesinden hem de yüzünden Astro'nun hafızasına kaydedildi!"
+        self.get_logger().info(f"✅ [Biyometrik Kayıt Tamamlandı]: {msg}")
+        return {
+            "status": "success",
+            "name": name,
+            "formal_title": formal_title,
+            "voice_enrolled": voice_ok,
+            "face_enrolled": face_ok,
+            "message": msg
+        }
+
 
     def _inspect_camera_view(self, focus: str = "") -> Dict[str, Any]:
         """Captures real-time camera frame from OAK-D Lite and runs visual recognition."""
@@ -780,7 +941,7 @@ class AstroRealtimeNode(Node):
             self.get_logger().info("👂 [Astro Dinliyor]: Mikrofon aktif, sizi dinliyor...")
 
     def _on_input_pcm(self, msg: String):
-        """Sends incoming microphone 24kHz PCM chunk directly to OpenAI Realtime WebSocket."""
+        """Sends incoming microphone 24kHz PCM chunk directly to OpenAI Realtime WebSocket and buffers 16k PCM for speaker recognition."""
         if not msg.data or not self._is_connected or not self._ws or not self._loop:
             return
 
@@ -788,6 +949,19 @@ class AstroRealtimeNode(Node):
         # Do not stream mic audio while Astro is generating or speaking, or within 300ms of playback finish
         if self._is_playback_active or self._is_responding or (time.monotonic() - getattr(self, "_playback_end_time", 0.0) < 0.30):
             return
+
+        # Downsample and buffer 16kHz audio for acoustic voice recognition & dynamic enrollment
+        try:
+            raw_24k = base64.b64decode(msg.data.encode("ascii"))
+            if raw_24k:
+                raw_16k = resample_24k_to_16k(raw_24k)
+                if raw_16k:
+                    with self._lock:
+                        self._user_speech_audio_buffer.append(raw_16k)
+                        if len(self._user_speech_audio_buffer) > 250:
+                            self._user_speech_audio_buffer = self._user_speech_audio_buffer[-250:]
+        except Exception:
+            pass
 
         payload = {
             "type": "input_audio_buffer.append",
@@ -797,6 +971,7 @@ class AstroRealtimeNode(Node):
             asyncio.run_coroutine_threadsafe(self._ws.send(json.dumps(payload)), self._loop)
         except Exception:
             pass
+
 
     def _trigger_proactive_greeting(self, name: str, formal_title: str):
         """Sends proactive greeting message to Realtime session."""
