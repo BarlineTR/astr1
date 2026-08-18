@@ -1093,8 +1093,42 @@ class AstroRealtimeNode(Node):
                 except urllib.error.HTTPError as http_e:
                     error_body = http_e.read().decode("utf-8", errors="ignore")
                     self.get_logger().warn(f"⚠️ [Groq API Hatası ({v_mod})]: {http_e.code} - {error_body}")
-                except Exception as ge:
-                    self.get_logger().warn(f"⚠️ [Groq Genel Uyarısı ({v_mod})]: {ge}")
+        # 3. Emergency Safety Fallback: OpenAI Vision REST API (gpt-4o-mini)
+        # (Only used if Gemini & Groq keys are invalid/failed, so robot never goes blind)
+        if not obs and self.openai_api_key:
+            try:
+                import urllib.request
+                req_data = {
+                    "model": "gpt-4o-mini",
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": [
+                                {"type": "text", "text": prompt_text},
+                                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64_img}"}}
+                            ]
+                        }
+                    ],
+                    "max_tokens": 150
+                }
+                data_bytes = json.dumps(req_data, ensure_ascii=False).encode("utf-8")
+                req = urllib.request.Request(
+                    "https://api.openai.com/v1/chat/completions",
+                    data=data_bytes,
+                    headers={
+                        "Content-Type": "application/json",
+                        "Authorization": f"Bearer {self.openai_api_key}",
+                        "User-Agent": "Mozilla/5.0"
+                    },
+                    method="POST"
+                )
+                with urllib.request.urlopen(req, timeout=6.0) as resp:
+                    resp_json = json.loads(resp.read().decode("utf-8"))
+                    candidate_obs = resp_json["choices"][0]["message"]["content"].strip()
+                    if candidate_obs and not any(rk in candidate_obs.lower() for rk in refusal_kws):
+                        obs = candidate_obs
+            except Exception as oe:
+                self.get_logger().debug(f"OpenAI Vision emergency fallback notice: {oe}")
 
         if obs:
             self.get_logger().info(f"👁️ [Kamera Görme Sonucu]: \"{obs}\"")
@@ -1348,11 +1382,41 @@ class AstroRealtimeNode(Node):
                             if obs:
                                 provider_name = f"Groq ({v_mod})"
                                 break
-                    except urllib.error.HTTPError as http_e:
-                        error_body = http_e.read().decode("utf-8", errors="ignore")
-                        self.get_logger().warn(f"⚠️ [Idle Groq API Hatası ({v_mod})]: {http_e.code} - {error_body}")
-                    except Exception as ge:
-                        self.get_logger().debug(f"Idle Groq Vision ({v_mod}) notice: {ge}")
+            # 3. Emergency Safety Fallback: OpenAI Vision REST (gpt-4o-mini)
+            # (Only used if Gemini & Groq keys are invalid/failed, so robot never goes blind)
+            if not obs and self.openai_api_key:
+                try:
+                    req_data = {
+                        "model": "gpt-4o-mini",
+                        "messages": [
+                            {
+                                "role": "user",
+                                "content": [
+                                    {"type": "text", "text": prompt},
+                                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64_img}"}}
+                                ]
+                            }
+                        ],
+                        "max_tokens": 80
+                    }
+                    data_bytes = json.dumps(req_data, ensure_ascii=False).encode("utf-8")
+                    req = urllib.request.Request(
+                        "https://api.openai.com/v1/chat/completions",
+                        data=data_bytes,
+                        headers={
+                            "Content-Type": "application/json",
+                            "Authorization": f"Bearer {self.openai_api_key}",
+                            "User-Agent": "Mozilla/5.0"
+                        },
+                        method="POST"
+                    )
+                    with urllib.request.urlopen(req, timeout=6.0) as resp:
+                        resp_json = json.loads(resp.read().decode("utf-8"))
+                        obs = resp_json["choices"][0]["message"]["content"].strip()
+                        if obs:
+                            provider_name = "OpenAI (gpt-4o-mini)"
+                except Exception as oe:
+                    self.get_logger().debug(f"Idle OpenAI Vision notice: {oe}")
 
             if obs and len(obs) > 4:
                 self.memory.profile.add_observation(f"Görsel Çevre: {obs}")
