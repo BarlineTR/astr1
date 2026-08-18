@@ -157,8 +157,17 @@ class AstroRealtimeNode(Node):
         self._latest_camera_frame: Optional[np.ndarray] = None
         self._last_img_time = 0.0
 
+        # Autonomous Idle Learning & Environmental Observation
+        self._enable_idle_learning = os.environ.get("ENABLE_IDLE_LEARNING", "true").lower() == "true"
+        self._last_idle_learning_time = 0.0
+        self._last_proactive_gaze_time = 0.0
+        if self._enable_idle_learning:
+            threading.Thread(target=self._idle_learning_loop, daemon=True).start()
+            self.get_logger().info("🤖 [Astro Realtime] Otonom Boşta Öğrenme ve Çevre Gözlem Motoru Aktif!")
+
         # ROS 2 Publishers
         self.pub_output_pcm = self.create_publisher(String, "/audio/realtime_output_pcm", 50)
+
         self.pub_interrupt = self.create_publisher(Bool, "/tts/interrupt", 10)
         self.pub_emotion = self.create_publisher(String, "/robot/emotion", 10)
         self.pub_gesture = self.create_publisher(String, "/robot/head_gesture", 10)
@@ -547,6 +556,141 @@ class AstroRealtimeNode(Node):
         if frame is not None:
             with self._lock:
                 self._latest_camera_frame = frame
+
+    def _idle_learning_loop(self):
+        """Continuous background loop for autonomous room exploration and cognitive memory consolidation."""
+        while rclpy.ok():
+            time.sleep(5)
+            if not self._enable_idle_learning:
+                continue
+
+            # Only run when robot is completely idle and not speaking
+            if self._is_responding or self._is_playback_active:
+                continue
+
+            now = time.monotonic()
+            if (now - self._last_idle_learning_time) > 35.0:
+                self._last_idle_learning_time = now
+
+                # 1. Background Cognitive Memory Reflection
+                self._idle_memory_reflection()
+
+                # 2. Background Room Scene & Object Observation via Camera
+                self._idle_room_observation(now)
+
+    def _idle_memory_reflection(self):
+        """Extracts user preferences and facts from recent dialogue into long-term profile."""
+        messages = self.memory.episodic.get_messages()
+        if len(messages) < 2:
+            return
+        try:
+            recent_conv = messages[-6:]
+            conv_str = "\n".join([f"{m['role']}: {m['content']}" for m in recent_conv])
+            prompt = (
+                f"Aşağıdaki konuşmayı incele. Kullanıcı hakkında öğrenilen yeni, kalıcı ve önemli bir bilgi varsa "
+                f"(örnek: adı, mesleği, hobisi, sevdiği/sevmediği bir şey, tercih ettiği konu) tek bir kısa Türkçe cümle olarak yaz. "
+                f"Yeni veya kayda değer bir bilgi yoksa sadece 'YOK' yaz.\n\nKonuşma:\n{conv_str}"
+            )
+            import urllib.request
+            req_data = {
+                "model": "gpt-4o-mini",
+                "messages": [{"role": "user", "content": prompt}],
+                "temperature": 0.1,
+                "max_tokens": 60
+            }
+            req = urllib.request.Request(
+                "https://api.openai.com/v1/chat/completions",
+                data=json.dumps(req_data).encode("utf-8"),
+                headers={
+                    "Content-Type": "application/json",
+                    "Authorization": f"Bearer {self.openai_api_key}"
+                },
+                method="POST"
+            )
+            with urllib.request.urlopen(req, timeout=4.0) as resp:
+                resp_json = json.loads(resp.read().decode("utf-8"))
+                ans = resp_json["choices"][0]["message"]["content"].strip()
+                if ans and "YOK" not in ans.upper() and len(ans) >= 5:
+                    identity = self._get_active_biometric_identity()
+                    name = identity.get("name", "Misafir")
+                    self.memory.profile.add_observation(f"Kullanıcı Bilgisi ({name}): {ans}")
+                    self.get_logger().info(f"🧠 [Otonom Hafıza Yansıtması]: {ans}")
+                    # Sync to session so Realtime AI immediately knows this new fact
+                    self._sync_perception_to_session()
+        except Exception as e:
+            self.get_logger().debug(f"Memory reflection notice: {e}")
+
+    def _idle_room_observation(self, now: float):
+        """Captures camera view in idle and saves visual environment observations to memory."""
+        with self._lock:
+            frame = self._latest_camera_frame
+
+        if frame is None:
+            return
+
+        b64_img = frame_to_base64_jpeg(frame, max_dim=512)
+        if not b64_img:
+            return
+
+        try:
+            import urllib.request
+            prompt = (
+                "Sen bir sosyal robotun kamera gözüsün. Karşındaki odayı, ortamı, masadaki eşyaları ve etraftaki insanları "
+                "tek bir kısa ve net Türkçe cümleyle açıkla (Örn: 'Masada dizüstü bilgisayar ve kahve fincanı duruyor.' "
+                "veya 'Oda aydınlık, masada çakmak ve telefon var.'). Başka hiçbir şey yazma."
+            )
+            req_data = {
+                "model": "gpt-4o-mini",
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": prompt},
+                            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64_img}"}}
+                        ]
+                    }
+                ],
+                "temperature": 0.2,
+                "max_tokens": 80
+            }
+            req = urllib.request.Request(
+                "https://api.openai.com/v1/chat/completions",
+                data=json.dumps(req_data).encode("utf-8"),
+                headers={
+                    "Content-Type": "application/json",
+                    "Authorization": f"Bearer {self.openai_api_key}"
+                },
+                method="POST"
+            )
+            self.get_logger().info("🕵️ [Otonom Boşta Öğrenme] Etraf sessiz, Astro odayı ve çevreyi inceliyor...")
+            with urllib.request.urlopen(req, timeout=4.0) as resp:
+                resp_json = json.loads(resp.read().decode("utf-8"))
+                obs = resp_json["choices"][0]["message"]["content"].strip()
+                if obs and len(obs) > 4:
+                    self.memory.profile.add_observation(f"Görsel Çevre: {obs}")
+                    self.get_logger().info(f"🧠 [Otonom Boşta Gözlem]: {obs}")
+
+                    # If vision observes a person looking or sitting in front of robot, proactively initiate greeting
+                    obs_l = obs.lower()
+                    if any(kw in obs_l for kw in ["bana bakıyor", "kameraya bakıyor", "karşımda oturan", "biri var", "insan var"]):
+                        if not self._is_responding and not self._is_playback_active:
+                            if (now - self._last_proactive_gaze_time) > 45.0:
+                                self._last_proactive_gaze_time = now
+                                self.get_logger().info(f"👁️ [Görsel Sahne Proaktif Etkileşim]: Astro karşısındaki kişiyi fark etti!")
+                                if self._ws and self._loop and self._is_connected:
+                                    gaze_event = {
+                                        "type": "conversation.item.create",
+                                        "item": {
+                                            "type": "message",
+                                            "role": "user",
+                                            "content": [{"type": "input_text", "text": f"[Sistem Olayı]: Karşındaki kişiyi veya odayı fark ettin ({obs}). Seçili kişiliğinle kısa, doğal ve esprili bir şekilde laf at veya selam ver!"}]
+                                        }
+                                    }
+                                    asyncio.run_coroutine_threadsafe(self._ws.send(json.dumps(gaze_event)), self._loop)
+                                    asyncio.run_coroutine_threadsafe(self._ws.send(json.dumps({"type": "response.create"})), self._loop)
+        except Exception as e:
+            self.get_logger().debug(f"Idle vision observation notice: {e}")
+
 
     def _check_reminders(self):
         now = time.monotonic()
