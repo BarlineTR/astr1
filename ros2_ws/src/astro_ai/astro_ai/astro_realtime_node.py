@@ -341,9 +341,9 @@ class AstroRealtimeNode(Node):
                 f"1. Tanışma & Öğrenme: Karşındaki kişi seninle konuştuğunda veya 'beni tanıdın mı / sesimden tanıdın mı?' dediğinde, "
                 f"seçili kişiliğinle ({self.persona_name}) sesini/yüzünü ilk defa duyduğunu belirt ve adını sorarak tanışmak ve kaydetmek istediğini söyle "
                 f"(Örn: 'Sesini ilk kez duyuyorum, henüz tanışmadık! Adın ne senin, tanışalım mı?' veya Küfürbaz modundaysan 'Ulan sesini ilk defa duyuyorum, kimsin sen? Adını söyle de kaydedeyim koçum!').\n"
-                f"2. Biyometrik Kayıt: Kullanıcı adını söylediğinde (örn: 'Adım Ahmet', 'Mehmet ben', 'Beni kaydet', 'Tanışalım') "
-                f"VAKİT KAYBETMEDEN 'enroll_user_biometrics' fonksiyon aracını çağırarak sesini ve yüzünü sisteme kaydet!\n"
-                f"3. Dürüstlük: Asla 'tanıdım' diyerek yalan söyleme veya uydurma."
+                f"2. Biyometrik Kayıt: SADECE VE SADECE kullanıcı AÇIKÇA kendi adını söylediğinde (örn: 'Adım Ahmet', 'Mehmet ben', 'Bana Ali de') "
+                f"'enroll_user_biometrics' fonksiyonunu çağır! Kullanıcı adını açıkça söylemediyse ASLA kafandan rastgele isim uydurarak bu fonksiyonu çağırma.\n"
+                f"3. Dürüstlük: Asla 'tanıdım' diyerek yalan söyleme, uydurma veya tanınmayan kişiye ezbere Baran deme."
             )
 
         memory_rule = (
@@ -560,6 +560,15 @@ class AstroRealtimeNode(Node):
         # 4. User Speech Transcription Completed
         elif event_type in ("conversation.item.input_audio_transcription.completed", "conversation.item.input_audio_transcription.done"):
             user_transcript = event.get("transcript", "").strip()
+            # Filter out known Whisper background noise / YouTube subtitle hallucinations
+            whisper_hallucinations = [
+                "çeviri ve altyazı", "altyazı m.k.", "altyazı:", "çeviren:", "abone ol", 
+                "izlediğiniz için", "beğenmeyi unutmayın", "subtitle", "transcription by"
+            ]
+            if any(h in user_transcript.lower() for h in whisper_hallucinations):
+                self.get_logger().info(f"🔇 [Gürültü/Halüsinasyon Filtrelendi]: \"{user_transcript}\"")
+                return
+
             if user_transcript:
                 self.get_logger().info(f"🗣️ [Siz]: \"{user_transcript}\"")
                 self.memory.episodic.add_message("user", user_transcript)
@@ -793,6 +802,23 @@ class AstroRealtimeNode(Node):
         formal_title = formal_title.strip() if formal_title else f"{name} Bey"
         formal_title = re.sub(r"\b(bey\s+bey|hanım\s+hanım)\b", "Bey", formal_title, flags=re.IGNORECASE).strip()
 
+        # Strict validation: verify that the user actually introduced this name in recent dialogue
+        recent_user_texts = [
+            m.get("content", "").lower() 
+            for m in self.memory.episodic.get_messages() 
+            if m.get("role") == "user"
+        ][-4:]
+        combined_text = " ".join(recent_user_texts)
+        name_lower = name.lower()
+        has_name_in_speech = (name_lower in combined_text)
+
+        if not has_name_in_speech:
+            self.get_logger().warn(f"⚠️ [Biyometrik Kayıt Reddedildi]: Kullanıcı son konuşmalarında ('{combined_text}') '{name}' ismini söylemedi!")
+            return {
+                "status": "rejected",
+                "message": f"Kullanıcı konuşmasında adının '{name}' olduğunu söylemedi. Kullanıcı adını açıkça söylemeden asla isim uydurma. Kullanıcıya doğrudan adını sor."
+            }
+
         # 1. Voice Enrollment
         voice_ok = False
         with self._lock:
@@ -823,8 +849,24 @@ class AstroRealtimeNode(Node):
 
         now = time.monotonic()
         with self._lock:
+            self._recognized_speaker = {
+                "name": name,
+                "title": formal_title,
+                "formal_title": formal_title,
+                "confidence": 0.95,
+                "is_known": True,
+                "source": "voice"
+            }
+            self._recognized_person = {
+                "name": name,
+                "title": formal_title,
+                "formal_title": formal_title,
+                "confidence": 0.95,
+                "is_known": True,
+                "source": "face"
+            }
             self._active_person_name = name
-            self._person_hold_until = now + 90.0
+            self._person_hold_until = now + 120.0
             self._last_synced_identity = ""  # Force immediate session update
 
         try:
