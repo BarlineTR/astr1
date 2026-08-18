@@ -27,8 +27,10 @@ setup(
     entry_points={
         "console_scripts": [
             "audio_capture_node = astro_audio.audio_capture_node:main",
+            "audio_stream_node = astro_audio.audio_stream_node:main",
             "speech_recognition_node = astro_audio.speech_recognition_node:main",
             "tts_node = astro_audio.tts_node:main",
         ],
+
     },
 )

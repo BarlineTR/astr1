@@ -24,7 +24,9 @@ setup(
     entry_points={
         'console_scripts': [
             'ai_brain_node = astro_ai.ai_brain_node:main',
+            'astro_realtime_node = astro_ai.astro_realtime_node:main',
             'profiler_node = astro_ai.profiler_node:main',
         ],
+
     },
 )
