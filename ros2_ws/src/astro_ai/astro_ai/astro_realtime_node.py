@@ -22,7 +22,14 @@ from typing import Any, Dict, List, Optional
 
 import rclpy
 from rclpy.node import Node
+from sensor_msgs.msg import Image
 from std_msgs.msg import Bool, Float32, String
+
+try:
+    import cv2
+except ImportError:
+    cv2 = None
+import numpy as np
 
 try:
     import websockets
@@ -39,6 +46,38 @@ except ImportError:
     from memory_manager import MemoryManager
     from persona_engine import PersonaEngine
     from state_machine import RobotState, StateMachine
+
+
+def imgmsg_to_bgr(msg: Image) -> Optional[np.ndarray]:
+    if cv2 is None or msg is None or not msg.data:
+        return None
+    try:
+        if msg.encoding == "bgr8":
+            return np.frombuffer(msg.data, dtype=np.uint8).reshape(msg.height, msg.width, 3)
+        elif msg.encoding == "rgb8":
+            data = np.frombuffer(msg.data, dtype=np.uint8).reshape(msg.height, msg.width, 3)
+            return cv2.cvtColor(data, cv2.COLOR_RGB2BGR)
+        elif msg.encoding in ("mono8", "8UC1"):
+            data = np.frombuffer(msg.data, dtype=np.uint8).reshape(msg.height, msg.width)
+            return cv2.cvtColor(data, cv2.COLOR_GRAY2BGR)
+    except Exception:
+        pass
+    return None
+
+
+def frame_to_base64_jpeg(frame: np.ndarray, max_dim: int = 640) -> Optional[str]:
+    if cv2 is None or frame is None:
+        return None
+    try:
+        h, w = frame.shape[:2]
+        if max(h, w) > max_dim:
+            scale = max_dim / float(max(h, w))
+            frame = cv2.resize(frame, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
+        _, buffer = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
+        return base64.b64encode(buffer).decode("utf-8")
+    except Exception:
+        return None
+
 
 
 REALTIME_WS_URL = "wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview"
@@ -110,6 +149,13 @@ class AstroRealtimeNode(Node):
         self._playback_end_time = 0.0
         self._last_synced_identity = "Misafir"
         self._last_sync_time = time.monotonic()
+        self._active_person_name = "Misafir"
+        self._person_hold_until = 0.0
+        self._greeted_people: Dict[str, float] = {}
+
+        # Camera Perception Frame Cache
+        self._latest_camera_frame: Optional[np.ndarray] = None
+        self._last_img_time = 0.0
 
         # ROS 2 Publishers
         self.pub_output_pcm = self.create_publisher(String, "/audio/realtime_output_pcm", 50)
@@ -127,6 +173,8 @@ class AstroRealtimeNode(Node):
         self.create_subscription(Bool, "/vision/looking_at_robot", self._on_looking_at_robot, 10)
         self.create_subscription(Float32, "/vision/user_distance", self._on_user_distance, 10)
         self.create_subscription(Float32, "/audio/doa", self._on_doa, 10)
+        self.create_subscription(Image, "/oak/rgb/image_raw", self._on_camera_image, 10)
+
 
 
         # Reminders storage
@@ -276,10 +324,23 @@ class AstroRealtimeNode(Node):
                             },
                             "required": ["key", "value"]
                         }
+                    },
+                    {
+                        "type": "function",
+                        "name": "inspect_camera_view",
+                        "description": "Kullanıcı 'ne görüyorsun?', 'elimde ne var?', 'bana bak', 'görebiliyor musun?', 'elimdeki ne renk?', 'bu ne?' veya kameranın önündeki eşyaları sorduğunda OAK-D kamerasından canlı görüntü alıp inceler.",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "focus": {"type": "string", "description": "İncelenmesi istenen nesne, detay, renk veya durum (örn: 'elimdeki nesne', 'kıyafet', 'çevre')"}
+                            },
+                            "required": ["focus"]
+                        }
                     }
                 ]
             }
         }
+
 
         await ws.send(json.dumps(session_config))
         self.get_logger().info(f"✨ [Realtime WS] Oturum Yapılandırıldı. Kişilik: [{self.persona_name.upper()}], Ses: [{self.realtime_voice}]")
@@ -417,7 +478,75 @@ class AstroRealtimeNode(Node):
             self.memory.profile.set_user_fact(name_p, key, val)
             return {"status": "success", "message": f"'{key}: {val}' bilgisi hafızaya kaydedildi."}
 
+        elif name == "inspect_camera_view":
+            focus = args.get("focus", "kullanıcının elindeki nesne, rengi ve çevre")
+            return self._inspect_camera_view(focus)
+
         return {"status": "unknown_tool"}
+
+    def _inspect_camera_view(self, focus: str = "") -> Dict[str, Any]:
+        """Captures real-time camera frame from OAK-D Lite and runs visual recognition."""
+        with self._lock:
+            frame = self._latest_camera_frame
+
+        if frame is None:
+            return {"status": "no_camera_frame", "observation": "Kamera görüntüsü şu an alınamadı."}
+
+        b64_img = frame_to_base64_jpeg(frame, max_dim=640)
+        if not b64_img:
+            return {"status": "encode_error", "observation": "Görüntü işlenemedi."}
+
+        # Query OpenAI Vision REST API (gpt-4o-mini)
+        try:
+            import urllib.request
+            req_data = {
+                "model": "gpt-4o-mini",
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": f"Sen Astro adlı sosyal robotun gözüsün. Bu fotoğrafta kullanıcının elinde tuttuğu nesneyi, rengini, materyalini, kullanıcının duruşunu ve çevreyi çok detaylı ve %100 doğru şekilde Türkçe açıkla. Odaklanılacak konu: {focus if focus else 'kullanıcının elindeki nesne ve detayları'}. Doğrudan kesin gözlemini kısa ve net yaz."
+                            },
+                            {
+                                "type": "image_url",
+                                "image_url": {
+                                    "url": f"data:image/jpeg;base64,{b64_img}"
+                                }
+                            }
+                        ]
+                    }
+                ],
+                "max_tokens": 150
+            }
+            req = urllib.request.Request(
+                "https://api.openai.com/v1/chat/completions",
+                data=json.dumps(req_data).encode("utf-8"),
+                headers={
+                    "Content-Type": "application/json",
+                    "Authorization": f"Bearer {self.openai_api_key}"
+                },
+                method="POST"
+            )
+            with urllib.request.urlopen(req, timeout=4.0) as resp:
+                resp_json = json.loads(resp.read().decode("utf-8"))
+                obs = resp_json["choices"][0]["message"]["content"].strip()
+                self.get_logger().info(f"👁️ [Kamera Görme Sonucu]: \"{obs}\"")
+                return {"status": "success", "observation": obs}
+        except Exception as e:
+            self.get_logger().error(f"❌ [Vision Hatası]: {e}")
+            return {"status": "error", "observation": "Görüntü analiz edilirken bir hata oluştu."}
+
+    def _on_camera_image(self, msg: Image):
+        now = time.monotonic()
+        if (now - self._last_img_time) < 0.2:  # Max 5 FPS decoding
+            return
+        self._last_img_time = now
+        frame = imgmsg_to_bgr(msg)
+        if frame is not None:
+            with self._lock:
+                self._latest_camera_frame = frame
 
     def _check_reminders(self):
         now = time.monotonic()
@@ -471,12 +600,50 @@ class AstroRealtimeNode(Node):
         except Exception:
             pass
 
+    def _trigger_proactive_greeting(self, name: str, formal_title: str):
+        """Sends proactive greeting message to Realtime session."""
+        if not self._ws or not self._loop or not self._is_connected:
+            return
+
+        greeting_event = {
+            "type": "conversation.item.create",
+            "item": {
+                "type": "message",
+                "role": "user",
+                "content": [
+                    {
+                        "type": "input_text",
+                        "text": f"[Sistem Olayı]: Karşında {name} ({formal_title}) duruyor! Kendisini seçili kişiliğinle coşkuyla ve uygun hitapla selamla, neşeyle hatırını sor."
+                    }
+                ]
+            }
+        }
+        try:
+            asyncio.run_coroutine_threadsafe(self._ws.send(json.dumps(greeting_event)), self._loop)
+            asyncio.run_coroutine_threadsafe(self._ws.send(json.dumps({"type": "response.create"})), self._loop)
+        except Exception:
+            pass
 
     def _on_recognized_person(self, msg: String):
         try:
             data = json.loads(msg.data)
+            now = time.monotonic()
             with self._lock:
                 self._recognized_person = data
+                if data.get("is_known") and data.get("confidence", 0.0) >= 0.45:
+                    name = data.get("name", "")
+                    title = data.get("title", "")
+                    formal_title = data.get("formal_title", title or name)
+                    self._active_person_name = name
+                    self._person_hold_until = now + 45.0  # Hold identity for 45 seconds
+
+                    # Proactive greeting check: greet once every 2 minutes per person
+                    last_greet = self._greeted_people.get(name, 0.0)
+                    if (now - last_greet) > 120.0 and not self._is_responding and not self._is_playback_active:
+                        self._greeted_people[name] = now
+                        self.get_logger().info(f"👋 [Proaktif Selamlama]: {name} ({formal_title}) algılandı — Selamlama başlatılıyor!")
+                        self._trigger_proactive_greeting(name, formal_title)
+
             self._sync_perception_to_session()
         except Exception:
             pass
@@ -503,15 +670,22 @@ class AstroRealtimeNode(Node):
         self._speaker_angle = float(msg.data)
 
     def _get_active_biometric_identity(self) -> Dict[str, Any]:
+        now = time.monotonic()
         with self._lock:
             face = self._recognized_person or {}
             spk = self._recognized_speaker or {}
+            held_name = getattr(self, "_active_person_name", "Misafir")
+            hold_until = getattr(self, "_person_hold_until", 0.0)
 
         if face.get("is_known") and face.get("confidence", 0.0) >= 0.45:
             return {**face, "source": "face"}
         if spk.get("is_known") and spk.get("confidence", 0.0) >= 0.40:
             return {**spk, "source": "voice"}
+        if now < hold_until and held_name != "Misafir":
+            return {"name": held_name, "title": held_name, "formal_title": held_name, "is_known": True, "source": "memory_hold"}
+
         return {"name": "Misafir", "title": "Ziyaretçi", "formal_title": "Misafir", "is_known": False}
+
 
     def _sync_perception_to_session(self):
         """Dynamically syncs persona & recognized identity to the active OpenAI Realtime session ONLY when identity changes."""
