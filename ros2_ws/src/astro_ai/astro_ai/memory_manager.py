@@ -90,9 +90,20 @@ class PersistentProfile:
             if env_path:
                 self.filepath = os.path.expanduser(env_path)
             else:
-                self.filepath = os.path.expanduser("~/Desktop/astr1/ros2_ws/astro_memory.json")
+                candidates = [
+                    os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..", "astro_memory.json")),
+                    os.path.expanduser("~/Desktop/astr1/ros2_ws/astro_memory.json"),
+                    os.path.expanduser("~/Desktop/astr1/astro_memory.json"),
+                    os.path.abspath("./astro_memory.json")
+                ]
+                self.filepath = candidates[1]
+                for c in candidates:
+                    if os.path.exists(c):
+                        self.filepath = c
+                        break
         else:
             self.filepath = filepath
+
 
         self._lock = threading.Lock()
         self.data: Dict[str, Any] = {

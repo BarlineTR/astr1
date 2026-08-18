@@ -229,6 +229,11 @@ class AstroRealtimeNode(Node):
         self._reminders: List[Dict[str, Any]] = []
         self.create_timer(1.0, self._check_reminders)
 
+        # Long-Term Episodic Session Lifecycle & Summarizer Timer
+        self._last_summarized_turn_count = 0
+        self.create_timer(1.0, self._check_session_lifecycle)
+
+
         # Async WebSocket Loop in background thread
         self._ws = None
         self._loop = None
@@ -331,10 +336,18 @@ class AstroRealtimeNode(Node):
                 f"3. Dürüstlük: Asla 'tanıdım' diyerek yalan söyleme veya uydurma."
             )
 
+        memory_rule = (
+            "\n\n[HAFIZA VE GEÇMİŞ KONUŞMALARI HATIRLAMA KURALI]:\n"
+            "- Sana yukarıda 'Kalıcı Bilgilerin', 'Geçmiş Konuşmaların', 'Tercihler' ve 'Kullanıcı Bilgisi' başlıkları altında gerçek hafıza verilerin verilmiştir.\n"
+            "- Kullanıcı 'Daha önce ne konuştuk?', 'Ne konuşmuştuk?', 'Hakkımda ne biliyorsun?', 'Beni hatırladın mı?', 'Hafızanda ne kayıtlı?' diye sorduğunda, "
+            "ASLA 'hatırlamıyorum' veya 'geçmişi bilmiyorum' deme! Hafızandaki geçmiş diyalog özetlerini, kullanıcının tercihlerini ve bildiğin bilgileri samimiyetle ve net olarak söyle!"
+        )
+
         return self.persona_engine.build_system_prompt(
-            memory_context=self.memory.get_prompt_context(recognized_person=identity) + bio_status,
+            memory_context=self.memory.get_prompt_context(recognized_person=identity) + bio_status + memory_rule,
             recognized_person=identity
         )
+
 
     async def _send_session_update(self, ws):
         """Sends comprehensive session configuration with persona prompt, tools, and turn detection."""
@@ -513,6 +526,8 @@ class AstroRealtimeNode(Node):
             if user_transcript:
                 self.get_logger().info(f"🗣️ [Siz]: \"{user_transcript}\"")
                 self.memory.episodic.add_message("user", user_transcript)
+                self.session.record_user_speech()
+                self.session.activate_session(reason="user_speech")
                 t_msg = String()
                 t_msg.data = user_transcript
                 self.pub_transcript.publish(t_msg)
@@ -523,6 +538,8 @@ class AstroRealtimeNode(Node):
             if assistant_transcript:
                 self.get_logger().info(f"🤖 [Astro Realtime]: \"{assistant_transcript}\"")
                 self.memory.episodic.add_message("assistant", assistant_transcript)
+                self.session.record_robot_speech()
+
 
         # 6. Realtime Function Calling Execution
         elif event_type in ("response.function_call_arguments.done", "response.output_item.done"):
@@ -1044,8 +1061,81 @@ class AstroRealtimeNode(Node):
                 asyncio.run_coroutine_threadsafe(self._ws.send(json.dumps(alarm_event)), self._loop)
                 asyncio.run_coroutine_threadsafe(self._ws.send(json.dumps({"type": "response.create"})), self._loop)
 
+    def _check_session_lifecycle(self):
+        """Periodically checks if the active session ended and summarizes it into long-term profile."""
+        if not self.session.is_active():
+            return
+
+        is_speaking = self._is_responding or self._is_playback_active
+        if is_speaking:
+            self.session.record_robot_speech()
+
+        was_active = self.session.is_active()
+        self.session.check_and_update_session_lifecycle(is_robot_speaking=is_speaking)
+
+        # If session just timed out / went idle after active turns:
+        if was_active and not self.session.is_active():
+            msgs = self.memory.episodic.get_messages()
+            if len(msgs) >= 2 and len(msgs) > getattr(self, "_last_summarized_turn_count", 0):
+                self._last_summarized_turn_count = len(msgs)
+                identity = self._get_active_biometric_identity()
+                p_name = identity.get("name", "Baran") if identity.get("is_known") else "Baran"
+                dialogue_text = " | ".join([f"{m.get('role')}: {m.get('content')}" for m in msgs[-6:]])
+                threading.Thread(target=self._async_summarize_and_save_session, args=(dialogue_text, p_name), daemon=True).start()
+
+    def _async_summarize_and_save_session(self, dialogue_text: str, person_name: str):
+        """Summarizes ended conversation using Groq / Gemini (0 OpenAI cost) and saves into persistent memory."""
+        prompt = (
+            f"Aşağıdaki kısa diyalogda ne konuşulduğunu tek bir kısa Türkçe cümleyle (örn: 'Hava durumu ve yemek planı konuşuldu') özetle:\n"
+            f"{dialogue_text}"
+        )
+        summary = None
+        # 1. Try Groq (0 Token Cost)
+        if self.groq_api_key:
+            try:
+                import urllib.request
+                req_data = {
+                    "model": "llama-3.3-70b-versatile",
+                    "messages": [{"role": "user", "content": prompt}],
+                    "temperature": 0.2,
+                    "max_tokens": 50
+                }
+                req = urllib.request.Request(
+                    "https://api.groq.com/openai/v1/chat/completions",
+                    data=json.dumps(req_data).encode("utf-8"),
+                    headers={
+                        "Content-Type": "application/json",
+                        "Authorization": f"Bearer {self.groq_api_key}"
+                    },
+                    method="POST"
+                )
+                with urllib.request.urlopen(req, timeout=4.0) as resp:
+                    resp_json = json.loads(resp.read().decode("utf-8"))
+                    summary = resp_json["choices"][0]["message"]["content"].strip()
+            except Exception:
+                pass
+
+        # 2. Try Gemini REST (0 Token Cost fallback)
+        if not summary and self.gemini_api_key:
+            try:
+                import urllib.request
+                url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={self.gemini_api_key}"
+                payload = {"contents": [{"parts": [{"text": prompt}]}], "generationConfig": {"temperature": 0.2, "maxOutputTokens": 50}}
+                req = urllib.request.Request(url, data=json.dumps(payload).encode("utf-8"), headers={"Content-Type": "application/json"})
+                with urllib.request.urlopen(req, timeout=4.0) as resp:
+                    res_json = json.loads(resp.read().decode("utf-8"))
+                    summary = res_json["candidates"][0]["content"]["parts"][0]["text"].strip()
+            except Exception:
+                pass
+
+        if summary and len(summary) > 5:
+            self.memory.profile.add_person_session_summary(person_name, summary)
+            self.get_logger().info(f"📝 [Kalıcı Hafıza Kaydı ({person_name})]: 'Önceki konuşma hafızaya kaydedildi -> {summary}'")
+            self._sync_perception_to_session()
+
     def _on_playback_active(self, msg: Bool):
         was_active = self._is_playback_active
+
         self._is_playback_active = bool(msg.data)
         if was_active and not self._is_playback_active:
             self._playback_end_time = time.monotonic()
