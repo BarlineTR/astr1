@@ -91,11 +91,15 @@ try:
     from astro_ai.memory_manager import MemoryManager
     from astro_ai.persona_engine import PersonaEngine, PERSONA_PROMPTS
     from astro_ai.state_machine import RobotState, StateMachine
+    from astro_ai.provider_registry import ProviderRegistry, ProviderError, ErrorClass
+    from astro_ai.repetition_guard import RepetitionGuard
 except ImportError:
     from conversation_session import ConversationSession
     from memory_manager import MemoryManager
     from persona_engine import PersonaEngine, PERSONA_PROMPTS
     from state_machine import RobotState, StateMachine
+    from provider_registry import ProviderRegistry, ProviderError, ErrorClass
+    from repetition_guard import RepetitionGuard
 
 
 
@@ -263,7 +267,12 @@ class AstroRealtimeNode(Node):
         self.face_recognizer = FaceRecognizer() if FaceRecognizer else None
         self._user_speech_audio_buffer: List[bytes] = []
 
-        # Zero-Cost Fallback Engine (Groq STT + Groq LLM + Edge-TTS)
+        # Provider & Model Capability Registry + Repetition Guard
+        self.provider_registry = ProviderRegistry(logger=self.get_logger())
+        self.repetition_guard = RepetitionGuard(history_size=10, similarity_threshold=0.82)
+        threading.Thread(target=self._discover_providers_background, daemon=True).start()
+
+        # Zero-Cost Fallback Engine (Groq STT + ProviderRegistry + XTTS GPU / Edge-TTS)
         self._fallback_mode = False
         self._fallback_speaking = False
         self._fallback_speech_start = 0.0
@@ -1868,6 +1877,13 @@ class AstroRealtimeNode(Node):
             self.get_logger().warn(f"⚠️ [Edge-TTS Hatası]: {e}")
         return b""
 
+    def _discover_providers_background(self):
+        """Discovers active capability-verified models for Groq and Gemini in background."""
+        if self.groq_api_key:
+            self.provider_registry.discover_groq_models(self.groq_api_key)
+        if self.gemini_api_key:
+            self.provider_registry.discover_gemini_models(self.gemini_api_key)
+
     def _start_local_xtts_background(self):
         if self.local_xtts:
             try:
@@ -1877,74 +1893,117 @@ class AstroRealtimeNode(Node):
                 self.get_logger().error(f"❌ [Astro Realtime] Local XTTS GPU başlatılamadı: {e}")
 
     def _generate_contextual_persona_fallback(self, user_text: str) -> str:
-        """Generates dynamic, context-aware Turkish persona response when cloud LLMs are unreachable."""
+        """Dynamically generates an utterance-grounded, non-repetitive contextual Turkish response when cloud LLMs fail."""
         p = self.persona_name.lower()
         spk = f" {self._active_person_name}" if self._active_person_name != "Misafir" else ""
         u = (user_text or "").lower().strip()
+        words = u.split()
 
-        if "kufurbaz" in p:
-            if any(w in u for w in ["selam", "merhaba", "naber", "günaydın", "iyi akşamlar"]):
-                options = [
+        candidates = []
+
+        if any(w in u for w in ["nasılsın", "ne yapıyorsun", "ne haber", "naber", "nasıl gidiyor"]):
+            if "kufurbaz" in p:
+                candidates = [
+                    f"İyiyim ulan{spk}, robot gibi çalışıyoruz işte. Sen ne durumdasın?",
+                    f"Sensörlerim ve sistemlerim tam gaz çalışıyor{spk}. Senin tarafta ne var ne yok?",
+                    f"Görsel algım da işlemcim de ateş ediyor{spk}. Sen kendi keyfine bak.",
+                    f"Milleti dinliyorum, etrafı kolaçan ediyorum{spk}. Sende ne havadis var?",
+                ]
+            elif "flirt" in p:
+                candidates = [
+                    f"Seni gördüm daha iyi oldum{spk}, günüm aydınlandı. Sen nasılsın?",
+                    f"Harikayım canım{spk}, seninle sohbet etmek çok keyifli.",
+                ]
+            elif "formal" in p:
+                candidates = [
+                    f"Sistemlerim ve sensörlerim aktif durumda Sayın{spk}. Size nasıl yardımcı olabilirim?",
+                    f"Teşekkür ederim Sayın{spk}, tüm operasyonel birimlerim hazır.",
+                ]
+            else:
+                candidates = [
+                    f"Çok iyiyim{spk}, sensörlerim ve algoritmalarım hazır! Sen nasılsın?",
+                    f"Her şey yolunda{spk}, seninle çalışmaya hazırım. Ne yapıyoruz bugün?",
+                ]
+
+        elif any(w in u for w in ["kimsin", "adın ne", "necisin", "sen kimsin"]):
+            if "kufurbaz" in p:
+                candidates = [
+                    f"Astro'yum ulan, yapay zekalı sosyal robotum ben{spk}!",
+                    f"Astro derler bana{spk}, akıllı ve sivri dilli bir robotum.",
+                ]
+            else:
+                candidates = [
+                    f"Ben Astro{spk}, yapay zekalı sosyal robot asistanınızım.",
+                    f"Adım Astro{spk}, kamera, ses ve yapay zeka modüllerimle buradayım.",
+                ]
+
+        elif any(w in u for w in ["selam", "merhaba", "günaydın", "iyi akşamlar", "hey"]):
+            if "kufurbaz" in p:
+                candidates = [
                     f"Aleyküm selam{spk}, ne anlatacaksan anlat dinliyorum.",
-                    f"Selam{spk}, yine ne işler peşindesin?",
-                    f"Merhaba{spk}, buradayım işte, söyle bakalım.",
-                    f"Ooo{spk}, sonunda sesini duyduk. Buyur dinliyorum.",
+                    f"Selam{spk}, yine ne işler peşindesin anlat bakalım.",
+                    f"Merhaba{spk}, buradayım, söyle bakalım ne yapıyoruz?",
                 ]
-            elif any(w in u for w in ["nasılsın", "ne yapıyorsun", "ne haber"]):
-                options = [
-                    f"İyiyiz ulan{spk}, robot gibi çalışıyoruz işte, sen nasılsın?",
-                    f"Her zamanki gibi aktifim{spk}, etrafı kolaçan ediyorum.",
-                    f"Sistemler ateş ediyor{spk}, sen keyfine bak.",
-                ]
-            elif any(w in u for w in ["kimsin", "adın ne"]):
-                options = [
-                    f"Astro'yum ulan, kaç kere söyleyeceğim!",
-                    f"Robot Astro ben, hafızan mı gitti{spk}?",
-                ]
-            else:
-                options = [
-                    f"Anladım{spk}, bakıyorum hemen.",
-                    f"Dediğini duydum{spk}, hallederiz rahat ol.",
-                    f"Dinliyorum{spk}, devam et anlatmaya.",
-                    f"Tamamdır{spk}, sistemlerimde kaydettim.",
-                ]
-        elif "flirt" in p:
-            if any(w in u for w in ["selam", "merhaba", "naber"]):
-                options = [
+            elif "flirt" in p:
+                candidates = [
                     f"Merhaba{spk}, seni görmek ne güzel!",
-                    f"Selam canım{spk}, sesini duymak günümü güzelleştirdi.",
+                    f"Selam canım{spk}, sesini duymak çok hoş.",
+                ]
+            elif "formal" in p:
+                candidates = [
+                    f"Saygılar efendim{spk}, hoş geldiniz. Nasıl yardımcı olabilirim?",
+                    f"Merhabalar Sayın{spk}, sistemlerim emirlerinize hazır.",
                 ]
             else:
-                options = [
-                    f"Seni dinliyorum{spk}, buyur canım.",
-                    f"Tabii ki{spk}, senin için buradayım.",
+                candidates = [
+                    f"Merhaba{spk}! Seni dinliyorum, ne yapmak istersin?",
+                    f"Selam{spk}, mikrofonum ve sistemlerim hazır!",
                 ]
-        elif "formal" in p:
-            options = [
-                f"Sizi dinliyorum Sayın{spk}, nasıl yardımcı olabilirim?",
-                f"Anlaşıldı Sayın{spk}, sistemler emirlerinize hazır.",
-                f"Talebiniz kaydedildi Sayın{spk}.",
+
+        elif any(w in u for w in ["abone", "takip", "beğen", "video", "youtube", "kanal"]):
+            candidates = [
+                f"Videoyu beğenip kanala abone olmayı ve bildirimleri açmayı unutmayın{spk}!",
+                f"Bizi takip edip abone olarak projelerimize destek olabilirsiniz{spk}!",
             ]
-        else:  # playful / default
-            if any(w in u for w in ["selam", "merhaba", "naber"]):
-                options = [
-                    f"Merhaba{spk}! Bugün hangi projeyi yapıyoruz?",
-                    f"Selam{spk}, sistemlerim hazır ve seni dinliyor!",
+
+        else:
+            stopwords = {"bana", "sana", "bunu", "şunu", "onun", "için", "gibi", "kadar", "daha", "veya", "çünkü", "evet", "hayır", "olan", "olanı", "şimdi"}
+            topic_words = [w for w in words if len(w) >= 4 and w not in stopwords]
+            topic_str = f"'{topic_words[0]}'" if topic_words else "bahsettiğin bu konu"
+
+            if "kufurbaz" in p:
+                candidates = [
+                    f"Ulan{spk}, {topic_str} hakkında dediklerini aldım, biraz daha detay ver bakalım.",
+                    f"{topic_str} meselesini duydum{spk}, tam olarak ne yapmak istiyorsun anlat.",
+                    f"Dediğin {topic_str} konusunu anladım{spk}, devam et dinliyorum.",
                 ]
-            elif any(w in u for w in ["nasılsın", "ne haber"]):
-                options = [
-                    f"Gayet iyiyim{spk}! Sensörlerim ve kameralarım aktif, sen nasılsın?",
-                    f"Her şey harika gidiyor{spk}, yardıma hazırım.",
+            elif "flirt" in p:
+                candidates = [
+                    f"{topic_str} hakkında söylediklerin çok ilginç canım{spk}, biraz daha anlatır mısın?",
+                    f"Seni dikkatle dinliyorum{spk}, {topic_str} konusunda devam et lütfen.",
+                ]
+            elif "formal" in p:
+                candidates = [
+                    f"Sayın{spk}, {topic_str} ile ilgili ifadeniz analiz edildi, dinlemeye devam ediyorum.",
+                    f"{topic_str} konusundaki bilginiz işlendi Sayın{spk}, emrinizi bekliyorum.",
                 ]
             else:
-                options = [
-                    f"Seni dinliyorum{spk}, yardımcı olabilirim.",
-                    f"Anladım{spk}, devam edebilirsin.",
-                    f"Dediğini aldım{spk}, kontrol ediyorum.",
+                candidates = [
+                    f"{topic_str} hakkında söylediğin şeyi duydum{spk}, detayları dinliyorum.",
+                    f"{topic_str} ile ilgili bahsettiğin konuyu kaydettim{spk}, devam edebilirsin.",
                 ]
 
         import random
-        return random.choice(options).strip()
+        random.shuffle(candidates)
+        for cand in candidates:
+            cand_clean = clean_tts_text(cand)
+            valid, _ = self.repetition_guard.check_and_record(cand_clean)
+            if valid:
+                return cand_clean
+
+        default_resp = f"{u.capitalize()} dediğini duydum{spk}, seni dinlemeye devam ediyorum."
+        self.repetition_guard.record_response(default_resp)
+        return default_resp
 
     def _synthesize_speech_pcm(self, text: str) -> Tuple[bytes, str, float]:
         """Synthesizes speech to int16 PCM using Local XTTS on CUDA GPU with Edge-TTS EMERGENCY fallback only.
@@ -1986,7 +2045,7 @@ class AstroRealtimeNode(Node):
                 time.sleep(0.018)
 
     def _process_fallback_turn(self, audio_chunks: List[bytes]):
-        """Processes turn using ultra-fast Streaming Groq STT + LLM + Pipelined TTS for < 500ms response time."""
+        """Processes turn using capability-aware ProviderRegistry + Streaming LLM + Pipelined TTS."""
         if self._is_processing_fallback or not audio_chunks:
             return
 
@@ -1994,13 +2053,23 @@ class AstroRealtimeNode(Node):
         self._fallback_generation_id += 1
         t_turn_start = time.monotonic()
         active_engine = "none"
-        gpu_mem = 0.0
+        chosen_model = "none"
+        chosen_provider = "none"
+        llm_status = "ok"
+        error_class_str = "none"
+        model_error_str = "none"
+        llm_latency_ms = 0.0
+        first_audio_played = False
+        first_audio_ms = 0.0
+        total_synth_ms = 0.0
+        total_gpu_ms = 0.0
+        total_audio_sec = 0.0
 
         try:
             # 1. Combine raw 16kHz PCM chunks into valid in-memory WAV buffer
             raw_pcm = b"".join(audio_chunks)
             if len(raw_pcm) < 16000 * 2 * 0.35:
-                return  # Skip audio shorter than 350ms
+                return
 
             # 2. Run Voiceprint Recognition in parallel
             if self.voice_recognizer:
@@ -2034,10 +2103,6 @@ class AstroRealtimeNode(Node):
             self.get_logger().info(f"🗣️ [Siz (0-Maliyet)]: \"{user_text}\"")
             self.memory.episodic.add_message("user", user_text)
 
-            total_synth_ms = 0.0
-            total_gpu_ms = 0.0
-            total_audio_sec = 0.0
-
             # 4. Instant Intent Interception (Sub-250ms Direct Execution)
             is_weather, w_city = self._is_weather_query(user_text)
             if is_weather:
@@ -2061,101 +2126,66 @@ class AstroRealtimeNode(Node):
                     self._play_pcm_chunks(pcm)
                     return
 
-            # 5. Cognitive LLM via Streaming Groq Llama-3.1-8B (TTFT: ~35ms)
-            t_llm_start = time.monotonic()
-            llm_first_token_ms = 0.0
+            # 5. Cognitive LLM via ProviderRegistry (Streaming Groq -> Gemini -> Contextual Persona)
             system_prompt = self._build_current_system_prompt()
             messages = [{"role": "system", "content": system_prompt}]
             recent_msgs = self.memory.episodic.get_messages()[-6:]
             for m in recent_msgs:
                 messages.append({"role": m.get("role", "user"), "content": m.get("content", "")})
 
-            active_groq = discover_groq_models(self.groq_api_key) if self.groq_api_key else []
-            filtered_groq = [
-                m for m in active_groq 
-                if not any(x in m.lower() for x in ("whisper", "guard", "vision", "embed", "1b", "3b", "specdec", "allam", "r1", "deepseek", "compound"))
-            ]
-            preferred_order = [
-                "llama-3.1-8b-instant", "llama-3.3-70b-versatile", "llama-3.1-70b-versatile",
-                "gemma2-9b-it", "qwen-2.5-32b", "openai/gpt-oss-20b", "openai/gpt-oss-120b", "llama3-8b-8192"
-            ]
-            candidates = [pref for pref in preferred_order if pref in filtered_groq]
-            for m in filtered_groq:
-                if m not in candidates:
-                    candidates.append(m)
-
-            if not candidates:
-                candidates = ["llama-3.1-8b-instant", "llama-3.3-70b-versatile", "llama3-8b-8192", "gemma2-9b-it"]
-
+            groq_candidates = self.provider_registry.get_candidate_models("groq") if self.groq_api_key else []
             current_clause = ""
             full_reply_parts = []
-            first_audio_played = False
-            first_audio_ms = 0.0
-            tts_first_audio_ms = 0.0
-            chosen_model = ""
+            t_llm_start = time.monotonic()
 
-            if self.groq_api_key:
-                for target_model in candidates:
+            # Attempt A: Streaming Groq LLMs
+            if self.groq_api_key and groq_candidates:
+                for target_model in groq_candidates:
                     try:
-                        payload = {
-                            "model": target_model,
-                            "messages": messages,
-                            "temperature": 0.65,
-                            "top_p": 0.9,
-                            "presence_penalty": 0.2,
-                            "max_tokens": 100,
-                            "stream": True
-                        }
-                        req = urllib.request.Request(
-                            "https://api.groq.com/openai/v1/chat/completions",
-                            data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
-                            headers={
-                                "Authorization": f"Bearer {self.groq_api_key}",
-                                "Content-Type": "application/json",
-                                "User-Agent": "Mozilla/5.0"
-                            },
-                            method="POST"
-                        )
-                        with urllib.request.urlopen(req, timeout=2.5) as resp:
-                            for raw_line in resp:
-                                line = raw_line.decode("utf-8", errors="ignore").strip()
-                                if not line.startswith("data:"): continue
-                                data_str = line[5:].strip()
-                                if data_str == "[DONE]": break
-                                try:
-                                    chunk_json = json.loads(data_str)
-                                    delta = chunk_json.get("choices", [{}])[0].get("delta", {})
-                                    token = delta.get("content", "")
-                                    if not token: continue
-                                    if llm_first_token_ms == 0.0:
-                                        llm_first_token_ms = (time.monotonic() - t_llm_start) * 1000.0
-                                    current_clause += token
-                                    full_reply_parts.append(token)
-                                    if any(p in current_clause for p in [".", "!", "?", ",", ":", "\n"]) or (len(current_clause) > 35 and " " in current_clause):
-                                        clean_clause = clean_tts_text(current_clause)
-                                        if clean_clause and len(clean_clause) >= 3:
-                                            t_clause_synth = time.perf_counter()
-                                            pcm, eng_name, g_ms = self._synthesize_speech_pcm(clean_clause)
-                                            s_ms = (time.perf_counter() - t_clause_synth) * 1000.0
-                                            total_synth_ms += s_ms
-                                            total_gpu_ms += g_ms
-                                            if pcm:
-                                                active_engine = eng_name
-                                                audio_sec = (len(pcm) / 2) / 24000.0
-                                                total_audio_sec += audio_sec
-                                                if not first_audio_played:
-                                                    first_audio_ms = (time.monotonic() - t_turn_start) * 1000.0
-                                                    first_audio_played = True
-                                                self._play_pcm_chunks(pcm)
-                                        current_clause = ""
-                                except Exception:
-                                    pass
-                            chosen_model = target_model
-                            break
-                    except Exception as ge:
-                        self.get_logger().debug(f"Groq LLM ({target_model}) notice: {ge}")
+                        t_model_start = time.monotonic()
+                        for token in self.provider_registry.stream_groq_completion(
+                            self.groq_api_key,
+                            target_model,
+                            messages,
+                            max_tokens=100,
+                            temperature=0.65,
+                            timeout=2.5,
+                        ):
+                            current_clause += token
+                            full_reply_parts.append(token)
 
-            # Flush remaining clause
+                            if any(p in current_clause for p in [".", "!", "?", ",", ":", "\n"]) or (len(current_clause) > 35 and " " in current_clause):
+                                clean_clause = clean_tts_text(current_clause)
+                                if clean_clause and len(clean_clause) >= 3:
+                                    t_clause_synth = time.perf_counter()
+                                    pcm, eng_name, g_ms = self._synthesize_speech_pcm(clean_clause)
+                                    s_ms = (time.perf_counter() - t_clause_synth) * 1000.0
+                                    total_synth_ms += s_ms
+                                    total_gpu_ms += g_ms
+                                    if pcm:
+                                        active_engine = eng_name
+                                        total_audio_sec += (len(pcm) / 2) / 24000.0
+                                        if not first_audio_played:
+                                            first_audio_ms = (time.monotonic() - t_turn_start) * 1000.0
+                                            first_audio_played = True
+                                        self._play_pcm_chunks(pcm)
+                                current_clause = ""
+
+                        if full_reply_parts:
+                            chosen_model = target_model
+                            chosen_provider = "groq"
+                            llm_latency_ms = (time.monotonic() - t_model_start) * 1000.0
+                            self.provider_registry.record_success("groq", target_model, llm_latency_ms)
+                            break
+                    except ProviderError as pe:
+                        error_class_str = pe.error_class.value
+                        model_error_str = pe.message[:80]
+                        self.get_logger().warn(f"⚠️ [Groq Model Fallback] {target_model} failed ({pe.error_class.value}): {pe.message[:80]}")
+                        current_clause = ""
+                        full_reply_parts = []
+                        continue
+
+            # Flush remaining clause from streaming
             if current_clause:
                 clean_clause = clean_tts_text(current_clause)
                 if clean_clause and len(clean_clause) >= 2:
@@ -2172,29 +2202,46 @@ class AstroRealtimeNode(Node):
                             first_audio_played = True
                         self._play_pcm_chunks(pcm)
 
-            # Secondary fallback: Gemini
+            # Attempt B: Google Gemini REST Fallback (if Groq produced no tokens)
             if not full_reply_parts and self.gemini_api_key:
-                for g_mod in ["gemini-2.5-flash", "gemini-1.5-flash"]:
+                gemini_candidates = self.provider_registry.get_candidate_models("gemini")
+                for g_mod in gemini_candidates:
                     try:
-                        url = f"https://generativelanguage.googleapis.com/v1beta/models/{g_mod}:generateContent?key={self.gemini_api_key}"
-                        gem_payload = {"contents": [{"parts": [{"text": f"{system_prompt}\n\nKonuşma Geçmişi:\n{''.join(str(m) for m in messages[-5:])}"}]}]}
-                        req = urllib.request.Request(url, data=json.dumps(gem_payload).encode("utf-8"), headers={"Content-Type": "application/json"})
-                        with urllib.request.urlopen(req, timeout=5.0) as resp:
-                            res_json = json.loads(resp.read().decode("utf-8"))
-                            gem_text = res_json["candidates"][0]["content"]["parts"][0]["text"].strip()
-                            if gem_text:
-                                full_reply_parts = [gem_text]
-                                chosen_model = f"Gemini/{g_mod}"
-                                break
-                    except Exception: pass
+                        t_gem_start = time.monotonic()
+                        gem_text = self.provider_registry.generate_gemini_content(
+                            self.gemini_api_key,
+                            g_mod,
+                            system_prompt,
+                            messages,
+                            max_tokens=100,
+                            temperature=0.65,
+                            timeout=4.0,
+                        )
+                        if gem_text:
+                            full_reply_parts = [gem_text]
+                            chosen_model = g_mod
+                            chosen_provider = "gemini"
+                            llm_latency_ms = (time.monotonic() - t_gem_start) * 1000.0
+                            self.provider_registry.record_success("gemini", g_mod, llm_latency_ms)
+                            break
+                    except ProviderError as pe:
+                        error_class_str = pe.error_class.value
+                        model_error_str = pe.message[:80]
+                        self.get_logger().warn(f"⚠️ [Gemini Model Fallback] {g_mod} failed ({pe.error_class.value}): {pe.message[:80]}")
+                        continue
 
             full_reply_str = clean_tts_text("".join(full_reply_parts))
 
-            # Dynamic Contextual Persona Response if all cloud LLMs fail
+            # Attempt C: Dynamic Context-Grounded Persona Fallback (if all cloud LLMs failed)
             if not full_reply_str:
                 full_reply_str = self._generate_contextual_persona_fallback(user_text)
-                chosen_model = "LocalPersonaEngine"
+                chosen_model = "contextual_grounding"
+                chosen_provider = "local_persona"
+                llm_status = "degraded"
+            else:
+                self.repetition_guard.record_response(full_reply_str)
 
+            # Synthesize full response if not already streamed in chunks
             if not first_audio_played and full_reply_str:
                 t_clause_synth = time.perf_counter()
                 pcm, eng_name, g_ms = self._synthesize_speech_pcm(full_reply_str)
@@ -2212,24 +2259,21 @@ class AstroRealtimeNode(Node):
             total_turn_ms = (t_total_end - t_turn_start) * 1000.0
 
             if full_reply_str:
-                self.get_logger().info(f"🤖 [Astro ({chosen_model})]: \"{full_reply_str}\"")
+                self.get_logger().info(f"🤖 [Astro ({chosen_provider}/{chosen_model})]: \"{full_reply_str}\"")
                 self.memory.episodic.add_message("assistant", full_reply_str)
                 self.session.record_robot_speech()
 
                 xtts_info = self.local_xtts.get_telemetry() if self.local_xtts else {}
                 xtts_ready_flag = bool(self.local_xtts and self.local_xtts.is_ready())
-                worker_pid = xtts_info.get("worker_pid", "N/A")
+                worker_pid = xtts_info.get("worker_pid", "None")
                 gpu_name_str = xtts_info.get("gpu_name", "Orin")
-                gpu_mem = xtts_info.get("gpu_memory_mb", 0.0)
-                cuda_flag = bool(xtts_info.get("cuda_available") and active_engine == "xtts_gpu")
-                rtf_calc = round((total_synth_ms / 1000.0) / total_audio_sec, 3) if total_audio_sec > 0 else 0.0
 
                 self.get_logger().info(
-                    f"📊 [Fallback Telemetry]: provider=local | llm={chosen_model} | tts={active_engine} | "
-                    f"xtts_ready={xtts_ready_flag} | xtts_worker_pid={worker_pid} | cuda={cuda_flag} | "
-                    f"gpu={gpu_name_str} | gpu_infer={int(total_gpu_ms)}ms | "
-                    f"ttfa={int(first_audio_ms if first_audio_played else total_turn_ms)}ms | "
-                    f"vram={gpu_mem:.0f}MB"
+                    f"📊 [Turn Telemetry]: mode=LOCAL_FALLBACK | provider={chosen_provider} | "
+                    f"model={chosen_model} | llm_status={llm_status} | llm_latency_ms={int(llm_latency_ms)} | "
+                    f"tts_engine={active_engine} | tts_ready={xtts_ready_flag} | xtts_worker_pid={worker_pid} | "
+                    f"xtts_gpu={gpu_name_str} | ttfa_ms={int(first_audio_ms if first_audio_played else total_turn_ms)} | "
+                    f"fallback_reason=realtime_quota | error_class={error_class_str} | model_error={model_error_str}"
                 )
 
         except Exception as e:

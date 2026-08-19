@@ -73,6 +73,7 @@ class XttsClient:
         self._ready = threading.Event()
         self._startup_error: Optional[str] = None
         self._req_lock = threading.Lock()
+        self._lifecycle_lock = threading.Lock()
         self._req_id = 0
         self._current_gen_id = 0
 
@@ -127,47 +128,61 @@ class XttsClient:
         return self._check_custom_model()
 
     def start(self) -> None:
-        """Starts the persistent XTTS worker subprocess."""
-        problem = self.check_install()
-        if problem:
-            raise XttsError(problem)
+        """Starts the persistent XTTS worker subprocess, guaranteeing single-process ownership."""
+        with self._lifecycle_lock:
+            # 1. If already alive and ready, reuse existing worker
+            if self.is_alive and self.is_ready:
+                self._log("debug", f"XTTS worker already running (PID {self.proc.pid}).")
+                return
 
-        cmd = [
-            str(self.python_path),
-            str(self.worker_path),
-            "--speaker-wav", self.speaker_wav,
-            "--language", self.language,
-            "--device", self.device,
-            "--half", "1" if self.half else "0",
-            "--batch-size", str(self.batch_size),
-            "--model", self.model,
-        ]
+            # 2. Ensure any lingering or crashed process is fully stopped first
+            if self.proc is not None:
+                self.stop()
 
-        if self.custom_model:
-            for key, flag in (("checkpoint", "--checkpoint"), ("config", "--config"),
-                              ("vocab", "--vocab"), ("speakers", "--speakers")):
-                if self.custom_model.get(key):
-                    cmd += [flag, self.custom_model[key]]
+            problem = self.check_install()
+            if problem:
+                raise XttsError(problem)
 
-        env = os.environ.copy()
-        env["PYTHONPATH"] = ""
-        env["PYTHONNOUSERSITE"] = "1"
-        env["COQUI_TOS_AGREED"] = "1"
-        env["PATH"] = f"{self.python_path.parent}{os.pathsep}{env.get('PATH', '')}"
-        env["VIRTUAL_ENV"] = str(self.python_path.parent.parent)
+            cmd = [
+                str(self.python_path),
+                str(self.worker_path),
+                "--speaker-wav", self.speaker_wav,
+                "--language", self.language,
+                "--device", self.device,
+                "--half", "1" if self.half else "0",
+                "--batch-size", str(self.batch_size),
+                "--model", self.model,
+            ]
 
-        self.proc = subprocess.Popen(
-            cmd,
-            cwd=str(self.home),
-            env=env,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            bufsize=1,
-        )
-        threading.Thread(target=self._read_stdout, daemon=True).start()
-        threading.Thread(target=self._read_stderr, daemon=True).start()
+            if self.custom_model:
+                for key, flag in (("checkpoint", "--checkpoint"), ("config", "--config"),
+                                  ("vocab", "--vocab"), ("speakers", "--speakers")):
+                    if self.custom_model.get(key):
+                        cmd += [flag, self.custom_model[key]]
+
+            env = os.environ.copy()
+            env["PYTHONPATH"] = ""
+            env["PYTHONNOUSERSITE"] = "1"
+            env["COQUI_TOS_AGREED"] = "1"
+            env["PATH"] = f"{self.python_path.parent}{os.pathsep}{env.get('PATH', '')}"
+            env["VIRTUAL_ENV"] = str(self.python_path.parent.parent)
+
+            self._ready.clear()
+            self._startup_error = None
+            self.info = {}
+
+            self.proc = subprocess.Popen(
+                cmd,
+                cwd=str(self.home),
+                env=env,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                bufsize=1,
+            )
+            threading.Thread(target=self._read_stdout, daemon=True).start()
+            threading.Thread(target=self._read_stderr, daemon=True).start()
 
     def _read_stdout(self):
         for line in self.proc.stdout:
@@ -288,17 +303,41 @@ class XttsClient:
         msg["pcm_bytes"] = pcm_bytes
         return msg
 
-    def stop(self):
-        if self.proc is None:
+    def stop(self, timeout: float = 3.0) -> None:
+        """Gracefully stops and terminates the worker subprocess, ensuring PID is dead."""
+        proc = self.proc
+        if proc is None:
             return
+
+        self._log("debug", f"Stopping XTTS worker (PID {proc.pid})...")
         try:
-            if self.is_alive:
-                self.proc.stdin.write(json.dumps({"cmd": "quit"}) + "\n")
-                self.proc.stdin.flush()
-                self.proc.wait(timeout=5)
-        except Exception:
-            pass
+            if proc.poll() is None and proc.stdin:
+                try:
+                    proc.stdin.write(json.dumps({"cmd": "quit"}) + "\n")
+                    proc.stdin.flush()
+                    proc.wait(timeout=1.5)
+                except Exception:
+                    pass
+
+            # If still running after quit command, send SIGTERM
+            if proc.poll() is None:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=1.5)
+                except subprocess.TimeoutExpired:
+                    pass
+
+            # If still running after SIGTERM, send SIGKILL
+            if proc.poll() is None:
+                proc.kill()
+                try:
+                    proc.wait(timeout=1.5)
+                except subprocess.TimeoutExpired:
+                    pass
+        except Exception as e:
+            self._log("warn", f"Notice while stopping XTTS worker: {e}")
         finally:
-            if self.is_alive:
-                self.proc.kill()
             self.proc = None
+            self.info = {}
+            self._ready.clear()
+            self._startup_error = None
