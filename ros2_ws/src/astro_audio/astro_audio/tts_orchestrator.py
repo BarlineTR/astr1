@@ -182,8 +182,8 @@ class TTSOrchestrator:
 
         t_synth_start = time.perf_counter()
         with self._telemetry_lock:
-            if self._current_telemetry and self._current_telemetry.tts_request_ms == 0.0:
-                self._current_telemetry.mark_tts_request()
+            if self._current_telemetry and self._current_telemetry.t2_first_xtts_inference_start == 0.0:
+                self._current_telemetry.mark_xtts_inference_start()
 
         pcm = self.xtts_engine.synthesize_sentence(text, generation_id=generation_id, language=language)
         t_synth_end = time.perf_counter()
@@ -196,12 +196,15 @@ class TTSOrchestrator:
 
             with self._telemetry_lock:
                 if self._current_telemetry:
-                    if self._current_telemetry.tts_first_audio_ms == 0.0:
-                        self._current_telemetry.mark_tts_first_audio()
+                    if self._current_telemetry.t3_first_synthesized_audio == 0.0:
+                        self._current_telemetry.mark_synthesized_audio_ready()
                     self._current_telemetry.record_synthesis(synth_ms, audio_sec)
                     self._current_telemetry.sentence_count += 1
 
             if auto_play:
+                with self._telemetry_lock:
+                    if self._current_telemetry and self._current_telemetry.t4_audio_manager_submitted == 0.0:
+                        self._current_telemetry.mark_audio_manager_submitted()
                 self.output_manager.play_pcm_chunk(pcm, sample_rate=sample_rate, generation_id=generation_id)
 
             return pcm

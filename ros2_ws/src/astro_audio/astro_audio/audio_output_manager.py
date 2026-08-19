@@ -72,6 +72,9 @@ def find_alsa_respeaker_device() -> str:
     return "default"
 
 
+find_respeaker_alsa_device = find_alsa_respeaker_device
+
+
 def find_sounddevice_output_index(preferred: str = "") -> Tuple[Optional[int], str]:
     if sd is None:
         return None, "sounddevice kurulu değil"
