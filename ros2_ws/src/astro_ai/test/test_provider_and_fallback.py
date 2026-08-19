@@ -21,9 +21,8 @@ from astro_ai.provider_registry import (
     ErrorClass,
     ModelCapability,
     ProviderError,
+    ProviderHealth,
     ProviderRegistry,
-    VERIFIED_GEMINI_SEEDS,
-    VERIFIED_GROQ_SEEDS,
 )
 from astro_ai.repetition_guard import (
     RepetitionGuard,
@@ -69,6 +68,7 @@ class TestProviderRegistry(unittest.TestCase):
                 {"id": "llama-guard-3-8b", "active": True},
                 {"id": "llama-3.1-8b-instant", "active": True},
                 {"id": "llama-3.3-70b-versatile", "active": True},
+                {"id": "openai/gpt-oss-20b", "active": True},
                 {"id": "gemma2-9b-it", "active": True},
                 {"id": "deprecated-model-old", "active": False},
             ]
@@ -79,15 +79,22 @@ class TestProviderRegistry(unittest.TestCase):
         mock_resp.__enter__.return_value = mock_resp
 
         with patch("urllib.request.urlopen", return_value=mock_resp):
-            discovered = self.registry.discover_groq_models("test_key")
+            discovered = self.registry.discover_models("groq", "test_key")
 
-        self.assertIn("llama-3.3-70b-versatile", discovered)
+        self.assertEqual(self.registry.get_provider_health("groq"), ProviderHealth.HEALTHY)
         self.assertIn("llama-3.1-8b-instant", discovered)
+        self.assertIn("llama-3.3-70b-versatile", discovered)
+        self.assertIn("openai/gpt-oss-20b", discovered)
         self.assertIn("gemma2-9b-it", discovered)
-        # Excluded models
+        # Excluded non-chat / deprecated models
         self.assertNotIn("whisper-large-v3", discovered)
         self.assertNotIn("llama-guard-3-8b", discovered)
         self.assertNotIn("deprecated-model-old", discovered)
+
+        # Priority order verification
+        self.assertEqual(discovered[0], "llama-3.1-8b-instant")
+        self.assertEqual(discovered[1], "llama-3.3-70b-versatile")
+        self.assertEqual(discovered[2], "openai/gpt-oss-20b")
 
     def test_gemini_discovery_and_filtering(self):
         mock_response_json = {
@@ -104,32 +111,40 @@ class TestProviderRegistry(unittest.TestCase):
         mock_resp.__enter__.return_value = mock_resp
 
         with patch("urllib.request.urlopen", return_value=mock_resp):
-            discovered = self.registry.discover_gemini_models("test_key")
+            discovered = self.registry.discover_models("gemini", "test_key")
 
+        self.assertEqual(self.registry.get_provider_health("gemini"), ProviderHealth.HEALTHY)
         self.assertIn("gemini-2.0-flash", discovered)
         self.assertIn("gemini-1.5-flash", discovered)
         self.assertNotIn("text-embedding-004", discovered)
         self.assertNotIn("aqa", discovered)
 
-    def test_blacklisting_and_no_retry_storm(self):
-        self.registry.register_model(ModelCapability(provider="groq", model_id="broken-model-v1"))
-        self.registry.register_model(ModelCapability(provider="groq", model_id="llama-3.1-8b-instant"))
+    def test_discovery_failure_sets_status_without_blind_seeds(self):
+        """If discovery fails, provider health becomes DISCOVERY_UNAVAILABLE and get_available_models returns empty list."""
+        with patch("urllib.request.urlopen", side_effect=urllib.error.URLError("Network unreachable")):
+            discovered = self.registry.discover_models("groq", "test_key")
 
-        # 1. Model encounters 400 unsupported
-        self.registry.record_error("groq", "broken-model-v1", ErrorClass.UNSUPPORTED_MODEL, "Model is deprecated")
-        
-        candidates = self.registry.get_candidate_models("groq")
-        self.assertNotIn("broken-model-v1", candidates, "Blacklisted model must NOT be returned in candidates!")
-        self.assertIn("llama-3.1-8b-instant", candidates)
+        self.assertEqual(discovered, [])
+        self.assertEqual(self.registry.get_provider_health("groq"), ProviderHealth.DISCOVERY_UNAVAILABLE)
+        self.assertEqual(self.registry.get_available_models("groq"), [])
+        self.assertIsNone(self.registry.select_best_model("groq"))
 
-        # 2. Rate limit cooldown test
-        self.registry.record_error("groq", "llama-3.1-8b-instant", ErrorClass.RATE_LIMITED, "Rate limit reached")
-        candidates_cooldown = self.registry.get_candidate_models("groq")
-        self.assertNotIn("llama-3.1-8b-instant", candidates_cooldown, "Model under cooldown should be skipped temporarily")
+    def test_select_best_model_and_is_routeable(self):
+        mock_response_json = {
+            "data": [
+                {"id": "llama-3.1-8b-instant", "active": True},
+                {"id": "llama-3.3-70b-versatile", "active": True},
+            ]
+        }
+        mock_resp = MagicMock()
+        mock_resp.read.return_value = json.dumps(mock_response_json).encode("utf-8")
+        mock_resp.__enter__.return_value = mock_resp
 
-        # Check model was not permanently blacklisted
-        model_obj = self.registry.get_model("groq", "llama-3.1-8b-instant")
-        self.assertFalse(model_obj.is_blacklisted, "Rate-limited model must not be permanently blacklisted")
+        with patch("urllib.request.urlopen", return_value=mock_resp):
+            self.registry.discover_models("groq", "test_key")
+
+        self.assertTrue(self.registry.is_routeable("groq", "llama-3.1-8b-instant"))
+        self.assertEqual(self.registry.select_best_model("groq"), "llama-3.1-8b-instant")
 
 
 class TestRepetitionGuard(unittest.TestCase):
@@ -222,8 +237,18 @@ class TestProductionEdgeScenarios(unittest.TestCase):
 
     def test_scenario_groq_unsupported_model_switch_without_retry_storm(self):
         """Scenario E: Groq model 400 unsupported -> blacklist immediately, no retry storm, switch to next model."""
-        self.registry.register_model(ModelCapability(provider="groq", model_id="llama-unsupported-v1"))
-        self.registry.register_model(ModelCapability(provider="groq", model_id="llama-3.1-8b-instant"))
+        mock_resp_json = {
+            "data": [
+                {"id": "llama-unsupported-v1", "active": True},
+                {"id": "llama-3.1-8b-instant", "active": True},
+            ]
+        }
+        mock_resp = MagicMock()
+        mock_resp.read.return_value = json.dumps(mock_resp_json).encode("utf-8")
+        mock_resp.__enter__.return_value = mock_resp
+
+        with patch("urllib.request.urlopen", return_value=mock_resp):
+            self.registry.discover_models("groq", "test_key")
 
         # First call to llama-unsupported-v1 raises 400
         http_error = urllib.error.HTTPError(
@@ -239,15 +264,26 @@ class TestProductionEdgeScenarios(unittest.TestCase):
                 list(self.registry.stream_groq_completion("key", "llama-unsupported-v1", [{"role": "user", "content": "hi"}]))
             self.assertEqual(cm.exception.error_class, ErrorClass.UNSUPPORTED_MODEL)
 
-        # Verify model is blacklisted and will NOT be queried again
-        candidates = self.registry.get_candidate_models("groq")
+        # Verify model is blacklisted and will NOT be returned in candidates again
+        candidates = self.registry.get_available_models("groq")
         self.assertNotIn("llama-unsupported-v1", candidates)
         self.assertIn("llama-3.1-8b-instant", candidates)
+        self.assertFalse(self.registry.is_routeable("groq", "llama-unsupported-v1"))
 
     def test_scenario_gemini_unsupported_model_fallback(self):
         """Scenario F: Gemini model 404 -> blacklist immediately, fallback to verified model."""
-        self.registry.register_model(ModelCapability(provider="gemini", model_id="gemini-old-broken"))
-        self.registry.register_model(ModelCapability(provider="gemini", model_id="gemini-2.0-flash"))
+        mock_resp_json = {
+            "models": [
+                {"name": "models/gemini-old-broken", "supportedGenerationMethods": ["generateContent"]},
+                {"name": "models/gemini-2.0-flash", "supportedGenerationMethods": ["generateContent"]},
+            ]
+        }
+        mock_resp = MagicMock()
+        mock_resp.read.return_value = json.dumps(mock_resp_json).encode("utf-8")
+        mock_resp.__enter__.return_value = mock_resp
+
+        with patch("urllib.request.urlopen", return_value=mock_resp):
+            self.registry.discover_models("gemini", "test_key")
 
         http_error = urllib.error.HTTPError(
             url="https://generativelanguage.googleapis.com",
@@ -262,7 +298,7 @@ class TestProductionEdgeScenarios(unittest.TestCase):
                 self.registry.generate_gemini_content("key", "gemini-old-broken", "prompt", [{"role": "user", "content": "hi"}])
             self.assertEqual(cm.exception.error_class, ErrorClass.MODEL_NOT_FOUND)
 
-        candidates = self.registry.get_candidate_models("gemini")
+        candidates = self.registry.get_available_models("gemini")
         self.assertNotIn("gemini-old-broken", candidates)
         self.assertIn("gemini-2.0-flash", candidates)
 

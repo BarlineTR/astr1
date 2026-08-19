@@ -1880,9 +1880,9 @@ class AstroRealtimeNode(Node):
     def _discover_providers_background(self):
         """Discovers active capability-verified models for Groq and Gemini in background."""
         if self.groq_api_key:
-            self.provider_registry.discover_groq_models(self.groq_api_key)
+            self.provider_registry.discover_models("groq", self.groq_api_key)
         if self.gemini_api_key:
-            self.provider_registry.discover_gemini_models(self.gemini_api_key)
+            self.provider_registry.discover_models("gemini", self.gemini_api_key)
 
     def _start_local_xtts_background(self):
         if self.local_xtts:
