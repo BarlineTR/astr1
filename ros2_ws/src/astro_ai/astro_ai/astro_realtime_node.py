@@ -12,12 +12,17 @@ Features:
 import asyncio
 import base64
 import inspect
+import io
 import json
 import os
 import re
+import subprocess
 import sys
 import threading
 import time
+import urllib.request
+import urllib.error
+import wave
 from typing import Any, Dict, List, Optional
 
 import rclpy
@@ -35,6 +40,36 @@ try:
     import websockets
 except ImportError:
     websockets = None
+
+EMOJI_RE = re.compile(
+    "["
+    "\U0001F1E0-\U0001F1FF"
+    "\U0001F300-\U0001F5FF"
+    "\U0001F600-\U0001F64F"
+    "\U0001F680-\U0001F6FF"
+    "\U0001F700-\U0001F77F"
+    "\U0001F780-\U0001F7FF"
+    "\U0001F800-\U0001F8FF"
+    "\U0001F900-\U0001F9FF"
+    "\U0001FA00-\U0001FAFF"
+    "\u2600-\u26FF"
+    "\u2700-\u27BF"
+    "]+",
+    flags=re.UNICODE
+)
+
+def clean_tts_text(text: str) -> str:
+    if not text:
+        return ""
+    text = re.sub(r"(?i)<think>[\s\S]*?</think>", "", text)
+    text = re.sub(r"(?i)<\/?think>", "", text)
+    text = EMOJI_RE.sub("", text)
+    text = re.sub(r'```.*?```', '', text, flags=re.DOTALL)
+    text = re.sub(r'`.*?`', '', text)
+    text = re.sub(r'[\*\_\~\#\<\>]', '', text)
+    text = " ".join(text.split())
+    text = re.sub(r'\s+([,.:;?!])', r'\1', text)
+    return text.strip()
 
 try:
     from astro_ai.conversation_session import ConversationSession
@@ -212,6 +247,14 @@ class AstroRealtimeNode(Node):
         self.face_recognizer = FaceRecognizer() if FaceRecognizer else None
         self._user_speech_audio_buffer: List[bytes] = []
 
+        # Zero-Cost Fallback Engine (Groq STT + Groq LLM + Edge-TTS)
+        self._fallback_mode = False
+        self._fallback_speaking = False
+        self._fallback_speech_start = 0.0
+        self._last_speech_time = 0.0
+        self._fallback_audio_buffer: List[bytes] = []
+        self._is_processing_fallback = False
+
         # Camera Perception Frame Cache
         self._latest_camera_frame: Optional[np.ndarray] = None
         self._last_img_time = 0.0
@@ -337,7 +380,12 @@ class AstroRealtimeNode(Node):
                 self._is_responding = False
                 self._is_playback_active = False
                 err_str = str(e)
-                if "4004" in err_str or "model_not_found" in err_str:
+                if "insufficient_quota" in err_str or "credit_balance_exhausted" in err_str or "1013" in err_str:
+                    if not self._fallback_mode:
+                        self._fallback_mode = True
+                        self.get_logger().warn("🚀 [0-Maliyetli Groq & Edge-TTS Modu Devrede]: OpenAI Realtime kredisi tükendi. Astro kesintisiz olarak 0-Token Groq LLM + Hızlı TTS modunda çalışıyor!")
+                    await asyncio.sleep(60.0)
+                elif "4004" in err_str or "model_not_found" in err_str:
                     self.get_logger().warn(f"⚠️ [Realtime Model Bulunamadı] '{current_model}' modeline erişilemedi, bir sonraki modele geçiliyor...")
                     model_idx += 1
                     await asyncio.sleep(1.0)
@@ -1622,9 +1670,253 @@ class AstroRealtimeNode(Node):
                     pass
             self.get_logger().info("👂 [Astro Dinliyor]: Mikrofon aktif, sizi dinliyor...")
 
+    def _transcribe_groq_whisper(self, wav_bytes: bytes) -> Optional[str]:
+        """Transcribes 16kHz WAV audio using free Groq Whisper Large V3 Turbo API in <200ms."""
+        if not self.groq_api_key:
+            return None
+        try:
+            boundary = "----WebKitFormBoundary" + os.urandom(16).hex()
+            body = bytearray()
+            body.extend(f"--{boundary}\r\n".encode())
+            body.extend(b'Content-Disposition: form-data; name="file"; filename="speech.wav"\r\n')
+            body.extend(b'Content-Type: audio/wav\r\n\r\n')
+            body.extend(wav_bytes)
+            body.extend(b'\r\n')
+            body.extend(f"--{boundary}\r\n".encode())
+            body.extend(b'Content-Disposition: form-data; name="model"\r\n\r\n')
+            body.extend(b'whisper-large-v3-turbo\r\n')
+            body.extend(f"--{boundary}\r\n".encode())
+            body.extend(b'Content-Disposition: form-data; name="language"\r\n\r\n')
+            body.extend(b'tr\r\n')
+            body.extend(f"--{boundary}\r\n".encode())
+            body.extend(b'Content-Disposition: form-data; name="prompt"\r\n\r\n')
+            body.extend("Astro, Baran, Deniz, nasılsın, Bitlis".encode("utf-8"))
+            body.extend(b'\r\n')
+            body.extend(f"--{boundary}--\r\n".encode())
+
+            req = urllib.request.Request(
+                "https://api.groq.com/openai/v1/audio/transcriptions",
+                data=bytes(body),
+                headers={
+                    "Authorization": f"Bearer {self.groq_api_key}",
+                    "Content-Type": f"multipart/form-data; boundary={boundary}",
+                    "User-Agent": "Mozilla/5.0"
+                },
+                method="POST"
+            )
+            with urllib.request.urlopen(req, timeout=6.0) as resp:
+                res = json.loads(resp.read().decode("utf-8"))
+                return res.get("text", "").strip()
+        except Exception as e:
+            self.get_logger().debug(f"Groq Whisper transcription notice: {e}")
+            return None
+
+    def _synthesize_edge_tts_pcm24k(self, text: str) -> bytes:
+        """Synthesizes Turkish speech via Edge-TTS and converts to 24kHz int16 mono raw PCM for playback."""
+        if not text:
+            return b""
+        clean_text = clean_tts_text(text)
+        if not clean_text:
+            return b""
+
+        p = self.persona_name.lower()
+        if p in ("flirt", "emotional"):
+            voice = "tr-TR-EmelNeural"
+            rate = "+12%"
+        else:
+            voice = "tr-TR-AhmetNeural"
+            rate = "+20%" if p in ("kufurbaz", "playful", "angry", "rude") else "+8%"
+
+        try:
+            proc = subprocess.Popen(
+                ["edge-tts", "--voice", voice, "--rate", rate, "--text", clean_text, "--write-media", "-"],
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
+            )
+            mp3_data, _ = proc.communicate(timeout=8.0)
+            if mp3_data:
+                ff_proc = subprocess.Popen(
+                    ["ffmpeg", "-i", "pipe:0", "-f", "s16le", "-acodec", "pcm_s16le", "-ac", "1", "-ar", "24000", "pipe:1"],
+                    stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
+                )
+                pcm_data, _ = ff_proc.communicate(input=mp3_data, timeout=8.0)
+                return pcm_data
+        except Exception as e:
+            self.get_logger().debug(f"Edge-TTS synthesis notice: {e}")
+        return b""
+
+    def _process_fallback_turn(self, audio_chunks: List[bytes]):
+        """Processes a full turn using 100% Free Groq Whisper STT + Groq LLM + Edge-TTS (0 OpenAI Token Cost)."""
+        if self._is_processing_fallback or not audio_chunks:
+            return
+
+        self._is_processing_fallback = True
+        self._is_responding = True
+        self._response_start_time = time.monotonic()
+        try:
+            raw_16k = b"".join(audio_chunks)
+            arr = np.frombuffer(raw_16k, dtype=np.int16)
+            if len(arr) < 16000 * 0.35:
+                return
+
+            # 1. Voice Biometric Identification
+            self._run_voice_identification()
+
+            # 2. Prepare WAV in memory
+            wav_io = io.BytesIO()
+            with wave.open(wav_io, 'wb') as wf:
+                wf.setnchannels(1)
+                wf.setsampwidth(2)
+                wf.setframerate(16000)
+                wf.writeframes(raw_16k)
+            wav_bytes = wav_io.getvalue()
+
+            # 3. Transcribe speech via Groq Whisper Large V3 Turbo
+            user_text = self._transcribe_groq_whisper(wav_bytes)
+            if not user_text:
+                return
+
+            whisper_hallucinations = [
+                "çeviri ve altyazı", "altyazı m.k.", "altyazı:", "çeviren:", "abone ol", 
+                "izlediğiniz için", "beğenmeyi unutmayın", "subtitle", "transcription by"
+            ]
+            if any(h in user_text.lower() for h in whisper_hallucinations):
+                self.get_logger().info(f"🔇 [Gürültü/Halüsinasyon Filtrelendi]: \"{user_text}\"")
+                return
+
+            self.get_logger().info(f"🗣️ [Siz (0-Maliyet)]: \"{user_text}\"")
+            self.memory.episodic.add_message("user", user_text)
+            self.session.record_user_speech()
+
+            # 4. Cognitive LLM via Groq Llama-3.3-70B
+            system_prompt = self._build_current_system_prompt()
+            messages = [{"role": "system", "content": system_prompt}]
+            recent_msgs = self.memory.episodic.get_messages()[-6:]
+            for m in recent_msgs:
+                messages.append({"role": m.get("role", "user"), "content": m.get("content", "")})
+
+            groq_tools = [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "get_live_weather",
+                        "description": "Bitlis, Ahlat veya istenen şehrin hava durumu bilgisini getirir.",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"city": {"type": "string"}},
+                            "required": ["city"]
+                        }
+                    }
+                },
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "inspect_camera_view",
+                        "description": "Kullanıcı ne görüyorsun, elimde ne var dediğinde kameradan bakar.",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"focus": {"type": "string"}},
+                            "required": ["focus"]
+                        }
+                    }
+                },
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "enroll_user_biometrics",
+                        "description": "Kullanıcı kendi adını söylediğinde çağrılır.",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "name": {"type": "string"},
+                                "formal_title": {"type": "string"}
+                            },
+                            "required": ["name"]
+                        }
+                    }
+                }
+            ]
+
+            payload = {
+                "model": "llama-3.3-70b-versatile",
+                "messages": messages,
+                "temperature": 0.85,
+                "max_tokens": 200,
+                "tools": groq_tools
+            }
+
+            req = urllib.request.Request(
+                "https://api.groq.com/openai/v1/chat/completions",
+                data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+                headers={
+                    "Authorization": f"Bearer {self.groq_api_key}",
+                    "Content-Type": "application/json",
+                    "User-Agent": "Mozilla/5.0"
+                },
+                method="POST"
+            )
+
+            reply_text = ""
+            with urllib.request.urlopen(req, timeout=6.0) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+                choice = data["choices"][0]["message"]
+                tool_calls = choice.get("tool_calls", [])
+
+                if tool_calls:
+                    messages.append(choice)
+                    for tc in tool_calls:
+                        fn = tc["function"]["name"]
+                        args = json.loads(tc["function"]["arguments"])
+                        self.get_logger().info(f"🛠️ [0-Maliyet Tool]: {fn}({args}) çalıştırılıyor...")
+                        res = self._execute_realtime_tool(fn, args)
+                        messages.append({
+                            "role": "tool",
+                            "tool_call_id": tc["id"],
+                            "content": json.dumps(res, ensure_ascii=False)
+                        })
+
+                    # Call Groq again with tool output
+                    p2 = {"model": "llama-3.3-70b-versatile", "messages": messages, "max_tokens": 200}
+                    r2 = urllib.request.Request(
+                        "https://api.groq.com/openai/v1/chat/completions",
+                        data=json.dumps(p2, ensure_ascii=False).encode("utf-8"),
+                        headers={"Authorization": f"Bearer {self.groq_api_key}", "Content-Type": "application/json"},
+                        method="POST"
+                    )
+                    with urllib.request.urlopen(r2, timeout=6.0) as resp2:
+                        d2 = json.loads(resp2.read().decode("utf-8"))
+                        reply_text = d2["choices"][0]["message"]["content"].strip()
+                else:
+                    reply_text = choice.get("content", "").strip()
+
+            if not reply_text:
+                return
+
+            self.get_logger().info(f"🤖 [Astro (0-Maliyet Groq)]: \"{reply_text}\"")
+            self.memory.episodic.add_message("assistant", reply_text)
+            self.session.record_robot_speech()
+
+            # 5. Synthesize speech to 24kHz PCM and stream to audio playback
+            pcm_data = self._synthesize_edge_tts_pcm24k(reply_text)
+            if pcm_data:
+                chunk_size = 960  # 480 samples @ 24kHz int16 = 20ms
+                for i in range(0, len(pcm_data), chunk_size):
+                    chunk = pcm_data[i : i + chunk_size]
+                    if chunk:
+                        b64_str = base64.b64encode(chunk).decode("ascii")
+                        out_msg = String()
+                        out_msg.data = b64_str
+                        self.pub_output_pcm.publish(out_msg)
+                        time.sleep(0.019)
+
+        except Exception as e:
+            self.get_logger().warn(f"Fallback turn processing notice: {e}")
+        finally:
+            self._is_processing_fallback = False
+            self._is_responding = False
+
     def _on_input_pcm(self, msg: String):
-        """Sends incoming microphone 24kHz PCM chunk directly to OpenAI Realtime WebSocket and buffers 16k PCM for speaker recognition."""
-        if not msg.data or not self._is_connected or not self._ws or not self._loop:
+        """Sends incoming microphone 24kHz PCM chunk to OpenAI Realtime WebSocket or processes turn via 0-cost Groq fallback."""
+        if not msg.data:
             return
 
         now = time.monotonic()
@@ -1637,7 +1929,6 @@ class AstroRealtimeNode(Node):
         # Do not stream mic audio while Astro is actively playing out of the speaker
         if self._is_playback_active or self._is_responding or (now - getattr(self, "_playback_end_time", 0.0) < 0.25):
             return
-
 
         # Downsample and buffer 16kHz audio for acoustic voice recognition & dynamic enrollment
         raw_16k = None
@@ -1670,11 +1961,37 @@ class AstroRealtimeNode(Node):
             except Exception:
                 pass
 
-        # IMPORTANT: While Astro is sleeping, DO NOT stream audio to OpenAI Realtime!
-        # This completely guarantees Astro remains 100% silent and consumes 0 OpenAI tokens in sleep mode.
+        # IMPORTANT: While Astro is sleeping, DO NOT process audio
         if self._is_sleeping:
             return
 
+        # --- 0-Cost Fallback Mode (Groq STT + Groq LLM + Edge-TTS) ---
+        if self._fallback_mode or not self._is_connected or not self._ws or not self._loop:
+            if raw_16k:
+                try:
+                    arr = np.frombuffer(raw_16k, dtype=np.int16)
+                    local_rms = float(np.sqrt(np.mean(arr.astype(np.float32) ** 2)))
+                    if local_rms > 380.0:
+                        self._last_speech_time = now
+                        if not self._fallback_speaking:
+                            self._fallback_speaking = True
+                            self._fallback_speech_start = now
+                            self._fallback_audio_buffer = []
+                        self._fallback_audio_buffer.append(raw_16k)
+                    elif self._fallback_speaking:
+                        self._fallback_audio_buffer.append(raw_16k)
+                        # Silence timeout (0.65s after speech ends)
+                        if (now - self._last_speech_time) > 0.65:
+                            self._fallback_speaking = False
+                            if len(self._fallback_audio_buffer) >= 20 and not self._is_processing_fallback:
+                                buf_to_proc = list(self._fallback_audio_buffer)
+                                self._fallback_audio_buffer = []
+                                threading.Thread(target=self._process_fallback_turn, args=(buf_to_proc,), daemon=True).start()
+                except Exception:
+                    pass
+            return
+
+        # --- Standard OpenAI Realtime Mode ---
         payload = {
             "type": "input_audio_buffer.append",
             "audio": msg.data
