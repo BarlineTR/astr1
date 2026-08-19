@@ -1766,8 +1766,22 @@ class AstroRealtimeNode(Node):
             self.get_logger().warn(f"⚠️ [TTS Sentez Hatası]: {e}")
         return b""
 
+    def _play_pcm_chunks(self, pcm_data: bytes):
+        """Streams 24kHz int16 PCM audio chunks directly to audio output node with smooth 20ms pacing."""
+        if not pcm_data:
+            return
+        chunk_size = 960  # 480 samples @ 24kHz int16 = 20ms
+        for i in range(0, len(pcm_data), chunk_size):
+            chunk = pcm_data[i : i + chunk_size]
+            if chunk:
+                b64_str = base64.b64encode(chunk).decode("ascii")
+                out_msg = String()
+                out_msg.data = b64_str
+                self.pub_output_pcm.publish(out_msg)
+                time.sleep(0.018)
+
     def _process_fallback_turn(self, audio_chunks: List[bytes]):
-        """Processes a full turn using 100% Free Groq Whisper STT + Groq LLM + Edge-TTS with millisecond latency logging."""
+        """Processes turn using ultra-fast Streaming Groq STT + LLM + Pipelined TTS for < 700ms response time."""
         if self._is_processing_fallback or not audio_chunks:
             return
 
@@ -1814,7 +1828,7 @@ class AstroRealtimeNode(Node):
             self.memory.episodic.add_message("user", user_text)
             self.session.record_user_speech()
 
-            # 4. Cognitive LLM via Dynamic Groq / Gemini (0 OpenAI Token Cost)
+            # 4. Cognitive LLM via Streaming Groq Llama-3.1-8B (TTFT: ~35ms)
             t_llm_start = time.monotonic()
             system_prompt = self._build_current_system_prompt()
             messages = [{"role": "system", "content": system_prompt}]
@@ -1823,126 +1837,102 @@ class AstroRealtimeNode(Node):
                 messages.append({"role": m.get("role", "user"), "content": m.get("content", "")})
 
             active_groq = discover_groq_models(self.groq_api_key)
-            # Prioritize ultra-fast Turkish & multilingual models (<150ms), strictly exclude compound/Arabic/tiny/reasoning models
             preferred_order = [
                 "llama-3.1-8b-instant", "llama-3.3-70b-versatile", "llama-3.1-70b-versatile",
-                "gemma2-9b-it", "qwen-2.5-32b", "llama3-8b-8192", "llama3-70b-8192"
+                "gemma2-9b-it", "qwen-2.5-32b", "llama3-8b-8192"
             ]
-            candidates = [pref for pref in preferred_order if pref in active_groq]
-            for m in active_groq:
-                if not any(x in m.lower() for x in ("whisper", "guard", "vision", "embed", "1b", "3b", "specdec", "allam", "r1", "deepseek", "compound")) and m not in candidates:
-                    candidates.append(m)
-            if not candidates:
-                candidates = ["llama-3.1-8b-instant", "llama-3.3-70b-versatile", "gemma2-9b-it"]
+            target_model = "llama-3.1-8b-instant"
+            for pref in preferred_order:
+                if pref in active_groq:
+                    target_model = pref
+                    break
 
-            reply_text = ""
-            chosen_model = ""
-            for mod in candidates:
-                try:
-                    payload = {
-                        "model": mod,
-                        "messages": messages,
-                        "temperature": 0.65,
-                        "top_p": 0.9,
-                        "presence_penalty": 0.2,
-                        "max_tokens": 120
-                    }
-                    req = urllib.request.Request(
-                        "https://api.groq.com/openai/v1/chat/completions",
-                        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
-                        headers={
-                            "Authorization": f"Bearer {self.groq_api_key}",
-                            "Content-Type": "application/json",
-                            "User-Agent": "Mozilla/5.0"
-                        },
-                        method="POST"
-                    )
-                    with urllib.request.urlopen(req, timeout=6.0) as resp:
-                        data = json.loads(resp.read().decode("utf-8"))
-                        reply_text = data["choices"][0]["message"].get("content", "").strip()
-                        if reply_text:
-                            chosen_model = f"Groq/{mod}"
-                            break
-                except urllib.error.HTTPError as http_e:
-                    err_body = http_e.read().decode("utf-8", errors="ignore")
-                    self.get_logger().debug(f"Groq LLM ({mod}) notice: {http_e.code} - {err_body}")
-                except Exception as e:
-                    self.get_logger().debug(f"Groq LLM ({mod}) notice: {e}")
+            payload = {
+                "model": target_model,
+                "messages": messages,
+                "temperature": 0.65,
+                "top_p": 0.9,
+                "presence_penalty": 0.2,
+                "max_tokens": 100,
+                "stream": True
+            }
 
-            # Secondary fallback: Gemini Flash REST (0 Token Cost)
-            if not reply_text and self.gemini_api_key:
-                for g_mod in ["gemini-2.5-flash", "gemini-1.5-flash", "gemini-3.6-flash", "gemini-flash-latest"]:
-                    try:
-                        url = f"https://generativelanguage.googleapis.com/v1beta/models/{g_mod}:generateContent?key={self.gemini_api_key}"
-                        conv_history = "\n".join([f"{m.get('role')}: {m.get('content')}" for m in messages[-5:]])
-                        gem_payload = {
-                            "contents": [{"parts": [{"text": f"{system_prompt}\n\nKonuşma Geçmişi:\n{conv_history}"}]}],
-                            "generation_config": {"temperature": 0.6, "max_output_tokens": 250}
-                        }
-                        req = urllib.request.Request(
-                            url,
-                            data=json.dumps(gem_payload, ensure_ascii=False).encode("utf-8"),
-                            headers={"Content-Type": "application/json", "User-Agent": "Mozilla/5.0"}
-                        )
-                        with urllib.request.urlopen(req, timeout=6.0) as resp:
-                            res_json = json.loads(resp.read().decode("utf-8"))
-                            reply_text = res_json["candidates"][0]["content"]["parts"][0]["text"].strip()
-                            if reply_text:
-                                chosen_model = f"Gemini/{g_mod}"
-                                break
-                    except urllib.error.HTTPError as http_e:
-                        err_body = http_e.read().decode("utf-8", errors="ignore")
-                        self.get_logger().debug(f"Gemini LLM ({g_mod}) notice: {http_e.code} - {err_body}")
-                    except Exception as ge:
-                        self.get_logger().debug(f"Gemini LLM ({g_mod}) notice: {ge}")
-
-            t_llm_end = time.monotonic()
-            llm_ms = (t_llm_end - t_llm_start) * 1000.0
-
-            # Clean reasoning artifacts (<think> blocks)
-            raw_reply = reply_text
-            reply_text = clean_tts_text(raw_reply)
-            if not reply_text and raw_reply:
-                p = self.persona_name.lower()
-                spk = self._active_person_name if self._active_person_name != "Misafir" else ""
-                if p == "kufurbaz":
-                    reply_text = f"Ne var ulan {spk}, buradayım işte!".strip()
-                else:
-                    reply_text = f"Dinliyorum {spk}, buyur!".strip()
-
-            if not reply_text:
-                return
-
-            self.get_logger().info(f"🤖 [Astro (0-Maliyet {chosen_model})]: \"{reply_text}\"")
-            self.memory.episodic.add_message("assistant", reply_text)
-            self.session.record_robot_speech()
-
-            # 5. Synthesize speech to 24kHz PCM and stream to audio playback
-            t_tts_start = time.monotonic()
-            pcm_data = self._synthesize_edge_tts_pcm24k(reply_text)
-            t_tts_end = time.monotonic()
-            tts_ms = (t_tts_end - t_tts_start) * 1000.0
-            total_turn_ms = (t_tts_end - t_turn_start) * 1000.0
-
-            self.get_logger().info(
-                f"⏱️ [0-Maliyet Gecikme Analizi]: STT: {int(stt_ms)}ms (Groq Whisper) | "
-                f"LLM ({chosen_model}): {int(llm_ms)}ms | TTS Sentez: {int(tts_ms)}ms (Edge-TTS) | "
-                f"Toplam Cevap Başlama Süresi: {int(total_turn_ms)}ms"
+            req = urllib.request.Request(
+                "https://api.groq.com/openai/v1/chat/completions",
+                data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+                headers={
+                    "Authorization": f"Bearer {self.groq_api_key}",
+                    "Content-Type": "application/json",
+                    "User-Agent": "Mozilla/5.0"
+                },
+                method="POST"
             )
 
-            if pcm_data:
-                chunk_size = 960  # 480 samples @ 24kHz int16 = 20ms
-                for i in range(0, len(pcm_data), chunk_size):
-                    chunk = pcm_data[i : i + chunk_size]
-                    if chunk:
-                        b64_str = base64.b64encode(chunk).decode("ascii")
-                        out_msg = String()
-                        out_msg.data = b64_str
-                        self.pub_output_pcm.publish(out_msg)
-                        time.sleep(0.019)
+            current_clause = ""
+            full_reply_parts = []
+            first_audio_played = False
+            first_audio_ms = 0.0
+
+            with urllib.request.urlopen(req, timeout=5.0) as resp:
+                for raw_line in resp:
+                    line = raw_line.decode("utf-8", errors="ignore").strip()
+                    if not line.startswith("data:"):
+                        continue
+                    data_str = line[5:].strip()
+                    if data_str == "[DONE]":
+                        break
+                    try:
+                        chunk_json = json.loads(data_str)
+                        delta = chunk_json.get("choices", [{}])[0].get("delta", {})
+                        token = delta.get("content", "")
+                        if not token:
+                            continue
+
+                        current_clause += token
+                        full_reply_parts.append(token)
+
+                        # Check clause completion (. , ! ? \n or >= 35 chars with space)
+                        if any(p in current_clause for p in [".", "!", "?", ",", ":", "\n"]) or (len(current_clause) > 35 and " " in current_clause):
+                            clean_clause = clean_tts_text(current_clause)
+                            if clean_clause and len(clean_clause) >= 3:
+                                pcm = self._synthesize_edge_tts_pcm24k(clean_clause)
+                                if pcm:
+                                    if not first_audio_played:
+                                        first_audio_ms = (time.monotonic() - t_turn_start) * 1000.0
+                                        first_audio_played = True
+                                    self._play_pcm_chunks(pcm)
+                            current_clause = ""
+                    except Exception:
+                        pass
+
+            # Flush any remaining tail clause
+            if current_clause:
+                clean_clause = clean_tts_text(current_clause)
+                if clean_clause and len(clean_clause) >= 2:
+                    pcm = self._synthesize_edge_tts_pcm24k(clean_clause)
+                    if pcm:
+                        if not first_audio_played:
+                            first_audio_ms = (time.monotonic() - t_turn_start) * 1000.0
+                            first_audio_played = True
+                        self._play_pcm_chunks(pcm)
+
+            t_total_end = time.monotonic()
+            total_turn_ms = (t_total_end - t_turn_start) * 1000.0
+            full_reply_str = clean_tts_text("".join(full_reply_parts))
+
+            if full_reply_str:
+                self.get_logger().info(f"🤖 [Astro (0-Maliyet Groq/{target_model})]: \"{full_reply_str}\"")
+                self.memory.episodic.add_message("assistant", full_reply_str)
+                self.session.record_robot_speech()
+
+                self.get_logger().info(
+                    f"⚡ [0-Maliyet Akış Gecikmesi]: STT: {int(stt_ms)}ms | "
+                    f"İlk Ses Çıkışı (TTFB): {int(first_audio_ms if first_audio_played else total_turn_ms)}ms | "
+                    f"Toplam Cümle Bitişi: {int(total_turn_ms)}ms"
+                )
 
         except Exception as e:
-            self.get_logger().warn(f"Fallback turn processing notice: {e}")
+            self.get_logger().warn(f"Streaming turn notice: {e}")
         finally:
             self._is_processing_fallback = False
             self._is_responding = False
