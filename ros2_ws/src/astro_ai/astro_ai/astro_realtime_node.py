@@ -396,18 +396,23 @@ class AstroRealtimeNode(Node):
             "session": {
                 "type": "realtime",
                 "instructions": system_prompt,
-                "voice": self.realtime_voice,
-                "temperature": 0.85,
-                "turn_detection": {
-                    "type": "server_vad",
-                    "threshold": 0.72,
-                    "prefix_padding_ms": 300,
-                    "silence_duration_ms": 600,
-                    "create_response": False
-                },
-                "input_audio_transcription": {
-                    "model": "whisper-1",
-                    "language": "tr"
+                "audio": {
+                    "input": {
+                        "transcription": {
+                            "model": "whisper-1",
+                            "language": "tr"
+                        },
+                        "turn_detection": {
+                            "type": "server_vad",
+                            "threshold": 0.72,
+                            "prefix_padding_ms": 300,
+                            "silence_duration_ms": 600,
+                            "create_response": False
+                        }
+                    },
+                    "output": {
+                        "voice": self.realtime_voice
+                    }
                 },
 
 
@@ -560,8 +565,7 @@ class AstroRealtimeNode(Node):
             resp_event = {
                 "type": "response.create",
                 "response": {
-                    "instructions": current_prompt,
-                    "temperature": 0.85
+                    "instructions": current_prompt
                 }
             }
             try:
@@ -1642,17 +1646,17 @@ class AstroRealtimeNode(Node):
         except Exception:
             pass
 
-        # Acoustic presence / wake-up (requires sustained human voice > 280 RMS across >=5 consecutive frames)
+        # Acoustic presence / wake-up (requires sustained intentional voice > 600 RMS across >=7 consecutive frames)
         if raw_16k:
             try:
                 arr = np.frombuffer(raw_16k, dtype=np.int16)
                 local_rms = float(np.sqrt(np.mean(arr.astype(np.float32) ** 2)))
-                if local_rms > 280.0:
+                if local_rms > 600.0:
                     self._consecutive_loud_frames += 1
                 else:
                     self._consecutive_loud_frames = max(0, self._consecutive_loud_frames - 1)
 
-                if self._consecutive_loud_frames >= 5 and (now - getattr(self, "_node_start_time", 0.0)) > 3.0:
+                if self._consecutive_loud_frames >= 7 and (now - getattr(self, "_node_start_time", 0.0)) > 5.0:
                     self._last_interaction_time = now
                     if self._is_sleeping:
                         self._wake_up()
