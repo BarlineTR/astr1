@@ -61,7 +61,11 @@ EMOJI_RE = re.compile(
 def clean_tts_text(text: str) -> str:
     if not text:
         return ""
-    text = re.sub(r"(?i)<think>[\s\S]*?</think>", "", text)
+    if "<think>" in text:
+        if "</think>" in text:
+            text = text.split("</think>")[-1].strip()
+        else:
+            text = re.sub(r"(?i)<think>[\s\S]*", "", text).strip()
     text = re.sub(r"(?i)<\/?think>", "", text)
     text = EMOJI_RE.sub("", text)
     text = re.sub(r'```.*?```', '', text, flags=re.DOTALL)
@@ -940,17 +944,28 @@ class AstroRealtimeNode(Node):
                     reason.append(f"güven düşük ({winner_conf:.2f})")
                 if not is_clear_winner:
                     reason.append(f"margin yetersiz ({margin:.2f})")
-                self.get_logger().info(
-                    f"🎙️ [Ses Tanıma]: Bilinmeyen Ses / Tanınmadı "
-                    f"(En Yakın: '{winner_name}', Güven: {winner_conf:.2f}, {', '.join(reason)})"
-                )
+
+                # Retain speaker identity if within active conversation hold (45s)
                 with self._lock:
-                    self._recognized_speaker = {"name": "Misafir", "confidence": winner_conf, "is_known": False, "source": "unknown_voice"}
-                    self._active_person_name = "Misafir"
-                    self._person_hold_until = 0.0
-                    streak_map[winner_name] = 0
-                    self._voice_id_streak = streak_map
-                self._sync_perception_to_session()
+                    has_active_hold = (now < self._person_hold_until) and (self._active_person_name != "Misafir")
+
+                if has_active_hold:
+                    self.get_logger().info(
+                        f"🎙️ [Ses Tanıma (Kişi Korundu)]: {self._active_person_name} konuşmaya devam ediyor "
+                        f"(Bu kısa kelimede anlık güven: {winner_conf:.2f})"
+                    )
+                else:
+                    self.get_logger().info(
+                        f"🎙️ [Ses Tanıma]: Bilinmeyen Ses / Tanınmadı "
+                        f"(En Yakın: '{winner_name}', Güven: {winner_conf:.2f}, {', '.join(reason)})"
+                    )
+                    with self._lock:
+                        self._recognized_speaker = {"name": "Misafir", "confidence": winner_conf, "is_known": False, "source": "unknown_voice"}
+                        self._active_person_name = "Misafir"
+                        self._person_hold_until = 0.0
+                        streak_map[winner_name] = 0
+                        self._voice_id_streak = streak_map
+                    self._sync_perception_to_session()
         except Exception as e:
             self.get_logger().debug(f"Voice id notice: {e}")
 
@@ -1802,8 +1817,10 @@ class AstroRealtimeNode(Node):
                 messages.append({"role": m.get("role", "user"), "content": m.get("content", "")})
 
             active_groq = discover_groq_models(self.groq_api_key)
-            # Filter out non-chat models (whisper, guard, vision)
-            candidates = [m for m in active_groq if not any(x in m for x in ("whisper", "guard", "vision", "embed"))]
+            # Prioritize direct chat models before reasoning models
+            direct_models = [m for m in active_groq if not any(x in m.lower() for x in ("whisper", "guard", "vision", "embed", "deepseek", "r1", "reason"))]
+            reasoning_models = [m for m in active_groq if any(x in m.lower() for x in ("deepseek", "r1", "reason"))]
+            candidates = direct_models + reasoning_models
             if not candidates:
                 candidates = [
                     "llama-3.3-70b-specdec", "llama-3.2-3b-preview", "llama-3.2-1b-preview", 
@@ -1818,7 +1835,7 @@ class AstroRealtimeNode(Node):
                         "model": mod,
                         "messages": messages,
                         "temperature": 0.85,
-                        "max_tokens": 200
+                        "max_tokens": 350
                     }
                     req = urllib.request.Request(
                         "https://api.groq.com/openai/v1/chat/completions",
@@ -1849,7 +1866,7 @@ class AstroRealtimeNode(Node):
                         conv_history = "\n".join([f"{m.get('role')}: {m.get('content')}" for m in messages[-5:]])
                         gem_payload = {
                             "contents": [{"parts": [{"text": f"{system_prompt}\n\nKonuşma Geçmişi:\n{conv_history}"}]}],
-                            "generation_config": {"temperature": 0.85, "max_output_tokens": 200}
+                            "generation_config": {"temperature": 0.85, "max_output_tokens": 300}
                         }
                         req = urllib.request.Request(
                             url,
@@ -1863,9 +1880,20 @@ class AstroRealtimeNode(Node):
                                 break
                     except urllib.error.HTTPError as http_e:
                         err_body = http_e.read().decode("utf-8", errors="ignore")
-                        self.get_logger().warn(f"⚠️ [Gemini LLM ({g_mod}) Hatası]: {http_e.code} - {err_body}")
+                        self.get_logger().debug(f"Gemini LLM ({g_mod}) notice: {http_e.code} - {err_body}")
                     except Exception as ge:
-                        self.get_logger().warn(f"⚠️ [Gemini LLM ({g_mod}) Hatası]: {ge}")
+                        self.get_logger().debug(f"Gemini LLM ({g_mod}) notice: {ge}")
+
+            # Clean reasoning artifacts (<think> blocks)
+            raw_reply = reply_text
+            reply_text = clean_tts_text(raw_reply)
+            if not reply_text and raw_reply:
+                p = self.persona_name.lower()
+                spk = self._active_person_name if self._active_person_name != "Misafir" else ""
+                if p == "kufurbaz":
+                    reply_text = f"Ne var ulan {spk}, buradayım işte!".strip()
+                else:
+                    reply_text = f"Dinliyorum {spk}, buyur!".strip()
 
             if not reply_text:
                 return
