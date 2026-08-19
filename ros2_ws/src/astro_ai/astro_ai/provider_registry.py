@@ -129,9 +129,21 @@ class ProviderRegistry:
         }
 
     def _log(self, level: str, msg: str) -> None:
-        if self.logger:
-            fn = getattr(self.logger, level, None) or getattr(self.logger, "info", print)
-            fn(msg)
+        if not self.logger:
+            return
+        lvl = str(level).lower()
+        if lvl == "debug":
+            fn = getattr(self.logger, "debug", getattr(self.logger, "info", print))
+        elif lvl in ("warn", "warning"):
+            fn = getattr(self.logger, "warn", getattr(self.logger, "warning", print))
+        elif lvl == "error":
+            fn = getattr(self.logger, "error", print)
+        else:
+            fn = getattr(self.logger, "info", print)
+        try:
+            fn(str(msg))
+        except Exception:
+            pass
 
     def get_provider_health(self, provider: str) -> ProviderHealth:
         return self._provider_health.get(provider, ProviderHealth.UNINITIALIZED)
@@ -524,7 +536,7 @@ class ProviderRegistry:
         timeout: float = 2.5,
     ) -> Generator[str, None, None]:
         """Streams tokens from Groq Chat Completions API with strict error classification and immediate blacklisting."""
-        payload = {
+        payload: Dict[str, Any] = {
             "model": model_id,
             "messages": messages,
             "temperature": temperature,
@@ -533,6 +545,8 @@ class ProviderRegistry:
             "max_tokens": max_tokens,
             "stream": True,
         }
+        if any(x in model_id.lower() for x in ("gpt-oss", "reasoning", "r1")):
+            payload["reasoning_effort"] = "low"
 
         req = urllib.request.Request(
             "https://api.groq.com/openai/v1/chat/completions",

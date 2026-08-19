@@ -231,6 +231,12 @@ def main() -> int:
                     req.get("language") or args.language,
                     req_cond_latent,
                     req_spk_emb,
+                    temperature=float(req.get("temperature", 0.75)),
+                    length_penalty=float(req.get("length_penalty", 1.0)),
+                    repetition_penalty=float(req.get("repetition_penalty", 2.0)),
+                    top_k=int(req.get("top_k", 50)),
+                    top_p=float(req.get("top_p", 0.85)),
+                    speed=float(req.get("speed", 1.05)),
                     enable_text_splitting=False,  # Sentence chunker already handles splitting
                     batch_size=args.batch_size,
                 )

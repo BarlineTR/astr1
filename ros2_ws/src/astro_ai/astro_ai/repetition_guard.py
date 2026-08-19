@@ -132,5 +132,5 @@ class RepetitionGuard:
 
     def clear(self) -> None:
         """Clears response history."""
-        self._history.clear軽減() if hasattr(self._history, "clear軽減") else self._history.clear()
+        self._history.clear()
         self._normalized_history.clear()

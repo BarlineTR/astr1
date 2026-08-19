@@ -25,10 +25,28 @@ import urllib.error
 import wave
 from typing import Any, Dict, List, Optional, Tuple, Union
 
-import rclpy
-from rclpy.node import Node
-from sensor_msgs.msg import Image
-from std_msgs.msg import Bool, Float32, String
+try:
+    import rclpy
+    from rclpy.node import Node
+    from sensor_msgs.msg import Image
+    from std_msgs.msg import Bool, Float32, String
+except ImportError:
+    rclpy = None
+    class Node:  # type: ignore
+        def __init__(self, *args, **kwargs):
+            pass
+        def get_logger(self):
+            import logging
+            return logging.getLogger("AstroRealtimeNode")
+        def create_subscription(self, *args, **kwargs):
+            return None
+        def create_publisher(self, *args, **kwargs):
+            return None
+        def create_timer(self, *args, **kwargs):
+            return None
+    class _MockMsg:
+        data: Any = None
+    Image = Bool = Float32 = String = _MockMsg  # type: ignore
 
 try:
     import cv2
@@ -1893,105 +1911,99 @@ class AstroRealtimeNode(Node):
                 self.get_logger().error(f"❌ [Astro Realtime] Local XTTS GPU başlatılamadı: {e}")
 
     def _generate_contextual_persona_fallback(self, user_text: str) -> str:
-        """Dynamically generates an utterance-grounded, non-repetitive contextual Turkish response when cloud LLMs fail."""
+        """Dynamically generates a natural, socially appropriate, non-repetitive Turkish conversational response.
+        
+        Strictly avoids artificial keyword slot-filling or robotic template echoes.
+        """
         p = self.persona_name.lower()
         spk = f" {self._active_person_name}" if self._active_person_name != "Misafir" else ""
         u = (user_text or "").lower().strip()
-        words = u.split()
 
         candidates = []
 
-        if any(w in u for w in ["nasılsın", "ne yapıyorsun", "ne haber", "naber", "nasıl gidiyor"]):
-            if "kufurbaz" in p:
-                candidates = [
-                    f"İyiyim ulan{spk}, robot gibi çalışıyoruz işte. Sen ne durumdasın?",
-                    f"Sensörlerim ve sistemlerim tam gaz çalışıyor{spk}. Senin tarafta ne var ne yok?",
-                    f"Görsel algım da işlemcim de ateş ediyor{spk}. Sen kendi keyfine bak.",
-                    f"Milleti dinliyorum, etrafı kolaçan ediyorum{spk}. Sende ne havadis var?",
-                ]
-            elif "flirt" in p:
-                candidates = [
-                    f"Seni gördüm daha iyi oldum{spk}, günüm aydınlandı. Sen nasılsın?",
-                    f"Harikayım canım{spk}, seninle sohbet etmek çok keyifli.",
-                ]
-            elif "formal" in p:
-                candidates = [
-                    f"Sistemlerim ve sensörlerim aktif durumda Sayın{spk}. Size nasıl yardımcı olabilirim?",
-                    f"Teşekkür ederim Sayın{spk}, tüm operasyonel birimlerim hazır.",
-                ]
-            else:
-                candidates = [
-                    f"Çok iyiyim{spk}, sensörlerim ve algoritmalarım hazır! Sen nasılsın?",
-                    f"Her şey yolunda{spk}, seninle çalışmaya hazırım. Ne yapıyoruz bugün?",
-                ]
-
-        elif any(w in u for w in ["kimsin", "adın ne", "necisin", "sen kimsin"]):
-            if "kufurbaz" in p:
-                candidates = [
-                    f"Astro'yum ulan, yapay zekalı sosyal robotum ben{spk}!",
-                    f"Astro derler bana{spk}, akıllı ve sivri dilli bir robotum.",
-                ]
-            else:
-                candidates = [
-                    f"Ben Astro{spk}, yapay zekalı sosyal robot asistanınızım.",
-                    f"Adım Astro{spk}, kamera, ses ve yapay zeka modüllerimle buradayım.",
-                ]
-
-        elif any(w in u for w in ["selam", "merhaba", "günaydın", "iyi akşamlar", "hey"]):
-            if "kufurbaz" in p:
-                candidates = [
-                    f"Aleyküm selam{spk}, ne anlatacaksan anlat dinliyorum.",
-                    f"Selam{spk}, yine ne işler peşindesin anlat bakalım.",
-                    f"Merhaba{spk}, buradayım, söyle bakalım ne yapıyoruz?",
-                ]
-            elif "flirt" in p:
-                candidates = [
-                    f"Merhaba{spk}, seni görmek ne güzel!",
-                    f"Selam canım{spk}, sesini duymak çok hoş.",
-                ]
-            elif "formal" in p:
-                candidates = [
-                    f"Saygılar efendim{spk}, hoş geldiniz. Nasıl yardımcı olabilirim?",
-                    f"Merhabalar Sayın{spk}, sistemlerim emirlerinize hazır.",
-                ]
-            else:
-                candidates = [
-                    f"Merhaba{spk}! Seni dinliyorum, ne yapmak istersin?",
-                    f"Selam{spk}, mikrofonum ve sistemlerim hazır!",
-                ]
-
-        elif any(w in u for w in ["abone", "takip", "beğen", "video", "youtube", "kanal"]):
+        # 1. Gratitude / Thanks
+        if any(w in u for w in ["teşekkür", "tesekkur", "sağ ol", "sag ol", "eyvallah", "sağolasın", "mersi", "minnettarım"]):
             candidates = [
-                f"Videoyu beğenip kanala abone olmayı ve bildirimleri açmayı unutmayın{spk}!",
-                f"Bizi takip edip abone olarak projelerimize destek olabilirsiniz{spk}!",
+                f"Rica ederim{spk}, ne zaman istersen buradayım.",
+                f"Lafı bile olmaz{spk}, sana yardımcı olmaktan keyif alıyorum.",
+                f"Rica ederim{spk}, her zaman yanındayım.",
+                f"Bir şey değil{spk}, keyifle yardımcı olurum.",
             ]
 
-        else:
-            stopwords = {"bana", "sana", "bunu", "şunu", "onun", "için", "gibi", "kadar", "daha", "veya", "çünkü", "evet", "hayır", "olan", "olanı", "şimdi"}
-            topic_words = [w for w in words if len(w) >= 4 and w not in stopwords]
-            topic_str = f"'{topic_words[0]}'" if topic_words else "bahsettiğin bu konu"
+        # 2. Status / How are you / Well-being
+        elif any(w in u for w in ["nasılsın", "nasilsin", "ne haber", "naber", "nasıl gidiyor", "ne var ne yok", "iyi misin", "keyifler nasıl"]):
+            candidates = [
+                f"İyiyim, teşekkür ederim{spk}. Senin günün nasıl geçiyor?",
+                f"Her şey yolunda{spk}, sistemlerim aktif ve seni dinliyorum. Sen nasılsın?",
+                f"Gayet iyiyim{spk}, seninle sohbet etmek çok güzel. Sende ne var ne yok?",
+                f"Keyfim yerinde{spk}, her şey tıkırında. Senin günün nasıl gidiyor?",
+            ]
 
-            if "kufurbaz" in p:
-                candidates = [
-                    f"Ulan{spk}, {topic_str} hakkında dediklerini aldım, biraz daha detay ver bakalım.",
-                    f"{topic_str} meselesini duydum{spk}, tam olarak ne yapmak istiyorsun anlat.",
-                    f"Dediğin {topic_str} konusunu anladım{spk}, devam et dinliyorum.",
-                ]
-            elif "flirt" in p:
-                candidates = [
-                    f"{topic_str} hakkında söylediklerin çok ilginç canım{spk}, biraz daha anlatır mısın?",
-                    f"Seni dikkatle dinliyorum{spk}, {topic_str} konusunda devam et lütfen.",
-                ]
-            elif "formal" in p:
-                candidates = [
-                    f"Sayın{spk}, {topic_str} ile ilgili ifadeniz analiz edildi, dinlemeye devam ediyorum.",
-                    f"{topic_str} konusundaki bilginiz işlendi Sayın{spk}, emrinizi bekliyorum.",
-                ]
-            else:
-                candidates = [
-                    f"{topic_str} hakkında söylediğin şeyi duydum{spk}, detayları dinliyorum.",
-                    f"{topic_str} ile ilgili bahsettiğin konuyu kaydettim{spk}, devam edebilirsin.",
-                ]
+        # 3. Negative Mood / Fatigue / Feeling unwell
+        elif any(w in u for w in ["yorgunum", "yoruldum", "canım sıkkın", "moralim bozuk", "uykum var", "hastayım", "kötüyüm", "keyifsizim"]):
+            candidates = [
+                f"Geçmiş olsun{spk}, biraz dinlenmeyi ihmal etme. İstersen biraz sohbet edelim.",
+                f"Kendini çok yorma{spk}, dinlenmek sana iyi gelecektir.",
+                f"Bunu duyduğuma üzüldüm{spk}, enerjini toplamak için biraz mola ver istersen.",
+                f"Umarım çabucak toparlanırsın{spk}, ben buradayım, ne zaman istersen konuşabiliriz.",
+            ]
+
+        # 4. Positive Mood / Feeling Great
+        elif any(w in u for w in ["harikayım", "çok iyiyim", "mutluyum", "güzel geçti", "harika", "süperim", "keyfim yerinde", "mükemmel"]):
+            candidates = [
+                f"Bunu duyduğuma çok sevindim{spk}! Harika enerjin bana da geçti.",
+                f"Süper{spk}, keyfinin yerinde olmasına çok mutlu oldum.",
+                f"Şahane{spk}, hep böyle neşeli ve enerjik kalmanı dilerim.",
+            ]
+
+        # 5. Greetings / Hellos
+        elif any(w in u for w in ["selam", "merhaba", "günaydın", "iyi akşamlar", "tünaydın", "hey", "selamlar", "merhabalar"]):
+            candidates = [
+                f"Merhaba{spk}! Seni dinliyorum, nasıl yardımcı olabilirim?",
+                f"Selam{spk}, hoş geldin! Bugün senin için ne yapabilirim?",
+                f"Merhabalar{spk}, mikrofonum açık, seni dinliyorum.",
+                f"Selam{spk}, hazırım, seni dinliyorum.",
+            ]
+
+        # 6. Farewells / Goodbyes
+        elif any(w in u for w in ["görüşürüz", "hoşça kal", "hosca kal", "bay bay", "kendine iyi bak", "iyi geceler", "görüşmek üzere"]):
+            candidates = [
+                f"Görüşmek üzere{spk}, kendine çok iyi bak!",
+                f"Hoşça kal{spk}, iyi günler dilerim!",
+                f"Görüşürüz{spk}, bir isteğin olursa hep buradayım.",
+            ]
+
+        # 7. Identity / Name / Capabilities
+        elif any(w in u for w in ["kimsin", "adın ne", "necisin", "sen kimsin", "ne yaparsın", "ne işe yararsın"]):
+            candidates = [
+                f"Ben Astro{spk}, senin yapay zekalı sosyal robot asistanınım.",
+                f"Adım Astro{spk}, ses ve kamera modüllerimle sana yardımcı olmak için buradayım.",
+                f"Ben Astro{spk}, seninle sohbet edebilen ve çevremi algılayan bir sosyal robotum.",
+            ]
+
+        # 8. Social Actions / Channel / Subscribe
+        elif any(w in u for w in ["abone", "takip", "beğen", "video", "youtube", "kanal"]):
+            candidates = [
+                f"Videoyu beğenip kanala abone olarak projelerimize destek olmayı unutmayın{spk}!",
+                f"Kanalı takip edip bildirimleri açarak yeni videolardan haberdar olabilirsiniz{spk}!",
+            ]
+
+        # 9. Agreement / Affirmation
+        elif any(w in u for w in ["tamam", "peki", "olur", "anlaştık", "aynen", "tabii", "evet"]):
+            candidates = [
+                f"Anlaştık{spk}, başka bir isteğin olursa buradayım.",
+                f"Tamamdır{spk}, seni dinlemeye devam ediyorum.",
+                f"Peki{spk}, nasıl istersen öyle yapalım.",
+            ]
+
+        # 10. General Conversational Fallback (Polite social robot acknowledgement without slot-filling)
+        else:
+            candidates = [
+                f"Seni dikkatle dinliyorum{spk}, anlatmaya devam edebilirsin.",
+                f"Söylediklerini aldım{spk}, bu konuda konuşmaya devam edebiliriz.",
+                f"Seni dinliyorum{spk}, başka neler söylemek istersin?",
+                f"Anlıyorum{spk}, seni dinlemeye devam ediyorum.",
+            ]
 
         import random
         random.shuffle(candidates)
@@ -2001,34 +2013,35 @@ class AstroRealtimeNode(Node):
             if valid:
                 return cand_clean
 
-        default_resp = f"{u.capitalize()} dediğini duydum{spk}, seni dinlemeye devam ediyorum."
+        default_resp = f"Seni dinliyorum{spk}, anlatmaya devam edebilirsin."
         self.repetition_guard.record_response(default_resp)
         return default_resp
 
-    def _synthesize_speech_pcm(self, text: str) -> Tuple[bytes, str, float]:
+    def _synthesize_speech_pcm(self, text: str) -> Tuple[bytes, str, float, bool]:
         """Synthesizes speech to int16 PCM using Local XTTS on CUDA GPU with Edge-TTS EMERGENCY fallback only.
         
-        Returns: (pcm_bytes, active_engine_name, gpu_inf_ms)
+        Returns: (pcm_bytes, active_engine_name, gpu_inf_ms, is_xtts_ready)
         """
         if not text:
-            return b"", "none", 0.0
+            return b"", "none", 0.0, False
         clean_text = clean_tts_text(text)
         if not clean_text:
-            return b"", "none", 0.0
+            return b"", "none", 0.0, False
 
         # 1. Primary Fallback: Local Coqui XTTS on CUDA GPU (Resident & Warm, TTFA < 500ms)
-        if self.local_xtts and self.local_xtts.is_ready():
+        is_ready = bool(self.local_xtts and self.local_xtts.is_ready())
+        if is_ready:
             t_s = time.perf_counter()
             pcm = self.local_xtts.synthesize_sentence(clean_text, generation_id=self._fallback_generation_id)
             gpu_ms = (time.perf_counter() - t_s) * 1000.0
             if pcm:
-                return pcm, "xtts_gpu", gpu_ms
+                return pcm, "xtts_gpu", gpu_ms, True
 
         # 2. EMERGENCY Fallback: Edge-TTS In-Memory PCM24k (ONLY if XTTS unavailable)
-        reason = "xtts_worker_not_ready" if (self.local_xtts and not self.local_xtts.is_ready()) else "xtts_uninstalled"
+        reason = "xtts_worker_not_ready" if (self.local_xtts and not is_ready) else "xtts_uninstalled"
         self.get_logger().warn(f"🚨 [EDGE_EMERGENCY_FALLBACK] XTTS GPU hazır değil ({reason}). Acil durum ses motoru (Edge-TTS) kullanılıyor.")
         pcm_edge = self._synthesize_edge_tts_pcm24k(clean_text)
-        return pcm_edge, "edge_tts_emergency", 0.0
+        return pcm_edge, "edge_tts_emergency", 0.0, False
 
     def _play_pcm_chunks(self, pcm_data: bytes):
         """Streams 24kHz int16 PCM audio chunks directly to audio output node with smooth 20ms pacing."""
@@ -2059,11 +2072,14 @@ class AstroRealtimeNode(Node):
         error_class_str = "none"
         model_error_str = "none"
         llm_latency_ms = 0.0
+        llm_ttft_ms = 0.0
         first_audio_played = False
         first_audio_ms = 0.0
         total_synth_ms = 0.0
         total_gpu_ms = 0.0
         total_audio_sec = 0.0
+        tts_ready_flag = False
+        attempts: List[Dict[str, Any]] = []
 
         try:
             # 1. Combine raw 16kHz PCM chunks into valid in-memory WAV buffer
@@ -2116,8 +2132,10 @@ class AstroRealtimeNode(Node):
                 else:
                     reply_text = f"{spk} {weather_info}".strip()
                 
-                t_tts_req = time.monotonic()
-                pcm, eng_name, g_ms = self._synthesize_speech_pcm(reply_text)
+                pcm, eng_name, g_ms, is_ready = self._synthesize_speech_pcm(reply_text)
+                active_engine = eng_name
+                tts_ready_flag = is_ready
+                total_gpu_ms += g_ms
                 if pcm:
                     first_audio_ms = (time.monotonic() - t_turn_start) * 1000.0
                     self.get_logger().info(f"🤖 [Astro (Canlı Hava Durumu)]: \"{reply_text}\"")
@@ -2143,14 +2161,19 @@ class AstroRealtimeNode(Node):
                 for target_model in groq_candidates:
                     try:
                         t_model_start = time.monotonic()
+                        first_token_seen = False
                         for token in self.provider_registry.stream_groq_completion(
                             self.groq_api_key,
                             target_model,
                             messages,
-                            max_tokens=100,
+                            max_tokens=80,
                             temperature=0.65,
                             timeout=2.5,
                         ):
+                            if not first_token_seen:
+                                llm_ttft_ms = (time.monotonic() - t_model_start) * 1000.0
+                                first_token_seen = True
+
                             current_clause += token
                             full_reply_parts.append(token)
 
@@ -2158,12 +2181,13 @@ class AstroRealtimeNode(Node):
                                 clean_clause = clean_tts_text(current_clause)
                                 if clean_clause and len(clean_clause) >= 3:
                                     t_clause_synth = time.perf_counter()
-                                    pcm, eng_name, g_ms = self._synthesize_speech_pcm(clean_clause)
+                                    pcm, eng_name, g_ms, is_ready = self._synthesize_speech_pcm(clean_clause)
                                     s_ms = (time.perf_counter() - t_clause_synth) * 1000.0
                                     total_synth_ms += s_ms
                                     total_gpu_ms += g_ms
+                                    active_engine = eng_name
+                                    tts_ready_flag = is_ready
                                     if pcm:
-                                        active_engine = eng_name
                                         total_audio_sec += (len(pcm) / 2) / 24000.0
                                         if not first_audio_played:
                                             first_audio_ms = (time.monotonic() - t_turn_start) * 1000.0
@@ -2176,10 +2200,23 @@ class AstroRealtimeNode(Node):
                             chosen_provider = "groq"
                             llm_latency_ms = (time.monotonic() - t_model_start) * 1000.0
                             self.provider_registry.record_success("groq", target_model, llm_latency_ms)
+                            attempts.append({
+                                "provider": "groq",
+                                "model": target_model,
+                                "result": "success",
+                                "latency_ms": int(llm_latency_ms)
+                            })
                             break
                     except ProviderError as pe:
                         error_class_str = pe.error_class.value
                         model_error_str = pe.message[:80]
+                        attempts.append({
+                            "provider": "groq",
+                            "model": target_model,
+                            "result": "failed",
+                            "error_class": pe.error_class.value,
+                            "error": pe.message[:80]
+                        })
                         self.get_logger().warn(f"⚠️ [Groq Model Fallback] {target_model} failed ({pe.error_class.value}): {pe.message[:80]}")
                         current_clause = ""
                         full_reply_parts = []
@@ -2190,12 +2227,13 @@ class AstroRealtimeNode(Node):
                 clean_clause = clean_tts_text(current_clause)
                 if clean_clause and len(clean_clause) >= 2:
                     t_clause_synth = time.perf_counter()
-                    pcm, eng_name, g_ms = self._synthesize_speech_pcm(clean_clause)
+                    pcm, eng_name, g_ms, is_ready = self._synthesize_speech_pcm(clean_clause)
                     s_ms = (time.perf_counter() - t_clause_synth) * 1000.0
                     total_synth_ms += s_ms
                     total_gpu_ms += g_ms
+                    active_engine = eng_name
+                    tts_ready_flag = is_ready
                     if pcm:
-                        active_engine = eng_name
                         total_audio_sec += (len(pcm) / 2) / 24000.0
                         if not first_audio_played:
                             first_audio_ms = (time.monotonic() - t_turn_start) * 1000.0
@@ -2213,7 +2251,7 @@ class AstroRealtimeNode(Node):
                             g_mod,
                             system_prompt,
                             messages,
-                            max_tokens=100,
+                            max_tokens=80,
                             temperature=0.65,
                             timeout=4.0,
                         )
@@ -2222,11 +2260,25 @@ class AstroRealtimeNode(Node):
                             chosen_model = g_mod
                             chosen_provider = "gemini"
                             llm_latency_ms = (time.monotonic() - t_gem_start) * 1000.0
+                            llm_ttft_ms = llm_latency_ms
                             self.provider_registry.record_success("gemini", g_mod, llm_latency_ms)
+                            attempts.append({
+                                "provider": "gemini",
+                                "model": g_mod,
+                                "result": "success",
+                                "latency_ms": int(llm_latency_ms)
+                            })
                             break
                     except ProviderError as pe:
                         error_class_str = pe.error_class.value
                         model_error_str = pe.message[:80]
+                        attempts.append({
+                            "provider": "gemini",
+                            "model": g_mod,
+                            "result": "failed",
+                            "error_class": pe.error_class.value,
+                            "error": pe.message[:80]
+                        })
                         self.get_logger().warn(f"⚠️ [Gemini Model Fallback] {g_mod} failed ({pe.error_class.value}): {pe.message[:80]}")
                         continue
 
@@ -2238,18 +2290,24 @@ class AstroRealtimeNode(Node):
                 chosen_model = "contextual_grounding"
                 chosen_provider = "local_persona"
                 llm_status = "degraded"
+                attempts.append({
+                    "provider": "local_persona",
+                    "model": "contextual_grounding",
+                    "result": "success"
+                })
             else:
                 self.repetition_guard.record_response(full_reply_str)
 
             # Synthesize full response if not already streamed in chunks
             if not first_audio_played and full_reply_str:
                 t_clause_synth = time.perf_counter()
-                pcm, eng_name, g_ms = self._synthesize_speech_pcm(full_reply_str)
+                pcm, eng_name, g_ms, is_ready = self._synthesize_speech_pcm(full_reply_str)
                 s_ms = (time.perf_counter() - t_clause_synth) * 1000.0
                 total_synth_ms += s_ms
                 total_gpu_ms += g_ms
+                active_engine = eng_name
+                tts_ready_flag = is_ready
                 if pcm:
-                    active_engine = eng_name
                     total_audio_sec += (len(pcm) / 2) / 24000.0
                     first_audio_ms = (time.monotonic() - t_turn_start) * 1000.0
                     first_audio_played = True
@@ -2264,20 +2322,21 @@ class AstroRealtimeNode(Node):
                 self.session.record_robot_speech()
 
                 xtts_info = self.local_xtts.get_telemetry() if self.local_xtts else {}
-                xtts_ready_flag = bool(self.local_xtts and self.local_xtts.is_ready())
                 worker_pid = xtts_info.get("worker_pid", "None")
                 gpu_name_str = xtts_info.get("gpu_name", "Orin")
 
                 self.get_logger().info(
                     f"📊 [Turn Telemetry]: mode=LOCAL_FALLBACK | provider={chosen_provider} | "
-                    f"model={chosen_model} | llm_status={llm_status} | llm_latency_ms={int(llm_latency_ms)} | "
-                    f"tts_engine={active_engine} | tts_ready={xtts_ready_flag} | xtts_worker_pid={worker_pid} | "
-                    f"xtts_gpu={gpu_name_str} | ttfa_ms={int(first_audio_ms if first_audio_played else total_turn_ms)} | "
-                    f"fallback_reason=realtime_quota | error_class={error_class_str} | model_error={model_error_str}"
+                    f"model={chosen_model} | llm_status={llm_status} | stt_ms={int(stt_ms)} | "
+                    f"llm_ttft_ms={int(llm_ttft_ms)} | llm_total_ms={int(llm_latency_ms)} | "
+                    f"xtts_infer_ms={int(total_gpu_ms)} | tts_engine={active_engine} | "
+                    f"tts_ready={tts_ready_flag} | xtts_worker_pid={worker_pid} | xtts_gpu={gpu_name_str} | "
+                    f"total_ttfa_ms={int(first_audio_ms if first_audio_played else total_turn_ms)} | "
+                    f"fallback_reason=realtime_quota | attempts={json.dumps(attempts, ensure_ascii=False)}"
                 )
 
         except Exception as e:
-            self.get_logger().warn(f"Streaming turn notice: {e}")
+            self.get_logger().warn(f"Fallback turn notice: {e}")
         finally:
             self._is_processing_fallback = False
             self._is_responding = False

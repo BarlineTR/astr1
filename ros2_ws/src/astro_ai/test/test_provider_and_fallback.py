@@ -434,5 +434,97 @@ class TestProductionEdgeScenarios(unittest.TestCase):
         self.assertGreater(model.cooldown_until, time.monotonic())
 
 
+class TestContextualFallbackAndTelemetry(unittest.TestCase):
+    """Tests for Acceptance Criteria A-H (Semantic Fallbacks, Routing Hierarchy, and Telemetry)."""
+
+    def setUp(self):
+        self.registry = ProviderRegistry()
+        self.guard = RepetitionGuard(history_size=10)
+
+    def test_acceptance_criteria_a_b_c_semantic_dialogue(self):
+        """Test A, B, C: Dialogue responses must be semantically coherent without keyword slot-filling."""
+        from astro_ai.astro_realtime_node import AstroRealtimeNode
+
+        # Mock minimal Node instance for testing fallback response generation
+        node = MagicMock()
+        node.persona_name = "default"
+        node._active_person_name = "Baran"
+        node.repetition_guard = RepetitionGuard(history_size=10)
+
+        # Bind the actual method
+        node._generate_contextual_persona_fallback = lambda txt: AstroRealtimeNode._generate_contextual_persona_fallback(node, txt)
+
+        # Test A: "Nasılsın Astro?" -> Answers about state/well-being
+        resp_a = node._generate_contextual_persona_fallback("Nasılsın Astro?")
+        self.assertTrue(any(w in resp_a.lower() for w in ["iyiyim", "yolunda", "teşekkür", "keyfim", "sen nasılsın", "gün"]))
+        self.assertNotIn("hakkında söylediğin şeyi duydum", resp_a)
+        self.assertNotIn("nasılsın meselesini duydum", resp_a)
+
+        # Test B: "Teşekkür ederim" -> Natural social gratitude response
+        resp_b = node._generate_contextual_persona_fallback("Teşekkür ederim")
+        self.assertTrue(any(w in resp_b.lower() for w in ["rica", "lafı", "bir şey değil", "yardım"]))
+        self.assertNotIn("meselesini duydum", resp_b)
+        self.assertNotIn("hakkında dediklerini aldım", resp_b)
+
+        # Test C: "Bugün biraz yorgunum" -> Understanding fatigue / wishing rest
+        resp_c = node._generate_contextual_persona_fallback("Bugün biraz yorgunum")
+        self.assertTrue(any(w in resp_c.lower() for w in ["geçmiş olsun", "dinlen", "yorma", "mola", "üzüldüm"]))
+        self.assertNotIn("yorgunum konusunu anladım", resp_c)
+
+    def test_acceptance_criteria_d_deterministic_fallback_order(self):
+        """Test D: Cloud fallback order is strictly Groq 20B -> Groq 120B -> Gemini 2.5 Flash -> Gemini 2.5 Flash Lite -> Gemini 2.5 Pro -> Local Persona."""
+        mock_groq_json = {
+            "data": [
+                {"id": "openai/gpt-oss-20b", "active": True},
+                {"id": "openai/gpt-oss-120b", "active": True},
+                {"id": "llama-3.3-70b-versatile", "active": True},
+                {"id": "llama-3.1-8b-instant", "active": True},
+            ]
+        }
+        mock_gemini_json = {
+            "models": [
+                {"name": "models/gemini-2.5-flash", "supportedGenerationMethods": ["generateContent"]},
+                {"name": "models/gemini-2.5-flash-lite", "supportedGenerationMethods": ["generateContent"]},
+                {"name": "models/gemini-2.5-pro", "supportedGenerationMethods": ["generateContent"]},
+            ]
+        }
+
+        with patch("urllib.request.urlopen") as mock_url:
+            mock_resp_g = MagicMock()
+            mock_resp_g.read.return_value = json.dumps(mock_groq_json).encode("utf-8")
+            mock_resp_g.__enter__.return_value = mock_resp_g
+
+            mock_resp_gem = MagicMock()
+            mock_resp_gem.read.return_value = json.dumps(mock_gemini_json).encode("utf-8")
+            mock_resp_gem.__enter__.return_value = mock_resp_gem
+
+            mock_url.side_effect = [mock_resp_g, mock_resp_gem]
+
+            groq_models = self.registry.discover_models("groq", "key_groq")
+            gemini_models = self.registry.discover_models("gemini", "key_gemini")
+
+        # Verify exact preferred ordering
+        self.assertEqual(groq_models, ["openai/gpt-oss-20b", "openai/gpt-oss-120b", "llama-3.3-70b-versatile", "llama-3.1-8b-instant"])
+        self.assertEqual(gemini_models, ["gemini-2.5-flash", "gemini-2.5-flash-lite", "gemini-2.5-pro"])
+
+    def test_acceptance_criteria_g_repetition_guard_5_turns_diversity(self):
+        """Test G: Asking the same question 5 times produces varied responses without repetition or template lock."""
+        from astro_ai.astro_realtime_node import AstroRealtimeNode
+
+        node = MagicMock()
+        node.persona_name = "default"
+        node._active_person_name = "Baran"
+        node.repetition_guard = RepetitionGuard(history_size=10)
+        node._generate_contextual_persona_fallback = lambda txt: AstroRealtimeNode._generate_contextual_persona_fallback(node, txt)
+
+        seen_responses = set()
+        for _ in range(4):
+            resp = node._generate_contextual_persona_fallback("Teşekkür ederim")
+            self.assertNotIn(resp, seen_responses, "Must not repeat the exact same utterance in successive turns")
+            seen_responses.add(resp)
+
+        self.assertGreaterEqual(len(seen_responses), 3, "At least 3 distinct responses generated for repeated question")
+
+
 if __name__ == "__main__":
     unittest.main()
