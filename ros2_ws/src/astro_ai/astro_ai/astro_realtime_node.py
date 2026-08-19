@@ -110,40 +110,58 @@ def frame_to_base64_jpeg(frame: np.ndarray, max_dim: int = 640) -> Optional[str]
 
 
 
-REALTIME_WS_URL = "wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview"
+REALTIME_WS_URL = "wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-12-17"
 VALID_REALTIME_VOICES = {"alloy", "ash", "ballad", "coral", "echo", "sage", "shimmer", "verse", "fable", "onyx"}
+
+
 def discover_realtime_models(api_key: str, preferred: str = "") -> list[str]:
     candidates = []
-    if preferred:
-        candidates.append(preferred)
-
-    standard_models = [
+    # Highest quality expressive human-like realtime models in strict priority
+    flagship_realtime_models = [
+        "gpt-4o-realtime-preview-2024-12-17",
         "gpt-4o-realtime-preview",
         "gpt-4o-mini-realtime-preview",
-        "gpt-4o-realtime-preview-2024-10-01",
-        "gpt-4o-realtime-preview-2024-12-17",
         "gpt-realtime",
         "gpt-realtime-mini"
     ]
-    for m in standard_models:
+    if preferred and preferred not in candidates:
+        candidates.append(preferred)
+
+    for m in flagship_realtime_models:
         if m not in candidates:
             candidates.append(m)
 
     try:
         import urllib.request
-        req = urllib.request.Request("https://api.openai.com/v1/models", headers={"Authorization": f"Bearer {api_key}"})
+        req = urllib.request.Request("https://api.openai.com/v1/models", headers={"Authorization": f"Bearer {api_key}", "User-Agent": "Mozilla/5.0"})
         with urllib.request.urlopen(req, timeout=4) as resp:
             data = json.loads(resp.read().decode())
             avail_ids = [m["id"] for m in data.get("data", []) if "realtime" in m.get("id", "")]
-            if avail_ids:
-                for mid in reversed(avail_ids):
-                    if mid in candidates:
-                        candidates.remove(mid)
-                    candidates.insert(0, mid)
+            for mid in avail_ids:
+                if mid not in candidates:
+                    candidates.append(mid)
     except Exception:
         pass
 
     return candidates
+
+
+def discover_groq_models(api_key: str) -> list[str]:
+    """Dynamically queries Groq /models API to discover currently active models."""
+    if not api_key:
+        return []
+    try:
+        import urllib.request
+        req = urllib.request.Request(
+            "https://api.groq.com/openai/v1/models",
+            headers={"Authorization": f"Bearer {api_key}", "User-Agent": "Mozilla/5.0"}
+        )
+        with urllib.request.urlopen(req, timeout=4.0) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            active_ids = [m["id"] for m in data.get("data", []) if "id" in m]
+            return active_ids
+    except Exception:
+        return []
 
 
 class AstroRealtimeNode(Node):
@@ -373,25 +391,20 @@ class AstroRealtimeNode(Node):
         session_config = {
             "type": "session.update",
             "session": {
-                "type": "realtime",
+                "modalities": ["text", "audio"],
                 "instructions": system_prompt,
-                "audio": {
-                    "input": {
-                        "transcription": {
-                            "model": "whisper-1",
-                            "language": "tr"
-                        },
-                        "turn_detection": {
-                            "type": "server_vad",
-                            "threshold": 0.72,
-                            "prefix_padding_ms": 300,
-                            "silence_duration_ms": 600,
-                            "create_response": False
-                        }
-                    },
-                    "output": {
-                        "voice": self.realtime_voice
-                    }
+                "voice": self.realtime_voice,
+                "temperature": 0.85,
+                "turn_detection": {
+                    "type": "server_vad",
+                    "threshold": 0.72,
+                    "prefix_padding_ms": 300,
+                    "silence_duration_ms": 600,
+                    "create_response": False
+                },
+                "input_audio_transcription": {
+                    "model": "whisper-1",
+                    "language": "tr"
                 },
 
 
@@ -544,7 +557,10 @@ class AstroRealtimeNode(Node):
             resp_event = {
                 "type": "response.create",
                 "response": {
-                    "instructions": current_prompt
+                    "instructions": current_prompt,
+                    "modalities": ["text", "audio"],
+                    "voice": self.realtime_voice,
+                    "temperature": 0.85
                 }
             }
             try:
@@ -1020,9 +1036,9 @@ class AstroRealtimeNode(Node):
         refusal_kws = ["üzgünüm", "yardımcı olamam", "açıklayamıyorum", "cannot assist", "i am sorry", "i'm sorry", "doğrudan açıklayamıyorum"]
         obs = None
 
-        # 1. Primary: Google Gemini 3.6 Flash / 2.5 Flash REST (0 Token Cost, Blazing Fast)
+        # 1. Primary: Google Gemini Flash REST (0 Token Cost, Blazing Fast)
         if self.gemini_api_key:
-            for g_mod in ["gemini-3.6-flash", "gemini-2.5-flash", "gemini-flash-latest"]:
+            for g_mod in ["gemini-2.5-flash", "gemini-1.5-flash", "gemini-3.6-flash", "gemini-flash-latest"]:
                 try:
                     import urllib.request
                     import urllib.error
@@ -1050,13 +1066,17 @@ class AstroRealtimeNode(Node):
                             break
                 except urllib.error.HTTPError as http_e:
                     error_body = http_e.read().decode("utf-8", errors="ignore")
-                    self.get_logger().warn(f"⚠️ [Gemini API Hatası ({g_mod})]: {http_e.code} - {error_body}")
+                    self.get_logger().debug(f"Gemini Vision ({g_mod}) notice: {http_e.code} - {error_body}")
                 except Exception as gem_e:
-                    self.get_logger().warn(f"⚠️ [Gemini Genel Uyarısı ({g_mod})]: {gem_e}")
+                    self.get_logger().debug(f"Gemini Vision ({g_mod}) notice: {gem_e}")
 
-        # 2. Fallback: Groq Vision (qwen-2.5-72b) (0 Token Cost)
+        # 2. Fallback: Dynamic Groq Vision Models (0 Token Cost)
         if not obs and self.groq_api_key:
-            for v_mod in ["qwen-2.5-72b", "llama-3.2-11b-vision-preview"]:
+            active_groq = discover_groq_models(self.groq_api_key)
+            groq_v_models = [m for m in active_groq if "vision" in m]
+            if not groq_v_models:
+                groq_v_models = ["llama-3.3-70b-versatile"] if "llama-3.3-70b-versatile" in active_groq else []
+            for v_mod in groq_v_models:
                 try:
                     import urllib.request
                     import urllib.error
@@ -1092,7 +1112,10 @@ class AstroRealtimeNode(Node):
                             break
                 except urllib.error.HTTPError as http_e:
                     error_body = http_e.read().decode("utf-8", errors="ignore")
-                    self.get_logger().warn(f"⚠️ [Groq API Hatası ({v_mod})]: {http_e.code} - {error_body}")
+                    self.get_logger().debug(f"Groq API ({v_mod}) notice: {http_e.code} - {error_body}")
+                except Exception as ge:
+                    self.get_logger().debug(f"Groq ({v_mod}) notice: {ge}")
+
         # 3. Emergency Safety Fallback: OpenAI Vision REST API (gpt-4o-mini)
         # (Only used if Gemini & Groq keys are invalid/failed, so robot never goes blind)
         if not obs and self.openai_api_key:
@@ -1247,39 +1270,51 @@ class AstroRealtimeNode(Node):
 
             # 1. Try Groq (0 Token Cost)
             if self.groq_api_key:
-                try:
-                    req_data = {
-                        "model": "llama-3.3-70b-versatile",
-                        "messages": [{"role": "user", "content": prompt}],
-                        "temperature": 0.1,
-                        "max_tokens": 60
-                    }
-                    req = urllib.request.Request(
-                        "https://api.groq.com/openai/v1/chat/completions",
-                        data=json.dumps(req_data).encode("utf-8"),
-                        headers={
-                            "Content-Type": "application/json",
-                            "Authorization": f"Bearer {self.groq_api_key}"
-                        },
-                        method="POST"
-                    )
-                    with urllib.request.urlopen(req, timeout=4.0) as resp:
-                        resp_json = json.loads(resp.read().decode("utf-8"))
-                        ans = resp_json["choices"][0]["message"]["content"].strip()
-                except Exception:
-                    pass
+                active_groq = discover_groq_models(self.groq_api_key)
+                text_models = [m for m in ["openai/gpt-oss-120b", "openai/gpt-oss-20b", "llama-3.3-70b-versatile", "llama-3.1-8b-instant"] if m in active_groq]
+                if not text_models and active_groq:
+                    text_models = active_groq[:2]
+                for g_m in (text_models or ["llama-3.3-70b-versatile"]):
+                    try:
+                        req_data = {
+                            "model": g_m,
+                            "messages": [{"role": "user", "content": prompt}],
+                            "temperature": 0.1,
+                            "max_tokens": 60
+                        }
+                        data_bytes = json.dumps(req_data, ensure_ascii=False).encode("utf-8")
+                        req = urllib.request.Request(
+                            "https://api.groq.com/openai/v1/chat/completions",
+                            data=data_bytes,
+                            headers={
+                                "Content-Type": "application/json",
+                                "Authorization": f"Bearer {self.groq_api_key}",
+                                "User-Agent": "Mozilla/5.0"
+                            },
+                            method="POST"
+                        )
+                        with urllib.request.urlopen(req, timeout=4.0) as resp:
+                            resp_json = json.loads(resp.read().decode("utf-8"))
+                            candidate_ans = resp_json["choices"][0]["message"]["content"].strip()
+                            if candidate_ans:
+                                ans = candidate_ans
+                                break
+                    except Exception:
+                        pass
 
             # 2. Try Gemini REST (0 Token Cost fallback)
             if not ans and self.gemini_api_key:
-                for g_mod in ["gemini-3.6-flash", "gemini-2.5-flash", "gemini-flash-latest"]:
+                for g_mod in ["gemini-2.5-flash", "gemini-1.5-flash", "gemini-3.6-flash", "gemini-flash-latest"]:
                     try:
                         url = f"https://generativelanguage.googleapis.com/v1beta/models/{g_mod}:generateContent?key={self.gemini_api_key}"
                         payload = {"contents": [{"parts": [{"text": prompt}]}], "generation_config": {"temperature": 0.1, "max_output_tokens": 60}}
-                        req = urllib.request.Request(url, data=json.dumps(payload).encode("utf-8"), headers={"Content-Type": "application/json"})
+                        data_bytes = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+                        req = urllib.request.Request(url, data=data_bytes, headers={"Content-Type": "application/json", "User-Agent": "Mozilla/5.0"})
                         with urllib.request.urlopen(req, timeout=4.0) as resp:
                             res_json = json.loads(resp.read().decode("utf-8"))
-                            ans = res_json["candidates"][0]["content"]["parts"][0]["text"].strip()
-                            if ans:
+                            candidate_ans = res_json["candidates"][0]["content"]["parts"][0]["text"].strip()
+                            if candidate_ans:
+                                ans = candidate_ans
                                 break
                     except Exception:
                         pass
@@ -1321,9 +1356,9 @@ class AstroRealtimeNode(Node):
             obs = None
             provider_name = ""
 
-            # 1. Primary: Google Gemini 3.6 Flash / 2.5 Flash REST (0 Token Cost, Blazing Fast)
+            # 1. Primary: Google Gemini Flash REST (0 Token Cost, Blazing Fast)
             if self.gemini_api_key:
-                for g_mod in ["gemini-3.6-flash", "gemini-2.5-flash", "gemini-flash-latest"]:
+                for g_mod in ["gemini-2.5-flash", "gemini-1.5-flash", "gemini-3.6-flash", "gemini-flash-latest"]:
                     try:
                         import urllib.request
                         import urllib.error
@@ -1351,13 +1386,17 @@ class AstroRealtimeNode(Node):
                                 break
                     except urllib.error.HTTPError as http_e:
                         error_body = http_e.read().decode("utf-8", errors="ignore")
-                        self.get_logger().warn(f"⚠️ [Idle Gemini API Hatası ({g_mod})]: {http_e.code} - {error_body}")
+                        self.get_logger().debug(f"Idle Gemini Vision ({g_mod}) notice: {http_e.code} - {error_body}")
                     except Exception as gem_e:
                         self.get_logger().debug(f"Idle Gemini Vision ({g_mod}) notice: {gem_e}")
 
-            # 2. Fallback: Groq Vision (qwen-2.5-72b) (0 Token Cost)
+            # 2. Fallback: Dynamic Groq Vision Models (0 Token Cost)
             if not obs and self.groq_api_key:
-                for v_mod in ["qwen-2.5-72b", "llama-3.2-11b-vision-preview"]:
+                active_groq = discover_groq_models(self.groq_api_key)
+                groq_v_models = [m for m in active_groq if "vision" in m]
+                if not groq_v_models:
+                    groq_v_models = ["llama-3.3-70b-versatile"] if "llama-3.3-70b-versatile" in active_groq else []
+                for v_mod in groq_v_models:
                     try:
                         import urllib.request
                         import urllib.error
@@ -1394,7 +1433,7 @@ class AstroRealtimeNode(Node):
                                 break
                     except urllib.error.HTTPError as http_e:
                         error_body = http_e.read().decode("utf-8", errors="ignore")
-                        self.get_logger().warn(f"⚠️ [Idle Groq API Hatası ({v_mod})]: {http_e.code} - {error_body}")
+                        self.get_logger().debug(f"Idle Groq Vision ({v_mod}) notice: {http_e.code} - {error_body}")
                     except Exception as ge:
                         self.get_logger().debug(f"Idle Groq Vision ({v_mod}) notice: {ge}")
 
