@@ -17,6 +17,7 @@ import time
 from typing import Any, Callable, Dict, List, Optional
 
 from astro_audio.audio_output_manager import AudioOutputManager
+from astro_audio.elevenlabs_engine import ElevenLabsEngine
 from astro_audio.local_xtts_engine import LocalXttsEngine
 from astro_audio.realtime_engine import RealtimeEngine
 from astro_audio.sentence_chunker import SentenceChunker
@@ -38,6 +39,7 @@ class TTSOrchestrator:
         output_manager: AudioOutputManager,
         realtime_engine: RealtimeEngine,
         local_xtts_engine: Optional[LocalXttsEngine] = None,
+        elevenlabs_engine: Optional[ElevenLabsEngine] = None,
         logger=None,
         on_state_change: Optional[Callable[[OrchestratorState], None]] = None,
     ):
@@ -45,6 +47,7 @@ class TTSOrchestrator:
         self.output_manager = output_manager
         self.realtime_engine = realtime_engine
         self.xtts_engine = local_xtts_engine
+        self.elevenlabs_engine = elevenlabs_engine
         self._on_state_change_cb = on_state_change
 
         self._state = OrchestratorState.REALTIME_ACTIVE
@@ -176,22 +179,39 @@ class TTSOrchestrator:
         language: str = "tr",
         auto_play: bool = True,
     ) -> Optional[bytes]:
-        """Synthesizes a single clause using the active local engine and enqueues to speaker."""
-        if not text or not self.xtts_engine or not self.xtts_engine.is_ready():
+        """Synthesizes a single clause using ElevenLabs (Primary) or Local XTTS (Fallback) and enqueues to speaker."""
+        if not text:
             return None
 
-        t_synth_start = time.perf_counter()
-        with self._telemetry_lock:
-            if self._current_telemetry and self._current_telemetry.t2_first_xtts_inference_start == 0.0:
-                self._current_telemetry.mark_xtts_inference_start()
+        pcm = None
+        sample_rate = 24000
+        engine_name = "none"
 
-        pcm = self.xtts_engine.synthesize_sentence(text, generation_id=generation_id, language=language)
-        t_synth_end = time.perf_counter()
-        synth_ms = (t_synth_end - t_synth_start) * 1000.0
+        # 1. Primary Remote: ElevenLabs Flash v2.5
+        if self.elevenlabs_engine and self.elevenlabs_engine.is_ready():
+            t_synth_start = time.perf_counter()
+            with self._telemetry_lock:
+                if self._current_telemetry and self._current_telemetry.t2_first_xtts_inference_start == 0.0:
+                    self._current_telemetry.mark_xtts_inference_start()
+            try:
+                pcm = self.elevenlabs_engine.synthesize_sentence(text, generation_id=generation_id, language=language)
+                engine_name = "elevenlabs"
+            except Exception as e:
+                self._log("warn", f"⚠️ [TTSOrchestrator] ElevenLabs hatası, XTTS fallback'e geçiliyor: {e}")
+
+        # 2. Local GPU Fallback: Local XTTS
+        if pcm is None and self.xtts_engine and self.xtts_engine.is_ready():
+            t_synth_start = time.perf_counter()
+            with self._telemetry_lock:
+                if self._current_telemetry and self._current_telemetry.t2_first_xtts_inference_start == 0.0:
+                    self._current_telemetry.mark_xtts_inference_start()
+            pcm = self.xtts_engine.synthesize_sentence(text, generation_id=generation_id, language=language)
+            sample_rate = getattr(getattr(self.xtts_engine, "client", None), "info", {}).get("sample_rate", 24000)
+            engine_name = "xtts_gpu"
 
         if pcm:
-            # Measure generated audio duration (24kHz or 16kHz)
-            sample_rate = getattr(getattr(self.xtts_engine, "client", None), "info", {}).get("sample_rate", 24000) if self.xtts_engine else 24000
+            t_synth_end = time.perf_counter()
+            synth_ms = (t_synth_end - t_synth_start) * 1000.0
             audio_sec = (len(pcm) / 2) / sample_rate
 
             with self._telemetry_lock:
@@ -200,6 +220,7 @@ class TTSOrchestrator:
                         self._current_telemetry.mark_synthesized_audio_ready()
                     self._current_telemetry.record_synthesis(synth_ms, audio_sec)
                     self._current_telemetry.sentence_count += 1
+                    self._current_telemetry.active_tts_engine = engine_name
 
             if auto_play:
                 with self._telemetry_lock:
@@ -216,6 +237,9 @@ class TTSOrchestrator:
         t_barge_start = time.monotonic()
         gen_id = self.output_manager.interrupt(new_generation_id)
         self.chunker.reset()
+
+        if self.elevenlabs_engine:
+            self.elevenlabs_engine.cancel(gen_id)
 
         if self.xtts_engine:
             self.xtts_engine.cancel(gen_id)

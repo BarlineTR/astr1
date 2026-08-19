@@ -277,5 +277,75 @@ class TestProductionHardening(unittest.TestCase):
         self.assertEqual(len(errors), 0, f"Race condition errors encountered: {errors}")
 
 
+class TestElevenLabsEngine(unittest.TestCase):
+    """Tests for ElevenLabs Flash v2.5 TTS Engine (Streaming, Formats, Errors, Barge-in)."""
+
+    def test_readiness(self):
+        from astro_audio.elevenlabs_engine import ElevenLabsEngine
+        engine = ElevenLabsEngine(api_key="", voice_id="")
+        self.assertFalse(engine.is_ready())
+
+        engine.set_api_key("test_key")
+        self.assertFalse(engine.is_ready())
+
+        engine.set_voice_id("test_voice")
+        self.assertTrue(engine.is_ready())
+
+    def test_error_classification(self):
+        from astro_audio.elevenlabs_engine import ElevenLabsEngine
+        engine = ElevenLabsEngine("test_key", "test_voice")
+
+        self.assertEqual(engine.classify_error(401, '{"detail": "Invalid API key"}'), "authentication_error")
+        self.assertEqual(engine.classify_error(404, '{"detail": "Voice not found"}'), "voice_not_found")
+        self.assertEqual(engine.classify_error(400, '{"detail": "Model eleven_flash_v2_5 does not support feature"}'), "model_not_found")
+        self.assertEqual(engine.classify_error(429, '{"detail": "Quota exceeded for tier"}'), "quota_exhausted")
+        self.assertEqual(engine.classify_error(429, '{"detail": "Too many requests per minute"}'), "rate_limited")
+        self.assertEqual(engine.classify_error(500, '{"detail": "Internal Server Error"}'), "server_error")
+
+    def test_streaming_and_synthesis(self):
+        from unittest.mock import MagicMock, patch
+        from astro_audio.elevenlabs_engine import ElevenLabsEngine
+
+        engine = ElevenLabsEngine("test_key", "test_voice")
+        fake_pcm_chunk = b"\x00\x00" * 480  # 480 samples of 24k int16
+
+        mock_resp = MagicMock()
+        mock_resp.read.side_effect = [fake_pcm_chunk, fake_pcm_chunk, b""]
+        mock_resp.__enter__.return_value = mock_resp
+
+        with patch("urllib.request.urlopen", return_value=mock_resp):
+            pcm = engine.synthesize_sentence("Merhaba Baran, nasılsın?", generation_id=1)
+
+        self.assertIsNotNone(pcm)
+        self.assertEqual(len(pcm), len(fake_pcm_chunk) * 2)
+
+    def test_cancel_barge_in(self):
+        from unittest.mock import MagicMock, patch
+        from astro_audio.elevenlabs_engine import ElevenLabsEngine
+
+        engine = ElevenLabsEngine("test_key", "test_voice")
+        fake_pcm_chunk = b"\x00\x00" * 480
+        mock_resp = MagicMock()
+        calls = 0
+        def fake_read(size):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                return fake_pcm_chunk
+            elif calls == 2:
+                engine.cancel(2)
+                return fake_pcm_chunk
+            return b""
+
+        mock_resp.read.side_effect = fake_read
+        mock_resp.__enter__.return_value = mock_resp
+
+        with patch("urllib.request.urlopen", return_value=mock_resp):
+            chunks = list(engine.stream_sentence_pcm("Merhaba", generation_id=1))
+
+        # Because generation_id 1 was cancelled during second read, only first chunk is yielded
+        self.assertEqual(len(chunks), 1)
+
+
 if __name__ == "__main__":
     unittest.main()

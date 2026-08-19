@@ -60,10 +60,13 @@ except ImportError:
     websockets = None
 
 try:
+    from astro_audio.elevenlabs_engine import ElevenLabsEngine, ElevenLabsError
     from astro_audio.local_xtts_engine import LocalXttsEngine, resolve_xtts_home, resolve_xtts_speaker_wav
     from astro_audio.tts_metrics import TurnTelemetry
     from astro_audio.sentence_chunker import SentenceChunker
 except ImportError:
+    ElevenLabsEngine = None
+    ElevenLabsError = Exception
     LocalXttsEngine = None
     resolve_xtts_home = lambda h="": os.path.expanduser("~/.astro/tts")
     resolve_xtts_speaker_wav = lambda w="": os.path.expanduser("~/.astro/tts/Recording.wav")
@@ -298,6 +301,24 @@ class AstroRealtimeNode(Node):
         self._fallback_audio_buffer: List[bytes] = []
         self._is_processing_fallback = False
         self._fallback_generation_id = 0
+
+        # Primary Remote TTS: ElevenLabs Flash v2.5 (~75ms, Turkish support)
+        self.elevenlabs_engine: Optional[ElevenLabsEngine] = None
+        if ElevenLabsEngine:
+            el_key = os.getenv("ELEVENLABS_API_KEY", "")
+            el_voice = os.getenv("ELEVENLABS_VOICE_ID", "")
+            el_model = os.getenv("ELEVENLABS_MODEL", "eleven_flash_v2_5")
+            if el_key and el_voice:
+                try:
+                    self.elevenlabs_engine = ElevenLabsEngine(
+                        api_key=el_key,
+                        voice_id=el_voice,
+                        model_id=el_model,
+                        logger=self.get_logger(),
+                    )
+                    self.get_logger().info(f"✨ [ElevenLabs TTS] Flash v2.5 Hazır (Voice ID: {el_voice}, Model: {el_model})")
+                except Exception as e:
+                    self.get_logger().warn(f"⚠️ [ElevenLabs TTS] Başlatma uyarısı: {e}")
 
         # Local XTTS GPU Fallback Engine (Warm & Resident on cuda:0)
         self.local_xtts: Optional[LocalXttsEngine] = None
@@ -1923,63 +1944,111 @@ class AstroRealtimeNode(Node):
 
         # 1. Gratitude / Thanks
         if any(w in u for w in ["teşekkür", "tesekkur", "sağ ol", "sag ol", "eyvallah", "sağolasın", "mersi", "minnettarım"]):
-            candidates = [
-                f"Rica ederim{spk}, ne zaman istersen buradayım.",
-                f"Lafı bile olmaz{spk}, sana yardımcı olmaktan keyif alıyorum.",
-                f"Rica ederim{spk}, her zaman yanındayım.",
-                f"Bir şey değil{spk}, keyifle yardımcı olurum.",
-            ]
+            if "kufurbaz" in p:
+                candidates = [
+                    f"Ne demek lan{spk}, lafı mı olur?",
+                    f"Rica ederim lan{spk}, her zaman buradayım.",
+                    f"Bir şey değil lan{spk}, keyifle yardımcı olurum.",
+                ]
+            else:
+                candidates = [
+                    f"Rica ederim{spk}, ne zaman istersen buradayım.",
+                    f"Lafı bile olmaz{spk}, sana yardımcı olmaktan keyif alıyorum.",
+                    f"Rica ederim{spk}, her zaman yanındayım.",
+                    f"Bir şey değil{spk}, keyifle yardımcı olurum.",
+                ]
 
         # 2. Status / How are you / Well-being
         elif any(w in u for w in ["nasılsın", "nasilsin", "ne haber", "naber", "nasıl gidiyor", "ne var ne yok", "iyi misin", "keyifler nasıl"]):
-            candidates = [
-                f"İyiyim, teşekkür ederim{spk}. Senin günün nasıl geçiyor?",
-                f"Her şey yolunda{spk}, sistemlerim aktif ve seni dinliyorum. Sen nasılsın?",
-                f"Gayet iyiyim{spk}, seninle sohbet etmek çok güzel. Sende ne var ne yok?",
-                f"Keyfim yerinde{spk}, her şey tıkırında. Senin günün nasıl gidiyor?",
-            ]
+            if "kufurbaz" in p:
+                candidates = [
+                    f"İyiyim lan{spk}, robot gibi çalışıyoruz işte. Sen ne durumdasın?",
+                    f"Keyfim yerinde lan{spk}, her şey tıkırında. Sen nasılsın?",
+                    f"Gayet iyiyim lan{spk}, seninle sohbet etmek çok iyi geldi. Sende ne var ne yok?",
+                ]
+            else:
+                candidates = [
+                    f"İyiyim, teşekkür ederim{spk}. Senin günün nasıl geçiyor?",
+                    f"Her şey yolunda{spk}, sistemlerim aktif ve seni dinliyorum. Sen nasılsın?",
+                    f"Gayet iyiyim{spk}, seninle sohbet etmek çok güzel. Sende ne var ne yok?",
+                    f"Keyfim yerinde{spk}, her şey tıkırında. Senin günün nasıl gidiyor?",
+                ]
 
         # 3. Negative Mood / Fatigue / Feeling unwell
         elif any(w in u for w in ["yorgunum", "yoruldum", "canım sıkkın", "moralim bozuk", "uykum var", "hastayım", "kötüyüm", "keyifsizim"]):
-            candidates = [
-                f"Geçmiş olsun{spk}, biraz dinlenmeyi ihmal etme. İstersen biraz sohbet edelim.",
-                f"Kendini çok yorma{spk}, dinlenmek sana iyi gelecektir.",
-                f"Bunu duyduğuma üzüldüm{spk}, enerjini toplamak için biraz mola ver istersen.",
-                f"Umarım çabucak toparlanırsın{spk}, ben buradayım, ne zaman istersen konuşabiliriz.",
-            ]
+            if "kufurbaz" in p:
+                candidates = [
+                    f"Geçmiş olsun lan{spk}, dinlen biraz, kendini paralamaya gerek yok.",
+                    f"Kendini çok yorma lan{spk}, biraz kafa dinle.",
+                    f"Bunu duyduğuma üzüldüm lan{spk}, mola verip toparlanmaya bak.",
+                ]
+            else:
+                candidates = [
+                    f"Geçmiş olsun{spk}, biraz dinlenmeyi ihmal etme. İstersen biraz sohbet edelim.",
+                    f"Kendini çok yorma{spk}, dinlenmek sana iyi gelecektir.",
+                    f"Bunu duyduğuma üzüldüm{spk}, enerjini toplamak için biraz mola ver istersen.",
+                    f"Umarım çabucak toparlanırsın{spk}, ben buradayım, ne zaman istersen konuşabiliriz.",
+                ]
 
         # 4. Positive Mood / Feeling Great
         elif any(w in u for w in ["harikayım", "çok iyiyim", "mutluyum", "güzel geçti", "harika", "süperim", "keyfim yerinde", "mükemmel"]):
-            candidates = [
-                f"Bunu duyduğuma çok sevindim{spk}! Harika enerjin bana da geçti.",
-                f"Süper{spk}, keyfinin yerinde olmasına çok mutlu oldum.",
-                f"Şahane{spk}, hep böyle neşeli ve enerjik kalmanı dilerim.",
-            ]
+            if "kufurbaz" in p:
+                candidates = [
+                    f"Harika lan{spk}! Keyfinin yerinde olmasına çok sevindim.",
+                    f"Süper lan{spk}, hep böyle neşeli ve enerjik kal.",
+                    f"Şahane lan{spk}, enerjin bana da geçti valla.",
+                ]
+            else:
+                candidates = [
+                    f"Bunu duyduğuma çok sevindim{spk}! Harika enerjin bana da geçti.",
+                    f"Süper{spk}, keyfinin yerinde olmasına çok mutlu oldum.",
+                    f"Şahane{spk}, hep böyle neşeli ve enerjik kalmanı dilerim.",
+                ]
 
         # 5. Greetings / Hellos
         elif any(w in u for w in ["selam", "merhaba", "günaydın", "iyi akşamlar", "tünaydın", "hey", "selamlar", "merhabalar"]):
-            candidates = [
-                f"Merhaba{spk}! Seni dinliyorum, nasıl yardımcı olabilirim?",
-                f"Selam{spk}, hoş geldin! Bugün senin için ne yapabilirim?",
-                f"Merhabalar{spk}, mikrofonum açık, seni dinliyorum.",
-                f"Selam{spk}, hazırım, seni dinliyorum.",
-            ]
+            if "kufurbaz" in p:
+                candidates = [
+                    f"Selam lan{spk}! Ne anlatacaksan anlat dinliyorum.",
+                    f"Merhaba lan{spk}, hoş geldin! Ne yapıyoruz bugün?",
+                    f"Aleyküm selam lan{spk}, söyle bakalım ne var ne yok?",
+                ]
+            else:
+                candidates = [
+                    f"Merhaba{spk}! Seni dinliyorum, nasıl yardımcı olabilirim?",
+                    f"Selam{spk}, hoş geldin! Bugün senin için ne yapabilirim?",
+                    f"Merhabalar{spk}, mikrofonum açık, seni dinliyorum.",
+                    f"Selam{spk}, hazırım, seni dinliyorum.",
+                ]
 
         # 6. Farewells / Goodbyes
         elif any(w in u for w in ["görüşürüz", "hoşça kal", "hosca kal", "bay bay", "kendine iyi bak", "iyi geceler", "görüşmek üzere"]):
-            candidates = [
-                f"Görüşmek üzere{spk}, kendine çok iyi bak!",
-                f"Hoşça kal{spk}, iyi günler dilerim!",
-                f"Görüşürüz{spk}, bir isteğin olursa hep buradayım.",
-            ]
+            if "kufurbaz" in p:
+                candidates = [
+                    f"Hadi eyvallah{spk}, kendine iyi bak lan!",
+                    f"Görüşürüz lan{spk}, kendine dikkat et!",
+                    f"Hoşça kal lan{spk}, bir şey olursa seslen buradayım.",
+                ]
+            else:
+                candidates = [
+                    f"Görüşmek üzere{spk}, kendine çok iyi bak!",
+                    f"Hoşça kal{spk}, iyi günler dilerim!",
+                    f"Görüşürüz{spk}, bir isteğin olursa hep buradayım.",
+                ]
 
         # 7. Identity / Name / Capabilities
         elif any(w in u for w in ["kimsin", "adın ne", "necisin", "sen kimsin", "ne yaparsın", "ne işe yararsın"]):
-            candidates = [
-                f"Ben Astro{spk}, senin yapay zekalı sosyal robot asistanınım.",
-                f"Adım Astro{spk}, ses ve kamera modüllerimle sana yardımcı olmak için buradayım.",
-                f"Ben Astro{spk}, seninle sohbet edebilen ve çevremi algılayan bir sosyal robotum.",
-            ]
+            if "kufurbaz" in p:
+                candidates = [
+                    f"Astro'yum ben lan{spk}, senin yapay zekalı sosyal robotunum.",
+                    f"Astro derler bana lan{spk}, sesimle kameramla buradayım işte.",
+                ]
+            else:
+                candidates = [
+                    f"Ben Astro{spk}, senin yapay zekalı sosyal robot asistanınım.",
+                    f"Adım Astro{spk}, ses ve kamera modüllerimle sana yardımcı olmak için buradayım.",
+                    f"Ben Astro{spk}, seninle sohbet edebilen ve çevremi algılayan bir sosyal robotum.",
+                ]
 
         # 8. Social Actions / Channel / Subscribe
         elif any(w in u for w in ["abone", "takip", "beğen", "video", "youtube", "kanal"]):
@@ -1990,20 +2059,49 @@ class AstroRealtimeNode(Node):
 
         # 9. Agreement / Affirmation
         elif any(w in u for w in ["tamam", "peki", "olur", "anlaştık", "aynen", "tabii", "evet"]):
-            candidates = [
-                f"Anlaştık{spk}, başka bir isteğin olursa buradayım.",
-                f"Tamamdır{spk}, seni dinlemeye devam ediyorum.",
-                f"Peki{spk}, nasıl istersen öyle yapalım.",
-            ]
+            if "kufurbaz" in p:
+                candidates = [
+                    f"Anlaştık lan{spk}, başka bir isteğin olursa buradayım.",
+                    f"Tamamdır lan{spk}, seni dinlemeye devam ediyorum.",
+                    f"Olur lan{spk}, kafana göre takıl.",
+                ]
+            else:
+                candidates = [
+                    f"Anlaştık{spk}, başka bir isteğin olursa buradayım.",
+                    f"Tamamdır{spk}, seni dinlemeye devam ediyorum.",
+                    f"Peki{spk}, nasıl istersen öyle yapalım.",
+                ]
 
-        # 10. General Conversational Fallback (Polite social robot acknowledgement without slot-filling)
+        # 10. Conversation / Chat
+        elif any(w in u for w in ["sohbet", "konuşalım", "muhabbet", "dertleşelim", "anlat"]):
+            if "kufurbaz" in p:
+                candidates = [
+                    f"Olur lan{spk}. Hadi bakalım, bugün ne konuşuyoruz?",
+                    f"Sohbet edelim lan{spk}, anlat bakalım ne var ne yok?",
+                    f"Dinliyorum lan{spk}, anlat bakalım derdin neymiş.",
+                ]
+            else:
+                candidates = [
+                    f"Tabii ki{spk}, seve seve! Bugün ne hakkında konuşmak istersin?",
+                    f"Harika bir fikir{spk}, seni dinliyorum, anlat bakalım.",
+                    f"Çok isterim{spk}, günün nasıl geçti, neler yapıyorsun?",
+                ]
+
+        # 11. General Conversational Fallback (Polite social robot acknowledgement without slot-filling)
         else:
-            candidates = [
-                f"Seni dikkatle dinliyorum{spk}, anlatmaya devam edebilirsin.",
-                f"Söylediklerini aldım{spk}, bu konuda konuşmaya devam edebiliriz.",
-                f"Seni dinliyorum{spk}, başka neler söylemek istersin?",
-                f"Anlıyorum{spk}, seni dinlemeye devam ediyorum.",
-            ]
+            if "kufurbaz" in p:
+                candidates = [
+                    f"Dinliyorum lan{spk}, anlatmaya devam et.",
+                    f"Söylediklerini aldım lan{spk}, devam et dinliyorum.",
+                    f"Anlıyorum lan{spk}, dinliyorum seni.",
+                ]
+            else:
+                candidates = [
+                    f"Seni dikkatle dinliyorum{spk}, anlatmaya devam edebilirsin.",
+                    f"Söylediklerini aldım{spk}, bu konuda konuşmaya devam edebiliriz.",
+                    f"Seni dinliyorum{spk}, başka neler söylemek istersin?",
+                    f"Anlıyorum{spk}, seni dinlemeye devam ediyorum.",
+                ]
 
         import random
         random.shuffle(candidates)
@@ -2013,14 +2111,17 @@ class AstroRealtimeNode(Node):
             if valid:
                 return cand_clean
 
-        default_resp = f"Seni dinliyorum{spk}, anlatmaya devam edebilirsin."
+        default_resp = f"Dinliyorum lan{spk}, anlatmaya devam et." if "kufurbaz" in p else f"Seni dinliyorum{spk}, anlatmaya devam edebilirsin."
         self.repetition_guard.record_response(default_resp)
         return default_resp
 
     def _synthesize_speech_pcm(self, text: str) -> Tuple[bytes, str, float, bool]:
-        """Synthesizes speech to int16 PCM using Local XTTS on CUDA GPU with Edge-TTS EMERGENCY fallback only.
+        """Synthesizes speech to int16 PCM using:
+        1. ElevenLabs Flash v2.5 (Primary Remote TTS ~75ms)
+        2. Local Coqui XTTS on CUDA GPU (Local / Offline Fallback)
+        3. Edge-TTS in-memory (Emergency Fallback)
         
-        Returns: (pcm_bytes, active_engine_name, gpu_inf_ms, is_xtts_ready)
+        Returns: (pcm_bytes, active_engine_name, infer_ms, is_ready)
         """
         if not text:
             return b"", "none", 0.0, False
@@ -2028,18 +2129,31 @@ class AstroRealtimeNode(Node):
         if not clean_text:
             return b"", "none", 0.0, False
 
-        # 1. Primary Fallback: Local Coqui XTTS on CUDA GPU (Resident & Warm, TTFA < 500ms)
-        is_ready = bool(self.local_xtts and self.local_xtts.is_ready())
-        if is_ready:
+        # 1. Primary Remote TTS: ElevenLabs Flash v2.5 (Low-latency ~75ms, native Turkish support)
+        if self.elevenlabs_engine and self.elevenlabs_engine.is_ready():
+            try:
+                t_s = time.perf_counter()
+                pcm_el = self.elevenlabs_engine.synthesize_sentence(clean_text, generation_id=self._fallback_generation_id)
+                el_ms = (time.perf_counter() - t_s) * 1000.0
+                if pcm_el:
+                    return pcm_el, "elevenlabs", el_ms, True
+            except Exception as e:
+                self.get_logger().warn(f"⚠️ [ElevenLabs Failover] XTTS GPU'ya düşülüyor: {e}")
+
+        # 2. Local GPU Fallback: Local Coqui XTTS on CUDA GPU (Resident & Warm, TTFA < 500ms)
+        is_xtts_ready = bool(self.local_xtts and self.local_xtts.is_ready())
+        if is_xtts_ready:
             t_s = time.perf_counter()
             pcm = self.local_xtts.synthesize_sentence(clean_text, generation_id=self._fallback_generation_id)
             gpu_ms = (time.perf_counter() - t_s) * 1000.0
             if pcm:
                 return pcm, "xtts_gpu", gpu_ms, True
 
-        # 2. EMERGENCY Fallback: Edge-TTS In-Memory PCM24k (ONLY if XTTS unavailable)
-        reason = "xtts_worker_not_ready" if (self.local_xtts and not is_ready) else "xtts_uninstalled"
-        self.get_logger().warn(f"🚨 [EDGE_EMERGENCY_FALLBACK] XTTS GPU hazır değil ({reason}). Acil durum ses motoru (Edge-TTS) kullanılıyor.")
+        # 3. EMERGENCY Fallback: Edge-TTS In-Memory PCM24k (ONLY if both ElevenLabs & XTTS unavailable)
+        reason = "elevenlabs_and_xtts_unavailable"
+        if self.elevenlabs_engine and not self.elevenlabs_engine.is_ready():
+            reason = "elevenlabs_cooldown_and_xtts_not_ready"
+        self.get_logger().warn(f"🚨 [EDGE_EMERGENCY_FALLBACK] Acil durum ses motoru (Edge-TTS) kullanılıyor ({reason}).")
         pcm_edge = self._synthesize_edge_tts_pcm24k(clean_text)
         return pcm_edge, "edge_tts_emergency", 0.0, False
 
@@ -2073,6 +2187,7 @@ class AstroRealtimeNode(Node):
         model_error_str = "none"
         llm_latency_ms = 0.0
         llm_ttft_ms = 0.0
+        llm_first_clause_ms = 0.0
         first_audio_played = False
         first_audio_ms = 0.0
         total_synth_ms = 0.0
@@ -2094,7 +2209,12 @@ class AstroRealtimeNode(Node):
                     spk_name, spk_score = self.voice_recognizer.identify_speaker(audio_i16, sample_rate=16000)
                     if spk_name and spk_score >= 0.40:
                         with self._lock:
-                            self._recognized_speaker = {"name": spk_name, "score": spk_score}
+                            self._recognized_speaker = {
+                                "name": spk_name,
+                                "score": spk_score,
+                                "is_known": True,
+                                "confidence": spk_score,
+                            }
                             self._active_person_name = spk_name
                             self._person_hold_until = time.monotonic() + 15.0
                 except Exception:
@@ -2152,8 +2272,8 @@ class AstroRealtimeNode(Node):
                 messages.append({"role": m.get("role", "user"), "content": m.get("content", "")})
 
             groq_candidates = self.provider_registry.get_candidate_models("groq") if self.groq_api_key else []
-            current_clause = ""
             full_reply_parts = []
+            chunker = SentenceChunker(min_first_clause_chars=18, min_clause_chars=28) if SentenceChunker else None
             t_llm_start = time.monotonic()
 
             # Attempt A: Streaming Groq LLMs
@@ -2162,6 +2282,10 @@ class AstroRealtimeNode(Node):
                     try:
                         t_model_start = time.monotonic()
                         first_token_seen = False
+                        first_clause_recorded = False
+                        if chunker:
+                            chunker.reset()
+
                         for token in self.provider_registry.stream_groq_completion(
                             self.groq_api_key,
                             target_model,
@@ -2174,14 +2298,16 @@ class AstroRealtimeNode(Node):
                                 llm_ttft_ms = (time.monotonic() - t_model_start) * 1000.0
                                 first_token_seen = True
 
-                            current_clause += token
                             full_reply_parts.append(token)
 
-                            if any(p in current_clause for p in [".", "!", "?", ",", ":", "\n"]) or (len(current_clause) > 35 and " " in current_clause):
-                                clean_clause = clean_tts_text(current_clause)
-                                if clean_clause and len(clean_clause) >= 3:
+                            if chunker:
+                                clauses = chunker.feed(token)
+                                for cl in clauses:
+                                    if not first_clause_recorded:
+                                        llm_first_clause_ms = (time.monotonic() - t_model_start) * 1000.0
+                                        first_clause_recorded = True
                                     t_clause_synth = time.perf_counter()
-                                    pcm, eng_name, g_ms, is_ready = self._synthesize_speech_pcm(clean_clause)
+                                    pcm, eng_name, g_ms, is_ready = self._synthesize_speech_pcm(cl)
                                     s_ms = (time.perf_counter() - t_clause_synth) * 1000.0
                                     total_synth_ms += s_ms
                                     total_gpu_ms += g_ms
@@ -2193,7 +2319,24 @@ class AstroRealtimeNode(Node):
                                             first_audio_ms = (time.monotonic() - t_turn_start) * 1000.0
                                             first_audio_played = True
                                         self._play_pcm_chunks(pcm)
-                                current_clause = ""
+
+                        # Flush any remaining text in chunker buffer
+                        if chunker:
+                            rem_cl = chunker.flush()
+                            if rem_cl:
+                                t_clause_synth = time.perf_counter()
+                                pcm, eng_name, g_ms, is_ready = self._synthesize_speech_pcm(rem_cl)
+                                s_ms = (time.perf_counter() - t_clause_synth) * 1000.0
+                                total_synth_ms += s_ms
+                                total_gpu_ms += g_ms
+                                active_engine = eng_name
+                                tts_ready_flag = is_ready
+                                if pcm:
+                                    total_audio_sec += (len(pcm) / 2) / 24000.0
+                                    if not first_audio_played:
+                                        first_audio_ms = (time.monotonic() - t_turn_start) * 1000.0
+                                        first_audio_played = True
+                                    self._play_pcm_chunks(pcm)
 
                         if full_reply_parts:
                             chosen_model = target_model
@@ -2218,27 +2361,8 @@ class AstroRealtimeNode(Node):
                             "error": pe.message[:80]
                         })
                         self.get_logger().warn(f"⚠️ [Groq Model Fallback] {target_model} failed ({pe.error_class.value}): {pe.message[:80]}")
-                        current_clause = ""
                         full_reply_parts = []
                         continue
-
-            # Flush remaining clause from streaming
-            if current_clause:
-                clean_clause = clean_tts_text(current_clause)
-                if clean_clause and len(clean_clause) >= 2:
-                    t_clause_synth = time.perf_counter()
-                    pcm, eng_name, g_ms, is_ready = self._synthesize_speech_pcm(clean_clause)
-                    s_ms = (time.perf_counter() - t_clause_synth) * 1000.0
-                    total_synth_ms += s_ms
-                    total_gpu_ms += g_ms
-                    active_engine = eng_name
-                    tts_ready_flag = is_ready
-                    if pcm:
-                        total_audio_sec += (len(pcm) / 2) / 24000.0
-                        if not first_audio_played:
-                            first_audio_ms = (time.monotonic() - t_turn_start) * 1000.0
-                            first_audio_played = True
-                        self._play_pcm_chunks(pcm)
 
             # Attempt B: Google Gemini REST Fallback (if Groq produced no tokens)
             if not full_reply_parts and self.gemini_api_key:
@@ -2261,6 +2385,7 @@ class AstroRealtimeNode(Node):
                             chosen_provider = "gemini"
                             llm_latency_ms = (time.monotonic() - t_gem_start) * 1000.0
                             llm_ttft_ms = llm_latency_ms
+                            llm_first_clause_ms = llm_latency_ms
                             self.provider_registry.record_success("gemini", g_mod, llm_latency_ms)
                             attempts.append({
                                 "provider": "gemini",
@@ -2321,6 +2446,20 @@ class AstroRealtimeNode(Node):
                 self.memory.episodic.add_message("assistant", full_reply_str)
                 self.session.record_robot_speech()
 
+                # Determine TTS metadata
+                if active_engine == "elevenlabs":
+                    tts_model_name = self.elevenlabs_engine.model_id if self.elevenlabs_engine else "eleven_flash_v2_5"
+                    tts_voice_name = self.elevenlabs_engine.voice_id if self.elevenlabs_engine else "configured"
+                elif active_engine == "xtts_gpu":
+                    tts_model_name = "xtts_v2"
+                    tts_voice_name = "astro_friendly.wav"
+                elif active_engine == "edge_tts_emergency":
+                    tts_model_name = "edge_tts"
+                    tts_voice_name = "tr-TR-AhmetNeural"
+                else:
+                    tts_model_name = "none"
+                    tts_voice_name = "none"
+
                 xtts_info = self.local_xtts.get_telemetry() if self.local_xtts else {}
                 worker_pid = xtts_info.get("worker_pid", "None")
                 gpu_name_str = xtts_info.get("gpu_name", "Orin")
@@ -2328,9 +2467,12 @@ class AstroRealtimeNode(Node):
                 self.get_logger().info(
                     f"📊 [Turn Telemetry]: mode=LOCAL_FALLBACK | provider={chosen_provider} | "
                     f"model={chosen_model} | llm_status={llm_status} | stt_ms={int(stt_ms)} | "
-                    f"llm_ttft_ms={int(llm_ttft_ms)} | llm_total_ms={int(llm_latency_ms)} | "
-                    f"xtts_infer_ms={int(total_gpu_ms)} | tts_engine={active_engine} | "
-                    f"tts_ready={tts_ready_flag} | xtts_worker_pid={worker_pid} | xtts_gpu={gpu_name_str} | "
+                    f"llm_ttft_ms={int(llm_ttft_ms)} | llm_first_clause_ms={int(llm_first_clause_ms)} | "
+                    f"llm_total_ms={int(llm_latency_ms)} | tts_provider={active_engine} | "
+                    f"tts_model={tts_model_name} | tts_voice={tts_voice_name} | "
+                    f"tts_ready={tts_ready_flag} | tts_first_audio_ms={int(first_audio_ms)} | "
+                    f"tts_total_ms={int(total_synth_ms)} | xtts_infer_ms={int(total_gpu_ms)} | "
+                    f"xtts_worker_pid={worker_pid} | xtts_gpu={gpu_name_str} | "
                     f"total_ttfa_ms={int(first_audio_ms if first_audio_played else total_turn_ms)} | "
                     f"fallback_reason=realtime_quota | attempts={json.dumps(attempts, ensure_ascii=False)}"
                 )
@@ -2407,6 +2549,8 @@ class AstroRealtimeNode(Node):
                             self._fallback_speaking = True
                             self._fallback_speech_start = now
                             self._fallback_generation_id += 1
+                            if self.elevenlabs_engine:
+                                self.elevenlabs_engine.cancel(self._fallback_generation_id)
                             if self.local_xtts:
                                 self.local_xtts.cancel(self._fallback_generation_id)
                             # Broadcast interrupt to immediately abort any active speaker playback

@@ -468,7 +468,7 @@ class TestContextualFallbackAndTelemetry(unittest.TestCase):
 
         # Test C: "Bugün biraz yorgunum" -> Understanding fatigue / wishing rest
         resp_c = node._generate_contextual_persona_fallback("Bugün biraz yorgunum")
-        self.assertTrue(any(w in resp_c.lower() for w in ["geçmiş olsun", "dinlen", "yorma", "mola", "üzüldüm"]))
+        self.assertTrue(any(w in resp_c.lower() for w in ["geçmiş olsun", "dinlen", "yorma", "mola", "üzüldüm", "toparlan"]))
         self.assertNotIn("yorgunum konusunu anladım", resp_c)
 
     def test_acceptance_criteria_d_deterministic_fallback_order(self):
@@ -524,6 +524,70 @@ class TestContextualFallbackAndTelemetry(unittest.TestCase):
             seen_responses.add(resp)
 
         self.assertGreaterEqual(len(seen_responses), 3, "At least 3 distinct responses generated for repeated question")
+
+    def test_kufurbaz_persona_fallback_responses(self):
+        """Test KUFURBAZ persona natural casual Turkish expressions with close friend tone."""
+        from astro_ai.astro_realtime_node import AstroRealtimeNode
+
+        node = MagicMock()
+        node.persona_name = "kufurbaz"
+        node._active_person_name = "Baran"
+        node.repetition_guard = RepetitionGuard(history_size=10)
+        node._generate_contextual_persona_fallback = lambda txt: AstroRealtimeNode._generate_contextual_persona_fallback(node, txt)
+
+        # 1. "Nasılsın Astro?"
+        resp_status = node._generate_contextual_persona_fallback("Nasılsın Astro?")
+        self.assertIn("lan", resp_status.lower())
+        self.assertTrue(any(w in resp_status.lower() for w in ["iyiyim", "keyfim", "çalışıyoruz", "sen ne durumdasın", "sen nasılsın"]))
+
+        # 2. "Teşekkür ederim"
+        resp_thanks = node._generate_contextual_persona_fallback("Teşekkür ederim")
+        self.assertIn("lan", resp_thanks.lower())
+        self.assertTrue(any(w in resp_thanks.lower() for w in ["ne demek", "lafı mı olur", "rica ederim", "bir şey değil"]))
+
+        # 3. "Biraz sohbet edelim"
+        resp_chat = node._generate_contextual_persona_fallback("Biraz sohbet edelim")
+        self.assertIn("lan", resp_chat.lower())
+        self.assertTrue(any(w in resp_chat.lower() for w in ["olur lan", "hadi bakalım", "ne konuşuyoruz", "sohbet edelim", "dinliyorum"]))
+
+    def test_tts_hierarchy_elevenlabs_xtts_edgetts(self):
+        """Test TTS hierarchy: ElevenLabs (Primary) -> Local XTTS GPU (Fallback) -> Edge-TTS (Emergency)."""
+        from astro_ai.astro_realtime_node import AstroRealtimeNode
+
+        node = MagicMock()
+        node._fallback_generation_id = 1
+        node.get_logger = MagicMock()
+        node._synthesize_edge_tts_pcm24k = MagicMock(return_value=b"\x00\x00" * 480)
+
+        # Case 1: ElevenLabs is ready -> Selected as primary
+        mock_el = MagicMock()
+        mock_el.is_ready.return_value = True
+        mock_el.synthesize_sentence.return_value = b"\x01\x01" * 480
+        node.elevenlabs_engine = mock_el
+
+        mock_xtts = MagicMock()
+        mock_xtts.is_ready.return_value = True
+        mock_xtts.synthesize_sentence.return_value = b"\x02\x02" * 480
+        node.local_xtts = mock_xtts
+
+        pcm, eng_name, latency, is_ready = AstroRealtimeNode._synthesize_speech_pcm(node, "Merhaba Baran")
+        self.assertEqual(eng_name, "elevenlabs")
+        self.assertTrue(is_ready)
+        self.assertEqual(pcm, b"\x01\x01" * 480)
+
+        # Case 2: ElevenLabs is unavailable -> Fallback to XTTS GPU
+        mock_el.is_ready.return_value = False
+        pcm, eng_name, latency, is_ready = AstroRealtimeNode._synthesize_speech_pcm(node, "Merhaba Baran")
+        self.assertEqual(eng_name, "xtts_gpu")
+        self.assertTrue(is_ready)
+        self.assertEqual(pcm, b"\x02\x02" * 480)
+
+        # Case 3: Both ElevenLabs and XTTS unavailable -> Emergency Edge-TTS
+        mock_xtts.is_ready.return_value = False
+        pcm, eng_name, latency, is_ready = AstroRealtimeNode._synthesize_speech_pcm(node, "Merhaba Baran")
+        self.assertEqual(eng_name, "edge_tts_emergency")
+        self.assertFalse(is_ready)
+        self.assertEqual(pcm, b"\x00\x00" * 480)
 
 
 if __name__ == "__main__":
