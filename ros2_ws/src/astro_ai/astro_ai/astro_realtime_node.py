@@ -1712,7 +1712,7 @@ class AstroRealtimeNode(Node):
             return None
 
     def _synthesize_edge_tts_pcm24k(self, text: str) -> bytes:
-        """Synthesizes Turkish speech via Edge-TTS and converts to 24kHz int16 mono raw PCM for playback."""
+        """Synthesizes Turkish speech via Python edge-tts and converts to 24kHz int16 mono raw PCM for playback."""
         if not text:
             return b""
         clean_text = clean_tts_text(text)
@@ -1728,11 +1728,18 @@ class AstroRealtimeNode(Node):
             rate = "+20%" if p in ("kufurbaz", "playful", "angry", "rude") else "+8%"
 
         try:
-            proc = subprocess.Popen(
-                ["edge-tts", "--voice", voice, "--rate", rate, "--text", clean_text, "--write-media", "-"],
-                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
-            )
-            mp3_data, _ = proc.communicate(timeout=8.0)
+            import edge_tts
+            loop = asyncio.new_event_loop()
+            async def _get_mp3():
+                communicate = edge_tts.Communicate(clean_text, voice, rate=rate)
+                buf = bytearray()
+                async for chunk in communicate.stream():
+                    if chunk["type"] == "audio":
+                        buf.extend(chunk["data"])
+                return bytes(buf)
+            mp3_data = loop.run_until_complete(_get_mp3())
+            loop.close()
+
             if mp3_data:
                 ff_proc = subprocess.Popen(
                     ["ffmpeg", "-i", "pipe:0", "-f", "s16le", "-acodec", "pcm_s16le", "-ac", "1", "-ar", "24000", "pipe:1"],
@@ -1741,7 +1748,7 @@ class AstroRealtimeNode(Node):
                 pcm_data, _ = ff_proc.communicate(input=mp3_data, timeout=8.0)
                 return pcm_data
         except Exception as e:
-            self.get_logger().debug(f"Edge-TTS synthesis notice: {e}")
+            self.get_logger().warn(f"⚠️ [TTS Sentez Hatası]: {e}")
         return b""
 
     def _process_fallback_turn(self, audio_chunks: List[bytes]):
@@ -1825,9 +1832,9 @@ class AstroRealtimeNode(Node):
                             break
                 except urllib.error.HTTPError as http_e:
                     err_body = http_e.read().decode("utf-8", errors="ignore")
-                    self.get_logger().debug(f"Groq LLM ({mod}) notice: {http_e.code} - {err_body}")
+                    self.get_logger().warn(f"⚠️ [Groq LLM ({mod}) Hatası]: {http_e.code} - {err_body}")
                 except Exception as e:
-                    self.get_logger().debug(f"Groq LLM ({mod}) notice: {e}")
+                    self.get_logger().warn(f"⚠️ [Groq LLM ({mod}) Hatası]: {e}")
 
             # Secondary fallback: Gemini Flash REST (0 Token Cost)
             if not reply_text and self.gemini_api_key:
@@ -1849,8 +1856,11 @@ class AstroRealtimeNode(Node):
                             reply_text = res_json["candidates"][0]["content"]["parts"][0]["text"].strip()
                             if reply_text:
                                 break
+                    except urllib.error.HTTPError as http_e:
+                        err_body = http_e.read().decode("utf-8", errors="ignore")
+                        self.get_logger().warn(f"⚠️ [Gemini LLM ({g_mod}) Hatası]: {http_e.code} - {err_body}")
                     except Exception as ge:
-                        self.get_logger().debug(f"Gemini LLM ({g_mod}) notice: {ge}")
+                        self.get_logger().warn(f"⚠️ [Gemini LLM ({g_mod}) Hatası]: {ge}")
 
             if not reply_text:
                 return
