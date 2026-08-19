@@ -1787,106 +1787,70 @@ class AstroRealtimeNode(Node):
             self.memory.episodic.add_message("user", user_text)
             self.session.record_user_speech()
 
-            # 4. Cognitive LLM via Groq Llama-3.3-70B
+            # 4. Cognitive LLM via Dynamic Groq / Gemini (0 OpenAI Token Cost)
             system_prompt = self._build_current_system_prompt()
             messages = [{"role": "system", "content": system_prompt}]
             recent_msgs = self.memory.episodic.get_messages()[-6:]
             for m in recent_msgs:
                 messages.append({"role": m.get("role", "user"), "content": m.get("content", "")})
 
-            groq_tools = [
-                {
-                    "type": "function",
-                    "function": {
-                        "name": "get_live_weather",
-                        "description": "Bitlis, Ahlat veya istenen şehrin hava durumu bilgisini getirir.",
-                        "parameters": {
-                            "type": "object",
-                            "properties": {"city": {"type": "string"}},
-                            "required": ["city"]
-                        }
-                    }
-                },
-                {
-                    "type": "function",
-                    "function": {
-                        "name": "inspect_camera_view",
-                        "description": "Kullanıcı ne görüyorsun, elimde ne var dediğinde kameradan bakar.",
-                        "parameters": {
-                            "type": "object",
-                            "properties": {"focus": {"type": "string"}},
-                            "required": ["focus"]
-                        }
-                    }
-                },
-                {
-                    "type": "function",
-                    "function": {
-                        "name": "enroll_user_biometrics",
-                        "description": "Kullanıcı kendi adını söylediğinde çağrılır.",
-                        "parameters": {
-                            "type": "object",
-                            "properties": {
-                                "name": {"type": "string"},
-                                "formal_title": {"type": "string"}
-                            },
-                            "required": ["name"]
-                        }
-                    }
-                }
-            ]
-
-            payload = {
-                "model": "llama-3.3-70b-versatile",
-                "messages": messages,
-                "temperature": 0.85,
-                "max_tokens": 200,
-                "tools": groq_tools
-            }
-
-            req = urllib.request.Request(
-                "https://api.groq.com/openai/v1/chat/completions",
-                data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
-                headers={
-                    "Authorization": f"Bearer {self.groq_api_key}",
-                    "Content-Type": "application/json",
-                    "User-Agent": "Mozilla/5.0"
-                },
-                method="POST"
-            )
+            active_groq = discover_groq_models(self.groq_api_key)
+            candidates = [m for m in ["llama-3.3-70b-versatile", "llama-3.1-8b-instant", "llama3-70b-8192", "llama3-8b-8192", "mixtral-8x7b-32768", "gemma2-9b-it"] if m in active_groq]
+            if not candidates:
+                candidates = ["llama-3.3-70b-versatile", "llama-3.1-8b-instant", "llama3-70b-8192", "mixtral-8x7b-32768"]
 
             reply_text = ""
-            with urllib.request.urlopen(req, timeout=6.0) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
-                choice = data["choices"][0]["message"]
-                tool_calls = choice.get("tool_calls", [])
-
-                if tool_calls:
-                    messages.append(choice)
-                    for tc in tool_calls:
-                        fn = tc["function"]["name"]
-                        args = json.loads(tc["function"]["arguments"])
-                        self.get_logger().info(f"🛠️ [0-Maliyet Tool]: {fn}({args}) çalıştırılıyor...")
-                        res = self._execute_realtime_tool(fn, args)
-                        messages.append({
-                            "role": "tool",
-                            "tool_call_id": tc["id"],
-                            "content": json.dumps(res, ensure_ascii=False)
-                        })
-
-                    # Call Groq again with tool output
-                    p2 = {"model": "llama-3.3-70b-versatile", "messages": messages, "max_tokens": 200}
-                    r2 = urllib.request.Request(
+            for mod in candidates:
+                try:
+                    payload = {
+                        "model": mod,
+                        "messages": messages,
+                        "temperature": 0.85,
+                        "max_tokens": 200
+                    }
+                    req = urllib.request.Request(
                         "https://api.groq.com/openai/v1/chat/completions",
-                        data=json.dumps(p2, ensure_ascii=False).encode("utf-8"),
-                        headers={"Authorization": f"Bearer {self.groq_api_key}", "Content-Type": "application/json"},
+                        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+                        headers={
+                            "Authorization": f"Bearer {self.groq_api_key}",
+                            "Content-Type": "application/json",
+                            "User-Agent": "Mozilla/5.0"
+                        },
                         method="POST"
                     )
-                    with urllib.request.urlopen(r2, timeout=6.0) as resp2:
-                        d2 = json.loads(resp2.read().decode("utf-8"))
-                        reply_text = d2["choices"][0]["message"]["content"].strip()
-                else:
-                    reply_text = choice.get("content", "").strip()
+                    with urllib.request.urlopen(req, timeout=6.0) as resp:
+                        data = json.loads(resp.read().decode("utf-8"))
+                        reply_text = data["choices"][0]["message"].get("content", "").strip()
+                        if reply_text:
+                            break
+                except urllib.error.HTTPError as http_e:
+                    err_body = http_e.read().decode("utf-8", errors="ignore")
+                    self.get_logger().debug(f"Groq LLM ({mod}) notice: {http_e.code} - {err_body}")
+                except Exception as e:
+                    self.get_logger().debug(f"Groq LLM ({mod}) notice: {e}")
+
+            # Secondary fallback: Gemini Flash REST (0 Token Cost)
+            if not reply_text and self.gemini_api_key:
+                for g_mod in ["gemini-2.5-flash", "gemini-1.5-flash", "gemini-3.6-flash", "gemini-flash-latest"]:
+                    try:
+                        url = f"https://generativelanguage.googleapis.com/v1beta/models/{g_mod}:generateContent?key={self.gemini_api_key}"
+                        conv_history = "\n".join([f"{m.get('role')}: {m.get('content')}" for m in messages[-5:]])
+                        gem_payload = {
+                            "contents": [{"parts": [{"text": f"{system_prompt}\n\nKonuşma Geçmişi:\n{conv_history}"}]}],
+                            "generation_config": {"temperature": 0.85, "max_output_tokens": 200}
+                        }
+                        req = urllib.request.Request(
+                            url,
+                            data=json.dumps(gem_payload, ensure_ascii=False).encode("utf-8"),
+                            headers={"Content-Type": "application/json", "User-Agent": "Mozilla/5.0"}
+                        )
+                        with urllib.request.urlopen(req, timeout=6.0) as resp:
+                            res_json = json.loads(resp.read().decode("utf-8"))
+                            reply_text = res_json["candidates"][0]["content"]["parts"][0]["text"].strip()
+                            if reply_text:
+                                break
+                    except Exception as ge:
+                        self.get_logger().debug(f"Gemini LLM ({g_mod}) notice: {ge}")
 
             if not reply_text:
                 return
