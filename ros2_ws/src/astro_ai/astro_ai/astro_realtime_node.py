@@ -1037,46 +1037,12 @@ class AstroRealtimeNode(Node):
         refusal_kws = ["üzgünüm", "yardımcı olamam", "açıklayamıyorum", "cannot assist", "i am sorry", "i'm sorry", "doğrudan açıklayamıyorum"]
         obs = None
 
-        # 1. Primary: Google Gemini Flash REST (0 Token Cost, Blazing Fast)
-        if self.gemini_api_key:
-            for g_mod in ["gemini-2.5-flash", "gemini-1.5-flash", "gemini-3.6-flash", "gemini-flash-latest"]:
-                try:
-                    import urllib.request
-                    import urllib.error
-                    url = f"https://generativelanguage.googleapis.com/v1beta/models/{g_mod}:generateContent?key={self.gemini_api_key}"
-                    payload = {
-                        "contents": [{
-                            "parts": [
-                                {"text": prompt_text},
-                                {"inline_data": {"mime_type": "image/jpeg", "data": b64_img}}
-                            ]
-                        }],
-                        "generation_config": {"temperature": 0.2, "max_output_tokens": 150}
-                    }
-                    data_bytes = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-                    req = urllib.request.Request(
-                        url,
-                        data=data_bytes,
-                        headers={"Content-Type": "application/json", "User-Agent": "Mozilla/5.0"}
-                    )
-                    with urllib.request.urlopen(req, timeout=5.0) as resp:
-                        res_json = json.loads(resp.read().decode("utf-8"))
-                        candidate_obs = res_json["candidates"][0]["content"]["parts"][0]["text"].strip()
-                        if candidate_obs and not any(rk in candidate_obs.lower() for rk in refusal_kws):
-                            obs = candidate_obs
-                            break
-                except urllib.error.HTTPError as http_e:
-                    error_body = http_e.read().decode("utf-8", errors="ignore")
-                    self.get_logger().debug(f"Gemini Vision ({g_mod}) notice: {http_e.code} - {error_body}")
-                except Exception as gem_e:
-                    self.get_logger().debug(f"Gemini Vision ({g_mod}) notice: {gem_e}")
-
-        # 2. Fallback: Dynamic Groq Vision Models (0 Token Cost)
-        if not obs and self.groq_api_key:
+        # 1. Primary: Groq Vision Models (0 Token Cost, Ultra Fast)
+        if self.groq_api_key:
             active_groq = discover_groq_models(self.groq_api_key)
             groq_v_models = [m for m in active_groq if "vision" in m]
             if not groq_v_models:
-                groq_v_models = ["llama-3.3-70b-versatile"] if "llama-3.3-70b-versatile" in active_groq else []
+                groq_v_models = [m for m in ["llama-3.3-70b-versatile", "openai/gpt-oss-120b", "openai/gpt-oss-20b"] if m in active_groq]
             for v_mod in groq_v_models:
                 try:
                     import urllib.request
@@ -1116,6 +1082,40 @@ class AstroRealtimeNode(Node):
                     self.get_logger().debug(f"Groq API ({v_mod}) notice: {http_e.code} - {error_body}")
                 except Exception as ge:
                     self.get_logger().debug(f"Groq ({v_mod}) notice: {ge}")
+
+        # 2. Secondary: Google Gemini Flash REST (0 Token Cost, Blazing Fast)
+        if not obs and self.gemini_api_key:
+            for g_mod in ["gemini-2.5-flash", "gemini-1.5-flash", "gemini-3.6-flash", "gemini-flash-latest"]:
+                try:
+                    import urllib.request
+                    import urllib.error
+                    url = f"https://generativelanguage.googleapis.com/v1beta/models/{g_mod}:generateContent?key={self.gemini_api_key}"
+                    payload = {
+                        "contents": [{
+                            "parts": [
+                                {"text": prompt_text},
+                                {"inline_data": {"mime_type": "image/jpeg", "data": b64_img}}
+                            ]
+                        }],
+                        "generation_config": {"temperature": 0.2, "max_output_tokens": 150}
+                    }
+                    data_bytes = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+                    req = urllib.request.Request(
+                        url,
+                        data=data_bytes,
+                        headers={"Content-Type": "application/json", "User-Agent": "Mozilla/5.0"}
+                    )
+                    with urllib.request.urlopen(req, timeout=5.0) as resp:
+                        res_json = json.loads(resp.read().decode("utf-8"))
+                        candidate_obs = res_json["candidates"][0]["content"]["parts"][0]["text"].strip()
+                        if candidate_obs and not any(rk in candidate_obs.lower() for rk in refusal_kws):
+                            obs = candidate_obs
+                            break
+                except urllib.error.HTTPError as http_e:
+                    error_body = http_e.read().decode("utf-8", errors="ignore")
+                    self.get_logger().debug(f"Gemini Vision ({g_mod}) notice: {http_e.code} - {error_body}")
+                except Exception as gem_e:
+                    self.get_logger().debug(f"Gemini Vision ({g_mod}) notice: {gem_e}")
 
         # 3. Emergency Safety Fallback: OpenAI Vision REST API (gpt-4o-mini)
         # (Only used if Gemini & Groq keys are invalid/failed, so robot never goes blind)
@@ -1357,46 +1357,12 @@ class AstroRealtimeNode(Node):
             obs = None
             provider_name = ""
 
-            # 1. Primary: Google Gemini Flash REST (0 Token Cost, Blazing Fast)
-            if self.gemini_api_key:
-                for g_mod in ["gemini-2.5-flash", "gemini-1.5-flash", "gemini-3.6-flash", "gemini-flash-latest"]:
-                    try:
-                        import urllib.request
-                        import urllib.error
-                        url = f"https://generativelanguage.googleapis.com/v1beta/models/{g_mod}:generateContent?key={self.gemini_api_key}"
-                        payload = {
-                            "contents": [{
-                                "parts": [
-                                    {"text": prompt},
-                                    {"inline_data": {"mime_type": "image/jpeg", "data": b64_img}}
-                                ]
-                            }],
-                            "generation_config": {"temperature": 0.2, "max_output_tokens": 80}
-                        }
-                        data_bytes = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-                        req = urllib.request.Request(
-                            url,
-                            data=data_bytes,
-                            headers={"Content-Type": "application/json", "User-Agent": "Mozilla/5.0"}
-                        )
-                        with urllib.request.urlopen(req, timeout=5.0) as resp:
-                            res_json = json.loads(resp.read().decode("utf-8"))
-                            obs = res_json["candidates"][0]["content"]["parts"][0]["text"].strip()
-                            if obs:
-                                provider_name = f"Gemini ({g_mod})"
-                                break
-                    except urllib.error.HTTPError as http_e:
-                        error_body = http_e.read().decode("utf-8", errors="ignore")
-                        self.get_logger().debug(f"Idle Gemini Vision ({g_mod}) notice: {http_e.code} - {error_body}")
-                    except Exception as gem_e:
-                        self.get_logger().debug(f"Idle Gemini Vision ({g_mod}) notice: {gem_e}")
-
-            # 2. Fallback: Dynamic Groq Vision Models (0 Token Cost)
-            if not obs and self.groq_api_key:
+            # 1. Primary: Groq Vision Models (0 Token Cost, Ultra Fast)
+            if self.groq_api_key:
                 active_groq = discover_groq_models(self.groq_api_key)
                 groq_v_models = [m for m in active_groq if "vision" in m]
                 if not groq_v_models:
-                    groq_v_models = ["llama-3.3-70b-versatile"] if "llama-3.3-70b-versatile" in active_groq else []
+                    groq_v_models = [m for m in ["llama-3.3-70b-versatile", "openai/gpt-oss-120b", "openai/gpt-oss-20b"] if m in active_groq]
                 for v_mod in groq_v_models:
                     try:
                         import urllib.request
@@ -1437,6 +1403,40 @@ class AstroRealtimeNode(Node):
                         self.get_logger().debug(f"Idle Groq Vision ({v_mod}) notice: {http_e.code} - {error_body}")
                     except Exception as ge:
                         self.get_logger().debug(f"Idle Groq Vision ({v_mod}) notice: {ge}")
+
+            # 2. Secondary: Google Gemini Flash REST (0 Token Cost, Blazing Fast)
+            if not obs and self.gemini_api_key:
+                for g_mod in ["gemini-2.5-flash", "gemini-1.5-flash", "gemini-3.6-flash", "gemini-flash-latest"]:
+                    try:
+                        import urllib.request
+                        import urllib.error
+                        url = f"https://generativelanguage.googleapis.com/v1beta/models/{g_mod}:generateContent?key={self.gemini_api_key}"
+                        payload = {
+                            "contents": [{
+                                "parts": [
+                                    {"text": prompt},
+                                    {"inline_data": {"mime_type": "image/jpeg", "data": b64_img}}
+                                ]
+                            }],
+                            "generation_config": {"temperature": 0.2, "max_output_tokens": 80}
+                        }
+                        data_bytes = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+                        req = urllib.request.Request(
+                            url,
+                            data=data_bytes,
+                            headers={"Content-Type": "application/json", "User-Agent": "Mozilla/5.0"}
+                        )
+                        with urllib.request.urlopen(req, timeout=5.0) as resp:
+                            res_json = json.loads(resp.read().decode("utf-8"))
+                            obs = res_json["candidates"][0]["content"]["parts"][0]["text"].strip()
+                            if obs:
+                                provider_name = f"Gemini ({g_mod})"
+                                break
+                    except urllib.error.HTTPError as http_e:
+                        error_body = http_e.read().decode("utf-8", errors="ignore")
+                        self.get_logger().debug(f"Idle Gemini Vision ({g_mod}) notice: {http_e.code} - {error_body}")
+                    except Exception as gem_e:
+                        self.get_logger().debug(f"Idle Gemini Vision ({g_mod}) notice: {gem_e}")
 
             # 3. Emergency Safety Fallback: OpenAI Vision REST (gpt-4o-mini)
             # (Only used if Gemini & Groq keys are invalid/failed, so robot never goes blind)
