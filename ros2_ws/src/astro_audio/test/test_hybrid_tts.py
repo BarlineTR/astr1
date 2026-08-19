@@ -116,8 +116,8 @@ class TestTTSMetrics(unittest.TestCase):
         tel.record_synthesis(synth_ms=70.0, audio_sec=0.5, gpu_inf_ms=65.0)
 
         self.assertAlmostEqual(tel.llm_first_token_ms, 40.0, delta=5.0)
-        self.assertAlmostEqual(tel.end_to_end_ttfa_ms, 150.0, delta=5.0)
-        self.assertAlmostEqual(tel.playback_first_audio_ms, 150.0, delta=5.0)
+        self.assertAlmostEqual(tel.software_ttfa_ms, 150.0, delta=5.0)
+        self.assertAlmostEqual(tel.total_end_to_end_ttfa_ms, 170.0, delta=5.0)
         self.assertEqual(tel.real_time_factor, 0.14)
         self.assertTrue(tel.cuda_available)
 
@@ -127,7 +127,7 @@ class TestTTSMetrics(unittest.TestCase):
 
         summary = tel.summary_line()
         self.assertIn("TTFA:", summary)
-        self.assertIn("Engine: [xtts_gpu]", summary)
+        self.assertIn("Provider: [xtts_gpu]", summary)
         self.assertIn("GPU: 65ms", summary)
 
 

@@ -113,7 +113,19 @@ class LocalXttsEngine(BaseTTSEngine):
 
         except Exception as exc:
             self._log("warn", f"⚠️ [LocalXttsEngine] Sentez hatası: {exc}")
+            if not self.client.is_alive:
+                self._log("error", "❌ [LocalXttsEngine] XTTS worker süreci çökmüş! Arka planda yeniden başlatılıyor...")
+                import threading
+                threading.Thread(target=self._try_auto_restart, daemon=True).start()
             return None
+
+    def _try_auto_restart(self) -> None:
+        try:
+            self.client.stop()
+            time.sleep(0.5)
+            self.start()
+        except Exception as e:
+            self._log("error", f"❌ [LocalXttsEngine] Yeniden başlatma başarısız: {e}")
 
     def cancel(self, generation_id: int) -> None:
         self.client.interrupt(generation_id)

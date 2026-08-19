@@ -241,20 +241,24 @@ class ProductionValidator:
         t5 = time.monotonic()  # T5: DAC buffer consumed
         tel.mark_playback_first_audio(t5)
 
-        end_to_end = tel.end_to_end_ttfa_ms
-        fb_sel_ms = tel.fallback_selection_ms
+        soft_ttfa = tel.software_ttfa_ms
+        end_to_end = tel.total_end_to_end_ttfa_ms
+        dac_buffer_ms = tel.estimated_hardware_dac_latency_ms
+        fb_sel_ms = tel.failover_decision_ms
         xtts_inf_ms = tel.xtts_first_chunk_ms
         q_lat_ms = tel.audio_queue_latency_ms
         pb_lat_ms = tel.playback_start_latency_ms
 
-        print(f"    • T0 (User Turn End)           : 0.0 ms")
-        print(f"    • T1 (Fallback Selected)       : +{fb_sel_ms:.2f} ms")
-        print(f"    • T2 (XTTS Inference Started)  : +{(t2 - t0)*1000:.2f} ms")
-        print(f"    • T3 (Audio Bytes Available)   : +{xtts_inf_ms:.2f} ms (Inference)")
-        print(f"    • T4 (AudioOutputManager Sent) : +{q_lat_ms:.2f} ms (Queue)")
-        print(f"    • T5 (Playback DAC Started)    : +{pb_lat_ms:.2f} ms (DAC Output)")
-        print(f"    -----------------------------------------------------")
-        print(f"    ⚡ {BOLD}TOTAL END-TO-END TTFA: {end_to_end:.1f} ms{RESET}")
+        print(f"    • T0 (User Turn End)             : 0.0 ms")
+        print(f"    • T1 (Fallback Selected)         : +{fb_sel_ms:.2f} ms")
+        print(f"    • T2 (XTTS Inference Started)    : +{(t2 - t0)*1000:.2f} ms")
+        print(f"    • T3 (Audio Bytes Available)     : +{xtts_inf_ms:.2f} ms (XTTS GPU Inference)")
+        print(f"    • T4 (AudioOutputManager Sent)   : +{q_lat_ms:.2f} ms (Queue)")
+        print(f"    • T5 (Software Callback Fed)     : +{pb_lat_ms:.2f} ms (Software Playback)")
+        print(f"    ---------------------------------------------------------")
+        print(f"    ⚡ Software TTFA (T5 - T0)       : {soft_ttfa:.1f} ms")
+        print(f"    🔊 Hardware DMA Buffer (Est)     : +{dac_buffer_ms:.1f} ms (ALSA 24kHz DMA)")
+        print(f"    🚀 {BOLD}TOTAL HARDWARE TTFA (Est)    : {end_to_end:.1f} ms{RESET}")
 
         if end_to_end < 1000.0:
             log_pass(f"Ana KPI Başarılı: TTFA ({end_to_end:.1f}ms) < 1000ms hedefi tutturuldu!")
@@ -266,6 +270,8 @@ class ProductionValidator:
             "xtts_inf_ms": xtts_inf_ms,
             "queue_ms": q_lat_ms,
             "playback_ms": pb_lat_ms,
+            "software_ttfa_ms": soft_ttfa,
+            "hardware_dac_buffer_ms": dac_buffer_ms,
             "end_to_end_ttfa_ms": end_to_end,
         }
         return self.results["ttfa_breakdown"]
@@ -405,7 +411,7 @@ class ProductionValidator:
 
             audio_dur_s = (len(pcm) / 2) / 24000.0 if pcm else 0.5
             rtf = round((infer_ms / 1000.0) / audio_dur_s, 2)
-            ttfa = tel.end_to_end_ttfa_ms
+            ttfa = tel.software_ttfa_ms
             vram = self.xtts_engine.get_telemetry().get("gpu_memory_mb", 435.0)
 
             ttfa_list.append(ttfa)
