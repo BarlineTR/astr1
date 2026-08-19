@@ -1767,13 +1767,14 @@ class AstroRealtimeNode(Node):
         return b""
 
     def _process_fallback_turn(self, audio_chunks: List[bytes]):
-        """Processes a full turn using 100% Free Groq Whisper STT + Groq LLM + Edge-TTS (0 OpenAI Token Cost)."""
+        """Processes a full turn using 100% Free Groq Whisper STT + Groq LLM + Edge-TTS with millisecond latency logging."""
         if self._is_processing_fallback or not audio_chunks:
             return
 
         self._is_processing_fallback = True
         self._is_responding = True
-        self._response_start_time = time.monotonic()
+        t_turn_start = time.monotonic()
+        self._response_start_time = t_turn_start
         try:
             raw_16k = b"".join(audio_chunks)
             arr = np.frombuffer(raw_16k, dtype=np.int16)
@@ -1793,7 +1794,11 @@ class AstroRealtimeNode(Node):
             wav_bytes = wav_io.getvalue()
 
             # 3. Transcribe speech via Groq Whisper Large V3 Turbo
+            t_stt_start = time.monotonic()
             user_text = self._transcribe_groq_whisper(wav_bytes)
+            t_stt_end = time.monotonic()
+            stt_ms = (t_stt_end - t_stt_start) * 1000.0
+
             if not user_text:
                 return
 
@@ -1810,6 +1815,7 @@ class AstroRealtimeNode(Node):
             self.session.record_user_speech()
 
             # 4. Cognitive LLM via Dynamic Groq / Gemini (0 OpenAI Token Cost)
+            t_llm_start = time.monotonic()
             system_prompt = self._build_current_system_prompt()
             messages = [{"role": "system", "content": system_prompt}]
             recent_msgs = self.memory.episodic.get_messages()[-6:]
@@ -1817,25 +1823,29 @@ class AstroRealtimeNode(Node):
                 messages.append({"role": m.get("role", "user"), "content": m.get("content", "")})
 
             active_groq = discover_groq_models(self.groq_api_key)
-            # Prioritize direct chat models before reasoning models
-            direct_models = [m for m in active_groq if not any(x in m.lower() for x in ("whisper", "guard", "vision", "embed", "deepseek", "r1", "reason"))]
-            reasoning_models = [m for m in active_groq if any(x in m.lower() for x in ("deepseek", "r1", "reason"))]
-            candidates = direct_models + reasoning_models
+            # Prioritize flagship high-quality models (avoid 1B/3B degenerations in Turkish)
+            preferred_order = [
+                "llama-3.3-70b-versatile", "llama-3.1-70b-versatile", "llama-3.1-8b-instant",
+                "qwen-2.5-32b", "gemma2-9b-it", "llama3-70b-8192", "llama3-8b-8192"
+            ]
+            candidates = [pref for pref in preferred_order if pref in active_groq]
+            for m in active_groq:
+                if not any(x in m.lower() for x in ("whisper", "guard", "vision", "embed", "1b", "3b", "specdec")) and m not in candidates:
+                    candidates.append(m)
             if not candidates:
-                candidates = [
-                    "llama-3.3-70b-specdec", "llama-3.2-3b-preview", "llama-3.2-1b-preview", 
-                    "llama-3.2-11b-text-preview", "llama-3.1-70b-versatile", "gemma2-9b-it", 
-                    "llama-3.1-8b-instant", "llama3-8b-8192"
-                ]
+                candidates = ["llama-3.3-70b-versatile", "llama-3.1-8b-instant", "gemma2-9b-it"]
 
             reply_text = ""
+            chosen_model = ""
             for mod in candidates:
                 try:
                     payload = {
                         "model": mod,
                         "messages": messages,
-                        "temperature": 0.85,
-                        "max_tokens": 350
+                        "temperature": 0.6,
+                        "top_p": 0.9,
+                        "presence_penalty": 0.15,
+                        "max_tokens": 250
                     }
                     req = urllib.request.Request(
                         "https://api.groq.com/openai/v1/chat/completions",
@@ -1851,6 +1861,7 @@ class AstroRealtimeNode(Node):
                         data = json.loads(resp.read().decode("utf-8"))
                         reply_text = data["choices"][0]["message"].get("content", "").strip()
                         if reply_text:
+                            chosen_model = f"Groq/{mod}"
                             break
                 except urllib.error.HTTPError as http_e:
                     err_body = http_e.read().decode("utf-8", errors="ignore")
@@ -1866,7 +1877,7 @@ class AstroRealtimeNode(Node):
                         conv_history = "\n".join([f"{m.get('role')}: {m.get('content')}" for m in messages[-5:]])
                         gem_payload = {
                             "contents": [{"parts": [{"text": f"{system_prompt}\n\nKonuşma Geçmişi:\n{conv_history}"}]}],
-                            "generation_config": {"temperature": 0.85, "max_output_tokens": 300}
+                            "generation_config": {"temperature": 0.6, "max_output_tokens": 250}
                         }
                         req = urllib.request.Request(
                             url,
@@ -1877,12 +1888,16 @@ class AstroRealtimeNode(Node):
                             res_json = json.loads(resp.read().decode("utf-8"))
                             reply_text = res_json["candidates"][0]["content"]["parts"][0]["text"].strip()
                             if reply_text:
+                                chosen_model = f"Gemini/{g_mod}"
                                 break
                     except urllib.error.HTTPError as http_e:
                         err_body = http_e.read().decode("utf-8", errors="ignore")
                         self.get_logger().debug(f"Gemini LLM ({g_mod}) notice: {http_e.code} - {err_body}")
                     except Exception as ge:
                         self.get_logger().debug(f"Gemini LLM ({g_mod}) notice: {ge}")
+
+            t_llm_end = time.monotonic()
+            llm_ms = (t_llm_end - t_llm_start) * 1000.0
 
             # Clean reasoning artifacts (<think> blocks)
             raw_reply = reply_text
@@ -1898,12 +1913,23 @@ class AstroRealtimeNode(Node):
             if not reply_text:
                 return
 
-            self.get_logger().info(f"🤖 [Astro (0-Maliyet Groq)]: \"{reply_text}\"")
+            self.get_logger().info(f"🤖 [Astro (0-Maliyet {chosen_model})]: \"{reply_text}\"")
             self.memory.episodic.add_message("assistant", reply_text)
             self.session.record_robot_speech()
 
             # 5. Synthesize speech to 24kHz PCM and stream to audio playback
+            t_tts_start = time.monotonic()
             pcm_data = self._synthesize_edge_tts_pcm24k(reply_text)
+            t_tts_end = time.monotonic()
+            tts_ms = (t_tts_end - t_tts_start) * 1000.0
+            total_turn_ms = (t_tts_end - t_turn_start) * 1000.0
+
+            self.get_logger().info(
+                f"⏱️ [0-Maliyet Gecikme Analizi]: STT: {int(stt_ms)}ms (Groq Whisper) | "
+                f"LLM ({chosen_model}): {int(llm_ms)}ms | TTS Sentez: {int(tts_ms)}ms (Edge-TTS) | "
+                f"Toplam Cevap Başlama Süresi: {int(total_turn_ms)}ms"
+            )
+
             if pcm_data:
                 chunk_size = 960  # 480 samples @ 24kHz int16 = 20ms
                 for i in range(0, len(pcm_data), chunk_size):
