@@ -41,6 +41,15 @@ try:
 except ImportError:
     websockets = None
 
+try:
+    from astro_audio.local_xtts_engine import LocalXttsEngine
+    from astro_audio.tts_metrics import TurnTelemetry
+    from astro_audio.sentence_chunker import SentenceChunker
+except ImportError:
+    LocalXttsEngine = None
+    TurnTelemetry = None
+    SentenceChunker = None
+
 EMOJI_RE = re.compile(
     "["
     "\U0001F1E0-\U0001F1FF"
@@ -259,6 +268,31 @@ class AstroRealtimeNode(Node):
         self._last_speech_time = 0.0
         self._fallback_audio_buffer: List[bytes] = []
         self._is_processing_fallback = False
+        self._fallback_generation_id = 0
+
+        # Local XTTS GPU Fallback Engine (Warm & Resident on cuda:0)
+        self.local_xtts: Optional[LocalXttsEngine] = None
+        if LocalXttsEngine:
+            xtts_home = os.getenv("TTS_XTTS_HOME", "") or os.path.expanduser("~/.astro/tts")
+            spk_wav = os.getenv("TTS_XTTS_SPEAKER_WAV", "")
+            if not spk_wav or not os.path.exists(spk_wav):
+                try:
+                    from ament_index_python.packages import get_package_share_directory
+                    spk_wav = os.path.join(get_package_share_directory("astro_audio"), "voices", "astro.wav")
+                except Exception:
+                    spk_wav = os.path.join(xtts_home, "Recording.wav")
+            try:
+                self.local_xtts = LocalXttsEngine(
+                    speaker_wav=spk_wav,
+                    language=os.getenv("TTS_LANGUAGE", "tr"),
+                    device=os.getenv("TTS_XTTS_DEVICE", "cuda"),
+                    half=os.getenv("TTS_XTTS_HALF", "1") not in ("0", "false", "False"),
+                    home=xtts_home,
+                    logger=lambda lvl, msg: getattr(self.get_logger(), lvl, self.get_logger().info)(msg),
+                )
+                threading.Thread(target=self._start_local_xtts_background, daemon=True).start()
+            except Exception as e:
+                self.get_logger().warn(f"⚠️ [Astro Realtime] Local XTTS GPU hazırlık uyarısı: {e}")
 
         # Camera Perception Frame Cache
         self._latest_camera_frame: Optional[np.ndarray] = None
@@ -1838,6 +1872,36 @@ class AstroRealtimeNode(Node):
             self.get_logger().warn(f"⚠️ [TTS Sentez Hatası]: {e}")
         return b""
 
+    def _start_local_xtts_background(self):
+        if self.local_xtts:
+            try:
+                self.local_xtts.start()
+            except Exception as e:
+                self.get_logger().error(f"❌ [Astro Realtime] Local XTTS GPU başlatılamadı: {e}")
+
+    def _synthesize_speech_pcm(self, text: str) -> Tuple[bytes, str, float]:
+        """Synthesizes speech to int16 PCM using Local XTTS on CUDA GPU with Edge-TTS secondary fallback.
+        
+        Returns: (pcm_bytes, active_engine_name, gpu_inf_ms)
+        """
+        if not text:
+            return b"", "none", 0.0
+        clean_text = clean_tts_text(text)
+        if not clean_text:
+            return b"", "none", 0.0
+
+        # 1. Primary Fallback: Local Coqui XTTS on CUDA GPU (Resident & Warm, TTFA < 800ms)
+        if self.local_xtts and self.local_xtts.is_ready():
+            t_s = time.perf_counter()
+            pcm = self.local_xtts.synthesize_sentence(clean_text, generation_id=self._fallback_generation_id)
+            gpu_ms = (time.perf_counter() - t_s) * 1000.0
+            if pcm:
+                return pcm, "xtts_gpu", gpu_ms
+
+        # 2. Secondary Fallback: Edge-TTS In-Memory PCM24k
+        pcm_edge = self._synthesize_edge_tts_pcm24k(clean_text)
+        return pcm_edge, "edge_tts", 0.0
+
     def _play_pcm_chunks(self, pcm_data: bytes):
         """Streams 24kHz int16 PCM audio chunks directly to audio output node with smooth 20ms pacing."""
         if not pcm_data:
@@ -1901,6 +1965,12 @@ class AstroRealtimeNode(Node):
             self.memory.episodic.add_message("user", user_text)
             self.session.record_user_speech()
 
+            active_engine = "xtts_gpu" if (self.local_xtts and self.local_xtts.is_ready()) else "edge_tts"
+            gpu_mem = self.local_xtts.get_telemetry().get("gpu_memory_mb", 0.0) if self.local_xtts else 0.0
+            total_synth_ms = 0.0
+            total_gpu_ms = 0.0
+            total_audio_sec = 0.0
+
             # 4. Instant Intent Interception (Sub-250ms Direct Execution)
             # A. Live Weather Intent:
             is_weather, w_city = self._is_weather_query(user_text)
@@ -1915,11 +1985,18 @@ class AstroRealtimeNode(Node):
                 else:
                     reply_text = f"{spk} {weather_info}".strip()
                 
-                pcm = self._synthesize_edge_tts_pcm24k(reply_text)
+                t_tts_req = time.monotonic()
+                pcm, eng_name, g_ms = self._synthesize_speech_pcm(reply_text)
                 if pcm:
                     first_audio_ms = (time.monotonic() - t_turn_start) * 1000.0
+                    audio_sec = (len(pcm) / 2) / 24000.0
+                    rtf = round(((time.monotonic() - t_tts_req) / audio_sec), 3) if audio_sec > 0 else 0.0
                     self.get_logger().info(f"🤖 [Astro (Canlı Hava Durumu)]: \"{reply_text}\"")
-                    self.get_logger().info(f"⚡ [Hızlı Araç Gecikmesi]: STT: {int(stt_ms)}ms | İlk Ses: {int(first_audio_ms)}ms")
+                    self.get_logger().info(
+                        f"📊 [Telemetry]: engine={eng_name} | TTFA={int(first_audio_ms)}ms | STT={int(stt_ms)}ms | "
+                        f"synth={(time.monotonic() - t_tts_req)*1000:.0f}ms | audio_dur={audio_sec:.2f}s | RTF={rtf} | "
+                        f"gpu_infer={g_ms:.0f}ms | vram={gpu_mem:.0f}MB | cuda=True"
+                    )
                     self.memory.episodic.add_message("assistant", reply_text)
                     self.session.record_robot_speech()
                     self._play_pcm_chunks(pcm)
@@ -1935,11 +2012,18 @@ class AstroRealtimeNode(Node):
                 else:
                     reply_text = "Ulan sesini tam çıkaramadım, adını söyle de seni hafızama kazıyayım!" if p == "kufurbaz" else "Sesini şu an tam eşleştiremedim, adını söylersen seni hemen kaydedebilirim."
                 
-                pcm = self._synthesize_edge_tts_pcm24k(reply_text)
+                t_tts_req = time.monotonic()
+                pcm, eng_name, g_ms = self._synthesize_speech_pcm(reply_text)
                 if pcm:
                     first_audio_ms = (time.monotonic() - t_turn_start) * 1000.0
+                    audio_sec = (len(pcm) / 2) / 24000.0
+                    rtf = round(((time.monotonic() - t_tts_req) / audio_sec), 3) if audio_sec > 0 else 0.0
                     self.get_logger().info(f"🤖 [Astro (Kimlik Yanıtı)]: \"{reply_text}\"")
-                    self.get_logger().info(f"⚡ [Hızlı Araç Gecikmesi]: STT: {int(stt_ms)}ms | İlk Ses: {int(first_audio_ms)}ms")
+                    self.get_logger().info(
+                        f"📊 [Telemetry]: engine={eng_name} | TTFA={int(first_audio_ms)}ms | STT={int(stt_ms)}ms | "
+                        f"synth={(time.monotonic() - t_tts_req)*1000:.0f}ms | audio_dur={audio_sec:.2f}s | RTF={rtf} | "
+                        f"gpu_infer={g_ms:.0f}ms | vram={gpu_mem:.0f}MB | cuda=True"
+                    )
                     self.memory.episodic.add_message("assistant", reply_text)
                     self.session.record_robot_speech()
                     self._play_pcm_chunks(pcm)
@@ -1947,6 +2031,7 @@ class AstroRealtimeNode(Node):
 
             # 5. Cognitive LLM via Streaming Groq Llama-3.1-8B (TTFT: ~35ms)
             t_llm_start = time.monotonic()
+            llm_first_token_ms = 0.0
             system_prompt = self._build_current_system_prompt()
             messages = [{"role": "system", "content": system_prompt}]
             recent_msgs = self.memory.episodic.get_messages()[-6:]
@@ -1971,6 +2056,7 @@ class AstroRealtimeNode(Node):
             full_reply_parts = []
             first_audio_played = False
             first_audio_ms = 0.0
+            tts_first_audio_ms = 0.0
             chosen_model = ""
 
             if self.groq_api_key and candidates:
@@ -2012,6 +2098,9 @@ class AstroRealtimeNode(Node):
                                     if not token:
                                         continue
 
+                                    if llm_first_token_ms == 0.0:
+                                        llm_first_token_ms = (time.monotonic() - t_llm_start) * 1000.0
+
                                     current_clause += token
                                     full_reply_parts.append(token)
 
@@ -2019,10 +2108,18 @@ class AstroRealtimeNode(Node):
                                     if any(p in current_clause for p in [".", "!", "?", ",", ":", "\n"]) or (len(current_clause) > 35 and " " in current_clause):
                                         clean_clause = clean_tts_text(current_clause)
                                         if clean_clause and len(clean_clause) >= 3:
-                                            pcm = self._synthesize_edge_tts_pcm24k(clean_clause)
+                                            t_clause_synth = time.perf_counter()
+                                            pcm, eng_name, g_ms = self._synthesize_speech_pcm(clean_clause)
+                                            s_ms = (time.perf_counter() - t_clause_synth) * 1000.0
+                                            total_synth_ms += s_ms
+                                            total_gpu_ms += g_ms
                                             if pcm:
+                                                active_engine = eng_name
+                                                audio_sec = (len(pcm) / 2) / 24000.0
+                                                total_audio_sec += audio_sec
                                                 if not first_audio_played:
                                                     first_audio_ms = (time.monotonic() - t_turn_start) * 1000.0
+                                                    tts_first_audio_ms = (time.monotonic() - t_llm_start) * 1000.0
                                                     first_audio_played = True
                                                 self._play_pcm_chunks(pcm)
                                         current_clause = ""
@@ -2042,10 +2139,18 @@ class AstroRealtimeNode(Node):
             if current_clause:
                 clean_clause = clean_tts_text(current_clause)
                 if clean_clause and len(clean_clause) >= 2:
-                    pcm = self._synthesize_edge_tts_pcm24k(clean_clause)
+                    t_clause_synth = time.perf_counter()
+                    pcm, eng_name, g_ms = self._synthesize_speech_pcm(clean_clause)
+                    s_ms = (time.perf_counter() - t_clause_synth) * 1000.0
+                    total_synth_ms += s_ms
+                    total_gpu_ms += g_ms
                     if pcm:
+                        active_engine = eng_name
+                        audio_sec = (len(pcm) / 2) / 24000.0
+                        total_audio_sec += audio_sec
                         if not first_audio_played:
                             first_audio_ms = (time.monotonic() - t_turn_start) * 1000.0
+                            tts_first_audio_ms = (time.monotonic() - t_llm_start) * 1000.0
                             first_audio_played = True
                         self._play_pcm_chunks(pcm)
 
@@ -2087,24 +2192,34 @@ class AstroRealtimeNode(Node):
                 chosen_model = "LocalPersonaFallback"
 
             if not first_audio_played and full_reply_str:
-                pcm = self._synthesize_edge_tts_pcm24k(full_reply_str)
+                t_clause_synth = time.perf_counter()
+                pcm, eng_name, g_ms = self._synthesize_speech_pcm(full_reply_str)
+                s_ms = (time.perf_counter() - t_clause_synth) * 1000.0
+                total_synth_ms += s_ms
+                total_gpu_ms += g_ms
                 if pcm:
+                    active_engine = eng_name
+                    audio_sec = (len(pcm) / 2) / 24000.0
+                    total_audio_sec += audio_sec
                     first_audio_ms = (time.monotonic() - t_turn_start) * 1000.0
                     first_audio_played = True
                     self._play_pcm_chunks(pcm)
 
             t_total_end = time.monotonic()
             total_turn_ms = (t_total_end - t_turn_start) * 1000.0
+            rtf_calc = round((total_synth_ms / 1000.0) / total_audio_sec, 3) if total_audio_sec > 0 else 0.0
 
             if full_reply_str:
-                self.get_logger().info(f"🤖 [Astro (0-Maliyet {chosen_model})]: \"{full_reply_str}\"")
+                self.get_logger().info(f"🤖 [Astro ({chosen_model})]: \"{full_reply_str}\"")
                 self.memory.episodic.add_message("assistant", full_reply_str)
                 self.session.record_robot_speech()
 
                 self.get_logger().info(
-                    f"⚡ [0-Maliyet Akış Gecikmesi]: STT: {int(stt_ms)}ms | "
-                    f"İlk Ses Çıkışı (TTFB): {int(first_audio_ms if first_audio_played else total_turn_ms)}ms | "
-                    f"Toplam Cümle Bitişi: {int(total_turn_ms)}ms"
+                    f"📊 [TTFA Telemetry]: engine=[{active_engine}] | "
+                    f"TTFA={int(first_audio_ms if first_audio_played else total_turn_ms)}ms | "
+                    f"LLM-TTFT={int(llm_first_token_ms)}ms | STT={int(stt_ms)}ms | "
+                    f"synth={int(total_synth_ms)}ms | audio_dur={total_audio_sec:.2f}s | RTF={rtf_calc:.2f} | "
+                    f"gpu_infer={int(total_gpu_ms)}ms | vram={gpu_mem:.0f}MB | cuda=True"
                 )
 
         except Exception as e:
@@ -2178,6 +2293,14 @@ class AstroRealtimeNode(Node):
                         if not self._fallback_speaking:
                             self._fallback_speaking = True
                             self._fallback_speech_start = now
+                            self._fallback_generation_id += 1
+                            if self.local_xtts:
+                                self.local_xtts.cancel(self._fallback_generation_id)
+                            # Broadcast interrupt to immediately abort any active speaker playback
+                            int_msg = Bool()
+                            int_msg.data = True
+                            self.pub_interrupt.publish(int_msg)
+
                             # Include pre-speech audio frames to avoid clipping initial word syllable
                             with self._lock:
                                 pre_frames = list(self._user_speech_audio_buffer[-8:]) if len(self._user_speech_audio_buffer) >= 8 else []
