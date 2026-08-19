@@ -180,6 +180,10 @@ class AiBrainNode(Node):
             on_session_end=self._on_session_timed_out
         )
 
+        # En az bir metin motoru (Groq / OpenAI / Gemini REST) hazır olduğunda True olur.
+        # Tanımsız kalırsa _on_speech ilk konuşmada AttributeError verir.
+        self._enabled = False
+
         # 1. Groq Client (Primary Ultra-Fast Free LPU Engine - Zero OpenAI Cost)
         self.groq_api_key = os.environ.get("GROQ_API_KEY", "").strip()
         self._groq = None
@@ -206,11 +210,24 @@ class AiBrainNode(Node):
             except Exception as e:
                 self.get_logger().error(f"❌ [AI Brain] OpenAI client başlatılamadı: {e}")
 
-        if not self._openai and not self._groq:
-            self.get_logger().error("❌ [AI Brain] Ne OPENAI_API_KEY ne de GROQ_API_KEY bulunamadı! LLM devre dışı.")
-
         # 3. Gemini REST API Key (Tertiary Fallback)
-        self._ai_api_key = os.environ.get("AI_API_KEY", "").strip()
+        # AI_API_KEY tarihsel isim; .env'de anahtar GEMINI_API_KEY olarak tutuluyor.
+        # OpenAI anahtarı (sk-...) buraya düşerse Gemini uç noktası 400 döner, ele.
+        self._ai_api_key = (
+            os.environ.get("AI_API_KEY", "").strip("\"' \t\n\r")
+            or os.environ.get("GEMINI_API_KEY", "").strip("\"' \t\n\r")
+        )
+        if self._ai_api_key.startswith("sk-"):
+            self._ai_api_key = ""
+
+        if self._ai_api_key:
+            self._enabled = True
+            self.get_logger().info("✅ [AI Brain] Google Gemini REST metin motoru hazır.")
+
+        if not self._enabled:
+            self.get_logger().error(
+                "❌ [AI Brain] GROQ_API_KEY / OPENAI_API_KEY / GEMINI_API_KEY bulunamadı! LLM devre dışı."
+            )
 
         # Perception & Hardware State
         self._lock = threading.Lock()
@@ -1203,7 +1220,7 @@ class AiBrainNode(Node):
                     self.get_logger().warn(f"⚠️ [OpenAI Vision ({m_cand}) Hatası]: {e}")
 
         # 2. Try Secondary Google Gemini REST Endpoint
-        if self._ai_api_key and self._ai_api_key.startswith("AIza"):
+        if self._ai_api_key:
             gemini_vision_models = ["gemini-3.6-flash", "gemini-2.5-flash", "gemini-flash-latest"]
             for g_model in gemini_vision_models:
                 try:
@@ -1243,7 +1260,15 @@ class AiBrainNode(Node):
         if not self._ai_api_key:
             return None
 
-        gemini_text_models = ["gemini-3.6-flash", "gemini-2.5-flash", "gemini-flash-latest"]
+        # Sıra gecikmeye göre: takma adlar ("-latest") her projede çözülür ve en hızlı
+        # yanıtı verir; sürüm numaralı adlar anahtarın projesinde 404 olabiliyor.
+        # .env'den GEMINI_TEXT_MODELS ile virgülle ayırarak değiştirilebilir.
+        gemini_text_models = [
+            m.strip() for m in os.getenv(
+                "GEMINI_TEXT_MODELS",
+                "gemini-flash-latest,gemini-3.6-flash,gemini-flash-lite-latest",
+            ).split(",") if m.strip()
+        ]
         for g_model in gemini_text_models:
             try:
                 url = f"https://generativelanguage.googleapis.com/v1beta/models/{g_model}:generateContent?key={self._ai_api_key}"
@@ -1543,7 +1568,7 @@ class AiBrainNode(Node):
                 self.get_logger().debug(f"OpenAI Idle Vision notice: {oe}")
 
         # 2. Try Gemini REST
-        if self._ai_api_key and self._ai_api_key.startswith("AIza"):
+        if self._ai_api_key:
             for g_model in ["gemini-2.0-flash", "gemini-1.5-flash"]:
                 try:
                     url = f"https://generativelanguage.googleapis.com/v1beta/models/{g_model}:generateContent?key={self._ai_api_key}"

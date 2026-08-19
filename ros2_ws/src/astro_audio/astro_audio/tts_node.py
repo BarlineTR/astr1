@@ -59,6 +59,23 @@ def _load_env():
 class TtsNode(Node):
     """ROS 2 Node orchestrating speech synthesis across Realtime API and Local GPU XTTS."""
 
+    def _log(self, level: str, message: str) -> None:
+        """Alt sistemler için seviye yönlendirici.
+
+        rclpy günlükçüsü seviyeyi çağrı yerine (dosya+satır) göre önbelleğe alır; tek bir
+        lambda satırından hem info hem warn gönderilirse "Logger severity cannot be changed
+        between calls" hatası çağıran iş parçacığını öldürür. Her seviye kendi satırında.
+        """
+        logger = self.get_logger()
+        if level == "error":
+            logger.error(message)
+        elif level in ("warn", "warning"):
+            logger.warn(message)
+        elif level == "debug":
+            logger.debug(message)
+        else:
+            logger.info(message)
+
     def __init__(self):
         super().__init__("tts_node")
         _load_env()
@@ -71,14 +88,14 @@ class TtsNode(Node):
         self.output_manager = AudioOutputManager(
             preferred_device=os.getenv("AUDIO_OUTPUT_DEVICE", ""),
             on_playback_state_change=self._on_playback_state_changed,
-            logger=lambda lvl, msg: getattr(self.get_logger(), lvl, self.get_logger().info)(msg),
+            logger=self._log,
         )
 
         # 2. Initialize Realtime Engine (Primary)
         self.realtime_engine = RealtimeEngine(
             model=os.getenv("REALTIME_MODEL", "gpt-realtime"),
             voice=self.openai_voice,
-            logger=lambda lvl, msg: getattr(self.get_logger(), lvl, self.get_logger().info)(msg),
+            logger=self._log,
         )
 
         # 3. Initialize Local XTTS GPU Engine (Warm Fallback)
@@ -94,7 +111,7 @@ class TtsNode(Node):
                 half=os.getenv("TTS_XTTS_HALF", "1") not in ("0", "false", "False"),
                 home=xtts_home,
                 model_dir=os.getenv("TTS_XTTS_MODEL_DIR", "") or None,
-                logger=lambda lvl, msg: getattr(self.get_logger(), lvl, self.get_logger().info)(msg),
+                logger=self._log,
             )
             # Start worker in background thread to avoid blocking ROS node initialization
             threading.Thread(target=self._start_xtts_background, daemon=True).start()
@@ -106,7 +123,7 @@ class TtsNode(Node):
             output_manager=self.output_manager,
             realtime_engine=self.realtime_engine,
             local_xtts_engine=self.local_xtts,
-            logger=lambda lvl, msg: getattr(self.get_logger(), lvl, self.get_logger().info)(msg),
+            logger=self._log,
             on_state_change=self._on_orchestrator_state_change,
         )
 

@@ -30,6 +30,12 @@ except ImportError:
     sd = None
 
 RESPEAKER_NAME_HINTS = ("respeaker", "uac1", "seeed", "arrayuac", "usb audio")
+# PulseAudio/PipeWire'ın ALSA köprüsü üzerinden açılan PortAudio çıkış akışları,
+# başka bir süreç aynı sunucudan yakalama (capture) akışı tutarken Pa_WriteStream
+# içinde kalıcı olarak kilitleniyor: ilk tampon duyuluyor, sonrası hiç akmıyor.
+# Bu adlarda aplay alt sürecine düşülür; gerçek donanım (ReSpeaker vb.) için
+# düşük gecikmeli doğrudan akış korunur.
+PULSE_BRIDGE_NAMES = ("pulse", "pipewire", "default", "sysdefault", "jack")
 HW_SAMPLE_RATE = 16000  # ReSpeaker hardware native DAC rate
 TARGET_SAMPLE_RATE = 24000
 CHANNELS = 1
@@ -108,6 +114,17 @@ def find_sounddevice_output_index(preferred: str = "") -> Tuple[Optional[int], s
         return None, str(e)
 
 
+def resolve_output_backend(preferred: str, sd_dev_name: str) -> str:
+    """Seçilen çıkış cihazına göre 'sounddevice' mi 'aplay' mi kullanılacağına karar verir."""
+    choice = (preferred or "auto").strip().lower()
+    if choice in ("sounddevice", "aplay"):
+        return choice
+    name = (sd_dev_name or "").strip().lower()
+    if any(name == n or name.startswith(n) for n in PULSE_BRIDGE_NAMES):
+        return "aplay"
+    return "sounddevice"
+
+
 class AudioOutputManager:
     """Centralized, thread-safe hardware audio playback controller with generation gating."""
 
@@ -128,10 +145,14 @@ class AudioOutputManager:
             self.alsa_device = find_alsa_respeaker_device()
             self.sd_dev_idx, self.sd_dev_name = find_sounddevice_output_index(preferred_device)
             self.has_aplay = shutil.which("aplay") is not None
+            self.backend = resolve_output_backend(os.getenv("AUDIO_OUTPUT_BACKEND", "auto"), self.sd_dev_name)
+            if self.backend == "aplay" and not self.has_aplay:
+                self.backend = "sounddevice"
         else:
             self.alsa_device = "mock"
             self.sd_dev_idx, self.sd_dev_name = None, "Mock In-Memory Audio Device"
             self.has_aplay = False
+            self.backend = "mock"
 
         self._play_queue: queue.Queue[Tuple[int, bytes]] = queue.Queue(maxsize=1000)
         self._current_generation = 0
@@ -147,7 +168,10 @@ class AudioOutputManager:
         self._worker_thread = threading.Thread(target=self._playback_loop, daemon=True)
         self._worker_thread.start()
 
-        mode_str = "MOCK (In-Memory Isolation)" if self.mock_playback else f"ALSA: [{self.alsa_device}] | Sounddevice: [{self.sd_dev_idx}: {self.sd_dev_name}]"
+        mode_str = (
+            "MOCK (In-Memory Isolation)" if self.mock_playback
+            else f"Arka uç: [{self.backend}] | ALSA: [{self.alsa_device}] | Sounddevice: [{self.sd_dev_idx}: {self.sd_dev_name}]"
+        )
         self._log("info", f"🔊 [AudioOutputManager] Başlatıldı | Mod: {mode_str}")
 
     @property
@@ -255,8 +279,28 @@ class AudioOutputManager:
                     pass
             self._current_process = None
 
+    def _open_output_stream(self):
+        """aplay arka ucunda akış açılmaz; aksi hâlde donanım DAC akışı açılır."""
+        if self.backend == "aplay":
+            self._log("info", f"🔈 [AudioOutputManager] Çalma aplay ile yapılacak (cihaz: {self.alsa_device}).")
+            return None
+        try:
+            stream = sd.RawOutputStream(
+                samplerate=HW_SAMPLE_RATE,
+                blocksize=0,
+                device=self.sd_dev_idx,
+                channels=CHANNELS,
+                dtype=DTYPE,
+            )
+            stream.start()
+            self._output_stream = stream
+            return stream
+        except Exception as e:
+            self._log("warn", f"⚠️ [AudioOutputManager] Sounddevice OutputStream başlatılamadı: {e}. ALSA aplay fallback kullanılacak.")
+            return None
+
     def _playback_loop(self) -> None:
-        """Dedicated sounddevice OutputStream playback thread."""
+        """Dedicated playback thread (hardware DAC stream or aplay subprocess)."""
         if self.mock_playback:
             while True:
                 try:
@@ -281,23 +325,11 @@ class AudioOutputManager:
                             self._on_state_change(True)
             return
 
-        if sd is None:
+        if sd is None and self.backend != "aplay":
             self._log("error", "❌ [AudioOutputManager] sounddevice bulunamadı!")
             return
 
-        stream = None
-        try:
-            stream = sd.RawOutputStream(
-                samplerate=HW_SAMPLE_RATE,
-                blocksize=0,
-                device=self.sd_dev_idx,
-                channels=CHANNELS,
-                dtype=DTYPE,
-            )
-            stream.start()
-            self._output_stream = stream
-        except Exception as e:
-            self._log("warn", f"⚠️ [AudioOutputManager] Sounddevice OutputStream başlatılamadı: {e}. ALSA aplay fallback kullanılacak.")
+        stream = self._open_output_stream()
 
         while True:
             try:
@@ -328,20 +360,25 @@ class AudioOutputManager:
                 try:
                     stream.write(chunk)
                 except Exception as e:
-                    self._log("debug", f"Audio stream write notice: {e}")
+                    self._log("warn", f"⚠️ [AudioOutputManager] DAC yazma hatası: {e}")
             else:
                 # Fallback to direct aplay pipe
                 self._play_chunk_via_aplay(chunk)
 
     def _play_chunk_via_aplay(self, chunk: bytes) -> None:
+        # Zaman aşımı sesin kendi süresinden türetilir: sabit 2 sn, iki saniyeden uzun
+        # her cümleyi ortasından kesiyordu.
+        audio_s = len(chunk) / 2.0 / float(HW_SAMPLE_RATE)
         try:
-            cmd = ["aplay", "-D", self.alsa_device, "-r", "16000", "-f", "S16_LE", "-c", "1", "-q"]
+            cmd = ["aplay", "-D", self.alsa_device, "-r", str(HW_SAMPLE_RATE), "-f", "S16_LE", "-c", "1", "-q"]
             proc = subprocess.Popen(cmd, stdin=subprocess.PIPE)
             with self._lock:
                 self._current_process = proc
-            proc.communicate(input=chunk, timeout=2.0)
-        except Exception:
-            pass
+            proc.communicate(input=chunk, timeout=audio_s + 5.0)
+        except subprocess.TimeoutExpired:
+            self._log("warn", f"⚠️ [AudioOutputManager] aplay {audio_s:.1f}sn'lik sesi zamanında bitiremedi.")
+        except Exception as e:
+            self._log("warn", f"⚠️ [AudioOutputManager] aplay çalma hatası: {e}")
         finally:
             with self._lock:
                 self._current_process = None

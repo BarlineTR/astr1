@@ -14,6 +14,7 @@
 
 # ── AI / LLM ────────────────────────────────────────────────
 openai                  # ai_brain_node + Whisper API (OpenAI uyumlu her sağlayıcı)
+groq                    # ai_brain_node LLM + speech_recognition_node Groq Whisper (opsiyonel import)
 python-dotenv           # .env okuma (ai_brain, tts, stt, bringup)
 websockets              # OpenAI Realtime WebSocket (gpt-4o-realtime-preview)
 

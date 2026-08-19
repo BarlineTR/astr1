@@ -245,6 +245,18 @@ def discover_groq_models(api_key: str) -> list[str]:
 class AstroRealtimeNode(Node):
     """ROS 2 Node bridging Astro sensors & audio streams to OpenAI Realtime WebSocket."""
 
+    def _log(self, level: str, message: str) -> None:
+        """Alt sistemler için seviye yönlendirici (bkz. tts_node._log)."""
+        logger = self.get_logger()
+        if level == "error":
+            logger.error(message)
+        elif level in ("warn", "warning"):
+            logger.warn(message)
+        elif level == "debug":
+            logger.debug(message)
+        else:
+            logger.info(message)
+
     def __init__(self):
         super().__init__("astro_realtime_node")
 
@@ -332,7 +344,7 @@ class AstroRealtimeNode(Node):
                     device=os.getenv("TTS_XTTS_DEVICE", "cuda"),
                     half=os.getenv("TTS_XTTS_HALF", "1") not in ("0", "false", "False"),
                     home=xtts_home,
-                    logger=lambda lvl, msg: getattr(self.get_logger(), lvl, self.get_logger().info)(msg),
+                    logger=self._log,
                 )
                 threading.Thread(target=self._start_local_xtts_background, daemon=True).start()
             except Exception as e:
