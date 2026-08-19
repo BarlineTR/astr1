@@ -151,6 +151,7 @@ class XttsClient:
 
         env = os.environ.copy()
         env["PYTHONPATH"] = ""
+        env["PYTHONNOUSERSITE"] = "1"
         env["COQUI_TOS_AGREED"] = "1"
         env["PATH"] = f"{self.python_path.parent}{os.pathsep}{env.get('PATH', '')}"
         env["VIRTUAL_ENV"] = str(self.python_path.parent.parent)

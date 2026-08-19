@@ -58,12 +58,24 @@ def main() -> int:
     args = parser.parse_args()
 
     os.environ.setdefault("COQUI_TOS_AGREED", "1")
+    os.environ["PYTHONNOUSERSITE"] = "1"
 
-    # 1. Dependency Imports
+    # 1. Dependency Imports & PyTorch 2.6+ Compatibility Monkeypatch
     try:
         import soundfile as sf
         import torch
         import numpy as np
+
+        try:
+            _orig_torch_load = torch.load
+            def _astro_safe_torch_load(*args, **kwargs):
+                if "weights_only" not in kwargs:
+                    kwargs["weights_only"] = False
+                return _orig_torch_load(*args, **kwargs)
+            torch.load = _astro_safe_torch_load
+        except Exception:
+            pass
+
         from TTS.api import TTS
     except Exception as exc:
         emit({"event": "error", "stage": "import", "message": f"Import failed: {type(exc).__name__}: {exc}"})
