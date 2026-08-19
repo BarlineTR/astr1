@@ -15,6 +15,7 @@ import os
 import re
 import threading
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from typing import Any, Dict, List, Optional, Tuple
@@ -245,16 +246,7 @@ class AiBrainNode(Node):
         self._recognized_person = None
         self._recognized_speaker = None
         self._last_speaker_embedding = None
-        self._enrollment_session = {
-            "active": False,
-            "name": "",
-            "title": "",
-            "turn": 0,
-            "max_turns": 3,
-            "embeddings": [],
-            "last_frame": None,
-            "start_time": 0.0
-        }
+        self._enrollment_session = self._new_enrollment_session()
         self._node_start_time = time.monotonic()
         self._latest_frame = None
         self._latest_frame_time = 0.0
@@ -615,6 +607,20 @@ class AiBrainNode(Node):
                     return True
         return False
 
+    @staticmethod
+    def _new_enrollment_session() -> Dict[str, Any]:
+        """Boş biyometrik kayıt oturumu. Şekil tek yerde tanımlı olsun diye."""
+        return {
+            "active": False,
+            "name": "",
+            "title": "",
+            "turn": 0,
+            "max_turns": 3,
+            "embeddings": [],
+            "last_frame": None,
+            "start_time": 0.0,
+        }
+
     def _on_speech(self, msg: String):
         if not self._enabled:
             return
@@ -809,8 +815,12 @@ class AiBrainNode(Node):
                             self.get_logger().warn(f"Face enrollment save notice: {e}")
 
                     # 3. Save to profile
-                    self.memory.profile.save_known_person(cand_name, formal_name)
-                    self._enrollment_session = {"active": False, "name": "", "title": "", "turn": 0, "embeddings": []}
+                    try:
+                        self.memory.profile.add_known_person(cand_name, title=formal_name)
+                    except Exception as e:
+                        self.get_logger().warn(f"Profile enrollment save notice: {e}")
+
+                    self._enrollment_session = self._new_enrollment_session()
                     self.state_machine.transition_to(RobotState.IDLE)
                     ans = f"Tebrikler {cand_name}! Sesinizi ve yüzünüzü başarıyla kaydettim. Artık seni her gördüğümde ve duyduğumda tanıyacağım!"
 
@@ -1263,10 +1273,14 @@ class AiBrainNode(Node):
         # Sıra gecikmeye göre: takma adlar ("-latest") her projede çözülür ve en hızlı
         # yanıtı verir; sürüm numaralı adlar anahtarın projesinde 404 olabiliyor.
         # .env'den GEMINI_TEXT_MODELS ile virgülle ayırarak değiştirilebilir.
+        # 5 sn sabit zaman aşımı, yavaş yanıt veren modelleri boşuna eliyordu.
+        gemini_timeout_s = float(os.getenv("GEMINI_TIMEOUT_S", "12"))
+        truncated_fallback: Optional[str] = None
+
         gemini_text_models = [
             m.strip() for m in os.getenv(
                 "GEMINI_TEXT_MODELS",
-                "gemini-flash-latest,gemini-3.6-flash,gemini-flash-lite-latest",
+                "gemini-flash-lite-latest,gemini-flash-latest,gemini-3.6-flash",
             ).split(",") if m.strip()
         ]
         for g_model in gemini_text_models:
@@ -1285,20 +1299,49 @@ class AiBrainNode(Node):
                     "contents": contents,
                     "generationConfig": {
                         "temperature": 0.5,
-                        "maxOutputTokens": 300
-                    }
+                        # Gemini 3.x "düşünen" modellerde akıl yürütme jetonları da bu
+                        # bütçeden harcanıyor; 300 sabitiyle cevap kelimenin ortasında
+                        # kesilip finishReason=MAX_TOKENS dönüyordu.
+                        "maxOutputTokens": max(int(self._max_tokens), 512),
+                    },
                 }
                 data_bytes = json.dumps(payload).encode("utf-8")
                 req = urllib.request.Request(url, data=data_bytes, headers={"Content-Type": "application/json"})
-                with urllib.request.urlopen(req, timeout=5.0) as resp:
+                with urllib.request.urlopen(req, timeout=gemini_timeout_s) as resp:
                     res_json = json.loads(resp.read().decode("utf-8"))
-                    text = res_json["candidates"][0]["content"]["parts"][0]["text"].strip()
-                    clean = clean_tts_text(text)
-                    if clean:
-                        return clean
+
+                candidate = (res_json.get("candidates") or [{}])[0]
+                parts = candidate.get("content", {}).get("parts", []) or []
+                # Yanıt birden fazla parçaya bölünebiliyor ve düşünen modellerde ilk
+                # parça düşünce özeti olabiliyor; yalnızca parts[0] okunduğu için cevap
+                # yarım kalıyordu. Düşünce parçaları atlanıp geri kalanı birleştirilir.
+                text = "".join(p.get("text", "") for p in parts if not p.get("thought")).strip()
+                finish_reason = candidate.get("finishReason", "")
+
+                if text and finish_reason == "MAX_TOKENS":
+                    # Cümle yarım; elde tut ama önce tam cevap verebilecek bir sonraki
+                    # modeli dene.
+                    self.get_logger().warn(
+                        f"⚠️ [Gemini Text REST ({g_model})] Cevap jeton sınırında kesildi, sonraki model deneniyor."
+                    )
+                    if truncated_fallback is None:
+                        truncated_fallback = clean_tts_text(text)
+                    continue
+
+                clean = clean_tts_text(text)
+                if clean:
+                    return clean
+            except urllib.error.HTTPError as http_e:
+                if http_e.code == 429:
+                    self.get_logger().warn(
+                        f"⚠️ [Gemini Text REST ({g_model})] Kota doldu (429), sonraki model deneniyor."
+                    )
+                else:
+                    self.get_logger().warn(f"⚠️ [Gemini Text REST ({g_model}) Hatası]: {http_e}")
             except Exception as e:
                 self.get_logger().warn(f"⚠️ [Gemini Text REST ({g_model}) Hatası]: {e}")
-        return None
+
+        return truncated_fallback
 
 
     def _format_turkish_weather(self, city: str, raw_weather: str) -> str:

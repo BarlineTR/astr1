@@ -14,5 +14,7 @@
   "user_facts": [
     "Robotun geliştiricisi",
     "Adı Baran"
-  ]
+  ],
+  "active_reminders": [],
+  "known_people": {}
 }

@@ -84,23 +84,50 @@ class PersistentProfile:
         r"\breddicim\b", r"\baldatıyor\b", r"\bposta\b", r"\bkumar\b"
     ]
 
+    @staticmethod
+    def _discover_memory_file() -> str:
+        """Çalışılan depoya ait astro_memory.json yolunu bulur.
+
+        Eskiden ilk aday modül konumundan üç seviye yukarısıydı (kurulu pakette
+        hiç var olmayan bir yol) ve hemen ardından sabit ~/Desktop/astr1 geliyordu:
+        makinede eski bir kopya duruyorsa tüm kalıcı bellek — tanınan kişiler dahil —
+        çalışan depoya değil o kopyaya yazılıyordu. Artık modülün bulunduğu yerden
+        yukarı yürüyüp ros2_ws içeren gerçek depo kökü aranır; sabit yollar yalnızca
+        en sonda, geriye dönük uyumluluk için denenir.
+        """
+        here = os.path.dirname(os.path.abspath(__file__))
+
+        # Kurulu paket (install/astro_ai/lib/pythonX/site-packages/astro_ai) ya da
+        # kaynak ağacı (ros2_ws/src/astro_ai/astro_ai) fark etmeksizin yukarı yürü.
+        current = here
+        for _ in range(10):
+            parent = os.path.dirname(current)
+            if parent == current:
+                break
+            current = parent
+            if os.path.basename(current) == "ros2_ws":
+                return os.path.join(current, "astro_memory.json")
+            candidate = os.path.join(current, "ros2_ws", "astro_memory.json")
+            if os.path.exists(candidate):
+                return candidate
+
+        legacy = [
+            os.path.expanduser("~/Desktop/astr1/ros2_ws/astro_memory.json"),
+            os.path.expanduser("~/Desktop/astr1/astro_memory.json"),
+            os.path.abspath("./astro_memory.json"),
+        ]
+        for c in legacy:
+            if os.path.exists(c):
+                return c
+        return legacy[0]
+
     def __init__(self, filepath: Optional[str] = None):
         if filepath is None:
             env_path = os.getenv("MEMORY_FILE_PATH", "").strip()
             if env_path:
                 self.filepath = os.path.expanduser(env_path)
             else:
-                candidates = [
-                    os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..", "astro_memory.json")),
-                    os.path.expanduser("~/Desktop/astr1/ros2_ws/astro_memory.json"),
-                    os.path.expanduser("~/Desktop/astr1/astro_memory.json"),
-                    os.path.abspath("./astro_memory.json")
-                ]
-                self.filepath = candidates[1]
-                for c in candidates:
-                    if os.path.exists(c):
-                        self.filepath = c
-                        break
+                self.filepath = self._discover_memory_file()
         else:
             self.filepath = filepath
 
