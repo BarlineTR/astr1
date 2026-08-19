@@ -15,6 +15,9 @@ import sys
 import time
 import unittest
 
+# Enforce in-memory audio isolation (never touch physical /dev/snd during unit tests)
+os.environ["ASTRO_MOCK_AUDIO"] = "1"
+
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "astro_audio")))
 

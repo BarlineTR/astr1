@@ -54,6 +54,7 @@ def _get_engine():
 
 class FaceRecognizer:
     """Manages facial feature embeddings, known gallery indexing, and matching."""
+    EMBEDDING_DIM: int = 128  # OpenCV SFace standard embedding dimension
 
     def __init__(self, data_dir: Optional[str] = None):
         if data_dir is None:

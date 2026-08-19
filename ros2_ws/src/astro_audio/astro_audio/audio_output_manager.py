@@ -116,15 +116,22 @@ class AudioOutputManager:
         preferred_device: str = "",
         on_playback_state_change: Optional[Callable[[bool], None]] = None,
         on_first_audio_callback: Optional[Callable[[int, float], None]] = None,
+        mock_playback: bool = False,
         logger: Optional[Callable[[str, str], None]] = None,
     ):
         self._log = logger or (lambda lvl, msg: None)
         self._on_state_change = on_playback_state_change
         self._on_first_audio = on_first_audio_callback
+        self.mock_playback = mock_playback or (os.getenv("ASTRO_MOCK_AUDIO", "0") in ("1", "true", "True"))
 
-        self.alsa_device = find_alsa_respeaker_device()
-        self.sd_dev_idx, self.sd_dev_name = find_sounddevice_output_index(preferred_device)
-        self.has_aplay = shutil.which("aplay") is not None
+        if not self.mock_playback:
+            self.alsa_device = find_alsa_respeaker_device()
+            self.sd_dev_idx, self.sd_dev_name = find_sounddevice_output_index(preferred_device)
+            self.has_aplay = shutil.which("aplay") is not None
+        else:
+            self.alsa_device = "mock"
+            self.sd_dev_idx, self.sd_dev_name = None, "Mock In-Memory Audio Device"
+            self.has_aplay = False
 
         self._play_queue: queue.Queue[Tuple[int, bytes]] = queue.Queue(maxsize=1000)
         self._current_generation = 0
@@ -140,7 +147,8 @@ class AudioOutputManager:
         self._worker_thread = threading.Thread(target=self._playback_loop, daemon=True)
         self._worker_thread.start()
 
-        self._log("info", f"🔊 [AudioOutputManager] Başlatıldı | ALSA: [{self.alsa_device}] | Sounddevice: [{self.sd_dev_idx}: {self.sd_dev_name}]")
+        mode_str = "MOCK (In-Memory Isolation)" if self.mock_playback else f"ALSA: [{self.alsa_device}] | Sounddevice: [{self.sd_dev_idx}: {self.sd_dev_name}]"
+        self._log("info", f"🔊 [AudioOutputManager] Başlatıldı | Mod: {mode_str}")
 
     @property
     def current_generation(self) -> int:
@@ -249,6 +257,30 @@ class AudioOutputManager:
 
     def _playback_loop(self) -> None:
         """Dedicated sounddevice OutputStream playback thread."""
+        if self.mock_playback:
+            while True:
+                try:
+                    gen, chunk = self._play_queue.get(timeout=0.05)
+                except queue.Empty:
+                    if self._is_playing:
+                        self._is_playing = False
+                        if self._on_state_change:
+                            self._on_state_change(False)
+                    continue
+
+                with self._lock:
+                    if gen < self._current_generation:
+                        continue
+                    self._is_playing = True
+                    self._last_playback_time = time.monotonic()
+                    if self._first_audio_emitted_for_gen != gen:
+                        self._first_audio_emitted_for_gen = gen
+                        if self._on_first_audio:
+                            self._on_first_audio(gen, self._last_playback_time)
+                        if self._on_state_change:
+                            self._on_state_change(True)
+            return
+
         if sd is None:
             self._log("error", "❌ [AudioOutputManager] sounddevice bulunamadı!")
             return

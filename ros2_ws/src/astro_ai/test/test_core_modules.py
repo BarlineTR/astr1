@@ -206,7 +206,7 @@ class TestBiometricsAndOfficials(unittest.TestCase):
         dummy_face = np.full((120, 120, 3), 128, dtype=np.uint8)
         emb = fr.extract_embedding(dummy_face)
         if emb is not None:
-            self.assertEqual(len(emb), 192)
+            self.assertEqual(len(emb), fr.EMBEDDING_DIM)
 
         # Voice Recognizer test
         vr = VoiceRecognizer()

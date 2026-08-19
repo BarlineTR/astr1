@@ -154,24 +154,40 @@ class SimulatedOrinGpuEngine(BaseTTSEngine):
 class ProductionValidator:
     """Executes all 15 validation and benchmarking phases."""
 
-    def __init__(self):
+    def __init__(self, mode: str = "auto", mock_audio: bool = False):
         self.results: Dict[str, Any] = {}
-        self.output_mgr = AudioOutputManager()
+        self.mode = mode
+        self.mock_audio = mock_audio
+        self.output_mgr = AudioOutputManager(mock_playback=mock_audio)
         self.realtime_eng = RealtimeEngine()
 
-        # Check if actual CUDA XTTS worker is available
         xtts_home = os.getenv("TTS_XTTS_HOME", "") or os.path.expanduser("~/.astro/tts")
         speaker_wav = os.path.join(ROOT_DIR, "ros2_ws", "src", "astro_audio", "voices", "astro.wav")
         if not os.path.exists(speaker_wav):
             speaker_wav = os.path.join(xtts_home, "Recording.wav")
 
-        self.use_live_worker = os.path.exists(os.path.join(xtts_home, ".venv")) and os.path.exists(speaker_wav)
-        if self.use_live_worker:
-            log_info(f"Gerçek Jetson XTTS ortamı algılandı: {xtts_home}")
+        has_live_worker = os.path.exists(os.path.join(xtts_home, ".venv")) and os.path.exists(speaker_wav)
+
+        if mode == "hardware":
+            if not has_live_worker:
+                raise RuntimeError(
+                    f"❌ [HARDWARE MODE ERROR] XTTS ortamı veya referans ses dosyası bulunamadı! (Home: {xtts_home}, Speaker: {speaker_wav})"
+                )
+            log_info(f"Gerçek Jetson XTTS ortamı devrede: {xtts_home}")
             self.xtts_engine = LocalXttsEngine(speaker_wav=speaker_wav, device="cuda", half=True, home=xtts_home)
-        else:
-            log_info("Gerçek GPU worker venv bulunamadı. Donanım doğrulama simülatörü devrede.")
+            self.xtts_engine.start()
+        elif mode == "simulation":
+            log_info("Simülasyon Modu devrede (Gerçek GPU worker kullanılmaz).")
             self.xtts_engine = SimulatedOrinGpuEngine()
+        else:
+            # Auto mode
+            if has_live_worker:
+                log_info(f"Gerçek Jetson XTTS ortamı algılandı: {xtts_home}")
+                self.xtts_engine = LocalXttsEngine(speaker_wav=speaker_wav, device="cuda", half=True, home=xtts_home)
+                self.xtts_engine.start()
+            else:
+                log_info("Gerçek GPU worker venv bulunamadı. Donanım doğrulama simülatörü devrede.")
+                self.xtts_engine = SimulatedOrinGpuEngine()
 
         self.orchestrator = TTSOrchestrator(
             output_manager=self.output_mgr,
@@ -521,7 +537,15 @@ class ProductionValidator:
 
 
 def main():
-    validator = ProductionValidator()
+    import argparse
+    parser = argparse.ArgumentParser(description="ASTRO V1 Hybrid TTS Production Validation")
+    parser.add_argument("--hardware", action="store_true", help="Strict live Jetson Orin Nano hardware validation")
+    parser.add_argument("--simulation", action="store_true", help="Run FSM / orchestrator simulation")
+    parser.add_argument("--mock-audio", action="store_true", help="Use in-memory mock audio backend")
+    args = parser.parse_args()
+
+    mode = "hardware" if args.hardware else ("simulation" if args.simulation else "auto")
+    validator = ProductionValidator(mode=mode, mock_audio=args.mock_audio)
     validator.validate_realtime_primary()
     validator.validate_xtts_gpu_enforcement()
     validator.validate_true_ttfa_breakdown()
