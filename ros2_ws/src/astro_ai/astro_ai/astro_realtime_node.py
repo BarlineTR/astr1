@@ -867,8 +867,9 @@ class AstroRealtimeNode(Node):
                 arr = np.frombuffer(raw, dtype=np.int16)
                 if len(arr) < int(16000 * 0.4):
                     continue
+                threshold = float(os.getenv("SPEAKER_MATCH_THRESHOLD", "0.32"))
                 spk_name, spk_conf, spk_meta = self.voice_recognizer.recognize_voice(
-                    arr, sample_rate=16000, threshold=0.42
+                    arr, sample_rate=16000, threshold=threshold
                 )
                 window_results.append((spk_name, spk_conf, spk_meta))
 
@@ -909,8 +910,8 @@ class AstroRealtimeNode(Node):
             majority_threshold = max(2, total_windows // 2 + 1) if total_windows >= 2 else 1
 
             is_majority = winner_votes >= majority_threshold
-            is_confident = winner_conf >= 0.42
-            is_clear_winner = (margin > 0.07) or (total_windows <= 1)
+            is_confident = winner_conf >= 0.32
+            is_clear_winner = (margin > 0.03) or (total_windows <= 1)
 
             with self._lock:
                 streak_map = getattr(self, "_voice_id_streak", {})
@@ -1933,12 +1934,55 @@ class AstroRealtimeNode(Node):
                             first_audio_played = True
                         self._play_pcm_chunks(pcm)
 
-            t_total_end = time.monotonic()
-            total_turn_ms = (t_total_end - t_turn_start) * 1000.0
+            # Secondary fallback: Gemini Flash REST (0 Token Cost) if Groq returned empty
+            if not full_reply_parts and self.gemini_api_key:
+                for g_mod in ["gemini-2.5-flash", "gemini-1.5-flash", "gemini-3.6-flash", "gemini-flash-latest"]:
+                    try:
+                        url = f"https://generativelanguage.googleapis.com/v1beta/models/{g_mod}:generateContent?key={self.gemini_api_key}"
+                        conv_history = "\n".join([f"{m.get('role')}: {m.get('content')}" for m in messages[-5:]])
+                        gem_payload = {
+                            "contents": [{"parts": [{"text": f"{system_prompt}\n\nKonuşma Geçmişi:\n{conv_history}"}]}],
+                            "generation_config": {"temperature": 0.65, "max_output_tokens": 100}
+                        }
+                        req = urllib.request.Request(
+                            url,
+                            data=json.dumps(gem_payload, ensure_ascii=False).encode("utf-8"),
+                            headers={"Content-Type": "application/json", "User-Agent": "Mozilla/5.0"}
+                        )
+                        with urllib.request.urlopen(req, timeout=5.0) as resp:
+                            res_json = json.loads(resp.read().decode("utf-8"))
+                            gem_text = res_json["candidates"][0]["content"]["parts"][0]["text"].strip()
+                            if gem_text:
+                                full_reply_parts = [gem_text]
+                                chosen_model = f"Gemini/{g_mod}"
+                                break
+                    except Exception as ge:
+                        self.get_logger().debug(f"Gemini LLM notice: {ge}")
+
             full_reply_str = clean_tts_text("".join(full_reply_parts))
 
+            # Emergency Persona Default if all APIs fail (so Astro NEVER goes mute!)
+            if not full_reply_str:
+                p = self.persona_name.lower()
+                spk = self._active_person_name if self._active_person_name != "Misafir" else ""
+                if p == "kufurbaz":
+                    full_reply_str = f"Ne var ulan {spk}, buradayım işte!".strip()
+                else:
+                    full_reply_str = f"Dinliyorum {spk}, buyur!".strip()
+                chosen_model = "LocalPersonaFallback"
+
+            if not first_audio_played and full_reply_str:
+                pcm = self._synthesize_edge_tts_pcm24k(full_reply_str)
+                if pcm:
+                    first_audio_ms = (time.monotonic() - t_turn_start) * 1000.0
+                    first_audio_played = True
+                    self._play_pcm_chunks(pcm)
+
+            t_total_end = time.monotonic()
+            total_turn_ms = (t_total_end - t_turn_start) * 1000.0
+
             if full_reply_str:
-                self.get_logger().info(f"🤖 [Astro (0-Maliyet Groq/{chosen_model})]: \"{full_reply_str}\"")
+                self.get_logger().info(f"🤖 [Astro (0-Maliyet {chosen_model})]: \"{full_reply_str}\"")
                 self.memory.episodic.add_message("assistant", full_reply_str)
                 self.session.record_robot_speech()
 
