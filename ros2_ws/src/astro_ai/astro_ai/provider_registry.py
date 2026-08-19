@@ -3,7 +3,8 @@
 
 Features:
   - Strict Runtime REST discovery of active models for Groq & Gemini (No blind seed fallbacks)
-  - Capability filtering (chat, streaming, vision, tool calling)
+  - Clear separation: DISCOVERED vs. ROUTEABLE vs. REJECTED vs. BLACKLISTED
+  - Capability filtering (generateContent, chat, streaming, vision, tool calling)
   - Clear separation of Provider Health vs. Model Availability
   - Strict 8-class error classification
   - Immediate blacklisting on 400/404/unsupported with zero retry storm
@@ -74,7 +75,7 @@ class ModelCapability:
     last_latency_ms: float = 0.0
 
 
-# Preference ordering among DISCOVERED models only (never used as unverified seed fallback)
+# Preference ordering among DISCOVERED & VALIDATED routeable models only
 GROQ_PREFERENCE_ORDER: List[str] = [
     "llama-3.1-8b-instant",
     "llama-3.3-70b-versatile",
@@ -108,9 +109,17 @@ class ProviderRegistry:
             "openai": ProviderHealth.UNINITIALIZED,
             "local": ProviderHealth.HEALTHY,
         }
-        self._discovered_models: Dict[str, List[str]] = {
+        self._discovered_raw: Dict[str, List[str]] = {
             "groq": [],
             "gemini": [],
+        }
+        self._routeable_models: Dict[str, List[str]] = {
+            "groq": [],
+            "gemini": [],
+        }
+        self._rejected_models: Dict[str, Dict[str, str]] = {
+            "groq": {},
+            "gemini": {},
         }
 
     def _log(self, level: str, msg: str) -> None:
@@ -132,9 +141,12 @@ class ProviderRegistry:
         return self._models.get(f"{provider}:{model_id}")
 
     def is_routeable(self, provider: str, model_id: str) -> bool:
-        """Returns True if the provider is healthy and the model is discovered, not blacklisted, and not under cooldown."""
+        """Returns True if the provider is healthy and the model is discovered, routeable, not blacklisted, and not under cooldown."""
         health = self.get_provider_health(provider)
         if health in (ProviderHealth.DISCOVERY_UNAVAILABLE, ProviderHealth.AUTHENTICATION_FAILED, ProviderHealth.DISABLED):
+            return False
+
+        if model_id not in self._routeable_models.get(provider, []):
             return False
 
         model = self.get_model(provider, model_id)
@@ -147,6 +159,19 @@ class ProviderRegistry:
 
         return True
 
+    def get_discovery_stats(self, provider: str) -> Dict[str, int]:
+        """Returns structured statistics: discovered, routeable, rejected, blacklisted."""
+        discovered = len(self._discovered_raw.get(provider, []))
+        routeable = len(self.get_available_models(provider))
+        rejected = len(self._rejected_models.get(provider, {}))
+        blacklisted = sum(1 for m in self._models.values() if m.provider == provider and m.is_blacklisted)
+        return {
+            "discovered": discovered,
+            "routeable": routeable,
+            "rejected": rejected,
+            "blacklisted": blacklisted,
+        }
+
     def discover_models(self, provider: str, api_key: str) -> List[str]:
         """Dispatches discovery to the specific provider and updates registry without blind fallbacks."""
         if provider == "groq":
@@ -157,6 +182,10 @@ class ProviderRegistry:
 
     def _discover_groq_models(self, api_key: str) -> List[str]:
         """Queries Groq /models API at runtime and registers active capability-filtered models."""
+        self._discovered_raw["groq"] = []
+        self._routeable_models["groq"] = []
+        self._rejected_models["groq"] = {}
+
         if not api_key:
             self._provider_health["groq"] = ProviderHealth.DISABLED
             return []
@@ -175,15 +204,28 @@ class ProviderRegistry:
                 raw_models = data.get("data", [])
 
             active_ids = []
-            exclusions = ("whisper", "guard", "embed", "vision", "specdec", "allam", "r1", "deepseek", "compound", "1b", "3b")
+            exclusions = ("whisper", "guard", "embed", "vision", "specdec", "allam", "r1", "deepseek", "compound", "1b", "3b", "preview")
 
             for item in raw_models:
                 m_id = item.get("id", "")
                 if not m_id:
                     continue
-                if any(x in m_id.lower() for x in exclusions):
-                    continue
+                self._discovered_raw["groq"].append(m_id)
+
                 if item.get("active") is False:
+                    self._rejected_models["groq"][m_id] = "inactive_model"
+                    continue
+                if any(x in m_id.lower() for x in ("whisper", "embed")):
+                    self._rejected_models["groq"][m_id] = "non_chat_modality"
+                    continue
+                if any(x in m_id.lower() for x in ("guard", "safety")):
+                    self._rejected_models["groq"][m_id] = "safety_guard_model"
+                    continue
+                if any(x in m_id.lower() for x in ("1b", "3b", "preview")):
+                    self._rejected_models["groq"][m_id] = "non_production_size"
+                    continue
+                if any(x in m_id.lower() for x in ("specdec", "allam", "r1", "deepseek", "compound")):
+                    self._rejected_models["groq"][m_id] = "unsupported_architecture"
                     continue
 
                 active_ids.append(m_id)
@@ -204,10 +246,15 @@ class ProviderRegistry:
                 if m not in ordered:
                     ordered.append(m)
 
+            self._routeable_models["groq"] = ordered
+
             if ordered:
                 self._provider_health["groq"] = ProviderHealth.HEALTHY
-                self._discovered_models["groq"] = ordered
-                self._log("info", f"✅ ProviderRegistry: Groq discovered {len(ordered)} routeable chat models: {ordered[:4]}")
+                stats = self.get_discovery_stats("groq")
+                self._log(
+                    "info",
+                    f"✅ ProviderRegistry: Groq discovered={stats['discovered']} routeable={stats['routeable']} rejected={stats['rejected']} (top: {ordered[:3]})"
+                )
             else:
                 self._provider_health["groq"] = ProviderHealth.DISCOVERY_UNAVAILABLE
                 self._log("warn", "⚠️ ProviderRegistry: Groq discovery returned 0 routeable chat models.")
@@ -230,6 +277,10 @@ class ProviderRegistry:
 
     def _discover_gemini_models(self, api_key: str) -> List[str]:
         """Queries Google Gemini /models API at runtime and registers active capability-filtered models."""
+        self._discovered_raw["gemini"] = []
+        self._routeable_models["gemini"] = []
+        self._rejected_models["gemini"] = {}
+
         if not api_key:
             self._provider_health["gemini"] = ProviderHealth.DISABLED
             return []
@@ -245,15 +296,32 @@ class ProviderRegistry:
                 raw_models = data.get("models", [])
 
             active_ids = []
-            exclusions = ("embedding", "aqa", "imagen", "learnlm", "tts", "stt", "bison", "chat-bison")
+            exclusions = ("embedding", "aqa", "imagen", "learnlm", "tts", "stt", "bison", "chat-bison", "experimental", "preview-")
 
             for item in raw_models:
                 raw_name = item.get("name", "")
                 m_id = raw_name.replace("models/", "")
+                if not m_id:
+                    continue
+                self._discovered_raw["gemini"].append(m_id)
+
                 methods = item.get("supportedGenerationMethods", [])
                 if "generateContent" not in methods:
+                    self._rejected_models["gemini"][m_id] = "no_generate_content"
                     continue
-                if any(x in m_id.lower() for x in exclusions):
+                if any(x in m_id.lower() for x in ("embedding", "aqa", "imagen", "tts", "stt")):
+                    self._rejected_models["gemini"][m_id] = "non_chat_modality"
+                    continue
+                if any(x in m_id.lower() for x in ("bison", "chat-bison", "learnlm")):
+                    self._rejected_models["gemini"][m_id] = "legacy_deprecated_family"
+                    continue
+                if any(x in m_id.lower() for x in ("experimental", "preview-")):
+                    self._rejected_models["gemini"][m_id] = "experimental_preview"
+                    continue
+
+                # Ensure model belongs to verified modern generation family
+                if not any(fam in m_id.lower() for fam in ("gemini-2.5", "gemini-2.0", "gemini-1.5")):
+                    self._rejected_models["gemini"][m_id] = "unverified_family"
                     continue
 
                 active_ids.append(m_id)
@@ -273,10 +341,15 @@ class ProviderRegistry:
                 if m not in ordered:
                     ordered.append(m)
 
+            self._routeable_models["gemini"] = ordered
+
             if ordered:
                 self._provider_health["gemini"] = ProviderHealth.HEALTHY
-                self._discovered_models["gemini"] = ordered
-                self._log("info", f"✅ ProviderRegistry: Gemini discovered {len(ordered)} routeable chat models: {ordered[:4]}")
+                stats = self.get_discovery_stats("gemini")
+                self._log(
+                    "info",
+                    f"✅ ProviderRegistry: Gemini discovered={stats['discovered']} routeable={stats['routeable']} rejected={stats['rejected']} (top: {ordered[:3]})"
+                )
             else:
                 self._provider_health["gemini"] = ProviderHealth.DISCOVERY_UNAVAILABLE
                 self._log("warn", "⚠️ ProviderRegistry: Gemini discovery returned 0 routeable chat models.")
@@ -382,16 +455,14 @@ class ProviderRegistry:
         self.set_provider_health(provider, ProviderHealth.HEALTHY)
 
     def get_available_models(self, provider: str) -> List[str]:
-        """Returns list of currently available, non-blacklisted models for provider."""
+        """Returns list of currently available, non-blacklisted routeable models for provider."""
         health = self.get_provider_health(provider)
         if health in (ProviderHealth.DISCOVERY_UNAVAILABLE, ProviderHealth.AUTHENTICATION_FAILED, ProviderHealth.DISABLED):
             return []
 
-        now = time.monotonic()
         candidates = []
-        # Maintain preference order from discovery
-        discovered = self._discovered_models.get(provider, [])
-        for m_id in discovered:
+        routeable = self._routeable_models.get(provider, [])
+        for m_id in routeable:
             if self.is_routeable(provider, m_id):
                 candidates.append(m_id)
 
@@ -535,7 +606,6 @@ def _cli_discover():
     parser.add_argument("--discover", action="store_true", help="Queries and prints routeable models for Groq & Gemini")
     args = parser.parse_args()
 
-    # Load environment variables if present
     try:
         from dotenv import load_dotenv
         env_path = os.path.join(os.path.dirname(__file__), "..", "..", "..", ".env")
@@ -557,21 +627,33 @@ def _cli_discover():
     print(" [*] ASTRO V1 Runtime Provider Discovery Report")
     print("=" * 65)
 
-    print(f"\n[Groq] Status: {registry.get_provider_health('groq').value.upper()}")
+    # Groq Report
+    g_stats = registry.get_discovery_stats("groq")
+    print(f"\n[Groq] Status: {registry.get_provider_health('groq').value.upper()} | discovered={g_stats['discovered']} routeable={g_stats['routeable']} rejected={g_stats['rejected']} blacklisted={g_stats['blacklisted']}")
     if groq_models:
-        print(f"  Routeable Chat Models ({len(groq_models)}):")
+        print(f"  Routeable Production Models ({len(groq_models)}):")
         for m in groq_models:
             print(f"    - {m}")
     else:
         print("  [!] No routeable Groq models discovered.")
+    if registry._rejected_models.get("groq"):
+        print(f"  Rejected Models ({len(registry._rejected_models['groq'])}):")
+        for r_id, r_reason in list(registry._rejected_models["groq"].items())[:6]:
+            print(f"    - {r_id} ({r_reason})")
 
-    print(f"\n[Gemini] Status: {registry.get_provider_health('gemini').value.upper()}")
+    # Gemini Report
+    gem_stats = registry.get_discovery_stats("gemini")
+    print(f"\n[Gemini] Status: {registry.get_provider_health('gemini').value.upper()} | discovered={gem_stats['discovered']} routeable={gem_stats['routeable']} rejected={gem_stats['rejected']} blacklisted={gem_stats['blacklisted']}")
     if gemini_models:
-        print(f"  Routeable Chat Models ({len(gemini_models)}):")
+        print(f"  Routeable Production Models ({len(gemini_models)}):")
         for m in gemini_models:
             print(f"    - {m}")
     else:
         print("  [!] No routeable Gemini models discovered.")
+    if registry._rejected_models.get("gemini"):
+        print(f"  Rejected Models ({len(registry._rejected_models['gemini'])}):")
+        for r_id, r_reason in list(registry._rejected_models["gemini"].items())[:6]:
+            print(f"    - {r_id} ({r_reason})")
 
     print("=" * 65 + "\n")
 

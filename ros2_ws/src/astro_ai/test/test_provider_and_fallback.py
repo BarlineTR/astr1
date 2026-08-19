@@ -146,6 +146,35 @@ class TestProviderRegistry(unittest.TestCase):
         self.assertTrue(self.registry.is_routeable("groq", "llama-3.1-8b-instant"))
         self.assertEqual(self.registry.select_best_model("groq"), "llama-3.1-8b-instant")
 
+    def test_deprecated_model_discovered_but_not_routeable(self):
+        """Item 11: Discovery returns legacy/deprecated models -> registry tracks them as discovered/rejected, but NOT routeable."""
+        mock_response_json = {
+            "data": [
+                {"id": "llama-3.1-8b-instant", "active": True},
+                {"id": "llama-3.2-1b-preview", "active": True},
+                {"id": "deprecated-model-old", "active": False},
+                {"id": "whisper-large-v3", "active": True},
+            ]
+        }
+        mock_resp = MagicMock()
+        mock_resp.read.return_value = json.dumps(mock_response_json).encode("utf-8")
+        mock_resp.__enter__.return_value = mock_resp
+
+        with patch("urllib.request.urlopen", return_value=mock_resp):
+            self.registry.discover_models("groq", "test_key")
+
+        stats = self.registry.get_discovery_stats("groq")
+        self.assertEqual(stats["discovered"], 4, "Must track all 4 raw discovered models")
+        self.assertEqual(stats["routeable"], 1, "Only 1 production model must be routeable")
+        self.assertEqual(stats["rejected"], 3, "3 models must be categorized as rejected")
+
+        # Check routeable vs non-routeable
+        self.assertTrue(self.registry.is_routeable("groq", "llama-3.1-8b-instant"))
+        self.assertFalse(self.registry.is_routeable("groq", "llama-3.2-1b-preview"))
+        self.assertFalse(self.registry.is_routeable("groq", "deprecated-model-old"))
+        self.assertFalse(self.registry.is_routeable("groq", "whisper-large-v3"))
+        self.assertEqual(self.registry.get_available_models("groq"), ["llama-3.1-8b-instant"])
+
 
 class TestRepetitionGuard(unittest.TestCase):
     """Tests for Repetition Guard and Standalone Filler Rejection."""
