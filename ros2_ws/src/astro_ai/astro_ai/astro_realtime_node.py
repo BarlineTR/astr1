@@ -1837,7 +1837,7 @@ class AstroRealtimeNode(Node):
             for m in recent_msgs:
                 messages.append({"role": m.get("role", "user"), "content": m.get("content", "")})
 
-            active_groq = discover_groq_models(self.groq_api_key)
+            active_groq = discover_groq_models(self.groq_api_key) if self.groq_api_key else []
             filtered_groq = [
                 m for m in active_groq 
                 if not any(x in m.lower() for x in ("whisper", "guard", "vision", "embed", "1b", "3b", "specdec", "allam", "r1", "deepseek", "compound"))
@@ -1850,8 +1850,6 @@ class AstroRealtimeNode(Node):
             for m in filtered_groq:
                 if m not in candidates:
                     candidates.append(m)
-            if not candidates:
-                candidates = filtered_groq if filtered_groq else ["openai/gpt-oss-120b", "llama-3.1-8b-instant"]
 
             current_clause = ""
             full_reply_parts = []
@@ -1859,69 +1857,70 @@ class AstroRealtimeNode(Node):
             first_audio_ms = 0.0
             chosen_model = ""
 
-            for target_model in candidates:
-                try:
-                    payload = {
-                        "model": target_model,
-                        "messages": messages,
-                        "temperature": 0.65,
-                        "top_p": 0.9,
-                        "presence_penalty": 0.2,
-                        "max_tokens": 100,
-                        "stream": True
-                    }
+            if self.groq_api_key and candidates:
+                for target_model in candidates:
+                    try:
+                        payload = {
+                            "model": target_model,
+                            "messages": messages,
+                            "temperature": 0.65,
+                            "top_p": 0.9,
+                            "presence_penalty": 0.2,
+                            "max_tokens": 100,
+                            "stream": True
+                        }
 
-                    req = urllib.request.Request(
-                        "https://api.groq.com/openai/v1/chat/completions",
-                        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
-                        headers={
-                            "Authorization": f"Bearer {self.groq_api_key}",
-                            "Content-Type": "application/json",
-                            "User-Agent": "Mozilla/5.0"
-                        },
-                        method="POST"
-                    )
+                        req = urllib.request.Request(
+                            "https://api.groq.com/openai/v1/chat/completions",
+                            data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+                            headers={
+                                "Authorization": f"Bearer {self.groq_api_key}",
+                                "Content-Type": "application/json",
+                                "User-Agent": "Mozilla/5.0"
+                            },
+                            method="POST"
+                        )
 
-                    with urllib.request.urlopen(req, timeout=5.0) as resp:
-                        for raw_line in resp:
-                            line = raw_line.decode("utf-8", errors="ignore").strip()
-                            if not line.startswith("data:"):
-                                continue
-                            data_str = line[5:].strip()
-                            if data_str == "[DONE]":
-                                break
-                            try:
-                                chunk_json = json.loads(data_str)
-                                delta = chunk_json.get("choices", [{}])[0].get("delta", {})
-                                token = delta.get("content", "")
-                                if not token:
+                        with urllib.request.urlopen(req, timeout=2.5) as resp:
+                            for raw_line in resp:
+                                line = raw_line.decode("utf-8", errors="ignore").strip()
+                                if not line.startswith("data:"):
                                     continue
+                                data_str = line[5:].strip()
+                                if data_str == "[DONE]":
+                                    break
+                                try:
+                                    chunk_json = json.loads(data_str)
+                                    delta = chunk_json.get("choices", [{}])[0].get("delta", {})
+                                    token = delta.get("content", "")
+                                    if not token:
+                                        continue
 
-                                current_clause += token
-                                full_reply_parts.append(token)
+                                    current_clause += token
+                                    full_reply_parts.append(token)
 
-                                # Check clause completion (. , ! ? \n or >= 35 chars with space)
-                                if any(p in current_clause for p in [".", "!", "?", ",", ":", "\n"]) or (len(current_clause) > 35 and " " in current_clause):
-                                    clean_clause = clean_tts_text(current_clause)
-                                    if clean_clause and len(clean_clause) >= 3:
-                                        pcm = self._synthesize_edge_tts_pcm24k(clean_clause)
-                                        if pcm:
-                                            if not first_audio_played:
-                                                first_audio_ms = (time.monotonic() - t_turn_start) * 1000.0
-                                                first_audio_played = True
-                                            self._play_pcm_chunks(pcm)
-                                    current_clause = ""
-                            except Exception:
-                                pass
-                        
-                        chosen_model = target_model
-                        break  # Stream succeeded!
+                                    # Check clause completion (. , ! ? \n or >= 35 chars with space)
+                                    if any(p in current_clause for p in [".", "!", "?", ",", ":", "\n"]) or (len(current_clause) > 35 and " " in current_clause):
+                                        clean_clause = clean_tts_text(current_clause)
+                                        if clean_clause and len(clean_clause) >= 3:
+                                            pcm = self._synthesize_edge_tts_pcm24k(clean_clause)
+                                            if pcm:
+                                                if not first_audio_played:
+                                                    first_audio_ms = (time.monotonic() - t_turn_start) * 1000.0
+                                                    first_audio_played = True
+                                                self._play_pcm_chunks(pcm)
+                                        current_clause = ""
+                                except Exception:
+                                    pass
+                            
+                            chosen_model = target_model
+                            break  # Stream succeeded!
 
-                except urllib.error.HTTPError as http_e:
-                    err_body = http_e.read().decode("utf-8", errors="ignore")
-                    self.get_logger().debug(f"Groq LLM ({target_model}) notice: {http_e.code} - {err_body}")
-                except Exception as ge:
-                    self.get_logger().debug(f"Groq LLM ({target_model}) notice: {ge}")
+                    except urllib.error.HTTPError as http_e:
+                        err_body = http_e.read().decode("utf-8", errors="ignore")
+                        self.get_logger().debug(f"Groq LLM ({target_model}) notice: {http_e.code} - {err_body}")
+                    except Exception as ge:
+                        self.get_logger().debug(f"Groq LLM ({target_model}) notice: {ge}")
 
             # Flush any remaining tail clause
             if current_clause:
