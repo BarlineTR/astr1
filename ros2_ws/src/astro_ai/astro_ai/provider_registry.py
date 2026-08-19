@@ -83,7 +83,6 @@ GROQ_PREFERENCE_ORDER: List[str] = [
     "openai/gpt-oss-120b",
     "llama-3.1-70b-versatile",
     "gemma2-9b-it",
-    "qwen-2.5-32b",
     "llama3-70b-8192",
     "llama3-8b-8192",
     "mixtral-8x7b-32768",
@@ -91,9 +90,9 @@ GROQ_PREFERENCE_ORDER: List[str] = [
 
 GEMINI_PREFERENCE_ORDER: List[str] = [
     "gemini-2.0-flash",
-    "gemini-1.5-flash",
-    "gemini-1.5-pro",
     "gemini-2.5-flash",
+    "gemini-2.0-flash-lite",
+    "gemini-2.5-pro",
 ]
 
 
@@ -174,6 +173,11 @@ class ProviderRegistry:
 
     def discover_models(self, provider: str, api_key: str) -> List[str]:
         """Dispatches discovery to the specific provider and updates registry without blind fallbacks."""
+        if not api_key:
+            self._provider_health[provider] = ProviderHealth.AUTHENTICATION_FAILED
+            self._log("warn", f"⚠️ ProviderRegistry: {provider.capitalize()} API key is missing. Status set to AUTHENTICATION_FAILED.")
+            return []
+
         if provider == "groq":
             return self._discover_groq_models(api_key)
         elif provider == "gemini":
@@ -187,7 +191,7 @@ class ProviderRegistry:
         self._rejected_models["groq"] = {}
 
         if not api_key:
-            self._provider_health["groq"] = ProviderHealth.DISABLED
+            self._provider_health["groq"] = ProviderHealth.AUTHENTICATION_FAILED
             return []
 
         try:
@@ -204,7 +208,6 @@ class ProviderRegistry:
                 raw_models = data.get("data", [])
 
             active_ids = []
-            exclusions = ("whisper", "guard", "embed", "vision", "specdec", "allam", "r1", "deepseek", "compound", "1b", "3b", "preview")
 
             for item in raw_models:
                 m_id = item.get("id", "")
@@ -215,14 +218,17 @@ class ProviderRegistry:
                 if item.get("active") is False:
                     self._rejected_models["groq"][m_id] = "inactive_model"
                     continue
+                if any(x in m_id.lower() for x in ("canopylabs", "orpheus", "tts", "audio")):
+                    self._rejected_models["groq"][m_id] = "tts_or_audio_model"
+                    continue
+                if any(x in m_id.lower() for x in ("qwen3.6", "preview", "1b", "3b", "qwen/qwen")):
+                    self._rejected_models["groq"][m_id] = "preview_or_unverified_model"
+                    continue
                 if any(x in m_id.lower() for x in ("whisper", "embed")):
                     self._rejected_models["groq"][m_id] = "non_chat_modality"
                     continue
                 if any(x in m_id.lower() for x in ("guard", "safety")):
                     self._rejected_models["groq"][m_id] = "safety_guard_model"
-                    continue
-                if any(x in m_id.lower() for x in ("1b", "3b", "preview")):
-                    self._rejected_models["groq"][m_id] = "non_production_size"
                     continue
                 if any(x in m_id.lower() for x in ("specdec", "allam", "r1", "deepseek", "compound")):
                     self._rejected_models["groq"][m_id] = "unsupported_architecture"
@@ -235,7 +241,7 @@ class ProviderRegistry:
                         model_id=m_id,
                         chat_supported=True,
                         streaming_supported=True,
-                        tool_calling_supported="llama" in m_id.lower() or "qwen" in m_id.lower(),
+                        tool_calling_supported="llama" in m_id.lower(),
                         vision_supported="vision" in m_id.lower(),
                     )
                 )
@@ -282,7 +288,7 @@ class ProviderRegistry:
         self._rejected_models["gemini"] = {}
 
         if not api_key:
-            self._provider_health["gemini"] = ProviderHealth.DISABLED
+            self._provider_health["gemini"] = ProviderHealth.AUTHENTICATION_FAILED
             return []
 
         try:
@@ -296,7 +302,6 @@ class ProviderRegistry:
                 raw_models = data.get("models", [])
 
             active_ids = []
-            exclusions = ("embedding", "aqa", "imagen", "learnlm", "tts", "stt", "bison", "chat-bison", "experimental", "preview-")
 
             for item in raw_models:
                 raw_name = item.get("name", "")
@@ -309,6 +314,9 @@ class ProviderRegistry:
                 if "generateContent" not in methods:
                     self._rejected_models["gemini"][m_id] = "no_generate_content"
                     continue
+                if any(x in m_id.lower() for x in ("gemini-1.5", "1.5")):
+                    self._rejected_models["gemini"][m_id] = "deprecated_or_legacy_family"
+                    continue
                 if any(x in m_id.lower() for x in ("embedding", "aqa", "imagen", "tts", "stt")):
                     self._rejected_models["gemini"][m_id] = "non_chat_modality"
                     continue
@@ -318,9 +326,7 @@ class ProviderRegistry:
                 if any(x in m_id.lower() for x in ("experimental", "preview-")):
                     self._rejected_models["gemini"][m_id] = "experimental_preview"
                     continue
-
-                # Ensure model belongs to verified modern generation family
-                if not any(fam in m_id.lower() for fam in ("gemini-2.5", "gemini-2.0", "gemini-1.5")):
+                if not any(fam in m_id.lower() for fam in ("gemini-2.5", "gemini-2.0")):
                     self._rejected_models["gemini"][m_id] = "unverified_family"
                     continue
 
@@ -620,8 +626,8 @@ def _cli_discover():
     gemini_key = os.environ.get("GEMINI_API_KEY", "")
 
     registry = ProviderRegistry()
-    groq_models = registry.discover_models("groq", groq_key) if groq_key else []
-    gemini_models = registry.discover_models("gemini", gemini_key) if gemini_key else []
+    groq_models = registry.discover_models("groq", groq_key)
+    gemini_models = registry.discover_models("gemini", gemini_key)
 
     print("\n" + "=" * 65)
     print(" [*] ASTRO V1 Runtime Provider Discovery Report")

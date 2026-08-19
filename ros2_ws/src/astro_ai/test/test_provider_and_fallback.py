@@ -114,10 +114,56 @@ class TestProviderRegistry(unittest.TestCase):
             discovered = self.registry.discover_models("gemini", "test_key")
 
         self.assertEqual(self.registry.get_provider_health("gemini"), ProviderHealth.HEALTHY)
+        # Modern 2.0+ is routeable
         self.assertIn("gemini-2.0-flash", discovered)
-        self.assertIn("gemini-1.5-flash", discovered)
+        # 1.5 is rejected as deprecated/legacy
+        self.assertNotIn("gemini-1.5-flash", discovered)
         self.assertNotIn("text-embedding-004", discovered)
         self.assertNotIn("aqa", discovered)
+
+        stats = self.registry.get_discovery_stats("gemini")
+        self.assertEqual(stats["discovered"], 4)
+        self.assertEqual(stats["routeable"], 1)
+        self.assertEqual(stats["rejected"], 3)
+
+    def test_missing_api_key_sets_authentication_failed(self):
+        """Item 6: If API key is missing/empty, status must be AUTHENTICATION_FAILED."""
+        res_groq = self.registry.discover_models("groq", "")
+        self.assertEqual(res_groq, [])
+        self.assertEqual(self.registry.get_provider_health("groq"), ProviderHealth.AUTHENTICATION_FAILED)
+
+        res_gem = self.registry.discover_models("gemini", "")
+        self.assertEqual(res_gem, [])
+        self.assertEqual(self.registry.get_provider_health("gemini"), ProviderHealth.AUTHENTICATION_FAILED)
+
+    def test_groq_tts_and_preview_models_rejected(self):
+        """Item 1 & 6: canopylabs/orpheus and qwen3.6 preview models must be marked REJECTED and not ROUTEABLE."""
+        mock_response_json = {
+            "data": [
+                {"id": "canopylabs/orpheus-arabic-saudi", "active": True},
+                {"id": "canopylabs/orpheus-v1-english", "active": True},
+                {"id": "qwen/qwen3.6-27b", "active": True},
+                {"id": "llama-3.1-8b-instant", "active": True},
+                {"id": "llama-3.3-70b-versatile", "active": True},
+            ]
+        }
+        mock_resp = MagicMock()
+        mock_resp.read.return_value = json.dumps(mock_response_json).encode("utf-8")
+        mock_resp.__enter__.return_value = mock_resp
+
+        with patch("urllib.request.urlopen", return_value=mock_resp):
+            routeable = self.registry.discover_models("groq", "test_key")
+
+        self.assertNotIn("canopylabs/orpheus-arabic-saudi", routeable)
+        self.assertNotIn("canopylabs/orpheus-v1-english", routeable)
+        self.assertNotIn("qwen/qwen3.6-27b", routeable)
+        self.assertIn("llama-3.1-8b-instant", routeable)
+        self.assertIn("llama-3.3-70b-versatile", routeable)
+
+        stats = self.registry.get_discovery_stats("groq")
+        self.assertEqual(stats["discovered"], 5)
+        self.assertEqual(stats["routeable"], 2)
+        self.assertEqual(stats["rejected"], 3)
 
     def test_discovery_failure_sets_status_without_blind_seeds(self):
         """If discovery fails, provider health becomes DISCOVERY_UNAVAILABLE and get_available_models returns empty list."""
