@@ -152,8 +152,12 @@ class SpeakerEngine:
         options = ort.SessionOptions()
         options.intra_op_num_threads = 1          # robotta CPU'yu tek çekirdekte tut
         try:
+            available_providers = ort.get_available_providers()
+            providers = [p for p in ["CUDAExecutionProvider", "CPUExecutionProvider"] if p in available_providers]
+            if not providers:
+                providers = ["CPUExecutionProvider"]
             self._session = ort.InferenceSession(
-                str(model_path), sess_options=options, providers=["CPUExecutionProvider"]
+                str(model_path), sess_options=options, providers=providers
             )
         except Exception as exc:
             raise SpeakerEngineUnavailable(f"Model yüklenemedi: {exc}") from exc
