@@ -1802,9 +1802,14 @@ class AstroRealtimeNode(Node):
                 messages.append({"role": m.get("role", "user"), "content": m.get("content", "")})
 
             active_groq = discover_groq_models(self.groq_api_key)
-            candidates = [m for m in ["llama-3.3-70b-versatile", "llama-3.1-8b-instant", "llama3-70b-8192", "llama3-8b-8192", "mixtral-8x7b-32768", "gemma2-9b-it"] if m in active_groq]
+            # Filter out non-chat models (whisper, guard, vision)
+            candidates = [m for m in active_groq if not any(x in m for x in ("whisper", "guard", "vision", "embed"))]
             if not candidates:
-                candidates = ["llama-3.3-70b-versatile", "llama-3.1-8b-instant", "llama3-70b-8192", "mixtral-8x7b-32768"]
+                candidates = [
+                    "llama-3.3-70b-specdec", "llama-3.2-3b-preview", "llama-3.2-1b-preview", 
+                    "llama-3.2-11b-text-preview", "llama-3.1-70b-versatile", "gemma2-9b-it", 
+                    "llama-3.1-8b-instant", "llama3-8b-8192"
+                ]
 
             reply_text = ""
             for mod in candidates:
@@ -1832,9 +1837,9 @@ class AstroRealtimeNode(Node):
                             break
                 except urllib.error.HTTPError as http_e:
                     err_body = http_e.read().decode("utf-8", errors="ignore")
-                    self.get_logger().warn(f"⚠️ [Groq LLM ({mod}) Hatası]: {http_e.code} - {err_body}")
+                    self.get_logger().debug(f"Groq LLM ({mod}) notice: {http_e.code} - {err_body}")
                 except Exception as e:
-                    self.get_logger().warn(f"⚠️ [Groq LLM ({mod}) Hatası]: {e}")
+                    self.get_logger().debug(f"Groq LLM ({mod}) notice: {e}")
 
             # Secondary fallback: Gemini Flash REST (0 Token Cost)
             if not reply_text and self.gemini_api_key:
