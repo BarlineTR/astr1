@@ -1705,7 +1705,7 @@ class AstroRealtimeNode(Node):
             body.extend(b'tr\r\n')
             body.extend(f"--{boundary}\r\n".encode())
             body.extend(b'Content-Disposition: form-data; name="prompt"\r\n\r\n')
-            body.extend("Astro, Baran, Deniz, nasılsın, Bitlis".encode("utf-8"))
+            body.extend("Astro, Baran, Deniz, Oktay, Eren, nasılsın, naber, ne yapıyorsun, merhaba, robot, buradayım".encode("utf-8"))
             body.extend(b'\r\n')
             body.extend(f"--{boundary}--\r\n".encode())
 
@@ -1837,73 +1837,90 @@ class AstroRealtimeNode(Node):
                 messages.append({"role": m.get("role", "user"), "content": m.get("content", "")})
 
             active_groq = discover_groq_models(self.groq_api_key)
+            filtered_groq = [
+                m for m in active_groq 
+                if not any(x in m.lower() for x in ("whisper", "guard", "vision", "embed", "1b", "3b", "specdec", "allam", "r1", "deepseek", "compound"))
+            ]
             preferred_order = [
                 "llama-3.1-8b-instant", "llama-3.3-70b-versatile", "llama-3.1-70b-versatile",
-                "gemma2-9b-it", "qwen-2.5-32b", "llama3-8b-8192"
+                "gemma2-9b-it", "qwen-2.5-32b", "openai/gpt-oss-20b", "openai/gpt-oss-120b", "llama3-8b-8192"
             ]
-            target_model = "llama-3.1-8b-instant"
-            for pref in preferred_order:
-                if pref in active_groq:
-                    target_model = pref
-                    break
-
-            payload = {
-                "model": target_model,
-                "messages": messages,
-                "temperature": 0.65,
-                "top_p": 0.9,
-                "presence_penalty": 0.2,
-                "max_tokens": 100,
-                "stream": True
-            }
-
-            req = urllib.request.Request(
-                "https://api.groq.com/openai/v1/chat/completions",
-                data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
-                headers={
-                    "Authorization": f"Bearer {self.groq_api_key}",
-                    "Content-Type": "application/json",
-                    "User-Agent": "Mozilla/5.0"
-                },
-                method="POST"
-            )
+            candidates = [pref for pref in preferred_order if pref in filtered_groq]
+            for m in filtered_groq:
+                if m not in candidates:
+                    candidates.append(m)
+            if not candidates:
+                candidates = filtered_groq if filtered_groq else ["openai/gpt-oss-120b", "llama-3.1-8b-instant"]
 
             current_clause = ""
             full_reply_parts = []
             first_audio_played = False
             first_audio_ms = 0.0
+            chosen_model = ""
 
-            with urllib.request.urlopen(req, timeout=5.0) as resp:
-                for raw_line in resp:
-                    line = raw_line.decode("utf-8", errors="ignore").strip()
-                    if not line.startswith("data:"):
-                        continue
-                    data_str = line[5:].strip()
-                    if data_str == "[DONE]":
-                        break
-                    try:
-                        chunk_json = json.loads(data_str)
-                        delta = chunk_json.get("choices", [{}])[0].get("delta", {})
-                        token = delta.get("content", "")
-                        if not token:
-                            continue
+            for target_model in candidates:
+                try:
+                    payload = {
+                        "model": target_model,
+                        "messages": messages,
+                        "temperature": 0.65,
+                        "top_p": 0.9,
+                        "presence_penalty": 0.2,
+                        "max_tokens": 100,
+                        "stream": True
+                    }
 
-                        current_clause += token
-                        full_reply_parts.append(token)
+                    req = urllib.request.Request(
+                        "https://api.groq.com/openai/v1/chat/completions",
+                        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+                        headers={
+                            "Authorization": f"Bearer {self.groq_api_key}",
+                            "Content-Type": "application/json",
+                            "User-Agent": "Mozilla/5.0"
+                        },
+                        method="POST"
+                    )
 
-                        # Check clause completion (. , ! ? \n or >= 35 chars with space)
-                        if any(p in current_clause for p in [".", "!", "?", ",", ":", "\n"]) or (len(current_clause) > 35 and " " in current_clause):
-                            clean_clause = clean_tts_text(current_clause)
-                            if clean_clause and len(clean_clause) >= 3:
-                                pcm = self._synthesize_edge_tts_pcm24k(clean_clause)
-                                if pcm:
-                                    if not first_audio_played:
-                                        first_audio_ms = (time.monotonic() - t_turn_start) * 1000.0
-                                        first_audio_played = True
-                                    self._play_pcm_chunks(pcm)
-                            current_clause = ""
-                    except Exception:
-                        pass
+                    with urllib.request.urlopen(req, timeout=5.0) as resp:
+                        for raw_line in resp:
+                            line = raw_line.decode("utf-8", errors="ignore").strip()
+                            if not line.startswith("data:"):
+                                continue
+                            data_str = line[5:].strip()
+                            if data_str == "[DONE]":
+                                break
+                            try:
+                                chunk_json = json.loads(data_str)
+                                delta = chunk_json.get("choices", [{}])[0].get("delta", {})
+                                token = delta.get("content", "")
+                                if not token:
+                                    continue
+
+                                current_clause += token
+                                full_reply_parts.append(token)
+
+                                # Check clause completion (. , ! ? \n or >= 35 chars with space)
+                                if any(p in current_clause for p in [".", "!", "?", ",", ":", "\n"]) or (len(current_clause) > 35 and " " in current_clause):
+                                    clean_clause = clean_tts_text(current_clause)
+                                    if clean_clause and len(clean_clause) >= 3:
+                                        pcm = self._synthesize_edge_tts_pcm24k(clean_clause)
+                                        if pcm:
+                                            if not first_audio_played:
+                                                first_audio_ms = (time.monotonic() - t_turn_start) * 1000.0
+                                                first_audio_played = True
+                                            self._play_pcm_chunks(pcm)
+                                    current_clause = ""
+                            except Exception:
+                                pass
+                        
+                        chosen_model = target_model
+                        break  # Stream succeeded!
+
+                except urllib.error.HTTPError as http_e:
+                    err_body = http_e.read().decode("utf-8", errors="ignore")
+                    self.get_logger().debug(f"Groq LLM ({target_model}) notice: {http_e.code} - {err_body}")
+                except Exception as ge:
+                    self.get_logger().debug(f"Groq LLM ({target_model}) notice: {ge}")
 
             # Flush any remaining tail clause
             if current_clause:
@@ -1921,7 +1938,7 @@ class AstroRealtimeNode(Node):
             full_reply_str = clean_tts_text("".join(full_reply_parts))
 
             if full_reply_str:
-                self.get_logger().info(f"🤖 [Astro (0-Maliyet Groq/{target_model})]: \"{full_reply_str}\"")
+                self.get_logger().info(f"🤖 [Astro (0-Maliyet Groq/{chosen_model})]: \"{full_reply_str}\"")
                 self.memory.episodic.add_message("assistant", full_reply_str)
                 self.session.record_robot_speech()
 
@@ -1967,17 +1984,17 @@ class AstroRealtimeNode(Node):
         except Exception:
             pass
 
-        # Acoustic presence / wake-up (requires sustained intentional voice > 600 RMS across >=7 consecutive frames)
+        # Acoustic presence / wake-up (requires sustained intentional voice > 500 RMS across >=5 consecutive frames)
         if raw_16k:
             try:
                 arr = np.frombuffer(raw_16k, dtype=np.int16)
                 local_rms = float(np.sqrt(np.mean(arr.astype(np.float32) ** 2)))
-                if local_rms > 600.0:
+                if local_rms > 500.0:
                     self._consecutive_loud_frames += 1
                 else:
                     self._consecutive_loud_frames = max(0, self._consecutive_loud_frames - 1)
 
-                if self._consecutive_loud_frames >= 7 and (now - getattr(self, "_node_start_time", 0.0)) > 5.0:
+                if self._consecutive_loud_frames >= 5 and (now - getattr(self, "_node_start_time", 0.0)) > 4.0:
                     self._last_interaction_time = now
                     if self._is_sleeping:
                         self._wake_up()
@@ -1994,19 +2011,22 @@ class AstroRealtimeNode(Node):
                 try:
                     arr = np.frombuffer(raw_16k, dtype=np.int16)
                     local_rms = float(np.sqrt(np.mean(arr.astype(np.float32) ** 2)))
-                    if local_rms > 380.0:
+                    if local_rms > 280.0:
                         self._last_speech_time = now
                         if not self._fallback_speaking:
                             self._fallback_speaking = True
                             self._fallback_speech_start = now
-                            self._fallback_audio_buffer = []
+                            # Include pre-speech audio frames to avoid clipping initial word syllable
+                            with self._lock:
+                                pre_frames = list(self._user_speech_audio_buffer[-8:]) if len(self._user_speech_audio_buffer) >= 8 else []
+                            self._fallback_audio_buffer = list(pre_frames)
                         self._fallback_audio_buffer.append(raw_16k)
                     elif self._fallback_speaking:
                         self._fallback_audio_buffer.append(raw_16k)
-                        # Silence timeout (0.65s after speech ends)
-                        if (now - self._last_speech_time) > 0.65:
+                        # Silence timeout (0.80s after speech ends)
+                        if (now - self._last_speech_time) > 0.80:
                             self._fallback_speaking = False
-                            if len(self._fallback_audio_buffer) >= 20 and not self._is_processing_fallback:
+                            if len(self._fallback_audio_buffer) >= 15 and not self._is_processing_fallback:
                                 buf_to_proc = list(self._fallback_audio_buffer)
                                 self._fallback_audio_buffer = []
                                 threading.Thread(target=self._process_fallback_turn, args=(buf_to_proc,), daemon=True).start()
