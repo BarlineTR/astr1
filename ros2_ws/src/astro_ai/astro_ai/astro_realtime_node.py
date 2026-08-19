@@ -115,21 +115,16 @@ VALID_REALTIME_VOICES = {"alloy", "ash", "ballad", "coral", "echo", "sage", "shi
 
 
 def discover_realtime_models(api_key: str, preferred: str = "") -> list[str]:
-    candidates = []
-    # Highest quality expressive human-like realtime models in strict priority
     flagship_realtime_models = [
+        "gpt-realtime",
         "gpt-4o-realtime-preview-2024-12-17",
         "gpt-4o-realtime-preview",
-        "gpt-4o-mini-realtime-preview",
-        "gpt-realtime",
-        "gpt-realtime-mini"
+        "gpt-realtime-mini",
+        "gpt-4o-mini-realtime-preview"
     ]
-    if preferred and preferred not in candidates:
+    candidates = []
+    if preferred:
         candidates.append(preferred)
-
-    for m in flagship_realtime_models:
-        if m not in candidates:
-            candidates.append(m)
 
     try:
         import urllib.request
@@ -137,11 +132,19 @@ def discover_realtime_models(api_key: str, preferred: str = "") -> list[str]:
         with urllib.request.urlopen(req, timeout=4) as resp:
             data = json.loads(resp.read().decode())
             avail_ids = [m["id"] for m in data.get("data", []) if "realtime" in m.get("id", "")]
+            # Sort available models by priority
+            for fm in flagship_realtime_models:
+                if fm in avail_ids and fm not in candidates:
+                    candidates.append(fm)
             for mid in avail_ids:
                 if mid not in candidates:
                     candidates.append(mid)
     except Exception:
         pass
+
+    for m in flagship_realtime_models:
+        if m not in candidates:
+            candidates.append(m)
 
     return candidates
 
@@ -391,6 +394,7 @@ class AstroRealtimeNode(Node):
         session_config = {
             "type": "session.update",
             "session": {
+                "type": "realtime",
                 "modalities": ["text", "audio"],
                 "instructions": system_prompt,
                 "voice": self.realtime_voice,
@@ -558,8 +562,6 @@ class AstroRealtimeNode(Node):
                 "type": "response.create",
                 "response": {
                     "instructions": current_prompt,
-                    "modalities": ["text", "audio"],
-                    "voice": self.realtime_voice,
                     "temperature": 0.85
                 }
             }
