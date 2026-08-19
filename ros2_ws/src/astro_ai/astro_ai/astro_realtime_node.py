@@ -215,7 +215,8 @@ class AstroRealtimeNode(Node):
         # Load environment variables (sanitized of quotes/whitespace)
         self.openai_api_key = os.environ.get("OPENAI_API_KEY", "").strip("\"' \t\n\r")
         self.groq_api_key = os.environ.get("GROQ_API_KEY", "").strip("\"' \t\n\r")
-        self.gemini_api_key = os.environ.get("GEMINI_API_KEY", os.environ.get("AI_API_KEY", "")).strip("\"' \t\n\r")
+        raw_gem = os.environ.get("GEMINI_API_KEY", "").strip("\"' \t\n\r")
+        self.gemini_api_key = raw_gem if (raw_gem and not raw_gem.startswith("sk-")) else ""
         self.realtime_model = os.environ.get("REALTIME_MODEL", "gpt-realtime").strip()
         raw_voice = os.environ.get("REALTIME_VOICE", os.environ.get("TTS_VOICE", "echo")).strip().lower()
         self.realtime_voice = raw_voice if raw_voice in VALID_REALTIME_VOICES else "echo"
@@ -1863,7 +1864,7 @@ class AstroRealtimeNode(Node):
         try:
             raw_16k = b"".join(audio_chunks)
             arr = np.frombuffer(raw_16k, dtype=np.int16)
-            if len(arr) < 16000 * 0.35:
+            if len(arr) < 16000 * 0.35 or int(np.max(np.abs(arr))) < 1100:
                 return
 
             # 1. Voice Biometric Identification
@@ -1884,12 +1885,13 @@ class AstroRealtimeNode(Node):
             t_stt_end = time.monotonic()
             stt_ms = (t_stt_end - t_stt_start) * 1000.0
 
-            if not user_text:
+            if not user_text or len(user_text.strip()) <= 2:
                 return
 
             whisper_hallucinations = [
                 "çeviri ve altyazı", "altyazı m.k.", "altyazı:", "çeviren:", "abone ol", 
-                "izlediğiniz için", "beğenmeyi unutmayın", "subtitle", "transcription by"
+                "izlediğiniz için", "beğenmeyi unutmayın", "subtitle", "transcription by",
+                "teşekkür ederim", "hoşça kalın", "görüşmek üzere", "bay bay"
             ]
             if any(h in user_text.lower() for h in whisper_hallucinations):
                 self.get_logger().info(f"🔇 [Gürültü/Halüsinasyon Filtrelendi]: \"{user_text}\"")
@@ -2168,7 +2170,10 @@ class AstroRealtimeNode(Node):
                 try:
                     arr = np.frombuffer(raw_16k, dtype=np.int16)
                     local_rms = float(np.sqrt(np.mean(arr.astype(np.float32) ** 2)))
-                    if local_rms > 280.0:
+                    peak_val = int(np.max(np.abs(arr))) if len(arr) > 0 else 0
+
+                    # True Speech Condition: Requires both sustained RMS and acoustic peak
+                    if local_rms > 480.0 and peak_val > 1100:
                         self._last_speech_time = now
                         if not self._fallback_speaking:
                             self._fallback_speaking = True
