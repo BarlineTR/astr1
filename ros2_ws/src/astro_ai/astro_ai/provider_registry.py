@@ -75,23 +75,30 @@ class ModelCapability:
     last_latency_ms: float = 0.0
 
 
-# Preference ordering among DISCOVERED & VALIDATED routeable models only
-GROQ_PREFERENCE_ORDER: List[str] = [
-    "llama-3.1-8b-instant",
-    "llama-3.3-70b-versatile",
+# Approved Production Chat LLM Models (Strict Whitelist among discovered models)
+GROQ_PRODUCTION_MODELS: Set[str] = {
     "openai/gpt-oss-20b",
     "openai/gpt-oss-120b",
-    "llama-3.1-70b-versatile",
-    "gemma2-9b-it",
-    "llama3-70b-8192",
-    "llama3-8b-8192",
-    "mixtral-8x7b-32768",
+    "llama-3.3-70b-versatile",
+    "llama-3.1-8b-instant",
+}
+
+GROQ_PREFERENCE_ORDER: List[str] = [
+    "openai/gpt-oss-20b",
+    "openai/gpt-oss-120b",
+    "llama-3.3-70b-versatile",
+    "llama-3.1-8b-instant",
 ]
 
-GEMINI_PREFERENCE_ORDER: List[str] = [
-    "gemini-2.0-flash",
+GEMINI_PRODUCTION_MODELS: Set[str] = {
     "gemini-2.5-flash",
-    "gemini-2.0-flash-lite",
+    "gemini-2.5-flash-lite",
+    "gemini-2.5-pro",
+}
+
+GEMINI_PREFERENCE_ORDER: List[str] = [
+    "gemini-2.5-flash",
+    "gemini-2.5-flash-lite",
     "gemini-2.5-pro",
 ]
 
@@ -233,6 +240,9 @@ class ProviderRegistry:
                 if any(x in m_id.lower() for x in ("specdec", "allam", "r1", "deepseek", "compound")):
                     self._rejected_models["groq"][m_id] = "unsupported_architecture"
                     continue
+                if m_id not in GROQ_PRODUCTION_MODELS:
+                    self._rejected_models["groq"][m_id] = "non_production_chat_model"
+                    continue
 
                 active_ids.append(m_id)
                 self.register_model(
@@ -242,7 +252,7 @@ class ProviderRegistry:
                         chat_supported=True,
                         streaming_supported=True,
                         tool_calling_supported="llama" in m_id.lower(),
-                        vision_supported="vision" in m_id.lower(),
+                        vision_supported=False,
                     )
                 )
 
@@ -314,6 +324,9 @@ class ProviderRegistry:
                 if "generateContent" not in methods:
                     self._rejected_models["gemini"][m_id] = "no_generate_content"
                     continue
+                if any(x in m_id.lower() for x in ("-image", "image-", "imagen")):
+                    self._rejected_models["gemini"][m_id] = "image_generation_model"
+                    continue
                 if any(x in m_id.lower() for x in ("gemini-1.5", "1.5")):
                     self._rejected_models["gemini"][m_id] = "deprecated_or_legacy_family"
                     continue
@@ -326,8 +339,8 @@ class ProviderRegistry:
                 if any(x in m_id.lower() for x in ("experimental", "preview-")):
                     self._rejected_models["gemini"][m_id] = "experimental_preview"
                     continue
-                if not any(fam in m_id.lower() for fam in ("gemini-2.5", "gemini-2.0")):
-                    self._rejected_models["gemini"][m_id] = "unverified_family"
+                if m_id not in GEMINI_PRODUCTION_MODELS:
+                    self._rejected_models["gemini"][m_id] = "non_production_llm_model"
                     continue
 
                 active_ids.append(m_id)

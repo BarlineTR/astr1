@@ -69,7 +69,9 @@ class TestProviderRegistry(unittest.TestCase):
                 {"id": "llama-3.1-8b-instant", "active": True},
                 {"id": "llama-3.3-70b-versatile", "active": True},
                 {"id": "openai/gpt-oss-20b", "active": True},
-                {"id": "gemma2-9b-it", "active": True},
+                {"id": "openai/gpt-oss-120b", "active": True},
+                {"id": "canopylabs/orpheus-v1-english", "active": True},
+                {"id": "qwen/qwen3.6-27b", "active": True},
                 {"id": "deprecated-model-old", "active": False},
             ]
         }
@@ -82,24 +84,37 @@ class TestProviderRegistry(unittest.TestCase):
             discovered = self.registry.discover_models("groq", "test_key")
 
         self.assertEqual(self.registry.get_provider_health("groq"), ProviderHealth.HEALTHY)
-        self.assertIn("llama-3.1-8b-instant", discovered)
-        self.assertIn("llama-3.3-70b-versatile", discovered)
         self.assertIn("openai/gpt-oss-20b", discovered)
-        self.assertIn("gemma2-9b-it", discovered)
-        # Excluded non-chat / deprecated models
+        self.assertIn("openai/gpt-oss-120b", discovered)
+        self.assertIn("llama-3.3-70b-versatile", discovered)
+        self.assertIn("llama-3.1-8b-instant", discovered)
+        self.assertEqual(len(discovered), 4, "Groq routeable pool must contain exactly 4 production models")
+
+        # Excluded non-chat / preview / TTS / deprecated models
+        self.assertNotIn("canopylabs/orpheus-v1-english", discovered)
+        self.assertNotIn("qwen/qwen3.6-27b", discovered)
         self.assertNotIn("whisper-large-v3", discovered)
         self.assertNotIn("llama-guard-3-8b", discovered)
         self.assertNotIn("deprecated-model-old", discovered)
 
+        stats = self.registry.get_discovery_stats("groq")
+        self.assertEqual(stats["discovered"], 9)
+        self.assertEqual(stats["routeable"], 4)
+        self.assertEqual(stats["rejected"], 5)
+
         # Priority order verification
-        self.assertEqual(discovered[0], "llama-3.1-8b-instant")
-        self.assertEqual(discovered[1], "llama-3.3-70b-versatile")
-        self.assertEqual(discovered[2], "openai/gpt-oss-20b")
+        self.assertEqual(discovered[0], "openai/gpt-oss-20b")
+        self.assertEqual(discovered[1], "openai/gpt-oss-120b")
+        self.assertEqual(discovered[2], "llama-3.3-70b-versatile")
+        self.assertEqual(discovered[3], "llama-3.1-8b-instant")
 
     def test_gemini_discovery_and_filtering(self):
         mock_response_json = {
             "models": [
-                {"name": "models/gemini-2.0-flash", "supportedGenerationMethods": ["generateContent"]},
+                {"name": "models/gemini-2.5-flash", "supportedGenerationMethods": ["generateContent"]},
+                {"name": "models/gemini-2.5-flash-lite", "supportedGenerationMethods": ["generateContent"]},
+                {"name": "models/gemini-2.5-pro", "supportedGenerationMethods": ["generateContent"]},
+                {"name": "models/gemini-2.5-flash-image", "supportedGenerationMethods": ["generateContent"]},
                 {"name": "models/gemini-1.5-flash", "supportedGenerationMethods": ["generateContent"]},
                 {"name": "models/text-embedding-004", "supportedGenerationMethods": ["embedContent"]},
                 {"name": "models/aqa", "supportedGenerationMethods": ["generateAnswer"]},
@@ -114,17 +129,22 @@ class TestProviderRegistry(unittest.TestCase):
             discovered = self.registry.discover_models("gemini", "test_key")
 
         self.assertEqual(self.registry.get_provider_health("gemini"), ProviderHealth.HEALTHY)
-        # Modern 2.0+ is routeable
-        self.assertIn("gemini-2.0-flash", discovered)
-        # 1.5 is rejected as deprecated/legacy
+        # Exactly 3 production LLM models are routeable
+        self.assertIn("gemini-2.5-flash", discovered)
+        self.assertIn("gemini-2.5-flash-lite", discovered)
+        self.assertIn("gemini-2.5-pro", discovered)
+        self.assertEqual(len(discovered), 3, "Gemini routeable pool must contain exactly 3 production LLM models")
+
+        # Image generation and legacy models are rejected
+        self.assertNotIn("gemini-2.5-flash-image", discovered)
         self.assertNotIn("gemini-1.5-flash", discovered)
         self.assertNotIn("text-embedding-004", discovered)
         self.assertNotIn("aqa", discovered)
 
         stats = self.registry.get_discovery_stats("gemini")
-        self.assertEqual(stats["discovered"], 4)
-        self.assertEqual(stats["routeable"], 1)
-        self.assertEqual(stats["rejected"], 3)
+        self.assertEqual(stats["discovered"], 7)
+        self.assertEqual(stats["routeable"], 3)
+        self.assertEqual(stats["rejected"], 4)
 
     def test_missing_api_key_sets_authentication_failed(self):
         """Item 6: If API key is missing/empty, status must be AUTHENTICATION_FAILED."""
@@ -190,7 +210,8 @@ class TestProviderRegistry(unittest.TestCase):
             self.registry.discover_models("groq", "test_key")
 
         self.assertTrue(self.registry.is_routeable("groq", "llama-3.1-8b-instant"))
-        self.assertEqual(self.registry.select_best_model("groq"), "llama-3.1-8b-instant")
+        self.assertTrue(self.registry.is_routeable("groq", "llama-3.3-70b-versatile"))
+        self.assertEqual(self.registry.select_best_model("groq"), "llama-3.3-70b-versatile")
 
     def test_deprecated_model_discovered_but_not_routeable(self):
         """Item 11: Discovery returns legacy/deprecated models -> registry tracks them as discovered/rejected, but NOT routeable."""
@@ -350,7 +371,7 @@ class TestProductionEdgeScenarios(unittest.TestCase):
         mock_resp_json = {
             "models": [
                 {"name": "models/gemini-old-broken", "supportedGenerationMethods": ["generateContent"]},
-                {"name": "models/gemini-2.0-flash", "supportedGenerationMethods": ["generateContent"]},
+                {"name": "models/gemini-2.5-flash", "supportedGenerationMethods": ["generateContent"]},
             ]
         }
         mock_resp = MagicMock()
@@ -375,7 +396,7 @@ class TestProductionEdgeScenarios(unittest.TestCase):
 
         candidates = self.registry.get_available_models("gemini")
         self.assertNotIn("gemini-old-broken", candidates)
-        self.assertIn("gemini-2.0-flash", candidates)
+        self.assertIn("gemini-2.5-flash", candidates)
 
     def test_scenario_quota_exhausted_failover(self):
         """Scenario B: Realtime / Provider 429 Quota exhausted classified correctly."""
