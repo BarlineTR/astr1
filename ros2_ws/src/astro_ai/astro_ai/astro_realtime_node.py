@@ -23,7 +23,7 @@ import time
 import urllib.request
 import urllib.error
 import wave
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import rclpy
 from rclpy.node import Node
