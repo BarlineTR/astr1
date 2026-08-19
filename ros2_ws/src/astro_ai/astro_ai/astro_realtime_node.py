@@ -1823,17 +1823,17 @@ class AstroRealtimeNode(Node):
                 messages.append({"role": m.get("role", "user"), "content": m.get("content", "")})
 
             active_groq = discover_groq_models(self.groq_api_key)
-            # Prioritize Turkish & multilingual flagship models, strictly exclude Arabic/tiny/reasoning models
+            # Prioritize ultra-fast Turkish & multilingual models (<150ms), strictly exclude compound/Arabic/tiny/reasoning models
             preferred_order = [
-                "llama-3.3-70b-versatile", "llama-3.1-70b-versatile", "llama-3.1-8b-instant",
-                "gemma2-9b-it", "qwen-2.5-32b", "llama3-70b-8192", "llama3-8b-8192"
+                "llama-3.1-8b-instant", "llama-3.3-70b-versatile", "llama-3.1-70b-versatile",
+                "gemma2-9b-it", "qwen-2.5-32b", "llama3-8b-8192", "llama3-70b-8192"
             ]
             candidates = [pref for pref in preferred_order if pref in active_groq]
             for m in active_groq:
-                if not any(x in m.lower() for x in ("whisper", "guard", "vision", "embed", "1b", "3b", "specdec", "allam", "r1", "deepseek")) and m not in candidates:
+                if not any(x in m.lower() for x in ("whisper", "guard", "vision", "embed", "1b", "3b", "specdec", "allam", "r1", "deepseek", "compound")) and m not in candidates:
                     candidates.append(m)
             if not candidates:
-                candidates = ["llama-3.3-70b-versatile", "llama-3.1-8b-instant", "gemma2-9b-it"]
+                candidates = ["llama-3.1-8b-instant", "llama-3.3-70b-versatile", "gemma2-9b-it"]
 
             reply_text = ""
             chosen_model = ""
