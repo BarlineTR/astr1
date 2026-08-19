@@ -177,7 +177,7 @@ class AstroRealtimeNode(Node):
         self.openai_api_key = os.environ.get("OPENAI_API_KEY", "").strip("\"' \t\n\r")
         self.groq_api_key = os.environ.get("GROQ_API_KEY", "").strip("\"' \t\n\r")
         self.gemini_api_key = os.environ.get("GEMINI_API_KEY", os.environ.get("AI_API_KEY", "")).strip("\"' \t\n\r")
-        self.realtime_model = os.environ.get("REALTIME_MODEL", "gpt-4o-realtime-preview").strip()
+        self.realtime_model = os.environ.get("REALTIME_MODEL", "gpt-realtime").strip()
         raw_voice = os.environ.get("REALTIME_VOICE", os.environ.get("TTS_VOICE", "echo")).strip().lower()
         self.realtime_voice = raw_voice if raw_voice in VALID_REALTIME_VOICES else "echo"
         self.persona_name = os.environ.get("PERSONA", "kufurbaz").strip().lower()
@@ -395,7 +395,6 @@ class AstroRealtimeNode(Node):
             "type": "session.update",
             "session": {
                 "type": "realtime",
-                "modalities": ["text", "audio"],
                 "instructions": system_prompt,
                 "voice": self.realtime_voice,
                 "temperature": 0.85,
