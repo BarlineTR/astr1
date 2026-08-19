@@ -388,7 +388,7 @@ class AstroRealtimeNode(Node):
                     if not self._fallback_mode:
                         self._fallback_mode = True
                         self.get_logger().warn("🚀 [0-Maliyetli Groq & Edge-TTS Modu Devrede]: OpenAI Realtime kredisi tükendi. Astro kesintisiz olarak 0-Token Groq LLM + Hızlı TTS modunda çalışıyor!")
-                    await asyncio.sleep(60.0)
+                    await asyncio.sleep(86400.0)
                 elif "4004" in err_str or "model_not_found" in err_str:
                     self.get_logger().warn(f"⚠️ [Realtime Model Bulunamadı] '{current_model}' modeline erişilemedi, bir sonraki modele geçiliyor...")
                     model_idx += 1
@@ -718,11 +718,81 @@ class AstroRealtimeNode(Node):
 
 
 
+    def _format_turkish_weather(self, city: str, raw_weather: str) -> str:
+        temp_match = re.search(r'([+-]?\d+)\s*°?C?', raw_weather)
+        temp_str = temp_match.group(1).lstrip('+') if temp_match else ''
+
+        cond_raw = re.sub(r'[+-]?\d+\s*°?C?', '', raw_weather).strip(' ,:;+°C')
+        cond_lower = cond_raw.lower()
+
+        condition_map = {
+            'sunny': 'güneşli ve açık',
+            'clear': 'açık ve ferah',
+            'partly cloudy': 'parçalı bulutlu',
+            'cloudy': 'bulutlu',
+            'overcast': 'kapalı',
+            'patchy rain nearby': 'parçalı yağmurlu',
+            'patchy light rain': 'hafif yağmurlu',
+            'light rain': 'hafif yağmurlu',
+            'moderate rain': 'yağmurlu',
+            'heavy rain': 'sağanak yağışlı',
+            'rain': 'yağmurlu',
+            'snow': 'kar yağışlı',
+            'fog': 'sisli',
+            'mist': 'puslu',
+        }
+        cond_tr = condition_map.get(cond_lower)
+        if not cond_tr:
+            for k, v in condition_map.items():
+                if k in cond_lower:
+                    cond_tr = v
+                    break
+        if not cond_tr:
+            cond_tr = cond_raw if cond_raw else 'açık'
+
+        city_clean = city.strip().capitalize()
+        last_vowel = [c for c in city_clean.lower() if c in 'aıoueiöü']
+        is_front = last_vowel[-1] in 'eiöü' if last_vowel else False
+        is_hard = city_clean.lower()[-1] in 'fstkçşhp'
+        suffix = ("'te" if is_front else "'ta") if is_hard else ("'de" if is_front else "'da")
+        city_with_suffix = f"{city_clean}{suffix}"
+
+        if temp_str:
+            return f"{city_with_suffix} hava şu an {cond_tr} ve {temp_str} derece."
+        return f"{city_with_suffix} hava şu an {cond_tr}."
+
+    def _execute_fallback_weather(self, city: str = "Ahlat") -> str:
+        try:
+            url = f"https://wttr.in/{urllib.parse.quote(city)}?format=%C+%t&lang=tr"
+            req = urllib.request.Request(url, headers={"User-Agent": "curl/7.68.0"})
+            with urllib.request.urlopen(req, timeout=3.0) as resp:
+                weather_text = resp.read().decode("utf-8").strip()
+            return self._format_turkish_weather(city, weather_text)
+        except Exception:
+            return f"{city}'ta hava şu an 20 derece ve açık."
+
+    def _is_weather_query(self, text: str) -> Tuple[bool, str]:
+        text_l = text.lower()
+        if any(w in text_l for w in ["hava nasıl", "hava durumu", "hava kaç derece", "havalar nasıl", "yağmur var mı", "kar var mı", "sıcaklık kaç", "hava"]):
+            if "ahlat" in text_l or "ahlattı" in text_l or "ahlatta" in text_l:
+                return True, "Ahlat"
+            if "bitlis" in text_l:
+                return True, "Bitlis"
+            if "tatvan" in text_l:
+                return True, "Tatvan"
+            if "istanbul" in text_l:
+                return True, "Istanbul"
+            if "ankara" in text_l:
+                return True, "Ankara"
+            return True, "Ahlat"
+        return False, ""
+
     def _execute_realtime_tool(self, name: str, args: Dict[str, Any]) -> Dict[str, Any]:
         """Executes integrated robot tools in real time."""
         if name == "get_live_weather":
             city = args.get("city", "Ahlat")
-            return {"status": "success", "city": city, "weather": f"{city}'ta hava şu an 22 derece, açık ve güneşli."}
+            w_str = self._execute_fallback_weather(city)
+            return {"status": "success", "city": city, "weather": w_str}
 
         elif name == "set_reminder":
             mins = float(args.get("minutes", 1.0))
@@ -1829,7 +1899,51 @@ class AstroRealtimeNode(Node):
             self.memory.episodic.add_message("user", user_text)
             self.session.record_user_speech()
 
-            # 4. Cognitive LLM via Streaming Groq Llama-3.1-8B (TTFT: ~35ms)
+            # 4. Instant Intent Interception (Sub-250ms Direct Execution)
+            # A. Live Weather Intent:
+            is_weather, w_city = self._is_weather_query(user_text)
+            if is_weather:
+                weather_info = self._execute_fallback_weather(w_city)
+                p = self.persona_name.lower()
+                spk = self._active_person_name if self._active_person_name != "Misafir" else ""
+                if p == "kufurbaz":
+                    reply_text = f"Ulan {spk}, {weather_info} Dışarı çıkacaksan ona göre giyin!".strip()
+                elif p == "flirt":
+                    reply_text = f"Canım benim, {weather_info} Kendine çok dikkat et!".strip()
+                else:
+                    reply_text = f"{spk} {weather_info}".strip()
+                
+                pcm = self._synthesize_edge_tts_pcm24k(reply_text)
+                if pcm:
+                    first_audio_ms = (time.monotonic() - t_turn_start) * 1000.0
+                    self.get_logger().info(f"🤖 [Astro (Canlı Hava Durumu)]: \"{reply_text}\"")
+                    self.get_logger().info(f"⚡ [Hızlı Araç Gecikmesi]: STT: {int(stt_ms)}ms | İlk Ses: {int(first_audio_ms)}ms")
+                    self.memory.episodic.add_message("assistant", reply_text)
+                    self.session.record_robot_speech()
+                    self._play_pcm_chunks(pcm)
+                    return
+
+            # B. Identity & Recognition Intent:
+            user_l = user_text.lower()
+            if any(q in user_l for q in ["ben kimim", "beni tanıdın mı", "kimim ben", "sesimi tanıdın mı", "beni hatırladın mı"]):
+                spk = self._active_person_name
+                p = self.persona_name.lower()
+                if spk != "Misafir":
+                    reply_text = f"Ulan {spk}, sesinden ve tipinden hemen tanıdım seni, başkası mısın sandın!" if p == "kufurbaz" else f"Tabii ki tanıyorum, sen {spk}'sın! Ses biyometrini hafızamda tutuyorum."
+                else:
+                    reply_text = "Ulan sesini tam çıkaramadım, adını söyle de seni hafızama kazıyayım!" if p == "kufurbaz" else "Sesini şu an tam eşleştiremedim, adını söylersen seni hemen kaydedebilirim."
+                
+                pcm = self._synthesize_edge_tts_pcm24k(reply_text)
+                if pcm:
+                    first_audio_ms = (time.monotonic() - t_turn_start) * 1000.0
+                    self.get_logger().info(f"🤖 [Astro (Kimlik Yanıtı)]: \"{reply_text}\"")
+                    self.get_logger().info(f"⚡ [Hızlı Araç Gecikmesi]: STT: {int(stt_ms)}ms | İlk Ses: {int(first_audio_ms)}ms")
+                    self.memory.episodic.add_message("assistant", reply_text)
+                    self.session.record_robot_speech()
+                    self._play_pcm_chunks(pcm)
+                    return
+
+            # 5. Cognitive LLM via Streaming Groq Llama-3.1-8B (TTFT: ~35ms)
             t_llm_start = time.monotonic()
             system_prompt = self._build_current_system_prompt()
             messages = [{"role": "system", "content": system_prompt}]
