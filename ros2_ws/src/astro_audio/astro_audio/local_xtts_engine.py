@@ -6,11 +6,67 @@ with cached speaker conditioning latents and zero-copy int16 PCM output.
 """
 
 import os
+import threading
 import time
-from typing import Any, Dict, Optional
+from pathlib import Path
+from typing import Any, Callable, Dict, List, Optional
 
 from astro_audio.base_tts_engine import BaseTTSEngine
 from astro_audio.xtts_client import XttsClient, XttsError
+
+
+def resolve_xtts_home(preferred_home: str = "") -> str:
+    """Finds existing XTTS home directory containing virtualenv and Coqui TTS."""
+    candidates = [
+        preferred_home,
+        os.getenv("TTS_XTTS_HOME", ""),
+        os.path.expanduser("~/.astro/tts"),
+        "/home/okistech/.astro/tts",
+        os.path.expanduser("~/Desktop/astr1/tts"),
+        os.path.abspath("./tts"),
+    ]
+    for cand in candidates:
+        if cand and os.path.exists(cand):
+            venv_py = os.path.join(cand, ".venv", "bin", "python")
+            venv_py_win = os.path.join(cand, ".venv", "Scripts", "python.exe")
+            if os.path.exists(venv_py) or os.path.exists(venv_py_win):
+                return os.path.abspath(cand)
+
+    # Return standard default location
+    return os.path.expanduser("~/.astro/tts")
+
+
+def resolve_xtts_speaker_wav(preferred_wav: str = "") -> str:
+    """Resolves and validates reference speaker WAV audio file."""
+    candidates: List[str] = [
+        preferred_wav,
+        os.getenv("TTS_XTTS_SPEAKER_WAV", ""),
+    ]
+    try:
+        from ament_index_python.packages import get_package_share_directory
+        share_wav = os.path.join(get_package_share_directory("astro_audio"), "voices", "astro.wav")
+        candidates.append(share_wav)
+    except Exception:
+        pass
+
+    # Source and install directory candidates
+    root_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..", ".."))
+    candidates.extend([
+        os.path.join(root_dir, "ros2_ws", "src", "astro_audio", "voices", "astro.wav"),
+        os.path.join(root_dir, "ros2_ws", "install", "astro_audio", "share", "astro_audio", "voices", "astro.wav"),
+        os.path.expanduser("~/.astro/tts/Recording.wav"),
+        os.path.expanduser("~/.astro/tts/voices/astro.wav"),
+        os.path.expanduser("~/.astro/voices/astro.wav"),
+        "/home/okistech/Desktop/astr1/ros2_ws/install/astro_audio/share/astro_audio/voices/astro.wav",
+        "/home/okistech/Desktop/astr1/ros2_ws/src/astro_audio/voices/astro.wav",
+    ])
+
+    for cand in candidates:
+        if cand and os.path.exists(cand) and os.path.getsize(cand) > 500:
+            return os.path.abspath(cand)
+
+    # Fallback to default expected path
+    return os.path.expanduser("~/.astro/tts/Recording.wav")
 
 
 class LocalXttsEngine(BaseTTSEngine):
@@ -18,23 +74,24 @@ class LocalXttsEngine(BaseTTSEngine):
 
     def __init__(
         self,
-        speaker_wav: str,
+        speaker_wav: str = "",
         language: str = "tr",
         device: str = "cuda",
         half: bool = True,
         home: Optional[str] = None,
         model_dir: Optional[str] = None,
-        logger=None,
+        logger: Optional[Callable[[str, str], None]] = None,
     ):
         self._log = logger or (lambda lvl, msg: None)
-        self.speaker_wav = speaker_wav
+        self.home = resolve_xtts_home(home or "")
+        self.speaker_wav = resolve_xtts_speaker_wav(speaker_wav or "")
         self.language = language
         self.device = device
         self.half = half
 
         self.client = XttsClient(
-            speaker_wav=speaker_wav,
-            home=home,
+            speaker_wav=self.speaker_wav,
+            home=self.home,
             language=language,
             device=device,
             half=half,
@@ -44,11 +101,13 @@ class LocalXttsEngine(BaseTTSEngine):
 
         self._last_telemetry: Dict[str, Any] = {
             "device": device,
-            "cuda_available": device == "cuda",
+            "cuda_available": False,
             "gpu_name": "",
             "gpu_memory_mb": 0.0,
             "rtf": 0.0,
             "last_infer_ms": 0.0,
+            "worker_pid": None,
+            "ready": False,
         }
 
     @property
@@ -57,17 +116,32 @@ class LocalXttsEngine(BaseTTSEngine):
 
     def start(self) -> None:
         """Starts the persistent XTTS worker and verifies GPU warm-up."""
-        self._log("info", f"🚀 [LocalXttsEngine] GPU XTTS başlatılıyor... (Referans: {self.speaker_wav}, Cihaz: {self.device})")
+        self._log("info", f"🚀 [LocalXttsEngine] GPU XTTS başlatılıyor... (Referans: {self.speaker_wav}, Home: {self.home}, Cihaz: {self.device})")
+        
+        if not os.path.exists(self.home):
+            raise XttsError(f"XTTS dizini yok: {self.home} — Lütfen './scripts/install_xtts.sh' betiğini çalıştırın.")
+
+        if not os.path.exists(self.speaker_wav):
+            self._log("warn", f"⚠️ [LocalXttsEngine] Referans ses dosyası bulunamadı ({self.speaker_wav}), standart sentez denenecek.")
+
         self.client.start()
         try:
             info = self.client.wait_ready(timeout=180.0)
+            worker_pid = self.client.proc.pid if self.client.proc else None
             self._last_telemetry.update({
                 "gpu_name": info.get("gpu", "cuda:0"),
                 "gpu_memory_mb": info.get("gpu_memory_mb", 0.0),
                 "cuda_available": info.get("device") == "cuda",
+                "worker_pid": worker_pid,
+                "ready": True,
             })
-            self._log("info", f"✅ [LocalXttsEngine] XTTS GPU Resident Hazır! ({info.get('gpu')}, VRAM: {info.get('gpu_memory_mb')}MB, FP16: {info.get('half')})")
+            self._log(
+                "info",
+                f"✅ [LocalXttsEngine] XTTS GPU Resident Hazır! ({info.get('gpu')}, PID: {worker_pid}, "
+                f"VRAM: {info.get('gpu_memory_mb')}MB, FP16: {info.get('half')})"
+            )
         except XttsError as e:
+            self._last_telemetry["ready"] = False
             self._log("error", f"❌ [LocalXttsEngine] XTTS başlatılamadı: {e}")
             raise
 
@@ -107,6 +181,7 @@ class LocalXttsEngine(BaseTTSEngine):
                 "last_infer_ms": gpu_ms,
                 "rtf": rtf,
                 "gpu_memory_mb": vram,
+                "ready": True,
             })
 
             return pcm_bytes
@@ -114,8 +189,8 @@ class LocalXttsEngine(BaseTTSEngine):
         except Exception as exc:
             self._log("warn", f"⚠️ [LocalXttsEngine] Sentez hatası: {exc}")
             if not self.client.is_alive:
+                self._last_telemetry["ready"] = False
                 self._log("error", "❌ [LocalXttsEngine] XTTS worker süreci çökmüş! Arka planda yeniden başlatılıyor...")
-                import threading
                 threading.Thread(target=self._try_auto_restart, daemon=True).start()
             return None
 
@@ -131,7 +206,12 @@ class LocalXttsEngine(BaseTTSEngine):
         self.client.interrupt(generation_id)
 
     def get_telemetry(self) -> Dict[str, Any]:
-        return dict(self._last_telemetry)
+        info = dict(self._last_telemetry)
+        if self.client.proc:
+            info["worker_pid"] = self.client.proc.pid
+        info["ready"] = self.is_ready()
+        return info
 
     def stop(self) -> None:
         self.client.stop()
+        self._last_telemetry["ready"] = False

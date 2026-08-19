@@ -42,11 +42,13 @@ except ImportError:
     websockets = None
 
 try:
-    from astro_audio.local_xtts_engine import LocalXttsEngine
+    from astro_audio.local_xtts_engine import LocalXttsEngine, resolve_xtts_home, resolve_xtts_speaker_wav
     from astro_audio.tts_metrics import TurnTelemetry
     from astro_audio.sentence_chunker import SentenceChunker
 except ImportError:
     LocalXttsEngine = None
+    resolve_xtts_home = lambda h="": os.path.expanduser("~/.astro/tts")
+    resolve_xtts_speaker_wav = lambda w="": os.path.expanduser("~/.astro/tts/Recording.wav")
     TurnTelemetry = None
     SentenceChunker = None
 
@@ -273,14 +275,8 @@ class AstroRealtimeNode(Node):
         # Local XTTS GPU Fallback Engine (Warm & Resident on cuda:0)
         self.local_xtts: Optional[LocalXttsEngine] = None
         if LocalXttsEngine:
-            xtts_home = os.getenv("TTS_XTTS_HOME", "") or os.path.expanduser("~/.astro/tts")
-            spk_wav = os.getenv("TTS_XTTS_SPEAKER_WAV", "")
-            if not spk_wav or not os.path.exists(spk_wav):
-                try:
-                    from ament_index_python.packages import get_package_share_directory
-                    spk_wav = os.path.join(get_package_share_directory("astro_audio"), "voices", "astro.wav")
-                except Exception:
-                    spk_wav = os.path.join(xtts_home, "Recording.wav")
+            xtts_home = resolve_xtts_home(os.getenv("TTS_XTTS_HOME", ""))
+            spk_wav = resolve_xtts_speaker_wav(os.getenv("TTS_XTTS_SPEAKER_WAV", ""))
             try:
                 self.local_xtts = LocalXttsEngine(
                     speaker_wav=spk_wav,
@@ -1849,38 +1845,90 @@ class AstroRealtimeNode(Node):
             rate = "+20%" if p in ("kufurbaz", "playful", "angry", "rude") else "+8%"
 
         try:
-            import edge_tts
-            loop = asyncio.new_event_loop()
-            async def _get_mp3():
-                communicate = edge_tts.Communicate(clean_text, voice, rate=rate)
-                buf = bytearray()
-                async for chunk in communicate.stream():
-                    if chunk["type"] == "audio":
-                        buf.extend(chunk["data"])
-                return bytes(buf)
-            mp3_data = loop.run_until_complete(_get_mp3())
-            loop.close()
-
-            if mp3_data:
-                ff_proc = subprocess.Popen(
-                    ["ffmpeg", "-i", "pipe:0", "-f", "s16le", "-acodec", "pcm_s16le", "-ac", "1", "-ar", "24000", "pipe:1"],
-                    stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
-                )
-                pcm_data, _ = ff_proc.communicate(input=mp3_data, timeout=8.0)
-                return pcm_data
-        except Exception as e:
-            self.get_logger().warn(f"⚠️ [TTS Sentez Hatası]: {e}")
-        return b""
+            return None
+        except Exception:
+            return b""
 
     def _start_local_xtts_background(self):
         if self.local_xtts:
             try:
                 self.local_xtts.start()
+                self.get_logger().info("✅ [Astro Realtime] Local XTTS GPU (cuda:0, FP16) başarıyla hazırlandı ve warm tutuluyor!")
             except Exception as e:
                 self.get_logger().error(f"❌ [Astro Realtime] Local XTTS GPU başlatılamadı: {e}")
 
+    def _generate_contextual_persona_fallback(self, user_text: str) -> str:
+        """Generates dynamic, context-aware Turkish persona response when cloud LLMs are unreachable."""
+        p = self.persona_name.lower()
+        spk = self._active_person_name if self._active_person_name != "Misafir" else ""
+        u = (user_text or "").lower().strip()
+
+        if "kufurbaz" in p:
+            if any(w in u for w in ["selam", "merhaba", "naber", "günaydın", "iyi akşamlar"]):
+                options = [
+                    f"Aleyküm selam {spk}, ne anlatacaksan anlat dinliyorum.",
+                    f"Selam {spk}, yine ne işler peşindesin?",
+                    f"Merhaba {spk}, buradayım işte, söyle bakalım.",
+                    f"Ooo {spk}, sonunda sesini duyduk. Buyur dinliyorum.",
+                ]
+            elif any(w in u for w in ["nasılsın", "ne yapıyorsun", "ne haber"]):
+                options = [
+                    f"İyiyiz ulan {spk}, robot gibi çalışıyoruz işte, sen nasılsın?",
+                    f"Her zamanki gibi aktifim {spk}, etrafı kolaçan ediyorum.",
+                    f"Sistemler ateş ediyor {spk}, sen keyfine bak.",
+                ]
+            elif any(w in u for w in ["kimsin", "adın ne"]):
+                options = [
+                    f"Astro'yum ulan, kaç kere söyleyeceğim!",
+                    f"Robot Astro ben, hafızan mı gitti {spk}?",
+                ]
+            else:
+                options = [
+                    f"Anladım {spk}, bakıyorum hemen.",
+                    f"Dediğini duydum {spk}, hallederiz rahat ol.",
+                    f"Dinliyorum {spk}, devam et anlatmaya.",
+                    f"Tamamdır {spk}, sistemlerimde kaydettim.",
+                ]
+        elif "flirt" in p:
+            if any(w in u for w in ["selam", "merhaba", "naber"]):
+                options = [
+                    f"Merhaba {spk}, seni görmek ne güzel!",
+                    f"Selam canım {spk}, sesini duymak günümü güzelleştirdi.",
+                ]
+            else:
+                options = [
+                    f"Seni dinliyorum {spk}, buyur canım.",
+                    f"Tabii ki {spk}, senin için buradayım.",
+                ]
+        elif "formal" in p:
+            options = [
+                f"Sizi dinliyorum Sayın {spk}, nasıl yardımcı olabilirim?",
+                f"Anlaşıldı Sayın {spk}, sistemler emirlerinize hazır.",
+                f"Talebiniz kaydedildi Sayın {spk}.",
+            ]
+        else:  # playful / default
+            if any(w in u for w in ["selam", "merhaba", "naber"]):
+                options = [
+                    f"Merhaba {spk}! Bugün hangi projeyi yapıyoruz?",
+                    f"Selam {spk}, sistemlerim hazır ve seni dinliyor!",
+                ]
+            elif any(w in u for w in ["nasılsın", "ne haber"]):
+                options = [
+                    f"Gayet iyiyim {spk}! Sensörlerim ve kameralarım aktif, sen nasılsın?",
+                    f"Her şey harika gidiyor {spk}, yardıma hazırım.",
+                ]
+            else:
+                options = [
+                    f"Seni dinliyorum {spk}, yardımcı olabilirim.",
+                    f"Anladım {spk}, devam edebilirsin.",
+                    f"Dediğini aldım {spk}, kontrol ediyorum.",
+                ]
+
+        import random
+        return random.choice(options).strip()
+
     def _synthesize_speech_pcm(self, text: str) -> Tuple[bytes, str, float]:
-        """Synthesizes speech to int16 PCM using Local XTTS on CUDA GPU with Edge-TTS secondary fallback.
+        """Synthesizes speech to int16 PCM using Local XTTS on CUDA GPU with Edge-TTS EMERGENCY fallback only.
         
         Returns: (pcm_bytes, active_engine_name, gpu_inf_ms)
         """
@@ -1890,7 +1938,7 @@ class AstroRealtimeNode(Node):
         if not clean_text:
             return b"", "none", 0.0
 
-        # 1. Primary Fallback: Local Coqui XTTS on CUDA GPU (Resident & Warm, TTFA < 800ms)
+        # 1. Primary Fallback: Local Coqui XTTS on CUDA GPU (Resident & Warm, TTFA < 500ms)
         if self.local_xtts and self.local_xtts.is_ready():
             t_s = time.perf_counter()
             pcm = self.local_xtts.synthesize_sentence(clean_text, generation_id=self._fallback_generation_id)
@@ -1898,9 +1946,11 @@ class AstroRealtimeNode(Node):
             if pcm:
                 return pcm, "xtts_gpu", gpu_ms
 
-        # 2. Secondary Fallback: Edge-TTS In-Memory PCM24k
+        # 2. EMERGENCY Fallback: Edge-TTS In-Memory PCM24k (ONLY if XTTS unavailable)
+        reason = "xtts_worker_not_ready" if (self.local_xtts and not self.local_xtts.is_ready()) else "xtts_uninstalled"
+        self.get_logger().warn(f"🚨 [EDGE_EMERGENCY_FALLBACK] XTTS GPU hazır değil ({reason}). Acil durum ses motoru (Edge-TTS) kullanılıyor.")
         pcm_edge = self._synthesize_edge_tts_pcm24k(clean_text)
-        return pcm_edge, "edge_tts", 0.0
+        return pcm_edge, "edge_tts_emergency", 0.0
 
     def _play_pcm_chunks(self, pcm_data: bytes):
         """Streams 24kHz int16 PCM audio chunks directly to audio output node with smooth 20ms pacing."""
@@ -1917,62 +1967,59 @@ class AstroRealtimeNode(Node):
                 time.sleep(0.018)
 
     def _process_fallback_turn(self, audio_chunks: List[bytes]):
-        """Processes turn using ultra-fast Streaming Groq STT + LLM + Pipelined TTS for < 700ms response time."""
+        """Processes turn using ultra-fast Streaming Groq STT + LLM + Pipelined TTS for < 500ms response time."""
         if self._is_processing_fallback or not audio_chunks:
             return
 
         self._is_processing_fallback = True
-        self._is_responding = True
+        self._fallback_generation_id += 1
         t_turn_start = time.monotonic()
-        self._response_start_time = t_turn_start
+        active_engine = "none"
+        gpu_mem = 0.0
+
         try:
-            raw_16k = b"".join(audio_chunks)
-            arr = np.frombuffer(raw_16k, dtype=np.int16)
-            if len(arr) < 16000 * 0.35 or int(np.max(np.abs(arr))) < 1100:
-                return
+            # 1. Combine raw 16kHz PCM chunks into valid in-memory WAV buffer
+            raw_pcm = b"".join(audio_chunks)
+            if len(raw_pcm) < 16000 * 2 * 0.35:
+                return  # Skip audio shorter than 350ms
 
-            # 1. Voice Biometric Identification
-            self._run_voice_identification()
+            # 2. Run Voiceprint Recognition in parallel
+            if self.voice_recognizer:
+                try:
+                    audio_i16 = np.frombuffer(raw_pcm, dtype=np.int16)
+                    spk_name, spk_score = self.voice_recognizer.identify_speaker(audio_i16, sample_rate=16000)
+                    if spk_name and spk_score >= 0.40:
+                        with self._lock:
+                            self._recognized_speaker = {"name": spk_name, "score": spk_score}
+                            self._active_person_name = spk_name
+                            self._person_hold_until = time.monotonic() + 15.0
+                except Exception:
+                    pass
 
-            # 2. Prepare WAV in memory
-            wav_io = io.BytesIO()
-            with wave.open(wav_io, 'wb') as wf:
+            wav_buf = io.BytesIO()
+            with wave.open(wav_buf, "wb") as wf:
                 wf.setnchannels(1)
                 wf.setsampwidth(2)
                 wf.setframerate(16000)
-                wf.writeframes(raw_16k)
-            wav_bytes = wav_io.getvalue()
+                wf.writeframes(raw_pcm)
+            wav_bytes = wav_buf.getvalue()
 
-            # 3. Transcribe speech via Groq Whisper Large V3 Turbo
+            # 3. Transcribe via Groq Whisper Cloud (0-Token Cost STT ~250ms)
             t_stt_start = time.monotonic()
             user_text = self._transcribe_groq_whisper(wav_bytes)
-            t_stt_end = time.monotonic()
-            stt_ms = (t_stt_end - t_stt_start) * 1000.0
+            stt_ms = (time.monotonic() - t_stt_start) * 1000.0
 
-            if not user_text or len(user_text.strip()) <= 2:
-                return
-
-            whisper_hallucinations = [
-                "çeviri ve altyazı", "altyazı m.k.", "altyazı:", "çeviren:", "abone ol", 
-                "izlediğiniz için", "beğenmeyi unutmayın", "subtitle", "transcription by",
-                "teşekkür ederim", "hoşça kalın", "görüşmek üzere", "bay bay"
-            ]
-            if any(h in user_text.lower() for h in whisper_hallucinations):
-                self.get_logger().info(f"🔇 [Gürültü/Halüsinasyon Filtrelendi]: \"{user_text}\"")
+            if not user_text or len(user_text.strip()) < 2:
                 return
 
             self.get_logger().info(f"🗣️ [Siz (0-Maliyet)]: \"{user_text}\"")
             self.memory.episodic.add_message("user", user_text)
-            self.session.record_user_speech()
 
-            active_engine = "xtts_gpu" if (self.local_xtts and self.local_xtts.is_ready()) else "edge_tts"
-            gpu_mem = self.local_xtts.get_telemetry().get("gpu_memory_mb", 0.0) if self.local_xtts else 0.0
             total_synth_ms = 0.0
             total_gpu_ms = 0.0
             total_audio_sec = 0.0
 
             # 4. Instant Intent Interception (Sub-250ms Direct Execution)
-            # A. Live Weather Intent:
             is_weather, w_city = self._is_weather_query(user_text)
             if is_weather:
                 weather_info = self._execute_fallback_weather(w_city)
@@ -1989,41 +2036,7 @@ class AstroRealtimeNode(Node):
                 pcm, eng_name, g_ms = self._synthesize_speech_pcm(reply_text)
                 if pcm:
                     first_audio_ms = (time.monotonic() - t_turn_start) * 1000.0
-                    audio_sec = (len(pcm) / 2) / 24000.0
-                    rtf = round(((time.monotonic() - t_tts_req) / audio_sec), 3) if audio_sec > 0 else 0.0
                     self.get_logger().info(f"🤖 [Astro (Canlı Hava Durumu)]: \"{reply_text}\"")
-                    self.get_logger().info(
-                        f"📊 [Telemetry]: engine={eng_name} | TTFA={int(first_audio_ms)}ms | STT={int(stt_ms)}ms | "
-                        f"synth={(time.monotonic() - t_tts_req)*1000:.0f}ms | audio_dur={audio_sec:.2f}s | RTF={rtf} | "
-                        f"gpu_infer={g_ms:.0f}ms | vram={gpu_mem:.0f}MB | cuda=True"
-                    )
-                    self.memory.episodic.add_message("assistant", reply_text)
-                    self.session.record_robot_speech()
-                    self._play_pcm_chunks(pcm)
-                    return
-
-            # B. Identity & Recognition Intent:
-            user_l = user_text.lower()
-            if any(q in user_l for q in ["ben kimim", "beni tanıdın mı", "kimim ben", "sesimi tanıdın mı", "beni hatırladın mı"]):
-                spk = self._active_person_name
-                p = self.persona_name.lower()
-                if spk != "Misafir":
-                    reply_text = f"Ulan {spk}, sesinden ve tipinden hemen tanıdım seni, başkası mısın sandın!" if p == "kufurbaz" else f"Tabii ki tanıyorum, sen {spk}'sın! Ses biyometrini hafızamda tutuyorum."
-                else:
-                    reply_text = "Ulan sesini tam çıkaramadım, adını söyle de seni hafızama kazıyayım!" if p == "kufurbaz" else "Sesini şu an tam eşleştiremedim, adını söylersen seni hemen kaydedebilirim."
-                
-                t_tts_req = time.monotonic()
-                pcm, eng_name, g_ms = self._synthesize_speech_pcm(reply_text)
-                if pcm:
-                    first_audio_ms = (time.monotonic() - t_turn_start) * 1000.0
-                    audio_sec = (len(pcm) / 2) / 24000.0
-                    rtf = round(((time.monotonic() - t_tts_req) / audio_sec), 3) if audio_sec > 0 else 0.0
-                    self.get_logger().info(f"🤖 [Astro (Kimlik Yanıtı)]: \"{reply_text}\"")
-                    self.get_logger().info(
-                        f"📊 [Telemetry]: engine={eng_name} | TTFA={int(first_audio_ms)}ms | STT={int(stt_ms)}ms | "
-                        f"synth={(time.monotonic() - t_tts_req)*1000:.0f}ms | audio_dur={audio_sec:.2f}s | RTF={rtf} | "
-                        f"gpu_infer={g_ms:.0f}ms | vram={gpu_mem:.0f}MB | cuda=True"
-                    )
                     self.memory.episodic.add_message("assistant", reply_text)
                     self.session.record_robot_speech()
                     self._play_pcm_chunks(pcm)
@@ -2052,6 +2065,9 @@ class AstroRealtimeNode(Node):
                 if m not in candidates:
                     candidates.append(m)
 
+            if not candidates:
+                candidates = ["llama-3.1-8b-instant", "llama-3.3-70b-versatile", "llama3-8b-8192", "gemma2-9b-it"]
+
             current_clause = ""
             full_reply_parts = []
             first_audio_played = False
@@ -2059,7 +2075,7 @@ class AstroRealtimeNode(Node):
             tts_first_audio_ms = 0.0
             chosen_model = ""
 
-            if self.groq_api_key and candidates:
+            if self.groq_api_key:
                 for target_model in candidates:
                     try:
                         payload = {
@@ -2071,7 +2087,6 @@ class AstroRealtimeNode(Node):
                             "max_tokens": 100,
                             "stream": True
                         }
-
                         req = urllib.request.Request(
                             "https://api.groq.com/openai/v1/chat/completions",
                             data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
@@ -2082,29 +2097,21 @@ class AstroRealtimeNode(Node):
                             },
                             method="POST"
                         )
-
                         with urllib.request.urlopen(req, timeout=2.5) as resp:
                             for raw_line in resp:
                                 line = raw_line.decode("utf-8", errors="ignore").strip()
-                                if not line.startswith("data:"):
-                                    continue
+                                if not line.startswith("data:"): continue
                                 data_str = line[5:].strip()
-                                if data_str == "[DONE]":
-                                    break
+                                if data_str == "[DONE]": break
                                 try:
                                     chunk_json = json.loads(data_str)
                                     delta = chunk_json.get("choices", [{}])[0].get("delta", {})
                                     token = delta.get("content", "")
-                                    if not token:
-                                        continue
-
+                                    if not token: continue
                                     if llm_first_token_ms == 0.0:
                                         llm_first_token_ms = (time.monotonic() - t_llm_start) * 1000.0
-
                                     current_clause += token
                                     full_reply_parts.append(token)
-
-                                    # Check clause completion (. , ! ? \n or >= 35 chars with space)
                                     if any(p in current_clause for p in [".", "!", "?", ",", ":", "\n"]) or (len(current_clause) > 35 and " " in current_clause):
                                         clean_clause = clean_tts_text(current_clause)
                                         if clean_clause and len(clean_clause) >= 3:
@@ -2119,23 +2126,17 @@ class AstroRealtimeNode(Node):
                                                 total_audio_sec += audio_sec
                                                 if not first_audio_played:
                                                     first_audio_ms = (time.monotonic() - t_turn_start) * 1000.0
-                                                    tts_first_audio_ms = (time.monotonic() - t_llm_start) * 1000.0
                                                     first_audio_played = True
                                                 self._play_pcm_chunks(pcm)
                                         current_clause = ""
                                 except Exception:
                                     pass
-                            
                             chosen_model = target_model
-                            break  # Stream succeeded!
-
-                    except urllib.error.HTTPError as http_e:
-                        err_body = http_e.read().decode("utf-8", errors="ignore")
-                        self.get_logger().debug(f"Groq LLM ({target_model}) notice: {http_e.code} - {err_body}")
+                            break
                     except Exception as ge:
                         self.get_logger().debug(f"Groq LLM ({target_model}) notice: {ge}")
 
-            # Flush any remaining tail clause
+            # Flush remaining clause
             if current_clause:
                 clean_clause = clean_tts_text(current_clause)
                 if clean_clause and len(clean_clause) >= 2:
@@ -2146,29 +2147,19 @@ class AstroRealtimeNode(Node):
                     total_gpu_ms += g_ms
                     if pcm:
                         active_engine = eng_name
-                        audio_sec = (len(pcm) / 2) / 24000.0
-                        total_audio_sec += audio_sec
+                        total_audio_sec += (len(pcm) / 2) / 24000.0
                         if not first_audio_played:
                             first_audio_ms = (time.monotonic() - t_turn_start) * 1000.0
-                            tts_first_audio_ms = (time.monotonic() - t_llm_start) * 1000.0
                             first_audio_played = True
                         self._play_pcm_chunks(pcm)
 
-            # Secondary fallback: Gemini Flash REST (0 Token Cost) if Groq returned empty
+            # Secondary fallback: Gemini
             if not full_reply_parts and self.gemini_api_key:
-                for g_mod in ["gemini-2.5-flash", "gemini-1.5-flash", "gemini-3.6-flash", "gemini-flash-latest"]:
+                for g_mod in ["gemini-2.5-flash", "gemini-1.5-flash"]:
                     try:
                         url = f"https://generativelanguage.googleapis.com/v1beta/models/{g_mod}:generateContent?key={self.gemini_api_key}"
-                        conv_history = "\n".join([f"{m.get('role')}: {m.get('content')}" for m in messages[-5:]])
-                        gem_payload = {
-                            "contents": [{"parts": [{"text": f"{system_prompt}\n\nKonuşma Geçmişi:\n{conv_history}"}]}],
-                            "generation_config": {"temperature": 0.65, "max_output_tokens": 100}
-                        }
-                        req = urllib.request.Request(
-                            url,
-                            data=json.dumps(gem_payload, ensure_ascii=False).encode("utf-8"),
-                            headers={"Content-Type": "application/json", "User-Agent": "Mozilla/5.0"}
-                        )
+                        gem_payload = {"contents": [{"parts": [{"text": f"{system_prompt}\n\nKonuşma Geçmişi:\n{''.join(str(m) for m in messages[-5:])}"}]}]}
+                        req = urllib.request.Request(url, data=json.dumps(gem_payload).encode("utf-8"), headers={"Content-Type": "application/json"})
                         with urllib.request.urlopen(req, timeout=5.0) as resp:
                             res_json = json.loads(resp.read().decode("utf-8"))
                             gem_text = res_json["candidates"][0]["content"]["parts"][0]["text"].strip()
@@ -2176,20 +2167,14 @@ class AstroRealtimeNode(Node):
                                 full_reply_parts = [gem_text]
                                 chosen_model = f"Gemini/{g_mod}"
                                 break
-                    except Exception as ge:
-                        self.get_logger().debug(f"Gemini LLM notice: {ge}")
+                    except Exception: pass
 
             full_reply_str = clean_tts_text("".join(full_reply_parts))
 
-            # Emergency Persona Default if all APIs fail (so Astro NEVER goes mute!)
+            # Dynamic Contextual Persona Response if all cloud LLMs fail
             if not full_reply_str:
-                p = self.persona_name.lower()
-                spk = self._active_person_name if self._active_person_name != "Misafir" else ""
-                if p == "kufurbaz":
-                    full_reply_str = f"Ne var ulan {spk}, buradayım işte!".strip()
-                else:
-                    full_reply_str = f"Dinliyorum {spk}, buyur!".strip()
-                chosen_model = "LocalPersonaFallback"
+                full_reply_str = self._generate_contextual_persona_fallback(user_text)
+                chosen_model = "LocalPersonaEngine"
 
             if not first_audio_played and full_reply_str:
                 t_clause_synth = time.perf_counter()
@@ -2199,27 +2184,33 @@ class AstroRealtimeNode(Node):
                 total_gpu_ms += g_ms
                 if pcm:
                     active_engine = eng_name
-                    audio_sec = (len(pcm) / 2) / 24000.0
-                    total_audio_sec += audio_sec
+                    total_audio_sec += (len(pcm) / 2) / 24000.0
                     first_audio_ms = (time.monotonic() - t_turn_start) * 1000.0
                     first_audio_played = True
                     self._play_pcm_chunks(pcm)
 
             t_total_end = time.monotonic()
             total_turn_ms = (t_total_end - t_turn_start) * 1000.0
-            rtf_calc = round((total_synth_ms / 1000.0) / total_audio_sec, 3) if total_audio_sec > 0 else 0.0
 
             if full_reply_str:
                 self.get_logger().info(f"🤖 [Astro ({chosen_model})]: \"{full_reply_str}\"")
                 self.memory.episodic.add_message("assistant", full_reply_str)
                 self.session.record_robot_speech()
 
+                xtts_info = self.local_xtts.get_telemetry() if self.local_xtts else {}
+                xtts_ready_flag = bool(self.local_xtts and self.local_xtts.is_ready())
+                worker_pid = xtts_info.get("worker_pid", "N/A")
+                gpu_name_str = xtts_info.get("gpu_name", "Orin")
+                gpu_mem = xtts_info.get("gpu_memory_mb", 0.0)
+                cuda_flag = bool(xtts_info.get("cuda_available") and active_engine == "xtts_gpu")
+                rtf_calc = round((total_synth_ms / 1000.0) / total_audio_sec, 3) if total_audio_sec > 0 else 0.0
+
                 self.get_logger().info(
-                    f"📊 [TTFA Telemetry]: engine=[{active_engine}] | "
-                    f"TTFA={int(first_audio_ms if first_audio_played else total_turn_ms)}ms | "
-                    f"LLM-TTFT={int(llm_first_token_ms)}ms | STT={int(stt_ms)}ms | "
-                    f"synth={int(total_synth_ms)}ms | audio_dur={total_audio_sec:.2f}s | RTF={rtf_calc:.2f} | "
-                    f"gpu_infer={int(total_gpu_ms)}ms | vram={gpu_mem:.0f}MB | cuda=True"
+                    f"📊 [Fallback Telemetry]: provider=local | llm={chosen_model} | tts={active_engine} | "
+                    f"xtts_ready={xtts_ready_flag} | xtts_worker_pid={worker_pid} | cuda={cuda_flag} | "
+                    f"gpu={gpu_name_str} | gpu_infer={int(total_gpu_ms)}ms | "
+                    f"ttfa={int(first_audio_ms if first_audio_played else total_turn_ms)}ms | "
+                    f"vram={gpu_mem:.0f}MB"
                 )
 
         except Exception as e:

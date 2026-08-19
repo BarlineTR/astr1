@@ -21,7 +21,7 @@ from rclpy.node import Node
 from std_msgs.msg import Bool, String
 
 from astro_audio.audio_output_manager import AudioOutputManager
-from astro_audio.local_xtts_engine import LocalXttsEngine
+from astro_audio.local_xtts_engine import LocalXttsEngine, resolve_xtts_home, resolve_xtts_speaker_wav
 from astro_audio.realtime_engine import RealtimeEngine
 from astro_audio.sentence_chunker import clean_text_for_tts
 from astro_audio.tts_orchestrator import OrchestratorState, TTSOrchestrator
@@ -82,8 +82,8 @@ class TtsNode(Node):
         )
 
         # 3. Initialize Local XTTS GPU Engine (Warm Fallback)
-        xtts_home = os.getenv("TTS_XTTS_HOME", "") or os.path.expanduser("~/.astro/tts")
-        speaker_wav = self._resolve_speaker_wav(xtts_home)
+        xtts_home = resolve_xtts_home(os.getenv("TTS_XTTS_HOME", ""))
+        speaker_wav = resolve_xtts_speaker_wav(os.getenv("TTS_XTTS_SPEAKER_WAV", ""))
         self.local_xtts = None
 
         try:
