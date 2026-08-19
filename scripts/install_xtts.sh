@@ -43,18 +43,22 @@ fi
 
 # ------------------------------------------------------------ depoyu getir/güncelle
 mkdir -p "$XTTS_HOME"
-mkdir -p "$XTTS_HOME/voices"
 
 if [ -d "$XTTS_HOME/.git" ]; then
   say "Mevcut Coqui TTS deposu güncelleniyor: $XTTS_HOME"
   git -C "$XTTS_HOME" fetch --depth 1 origin || warn "fetch başarısız, mevcut kopya kullanılıyor"
   git -C "$XTTS_HOME" reset --hard origin/HEAD 2>/dev/null || true
-elif [ -e "$XTTS_HOME/setup.py" ]; then
+elif [ -f "$XTTS_HOME/setup.py" ]; then
   say "Mevcut TTS kaynak kodu kullanılıyor: $XTTS_HOME"
 else
-  say "Coqui TTS deposu klonlanıyor: $REPO_URL -> $XTTS_HOME"
-  git clone --depth 1 "$REPO_URL" "$XTTS_HOME"
+  say "Coqui TTS deposu indiriliyor: $REPO_URL -> $XTTS_HOME"
+  TMP_CLONE_DIR="$(mktemp -d)"
+  git clone --depth 1 "$REPO_URL" "$TMP_CLONE_DIR"
+  cp -r "$TMP_CLONE_DIR"/. "$XTTS_HOME"/
+  rm -rf "$TMP_CLONE_DIR"
 fi
+
+mkdir -p "$XTTS_HOME/voices"
 
 cd "$XTTS_HOME"
 VENV="$XTTS_HOME/.venv"

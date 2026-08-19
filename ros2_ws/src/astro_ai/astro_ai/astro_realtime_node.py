@@ -1845,9 +1845,28 @@ class AstroRealtimeNode(Node):
             rate = "+20%" if p in ("kufurbaz", "playful", "angry", "rude") else "+8%"
 
         try:
-            return None
-        except Exception:
-            return b""
+            import edge_tts
+            loop = asyncio.new_event_loop()
+            async def _get_mp3():
+                communicate = edge_tts.Communicate(clean_text, voice, rate=rate)
+                buf = bytearray()
+                async for chunk in communicate.stream():
+                    if chunk["type"] == "audio":
+                        buf.extend(chunk["data"])
+                return bytes(buf)
+            mp3_data = loop.run_until_complete(_get_mp3())
+            loop.close()
+
+            if mp3_data:
+                ff_proc = subprocess.Popen(
+                    ["ffmpeg", "-i", "pipe:0", "-f", "s16le", "-acodec", "pcm_s16le", "-ac", "1", "-ar", "24000", "pipe:1"],
+                    stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
+                )
+                pcm_data, _ = ff_proc.communicate(input=mp3_data, timeout=8.0)
+                return pcm_data
+        except Exception as e:
+            self.get_logger().warn(f"⚠️ [Edge-TTS Hatası]: {e}")
+        return b""
 
     def _start_local_xtts_background(self):
         if self.local_xtts:
@@ -1860,68 +1879,68 @@ class AstroRealtimeNode(Node):
     def _generate_contextual_persona_fallback(self, user_text: str) -> str:
         """Generates dynamic, context-aware Turkish persona response when cloud LLMs are unreachable."""
         p = self.persona_name.lower()
-        spk = self._active_person_name if self._active_person_name != "Misafir" else ""
+        spk = f" {self._active_person_name}" if self._active_person_name != "Misafir" else ""
         u = (user_text or "").lower().strip()
 
         if "kufurbaz" in p:
             if any(w in u for w in ["selam", "merhaba", "naber", "günaydın", "iyi akşamlar"]):
                 options = [
-                    f"Aleyküm selam {spk}, ne anlatacaksan anlat dinliyorum.",
-                    f"Selam {spk}, yine ne işler peşindesin?",
-                    f"Merhaba {spk}, buradayım işte, söyle bakalım.",
-                    f"Ooo {spk}, sonunda sesini duyduk. Buyur dinliyorum.",
+                    f"Aleyküm selam{spk}, ne anlatacaksan anlat dinliyorum.",
+                    f"Selam{spk}, yine ne işler peşindesin?",
+                    f"Merhaba{spk}, buradayım işte, söyle bakalım.",
+                    f"Ooo{spk}, sonunda sesini duyduk. Buyur dinliyorum.",
                 ]
             elif any(w in u for w in ["nasılsın", "ne yapıyorsun", "ne haber"]):
                 options = [
-                    f"İyiyiz ulan {spk}, robot gibi çalışıyoruz işte, sen nasılsın?",
-                    f"Her zamanki gibi aktifim {spk}, etrafı kolaçan ediyorum.",
-                    f"Sistemler ateş ediyor {spk}, sen keyfine bak.",
+                    f"İyiyiz ulan{spk}, robot gibi çalışıyoruz işte, sen nasılsın?",
+                    f"Her zamanki gibi aktifim{spk}, etrafı kolaçan ediyorum.",
+                    f"Sistemler ateş ediyor{spk}, sen keyfine bak.",
                 ]
             elif any(w in u for w in ["kimsin", "adın ne"]):
                 options = [
                     f"Astro'yum ulan, kaç kere söyleyeceğim!",
-                    f"Robot Astro ben, hafızan mı gitti {spk}?",
+                    f"Robot Astro ben, hafızan mı gitti{spk}?",
                 ]
             else:
                 options = [
-                    f"Anladım {spk}, bakıyorum hemen.",
-                    f"Dediğini duydum {spk}, hallederiz rahat ol.",
-                    f"Dinliyorum {spk}, devam et anlatmaya.",
-                    f"Tamamdır {spk}, sistemlerimde kaydettim.",
+                    f"Anladım{spk}, bakıyorum hemen.",
+                    f"Dediğini duydum{spk}, hallederiz rahat ol.",
+                    f"Dinliyorum{spk}, devam et anlatmaya.",
+                    f"Tamamdır{spk}, sistemlerimde kaydettim.",
                 ]
         elif "flirt" in p:
             if any(w in u for w in ["selam", "merhaba", "naber"]):
                 options = [
-                    f"Merhaba {spk}, seni görmek ne güzel!",
-                    f"Selam canım {spk}, sesini duymak günümü güzelleştirdi.",
+                    f"Merhaba{spk}, seni görmek ne güzel!",
+                    f"Selam canım{spk}, sesini duymak günümü güzelleştirdi.",
                 ]
             else:
                 options = [
-                    f"Seni dinliyorum {spk}, buyur canım.",
-                    f"Tabii ki {spk}, senin için buradayım.",
+                    f"Seni dinliyorum{spk}, buyur canım.",
+                    f"Tabii ki{spk}, senin için buradayım.",
                 ]
         elif "formal" in p:
             options = [
-                f"Sizi dinliyorum Sayın {spk}, nasıl yardımcı olabilirim?",
-                f"Anlaşıldı Sayın {spk}, sistemler emirlerinize hazır.",
-                f"Talebiniz kaydedildi Sayın {spk}.",
+                f"Sizi dinliyorum Sayın{spk}, nasıl yardımcı olabilirim?",
+                f"Anlaşıldı Sayın{spk}, sistemler emirlerinize hazır.",
+                f"Talebiniz kaydedildi Sayın{spk}.",
             ]
         else:  # playful / default
             if any(w in u for w in ["selam", "merhaba", "naber"]):
                 options = [
-                    f"Merhaba {spk}! Bugün hangi projeyi yapıyoruz?",
-                    f"Selam {spk}, sistemlerim hazır ve seni dinliyor!",
+                    f"Merhaba{spk}! Bugün hangi projeyi yapıyoruz?",
+                    f"Selam{spk}, sistemlerim hazır ve seni dinliyor!",
                 ]
             elif any(w in u for w in ["nasılsın", "ne haber"]):
                 options = [
-                    f"Gayet iyiyim {spk}! Sensörlerim ve kameralarım aktif, sen nasılsın?",
-                    f"Her şey harika gidiyor {spk}, yardıma hazırım.",
+                    f"Gayet iyiyim{spk}! Sensörlerim ve kameralarım aktif, sen nasılsın?",
+                    f"Her şey harika gidiyor{spk}, yardıma hazırım.",
                 ]
             else:
                 options = [
-                    f"Seni dinliyorum {spk}, yardımcı olabilirim.",
-                    f"Anladım {spk}, devam edebilirsin.",
-                    f"Dediğini aldım {spk}, kontrol ediyorum.",
+                    f"Seni dinliyorum{spk}, yardımcı olabilirim.",
+                    f"Anladım{spk}, devam edebilirsin.",
+                    f"Dediğini aldım{spk}, kontrol ediyorum.",
                 ]
 
         import random
