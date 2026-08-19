@@ -130,9 +130,12 @@ class XttsClient:
     def start(self) -> None:
         """Starts the persistent XTTS worker subprocess, guaranteeing single-process ownership."""
         with self._lifecycle_lock:
-            # 1. If already alive and ready, reuse existing worker
-            if self.is_alive and self.is_ready:
-                self._log("debug", f"XTTS worker already running (PID {self.proc.pid}).")
+            # 1. If already alive and ready OR alive and in progress of starting, reuse existing worker!
+            if self.is_alive:
+                if self.is_ready:
+                    self._log("debug", f"XTTS worker already running (PID {self.proc.pid}).")
+                    return
+                self._log("debug", f"XTTS worker is currently starting (PID {self.proc.pid}). Waiting for initialization.")
                 return
 
             # 2. Ensure any lingering or crashed process is fully stopped first

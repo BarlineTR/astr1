@@ -547,6 +547,7 @@ class ProviderRegistry:
         }
         if any(x in model_id.lower() for x in ("gpt-oss", "reasoning", "r1")):
             payload["reasoning_effort"] = "low"
+            payload["include_reasoning"] = False
 
         req = urllib.request.Request(
             "https://api.groq.com/openai/v1/chat/completions",

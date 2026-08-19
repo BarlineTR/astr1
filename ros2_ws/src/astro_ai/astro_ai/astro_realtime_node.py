@@ -476,10 +476,13 @@ class AstroRealtimeNode(Node):
                     self.get_logger().warn(f"⚠️ [Realtime WS] Bağlantı koptu ({e}), 3 saniye sonra yeniden bağlanılacak...")
                     await asyncio.sleep(3.0)
 
-    def _build_current_system_prompt(self) -> str:
-        """Builds system instructions with memory, identity, persona, and onboarding behavior."""
-        identity = self._get_active_biometric_identity()
-        is_known = identity.get("is_known", False)
+    def _build_current_system_prompt(self, active_speaker: Optional[Dict[str, Any]] = None) -> str:
+        """Builds system instructions with memory, identity, persona, and strict anti-hallucination rules."""
+        identity = active_speaker or self._get_active_biometric_identity()
+        is_known = identity.get("is_known", False) and identity.get("name", "Misafir").lower() != "misafir"
+        name_val = identity.get("name", "Misafir")
+        conf_pct = int(identity.get("confidence", identity.get("score", 0.0)) * 100)
+        source_str = identity.get("source", "perception")
 
         known_speakers = []
         if self.voice_recognizer:
@@ -487,37 +490,35 @@ class AstroRealtimeNode(Node):
                 known_speakers = [k for k, v in self.voice_recognizer._known_voiceprints.items() if len(v) > 0 and k.lower() != "misafir"]
             except Exception:
                 pass
-        known_str = ", ".join(known_speakers) if known_speakers else "Kayıtlı kişi yok"
-        room_context = f"\n[HAFIZANDAKİ VE ODADAKİ KAYITLI KİŞİLER]: {known_str}\n"
+        known_str = ", ".join(known_speakers) if known_speakers else "Baran"
+        room_context = f"\n[KAYITLI KİŞİLER]: {known_str}\n"
 
         if is_known:
-            name_val = identity.get("name", "Misafir")
             title_val = identity.get("formal_title", identity.get("title", name_val))
             bio_status = (
-                f"\n[ŞU AN SENİNLE KONUŞAN KİŞİ]: Karşındaki konuşmacı sesinden/yüzünden %100 doğrulandı -> İsim: {name_val}, Hitap: {title_val}.\n"
+                f"\n[ŞU AN SENİNLE KONUŞAN KİŞİ]:\n"
+                f"- İsim: {name_val} (Hitap: {title_val}, Doğrulama: %{conf_pct}, Kaynak: {source_str})\n"
                 f"{room_context}"
-                f"KİMLİK DOĞRULAMA & ÇOKLU KONUŞMACI KURALLARI:\n"
-                f"1. Şu an doğrudan seninle konuşan kişi: {name_val} ({title_val}). Kullanıcı 'ben kimim?', 'beni tanıdın mı?', 'sesimi bildin mi?' diye sorduğunda kesinlikle 'Sen {name_val}'sın, sesinden ve yüzünden tanıdım!' diyerek yanıt ver!\n"
-                f"2. Kendisine doğrudan ismiyle/hitabıyla ({title_val}) hitap et.\n"
-                f"3. Odada {known_str} gibi birden fazla kişi olabilir. Eğer {name_val} başka biri hakkında konuşursa (örn: Deniz Baran'ı savunursa veya sorarsa), karşındaki {name_val}'e hitap ederek diğer kişi hakkındaki fikrini/muhabbetini anlat.\n"
-                f"4. Karşındaki {name_val} iken kendisini başka biri sanma."
+                f"KİMLİK DOĞRULAMA VE HİTAP KURALLARI:\n"
+                f"1. Şu an doğrudan seninle konuşan kişi: {name_val}. Kendisine samimiyetle ismiyle ({name_val}) hitap et.\n"
+                f"2. KESİNLİKLE 'Seni ilk kez duyuyorum', 'Sesini tanıyamadım', 'Adın ne senin?' veya 'Kimsin sen?' gibi yabancılayıcı cümleler kurma!\n"
+                f"3. Karşındaki {name_val} iken kendisini başka biri sanma. Yakın arkadaş samimiyetini koru.\n"
             )
         else:
             bio_status = (
-                f"\n[ŞU AN KONUŞAN KİŞİ]: Karşındaki kişi HENÜZ TANINMIYOR (Bilinmeyen Ses & Yüz / Yeni Kullanıcı / Misafir).\n"
+                f"\n[ŞU AN KONUŞAN KİŞİ]:\n"
+                f"- Misafir / Tanımlanmamış Konuşmacı.\n"
                 f"{room_context}"
-                f"KRİTİK DAVRANIŞ KURALLARI:\n"
-                f"1. Karşındaki konuşmacının sesi hafızandaki kayıtlı kişilere ({known_str}) uymuyor. Karşındaki kişiye ASLA ezbere önceki isimlerle hitap etme!\n"
-                f"2. Tanışma: Seçili kişiliğinle ({self.persona_name}) sesini ilk defa duyduğunu, hafızandaki kayıtlara uymadığını belirt ve adını sor (Örn: 'Sesini ilk kez duyuyorum, tanıyamadım! Adın ne senin?' veya Küfürbaz modundaysan 'Ulan sesini çıkaramadım, kimsin sen? Adını söyle de kaydedeyim koçum!').\n"
-                f"3. Biyometrik Kayıt: SADECE VE SADECE kullanıcı AÇIKÇA kendi adını söylediğinde (örn: 'Adım Deniz', 'Ben Mehmet', 'Bana Ali de') 'enroll_user_biometrics' fonksiyonunu çağır!\n"
-                f"4. Dürüstlük: Asla 'tanıdım' diyerek yalan söyleme."
+                f"DAVRANIŞ KURALLARI:\n"
+                f"1. Karşındaki kişinin kimliği henüz biyometrik olarak doğrulanmadı.\n"
+                f"2. Kullanıcının sorusuna veya konusuna doğrudan ve doğal cevap ver.\n"
+                f"3. Gerçekte işlem yapmadıysan 'kaydını yaptım', 'işleme aldım', 'kaydettim' gibi sahte iddialarda kesinlikle bulunma.\n"
             )
 
         memory_rule = (
-            "\n\n[HAFIZA VE GEÇMİŞ KONUŞMALARI HATIRLAMA KURALI]:\n"
-            "- Sana yukarıda 'Kalıcı Bilgilerin', 'Geçmiş Konuşmaların', 'Tercihler' ve 'Kullanıcı Bilgisi' başlıkları altında gerçek hafıza verilerin verilmiştir.\n"
-            "- Kullanıcı 'Daha önce ne konuştuk?', 'Ne konuşmuştuk?', 'Hakkımda ne biliyorsun?', 'Beni hatırladın mı?', 'Hafızanda ne kayıtlı?' diye sorduğunda, "
-            "ASLA 'hatırlamıyorum' veya 'geçmişi bilmiyorum' deme! Hafızandaki geçmiş diyalog özetlerini, kullanıcının tercihlerini ve bildiğin bilgileri samimiyetle ve net olarak söyle!"
+            "\n\n[HAFIZA VE BAĞLAM KURALI]:\n"
+            "- Kullanıcı geçmiş veya tercihlerle ilgili bir şey sorduğunda hafızandaki bilgileri samimiyetle kullan.\n"
+            "- Yapılmayan eylemler için yapılmış gibi iddialarda bulunma."
         )
 
         return self.persona_engine.build_system_prompt(
@@ -1722,9 +1723,11 @@ class AstroRealtimeNode(Node):
                                 asyncio.run_coroutine_threadsafe(self._ws.send(json.dumps(gaze_event)), self._loop)
                                 asyncio.run_coroutine_threadsafe(self._ws.send(json.dumps({"type": "response.create"})), self._loop)
             else:
-                self.get_logger().warn("⚠️ [Otonom Görsel Öğrenme]: Görüntü analiz edilemedi (tüm Vision servisleri yanıt vermedi).")
+                self._vision_status = "unavailable"
+                self.get_logger().debug("ℹ️ [Otonom Görsel]: Vision servisi yanıt vermedi, konuşma akışı kesintisiz devam ediyor.")
         except Exception as e:
-            self.get_logger().warn(f"⚠️ [Otonom Görsel Öğrenme Hatası]: {e}")
+            self._vision_status = "unavailable"
+            self.get_logger().debug(f"ℹ️ [Otonom Görsel Hatası]: {e}")
 
 
 
@@ -2179,7 +2182,6 @@ class AstroRealtimeNode(Node):
         self._is_processing_fallback = True
         self._fallback_generation_id += 1
         t_turn_start = time.monotonic()
-        active_engine = "none"
         chosen_model = "none"
         chosen_provider = "none"
         llm_status = "ok"
@@ -2193,7 +2195,6 @@ class AstroRealtimeNode(Node):
         total_synth_ms = 0.0
         total_gpu_ms = 0.0
         total_audio_sec = 0.0
-        tts_ready_flag = False
         attempts: List[Dict[str, Any]] = []
 
         try:
@@ -2202,23 +2203,84 @@ class AstroRealtimeNode(Node):
             if len(raw_pcm) < 16000 * 2 * 0.35:
                 return
 
-            # 2. Run Voiceprint Recognition in parallel
+            # 2. Run Voiceprint Recognition (Acoustic Speaker Identification)
+            spk_name = "Misafir"
+            spk_score = 0.0
+            spk_source = "unidentified"
+
             if self.voice_recognizer:
                 try:
                     audio_i16 = np.frombuffer(raw_pcm, dtype=np.int16)
-                    spk_name, spk_score = self.voice_recognizer.identify_speaker(audio_i16, sample_rate=16000)
-                    if spk_name and spk_score >= 0.40:
+                    identified_name, score = self.voice_recognizer.identify_speaker(audio_i16, sample_rate=16000)
+                    if identified_name and score >= 0.40 and identified_name.lower() != "misafir":
+                        spk_name = identified_name
+                        spk_score = score
+                        spk_source = "voice_recognition"
                         with self._lock:
                             self._recognized_speaker = {
-                                "name": spk_name,
-                                "score": spk_score,
+                                "name": identified_name,
+                                "score": score,
                                 "is_known": True,
-                                "confidence": spk_score,
+                                "confidence": score,
+                                "source": "voice_recognition",
                             }
-                            self._active_person_name = spk_name
-                            self._person_hold_until = time.monotonic() + 15.0
+                            self._active_person_name = identified_name
+                            self._person_hold_until = time.monotonic() + 45.0
                 except Exception:
                     pass
+
+            if spk_name == "Misafir":
+                identity = self._get_active_biometric_identity()
+                if identity.get("is_known") and identity.get("name", "").lower() != "misafir":
+                    spk_name = identity.get("name")
+                    spk_score = identity.get("confidence", 0.85)
+                    spk_source = identity.get("source", "memory_hold")
+
+            active_speaker_dict = {
+                "name": spk_name,
+                "confidence": spk_score,
+                "is_known": (spk_name.lower() != "misafir"),
+                "source": spk_source,
+            }
+            self.get_logger().info(f"👤 [Speaker Context] name={spk_name} confidence={spk_score:.2f} source={spk_source}")
+
+            # 3. Select Atomic TTS Owner for this turn (Single Turn = Single TTS Owner)
+            if self.elevenlabs_engine and self.elevenlabs_engine.is_ready():
+                turn_tts_engine = "elevenlabs"
+                tts_ready_flag = True
+            elif self.local_xtts and self.local_xtts.is_ready():
+                turn_tts_engine = "xtts_gpu"
+                tts_ready_flag = True
+            else:
+                turn_tts_engine = "edge_tts_emergency"
+                tts_ready_flag = False
+                xtts_state = "starting" if (self.local_xtts and getattr(self.local_xtts.client, "is_alive", False)) else "not_ready"
+                self.get_logger().info(f"ℹ️ [TTS Routing] Turn #{self._fallback_generation_id} TTS: edge_tts_emergency (XTTS: {xtts_state})")
+
+            active_engine = turn_tts_engine
+
+            def _synthesize_turn_clause(clause_text: str) -> Tuple[Optional[bytes], float, float]:
+                clean_text = clean_tts_text(clause_text)
+                if not clean_text:
+                    return None, 0.0, 0.0
+                if turn_tts_engine == "elevenlabs" and self.elevenlabs_engine and self.elevenlabs_engine.is_ready():
+                    try:
+                        t_s = time.perf_counter()
+                        pcm_res = self.elevenlabs_engine.synthesize_sentence(clean_text, generation_id=self._fallback_generation_id)
+                        ms = (time.perf_counter() - t_s) * 1000.0
+                        return pcm_res, ms, 0.0
+                    except Exception:
+                        pass
+                elif turn_tts_engine == "xtts_gpu" and self.local_xtts and self.local_xtts.is_ready():
+                    t_s = time.perf_counter()
+                    pcm_res = self.local_xtts.synthesize_sentence(clean_text, generation_id=self._fallback_generation_id)
+                    ms = (time.perf_counter() - t_s) * 1000.0
+                    return pcm_res, ms, ms
+                # Fallback to in-memory Edge-TTS without logging repeated warnings
+                t_s = time.perf_counter()
+                pcm_res = self._synthesize_edge_tts_pcm24k(clean_text)
+                ms = (time.perf_counter() - t_s) * 1000.0
+                return pcm_res, ms, 0.0
 
             wav_buf = io.BytesIO()
             with wave.open(wav_buf, "wb") as wf:
@@ -2228,7 +2290,7 @@ class AstroRealtimeNode(Node):
                 wf.writeframes(raw_pcm)
             wav_bytes = wav_buf.getvalue()
 
-            # 3. Transcribe via Groq Whisper Cloud (0-Token Cost STT ~250ms)
+            # 4. Transcribe via Groq Whisper Cloud (0-Token Cost STT ~250ms)
             t_stt_start = time.monotonic()
             user_text = self._transcribe_groq_whisper(wav_bytes)
             stt_ms = (time.monotonic() - t_stt_start) * 1000.0
@@ -2239,12 +2301,12 @@ class AstroRealtimeNode(Node):
             self.get_logger().info(f"🗣️ [Siz (0-Maliyet)]: \"{user_text}\"")
             self.memory.episodic.add_message("user", user_text)
 
-            # 4. Instant Intent Interception (Sub-250ms Direct Execution)
+            # 5. Instant Intent Interception (Sub-250ms Direct Execution)
             is_weather, w_city = self._is_weather_query(user_text)
             if is_weather:
                 weather_info = self._execute_fallback_weather(w_city)
                 p = self.persona_name.lower()
-                spk = self._active_person_name if self._active_person_name != "Misafir" else ""
+                spk = spk_name if spk_name != "Misafir" else ""
                 if p == "kufurbaz":
                     reply_text = f"Ulan {spk}, {weather_info} Dışarı çıkacaksan ona göre giyin!".strip()
                 elif p == "flirt":
@@ -2252,9 +2314,8 @@ class AstroRealtimeNode(Node):
                 else:
                     reply_text = f"{spk} {weather_info}".strip()
                 
-                pcm, eng_name, g_ms, is_ready = self._synthesize_speech_pcm(reply_text)
-                active_engine = eng_name
-                tts_ready_flag = is_ready
+                pcm, s_ms, g_ms = _synthesize_turn_clause(reply_text)
+                total_synth_ms += s_ms
                 total_gpu_ms += g_ms
                 if pcm:
                     first_audio_ms = (time.monotonic() - t_turn_start) * 1000.0
@@ -2264,8 +2325,8 @@ class AstroRealtimeNode(Node):
                     self._play_pcm_chunks(pcm)
                     return
 
-            # 5. Cognitive LLM via ProviderRegistry (Streaming Groq -> Gemini -> Contextual Persona)
-            system_prompt = self._build_current_system_prompt()
+            # 6. Cognitive LLM via ProviderRegistry (Streaming Groq -> Gemini -> Contextual Persona)
+            system_prompt = self._build_current_system_prompt(active_speaker=active_speaker_dict)
             messages = [{"role": "system", "content": system_prompt}]
             recent_msgs = self.memory.episodic.get_messages()[-6:]
             for m in recent_msgs:
@@ -2276,7 +2337,7 @@ class AstroRealtimeNode(Node):
             chunker = SentenceChunker(min_first_clause_chars=18, min_clause_chars=28) if SentenceChunker else None
             t_llm_start = time.monotonic()
 
-            # Attempt A: Streaming Groq LLMs
+            # Attempt A: Streaming Groq LLMs (20B preferred, fallback to 120B on failure)
             if self.groq_api_key and groq_candidates:
                 for target_model in groq_candidates:
                     try:
@@ -2306,13 +2367,9 @@ class AstroRealtimeNode(Node):
                                     if not first_clause_recorded:
                                         llm_first_clause_ms = (time.monotonic() - t_model_start) * 1000.0
                                         first_clause_recorded = True
-                                    t_clause_synth = time.perf_counter()
-                                    pcm, eng_name, g_ms, is_ready = self._synthesize_speech_pcm(cl)
-                                    s_ms = (time.perf_counter() - t_clause_synth) * 1000.0
+                                    pcm, s_ms, g_ms = _synthesize_turn_clause(cl)
                                     total_synth_ms += s_ms
                                     total_gpu_ms += g_ms
-                                    active_engine = eng_name
-                                    tts_ready_flag = is_ready
                                     if pcm:
                                         total_audio_sec += (len(pcm) / 2) / 24000.0
                                         if not first_audio_played:
@@ -2324,13 +2381,9 @@ class AstroRealtimeNode(Node):
                         if chunker:
                             rem_cl = chunker.flush()
                             if rem_cl:
-                                t_clause_synth = time.perf_counter()
-                                pcm, eng_name, g_ms, is_ready = self._synthesize_speech_pcm(rem_cl)
-                                s_ms = (time.perf_counter() - t_clause_synth) * 1000.0
+                                pcm, s_ms, g_ms = _synthesize_turn_clause(rem_cl)
                                 total_synth_ms += s_ms
                                 total_gpu_ms += g_ms
-                                active_engine = eng_name
-                                tts_ready_flag = is_ready
                                 if pcm:
                                     total_audio_sec += (len(pcm) / 2) / 24000.0
                                     if not first_audio_played:
@@ -2425,13 +2478,9 @@ class AstroRealtimeNode(Node):
 
             # Synthesize full response if not already streamed in chunks
             if not first_audio_played and full_reply_str:
-                t_clause_synth = time.perf_counter()
-                pcm, eng_name, g_ms, is_ready = self._synthesize_speech_pcm(full_reply_str)
-                s_ms = (time.perf_counter() - t_clause_synth) * 1000.0
+                pcm, s_ms, g_ms = _synthesize_turn_clause(full_reply_str)
                 total_synth_ms += s_ms
                 total_gpu_ms += g_ms
-                active_engine = eng_name
-                tts_ready_flag = is_ready
                 if pcm:
                     total_audio_sec += (len(pcm) / 2) / 24000.0
                     first_audio_ms = (time.monotonic() - t_turn_start) * 1000.0
@@ -2466,7 +2515,8 @@ class AstroRealtimeNode(Node):
 
                 self.get_logger().info(
                     f"📊 [Turn Telemetry]: mode=LOCAL_FALLBACK | provider={chosen_provider} | "
-                    f"model={chosen_model} | llm_status={llm_status} | stt_ms={int(stt_ms)} | "
+                    f"model={chosen_model} | llm_status={llm_status} | speaker={spk_name} | "
+                    f"speaker_confidence={spk_score:.2f} | stt_ms={int(stt_ms)} | "
                     f"llm_ttft_ms={int(llm_ttft_ms)} | llm_first_clause_ms={int(llm_first_clause_ms)} | "
                     f"llm_total_ms={int(llm_latency_ms)} | tts_provider={active_engine} | "
                     f"tts_model={tts_model_name} | tts_voice={tts_voice_name} | "
@@ -2666,23 +2716,19 @@ class AstroRealtimeNode(Node):
             held_name = getattr(self, "_active_person_name", "Misafir")
             hold_until = getattr(self, "_person_hold_until", 0.0)
 
-        # 1. Unknown Voice Priority: If active voice is analyzed and is UNKNOWN, it MUST be treated as guest
-        if spk and not spk.get("is_known", False):
-            return {"name": "Misafir", "title": "Ziyaretçi", "formal_title": "Misafir", "is_known": False, "source": "unknown_voice"}
-
-        # 2. Known Active Voice
-        if spk.get("is_known") and spk.get("confidence", 0.0) >= 0.42:
+        # 1. Known Active Voice
+        if spk.get("is_known") and spk.get("confidence", 0.0) >= 0.40 and spk.get("name", "").lower() != "misafir":
             return {**spk, "source": "voice"}
 
-        # 3. Known Active Face
-        if face.get("is_known") and face.get("confidence", 0.0) >= 0.45:
+        # 2. Known Active Face
+        if face.get("is_known") and face.get("confidence", 0.0) >= 0.45 and face.get("name", "").lower() != "misafir":
             return {**face, "source": "face"}
 
-        # 4. Memory Hold
-        if now < hold_until and held_name != "Misafir":
-            return {"name": held_name, "title": held_name, "formal_title": held_name, "is_known": True, "source": "memory_hold"}
+        # 3. Memory Hold (Active conversation continuity)
+        if now < hold_until and held_name and held_name.lower() != "misafir":
+            return {"name": held_name, "title": held_name, "formal_title": held_name, "is_known": True, "source": "memory_hold", "confidence": 0.90}
 
-        return {"name": "Misafir", "title": "Ziyaretçi", "formal_title": "Misafir", "is_known": False}
+        return {"name": "Misafir", "title": "Ziyaretçi", "formal_title": "Misafir", "is_known": False, "source": "guest"}
 
     def _sync_perception_to_session(self):
         """Dynamically syncs persona & recognized identity to the active OpenAI Realtime session ONLY when identity changes."""

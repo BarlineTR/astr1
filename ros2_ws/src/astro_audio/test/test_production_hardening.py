@@ -282,7 +282,10 @@ class TestElevenLabsEngine(unittest.TestCase):
 
     def test_readiness(self):
         from astro_audio.elevenlabs_engine import ElevenLabsEngine
-        engine = ElevenLabsEngine(api_key="", voice_id="")
+        engine = ElevenLabsEngine(api_key="", voice_id="", enabled=False)
+        self.assertFalse(engine.is_ready())
+
+        engine.set_enabled(True)
         self.assertFalse(engine.is_ready())
 
         engine.set_api_key("test_key")
@@ -293,9 +296,10 @@ class TestElevenLabsEngine(unittest.TestCase):
 
     def test_error_classification(self):
         from astro_audio.elevenlabs_engine import ElevenLabsEngine
-        engine = ElevenLabsEngine("test_key", "test_voice")
+        engine = ElevenLabsEngine("test_key", "test_voice", enabled=True)
 
         self.assertEqual(engine.classify_error(401, '{"detail": "Invalid API key"}'), "authentication_error")
+        self.assertEqual(engine.classify_error(402, '{"detail": "Paid plan required (code: paid_plan_required)"}'), "billing_required")
         self.assertEqual(engine.classify_error(404, '{"detail": "Voice not found"}'), "voice_not_found")
         self.assertEqual(engine.classify_error(400, '{"detail": "Model eleven_flash_v2_5 does not support feature"}'), "model_not_found")
         self.assertEqual(engine.classify_error(429, '{"detail": "Quota exceeded for tier"}'), "quota_exhausted")
@@ -306,7 +310,7 @@ class TestElevenLabsEngine(unittest.TestCase):
         from unittest.mock import MagicMock, patch
         from astro_audio.elevenlabs_engine import ElevenLabsEngine
 
-        engine = ElevenLabsEngine("test_key", "test_voice")
+        engine = ElevenLabsEngine("test_key", "test_voice", enabled=True)
         fake_pcm_chunk = b"\x00\x00" * 480  # 480 samples of 24k int16
 
         mock_resp = MagicMock()
@@ -323,7 +327,7 @@ class TestElevenLabsEngine(unittest.TestCase):
         from unittest.mock import MagicMock, patch
         from astro_audio.elevenlabs_engine import ElevenLabsEngine
 
-        engine = ElevenLabsEngine("test_key", "test_voice")
+        engine = ElevenLabsEngine("test_key", "test_voice", enabled=True)
         fake_pcm_chunk = b"\x00\x00" * 480
         mock_resp = MagicMock()
         calls = 0

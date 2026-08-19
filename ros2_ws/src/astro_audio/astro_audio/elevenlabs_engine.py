@@ -46,15 +46,17 @@ class ElevenLabsEngine(BaseTTSEngine):
         api_key: Optional[str] = None,
         voice_id: Optional[str] = None,
         model_id: Optional[str] = None,
+        enabled: Optional[bool] = None,
         logger: Optional[Any] = None,
     ):
+        self._enabled = (enabled if enabled is not None else os.getenv("ELEVENLABS_ENABLED", "false").lower() in ("1", "true", "yes"))
         self._api_key = api_key or os.getenv("ELEVENLABS_API_KEY", "")
         self._voice_id = voice_id or os.getenv("ELEVENLABS_VOICE_ID", "")
         self._model_id = model_id or os.getenv("ELEVENLABS_MODEL", "eleven_flash_v2_5")
         self.logger = logger
 
         self._active_gen_id = 0
-        self._is_available = bool(self._api_key and self._voice_id)
+        self._is_available = bool(self._enabled and self._api_key and self._voice_id)
         self._last_error_class = "none"
         self._last_error_msg = ""
         self._cooldown_until = 0.0
@@ -81,6 +83,14 @@ class ElevenLabsEngine(BaseTTSEngine):
         return "elevenlabs"
 
     @property
+    def is_enabled(self) -> bool:
+        return self._enabled
+
+    def set_enabled(self, enabled: bool) -> None:
+        self._enabled = bool(enabled)
+        self._is_available = bool(self._enabled and self._api_key and self._voice_id)
+
+    @property
     def model_id(self) -> str:
         return self._model_id
 
@@ -90,15 +100,15 @@ class ElevenLabsEngine(BaseTTSEngine):
 
     def set_voice_id(self, voice_id: str) -> None:
         self._voice_id = voice_id
-        self._is_available = bool(self._api_key and self._voice_id)
+        self._is_available = bool(self._enabled and self._api_key and self._voice_id)
 
     def set_api_key(self, api_key: str) -> None:
         self._api_key = api_key
-        self._is_available = bool(self._api_key and self._voice_id)
+        self._is_available = bool(self._enabled and self._api_key and self._voice_id)
 
     def is_ready(self) -> bool:
-        """Returns True if ElevenLabs is configured, not under cooldown, and available."""
-        if not self._api_key or not self._voice_id:
+        """Returns True ONLY if ElevenLabs is explicitly enabled, configured, and not under cooldown."""
+        if not self._enabled or not self._api_key or not self._voice_id:
             return False
         if time.monotonic() < self._cooldown_until:
             return False
@@ -110,6 +120,8 @@ class ElevenLabsEngine(BaseTTSEngine):
 
         if http_code == 401:
             return "authentication_error"
+        if http_code == 402 or "paid_plan_required" in body_lower or "billing_required" in body_lower:
+            return "billing_required"
         if http_code == 404:
             return "voice_not_found"
         if http_code == 400:

@@ -589,6 +589,62 @@ class TestContextualFallbackAndTelemetry(unittest.TestCase):
         self.assertFalse(is_ready)
         self.assertEqual(pcm, b"\x00\x00" * 480)
 
+    def test_speaker_context_in_system_prompt_eliminates_unknown_speaker_claims(self):
+        """Test that verified speaker context prevents 'Seni ilk kez duyuyorum' hallucinations."""
+        from astro_ai.astro_realtime_node import AstroRealtimeNode
+        from astro_ai.persona_engine import PersonaEngine
+        from astro_ai.memory_manager import MemoryManager
+
+        node = MagicMock()
+        node.persona_name = "kufurbaz"
+        node.persona_engine = PersonaEngine(current_persona="kufurbaz")
+        node.memory = MemoryManager()
+        node.voice_recognizer = MagicMock()
+        node.voice_recognizer._known_voiceprints = {"Baran": [1, 2, 3]}
+
+        # When active_speaker is verified as Baran
+        active_speaker = {
+            "name": "Baran",
+            "confidence": 0.94,
+            "is_known": True,
+            "source": "voice_recognition",
+        }
+        prompt = AstroRealtimeNode._build_current_system_prompt(node, active_speaker=active_speaker)
+
+        self.assertIn("Baran", prompt)
+        self.assertIn("ŞU AN SENİNLE KONUŞAN KİŞİ", prompt)
+        self.assertIn("KESİNLİKLE 'Seni ilk kez duyuyorum'", prompt)
+        self.assertNotIn("Sesini ilk defa duyduğunu, hafızandaki kayıtlara uymadığını belirt ve adını sor", prompt)
+
+    def test_groq_gpt_oss_reasoning_parameters(self):
+        """Test that Groq GPT-OSS requests include reasoning_effort='low' and exclude reasoning tokens."""
+        from astro_ai.provider_registry import ProviderRegistry
+
+        registry = ProviderRegistry()
+        mock_resp = MagicMock()
+        mock_resp.__enter__.return_value = [
+            b'data: {"choices": [{"delta": {"content": "Merhaba "}}]}\n',
+            b'data: {"choices": [{"delta": {"reasoning": "some thought"}}]}\n',
+            b'data: {"choices": [{"delta": {"content": "Baran!"}}]}\n',
+            b'data: [DONE]\n'
+        ]
+
+        with patch("urllib.request.urlopen", return_value=mock_resp) as mock_url:
+            tokens = list(registry.stream_groq_completion(
+                api_key="test_key",
+                model_id="openai/gpt-oss-20b",
+                messages=[{"role": "user", "content": "Selam"}],
+            ))
+
+            # Verify request payload
+            req_call = mock_url.call_args[0][0]
+            payload = json.loads(req_call.data.decode("utf-8"))
+            self.assertEqual(payload.get("reasoning_effort"), "low")
+            self.assertFalse(payload.get("include_reasoning", True))
+
+            # Verify that only content tokens are yielded, reasoning is discarded
+            self.assertEqual("".join(tokens), "Merhaba Baran!")
+
 
 if __name__ == "__main__":
     unittest.main()
