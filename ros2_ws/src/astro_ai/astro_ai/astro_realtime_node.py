@@ -345,31 +345,41 @@ class AstroRealtimeNode(Node):
                     self.get_logger().warn(f"⚠️ [Realtime WS] Bağlantı koptu ({e}), 3 saniye sonra yeniden bağlanılacak...")
                     await asyncio.sleep(3.0)
 
-
-
     def _build_current_system_prompt(self) -> str:
         """Builds system instructions with memory, identity, persona, and onboarding behavior."""
         identity = self._get_active_biometric_identity()
         is_known = identity.get("is_known", False)
+
+        known_speakers = []
+        if self.voice_recognizer:
+            try:
+                known_speakers = [k for k, v in self.voice_recognizer._known_voiceprints.items() if len(v) > 0 and k.lower() != "misafir"]
+            except Exception:
+                pass
+        known_str = ", ".join(known_speakers) if known_speakers else "Kayıtlı kişi yok"
+        room_context = f"\n[HAFIZANDAKİ VE ODADAKİ KAYITLI KİŞİLER]: {known_str}\n"
+
         if is_known:
             name_val = identity.get("name", "Misafir")
             title_val = identity.get("formal_title", identity.get("title", name_val))
             bio_status = (
-                f"\n[GÜNCEL BİYOMETRİK KİMLİK]: Karşındaki kişi %100 tanındı -> İsim: {name_val}, Hitap: {title_val}.\n"
-                f"KİMLİK DOĞRULAMA & ÇOKLU KONUŞMACI KURALI:\n"
-                f"1. Karşında {name_val} ({title_val}) var. Kullanıcı 'ben kimim?', 'beni tanıdın mı?', 'sesimi bildin mi?' diye sorduğunda kesinlikle 'Sen {name_val}'sın, sesinden ve yüzünden tanıdım!' diyerek adını söyle!\n"
+                f"\n[ŞU AN SENİNLE KONUŞAN KİŞİ]: Karşındaki konuşmacı sesinden/yüzünden %100 doğrulandı -> İsim: {name_val}, Hitap: {title_val}.\n"
+                f"{room_context}"
+                f"KİMLİK DOĞRULAMA & ÇOKLU KONUŞMACI KURALLARI:\n"
+                f"1. Şu an doğrudan seninle konuşan kişi: {name_val} ({title_val}). Kullanıcı 'ben kimim?', 'beni tanıdın mı?', 'sesimi bildin mi?' diye sorduğunda kesinlikle 'Sen {name_val}'sın, sesinden ve yüzünden tanıdım!' diyerek yanıt ver!\n"
                 f"2. Kendisine doğrudan ismiyle/hitabıyla ({title_val}) hitap et.\n"
-                f"3. Eğer odada 2 kişi aynı anda konuşursa veya arkadan başka bir ses gelirse, DAİMA ÖNCELİĞİ TANIDIĞIN KİŞİYE ({name_val}) VER ve ona yanıt ver.\n"
-                f"4. Tanıdığın kişi ({name_val}) karşındayken araya giren bilinmeyen sesleri kaydetmeye çalışma veya asıl kişiyi bırakma."
+                f"3. Odada {known_str} gibi birden fazla kişi olabilir. Eğer {name_val} başka biri hakkında konuşursa (örn: Deniz Baran'ı savunursa veya sorarsa), karşındaki {name_val}'e hitap ederek diğer kişi hakkındaki fikrini/muhabbetini anlat.\n"
+                f"4. Karşındaki {name_val} iken kendisini başka biri sanma."
             )
         else:
             bio_status = (
-                f"\n[GÜNCEL BİYOMETRİK DURUM]: Karşındaki kişi HENÜZ TANINMIYOR (Bilinmeyen Ses & Yüz / Yeni Kullanıcı / Misafir).\n"
+                f"\n[ŞU AN KONUŞAN KİŞİ]: Karşındaki kişi HENÜZ TANINMIYOR (Bilinmeyen Ses & Yüz / Yeni Kullanıcı / Misafir).\n"
+                f"{room_context}"
                 f"KRİTİK DAVRANIŞ KURALLARI:\n"
-                f"1. Karşındaki kişi az önceki kişi DEĞİLDİR (veya sesi tanınmayan farklı biridir). Karşındaki kişiye ASLA önceki isimlerle (Oktay, Baran vb.) hitap etme!\n"
-                f"2. Tanışma & Öğrenme: Ortamda tanıdığın hiç kimse yoksa ve SADECE bu bilinmeyen kişi seninle konuşuyorsa, seçili kişiliğinle ({self.persona_name}) sesini ilk defa duyduğunu, hafızandaki kayıtlara uymadığını belirt ve adını sor (Örn: 'Sesini ilk kez duyuyorum, tanıyamadım! Adın ne senin?' veya Küfürbaz modundaysan 'Ulan sesini çıkaramadım, kimsin sen? Adını söyle de kaydedeyim koçum!').\n"
-                f"3. Biyometrik Kayıt: SADECE VE SADECE kullanıcı AÇIKÇA kendi adını söylediğinde (örn: 'Adım Ahmet', 'Mehmet ben', 'Bana Ali de') 'enroll_user_biometrics' fonksiyonunu çağır! Kullanıcı adını açıkça söylemediyse ASLA kafandan rastgele isim uydurarak bu fonksiyonu çağırma.\n"
-                f"4. Dürüstlük: Asla 'tanıdım' diyerek yalan söyleme veya tanınmayan kişiye ezbere önceki isimleri yapıştırma."
+                f"1. Karşındaki konuşmacının sesi hafızandaki kayıtlı kişilere ({known_str}) uymuyor. Karşındaki kişiye ASLA ezbere önceki isimlerle hitap etme!\n"
+                f"2. Tanışma: Seçili kişiliğinle ({self.persona_name}) sesini ilk defa duyduğunu, hafızandaki kayıtlara uymadığını belirt ve adını sor (Örn: 'Sesini ilk kez duyuyorum, tanıyamadım! Adın ne senin?' veya Küfürbaz modundaysan 'Ulan sesini çıkaramadım, kimsin sen? Adını söyle de kaydedeyim koçum!').\n"
+                f"3. Biyometrik Kayıt: SADECE VE SADECE kullanıcı AÇIKÇA kendi adını söylediğinde (örn: 'Adım Deniz', 'Ben Mehmet', 'Bana Ali de') 'enroll_user_biometrics' fonksiyonunu çağır!\n"
+                f"4. Dürüstlük: Asla 'tanıdım' diyerek yalan söyleme."
             )
 
         memory_rule = (
@@ -384,12 +394,10 @@ class AstroRealtimeNode(Node):
             recognized_person=identity
         )
 
-
     async def _send_session_update(self, ws):
         """Sends comprehensive session configuration with persona prompt, tools, and turn detection."""
         identity = self._get_active_biometric_identity()
         system_prompt = self._build_current_system_prompt()
-
 
         session_config = {
             "type": "session.update",
@@ -414,8 +422,6 @@ class AstroRealtimeNode(Node):
                         "voice": self.realtime_voice
                     }
                 },
-
-
                 "tools": [
                     {
                         "type": "function",
@@ -512,10 +518,8 @@ class AstroRealtimeNode(Node):
             }
         }
 
-
         await ws.send(json.dumps(session_config))
         self.get_logger().info(f"✨ [Realtime WS] Oturum Yapılandırıldı. Kişilik: [{self.persona_name.upper()}], Ses: [{self.realtime_voice}], Kimlik: [{identity.get('name')}]")
-
 
     async def _handle_realtime_event(self, ws, event: Dict[str, Any]):
         """Dispatches Realtime WebSocket server events."""
@@ -523,7 +527,7 @@ class AstroRealtimeNode(Node):
 
         # 0. Session Update Acknowledged
         if event_type == "session.updated":
-            self.get_logger().info("✅ [Realtime WS] Oturum OpenAI tarafından başarıyla onaylandı ve hazır!")
+            self.get_logger().debug("✅ [Realtime WS] Oturum parametreleri başarıyla güncellendi.")
 
         # 1. Real-Time Streaming Audio Output (GA & Preview names)
         elif event_type in ("response.audio.delta", "response.output_audio.delta"):
@@ -1241,12 +1245,15 @@ class AstroRealtimeNode(Node):
             if not self._enable_idle_learning:
                 continue
 
-            # Run during both awake+idle AND sleep mode — skip only when actively speaking
+            # Run during sleep mode OR when truly idle for >= 30s (do not interrupt active conversation)
             if self._is_responding or self._is_playback_active:
                 continue
 
             now = time.monotonic()
-            if (now - self._last_idle_learning_time) > 20.0:
+            if not self._is_sleeping and (now - getattr(self, "_last_interaction_time", 0.0)) < 30.0:
+                continue
+
+            if (now - self._last_idle_learning_time) > 25.0:
                 self._last_idle_learning_time = now
                 sleep_tag = " [UYKU MODU]" if self._is_sleeping else ""
                 self.get_logger().info(f"👁️🧠 [Otonom Öğrenme{sleep_tag}]: Astro kamerayı ve hafızayı inceliyor...")
