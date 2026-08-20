@@ -148,9 +148,12 @@ class AudioStreamNode(Node):
 
         # Configurable Acoustic Echo & Barge-In Parameters
         self.echo_mute_cooldown_s = float(os.getenv("ECHO_MUTE_COOLDOWN_S", "0.65"))
+        self.barge_in_protection_ms = float(os.getenv("TTS_BARGE_IN_PROTECTION_MS", "350.0"))
         self.barge_in_min_rms = float(os.getenv("BARGE_IN_MIN_RMS", "1200.0"))
+        self.barge_in_playback_min_rms = float(os.getenv("BARGE_IN_PLAYBACK_MIN_RMS", "4500.0"))
         self.barge_in_noise_mult = float(os.getenv("BARGE_IN_NOISE_MULTIPLIER", "3.5"))
         self.barge_in_min_peak = int(os.getenv("BARGE_IN_MIN_PEAK", "2800"))
+        self.barge_in_playback_min_peak = int(os.getenv("BARGE_IN_PLAYBACK_MIN_PEAK", "14000"))
         self._ambient_rms = 120.0
         self._playback_drop_until = 0.0
 
@@ -249,13 +252,18 @@ class AudioStreamNode(Node):
                 # Continuously adapt ambient background noise floor during quiet periods
                 self._ambient_rms = 0.96 * self._ambient_rms + 0.04 * rms
 
-            # Adaptive barge-in threshold derived from ambient noise floor
-            adaptive_barge_in_rms = max(self.barge_in_min_rms, self._ambient_rms * self.barge_in_noise_mult)
-
-            # Software Echo Mute (Zero Self-Hearing):
-            # When Astro is playing voice or within echo cooldown, drop microphone input
-            # unless user intentionally interrupts with distinct acoustic speech energy
+            # Software Echo Mute & Self-Voice Suppression (Zero Self-Hearing):
+            # When Astro is playing voice or within echo cooldown, protect playback
             if is_active_playback:
+                burst_start = getattr(self, "_burst_start_time", 0.0)
+                # 1. Acoustic Protection Window: Strictly suppress feedback during initial burst (e.g. 350ms)
+                if self._playback_burst_active and burst_start > 0.0 and ((now - burst_start) * 1000.0 < self.barge_in_protection_ms):
+                    return
+
+                # Adaptive barge-in threshold derived from ambient noise floor
+                adaptive_barge_in_rms = max(self.barge_in_min_rms, self._ambient_rms * self.barge_in_noise_mult)
+
+                # 2. Distinguish loud speech energy during active playback
                 is_genuine_barge_in = (rms >= adaptive_barge_in_rms and peak >= self.barge_in_min_peak)
                 if not is_genuine_barge_in:
                     return
@@ -312,13 +320,20 @@ class AudioStreamNode(Node):
                         discarded_bytes += len(c)
                     except queue.Empty:
                         break
+            barge_in_after_ms = int((time.monotonic() - self._burst_start_time) * 1000.0) if self._burst_start_time > 0 else 0
+            barge_in_source = "self_voice" if (self._burst_start_time > 0 and barge_in_after_ms < int(self.barge_in_protection_ms)) else "user"
             self._is_playing = False
             self._playback_burst_active = False
             self._last_playback_time = 0.0
             self._playback_drop_until = time.monotonic() + 0.15
             self.get_logger().info(
                 f"⚡ [Playback Telemetry]: tts_playback_cancelled=True | "
-                f"discarded_bytes={discarded_bytes} | reason=barge_in"
+                f"tts_played_bytes={self._total_played_bytes} | "
+                f"tts_remaining_bytes={discarded_bytes} | "
+                f"playback_duration_ms={barge_in_after_ms} | "
+                f"barge_in_after_ms={barge_in_after_ms} | "
+                f"barge_in_source={barge_in_source} | "
+                f"reason=barge_in"
             )
 
     def _playback_worker(self):
@@ -378,6 +393,7 @@ class AudioStreamNode(Node):
                     burst_dur_ms = (time.monotonic() - self._burst_start_time) * 1000.0
                     self.get_logger().info(
                         f"🔊 [Playback Telemetry]: tts_playback_finished=True | "
+                        f"tts_played_bytes={self._total_played_bytes} | "
                         f"total_playback_bytes={self._total_played_bytes} | "
                         f"playback_duration_ms={int(burst_dur_ms)}"
                     )

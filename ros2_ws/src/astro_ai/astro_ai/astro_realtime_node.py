@@ -416,11 +416,16 @@ class AstroRealtimeNode(Node):
 
         # Configurable Acoustic Echo & Barge-In Parameters
         self.echo_mute_cooldown_s = float(os.getenv("ECHO_MUTE_COOLDOWN_S", "0.65"))
+        self.barge_in_protection_ms = float(os.getenv("TTS_BARGE_IN_PROTECTION_MS", "350.0"))
         self.barge_in_min_rms = float(os.getenv("BARGE_IN_MIN_RMS", "1200.0"))
+        self.barge_in_playback_min_rms = float(os.getenv("BARGE_IN_PLAYBACK_MIN_RMS", "4500.0"))
         self.barge_in_noise_mult = float(os.getenv("BARGE_IN_NOISE_MULTIPLIER", "3.5"))
         self.barge_in_min_peak = int(os.getenv("BARGE_IN_MIN_PEAK", "2800"))
+        self.barge_in_playback_min_peak = int(os.getenv("BARGE_IN_PLAYBACK_MIN_PEAK", "14000"))
         self._barge_in_consecutive_frames = 0
         self.barge_in_min_consecutive_frames = int(os.getenv("BARGE_IN_MIN_CONSECUTIVE_FRAMES", "3"))
+        self.barge_in_playback_min_consecutive_frames = int(os.getenv("BARGE_IN_PLAYBACK_CONSECUTIVE_FRAMES", "6"))
+        self._playback_start_monotonic = 0.0
         self._ambient_rms = 120.0
         self._recent_robot_phrases: List[str] = []
 
@@ -2086,7 +2091,9 @@ class AstroRealtimeNode(Node):
         was_active = self._is_playback_active
 
         self._is_playback_active = bool(msg.data)
-        if was_active and not self._is_playback_active:
+        if not was_active and self._is_playback_active:
+            self._playback_start_monotonic = time.monotonic()
+        elif was_active and not self._is_playback_active:
             self._playback_end_time = time.monotonic()
             if not self._is_processing_fallback:
                 self._is_responding = False
@@ -2628,6 +2635,7 @@ class AstroRealtimeNode(Node):
         if not pcm_data:
             return
         self._is_playback_active = True
+        self._playback_start_monotonic = time.monotonic()
         self.state_machine.transition_to(RobotState.SPEAKING)
         chunk_size = 960  # 480 samples @ 24kHz int16 = 20ms
         try:
@@ -3317,11 +3325,22 @@ class AstroRealtimeNode(Node):
 
         # Zero Self-Hearing Protection & Multi-Signal Persistent Barge-In
         if is_active_playback:
+            playback_start = getattr(self, "_playback_start_monotonic", 0.0)
+
+            # 1. Acoustic Protection Window: Strictly suppress self-voice feedback during initial burst (e.g. 350ms)
+            if self._is_playback_active and playback_start > 0.0 and ((now - playback_start) * 1000.0 < self.barge_in_protection_ms):
+                self._barge_in_consecutive_frames = 0
+                return
+
+            # Adaptive barge-in threshold derived from ambient noise floor
+            adaptive_barge_in_rms = max(self.barge_in_min_rms, self._ambient_rms * self.barge_in_noise_mult)
+
+            # 2. Distinguish loud acoustic voice from background
             is_loud = (local_rms >= adaptive_barge_in_rms and peak_val >= self.barge_in_min_peak)
             if is_loud:
                 self._barge_in_consecutive_frames += 1
             else:
-                self._barge_in_consecutive_frames = 0
+                self._barge_in_consecutive_frames = max(0, self._barge_in_consecutive_frames - 1)
 
             # Require persistent speech across multiple consecutive frames (>= 3 frames = 60ms) to avoid impulse noise
             if self._barge_in_consecutive_frames < self.barge_in_min_consecutive_frames:
@@ -3332,6 +3351,7 @@ class AstroRealtimeNode(Node):
                 return
             self._barge_in_latched = True
             self._barge_in_consecutive_frames = 0
+            barge_in_after_ms = int((now - playback_start) * 1000.0) if playback_start > 0.0 else 0
 
             # Genuine User Barge-In during Playback!
             self.state_machine.transition_to(RobotState.INTERRUPTED)
@@ -3353,7 +3373,10 @@ class AstroRealtimeNode(Node):
             self.pub_interrupt.publish(int_msg)
             with self._lock:
                 self._fallback_audio_buffer = [raw_16k]
-            self.get_logger().info(f"⚡ [Realtime Barge-In] Kullanıcı araya girdi (RMS: {local_rms:.0f}, Peak: {peak_val}, Latch: True).")
+            self.get_logger().info(
+                f"⚡ [Realtime Barge-In] Kullanıcı araya girdi (RMS: {local_rms:.0f}, Peak: {peak_val}, "
+                f"barge_in_after_ms={barge_in_after_ms}, Latch: True)."
+            )
             self.state_machine.transition_to(RobotState.LISTENING)
             return
 

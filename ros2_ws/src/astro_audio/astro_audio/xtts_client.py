@@ -287,8 +287,17 @@ class XttsClient:
                 continue
 
             event = msg.get("event")
-            if event == "ready":
-                self.info = msg
+            if event == "probe":
+                self.info.update(msg)
+                self._safe_log(
+                    "info",
+                    f"🔍 [XTTS Probe Success]: python={msg.get('python_executable')} | "
+                    f"torch={msg.get('torch_version')} | cuda_ver={msg.get('torch_cuda_version')} | "
+                    f"torch_cuda_available={msg.get('torch_cuda_available')} | device_count={msg.get('device_count')} | "
+                    f"gpu_name={msg.get('device_name')}"
+                )
+            elif event == "ready":
+                self.info.update(msg)
                 self._ready.set()
             elif event == "error":
                 self._startup_error = f"{msg.get('stage')}: {msg.get('message')}"
@@ -311,10 +320,17 @@ class XttsClient:
         if not self._ready.wait(timeout):
             stderr_snippet = "\n".join(self._stderr_lines[-20:]) if self._stderr_lines else "None"
             raise XttsError(f"XTTS did not become ready in {timeout:.0f}s. Stderr: {stderr_snippet}")
-        if self._startup_error or not self.info:
-            code = self.returncode
+        if self._startup_error or not self.info or not self.is_ready:
+            if self.proc is not None:
+                try:
+                    code = self.proc.wait(timeout=1.5)
+                except Exception:
+                    code = self.proc.poll()
+            else:
+                code = None
             stderr_snippet = "\n".join(self._stderr_lines[-40:]) if self._stderr_lines else "None"
             cmd_str = " ".join(getattr(self, "_cmd", []))
+            probe = self.info if self.info else {}
             err_diag = (getattr(self, "_last_error_event", None) or {}).get("diagnostics", {})
             self._safe_log(
                 "error",
@@ -322,17 +338,17 @@ class XttsClient:
                 f"  exit_code={code}\n"
                 f"  argv={cmd_str}\n"
                 f"  cwd={self.home}\n"
-                f"  python_executable={err_diag.get('python_executable', self.python_path)}\n"
-                f"  torch_version={err_diag.get('torch_version', 'unknown')}\n"
-                f"  torch_cuda_version={err_diag.get('torch_cuda_version', 'unknown')}\n"
-                f"  cuda_available={err_diag.get('cuda_available', False)}\n"
-                f"  gpu_name={err_diag.get('gpu_name', 'unknown')}\n"
-                f"  free_gpu_memory_mb={err_diag.get('free_gpu_memory_mb', 'unknown')}\n"
-                f"  total_gpu_memory_mb={err_diag.get('total_gpu_memory_mb', 'unknown')}\n"
+                f"  python_executable={probe.get('python_executable') or err_diag.get('python_executable', self.python_path)}\n"
+                f"  torch_version={probe.get('torch_version') or err_diag.get('torch_version', 'unknown')}\n"
+                f"  torch_cuda_version={probe.get('torch_cuda_version') or err_diag.get('torch_cuda_version', 'unknown')}\n"
+                f"  cuda_available={probe.get('torch_cuda_available', err_diag.get('cuda_available', False))}\n"
+                f"  gpu_name={probe.get('device_name') or err_diag.get('gpu_name', 'unknown')}\n"
+                f"  free_gpu_memory_mb={probe.get('free_gpu_memory_mb', err_diag.get('free_gpu_memory_mb', 'unknown'))}\n"
+                f"  total_gpu_memory_mb={probe.get('total_gpu_memory_mb', err_diag.get('total_gpu_memory_mb', 'unknown'))}\n"
                 f"  device_properties={err_diag.get('device_properties', {})}\n"
-                f"  PYTHONPATH={err_diag.get('PYTHONPATH', os.getenv('PYTHONPATH', 'none'))}\n"
-                f"  CUDA_VISIBLE_DEVICES={err_diag.get('CUDA_VISIBLE_DEVICES', os.getenv('CUDA_VISIBLE_DEVICES', 'all'))}\n"
-                f"  LD_LIBRARY_PATH={err_diag.get('LD_LIBRARY_PATH', os.getenv('LD_LIBRARY_PATH', 'none'))}\n"
+                f"  PYTHONPATH={probe.get('PYTHONPATH', os.getenv('PYTHONPATH', 'none'))}\n"
+                f"  CUDA_VISIBLE_DEVICES={probe.get('CUDA_VISIBLE_DEVICES', os.getenv('CUDA_VISIBLE_DEVICES', 'all'))}\n"
+                f"  LD_LIBRARY_PATH={probe.get('LD_LIBRARY_PATH', os.getenv('LD_LIBRARY_PATH', 'none'))}\n"
                 f"  checkpoint={self.custom_model.get('checkpoint') if self.custom_model else 'default'}\n"
                 f"  startup_error={self._startup_error}\n"
                 f"  stderr:\n{stderr_snippet}"

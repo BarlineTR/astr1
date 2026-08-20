@@ -142,6 +142,10 @@ def main() -> int:
         return snap
 
     # Hardware & Runtime Diagnostics Collection
+    cuda_avail = torch.cuda.is_available()
+    dev_count = torch.cuda.device_count() if cuda_avail else 0
+    dev_name = torch.cuda.get_device_name(0) if cuda_avail and dev_count > 0 else "CPU"
+
     diag: Dict[str, Any] = {
         "python_executable": sys.executable,
         "argv": sys.argv,
@@ -151,9 +155,27 @@ def main() -> int:
         "LD_LIBRARY_PATH": os.getenv("LD_LIBRARY_PATH", ""),
         "torch_version": torch.__version__,
         "torch_cuda_version": getattr(torch.version, "cuda", "none"),
-        "cuda_available": torch.cuda.is_available(),
+        "torch_cuda_available": cuda_avail,
+        "device_count": dev_count,
+        "device_name": dev_name,
         "batch_size": args.batch_size,
     }
+
+    # Emit probe event immediately to parent process before heavy initialization
+    emit({"event": "probe", **diag})
+
+    # Resource pressure detection on Tegra unified memory
+    try:
+        import psutil
+        vmem = psutil.virtual_memory()
+        if vmem.available < 600 * 1024 * 1024:
+            sys.stderr.write(
+                f"⚠️ [XTTS_RESOURCE_PRESSURE] System RAM available is low: "
+                f"{round(vmem.available / (1024 * 1024), 1)}MB / {round(vmem.total / (1024 * 1024), 1)}MB\n"
+            )
+            sys.stderr.flush()
+    except Exception:
+        pass
 
     # 2. Strict CUDA Validation
     device = args.device

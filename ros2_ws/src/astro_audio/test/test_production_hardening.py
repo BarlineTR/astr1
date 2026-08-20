@@ -24,6 +24,7 @@ import unittest
 from unittest.mock import MagicMock, patch
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+import base64
 import numpy as np
 
 # Enforce in-memory audio isolation (never touch physical /dev/snd during unit tests)
@@ -775,6 +776,83 @@ class TestSTTValidationAndEchoImmunity(unittest.TestCase):
                 self.assertEqual(audio_node._callback_exception_count, 1)
 
             audio_node.destroy_node()
+
+    def test_self_voice_barge_in_protection_window(self):
+        """Self-voice feedback during initial 350ms playback window is strictly suppressed without barge-in."""
+        from astro_ai.state_machine import RobotState
+        self.node._is_playback_active = True
+        self.node._playback_start_monotonic = time.monotonic()
+        self.node._barge_in_latched = False
+        self.node._barge_in_consecutive_frames = 0
+
+        # Simulate robot speaker feedback at t = 50ms into playback (RMS 3691, Peak 9241)
+        mock_msg = MagicMock()
+        feedback_pcm = (np.ones(320, dtype=np.int16) * 3600).tobytes()
+        mock_msg.data = base64.b64encode(feedback_pcm).decode("ascii")
+
+        with patch("astro_ai.astro_realtime_node.resample_24k_to_16k", return_value=feedback_pcm):
+            # Process input chunk during protection window
+            self.node._on_input_pcm(mock_msg)
+
+            # Verify NO barge-in triggered
+            self.assertFalse(self.node._barge_in_latched)
+            self.assertEqual(self.node._barge_in_consecutive_frames, 0)
+            self.assertNotEqual(self.node.state_machine.current_state, RobotState.INTERRUPTED)
+
+    def test_genuine_user_barge_in_after_protection_window(self):
+        """Genuine sustained user speech after protection window triggers single clean barge-in."""
+        from astro_ai.state_machine import RobotState
+        self.node._is_sleeping = False
+        self.node._is_playback_active = True
+        self.node._is_responding = True
+        self.node.state_machine.transition_to(RobotState.SPEAKING)
+        self.node.pub_interrupt = MagicMock()
+        # Set playback start to 500ms ago (past 350ms protection window)
+        self.node._playback_start_monotonic = time.monotonic() - 0.50
+        self.node._barge_in_latched = False
+        self.node._barge_in_consecutive_frames = 0
+        self.node.barge_in_min_consecutive_frames = 3
+
+        # Loud user voice (RMS 5000, Peak 15000)
+        user_pcm = (np.ones(320, dtype=np.int16) * 5000).tobytes()
+        mock_msg = MagicMock()
+        mock_msg.data = base64.b64encode(user_pcm).decode("ascii")
+
+        with patch("astro_ai.astro_realtime_node.resample_24k_to_16k", return_value=user_pcm):
+            # Frame 1 & 2
+            self.node._on_input_pcm(mock_msg)
+            self.node._on_input_pcm(mock_msg)
+            self.assertFalse(self.node._barge_in_latched)
+
+            # Frame 3: reaches consecutive threshold -> triggers barge-in
+            self.node._on_input_pcm(mock_msg)
+            self.assertTrue(self.node._barge_in_latched)
+
+    def test_xtts_child_process_probe_and_diagnostics(self):
+        """XTTS client parses probe event from child process and records hardware diagnostics."""
+        from astro_audio.xtts_client import XttsClient
+        client = XttsClient(speaker_wav="test.wav")
+        client._cmd = ["python", "xtts_worker.py", "--batch-size", "1"]
+
+        # Simulate receiving probe JSON from child stdout
+        probe_json = json.dumps({
+            "event": "probe",
+            "python_executable": "/usr/bin/python3",
+            "torch_version": "2.5.0",
+            "torch_cuda_version": "12.6",
+            "torch_cuda_available": True,
+            "device_count": 1,
+            "device_name": "Orin",
+            "batch_size": 1,
+        })
+        with patch.object(client, "_safe_log"):
+            client.proc = MagicMock()
+            client.proc.stdout = [f"@@XTTS@@ {probe_json}\n"]
+            client._read_stdout()
+
+            self.assertEqual(client.info.get("device_name"), "Orin")
+            self.assertTrue(client.info.get("torch_cuda_available"))
+            self.assertEqual(client.info.get("batch_size"), 1)
 
 
 if __name__ == "__main__":
