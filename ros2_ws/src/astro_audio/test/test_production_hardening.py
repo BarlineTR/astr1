@@ -21,6 +21,7 @@ import sys
 import threading
 import time
 import unittest
+from unittest.mock import MagicMock, patch
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 import numpy as np
@@ -595,6 +596,60 @@ class TestSTTValidationAndEchoImmunity(unittest.TestCase):
             # Frame 4 in same generation: Debounced by latch
             self.node._on_input_pcm(loud_msg)
             self.assertEqual(self.node.pub_interrupt.publish.call_count, 1)
+
+
+    def test_input_pcm_does_not_jump_self_voice_counter_at_50hz(self):
+        """Feeding quiet frames during playback does NOT increment self_voice_rejection_count at 50Hz."""
+        import base64
+        self.node._is_playback_active = True
+        self.node._is_responding = True
+        self.node.self_voice_rejection_count = 0
+        quiet_pcm = self._generate_pcm(0.02, rms_target=100.0)
+        msg = MagicMock()
+        msg.data = base64.b64encode(quiet_pcm).decode("ascii")
+
+        for _ in range(50):
+            self.node._on_input_pcm(msg)
+
+        self.assertEqual(self.node.self_voice_rejection_count, 0)
+
+    def test_wake_phantom_command_dropped_in_candidate(self):
+        """Wake candidate 'Astro. Altyazı M.K.' wakes robot to LISTENING but creates 0 LLM turns."""
+        from astro_ai.state_machine import RobotState
+
+        fake_pcm = self._generate_pcm(0.85, rms_target=600.0)
+        with patch.object(self.node, "_transcribe_groq_whisper", return_value="Astro. Altyazı M.K."), \
+             patch.object(self.node, "_process_fallback_turn") as mock_turn:
+            self.node._process_wake_candidate([fake_pcm])
+            self.assertEqual(self.node.state_machine.current_state, RobotState.LISTENING)
+            mock_turn.assert_not_called()
+
+    def test_active_mode_wake_only_transitions_to_listening_without_llm(self):
+        """In active mode, saying 'Astro.' transitions to LISTENING and produces 0 LLM / 0 TTS calls."""
+        from astro_ai.state_machine import RobotState
+
+        self.node._is_sleeping = False
+        fake_pcm = self._generate_pcm(0.40, rms_target=600.0)
+        with patch.object(self.node, "_transcribe_groq_whisper", return_value="Astro."), \
+             patch.object(self.node, "_validate_stt_transcript", return_value=("Astro.", {"stt_rejected": False})), \
+             patch.object(self.node.provider_registry, "stream_groq_completion") as mock_groq, \
+             patch.object(self.node, "_play_pcm_chunks") as mock_play:
+            self.node._process_fallback_turn([fake_pcm])
+            self.assertEqual(self.node.state_machine.current_state, RobotState.LISTENING)
+            mock_groq.assert_not_called()
+            mock_play.assert_not_called()
+
+    def test_wake_with_genuine_command_strips_wake_and_forwards(self):
+        """In active mode, 'Hey Astro, nasılsın?' strips wake prefix and passes 'nasılsın?' to LLM."""
+        self.node._is_sleeping = False
+        fake_pcm = self._generate_pcm(0.40, rms_target=600.0)
+        with patch.object(self.node, "_transcribe_groq_whisper", return_value="Hey Astro, nasılsın?"), \
+             patch.object(self.node, "_validate_stt_transcript", return_value=("Hey Astro, nasılsın?", {"stt_rejected": False})), \
+             patch.object(self.node, "_synthesize_speech_pcm", return_value=(b"fake_pcm", "xtts_gpu", 50.0, True)), \
+             patch.object(self.node, "_play_pcm_chunks"):
+            self.node._process_fallback_turn([fake_pcm])
+            msgs = self.node.memory.episodic.get_messages()
+            self.assertTrue(any("nasılsın" in m.get("content", "").lower() for m in msms if m.get("role") == "user") if (msms := msgs) else False)
 
 
 if __name__ == "__main__":

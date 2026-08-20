@@ -290,6 +290,31 @@ def compute_self_voice_score(transcript: str, recent_robot_phrases: List[str]) -
     return min(1.0, max_score)
 
 
+def is_known_phantom_pattern(text: str) -> bool:
+    """Checks if text contains known Whisper hallucination/phantom pattern without semantic context."""
+    if not text:
+        return True
+    t = re.sub(r"[^\w\s]", "", text.lower()).strip()
+    if not t:
+        return True
+    phantom_exacts = {
+        "altyazı", "altyazı mk", "altyazı m k", "altyazi", "altyazi mk", "altyazi m k",
+        "abone ol", "kanala abone ol", "abone olun", "videoyu beğenmeyi unutmayın",
+        "izlediğiniz için teşekkürler", "izlediginiz icin tesekkurler",
+        "izlediğiniz için teşekkür ederiz", "izlediginiz icin tesekkur ederiz",
+        "diz", "dizi", "hahaha", "hahahaha", "hehehe", "hihihi",
+        "türen türen türen", "türen", "turen", "turen turen turen",
+        "evet evet evet", "nokta", "virgül", "şşş", "sss", "hı hı", "cık", "çık"
+    }
+    if t in phantom_exacts:
+        return True
+    # Repetitive single word loop e.g. "türen, türen, türen" or "evet, evet, evet"
+    words = t.split()
+    if len(words) >= 2 and len(set(words)) == 1 and words[0] in ("türen", "turen", "evet", "hayır", "ha", "he", "diz", "dizi", "altyazı", "hahaha"):
+        return True
+    return False
+
+
 class AstroRealtimeNode(Node):
     """ROS 2 Node bridging Astro sensors & audio streams to OpenAI Realtime WebSocket."""
 
@@ -300,6 +325,10 @@ class AstroRealtimeNode(Node):
             except Exception:
                 pass
         super().__init__("astro_realtime_node")
+
+        # Startup timestamp & Grace Period tracking
+        self._node_start_time = time.monotonic()
+        self.xtts_startup_grace_s = float(os.getenv("XTTS_STARTUP_GRACE_S", "60.0"))
 
         # Load environment variables (sanitized of quotes/whitespace)
         self.openai_api_key = os.environ.get("OPENAI_API_KEY", "").strip("\"' \t\n\r")
@@ -1651,14 +1680,17 @@ class AstroRealtimeNode(Node):
         vad_confidence = round(min(1.0, total_rms / 600.0), 2)
 
         is_only_wake_word = (len(extracted_cmd) < 2)
+        is_phantom_cmd = is_known_phantom_pattern(extracted_cmd)
 
-        if is_only_wake_word:
-            # Pure Wake Phrase: Wakes robot up, flushes buffers, transitions to LISTENING. NO fake LLM turn!
+        if is_only_wake_word or is_phantom_cmd:
+            # Pure Wake Phrase or Wake + Phantom Hallucination (e.g. "Astro. Altyazı M.K."):
+            # Wakes robot up, flushes buffers, transitions to LISTENING. NO fake LLM / TTS turn!
             self._wake_up()
             self.get_logger().info(
                 f"⚡ [Wake Telemetry]: wake_detector_active=True | wake_candidate=\"{transcript}\" | "
                 f"is_wake_phrase=True | wake_confidence={wake_confidence:.2f} | vad_confidence={vad_confidence:.2f} | "
                 f"stt_started=True | stt_finished=True | transcript=\"{transcript}\" | "
+                f"extracted_command=\"{extracted_cmd}\" | command_invalid={is_phantom_cmd} | "
                 f"wake_only=True | wake_rejected=False | conversation_turn_created=False | llm_started=False | tts_started=False"
             )
         else:
@@ -1668,7 +1700,7 @@ class AstroRealtimeNode(Node):
                 f"⚡ [Wake Telemetry]: wake_detector_active=True | wake_candidate=\"{transcript}\" | "
                 f"is_wake_phrase=True | wake_confidence={wake_confidence:.2f} | vad_confidence={vad_confidence:.2f} | "
                 f"stt_started=True | stt_finished=True | transcript=\"{transcript}\" | "
-                f"extracted_command=\"{extracted_cmd}\" | "
+                f"extracted_command=\"{extracted_cmd}\" | command_invalid=False | "
                 f"wake_only=False | wake_rejected=False | conversation_turn_created=True | llm_started=True | tts_started=True"
             )
             if self._fallback_mode or not self._is_connected:
@@ -2076,8 +2108,25 @@ class AstroRealtimeNode(Node):
         rejected = False
         reject_reason = "none"
 
+        # Check if audio has strong acoustic evidence of real human speech articulation
+        has_strong_evidence = (
+            not is_playback_active
+            and not is_echo_cooldown
+            and speech_ms >= 550
+            and audio_ms >= 700
+            and vad_confidence >= 0.55
+            and total_rms >= 480.0
+            and self_voice_score < 0.20
+        )
+
+        # 0. Pure Known Phantom Hallucination Patterns (e.g. 'Altyazı M.K.', 'Abone ol', 'İzlediğiniz için teşekkürler', 'türen türen türen')
+        is_phantom = is_known_phantom_pattern(norm_text)
+        if is_phantom and not is_short_utterance and not has_strong_evidence:
+            rejected = True
+            reject_reason = "known_phantom"
+
         # 1. Playback active or room echo cooldown with high self-voice correlation
-        if (is_playback_active or is_echo_cooldown) and self_voice_score >= 0.45:
+        elif (is_playback_active or is_echo_cooldown) and self_voice_score >= 0.45:
             rejected = True
             reject_reason = "self_voice"
 
@@ -2092,20 +2141,9 @@ class AstroRealtimeNode(Node):
             reject_reason = "no_speech"
 
         # 4. Suspect phrases (e.g. "abone ol", "diz", "altyazı m.k.", "altyazı") evaluated against genuine speech evidence
-        elif is_suspect_phrase:
-            # Suspect phantom hallucinations require genuine articulation duration (>= 550ms speech, >= 700ms audio)
-            has_strong_evidence = (
-                not is_playback_active
-                and not is_echo_cooldown
-                and speech_ms >= 550
-                and audio_ms >= 700
-                and vad_confidence >= 0.55
-                and total_rms >= 480.0
-                and self_voice_score < 0.20
-            )
-            if not has_strong_evidence:
-                rejected = True
-                reject_reason = "self_voice" if (is_playback_active or is_echo_cooldown or self_voice_score >= 0.20) else "no_speech"
+        elif is_suspect_phrase and not has_strong_evidence:
+            rejected = True
+            reject_reason = "self_voice" if (is_playback_active or is_echo_cooldown or self_voice_score >= 0.20) else "no_speech"
 
         # 5. Short utterances (e.g. "Hey", "Lan", "Dur", "Tamam", "Ne?")
         elif len(words) == 1:
@@ -2145,7 +2183,7 @@ class AstroRealtimeNode(Node):
                 self.self_voice_rejection_count += 1
             elif reject_reason == "no_speech":
                 self.no_speech_rejection_count += 1
-            elif reject_reason in ("low_confidence", "empty_transcript"):
+            elif reject_reason in ("low_confidence", "empty_transcript", "known_phantom"):
                 self.false_transcript_count += 1
             elif reject_reason == "stale_audio":
                 self.stale_audio_rejection_count += 1
@@ -2475,6 +2513,21 @@ class AstroRealtimeNode(Node):
         if not clean_text:
             return b"", "none", 0.0, False
 
+        # If XTTS is STARTING within startup grace period, wait for it before fallback
+        if self.local_xtts and not self.local_xtts.is_ready():
+            now_m = time.monotonic()
+            start_val = getattr(self, "_node_start_time", now_m)
+            start_s = float(start_val) if isinstance(start_val, (int, float)) else now_m
+            elapsed_since_start = now_m - start_s
+            grace_val = getattr(self, "xtts_startup_grace_s", 60.0)
+            grace_s = float(grace_val) if isinstance(grace_val, (int, float)) else 60.0
+            remaining_grace = max(0.0, grace_s - elapsed_since_start)
+            if getattr(self.local_xtts, "state", "") == "STARTING" and remaining_grace > 0.0:
+                wait_time = min(remaining_grace, 15.0)
+                t_wait_start = time.monotonic()
+                while (time.monotonic() - t_wait_start) < wait_time and not self.local_xtts.is_ready():
+                    time.sleep(0.3)
+
         # 1. Primary Remote TTS: ElevenLabs Flash v2.5 (Only if configured and ready)
         if self.elevenlabs_engine and self.elevenlabs_engine.is_ready():
             try:
@@ -2525,15 +2578,25 @@ class AstroRealtimeNode(Node):
         """Streams 24kHz int16 PCM audio chunks directly to audio output node with smooth 20ms pacing."""
         if not pcm_data:
             return
+        self._is_playback_active = True
+        self.state_machine.transition_to(RobotState.SPEAKING)
         chunk_size = 960  # 480 samples @ 24kHz int16 = 20ms
-        for i in range(0, len(pcm_data), chunk_size):
-            chunk = pcm_data[i : i + chunk_size]
-            if chunk:
-                b64_str = base64.b64encode(chunk).decode("ascii")
-                out_msg = String()
-                out_msg.data = b64_str
-                self.pub_output_pcm.publish(out_msg)
-                time.sleep(0.018)
+        try:
+            for i in range(0, len(pcm_data), chunk_size):
+                if self._barge_in_latched or not self._is_responding:
+                    break
+                chunk = pcm_data[i : i + chunk_size]
+                if chunk:
+                    b64_str = base64.b64encode(chunk).decode("ascii")
+                    out_msg = String()
+                    out_msg.data = b64_str
+                    self.pub_output_pcm.publish(out_msg)
+                    time.sleep(0.018)
+        finally:
+            self._is_playback_active = False
+            self._playback_end_time = time.monotonic()
+            if self.state_machine.current_state == RobotState.SPEAKING:
+                self.state_machine.transition_to(RobotState.LISTENING)
 
     def _process_fallback_turn(self, audio_chunks: List[bytes]):
         """Processes turn using capability-aware ProviderRegistry + Streaming LLM + Pipelined TTS."""
@@ -2557,6 +2620,7 @@ class AstroRealtimeNode(Node):
         first_audio_ms = 0.0
         total_synth_ms = 0.0
         total_gpu_ms = 0.0
+        total_queue_wait_ms = 0.0
         total_audio_sec = 0.0
         attempts: List[Dict[str, Any]] = []
 
@@ -2629,6 +2693,31 @@ class AstroRealtimeNode(Node):
 
             # If rejected, immediately abort turn without LLM, memory, or TTS invocation
             if not validated_text:
+                return
+
+            # Check for pure wake word in active mode (e.g. "Astro.", "Hey Astro", "Selam")
+            norm_wake_check = re.sub(r"[^\w\s]", "", validated_text.lower()).strip()
+            if norm_wake_check in ("astro", "hey astro", "selam astro", "hey", "selam"):
+                self.state_machine.transition_to(RobotState.LISTENING)
+                self.get_logger().info(
+                    f"⚡ [Active Wake-Only]: \"{validated_text}\" -> Woke to LISTENING (wake_only=True, turn_created=False, 0 LLM / 0 TTS)."
+                )
+                return
+
+            # Check if user said "Hey Astro, <command>" or "Astro, <command>"
+            if norm_wake_check.startswith("hey astro "):
+                validated_text = validated_text[len("hey astro"):].lstrip(" ,.")
+            elif norm_wake_check.startswith("astro "):
+                validated_text = validated_text[len("astro"):].lstrip(" ,.")
+            elif norm_wake_check.startswith("selam astro "):
+                validated_text = validated_text[len("selam astro"):].lstrip(" ,.")
+
+            cmd_norm = re.sub(r"[^\w\s]", "", validated_text.lower()).strip()
+            if not cmd_norm or is_known_phantom_pattern(cmd_norm):
+                self.state_machine.transition_to(RobotState.LISTENING)
+                self.get_logger().info(
+                    f"⚡ [Wake + Phantom Command Dropped]: \"{raw_transcript}\" -> Transitioned to LISTENING (0 LLM / 0 TTS)."
+                )
                 return
 
             user_text = validated_text
@@ -2718,6 +2807,18 @@ class AstroRealtimeNode(Node):
             speaker_display = spk_name if spk_name else "null"
             self.get_logger().info(f"👤 [Speaker Context] speaker={speaker_display} confidence={spk_score:.2f} source={spk_source}")
 
+            # If XTTS is starting and node is in startup grace period, wait for XTTS instead of jumping to eSpeak
+            if self.local_xtts and not self.local_xtts.is_ready():
+                now_m = time.monotonic()
+                elapsed_since_start = now_m - getattr(self, "_node_start_time", now_m)
+                remaining_grace = max(0.0, getattr(self, "xtts_startup_grace_s", 60.0) - elapsed_since_start)
+                if getattr(self.local_xtts, "state", "") == "STARTING" and remaining_grace > 0.0:
+                    wait_time = min(remaining_grace, 20.0)
+                    self.get_logger().info(f"⏳ [XTTS Startup Grace] XTTS is STARTING. Waiting up to {wait_time:.1f}s for XTTS READY...")
+                    t_wait_start = time.monotonic()
+                    while (time.monotonic() - t_wait_start) < wait_time and not self.local_xtts.is_ready():
+                        time.sleep(0.3)
+
             # 5. Select Atomic TTS Owner for this turn (Single Turn = Single TTS Owner)
             if self.elevenlabs_engine and self.elevenlabs_engine.is_ready():
                 turn_tts_engine = "elevenlabs"
@@ -2742,24 +2843,27 @@ class AstroRealtimeNode(Node):
 
             active_engine = turn_tts_engine
 
-            def _synthesize_turn_clause(clause_text: str) -> Tuple[Optional[bytes], float, float]:
+            def _synthesize_turn_clause(clause_text: str) -> Tuple[Optional[bytes], float, float, float]:
                 clean_text = clean_tts_text(clause_text)
                 if not clean_text:
-                    return None, 0.0, 0.0
+                    return None, 0.0, 0.0, 0.0
                 if turn_tts_engine == "elevenlabs" and self.elevenlabs_engine and self.elevenlabs_engine.is_ready():
                     try:
                         t_s = time.perf_counter()
                         pcm_res = self.elevenlabs_engine.synthesize_sentence(clean_text, generation_id=self._fallback_generation_id)
                         ms = (time.perf_counter() - t_s) * 1000.0
-                        return pcm_res, ms, 0.0
+                        return pcm_res, ms, 0.0, 0.0
                     except Exception:
                         pass
                 elif turn_tts_engine == "xtts_gpu" and self.local_xtts and self.local_xtts.is_ready():
                     try:
                         t_s = time.perf_counter()
                         pcm_res = self.local_xtts.synthesize_sentence(clean_text, generation_id=self._fallback_generation_id)
-                        ms = (time.perf_counter() - t_s) * 1000.0
-                        return pcm_res, ms, ms
+                        tot_ms = (time.perf_counter() - t_s) * 1000.0
+                        telem = self.local_xtts.get_telemetry()
+                        gpu_ms = telem.get("last_infer_ms", tot_ms)
+                        q_wait = max(0.0, tot_ms - gpu_ms)
+                        return pcm_res, tot_ms, gpu_ms, q_wait
                     except Exception:
                         pass
                 elif turn_tts_engine == "local_offline_tts" and self.local_offline_tts and self.local_offline_tts.is_ready():
@@ -2767,14 +2871,14 @@ class AstroRealtimeNode(Node):
                         t_s = time.perf_counter()
                         pcm_res = self.local_offline_tts.synthesize_sentence(clean_text, generation_id=self._fallback_generation_id)
                         ms = (time.perf_counter() - t_s) * 1000.0
-                        return pcm_res, ms, 0.0
+                        return pcm_res, ms, 0.0, 0.0
                     except Exception:
                         pass
                 # Network fallback to in-memory Edge-TTS
                 t_s = time.perf_counter()
                 pcm_res = self._synthesize_edge_tts_pcm24k(clean_text)
                 ms = (time.perf_counter() - t_s) * 1000.0
-                return pcm_res, ms, 0.0
+                return pcm_res, ms, 0.0, 0.0
 
             # 6. Instant Intent Interception (Sub-250ms Direct Execution)
             is_weather, w_city = self._is_weather_query(user_text)
@@ -2794,9 +2898,10 @@ class AstroRealtimeNode(Node):
                     if len(self._recent_robot_phrases) > 10:
                         self._recent_robot_phrases = self._recent_robot_phrases[-10:]
 
-                pcm, s_ms, g_ms = _synthesize_turn_clause(reply_text)
+                pcm, s_ms, g_ms, q_ms = _synthesize_turn_clause(reply_text)
                 total_synth_ms += s_ms
                 total_gpu_ms += g_ms
+                total_queue_wait_ms += q_ms
                 if pcm:
                     first_audio_ms = (time.monotonic() - t_turn_start) * 1000.0
                     self.get_logger().info(f"🤖 [Astro (Canlı Hava Durumu)]: \"{reply_text}\"")
@@ -2847,9 +2952,10 @@ class AstroRealtimeNode(Node):
                                     clause_count += 1
                                     if llm_first_clause_ms is None:
                                         llm_first_clause_ms = (time.monotonic() - t_model_start) * 1000.0
-                                    pcm, s_ms, g_ms = _synthesize_turn_clause(cl)
+                                    pcm, s_ms, g_ms, q_ms = _synthesize_turn_clause(cl)
                                     total_synth_ms += s_ms
                                     total_gpu_ms += g_ms
+                                    total_queue_wait_ms += q_ms
                                     if pcm:
                                         total_audio_sec += (len(pcm) / 2) / 24000.0
                                         if not first_audio_played:
@@ -2867,9 +2973,10 @@ class AstroRealtimeNode(Node):
                             if rem_cl:
                                 if llm_first_clause_ms is None:
                                     llm_first_clause_ms = (time.monotonic() - t_model_start) * 1000.0
-                                pcm, s_ms, g_ms = _synthesize_turn_clause(rem_cl)
+                                pcm, s_ms, g_ms, q_ms = _synthesize_turn_clause(rem_cl)
                                 total_synth_ms += s_ms
                                 total_gpu_ms += g_ms
+                                total_queue_wait_ms += q_ms
                                 if pcm:
                                     total_audio_sec += (len(pcm) / 2) / 24000.0
                                     if not first_audio_played:
@@ -2970,9 +3077,10 @@ class AstroRealtimeNode(Node):
 
             # Synthesize full response if not already streamed in chunks
             if not first_audio_played and full_reply_str:
-                pcm, s_ms, g_ms = _synthesize_turn_clause(full_reply_str)
+                pcm, s_ms, g_ms, q_ms = _synthesize_turn_clause(full_reply_str)
                 total_synth_ms += s_ms
                 total_gpu_ms += g_ms
+                total_queue_wait_ms += q_ms
                 if pcm:
                     total_audio_sec += (len(pcm) / 2) / 24000.0
                     first_audio_ms = (time.monotonic() - t_turn_start) * 1000.0
@@ -3037,6 +3145,7 @@ class AstroRealtimeNode(Node):
                     f"xtts_checkpoint={xtts_ckpt_str} | xtts_sha256={xtts_sha_short} | "
                     f"tts_ready={tts_ready_flag} | tts_first_audio_ms={int(first_audio_ms)} | "
                     f"tts_total_ms={int(total_synth_ms)} | xtts_infer_ms={int(total_gpu_ms)} | "
+                    f"xtts_queue_wait_ms={int(total_queue_wait_ms)} | "
                     f"xtts_worker_pid={worker_pid} | xtts_gpu={gpu_name_str} | "
                     f"total_ttfa_ms={int(first_audio_ms if first_audio_played else total_turn_ms)} | "
                     f"fallback_reason=realtime_quota | attempts={json.dumps(attempts, ensure_ascii=False)}"
@@ -3151,8 +3260,6 @@ class AstroRealtimeNode(Node):
 
             # Require persistent speech across multiple consecutive frames (>= 3 frames = 60ms) to avoid impulse noise
             if self._barge_in_consecutive_frames < self.barge_in_min_consecutive_frames:
-                if not is_loud:
-                    self.self_voice_rejection_count += 1
                 return
 
             # Barge-In latch: Only one logical barge-in transition per generation
