@@ -15,12 +15,33 @@ import struct
 import sys
 import threading
 import time
-from typing import Optional
+from typing import Any, Optional
 
 import numpy as np
-import rclpy
-from rclpy.node import Node
-from std_msgs.msg import Bool, Float32, String
+
+try:
+    import rclpy
+    from rclpy.node import Node
+    from std_msgs.msg import Bool, Float32, String
+except ImportError:
+    rclpy = None
+    class Node:  # type: ignore
+        def __init__(self, *args, **kwargs):
+            pass
+        def get_logger(self):
+            import logging
+            return logging.getLogger("AudioStreamNode")
+        def create_subscription(self, *args, **kwargs):
+            return None
+        def create_publisher(self, *args, **kwargs):
+            return None
+        def create_timer(self, *args, **kwargs):
+            return None
+        def destroy_node(self):
+            pass
+    class _MockMsg:
+        data: Any = None
+    Bool = Float32 = String = _MockMsg  # type: ignore
 
 try:
     import sounddevice as sd
@@ -122,6 +143,8 @@ class AudioStreamNode(Node):
         pref_out = os.getenv("AUDIO_OUTPUT_DEVICE", "")
         self._in_dev_idx, in_name = find_audio_device(is_input=True, preferred=pref_in)
         self._out_dev_idx, out_name = find_audio_device(is_input=False, preferred=pref_out)
+        self._in_device_name = in_name
+        self._out_device_name = out_name
 
         # Configurable Acoustic Echo & Barge-In Parameters
         self.echo_mute_cooldown_s = float(os.getenv("ECHO_MUTE_COOLDOWN_S", "0.65"))
@@ -131,22 +154,27 @@ class AudioStreamNode(Node):
         self._ambient_rms = 120.0
         self._playback_drop_until = 0.0
 
-        self.get_logger().info(f"🎤 [Realtime Audio] Giriş Cihazı: [{self._in_dev_idx}] {in_name} (16kHz Native -> 24kHz Stream)")
-        self.get_logger().info(f"🔊 [Realtime Audio] Çıkış Cihazı: [{self._out_dev_idx}] {out_name} (24kHz Stream -> 16kHz DAC)")
-        self.get_logger().info(f"🛡️  [Echo Guard] Cooldown: {self.echo_mute_cooldown_s:.2f}s | Min Barge-In RMS: {self.barge_in_min_rms:.0f}")
-
-        # Playback Queue & Thread
+        # Complete Playback & Callback State (Initialized BEFORE spawning worker thread)
         self._play_queue: queue.Queue[bytes] = queue.Queue(maxsize=500)
         self._is_playing = False
         self._last_playback_time = 0.0
         self._playback_lock = threading.Lock()
         self._stop_event = threading.Event()
+        self._total_enqueued_bytes = 0
+        self._total_played_bytes = 0
+        self._playback_burst_active = False
+        self._burst_start_time = 0.0
+        self._playback_worker_alive = True
+        self._playback_worker_error = "none"
+        self._callback_exception_count = 0
+        self._last_input_callback_time = time.monotonic()
+        self._last_cb_err_log_time = 0.0
 
         # Streams
         self._input_stream = None
         self._output_stream = None
 
-        # Start Playback Thread
+        # Start Playback Worker Thread
         self._play_thread = threading.Thread(target=self._playback_worker, daemon=True)
         self._play_thread.start()
 
@@ -155,6 +183,16 @@ class AudioStreamNode(Node):
 
         # Playback status ticker timer
         self.create_timer(0.05, self._publish_status)
+
+        self.get_logger().info(
+            f"🔊 [AUDIO READY]\n"
+            f"  input_device=[{self._in_dev_idx}] {self._in_device_name}\n"
+            f"  output_device=[{self._out_dev_idx}] {self._out_device_name}\n"
+            f"  input_callback=alive\n"
+            f"  playback_worker=alive\n"
+            f"  audio_input_callback_alive=True\n"
+            f"  audio_playback_worker_alive=True"
+        )
 
     def _start_input_stream(self):
         if sd is None:
@@ -177,72 +215,77 @@ class AudioStreamNode(Node):
 
     def _input_callback(self, indata, frames, time_info, status):
         """Audio hardware callback triggered every 20ms with 320 16-bit PCM samples."""
-        if status:
-            pass
-
-        raw_bytes = bytes(indata)
-        if not raw_bytes:
-            return
-
-        now = time.monotonic()
-        if now < self._playback_drop_until:
-            return
-
-        # Measure RMS level and peak for diagnostic & VAD
-        peak = 0
         try:
-            arr = np.frombuffer(raw_bytes, dtype=np.int16)
-            rms = float(np.sqrt(np.mean(arr.astype(np.float32) ** 2)))
-            if len(arr) > 0:
-                peak = int(np.max(np.abs(arr)))
-        except Exception:
-            rms = 0.0
-            peak = 0
+            self._last_input_callback_time = time.monotonic()
+            if status:
+                pass
 
-        is_active_playback = (
-            self._is_playing
-            or (now - self._last_playback_time < self.echo_mute_cooldown_s)
-            or not self._play_queue.empty()
-        )
-
-        if not is_active_playback and rms < 400.0:
-            # Continuously adapt ambient background noise floor during quiet periods
-            self._ambient_rms = 0.96 * self._ambient_rms + 0.04 * rms
-
-        # Adaptive barge-in threshold derived from ambient noise floor
-        adaptive_barge_in_rms = max(self.barge_in_min_rms, self._ambient_rms * self.barge_in_noise_mult)
-
-        # Software Echo Mute (Zero Self-Hearing):
-        # When Astro is playing voice or within echo cooldown, drop microphone input
-        # unless user intentionally interrupts with distinct acoustic speech energy
-        if is_active_playback:
-            is_genuine_barge_in = (rms >= adaptive_barge_in_rms and peak >= self.barge_in_min_peak)
-            if not is_genuine_barge_in:
+            raw_bytes = bytes(indata)
+            if not raw_bytes:
                 return
 
-        # Energy gate: do not stream dead room silence (saves bandwidth and prevents Whisper hallucination)
-        if not is_active_playback and rms < max(65.0, self._ambient_rms * 0.75):
-            return
+            now = time.monotonic()
+            if now < self._playback_drop_until:
+                return
 
-        # Publish mic level
-        lvl_msg = Float32()
-        lvl_msg.data = float(rms)
-        self.pub_input_level.publish(lvl_msg)
+            # Measure RMS level and peak for diagnostic & VAD
+            peak = 0
+            try:
+                arr = np.frombuffer(raw_bytes, dtype=np.int16)
+                rms = float(np.sqrt(np.mean(arr.astype(np.float32) ** 2)))
+                if len(arr) > 0:
+                    peak = int(np.max(np.abs(arr)))
+            except Exception:
+                rms = 0.0
+                peak = 0
 
-        # Resample 16kHz -> 24kHz for OpenAI Realtime API
-        pcm_24k = resample_16k_to_24k(raw_bytes)
+            is_active_playback = (
+                self._is_playing
+                or (now - self._last_playback_time < self.echo_mute_cooldown_s)
+                or not self._play_queue.empty()
+            )
 
-        # Encode to base64 and publish to ROS 2 topic
-        b64_str = base64.b64encode(pcm_24k).decode("ascii")
-        msg = String()
-        msg.data = b64_str
-        self.pub_input_pcm.publish(msg)
+            if not is_active_playback and rms < 400.0:
+                # Continuously adapt ambient background noise floor during quiet periods
+                self._ambient_rms = 0.96 * self._ambient_rms + 0.04 * rms
 
-        self._out_device_name = out_name
-        self._total_enqueued_bytes = 0
-        self._total_played_bytes = 0
-        self._playback_burst_active = False
-        self._burst_start_time = 0.0
+            # Adaptive barge-in threshold derived from ambient noise floor
+            adaptive_barge_in_rms = max(self.barge_in_min_rms, self._ambient_rms * self.barge_in_noise_mult)
+
+            # Software Echo Mute (Zero Self-Hearing):
+            # When Astro is playing voice or within echo cooldown, drop microphone input
+            # unless user intentionally interrupts with distinct acoustic speech energy
+            if is_active_playback:
+                is_genuine_barge_in = (rms >= adaptive_barge_in_rms and peak >= self.barge_in_min_peak)
+                if not is_genuine_barge_in:
+                    return
+
+            # Energy gate: do not stream dead room silence (saves bandwidth and prevents Whisper hallucination)
+            if not is_active_playback and rms < max(65.0, self._ambient_rms * 0.75):
+                return
+
+            # Publish mic level
+            lvl_msg = Float32()
+            lvl_msg.data = float(rms)
+            self.pub_input_level.publish(lvl_msg)
+
+            # Resample 16kHz -> 24kHz for OpenAI Realtime API
+            pcm_24k = resample_16k_to_24k(raw_bytes)
+
+            # Encode to base64 and publish to ROS 2 topic
+            b64_str = base64.b64encode(pcm_24k).decode("ascii")
+            msg = String()
+            msg.data = b64_str
+            self.pub_input_pcm.publish(msg)
+        except Exception as exc:
+            self._callback_exception_count += 1
+            now_cb = time.monotonic()
+            if (now_cb - self._last_cb_err_log_time) > 2.0:
+                self._last_cb_err_log_time = now_cb
+                self.get_logger().error(
+                    f"❌ [Realtime Audio Callback Error]: callback_exception={type(exc).__name__}: {exc} | "
+                    f"callback_exception_count={self._callback_exception_count} | audio_input_alive=True"
+                )
 
     def _on_output_pcm(self, msg: String):
         """Incoming 24kHz PCM audio chunk from OpenAI Realtime API or Fallback TTS (base64)."""
@@ -281,8 +324,11 @@ class AudioStreamNode(Node):
     def _playback_worker(self):
         """Dedicated real-time audio playback loop sending PCM directly to hardware DAC."""
         if sd is None:
+            self._playback_worker_alive = False
+            self._playback_worker_error = "sounddevice_library_missing"
             return
 
+        out_stream = None
         try:
             out_stream = sd.RawOutputStream(
                 samplerate=HW_SAMPLE_RATE,
@@ -293,8 +339,15 @@ class AudioStreamNode(Node):
             )
             out_stream.start()
             self._output_stream = out_stream
+            self._playback_worker_alive = True
+            self._playback_worker_error = "none"
         except Exception as e:
-            self.get_logger().error(f"❌ [Realtime Audio] Çıkış akışı başlatılamadı ({self._out_device_name}): {e}")
+            self._playback_worker_alive = False
+            self._playback_worker_error = f"dac_init_failed: {e}"
+            self.get_logger().error(
+                f"❌ [Realtime Audio] Çıkış akışı başlatılamadı ({self._out_device_name}): {e} | "
+                f"tts_playback_started=False | tts_playback_error={self._playback_worker_error}"
+            )
             return
 
         while not self._stop_event.is_set():
@@ -330,9 +383,14 @@ class AudioStreamNode(Node):
                     )
                 if (time.monotonic() - self._last_playback_time) > 0.35:
                     self._is_playing = False
-            except Exception as e:
+            except Exception as exc:
                 self._is_playing = False
-                self.get_logger().debug(f"Playback write notice: {e}")
+                self._playback_worker_error = f"{type(exc).__name__}: {exc}"
+                self.get_logger().error(
+                    f"❌ [Playback Worker Error]: exception={type(exc).__name__}: {exc} | "
+                    f"tts_playback_started=False | tts_playback_error={self._playback_worker_error}"
+                )
+                time.sleep(0.05)
 
 
 

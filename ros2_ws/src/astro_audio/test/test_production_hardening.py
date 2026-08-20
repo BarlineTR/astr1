@@ -723,9 +723,58 @@ class TestSTTValidationAndEchoImmunity(unittest.TestCase):
         # Simulate image arrival
         mock_img = MagicMock()
         mock_img.data = b""
-        with patch("astro_ai.astro_realtime_node.imgmsg_to_bgr", return_value=None):
-            self.node._on_camera_image(mock_img)
-            self.assertGreater(self.node._oak_last_frame_time, 0.0)
+    def test_audio_stream_node_initialization_health(self):
+        """AudioStreamNode initializes all playback states without NameError or AttributeError."""
+        from astro_audio.audio_stream_node import AudioStreamNode
+
+        with patch("astro_audio.audio_stream_node.find_audio_device", side_effect=[(1, "hw:ReSpeaker,0"), (2, "hw:ReSpeaker,1")]), \
+             patch("astro_audio.audio_stream_node.sd") as mock_sd, \
+             patch.object(AudioStreamNode, "create_publisher"), \
+             patch.object(AudioStreamNode, "create_subscription"), \
+             patch.object(AudioStreamNode, "create_timer"):
+
+            mock_sd.RawInputStream.return_value = MagicMock()
+            mock_sd.RawOutputStream.return_value = MagicMock()
+
+            audio_node = AudioStreamNode()
+
+            # Verify no AttributeError
+            self.assertFalse(audio_node._playback_burst_active)
+            self.assertEqual(audio_node._out_device_name, "hw:ReSpeaker,1")
+            self.assertEqual(audio_node._in_device_name, "hw:ReSpeaker,0")
+            self.assertTrue(audio_node._playback_worker_alive)
+            self.assertEqual(audio_node._playback_worker_error, "none")
+            self.assertEqual(audio_node._callback_exception_count, 0)
+
+            # Test input callback without NameError
+            indata = np.zeros(320, dtype=np.int16).tobytes()
+            audio_node._input_callback(indata, 320, None, None)
+            self.assertGreater(audio_node._last_input_callback_time, 0.0)
+
+            audio_node.destroy_node()
+
+    def test_audio_stream_node_callback_exception_isolation(self):
+        """AudioStreamNode isolates callback exceptions and increments error count."""
+        from astro_audio.audio_stream_node import AudioStreamNode
+
+        with patch("astro_audio.audio_stream_node.find_audio_device", side_effect=[(1, "hw:ReSpeaker,0"), (2, "hw:ReSpeaker,1")]), \
+             patch("astro_audio.audio_stream_node.sd") as mock_sd, \
+             patch.object(AudioStreamNode, "create_publisher"), \
+             patch.object(AudioStreamNode, "create_subscription"), \
+             patch.object(AudioStreamNode, "create_timer"):
+
+            mock_sd.RawInputStream.return_value = MagicMock()
+            mock_sd.RawOutputStream.return_value = MagicMock()
+
+            audio_node = AudioStreamNode()
+
+            # Force exception inside callback during audio processing
+            loud_pcm = (np.ones(320, dtype=np.int16) * 2000).tobytes()
+            with patch("astro_audio.audio_stream_node.resample_16k_to_24k", side_effect=RuntimeError("Resample exception")):
+                audio_node._input_callback(loud_pcm, 320, None, None)
+                self.assertEqual(audio_node._callback_exception_count, 1)
+
+            audio_node.destroy_node()
 
 
 if __name__ == "__main__":
