@@ -457,13 +457,16 @@ def main() -> int:
                     req.get("language") or args.language,
                     req_cond_latent,
                     req_spk_emb,
+                    # İstek JSON'u değer taşıyorsa o kazanır, yoksa başlangıç
+                    # argümanlarına (TTS_XTTS_* ortam değişkenleri) düşülür.
                     temperature=float(req.get("temperature", args.temperature)),
                     length_penalty=float(req.get("length_penalty", args.length_penalty)),
                     repetition_penalty=float(req.get("repetition_penalty", args.repetition_penalty)),
                     top_k=int(req.get("top_k", args.top_k)),
                     top_p=float(req.get("top_p", args.top_p)),
                     speed=float(req.get("speed", args.speed)),
-                    enable_text_splitting=False,  # Sentence chunker already handles splitting
+                    # Sentence chunker already splits, so the client normally sends False here.
+                    enable_text_splitting=bool(req.get("enable_text_splitting", False)),
                 )
             t_infer_end = time.perf_counter()
             gpu_infer_ms = (t_infer_end - t_infer_start) * 1000.0

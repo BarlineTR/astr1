@@ -34,6 +34,7 @@ def generate_launch_description():
     enable_vision = LaunchConfiguration("enable_vision")
     enable_ai = LaunchConfiguration("enable_ai")
     use_native_spatial = LaunchConfiguration("use_native_spatial")
+    camera_source = LaunchConfiguration("camera_source")
 
     return LaunchDescription(
         [
@@ -46,6 +47,11 @@ def generate_launch_description():
                 "use_native_spatial",
                 default_value="false",
                 description="Use 100% Native DepthAI on-chip VPU spatial perception pipeline",
+            ),
+            DeclareLaunchArgument(
+                "camera_source",
+                default_value="oakd",
+                description="Görüntü kaynağı: oakd | webcam | none",
             ),
             DeclareLaunchArgument(
                 "enable_lidar",
@@ -82,6 +88,7 @@ def generate_launch_description():
                 launch_arguments={
                     "use_sim_time": use_sim_time,
                     "use_native_spatial": use_native_spatial,
+                    "source": camera_source,
                 }.items(),
             ),
             IncludeLaunchDescription(

@@ -33,6 +33,45 @@ CUSTOM_MODEL_FILES = {
 OPTIONAL_MODEL_FILES = ("speakers",)
 
 
+def _env_float(name: str, default: float, lo: float, hi: float) -> float:
+    """Reads a float tuning knob from the environment, clamped to the model's valid range."""
+    try:
+        return min(hi, max(lo, float(os.getenv(name, "").strip() or default)))
+    except ValueError:
+        return default
+
+
+def _env_int(name: str, default: int, lo: int, hi: int) -> int:
+    try:
+        return min(hi, max(lo, int(float(os.getenv(name, "").strip() or default))))
+    except ValueError:
+        return default
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.getenv(name, "").strip().lower()
+    if not raw:
+        return default
+    return raw in ("1", "true", "yes", "on", "evet")
+
+
+def load_inference_params() -> Dict[str, Any]:
+    """Builds the XTTS decoder tuning payload from TTS_XTTS_* environment variables.
+
+    These mirror the "Advanced settings" panel of the Coqui XTTS demo UI and are sent
+    with every synthesis request, so editing .env is enough to retune the voice.
+    """
+    return {
+        "temperature": _env_float("TTS_XTTS_TEMPERATURE", 0.75, 0.0, 1.0),
+        "length_penalty": _env_float("TTS_XTTS_LENGTH_PENALTY", 1.0, -10.0, 10.0),
+        "repetition_penalty": _env_float("TTS_XTTS_REPETITION_PENALTY", 5.0, 1.0, 10.0),
+        "top_k": _env_int("TTS_XTTS_TOP_K", 50, 1, 100),
+        "top_p": _env_float("TTS_XTTS_TOP_P", 0.85, 0.0, 1.0),
+        "speed": _env_float("TTS_XTTS_SPEED", 1.05, 0.5, 2.0),
+        "enable_text_splitting": _env_bool("TTS_XTTS_TEXT_SPLITTING", False),
+    }
+
+
 class XttsError(RuntimeError):
     """Worker failed to start or synthesis failed."""
 
@@ -81,6 +120,7 @@ class XttsClient:
         self._lifecycle_lock = threading.Lock()
         self._req_id = 0
         self._current_gen_id = 0
+        self.inference_params = load_inference_params()
 
     def _safe_log(self, lvl: str, msg: str) -> None:
         """Safely dispatches log message without letting ROS2 severity context errors bubble up."""
@@ -435,6 +475,7 @@ class XttsClient:
                 "out": os.path.abspath(str(out_path)) if out_path else "",
                 "return_pcm": return_pcm,
                 "language": language or self.language,
+                **self.inference_params,
             }
 
             try:

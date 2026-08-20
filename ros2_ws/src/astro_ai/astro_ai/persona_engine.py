@@ -126,6 +126,22 @@ ROBOT_TOOLS = [
 ]
 
 
+TURKISH_CHARS = set("çğıöşüÇĞİÖŞÜ")
+# Sözcük sınırlı arama: düz alt dize kontrolü ("ve" in "seven") İngilizce akıl
+# yürütme satırlarını Türkçe sanabiliyordu.
+_TURKISH_HINT_RE = re.compile(
+    r"\b(?:sen|ben|merhaba|selam|evet|hayır|nasıl|neden|kim|nerede|burada|görüyorum|"
+    r"bakıyorsun|tamam|güzel|efendim|kral|kardeşim|hocam|abi|abla|usta|güzellik|"
+    r"bir|ve|ile|için|çok|var|yok)\b",
+    re.IGNORECASE,
+)
+
+
+def _looks_turkish(line: str) -> bool:
+    """Satır seslendirilecek Türkçe bir cümle mi, yoksa model akıl yürütmesi mi?"""
+    return any(c in line for c in TURKISH_CHARS) or bool(_TURKISH_HINT_RE.search(line))
+
+
 def extract_spoken_turkish_sentence(raw_text: str) -> str:
     """Aggressively strips English reasoning chains, thought tags, and quotes."""
     if not raw_text:
@@ -156,17 +172,12 @@ def extract_spoken_turkish_sentence(raw_text: str) -> str:
     if not clean_lines:
         return ""
 
-    turkish_chars = set("çğıöşüÇĞİÖŞÜ")
-    for l in reversed(clean_lines):
-        if any(c in l for c in turkish_chars) or any(
-            w in l.lower()
-            for w in [
-                "sen", "ben", "merhaba", "selam", "evet", "hayır", "nasıl", "neden", "kim",
-                "nerede", "burada", "görüyorum", "bakıyorsun", "tamam", "güzel", "efendim",
-                "kral", "kardeşim", "hocam", "abi", "abla", "usta", "güzellik", "bir", "ve", "ile", "için", "çok", "var", "yok"
-            ]
-        ):
-            return l.strip('"\': ')
+    # Konuşulacak satırların HEPSİ döndürülür. Eskiden yalnızca sondan ilk eşleşen
+    # satır dönüyordu; çok satırlı bir cevabın ("Merhaba Cevdet Bey!\nSeni tekrar
+    # görmek güzel...") baş tarafı sessizce düşüyordu.
+    spoken = [l.strip('"\': ') for l in clean_lines if _looks_turkish(l)]
+    if spoken:
+        return " ".join(spoken).strip()
 
     last_line = clean_lines[-1].strip('"\': ')
     if any(p in last_line.lower() for p in ["thinking", "process", "here's", "thought", "analysis"]):

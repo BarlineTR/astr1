@@ -59,6 +59,7 @@ def generate_launch_description():
     enable_audio = LaunchConfiguration("enable_audio")
     enable_vision = LaunchConfiguration("enable_vision")
     enable_ai = LaunchConfiguration("enable_ai")
+    camera_source = LaunchConfiguration("camera_source")
 
     return LaunchDescription(
         _dotenv_launch_actions()
@@ -94,6 +95,11 @@ def generate_launch_description():
                 description="Start OAK-D camera and face detector",
             ),
             DeclareLaunchArgument(
+                "camera_source",
+                default_value="oakd",
+                description="Görüntü kaynağı: oakd | webcam | none",
+            ),
+            DeclareLaunchArgument(
                 "enable_ai",
                 default_value="true",
                 description="Start AI Brain for NLP processing",
@@ -122,6 +128,7 @@ def generate_launch_description():
                     "enable_audio": enable_audio,
                     "enable_vision": enable_vision,
                     "enable_ai": enable_ai,
+                    "camera_source": camera_source,
                 }.items(),
             ),
         ]
