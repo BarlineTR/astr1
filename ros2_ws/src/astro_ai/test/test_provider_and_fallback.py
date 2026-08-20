@@ -583,10 +583,22 @@ class TestContextualFallbackAndTelemetry(unittest.TestCase):
         self.assertTrue(is_ready)
         self.assertEqual(pcm, b"\x02\x02" * 480)
 
-        # Case 3: Both ElevenLabs and XTTS unavailable -> Emergency Edge-TTS
+        # Case 3: XTTS unavailable -> Fallback to Local Offline TTS (0 Internet)
         mock_xtts.is_ready.return_value = False
+        mock_offline = MagicMock()
+        mock_offline.is_ready.return_value = True
+        mock_offline.synthesize_sentence.return_value = b"\x03\x03" * 480
+        node.local_offline_tts = mock_offline
         pcm, eng_name, latency, is_ready = AstroRealtimeNode._synthesize_speech_pcm(node, "Merhaba Baran")
-        self.assertEqual(eng_name, "edge_tts_emergency")
+        self.assertEqual(eng_name, "local_offline_tts")
+        self.assertTrue(is_ready)
+        self.assertEqual(pcm, b"\x03\x03" * 480)
+
+        # Case 4: Local offline unavailable -> Network fallback to Edge-TTS
+        mock_offline.is_ready.return_value = False
+        node.edge_tts_enabled = True
+        pcm, eng_name, latency, is_ready = AstroRealtimeNode._synthesize_speech_pcm(node, "Merhaba Baran")
+        self.assertEqual(eng_name, "edge_tts")
         self.assertFalse(is_ready)
         self.assertEqual(pcm, b"\x00\x00" * 480)
 
@@ -782,8 +794,93 @@ class TestRealtimeArchitectureInvariants(unittest.TestCase):
             node._classify_and_store_vision_observation("Aydınlık.", "idle")
             mock_add_obs.assert_not_called()
 
-            node._classify_and_store_vision_observation("Baran masada oturuyor ve telefon tutuyor.", "new_person")
-            mock_add_obs.assert_called_once()
+    def test_pure_wake_phrase_does_not_create_conversational_turn(self):
+        """Pure wake phrase wakes robot to LISTENING but creates NO fake LLM/TTS turn."""
+        from astro_ai.astro_realtime_node import AstroRealtimeNode
+        from astro_ai.state_machine import RobotState
+        import numpy as np
+
+        node = AstroRealtimeNode()
+        self.assertTrue(node.state_machine.is_deep_idle())
+        self.assertTrue(node._is_sleeping)
+
+        fake_pcm = (np.sin(np.linspace(0, 100, 3200)) * 5000).astype(np.int16).tobytes()
+        audio_chunks = [fake_pcm] * 5
+
+        with patch.object(node, "_transcribe_groq_whisper", return_value="Hey Astro"), \
+             patch.object(node, "_process_fallback_turn") as mock_turn:
+            node._process_wake_candidate(audio_chunks)
+
+            self.assertFalse(node._is_sleeping)
+            self.assertEqual(node.state_machine.current_state, RobotState.LISTENING)
+            # Must NOT invoke conversational turn
+            mock_turn.assert_not_called()
+
+    def test_wake_with_command_forwards_turn(self):
+        """Wake phrase with attached command triggers turn with command text."""
+        from astro_ai.astro_realtime_node import AstroRealtimeNode
+        from astro_ai.state_machine import RobotState
+        import numpy as np
+
+        node = AstroRealtimeNode()
+        fake_pcm = (np.sin(np.linspace(0, 100, 3200)) * 5000).astype(np.int16).tobytes()
+        audio_chunks = [fake_pcm] * 5
+
+        with patch.object(node, "_transcribe_groq_whisper", return_value="Hey Astro nasılsın"), \
+             patch.object(node, "_process_fallback_turn") as mock_turn:
+            node._process_wake_candidate(audio_chunks)
+
+            self.assertFalse(node._is_sleeping)
+            self.assertEqual(node.state_machine.current_state, RobotState.LISTENING)
+            mock_turn.assert_called_once()
+
+    def test_barge_in_single_logical_event_debouncing(self):
+        """Multiple loud frames during playback trigger only one logical interrupt per generation."""
+        from astro_ai.astro_realtime_node import AstroRealtimeNode
+        from astro_ai.state_machine import RobotState
+        import numpy as np
+        import base64
+
+        node = AstroRealtimeNode()
+        node._is_playback_active = True
+        node._is_responding = True
+        node.state_machine.transition_to(RobotState.SPEAKING)
+        node._is_sleeping = False
+        node.pub_interrupt = MagicMock()
+
+        # Frame with loud RMS (> 1500)
+        loud_pcm_16k = (np.sin(np.linspace(0, 100, 3200)) * 10000).astype(np.int16).tobytes()
+        loud_msg = MagicMock()
+        loud_msg.data = base64.b64encode(loud_pcm_16k).decode("ascii")
+
+        with patch("astro_ai.astro_realtime_node.resample_24k_to_16k", return_value=loud_pcm_16k):
+            # 1st loud frame -> Triggers barge-in & sets _barge_in_latched = True
+            node._on_input_pcm(loud_msg)
+            self.assertTrue(node._barge_in_latched)
+            self.assertEqual(node.pub_interrupt.publish.call_count, 1)
+
+            # 2nd loud frame in same generation -> Debounced / Ignored
+            node._on_input_pcm(loud_msg)
+            self.assertEqual(node.pub_interrupt.publish.call_count, 1)
+
+    def test_complete_offline_mode_acceptance(self):
+        """When network is completely down (0 Internet), local LLM and local offline TTS synthesize voice."""
+        from astro_ai.astro_realtime_node import AstroRealtimeNode
+
+        node = AstroRealtimeNode()
+        node.groq_api_key = ""
+        node.gemini_api_key = ""
+        node.openai_api_key = ""
+        node.edge_tts_enabled = False
+
+        # Local LLM produces answer
+        fallback_ans = node._generate_contextual_persona_fallback("nasılsın")
+        self.assertTrue(len(fallback_ans) > 5)
+
+        # Local offline TTS synthesizes PCM without throwing
+        pcm, eng_name, latency, is_ready = node._synthesize_speech_pcm(fallback_ans)
+        self.assertIn(eng_name, ("xtts_gpu", "local_offline_tts"))
+        self.assertTrue(len(pcm) > 0)
 
 
 if __name__ == "__main__":

@@ -187,14 +187,24 @@ class XttsClient:
                 for key, flag in (("checkpoint", "--checkpoint"), ("config", "--config"),
                                   ("vocab", "--vocab"), ("speakers", "--speakers")):
                     if self.custom_model.get(key):
-                        cmd += [flag, self.custom_model[key]]
+                        cmd += [flag, str(self.custom_model[key])]
+
+            self._cmd = cmd
+            self._stderr_lines = []
 
             env = os.environ.copy()
-            env["PYTHONPATH"] = ""
+            # Preserve system CUDA paths for Jetson Orin Nano
+            pkg_dir = str(Path(__file__).parent.parent)
+            env["PYTHONPATH"] = pkg_dir + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
             env["PYTHONNOUSERSITE"] = "1"
             env["COQUI_TOS_AGREED"] = "1"
             env["PATH"] = f"{self.python_path.parent}{os.pathsep}{env.get('PATH', '')}"
             env["VIRTUAL_ENV"] = str(self.python_path.parent.parent)
+
+            # Preserve CUDA and Torch library locations
+            cuda_lib = "/usr/local/cuda/lib64"
+            if os.path.exists(cuda_lib):
+                env["LD_LIBRARY_PATH"] = cuda_lib + (os.pathsep + env.get("LD_LIBRARY_PATH", "") if env.get("LD_LIBRARY_PATH") else "")
 
             self._ready.clear()
             self._startup_error = None
@@ -241,15 +251,38 @@ class XttsClient:
         for line in self.proc.stderr:
             line = line.rstrip("\n")
             if line.strip():
-                self._log("debug", f"[xtts:err] {line}")
+                self._stderr_lines.append(line)
+                if len(self._stderr_lines) > 200:
+                    self._stderr_lines = self._stderr_lines[-200:]
+                self._safe_log("debug", f"[xtts:err] {line}")
 
     def wait_ready(self, timeout: float = 180.0) -> Dict[str, Any]:
         if not self._ready.wait(timeout):
-            raise XttsError(f"XTTS did not become ready in {timeout:.0f}s")
+            stderr_snippet = "\n".join(self._stderr_lines[-20:]) if self._stderr_lines else "None"
+            raise XttsError(f"XTTS did not become ready in {timeout:.0f}s. Stderr: {stderr_snippet}")
         if self._startup_error:
-            raise XttsError(f"XTTS startup failed: {self._startup_error}")
+            stderr_snippet = "\n".join(self._stderr_lines[-20:]) if self._stderr_lines else "None"
+            raise XttsError(f"XTTS startup failed: {self._startup_error}. Stderr: {stderr_snippet}")
         if not self.info:
-            raise XttsError(f"XTTS worker exited unexpectedly (code {self.returncode})")
+            code = self.returncode
+            stderr_snippet = "\n".join(self._stderr_lines[-30:]) if self._stderr_lines else "None"
+            cmd_str = " ".join(getattr(self, "_cmd", []))
+            self._safe_log(
+                "error",
+                f"🚨 [XTTS Worker Crash Diagnostics]:\n"
+                f"  exit_code={code}\n"
+                f"  argv={cmd_str}\n"
+                f"  cwd={self.home}\n"
+                f"  python_path={self.python_path}\n"
+                f"  checkpoint={self.custom_model.get('checkpoint') if self.custom_model else 'default'}\n"
+                f"  config={self.custom_model.get('config') if self.custom_model else 'default'}\n"
+                f"  vocab={self.custom_model.get('vocab') if self.custom_model else 'default'}\n"
+                f"  speakers={self.custom_model.get('speakers') if self.custom_model else 'default'}\n"
+                f"  speaker_wav={self.speaker_wav}\n"
+                f"  startup_error={self._startup_error}\n"
+                f"  stderr:\n{stderr_snippet}"
+            )
+            raise XttsError(f"XTTS worker exited unexpectedly (code {code}):\n{stderr_snippet}")
         return self.info
 
     @property

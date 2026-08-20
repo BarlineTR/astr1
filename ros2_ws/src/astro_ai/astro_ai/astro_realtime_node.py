@@ -62,12 +62,14 @@ except ImportError:
 try:
     from astro_audio.elevenlabs_engine import ElevenLabsEngine, ElevenLabsError
     from astro_audio.local_xtts_engine import LocalXttsEngine, resolve_xtts_home, resolve_xtts_speaker_wav
+    from astro_audio.local_offline_tts_engine import LocalOfflineTTSEngine
     from astro_audio.tts_metrics import TurnTelemetry
     from astro_audio.sentence_chunker import SentenceChunker
 except ImportError:
     ElevenLabsEngine = None
     ElevenLabsError = Exception
     LocalXttsEngine = None
+    LocalOfflineTTSEngine = None
     resolve_xtts_home = lambda h="": os.path.expanduser("~/.astro/tts")
     resolve_xtts_speaker_wav = lambda w="": os.path.expanduser("~/.astro/tts/Recording.wav")
     TurnTelemetry = None
@@ -424,6 +426,21 @@ class AstroRealtimeNode(Node):
                 threading.Thread(target=self._start_local_xtts_background, daemon=True).start()
             except Exception as e:
                 self.get_logger().warn(f"⚠️ [Astro Realtime] Local XTTS GPU hazırlık uyarısı: {e}")
+
+        # Local Offline Backup TTS Engine (Zero internet local resilience fallback)
+        self.local_offline_tts: Optional[LocalOfflineTTSEngine] = None
+        if LocalOfflineTTSEngine:
+            try:
+                self.local_offline_tts = LocalOfflineTTSEngine(
+                    language=os.getenv("TTS_LANGUAGE", "tr"),
+                    logger=self._safe_log,
+                )
+            except Exception as e:
+                self.get_logger().debug(f"LocalOfflineTTSEngine notice: {e}")
+
+        # Generation-level Barge-In Debounce State
+        self._barge_in_latched = False
+        self.edge_tts_enabled = os.getenv("EDGE_TTS_ENABLED", "true").lower() in ("1", "true", "yes")
 
         # Camera Perception Frame Cache
         self._latest_camera_frame: Optional[np.ndarray] = None
@@ -1582,27 +1599,28 @@ class AstroRealtimeNode(Node):
         vad_confidence = round(min(1.0, total_rms / 600.0), 2)
 
         if is_wake_pattern or has_high_energy_speech:
-            self._wake_up()
-
-            self.get_logger().info(
-                f"⚡ [Wake Telemetry]: wake_detector_active=True | wake_candidate=\"{transcript}\" | "
-                f"wake_confidence={wake_confidence:.2f} | vad_confidence={vad_confidence:.2f} | "
-                f"stt_started=True | stt_finished=True | transcript=\"{transcript}\" | "
-                f"conversation_turn_created=True | llm_started=True | tts_started=True"
-            )
-
-            # If user spoke a wake word with an attached question/command (e.g. "Hey Astro hava nasıl?")
             words = t_clean.split()
-            is_only_wake_word = len(words) <= 2 and is_wake_pattern
+            pure_wake_patterns = ["hey astro", "astro", "hey", "lan", "alo", "selam"]
+            is_only_wake_word = (t_clean in pure_wake_patterns or (len(words) <= 2 and any(wp in t_clean for wp in pure_wake_patterns)))
+
             if is_only_wake_word:
-                # Play brief responsive acknowledgment
-                p = self.persona_name.lower()
-                ack_text = "Dinliyorum lan, ne var?" if "kufurbaz" in p else "Buradayım, seni dinliyorum."
-                pcm, eng, _, _ = self._synthesize_speech_pcm(ack_text)
-                if pcm:
-                    self._play_pcm_chunks(pcm)
+                # Pure Wake Phrase: Wakes robot up, flushes buffers, transitions to LISTENING. NO fake LLM turn!
+                self._wake_up()
+                self.get_logger().info(
+                    f"⚡ [Wake Telemetry]: wake_detector_active=True | wake_candidate=\"{transcript}\" | "
+                    f"wake_confidence={wake_confidence:.2f} | vad_confidence={vad_confidence:.2f} | "
+                    f"stt_started=True | stt_finished=True | transcript=\"{transcript}\" | "
+                    f"wake_only=True | conversation_turn_created=False | llm_started=False | tts_started=False"
+                )
             else:
-                # Forward full turn
+                # Wake + Attached Command (e.g. "Hey Astro hava nasıl?"): Strip wake phrase and forward command
+                self._wake_up()
+                self.get_logger().info(
+                    f"⚡ [Wake Telemetry]: wake_detector_active=True | wake_candidate=\"{transcript}\" | "
+                    f"wake_confidence={wake_confidence:.2f} | vad_confidence={vad_confidence:.2f} | "
+                    f"stt_started=True | stt_finished=True | transcript=\"{transcript}\" | "
+                    f"wake_only=False | conversation_turn_created=True | llm_started=True | tts_started=True"
+                )
                 if self._fallback_mode or not self._is_connected:
                     threading.Thread(target=self._process_fallback_turn, args=(audio_chunks,), daemon=True).start()
         else:
@@ -2403,7 +2421,7 @@ class AstroRealtimeNode(Node):
         if not clean_text:
             return b"", "none", 0.0, False
 
-        # 1. Primary Remote TTS: ElevenLabs Flash v2.5 (Low-latency ~75ms, native Turkish support)
+        # 1. Primary Remote TTS: ElevenLabs Flash v2.5 (Only if configured and ready)
         if self.elevenlabs_engine and self.elevenlabs_engine.is_ready():
             try:
                 t_s = time.perf_counter()
@@ -2414,22 +2432,40 @@ class AstroRealtimeNode(Node):
             except Exception as e:
                 self.get_logger().warn(f"⚠️ [ElevenLabs Failover] XTTS GPU'ya düşülüyor: {e}")
 
-        # 2. Local GPU Fallback: Local Coqui XTTS on CUDA GPU (Resident & Warm, TTFA < 500ms)
+        # 2. Primary Local GPU Engine: Fine-tuned Coqui XTTS on CUDA GPU (Resident & Warm, TTFA < 500ms)
         is_xtts_ready = bool(self.local_xtts and self.local_xtts.is_ready())
         if is_xtts_ready:
-            t_s = time.perf_counter()
-            pcm = self.local_xtts.synthesize_sentence(clean_text, generation_id=self._fallback_generation_id)
-            gpu_ms = (time.perf_counter() - t_s) * 1000.0
-            if pcm:
-                return pcm, "xtts_gpu", gpu_ms, True
+            try:
+                t_s = time.perf_counter()
+                pcm = self.local_xtts.synthesize_sentence(clean_text, generation_id=self._fallback_generation_id)
+                gpu_ms = (time.perf_counter() - t_s) * 1000.0
+                if pcm:
+                    return pcm, "xtts_gpu", gpu_ms, True
+            except Exception as e:
+                self.get_logger().warn(f"⚠️ [XTTS GPU Failover] Yerel yedek TTS'e düşülüyor: {e}")
 
-        # 3. EMERGENCY Fallback: Edge-TTS In-Memory PCM24k (ONLY if both ElevenLabs & XTTS unavailable)
-        reason = "elevenlabs_and_xtts_unavailable"
-        if self.elevenlabs_engine and not self.elevenlabs_engine.is_ready():
-            reason = "elevenlabs_cooldown_and_xtts_not_ready"
-        self.get_logger().warn(f"🚨 [EDGE_EMERGENCY_FALLBACK] Acil durum ses motoru (Edge-TTS) kullanılıyor ({reason}).")
-        pcm_edge = self._synthesize_edge_tts_pcm24k(clean_text)
-        return pcm_edge, "edge_tts_emergency", 0.0, False
+        # 3. Local Offline Backup TTS Engine (Zero internet local resilience fallback)
+        if self.local_offline_tts and self.local_offline_tts.is_ready():
+            try:
+                t_s = time.perf_counter()
+                pcm_loc = self.local_offline_tts.synthesize_sentence(clean_text, generation_id=self._fallback_generation_id)
+                loc_ms = (time.perf_counter() - t_s) * 1000.0
+                if pcm_loc:
+                    return pcm_loc, "local_offline_tts", loc_ms, True
+            except Exception as e:
+                self.get_logger().warn(f"⚠️ [Local Offline TTS Failover]: {e}")
+
+        # 4. Optional Network Fallback: Edge-TTS In-Memory PCM24k (Network required)
+        if getattr(self, "edge_tts_enabled", True):
+            try:
+                self.get_logger().warn("🚨 [EDGE_NETWORK_FALLBACK] İsteğe bağlı ağ ses motoru (Edge-TTS) kullanılıyor.")
+                pcm_edge = self._synthesize_edge_tts_pcm24k(clean_text)
+                if pcm_edge:
+                    return pcm_edge, "edge_tts", 0.0, False
+            except Exception as e:
+                self.get_logger().debug(f"Edge-TTS notice: {e}")
+
+        return b"", "none", 0.0, False
 
     def _play_pcm_chunks(self, pcm_data: bytes):
         """Streams 24kHz int16 PCM audio chunks directly to audio output node with smooth 20ms pacing."""
@@ -2453,6 +2489,7 @@ class AstroRealtimeNode(Node):
         self._is_processing_fallback = True
         self._is_responding = True
         self._fallback_generation_id += 1
+        self._barge_in_latched = False  # Reset single logical barge-in debounce for new turn
         t_turn_start = time.monotonic()
         chosen_model = "none"
         chosen_provider = "none"
@@ -2558,14 +2595,23 @@ class AstroRealtimeNode(Node):
             if self.elevenlabs_engine and self.elevenlabs_engine.is_ready():
                 turn_tts_engine = "elevenlabs"
                 tts_ready_flag = True
+                tts_mode_str = "remote_cloud"
             elif self.local_xtts and self.local_xtts.is_ready():
                 turn_tts_engine = "xtts_gpu"
                 tts_ready_flag = True
-            else:
-                turn_tts_engine = "edge_tts_emergency"
+                tts_mode_str = "local_gpu"
+            elif self.local_offline_tts and self.local_offline_tts.is_ready():
+                turn_tts_engine = "local_offline_tts"
+                tts_ready_flag = True
+                tts_mode_str = "local_offline"
+            elif getattr(self, "edge_tts_enabled", True):
+                turn_tts_engine = "edge_tts"
                 tts_ready_flag = False
-                xtts_state = "starting" if (self.local_xtts and getattr(self.local_xtts.client, "is_alive", False)) else "not_ready"
-                self.get_logger().info(f"ℹ️ [TTS Routing] Turn #{self._fallback_generation_id} TTS: edge_tts_emergency (XTTS: {xtts_state})")
+                tts_mode_str = "network"
+            else:
+                turn_tts_engine = "none"
+                tts_ready_flag = False
+                tts_mode_str = "none"
 
             active_engine = turn_tts_engine
 
@@ -2582,11 +2628,22 @@ class AstroRealtimeNode(Node):
                     except Exception:
                         pass
                 elif turn_tts_engine == "xtts_gpu" and self.local_xtts and self.local_xtts.is_ready():
-                    t_s = time.perf_counter()
-                    pcm_res = self.local_xtts.synthesize_sentence(clean_text, generation_id=self._fallback_generation_id)
-                    ms = (time.perf_counter() - t_s) * 1000.0
-                    return pcm_res, ms, ms
-                # Fallback to in-memory Edge-TTS without logging repeated warnings
+                    try:
+                        t_s = time.perf_counter()
+                        pcm_res = self.local_xtts.synthesize_sentence(clean_text, generation_id=self._fallback_generation_id)
+                        ms = (time.perf_counter() - t_s) * 1000.0
+                        return pcm_res, ms, ms
+                    except Exception:
+                        pass
+                elif turn_tts_engine == "local_offline_tts" and self.local_offline_tts and self.local_offline_tts.is_ready():
+                    try:
+                        t_s = time.perf_counter()
+                        pcm_res = self.local_offline_tts.synthesize_sentence(clean_text, generation_id=self._fallback_generation_id)
+                        ms = (time.perf_counter() - t_s) * 1000.0
+                        return pcm_res, ms, 0.0
+                    except Exception:
+                        pass
+                # Network fallback to in-memory Edge-TTS
                 t_s = time.perf_counter()
                 pcm_res = self._synthesize_edge_tts_pcm24k(clean_text)
                 ms = (time.perf_counter() - t_s) * 1000.0
@@ -2808,15 +2865,23 @@ class AstroRealtimeNode(Node):
                 if active_engine == "elevenlabs":
                     tts_model_name = self.elevenlabs_engine.model_id if self.elevenlabs_engine else "eleven_flash_v2_5"
                     tts_voice_name = self.elevenlabs_engine.voice_id if self.elevenlabs_engine else "configured"
+                    tts_mode_val = "remote_cloud"
                 elif active_engine == "xtts_gpu":
                     tts_model_name = "xtts_finetuned" if xtts_info.get("is_finetuned") else "xtts_v2"
                     tts_voice_name = xtts_info.get("xtts_reference_wav", self.local_xtts.speaker_wav if self.local_xtts else "reference.wav")
-                elif active_engine == "edge_tts_emergency":
+                    tts_mode_val = "local_gpu"
+                elif active_engine == "local_offline_tts":
+                    tts_model_name = getattr(self.local_offline_tts, "_mode", "local_offline") if self.local_offline_tts else "local_offline"
+                    tts_voice_name = "local_offline_synth"
+                    tts_mode_val = "local_offline"
+                elif active_engine == "edge_tts":
                     tts_model_name = "edge_tts"
                     tts_voice_name = "tr-TR-AhmetNeural"
+                    tts_mode_val = "network"
                 else:
                     tts_model_name = "none"
                     tts_voice_name = "none"
+                    tts_mode_val = "none"
 
                 worker_pid = xtts_info.get("worker_pid", "None")
                 gpu_name_str = xtts_info.get("gpu_name", "Orin")
@@ -2833,7 +2898,7 @@ class AstroRealtimeNode(Node):
                     f"model={chosen_model} | llm_status={llm_status} | speaker={speaker_log_val} | "
                     f"speaker_confidence={spk_score:.2f} | speaker_source={spk_source} | stt_ms={int(stt_ms)} | "
                     f"llm_ttft_ms={ttft_str} | llm_first_clause_ms={first_clause_str} | "
-                    f"llm_total_ms={int(llm_latency_ms)} | tts_provider={active_engine} | "
+                    f"llm_total_ms={int(llm_latency_ms)} | tts_provider={active_engine} | tts_mode={tts_mode_val} | "
                     f"tts_model={tts_model_name} | tts_voice={tts_voice_name} | "
                     f"xtts_checkpoint={xtts_ckpt_str} | xtts_sha256={xtts_sha_short} | "
                     f"tts_ready={tts_ready_flag} | tts_first_audio_ms={int(first_audio_ms)} | "
@@ -2942,6 +3007,11 @@ class AstroRealtimeNode(Node):
                 self.self_voice_rejection_count += 1
                 return
             else:
+                # Barge-In debounce: Only one logical barge-in per generation
+                if self._barge_in_latched:
+                    return
+                self._barge_in_latched = True
+
                 # Genuine User Barge-In during Playback!
                 self.state_machine.transition_to(RobotState.INTERRUPTED)
                 self._is_responding = False
@@ -2955,6 +3025,8 @@ class AstroRealtimeNode(Node):
                     self.elevenlabs_engine.cancel(self._fallback_generation_id)
                 if self.local_xtts:
                     self.local_xtts.cancel(self._fallback_generation_id)
+                if self.local_offline_tts:
+                    self.local_offline_tts.cancel(self._fallback_generation_id)
                 int_msg = Bool()
                 int_msg.data = True
                 self.pub_interrupt.publish(int_msg)

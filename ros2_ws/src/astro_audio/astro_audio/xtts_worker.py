@@ -79,6 +79,8 @@ def main() -> int:
         except Exception as e:
             return f"error:{e}"
 
+    import traceback
+
     # 1. Dependency Imports & PyTorch 2.6+ Compatibility Monkeypatch
     try:
         import soundfile as sf
@@ -97,7 +99,10 @@ def main() -> int:
 
         from TTS.api import TTS
     except Exception as exc:
-        emit({"event": "error", "stage": "import", "message": f"Import failed: {type(exc).__name__}: {exc}"})
+        tb = traceback.format_exc()
+        sys.stderr.write(f"[XTTS Worker Import Exception]:\n{tb}\n")
+        sys.stderr.flush()
+        emit({"event": "error", "stage": "import", "message": f"Import failed: {type(exc).__name__}: {exc}", "traceback": tb})
         return 1
 
     # 2. Strict CUDA Validation
@@ -106,15 +111,17 @@ def main() -> int:
         device = "cuda" if torch.cuda.is_available() else "cpu"
 
     if device == "cuda" and not torch.cuda.is_available():
-        emit({
-            "event": "error",
-            "stage": "device",
-            "message": "CUDA is requested but torch.cuda.is_available() is False. Refusing silent CPU fallback!"
-        })
+        msg = "CUDA is requested but torch.cuda.is_available() is False. Refusing silent CPU fallback!"
+        sys.stderr.write(f"[XTTS Worker Device Error]: {msg}\n")
+        sys.stderr.flush()
+        emit({"event": "error", "stage": "device", "message": msg})
         return 1
 
     if not os.path.exists(args.speaker_wav):
-        emit({"event": "error", "stage": "speaker", "message": f"Speaker reference audio not found: {args.speaker_wav}"})
+        msg = f"Speaker reference audio not found: {args.speaker_wav}"
+        sys.stderr.write(f"[XTTS Worker Speaker Error]: {msg}\n")
+        sys.stderr.flush()
+        emit({"event": "error", "stage": "speaker", "message": msg})
         return 1
 
     # 3. Model Loading & GPU Residency
@@ -125,20 +132,49 @@ def main() -> int:
             from TTS.tts.configs.xtts_config import XttsConfig
             from TTS.tts.models.xtts import Xtts
 
+            ckpt_dir = os.path.dirname(os.path.abspath(args.checkpoint))
+
+            # Auto-resolve config path if omitted
+            cfg_path = args.config_path
+            if not cfg_path or not os.path.exists(cfg_path):
+                cand_cfg = os.path.join(ckpt_dir, "config.json")
+                if os.path.exists(cand_cfg):
+                    cfg_path = cand_cfg
+
+            if not cfg_path or not os.path.exists(cfg_path):
+                raise FileNotFoundError(f"XTTS config.json not found for checkpoint: {args.checkpoint}")
+
+            # Auto-resolve vocab path if omitted
+            vocab_path = args.vocab
+            if not vocab_path or not os.path.exists(vocab_path):
+                cand_vocab = os.path.join(ckpt_dir, "vocab.json")
+                if os.path.exists(cand_vocab):
+                    vocab_path = cand_vocab
+
+            # Auto-resolve speakers path if omitted
+            speakers_path = args.speakers
+            if not speakers_path or not os.path.exists(speakers_path):
+                cand_spk = os.path.join(ckpt_dir, "speakers_xtts.pth")
+                if os.path.exists(cand_spk):
+                    speakers_path = cand_spk
+
             config = XttsConfig()
-            config.load_json(args.config_path)
+            config.load_json(cfg_path)
             model = Xtts.init_from_config(config)
             model.load_checkpoint(
                 config,
                 checkpoint_path=args.checkpoint,
-                vocab_path=args.vocab,
-                speaker_file_path=args.speakers,
+                vocab_path=vocab_path,
+                speaker_file_path=speakers_path,
                 eval=True,
                 use_deepspeed=False,
             )
             model.to(device)
             model_label = args.checkpoint
             checkpoint_sha = compute_file_sha256(args.checkpoint)
+            args.config_path = cfg_path
+            args.vocab = vocab_path
+            args.speakers = speakers_path
         else:
             tts = TTS(args.model).to(device)
             model = tts.synthesizer.tts_model
@@ -185,7 +221,10 @@ def main() -> int:
             t_warmup_ms = (time.perf_counter() - t_w_start) * 1000.0
 
     except Exception as exc:
-        emit({"event": "error", "stage": "load", "message": f"Model load failed: {type(exc).__name__}: {exc}"})
+        tb = traceback.format_exc()
+        sys.stderr.write(f"[XTTS Worker Load Exception]:\n{tb}\n")
+        sys.stderr.flush()
+        emit({"event": "error", "stage": "load", "message": f"Model load failed: {type(exc).__name__}: {exc}", "traceback": tb})
         return 1
 
     t_load_ms = (time.perf_counter() - t_load_start) * 1000.0
