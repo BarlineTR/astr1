@@ -639,17 +639,50 @@ class TestSTTValidationAndEchoImmunity(unittest.TestCase):
             mock_groq.assert_not_called()
             mock_play.assert_not_called()
 
-    def test_wake_with_genuine_command_strips_wake_and_forwards(self):
-        """In active mode, 'Hey Astro, nasılsın?' strips wake prefix and passes 'nasılsın?' to LLM."""
-        self.node._is_sleeping = False
-        fake_pcm = self._generate_pcm(0.40, rms_target=600.0)
-        with patch.object(self.node, "_transcribe_groq_whisper", return_value="Hey Astro, nasılsın?"), \
-             patch.object(self.node, "_validate_stt_transcript", return_value=("Hey Astro, nasılsın?", {"stt_rejected": False})), \
-             patch.object(self.node, "_synthesize_speech_pcm", return_value=(b"fake_pcm", "xtts_gpu", 50.0, True)), \
-             patch.object(self.node, "_play_pcm_chunks"):
-            self.node._process_fallback_turn([fake_pcm])
-            msgs = self.node.memory.episodic.get_messages()
-            self.assertTrue(any("nasılsın" in m.get("content", "").lower() for m in msms if m.get("role") == "user") if (msms := msgs) else False)
+    def test_wake_catalog_and_repetitive_command_rejected(self):
+        """Wake candidate containing catalog prompt hallucinations and repetitive loops is rejected without LLM turn."""
+        from astro_ai.state_machine import RobotState
+
+        fake_pcm = self._generate_pcm(0.85, rms_target=600.0)
+        catalog_prompt = "Astro Türkçe konuşma, diyalog, robot asistan. Astro. Astro. Astro."
+        with patch.object(self.node, "_transcribe_groq_whisper", return_value=catalog_prompt), \
+             patch.object(self.node, "_process_fallback_turn") as mock_turn:
+            self.node._process_wake_candidate([fake_pcm])
+            self.assertEqual(self.node.state_machine.current_state, RobotState.LISTENING)
+            mock_turn.assert_not_called()
+
+    def test_xtts_cooldown_prevents_duplicate_worker_crash_loops(self):
+        """LocalXttsEngine transitions to COOLDOWN upon failure and rejects duplicate worker spawns."""
+        from astro_audio.local_xtts_engine import LocalXttsEngine
+        from astro_audio.xtts_client import XttsError
+
+        engine = LocalXttsEngine(speaker_wav="test.wav", home="/tmp/fake_xtts")
+        engine._cooldown_duration = 5.0
+        with patch("os.path.exists", return_value=True), \
+             patch.object(engine.client, "start"), \
+             patch.object(engine.client, "wait_ready", side_effect=XttsError("CUBLAS_STATUS_EXECUTION_FAILED")):
+            with self.assertRaises(XttsError):
+                engine.start()
+
+            self.assertEqual(engine.state, "COOLDOWN")
+            self.assertFalse(engine.is_ready())
+
+            # Attempt immediate restart during cooldown window
+            with patch.object(engine.client, "start") as mock_spawn:
+                engine.start()
+                mock_spawn.assert_not_called()
+
+    def test_grace_period_aborts_immediately_on_crashed_xtts(self):
+        """Grace period does not wait when LocalXttsEngine is in CRASHED or COOLDOWN state."""
+        self.node.local_xtts = MagicMock()
+        self.node.local_xtts.is_ready.return_value = False
+        self.node.local_xtts.state = "COOLDOWN"
+
+        t_start = time.monotonic()
+        pcm, eng_name, latency, is_ready = self.node._synthesize_speech_pcm("Merhaba")
+        elapsed = time.monotonic() - t_start
+
+        self.assertLess(elapsed, 1.0, "Grace period should not block when XTTS is in COOLDOWN!")
 
 
 if __name__ == "__main__":

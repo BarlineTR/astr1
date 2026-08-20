@@ -107,23 +107,60 @@ def main() -> int:
         emit({"event": "error", "stage": "import", "message": f"Import failed: {type(exc).__name__}: {exc}", "traceback": tb})
         return 1
 
+    # Hardware & Runtime Diagnostics Collection
+    diag: Dict[str, Any] = {
+        "python_executable": sys.executable,
+        "argv": sys.argv,
+        "cwd": os.getcwd(),
+        "PYTHONPATH": os.getenv("PYTHONPATH", ""),
+        "CUDA_VISIBLE_DEVICES": os.getenv("CUDA_VISIBLE_DEVICES", ""),
+        "LD_LIBRARY_PATH": os.getenv("LD_LIBRARY_PATH", ""),
+        "torch_version": torch.__version__,
+        "torch_cuda_version": getattr(torch.version, "cuda", "none"),
+        "cuda_available": torch.cuda.is_available(),
+    }
+
     # 2. Strict CUDA Validation
     device = args.device
     if device == "auto":
         device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    if device == "cuda" and not torch.cuda.is_available():
-        msg = "CUDA is requested but torch.cuda.is_available() is False. Refusing silent CPU fallback!"
-        sys.stderr.write(f"[XTTS Worker Device Error]: {msg}\n")
-        sys.stderr.flush()
-        emit({"event": "error", "stage": "device", "message": msg})
-        return 1
+    if device == "cuda":
+        if not torch.cuda.is_available():
+            msg = "CUDA is requested but torch.cuda.is_available() is False. Refusing silent CPU fallback!"
+            sys.stderr.write(f"[XTTS Worker Device Error]: {msg}\n")
+            sys.stderr.flush()
+            emit({"event": "error", "stage": "device", "message": msg, "diagnostics": diag})
+            return 1
+        try:
+            props = torch.cuda.get_device_properties(0)
+            free_b, tot_b = torch.cuda.mem_get_info(0)
+            diag.update({
+                "cuda_device": 0,
+                "gpu_name": props.name,
+                "device_properties": {
+                    "name": props.name,
+                    "total_memory_mb": round(props.total_memory / (1024 * 1024), 1),
+                    "major": props.major,
+                    "minor": props.minor,
+                    "multi_processor_count": props.multi_processor_count,
+                },
+                "free_gpu_memory_mb": round(free_b / (1024 * 1024), 1),
+                "total_gpu_memory_mb": round(tot_b / (1024 * 1024), 1),
+            })
+            # Jetson Orin Nano PyTorch CUDA optimizations
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+            torch.backends.cudnn.benchmark = False
+            torch.cuda.empty_cache()
+        except Exception as e:
+            diag["cuda_init_warning"] = str(e)
 
     if not os.path.exists(args.speaker_wav):
         msg = f"Speaker reference audio not found: {args.speaker_wav}"
         sys.stderr.write(f"[XTTS Worker Speaker Error]: {msg}\n")
         sys.stderr.flush()
-        emit({"event": "error", "stage": "speaker", "message": msg})
+        emit({"event": "error", "stage": "speaker", "message": msg, "diagnostics": diag})
         return 1
 
     # 3. Model Loading & GPU Residency
@@ -206,6 +243,8 @@ def main() -> int:
             model.use_half_precision()
 
         model.eval()
+        if device == "cuda":
+            torch.cuda.empty_cache()
 
         # 4. Extract and Cache Speaker Conditioning Latents
         def get_or_extract_latents(spk_path: str):
@@ -218,7 +257,7 @@ def main() -> int:
 
         gpt_lat, spk_emb = get_or_extract_latents(args.speaker_wav)
 
-        # 5. Startup Warm-up Inference (CUDA Kernel compilation & VRAM pre-allocation)
+        # 5. Startup Warm-up Inference (Optional)
         t_warmup_ms = 0.0
         if not args.no_warmup:
             t_w_start = time.perf_counter()
@@ -242,7 +281,13 @@ def main() -> int:
         tb = traceback.format_exc()
         sys.stderr.write(f"[XTTS Worker Load Exception]:\n{tb}\n")
         sys.stderr.flush()
-        emit({"event": "error", "stage": "load", "message": f"Model load failed: {type(exc).__name__}: {exc}", "traceback": tb})
+        emit({
+            "event": "error",
+            "stage": "load",
+            "message": f"Model load failed: {type(exc).__name__}: {exc}",
+            "traceback": tb,
+            "diagnostics": diag,
+        })
         return 1
 
     t_load_ms = (time.perf_counter() - t_load_start) * 1000.0
@@ -273,6 +318,7 @@ def main() -> int:
         "load_time_ms": round(t_load_ms, 1),
         "warmup_time_ms": round(t_warmup_ms, 1),
         "cached_speakers": list(_LATENT_CACHE.keys()),
+        "diagnostics": diag,
     })
 
     # 6. Persistent Request Processing Loop

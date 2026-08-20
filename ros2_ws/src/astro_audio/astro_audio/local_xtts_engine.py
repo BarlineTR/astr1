@@ -200,8 +200,10 @@ class LocalXttsEngine(BaseTTSEngine):
             logger=self._safe_log,
         )
 
-        self._state = "STOPPED"  # STOPPED, STARTING, READY, DEGRADED, CRASHED, STOPPING
+        self._state = "STOPPED"  # STOPPED, STARTING, READY, CRASHED, COOLDOWN, STOPPING
         self._state_lock = threading.Lock()
+        self._cooldown_duration = float(os.getenv("XTTS_COOLDOWN_S", "60.0"))
+        self._cooldown_until = 0.0
 
         self._last_telemetry: Dict[str, Any] = {
             "device": device,
@@ -237,6 +239,8 @@ class LocalXttsEngine(BaseTTSEngine):
     @property
     def state(self) -> str:
         with self._state_lock:
+            if self._state == "COOLDOWN" and time.monotonic() >= self._cooldown_until:
+                self._state = "STOPPED"
             return self._state
 
     def start(self) -> None:
@@ -247,6 +251,11 @@ class LocalXttsEngine(BaseTTSEngine):
                 return
             if self._state == "STARTING" and self.client.is_alive:
                 self._safe_log("debug", f"LocalXttsEngine is already in STARTING state (PID: {getattr(self.client.proc, 'pid', None)}). Reusing worker.")
+                return
+            now_m = time.monotonic()
+            if self._state == "COOLDOWN" and now_m < self._cooldown_until:
+                rem_s = self._cooldown_until - now_m
+                self._safe_log("warn", f"⏳ [LocalXttsEngine] XTTS is in COOLDOWN ({rem_s:.1f}s remaining). Spawn refused.")
                 return
             self._state = "STARTING"
 
@@ -276,6 +285,7 @@ class LocalXttsEngine(BaseTTSEngine):
                 "xtts_model_path": info.get("xtts_model_path", self.speaker_wav),
                 "xtts_checkpoint_sha256": info.get("xtts_checkpoint_sha256", "none"),
                 "is_finetuned": info.get("is_finetuned", False),
+                "error": "none",
             })
             model_type_str = "xtts_finetuned" if info.get("is_finetuned") else "xtts_v2"
             self._safe_log(
@@ -293,10 +303,13 @@ class LocalXttsEngine(BaseTTSEngine):
         except XttsError as e:
             with self._state_lock:
                 self._state = "CRASHED"
+                self._cooldown_until = time.monotonic() + self._cooldown_duration
             self._last_telemetry["ready"] = False
             self._last_telemetry["state"] = "CRASHED"
             self._last_telemetry["error"] = str(e)
-            self._safe_log("error", f"❌ [LocalXttsEngine] XTTS başlatılamadı: {e}")
+            self._safe_log("error", f"❌ [LocalXttsEngine] XTTS başlatılamadı (CRASHED -> COOLDOWN {self._cooldown_duration:.0f}s): {e}")
+            with self._state_lock:
+                self._state = "COOLDOWN"
             raise
 
     def is_ready(self) -> bool:
@@ -347,10 +360,13 @@ class LocalXttsEngine(BaseTTSEngine):
             if not self.client.is_alive:
                 with self._state_lock:
                     self._state = "CRASHED"
+                    self._cooldown_until = time.monotonic() + self._cooldown_duration
                 self._last_telemetry["ready"] = False
                 self._last_telemetry["state"] = "CRASHED"
-                self._safe_log("error", "❌ [LocalXttsEngine] XTTS worker süreci çökmüş! Arka planda yeniden başlatılıyor...")
-                threading.Thread(target=self._try_auto_restart, daemon=True).start()
+                self._last_telemetry["error"] = str(exc)
+                self._safe_log("error", f"❌ [LocalXttsEngine] XTTS worker süreci çökmüş! Cooldown başlatıldı ({self._cooldown_duration:.0f}s).")
+                with self._state_lock:
+                    self._state = "COOLDOWN"
             return None
 
     def _try_auto_restart(self) -> None:

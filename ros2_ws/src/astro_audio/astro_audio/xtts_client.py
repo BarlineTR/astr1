@@ -205,11 +205,12 @@ class XttsClient:
                 "--top-p", str(os.getenv("TTS_XTTS_TOP_P", "0.65")),
                 "--speed", str(os.getenv("TTS_XTTS_SPEED", "1.05")),
             ]
-            if os.getenv("TTS_XTTS_NO_WARMUP", "0") in ("1", "true", "True"):
+            if os.getenv("TTS_XTTS_NO_WARMUP", "1") not in ("0", "false", "False"):
                 cmd.append("--no-warmup")
 
             self._cmd = cmd
             self._stderr_lines = []
+            self._last_error_event = None
 
             env = os.environ.copy()
             # Preserve system CUDA paths for Jetson Orin Nano
@@ -261,6 +262,7 @@ class XttsClient:
                 self._ready.set()
             elif event == "error":
                 self._startup_error = f"{msg.get('stage')}: {msg.get('message')}"
+                self._last_error_event = msg
                 self._ready.set()
             else:
                 self._responses.put(msg)
@@ -279,33 +281,34 @@ class XttsClient:
         if not self._ready.wait(timeout):
             stderr_snippet = "\n".join(self._stderr_lines[-20:]) if self._stderr_lines else "None"
             raise XttsError(f"XTTS did not become ready in {timeout:.0f}s. Stderr: {stderr_snippet}")
-        if self._startup_error:
-            stderr_snippet = "\n".join(self._stderr_lines[-20:]) if self._stderr_lines else "None"
-            raise XttsError(f"XTTS startup failed: {self._startup_error}. Stderr: {stderr_snippet}")
-        if not self.info:
+        if self._startup_error or not self.info:
             code = self.returncode
             stderr_snippet = "\n".join(self._stderr_lines[-40:]) if self._stderr_lines else "None"
             cmd_str = " ".join(getattr(self, "_cmd", []))
+            err_diag = (getattr(self, "_last_error_event", None) or {}).get("diagnostics", {})
             self._safe_log(
                 "error",
                 f"🚨 [XTTS Worker Crash Diagnostics]:\n"
                 f"  exit_code={code}\n"
                 f"  argv={cmd_str}\n"
                 f"  cwd={self.home}\n"
-                f"  python_executable={self.python_path}\n"
-                f"  sys_path={sys.path[:3]}\n"
-                f"  PYTHONPATH={os.getenv('PYTHONPATH', 'none')}\n"
-                f"  PATH={os.getenv('PATH', 'none')[:120]}\n"
-                f"  CUDA_VISIBLE_DEVICES={os.getenv('CUDA_VISIBLE_DEVICES', 'all')}\n"
-                f"  LD_LIBRARY_PATH={os.getenv('LD_LIBRARY_PATH', 'none')}\n"
+                f"  python_executable={err_diag.get('python_executable', self.python_path)}\n"
+                f"  torch_version={err_diag.get('torch_version', 'unknown')}\n"
+                f"  torch_cuda_version={err_diag.get('torch_cuda_version', 'unknown')}\n"
+                f"  cuda_available={err_diag.get('cuda_available', False)}\n"
+                f"  gpu_name={err_diag.get('gpu_name', 'unknown')}\n"
+                f"  free_gpu_memory_mb={err_diag.get('free_gpu_memory_mb', 'unknown')}\n"
+                f"  total_gpu_memory_mb={err_diag.get('total_gpu_memory_mb', 'unknown')}\n"
+                f"  device_properties={err_diag.get('device_properties', {})}\n"
+                f"  PYTHONPATH={err_diag.get('PYTHONPATH', os.getenv('PYTHONPATH', 'none'))}\n"
+                f"  CUDA_VISIBLE_DEVICES={err_diag.get('CUDA_VISIBLE_DEVICES', os.getenv('CUDA_VISIBLE_DEVICES', 'all'))}\n"
+                f"  LD_LIBRARY_PATH={err_diag.get('LD_LIBRARY_PATH', os.getenv('LD_LIBRARY_PATH', 'none'))}\n"
                 f"  checkpoint={self.custom_model.get('checkpoint') if self.custom_model else 'default'}\n"
-                f"  config={self.custom_model.get('config') if self.custom_model else 'default'}\n"
-                f"  vocab={self.custom_model.get('vocab') if self.custom_model else 'default'}\n"
-                f"  speakers={self.custom_model.get('speakers') if self.custom_model else 'default'}\n"
-                f"  reference_wav={self.speaker_wav}\n"
                 f"  startup_error={self._startup_error}\n"
                 f"  stderr:\n{stderr_snippet}"
             )
+            if self._startup_error:
+                raise XttsError(f"XTTS startup failed: {self._startup_error}. Stderr: {stderr_snippet}")
             raise XttsError(f"XTTS worker exited unexpectedly (code {code}):\n{stderr_snippet}")
         return self.info
 

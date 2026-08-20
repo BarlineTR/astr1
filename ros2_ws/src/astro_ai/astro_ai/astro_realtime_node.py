@@ -315,6 +315,55 @@ def is_known_phantom_pattern(text: str) -> bool:
     return False
 
 
+def is_valid_user_command(command: str) -> Tuple[bool, str]:
+    """Validates extracted user command for semantic plausibility, repetition, catalog hallucinations, and phantom patterns."""
+    if not command:
+        return False, "empty_command"
+    c_clean = re.sub(r"[^\w\s]", "", command.lower()).strip()
+    if not c_clean or len(c_clean) < 2:
+        return False, "empty_command"
+
+    # 1. Known Phantom Patterns
+    if is_known_phantom_pattern(c_clean):
+        return False, "known_phantom"
+
+    words = c_clean.split()
+    if not words:
+        return False, "empty_command"
+
+    # 2. Pure Wake Prefix Remainder (only wake tokens)
+    if all(w in ("astro", "hey", "selam") for w in words):
+        return False, "wake_only_remainder"
+
+    # 3. Prompt / Catalog / Hallucinated Training Metadata Artifacts (e.g. "Türkçe konuşma, diyalog, robot asistan")
+    catalog_triggers = [
+        "türkçe konuşma", "turkce konusma", "robot asistan", "sesli asistan",
+        "türkçe diyalog", "turkce diyalog", "türkçe dublaj", "turkce dublaj",
+        "türkçe altyazı", "turkce altyazi", "altyazı m k", "altyazi mk",
+        "abone ol", "kanala abone", "videoyu beğen", "izlediğiniz için",
+    ]
+    for ct in catalog_triggers:
+        if ct in c_clean:
+            conversational_clues = ("hakkında", "nasıl", "neden", "ne", "nerede", "kim", "yap", "aç", "kapat", "anlat", "söyle", "nedir", "istiyorum", "misin")
+            if not any(w in c_clean for w in conversational_clues):
+                return False, "catalog_hallucination"
+
+    # 4. Excessive Wake Word Repetition in Command (e.g. "astro astro astro", "hey astro hey astro")
+    wake_tokens = [w for w in words if w in ("astro", "hey", "selam")]
+    if len(wake_tokens) >= 2 and (len(wake_tokens) / len(words)) >= 0.30:
+        return False, "wake_word_loop"
+
+    # 5. Word Repetition Ratio (e.g. "evet evet evet", "türen türen türen")
+    if len(words) >= 3:
+        from collections import Counter
+        counts = Counter(words)
+        most_common_word, most_common_count = counts.most_common(1)[0]
+        if most_common_count >= 3 and (most_common_count / len(words)) >= 0.35:
+            return False, "repetitive_word_loop"
+
+    return True, "valid"
+
+
 class AstroRealtimeNode(Node):
     """ROS 2 Node bridging Astro sensors & audio streams to OpenAI Realtime WebSocket."""
 
@@ -1680,27 +1729,29 @@ class AstroRealtimeNode(Node):
         vad_confidence = round(min(1.0, total_rms / 600.0), 2)
 
         is_only_wake_word = (len(extracted_cmd) < 2)
-        is_phantom_cmd = is_known_phantom_pattern(extracted_cmd)
+        valid_cmd, cmd_reason = is_valid_user_command(extracted_cmd)
 
-        if is_only_wake_word or is_phantom_cmd:
-            # Pure Wake Phrase or Wake + Phantom Hallucination (e.g. "Astro. Altyazı M.K."):
+        if is_only_wake_word or not valid_cmd:
+            # Pure Wake Phrase, Wake + Phantom, or Wake + Catalog/Repetitive Hallucination:
             # Wakes robot up, flushes buffers, transitions to LISTENING. NO fake LLM / TTS turn!
             self._wake_up()
             self.get_logger().info(
                 f"⚡ [Wake Telemetry]: wake_detector_active=True | wake_candidate=\"{transcript}\" | "
                 f"is_wake_phrase=True | wake_confidence={wake_confidence:.2f} | vad_confidence={vad_confidence:.2f} | "
                 f"stt_started=True | stt_finished=True | transcript=\"{transcript}\" | "
-                f"extracted_command=\"{extracted_cmd}\" | command_invalid={is_phantom_cmd} | "
+                f"extracted_command=\"{extracted_cmd}\" | command_invalid={not valid_cmd} | "
+                f"command_reject_reason={cmd_reason if not valid_cmd else 'none'} | "
                 f"wake_only=True | wake_rejected=False | conversation_turn_created=False | llm_started=False | tts_started=False"
             )
         else:
-            # Wake + Attached Command (e.g. "Hey Astro hava nasıl?"): Strip wake phrase and forward command
+            # Wake + Attached Genuine Command (e.g. "Hey Astro hava nasıl?"): Strip wake phrase and forward command
             self._wake_up()
             self.get_logger().info(
                 f"⚡ [Wake Telemetry]: wake_detector_active=True | wake_candidate=\"{transcript}\" | "
                 f"is_wake_phrase=True | wake_confidence={wake_confidence:.2f} | vad_confidence={vad_confidence:.2f} | "
                 f"stt_started=True | stt_finished=True | transcript=\"{transcript}\" | "
                 f"extracted_command=\"{extracted_cmd}\" | command_invalid=False | "
+                f"command_reject_reason=none | "
                 f"wake_only=False | wake_rejected=False | conversation_turn_created=True | llm_started=True | tts_started=True"
             )
             if self._fallback_mode or not self._is_connected:
@@ -2526,6 +2577,8 @@ class AstroRealtimeNode(Node):
                 wait_time = min(remaining_grace, 15.0)
                 t_wait_start = time.monotonic()
                 while (time.monotonic() - t_wait_start) < wait_time and not self.local_xtts.is_ready():
+                    if getattr(self.local_xtts, "state", "") in ("CRASHED", "COOLDOWN", "STOPPED"):
+                        break
                     time.sleep(0.3)
 
         # 1. Primary Remote TTS: ElevenLabs Flash v2.5 (Only if configured and ready)
@@ -2712,11 +2765,11 @@ class AstroRealtimeNode(Node):
             elif norm_wake_check.startswith("selam astro "):
                 validated_text = validated_text[len("selam astro"):].lstrip(" ,.")
 
-            cmd_norm = re.sub(r"[^\w\s]", "", validated_text.lower()).strip()
-            if not cmd_norm or is_known_phantom_pattern(cmd_norm):
+            valid_cmd, cmd_reason = is_valid_user_command(validated_text)
+            if not valid_cmd:
                 self.state_machine.transition_to(RobotState.LISTENING)
                 self.get_logger().info(
-                    f"⚡ [Wake + Phantom Command Dropped]: \"{raw_transcript}\" -> Transitioned to LISTENING (0 LLM / 0 TTS)."
+                    f"⚡ [Wake + Invalid Command Dropped]: \"{raw_transcript}\" (reason={cmd_reason}) -> Transitioned to LISTENING (0 LLM / 0 TTS)."
                 )
                 return
 
@@ -2810,13 +2863,19 @@ class AstroRealtimeNode(Node):
             # If XTTS is starting and node is in startup grace period, wait for XTTS instead of jumping to eSpeak
             if self.local_xtts and not self.local_xtts.is_ready():
                 now_m = time.monotonic()
-                elapsed_since_start = now_m - getattr(self, "_node_start_time", now_m)
-                remaining_grace = max(0.0, getattr(self, "xtts_startup_grace_s", 60.0) - elapsed_since_start)
+                start_val = getattr(self, "_node_start_time", now_m)
+                start_s = float(start_val) if isinstance(start_val, (int, float)) else now_m
+                elapsed_since_start = now_m - start_s
+                grace_val = getattr(self, "xtts_startup_grace_s", 60.0)
+                grace_s = float(grace_val) if isinstance(grace_val, (int, float)) else 60.0
+                remaining_grace = max(0.0, grace_s - elapsed_since_start)
                 if getattr(self.local_xtts, "state", "") == "STARTING" and remaining_grace > 0.0:
-                    wait_time = min(remaining_grace, 20.0)
+                    wait_time = min(remaining_grace, 15.0)
                     self.get_logger().info(f"⏳ [XTTS Startup Grace] XTTS is STARTING. Waiting up to {wait_time:.1f}s for XTTS READY...")
                     t_wait_start = time.monotonic()
                     while (time.monotonic() - t_wait_start) < wait_time and not self.local_xtts.is_ready():
+                        if getattr(self.local_xtts, "state", "") in ("CRASHED", "COOLDOWN", "STOPPED"):
+                            break
                         time.sleep(0.3)
 
             # 5. Select Atomic TTS Owner for this turn (Single Turn = Single TTS Owner)
@@ -3134,12 +3193,16 @@ class AstroRealtimeNode(Node):
                 first_clause_str = int(llm_first_clause_ms) if llm_first_clause_ms is not None else "null"
                 speaker_log_val = spk_name if spk_name else "null"
 
+                tts_error_val = xtts_err_str if active_engine == "xtts_gpu" else ("none" if tts_ready_flag else "provider_unavailable")
+
                 self.get_logger().info(
                     f"📊 [Turn Telemetry]: mode=LOCAL_FALLBACK | provider={chosen_provider} | "
                     f"model={chosen_model} | llm_status={llm_status} | speaker={speaker_log_val} | "
                     f"speaker_confidence={spk_score:.2f} | speaker_source={spk_source} | stt_ms={int(stt_ms)} | "
                     f"llm_ttft_ms={ttft_str} | llm_first_clause_ms={first_clause_str} | "
-                    f"llm_total_ms={int(llm_latency_ms)} | tts_provider={active_engine} | tts_mode={tts_mode_val} | "
+                    f"llm_total_ms={int(llm_latency_ms)} | "
+                    f"selected_tts_provider={active_engine} | selected_tts_ready={tts_ready_flag} | "
+                    f"tts_provider={active_engine} | tts_mode={tts_mode_val} | tts_error={tts_error_val} | "
                     f"tts_model={tts_model_name} | tts_voice={tts_voice_name} | "
                     f"xtts_ready={is_xtts_actually_ready} | xtts_error={xtts_err_str} | "
                     f"xtts_checkpoint={xtts_ckpt_str} | xtts_sha256={xtts_sha_short} | "
