@@ -242,6 +242,52 @@ def discover_groq_models(api_key: str) -> list[str]:
         return []
 
 
+VALID_SHORT_UTTERANCES = {
+    "hey", "lan", "dur", "ne", "tamam", "merhaba", "evet", "hayır",
+    "astro", "selam", "alo", "sus", "günaydın", "iyi geceler", "naber",
+    "efendim", "anladım", "peki", "dinliyorum", "burada", "buradayım"
+}
+
+SUSPECT_PHRASES = [
+    "abone ol", "abone olmayı", "abone olmayı unutmayın", "altyazı",
+    "altyazı m.k.", "altyazı:", "çeviren:", "çeviri ve altyazı",
+    "diz", "dizi", "altyazı ekibi", "izlediğiniz için", "izlediğiniz için teşekkürler",
+    "beğenmeyi unutmayın", "hoşça kalın", "hoşçakalın", "bay bay", "m.k.", "sponsor",
+    "videoyu beğenmeyi", "subtitle", "transcription by", "hı hı", "cık", "çık", "ııı", "eee", "hmm"
+]
+
+
+def compute_self_voice_score(transcript: str, recent_robot_phrases: List[str]) -> float:
+    """Computes acoustic & lexical correlation score (0.0 - 1.0) between transcript and recent robot speech."""
+    if not transcript or not recent_robot_phrases:
+        return 0.0
+    t_clean = re.sub(r"[^\w\s]", "", transcript.lower()).strip()
+    if not t_clean:
+        return 0.0
+    t_words = set(t_clean.split())
+    if not t_words:
+        return 0.0
+
+    max_score = 0.0
+    for phrase in recent_robot_phrases:
+        p_clean = re.sub(r"[^\w\s]", "", phrase.lower()).strip()
+        if not p_clean:
+            continue
+        p_words = set(p_clean.split())
+        if not p_words:
+            continue
+        # Exact substring match
+        if t_clean in p_clean or p_clean in t_clean:
+            score = 0.95
+        else:
+            # Word overlap (Jaccard / containment)
+            intersection = t_words.intersection(p_words)
+            score = len(intersection) / float(len(t_words))
+        if score > max_score:
+            max_score = score
+    return min(1.0, max_score)
+
+
 class AstroRealtimeNode(Node):
     """ROS 2 Node bridging Astro sensors & audio streams to OpenAI Realtime WebSocket."""
 
@@ -282,6 +328,20 @@ class AstroRealtimeNode(Node):
         self._active_person_name = "Misafir"
         self._person_hold_until = 0.0
         self._greeted_people: Dict[str, float] = {}
+
+        # Configurable Acoustic Echo & Barge-In Parameters
+        self.echo_mute_cooldown_s = float(os.getenv("ECHO_MUTE_COOLDOWN_S", "0.65"))
+        self.barge_in_min_rms = float(os.getenv("BARGE_IN_MIN_RMS", "1200.0"))
+        self.barge_in_noise_mult = float(os.getenv("BARGE_IN_NOISE_MULTIPLIER", "3.5"))
+        self.barge_in_min_peak = int(os.getenv("BARGE_IN_MIN_PEAK", "2800"))
+        self._ambient_rms = 120.0
+        self._recent_robot_phrases: List[str] = []
+
+        # False Transcript & Rejection Counters
+        self.false_transcript_count = 0
+        self.self_voice_rejection_count = 0
+        self.no_speech_rejection_count = 0
+        self.stale_audio_rejection_count = 0
 
         # Biometric Voice & Face Engines
         self.voice_recognizer = VoiceRecognizer() if VoiceRecognizer else None
@@ -1461,7 +1521,7 @@ class AstroRealtimeNode(Node):
         has idle CPU and a clear unobstructed camera view of the environment.
         Only pauses when actively speaking or playing audio.
         """
-        while rclpy.ok():
+        while (rclpy is not None and getattr(rclpy, "ok", lambda: True)()):
             time.sleep(3)
             if not self._enable_idle_learning:
                 continue
@@ -1830,6 +1890,16 @@ class AstroRealtimeNode(Node):
             self.get_logger().info(f"📝 [Kalıcı Hafıza Kaydı ({person_name})]: 'Önceki konuşma hafızaya kaydedildi -> {summary}'")
             self._sync_perception_to_session()
 
+    def _flush_audio_buffers(self, reason: str = "transition"):
+        """Completely purges all audio input buffers, queues, and VAD state during turn state transitions."""
+        with self._lock:
+            self._fallback_audio_buffer.clear()
+            self._fallback_speaking = False
+            self._consecutive_loud_frames = 0
+            if len(self._user_speech_audio_buffer) > 10:
+                self._user_speech_audio_buffer = self._user_speech_audio_buffer[-10:]
+        self.get_logger().debug(f"🧹 [Audio Buffer Flush] State transition purge: reason={reason}")
+
     def _on_playback_active(self, msg: Bool):
         was_active = self._is_playback_active
 
@@ -1837,6 +1907,7 @@ class AstroRealtimeNode(Node):
         if was_active and not self._is_playback_active:
             self._playback_end_time = time.monotonic()
             self._is_responding = False
+            self._flush_audio_buffers("playback_ended")
             # Clear OpenAI input audio buffer so trailing room reverberation doesn't trigger VAD
             if self._ws and self._loop and self._is_connected:
                 try:
@@ -1844,6 +1915,166 @@ class AstroRealtimeNode(Node):
                 except Exception:
                     pass
             self.get_logger().info("👂 [Astro Dinliyor]: Mikrofon aktif, sizi dinliyor...")
+
+    def _validate_stt_transcript(
+        self,
+        transcript: str,
+        raw_pcm: bytes,
+        is_playback_active: bool,
+        is_echo_cooldown: bool,
+    ) -> Tuple[Optional[str], Dict[str, Any]]:
+        """Multi-signal validation fusing transcript text, acoustic evidence, VAD, playback state, and self-voice score."""
+        cleaned = (transcript or "").strip()
+        if not cleaned:
+            return None, {
+                "transcript": "",
+                "stt_rejected": True,
+                "stt_reject_reason": "empty_transcript",
+                "audio_ms": 0,
+                "speech_ms": 0,
+                "rms": 0.0,
+                "peak": 0,
+                "vad_confidence": 0.0,
+                "stt_confidence": 0.0,
+                "playback_active": is_playback_active,
+                "echo_cooldown_active": is_echo_cooldown,
+                "self_voice_score": 0.0,
+            }
+
+        arr = np.frombuffer(raw_pcm, dtype=np.int16) if raw_pcm else np.array([], dtype=np.int16)
+        audio_ms = int((len(arr) / 16000.0) * 1000.0)
+        if len(arr) == 0:
+            return None, {
+                "transcript": cleaned,
+                "stt_rejected": True,
+                "stt_reject_reason": "no_audio",
+                "audio_ms": 0,
+                "speech_ms": 0,
+                "rms": 0.0,
+                "peak": 0,
+                "vad_confidence": 0.0,
+                "stt_confidence": 0.0,
+                "playback_active": is_playback_active,
+                "echo_cooldown_active": is_echo_cooldown,
+                "self_voice_score": 0.0,
+            }
+
+        total_rms = float(np.sqrt(np.mean(arr.astype(np.float32) ** 2)))
+        peak_val = int(np.max(np.abs(arr)))
+
+        # Speech frame estimation (20ms = 320 samples @ 16kHz)
+        chunk_size = 320
+        speech_frames = 0
+        total_frames = max(1, len(arr) // chunk_size)
+        speech_threshold = max(350.0, self._ambient_rms * 1.5)
+        for i in range(0, len(arr) - chunk_size + 1, chunk_size):
+            c_arr = arr[i : i + chunk_size]
+            c_rms = float(np.sqrt(np.mean(c_arr.astype(np.float32) ** 2)))
+            if c_rms > speech_threshold:
+                speech_frames += 1
+
+        speech_ms = int((speech_frames * chunk_size / 16000.0) * 1000.0)
+        vad_confidence = round(min(1.0, speech_frames / float(total_frames)), 2)
+        stt_confidence = 0.90 if len(cleaned.split()) > 1 else 0.80
+
+        with self._lock:
+            recent_phrases = list(self._recent_robot_phrases)
+        self_voice_score = round(compute_self_voice_score(cleaned, recent_phrases), 2)
+
+        norm_text = re.sub(r"[^\w\s]", "", cleaned.lower()).strip()
+        words = norm_text.split()
+        is_short_utterance = (len(words) == 1 and words[0] in VALID_SHORT_UTTERANCES)
+        is_suspect_phrase = any(sp in norm_text for sp in SUSPECT_PHRASES)
+
+        rejected = False
+        reject_reason = "none"
+
+        # 1. Playback active or room echo cooldown with high self-voice correlation
+        if (is_playback_active or is_echo_cooldown) and self_voice_score >= 0.45:
+            rejected = True
+            reject_reason = "self_voice"
+
+        # 2. Playback is active and input does not exceed barge-in energy
+        elif is_playback_active and total_rms < self.barge_in_min_rms:
+            rejected = True
+            reject_reason = "self_voice"
+
+        # 3. Weak speech duration or ambient noise floor
+        elif speech_ms < 70 or total_rms < max(180.0, self._ambient_rms * 1.15):
+            rejected = True
+            reject_reason = "no_speech"
+
+        # 4. Suspect phrases (e.g. "abone ol", "diz", "altyazı") evaluated against genuine speech evidence
+        elif is_suspect_phrase:
+            has_strong_evidence = (
+                not is_playback_active
+                and not is_echo_cooldown
+                and speech_ms >= 240
+                and total_rms >= 450.0
+                and self_voice_score < 0.20
+            )
+            if not has_strong_evidence:
+                rejected = True
+                reject_reason = "self_voice" if (is_playback_active or is_echo_cooldown or self_voice_score >= 0.20) else "no_speech"
+
+        # 5. Short utterances (e.g. "Hey", "Lan", "Dur", "Tamam", "Ne?")
+        elif len(words) == 1:
+            if is_short_utterance and speech_ms >= 70 and total_rms >= 280.0 and not is_playback_active:
+                rejected = False
+            elif not is_short_utterance and (speech_ms < 140 or total_rms < 380.0):
+                rejected = True
+                reject_reason = "low_confidence"
+
+        # 6. General sentence threshold
+        elif speech_ms < 100 or total_rms < 240.0:
+            rejected = True
+            reject_reason = "low_confidence"
+
+        telem = {
+            "transcript": cleaned,
+            "stt_rejected": rejected,
+            "stt_reject_reason": reject_reason,
+            "audio_ms": audio_ms,
+            "speech_ms": speech_ms,
+            "rms": round(total_rms, 2),
+            "peak": peak_val,
+            "vad_confidence": vad_confidence,
+            "stt_confidence": stt_confidence,
+            "playback_active": is_playback_active,
+            "echo_cooldown_active": is_echo_cooldown,
+            "self_voice_score": self_voice_score,
+        }
+
+        if rejected:
+            self.false_transcript_count += 1
+            if reject_reason == "self_voice":
+                self.self_voice_rejection_count += 1
+            elif reject_reason == "no_speech":
+                self.no_speech_rejection_count += 1
+            elif reject_reason == "stale_audio":
+                self.stale_audio_rejection_count += 1
+
+            self.get_logger().info(
+                f'📊 [STT Telemetry]: transcript="{cleaned}" | stt_rejected=True | '
+                f'stt_reject_reason={reject_reason} | playback_active={is_playback_active} | '
+                f'echo_cooldown_active={is_echo_cooldown} | self_voice_score={self_voice_score:.2f} | '
+                f'vad_confidence={vad_confidence:.2f} | stt_confidence={stt_confidence:.2f} | '
+                f'rms={total_rms:.1f} | peak={peak_val} | audio_ms={audio_ms} | speech_ms={speech_ms} | '
+                f'false_transcripts_total={self.false_transcript_count} | '
+                f'self_voice_rejections_total={self.self_voice_rejection_count}'
+            )
+            return None, telem
+
+        self.get_logger().info(
+            f'📊 [STT Telemetry]: transcript="{cleaned}" | stt_rejected=False | '
+            f'stt_reject_reason=none | playback_active={is_playback_active} | '
+            f'echo_cooldown_active={is_echo_cooldown} | self_voice_score={self_voice_score:.2f} | '
+            f'vad_confidence={vad_confidence:.2f} | stt_confidence={stt_confidence:.2f} | '
+            f'rms={total_rms:.1f} | peak={peak_val} | audio_ms={audio_ms} | speech_ms={speech_ms} | '
+            f'false_transcripts_total={self.false_transcript_count} | '
+            f'self_voice_rejections_total={self.self_voice_rejection_count}'
+        )
+        return cleaned, telem
 
     def _transcribe_groq_whisper(self, wav_bytes: bytes) -> Optional[str]:
         """Transcribes 16kHz WAV audio using free Groq Whisper Large V3 Turbo API in <200ms."""
@@ -1865,7 +2096,7 @@ class AstroRealtimeNode(Node):
             body.extend(b'tr\r\n')
             body.extend(f"--{boundary}\r\n".encode())
             body.extend(b'Content-Disposition: form-data; name="prompt"\r\n\r\n')
-            body.extend("Astro, Baran, Deniz, Oktay, Eren, nasılsın, naber, ne yapıyorsun, merhaba, robot, buradayım".encode("utf-8"))
+            body.extend("Astro Türkçe konuşma, diyalog, robot asistan.".encode("utf-8"))
             body.extend(b'\r\n')
             body.extend(f"--{boundary}--\r\n".encode())
 
@@ -2194,6 +2425,7 @@ class AstroRealtimeNode(Node):
             return
 
         self._is_processing_fallback = True
+        self._is_responding = True
         self._fallback_generation_id += 1
         t_turn_start = time.monotonic()
         chosen_model = "none"
@@ -2214,10 +2446,43 @@ class AstroRealtimeNode(Node):
         try:
             # 1. Combine raw 16kHz PCM chunks into valid in-memory WAV buffer
             raw_pcm = b"".join(audio_chunks)
-            if len(raw_pcm) < 16000 * 2 * 0.35:
+            if len(raw_pcm) < 16000 * 2 * 0.25:
                 return
 
-            # 2. Run Voiceprint Recognition (Acoustic Speaker Identification)
+            # 2. Transcribe via Groq Whisper Cloud (0-Token Cost STT ~250ms)
+            wav_buf = io.BytesIO()
+            with wave.open(wav_buf, "wb") as wf:
+                wf.setnchannels(1)
+                wf.setsampwidth(2)
+                wf.setframerate(16000)
+                wf.writeframes(raw_pcm)
+            wav_bytes = wav_buf.getvalue()
+
+            t_stt_start = time.monotonic()
+            raw_transcript = self._transcribe_groq_whisper(wav_bytes)
+            stt_ms = (time.monotonic() - t_stt_start) * 1000.0
+
+            # 3. Multi-Signal Validation Gate (Transcript + Acoustics + VAD + Playback + Self-Voice)
+            now = time.monotonic()
+            is_playback = bool(self._is_playback_active)
+            is_cooldown = bool((now - self._playback_end_time) < self.echo_mute_cooldown_s)
+
+            validated_text, stt_meta = self._validate_stt_transcript(
+                transcript=raw_transcript or "",
+                raw_pcm=raw_pcm,
+                is_playback_active=is_playback,
+                is_echo_cooldown=is_cooldown,
+            )
+
+            # If rejected, immediately abort turn without LLM, memory, or TTS invocation
+            if not validated_text:
+                return
+
+            user_text = validated_text
+            self.get_logger().info(f"🗣️ [Siz (0-Maliyet)]: \"{user_text}\"")
+            self.memory.episodic.add_message("user", user_text)
+
+            # 4. Run Voiceprint Recognition (Acoustic Speaker Identification)
             spk_name = None
             spk_score = 0.0
             spk_source = "unidentified"
@@ -2263,7 +2528,7 @@ class AstroRealtimeNode(Node):
             speaker_display = spk_name if spk_name else "null"
             self.get_logger().info(f"👤 [Speaker Context] speaker={speaker_display} confidence={spk_score:.2f} source={spk_source}")
 
-            # 3. Select Atomic TTS Owner for this turn (Single Turn = Single TTS Owner)
+            # 5. Select Atomic TTS Owner for this turn (Single Turn = Single TTS Owner)
             if self.elevenlabs_engine and self.elevenlabs_engine.is_ready():
                 turn_tts_engine = "elevenlabs"
                 tts_ready_flag = True
@@ -2301,26 +2566,7 @@ class AstroRealtimeNode(Node):
                 ms = (time.perf_counter() - t_s) * 1000.0
                 return pcm_res, ms, 0.0
 
-            wav_buf = io.BytesIO()
-            with wave.open(wav_buf, "wb") as wf:
-                wf.setnchannels(1)
-                wf.setsampwidth(2)
-                wf.setframerate(16000)
-                wf.writeframes(raw_pcm)
-            wav_bytes = wav_buf.getvalue()
-
-            # 4. Transcribe via Groq Whisper Cloud (0-Token Cost STT ~250ms)
-            t_stt_start = time.monotonic()
-            user_text = self._transcribe_groq_whisper(wav_bytes)
-            stt_ms = (time.monotonic() - t_stt_start) * 1000.0
-
-            if not user_text or len(user_text.strip()) < 2:
-                return
-
-            self.get_logger().info(f"🗣️ [Siz (0-Maliyet)]: \"{user_text}\"")
-            self.memory.episodic.add_message("user", user_text)
-
-            # 5. Instant Intent Interception (Sub-250ms Direct Execution)
+            # 6. Instant Intent Interception (Sub-250ms Direct Execution)
             is_weather, w_city = self._is_weather_query(user_text)
             if is_weather:
                 weather_info = self._execute_fallback_weather(w_city)
@@ -2332,7 +2578,12 @@ class AstroRealtimeNode(Node):
                     reply_text = f"Canım benim, {weather_info} Kendine çok dikkat et!".strip()
                 else:
                     reply_text = f"{spk} {weather_info}".strip()
-                
+
+                with self._lock:
+                    self._recent_robot_phrases.append(reply_text.lower())
+                    if len(self._recent_robot_phrases) > 10:
+                        self._recent_robot_phrases = self._recent_robot_phrases[-10:]
+
                 pcm, s_ms, g_ms = _synthesize_turn_clause(reply_text)
                 total_synth_ms += s_ms
                 total_gpu_ms += g_ms
@@ -2344,7 +2595,7 @@ class AstroRealtimeNode(Node):
                     self._play_pcm_chunks(pcm)
                     return
 
-            # 6. Cognitive LLM via ProviderRegistry (Streaming Groq -> Gemini -> Contextual Persona)
+            # 7. Cognitive LLM via ProviderRegistry (Streaming Groq -> Gemini -> Contextual Persona)
             system_prompt = self._build_current_system_prompt(active_speaker=active_speaker_dict)
             messages = [{"role": "system", "content": system_prompt}]
             recent_msgs = self.memory.episodic.get_messages()[-6:]
@@ -2501,6 +2752,12 @@ class AstroRealtimeNode(Node):
             else:
                 self.repetition_guard.record_response(full_reply_str)
 
+            # Record assistant reply for self-voice echo correlation
+            with self._lock:
+                self._recent_robot_phrases.append(full_reply_str.lower())
+                if len(self._recent_robot_phrases) > 10:
+                    self._recent_robot_phrases = self._recent_robot_phrases[-10:]
+
             # Synthesize full response if not already streamed in chunks
             if not first_audio_played and full_reply_str:
                 pcm, s_ms, g_ms = _synthesize_turn_clause(full_reply_str)
@@ -2565,6 +2822,8 @@ class AstroRealtimeNode(Node):
         finally:
             self._is_processing_fallback = False
             self._is_responding = False
+            self._playback_end_time = time.monotonic()
+            self._flush_audio_buffers("end_fallback_turn")
 
     def _on_input_pcm(self, msg: String):
         """Sends incoming microphone 24kHz PCM chunk to OpenAI Realtime WebSocket or processes turn via 0-cost Groq fallback."""
@@ -2576,11 +2835,6 @@ class AstroRealtimeNode(Node):
         if self._is_responding and not self._is_playback_active:
             if (now - getattr(self, "_response_start_time", now)) > 6.0:
                 self._is_responding = False
-
-        # Zero Self-Hearing Protection:
-        # Do not stream mic audio while Astro is actively playing out of the speaker
-        if self._is_playback_active or self._is_responding or (now - getattr(self, "_playback_end_time", 0.0) < 0.25):
-            return
 
         # Downsample and buffer 16kHz audio for acoustic voice recognition & dynamic enrollment
         raw_16k = None
@@ -2596,64 +2850,98 @@ class AstroRealtimeNode(Node):
         except Exception:
             pass
 
-        # Acoustic presence / wake-up (requires sustained intentional voice > 500 RMS across >=5 consecutive frames)
+        # IMPORTANT: While Astro is sleeping, DO NOT process audio
+        if self._is_sleeping:
+            return
+
+        # Playback & Echo Cooldown State Determination
+        is_active_playback = bool(
+            self._is_playback_active
+            or self._is_responding
+            or (now - getattr(self, "_playback_end_time", 0.0) < self.echo_mute_cooldown_s)
+        )
+
+        # Acoustic Level Evaluation
+        local_rms = 0.0
+        peak_val = 0
         if raw_16k:
             try:
                 arr = np.frombuffer(raw_16k, dtype=np.int16)
                 local_rms = float(np.sqrt(np.mean(arr.astype(np.float32) ** 2)))
-                if local_rms > 500.0:
-                    self._consecutive_loud_frames += 1
-                else:
-                    self._consecutive_loud_frames = max(0, self._consecutive_loud_frames - 1)
-
-                if self._consecutive_loud_frames >= 5 and (now - getattr(self, "_node_start_time", 0.0)) > 4.0:
-                    self._last_interaction_time = now
-                    if self._is_sleeping:
-                        self._wake_up()
+                if len(arr) > 0:
+                    peak_val = int(np.max(np.abs(arr)))
             except Exception:
                 pass
 
-        # IMPORTANT: While Astro is sleeping, DO NOT process audio
-        if self._is_sleeping:
-            return
+        if not is_active_playback and local_rms < 400.0:
+            self._ambient_rms = 0.96 * self._ambient_rms + 0.04 * local_rms
+
+        # Adaptive barge-in threshold derived from ambient noise floor
+        adaptive_barge_in_rms = max(self.barge_in_min_rms, self._ambient_rms * self.barge_in_noise_mult)
+
+        # Zero Self-Hearing Protection:
+        # When Astro is actively playing out of the speaker or in room echo cooldown,
+        # drop microphone input unless user intentionally interrupts with distinct acoustic speech energy
+        if is_active_playback:
+            is_genuine_barge_in = (local_rms >= adaptive_barge_in_rms and peak_val >= self.barge_in_min_peak)
+            if not is_genuine_barge_in:
+                self.self_voice_rejection_count += 1
+                return
+            else:
+                # Genuine User Barge-In during Playback!
+                self._is_responding = False
+                self._is_playback_active = False
+                self._playback_end_time = 0.0
+                self._fallback_speaking = True
+                self._fallback_speech_start = now
+                self._last_speech_time = now
+                self._fallback_generation_id += 1
+                if self.elevenlabs_engine:
+                    self.elevenlabs_engine.cancel(self._fallback_generation_id)
+                if self.local_xtts:
+                    self.local_xtts.cancel(self._fallback_generation_id)
+                int_msg = Bool()
+                int_msg.data = True
+                self.pub_interrupt.publish(int_msg)
+                with self._lock:
+                    self._fallback_audio_buffer = [raw_16k]
+                self.get_logger().info(f"⚡ [Realtime Barge-In] Kullanıcı araya girdi (RMS: {local_rms:.0f}, Peak: {peak_val}).")
+                return
+
+        # Acoustic presence / wake-up (requires sustained intentional voice > 500 RMS across >=5 consecutive frames)
+        if local_rms > 500.0:
+            self._consecutive_loud_frames += 1
+        else:
+            self._consecutive_loud_frames = max(0, self._consecutive_loud_frames - 1)
+
+        if self._consecutive_loud_frames >= 5 and (now - getattr(self, "_node_start_time", 0.0)) > 4.0:
+            self._last_interaction_time = now
+            if self._is_sleeping:
+                self._wake_up()
 
         # --- 0-Cost Fallback Mode (Groq STT + Groq LLM + Edge-TTS) ---
         if self._fallback_mode or not self._is_connected or not self._ws or not self._loop:
             if raw_16k:
                 try:
-                    arr = np.frombuffer(raw_16k, dtype=np.int16)
-                    local_rms = float(np.sqrt(np.mean(arr.astype(np.float32) ** 2)))
-                    peak_val = int(np.max(np.abs(arr))) if len(arr) > 0 else 0
-
-                    # True Speech Condition: Requires both sustained RMS and acoustic peak
-                    if local_rms > 480.0 and peak_val > 1100:
+                    speech_start_condition = (local_rms > max(400.0, self._ambient_rms * 1.45) and peak_val > 950)
+                    if speech_start_condition:
                         self._last_speech_time = now
                         if not self._fallback_speaking:
                             self._fallback_speaking = True
                             self._fallback_speech_start = now
-                            self._fallback_generation_id += 1
-                            if self.elevenlabs_engine:
-                                self.elevenlabs_engine.cancel(self._fallback_generation_id)
-                            if self.local_xtts:
-                                self.local_xtts.cancel(self._fallback_generation_id)
-                            # Broadcast interrupt to immediately abort any active speaker playback
-                            int_msg = Bool()
-                            int_msg.data = True
-                            self.pub_interrupt.publish(int_msg)
-
-                            # Include pre-speech audio frames to avoid clipping initial word syllable
                             with self._lock:
                                 pre_frames = list(self._user_speech_audio_buffer[-8:]) if len(self._user_speech_audio_buffer) >= 8 else []
-                            self._fallback_audio_buffer = list(pre_frames)
-                        self._fallback_audio_buffer.append(raw_16k)
+                            self._fallback_audio_buffer = list(pre_frames) + [raw_16k]
+                        else:
+                            self._fallback_audio_buffer.append(raw_16k)
                     elif self._fallback_speaking:
                         self._fallback_audio_buffer.append(raw_16k)
-                        # Silence timeout (0.80s after speech ends)
-                        if (now - self._last_speech_time) > 0.80:
+                        # Silence timeout (0.75s after speech ends)
+                        if (now - self._last_speech_time) > 0.75:
                             self._fallback_speaking = False
-                            if len(self._fallback_audio_buffer) >= 15 and not self._is_processing_fallback:
+                            if len(self._fallback_audio_buffer) >= 12 and not self._is_processing_fallback:
                                 buf_to_proc = list(self._fallback_audio_buffer)
-                                self._fallback_audio_buffer = []
+                                self._fallback_audio_buffer.clear()
                                 threading.Thread(target=self._process_fallback_turn, args=(buf_to_proc,), daemon=True).start()
                 except Exception:
                     pass

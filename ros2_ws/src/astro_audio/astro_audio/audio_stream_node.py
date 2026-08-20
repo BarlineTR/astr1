@@ -123,8 +123,17 @@ class AudioStreamNode(Node):
         self._in_dev_idx, in_name = find_audio_device(is_input=True, preferred=pref_in)
         self._out_dev_idx, out_name = find_audio_device(is_input=False, preferred=pref_out)
 
+        # Configurable Acoustic Echo & Barge-In Parameters
+        self.echo_mute_cooldown_s = float(os.getenv("ECHO_MUTE_COOLDOWN_S", "0.65"))
+        self.barge_in_min_rms = float(os.getenv("BARGE_IN_MIN_RMS", "1200.0"))
+        self.barge_in_noise_mult = float(os.getenv("BARGE_IN_NOISE_MULTIPLIER", "3.5"))
+        self.barge_in_min_peak = int(os.getenv("BARGE_IN_MIN_PEAK", "2800"))
+        self._ambient_rms = 120.0
+        self._playback_drop_until = 0.0
+
         self.get_logger().info(f"🎤 [Realtime Audio] Giriş Cihazı: [{self._in_dev_idx}] {in_name} (16kHz Native -> 24kHz Stream)")
         self.get_logger().info(f"🔊 [Realtime Audio] Çıkış Cihazı: [{self._out_dev_idx}] {out_name} (24kHz Stream -> 16kHz DAC)")
+        self.get_logger().info(f"🛡️  [Echo Guard] Cooldown: {self.echo_mute_cooldown_s:.2f}s | Min Barge-In RMS: {self.barge_in_min_rms:.0f}")
 
         # Playback Queue & Thread
         self._play_queue: queue.Queue[bytes] = queue.Queue(maxsize=500)
@@ -175,22 +184,44 @@ class AudioStreamNode(Node):
         if not raw_bytes:
             return
 
-        # Measure RMS level for diagnostic & VAD
+        now = time.monotonic()
+        if now < self._playback_drop_until:
+            return
+
+        # Measure RMS level and peak for diagnostic & VAD
+        peak = 0
         try:
             arr = np.frombuffer(raw_bytes, dtype=np.int16)
             rms = float(np.sqrt(np.mean(arr.astype(np.float32) ** 2)))
+            if len(arr) > 0:
+                peak = int(np.max(np.abs(arr)))
         except Exception:
             rms = 0.0
+            peak = 0
+
+        is_active_playback = (
+            self._is_playing
+            or (now - self._last_playback_time < self.echo_mute_cooldown_s)
+            or not self._play_queue.empty()
+        )
+
+        if not is_active_playback and rms < 400.0:
+            # Continuously adapt ambient background noise floor during quiet periods
+            self._ambient_rms = 0.96 * self._ambient_rms + 0.04 * rms
+
+        # Adaptive barge-in threshold derived from ambient noise floor
+        adaptive_barge_in_rms = max(self.barge_in_min_rms, self._ambient_rms * self.barge_in_noise_mult)
 
         # Software Echo Mute (Zero Self-Hearing):
-        # When Astro is playing voice out of the speaker, completely drop microphone input.
-        # This stops the mic from picking up Astro's own voice and creating an endless loop.
-        is_active_playback = self._is_playing or (time.monotonic() - self._last_playback_time < 0.35) or not self._play_queue.empty()
+        # When Astro is playing voice or within echo cooldown, drop microphone input
+        # unless user intentionally interrupts with distinct acoustic speech energy
         if is_active_playback:
-            return
+            is_genuine_barge_in = (rms >= adaptive_barge_in_rms and peak >= self.barge_in_min_peak)
+            if not is_genuine_barge_in:
+                return
 
         # Energy gate: do not stream dead room silence (saves bandwidth and prevents Whisper hallucination)
-        if rms < 80.0:
+        if not is_active_playback and rms < max(65.0, self._ambient_rms * 0.75):
             return
 
         # Publish mic level
@@ -221,7 +252,7 @@ class AudioStreamNode(Node):
             self.get_logger().debug(f"PCM enqueue notice: {e}")
 
     def _on_interrupt(self, msg: Bool):
-        """Zero-latency barge-in signal: instantly flush playback buffer queue."""
+        """Zero-latency barge-in signal: instantly flush playback buffer queue and mute lingering tail."""
         if msg.data:
             with self._playback_lock:
                 while not self._play_queue.empty():
@@ -230,6 +261,8 @@ class AudioStreamNode(Node):
                     except queue.Empty:
                         break
             self._is_playing = False
+            self._last_playback_time = 0.0
+            self._playback_drop_until = time.monotonic() + 0.15
             self.get_logger().info("⚡ [Realtime Audio] Araya Girme (Barge-In) — Ses Çalma Anında Kesildi.")
 
     def _playback_worker(self):

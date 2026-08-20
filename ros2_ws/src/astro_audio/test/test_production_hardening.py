@@ -23,6 +23,7 @@ import time
 import unittest
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+import numpy as np
 
 # Enforce in-memory audio isolation (never touch physical /dev/snd during unit tests)
 os.environ["ASTRO_MOCK_AUDIO"] = "1"
@@ -397,6 +398,128 @@ class TestElevenLabsEngine(unittest.TestCase):
         self.assertIn("known_voices_path", telem)
         self.assertIn("known_speakers", telem)
         self.assertIn("Baran", telem["known_speakers"])
+
+
+class TestSTTValidationAndEchoImmunity(unittest.TestCase):
+    """Production acceptance tests for STT multi-signal validation, self-voice echo immunity, and hallucination rejection."""
+
+    def setUp(self):
+        from astro_ai.astro_realtime_node import AstroRealtimeNode, compute_self_voice_score
+        self.node = AstroRealtimeNode()
+        self.compute_self_voice_score = compute_self_voice_score
+
+    def _generate_pcm(self, duration_s: float, rms_target: float) -> bytes:
+        """Helper to create synthetic 16kHz int16 PCM with controllable RMS amplitude."""
+        num_samples = int(duration_s * 16000)
+        if rms_target <= 0:
+            return np.zeros(num_samples, dtype=np.int16).tobytes()
+        t = np.linspace(0, duration_s, num_samples, endpoint=False)
+        # 440 Hz tone scaled to desired RMS
+        sine = np.sin(2 * np.pi * 440 * t) * (rms_target * np.sqrt(2))
+        int16_samples = np.clip(sine, -32767, 32767).astype(np.int16)
+        return int16_samples.tobytes()
+
+    def test_compute_self_voice_score_exact_and_partial(self):
+        recent = [
+            "merhaba baran nasılsın bugün",
+            "hava durumu şu anda güneşli ve 22 derece",
+        ]
+        # Exact match / major substring
+        score_exact = self.compute_self_voice_score("merhaba baran nasılsın", recent)
+        self.assertGreaterEqual(score_exact, 0.90)
+
+        # Word overlap
+        score_partial = self.compute_self_voice_score("güneşli ve sıcak hava", recent)
+        self.assertGreater(score_partial, 0.30)
+
+        # Totally unrelated user speech
+        score_unrelated = self.compute_self_voice_score("ışıkları kapat lütfen", recent)
+        self.assertEqual(score_unrelated, 0.0)
+
+    def test_stt_phantom_hallucination_rejected_on_weak_evidence(self):
+        """When Whisper returns 'abone ol' or 'altyazı' on quiet room noise, it MUST be rejected."""
+        weak_pcm = self._generate_pcm(0.40, rms_target=120.0)
+        
+        for phantom in ["abone ol", "Altyazı M.K.", "Diz", "Dizi", "izlediğiniz için teşekkürler"]:
+            validated, meta = self.node._validate_stt_transcript(
+                transcript=phantom,
+                raw_pcm=weak_pcm,
+                is_playback_active=False,
+                is_echo_cooldown=False,
+            )
+            self.assertIsNone(validated, f"Phantom '{phantom}' should be rejected on weak acoustic evidence!")
+            self.assertTrue(meta["stt_rejected"])
+            self.assertIn(meta["stt_reject_reason"], ("no_speech", "self_voice", "low_confidence"))
+
+    def test_stt_legitimate_suspect_phrase_accepted_on_strong_evidence(self):
+        """When user genuinely says 'abone ol' or 'diz' with strong acoustic evidence, it MUST be accepted."""
+        strong_pcm = self._generate_pcm(0.60, rms_target=750.0)
+        self.node._recent_robot_phrases.clear()
+
+        for legit in ["abone ol", "diz", "altyazı lazım"]:
+            validated, meta = self.node._validate_stt_transcript(
+                transcript=legit,
+                raw_pcm=strong_pcm,
+                is_playback_active=False,
+                is_echo_cooldown=False,
+            )
+            self.assertEqual(validated, legit, f"Legitimate utterance '{legit}' with strong acoustic evidence should be accepted!")
+            self.assertFalse(meta["stt_rejected"])
+            self.assertEqual(meta["stt_reject_reason"], "none")
+
+    def test_stt_self_voice_rejected_during_playback_and_echo_cooldown(self):
+        """When microphone picks up Astro's own voice during playback or echo cooldown, it MUST be rejected."""
+        self.node._recent_robot_phrases = ["anlıyorum baran sana yardımcı olabilirim"]
+        pcm = self._generate_pcm(0.50, rms_target=500.0)
+
+        # 1. During active playback
+        val_play, meta_play = self.node._validate_stt_transcript(
+            transcript="sana yardımcı olabilirim",
+            raw_pcm=pcm,
+            is_playback_active=True,
+            is_echo_cooldown=False,
+        )
+        self.assertIsNone(val_play)
+        self.assertTrue(meta_play["stt_rejected"])
+        self.assertEqual(meta_play["stt_reject_reason"], "self_voice")
+
+        # 2. During post-playback echo cooldown
+        val_cool, meta_cool = self.node._validate_stt_transcript(
+            transcript="yardımcı olabilirim",
+            raw_pcm=pcm,
+            is_playback_active=False,
+            is_echo_cooldown=True,
+        )
+        self.assertIsNone(val_cool)
+        self.assertTrue(meta_cool["stt_rejected"])
+        self.assertEqual(meta_cool["stt_reject_reason"], "self_voice")
+
+    def test_stt_short_utterance_acceptance(self):
+        """Short single-word commands (Hey, Lan, Dur, Tamam, Ne?) with valid acoustic evidence are ACCEPTED."""
+        short_pcm = self._generate_pcm(0.35, rms_target=450.0)
+        self.node._recent_robot_phrases.clear()
+
+        for word in ["Hey", "Lan", "Dur", "Tamam", "Ne", "Astro", "Evet", "Hayır"]:
+            val, meta = self.node._validate_stt_transcript(
+                transcript=word,
+                raw_pcm=short_pcm,
+                is_playback_active=False,
+                is_echo_cooldown=False,
+            )
+            self.assertEqual(val, word)
+            self.assertFalse(meta["stt_rejected"])
+
+    def test_stt_buffer_flushing_on_state_transition(self):
+        """Buffer flush must clear accumulators without memory bleed into future turns."""
+        self.node._fallback_audio_buffer = [b"123" * 100, b"456" * 100]
+        self.node._fallback_speaking = True
+        self.node._consecutive_loud_frames = 10
+
+        self.node._flush_audio_buffers("test_transition")
+
+        self.assertEqual(len(self.node._fallback_audio_buffer), 0)
+        self.assertFalse(self.node._fallback_speaking)
+        self.assertEqual(self.node._consecutive_loud_frames, 0)
 
 
 if __name__ == "__main__":
