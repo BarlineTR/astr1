@@ -294,6 +294,11 @@ class AstroRealtimeNode(Node):
     """ROS 2 Node bridging Astro sensors & audio streams to OpenAI Realtime WebSocket."""
 
     def __init__(self):
+        if rclpy is not None and hasattr(rclpy, "ok") and not rclpy.ok():
+            try:
+                rclpy.init()
+            except Exception:
+                pass
         super().__init__("astro_realtime_node")
 
         # Load environment variables (sanitized of quotes/whitespace)

@@ -662,6 +662,15 @@ class TestContextualFallbackAndTelemetry(unittest.TestCase):
 class TestRealtimeArchitectureInvariants(unittest.TestCase):
     """Formal regression assertions ensuring OpenAI Realtime P0 invariants & Vision isolation are preserved."""
 
+    @classmethod
+    def setUpClass(cls):
+        try:
+            import rclpy
+            if not rclpy.ok():
+                rclpy.init()
+        except Exception:
+            pass
+
     def test_realtime_model_default_and_candidates(self):
         """OpenAI Realtime model defaults to gpt-realtime and WebSocket connection targets gpt-realtime."""
         from astro_ai.astro_realtime_node import AstroRealtimeNode, discover_realtime_models

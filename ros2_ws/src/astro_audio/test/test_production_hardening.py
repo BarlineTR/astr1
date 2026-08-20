@@ -403,6 +403,15 @@ class TestElevenLabsEngine(unittest.TestCase):
 class TestSTTValidationAndEchoImmunity(unittest.TestCase):
     """Production acceptance tests for STT multi-signal validation, self-voice echo immunity, and hallucination rejection."""
 
+    @classmethod
+    def setUpClass(cls):
+        try:
+            import rclpy
+            if not rclpy.ok():
+                rclpy.init()
+        except Exception:
+            pass
+
     def setUp(self):
         from astro_ai.astro_realtime_node import AstroRealtimeNode, compute_self_voice_score
         self.node = AstroRealtimeNode()
