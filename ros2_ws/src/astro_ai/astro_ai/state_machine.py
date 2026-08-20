@@ -8,6 +8,8 @@ from typing import Callable, Optional
 
 
 class RobotState(enum.Enum):
+    DEEP_IDLE = "DEEP_IDLE"
+    WAKE = "WAKE"
     IDLE = "IDLE"
     LISTENING = "LISTENING"
     THINKING = "THINKING"
@@ -66,6 +68,12 @@ class StateMachine:
                 pass
 
         return True
+
+    def is_deep_idle(self) -> bool:
+        return self.current_state == RobotState.DEEP_IDLE
+
+    def is_wake(self) -> bool:
+        return self.current_state == RobotState.WAKE
 
     def is_idle(self) -> bool:
         return self.current_state == RobotState.IDLE

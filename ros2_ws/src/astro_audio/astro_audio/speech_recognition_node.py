@@ -485,16 +485,17 @@ class SpeechRecognitionNode(Node):
             if text_lower in session_dependent and not self._session_active:
                 return
 
-            # Filter empty / junk / phantom noise
+            # Filter empty / junk / phantom noise when acoustic evidence is weak
             junk_filters = [
                 "altyazı", "abone ol", "izlediğiniz için", "www.", ".com",
                 "you", "thank you", "bye", "subtitles", "watching", "amara.org",
-                "kalbimde", "sizle geldim", "sıfır tutu", "gizletme üzerime"
+                "kalbimde", "sizle geldim", "sıfır tutu", "gizletme üzerime", "diz"
             ]
-            if any(junk in text_lower for junk in junk_filters):
+            if any(junk in text_lower for junk in junk_filters) and (total_rms < 450.0 or voice_ratio < 0.30 or total_voice_duration < 0.30):
+                self.get_logger().info(f'🔇 [Phantom Gürültü Filtrelendi (RMS: {total_rms:.1f})]: "{text}"')
                 return
 
-            if len(text_lower) < 3 and text_lower not in ["ne", "su", "al", "ev", "on"]:
+            if len(text_lower) < 3 and text_lower not in ["ne", "su", "al", "ev", "on", "dur", "hey", "lan"]:
                 return
 
             # ── Self-Echo Immunity Check ──────────────────────────────────────────

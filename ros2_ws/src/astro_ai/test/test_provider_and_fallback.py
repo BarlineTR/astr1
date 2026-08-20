@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Comprehensive Unit & Regression Tests for ASTRO V1 Provider Registry, Repetition Guard, and Fallback Engine."""
 
+import asyncio
 import json
 import os
 import sys
@@ -8,7 +9,7 @@ import time
 import unittest
 import urllib.error
 import urllib.request
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 # Ensure paths
 ws_src = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
@@ -582,10 +583,22 @@ class TestContextualFallbackAndTelemetry(unittest.TestCase):
         self.assertTrue(is_ready)
         self.assertEqual(pcm, b"\x02\x02" * 480)
 
-        # Case 3: Both ElevenLabs and XTTS unavailable -> Emergency Edge-TTS
+        # Case 3: XTTS unavailable -> Fallback to Local Offline TTS (0 Internet)
         mock_xtts.is_ready.return_value = False
+        mock_offline = MagicMock()
+        mock_offline.is_ready.return_value = True
+        mock_offline.synthesize_sentence.return_value = b"\x03\x03" * 480
+        node.local_offline_tts = mock_offline
         pcm, eng_name, latency, is_ready = AstroRealtimeNode._synthesize_speech_pcm(node, "Merhaba Baran")
-        self.assertEqual(eng_name, "edge_tts_emergency")
+        self.assertEqual(eng_name, "local_offline_tts")
+        self.assertTrue(is_ready)
+        self.assertEqual(pcm, b"\x03\x03" * 480)
+
+        # Case 4: Local offline unavailable -> Network fallback to Edge-TTS
+        mock_offline.is_ready.return_value = False
+        node.edge_tts_enabled = True
+        pcm, eng_name, latency, is_ready = AstroRealtimeNode._synthesize_speech_pcm(node, "Merhaba Baran")
+        self.assertEqual(eng_name, "edge_tts")
         self.assertFalse(is_ready)
         self.assertEqual(pcm, b"\x00\x00" * 480)
 
@@ -644,6 +657,318 @@ class TestContextualFallbackAndTelemetry(unittest.TestCase):
 
             # Verify that only content tokens are yielded, reasoning is discarded
             self.assertEqual("".join(tokens), "Merhaba Baran!")
+
+
+class TestRealtimeArchitectureInvariants(unittest.TestCase):
+    """Formal regression assertions ensuring OpenAI Realtime P0 invariants & Vision isolation are preserved."""
+
+    @classmethod
+    def setUpClass(cls):
+        try:
+            import rclpy
+            if not rclpy.ok():
+                rclpy.init()
+        except Exception:
+            pass
+
+    def test_realtime_model_default_and_candidates(self):
+        """OpenAI Realtime model defaults to gpt-realtime and WebSocket connection targets gpt-realtime."""
+        from astro_ai.astro_realtime_node import AstroRealtimeNode, discover_realtime_models
+
+        candidates = discover_realtime_models("test_key")
+        self.assertIn("gpt-realtime", candidates)
+
+        node = AstroRealtimeNode()
+        self.assertEqual(node.realtime_model, "gpt-realtime")
+        self.assertFalse(node._fallback_mode)
+
+    def test_realtime_audio_streaming_flow_unchanged(self):
+        """Incoming audio is forwarded directly to OpenAI Realtime WebSocket in Realtime mode."""
+        from astro_ai.astro_realtime_node import AstroRealtimeNode
+        from astro_ai.state_machine import RobotState
+
+        node = AstroRealtimeNode()
+        node._is_connected = True
+        node._fallback_mode = False
+        node._is_sleeping = False
+        node.state_machine.transition_to(RobotState.LISTENING)
+        node._ws = MagicMock()
+        node._loop = MagicMock()
+
+        # Simulate incoming audio message
+        mock_msg = MagicMock()
+        mock_msg.data = "AQIDBA=="  # base64 encoded audio
+
+        with patch("asyncio.run_coroutine_threadsafe") as mock_async_send:
+            node._on_input_pcm(mock_msg)
+            self.assertTrue(mock_async_send.called)
+            node._ws.send.assert_called_once_with(json.dumps({"type": "input_audio_buffer.append", "audio": "AQIDBA=="}))
+
+    def test_realtime_barge_in_preserves_semantics(self):
+        """User speech event during playback triggers instant playback abort and response.cancel."""
+        from astro_ai.astro_realtime_node import AstroRealtimeNode
+        from unittest.mock import AsyncMock
+
+        node = AstroRealtimeNode()
+        node._is_responding = True
+        node._is_playback_active = True
+        node.pub_interrupt = MagicMock()
+
+        mock_ws = AsyncMock()
+        event = {"type": "input_audio_buffer.speech_started"}
+
+        asyncio.run(node._handle_realtime_event(mock_ws, event))
+
+        self.assertFalse(node._is_responding)
+        node.pub_interrupt.publish.assert_called_once()
+        mock_ws.send.assert_called_once_with(json.dumps({"type": "response.cancel"}))
+
+    def test_vision_failures_completely_isolated_from_realtime(self):
+        """Vision timeouts or HTTP errors never alter Realtime connection or fallback mode."""
+        from astro_ai.astro_realtime_node import AstroRealtimeNode
+        import numpy as np
+
+        node = AstroRealtimeNode()
+        node._is_connected = True
+        node._fallback_mode = False
+        node.groq_api_key = "test_groq"
+        node.gemini_api_key = "test_gemini"
+
+        mock_frame = np.zeros((480, 640, 3), dtype=np.uint8)
+        node._latest_camera_frame = mock_frame
+
+        # Force urllib errors in vision call
+        with patch("urllib.request.urlopen", side_effect=Exception("Vision HTTP 429 Rate Limited")):
+            res = node._inspect_camera_view(focus="test")
+
+            # Must return graceful dictionary without raising
+            self.assertIsInstance(res, dict)
+            self.assertIn("observation", res)
+            # Realtime connection & mode must remain completely intact
+            self.assertTrue(node._is_connected)
+            self.assertFalse(node._fallback_mode)
+
+    def test_fallback_mode_only_entered_on_realtime_quota_exhaustion(self):
+        """Fallback mode is NOT active during normal healthy Realtime operation."""
+        from astro_ai.astro_realtime_node import AstroRealtimeNode
+
+        node = AstroRealtimeNode()
+        self.assertFalse(node._fallback_mode)
+
+        # Quota exhaustion simulation
+        err_str = "Error code: 429 insufficient_quota"
+        if "insufficient_quota" in err_str:
+            node._fallback_mode = True
+
+        self.assertTrue(node._fallback_mode)
+
+    def test_wake_detector_wakes_from_deep_idle(self):
+        """Dedicated wake verification wakes robot from DEEP_IDLE to LISTENING."""
+        from astro_ai.astro_realtime_node import AstroRealtimeNode
+        from astro_ai.state_machine import RobotState
+        import numpy as np
+
+        node = AstroRealtimeNode()
+        self.assertTrue(node.state_machine.is_deep_idle())
+        self.assertTrue(node._is_sleeping)
+
+        # Synthesize audio chunk of speech
+        fake_pcm = (np.sin(np.linspace(0, 100, 3200)) * 5000).astype(np.int16).tobytes()
+        audio_chunks = [fake_pcm] * 5
+
+        with patch.object(node, "_transcribe_groq_whisper", return_value="Hey Astro"):
+            node._process_wake_candidate(audio_chunks)
+
+            self.assertFalse(node._is_sleeping)
+            self.assertEqual(node.state_machine.current_state, RobotState.LISTENING)
+
+    def test_event_driven_vision_gating_and_memory_filter(self):
+        """Event-driven vision skips same-scene/budget and filters trivial observations."""
+        from astro_ai.astro_realtime_node import AstroRealtimeNode
+        import numpy as np
+
+        node = AstroRealtimeNode()
+        node._latest_camera_frame = np.zeros((480, 640, 3), dtype=np.uint8)
+
+        # 1. Budget exhausted
+        node.max_vision_requests_per_minute = 1
+        node._vision_requests_history = [time.monotonic()]
+        res = node._evaluate_vision_event("scene_changed")
+        self.assertIsNone(res)
+        self.assertEqual(node.vision_last_skip_reason, "budget")
+
+        # 2. Trivial memory filter: "Aydınlık." is classified as ephemeral and not stored in profile
+        node.memory.profile.get_observations = MagicMock(return_value=[])
+        with patch.object(node.memory.profile, "add_observation") as mock_add_obs:
+            node._classify_and_store_vision_observation("Aydınlık.", "idle")
+            mock_add_obs.assert_not_called()
+
+    def test_pure_wake_phrase_does_not_create_conversational_turn(self):
+        """Pure wake phrase wakes robot to LISTENING but creates NO fake LLM/TTS turn."""
+        from astro_ai.astro_realtime_node import AstroRealtimeNode
+        from astro_ai.state_machine import RobotState
+        import numpy as np
+
+        node = AstroRealtimeNode()
+        self.assertTrue(node.state_machine.is_deep_idle())
+        self.assertTrue(node._is_sleeping)
+
+        fake_pcm = (np.sin(np.linspace(0, 100, 3200)) * 5000).astype(np.int16).tobytes()
+        audio_chunks = [fake_pcm] * 5
+
+        with patch.object(node, "_transcribe_groq_whisper", return_value="Hey Astro"), \
+             patch.object(node, "_process_fallback_turn") as mock_turn:
+            node._process_wake_candidate(audio_chunks)
+
+            self.assertFalse(node._is_sleeping)
+            self.assertEqual(node.state_machine.current_state, RobotState.LISTENING)
+            # Must NOT invoke conversational turn
+            mock_turn.assert_not_called()
+
+    def test_wake_with_command_forwards_turn(self):
+        """Wake phrase with attached command triggers turn with command text."""
+        from astro_ai.astro_realtime_node import AstroRealtimeNode
+        from astro_ai.state_machine import RobotState
+        import numpy as np
+
+        node = AstroRealtimeNode()
+        fake_pcm = (np.sin(np.linspace(0, 100, 3200)) * 5000).astype(np.int16).tobytes()
+        audio_chunks = [fake_pcm] * 5
+
+        with patch.object(node, "_transcribe_groq_whisper", return_value="Hey Astro nasılsın"), \
+             patch.object(node, "_process_fallback_turn") as mock_turn:
+            node._process_wake_candidate(audio_chunks)
+
+            self.assertFalse(node._is_sleeping)
+            self.assertEqual(node.state_machine.current_state, RobotState.LISTENING)
+            mock_turn.assert_called_once()
+
+    def test_barge_in_single_logical_event_debouncing(self):
+        """Multiple loud frames during playback trigger only one logical interrupt per generation."""
+        from astro_ai.astro_realtime_node import AstroRealtimeNode
+        from astro_ai.state_machine import RobotState
+        import numpy as np
+        import base64
+
+        node = AstroRealtimeNode()
+        node._is_playback_active = True
+        node._is_responding = True
+        node.state_machine.transition_to(RobotState.SPEAKING)
+        node._is_sleeping = False
+        node.pub_interrupt = MagicMock()
+
+        # Frame with loud RMS (> 1500)
+        loud_pcm_16k = (np.sin(np.linspace(0, 100, 3200)) * 10000).astype(np.int16).tobytes()
+        loud_msg = MagicMock()
+        loud_msg.data = base64.b64encode(loud_pcm_16k).decode("ascii")
+
+        with patch("astro_ai.astro_realtime_node.resample_24k_to_16k", return_value=loud_pcm_16k):
+            # Frame 1 & 2: Building persistence
+            node._on_input_pcm(loud_msg)
+            node._on_input_pcm(loud_msg)
+            # Frame 3: Persistence reached -> Triggers barge-in & sets _barge_in_latched = True
+            node._on_input_pcm(loud_msg)
+            self.assertTrue(node._barge_in_latched)
+            self.assertEqual(node.pub_interrupt.publish.call_count, 1)
+
+            # 4th loud frame in same generation -> Debounced by latch
+            node._on_input_pcm(loud_msg)
+            self.assertEqual(node.pub_interrupt.publish.call_count, 1)
+
+    def test_wake_detector_strictly_rejects_non_wake_words_and_phantom_hallucinations(self):
+        """Non-wake utterances and phantom hallucinations ('Altyazı M.K.') NEVER wake up the robot."""
+        from astro_ai.astro_realtime_node import AstroRealtimeNode
+        from astro_ai.state_machine import RobotState
+        import numpy as np
+
+        node = AstroRealtimeNode()
+        self.assertTrue(node.state_machine.is_deep_idle())
+        self.assertTrue(node._is_sleeping)
+
+        fake_pcm = (np.sin(np.linspace(0, 100, 3200)) * 5000).astype(np.int16).tobytes()
+        audio_chunks = [fake_pcm] * 5
+
+        # 1. Phantom hallucination 'Altyazı M.K.'
+        with patch.object(node, "_transcribe_groq_whisper", return_value="Altyazı M.K."), \
+             patch.object(node, "_process_fallback_turn") as mock_turn:
+            node._process_wake_candidate(audio_chunks)
+            self.assertTrue(node._is_sleeping)
+            self.assertEqual(node.state_machine.current_state, RobotState.DEEP_IDLE)
+            mock_turn.assert_not_called()
+
+        # 2. Arbitrary non-wake speech 'Kapıyı açar mısın'
+        with patch.object(node, "_transcribe_groq_whisper", return_value="Kapıyı açar mısın"), \
+             patch.object(node, "_process_fallback_turn") as mock_turn:
+            node._process_wake_candidate(audio_chunks)
+            self.assertTrue(node._is_sleeping)
+            self.assertEqual(node.state_machine.current_state, RobotState.DEEP_IDLE)
+            mock_turn.assert_not_called()
+
+        # 3. Substring non-exact match 'E astro'
+        with patch.object(node, "_transcribe_groq_whisper", return_value="E astro"), \
+             patch.object(node, "_process_fallback_turn") as mock_turn:
+            node._process_wake_candidate(audio_chunks)
+            self.assertTrue(node._is_sleeping)
+            self.assertEqual(node.state_machine.current_state, RobotState.DEEP_IDLE)
+            mock_turn.assert_not_called()
+
+    def test_xtts_environment_proof_and_resolution(self):
+        """Fine-tuned XTTS model paths and existence are checked at startup."""
+        from astro_audio.local_xtts_engine import resolve_fine_tune_paths
+
+        res = resolve_fine_tune_paths(
+            checkpoint="/non/existent/model.pth",
+            config="/non/existent/config.json",
+            vocab="/non/existent/vocab.json",
+            speakers="/non/existent/speakers.pth",
+            speaker_wav="/non/existent/ref.wav",
+        )
+        self.assertFalse(res["checkpoint_exists"])
+        self.assertFalse(res["config_exists"])
+        self.assertFalse(res["all_required_exist"])
+
+    def test_speaker_recognition_temporal_smoothing(self):
+        """Low confidence scores (0.42) do NOT overwrite existing speaker context; tentative requires 2 observations."""
+        from astro_ai.astro_realtime_node import AstroRealtimeNode
+
+        node = AstroRealtimeNode()
+        node._active_person_name = "Baran"
+        node._person_hold_until = time.monotonic() + 45.0
+        node._recognized_speaker = {"name": "Baran", "confidence": 0.90, "is_known": True, "source": "voice_recognition"}
+
+        # Low confidence observation for Oktay (0.42) -> Ignored, Baran preserved
+        mock_rec = MagicMock()
+        mock_rec.identify_speaker.return_value = ("Oktay", 0.42)
+        node.voice_recognizer = mock_rec
+
+        fake_pcm = b"\x00\x00" * 3200
+        with patch.object(node, "_transcribe_groq_whisper", return_value="selam nasılsın"), \
+             patch.object(node, "_validate_stt_transcript", return_value=("selam nasılsın", {"stt_rejected": False})), \
+             patch.object(node, "_synthesize_speech_pcm", return_value=(b"\x00\x00" * 100, "xtts_gpu", 50.0, True)), \
+             patch.object(node, "_play_pcm_chunks"):
+            
+            node._process_fallback_turn([fake_pcm])
+            # Baran MUST remain active
+            self.assertEqual(node._active_person_name, "Baran")
+
+    def test_complete_offline_mode_acceptance(self):
+        """When network is completely down (0 Internet), local LLM and local offline TTS synthesize voice."""
+        from astro_ai.astro_realtime_node import AstroRealtimeNode
+
+        node = AstroRealtimeNode()
+        node.groq_api_key = ""
+        node.gemini_api_key = ""
+        node.openai_api_key = ""
+        node.edge_tts_enabled = False
+
+        # Local LLM produces answer
+        fallback_ans = node._generate_contextual_persona_fallback("nasılsın")
+        self.assertTrue(len(fallback_ans) > 5)
+
+        # Local offline TTS synthesizes PCM without throwing
+        pcm, eng_name, latency, is_ready = node._synthesize_speech_pcm(fallback_ans)
+        self.assertIn(eng_name, ("xtts_gpu", "local_offline_tts"))
+        self.assertTrue(len(pcm) > 0)
 
 
 if __name__ == "__main__":

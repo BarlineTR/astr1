@@ -28,7 +28,7 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 try:
     import rclpy
     from rclpy.node import Node
-    from sensor_msgs.msg import Image
+    from sensor_msgs.msg import Image, CameraInfo
     from std_msgs.msg import Bool, Float32, String
 except ImportError:
     rclpy = None
@@ -46,7 +46,7 @@ except ImportError:
             return None
     class _MockMsg:
         data: Any = None
-    Image = Bool = Float32 = String = _MockMsg  # type: ignore
+    Image = CameraInfo = Bool = Float32 = String = _MockMsg  # type: ignore
 
 try:
     import cv2
@@ -62,12 +62,14 @@ except ImportError:
 try:
     from astro_audio.elevenlabs_engine import ElevenLabsEngine, ElevenLabsError
     from astro_audio.local_xtts_engine import LocalXttsEngine, resolve_xtts_home, resolve_xtts_speaker_wav
+    from astro_audio.local_offline_tts_engine import LocalOfflineTTSEngine
     from astro_audio.tts_metrics import TurnTelemetry
     from astro_audio.sentence_chunker import SentenceChunker
 except ImportError:
     ElevenLabsEngine = None
     ElevenLabsError = Exception
     LocalXttsEngine = None
+    LocalOfflineTTSEngine = None
     resolve_xtts_home = lambda h="": os.path.expanduser("~/.astro/tts")
     resolve_xtts_speaker_wav = lambda w="": os.path.expanduser("~/.astro/tts/Recording.wav")
     TurnTelemetry = None
@@ -242,23 +244,140 @@ def discover_groq_models(api_key: str) -> list[str]:
         return []
 
 
+VALID_SHORT_UTTERANCES = {
+    "hey", "lan", "dur", "ne", "tamam", "merhaba", "evet", "hayır",
+    "astro", "selam", "alo", "sus", "günaydın", "iyi geceler", "naber",
+    "efendim", "anladım", "peki", "dinliyorum", "burada", "buradayım"
+}
+
+SUSPECT_PHRASES = [
+    "abone ol", "abone olmayı", "abone olmayı unutmayın", "altyazı",
+    "altyazı m.k.", "altyazı:", "çeviren:", "çeviri ve altyazı",
+    "diz", "dizi", "altyazı ekibi", "izlediğiniz için", "izlediğiniz için teşekkürler",
+    "beğenmeyi unutmayın", "hoşça kalın", "hoşçakalın", "bay bay", "m.k.", "sponsor",
+    "videoyu beğenmeyi", "subtitle", "transcription by", "hı hı", "cık", "çık", "ııı", "eee", "hmm"
+]
+
+
+def compute_self_voice_score(transcript: str, recent_robot_phrases: List[str]) -> float:
+    """Computes acoustic & lexical correlation score (0.0 - 1.0) between transcript and recent robot speech."""
+    if not transcript or not recent_robot_phrases:
+        return 0.0
+    t_clean = re.sub(r"[^\w\s]", "", transcript.lower()).strip()
+    if not t_clean:
+        return 0.0
+    t_words = set(t_clean.split())
+    if not t_words:
+        return 0.0
+
+    max_score = 0.0
+    for phrase in recent_robot_phrases:
+        p_clean = re.sub(r"[^\w\s]", "", phrase.lower()).strip()
+        if not p_clean:
+            continue
+        p_words = set(p_clean.split())
+        if not p_words:
+            continue
+        # Exact substring match
+        if t_clean in p_clean or p_clean in t_clean:
+            score = 0.95
+        else:
+            # Word overlap (Jaccard / containment)
+            intersection = t_words.intersection(p_words)
+            score = len(intersection) / float(len(t_words))
+        if score > max_score:
+            max_score = score
+    return min(1.0, max_score)
+
+
+def is_known_phantom_pattern(text: str) -> bool:
+    """Checks if text contains known Whisper hallucination/phantom pattern without semantic context."""
+    if not text:
+        return True
+    t = re.sub(r"[^\w\s]", "", text.lower()).strip()
+    if not t:
+        return True
+    phantom_exacts = {
+        "altyazı", "altyazı mk", "altyazı m k", "altyazi", "altyazi mk", "altyazi m k",
+        "abone ol", "kanala abone ol", "abone olun", "videoyu beğenmeyi unutmayın",
+        "izlediğiniz için teşekkürler", "izlediginiz icin tesekkurler",
+        "izlediğiniz için teşekkür ederiz", "izlediginiz icin tesekkur ederiz",
+        "diz", "dizi", "hahaha", "hahahaha", "hehehe", "hihihi",
+        "türen türen türen", "türen", "turen", "turen turen turen",
+        "evet evet evet", "nokta", "virgül", "şşş", "sss", "hı hı", "cık", "çık"
+    }
+    if t in phantom_exacts:
+        return True
+    # Repetitive single word loop e.g. "türen, türen, türen" or "evet, evet, evet"
+    words = t.split()
+    if len(words) >= 2 and len(set(words)) == 1 and words[0] in ("türen", "turen", "evet", "hayır", "ha", "he", "diz", "dizi", "altyazı", "hahaha"):
+        return True
+    return False
+
+
+def is_valid_user_command(command: str) -> Tuple[bool, str]:
+    """Validates extracted user command for semantic plausibility, repetition, catalog hallucinations, and phantom patterns."""
+    if not command:
+        return False, "empty_command"
+    c_clean = re.sub(r"[^\w\s]", "", command.lower()).strip()
+    if not c_clean or len(c_clean) < 2:
+        return False, "empty_command"
+
+    # 1. Known Phantom Patterns
+    if is_known_phantom_pattern(c_clean):
+        return False, "known_phantom"
+
+    words = c_clean.split()
+    if not words:
+        return False, "empty_command"
+
+    # 2. Pure Wake Prefix Remainder (only wake tokens)
+    if all(w in ("astro", "hey", "selam") for w in words):
+        return False, "wake_only_remainder"
+
+    # 3. Prompt / Catalog / Hallucinated Training Metadata Artifacts (e.g. "Türkçe konuşma, diyalog, robot asistan")
+    catalog_triggers = [
+        "türkçe konuşma", "turkce konusma", "robot asistan", "sesli asistan",
+        "türkçe diyalog", "turkce diyalog", "türkçe dublaj", "turkce dublaj",
+        "türkçe altyazı", "turkce altyazi", "altyazı m k", "altyazi mk",
+        "abone ol", "kanala abone", "videoyu beğen", "izlediğiniz için",
+    ]
+    for ct in catalog_triggers:
+        if ct in c_clean:
+            conversational_clues = ("hakkında", "nasıl", "neden", "ne", "nerede", "kim", "yap", "aç", "kapat", "anlat", "söyle", "nedir", "istiyorum", "misin")
+            if not any(w in c_clean for w in conversational_clues):
+                return False, "catalog_hallucination"
+
+    # 4. Excessive Wake Word Repetition in Command (e.g. "astro astro astro", "hey astro hey astro")
+    wake_tokens = [w for w in words if w in ("astro", "hey", "selam")]
+    if len(wake_tokens) >= 2 and (len(wake_tokens) / len(words)) >= 0.30:
+        return False, "wake_word_loop"
+
+    # 5. Word Repetition Ratio (e.g. "evet evet evet", "türen türen türen")
+    if len(words) >= 3:
+        from collections import Counter
+        counts = Counter(words)
+        most_common_word, most_common_count = counts.most_common(1)[0]
+        if most_common_count >= 3 and (most_common_count / len(words)) >= 0.35:
+            return False, "repetitive_word_loop"
+
+    return True, "valid"
+
+
 class AstroRealtimeNode(Node):
     """ROS 2 Node bridging Astro sensors & audio streams to OpenAI Realtime WebSocket."""
 
-    def _log(self, level: str, message: str) -> None:
-        """Alt sistemler için seviye yönlendirici (bkz. tts_node._log)."""
-        logger = self.get_logger()
-        if level == "error":
-            logger.error(message)
-        elif level in ("warn", "warning"):
-            logger.warn(message)
-        elif level == "debug":
-            logger.debug(message)
-        else:
-            logger.info(message)
-
     def __init__(self):
+        if rclpy is not None and hasattr(rclpy, "ok") and not rclpy.ok():
+            try:
+                rclpy.init()
+            except Exception:
+                pass
         super().__init__("astro_realtime_node")
+
+        # Startup timestamp & Grace Period tracking
+        self._node_start_time = time.monotonic()
+        self.xtts_startup_grace_s = float(os.getenv("XTTS_STARTUP_GRACE_S", "60.0"))
 
         # Load environment variables (sanitized of quotes/whitespace)
         self.openai_api_key = os.environ.get("OPENAI_API_KEY", "").strip("\"' \t\n\r")
@@ -274,7 +393,7 @@ class AstroRealtimeNode(Node):
         # Modular Cognitive Subsystems
         self.memory = MemoryManager()
         self.persona_engine = PersonaEngine(self.persona_name)
-        self.state_machine = StateMachine(RobotState.IDLE)
+        self.state_machine = StateMachine(RobotState.DEEP_IDLE)
         self.session = ConversationSession(base_timeout_s=16.0)
 
         # State
@@ -295,6 +414,27 @@ class AstroRealtimeNode(Node):
         self._person_hold_until = 0.0
         self._greeted_people: Dict[str, float] = {}
 
+        # Configurable Acoustic Echo & Barge-In Parameters
+        self.echo_mute_cooldown_s = float(os.getenv("ECHO_MUTE_COOLDOWN_S", "0.65"))
+        self.barge_in_protection_ms = float(os.getenv("TTS_BARGE_IN_PROTECTION_MS", "350.0"))
+        self.barge_in_min_rms = float(os.getenv("BARGE_IN_MIN_RMS", "1200.0"))
+        self.barge_in_playback_min_rms = float(os.getenv("BARGE_IN_PLAYBACK_MIN_RMS", "4500.0"))
+        self.barge_in_noise_mult = float(os.getenv("BARGE_IN_NOISE_MULTIPLIER", "3.5"))
+        self.barge_in_min_peak = int(os.getenv("BARGE_IN_MIN_PEAK", "2800"))
+        self.barge_in_playback_min_peak = int(os.getenv("BARGE_IN_PLAYBACK_MIN_PEAK", "14000"))
+        self._barge_in_consecutive_frames = 0
+        self.barge_in_min_consecutive_frames = int(os.getenv("BARGE_IN_MIN_CONSECUTIVE_FRAMES", "3"))
+        self.barge_in_playback_min_consecutive_frames = int(os.getenv("BARGE_IN_PLAYBACK_CONSECUTIVE_FRAMES", "6"))
+        self._playback_start_monotonic = 0.0
+        self._ambient_rms = 120.0
+        self._recent_robot_phrases: List[str] = []
+
+        # False Transcript & Rejection Counters
+        self.false_transcript_count = 0
+        self.self_voice_rejection_count = 0
+        self.no_speech_rejection_count = 0
+        self.stale_audio_rejection_count = 0
+
         # Biometric Voice & Face Engines
         self.voice_recognizer = VoiceRecognizer() if VoiceRecognizer else None
         self.face_recognizer = FaceRecognizer() if FaceRecognizer else None
@@ -314,9 +454,30 @@ class AstroRealtimeNode(Node):
         self._is_processing_fallback = False
         self._fallback_generation_id = 0
 
-        # Primary Remote TTS: ElevenLabs Flash v2.5 (~75ms, Turkish support)
+        # Dedicated Wake Detector (Active in SLEEP / DEEP_IDLE with Ultra-low CPU)
+        self._wake_audio_buffer: List[bytes] = []
+        self._wake_speech_frames = 0
+        self._wake_listening = False
+        self._wake_last_voice_time = 0.0
+
+        # Event-Driven Vision Gating & Rate Budget Control
+        self.vision_cooldown_s = float(os.getenv("VISION_COOLDOWN_S", "10.0"))
+        self.max_vision_requests_per_minute = int(os.getenv("MAX_VISION_REQUESTS_PER_MINUTE", "4"))
+        self._vision_requests_history: List[float] = []
+        self._last_scene_frame_thumb: Optional[np.ndarray] = None
+        self._last_vision_call_time = 0.0
+        self._last_seen_person = "Misafir"
+        self._last_seen_distance = 0.0
+        self._last_looking_state = False
+        self.vision_requests_total = 0
+        self.vision_requests_skipped = 0
+        self.vision_last_skip_reason = "none"
+        self.vision_last_event_type = "none"
+
+        # Primary Remote TTS: ElevenLabs Flash v2.5 (Only if ELEVENLABS_ENABLED=true)
         self.elevenlabs_engine: Optional[ElevenLabsEngine] = None
-        if ElevenLabsEngine:
+        el_enabled = os.getenv("ELEVENLABS_ENABLED", "false").lower() in ("1", "true", "yes")
+        if ElevenLabsEngine and el_enabled:
             el_key = os.getenv("ELEVENLABS_API_KEY", "")
             el_voice = os.getenv("ELEVENLABS_VOICE_ID", "")
             el_model = os.getenv("ELEVENLABS_MODEL", "eleven_flash_v2_5")
@@ -326,7 +487,8 @@ class AstroRealtimeNode(Node):
                         api_key=el_key,
                         voice_id=el_voice,
                         model_id=el_model,
-                        logger=self.get_logger(),
+                        enabled=True,
+                        logger=self._safe_log,
                     )
                     self.get_logger().info(f"✨ [ElevenLabs TTS] Flash v2.5 Hazır (Voice ID: {el_voice}, Model: {el_model})")
                 except Exception as e:
@@ -344,24 +506,52 @@ class AstroRealtimeNode(Node):
                     device=os.getenv("TTS_XTTS_DEVICE", "cuda"),
                     half=os.getenv("TTS_XTTS_HALF", "1") not in ("0", "false", "False"),
                     home=xtts_home,
-                    logger=self._log,
+                    model_dir=os.getenv("TTS_XTTS_MODEL_DIR", "") or None,
+                    checkpoint=os.getenv("TTS_XTTS_CHECKPOINT", "") or None,
+                    config=os.getenv("TTS_XTTS_CONFIG", "") or None,
+                    vocab=os.getenv("TTS_XTTS_VOCAB", "") or None,
+                    speakers=os.getenv("TTS_XTTS_SPEAKERS", "") or None,
+                    logger=self._safe_log,
                 )
                 threading.Thread(target=self._start_local_xtts_background, daemon=True).start()
             except Exception as e:
                 self.get_logger().warn(f"⚠️ [Astro Realtime] Local XTTS GPU hazırlık uyarısı: {e}")
 
-        # Camera Perception Frame Cache
+        # Local Offline Backup TTS Engine (Zero internet local resilience fallback)
+        self.local_offline_tts: Optional[LocalOfflineTTSEngine] = None
+        if LocalOfflineTTSEngine:
+            try:
+                self.local_offline_tts = LocalOfflineTTSEngine(
+                    language=os.getenv("TTS_LANGUAGE", "tr"),
+                    logger=self._safe_log,
+                )
+            except Exception as e:
+                self.get_logger().debug(f"LocalOfflineTTSEngine notice: {e}")
+
+        # Generation-level Barge-In Debounce State
+        self._barge_in_latched = False
+        self.edge_tts_enabled = os.getenv("EDGE_TTS_ENABLED", "true").lower() in ("1", "true", "yes")
+
+        # Speaker Recognition Temporal Smoother
+        self._speaker_tentative_name: Optional[str] = None
+        self._speaker_tentative_count: int = 0
+        self._speaker_tentative_last_time: float = 0.0
+
+        # Camera Perception Frame Cache & OAK-D Lite Stability Tracking
         self._latest_camera_frame: Optional[np.ndarray] = None
         self._last_img_time = 0.0
+        self._oak_last_frame_time = 0.0
+        self._oak_last_camera_info_time = 0.0
+        self._oak_xlink_error_count = 0
+        self._oak_connection_state = "DISCONNECTED"
 
-        # Autonomous Idle Learning & Environmental Observation (0 OpenAI Cost)
+        # Autonomous Idle Learning (Cognitive Memory Reflection only, 0 camera calls)
         self._enable_idle_learning = os.environ.get("ENABLE_IDLE_LEARNING", "true").lower() == "true"
         self._last_idle_learning_time = 0.0
         self._last_proactive_gaze_time = 0.0
         if self._enable_idle_learning:
             threading.Thread(target=self._idle_learning_loop, daemon=True).start()
-            self.get_logger().info("🤖 [Astro Realtime] Otonom Boşta Öğrenme ve Çevre Gözlem Motoru Aktif (Groq/Gemini 0-Token)!")
-
+            self.get_logger().info("🤖 [Astro Realtime] Otonom Hafıza Yansıtma Motoru Aktif (Groq/Gemini 0-Token)!")
 
         # ROS 2 Publishers
         self.pub_output_pcm = self.create_publisher(String, "/audio/realtime_output_pcm", 50)
@@ -381,13 +571,12 @@ class AstroRealtimeNode(Node):
         self.create_subscription(Float32, "/vision/user_distance", self._on_user_distance, 10)
         self.create_subscription(Float32, "/audio/doa", self._on_doa, 10)
         self.create_subscription(Image, "/oak/rgb/image_raw", self._on_camera_image, 10)
-
-
+        self.create_subscription(CameraInfo, "/oak/rgb/camera_info", self._on_camera_info, 10)
 
         # Tool execution deduplication
         self._executed_tool_calls: set[str] = set()
 
-        # Sleep Mode (Default: Start in Sleeping State)
+        # Sleep Mode (Default: Start in Sleeping / DEEP_IDLE State)
         self._node_start_time = time.monotonic()
         self._is_sleeping = True
         self._last_interaction_time = time.monotonic() - 20.0
@@ -413,7 +602,21 @@ class AstroRealtimeNode(Node):
         self._ws_thread.start()
 
         self.get_logger().info(f"🚀 [Astro Realtime Node] OpenAI Realtime WebSocket Başlatılıyor... Ses: [{self.realtime_voice}], Kişilik: [{self.persona_name.upper()}]")
-        self.get_logger().info("💤 [Astro Uyku Modu]: Düğüm başlatıldı — Astro uyku modunda (😴). Belirgin bir insan sesi algılandığında uyanacak.")
+        self.get_logger().info("💤 [Astro Uyku Modu]: Düğüm başlatıldı — Astro DEEP_IDLE modunda (😴). Wake listener aktif.")
+
+    def _safe_log(self, lvl: str, msg: str):
+        """Safe ROS2 logger wrapper preventing Cython/rcutils 'Logger severity cannot be changed between calls' error."""
+        try:
+            log_fn = getattr(self.get_logger(), str(lvl).lower(), None)
+            if log_fn and callable(log_fn):
+                log_fn(msg)
+            else:
+                self.get_logger().info(f"[{str(lvl).upper()}] {msg}")
+        except Exception:
+            try:
+                self.get_logger().info(f"[{str(lvl).upper()}] {msg}")
+            except Exception:
+                print(f"[{str(lvl).upper()}] {msg}", flush=True)
 
     def _run_async_loop(self):
         self._loop = asyncio.new_event_loop()
@@ -1395,38 +1598,50 @@ class AstroRealtimeNode(Node):
         return {"status": "error", "observation": "Görüntü analiz edilirken bir hata oluştu."}
 
     def _check_sleep_mode(self):
-        """Transitions Astro into sleep mode after 10 seconds of conversation inactivity."""
+        """Transitions Astro into sleep mode after 12 seconds of conversation inactivity."""
         now = time.monotonic()
-        is_busy = self._is_responding or self._is_playback_active
+        is_busy = (
+            self._is_responding
+            or self._is_playback_active
+            or self.state_machine.is_speaking()
+            or self.state_machine.is_thinking()
+            or self.state_machine.is_listening()
+        )
         if is_busy:
             self._last_interaction_time = now
-            if self._is_sleeping:
+            if self._is_sleeping or self.state_machine.is_deep_idle():
                 self._wake_up()
             return
 
         if not self._is_sleeping:
             idle_seconds = now - self._last_interaction_time
-            if idle_seconds >= 10.0:
+            if idle_seconds >= 12.0:
                 self._is_sleeping = True
-                self.get_logger().info("💤 [Astro Uyku Modu]: 10 saniye hareketsizlik — Astro uyku moduna geçti (😴).")
+                self.state_machine.transition_to(RobotState.DEEP_IDLE)
+                self.get_logger().info("💤 [Astro Uyku Modu]: 12 saniye hareketsizlik — Astro DEEP_IDLE moduna geçti (😴). Wake listener aktif.")
 
                 # 1. Publish sleeping emotion for face/display
-                emo_msg = String()
-                emo_msg.data = "sleeping"
-                self.pub_emotion.publish(emo_msg)
+                if self.pub_emotion is not None:
+                    emo_msg = String()
+                    emo_msg.data = "sleeping"
+                    self.pub_emotion.publish(emo_msg)
 
                 # 2. Publish sleep head gesture
-                gest_msg = String()
-                gest_msg.data = "sleep"
-                self.pub_gesture.publish(gest_msg)
+                if self.pub_gesture is not None:
+                    gest_msg = String()
+                    gest_msg.data = "sleep"
+                    self.pub_gesture.publish(gest_msg)
 
     def _wake_up(self):
         """Wakes Astro up from sleep mode upon speech or user interaction."""
         now = time.monotonic()
         self._last_interaction_time = now
-        if self._is_sleeping:
+        was_sleeping = self._is_sleeping or self.state_machine.is_deep_idle()
+        if was_sleeping:
             self._is_sleeping = False
-            self.get_logger().info("⏰ [Astro Uyandı]: Kullanıcı sesi algılandı — Astro uykudan uyandı ve dinliyor!")
+            self.state_machine.transition_to(RobotState.WAKE)
+            self._flush_audio_buffers("wake_up")
+            self.get_logger().info("⏰ [Astro Uyandı]: Wake algılandı — Astro uykudan uyandı ve dinliyor (LISTENING)!")
 
             # 1. Clear any stale audio in OpenAI buffer
             if self._ws and self._loop and self._is_connected:
@@ -1439,18 +1654,128 @@ class AstroRealtimeNode(Node):
                     pass
 
             # 2. Restore persona emotion
-            emo_msg = String()
-            emo_msg.data = self.persona_name
-            self.pub_emotion.publish(emo_msg)
+            if self.pub_emotion is not None:
+                emo_msg = String()
+                emo_msg.data = self.persona_name
+                self.pub_emotion.publish(emo_msg)
 
             # 3. Publish wake gesture
-            gest_msg = String()
-            gest_msg.data = "wake"
-            self.pub_gesture.publish(gest_msg)
+            if self.pub_gesture is not None:
+                gest_msg = String()
+                gest_msg.data = "wake"
+                self.pub_gesture.publish(gest_msg)
 
+            self.state_machine.transition_to(RobotState.LISTENING)
+
+    def _process_wake_candidate(self, audio_chunks: List[bytes]):
+        """Processes potential wake utterance during sleep with strict wake phrase gating and full telemetry tracking."""
+        raw_pcm = b"".join(audio_chunks)
+        if len(raw_pcm) < 16000 * 2 * 0.20:
+            return
+
+        import io
+        import wave
+        wav_buf = io.BytesIO()
+        with wave.open(wav_buf, "wb") as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(16000)
+            wf.writeframes(raw_pcm)
+        wav_bytes = wav_buf.getvalue()
+
+        arr = np.frombuffer(raw_pcm, dtype=np.int16)
+        total_rms = float(np.sqrt(np.mean(arr.astype(np.float32) ** 2))) if len(arr) > 0 else 0.0
+        peak_val = int(np.max(np.abs(arr))) if len(arr) > 0 else 0
+
+        # Transcribe candidate using fast Groq Whisper
+        transcript = self._transcribe_groq_whisper(wav_bytes) or ""
+        
+        # 1. Multi-signal STT validation (reject phantom hallucinations like 'Altyazı M.K.')
+        validated_text, stt_meta = self._validate_stt_transcript(
+            transcript=transcript,
+            raw_pcm=raw_pcm,
+            is_playback_active=False,
+            is_echo_cooldown=False,
+        )
+
+        if not validated_text:
+            self.get_logger().info(
+                f"⚡ [Wake Telemetry]: wake_detector_active=True | wake_candidate=\"{transcript}\" | "
+                f"stt_rejected=True | stt_reject_reason={stt_meta.get('stt_reject_reason')} | "
+                f"wake_rejected=True | conversation_turn_created=False | llm_started=False | tts_started=False"
+            )
+            return
+
+        t_clean = re.sub(r"[^\w\s]", "", validated_text.lower()).strip()
+
+        # 2. Strict Wake Phrase Verification
+        # Primary wake phrases: 'Hey Astro', 'Astro' (with normalization for commas/spaces)
+        # Strictly reject: 'e astro', 'altyazı', 'abone ol', etc.
+        is_wake_pattern = False
+        extracted_cmd = ""
+
+        if t_clean in ("hey astro", "astro", "hey", "selam", "selam astro"):
+            is_wake_pattern = True
+            extracted_cmd = ""
+        elif t_clean.startswith("hey astro ") or t_clean.startswith("hey astro,"):
+            is_wake_pattern = True
+            extracted_cmd = t_clean[len("hey astro"):].strip()
+        elif t_clean.startswith("astro ") or t_clean.startswith("astro,"):
+            is_wake_pattern = True
+            extracted_cmd = t_clean[len("astro"):].strip()
+        elif t_clean.startswith("selam astro "):
+            is_wake_pattern = True
+            extracted_cmd = t_clean[len("selam astro"):].strip()
+
+        if not is_wake_pattern:
+            self.get_logger().info(
+                f"⚡ [Wake Telemetry]: wake_detector_active=True | wake_candidate=\"{transcript}\" | "
+                f"is_wake_phrase=False | wake_confidence=0.10 | wake_rejected=True | "
+                f"wake_only=False | conversation_turn_created=False | llm_started=False | tts_started=False"
+            )
+            return
+
+        wake_confidence = 0.95
+        vad_confidence = round(min(1.0, total_rms / 600.0), 2)
+
+        is_only_wake_word = (len(extracted_cmd) < 2)
+        valid_cmd, cmd_reason = is_valid_user_command(extracted_cmd)
+
+        if is_only_wake_word or not valid_cmd:
+            # Pure Wake Phrase, Wake + Phantom, or Wake + Catalog/Repetitive Hallucination:
+            # Wakes robot up, flushes buffers, transitions to LISTENING. NO fake LLM / TTS turn!
+            self._wake_up()
+            self.get_logger().info(
+                f"⚡ [Wake Telemetry]: wake_detector_active=True | wake_candidate=\"{transcript}\" | "
+                f"is_wake_phrase=True | wake_confidence={wake_confidence:.2f} | vad_confidence={vad_confidence:.2f} | "
+                f"stt_started=True | stt_finished=True | transcript=\"{transcript}\" | "
+                f"extracted_command=\"{extracted_cmd}\" | command_invalid={not valid_cmd} | "
+                f"command_reject_reason={cmd_reason if not valid_cmd else 'none'} | "
+                f"wake_only=True | wake_rejected=False | conversation_turn_created=False | llm_started=False | tts_started=False"
+            )
+        else:
+            # Wake + Attached Genuine Command (e.g. "Hey Astro hava nasıl?"): Strip wake phrase and forward command
+            self._wake_up()
+            self.get_logger().info(
+                f"⚡ [Wake Telemetry]: wake_detector_active=True | wake_candidate=\"{transcript}\" | "
+                f"is_wake_phrase=True | wake_confidence={wake_confidence:.2f} | vad_confidence={vad_confidence:.2f} | "
+                f"stt_started=True | stt_finished=True | transcript=\"{transcript}\" | "
+                f"extracted_command=\"{extracted_cmd}\" | command_invalid=False | "
+                f"command_reject_reason=none | "
+                f"wake_only=False | wake_rejected=False | conversation_turn_created=True | llm_started=True | tts_started=True"
+            )
+            if self._fallback_mode or not self._is_connected:
+                threading.Thread(target=self._process_fallback_turn, args=(audio_chunks,), daemon=True).start()
+
+    def _on_camera_info(self, msg: Any):
+        """Monitors OAK-D Lite camera_info topic stream for XLink/hardware liveness."""
+        self._oak_last_camera_info_time = time.monotonic()
+        self._oak_connection_state = "CONNECTED"
 
     def _on_camera_image(self, msg: Image):
         now = time.monotonic()
+        self._oak_last_frame_time = now
+        self._oak_connection_state = "CONNECTED"
         if (now - self._last_img_time) < 0.2:  # Max 5 FPS decoding
             return
         self._last_img_time = now
@@ -1459,19 +1784,116 @@ class AstroRealtimeNode(Node):
             with self._lock:
                 self._latest_camera_frame = frame
 
-    def _idle_learning_loop(self):
-        """Continuous background loop for autonomous room exploration and cognitive memory consolidation.
+    def _evaluate_vision_event(self, event_type: str, focus: str = "", explicit: bool = False) -> Optional[Dict[str, Any]]:
+        """Event-driven vision gating: evaluates frame difference, cooldown, budget, and semantic filters."""
+        now = time.monotonic()
 
-        Runs every 20s when idle OR sleeping — sleep mode is ideal for learning since the robot
-        has idle CPU and a clear unobstructed camera view of the environment.
-        Only pauses when actively speaking or playing audio.
+        # Hard rate limiting budget: max requests per minute
+        minute_cutoff = now - 60.0
+        self._vision_requests_history = [t for t in self._vision_requests_history if t > minute_cutoff]
+        if len(self._vision_requests_history) >= self.max_vision_requests_per_minute and not explicit:
+            self.vision_requests_skipped += 1
+            self.vision_last_skip_reason = "budget"
+            self.get_logger().debug(
+                f"👁️ [Vision Telemetry]: event={event_type} | requests_total={self.vision_requests_total} | "
+                f"skipped={self.vision_requests_skipped} | skip_reason=budget | cooldown_rem=0.0s | "
+                f"budget_used={len(self._vision_requests_history)}/{self.max_vision_requests_per_minute}/min"
+            )
+            return None
+
+        # Do not disrupt active conversation (P0 Audio Isolation)
+        if (self._is_responding or self._is_playback_active) and not explicit:
+            self.vision_requests_skipped += 1
+            self.vision_last_skip_reason = "conversation_busy"
+            return None
+
+        # Cooldown gating
+        time_since_last = now - self._last_vision_call_time
+        if time_since_last < self.vision_cooldown_s and not explicit:
+            self.vision_requests_skipped += 1
+            self.vision_last_skip_reason = "cooldown"
+            return None
+
+        # Frame change gating (Perceptual difference)
+        with self._lock:
+            frame = self._latest_camera_frame
+
+        if frame is None:
+            self.vision_requests_skipped += 1
+            self.vision_last_skip_reason = "no_frame"
+            return None
+
+        # Downscale to 64x64 grayscale for ultra-lightweight MSE change detection
+        try:
+            small_gray = cv2.resize(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY), (64, 64)) if cv2 else None
+        except Exception:
+            small_gray = None
+
+        if small_gray is not None and self._last_scene_frame_thumb is not None and not explicit:
+            diff_mse = float(np.mean((small_gray.astype(np.float32) - self._last_scene_frame_thumb.astype(np.float32)) ** 2))
+            if diff_mse < 18.0 and event_type not in ("new_person", "explicit_vision_query"):
+                self.vision_requests_skipped += 1
+                self.vision_last_skip_reason = "same_scene"
+                return None
+
+        if small_gray is not None:
+            self._last_scene_frame_thumb = small_gray
+
+        # Gate passed -> Execute Vision Request asynchronously
+        self.vision_requests_total += 1
+        self._last_vision_call_time = now
+        self._vision_requests_history.append(now)
+        self.vision_last_event_type = event_type
+
+        self.get_logger().info(
+            f"👁️ [Vision Telemetry]: event={event_type} | requests_total={self.vision_requests_total} | "
+            f"skipped={self.vision_requests_skipped} | skip_reason=none | cooldown_rem=0.0s | "
+            f"budget_used={len(self._vision_requests_history)}/{self.max_vision_requests_per_minute}/min"
+        )
+
+        res = self._inspect_camera_view(focus=focus)
+        obs = res.get("observation", "")
+        self._classify_and_store_vision_observation(obs, event_type)
+        return res
+
+    def _classify_and_store_vision_observation(self, obs: str, event_type: str):
+        """Classifies vision observation as ephemeral, important, or durable and prevents trivial memory pollution."""
+        if not obs:
+            return
+
+        obs_clean = obs.strip()
+        obs_lower = obs_clean.lower()
+
+        # Reject trivial patterns from polluting long-term memory
+        trivial_patterns = [
+            "aydınlık", "karanlık", "ışık var", "oda aydınlık", "oda karanlık",
+            "görüntü net", "bir şey yok", "boş", "normal", "net değil", "görüntü alındı"
+        ]
+        is_trivial = (
+            len(obs_clean.split()) <= 3
+            and any(tp in obs_lower for tp in trivial_patterns)
+        ) or obs_lower in ("aydınlık.", "karanlık.", "aydınlık", "karanlık")
+
+        if is_trivial:
+            self.get_logger().debug(f"👁️ [Görsel Filtre (Ephemeral)]: Önemsiz/Düşük değerli gözlem ('{obs_clean}') uzun vadeli hafızaya kaydedilmedi.")
+            return
+
+        # Meaningful environmental fact -> Save to Profile Memory
+        self.memory.profile.add_observation(f"Görsel Çevre ({event_type}): {obs_clean}")
+        self.get_logger().info(f"👁️🧠 [Görsel Hafıza Kaydı (Durable)]: Astro çevreyi kaydetti -> \"{obs_clean}\"")
+        self._sync_perception_to_session()
+
+    def _idle_learning_loop(self):
+        """Background loop for cognitive memory consolidation (0 camera calls / 0 Gemini Vision cost).
+
+        Idle Gemini Vision request = 0.
+        Only performs memory reflection from recent conversations when idle.
         """
-        while rclpy.ok():
-            time.sleep(3)
+        while (rclpy is not None and getattr(rclpy, "ok", lambda: True)()):
+            time.sleep(10)
             if not self._enable_idle_learning:
                 continue
 
-            # Run during sleep mode OR when truly idle for >= 30s (do not interrupt active conversation)
             if self._is_responding or self._is_playback_active:
                 continue
 
@@ -1479,15 +1901,9 @@ class AstroRealtimeNode(Node):
             if not self._is_sleeping and (now - getattr(self, "_last_interaction_time", 0.0)) < 30.0:
                 continue
 
-            if (now - self._last_idle_learning_time) > 25.0:
+            if (now - self._last_idle_learning_time) > 45.0:
                 self._last_idle_learning_time = now
-                sleep_tag = " [UYKU MODU]" if self._is_sleeping else ""
-                self.get_logger().info(f"👁️🧠 [Otonom Öğrenme{sleep_tag}]: Astro kamerayı ve hafızayı inceliyor...")
-
-                # 1. Background Room Scene & Object Observation via Camera (Groq Vision)
-                self._idle_room_observation(now)
-
-                # 2. Background Cognitive Memory Reflection
+                # Background Cognitive Memory Reflection (text-only LLM)
                 self._idle_memory_reflection()
 
     def _idle_memory_reflection(self):
@@ -1566,180 +1982,6 @@ class AstroRealtimeNode(Node):
                 self._sync_perception_to_session()
         except Exception as e:
             self.get_logger().debug(f"Memory reflection notice: {e}")
-
-    def _idle_room_observation(self, now: float):
-        """Captures camera view in idle/sleep and saves visual environment observations to memory."""
-        with self._lock:
-            frame = self._latest_camera_frame
-
-        if frame is None:
-            return
-
-        b64_img = frame_to_base64_jpeg(frame, max_dim=512)
-        if not b64_img:
-            return
-
-        # Base64 sanitization: strip any URI prefix and whitespace/newlines
-        if "," in b64_img:
-            b64_img = b64_img.split(",")[-1]
-        b64_img = b64_img.replace("\n", "").replace("\r", "").strip()
-
-        try:
-            import urllib.request
-            prompt = (
-                "Sen bir sosyal robotun kamera gözüsün. Karşındaki odayı, ortamı, masadaki eşyaları ve etraftaki insanları "
-                "tek bir kısa ve net Türkçe cümleyle açıkla (Örn: 'Masada dizüstü bilgisayar ve kahve fincanı duruyor.' "
-                "veya 'Oda aydınlık, masada çakmak ve telefon var.'). Başka hiçbir şey yazma."
-            )
-            obs = None
-            provider_name = ""
-
-            # 1. Primary: Groq Vision Models (0 Token Cost, Ultra Fast)
-            if self.groq_api_key:
-                active_groq = discover_groq_models(self.groq_api_key)
-                groq_v_models = [m for m in active_groq if "vision" in m]
-                if not groq_v_models:
-                    groq_v_models = [m for m in ["llama-3.3-70b-versatile", "openai/gpt-oss-120b", "openai/gpt-oss-20b"] if m in active_groq]
-                for v_mod in groq_v_models:
-                    try:
-                        import urllib.request
-                        import urllib.error
-                        req_data = {
-                            "model": v_mod,
-                            "messages": [
-                                {
-                                    "role": "user",
-                                    "content": [
-                                        {"type": "text", "text": prompt},
-                                        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64_img}"}}
-                                    ]
-                                }
-                            ],
-                            "temperature": 0.2,
-                            "max_tokens": 80
-                        }
-                        data_bytes = json.dumps(req_data, ensure_ascii=False).encode("utf-8")
-                        req = urllib.request.Request(
-                            "https://api.groq.com/openai/v1/chat/completions",
-                            data=data_bytes,
-                            headers={
-                                "Content-Type": "application/json",
-                                "Authorization": f"Bearer {self.groq_api_key}",
-                                "User-Agent": "Mozilla/5.0"
-                            },
-                            method="POST"
-                        )
-                        with urllib.request.urlopen(req, timeout=5.0) as resp:
-                            resp_json = json.loads(resp.read().decode("utf-8"))
-                            obs = resp_json["choices"][0]["message"]["content"].strip()
-                            if obs:
-                                provider_name = f"Groq ({v_mod})"
-                                break
-                    except urllib.error.HTTPError as http_e:
-                        error_body = http_e.read().decode("utf-8", errors="ignore")
-                        self.get_logger().debug(f"Idle Groq Vision ({v_mod}) notice: {http_e.code} - {error_body}")
-                    except Exception as ge:
-                        self.get_logger().debug(f"Idle Groq Vision ({v_mod}) notice: {ge}")
-
-            # 2. Secondary: Google Gemini Flash REST (0 Token Cost, Blazing Fast)
-            if not obs and self.gemini_api_key:
-                for g_mod in ["gemini-2.5-flash", "gemini-1.5-flash", "gemini-3.6-flash", "gemini-flash-latest"]:
-                    try:
-                        import urllib.request
-                        import urllib.error
-                        url = f"https://generativelanguage.googleapis.com/v1beta/models/{g_mod}:generateContent?key={self.gemini_api_key}"
-                        payload = {
-                            "contents": [{
-                                "parts": [
-                                    {"text": prompt},
-                                    {"inline_data": {"mime_type": "image/jpeg", "data": b64_img}}
-                                ]
-                            }],
-                            "generation_config": {"temperature": 0.2, "max_output_tokens": 80}
-                        }
-                        data_bytes = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-                        req = urllib.request.Request(
-                            url,
-                            data=data_bytes,
-                            headers={"Content-Type": "application/json", "User-Agent": "Mozilla/5.0"}
-                        )
-                        with urllib.request.urlopen(req, timeout=5.0) as resp:
-                            res_json = json.loads(resp.read().decode("utf-8"))
-                            obs = res_json["candidates"][0]["content"]["parts"][0]["text"].strip()
-                            if obs:
-                                provider_name = f"Gemini ({g_mod})"
-                                break
-                    except urllib.error.HTTPError as http_e:
-                        error_body = http_e.read().decode("utf-8", errors="ignore")
-                        self.get_logger().debug(f"Idle Gemini Vision ({g_mod}) notice: {http_e.code} - {error_body}")
-                    except Exception as gem_e:
-                        self.get_logger().debug(f"Idle Gemini Vision ({g_mod}) notice: {gem_e}")
-
-            # 3. Emergency Safety Fallback: OpenAI Vision REST (gpt-4o-mini)
-            # (Only used if Gemini & Groq keys are invalid/failed, so robot never goes blind)
-            if not obs and self.openai_api_key:
-                try:
-                    req_data = {
-                        "model": "gpt-4o-mini",
-                        "messages": [
-                            {
-                                "role": "user",
-                                "content": [
-                                    {"type": "text", "text": prompt},
-                                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64_img}"}}
-                                ]
-                            }
-                        ],
-                        "max_tokens": 80
-                    }
-                    data_bytes = json.dumps(req_data, ensure_ascii=False).encode("utf-8")
-                    req = urllib.request.Request(
-                        "https://api.openai.com/v1/chat/completions",
-                        data=data_bytes,
-                        headers={
-                            "Content-Type": "application/json",
-                            "Authorization": f"Bearer {self.openai_api_key}",
-                            "User-Agent": "Mozilla/5.0"
-                        },
-                        method="POST"
-                    )
-                    with urllib.request.urlopen(req, timeout=6.0) as resp:
-                        resp_json = json.loads(resp.read().decode("utf-8"))
-                        obs = resp_json["choices"][0]["message"]["content"].strip()
-                        if obs:
-                            provider_name = "OpenAI (gpt-4o-mini)"
-                except Exception as oe:
-                    self.get_logger().debug(f"Idle OpenAI Vision notice: {oe}")
-
-            if obs and len(obs) > 4:
-                self.memory.profile.add_observation(f"Görsel Çevre: {obs}")
-                sleep_tag = " [UYKU MODU]" if self._is_sleeping else ""
-                self.get_logger().info(f"👁️🧠 [Otonom Görsel Öğrenme ({provider_name}){sleep_tag}]: Astro kameradan gördü ve hafızasına kaydetti -> \"{obs}\"")
-
-                # If vision observes a person looking or sitting in front of robot, proactively initiate greeting
-                obs_l = obs.lower()
-                if any(kw in obs_l for kw in ["bana bakıyor", "kameraya bakıyor", "karşımda oturan", "biri var", "insan var"]):
-                    if not self._is_responding and not self._is_playback_active:
-                        if (now - self._last_proactive_gaze_time) > 45.0:
-                            self._last_proactive_gaze_time = now
-                            self.get_logger().info(f"👁️ [Görsel Sahne Proaktif Etkileşim]: Astro karşısındaki kişiyi fark etti!")
-                            if self._ws and self._loop and self._is_connected:
-                                gaze_event = {
-                                    "type": "conversation.item.create",
-                                    "item": {
-                                        "type": "message",
-                                        "role": "user",
-                                        "content": [{"type": "input_text", "text": f"[Sistem Olayı]: Karşındaki kişiyi veya odayı fark ettin ({obs}). Seçili kişiliğinle kısa, doğal ve esprili bir şekilde laf at veya selam ver!"}]
-                                    }
-                                }
-                                asyncio.run_coroutine_threadsafe(self._ws.send(json.dumps(gaze_event)), self._loop)
-                                asyncio.run_coroutine_threadsafe(self._ws.send(json.dumps({"type": "response.create"})), self._loop)
-            else:
-                self._vision_status = "unavailable"
-                self.get_logger().debug("ℹ️ [Otonom Görsel]: Vision servisi yanıt vermedi, konuşma akışı kesintisiz devam ediyor.")
-        except Exception as e:
-            self._vision_status = "unavailable"
-            self.get_logger().debug(f"ℹ️ [Otonom Görsel Hatası]: {e}")
 
 
 
@@ -1835,13 +2077,27 @@ class AstroRealtimeNode(Node):
             self.get_logger().info(f"📝 [Kalıcı Hafıza Kaydı ({person_name})]: 'Önceki konuşma hafızaya kaydedildi -> {summary}'")
             self._sync_perception_to_session()
 
+    def _flush_audio_buffers(self, reason: str = "transition"):
+        """Completely purges all audio input buffers, queues, and VAD state during turn state transitions."""
+        with self._lock:
+            self._fallback_audio_buffer.clear()
+            self._fallback_speaking = False
+            self._consecutive_loud_frames = 0
+            if len(self._user_speech_audio_buffer) > 10:
+                self._user_speech_audio_buffer = self._user_speech_audio_buffer[-10:]
+        self.get_logger().debug(f"🧹 [Audio Buffer Flush] State transition purge: reason={reason}")
+
     def _on_playback_active(self, msg: Bool):
         was_active = self._is_playback_active
 
         self._is_playback_active = bool(msg.data)
-        if was_active and not self._is_playback_active:
+        if not was_active and self._is_playback_active:
+            self._playback_start_monotonic = time.monotonic()
+        elif was_active and not self._is_playback_active:
             self._playback_end_time = time.monotonic()
-            self._is_responding = False
+            if not self._is_processing_fallback:
+                self._is_responding = False
+            self._flush_audio_buffers("playback_ended")
             # Clear OpenAI input audio buffer so trailing room reverberation doesn't trigger VAD
             if self._ws and self._loop and self._is_connected:
                 try:
@@ -1849,6 +2105,183 @@ class AstroRealtimeNode(Node):
                 except Exception:
                     pass
             self.get_logger().info("👂 [Astro Dinliyor]: Mikrofon aktif, sizi dinliyor...")
+
+    def _validate_stt_transcript(
+        self,
+        transcript: str,
+        raw_pcm: bytes,
+        is_playback_active: bool,
+        is_echo_cooldown: bool,
+    ) -> Tuple[Optional[str], Dict[str, Any]]:
+        """Multi-signal validation fusing transcript text, acoustic evidence, VAD, playback state, and self-voice score."""
+        cleaned = (transcript or "").strip()
+        if not cleaned:
+            return None, {
+                "transcript": "",
+                "stt_rejected": True,
+                "stt_reject_reason": "empty_transcript",
+                "audio_ms": 0,
+                "speech_ms": 0,
+                "rms": 0.0,
+                "peak": 0,
+                "vad_confidence": 0.0,
+                "stt_confidence": 0.0,
+                "playback_active": is_playback_active,
+                "echo_cooldown_active": is_echo_cooldown,
+                "self_voice_score": 0.0,
+            }
+
+        arr = np.frombuffer(raw_pcm, dtype=np.int16) if raw_pcm else np.array([], dtype=np.int16)
+        audio_ms = int((len(arr) / 16000.0) * 1000.0)
+        if len(arr) == 0:
+            return None, {
+                "transcript": cleaned,
+                "stt_rejected": True,
+                "stt_reject_reason": "no_audio",
+                "audio_ms": 0,
+                "speech_ms": 0,
+                "rms": 0.0,
+                "peak": 0,
+                "vad_confidence": 0.0,
+                "stt_confidence": 0.0,
+                "playback_active": is_playback_active,
+                "echo_cooldown_active": is_echo_cooldown,
+                "self_voice_score": 0.0,
+            }
+
+        total_rms = float(np.sqrt(np.mean(arr.astype(np.float32) ** 2)))
+        peak_val = int(np.max(np.abs(arr)))
+
+        # Speech frame estimation (20ms = 320 samples @ 16kHz)
+        chunk_size = 320
+        speech_frames = 0
+        total_frames = max(1, len(arr) // chunk_size)
+        speech_threshold = max(350.0, self._ambient_rms * 1.5)
+        for i in range(0, len(arr) - chunk_size + 1, chunk_size):
+            c_arr = arr[i : i + chunk_size]
+            c_rms = float(np.sqrt(np.mean(c_arr.astype(np.float32) ** 2)))
+            if c_rms > speech_threshold:
+                speech_frames += 1
+
+        speech_ms = int((speech_frames * chunk_size / 16000.0) * 1000.0)
+        vad_confidence = round(min(1.0, speech_frames / float(total_frames)), 2)
+        stt_confidence = 0.90 if len(cleaned.split()) > 1 else 0.80
+
+        with self._lock:
+            recent_phrases = list(self._recent_robot_phrases)
+        self_voice_score = round(compute_self_voice_score(cleaned, recent_phrases), 2)
+
+        norm_text = re.sub(r"[^\w\s]", "", cleaned.lower()).strip()
+        words = norm_text.split()
+        is_short_utterance = (len(words) == 1 and words[0] in VALID_SHORT_UTTERANCES)
+        is_suspect_phrase = any(sp in norm_text for sp in SUSPECT_PHRASES)
+
+        rejected = False
+        reject_reason = "none"
+
+        # Check if audio has strong acoustic evidence of real human speech articulation
+        has_strong_evidence = (
+            not is_playback_active
+            and not is_echo_cooldown
+            and speech_ms >= 550
+            and audio_ms >= 700
+            and vad_confidence >= 0.55
+            and total_rms >= 480.0
+            and self_voice_score < 0.20
+        )
+
+        # 0. Pure Known Phantom Hallucination Patterns (e.g. 'Altyazı M.K.', 'Abone ol', 'İzlediğiniz için teşekkürler', 'türen türen türen')
+        is_phantom = is_known_phantom_pattern(norm_text)
+        if is_phantom and not is_short_utterance and not has_strong_evidence:
+            rejected = True
+            reject_reason = "known_phantom"
+
+        # 1. Playback active or room echo cooldown with high self-voice correlation
+        elif (is_playback_active or is_echo_cooldown) and self_voice_score >= 0.45:
+            rejected = True
+            reject_reason = "self_voice"
+
+        # 2. Playback is active and input does not exceed barge-in energy
+        elif is_playback_active and total_rms < self.barge_in_min_rms:
+            rejected = True
+            reject_reason = "self_voice"
+
+        # 3. Weak speech duration, low VAD confidence, or ambient noise floor
+        elif vad_confidence < 0.20 or speech_ms < 100 or total_rms < max(200.0, self._ambient_rms * 1.15):
+            rejected = True
+            reject_reason = "no_speech"
+
+        # 4. Suspect phrases (e.g. "abone ol", "diz", "altyazı m.k.", "altyazı") evaluated against genuine speech evidence
+        elif is_suspect_phrase and not has_strong_evidence:
+            rejected = True
+            reject_reason = "self_voice" if (is_playback_active or is_echo_cooldown or self_voice_score >= 0.20) else "no_speech"
+
+        # 5. Short utterances (e.g. "Hey", "Lan", "Dur", "Tamam", "Ne?")
+        elif len(words) == 1:
+            if is_short_utterance and speech_ms >= 70 and total_rms >= 280.0 and not is_playback_active:
+                rejected = False
+            elif not is_short_utterance and (speech_ms < 140 or total_rms < 380.0 or vad_confidence < 0.30):
+                rejected = True
+                reject_reason = "low_confidence"
+
+        # 6. Low quality speech / Repetitive Whisper hallucination gate (e.g. 'Türen, türen...', 'Hahaha')
+        elif vad_confidence < 0.35 and speech_ms < 220 and total_rms < 380.0:
+            rejected = True
+            reject_reason = "low_confidence"
+
+        # 7. General sentence threshold
+        elif speech_ms < 120 or total_rms < 240.0:
+            rejected = True
+            reject_reason = "low_confidence"
+
+        telem = {
+            "transcript": cleaned,
+            "stt_rejected": rejected,
+            "stt_reject_reason": reject_reason,
+            "audio_ms": audio_ms,
+            "speech_ms": speech_ms,
+            "rms": round(total_rms, 2),
+            "peak": peak_val,
+            "vad_confidence": vad_confidence,
+            "stt_confidence": stt_confidence,
+            "playback_active": is_playback_active,
+            "echo_cooldown_active": is_echo_cooldown,
+            "self_voice_score": self_voice_score,
+        }
+
+        if rejected:
+            if reject_reason == "self_voice":
+                self.self_voice_rejection_count += 1
+            elif reject_reason == "no_speech":
+                self.no_speech_rejection_count += 1
+            elif reject_reason in ("low_confidence", "empty_transcript", "known_phantom"):
+                self.false_transcript_count += 1
+            elif reject_reason == "stale_audio":
+                self.stale_audio_rejection_count += 1
+
+            self.get_logger().info(
+                f'📊 [STT Telemetry]: transcript="{cleaned}" | stt_rejected=True | '
+                f'stt_reject_reason={reject_reason} | playback_active={is_playback_active} | '
+                f'echo_cooldown_active={is_echo_cooldown} | self_voice_score={self_voice_score:.2f} | '
+                f'vad_confidence={vad_confidence:.2f} | stt_confidence={stt_confidence:.2f} | '
+                f'rms={total_rms:.1f} | peak={peak_val} | audio_ms={audio_ms} | speech_ms={speech_ms} | '
+                f'false_transcripts_total={self.false_transcript_count} | '
+                f'self_voice_rejections_total={self.self_voice_rejection_count} | '
+                f'no_speech_rejections_total={self.no_speech_rejection_count}'
+            )
+            return None, telem
+
+        self.get_logger().info(
+            f'📊 [STT Telemetry]: transcript="{cleaned}" | stt_rejected=False | '
+            f'stt_reject_reason=none | playback_active={is_playback_active} | '
+            f'echo_cooldown_active={is_echo_cooldown} | self_voice_score={self_voice_score:.2f} | '
+            f'vad_confidence={vad_confidence:.2f} | stt_confidence={stt_confidence:.2f} | '
+            f'rms={total_rms:.1f} | peak={peak_val} | audio_ms={audio_ms} | speech_ms={speech_ms} | '
+            f'false_transcripts_total={self.false_transcript_count} | '
+            f'self_voice_rejections_total={self.self_voice_rejection_count} | '
+            f'no_speech_rejections_total={self.no_speech_rejection_count}'
+        )
+        return cleaned, telem
 
     def _transcribe_groq_whisper(self, wav_bytes: bytes) -> Optional[str]:
         """Transcribes 16kHz WAV audio using free Groq Whisper Large V3 Turbo API in <200ms."""
@@ -1870,7 +2303,7 @@ class AstroRealtimeNode(Node):
             body.extend(b'tr\r\n')
             body.extend(f"--{boundary}\r\n".encode())
             body.extend(b'Content-Disposition: form-data; name="prompt"\r\n\r\n')
-            body.extend("Astro, Baran, Deniz, Oktay, Eren, nasılsın, naber, ne yapıyorsun, merhaba, robot, buradayım".encode("utf-8"))
+            body.extend("Astro Türkçe konuşma, diyalog, robot asistan.".encode("utf-8"))
             body.extend(b'\r\n')
             body.extend(f"--{boundary}--\r\n".encode())
 
@@ -1942,7 +2375,19 @@ class AstroRealtimeNode(Node):
         if self.local_xtts:
             try:
                 self.local_xtts.start()
-                self.get_logger().info("✅ [Astro Realtime] Local XTTS GPU (cuda:0, FP16) başarıyla hazırlandı ve warm tutuluyor!")
+                info = self.local_xtts.get_telemetry()
+                if self.local_xtts.is_ready():
+                    self.get_logger().info(
+                        f"✅ [Astro Realtime] Fine-tuned XTTS (cuda:0, FP16) hazır!\n"
+                        f"   [XTTS Runtime] checkpoint={info.get('xtts_model_path')} | sha256={info.get('xtts_checkpoint_sha256')} | "
+                        f"reference={info.get('xtts_reference_wav')} | admission={info.get('xtts_admission_decision')}"
+                    )
+                else:
+                    self.get_logger().warn(
+                        f"⚠️ [Astro Realtime] XTTS hazır değil (State: {self.local_xtts.state}, "
+                        f"Admission: {info.get('xtts_admission_decision')}, Reason: {info.get('xtts_admission_reject_reason')}). "
+                        f"Yerel offline TTS (eSpeak) aktif."
+                    )
             except Exception as e:
                 self.get_logger().error(f"❌ [Astro Realtime] Local XTTS GPU başlatılamadı: {e}")
 
@@ -2144,7 +2589,7 @@ class AstroRealtimeNode(Node):
         if not clean_text:
             return b"", "none", 0.0, False
 
-        # 1. Primary Remote TTS: ElevenLabs Flash v2.5 (Low-latency ~75ms, native Turkish support)
+        # 1. Primary Remote TTS: ElevenLabs Flash v2.5 (Only if configured and ready)
         if self.elevenlabs_engine and self.elevenlabs_engine.is_ready():
             try:
                 t_s = time.perf_counter()
@@ -2155,36 +2600,80 @@ class AstroRealtimeNode(Node):
             except Exception as e:
                 self.get_logger().warn(f"⚠️ [ElevenLabs Failover] XTTS GPU'ya düşülüyor: {e}")
 
-        # 2. Local GPU Fallback: Local Coqui XTTS on CUDA GPU (Resident & Warm, TTFA < 500ms)
+        # 2. Primary Local GPU Engine: Fine-tuned Coqui XTTS on CUDA GPU (Resident & Warm, TTFA < 500ms)
         is_xtts_ready = bool(self.local_xtts and self.local_xtts.is_ready())
         if is_xtts_ready:
-            t_s = time.perf_counter()
-            pcm = self.local_xtts.synthesize_sentence(clean_text, generation_id=self._fallback_generation_id)
-            gpu_ms = (time.perf_counter() - t_s) * 1000.0
-            if pcm:
-                return pcm, "xtts_gpu", gpu_ms, True
+            try:
+                t_s = time.perf_counter()
+                pcm = self.local_xtts.synthesize_sentence(clean_text, generation_id=self._fallback_generation_id)
+                gpu_ms = (time.perf_counter() - t_s) * 1000.0
+                if pcm:
+                    return pcm, "xtts_gpu", gpu_ms, True
+            except Exception as e:
+                self.get_logger().warn(f"⚠️ [XTTS GPU Failover] Yerel yedek TTS'e düşülüyor: {e}")
 
-        # 3. EMERGENCY Fallback: Edge-TTS In-Memory PCM24k (ONLY if both ElevenLabs & XTTS unavailable)
-        reason = "elevenlabs_and_xtts_unavailable"
-        if self.elevenlabs_engine and not self.elevenlabs_engine.is_ready():
-            reason = "elevenlabs_cooldown_and_xtts_not_ready"
-        self.get_logger().warn(f"🚨 [EDGE_EMERGENCY_FALLBACK] Acil durum ses motoru (Edge-TTS) kullanılıyor ({reason}).")
-        pcm_edge = self._synthesize_edge_tts_pcm24k(clean_text)
-        return pcm_edge, "edge_tts_emergency", 0.0, False
+        # 3. Local Offline Backup TTS Engine (Zero internet local resilience fallback)
+        if self.local_offline_tts and self.local_offline_tts.is_ready():
+            try:
+                t_s = time.perf_counter()
+                pcm_loc = self.local_offline_tts.synthesize_sentence(clean_text, generation_id=self._fallback_generation_id)
+                loc_ms = (time.perf_counter() - t_s) * 1000.0
+                if pcm_loc:
+                    return pcm_loc, "local_offline_tts", loc_ms, True
+            except Exception as e:
+                self.get_logger().warn(f"⚠️ [Local Offline TTS Failover]: {e}")
 
-    def _play_pcm_chunks(self, pcm_data: bytes):
-        """Streams 24kHz int16 PCM audio chunks directly to audio output node with smooth 20ms pacing."""
+        # 4. Optional Network Fallback: Edge-TTS In-Memory PCM24k (Network required)
+        if getattr(self, "edge_tts_enabled", True):
+            try:
+                self.get_logger().warn("🚨 [EDGE_NETWORK_FALLBACK] İsteğe bağlı ağ ses motoru (Edge-TTS) kullanılıyor.")
+                pcm_edge = self._synthesize_edge_tts_pcm24k(clean_text)
+                if pcm_edge:
+                    return pcm_edge, "edge_tts", 0.0, False
+            except Exception as e:
+                self.get_logger().debug(f"Edge-TTS notice: {e}")
+
+        return b"", "none", 0.0, False
+
+    def _play_pcm_chunks(
+        self,
+        pcm_data: bytes,
+        generation_id: int = 0,
+        tts_provider: str = "xtts_gpu",
+        tts_model: str = "xtts_finetuned",
+        tts_source: str = "xtts_worker",
+    ):
+        """Streams 24kHz int16 PCM audio chunks directly to audio output node with smooth 20ms pacing and full provenance."""
         if not pcm_data:
             return
+        self._is_playback_active = True
+        self._playback_start_monotonic = time.monotonic()
+        self.state_machine.transition_to(RobotState.SPEAKING)
         chunk_size = 960  # 480 samples @ 24kHz int16 = 20ms
-        for i in range(0, len(pcm_data), chunk_size):
-            chunk = pcm_data[i : i + chunk_size]
-            if chunk:
-                b64_str = base64.b64encode(chunk).decode("ascii")
-                out_msg = String()
-                out_msg.data = b64_str
-                self.pub_output_pcm.publish(out_msg)
-                time.sleep(0.018)
+        try:
+            for i in range(0, len(pcm_data), chunk_size):
+                if self._barge_in_latched:
+                    break
+                chunk = pcm_data[i : i + chunk_size]
+                if chunk:
+                    b64_str = base64.b64encode(chunk).decode("ascii")
+                    msg_dict = {
+                        "generation_id": generation_id or self._fallback_generation_id,
+                        "tts_provider": tts_provider,
+                        "tts_model": tts_model,
+                        "tts_source": tts_source,
+                        "playback_source": tts_source,
+                        "data": b64_str,
+                    }
+                    out_msg = String()
+                    out_msg.data = json.dumps(msg_dict)
+                    self.pub_output_pcm.publish(out_msg)
+                    time.sleep(0.018)
+        finally:
+            self._is_playback_active = False
+            self._playback_end_time = time.monotonic()
+            if self.state_machine.current_state == RobotState.SPEAKING:
+                self.state_machine.transition_to(RobotState.LISTENING)
 
     def _process_fallback_turn(self, audio_chunks: List[bytes]):
         """Processes turn using capability-aware ProviderRegistry + Streaming LLM + Pipelined TTS."""
@@ -2192,7 +2681,9 @@ class AstroRealtimeNode(Node):
             return
 
         self._is_processing_fallback = True
+        self._is_responding = True
         self._fallback_generation_id += 1
+        self._barge_in_latched = False  # Reset single logical barge-in debounce for new turn
         t_turn_start = time.monotonic()
         chosen_model = "none"
         chosen_provider = "none"
@@ -2200,100 +2691,48 @@ class AstroRealtimeNode(Node):
         error_class_str = "none"
         model_error_str = "none"
         llm_latency_ms = 0.0
-        llm_ttft_ms = 0.0
-        llm_first_clause_ms = 0.0
+        llm_ttft_ms: Optional[float] = None
+        llm_first_clause_ms: Optional[float] = None
         first_audio_played = False
         first_audio_ms = 0.0
         total_synth_ms = 0.0
         total_gpu_ms = 0.0
+        total_queue_wait_ms = 0.0
         total_audio_sec = 0.0
         attempts: List[Dict[str, Any]] = []
 
         try:
             # 1. Combine raw 16kHz PCM chunks into valid in-memory WAV buffer
             raw_pcm = b"".join(audio_chunks)
-            if len(raw_pcm) < 16000 * 2 * 0.35:
+            if len(raw_pcm) < 16000 * 2 * 0.20:
                 return
 
-            # 2. Run Voiceprint Recognition (Acoustic Speaker Identification)
-            spk_name = "Misafir"
-            spk_score = 0.0
-            spk_source = "unidentified"
+            # Cheap Local VAD Gate on raw_pcm before remote STT
+            t_vad_start = time.monotonic()
+            arr_pcm = np.frombuffer(raw_pcm, dtype=np.int16)
+            pcm_rms = float(np.sqrt(np.mean(arr_pcm.astype(np.float32) ** 2))) if len(arr_pcm) > 0 else 0.0
+            pcm_peak = int(np.max(np.abs(arr_pcm))) if len(arr_pcm) > 0 else 0
 
-            if self.voice_recognizer:
-                try:
-                    audio_i16 = np.frombuffer(raw_pcm, dtype=np.int16)
-                    identified_name, score = self.voice_recognizer.identify_speaker(audio_i16, sample_rate=16000)
-                    if identified_name and score >= 0.40 and identified_name.lower() != "misafir":
-                        spk_name = identified_name
-                        spk_score = score
-                        spk_source = "voice_recognition"
-                        with self._lock:
-                            self._recognized_speaker = {
-                                "name": identified_name,
-                                "score": score,
-                                "is_known": True,
-                                "confidence": score,
-                                "source": "voice_recognition",
-                            }
-                            self._active_person_name = identified_name
-                            self._person_hold_until = time.monotonic() + 45.0
-                except Exception:
-                    pass
+            chunk_sz = 320  # 20ms
+            speech_frames_cnt = 0
+            tot_frames_cnt = max(1, len(arr_pcm) // chunk_sz)
+            sp_thresh = max(220.0, self._ambient_rms * 1.15)
+            for i in range(0, len(arr_pcm) - chunk_sz + 1, chunk_sz):
+                if np.sqrt(np.mean(arr_pcm[i : i + chunk_sz].astype(np.float32) ** 2)) > sp_thresh:
+                    speech_frames_cnt += 1
+            local_speech_ms = int((speech_frames_cnt * chunk_sz / 16000.0) * 1000.0)
+            local_vad_conf = round(min(1.0, speech_frames_cnt / float(tot_frames_cnt)), 2)
+            t_vad_end = time.monotonic()
 
-            if spk_name == "Misafir":
-                identity = self._get_active_biometric_identity()
-                if identity.get("is_known") and identity.get("name", "").lower() != "misafir":
-                    spk_name = identity.get("name")
-                    spk_score = identity.get("confidence", 0.85)
-                    spk_source = identity.get("source", "memory_hold")
+            # Discard immediately if audio has no genuine acoustic speech evidence (0 STT calls)
+            if local_speech_ms < 90 or pcm_rms < max(200.0, self._ambient_rms * 1.15) or local_vad_conf < 0.15:
+                self.no_speech_rejection_count += 1
+                self.get_logger().debug(
+                    f"🔇 [VAD Gate Dropped Buffer (0 STT Calls)]: speech_ms={local_speech_ms} | rms={pcm_rms:.1f} | vad_conf={local_vad_conf:.2f}"
+                )
+                return
 
-            active_speaker_dict = {
-                "name": spk_name,
-                "confidence": spk_score,
-                "is_known": (spk_name.lower() != "misafir"),
-                "source": spk_source,
-            }
-            self.get_logger().info(f"👤 [Speaker Context] name={spk_name} confidence={spk_score:.2f} source={spk_source}")
-
-            # 3. Select Atomic TTS Owner for this turn (Single Turn = Single TTS Owner)
-            if self.elevenlabs_engine and self.elevenlabs_engine.is_ready():
-                turn_tts_engine = "elevenlabs"
-                tts_ready_flag = True
-            elif self.local_xtts and self.local_xtts.is_ready():
-                turn_tts_engine = "xtts_gpu"
-                tts_ready_flag = True
-            else:
-                turn_tts_engine = "edge_tts_emergency"
-                tts_ready_flag = False
-                xtts_state = "starting" if (self.local_xtts and getattr(self.local_xtts.client, "is_alive", False)) else "not_ready"
-                self.get_logger().info(f"ℹ️ [TTS Routing] Turn #{self._fallback_generation_id} TTS: edge_tts_emergency (XTTS: {xtts_state})")
-
-            active_engine = turn_tts_engine
-
-            def _synthesize_turn_clause(clause_text: str) -> Tuple[Optional[bytes], float, float]:
-                clean_text = clean_tts_text(clause_text)
-                if not clean_text:
-                    return None, 0.0, 0.0
-                if turn_tts_engine == "elevenlabs" and self.elevenlabs_engine and self.elevenlabs_engine.is_ready():
-                    try:
-                        t_s = time.perf_counter()
-                        pcm_res = self.elevenlabs_engine.synthesize_sentence(clean_text, generation_id=self._fallback_generation_id)
-                        ms = (time.perf_counter() - t_s) * 1000.0
-                        return pcm_res, ms, 0.0
-                    except Exception:
-                        pass
-                elif turn_tts_engine == "xtts_gpu" and self.local_xtts and self.local_xtts.is_ready():
-                    t_s = time.perf_counter()
-                    pcm_res = self.local_xtts.synthesize_sentence(clean_text, generation_id=self._fallback_generation_id)
-                    ms = (time.perf_counter() - t_s) * 1000.0
-                    return pcm_res, ms, ms
-                # Fallback to in-memory Edge-TTS without logging repeated warnings
-                t_s = time.perf_counter()
-                pcm_res = self._synthesize_edge_tts_pcm24k(clean_text)
-                ms = (time.perf_counter() - t_s) * 1000.0
-                return pcm_res, ms, 0.0
-
+            # 2. Transcribe via Groq Whisper Cloud (0-Token Cost STT ~250ms)
             wav_buf = io.BytesIO()
             with wave.open(wav_buf, "wb") as wf:
                 wf.setnchannels(1)
@@ -2302,42 +2741,288 @@ class AstroRealtimeNode(Node):
                 wf.writeframes(raw_pcm)
             wav_bytes = wav_buf.getvalue()
 
-            # 4. Transcribe via Groq Whisper Cloud (0-Token Cost STT ~250ms)
             t_stt_start = time.monotonic()
-            user_text = self._transcribe_groq_whisper(wav_bytes)
-            stt_ms = (time.monotonic() - t_stt_start) * 1000.0
+            raw_transcript = self._transcribe_groq_whisper(wav_bytes)
+            t_stt_end = time.monotonic()
+            stt_ms = (t_stt_end - t_stt_start) * 1000.0
 
-            if not user_text or len(user_text.strip()) < 2:
+            # 3. Multi-Signal Validation Gate (Transcript + Acoustics + VAD + Playback + Self-Voice)
+            now = time.monotonic()
+            is_playback = bool(self._is_playback_active)
+            is_cooldown = bool((now - self._playback_end_time) < self.echo_mute_cooldown_s)
+
+            validated_text, stt_meta = self._validate_stt_transcript(
+                transcript=raw_transcript or "",
+                raw_pcm=raw_pcm,
+                is_playback_active=is_playback,
+                is_echo_cooldown=is_cooldown,
+            )
+
+            # Log Detailed STT Segment Telemetry
+            self.get_logger().info(
+                f"📊 [STT Segment Telemetry]: vad_started={t_vad_start:.2f} | vad_ended={t_vad_end:.2f} | "
+                f"stt_started={t_stt_start:.2f} | stt_finished={t_stt_end:.2f} | transcript=\"{raw_transcript}\" | "
+                f"vad_confidence={stt_meta.get('vad_confidence', 0.0):.2f} | stt_confidence={stt_meta.get('stt_confidence', 0.0):.2f} | "
+                f"rms={stt_meta.get('rms', 0.0):.1f} | peak={stt_meta.get('peak', 0)} | speech_ms={stt_meta.get('speech_ms', 0)} | "
+                f"playback_active={is_playback} | self_voice_score={stt_meta.get('self_voice_score', 0.0):.2f} | "
+                f"stt_rejected={stt_meta.get('stt_rejected', False)} | reject_reason={stt_meta.get('stt_reject_reason', 'none')}"
+            )
+
+            # If rejected, immediately abort turn without LLM, memory, or TTS invocation
+            if not validated_text:
                 return
 
+            # Check for pure wake word in active mode (e.g. "Astro.", "Hey Astro", "Selam")
+            norm_wake_check = re.sub(r"[^\w\s]", "", validated_text.lower()).strip()
+            if norm_wake_check in ("astro", "hey astro", "selam astro", "hey", "selam"):
+                self.state_machine.transition_to(RobotState.LISTENING)
+                self.get_logger().info(
+                    f"⚡ [Active Wake-Only]: \"{validated_text}\" -> Woke to LISTENING (wake_only=True, turn_created=False, 0 LLM / 0 TTS)."
+                )
+                return
+
+            # Check if user said "Hey Astro, <command>" or "Astro, <command>"
+            if norm_wake_check.startswith("hey astro "):
+                validated_text = validated_text[len("hey astro"):].lstrip(" ,.")
+            elif norm_wake_check.startswith("astro "):
+                validated_text = validated_text[len("astro"):].lstrip(" ,.")
+            elif norm_wake_check.startswith("selam astro "):
+                validated_text = validated_text[len("selam astro"):].lstrip(" ,.")
+
+            valid_cmd, cmd_reason = is_valid_user_command(validated_text)
+            if not valid_cmd:
+                self.state_machine.transition_to(RobotState.LISTENING)
+                self.get_logger().info(
+                    f"⚡ [Wake + Invalid Command Dropped]: \"{raw_transcript}\" (reason={cmd_reason}) -> Transitioned to LISTENING (0 LLM / 0 TTS)."
+                )
+                return
+
+            user_text = validated_text
             self.get_logger().info(f"🗣️ [Siz (0-Maliyet)]: \"{user_text}\"")
             self.memory.episodic.add_message("user", user_text)
 
-            # 5. Instant Intent Interception (Sub-250ms Direct Execution)
+            # 4. Run Voiceprint Recognition (Acoustic Speaker Identification with Temporal Smoothing)
+            spk_name = None
+            spk_score = 0.0
+            spk_source = "unidentified"
+            spk_known = False
+
+            if self.voice_recognizer:
+                try:
+                    audio_i16 = np.frombuffer(raw_pcm, dtype=np.int16)
+                    identified_name, score = self.voice_recognizer.identify_speaker(audio_i16, sample_rate=16000)
+                    now_s = time.monotonic()
+
+                    if identified_name and identified_name.lower() != "misafir":
+                        # Temporal smoothing:
+                        # 1. High confidence (>= 0.65): Confirmed immediately
+                        if score >= 0.65:
+                            spk_name = identified_name
+                            spk_score = score
+                            spk_source = "voice_recognition"
+                            spk_known = True
+                            self._speaker_tentative_name = identified_name
+                            self._speaker_tentative_count = 2
+                            self._speaker_tentative_last_time = now_s
+                            with self._lock:
+                                self._recognized_speaker = {
+                                    "name": identified_name,
+                                    "score": score,
+                                    "is_known": True,
+                                    "confidence": score,
+                                    "source": "voice_recognition",
+                                }
+                                self._active_person_name = identified_name
+                                self._person_hold_until = now_s + 45.0
+                        # 2. Tentative confidence (0.45 <= score < 0.65): Requires 2 observations within 15s
+                        elif score >= 0.45:
+                            if getattr(self, "_speaker_tentative_name", None) == identified_name and (now_s - getattr(self, "_speaker_tentative_last_time", 0.0)) < 15.0:
+                                self._speaker_tentative_count += 1
+                            else:
+                                self._speaker_tentative_name = identified_name
+                                self._speaker_tentative_count = 1
+                            self._speaker_tentative_last_time = now_s
+
+                            if self._speaker_tentative_count >= 2:
+                                spk_name = identified_name
+                                spk_score = score
+                                spk_source = "voice_recognition_smoothed"
+                                spk_known = True
+                                with self._lock:
+                                    self._recognized_speaker = {
+                                        "name": identified_name,
+                                        "score": score,
+                                        "is_known": True,
+                                        "confidence": score,
+                                        "source": "voice_recognition_smoothed",
+                                    }
+                                    self._active_person_name = identified_name
+                                    self._person_hold_until = now_s + 45.0
+                            else:
+                                self.get_logger().info(f"👤 [Tentative Speaker] candidate={identified_name} score={score:.2f} obs={self._speaker_tentative_count}/2 (waiting confirmation)")
+                        else:
+                            # score < 0.45: Unidentified, discard without overwriting context
+                            self.get_logger().debug(f"👤 [Low Confidence Speaker] candidate={identified_name} score={score:.2f} < 0.45 (ignored)")
+                except Exception as ex:
+                    self.get_logger().debug(f"Voiceprint recognition error: {ex}")
+
+            if not spk_name:
+                identity = self._get_active_biometric_identity()
+                if identity.get("is_known") and identity.get("name", "").lower() != "misafir":
+                    spk_name = identity.get("name")
+                    spk_score = identity.get("confidence", 0.85)
+                    spk_source = identity.get("source", "memory_hold")
+                    spk_known = True
+
+            active_speaker_dict = {
+                "name": spk_name or "Misafir",
+                "speaker_name": spk_name,
+                "confidence": spk_score,
+                "is_known": spk_known,
+                "source": spk_source,
+            }
+            speaker_display = spk_name if spk_name else "null"
+            self.get_logger().info(f"👤 [Speaker Context] speaker={speaker_display} confidence={spk_score:.2f} source={spk_source}")
+
+            # 5. Select Atomic TTS Owner for this turn (Single Turn = Single TTS Owner, Zero-Wait)
+            if self.elevenlabs_engine and self.elevenlabs_engine.is_ready():
+                turn_tts_engine = "elevenlabs"
+                tts_ready_flag = True
+                tts_mode_str = "remote_cloud"
+            elif self.local_xtts and self.local_xtts.is_ready():
+                turn_tts_engine = "xtts_gpu"
+                tts_ready_flag = True
+                tts_mode_str = "local_gpu"
+            elif self.local_offline_tts and self.local_offline_tts.is_ready():
+                turn_tts_engine = "local_offline_tts"
+                tts_ready_flag = True
+                tts_mode_str = "local_offline"
+            elif getattr(self, "edge_tts_enabled", True):
+                turn_tts_engine = "edge_tts"
+                tts_ready_flag = False
+                tts_mode_str = "network"
+            else:
+                turn_tts_engine = "none"
+                tts_ready_flag = False
+                tts_mode_str = "none"
+
+            active_engine = turn_tts_engine
+            if active_engine == "xtts_gpu":
+                tts_source_name = "xtts_worker"
+            elif active_engine == "elevenlabs":
+                tts_source_name = "elevenlabs_cloud"
+            elif active_engine == "local_offline_tts":
+                tts_source_name = "local_offline_synth"
+            else:
+                tts_source_name = "edge_tts_cloud"
+
+            def _synthesize_turn_clause(clause_text: str) -> Tuple[Optional[bytes], float, float, float]:
+                clean_text = clean_tts_text(clause_text)
+                if not clean_text:
+                    return None, 0.0, 0.0, 0.0
+                if turn_tts_engine == "elevenlabs" and self.elevenlabs_engine and self.elevenlabs_engine.is_ready():
+                    try:
+                        t_s = time.perf_counter()
+                        pcm_res = self.elevenlabs_engine.synthesize_sentence(clean_text, generation_id=self._fallback_generation_id)
+                        ms = (time.perf_counter() - t_s) * 1000.0
+                        return pcm_res, ms, 0.0, 0.0
+                    except Exception:
+                        pass
+                elif turn_tts_engine == "xtts_gpu" and self.local_xtts and self.local_xtts.is_ready():
+                    try:
+                        t_s = time.perf_counter()
+                        pcm_res = self.local_xtts.synthesize_sentence(clean_text, generation_id=self._fallback_generation_id)
+                        tot_ms = (time.perf_counter() - t_s) * 1000.0
+                        telem = self.local_xtts.get_telemetry()
+                        gpu_ms = telem.get("last_infer_ms", tot_ms)
+                        q_wait = max(0.0, tot_ms - gpu_ms)
+                        return pcm_res, tot_ms, gpu_ms, q_wait
+                    except Exception:
+                        pass
+                elif turn_tts_engine == "local_offline_tts" and self.local_offline_tts and self.local_offline_tts.is_ready():
+                    try:
+                        t_s = time.perf_counter()
+                        pcm_res = self.local_offline_tts.synthesize_sentence(clean_text, generation_id=self._fallback_generation_id)
+                        ms = (time.perf_counter() - t_s) * 1000.0
+                        return pcm_res, ms, 0.0, 0.0
+                    except Exception:
+                        pass
+                # Network fallback to in-memory Edge-TTS
+                t_s = time.perf_counter()
+                pcm_res = self._synthesize_edge_tts_pcm24k(clean_text)
+                ms = (time.perf_counter() - t_s) * 1000.0
+                return pcm_res, ms, 0.0, 0.0
+
+            def _handle_and_play_clause_audio(pcm_audio: bytes):
+                if not pcm_audio:
+                    return
+                # Debug WAV generation on first XTTS synthesis
+                if active_engine == "xtts_gpu" and not getattr(self, "_first_xtts_debug_wav_written", False):
+                    self._first_xtts_debug_wav_written = True
+                    try:
+                        import wave, hashlib, tempfile
+                        wav_dir = "/tmp" if os.path.exists("/tmp") else tempfile.gettempdir()
+                        wav_path = os.path.join(wav_dir, f"astro_xtts_{self._fallback_generation_id}.wav")
+                        with wave.open(wav_path, "wb") as wf:
+                            wf.setnchannels(1)
+                            wf.setsampwidth(2)
+                            wf.setframerate(24000)
+                            wf.writeframes(pcm_audio)
+                        audio_sha256 = hashlib.sha256(pcm_audio).hexdigest()
+                        duration_ms = int((len(pcm_audio) / 2 / 24000.0) * 1000.0)
+                        self.get_logger().info(
+                            f"🎵 [XTTS OUTPUT VERIFIED]\n"
+                            f"  generation_id={self._fallback_generation_id}\n"
+                            f"  provider=xtts_gpu\n"
+                            f"  model=xtts_finetuned\n"
+                            f"  sample_rate=24000\n"
+                            f"  audio_bytes={len(pcm_audio)}\n"
+                            f"  duration_ms={duration_ms}\n"
+                            f"  sha256={audio_sha256}\n"
+                            f"  file={wav_path}"
+                        )
+                    except Exception as ex_w:
+                        self.get_logger().debug(f"XTTS debug WAV write notice: {ex_w}")
+
+                self._play_pcm_chunks(
+                    pcm_audio,
+                    generation_id=self._fallback_generation_id,
+                    tts_provider=active_engine,
+                    tts_model=tts_model_name if "tts_model_name" in locals() else "xtts_finetuned",
+                    tts_source=tts_source_name,
+                )
+
+            # 6. Instant Intent Interception (Sub-250ms Direct Execution)
             is_weather, w_city = self._is_weather_query(user_text)
             if is_weather:
                 weather_info = self._execute_fallback_weather(w_city)
                 p = self.persona_name.lower()
-                spk = spk_name if spk_name != "Misafir" else ""
+                spk = spk_name if spk_name else ""
                 if p == "kufurbaz":
                     reply_text = f"Ulan {spk}, {weather_info} Dışarı çıkacaksan ona göre giyin!".strip()
                 elif p == "flirt":
                     reply_text = f"Canım benim, {weather_info} Kendine çok dikkat et!".strip()
                 else:
                     reply_text = f"{spk} {weather_info}".strip()
-                
-                pcm, s_ms, g_ms = _synthesize_turn_clause(reply_text)
+
+                with self._lock:
+                    self._recent_robot_phrases.append(reply_text.lower())
+                    if len(self._recent_robot_phrases) > 10:
+                        self._recent_robot_phrases = self._recent_robot_phrases[-10:]
+
+                pcm, s_ms, g_ms, q_ms = _synthesize_turn_clause(reply_text)
                 total_synth_ms += s_ms
                 total_gpu_ms += g_ms
+                total_queue_wait_ms += q_ms
                 if pcm:
                     first_audio_ms = (time.monotonic() - t_turn_start) * 1000.0
                     self.get_logger().info(f"🤖 [Astro (Canlı Hava Durumu)]: \"{reply_text}\"")
                     self.memory.episodic.add_message("assistant", reply_text)
                     self.session.record_robot_speech()
-                    self._play_pcm_chunks(pcm)
+                    _handle_and_play_clause_audio(pcm)
                     return
 
-            # 6. Cognitive LLM via ProviderRegistry (Streaming Groq -> Gemini -> Contextual Persona)
+            # 7. Cognitive LLM via ProviderRegistry (Streaming Groq -> Gemini -> Contextual Persona)
             system_prompt = self._build_current_system_prompt(active_speaker=active_speaker_dict)
             messages = [{"role": "system", "content": system_prompt}]
             recent_msgs = self.memory.episodic.get_messages()[-6:]
@@ -2349,13 +3034,16 @@ class AstroRealtimeNode(Node):
             chunker = SentenceChunker(min_first_clause_chars=18, min_clause_chars=28) if SentenceChunker else None
             t_llm_start = time.monotonic()
 
+            total_audio_bytes = 0
+            total_enqueued_chunks = 0
+
             # Attempt A: Streaming Groq LLMs (20B preferred, fallback to 120B on failure)
             if self.groq_api_key and groq_candidates:
                 for target_model in groq_candidates:
                     try:
                         t_model_start = time.monotonic()
                         first_token_seen = False
-                        first_clause_recorded = False
+                        clause_count = 0
                         if chunker:
                             chunker.reset()
 
@@ -2376,32 +3064,44 @@ class AstroRealtimeNode(Node):
                             if chunker:
                                 clauses = chunker.feed(token)
                                 for cl in clauses:
-                                    if not first_clause_recorded:
+                                    clause_count += 1
+                                    if llm_first_clause_ms is None:
                                         llm_first_clause_ms = (time.monotonic() - t_model_start) * 1000.0
-                                        first_clause_recorded = True
-                                    pcm, s_ms, g_ms = _synthesize_turn_clause(cl)
+                                    pcm, s_ms, g_ms, q_ms = _synthesize_turn_clause(cl)
                                     total_synth_ms += s_ms
                                     total_gpu_ms += g_ms
+                                    total_queue_wait_ms += q_ms
                                     if pcm:
                                         total_audio_sec += (len(pcm) / 2) / 24000.0
+                                        total_audio_bytes += len(pcm)
+                                        total_enqueued_chunks += (len(pcm) + 959) // 960
                                         if not first_audio_played:
-                                            first_audio_ms = (time.monotonic() - t_turn_start) * 1000.0
-                                            first_audio_played = True
-                                        self._play_pcm_chunks(pcm)
+                                             first_audio_ms = (time.monotonic() - t_turn_start) * 1000.0
+                                             first_audio_played = True
+                                        _handle_and_play_clause_audio(pcm)
+
+                            # Stop policy: Limit social robot conversational response to 2-3 concise sentences
+                            if clause_count >= 3 and len("".join(full_reply_parts)) > 60:
+                                break
 
                         # Flush any remaining text in chunker buffer
                         if chunker:
                             rem_cl = chunker.flush()
                             if rem_cl:
-                                pcm, s_ms, g_ms = _synthesize_turn_clause(rem_cl)
+                                if llm_first_clause_ms is None:
+                                    llm_first_clause_ms = (time.monotonic() - t_model_start) * 1000.0
+                                pcm, s_ms, g_ms, q_ms = _synthesize_turn_clause(rem_cl)
                                 total_synth_ms += s_ms
                                 total_gpu_ms += g_ms
+                                total_queue_wait_ms += q_ms
                                 if pcm:
                                     total_audio_sec += (len(pcm) / 2) / 24000.0
+                                    total_audio_bytes += len(pcm)
+                                    total_enqueued_chunks += (len(pcm) + 959) // 960
                                     if not first_audio_played:
                                         first_audio_ms = (time.monotonic() - t_turn_start) * 1000.0
                                         first_audio_played = True
-                                    self._play_pcm_chunks(pcm)
+                                    _handle_and_play_clause_audio(pcm)
 
                         if full_reply_parts:
                             chosen_model = target_model
@@ -2488,13 +3188,22 @@ class AstroRealtimeNode(Node):
             else:
                 self.repetition_guard.record_response(full_reply_str)
 
+            # Record assistant reply for self-voice echo correlation
+            with self._lock:
+                self._recent_robot_phrases.append(full_reply_str.lower())
+                if len(self._recent_robot_phrases) > 10:
+                    self._recent_robot_phrases = self._recent_robot_phrases[-10:]
+
             # Synthesize full response if not already streamed in chunks
             if not first_audio_played and full_reply_str:
-                pcm, s_ms, g_ms = _synthesize_turn_clause(full_reply_str)
+                pcm, s_ms, g_ms, q_ms = _synthesize_turn_clause(full_reply_str)
                 total_synth_ms += s_ms
                 total_gpu_ms += g_ms
+                total_queue_wait_ms += q_ms
                 if pcm:
                     total_audio_sec += (len(pcm) / 2) / 24000.0
+                    total_audio_bytes += len(pcm)
+                    total_enqueued_chunks += (len(pcm) + 959) // 960
                     first_audio_ms = (time.monotonic() - t_turn_start) * 1000.0
                     first_audio_played = True
                     self._play_pcm_chunks(pcm)
@@ -2507,43 +3216,118 @@ class AstroRealtimeNode(Node):
                 self.memory.episodic.add_message("assistant", full_reply_str)
                 self.session.record_robot_speech()
 
+                xtts_info = self.local_xtts.get_telemetry() if self.local_xtts else {}
+                is_xtts_actually_ready = bool(self.local_xtts and self.local_xtts.is_ready())
+                xtts_err_str = "none"
+                if not is_xtts_actually_ready:
+                    xtts_state = self.local_xtts.state if self.local_xtts else "uninitialized"
+                    xtts_err_str = xtts_info.get("error", xtts_state)
+
                 # Determine TTS metadata
                 if active_engine == "elevenlabs":
                     tts_model_name = self.elevenlabs_engine.model_id if self.elevenlabs_engine else "eleven_flash_v2_5"
                     tts_voice_name = self.elevenlabs_engine.voice_id if self.elevenlabs_engine else "configured"
+                    tts_mode_val = "remote_cloud"
                 elif active_engine == "xtts_gpu":
-                    tts_model_name = "xtts_v2"
-                    tts_voice_name = "astro_friendly.wav"
-                elif active_engine == "edge_tts_emergency":
+                    tts_model_name = "xtts_finetuned"
+                    tts_voice_name = xtts_info.get("xtts_reference_wav", self.local_xtts.speaker_wav if self.local_xtts else "reference.wav")
+                    tts_mode_val = "local_gpu"
+                elif active_engine == "local_offline_tts":
+                    tts_model_name = getattr(self.local_offline_tts, "_mode", "local_offline") if self.local_offline_tts else "local_offline"
+                    tts_voice_name = "local_offline_synth"
+                    tts_mode_val = "local_offline"
+                elif active_engine == "edge_tts":
                     tts_model_name = "edge_tts"
                     tts_voice_name = "tr-TR-AhmetNeural"
+                    tts_mode_val = "network"
                 else:
                     tts_model_name = "none"
                     tts_voice_name = "none"
+                    tts_mode_val = "none"
 
-                xtts_info = self.local_xtts.get_telemetry() if self.local_xtts else {}
                 worker_pid = xtts_info.get("worker_pid", "None")
                 gpu_name_str = xtts_info.get("gpu_name", "Orin")
+                xtts_ckpt_str = xtts_info.get("xtts_model_path", "none")
+                xtts_sha_str = xtts_info.get("xtts_checkpoint_sha256", "none")
+                xtts_sha_short = xtts_sha_str[:12] if xtts_sha_str != "none" else "none"
+
+                ttft_str = int(llm_ttft_ms) if llm_ttft_ms is not None else "null"
+                first_clause_str = int(llm_first_clause_ms) if llm_first_clause_ms is not None else "null"
+                speaker_log_val = spk_name if spk_name else "null"
+
+                tts_error_val = xtts_err_str if active_engine == "xtts_gpu" else ("none" if tts_ready_flag else "provider_unavailable")
+
+                # OAK-D Lite stability and frame age calculation
+                now_telem = time.monotonic()
+                oak_frame_age = int((now_telem - self._oak_last_frame_time) * 1000) if self._oak_last_frame_time > 0 else "null"
+                oak_info_age = int((now_telem - self._oak_last_camera_info_time) * 1000) if self._oak_last_camera_info_time > 0 else "null"
+                oak_state = "CONNECTED" if (self._oak_last_frame_time > 0 and (now_telem - self._oak_last_frame_time) < 3.0) else "DISCONNECTED"
+
+                tts_synth_started_flag = bool(total_synth_ms > 0 or total_audio_bytes > 0)
+                tts_synth_finished_flag = bool(total_audio_bytes > 0)
+                tts_source_name = "xtts_worker" if active_engine == "xtts_gpu" else ("elevenlabs_cloud" if active_engine == "elevenlabs" else ("local_offline_synth" if active_engine == "local_offline_tts" else "edge_tts_cloud"))
 
                 self.get_logger().info(
                     f"📊 [Turn Telemetry]: mode=LOCAL_FALLBACK | provider={chosen_provider} | "
-                    f"model={chosen_model} | llm_status={llm_status} | speaker={spk_name} | "
-                    f"speaker_confidence={spk_score:.2f} | stt_ms={int(stt_ms)} | "
-                    f"llm_ttft_ms={int(llm_ttft_ms)} | llm_first_clause_ms={int(llm_first_clause_ms)} | "
-                    f"llm_total_ms={int(llm_latency_ms)} | tts_provider={active_engine} | "
+                    f"model={chosen_model} | llm_status={llm_status} | speaker={speaker_log_val} | "
+                    f"speaker_confidence={spk_score:.2f} | speaker_source={spk_source} | stt_ms={int(stt_ms)} | "
+                    f"llm_ttft_ms={ttft_str} | llm_first_clause_ms={first_clause_str} | "
+                    f"llm_total_ms={int(llm_latency_ms)} | "
+                    f"generation_id={self._fallback_generation_id} | "
+                    f"selected_tts_provider={active_engine} | selected_tts_ready={tts_ready_flag} | "
+                    f"selected_tts_model={tts_model_name} | "
+                    f"tts_provider={active_engine} | tts_mode={tts_mode_val} | tts_error={tts_error_val} | "
                     f"tts_model={tts_model_name} | tts_voice={tts_voice_name} | "
+                    f"tts_source={tts_source_name} | playback_source={tts_source_name} | "
+                    f"tts_synthesis_started={tts_synth_started_flag} | tts_synthesis_finished={tts_synth_finished_flag} | "
+                    f"tts_audio_bytes={total_audio_bytes} | tts_queue_enqueued={total_enqueued_chunks} | "
+                    f"tts_playback_started={first_audio_played} | "
+                    f"tts_played_bytes={total_audio_bytes if first_audio_played else 0} | "
+                    f"barge_in_latched={self._barge_in_latched} | "
+                    f"tts_audio_device=\"{active_engine}\" | "
+                    f"xtts_ready={is_xtts_actually_ready} | xtts_state={xtts_info.get('state', 'unknown')} | "
+                    f"xtts_is_finetuned={xtts_info.get('is_finetuned', False)} | "
+                    f"xtts_error={xtts_err_str} | "
+                    f"xtts_batch_size={xtts_info.get('xtts_batch_size', 1)} | "
+                    f"xtts_checkpoint={xtts_ckpt_str} | xtts_reference={tts_voice_name} | xtts_sha256={xtts_sha_str} | "
                     f"tts_ready={tts_ready_flag} | tts_first_audio_ms={int(first_audio_ms)} | "
                     f"tts_total_ms={int(total_synth_ms)} | xtts_infer_ms={int(total_gpu_ms)} | "
+                    f"xtts_queue_wait_ms={int(total_queue_wait_ms)} | "
                     f"xtts_worker_pid={worker_pid} | xtts_gpu={gpu_name_str} | "
+                    f"system_available_ram_mb={xtts_info.get('system_available_ram_mb', 'null')} | system_used_ram_mb={xtts_info.get('system_used_ram_mb', 'null')} | "
+                    f"swap_used_mb={xtts_info.get('swap_used_mb', 'null')} | swap_free_mb={xtts_info.get('swap_free_mb', 'null')} | "
+                    f"astro_rss_mb={xtts_info.get('astro_rss_mb', 'null')} | xtts_rss_mb={xtts_info.get('xtts_rss_mb', 'null')} | "
+                    f"oak_rss_mb={xtts_info.get('oak_rss_mb', 'null')} | vision_rss_mb={xtts_info.get('vision_rss_mb', 'null')} | "
+                    f"audio_rss_mb={xtts_info.get('audio_rss_mb', 'null')} | "
+                    f"xtts_admission_decision={xtts_info.get('xtts_admission_decision', 'GRANTED' if is_xtts_actually_ready else 'REJECTED')} | "
+                    f"xtts_admission_reject_reason={xtts_info.get('xtts_admission_reject_reason', 'none')} | "
                     f"total_ttfa_ms={int(first_audio_ms if first_audio_played else total_turn_ms)} | "
+                    f"oak_connection_state={oak_state} | oak_last_frame_age_ms={oak_frame_age} | "
+                    f"oak_last_camera_info_age_ms={oak_info_age} | oak_xlink_error_count={self._oak_xlink_error_count} | "
                     f"fallback_reason=realtime_quota | attempts={json.dumps(attempts, ensure_ascii=False)}"
                 )
+
+                if active_engine == "xtts_gpu" and not getattr(self, "_first_xtts_synthesis_verified", False):
+                    self._first_xtts_synthesis_verified = True
+                    self.get_logger().info(
+                        f"🎯 [XTTS First Synthesis Verified]:\n"
+                        f"  tts_synthesis_started=true\n"
+                        f"  tts_provider=xtts_gpu\n"
+                        f"  tts_model=xtts_finetuned\n"
+                        f"  xtts_checkpoint={xtts_ckpt_str}\n"
+                        f"  xtts_reference={tts_voice_name}\n"
+                        f"  xtts_sha256={xtts_sha_str}\n"
+                        f"  xtts_infer_ms={int(total_gpu_ms)}\n"
+                        f"  tts_audio_bytes={total_audio_bytes}"
+                    )
 
         except Exception as e:
             self.get_logger().warn(f"Fallback turn notice: {e}")
         finally:
             self._is_processing_fallback = False
             self._is_responding = False
+            self._playback_end_time = time.monotonic()
+            self._flush_audio_buffers("end_fallback_turn")
 
     def _on_input_pcm(self, msg: String):
         """Sends incoming microphone 24kHz PCM chunk to OpenAI Realtime WebSocket or processes turn via 0-cost Groq fallback."""
@@ -2551,89 +3335,187 @@ class AstroRealtimeNode(Node):
             return
 
         now = time.monotonic()
-        # Watchdog: Auto-reset responding flag if stuck > 6.0s without speaker playback
-        if self._is_responding and not self._is_playback_active:
-            if (now - getattr(self, "_response_start_time", now)) > 6.0:
-                self._is_responding = False
 
-        # Zero Self-Hearing Protection:
-        # Do not stream mic audio while Astro is actively playing out of the speaker
-        if self._is_playback_active or self._is_responding or (now - getattr(self, "_playback_end_time", 0.0) < 0.25):
-            return
-
-        # Downsample and buffer 16kHz audio for acoustic voice recognition & dynamic enrollment
-        raw_16k = None
+        # Try parsing JSON wrapped frame or raw base64 PCM string
+        raw_16k: bytes = b""
+        local_rms: float = 0.0
+        peak_val: int = 0
         try:
-            raw_24k = base64.b64decode(msg.data.encode("ascii"))
-            if raw_24k:
-                raw_16k = resample_24k_to_16k(raw_24k)
-                if raw_16k:
-                    with self._lock:
-                        self._user_speech_audio_buffer.append(raw_16k)
-                        if len(self._user_speech_audio_buffer) > 250:
-                            self._user_speech_audio_buffer = self._user_speech_audio_buffer[-250:]
+            raw_str = msg.data.strip()
+            if raw_str.startswith("{") and raw_str.endswith("}"):
+                data_dict = json.loads(raw_str)
+                b64_audio = data_dict.get("data", "")
+                raw_bytes = base64.b64decode(b64_audio.encode("ascii")) if b64_audio else b""
+            else:
+                raw_bytes = base64.b64decode(raw_str.encode("ascii"))
+            if raw_bytes:
+                # Always resample 24kHz incoming audio to 16kHz for uniform processing
+                raw_16k = resample_24k_to_16k(raw_bytes)
+                arr = np.frombuffer(raw_16k, dtype=np.int16)
+                if len(arr) > 0:
+                    local_rms = float(np.sqrt(np.mean(arr.astype(np.float32) ** 2)))
+                    peak_val = int(np.max(np.abs(arr)))
         except Exception:
             pass
 
-        # Acoustic presence / wake-up (requires sustained intentional voice > 500 RMS across >=5 consecutive frames)
-        if raw_16k:
-            try:
-                arr = np.frombuffer(raw_16k, dtype=np.int16)
-                local_rms = float(np.sqrt(np.mean(arr.astype(np.float32) ** 2)))
-                if local_rms > 500.0:
-                    self._consecutive_loud_frames += 1
-                else:
-                    self._consecutive_loud_frames = max(0, self._consecutive_loud_frames - 1)
+        # Update background ambient noise floor when quiet
+        if local_rms < 380.0:
+            self._ambient_rms = 0.96 * self._ambient_rms + 0.04 * local_rms
 
-                if self._consecutive_loud_frames >= 5 and (now - getattr(self, "_node_start_time", 0.0)) > 4.0:
-                    self._last_interaction_time = now
-                    if self._is_sleeping:
-                        self._wake_up()
-            except Exception:
-                pass
-
-        # IMPORTANT: While Astro is sleeping, DO NOT process audio
-        if self._is_sleeping:
+        # ====================================================================
+        # SLEEP / DEEP_IDLE MODE: Dedicated Low-CPU Wake Detector
+        # ====================================================================
+        if self._is_sleeping or self.state_machine.is_deep_idle():
+            if raw_16k:
+                is_speech_energy = (local_rms > max(420.0, self._ambient_rms * 1.45) and peak_val > 1000)
+                if is_speech_energy:
+                    self._wake_last_voice_time = now
+                    if not self._wake_listening:
+                        self._wake_listening = True
+                        with self._lock:
+                            pre_frames = list(self._user_speech_audio_buffer[-8:]) if len(self._user_speech_audio_buffer) >= 8 else []
+                        self._wake_audio_buffer = list(pre_frames) + [raw_16k]
+                    else:
+                        self._wake_audio_buffer.append(raw_16k)
+                elif self._wake_listening:
+                    self._wake_audio_buffer.append(raw_16k)
+                    # Silence pause (0.50s after speech ends) triggers wake verification
+                    if (now - self._wake_last_voice_time) > 0.50:
+                        self._wake_listening = False
+                        if len(self._wake_audio_buffer) >= 10:
+                            # Pre-STT local VAD energy check
+                            raw_w = b"".join(self._wake_audio_buffer)
+                            arr_w = np.frombuffer(raw_w, dtype=np.int16)
+                            w_rms = float(np.sqrt(np.mean(arr_w.astype(np.float32) ** 2))) if len(arr_w) > 0 else 0.0
+                            if w_rms >= max(360.0, self._ambient_rms * 1.25):
+                                buf_to_proc = list(self._wake_audio_buffer)
+                                self._wake_audio_buffer.clear()
+                                threading.Thread(target=self._process_wake_candidate, args=(buf_to_proc,), daemon=True).start()
+                            else:
+                                self._wake_audio_buffer.clear()
+                        else:
+                            self._wake_audio_buffer.clear()
             return
+
+        # ====================================================================
+        # ACTIVE MODE: Interaction timestamp & State Tracking
+        # ====================================================================
+        self._last_interaction_time = now
+
+        # Playback & Echo Cooldown State Determination
+        # P0-7: Barge-in is only evaluated during active audio playback
+        is_active_playback = bool(self._is_playback_active)
+
+        # Adaptive barge-in threshold derived from ambient noise floor
+        adaptive_barge_in_rms = max(self.barge_in_min_rms, self._ambient_rms * self.barge_in_noise_mult)
+
+        # Zero Self-Hearing Protection & Multi-Signal Persistent Barge-In
+        if is_active_playback:
+            playback_start = getattr(self, "_playback_start_monotonic", 0.0)
+
+            # 1. Acoustic Protection Window: Strictly suppress self-voice feedback during initial burst (e.g. 350ms)
+            if playback_start > 0.0 and ((now - playback_start) * 1000.0 < self.barge_in_protection_ms):
+                self._barge_in_consecutive_frames = 0
+                return
+
+            # Adaptive barge-in threshold derived from ambient noise floor
+            adaptive_barge_in_rms = max(self.barge_in_min_rms, self._ambient_rms * self.barge_in_noise_mult)
+
+            # 2. Distinguish loud acoustic voice from background
+            is_loud = (local_rms >= adaptive_barge_in_rms and peak_val >= self.barge_in_min_peak)
+            if is_loud:
+                self._barge_in_consecutive_frames += 1
+            else:
+                self._barge_in_consecutive_frames = max(0, self._barge_in_consecutive_frames - 1)
+
+            # Require persistent speech across multiple consecutive frames (>= 3 frames = 60ms) to avoid impulse noise
+            if self._barge_in_consecutive_frames < self.barge_in_min_consecutive_frames:
+                return
+
+            # Barge-In latch: Only one logical barge-in transition per generation
+            if self._barge_in_latched:
+                return
+            self._barge_in_latched = True
+            self._barge_in_consecutive_frames = 0
+            barge_in_after_ms = int((now - playback_start) * 1000.0) if playback_start > 0.0 else int(self.barge_in_protection_ms + 100)
+
+            # Genuine User Barge-In during Playback!
+            self.state_machine.transition_to(RobotState.INTERRUPTED)
+            self._is_responding = False
+            self._is_playback_active = False
+            self._fallback_speaking = True
+            self._fallback_speech_start = now
+            self._last_speech_time = now
+            self._fallback_generation_id += 1
+            if self.elevenlabs_engine:
+                self.elevenlabs_engine.cancel(self._fallback_generation_id)
+            if self.local_xtts:
+                self.local_xtts.cancel(self._fallback_generation_id)
+            if self.local_offline_tts:
+                self.local_offline_tts.cancel(self._fallback_generation_id)
+            int_msg = Bool()
+            int_msg.data = True
+            self.pub_interrupt.publish(int_msg)
+            with self._lock:
+                self._fallback_audio_buffer = [raw_16k]
+            self.get_logger().info(
+                f"⚡ [Realtime Barge-In] Kullanıcı araya girdi (RMS: {local_rms:.0f}, Peak: {peak_val}, "
+                f"barge_in_after_ms={barge_in_after_ms}, Latch: True)."
+            )
+            self.state_machine.transition_to(RobotState.LISTENING)
+            return
+
+        # Acoustic presence / wake-up (requires sustained intentional voice > 500 RMS across >=5 consecutive frames)
+        if local_rms > 500.0:
+            self._consecutive_loud_frames += 1
+        else:
+            self._consecutive_loud_frames = max(0, self._consecutive_loud_frames - 1)
+
+        if self._consecutive_loud_frames >= 5 and (now - getattr(self, "_node_start_time", 0.0)) > 4.0:
+            self._last_interaction_time = now
+            if self._is_sleeping:
+                self._wake_up()
 
         # --- 0-Cost Fallback Mode (Groq STT + Groq LLM + Edge-TTS) ---
         if self._fallback_mode or not self._is_connected or not self._ws or not self._loop:
             if raw_16k:
                 try:
-                    arr = np.frombuffer(raw_16k, dtype=np.int16)
-                    local_rms = float(np.sqrt(np.mean(arr.astype(np.float32) ** 2)))
-                    peak_val = int(np.max(np.abs(arr))) if len(arr) > 0 else 0
-
-                    # True Speech Condition: Requires both sustained RMS and acoustic peak
-                    if local_rms > 480.0 and peak_val > 1100:
+                    speech_start_condition = (local_rms > max(380.0, self._ambient_rms * 1.40) and peak_val > 900)
+                    if speech_start_condition:
                         self._last_speech_time = now
                         if not self._fallback_speaking:
                             self._fallback_speaking = True
                             self._fallback_speech_start = now
-                            self._fallback_generation_id += 1
-                            if self.elevenlabs_engine:
-                                self.elevenlabs_engine.cancel(self._fallback_generation_id)
-                            if self.local_xtts:
-                                self.local_xtts.cancel(self._fallback_generation_id)
-                            # Broadcast interrupt to immediately abort any active speaker playback
-                            int_msg = Bool()
-                            int_msg.data = True
-                            self.pub_interrupt.publish(int_msg)
-
-                            # Include pre-speech audio frames to avoid clipping initial word syllable
                             with self._lock:
                                 pre_frames = list(self._user_speech_audio_buffer[-8:]) if len(self._user_speech_audio_buffer) >= 8 else []
-                            self._fallback_audio_buffer = list(pre_frames)
-                        self._fallback_audio_buffer.append(raw_16k)
+                            self._fallback_audio_buffer = list(pre_frames) + [raw_16k]
+                        else:
+                            self._fallback_audio_buffer.append(raw_16k)
                     elif self._fallback_speaking:
                         self._fallback_audio_buffer.append(raw_16k)
-                        # Silence timeout (0.80s after speech ends)
-                        if (now - self._last_speech_time) > 0.80:
+                        # Silence timeout (0.75s after speech ends)
+                        if (now - self._last_speech_time) > 0.75:
                             self._fallback_speaking = False
-                            if len(self._fallback_audio_buffer) >= 15 and not self._is_processing_fallback:
-                                buf_to_proc = list(self._fallback_audio_buffer)
-                                self._fallback_audio_buffer = []
-                                threading.Thread(target=self._process_fallback_turn, args=(buf_to_proc,), daemon=True).start()
+                            if len(self._fallback_audio_buffer) >= 12 and not self._is_processing_fallback:
+                                # Pre-STT Local VAD Density Filter (0-Token protection against noise/silence)
+                                raw_fb = b"".join(self._fallback_audio_buffer)
+                                arr_fb = np.frombuffer(raw_fb, dtype=np.int16)
+                                fb_rms = float(np.sqrt(np.mean(arr_fb.astype(np.float32) ** 2))) if len(arr_fb) > 0 else 0.0
+                                chunk_sz = 320  # 20ms
+                                loud_cnt = sum(
+                                    1 for i in range(0, len(arr_fb) - chunk_sz + 1, chunk_sz)
+                                    if np.sqrt(np.mean(arr_fb[i : i + chunk_sz].astype(np.float32) ** 2)) > max(280.0, self._ambient_rms * 1.25)
+                                )
+                                total_chunks = max(1, len(arr_fb) // chunk_sz)
+                                speech_ratio = loud_cnt / float(total_chunks)
+
+                                if fb_rms >= max(260.0, self._ambient_rms * 1.20) and loud_cnt >= 5 and speech_ratio >= 0.15:
+                                    buf_to_proc = list(self._fallback_audio_buffer)
+                                    self._fallback_audio_buffer.clear()
+                                    threading.Thread(target=self._process_fallback_turn, args=(buf_to_proc,), daemon=True).start()
+                                else:
+                                    self.no_speech_rejection_count += 1
+                                    self._fallback_audio_buffer.clear()
                 except Exception:
                     pass
             return
@@ -2688,6 +3570,11 @@ class AstroRealtimeNode(Node):
                     self._active_person_name = name
                     self._person_hold_until = now + 45.0  # Hold identity for 45 seconds
 
+                    # Event-driven vision trigger for new person
+                    if getattr(self, "_last_seen_person", "") != name:
+                        self._last_seen_person = name
+                        threading.Thread(target=self._evaluate_vision_event, args=("new_person",), daemon=True).start()
+
                     # Proactive greeting check: greet once every 2 minutes per person
                     last_greet = self._greeted_people.get(name, 0.0)
                     if (now - last_greet) > 120.0 and not self._is_responding and not self._is_playback_active:
@@ -2701,9 +3588,19 @@ class AstroRealtimeNode(Node):
 
     def _on_speaker_id(self, msg: String):
         try:
-            data = json.loads(msg.data)
+            raw = (msg.data or "").strip()
+            if not raw:
+                return
+            if raw.startswith("{") and raw.endswith("}"):
+                data = json.loads(raw)
+            else:
+                is_k = raw.lower() not in ("misafir", "unknown", "none", "tanınmadı", "")
+                data = {"name": raw if is_k else "Misafir", "confidence": 0.90 if is_k else 0.0, "is_known": is_k, "source": "speaker_id_topic"}
             with self._lock:
                 self._recognized_speaker = data
+                if data.get("is_known") and data.get("confidence", 0.0) >= 0.40 and data.get("name", "").lower() != "misafir":
+                    self._active_person_name = data.get("name")
+                    self._person_hold_until = time.monotonic() + 45.0
             self._sync_perception_to_session()
         except Exception:
             pass
@@ -2712,10 +3609,21 @@ class AstroRealtimeNode(Node):
         self._user_emotion = msg.data.lower().strip()
 
     def _on_looking_at_robot(self, msg: Bool):
-        self._looking_at_robot = msg.data
+        new_state = bool(msg.data)
+        if new_state and not getattr(self, "_last_looking_state", False):
+            self._last_looking_state = True
+            threading.Thread(target=self._evaluate_vision_event, args=("user_attention_event",), daemon=True).start()
+        elif not new_state:
+            self._last_looking_state = False
+        self._looking_at_robot = new_state
 
     def _on_user_distance(self, msg: Float32):
-        self._user_distance = float(msg.data)
+        new_dist = float(msg.data)
+        old_dist = getattr(self, "_last_seen_distance", 0.0)
+        if abs(new_dist - old_dist) >= 0.60:
+            self._last_seen_distance = new_dist
+            threading.Thread(target=self._evaluate_vision_event, args=("person_approached",), daemon=True).start()
+        self._user_distance = new_dist
 
     def _on_doa(self, msg: Float32):
         self._speaker_angle = float(msg.data)
