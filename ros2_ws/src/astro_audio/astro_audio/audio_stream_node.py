@@ -9,6 +9,7 @@ Features:
 """
 
 import base64
+import json
 import os
 import queue
 import struct
@@ -296,45 +297,77 @@ class AudioStreamNode(Node):
                 )
 
     def _on_output_pcm(self, msg: String):
-        """Incoming 24kHz PCM audio chunk from OpenAI Realtime API or Fallback TTS (base64)."""
+        """Incoming 24kHz PCM audio chunk from OpenAI Realtime API or Fallback TTS (base64 or JSON)."""
         if not msg.data:
             return
         try:
-            raw_24k = base64.b64decode(msg.data.encode("ascii"))
+            payload = {}
+            raw_str = msg.data.strip()
+            if raw_str.startswith("{") and raw_str.endswith("}"):
+                try:
+                    payload = json.loads(raw_str)
+                    b64_pcm = payload.get("data", "")
+                except Exception:
+                    b64_pcm = raw_str
+            else:
+                b64_pcm = raw_str
+
+            raw_24k = base64.b64decode(b64_pcm.encode("ascii"))
             if raw_24k:
                 # Resample 24kHz -> 16kHz for hardware ReSpeaker DAC
                 raw_16k = resample_24k_to_16k(raw_24k)
-                self._play_queue.put_nowait(raw_16k)
+                item = {
+                    "pcm": raw_16k,
+                    "generation_id": payload.get("generation_id", 0),
+                    "tts_provider": payload.get("tts_provider", "openai"),
+                    "tts_model": payload.get("tts_model", "gpt-4o-realtime"),
+                    "tts_source": payload.get("tts_source", "realtime_openai"),
+                    "playback_source": payload.get("playback_source", payload.get("tts_source", "realtime_openai")),
+                }
+                self._play_queue.put_nowait(item)
                 self._total_enqueued_bytes += len(raw_16k)
         except (queue.Full, Exception) as e:
             self.get_logger().debug(f"PCM enqueue notice: {e}")
 
     def _on_interrupt(self, msg: Bool):
         """Zero-latency barge-in signal: instantly flush playback buffer queue and mute lingering tail."""
-        if msg.data:
-            discarded_bytes = 0
-            with self._playback_lock:
-                while not self._play_queue.empty():
-                    try:
-                        c = self._play_queue.get_nowait()
-                        discarded_bytes += len(c)
-                    except queue.Empty:
-                        break
-            barge_in_after_ms = int((time.monotonic() - self._burst_start_time) * 1000.0) if self._burst_start_time > 0 else 0
-            barge_in_source = "self_voice" if (self._burst_start_time > 0 and barge_in_after_ms < int(self.barge_in_protection_ms)) else "user"
-            self._is_playing = False
-            self._playback_burst_active = False
-            self._last_playback_time = 0.0
-            self._playback_drop_until = time.monotonic() + 0.15
-            self.get_logger().info(
-                f"⚡ [Playback Telemetry]: tts_playback_cancelled=True | "
-                f"tts_played_bytes={self._total_played_bytes} | "
-                f"tts_remaining_bytes={discarded_bytes} | "
-                f"playback_duration_ms={barge_in_after_ms} | "
-                f"barge_in_after_ms={barge_in_after_ms} | "
-                f"barge_in_source={barge_in_source} | "
-                f"reason=barge_in"
-            )
+        if not msg.data:
+            return
+
+        # P0-7: Barge-in is only valid if playback has actually started and played bytes > 0
+        if not self._playback_burst_active or self._total_played_bytes == 0:
+            return
+
+        discarded_bytes = 0
+        with self._playback_lock:
+            while not self._play_queue.empty():
+                try:
+                    c = self._play_queue.get_nowait()
+                    raw_len = len(c["pcm"]) if isinstance(c, dict) else len(c)
+                    discarded_bytes += raw_len
+                except queue.Empty:
+                    break
+
+        barge_in_after_ms = int((time.monotonic() - self._burst_start_time) * 1000.0) if self._burst_start_time > 0 else 0
+        barge_in_source = "self_voice" if (self._burst_start_time > 0 and barge_in_after_ms < int(self.barge_in_protection_ms)) else "user"
+        self._is_playing = False
+        self._playback_burst_active = False
+        self._last_playback_time = 0.0
+        self._playback_drop_until = time.monotonic() + 0.15
+        prov = getattr(self, "_active_provenance", {})
+        self.get_logger().info(
+            f"⚡ [Playback Telemetry]: tts_playback_cancelled=True | "
+            f"generation_id={prov.get('generation_id', 0)} | "
+            f"playback_source={prov.get('playback_source', 'unknown')} | "
+            f"tts_provider={prov.get('tts_provider', 'unknown')} | "
+            f"tts_model={prov.get('tts_model', 'unknown')} | "
+            f"tts_played_bytes={self._total_played_bytes} | "
+            f"tts_remaining_bytes={discarded_bytes} | "
+            f"playback_duration_ms={barge_in_after_ms} | "
+            f"barge_in_after_ms={barge_in_after_ms} | "
+            f"barge_in_source={barge_in_source} | "
+            f"reason=barge_in"
+        )
 
     def _playback_worker(self):
         """Dedicated real-time audio playback loop sending PCM directly to hardware DAC."""
@@ -367,7 +400,26 @@ class AudioStreamNode(Node):
 
         while not self._stop_event.is_set():
             try:
-                chunk = self._play_queue.get(timeout=0.05)
+                item = self._play_queue.get(timeout=0.05)
+                if isinstance(item, dict):
+                    chunk = item["pcm"]
+                    gen_id = item.get("generation_id", 0)
+                    tts_provider = item.get("tts_provider", "openai")
+                    tts_model = item.get("tts_model", "unknown")
+                    tts_source = item.get("tts_source", "unknown")
+                    playback_source = item.get("playback_source", tts_source)
+                else:
+                    chunk = item
+                    gen_id = 0
+                    tts_provider = "openai"
+                    tts_model = "gpt-4o-realtime"
+                    tts_source = "realtime_openai"
+                    playback_source = "realtime_openai"
+
+                # Provenance sanity assertion
+                if (tts_provider == "xtts_gpu" and playback_source in ("local_offline_tts", "espeak")) or (tts_model == "xtts_finetuned" and playback_source == "espeak"):
+                    self.get_logger().error(f"🚨 [Provenance Mismatch]: Invalid combination tts_provider={tts_provider}, playback_source={playback_source}")
+
                 t_w_start = time.perf_counter()
                 with self._playback_lock:
                     out_stream.write(chunk)
@@ -381,8 +433,18 @@ class AudioStreamNode(Node):
                 if not self._playback_burst_active:
                     self._playback_burst_active = True
                     self._burst_start_time = time.monotonic()
+                    self._active_provenance = {
+                        "generation_id": gen_id,
+                        "playback_source": playback_source,
+                        "tts_provider": tts_provider,
+                        "tts_model": tts_model,
+                        "tts_source": tts_source,
+                    }
                     self.get_logger().info(
                         f"🔊 [Playback Telemetry]: tts_playback_started=True | "
+                        f"generation_id={gen_id} | playback_source={playback_source} | "
+                        f"tts_provider={tts_provider} | tts_model={tts_model} | "
+                        f"tts_source={tts_source} | audio_bytes={len(chunk)} | "
                         f"tts_audio_device=\"{self._out_device_name}\" | "
                         f"tts_audio_write_ms={write_ms:.1f} | "
                         f"chunk_bytes={len(chunk)}"
@@ -391,8 +453,13 @@ class AudioStreamNode(Node):
                 if self._playback_burst_active and (time.monotonic() - self._last_playback_time) > 0.20:
                     self._playback_burst_active = False
                     burst_dur_ms = (time.monotonic() - self._burst_start_time) * 1000.0
+                    prov = getattr(self, "_active_provenance", {})
                     self.get_logger().info(
                         f"🔊 [Playback Telemetry]: tts_playback_finished=True | "
+                        f"generation_id={prov.get('generation_id', 0)} | "
+                        f"playback_source={prov.get('playback_source', 'unknown')} | "
+                        f"tts_provider={prov.get('tts_provider', 'unknown')} | "
+                        f"tts_model={prov.get('tts_model', 'unknown')} | "
                         f"tts_played_bytes={self._total_played_bytes} | "
                         f"total_playback_bytes={self._total_played_bytes} | "
                         f"playback_duration_ms={int(burst_dur_ms)}"

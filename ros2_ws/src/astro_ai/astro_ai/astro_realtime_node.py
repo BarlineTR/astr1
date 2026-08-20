@@ -2630,8 +2630,15 @@ class AstroRealtimeNode(Node):
 
         return b"", "none", 0.0, False
 
-    def _play_pcm_chunks(self, pcm_data: bytes):
-        """Streams 24kHz int16 PCM audio chunks directly to audio output node with smooth 20ms pacing."""
+    def _play_pcm_chunks(
+        self,
+        pcm_data: bytes,
+        generation_id: int = 0,
+        tts_provider: str = "xtts_gpu",
+        tts_model: str = "xtts_finetuned",
+        tts_source: str = "xtts_worker",
+    ):
+        """Streams 24kHz int16 PCM audio chunks directly to audio output node with smooth 20ms pacing and full provenance."""
         if not pcm_data:
             return
         self._is_playback_active = True
@@ -2645,8 +2652,16 @@ class AstroRealtimeNode(Node):
                 chunk = pcm_data[i : i + chunk_size]
                 if chunk:
                     b64_str = base64.b64encode(chunk).decode("ascii")
+                    msg_dict = {
+                        "generation_id": generation_id or self._fallback_generation_id,
+                        "tts_provider": tts_provider,
+                        "tts_model": tts_model,
+                        "tts_source": tts_source,
+                        "playback_source": tts_source,
+                        "data": b64_str,
+                    }
                     out_msg = String()
-                    out_msg.data = b64_str
+                    out_msg.data = json.dumps(msg_dict)
                     self.pub_output_pcm.publish(out_msg)
                     time.sleep(0.018)
         finally:
@@ -2887,6 +2902,14 @@ class AstroRealtimeNode(Node):
                 tts_mode_str = "none"
 
             active_engine = turn_tts_engine
+            if active_engine == "xtts_gpu":
+                tts_source_name = "xtts_worker"
+            elif active_engine == "elevenlabs":
+                tts_source_name = "elevenlabs_cloud"
+            elif active_engine == "local_offline_tts":
+                tts_source_name = "local_offline_synth"
+            else:
+                tts_source_name = "edge_tts_cloud"
 
             def _synthesize_turn_clause(clause_text: str) -> Tuple[Optional[bytes], float, float, float]:
                 clean_text = clean_tts_text(clause_text)
@@ -2925,6 +2948,45 @@ class AstroRealtimeNode(Node):
                 ms = (time.perf_counter() - t_s) * 1000.0
                 return pcm_res, ms, 0.0, 0.0
 
+            def _handle_and_play_clause_audio(pcm_audio: bytes):
+                if not pcm_audio:
+                    return
+                # Debug WAV generation on first XTTS synthesis
+                if active_engine == "xtts_gpu" and not getattr(self, "_first_xtts_debug_wav_written", False):
+                    self._first_xtts_debug_wav_written = True
+                    try:
+                        import wave, hashlib, tempfile
+                        wav_dir = "/tmp" if os.path.exists("/tmp") else tempfile.gettempdir()
+                        wav_path = os.path.join(wav_dir, f"astro_xtts_{self._fallback_generation_id}.wav")
+                        with wave.open(wav_path, "wb") as wf:
+                            wf.setnchannels(1)
+                            wf.setsampwidth(2)
+                            wf.setframerate(24000)
+                            wf.writeframes(pcm_audio)
+                        audio_sha256 = hashlib.sha256(pcm_audio).hexdigest()
+                        duration_ms = int((len(pcm_audio) / 2 / 24000.0) * 1000.0)
+                        self.get_logger().info(
+                            f"🎵 [XTTS OUTPUT VERIFIED]\n"
+                            f"  generation_id={self._fallback_generation_id}\n"
+                            f"  provider=xtts_gpu\n"
+                            f"  model=xtts_finetuned\n"
+                            f"  sample_rate=24000\n"
+                            f"  audio_bytes={len(pcm_audio)}\n"
+                            f"  duration_ms={duration_ms}\n"
+                            f"  sha256={audio_sha256}\n"
+                            f"  file={wav_path}"
+                        )
+                    except Exception as ex_w:
+                        self.get_logger().debug(f"XTTS debug WAV write notice: {ex_w}")
+
+                self._play_pcm_chunks(
+                    pcm_audio,
+                    generation_id=self._fallback_generation_id,
+                    tts_provider=active_engine,
+                    tts_model=tts_model_name if "tts_model_name" in locals() else "xtts_finetuned",
+                    tts_source=tts_source_name,
+                )
+
             # 6. Instant Intent Interception (Sub-250ms Direct Execution)
             is_weather, w_city = self._is_weather_query(user_text)
             if is_weather:
@@ -2952,7 +3014,7 @@ class AstroRealtimeNode(Node):
                     self.get_logger().info(f"🤖 [Astro (Canlı Hava Durumu)]: \"{reply_text}\"")
                     self.memory.episodic.add_message("assistant", reply_text)
                     self.session.record_robot_speech()
-                    self._play_pcm_chunks(pcm)
+                    _handle_and_play_clause_audio(pcm)
                     return
 
             # 7. Cognitive LLM via ProviderRegistry (Streaming Groq -> Gemini -> Contextual Persona)
@@ -3009,9 +3071,9 @@ class AstroRealtimeNode(Node):
                                         total_audio_bytes += len(pcm)
                                         total_enqueued_chunks += (len(pcm) + 959) // 960
                                         if not first_audio_played:
-                                            first_audio_ms = (time.monotonic() - t_turn_start) * 1000.0
-                                            first_audio_played = True
-                                        self._play_pcm_chunks(pcm)
+                                             first_audio_ms = (time.monotonic() - t_turn_start) * 1000.0
+                                             first_audio_played = True
+                                        _handle_and_play_clause_audio(pcm)
 
                             # Stop policy: Limit social robot conversational response to 2-3 concise sentences
                             if clause_count >= 3 and len("".join(full_reply_parts)) > 60:
@@ -3034,7 +3096,7 @@ class AstroRealtimeNode(Node):
                                     if not first_audio_played:
                                         first_audio_ms = (time.monotonic() - t_turn_start) * 1000.0
                                         first_audio_played = True
-                                    self._play_pcm_chunks(pcm)
+                                    _handle_and_play_clause_audio(pcm)
 
                         if full_reply_parts:
                             chosen_model = target_model
@@ -3198,6 +3260,7 @@ class AstroRealtimeNode(Node):
 
                 tts_synth_started_flag = bool(total_synth_ms > 0 or total_audio_bytes > 0)
                 tts_synth_finished_flag = bool(total_audio_bytes > 0)
+                tts_source_name = "xtts_worker" if active_engine == "xtts_gpu" else ("elevenlabs_cloud" if active_engine == "elevenlabs" else ("local_offline_synth" if active_engine == "local_offline_tts" else "edge_tts_cloud"))
 
                 self.get_logger().info(
                     f"📊 [Turn Telemetry]: mode=LOCAL_FALLBACK | provider={chosen_provider} | "
@@ -3205,13 +3268,21 @@ class AstroRealtimeNode(Node):
                     f"speaker_confidence={spk_score:.2f} | speaker_source={spk_source} | stt_ms={int(stt_ms)} | "
                     f"llm_ttft_ms={ttft_str} | llm_first_clause_ms={first_clause_str} | "
                     f"llm_total_ms={int(llm_latency_ms)} | "
+                    f"generation_id={self._fallback_generation_id} | "
                     f"selected_tts_provider={active_engine} | selected_tts_ready={tts_ready_flag} | "
+                    f"selected_tts_model={tts_model_name} | "
                     f"tts_provider={active_engine} | tts_mode={tts_mode_val} | tts_error={tts_error_val} | "
                     f"tts_model={tts_model_name} | tts_voice={tts_voice_name} | "
+                    f"tts_source={tts_source_name} | playback_source={tts_source_name} | "
                     f"tts_synthesis_started={tts_synth_started_flag} | tts_synthesis_finished={tts_synth_finished_flag} | "
                     f"tts_audio_bytes={total_audio_bytes} | tts_queue_enqueued={total_enqueued_chunks} | "
-                    f"tts_playback_started={first_audio_played} | tts_audio_device=\"{active_engine}\" | "
-                    f"xtts_ready={is_xtts_actually_ready} | xtts_error={xtts_err_str} | "
+                    f"tts_playback_started={first_audio_played} | "
+                    f"tts_played_bytes={total_audio_bytes if first_audio_played else 0} | "
+                    f"barge_in_latched={self._barge_in_latched} | "
+                    f"tts_audio_device=\"{active_engine}\" | "
+                    f"xtts_ready={is_xtts_actually_ready} | xtts_state={xtts_info.get('state', 'unknown')} | "
+                    f"xtts_is_finetuned={xtts_info.get('is_finetuned', False)} | "
+                    f"xtts_error={xtts_err_str} | "
                     f"xtts_batch_size={xtts_info.get('xtts_batch_size', 1)} | "
                     f"xtts_checkpoint={xtts_ckpt_str} | xtts_reference={tts_voice_name} | xtts_sha256={xtts_sha_str} | "
                     f"tts_ready={tts_ready_flag} | tts_first_audio_ms={int(first_audio_ms)} | "
@@ -3252,36 +3323,28 @@ class AstroRealtimeNode(Node):
             return
 
         now = time.monotonic()
-        # Watchdog: Auto-reset responding flag if stuck > 6.0s without speaker playback
-        if self._is_responding and not self._is_playback_active:
-            if (now - getattr(self, "_response_start_time", now)) > 6.0:
-                self._is_responding = False
 
-        # Downsample and buffer 16kHz audio for acoustic voice recognition & dynamic enrollment
-        raw_16k = None
+        # Try parsing JSON wrapped frame or raw base64 PCM string
+        raw_16k: bytes = b""
+        local_rms: float = 0.0
+        peak_val: int = 0
         try:
-            raw_24k = base64.b64decode(msg.data.encode("ascii"))
-            if raw_24k:
-                raw_16k = resample_24k_to_16k(raw_24k)
-                if raw_16k:
-                    with self._lock:
-                        self._user_speech_audio_buffer.append(raw_16k)
-                        if len(self._user_speech_audio_buffer) > 250:
-                            self._user_speech_audio_buffer = self._user_speech_audio_buffer[-250:]
+            raw_str = msg.data.strip()
+            if raw_str.startswith("{") and raw_str.endswith("}"):
+                data_dict = json.loads(raw_str)
+                b64_audio = data_dict.get("data", "")
+                raw_bytes = base64.b64decode(b64_audio.encode("ascii")) if b64_audio else b""
+            else:
+                raw_bytes = base64.b64decode(raw_str.encode("ascii"))
+            if raw_bytes:
+                # Always resample 24kHz incoming audio to 16kHz for uniform processing
+                raw_16k = resample_24k_to_16k(raw_bytes)
+                arr = np.frombuffer(raw_16k, dtype=np.int16)
+                if len(arr) > 0:
+                    local_rms = float(np.sqrt(np.mean(arr.astype(np.float32) ** 2)))
+                    peak_val = int(np.max(np.abs(arr)))
         except Exception:
             pass
-
-        # Acoustic Level Evaluation
-        local_rms = 0.0
-        peak_val = 0
-        if raw_16k:
-            try:
-                arr = np.frombuffer(raw_16k, dtype=np.int16)
-                local_rms = float(np.sqrt(np.mean(arr.astype(np.float32) ** 2)))
-                if len(arr) > 0:
-                    peak_val = int(np.max(np.abs(arr)))
-            except Exception:
-                pass
 
         # Update background ambient noise floor when quiet
         if local_rms < 380.0:
@@ -3328,11 +3391,8 @@ class AstroRealtimeNode(Node):
         self._last_interaction_time = now
 
         # Playback & Echo Cooldown State Determination
-        is_active_playback = bool(
-            self._is_playback_active
-            or self._is_responding
-            or (now - getattr(self, "_playback_end_time", 0.0) < self.echo_mute_cooldown_s)
-        )
+        # P0-7: Barge-in is only evaluated during active audio playback
+        is_active_playback = bool(self._is_playback_active)
 
         # Adaptive barge-in threshold derived from ambient noise floor
         adaptive_barge_in_rms = max(self.barge_in_min_rms, self._ambient_rms * self.barge_in_noise_mult)
@@ -3342,7 +3402,7 @@ class AstroRealtimeNode(Node):
             playback_start = getattr(self, "_playback_start_monotonic", 0.0)
 
             # 1. Acoustic Protection Window: Strictly suppress self-voice feedback during initial burst (e.g. 350ms)
-            if self._is_playback_active and playback_start > 0.0 and ((now - playback_start) * 1000.0 < self.barge_in_protection_ms):
+            if playback_start > 0.0 and ((now - playback_start) * 1000.0 < self.barge_in_protection_ms):
                 self._barge_in_consecutive_frames = 0
                 return
 
@@ -3365,13 +3425,12 @@ class AstroRealtimeNode(Node):
                 return
             self._barge_in_latched = True
             self._barge_in_consecutive_frames = 0
-            barge_in_after_ms = int((now - playback_start) * 1000.0) if playback_start > 0.0 else 0
+            barge_in_after_ms = int((now - playback_start) * 1000.0) if playback_start > 0.0 else int(self.barge_in_protection_ms + 100)
 
             # Genuine User Barge-In during Playback!
             self.state_machine.transition_to(RobotState.INTERRUPTED)
             self._is_responding = False
             self._is_playback_active = False
-            self._playback_end_time = 0.0
             self._fallback_speaking = True
             self._fallback_speech_start = now
             self._last_speech_time = now

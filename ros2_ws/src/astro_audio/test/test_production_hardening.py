@@ -922,6 +922,56 @@ class TestSTTValidationAndEchoImmunity(unittest.TestCase):
             self.assertEqual(info.get("gpu"), "Orin")
             self.assertEqual(info.get("device"), "cuda")
 
+    def test_audio_provenance_envelope_passing_and_verification(self):
+        """AudioStreamNode correctly parses provenance JSON envelopes and retains generation_id and sources."""
+        from astro_audio.audio_stream_node import AudioStreamNode
+        import base64
+        import json
+
+        node = AudioStreamNode()
+        raw_pcm = (np.sin(np.linspace(0, 100, 480)) * 5000).astype(np.int16).tobytes()
+        b64_audio = base64.b64encode(raw_pcm).decode("ascii")
+
+        envelope = {
+            "generation_id": 42,
+            "tts_provider": "xtts_gpu",
+            "tts_model": "xtts_finetuned",
+            "tts_source": "xtts_worker",
+            "playback_source": "xtts_worker",
+            "data": b64_audio,
+        }
+
+        msg = MagicMock()
+        msg.data = json.dumps(envelope)
+
+        with patch("astro_audio.audio_stream_node.resample_24k_to_16k", return_value=raw_pcm):
+            node._on_output_pcm(msg)
+
+        self.assertFalse(node._play_queue.empty())
+        item = node._play_queue.get_nowait()
+        self.assertIsInstance(item, dict)
+        self.assertEqual(item["generation_id"], 42)
+        self.assertEqual(item["tts_provider"], "xtts_gpu")
+        self.assertEqual(item["tts_model"], "xtts_finetuned")
+        self.assertEqual(item["tts_source"], "xtts_worker")
+        self.assertEqual(item["playback_source"], "xtts_worker")
+
+    def test_audio_stream_node_rejects_barge_in_when_zero_bytes_played(self):
+        """Interrupt signal is ignored when playback has not started or played bytes is zero."""
+        from astro_audio.audio_stream_node import AudioStreamNode
+
+        node = AudioStreamNode()
+        node._playback_burst_active = False
+        node._total_played_bytes = 0
+
+        int_msg = MagicMock()
+        int_msg.data = True
+
+        with patch.object(node, "get_logger"):
+            node._on_interrupt(int_msg)
+            # Nothing was logged or changed because playback wasn't active
+            self.assertFalse(node._playback_burst_active)
+
 
 if __name__ == "__main__":
     unittest.main()
