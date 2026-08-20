@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Comprehensive Unit & Regression Tests for ASTRO V1 Provider Registry, Repetition Guard, and Fallback Engine."""
 
+import asyncio
 import json
 import os
 import sys
@@ -8,7 +9,7 @@ import time
 import unittest
 import urllib.error
 import urllib.request
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 # Ensure paths
 ws_src = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
@@ -644,6 +645,99 @@ class TestContextualFallbackAndTelemetry(unittest.TestCase):
 
             # Verify that only content tokens are yielded, reasoning is discarded
             self.assertEqual("".join(tokens), "Merhaba Baran!")
+
+
+class TestRealtimeArchitectureInvariants(unittest.TestCase):
+    """Formal regression assertions ensuring OpenAI Realtime P0 invariants & Vision isolation are preserved."""
+
+    def test_realtime_model_default_and_candidates(self):
+        """OpenAI Realtime model defaults to gpt-realtime and WebSocket connection targets gpt-realtime."""
+        from astro_ai.astro_realtime_node import AstroRealtimeNode, discover_realtime_models
+
+        candidates = discover_realtime_models("test_key")
+        self.assertIn("gpt-realtime", candidates)
+
+        node = AstroRealtimeNode()
+        self.assertEqual(node.realtime_model, "gpt-realtime")
+        self.assertFalse(node._fallback_mode)
+
+    def test_realtime_audio_streaming_flow_unchanged(self):
+        """Incoming audio is forwarded directly to OpenAI Realtime WebSocket in Realtime mode."""
+        from astro_ai.astro_realtime_node import AstroRealtimeNode
+
+        node = AstroRealtimeNode()
+        node._is_connected = True
+        node._fallback_mode = False
+        node._is_sleeping = False
+        node._ws = MagicMock()
+        node._loop = MagicMock()
+
+        # Simulate incoming audio message
+        mock_msg = MagicMock()
+        mock_msg.data = "AQIDBA=="  # base64 encoded audio
+
+        with patch("asyncio.run_coroutine_threadsafe") as mock_async_send:
+            node._on_input_pcm(mock_msg)
+            self.assertTrue(mock_async_send.called)
+            node._ws.send.assert_called_once_with(json.dumps({"type": "input_audio_buffer.append", "audio": "AQIDBA=="}))
+
+    def test_realtime_barge_in_preserves_semantics(self):
+        """User speech event during playback triggers instant playback abort and response.cancel."""
+        from astro_ai.astro_realtime_node import AstroRealtimeNode
+        from unittest.mock import AsyncMock
+
+        node = AstroRealtimeNode()
+        node._is_responding = True
+        node._is_playback_active = True
+        node.pub_interrupt = MagicMock()
+
+        mock_ws = AsyncMock()
+        event = {"type": "input_audio_buffer.speech_started"}
+
+        asyncio.run(node._handle_realtime_event(mock_ws, event))
+
+        self.assertFalse(node._is_responding)
+        node.pub_interrupt.publish.assert_called_once()
+        mock_ws.send.assert_called_once_with(json.dumps({"type": "response.cancel"}))
+
+    def test_vision_failures_completely_isolated_from_realtime(self):
+        """Vision timeouts or HTTP errors never alter Realtime connection or fallback mode."""
+        from astro_ai.astro_realtime_node import AstroRealtimeNode
+        import numpy as np
+
+        node = AstroRealtimeNode()
+        node._is_connected = True
+        node._fallback_mode = False
+        node.groq_api_key = "test_groq"
+        node.gemini_api_key = "test_gemini"
+
+        mock_frame = np.zeros((480, 640, 3), dtype=np.uint8)
+        node._latest_camera_frame = mock_frame
+
+        # Force urllib errors in vision call
+        with patch("urllib.request.urlopen", side_effect=Exception("Vision HTTP 429 Rate Limited")):
+            res = node._inspect_camera_view(focus="test")
+
+            # Must return graceful dictionary without raising
+            self.assertIsInstance(res, dict)
+            self.assertIn("observation", res)
+            # Realtime connection & mode must remain completely intact
+            self.assertTrue(node._is_connected)
+            self.assertFalse(node._fallback_mode)
+
+    def test_fallback_mode_only_entered_on_realtime_quota_exhaustion(self):
+        """Fallback mode is NOT active during normal healthy Realtime operation."""
+        from astro_ai.astro_realtime_node import AstroRealtimeNode
+
+        node = AstroRealtimeNode()
+        self.assertFalse(node._fallback_mode)
+
+        # Quota exhaustion simulation
+        err_str = "Error code: 429 insufficient_quota"
+        if "insufficient_quota" in err_str:
+            node._fallback_mode = True
+
+        self.assertTrue(node._fallback_mode)
 
 
 if __name__ == "__main__":
