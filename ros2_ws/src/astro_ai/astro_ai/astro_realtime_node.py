@@ -302,9 +302,10 @@ class AstroRealtimeNode(Node):
         self._is_processing_fallback = False
         self._fallback_generation_id = 0
 
-        # Primary Remote TTS: ElevenLabs Flash v2.5 (~75ms, Turkish support)
+        # Primary Remote TTS: ElevenLabs Flash v2.5 (Only if ELEVENLABS_ENABLED=true)
         self.elevenlabs_engine: Optional[ElevenLabsEngine] = None
-        if ElevenLabsEngine:
+        el_enabled = os.getenv("ELEVENLABS_ENABLED", "false").lower() in ("1", "true", "yes")
+        if ElevenLabsEngine and el_enabled:
             el_key = os.getenv("ELEVENLABS_API_KEY", "")
             el_voice = os.getenv("ELEVENLABS_VOICE_ID", "")
             el_model = os.getenv("ELEVENLABS_MODEL", "eleven_flash_v2_5")
@@ -314,6 +315,7 @@ class AstroRealtimeNode(Node):
                         api_key=el_key,
                         voice_id=el_voice,
                         model_id=el_model,
+                        enabled=True,
                         logger=self.get_logger(),
                     )
                     self.get_logger().info(f"✨ [ElevenLabs TTS] Flash v2.5 Hazır (Voice ID: {el_voice}, Model: {el_model})")
@@ -332,6 +334,11 @@ class AstroRealtimeNode(Node):
                     device=os.getenv("TTS_XTTS_DEVICE", "cuda"),
                     half=os.getenv("TTS_XTTS_HALF", "1") not in ("0", "false", "False"),
                     home=xtts_home,
+                    model_dir=os.getenv("TTS_XTTS_MODEL_DIR", "") or None,
+                    checkpoint=os.getenv("TTS_XTTS_CHECKPOINT", "") or None,
+                    config=os.getenv("TTS_XTTS_CONFIG", "") or None,
+                    vocab=os.getenv("TTS_XTTS_VOCAB", "") or None,
+                    speakers=os.getenv("TTS_XTTS_SPEAKERS", "") or None,
                     logger=lambda lvl, msg: getattr(self.get_logger(), lvl, self.get_logger().info)(msg),
                 )
                 threading.Thread(target=self._start_local_xtts_background, daemon=True).start()
@@ -1930,7 +1937,14 @@ class AstroRealtimeNode(Node):
         if self.local_xtts:
             try:
                 self.local_xtts.start()
-                self.get_logger().info("✅ [Astro Realtime] Local XTTS GPU (cuda:0, FP16) başarıyla hazırlandı ve warm tutuluyor!")
+                info = self.local_xtts.get_telemetry()
+                m_type = "Fine-tuned XTTS" if info.get("is_finetuned") else "Generic XTTS v2"
+                self.get_logger().info(
+                    f"✅ [Astro Realtime] {m_type} (cuda:0, FP16) hazır!\n"
+                    f"   [XTTS Runtime] checkpoint={info.get('xtts_model_path')} | sha256={info.get('xtts_checkpoint_sha256')} | "
+                    f"reference={info.get('xtts_reference_wav')} | temp={info.get('temperature')} | "
+                    f"rep_pen={info.get('repetition_penalty')} | top_k={info.get('top_k')} | speed={info.get('speed')}"
+                )
             except Exception as e:
                 self.get_logger().error(f"❌ [Astro Realtime] Local XTTS GPU başlatılamadı: {e}")
 
@@ -2188,8 +2202,8 @@ class AstroRealtimeNode(Node):
         error_class_str = "none"
         model_error_str = "none"
         llm_latency_ms = 0.0
-        llm_ttft_ms = 0.0
-        llm_first_clause_ms = 0.0
+        llm_ttft_ms: Optional[float] = None
+        llm_first_clause_ms: Optional[float] = None
         first_audio_played = False
         first_audio_ms = 0.0
         total_synth_ms = 0.0
@@ -2204,9 +2218,10 @@ class AstroRealtimeNode(Node):
                 return
 
             # 2. Run Voiceprint Recognition (Acoustic Speaker Identification)
-            spk_name = "Misafir"
+            spk_name = None
             spk_score = 0.0
             spk_source = "unidentified"
+            spk_known = False
 
             if self.voice_recognizer:
                 try:
@@ -2216,6 +2231,7 @@ class AstroRealtimeNode(Node):
                         spk_name = identified_name
                         spk_score = score
                         spk_source = "voice_recognition"
+                        spk_known = True
                         with self._lock:
                             self._recognized_speaker = {
                                 "name": identified_name,
@@ -2226,23 +2242,26 @@ class AstroRealtimeNode(Node):
                             }
                             self._active_person_name = identified_name
                             self._person_hold_until = time.monotonic() + 45.0
-                except Exception:
-                    pass
+                except Exception as ex:
+                    self.get_logger().debug(f"Voiceprint recognition error: {ex}")
 
-            if spk_name == "Misafir":
+            if not spk_name:
                 identity = self._get_active_biometric_identity()
                 if identity.get("is_known") and identity.get("name", "").lower() != "misafir":
                     spk_name = identity.get("name")
                     spk_score = identity.get("confidence", 0.85)
                     spk_source = identity.get("source", "memory_hold")
+                    spk_known = True
 
             active_speaker_dict = {
-                "name": spk_name,
+                "name": spk_name or "Misafir",
+                "speaker_name": spk_name,
                 "confidence": spk_score,
-                "is_known": (spk_name.lower() != "misafir"),
+                "is_known": spk_known,
                 "source": spk_source,
             }
-            self.get_logger().info(f"👤 [Speaker Context] name={spk_name} confidence={spk_score:.2f} source={spk_source}")
+            speaker_display = spk_name if spk_name else "null"
+            self.get_logger().info(f"👤 [Speaker Context] speaker={speaker_display} confidence={spk_score:.2f} source={spk_source}")
 
             # 3. Select Atomic TTS Owner for this turn (Single Turn = Single TTS Owner)
             if self.elevenlabs_engine and self.elevenlabs_engine.is_ready():
@@ -2306,7 +2325,7 @@ class AstroRealtimeNode(Node):
             if is_weather:
                 weather_info = self._execute_fallback_weather(w_city)
                 p = self.persona_name.lower()
-                spk = spk_name if spk_name != "Misafir" else ""
+                spk = spk_name if spk_name else ""
                 if p == "kufurbaz":
                     reply_text = f"Ulan {spk}, {weather_info} Dışarı çıkacaksan ona göre giyin!".strip()
                 elif p == "flirt":
@@ -2343,7 +2362,7 @@ class AstroRealtimeNode(Node):
                     try:
                         t_model_start = time.monotonic()
                         first_token_seen = False
-                        first_clause_recorded = False
+                        clause_count = 0
                         if chunker:
                             chunker.reset()
 
@@ -2364,9 +2383,9 @@ class AstroRealtimeNode(Node):
                             if chunker:
                                 clauses = chunker.feed(token)
                                 for cl in clauses:
-                                    if not first_clause_recorded:
+                                    clause_count += 1
+                                    if llm_first_clause_ms is None:
                                         llm_first_clause_ms = (time.monotonic() - t_model_start) * 1000.0
-                                        first_clause_recorded = True
                                     pcm, s_ms, g_ms = _synthesize_turn_clause(cl)
                                     total_synth_ms += s_ms
                                     total_gpu_ms += g_ms
@@ -2377,10 +2396,16 @@ class AstroRealtimeNode(Node):
                                             first_audio_played = True
                                         self._play_pcm_chunks(pcm)
 
+                            # Stop policy: Limit social robot conversational response to 2-3 concise sentences
+                            if clause_count >= 3 and len("".join(full_reply_parts)) > 60:
+                                break
+
                         # Flush any remaining text in chunker buffer
                         if chunker:
                             rem_cl = chunker.flush()
                             if rem_cl:
+                                if llm_first_clause_ms is None:
+                                    llm_first_clause_ms = (time.monotonic() - t_model_start) * 1000.0
                                 pcm, s_ms, g_ms = _synthesize_turn_clause(rem_cl)
                                 total_synth_ms += s_ms
                                 total_gpu_ms += g_ms
@@ -2495,13 +2520,14 @@ class AstroRealtimeNode(Node):
                 self.memory.episodic.add_message("assistant", full_reply_str)
                 self.session.record_robot_speech()
 
+                xtts_info = self.local_xtts.get_telemetry() if self.local_xtts else {}
                 # Determine TTS metadata
                 if active_engine == "elevenlabs":
                     tts_model_name = self.elevenlabs_engine.model_id if self.elevenlabs_engine else "eleven_flash_v2_5"
                     tts_voice_name = self.elevenlabs_engine.voice_id if self.elevenlabs_engine else "configured"
                 elif active_engine == "xtts_gpu":
-                    tts_model_name = "xtts_v2"
-                    tts_voice_name = "astro_friendly.wav"
+                    tts_model_name = "xtts_finetuned" if xtts_info.get("is_finetuned") else "xtts_v2"
+                    tts_voice_name = xtts_info.get("xtts_reference_wav", self.local_xtts.speaker_wav if self.local_xtts else "reference.wav")
                 elif active_engine == "edge_tts_emergency":
                     tts_model_name = "edge_tts"
                     tts_voice_name = "tr-TR-AhmetNeural"
@@ -2509,17 +2535,24 @@ class AstroRealtimeNode(Node):
                     tts_model_name = "none"
                     tts_voice_name = "none"
 
-                xtts_info = self.local_xtts.get_telemetry() if self.local_xtts else {}
                 worker_pid = xtts_info.get("worker_pid", "None")
                 gpu_name_str = xtts_info.get("gpu_name", "Orin")
+                xtts_ckpt_str = xtts_info.get("xtts_model_path", "none")
+                xtts_sha_str = xtts_info.get("xtts_checkpoint_sha256", "none")
+                xtts_sha_short = xtts_sha_str[:12] if xtts_sha_str != "none" else "none"
+
+                ttft_str = int(llm_ttft_ms) if llm_ttft_ms is not None else "null"
+                first_clause_str = int(llm_first_clause_ms) if llm_first_clause_ms is not None else "null"
+                speaker_log_val = spk_name if spk_name else "null"
 
                 self.get_logger().info(
                     f"📊 [Turn Telemetry]: mode=LOCAL_FALLBACK | provider={chosen_provider} | "
-                    f"model={chosen_model} | llm_status={llm_status} | speaker={spk_name} | "
-                    f"speaker_confidence={spk_score:.2f} | stt_ms={int(stt_ms)} | "
-                    f"llm_ttft_ms={int(llm_ttft_ms)} | llm_first_clause_ms={int(llm_first_clause_ms)} | "
+                    f"model={chosen_model} | llm_status={llm_status} | speaker={speaker_log_val} | "
+                    f"speaker_confidence={spk_score:.2f} | speaker_source={spk_source} | stt_ms={int(stt_ms)} | "
+                    f"llm_ttft_ms={ttft_str} | llm_first_clause_ms={first_clause_str} | "
                     f"llm_total_ms={int(llm_latency_ms)} | tts_provider={active_engine} | "
                     f"tts_model={tts_model_name} | tts_voice={tts_voice_name} | "
+                    f"xtts_checkpoint={xtts_ckpt_str} | xtts_sha256={xtts_sha_short} | "
                     f"tts_ready={tts_ready_flag} | tts_first_audio_ms={int(first_audio_ms)} | "
                     f"tts_total_ms={int(total_synth_ms)} | xtts_infer_ms={int(total_gpu_ms)} | "
                     f"xtts_worker_pid={worker_pid} | xtts_gpu={gpu_name_str} | "
@@ -2689,9 +2722,19 @@ class AstroRealtimeNode(Node):
 
     def _on_speaker_id(self, msg: String):
         try:
-            data = json.loads(msg.data)
+            raw = (msg.data or "").strip()
+            if not raw:
+                return
+            if raw.startswith("{") and raw.endswith("}"):
+                data = json.loads(raw)
+            else:
+                is_k = raw.lower() not in ("misafir", "unknown", "none", "tanınmadı", "")
+                data = {"name": raw if is_k else "Misafir", "confidence": 0.90 if is_k else 0.0, "is_known": is_k, "source": "speaker_id_topic"}
             with self._lock:
                 self._recognized_speaker = data
+                if data.get("is_known") and data.get("confidence", 0.0) >= 0.40 and data.get("name", "").lower() != "misafir":
+                    self._active_person_name = data.get("name")
+                    self._person_hold_until = time.monotonic() + 45.0
             self._sync_perception_to_session()
         except Exception:
             pass

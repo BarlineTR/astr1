@@ -350,6 +350,54 @@ class TestElevenLabsEngine(unittest.TestCase):
         # Because generation_id 1 was cancelled during second read, only first chunk is yielded
         self.assertEqual(len(chunks), 1)
 
+    def test_xtts_finetuned_model_resolution_and_telemetry(self):
+        import tempfile
+        from unittest.mock import patch
+        from astro_audio.local_xtts_engine import LocalXttsEngine, resolve_xtts_speaker_wav
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            model_file = os.path.join(tmpdir, "model.pth")
+            config_file = os.path.join(tmpdir, "config.json")
+            vocab_file = os.path.join(tmpdir, "vocab.json")
+            ref_wav = os.path.join(tmpdir, "reference.wav")
+
+            for f in (model_file, config_file, vocab_file, ref_wav):
+                with open(f, "wb") as fp:
+                    fp.write(b"0" * 1024)
+
+            with patch.dict(os.environ, {
+                "TTS_XTTS_CHECKPOINT": model_file,
+                "TTS_XTTS_CONFIG": config_file,
+                "TTS_XTTS_VOCAB": vocab_file,
+                "TTS_XTTS_SPEAKER_WAV": ref_wav,
+            }):
+                resolved_wav = resolve_xtts_speaker_wav()
+                self.assertEqual(resolved_wav, os.path.abspath(ref_wav))
+
+                engine = LocalXttsEngine()
+                self.assertTrue(engine.client.custom_model is not None)
+                self.assertEqual(engine.client.custom_model["checkpoint"], os.path.abspath(model_file))
+                self.assertEqual(engine.client.custom_model["config"], os.path.abspath(config_file))
+
+                telemetry = engine.get_telemetry()
+                self.assertTrue(telemetry["is_finetuned"])
+
+    def test_voice_recognizer_telemetry_and_identify_speaker(self):
+        import numpy as np
+        from astro_audio.voice_recognizer import VoiceRecognizer
+
+        rec = VoiceRecognizer()
+        self.assertTrue(hasattr(rec, "identify_speaker"))
+        name, score = rec.identify_speaker(np.zeros(16000, dtype=np.int16))
+        self.assertIsInstance(score, float)
+
+        telem = rec.get_telemetry()
+        self.assertIn("speaker_model_path", telem)
+        self.assertIn("speaker_model_exists", telem)
+        self.assertIn("known_voices_path", telem)
+        self.assertIn("known_speakers", telem)
+        self.assertIn("Baran", telem["known_speakers"])
+
 
 if __name__ == "__main__":
     unittest.main()

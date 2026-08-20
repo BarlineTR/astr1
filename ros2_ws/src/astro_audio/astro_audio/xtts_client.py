@@ -79,12 +79,21 @@ class XttsClient:
 
     @staticmethod
     def _resolve_custom_model(model_dir, checkpoint, config, vocab, speakers):
-        explicit = {"checkpoint": checkpoint, "config": config, "vocab": vocab, "speakers": speakers}
-        if not model_dir and not any(explicit.values()):
+        explicit = {
+            "checkpoint": checkpoint or os.getenv("TTS_XTTS_CHECKPOINT"),
+            "config": config or os.getenv("TTS_XTTS_CONFIG"),
+            "vocab": vocab or os.getenv("TTS_XTTS_VOCAB"),
+            "speakers": speakers or os.getenv("TTS_XTTS_SPEAKERS"),
+        }
+        resolved_model_dir = model_dir or os.getenv("TTS_XTTS_MODEL_DIR")
+        if not resolved_model_dir and explicit.get("checkpoint"):
+            resolved_model_dir = str(Path(os.path.expanduser(explicit["checkpoint"])).parent)
+
+        if not resolved_model_dir and not any(explicit.values()):
             return None
 
         resolved = {}
-        base = Path(os.path.expanduser(model_dir)) if model_dir else None
+        base = Path(os.path.expanduser(resolved_model_dir)) if resolved_model_dir else None
         for key, filename in CUSTOM_MODEL_FILES.items():
             given = explicit.get(key)
             if given:
@@ -155,6 +164,12 @@ class XttsClient:
                 "--half", "1" if self.half else "0",
                 "--batch-size", str(self.batch_size),
                 "--model", self.model,
+                "--temperature", str(os.getenv("TTS_XTTS_TEMPERATURE", "0.50")),
+                "--length-penalty", str(os.getenv("TTS_XTTS_LENGTH_PENALTY", "1.0")),
+                "--repetition-penalty", str(os.getenv("TTS_XTTS_REPETITION_PENALTY", "4.0")),
+                "--top-k", str(os.getenv("TTS_XTTS_TOP_K", "45")),
+                "--top-p", str(os.getenv("TTS_XTTS_TOP_P", "0.65")),
+                "--speed", str(os.getenv("TTS_XTTS_SPEED", "1.05")),
             ]
 
             if self.custom_model:

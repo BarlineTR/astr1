@@ -139,11 +139,40 @@ class SpeakerEngine:
         self.db_path = Path(os.path.expanduser(str(db_path))) if db_path else DEFAULT_DB_PATH
         self.threshold = threshold
 
-        model_path = self.model_dir / MODEL_FILE
-        if not model_path.exists():
+        model_candidates = [
+            (self.model_dir / MODEL_FILE),
+            Path(os.path.expanduser("~/.astro/models")) / MODEL_FILE,
+            Path("/home/okistech/Desktop/astr1/models") / MODEL_FILE,
+            Path("/home/okistech/.astro/models") / MODEL_FILE,
+            Path(os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..", "..", "models"))) / MODEL_FILE,
+            Path(os.path.abspath("./models")) / MODEL_FILE,
+        ]
+        resolved_model_path = None
+        for cand in model_candidates:
+            if cand and cand.exists() and cand.stat().st_size > 1000:
+                resolved_model_path = cand
+                self.model_dir = cand.parent
+                break
+
+        if not resolved_model_path:
             raise SpeakerEngineUnavailable(
-                f"Konuşmacı modeli yok: {model_path} — ./scripts/install_face_models.sh çalıştırın"
+                f"Konuşmacı modeli yok: {self.model_dir / MODEL_FILE} — ./scripts/install_face_models.sh çalıştırın"
             )
+
+        self.model_path = resolved_model_path
+
+        db_candidates = [
+            self.db_path,
+            Path(os.path.expanduser("~/.astro/voices/speakers.json")),
+            Path(os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "data", "known_voices", "speakers.json"))),
+            Path("/home/okistech/Desktop/astr1/ros2_ws/src/astro_audio/data/known_voices/speakers.json"),
+            Path("/home/okistech/Desktop/astr1/data/known_voices/speakers.json"),
+        ]
+        for cand in db_candidates:
+            if cand and cand.exists():
+                self.db_path = cand
+                break
+
         try:
             import onnxruntime as ort
         except ImportError as exc:
@@ -157,7 +186,7 @@ class SpeakerEngine:
             if not providers:
                 providers = ["CPUExecutionProvider"]
             self._session = ort.InferenceSession(
-                str(model_path), sess_options=options, providers=providers
+                str(self.model_path), sess_options=options, providers=providers
             )
         except Exception as exc:
             raise SpeakerEngineUnavailable(f"Model yüklenemedi: {exc}") from exc

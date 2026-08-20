@@ -54,11 +54,30 @@ def main() -> int:
     parser.add_argument("--device", default="cuda", choices=["auto", "cuda", "cpu"])
     parser.add_argument("--half", default="1", help="1 = fp16 (recommended for CUDA)")
     parser.add_argument("--batch-size", type=int, default=4)
+    parser.add_argument("--temperature", type=float, default=float(os.getenv("TTS_XTTS_TEMPERATURE", "0.50")))
+    parser.add_argument("--length-penalty", type=float, default=float(os.getenv("TTS_XTTS_LENGTH_PENALTY", "1.0")))
+    parser.add_argument("--repetition-penalty", type=float, default=float(os.getenv("TTS_XTTS_REPETITION_PENALTY", "4.0")))
+    parser.add_argument("--top-k", type=int, default=int(os.getenv("TTS_XTTS_TOP_K", "45")))
+    parser.add_argument("--top-p", type=float, default=float(os.getenv("TTS_XTTS_TOP_P", "0.65")))
+    parser.add_argument("--speed", type=float, default=float(os.getenv("TTS_XTTS_SPEED", "1.05")))
     parser.add_argument("--no-warmup", action="store_true")
     args = parser.parse_args()
 
     os.environ.setdefault("COQUI_TOS_AGREED", "1")
     os.environ["PYTHONNOUSERSITE"] = "1"
+
+    def compute_file_sha256(filepath: Optional[str]) -> str:
+        if not filepath or not os.path.exists(filepath):
+            return "none"
+        try:
+            import hashlib
+            hasher = hashlib.sha256()
+            with open(filepath, "rb") as f:
+                for chunk in iter(lambda: f.read(65536), b""):
+                    hasher.update(chunk)
+            return hasher.hexdigest()
+        except Exception as e:
+            return f"error:{e}"
 
     # 1. Dependency Imports & PyTorch 2.6+ Compatibility Monkeypatch
     try:
@@ -100,6 +119,7 @@ def main() -> int:
 
     # 3. Model Loading & GPU Residency
     t_load_start = time.perf_counter()
+    checkpoint_sha = "none"
     try:
         if args.checkpoint:
             from TTS.tts.configs.xtts_config import XttsConfig
@@ -118,6 +138,7 @@ def main() -> int:
             )
             model.to(device)
             model_label = args.checkpoint
+            checkpoint_sha = compute_file_sha256(args.checkpoint)
         else:
             tts = TTS(args.model).to(device)
             model = tts.synthesizer.tts_model
@@ -148,7 +169,19 @@ def main() -> int:
         if not args.no_warmup:
             t_w_start = time.perf_counter()
             with torch.inference_mode():
-                model.inference("Robot hazır.", args.language, gpt_cond_latent, speaker_embedding)
+                model.inference(
+                    "Robot hazır.",
+                    args.language,
+                    gpt_cond_latent,
+                    speaker_embedding,
+                    temperature=args.temperature,
+                    length_penalty=args.length_penalty,
+                    repetition_penalty=args.repetition_penalty,
+                    top_k=args.top_k,
+                    top_p=args.top_p,
+                    speed=args.speed,
+                    enable_text_splitting=False,
+                )
             t_warmup_ms = (time.perf_counter() - t_w_start) * 1000.0
 
     except Exception as exc:
@@ -165,6 +198,18 @@ def main() -> int:
         "half": half,
         "sample_rate": sample_rate,
         "model": model_label,
+        "xtts_model_path": os.path.abspath(args.checkpoint) if args.checkpoint else args.model,
+        "xtts_config_path": os.path.abspath(args.config_path) if args.config_path else "default",
+        "xtts_vocab_path": os.path.abspath(args.vocab) if args.vocab else "default",
+        "xtts_speakers_path": os.path.abspath(args.speakers) if args.speakers else "default",
+        "xtts_reference_wav": os.path.abspath(args.speaker_wav),
+        "xtts_checkpoint_sha256": checkpoint_sha,
+        "temperature": args.temperature,
+        "length_penalty": args.length_penalty,
+        "repetition_penalty": args.repetition_penalty,
+        "top_k": args.top_k,
+        "top_p": args.top_p,
+        "speed": args.speed,
         "gpu": gpu_name,
         "gpu_memory_mb": gpu_mem_mb,
         "load_time_ms": round(t_load_ms, 1),
@@ -231,14 +276,13 @@ def main() -> int:
                     req.get("language") or args.language,
                     req_cond_latent,
                     req_spk_emb,
-                    temperature=float(req.get("temperature", 0.75)),
-                    length_penalty=float(req.get("length_penalty", 1.0)),
-                    repetition_penalty=float(req.get("repetition_penalty", 2.0)),
-                    top_k=int(req.get("top_k", 50)),
-                    top_p=float(req.get("top_p", 0.85)),
-                    speed=float(req.get("speed", 1.05)),
+                    temperature=float(req.get("temperature", args.temperature)),
+                    length_penalty=float(req.get("length_penalty", args.length_penalty)),
+                    repetition_penalty=float(req.get("repetition_penalty", args.repetition_penalty)),
+                    top_k=int(req.get("top_k", args.top_k)),
+                    top_p=float(req.get("top_p", args.top_p)),
+                    speed=float(req.get("speed", args.speed)),
                     enable_text_splitting=False,  # Sentence chunker already handles splitting
-                    batch_size=args.batch_size,
                 )
             t_infer_end = time.perf_counter()
             gpu_infer_ms = (t_infer_end - t_infer_start) * 1000.0

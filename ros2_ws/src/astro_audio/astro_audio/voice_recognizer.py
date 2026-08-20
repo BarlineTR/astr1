@@ -241,6 +241,28 @@ class VoiceRecognizer:
         # Always return best candidate — let caller decide accept/reject via margin
         return best_meta.get("name", best_norm.replace("_", " ").title()), round(max(0.0, best_sim), 4), best_meta
 
+    def identify_speaker(self, audio_arr: np.ndarray, sample_rate: int = 16000) -> Tuple[Optional[str], float]:
+        """Convenience method returning (name, score) for direct pipeline consumption."""
+        name, score, _ = self.recognize_voice(audio_arr, sample_rate)
+        return name, score
+
+    def get_telemetry(self) -> Dict[str, Any]:
+        """Returns runtime speaker recognition telemetry."""
+        engine = _get_engine()
+        model_p = str(getattr(engine, "model_path", "none")) if engine else "none"
+        model_exists = bool(engine and getattr(engine, "_session", None) is not None)
+        db_p = str(getattr(engine, "db_path", self.data_dir)) if engine else self.data_dir
+
+        with self._lock:
+            known_list = [v.get("name", k) for k, v in self._speaker_metadata.items()]
+
+        return {
+            "speaker_model_path": model_p,
+            "speaker_model_exists": model_exists,
+            "known_voices_path": db_p,
+            "known_speakers": known_list,
+        }
+
     def delete_speaker(self, name: str) -> bool:
         """Deletes speaker from memory, .npy files, and speakers.json."""
         norm_name = self._normalize_name(name)
@@ -263,4 +285,30 @@ class VoiceRecognizer:
             except Exception:
                 pass
         return True
+
+
+if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser(description="ASTRO Speaker Recognition Telemetry & Test CLI")
+    parser.add_argument("--test-speaker", help="Test if speaker is enrolled and ready")
+    parser.add_argument("--list", action="store_true", help="List enrolled speakers and paths")
+    args = parser.parse_args()
+
+    rec = VoiceRecognizer()
+    telemetry = rec.get_telemetry()
+    print("=" * 60)
+    print("[ASTRO Speaker Recognition Runtime Telemetry]")
+    print(f"   Model Path:          {telemetry['speaker_model_path']}")
+    print(f"   Model Exists/Ready:  {telemetry['speaker_model_exists']}")
+    print(f"   Known Voices Path:   {telemetry['known_voices_path']}")
+    print(f"   Enrolled Speakers:   {', '.join(telemetry['known_speakers']) if telemetry['known_speakers'] else 'None'}")
+    print("=" * 60)
+
+    if args.test_speaker:
+        name_query = args.test_speaker.strip().lower()
+        matched = [s for s in telemetry['known_speakers'] if s.lower() == name_query]
+        if matched:
+            print(f"[OK] Speaker '{args.test_speaker}' is verified and registered in database!")
+        else:
+            print(f"[ERROR] Speaker '{args.test_speaker}' NOT found in enrolled speakers: {telemetry['known_speakers']}")
 

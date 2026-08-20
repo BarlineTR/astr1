@@ -37,11 +37,32 @@ def resolve_xtts_home(preferred_home: str = "") -> str:
 
 
 def resolve_xtts_speaker_wav(preferred_wav: str = "") -> str:
-    """Resolves and validates reference speaker WAV audio file."""
+    """Resolves and validates reference speaker WAV audio file with priority for fine-tuned reference.wav."""
     candidates: List[str] = [
         preferred_wav,
         os.getenv("TTS_XTTS_SPEAKER_WAV", ""),
     ]
+
+    # Model directory / checkpoint directory reference WAV
+    ckpt = os.getenv("TTS_XTTS_CHECKPOINT", "")
+    mdir = os.getenv("TTS_XTTS_MODEL_DIR", "")
+    for base_p in [mdir, str(Path(os.path.expanduser(ckpt)).parent) if ckpt else ""]:
+        if base_p and os.path.exists(base_p):
+            candidates.extend([
+                os.path.join(base_p, "reference.wav"),
+                os.path.join(base_p, "speaker.wav"),
+                os.path.join(base_p, "Recording.wav"),
+            ])
+
+    # Standard fine-tune directory locations
+    root_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..", ".."))
+    candidates.extend([
+        "/home/okistech/Desktop/astr1/models/xtts_finetune_ready_v2/reference.wav",
+        os.path.join(root_dir, "models", "xtts_finetune_ready_v2", "reference.wav"),
+        os.path.expanduser("~/.astro/models/xtts_finetune_ready_v2/reference.wav"),
+        os.path.abspath("./models/xtts_finetune_ready_v2/reference.wav"),
+    ])
+
     try:
         from ament_index_python.packages import get_package_share_directory
         share_wav = os.path.join(get_package_share_directory("astro_audio"), "voices", "astro.wav")
@@ -50,7 +71,6 @@ def resolve_xtts_speaker_wav(preferred_wav: str = "") -> str:
         pass
 
     # Source and install directory candidates
-    root_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..", ".."))
     candidates.extend([
         os.path.join(root_dir, "ros2_ws", "src", "astro_audio", "voices", "astro.wav"),
         os.path.join(root_dir, "ros2_ws", "install", "astro_audio", "share", "astro_audio", "voices", "astro.wav"),
@@ -80,6 +100,10 @@ class LocalXttsEngine(BaseTTSEngine):
         half: bool = True,
         home: Optional[str] = None,
         model_dir: Optional[str] = None,
+        checkpoint: Optional[str] = None,
+        config: Optional[str] = None,
+        vocab: Optional[str] = None,
+        speakers: Optional[str] = None,
         logger: Optional[Callable[[str, str], None]] = None,
     ):
         self._log = logger or (lambda lvl, msg: None)
@@ -89,13 +113,23 @@ class LocalXttsEngine(BaseTTSEngine):
         self.device = device
         self.half = half
 
+        ckpt = checkpoint or os.getenv("TTS_XTTS_CHECKPOINT") or None
+        cfg = config or os.getenv("TTS_XTTS_CONFIG") or None
+        voc = vocab or os.getenv("TTS_XTTS_VOCAB") or None
+        spks = speakers or os.getenv("TTS_XTTS_SPEAKERS") or None
+        md = model_dir or os.getenv("TTS_XTTS_MODEL_DIR") or None
+
         self.client = XttsClient(
             speaker_wav=self.speaker_wav,
             home=self.home,
             language=language,
             device=device,
             half=half,
-            model_dir=model_dir,
+            model_dir=md,
+            checkpoint=ckpt,
+            config=cfg,
+            vocab=voc,
+            speakers=spks,
             logger=logger,
         )
 
@@ -112,6 +146,7 @@ class LocalXttsEngine(BaseTTSEngine):
             "worker_pid": None,
             "ready": False,
             "state": "STOPPED",
+            "is_finetuned": bool(self.client.custom_model and self.client.custom_model.get("checkpoint")),
         }
 
     @property
@@ -242,9 +277,15 @@ class LocalXttsEngine(BaseTTSEngine):
 
     def get_telemetry(self) -> Dict[str, Any]:
         info = dict(self._last_telemetry)
+        if self.client.info:
+            info.update(self.client.info)
         if self.client.proc:
             info["worker_pid"] = self.client.proc.pid
         info["ready"] = self.is_ready()
+        info["xtts_reference_wav"] = self.client.info.get("xtts_reference_wav", self.speaker_wav)
+        info["xtts_model_path"] = self.client.info.get("xtts_model_path", self.client.model)
+        info["xtts_checkpoint_sha256"] = self.client.info.get("xtts_checkpoint_sha256", "none")
+        info["is_finetuned"] = bool(self.client.custom_model and self.client.custom_model.get("checkpoint"))
         with self._state_lock:
             info["state"] = self._state
         return info
