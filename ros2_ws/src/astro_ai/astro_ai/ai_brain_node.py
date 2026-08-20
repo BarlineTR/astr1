@@ -749,7 +749,14 @@ class AiBrainNode(Node):
     def _process_llm(self, user_text: str, frame: np.ndarray | None, t_turn_start: float):
         try:
             t_llm_start = time.monotonic()
-            stt_latency_ms = (t_llm_start - t_turn_start) * 1000.0
+            # DİKKAT: t_turn_start, konuşmanın başlangıcı değil, transkriptin
+            # /speech/text üzerinden GELDİĞİ andır (_on_speech'in ilk satırı).
+            # Dolayısıyla bu süre STT değil, transkript geldikten sonra çalışan
+            # kapı mantığıdır: uyandırma sözcüğü kontrolü ve sosyal filtre LLM
+            # çağrısı. Eskiden "STT" diye raporlanıyordu ve gerçek STT süresi
+            # hiçbir yerde görünmüyordu. Asıl STT süresi speech_recognition_node
+            # içinde ölçülüp orada loglanır.
+            gate_latency_ms = (t_llm_start - t_turn_start) * 1000.0
 
             self.get_logger().info(f"🗣️ [Siz]: \"{user_text}\"")
             self.memory.episodic.add_message("user", user_text)
@@ -830,7 +837,7 @@ class AiBrainNode(Node):
                 self.memory.episodic.add_message("assistant", ans)
                 t_done = time.monotonic()
                 total_turn_ms = (t_done - t_turn_start) * 1000.0
-                self.session.latency_tracker.record_turn(stt_latency_ms, total_turn_ms - stt_latency_ms, total_turn_ms)
+                self.session.latency_tracker.record_turn(gate_latency_ms, total_turn_ms - gate_latency_ms, total_turn_ms)
                 return
 
             # 1. Live Weather Tool Direct Handling
@@ -844,9 +851,9 @@ class AiBrainNode(Node):
                 self.memory.episodic.add_message("assistant", clean_ans)
                 t_done = time.monotonic()
                 total_turn_ms = (t_done - t_turn_start) * 1000.0
-                self.session.latency_tracker.record_turn(stt_latency_ms, total_turn_ms - stt_latency_ms, total_turn_ms)
+                self.session.latency_tracker.record_turn(gate_latency_ms, total_turn_ms - gate_latency_ms, total_turn_ms)
                 stats = self.session.latency_tracker.get_stats()
-                self.get_logger().info(f"⚡ [Latency] Bu Dönüş: {total_turn_ms:.0f}ms (STT: {stt_latency_ms:.0f}ms, Hava API: {total_turn_ms - stt_latency_ms:.0f}ms) | p50: {stats['p50_total_ms']}ms, p95: {stats['p95_total_ms']}ms")
+                self.get_logger().info(f"⚡ [Latency] Bu Dönüş: {total_turn_ms:.0f}ms (Ön filtre: {gate_latency_ms:.0f}ms, Hava API: {total_turn_ms - gate_latency_ms:.0f}ms) | p50: {stats['p50_total_ms']}ms, p95: {stats['p95_total_ms']}ms")
                 return
 
             # 2. Reminder & Alarm Direct Intent
@@ -881,9 +888,9 @@ class AiBrainNode(Node):
                 self.memory.episodic.add_message("assistant", ans)
                 t_done = time.monotonic()
                 total_turn_ms = (t_done - t_turn_start) * 1000.0
-                self.session.latency_tracker.record_turn(stt_latency_ms, total_turn_ms - stt_latency_ms, total_turn_ms)
+                self.session.latency_tracker.record_turn(gate_latency_ms, total_turn_ms - gate_latency_ms, total_turn_ms)
                 stats = self.session.latency_tracker.get_stats()
-                self.get_logger().info(f"⚡ [Latency] Bu Dönüş: {total_turn_ms:.0f}ms (STT: {stt_latency_ms:.0f}ms, Hatırlatıcı: {total_turn_ms - stt_latency_ms:.0f}ms) | p50: {stats['p50_total_ms']}ms, p95: {stats['p95_total_ms']}ms")
+                self.get_logger().info(f"⚡ [Latency] Bu Dönüş: {total_turn_ms:.0f}ms (Ön filtre: {gate_latency_ms:.0f}ms, Hatırlatıcı: {total_turn_ms - gate_latency_ms:.0f}ms) | p50: {stats['p50_total_ms']}ms, p95: {stats['p95_total_ms']}ms")
                 return
 
             # 3. Identity Query ("Ben kimim? / Beni tanıdın mı? / Sesimi tanıdın mı?")
@@ -912,9 +919,9 @@ class AiBrainNode(Node):
                 self.memory.episodic.add_message("assistant", ans)
                 t_done = time.monotonic()
                 total_turn_ms = (t_done - t_turn_start) * 1000.0
-                self.session.latency_tracker.record_turn(stt_latency_ms, total_turn_ms - stt_latency_ms, total_turn_ms)
+                self.session.latency_tracker.record_turn(gate_latency_ms, total_turn_ms - gate_latency_ms, total_turn_ms)
                 stats = self.session.latency_tracker.get_stats()
-                self.get_logger().info(f"⚡ [Latency] Bu Dönüş: {total_turn_ms:.0f}ms (STT: {stt_latency_ms:.0f}ms, Biyometri: {total_turn_ms - stt_latency_ms:.0f}ms) | p50: {stats['p50_total_ms']}ms, p95: {stats['p95_total_ms']}ms")
+                self.get_logger().info(f"⚡ [Latency] Bu Dönüş: {total_turn_ms:.0f}ms (Ön filtre: {gate_latency_ms:.0f}ms, Biyometri: {total_turn_ms - gate_latency_ms:.0f}ms) | p50: {stats['p50_total_ms']}ms, p95: {stats['p95_total_ms']}ms")
                 return
 
             # 4. Initiate Conversational Biometric Enrollment
@@ -949,9 +956,9 @@ class AiBrainNode(Node):
                 self.memory.episodic.add_message("assistant", ans)
                 t_done = time.monotonic()
                 total_turn_ms = (t_done - t_turn_start) * 1000.0
-                self.session.latency_tracker.record_turn(stt_latency_ms, total_turn_ms - stt_latency_ms, total_turn_ms)
+                self.session.latency_tracker.record_turn(gate_latency_ms, total_turn_ms - gate_latency_ms, total_turn_ms)
                 stats = self.session.latency_tracker.get_stats()
-                self.get_logger().info(f"⚡ [Latency] Bu Dönüş: {total_turn_ms:.0f}ms (STT: {stt_latency_ms:.0f}ms, Kayıt Başlatma: {total_turn_ms - stt_latency_ms:.0f}ms) | p50: {stats['p50_total_ms']}ms, p95: {stats['p95_total_ms']}ms")
+                self.get_logger().info(f"⚡ [Latency] Bu Dönüş: {total_turn_ms:.0f}ms (Ön filtre: {gate_latency_ms:.0f}ms, Kayıt Başlatma: {total_turn_ms - gate_latency_ms:.0f}ms) | p50: {stats['p50_total_ms']}ms, p95: {stats['p95_total_ms']}ms")
                 return
 
 
@@ -999,9 +1006,9 @@ class AiBrainNode(Node):
                 self.memory.episodic.add_message("assistant", clean_ans)
                 t_done = time.monotonic()
                 total_turn_ms = (t_done - t_turn_start) * 1000.0
-                self.session.latency_tracker.record_turn(stt_latency_ms, total_turn_ms - stt_latency_ms, total_turn_ms)
+                self.session.latency_tracker.record_turn(gate_latency_ms, total_turn_ms - gate_latency_ms, total_turn_ms)
                 stats = self.session.latency_tracker.get_stats()
-                self.get_logger().info(f"⚡ [Latency] Bu Dönüş: {total_turn_ms:.0f}ms (STT: {stt_latency_ms:.0f}ms, Bellek: {total_turn_ms - stt_latency_ms:.0f}ms) | p50: {stats['p50_total_ms']}ms, p95: {stats['p95_total_ms']}ms")
+                self.get_logger().info(f"⚡ [Latency] Bu Dönüş: {total_turn_ms:.0f}ms (Ön filtre: {gate_latency_ms:.0f}ms, Bellek: {total_turn_ms - gate_latency_ms:.0f}ms) | p50: {stats['p50_total_ms']}ms, p95: {stats['p95_total_ms']}ms")
                 return
 
             # 2. Conversational LLM with Real-Time Token Streaming
@@ -1122,10 +1129,10 @@ class AiBrainNode(Node):
             t_done = time.monotonic()
             llm_first_ms = ((first_token_time or t_done) - t_llm_start) * 1000.0
             total_turn_ms = (t_done - t_turn_start) * 1000.0
-            self.session.latency_tracker.record_turn(stt_latency_ms, llm_first_ms, total_turn_ms)
+            self.session.latency_tracker.record_turn(gate_latency_ms, llm_first_ms, total_turn_ms)
 
             stats = self.session.latency_tracker.get_stats()
-            self.get_logger().info(f"⚡ [Latency] Bu Dönüş: {total_turn_ms:.0f}ms (STT: {stt_latency_ms:.0f}ms, İlk Token: {llm_first_ms:.0f}ms) | p50: {stats['p50_total_ms']}ms, p95: {stats['p95_total_ms']}ms")
+            self.get_logger().info(f"⚡ [Latency] Bu Dönüş: {total_turn_ms:.0f}ms (Ön filtre: {gate_latency_ms:.0f}ms, İlk Token: {llm_first_ms:.0f}ms) | p50: {stats['p50_total_ms']}ms, p95: {stats['p95_total_ms']}ms")
 
         except Exception as e:
             self.get_logger().error(f"❌ [AI] LLM İşleme Hatası: {e}")
