@@ -142,6 +142,9 @@ def resolve_fine_tune_paths(
     }
 
 
+_PERMANENT_S = 10.0 ** 9  # "asla süresi dolmasın" işareti
+
+
 class LocalXttsEngine(BaseTTSEngine):
     """Local Coqui XTTS v2 Engine running resident on CUDA GPU."""
 
@@ -206,6 +209,19 @@ class LocalXttsEngine(BaseTTSEngine):
         self._state_lock = threading.Lock()
         self._cooldown_duration = float(os.getenv("XTTS_COOLDOWN_S", "60.0"))
         self._cooldown_until = 0.0
+        # DEGRADED (kabul reddi) de COOLDOWN gibi süreli olmalı. Aksi hâlde açılış
+        # telaşında verilen tek bir "bellek yetersiz" kararı sürecin ömrü boyunca
+        # kilitleniyor ve bellek sonradan boşalsa bile XTTS bir daha denenmiyordu.
+        self._degraded_duration = float(os.getenv("XTTS_DEGRADED_RETRY_S", "120.0"))
+        self._degraded_until = 0.0
+        # İlk yeniden deneme kısa: açılışta kamera/ONNX/Whisper aynı anda yüklenirken
+        # ölçülen bellek tepe noktasıdır, ~20 sn sonra sistem rahatlar.
+        self._first_retry_delay = float(os.getenv("XTTS_FIRST_RETRY_S", "20.0"))
+        self._max_retries = int(float(os.getenv("XTTS_MAX_ADMISSION_RETRIES", "10")))
+        self._retry_count = 0
+        self._next_retry_delay = 0.0
+        self._supervisor: Optional[threading.Thread] = None
+        self._supervisor_stop = threading.Event()
 
         mem_snap = self.memory_guard.get_memory_snapshot()
         self._last_telemetry: Dict[str, Any] = {
@@ -245,9 +261,62 @@ class LocalXttsEngine(BaseTTSEngine):
     @property
     def state(self) -> str:
         with self._state_lock:
-            if self._state == "COOLDOWN" and time.monotonic() >= self._cooldown_until:
+            now_m = time.monotonic()
+            if self._state == "COOLDOWN" and now_m >= self._cooldown_until:
+                self._state = "STOPPED"
+            elif self._state == "DEGRADED" and now_m >= self._degraded_until:
                 self._state = "STOPPED"
             return self._state
+
+    def _arm_supervisor(self, delay_s: float) -> None:
+        """XTTS reddedildikten/çöktükten sonra kendini toparlama döngüsünü başlatır.
+
+        Çağıran `_state_lock`'u tutuyor olabilir; bu yüzden burada kilit alınmaz ve
+        hiçbir şey beklenmez. Aynı anda tek bir denetleyici iş parçacığı yaşar ve
+        deneme sayısı sınırlıdır — upstream'in kaçınmak istediği "retry storm" oluşmaz.
+        Döngü içinden tekrar çağrılırsa yalnızca bir sonraki bekleme süresini günceller.
+        """
+        if self._supervisor_stop.is_set():
+            return
+        self._next_retry_delay = max(1.0, delay_s)
+        if self._supervisor is not None and self._supervisor.is_alive():
+            return
+
+        def _loop():
+            while not self._supervisor_stop.is_set():
+                if self.memory_guard.is_oom_quarantined:
+                    self._safe_log(
+                        "warn",
+                        "⛔ [LocalXttsEngine] OOM karantinası etkin — yeniden deneme durduruldu.",
+                    )
+                    return
+                if self._max_retries > 0 and self._retry_count >= self._max_retries:
+                    self._safe_log(
+                        "warn",
+                        f"⛔ [LocalXttsEngine] Yeniden deneme sınırına ulaşıldı "
+                        f"({self._retry_count}/{self._max_retries}). XTTS bu oturumda devre dışı.",
+                    )
+                    return
+                if self._supervisor_stop.wait(self._next_retry_delay):
+                    return
+                if self.is_ready():
+                    return
+                self._retry_count += 1
+                limit = "∞" if self._max_retries <= 0 else str(self._max_retries)
+                self._safe_log(
+                    "info",
+                    f"🔁 [LocalXttsEngine] XTTS yeniden deneniyor ({self._retry_count}/{limit})...",
+                )
+                try:
+                    self.start()
+                except Exception as exc:
+                    self._safe_log("warn", f"⚠️ [LocalXttsEngine] Yeniden deneme başarısız: {exc}")
+                if self.is_ready():
+                    self._safe_log("info", "✅ [LocalXttsEngine] XTTS kendiliğinden toparlandı.")
+                    return
+
+        self._supervisor = threading.Thread(target=_loop, daemon=True, name="xtts-supervisor")
+        self._supervisor.start()
 
     def start(self) -> None:
         """Starts the persistent XTTS worker after system resource admission control."""
@@ -258,10 +327,15 @@ class LocalXttsEngine(BaseTTSEngine):
             if self._state == "STARTING" and self.client.is_alive:
                 self._safe_log("debug", f"LocalXttsEngine is already in STARTING state (PID: {getattr(self.client.proc, 'pid', None)}). Reusing worker.")
                 return
-            if self._state == "DEGRADED":
-                self._safe_log("warn", "⛔ [LocalXttsEngine] State is DEGRADED (Memory pressure / OOM quarantine). Spawn refused. Local offline TTS remains active.")
-                return
             now_m = time.monotonic()
+            if self._state == "DEGRADED" and now_m < self._degraded_until:
+                rem_s = self._degraded_until - now_m
+                self._safe_log(
+                    "warn",
+                    f"⛔ [LocalXttsEngine] State is DEGRADED (Memory pressure / OOM quarantine). "
+                    f"Spawn refused, {rem_s:.0f}s to re-evaluation. Local offline TTS remains active.",
+                )
+                return
             if self._state == "COOLDOWN" and now_m < self._cooldown_until:
                 rem_s = self._cooldown_until - now_m
                 self._safe_log("warn", f"⏳ [LocalXttsEngine] XTTS is in COOLDOWN ({rem_s:.1f}s remaining). Spawn refused.")
@@ -274,6 +348,8 @@ class LocalXttsEngine(BaseTTSEngine):
             self._last_telemetry["xtts_admission_reject_reason"] = reject_reason
 
             if not admitted:
+                retry_delay = self._first_retry_delay if self._retry_count == 0 else self._degraded_duration
+                self._degraded_until = time.monotonic() + retry_delay
                 self._state = "DEGRADED"
                 self._last_telemetry["ready"] = False
                 self._last_telemetry["state"] = "DEGRADED"
@@ -285,8 +361,10 @@ class LocalXttsEngine(BaseTTSEngine):
                     f"  available_ram_mb={mem_snap.get('system_available_ram_mb')}\n"
                     f"  swap_used_mb={mem_snap.get('swap_used_mb')}\n"
                     f"  swap_used_percent={mem_snap.get('swap_used_percent')}%\n"
-                    f"  action=degraded_mode_local_offline_tts_active"
+                    f"  action=degraded_mode_local_offline_tts_active\n"
+                    f"  retry_in_s={retry_delay:.0f}"
                 )
+                self._arm_supervisor(retry_delay)
                 return
 
             self._state = "STARTING"
@@ -369,6 +447,8 @@ class LocalXttsEngine(BaseTTSEngine):
             if is_oom:
                 self.memory_guard.record_oom_kill(pid=getattr(self.client.proc, "pid", None), details=str(e))
                 with self._state_lock:
+                    # Gerçek OOM ölümü kalıcı karantinadır — süre dolumu yok.
+                    self._degraded_until = time.monotonic() + _PERMANENT_S
                     self._state = "DEGRADED"
                 self._last_telemetry["state"] = "DEGRADED"
                 self._last_telemetry["ready"] = False
@@ -389,6 +469,7 @@ class LocalXttsEngine(BaseTTSEngine):
                 self._safe_log("error", f"❌ [LocalXttsEngine] XTTS başlatılamadı (CRASHED -> COOLDOWN {self._cooldown_duration:.0f}s): {e}")
                 with self._state_lock:
                     self._state = "COOLDOWN"
+                    self._arm_supervisor(self._cooldown_duration + 1.0)
             raise
 
     def is_ready(self) -> bool:
@@ -447,6 +528,8 @@ class LocalXttsEngine(BaseTTSEngine):
                 if is_oom:
                     self.memory_guard.record_oom_kill(pid=getattr(self.client.proc, "pid", None), details=str(exc))
                     with self._state_lock:
+                        # Gerçek OOM ölümü kalıcı karantinadır — süre dolumu yok.
+                        self._degraded_until = time.monotonic() + _PERMANENT_S
                         self._state = "DEGRADED"
                     self._last_telemetry["state"] = "DEGRADED"
                     self._last_telemetry["ready"] = False
@@ -462,6 +545,7 @@ class LocalXttsEngine(BaseTTSEngine):
                     self._safe_log("error", f"❌ [LocalXttsEngine] XTTS worker süreci çökmüş! Cooldown başlatıldı ({self._cooldown_duration:.0f}s).")
                     with self._state_lock:
                         self._state = "COOLDOWN"
+                        self._arm_supervisor(self._cooldown_duration + 1.0)
             return None
 
     def _try_auto_restart(self) -> None:
@@ -507,6 +591,9 @@ class LocalXttsEngine(BaseTTSEngine):
         return info
 
     def stop(self) -> None:
+        # Bekleyen yeniden denemeyi iptal et; aksi hâlde kapanıştan sonra
+        # denetleyici uyanıp worker'ı yeniden başlatmaya çalışırdı.
+        self._supervisor_stop.set()
         with self._state_lock:
             self._state = "STOPPING"
         self.client.stop()
