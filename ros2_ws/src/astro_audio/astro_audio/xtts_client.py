@@ -101,6 +101,19 @@ class XttsClient:
             resolved_model_dir = str(Path(os.path.expanduser(explicit["checkpoint"])).parent)
 
         if not resolved_model_dir and not any(explicit.values()):
+            # Auto-discover standard fine-tuned model directories if present on system
+            candidates = [
+                "/home/okistech/Desktop/astr1/models/xtts_finetune_ready_v2",
+                os.path.abspath("./models/xtts_finetune_ready_v2"),
+                os.path.expanduser("~/.astro/models/xtts_finetune_ready_v2"),
+                os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..", "..", "models", "xtts_finetune_ready_v2")),
+            ]
+            for cand in candidates:
+                if os.path.exists(cand) and os.path.exists(os.path.join(cand, "model.pth")):
+                    resolved_model_dir = cand
+                    break
+
+        if not resolved_model_dir and not any(explicit.values()):
             return None
 
         resolved = {}
