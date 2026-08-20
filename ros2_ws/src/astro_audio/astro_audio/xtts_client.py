@@ -278,7 +278,7 @@ class XttsClient:
             raise XttsError(f"XTTS startup failed: {self._startup_error}. Stderr: {stderr_snippet}")
         if not self.info:
             code = self.returncode
-            stderr_snippet = "\n".join(self._stderr_lines[-30:]) if self._stderr_lines else "None"
+            stderr_snippet = "\n".join(self._stderr_lines[-40:]) if self._stderr_lines else "None"
             cmd_str = " ".join(getattr(self, "_cmd", []))
             self._safe_log(
                 "error",
@@ -286,12 +286,17 @@ class XttsClient:
                 f"  exit_code={code}\n"
                 f"  argv={cmd_str}\n"
                 f"  cwd={self.home}\n"
-                f"  python_path={self.python_path}\n"
+                f"  python_executable={self.python_path}\n"
+                f"  sys_path={sys.path[:3]}\n"
+                f"  PYTHONPATH={os.getenv('PYTHONPATH', 'none')}\n"
+                f"  PATH={os.getenv('PATH', 'none')[:120]}\n"
+                f"  CUDA_VISIBLE_DEVICES={os.getenv('CUDA_VISIBLE_DEVICES', 'all')}\n"
+                f"  LD_LIBRARY_PATH={os.getenv('LD_LIBRARY_PATH', 'none')}\n"
                 f"  checkpoint={self.custom_model.get('checkpoint') if self.custom_model else 'default'}\n"
                 f"  config={self.custom_model.get('config') if self.custom_model else 'default'}\n"
                 f"  vocab={self.custom_model.get('vocab') if self.custom_model else 'default'}\n"
                 f"  speakers={self.custom_model.get('speakers') if self.custom_model else 'default'}\n"
-                f"  speaker_wav={self.speaker_wav}\n"
+                f"  reference_wav={self.speaker_wav}\n"
                 f"  startup_error={self._startup_error}\n"
                 f"  stderr:\n{stderr_snippet}"
             )

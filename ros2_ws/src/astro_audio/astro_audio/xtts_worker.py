@@ -129,6 +129,21 @@ def main() -> int:
     # 3. Model Loading & GPU Residency
     t_load_start = time.perf_counter()
     checkpoint_sha = "none"
+    is_finetuned = False
+
+    # Auto-resolve fine-tuned checkpoint if not explicitly provided
+    if not args.checkpoint:
+        cand_ckpts = [
+            os.getenv("TTS_XTTS_CHECKPOINT"),
+            "/home/okistech/Desktop/astr1/models/xtts_finetune_ready_v2/model.pth",
+            os.path.abspath("./models/xtts_finetune_ready_v2/model.pth"),
+            os.path.expanduser("~/.astro/models/xtts_finetune_ready_v2/model.pth"),
+        ]
+        for c_path in cand_ckpts:
+            if c_path and os.path.exists(c_path):
+                args.checkpoint = os.path.abspath(c_path)
+                break
+
     try:
         if args.checkpoint:
             from TTS.tts.configs.xtts_config import XttsConfig
@@ -172,7 +187,8 @@ def main() -> int:
                 use_deepspeed=False,
             )
             model.to(device)
-            model_label = args.checkpoint
+            model_label = "xtts_finetuned"
+            is_finetuned = True
             checkpoint_sha = compute_file_sha256(args.checkpoint)
             args.config_path = cfg_path
             args.vocab = vocab_path
@@ -200,18 +216,18 @@ def main() -> int:
                     _LATENT_CACHE[abs_path] = (g_latent, spk_emb)
             return _LATENT_CACHE[abs_path]
 
-        gpt_cond_latent, speaker_embedding = get_or_extract_latents(args.speaker_wav)
+        gpt_lat, spk_emb = get_or_extract_latents(args.speaker_wav)
 
         # 5. Startup Warm-up Inference (CUDA Kernel compilation & VRAM pre-allocation)
         t_warmup_ms = 0.0
         if not args.no_warmup:
             t_w_start = time.perf_counter()
             with torch.inference_mode():
-                model.inference(
-                    "Robot hazır.",
-                    args.language,
-                    gpt_cond_latent,
-                    speaker_embedding,
+                _ = model.inference(
+                    text="Astro hazır.",
+                    language=args.language,
+                    gpt_cond_latent=gpt_lat,
+                    speaker_embedding=spk_emb,
                     temperature=args.temperature,
                     length_penalty=args.length_penalty,
                     repetition_penalty=args.repetition_penalty,
@@ -239,6 +255,7 @@ def main() -> int:
         "half": half,
         "sample_rate": sample_rate,
         "model": model_label,
+        "is_finetuned": is_finetuned,
         "xtts_model_path": os.path.abspath(args.checkpoint) if args.checkpoint else args.model,
         "xtts_config_path": os.path.abspath(args.config_path) if args.config_path else "default",
         "xtts_vocab_path": os.path.abspath(args.vocab) if args.vocab else "default",

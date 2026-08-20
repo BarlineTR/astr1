@@ -872,6 +872,59 @@ class TestRealtimeArchitectureInvariants(unittest.TestCase):
             node._on_input_pcm(loud_msg)
             self.assertEqual(node.pub_interrupt.publish.call_count, 1)
 
+    def test_wake_detector_strictly_rejects_non_wake_words_and_phantom_hallucinations(self):
+        """Non-wake utterances and phantom hallucinations ('Altyazı M.K.') NEVER wake up the robot."""
+        from astro_ai.astro_realtime_node import AstroRealtimeNode
+        from astro_ai.state_machine import RobotState
+        import numpy as np
+
+        node = AstroRealtimeNode()
+        self.assertTrue(node.state_machine.is_deep_idle())
+        self.assertTrue(node._is_sleeping)
+
+        fake_pcm = (np.sin(np.linspace(0, 100, 3200)) * 5000).astype(np.int16).tobytes()
+        audio_chunks = [fake_pcm] * 5
+
+        # 1. Phantom hallucination 'Altyazı M.K.'
+        with patch.object(node, "_transcribe_groq_whisper", return_value="Altyazı M.K."), \
+             patch.object(node, "_process_fallback_turn") as mock_turn:
+            node._process_wake_candidate(audio_chunks)
+            self.assertTrue(node._is_sleeping)
+            self.assertEqual(node.state_machine.current_state, RobotState.DEEP_IDLE)
+            mock_turn.assert_not_called()
+
+        # 2. Arbitrary non-wake speech 'Kapıyı açar mısın'
+        with patch.object(node, "_transcribe_groq_whisper", return_value="Kapıyı açar mısın"), \
+             patch.object(node, "_process_fallback_turn") as mock_turn:
+            node._process_wake_candidate(audio_chunks)
+            self.assertTrue(node._is_sleeping)
+            self.assertEqual(node.state_machine.current_state, RobotState.DEEP_IDLE)
+            mock_turn.assert_not_called()
+
+    def test_speaker_recognition_temporal_smoothing(self):
+        """Low confidence scores (0.42) do NOT overwrite existing speaker context; tentative requires 2 observations."""
+        from astro_ai.astro_realtime_node import AstroRealtimeNode
+
+        node = AstroRealtimeNode()
+        node._active_person_name = "Baran"
+        node._person_hold_until = time.monotonic() + 45.0
+        node._recognized_speaker = {"name": "Baran", "confidence": 0.90, "is_known": True, "source": "voice_recognition"}
+
+        # Low confidence observation for Oktay (0.42) -> Ignored, Baran preserved
+        mock_rec = MagicMock()
+        mock_rec.identify_speaker.return_value = ("Oktay", 0.42)
+        node.voice_recognizer = mock_rec
+
+        fake_pcm = b"\x00\x00" * 3200
+        with patch.object(node, "_transcribe_groq_whisper", return_value="selam nasılsın"), \
+             patch.object(node, "_validate_stt_transcript", return_value=("selam nasılsın", {"stt_rejected": False})), \
+             patch.object(node, "_synthesize_speech_pcm", return_value=(b"\x00\x00" * 100, "xtts_gpu", 50.0, True)), \
+             patch.object(node, "_play_pcm_chunks"):
+            
+            node._process_fallback_turn([fake_pcm])
+            # Baran MUST remain active
+            self.assertEqual(node._active_person_name, "Baran")
+
     def test_complete_offline_mode_acceptance(self):
         """When network is completely down (0 Internet), local LLM and local offline TTS synthesize voice."""
         from astro_ai.astro_realtime_node import AstroRealtimeNode

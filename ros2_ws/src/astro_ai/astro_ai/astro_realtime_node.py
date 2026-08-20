@@ -447,6 +447,11 @@ class AstroRealtimeNode(Node):
         self._barge_in_latched = False
         self.edge_tts_enabled = os.getenv("EDGE_TTS_ENABLED", "true").lower() in ("1", "true", "yes")
 
+        # Speaker Recognition Temporal Smoother
+        self._speaker_tentative_name: Optional[str] = None
+        self._speaker_tentative_count: int = 0
+        self._speaker_tentative_last_time: float = 0.0
+
         # Camera Perception Frame Cache
         self._latest_camera_frame: Optional[np.ndarray] = None
         self._last_img_time = 0.0
@@ -1573,7 +1578,7 @@ class AstroRealtimeNode(Node):
             self.state_machine.transition_to(RobotState.LISTENING)
 
     def _process_wake_candidate(self, audio_chunks: List[bytes]):
-        """Processes potential wake utterance during sleep with full telemetry tracking."""
+        """Processes potential wake utterance during sleep with strict wake phrase gating and full telemetry tracking."""
         raw_pcm = b"".join(audio_chunks)
         if len(raw_pcm) < 16000 * 2 * 0.20:
             return
@@ -1594,47 +1599,70 @@ class AstroRealtimeNode(Node):
 
         # Transcribe candidate using fast Groq Whisper
         transcript = self._transcribe_groq_whisper(wav_bytes) or ""
-        t_clean = re.sub(r"[^\w\s]", "", transcript.lower()).strip()
+        
+        # 1. Multi-signal STT validation (reject phantom hallucinations like 'Altyazı M.K.')
+        validated_text, stt_meta = self._validate_stt_transcript(
+            transcript=transcript,
+            raw_pcm=raw_pcm,
+            is_playback_active=False,
+            is_echo_cooldown=False,
+        )
 
-        WAKE_PATTERNS = ["hey astro", "astro", "hey", "lan", "alo", "selam", "astro bak", "astro naber", "günaydın", "merhaba"]
-        is_wake_pattern = any(wp in t_clean for wp in WAKE_PATTERNS)
-        has_high_energy_speech = (total_rms >= 460.0 and peak_val >= 1200 and len(t_clean) >= 2)
+        if not validated_text:
+            self.get_logger().info(
+                f"⚡ [Wake Telemetry]: wake_detector_active=True | wake_candidate=\"{transcript}\" | "
+                f"stt_rejected=True | stt_reject_reason={stt_meta.get('stt_reject_reason')} | "
+                f"wake_rejected=True | conversation_turn_created=False | llm_started=False | tts_started=False"
+            )
+            return
 
-        wake_confidence = 0.95 if is_wake_pattern else (0.80 if has_high_energy_speech else 0.20)
+        t_clean = re.sub(r"[^\w\s]", "", validated_text.lower()).strip()
+
+        # 2. Strict Wake Phrase Verification
+        WAKE_PATTERNS = ["hey astro", "astro", "e astro", "hey", "lan", "alo", "selam", "astro bak", "astro naber", "günaydın", "merhaba"]
+        is_wake_pattern = any(t_clean == wp or t_clean.startswith(wp + " ") or wp in t_clean for wp in WAKE_PATTERNS)
+
+        if not is_wake_pattern:
+            self.get_logger().info(
+                f"⚡ [Wake Telemetry]: wake_detector_active=True | wake_candidate=\"{transcript}\" | "
+                f"is_wake_phrase=False | wake_rejected=True | "
+                f"conversation_turn_created=False | llm_started=False | tts_started=False"
+            )
+            return
+
+        wake_confidence = 0.95
         vad_confidence = round(min(1.0, total_rms / 600.0), 2)
 
-        if is_wake_pattern or has_high_energy_speech:
-            words = t_clean.split()
-            pure_wake_patterns = ["hey astro", "astro", "hey", "lan", "alo", "selam"]
-            is_only_wake_word = (t_clean in pure_wake_patterns or (len(words) <= 2 and any(wp in t_clean for wp in pure_wake_patterns)))
+        # 3. Extract command and decide whether it's pure wake phrase vs wake + command
+        extracted_cmd = t_clean
+        for wp in ["hey astro", "e astro", "astro bak", "astro naber", "astro", "hey", "lan", "alo", "selam", "günaydın", "merhaba"]:
+            if extracted_cmd.startswith(wp):
+                extracted_cmd = extracted_cmd[len(wp):].strip()
+                break
 
-            if is_only_wake_word:
-                # Pure Wake Phrase: Wakes robot up, flushes buffers, transitions to LISTENING. NO fake LLM turn!
-                self._wake_up()
-                self.get_logger().info(
-                    f"⚡ [Wake Telemetry]: wake_detector_active=True | wake_candidate=\"{transcript}\" | "
-                    f"wake_confidence={wake_confidence:.2f} | vad_confidence={vad_confidence:.2f} | "
-                    f"stt_started=True | stt_finished=True | transcript=\"{transcript}\" | "
-                    f"wake_only=True | conversation_turn_created=False | llm_started=False | tts_started=False"
-                )
-            else:
-                # Wake + Attached Command (e.g. "Hey Astro hava nasıl?"): Strip wake phrase and forward command
-                self._wake_up()
-                self.get_logger().info(
-                    f"⚡ [Wake Telemetry]: wake_detector_active=True | wake_candidate=\"{transcript}\" | "
-                    f"wake_confidence={wake_confidence:.2f} | vad_confidence={vad_confidence:.2f} | "
-                    f"stt_started=True | stt_finished=True | transcript=\"{transcript}\" | "
-                    f"wake_only=False | conversation_turn_created=True | llm_started=True | tts_started=True"
-                )
-                if self._fallback_mode or not self._is_connected:
-                    threading.Thread(target=self._process_fallback_turn, args=(audio_chunks,), daemon=True).start()
-        else:
-            self.get_logger().debug(
+        is_only_wake_word = (len(extracted_cmd) < 2)
+
+        if is_only_wake_word:
+            # Pure Wake Phrase: Wakes robot up, flushes buffers, transitions to LISTENING. NO fake LLM turn!
+            self._wake_up()
+            self.get_logger().info(
                 f"⚡ [Wake Telemetry]: wake_detector_active=True | wake_candidate=\"{transcript}\" | "
                 f"wake_confidence={wake_confidence:.2f} | vad_confidence={vad_confidence:.2f} | "
                 f"stt_started=True | stt_finished=True | transcript=\"{transcript}\" | "
-                f"conversation_turn_created=False | llm_started=False | tts_started=False"
+                f"wake_only=True | conversation_turn_created=False | llm_started=False | tts_started=False"
             )
+        else:
+            # Wake + Attached Command (e.g. "Hey Astro hava nasıl?"): Strip wake phrase and forward command
+            self._wake_up()
+            self.get_logger().info(
+                f"⚡ [Wake Telemetry]: wake_detector_active=True | wake_candidate=\"{transcript}\" | "
+                f"wake_confidence={wake_confidence:.2f} | vad_confidence={vad_confidence:.2f} | "
+                f"stt_started=True | stt_finished=True | transcript=\"{transcript}\" | "
+                f"extracted_command=\"{extracted_cmd}\" | "
+                f"wake_only=False | conversation_turn_created=True | llm_started=True | tts_started=True"
+            )
+            if self._fallback_mode or not self._is_connected:
+                threading.Thread(target=self._process_fallback_turn, args=(audio_chunks,), daemon=True).start()
 
     def _on_camera_image(self, msg: Image):
         now = time.monotonic()
@@ -2053,13 +2081,16 @@ class AstroRealtimeNode(Node):
             rejected = True
             reject_reason = "no_speech"
 
-        # 4. Suspect phrases (e.g. "abone ol", "diz", "altyazı") evaluated against genuine speech evidence
+        # 4. Suspect phrases (e.g. "abone ol", "diz", "altyazı m.k.", "altyazı") evaluated against genuine speech evidence
         elif is_suspect_phrase:
+            # Suspect phantom hallucinations require genuine articulation duration (>= 550ms speech, >= 700ms audio)
             has_strong_evidence = (
                 not is_playback_active
                 and not is_echo_cooldown
-                and speech_ms >= 240
-                and total_rms >= 450.0
+                and speech_ms >= 550
+                and audio_ms >= 700
+                and vad_confidence >= 0.55
+                and total_rms >= 480.0
                 and self_voice_score < 0.20
             )
             if not has_strong_evidence:
@@ -2550,7 +2581,7 @@ class AstroRealtimeNode(Node):
             self.get_logger().info(f"🗣️ [Siz (0-Maliyet)]: \"{user_text}\"")
             self.memory.episodic.add_message("user", user_text)
 
-            # 4. Run Voiceprint Recognition (Acoustic Speaker Identification)
+            # 4. Run Voiceprint Recognition (Acoustic Speaker Identification with Temporal Smoothing)
             spk_name = None
             spk_score = 0.0
             spk_source = "unidentified"
@@ -2560,21 +2591,58 @@ class AstroRealtimeNode(Node):
                 try:
                     audio_i16 = np.frombuffer(raw_pcm, dtype=np.int16)
                     identified_name, score = self.voice_recognizer.identify_speaker(audio_i16, sample_rate=16000)
-                    if identified_name and score >= 0.40 and identified_name.lower() != "misafir":
-                        spk_name = identified_name
-                        spk_score = score
-                        spk_source = "voice_recognition"
-                        spk_known = True
-                        with self._lock:
-                            self._recognized_speaker = {
-                                "name": identified_name,
-                                "score": score,
-                                "is_known": True,
-                                "confidence": score,
-                                "source": "voice_recognition",
-                            }
-                            self._active_person_name = identified_name
-                            self._person_hold_until = time.monotonic() + 45.0
+                    now_s = time.monotonic()
+
+                    if identified_name and identified_name.lower() != "misafir":
+                        # Temporal smoothing:
+                        # 1. High confidence (>= 0.65): Confirmed immediately
+                        if score >= 0.65:
+                            spk_name = identified_name
+                            spk_score = score
+                            spk_source = "voice_recognition"
+                            spk_known = True
+                            self._speaker_tentative_name = identified_name
+                            self._speaker_tentative_count = 2
+                            self._speaker_tentative_last_time = now_s
+                            with self._lock:
+                                self._recognized_speaker = {
+                                    "name": identified_name,
+                                    "score": score,
+                                    "is_known": True,
+                                    "confidence": score,
+                                    "source": "voice_recognition",
+                                }
+                                self._active_person_name = identified_name
+                                self._person_hold_until = now_s + 45.0
+                        # 2. Tentative confidence (0.45 <= score < 0.65): Requires 2 observations within 15s
+                        elif score >= 0.45:
+                            if getattr(self, "_speaker_tentative_name", None) == identified_name and (now_s - getattr(self, "_speaker_tentative_last_time", 0.0)) < 15.0:
+                                self._speaker_tentative_count += 1
+                            else:
+                                self._speaker_tentative_name = identified_name
+                                self._speaker_tentative_count = 1
+                            self._speaker_tentative_last_time = now_s
+
+                            if self._speaker_tentative_count >= 2:
+                                spk_name = identified_name
+                                spk_score = score
+                                spk_source = "voice_recognition_smoothed"
+                                spk_known = True
+                                with self._lock:
+                                    self._recognized_speaker = {
+                                        "name": identified_name,
+                                        "score": score,
+                                        "is_known": True,
+                                        "confidence": score,
+                                        "source": "voice_recognition_smoothed",
+                                    }
+                                    self._active_person_name = identified_name
+                                    self._person_hold_until = now_s + 45.0
+                            else:
+                                self.get_logger().info(f"👤 [Tentative Speaker] candidate={identified_name} score={score:.2f} obs={self._speaker_tentative_count}/2 (waiting confirmation)")
+                        else:
+                            # score < 0.45: Unidentified, discard without overwriting context
+                            self.get_logger().debug(f"👤 [Low Confidence Speaker] candidate={identified_name} score={score:.2f} < 0.45 (ignored)")
                 except Exception as ex:
                     self.get_logger().debug(f"Voiceprint recognition error: {ex}")
 
@@ -2866,13 +2934,19 @@ class AstroRealtimeNode(Node):
                 self.session.record_robot_speech()
 
                 xtts_info = self.local_xtts.get_telemetry() if self.local_xtts else {}
+                is_xtts_actually_ready = bool(self.local_xtts and self.local_xtts.is_ready())
+                xtts_err_str = "none"
+                if not is_xtts_actually_ready:
+                    xtts_state = self.local_xtts.state if self.local_xtts else "uninitialized"
+                    xtts_err_str = xtts_info.get("error", xtts_state)
+
                 # Determine TTS metadata
                 if active_engine == "elevenlabs":
                     tts_model_name = self.elevenlabs_engine.model_id if self.elevenlabs_engine else "eleven_flash_v2_5"
                     tts_voice_name = self.elevenlabs_engine.voice_id if self.elevenlabs_engine else "configured"
                     tts_mode_val = "remote_cloud"
                 elif active_engine == "xtts_gpu":
-                    tts_model_name = "xtts_finetuned" if xtts_info.get("is_finetuned") else "xtts_v2"
+                    tts_model_name = "xtts_finetuned" if xtts_info.get("is_finetuned", True) else "xtts_v2"
                     tts_voice_name = xtts_info.get("xtts_reference_wav", self.local_xtts.speaker_wav if self.local_xtts else "reference.wav")
                     tts_mode_val = "local_gpu"
                 elif active_engine == "local_offline_tts":
@@ -2905,6 +2979,7 @@ class AstroRealtimeNode(Node):
                     f"llm_ttft_ms={ttft_str} | llm_first_clause_ms={first_clause_str} | "
                     f"llm_total_ms={int(llm_latency_ms)} | tts_provider={active_engine} | tts_mode={tts_mode_val} | "
                     f"tts_model={tts_model_name} | tts_voice={tts_voice_name} | "
+                    f"xtts_ready={is_xtts_actually_ready} | xtts_error={xtts_err_str} | "
                     f"xtts_checkpoint={xtts_ckpt_str} | xtts_sha256={xtts_sha_short} | "
                     f"tts_ready={tts_ready_flag} | tts_first_audio_ms={int(first_audio_ms)} | "
                     f"tts_total_ms={int(total_synth_ms)} | xtts_infer_ms={int(total_gpu_ms)} | "

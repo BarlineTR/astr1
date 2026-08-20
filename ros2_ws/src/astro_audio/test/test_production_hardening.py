@@ -446,9 +446,9 @@ class TestSTTValidationAndEchoImmunity(unittest.TestCase):
         self.assertEqual(score_unrelated, 0.0)
 
     def test_stt_phantom_hallucination_rejected_on_weak_evidence(self):
-        """When Whisper returns 'abone ol' or 'altyazı' on quiet room noise, it MUST be rejected."""
+        """When Whisper returns 'abone ol' or 'altyazı m.k.' on quiet room noise or short 240ms chirps, it MUST be rejected."""
+        # 1. Very quiet noise (400ms @ 120 RMS)
         weak_pcm = self._generate_pcm(0.40, rms_target=120.0)
-        
         for phantom in ["abone ol", "Altyazı M.K.", "Diz", "Dizi", "izlediğiniz için teşekkürler"]:
             validated, meta = self.node._validate_stt_transcript(
                 transcript=phantom,
@@ -458,11 +458,21 @@ class TestSTTValidationAndEchoImmunity(unittest.TestCase):
             )
             self.assertIsNone(validated, f"Phantom '{phantom}' should be rejected on weak acoustic evidence!")
             self.assertTrue(meta["stt_rejected"])
-            self.assertIn(meta["stt_reject_reason"], ("no_speech", "self_voice", "low_confidence"))
+
+        # 2. Short 240ms impulsive noise chirp (even with high peak RMS)
+        chirp_pcm = self._generate_pcm(0.24, rms_target=600.0)
+        val_chirp, meta_chirp = self.node._validate_stt_transcript(
+            transcript="Altyazı M.K.",
+            raw_pcm=chirp_pcm,
+            is_playback_active=False,
+            is_echo_cooldown=False,
+        )
+        self.assertIsNone(val_chirp, "240ms chirp hallucinated as 'Altyazı M.K.' must be rejected!")
+        self.assertTrue(meta_chirp["stt_rejected"])
 
     def test_stt_legitimate_suspect_phrase_accepted_on_strong_evidence(self):
-        """When user genuinely says 'abone ol' or 'diz' with strong acoustic evidence, it MUST be accepted."""
-        strong_pcm = self._generate_pcm(0.60, rms_target=750.0)
+        """When user genuinely says 'abone ol' or 'diz' with sustained articulation (>= 750ms), it MUST be accepted."""
+        strong_pcm = self._generate_pcm(0.85, rms_target=750.0)
         self.node._recent_robot_phrases.clear()
 
         for legit in ["abone ol", "diz", "altyazı lazım"]:

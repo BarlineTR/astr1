@@ -203,17 +203,29 @@ class LocalXttsEngine(BaseTTSEngine):
                 "worker_pid": worker_pid,
                 "ready": True,
                 "state": "READY",
+                "xtts_model_path": info.get("xtts_model_path", self.speaker_wav),
+                "xtts_checkpoint_sha256": info.get("xtts_checkpoint_sha256", "none"),
+                "is_finetuned": info.get("is_finetuned", False),
             })
+            model_type_str = "xtts_finetuned" if info.get("is_finetuned") else "xtts_v2"
             self._safe_log(
                 "info",
-                f"✅ [LocalXttsEngine] XTTS GPU Resident Hazır! ({info.get('gpu')}, PID: {worker_pid}, "
-                f"VRAM: {info.get('gpu_memory_mb')}MB, FP16: {info.get('half')})"
+                f"✅ [XTTS READY]\n"
+                f"  model={model_type_str}\n"
+                f"  checkpoint={info.get('xtts_model_path')}\n"
+                f"  reference={info.get('xtts_reference_wav')}\n"
+                f"  sha256={info.get('xtts_checkpoint_sha256')}\n"
+                f"  device={info.get('device')}\n"
+                f"  gpu={info.get('gpu')}\n"
+                f"  half={info.get('half')}\n"
+                f"  PID={worker_pid}"
             )
         except XttsError as e:
             with self._state_lock:
                 self._state = "CRASHED"
             self._last_telemetry["ready"] = False
             self._last_telemetry["state"] = "CRASHED"
+            self._last_telemetry["error"] = str(e)
             self._safe_log("error", f"❌ [LocalXttsEngine] XTTS başlatılamadı: {e}")
             raise
 
