@@ -273,31 +273,61 @@ class LocalXttsEngine(BaseTTSEngine):
         try:
             info = self.client.wait_ready(timeout=180.0)
             worker_pid = self.client.proc.pid if self.client.proc else None
+
+            is_ft = bool(info.get("is_finetuned", False))
+            model_lbl = info.get("model", "")
+            ckpt_path = info.get("checkpoint") or info.get("xtts_model_path")
+            ref_path = info.get("reference") or info.get("xtts_reference_wav")
+            sha = info.get("sha256") or info.get("xtts_checkpoint_sha256")
+            dev = info.get("device")
+            gpu = info.get("gpu")
+            half_flag = info.get("half")
+
+            # Production Assertion: Only accept verified fine-tuned model
+            if not is_ft or model_lbl != "xtts_finetuned" or not ckpt_path or not ref_path or not sha or sha == "none" or dev != "cuda":
+                with self._state_lock:
+                    self._state = "CRASHED"
+                    self._cooldown_until = time.monotonic() + self._cooldown_duration
+                self._last_telemetry["ready"] = False
+                self._last_telemetry["state"] = "CRASHED"
+                err_msg = (
+                    f"XTTS READY validation rejected: invalid fine-tuned metadata: "
+                    f"model={model_lbl}, is_finetuned={is_ft}, checkpoint={ckpt_path}, "
+                    f"reference={ref_path}, sha256={sha}, device={dev}, gpu={gpu}"
+                )
+                self._last_telemetry["error"] = err_msg
+                self._safe_log("error", f"❌ [LocalXttsEngine] {err_msg}")
+                raise XttsError(err_msg)
+
             with self._state_lock:
                 self._state = "READY"
             self._last_telemetry.update({
-                "gpu_name": info.get("gpu", "cuda:0"),
+                "gpu_name": gpu or "Orin",
                 "gpu_memory_mb": info.get("gpu_memory_mb", 0.0),
-                "cuda_available": info.get("device") == "cuda",
+                "cuda_available": dev == "cuda",
                 "worker_pid": worker_pid,
                 "ready": True,
                 "state": "READY",
-                "xtts_model_path": info.get("xtts_model_path", self.speaker_wav),
-                "xtts_checkpoint_sha256": info.get("xtts_checkpoint_sha256", "none"),
-                "is_finetuned": info.get("is_finetuned", False),
+                "model": "xtts_finetuned",
+                "is_finetuned": True,
+                "xtts_model_path": ckpt_path,
+                "xtts_reference_wav": ref_path,
+                "xtts_checkpoint_sha256": sha,
+                "device": dev,
+                "gpu": gpu,
+                "half": half_flag,
                 "error": "none",
             })
-            model_type_str = "xtts_finetuned" if info.get("is_finetuned") else "xtts_v2"
             self._safe_log(
                 "info",
                 f"✅ [XTTS READY]\n"
-                f"  model={model_type_str}\n"
-                f"  checkpoint={info.get('xtts_model_path')}\n"
-                f"  reference={info.get('xtts_reference_wav')}\n"
-                f"  sha256={info.get('xtts_checkpoint_sha256')}\n"
-                f"  device={info.get('device')}\n"
-                f"  gpu={info.get('gpu')}\n"
-                f"  half={info.get('half')}\n"
+                f"  model=xtts_finetuned\n"
+                f"  checkpoint={ckpt_path}\n"
+                f"  reference={ref_path}\n"
+                f"  sha256={sha}\n"
+                f"  device={dev}\n"
+                f"  gpu={gpu}\n"
+                f"  half={half_flag}\n"
                 f"  PID={worker_pid}"
             )
         except XttsError as e:
@@ -325,6 +355,11 @@ class LocalXttsEngine(BaseTTSEngine):
     ) -> Optional[bytes]:
         """Synthesizes text clause and returns raw int16 PCM bytes."""
         if not self.is_ready():
+            return None
+
+        # Pre-synthesis assertion: Ensure model is strictly verified fine-tuned
+        if not self._last_telemetry.get("is_finetuned"):
+            self._safe_log("error", "❌ [LocalXttsEngine] Sentez iptal: Fine-tuned model doğrulanmadı!")
             return None
 
         t_start = time.perf_counter()
@@ -386,16 +421,19 @@ class LocalXttsEngine(BaseTTSEngine):
 
     def get_telemetry(self) -> Dict[str, Any]:
         info = dict(self._last_telemetry)
-        if self.client.info:
-            info.update(self.client.info)
+        if self.client.ready_info:
+            info.update(self.client.ready_info)
         if self.client.proc:
             info["worker_pid"] = self.client.proc.pid
-        info["ready"] = self.is_ready()
-        info["xtts_reference_wav"] = self.client.info.get("xtts_reference_wav", self.ft_paths.get("speaker_wav", self.speaker_wav))
-        info["xtts_model_path"] = self.client.info.get("xtts_model_path", self.ft_paths.get("checkpoint", self.client.model))
-        info["xtts_checkpoint_sha256"] = self.client.info.get("xtts_checkpoint_sha256", "none")
-        info["is_finetuned"] = bool(self.ft_paths.get("checkpoint_exists", False))
-        info["xtts_batch_size"] = self.client.info.get("batch_size", getattr(self.client, "batch_size", 1))
+        is_ready_val = self.is_ready()
+        is_ft = bool(self.client.ready_info.get("is_finetuned", self.ft_paths.get("checkpoint_exists", False)))
+        info["ready"] = is_ready_val
+        info["is_finetuned"] = is_ft
+        info["model"] = "xtts_finetuned" if is_ft else "none"
+        info["xtts_reference_wav"] = self.client.ready_info.get("reference") or self.client.ready_info.get("xtts_reference_wav", self.ft_paths.get("speaker_wav", self.speaker_wav))
+        info["xtts_model_path"] = self.client.ready_info.get("checkpoint") or self.client.ready_info.get("xtts_model_path", self.ft_paths.get("checkpoint", self.client.model))
+        info["xtts_checkpoint_sha256"] = self.client.ready_info.get("sha256") or self.client.ready_info.get("xtts_checkpoint_sha256", "none")
+        info["xtts_batch_size"] = self.client.ready_info.get("batch_size", getattr(self.client, "batch_size", 1))
         with self._state_lock:
             info["state"] = self._state
         return info

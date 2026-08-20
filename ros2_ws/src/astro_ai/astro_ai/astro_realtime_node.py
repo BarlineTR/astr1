@@ -3162,7 +3162,7 @@ class AstroRealtimeNode(Node):
                     tts_voice_name = self.elevenlabs_engine.voice_id if self.elevenlabs_engine else "configured"
                     tts_mode_val = "remote_cloud"
                 elif active_engine == "xtts_gpu":
-                    tts_model_name = "xtts_finetuned" if xtts_info.get("is_finetuned", True) else "xtts_v2"
+                    tts_model_name = "xtts_finetuned"
                     tts_voice_name = xtts_info.get("xtts_reference_wav", self.local_xtts.speaker_wav if self.local_xtts else "reference.wav")
                     tts_mode_val = "local_gpu"
                 elif active_engine == "local_offline_tts":
@@ -3213,7 +3213,7 @@ class AstroRealtimeNode(Node):
                     f"tts_playback_started={first_audio_played} | tts_audio_device=\"{active_engine}\" | "
                     f"xtts_ready={is_xtts_actually_ready} | xtts_error={xtts_err_str} | "
                     f"xtts_batch_size={xtts_info.get('xtts_batch_size', 1)} | "
-                    f"xtts_checkpoint={xtts_ckpt_str} | xtts_sha256={xtts_sha_short} | "
+                    f"xtts_checkpoint={xtts_ckpt_str} | xtts_reference={tts_voice_name} | xtts_sha256={xtts_sha_str} | "
                     f"tts_ready={tts_ready_flag} | tts_first_audio_ms={int(first_audio_ms)} | "
                     f"tts_total_ms={int(total_synth_ms)} | xtts_infer_ms={int(total_gpu_ms)} | "
                     f"xtts_queue_wait_ms={int(total_queue_wait_ms)} | "
@@ -3223,6 +3223,20 @@ class AstroRealtimeNode(Node):
                     f"oak_last_camera_info_age_ms={oak_info_age} | oak_xlink_error_count={self._oak_xlink_error_count} | "
                     f"fallback_reason=realtime_quota | attempts={json.dumps(attempts, ensure_ascii=False)}"
                 )
+
+                if active_engine == "xtts_gpu" and not getattr(self, "_first_xtts_synthesis_verified", False):
+                    self._first_xtts_synthesis_verified = True
+                    self.get_logger().info(
+                        f"🎯 [XTTS First Synthesis Verified]:\n"
+                        f"  tts_synthesis_started=true\n"
+                        f"  tts_provider=xtts_gpu\n"
+                        f"  tts_model=xtts_finetuned\n"
+                        f"  xtts_checkpoint={xtts_ckpt_str}\n"
+                        f"  xtts_reference={tts_voice_name}\n"
+                        f"  xtts_sha256={xtts_sha_str}\n"
+                        f"  xtts_infer_ms={int(total_gpu_ms)}\n"
+                        f"  tts_audio_bytes={total_audio_bytes}"
+                    )
 
         except Exception as e:
             self.get_logger().warn(f"Fallback turn notice: {e}")

@@ -850,9 +850,77 @@ class TestSTTValidationAndEchoImmunity(unittest.TestCase):
             client.proc.stdout = [f"@@XTTS@@ {probe_json}\n"]
             client._read_stdout()
 
-            self.assertEqual(client.info.get("device_name"), "Orin")
-            self.assertTrue(client.info.get("torch_cuda_available"))
-            self.assertEqual(client.info.get("batch_size"), 1)
+            self.assertEqual(client.probe_info.get("device_name"), "Orin")
+            self.assertTrue(client.probe_info.get("torch_cuda_available"))
+            self.assertEqual(client.probe_info.get("batch_size"), 1)
+            # Crucial: probe event alone MUST NOT mark client as ready!
+            self.assertFalse(client.is_ready)
+
+    def test_generic_xtts_metadata_strictly_rejected(self):
+        """Generic xtts_v2 READY event or missing checkpoint metadata is strictly rejected."""
+        from astro_audio.xtts_client import XttsClient, XttsError
+        client = XttsClient(speaker_wav="test.wav")
+        client._cmd = ["python", "xtts_worker.py"]
+
+        generic_ready_json = json.dumps({
+            "event": "ready",
+            "model": "xtts_v2",
+            "checkpoint": None,
+            "reference": None,
+            "sha256": None,
+            "device": None,
+            "gpu": None,
+            "half": None,
+            "is_finetuned": False,
+        })
+
+        with patch.object(client, "_safe_log"):
+            client.proc = MagicMock()
+            client.proc.stdout = [f"@@XTTS@@ {generic_ready_json}\n"]
+            client._read_stdout()
+
+            # Verify client is NOT ready and has startup error
+            self.assertFalse(client.is_ready)
+            self.assertIsNotNone(client._startup_error)
+            with self.assertRaises(XttsError):
+                client.wait_ready(timeout=1.0)
+
+    def test_finetuned_xtts_metadata_accepted_and_marked_ready(self):
+        """Fine-tuned XTTS READY event with all required files is accepted and marked READY."""
+        from astro_audio.xtts_client import XttsClient
+        from astro_audio.local_xtts_engine import LocalXttsEngine
+        client = XttsClient(speaker_wav="test.wav")
+        client._cmd = ["python", "xtts_worker.py"]
+
+        valid_ft_ready = json.dumps({
+            "event": "ready",
+            "model": "xtts_finetuned",
+            "is_finetuned": True,
+            "checkpoint": "/home/okistech/Desktop/astr1/models/xtts_finetune_ready_v2/model.pth",
+            "reference": "/home/okistech/Desktop/astr1/models/xtts_finetune_ready_v2/reference.wav",
+            "config": "/home/okistech/Desktop/astr1/models/xtts_finetune_ready_v2/config.json",
+            "vocab": "/home/okistech/Desktop/astr1/models/xtts_finetune_ready_v2/vocab.json",
+            "speakers": "/home/okistech/Desktop/astr1/models/xtts_finetune_ready_v2/speakers_xtts.pth",
+            "sha256": "db0ffe8aca560d117f694c7992f01f724db789ac9ee3a4df9a6d6526a8beedc0",
+            "device": "cuda",
+            "gpu": "Orin",
+            "half": True,
+            "batch_size": 1,
+            "sample_rate": 24000,
+        })
+
+        with patch.object(client, "_safe_log"):
+            client.proc = MagicMock()
+            client.proc.poll.return_value = None  # Process alive
+            client.proc.stdout = [f"@@XTTS@@ {valid_ft_ready}\n"]
+            client._read_stdout()
+
+            self.assertTrue(client.is_ready)
+            info = client.wait_ready(timeout=1.0)
+            self.assertEqual(info.get("model"), "xtts_finetuned")
+            self.assertTrue(info.get("is_finetuned"))
+            self.assertEqual(info.get("gpu"), "Orin")
+            self.assertEqual(info.get("device"), "cuda")
 
 
 if __name__ == "__main__":

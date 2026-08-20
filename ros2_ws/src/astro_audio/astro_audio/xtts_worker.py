@@ -233,65 +233,74 @@ def main() -> int:
             "/home/okistech/Desktop/astr1/models/xtts_finetune_ready_v2/model.pth",
             os.path.abspath("./models/xtts_finetune_ready_v2/model.pth"),
             os.path.expanduser("~/.astro/models/xtts_finetune_ready_v2/model.pth"),
+            os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..", "..", "models", "xtts_finetune_ready_v2", "model.pth")),
         ]
         for c_path in cand_ckpts:
             if c_path and os.path.exists(c_path):
                 args.checkpoint = os.path.abspath(c_path)
                 break
 
+    if not args.checkpoint or not os.path.exists(args.checkpoint):
+        msg = (
+            f"Fine-tuned XTTS checkpoint (model.pth) not found: {args.checkpoint}. "
+            f"Generic xtts_v2 fallback is strictly forbidden in production."
+        )
+        sys.stderr.write(f"[XTTS Worker Model Error]: {msg}\n")
+        sys.stderr.flush()
+        emit({"event": "error", "stage": "checkpoint", "message": msg, "diagnostics": diag})
+        return 1
+
     try:
-        if args.checkpoint:
-            from TTS.tts.configs.xtts_config import XttsConfig
-            from TTS.tts.models.xtts import Xtts
+        from TTS.tts.configs.xtts_config import XttsConfig
+        from TTS.tts.models.xtts import Xtts
 
-            ckpt_dir = os.path.dirname(os.path.abspath(args.checkpoint))
+        ckpt_dir = os.path.dirname(os.path.abspath(args.checkpoint))
 
-            # Auto-resolve config path if omitted
-            cfg_path = args.config_path
-            if not cfg_path or not os.path.exists(cfg_path):
-                cand_cfg = os.path.join(ckpt_dir, "config.json")
-                if os.path.exists(cand_cfg):
-                    cfg_path = cand_cfg
+        # Auto-resolve config path if omitted
+        cfg_path = args.config_path
+        if not cfg_path or not os.path.exists(cfg_path):
+            cand_cfg = os.path.join(ckpt_dir, "config.json")
+            if os.path.exists(cand_cfg):
+                cfg_path = cand_cfg
 
-            if not cfg_path or not os.path.exists(cfg_path):
-                raise FileNotFoundError(f"XTTS config.json not found for checkpoint: {args.checkpoint}")
+        if not cfg_path or not os.path.exists(cfg_path):
+            raise FileNotFoundError(f"XTTS config.json not found for checkpoint: {args.checkpoint}")
 
-            # Auto-resolve vocab path if omitted
-            vocab_path = args.vocab
-            if not vocab_path or not os.path.exists(vocab_path):
-                cand_vocab = os.path.join(ckpt_dir, "vocab.json")
-                if os.path.exists(cand_vocab):
-                    vocab_path = cand_vocab
+        # Auto-resolve vocab path if omitted
+        vocab_path = args.vocab
+        if not vocab_path or not os.path.exists(vocab_path):
+            cand_vocab = os.path.join(ckpt_dir, "vocab.json")
+            if os.path.exists(cand_vocab):
+                vocab_path = cand_vocab
 
-            # Auto-resolve speakers path if omitted
-            speakers_path = args.speakers
-            if not speakers_path or not os.path.exists(speakers_path):
-                cand_spk = os.path.join(ckpt_dir, "speakers_xtts.pth")
-                if os.path.exists(cand_spk):
-                    speakers_path = cand_spk
+        if not vocab_path or not os.path.exists(vocab_path):
+            raise FileNotFoundError(f"XTTS vocab.json not found for checkpoint: {args.checkpoint}")
 
-            config = XttsConfig()
-            config.load_json(cfg_path)
-            model = Xtts.init_from_config(config)
-            model.load_checkpoint(
-                config,
-                checkpoint_path=args.checkpoint,
-                vocab_path=vocab_path,
-                speaker_file_path=speakers_path,
-                eval=True,
-                use_deepspeed=False,
-            )
-            model.to(device)
-            model_label = "xtts_finetuned"
-            is_finetuned = True
-            checkpoint_sha = compute_file_sha256(args.checkpoint)
-            args.config_path = cfg_path
-            args.vocab = vocab_path
-            args.speakers = speakers_path
-        else:
-            tts = TTS(args.model).to(device)
-            model = tts.synthesizer.tts_model
-            model_label = args.model
+        # Auto-resolve speakers path if omitted
+        speakers_path = args.speakers
+        if not speakers_path or not os.path.exists(speakers_path):
+            cand_spk = os.path.join(ckpt_dir, "speakers_xtts.pth")
+            if os.path.exists(cand_spk):
+                speakers_path = cand_spk
+
+        config = XttsConfig()
+        config.load_json(cfg_path)
+        model = Xtts.init_from_config(config)
+        model.load_checkpoint(
+            config,
+            checkpoint_path=args.checkpoint,
+            vocab_path=vocab_path,
+            speaker_file_path=speakers_path,
+            eval=True,
+            use_deepspeed=False,
+        )
+        model.to(device)
+        model_label = "xtts_finetuned"
+        is_finetuned = True
+        checkpoint_sha = compute_file_sha256(args.checkpoint)
+        args.config_path = cfg_path
+        args.vocab = vocab_path
+        args.speakers = speakers_path
 
         sample_rate = model.config.audio.output_sample_rate
 
@@ -356,16 +365,20 @@ def main() -> int:
 
     emit({
         "event": "ready",
+        "model": "xtts_finetuned",
+        "is_finetuned": True,
+        "checkpoint": os.path.abspath(args.checkpoint),
+        "reference": os.path.abspath(args.speaker_wav),
+        "config": os.path.abspath(cfg_path),
+        "vocab": os.path.abspath(vocab_path),
+        "speakers": os.path.abspath(speakers_path) if speakers_path else "none",
+        "sha256": checkpoint_sha,
         "device": device,
+        "gpu": gpu_name,
         "half": half,
         "batch_size": args.batch_size,
         "sample_rate": sample_rate,
-        "model": model_label,
-        "is_finetuned": is_finetuned,
-        "xtts_model_path": os.path.abspath(args.checkpoint) if args.checkpoint else args.model,
-        "xtts_config_path": os.path.abspath(args.config_path) if args.config_path else "default",
-        "xtts_vocab_path": os.path.abspath(args.vocab) if args.vocab else "default",
-        "xtts_speakers_path": os.path.abspath(args.speakers) if args.speakers else "default",
+        "xtts_model_path": os.path.abspath(args.checkpoint),
         "xtts_reference_wav": os.path.abspath(args.speaker_wav),
         "xtts_checkpoint_sha256": checkpoint_sha,
         "temperature": args.temperature,
@@ -374,7 +387,6 @@ def main() -> int:
         "top_k": args.top_k,
         "top_p": args.top_p,
         "speed": args.speed,
-        "gpu": gpu_name,
         "gpu_memory_mb": gpu_mem_mb,
         "load_time_ms": round(t_load_ms, 1),
         "warmup_time_ms": round(t_warmup_ms, 1),

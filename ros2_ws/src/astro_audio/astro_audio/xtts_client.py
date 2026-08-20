@@ -68,7 +68,12 @@ class XttsClient:
         self.custom_model = self._resolve_custom_model(model_dir, checkpoint, config, vocab, speakers)
 
         self.proc: Optional[subprocess.Popen] = None
+        self.probe_info: Dict[str, Any] = {}
+        self.ready_info: Dict[str, Any] = {}
         self.info: Dict[str, Any] = {}
+        self._stderr_lines: List[str] = []
+        self._last_error_event: Optional[Dict[str, Any]] = None
+        self._cmd: List[str] = []
         self._responses = queue.Queue()
         self._ready = threading.Event()
         self._startup_error: Optional[str] = None
@@ -288,7 +293,7 @@ class XttsClient:
 
             event = msg.get("event")
             if event == "probe":
-                self.info.update(msg)
+                self.probe_info = msg
                 self._safe_log(
                     "info",
                     f"🔍 [XTTS Probe Success]: python={msg.get('python_executable')} | "
@@ -297,7 +302,23 @@ class XttsClient:
                     f"gpu_name={msg.get('device_name')}"
                 )
             elif event == "ready":
-                self.info.update(msg)
+                is_ft = bool(msg.get("is_finetuned", False))
+                model_lbl = msg.get("model", "")
+                ckpt_p = msg.get("checkpoint") or msg.get("xtts_model_path")
+                sha_v = msg.get("sha256") or msg.get("xtts_checkpoint_sha256")
+                dev_v = msg.get("device")
+
+                # Strict fine-tuned metadata gate: Reject generic or incomplete models
+                if not is_ft or model_lbl != "xtts_finetuned" or not ckpt_p or not sha_v or sha_v == "none":
+                    err_msg = (
+                        f"Generic or unverified XTTS model rejected: model={model_lbl}, "
+                        f"is_finetuned={is_ft}, checkpoint={ckpt_p}, sha256={sha_v}, device={dev_v}"
+                    )
+                    self._startup_error = err_msg
+                    self._last_error_event = {"event": "error", "stage": "validation", "message": err_msg}
+                else:
+                    self.ready_info = msg
+                    self.info = msg
                 self._ready.set()
             elif event == "error":
                 self._startup_error = f"{msg.get('stage')}: {msg.get('message')}"
@@ -320,7 +341,7 @@ class XttsClient:
         if not self._ready.wait(timeout):
             stderr_snippet = "\n".join(self._stderr_lines[-20:]) if self._stderr_lines else "None"
             raise XttsError(f"XTTS did not become ready in {timeout:.0f}s. Stderr: {stderr_snippet}")
-        if self._startup_error or not self.info or not self.is_ready:
+        if self._startup_error or not self.ready_info or not self.is_ready:
             if self.proc is not None:
                 try:
                     code = self.proc.wait(timeout=1.5)
@@ -330,7 +351,7 @@ class XttsClient:
                 code = None
             stderr_snippet = "\n".join(self._stderr_lines[-40:]) if self._stderr_lines else "None"
             cmd_str = " ".join(getattr(self, "_cmd", []))
-            probe = self.info if self.info else {}
+            probe = self.probe_info if self.probe_info else self.info
             err_diag = (getattr(self, "_last_error_event", None) or {}).get("diagnostics", {})
             self._safe_log(
                 "error",
@@ -356,11 +377,16 @@ class XttsClient:
             if self._startup_error:
                 raise XttsError(f"XTTS startup failed: {self._startup_error}. Stderr: {stderr_snippet}")
             raise XttsError(f"XTTS worker exited unexpectedly (code {code}):\n{stderr_snippet}")
-        return self.info
+        return self.ready_info
 
     @property
     def is_ready(self) -> bool:
-        return bool(self.info) and self.is_alive
+        return (
+            bool(self.ready_info)
+            and self.ready_info.get("event") == "ready"
+            and self.ready_info.get("is_finetuned") is True
+            and self.is_alive
+        )
 
     @property
     def is_alive(self) -> bool:
