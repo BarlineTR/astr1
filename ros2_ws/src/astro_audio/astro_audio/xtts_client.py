@@ -47,7 +47,7 @@ class XttsClient:
         language: str = "tr",
         device: str = "cuda",
         half: bool = True,
-        batch_size: int = 4,
+        batch_size: Optional[int] = None,
         model: str = "tts_models/multilingual/multi-dataset/xtts_v2",
         model_dir: Optional[str] = None,
         checkpoint: Optional[str] = None,
@@ -61,7 +61,7 @@ class XttsClient:
         self.language = language
         self.device = device
         self.half = half
-        self.batch_size = batch_size
+        self.batch_size = batch_size if batch_size is not None else int(os.getenv("TTS_XTTS_BATCH_SIZE", "1"))
         self.model = model
         self._log = logger or (lambda level, msg: None)
 
@@ -213,9 +213,25 @@ class XttsClient:
             self._last_error_event = None
 
             env = os.environ.copy()
-            # Preserve system CUDA paths for Jetson Orin Nano
-            pkg_dir = str(Path(__file__).parent.parent)
-            env["PYTHONPATH"] = pkg_dir + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
+            # Clean and isolate PYTHONPATH to active workspace and system ROS2
+            pkg_dir = str(Path(__file__).parent.parent.resolve())
+            raw_pp = env.get("PYTHONPATH", "")
+            cleaned_paths = [pkg_dir]
+            seen = {pkg_dir}
+            for p in raw_pp.split(os.pathsep):
+                p_str = p.strip()
+                if not p_str or not os.path.exists(p_str):
+                    continue
+                p_norm = str(Path(p_str).resolve())
+                # Exclude duplicate or legacy workspace build/install paths outside ros2_ws
+                if "/astr1/install" in p_norm or "/astr1/build" in p_norm:
+                    if not ("/ros2_ws/install" in p_norm or "/ros2_ws/build" in p_norm):
+                        continue
+                if p_norm not in seen:
+                    cleaned_paths.append(p_str)
+                    seen.add(p_norm)
+
+            env["PYTHONPATH"] = os.pathsep.join(cleaned_paths)
             env["PYTHONNOUSERSITE"] = "1"
             env["COQUI_TOS_AGREED"] = "1"
             env["PATH"] = f"{self.python_path.parent}{os.pathsep}{env.get('PATH', '')}"
@@ -225,6 +241,20 @@ class XttsClient:
             cuda_lib = "/usr/local/cuda/lib64"
             if os.path.exists(cuda_lib):
                 env["LD_LIBRARY_PATH"] = cuda_lib + (os.pathsep + env.get("LD_LIBRARY_PATH", "") if env.get("LD_LIBRARY_PATH") else "")
+
+            # STAGE 1: Log Pre-Start Hardware & Memory Snapshot
+            try:
+                import psutil
+                mem = psutil.virtual_memory()
+                self._safe_log(
+                    "info",
+                    f"📊 [XTTS Memory Snapshot - pre_worker_start]: "
+                    f"sys_avail_mb={round(mem.available / (1024 * 1024), 1)} | "
+                    f"sys_total_mb={round(mem.total / (1024 * 1024), 1)} | "
+                    f"sys_percent={mem.percent}%"
+                )
+            except Exception:
+                pass
 
             self._ready.clear()
             self._startup_error = None

@@ -55,7 +55,7 @@ def main() -> int:
     parser.add_argument("--speakers", help="Custom model speakers path")
     parser.add_argument("--device", default="cuda", choices=["auto", "cuda", "cpu"])
     parser.add_argument("--half", default="1", help="1 = fp16 (recommended for CUDA)")
-    parser.add_argument("--batch-size", type=int, default=4)
+    parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--temperature", type=float, default=float(os.getenv("TTS_XTTS_TEMPERATURE", "0.50")))
     parser.add_argument("--length-penalty", type=float, default=float(os.getenv("TTS_XTTS_LENGTH_PENALTY", "1.0")))
     parser.add_argument("--repetition-penalty", type=float, default=float(os.getenv("TTS_XTTS_REPETITION_PENALTY", "4.0")))
@@ -107,6 +107,40 @@ def main() -> int:
         emit({"event": "error", "stage": "import", "message": f"Import failed: {type(exc).__name__}: {exc}", "traceback": tb})
         return 1
 
+    def capture_memory_snapshot(stage_name: str) -> Dict[str, Any]:
+        """Captures and logs deep GPU and System RAM resource metrics at key pipeline lifecycle points."""
+        snap: Dict[str, Any] = {"stage": stage_name}
+        try:
+            import psutil
+            proc = psutil.Process()
+            snap["cpu_rss_mb"] = round(proc.memory_info().rss / (1024 * 1024), 1)
+            vmem = psutil.virtual_memory()
+            snap["sys_avail_ram_mb"] = round(vmem.available / (1024 * 1024), 1)
+            snap["sys_total_ram_mb"] = round(vmem.total / (1024 * 1024), 1)
+        except Exception:
+            pass
+
+        if torch.cuda.is_available():
+            try:
+                free_b, tot_b = torch.cuda.mem_get_info(0)
+                snap["free_gpu_memory_mb"] = round(free_b / (1024 * 1024), 1)
+                snap["total_gpu_memory_mb"] = round(tot_b / (1024 * 1024), 1)
+                snap["allocated_gpu_mb"] = round(torch.cuda.memory_allocated(0) / (1024 * 1024), 1)
+                snap["reserved_gpu_mb"] = round(torch.cuda.memory_reserved(0) / (1024 * 1024), 1)
+            except Exception:
+                pass
+
+        sys.stderr.write(
+            f"📊 [XTTS Memory Snapshot - {stage_name}]: "
+            f"free_gpu={snap.get('free_gpu_memory_mb', 'N/A')}MB | "
+            f"alloc={snap.get('allocated_gpu_mb', 'N/A')}MB | "
+            f"res={snap.get('reserved_gpu_mb', 'N/A')}MB | "
+            f"cpu_rss={snap.get('cpu_rss_mb', 'N/A')}MB | "
+            f"sys_avail={snap.get('sys_avail_ram_mb', 'N/A')}MB\n"
+        )
+        sys.stderr.flush()
+        return snap
+
     # Hardware & Runtime Diagnostics Collection
     diag: Dict[str, Any] = {
         "python_executable": sys.executable,
@@ -118,6 +152,7 @@ def main() -> int:
         "torch_version": torch.__version__,
         "torch_cuda_version": getattr(torch.version, "cuda", "none"),
         "cuda_available": torch.cuda.is_available(),
+        "batch_size": args.batch_size,
     }
 
     # 2. Strict CUDA Validation
@@ -153,6 +188,7 @@ def main() -> int:
             torch.backends.cudnn.allow_tf32 = True
             torch.backends.cudnn.benchmark = False
             torch.cuda.empty_cache()
+            diag["memory_snapshot_init"] = capture_memory_snapshot("worker_init")
         except Exception as e:
             diag["cuda_init_warning"] = str(e)
 
@@ -246,6 +282,8 @@ def main() -> int:
         if device == "cuda":
             torch.cuda.empty_cache()
 
+        diag["memory_snapshot_model_loaded"] = capture_memory_snapshot("model_loaded")
+
         # 4. Extract and Cache Speaker Conditioning Latents
         def get_or_extract_latents(spk_path: str):
             abs_path = os.path.abspath(spk_path)
@@ -298,6 +336,7 @@ def main() -> int:
         "event": "ready",
         "device": device,
         "half": half,
+        "batch_size": args.batch_size,
         "sample_rate": sample_rate,
         "model": model_label,
         "is_finetuned": is_finetuned,
@@ -323,6 +362,7 @@ def main() -> int:
 
     # 6. Persistent Request Processing Loop
     current_active_gen_id = 0
+    first_inference_done = False
 
     for line in sys.stdin:
         line = line.strip()
@@ -373,6 +413,9 @@ def main() -> int:
             req_cond_latent, req_spk_emb = gpt_cond_latent, speaker_embedding
 
         try:
+            if not first_inference_done:
+                capture_memory_snapshot("pre_first_inference")
+
             t_infer_start = time.perf_counter()
             with torch.inference_mode():
                 out = model.inference(
@@ -390,6 +433,10 @@ def main() -> int:
                 )
             t_infer_end = time.perf_counter()
             gpu_infer_ms = (t_infer_end - t_infer_start) * 1000.0
+
+            if not first_inference_done:
+                capture_memory_snapshot("post_first_inference")
+                first_inference_done = True
 
             wav_data = out["wav"]
             audio_seconds = len(wav_data) / sample_rate
@@ -419,7 +466,23 @@ def main() -> int:
             })
 
         except Exception as exc:
-            emit({"id": req_id, "gen_id": gen_id, "ok": False, "message": f"Synthesis error: {type(exc).__name__}: {exc}"})
+            tb = traceback.format_exc()
+            sys.stderr.write(f"[XTTS Worker Synthesis Exception]:\n{tb}\n")
+            sys.stderr.flush()
+            diag_err = capture_memory_snapshot("synthesis_error")
+            if device == "cuda":
+                try:
+                    torch.cuda.empty_cache()
+                except Exception:
+                    pass
+            emit({
+                "id": req_id,
+                "gen_id": gen_id,
+                "ok": False,
+                "message": f"Synthesis error: {type(exc).__name__}: {exc}",
+                "traceback": tb,
+                "diagnostics": diag_err,
+            })
 
     return 0
 

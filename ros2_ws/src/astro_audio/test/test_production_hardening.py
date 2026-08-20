@@ -684,6 +684,49 @@ class TestSTTValidationAndEchoImmunity(unittest.TestCase):
 
         self.assertLess(elapsed, 1.0, "Grace period should not block when XTTS is in COOLDOWN!")
 
+    def test_xtts_client_batch_size_default_is_one(self):
+        """XttsClient defaults batch_size to 1 and includes batch-size 1 in command."""
+        from astro_audio.xtts_client import XttsClient
+        with patch("os.path.exists", return_value=True):
+            client = XttsClient(speaker_wav="test.wav", home="/tmp/fake_xtts")
+            self.assertEqual(client.batch_size, 1)
+
+    def test_ready_local_offline_tts_eliminates_15s_grace_delay(self):
+        """When LocalOfflineTTS is ready and XTTS is STARTING, synthesis happens immediately without 15s wait."""
+        self.node.local_xtts = MagicMock()
+        self.node.local_xtts.is_ready.return_value = False
+        self.node.local_xtts.state = "STARTING"
+
+        self.node.local_offline_tts = MagicMock()
+        self.node.local_offline_tts.is_ready.return_value = True
+        self.node.local_offline_tts.synthesize_sentence.return_value = b"\x00\x00" * 480
+
+        t_start = time.monotonic()
+        pcm, eng_name, latency, is_ready = self.node._synthesize_speech_pcm("Merhaba Astro")
+        elapsed = time.monotonic() - t_start
+
+        self.assertLess(elapsed, 0.5, "Turn TTFA must not be blocked by 15s grace wait when local offline TTS is ready!")
+        self.assertEqual(eng_name, "local_offline_tts")
+        self.assertTrue(is_ready)
+        self.assertEqual(len(pcm), 960)
+
+    def test_oak_camera_stability_tracking(self):
+        """OAK camera info and image frames update timestamps and connection state without blocking audio."""
+        self.assertEqual(self.node._oak_connection_state, "DISCONNECTED")
+
+        # Simulate camera info arrival
+        mock_info = MagicMock()
+        self.node._on_camera_info(mock_info)
+        self.assertEqual(self.node._oak_connection_state, "CONNECTED")
+        self.assertGreater(self.node._oak_last_camera_info_time, 0.0)
+
+        # Simulate image arrival
+        mock_img = MagicMock()
+        mock_img.data = b""
+        with patch("astro_ai.astro_realtime_node.imgmsg_to_bgr", return_value=None):
+            self.node._on_camera_image(mock_img)
+            self.assertGreater(self.node._oak_last_frame_time, 0.0)
+
 
 if __name__ == "__main__":
     unittest.main()

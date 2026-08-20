@@ -28,7 +28,7 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 try:
     import rclpy
     from rclpy.node import Node
-    from sensor_msgs.msg import Image
+    from sensor_msgs.msg import Image, CameraInfo
     from std_msgs.msg import Bool, Float32, String
 except ImportError:
     rclpy = None
@@ -46,7 +46,7 @@ except ImportError:
             return None
     class _MockMsg:
         data: Any = None
-    Image = Bool = Float32 = String = _MockMsg  # type: ignore
+    Image = CameraInfo = Bool = Float32 = String = _MockMsg  # type: ignore
 
 try:
     import cv2
@@ -532,9 +532,13 @@ class AstroRealtimeNode(Node):
         self._speaker_tentative_count: int = 0
         self._speaker_tentative_last_time: float = 0.0
 
-        # Camera Perception Frame Cache
+        # Camera Perception Frame Cache & OAK-D Lite Stability Tracking
         self._latest_camera_frame: Optional[np.ndarray] = None
         self._last_img_time = 0.0
+        self._oak_last_frame_time = 0.0
+        self._oak_last_camera_info_time = 0.0
+        self._oak_xlink_error_count = 0
+        self._oak_connection_state = "DISCONNECTED"
 
         # Autonomous Idle Learning (Cognitive Memory Reflection only, 0 camera calls)
         self._enable_idle_learning = os.environ.get("ENABLE_IDLE_LEARNING", "true").lower() == "true"
@@ -562,6 +566,7 @@ class AstroRealtimeNode(Node):
         self.create_subscription(Float32, "/vision/user_distance", self._on_user_distance, 10)
         self.create_subscription(Float32, "/audio/doa", self._on_doa, 10)
         self.create_subscription(Image, "/oak/rgb/image_raw", self._on_camera_image, 10)
+        self.create_subscription(CameraInfo, "/oak/rgb/camera_info", self._on_camera_info, 10)
 
         # Tool execution deduplication
         self._executed_tool_calls: set[str] = set()
@@ -1757,8 +1762,15 @@ class AstroRealtimeNode(Node):
             if self._fallback_mode or not self._is_connected:
                 threading.Thread(target=self._process_fallback_turn, args=(audio_chunks,), daemon=True).start()
 
+    def _on_camera_info(self, msg: Any):
+        """Monitors OAK-D Lite camera_info topic stream for XLink/hardware liveness."""
+        self._oak_last_camera_info_time = time.monotonic()
+        self._oak_connection_state = "CONNECTED"
+
     def _on_camera_image(self, msg: Image):
         now = time.monotonic()
+        self._oak_last_frame_time = now
+        self._oak_connection_state = "CONNECTED"
         if (now - self._last_img_time) < 0.2:  # Max 5 FPS decoding
             return
         self._last_img_time = now
@@ -2076,7 +2088,8 @@ class AstroRealtimeNode(Node):
         self._is_playback_active = bool(msg.data)
         if was_active and not self._is_playback_active:
             self._playback_end_time = time.monotonic()
-            self._is_responding = False
+            if not self._is_processing_fallback:
+                self._is_responding = False
             self._flush_audio_buffers("playback_ended")
             # Clear OpenAI input audio buffer so trailing room reverberation doesn't trigger VAD
             if self._ws and self._loop and self._is_connected:
@@ -2564,23 +2577,6 @@ class AstroRealtimeNode(Node):
         if not clean_text:
             return b"", "none", 0.0, False
 
-        # If XTTS is STARTING within startup grace period, wait for it before fallback
-        if self.local_xtts and not self.local_xtts.is_ready():
-            now_m = time.monotonic()
-            start_val = getattr(self, "_node_start_time", now_m)
-            start_s = float(start_val) if isinstance(start_val, (int, float)) else now_m
-            elapsed_since_start = now_m - start_s
-            grace_val = getattr(self, "xtts_startup_grace_s", 60.0)
-            grace_s = float(grace_val) if isinstance(grace_val, (int, float)) else 60.0
-            remaining_grace = max(0.0, grace_s - elapsed_since_start)
-            if getattr(self.local_xtts, "state", "") == "STARTING" and remaining_grace > 0.0:
-                wait_time = min(remaining_grace, 15.0)
-                t_wait_start = time.monotonic()
-                while (time.monotonic() - t_wait_start) < wait_time and not self.local_xtts.is_ready():
-                    if getattr(self.local_xtts, "state", "") in ("CRASHED", "COOLDOWN", "STOPPED"):
-                        break
-                    time.sleep(0.3)
-
         # 1. Primary Remote TTS: ElevenLabs Flash v2.5 (Only if configured and ready)
         if self.elevenlabs_engine and self.elevenlabs_engine.is_ready():
             try:
@@ -2636,7 +2632,7 @@ class AstroRealtimeNode(Node):
         chunk_size = 960  # 480 samples @ 24kHz int16 = 20ms
         try:
             for i in range(0, len(pcm_data), chunk_size):
-                if self._barge_in_latched or not self._is_responding:
+                if self._barge_in_latched:
                     break
                 chunk = pcm_data[i : i + chunk_size]
                 if chunk:
@@ -2860,25 +2856,7 @@ class AstroRealtimeNode(Node):
             speaker_display = spk_name if spk_name else "null"
             self.get_logger().info(f"👤 [Speaker Context] speaker={speaker_display} confidence={spk_score:.2f} source={spk_source}")
 
-            # If XTTS is starting and node is in startup grace period, wait for XTTS instead of jumping to eSpeak
-            if self.local_xtts and not self.local_xtts.is_ready():
-                now_m = time.monotonic()
-                start_val = getattr(self, "_node_start_time", now_m)
-                start_s = float(start_val) if isinstance(start_val, (int, float)) else now_m
-                elapsed_since_start = now_m - start_s
-                grace_val = getattr(self, "xtts_startup_grace_s", 60.0)
-                grace_s = float(grace_val) if isinstance(grace_val, (int, float)) else 60.0
-                remaining_grace = max(0.0, grace_s - elapsed_since_start)
-                if getattr(self.local_xtts, "state", "") == "STARTING" and remaining_grace > 0.0:
-                    wait_time = min(remaining_grace, 15.0)
-                    self.get_logger().info(f"⏳ [XTTS Startup Grace] XTTS is STARTING. Waiting up to {wait_time:.1f}s for XTTS READY...")
-                    t_wait_start = time.monotonic()
-                    while (time.monotonic() - t_wait_start) < wait_time and not self.local_xtts.is_ready():
-                        if getattr(self.local_xtts, "state", "") in ("CRASHED", "COOLDOWN", "STOPPED"):
-                            break
-                        time.sleep(0.3)
-
-            # 5. Select Atomic TTS Owner for this turn (Single Turn = Single TTS Owner)
+            # 5. Select Atomic TTS Owner for this turn (Single Turn = Single TTS Owner, Zero-Wait)
             if self.elevenlabs_engine and self.elevenlabs_engine.is_ready():
                 turn_tts_engine = "elevenlabs"
                 tts_ready_flag = True
@@ -2981,6 +2959,9 @@ class AstroRealtimeNode(Node):
             chunker = SentenceChunker(min_first_clause_chars=18, min_clause_chars=28) if SentenceChunker else None
             t_llm_start = time.monotonic()
 
+            total_audio_bytes = 0
+            total_enqueued_chunks = 0
+
             # Attempt A: Streaming Groq LLMs (20B preferred, fallback to 120B on failure)
             if self.groq_api_key and groq_candidates:
                 for target_model in groq_candidates:
@@ -3017,6 +2998,8 @@ class AstroRealtimeNode(Node):
                                     total_queue_wait_ms += q_ms
                                     if pcm:
                                         total_audio_sec += (len(pcm) / 2) / 24000.0
+                                        total_audio_bytes += len(pcm)
+                                        total_enqueued_chunks += (len(pcm) + 959) // 960
                                         if not first_audio_played:
                                             first_audio_ms = (time.monotonic() - t_turn_start) * 1000.0
                                             first_audio_played = True
@@ -3038,6 +3021,8 @@ class AstroRealtimeNode(Node):
                                 total_queue_wait_ms += q_ms
                                 if pcm:
                                     total_audio_sec += (len(pcm) / 2) / 24000.0
+                                    total_audio_bytes += len(pcm)
+                                    total_enqueued_chunks += (len(pcm) + 959) // 960
                                     if not first_audio_played:
                                         first_audio_ms = (time.monotonic() - t_turn_start) * 1000.0
                                         first_audio_played = True
@@ -3142,6 +3127,8 @@ class AstroRealtimeNode(Node):
                 total_queue_wait_ms += q_ms
                 if pcm:
                     total_audio_sec += (len(pcm) / 2) / 24000.0
+                    total_audio_bytes += len(pcm)
+                    total_enqueued_chunks += (len(pcm) + 959) // 960
                     first_audio_ms = (time.monotonic() - t_turn_start) * 1000.0
                     first_audio_played = True
                     self._play_pcm_chunks(pcm)
@@ -3195,6 +3182,15 @@ class AstroRealtimeNode(Node):
 
                 tts_error_val = xtts_err_str if active_engine == "xtts_gpu" else ("none" if tts_ready_flag else "provider_unavailable")
 
+                # OAK-D Lite stability and frame age calculation
+                now_telem = time.monotonic()
+                oak_frame_age = int((now_telem - self._oak_last_frame_time) * 1000) if self._oak_last_frame_time > 0 else "null"
+                oak_info_age = int((now_telem - self._oak_last_camera_info_time) * 1000) if self._oak_last_camera_info_time > 0 else "null"
+                oak_state = "CONNECTED" if (self._oak_last_frame_time > 0 and (now_telem - self._oak_last_frame_time) < 3.0) else "DISCONNECTED"
+
+                tts_synth_started_flag = bool(total_synth_ms > 0 or total_audio_bytes > 0)
+                tts_synth_finished_flag = bool(total_audio_bytes > 0)
+
                 self.get_logger().info(
                     f"📊 [Turn Telemetry]: mode=LOCAL_FALLBACK | provider={chosen_provider} | "
                     f"model={chosen_model} | llm_status={llm_status} | speaker={speaker_log_val} | "
@@ -3204,13 +3200,19 @@ class AstroRealtimeNode(Node):
                     f"selected_tts_provider={active_engine} | selected_tts_ready={tts_ready_flag} | "
                     f"tts_provider={active_engine} | tts_mode={tts_mode_val} | tts_error={tts_error_val} | "
                     f"tts_model={tts_model_name} | tts_voice={tts_voice_name} | "
+                    f"tts_synthesis_started={tts_synth_started_flag} | tts_synthesis_finished={tts_synth_finished_flag} | "
+                    f"tts_audio_bytes={total_audio_bytes} | tts_queue_enqueued={total_enqueued_chunks} | "
+                    f"tts_playback_started={first_audio_played} | tts_audio_device=\"{active_engine}\" | "
                     f"xtts_ready={is_xtts_actually_ready} | xtts_error={xtts_err_str} | "
+                    f"xtts_batch_size={xtts_info.get('xtts_batch_size', 1)} | "
                     f"xtts_checkpoint={xtts_ckpt_str} | xtts_sha256={xtts_sha_short} | "
                     f"tts_ready={tts_ready_flag} | tts_first_audio_ms={int(first_audio_ms)} | "
                     f"tts_total_ms={int(total_synth_ms)} | xtts_infer_ms={int(total_gpu_ms)} | "
                     f"xtts_queue_wait_ms={int(total_queue_wait_ms)} | "
                     f"xtts_worker_pid={worker_pid} | xtts_gpu={gpu_name_str} | "
                     f"total_ttfa_ms={int(first_audio_ms if first_audio_played else total_turn_ms)} | "
+                    f"oak_connection_state={oak_state} | oak_last_frame_age_ms={oak_frame_age} | "
+                    f"oak_last_camera_info_age_ms={oak_info_age} | oak_xlink_error_count={self._oak_xlink_error_count} | "
                     f"fallback_reason=realtime_quota | attempts={json.dumps(attempts, ensure_ascii=False)}"
                 )
 

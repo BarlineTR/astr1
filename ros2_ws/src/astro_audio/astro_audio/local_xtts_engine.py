@@ -395,6 +395,7 @@ class LocalXttsEngine(BaseTTSEngine):
         info["xtts_model_path"] = self.client.info.get("xtts_model_path", self.ft_paths.get("checkpoint", self.client.model))
         info["xtts_checkpoint_sha256"] = self.client.info.get("xtts_checkpoint_sha256", "none")
         info["is_finetuned"] = bool(self.ft_paths.get("checkpoint_exists", False))
+        info["xtts_batch_size"] = self.client.info.get("batch_size", getattr(self.client, "batch_size", 1))
         with self._state_lock:
             info["state"] = self._state
         return info

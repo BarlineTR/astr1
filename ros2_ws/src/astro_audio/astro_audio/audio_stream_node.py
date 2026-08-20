@@ -238,8 +238,14 @@ class AudioStreamNode(Node):
         msg.data = b64_str
         self.pub_input_pcm.publish(msg)
 
+        self._out_device_name = out_name
+        self._total_enqueued_bytes = 0
+        self._total_played_bytes = 0
+        self._playback_burst_active = False
+        self._burst_start_time = 0.0
+
     def _on_output_pcm(self, msg: String):
-        """Incoming 24kHz PCM audio chunk from OpenAI Realtime API (base64)."""
+        """Incoming 24kHz PCM audio chunk from OpenAI Realtime API or Fallback TTS (base64)."""
         if not msg.data:
             return
         try:
@@ -248,22 +254,29 @@ class AudioStreamNode(Node):
                 # Resample 24kHz -> 16kHz for hardware ReSpeaker DAC
                 raw_16k = resample_24k_to_16k(raw_24k)
                 self._play_queue.put_nowait(raw_16k)
+                self._total_enqueued_bytes += len(raw_16k)
         except (queue.Full, Exception) as e:
             self.get_logger().debug(f"PCM enqueue notice: {e}")
 
     def _on_interrupt(self, msg: Bool):
         """Zero-latency barge-in signal: instantly flush playback buffer queue and mute lingering tail."""
         if msg.data:
+            discarded_bytes = 0
             with self._playback_lock:
                 while not self._play_queue.empty():
                     try:
-                        self._play_queue.get_nowait()
+                        c = self._play_queue.get_nowait()
+                        discarded_bytes += len(c)
                     except queue.Empty:
                         break
             self._is_playing = False
+            self._playback_burst_active = False
             self._last_playback_time = 0.0
             self._playback_drop_until = time.monotonic() + 0.15
-            self.get_logger().info("⚡ [Realtime Audio] Araya Girme (Barge-In) — Ses Çalma Anında Kesildi.")
+            self.get_logger().info(
+                f"⚡ [Playback Telemetry]: tts_playback_cancelled=True | "
+                f"discarded_bytes={discarded_bytes} | reason=barge_in"
+            )
 
     def _playback_worker(self):
         """Dedicated real-time audio playback loop sending PCM directly to hardware DAC."""
@@ -281,18 +294,40 @@ class AudioStreamNode(Node):
             out_stream.start()
             self._output_stream = out_stream
         except Exception as e:
-            self.get_logger().error(f"❌ [Realtime Audio] Çıkış akışı başlatılamadı: {e}")
+            self.get_logger().error(f"❌ [Realtime Audio] Çıkış akışı başlatılamadı ({self._out_device_name}): {e}")
             return
 
         while not self._stop_event.is_set():
             try:
                 chunk = self._play_queue.get(timeout=0.05)
-                self._is_playing = True
-                self._last_playback_time = time.monotonic()
+                t_w_start = time.perf_counter()
                 with self._playback_lock:
                     out_stream.write(chunk)
+                t_w_end = time.perf_counter()
+                write_ms = (t_w_end - t_w_start) * 1000.0
+
+                self._is_playing = True
                 self._last_playback_time = time.monotonic()
+                self._total_played_bytes += len(chunk)
+
+                if not self._playback_burst_active:
+                    self._playback_burst_active = True
+                    self._burst_start_time = time.monotonic()
+                    self.get_logger().info(
+                        f"🔊 [Playback Telemetry]: tts_playback_started=True | "
+                        f"tts_audio_device=\"{self._out_device_name}\" | "
+                        f"tts_audio_write_ms={write_ms:.1f} | "
+                        f"chunk_bytes={len(chunk)}"
+                    )
             except queue.Empty:
+                if self._playback_burst_active and (time.monotonic() - self._last_playback_time) > 0.20:
+                    self._playback_burst_active = False
+                    burst_dur_ms = (time.monotonic() - self._burst_start_time) * 1000.0
+                    self.get_logger().info(
+                        f"🔊 [Playback Telemetry]: tts_playback_finished=True | "
+                        f"total_playback_bytes={self._total_played_bytes} | "
+                        f"playback_duration_ms={int(burst_dur_ms)}"
+                    )
                 if (time.monotonic() - self._last_playback_time) > 0.35:
                     self._is_playing = False
             except Exception as e:
