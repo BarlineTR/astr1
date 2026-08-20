@@ -242,7 +242,14 @@ STT_FW_MODEL="large-v2"        # "turbo", "medium", "small" on weaker GPUs
 STT_FW_DEVICE="cuda"           # falls back to CPU automatically if CUDA fails
 STT_FW_COMPUTE_TYPE="float16"  # "int8" on CPU
 STT_FW_CPU_COMPUTE_TYPE="int8"
+STT_FW_CPU_MODEL="base"        # model used after a CPU fallback
 ```
+
+> 🟩 **On Jetson (aarch64), `STT_FW_DEVICE="cuda"` silently falls back to CPU.** The
+> `ctranslate2` aarch64 wheel on PyPI is built without CUDA, so Faster-Whisper cannot
+> reach the GPU no matter how you configure it — you get the small `base` model on CPU,
+> which is slow and hallucinates on silence. Fixing it means building CTranslate2 from
+> source: see **[docs/jetson-cuda-stt.md](docs/jetson-cuda-stt.md)**.
 
 > ⚠️ **Never use `distil-*` models for Turkish.** Every Distil-Whisper checkpoint is an
 > English-only distillation — it ignores `language="tr"` and returns English text.

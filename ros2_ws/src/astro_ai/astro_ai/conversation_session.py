@@ -24,9 +24,12 @@ class LatencyTracker:
         self._total_turn_latencies: collections.deque[float] = collections.deque(maxlen=history_size)
         self._lock = threading.Lock()
 
-    def record_turn(self, stt_ms: float, llm_first_token_ms: float, total_turn_ms: float):
+    def record_turn(self, gate_ms: float, llm_first_token_ms: float, total_turn_ms: float):
+        """gate_ms: transkript geldikten sonra kapı mantığında (uyandırma sözcüğü
+        kontrolü + sosyal filtre LLM çağrısı) geçen süre. STT süresi DEĞİLDİR —
+        o speech_recognition_node içinde ölçülür."""
         with self._lock:
-            self._stt_latencies.append(stt_ms)
+            self._stt_latencies.append(gate_ms)
             self._llm_first_token_latencies.append(llm_first_token_ms)
             self._total_turn_latencies.append(total_turn_ms)
 

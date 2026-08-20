@@ -318,6 +318,7 @@ class SpeechRecognitionNode(Node):
 
         name = os.getenv("STT_FW_MODEL", "large-v2")
         device = os.getenv("STT_FW_DEVICE", "cuda")
+        self._fw_model_name, self._fw_device = name, device
         compute = os.getenv("STT_FW_COMPUTE_TYPE", "float16")
         try:
             self.get_logger().info(f"Yerele yükleniyor: Faster-Whisper ({name}, {device}, {compute})...")
@@ -338,6 +339,8 @@ class SpeechRecognitionNode(Node):
             self.fw_model = None
             return False
 
+        self._fw_model_name = name
+        self._fw_device = device
         self.get_logger().info(f"✅ [STT] Faster-Whisper hazır (model: {name}, cihaz: {device})")
         return True
 
@@ -417,6 +420,10 @@ class SpeechRecognitionNode(Node):
                 self.get_logger().info(f"🎙️ [Ses Tanıma]: {spk_name} ({spk_meta.get('formal_title', '')}) (Güven: {spk_conf:.2f})")
 
             text = None
+            # Gerçek STT süresi burada ölçülür. ai_brain_node'un "Bu Dönüş" satırı
+            # transkript GELDİKTEN sonrasını ölçer, dolayısıyla bu süreyi göremez.
+            stt_engine_used = "none"
+            t_stt_start = time.monotonic()
 
             # 1. Ultra-Fast Groq Whisper Large V3 (80ms Latency - Primary Free STT)
             if self.groq_client:
@@ -429,6 +436,7 @@ class SpeechRecognitionNode(Node):
                         response_format="text"
                     )
                     text = str(result).strip()
+                    stt_engine_used = "groq/whisper-large-v3"
                 except Exception as ge:
                     self.get_logger().warn(f"⚠️ [Groq Whisper] Hatası ({ge}), yedek motorlara geçiliyor...")
 
@@ -443,6 +451,7 @@ class SpeechRecognitionNode(Node):
                         response_format="text"
                     )
                     text = str(res).strip()
+                    stt_engine_used = "openai/whisper-1"
                 except Exception as oe:
                     self.get_logger().warn(f"⚠️ [OpenAI Whisper] Hatası: {oe}")
 
@@ -454,9 +463,12 @@ class SpeechRecognitionNode(Node):
                         audio_f32, beam_size=1, language="tr"
                     )
                     text = "".join(seg.text for seg in segments).strip()
+                    stt_engine_used = f"faster-whisper/{self._fw_model_name}@{self._fw_device}"
                 except Exception as fe:
                     self.get_logger().warn(f"⚠️ [Faster-Whisper] Hatası ({fe})")
 
+
+            stt_ms = (time.monotonic() - t_stt_start) * 1000.0
 
             if not text:
                 return
@@ -520,7 +532,12 @@ class SpeechRecognitionNode(Node):
                     if seq != self._stt_sequence:
                         return
 
-                self.get_logger().info(f'🎤 [Duyulan]: "{text}"')
+                audio_s = len(arr) / float(self._sample_rate)
+                rtf = (stt_ms / 1000.0) / audio_s if audio_s > 0 else 0.0
+                self.get_logger().info(
+                    f'🎤 [Duyulan]: "{text}" '
+                    f'(STT: {stt_ms:.0f}ms | motor: {stt_engine_used} | ses: {audio_s:.1f}sn | RTF: {rtf:.2f})'
+                )
                 msg = String()
                 msg.data = text
                 self._text_pub.publish(msg)

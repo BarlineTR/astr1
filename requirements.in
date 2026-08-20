@@ -35,7 +35,14 @@ pyusb                   # ReSpeaker USB kontrol arayüzü
 
 # ── Donanım / sayısal ───────────────────────────────────────
 pyserial                # Arduino Mega seri köprüsü
-numpy==2.2.6            # sistem/ROS numpy sürümüyle aynı tutuluyor (ABI uyumu)
+# x86_64'da sistem/ROS numpy sürümüyle aynı tutulur (ABI uyumu).
+numpy==2.2.6 ; platform_machine != "aarch64"
+# Jetson'da (aarch64) NVIDIA'nın kendi torch derlemesi NumPy 1.x'e karşı derlenmiştir.
+# NumPy 2.x kurulursa torch "Failed to initialize NumPy: _ARRAY_API not found" verir ve
+# torch<->numpy dönüşümleri bozulur; bu yüzden orada 1.x serisinde kalıyoruz.
+numpy==1.26.4 ; platform_machine == "aarch64"
+# NOT: requirements.txt x86_64 için çözüldüğünden bu marker kilide yansımaz;
+# aarch64 sabitlemesini scripts/install.sh açıkça uygular.
 
 # ── Görü ────────────────────────────────────────────────────
 opencv-python<5         # face_detector_node Haar cascade kullanıyor (bkz. yukarıdaki not)
