@@ -664,11 +664,13 @@ class TestRealtimeArchitectureInvariants(unittest.TestCase):
     def test_realtime_audio_streaming_flow_unchanged(self):
         """Incoming audio is forwarded directly to OpenAI Realtime WebSocket in Realtime mode."""
         from astro_ai.astro_realtime_node import AstroRealtimeNode
+        from astro_ai.state_machine import RobotState
 
         node = AstroRealtimeNode()
         node._is_connected = True
         node._fallback_mode = False
         node._is_sleeping = False
+        node.state_machine.transition_to(RobotState.LISTENING)
         node._ws = MagicMock()
         node._loop = MagicMock()
 
@@ -738,6 +740,50 @@ class TestRealtimeArchitectureInvariants(unittest.TestCase):
             node._fallback_mode = True
 
         self.assertTrue(node._fallback_mode)
+
+    def test_wake_detector_wakes_from_deep_idle(self):
+        """Dedicated wake verification wakes robot from DEEP_IDLE to LISTENING."""
+        from astro_ai.astro_realtime_node import AstroRealtimeNode
+        from astro_ai.state_machine import RobotState
+        import numpy as np
+
+        node = AstroRealtimeNode()
+        self.assertTrue(node.state_machine.is_deep_idle())
+        self.assertTrue(node._is_sleeping)
+
+        # Synthesize audio chunk of speech
+        fake_pcm = (np.sin(np.linspace(0, 100, 3200)) * 5000).astype(np.int16).tobytes()
+        audio_chunks = [fake_pcm] * 5
+
+        with patch.object(node, "_transcribe_groq_whisper", return_value="Hey Astro"):
+            node._process_wake_candidate(audio_chunks)
+
+            self.assertFalse(node._is_sleeping)
+            self.assertEqual(node.state_machine.current_state, RobotState.LISTENING)
+
+    def test_event_driven_vision_gating_and_memory_filter(self):
+        """Event-driven vision skips same-scene/budget and filters trivial observations."""
+        from astro_ai.astro_realtime_node import AstroRealtimeNode
+        import numpy as np
+
+        node = AstroRealtimeNode()
+        node._latest_camera_frame = np.zeros((480, 640, 3), dtype=np.uint8)
+
+        # 1. Budget exhausted
+        node.max_vision_requests_per_minute = 1
+        node._vision_requests_history = [time.monotonic()]
+        res = node._evaluate_vision_event("scene_changed")
+        self.assertIsNone(res)
+        self.assertEqual(node.vision_last_skip_reason, "budget")
+
+        # 2. Trivial memory filter: "Aydınlık." is classified as ephemeral and not stored in profile
+        node.memory.profile.get_observations = MagicMock(return_value=[])
+        with patch.object(node.memory.profile, "add_observation") as mock_add_obs:
+            node._classify_and_store_vision_observation("Aydınlık.", "idle")
+            mock_add_obs.assert_not_called()
+
+            node._classify_and_store_vision_observation("Baran masada oturuyor ve telefon tutuyor.", "new_person")
+            mock_add_obs.assert_called_once()
 
 
 if __name__ == "__main__":

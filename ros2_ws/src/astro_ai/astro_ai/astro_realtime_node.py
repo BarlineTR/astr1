@@ -308,7 +308,7 @@ class AstroRealtimeNode(Node):
         # Modular Cognitive Subsystems
         self.memory = MemoryManager()
         self.persona_engine = PersonaEngine(self.persona_name)
-        self.state_machine = StateMachine(RobotState.IDLE)
+        self.state_machine = StateMachine(RobotState.DEEP_IDLE)
         self.session = ConversationSession(base_timeout_s=16.0)
 
         # State
@@ -362,6 +362,26 @@ class AstroRealtimeNode(Node):
         self._is_processing_fallback = False
         self._fallback_generation_id = 0
 
+        # Dedicated Wake Detector (Active in SLEEP / DEEP_IDLE with Ultra-low CPU)
+        self._wake_audio_buffer: List[bytes] = []
+        self._wake_speech_frames = 0
+        self._wake_listening = False
+        self._wake_last_voice_time = 0.0
+
+        # Event-Driven Vision Gating & Rate Budget Control
+        self.vision_cooldown_s = float(os.getenv("VISION_COOLDOWN_S", "10.0"))
+        self.max_vision_requests_per_minute = int(os.getenv("MAX_VISION_REQUESTS_PER_MINUTE", "4"))
+        self._vision_requests_history: List[float] = []
+        self._last_scene_frame_thumb: Optional[np.ndarray] = None
+        self._last_vision_call_time = 0.0
+        self._last_seen_person = "Misafir"
+        self._last_seen_distance = 0.0
+        self._last_looking_state = False
+        self.vision_requests_total = 0
+        self.vision_requests_skipped = 0
+        self.vision_last_skip_reason = "none"
+        self.vision_last_event_type = "none"
+
         # Primary Remote TTS: ElevenLabs Flash v2.5 (Only if ELEVENLABS_ENABLED=true)
         self.elevenlabs_engine: Optional[ElevenLabsEngine] = None
         el_enabled = os.getenv("ELEVENLABS_ENABLED", "false").lower() in ("1", "true", "yes")
@@ -376,7 +396,7 @@ class AstroRealtimeNode(Node):
                         voice_id=el_voice,
                         model_id=el_model,
                         enabled=True,
-                        logger=self.get_logger(),
+                        logger=self._safe_log,
                     )
                     self.get_logger().info(f"✨ [ElevenLabs TTS] Flash v2.5 Hazır (Voice ID: {el_voice}, Model: {el_model})")
                 except Exception as e:
@@ -399,7 +419,7 @@ class AstroRealtimeNode(Node):
                     config=os.getenv("TTS_XTTS_CONFIG", "") or None,
                     vocab=os.getenv("TTS_XTTS_VOCAB", "") or None,
                     speakers=os.getenv("TTS_XTTS_SPEAKERS", "") or None,
-                    logger=lambda lvl, msg: getattr(self.get_logger(), lvl, self.get_logger().info)(msg),
+                    logger=self._safe_log,
                 )
                 threading.Thread(target=self._start_local_xtts_background, daemon=True).start()
             except Exception as e:
@@ -409,14 +429,13 @@ class AstroRealtimeNode(Node):
         self._latest_camera_frame: Optional[np.ndarray] = None
         self._last_img_time = 0.0
 
-        # Autonomous Idle Learning & Environmental Observation (0 OpenAI Cost)
+        # Autonomous Idle Learning (Cognitive Memory Reflection only, 0 camera calls)
         self._enable_idle_learning = os.environ.get("ENABLE_IDLE_LEARNING", "true").lower() == "true"
         self._last_idle_learning_time = 0.0
         self._last_proactive_gaze_time = 0.0
         if self._enable_idle_learning:
             threading.Thread(target=self._idle_learning_loop, daemon=True).start()
-            self.get_logger().info("🤖 [Astro Realtime] Otonom Boşta Öğrenme ve Çevre Gözlem Motoru Aktif (Groq/Gemini 0-Token)!")
-
+            self.get_logger().info("🤖 [Astro Realtime] Otonom Hafıza Yansıtma Motoru Aktif (Groq/Gemini 0-Token)!")
 
         # ROS 2 Publishers
         self.pub_output_pcm = self.create_publisher(String, "/audio/realtime_output_pcm", 50)
@@ -437,12 +456,10 @@ class AstroRealtimeNode(Node):
         self.create_subscription(Float32, "/audio/doa", self._on_doa, 10)
         self.create_subscription(Image, "/oak/rgb/image_raw", self._on_camera_image, 10)
 
-
-
         # Tool execution deduplication
         self._executed_tool_calls: set[str] = set()
 
-        # Sleep Mode (Default: Start in Sleeping State)
+        # Sleep Mode (Default: Start in Sleeping / DEEP_IDLE State)
         self._node_start_time = time.monotonic()
         self._is_sleeping = True
         self._last_interaction_time = time.monotonic() - 20.0
@@ -468,7 +485,21 @@ class AstroRealtimeNode(Node):
         self._ws_thread.start()
 
         self.get_logger().info(f"🚀 [Astro Realtime Node] OpenAI Realtime WebSocket Başlatılıyor... Ses: [{self.realtime_voice}], Kişilik: [{self.persona_name.upper()}]")
-        self.get_logger().info("💤 [Astro Uyku Modu]: Düğüm başlatıldı — Astro uyku modunda (😴). Belirgin bir insan sesi algılandığında uyanacak.")
+        self.get_logger().info("💤 [Astro Uyku Modu]: Düğüm başlatıldı — Astro DEEP_IDLE modunda (😴). Wake listener aktif.")
+
+    def _safe_log(self, lvl: str, msg: str):
+        """Safe ROS2 logger wrapper preventing Cython/rcutils 'Logger severity cannot be changed between calls' error."""
+        try:
+            log_fn = getattr(self.get_logger(), str(lvl).lower(), None)
+            if log_fn and callable(log_fn):
+                log_fn(msg)
+            else:
+                self.get_logger().info(f"[{str(lvl).upper()}] {msg}")
+        except Exception:
+            try:
+                self.get_logger().info(f"[{str(lvl).upper()}] {msg}")
+            except Exception:
+                print(f"[{str(lvl).upper()}] {msg}", flush=True)
 
     def _run_async_loop(self):
         self._loop = asyncio.new_event_loop()
@@ -1450,38 +1481,50 @@ class AstroRealtimeNode(Node):
         return {"status": "error", "observation": "Görüntü analiz edilirken bir hata oluştu."}
 
     def _check_sleep_mode(self):
-        """Transitions Astro into sleep mode after 10 seconds of conversation inactivity."""
+        """Transitions Astro into sleep mode after 12 seconds of conversation inactivity."""
         now = time.monotonic()
-        is_busy = self._is_responding or self._is_playback_active
+        is_busy = (
+            self._is_responding
+            or self._is_playback_active
+            or self.state_machine.is_speaking()
+            or self.state_machine.is_thinking()
+            or self.state_machine.is_listening()
+        )
         if is_busy:
             self._last_interaction_time = now
-            if self._is_sleeping:
+            if self._is_sleeping or self.state_machine.is_deep_idle():
                 self._wake_up()
             return
 
         if not self._is_sleeping:
             idle_seconds = now - self._last_interaction_time
-            if idle_seconds >= 10.0:
+            if idle_seconds >= 12.0:
                 self._is_sleeping = True
-                self.get_logger().info("💤 [Astro Uyku Modu]: 10 saniye hareketsizlik — Astro uyku moduna geçti (😴).")
+                self.state_machine.transition_to(RobotState.DEEP_IDLE)
+                self.get_logger().info("💤 [Astro Uyku Modu]: 12 saniye hareketsizlik — Astro DEEP_IDLE moduna geçti (😴). Wake listener aktif.")
 
                 # 1. Publish sleeping emotion for face/display
-                emo_msg = String()
-                emo_msg.data = "sleeping"
-                self.pub_emotion.publish(emo_msg)
+                if self.pub_emotion is not None:
+                    emo_msg = String()
+                    emo_msg.data = "sleeping"
+                    self.pub_emotion.publish(emo_msg)
 
                 # 2. Publish sleep head gesture
-                gest_msg = String()
-                gest_msg.data = "sleep"
-                self.pub_gesture.publish(gest_msg)
+                if self.pub_gesture is not None:
+                    gest_msg = String()
+                    gest_msg.data = "sleep"
+                    self.pub_gesture.publish(gest_msg)
 
     def _wake_up(self):
         """Wakes Astro up from sleep mode upon speech or user interaction."""
         now = time.monotonic()
         self._last_interaction_time = now
-        if self._is_sleeping:
+        was_sleeping = self._is_sleeping or self.state_machine.is_deep_idle()
+        if was_sleeping:
             self._is_sleeping = False
-            self.get_logger().info("⏰ [Astro Uyandı]: Kullanıcı sesi algılandı — Astro uykudan uyandı ve dinliyor!")
+            self.state_machine.transition_to(RobotState.WAKE)
+            self._flush_audio_buffers("wake_up")
+            self.get_logger().info("⏰ [Astro Uyandı]: Wake algılandı — Astro uykudan uyandı ve dinliyor (LISTENING)!")
 
             # 1. Clear any stale audio in OpenAI buffer
             if self._ws and self._loop and self._is_connected:
@@ -1494,15 +1537,81 @@ class AstroRealtimeNode(Node):
                     pass
 
             # 2. Restore persona emotion
-            emo_msg = String()
-            emo_msg.data = self.persona_name
-            self.pub_emotion.publish(emo_msg)
+            if self.pub_emotion is not None:
+                emo_msg = String()
+                emo_msg.data = self.persona_name
+                self.pub_emotion.publish(emo_msg)
 
             # 3. Publish wake gesture
-            gest_msg = String()
-            gest_msg.data = "wake"
-            self.pub_gesture.publish(gest_msg)
+            if self.pub_gesture is not None:
+                gest_msg = String()
+                gest_msg.data = "wake"
+                self.pub_gesture.publish(gest_msg)
 
+            self.state_machine.transition_to(RobotState.LISTENING)
+
+    def _process_wake_candidate(self, audio_chunks: List[bytes]):
+        """Processes potential wake utterance during sleep with full telemetry tracking."""
+        raw_pcm = b"".join(audio_chunks)
+        if len(raw_pcm) < 16000 * 2 * 0.20:
+            return
+
+        import io
+        import wave
+        wav_buf = io.BytesIO()
+        with wave.open(wav_buf, "wb") as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(16000)
+            wf.writeframes(raw_pcm)
+        wav_bytes = wav_buf.getvalue()
+
+        arr = np.frombuffer(raw_pcm, dtype=np.int16)
+        total_rms = float(np.sqrt(np.mean(arr.astype(np.float32) ** 2))) if len(arr) > 0 else 0.0
+        peak_val = int(np.max(np.abs(arr))) if len(arr) > 0 else 0
+
+        # Transcribe candidate using fast Groq Whisper
+        transcript = self._transcribe_groq_whisper(wav_bytes) or ""
+        t_clean = re.sub(r"[^\w\s]", "", transcript.lower()).strip()
+
+        WAKE_PATTERNS = ["hey astro", "astro", "hey", "lan", "alo", "selam", "astro bak", "astro naber", "günaydın", "merhaba"]
+        is_wake_pattern = any(wp in t_clean for wp in WAKE_PATTERNS)
+        has_high_energy_speech = (total_rms >= 460.0 and peak_val >= 1200 and len(t_clean) >= 2)
+
+        wake_confidence = 0.95 if is_wake_pattern else (0.80 if has_high_energy_speech else 0.20)
+        vad_confidence = round(min(1.0, total_rms / 600.0), 2)
+
+        if is_wake_pattern or has_high_energy_speech:
+            self._wake_up()
+
+            self.get_logger().info(
+                f"⚡ [Wake Telemetry]: wake_detector_active=True | wake_candidate=\"{transcript}\" | "
+                f"wake_confidence={wake_confidence:.2f} | vad_confidence={vad_confidence:.2f} | "
+                f"stt_started=True | stt_finished=True | transcript=\"{transcript}\" | "
+                f"conversation_turn_created=True | llm_started=True | tts_started=True"
+            )
+
+            # If user spoke a wake word with an attached question/command (e.g. "Hey Astro hava nasıl?")
+            words = t_clean.split()
+            is_only_wake_word = len(words) <= 2 and is_wake_pattern
+            if is_only_wake_word:
+                # Play brief responsive acknowledgment
+                p = self.persona_name.lower()
+                ack_text = "Dinliyorum lan, ne var?" if "kufurbaz" in p else "Buradayım, seni dinliyorum."
+                pcm, eng, _, _ = self._synthesize_speech_pcm(ack_text)
+                if pcm:
+                    self._play_pcm_chunks(pcm)
+            else:
+                # Forward full turn
+                if self._fallback_mode or not self._is_connected:
+                    threading.Thread(target=self._process_fallback_turn, args=(audio_chunks,), daemon=True).start()
+        else:
+            self.get_logger().debug(
+                f"⚡ [Wake Telemetry]: wake_detector_active=True | wake_candidate=\"{transcript}\" | "
+                f"wake_confidence={wake_confidence:.2f} | vad_confidence={vad_confidence:.2f} | "
+                f"stt_started=True | stt_finished=True | transcript=\"{transcript}\" | "
+                f"conversation_turn_created=False | llm_started=False | tts_started=False"
+            )
 
     def _on_camera_image(self, msg: Image):
         now = time.monotonic()
@@ -1514,19 +1623,116 @@ class AstroRealtimeNode(Node):
             with self._lock:
                 self._latest_camera_frame = frame
 
-    def _idle_learning_loop(self):
-        """Continuous background loop for autonomous room exploration and cognitive memory consolidation.
+    def _evaluate_vision_event(self, event_type: str, focus: str = "", explicit: bool = False) -> Optional[Dict[str, Any]]:
+        """Event-driven vision gating: evaluates frame difference, cooldown, budget, and semantic filters."""
+        now = time.monotonic()
 
-        Runs every 20s when idle OR sleeping — sleep mode is ideal for learning since the robot
-        has idle CPU and a clear unobstructed camera view of the environment.
-        Only pauses when actively speaking or playing audio.
+        # Hard rate limiting budget: max requests per minute
+        minute_cutoff = now - 60.0
+        self._vision_requests_history = [t for t in self._vision_requests_history if t > minute_cutoff]
+        if len(self._vision_requests_history) >= self.max_vision_requests_per_minute and not explicit:
+            self.vision_requests_skipped += 1
+            self.vision_last_skip_reason = "budget"
+            self.get_logger().debug(
+                f"👁️ [Vision Telemetry]: event={event_type} | requests_total={self.vision_requests_total} | "
+                f"skipped={self.vision_requests_skipped} | skip_reason=budget | cooldown_rem=0.0s | "
+                f"budget_used={len(self._vision_requests_history)}/{self.max_vision_requests_per_minute}/min"
+            )
+            return None
+
+        # Do not disrupt active conversation (P0 Audio Isolation)
+        if (self._is_responding or self._is_playback_active) and not explicit:
+            self.vision_requests_skipped += 1
+            self.vision_last_skip_reason = "conversation_busy"
+            return None
+
+        # Cooldown gating
+        time_since_last = now - self._last_vision_call_time
+        if time_since_last < self.vision_cooldown_s and not explicit:
+            self.vision_requests_skipped += 1
+            self.vision_last_skip_reason = "cooldown"
+            return None
+
+        # Frame change gating (Perceptual difference)
+        with self._lock:
+            frame = self._latest_camera_frame
+
+        if frame is None:
+            self.vision_requests_skipped += 1
+            self.vision_last_skip_reason = "no_frame"
+            return None
+
+        # Downscale to 64x64 grayscale for ultra-lightweight MSE change detection
+        try:
+            small_gray = cv2.resize(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY), (64, 64)) if cv2 else None
+        except Exception:
+            small_gray = None
+
+        if small_gray is not None and self._last_scene_frame_thumb is not None and not explicit:
+            diff_mse = float(np.mean((small_gray.astype(np.float32) - self._last_scene_frame_thumb.astype(np.float32)) ** 2))
+            if diff_mse < 18.0 and event_type not in ("new_person", "explicit_vision_query"):
+                self.vision_requests_skipped += 1
+                self.vision_last_skip_reason = "same_scene"
+                return None
+
+        if small_gray is not None:
+            self._last_scene_frame_thumb = small_gray
+
+        # Gate passed -> Execute Vision Request asynchronously
+        self.vision_requests_total += 1
+        self._last_vision_call_time = now
+        self._vision_requests_history.append(now)
+        self.vision_last_event_type = event_type
+
+        self.get_logger().info(
+            f"👁️ [Vision Telemetry]: event={event_type} | requests_total={self.vision_requests_total} | "
+            f"skipped={self.vision_requests_skipped} | skip_reason=none | cooldown_rem=0.0s | "
+            f"budget_used={len(self._vision_requests_history)}/{self.max_vision_requests_per_minute}/min"
+        )
+
+        res = self._inspect_camera_view(focus=focus)
+        obs = res.get("observation", "")
+        self._classify_and_store_vision_observation(obs, event_type)
+        return res
+
+    def _classify_and_store_vision_observation(self, obs: str, event_type: str):
+        """Classifies vision observation as ephemeral, important, or durable and prevents trivial memory pollution."""
+        if not obs:
+            return
+
+        obs_clean = obs.strip()
+        obs_lower = obs_clean.lower()
+
+        # Reject trivial patterns from polluting long-term memory
+        trivial_patterns = [
+            "aydınlık", "karanlık", "ışık var", "oda aydınlık", "oda karanlık",
+            "görüntü net", "bir şey yok", "boş", "normal", "net değil", "görüntü alındı"
+        ]
+        is_trivial = (
+            len(obs_clean.split()) <= 3
+            and any(tp in obs_lower for tp in trivial_patterns)
+        ) or obs_lower in ("aydınlık.", "karanlık.", "aydınlık", "karanlık")
+
+        if is_trivial:
+            self.get_logger().debug(f"👁️ [Görsel Filtre (Ephemeral)]: Önemsiz/Düşük değerli gözlem ('{obs_clean}') uzun vadeli hafızaya kaydedilmedi.")
+            return
+
+        # Meaningful environmental fact -> Save to Profile Memory
+        self.memory.profile.add_observation(f"Görsel Çevre ({event_type}): {obs_clean}")
+        self.get_logger().info(f"👁️🧠 [Görsel Hafıza Kaydı (Durable)]: Astro çevreyi kaydetti -> \"{obs_clean}\"")
+        self._sync_perception_to_session()
+
+    def _idle_learning_loop(self):
+        """Background loop for cognitive memory consolidation (0 camera calls / 0 Gemini Vision cost).
+
+        Idle Gemini Vision request = 0.
+        Only performs memory reflection from recent conversations when idle.
         """
         while (rclpy is not None and getattr(rclpy, "ok", lambda: True)()):
-            time.sleep(3)
+            time.sleep(10)
             if not self._enable_idle_learning:
                 continue
 
-            # Run during sleep mode OR when truly idle for >= 30s (do not interrupt active conversation)
             if self._is_responding or self._is_playback_active:
                 continue
 
@@ -1534,15 +1740,9 @@ class AstroRealtimeNode(Node):
             if not self._is_sleeping and (now - getattr(self, "_last_interaction_time", 0.0)) < 30.0:
                 continue
 
-            if (now - self._last_idle_learning_time) > 25.0:
+            if (now - self._last_idle_learning_time) > 45.0:
                 self._last_idle_learning_time = now
-                sleep_tag = " [UYKU MODU]" if self._is_sleeping else ""
-                self.get_logger().info(f"👁️🧠 [Otonom Öğrenme{sleep_tag}]: Astro kamerayı ve hafızayı inceliyor...")
-
-                # 1. Background Room Scene & Object Observation via Camera (Groq Vision)
-                self._idle_room_observation(now)
-
-                # 2. Background Cognitive Memory Reflection
+                # Background Cognitive Memory Reflection (text-only LLM)
                 self._idle_memory_reflection()
 
     def _idle_memory_reflection(self):
@@ -1621,180 +1821,6 @@ class AstroRealtimeNode(Node):
                 self._sync_perception_to_session()
         except Exception as e:
             self.get_logger().debug(f"Memory reflection notice: {e}")
-
-    def _idle_room_observation(self, now: float):
-        """Captures camera view in idle/sleep and saves visual environment observations to memory."""
-        with self._lock:
-            frame = self._latest_camera_frame
-
-        if frame is None:
-            return
-
-        b64_img = frame_to_base64_jpeg(frame, max_dim=512)
-        if not b64_img:
-            return
-
-        # Base64 sanitization: strip any URI prefix and whitespace/newlines
-        if "," in b64_img:
-            b64_img = b64_img.split(",")[-1]
-        b64_img = b64_img.replace("\n", "").replace("\r", "").strip()
-
-        try:
-            import urllib.request
-            prompt = (
-                "Sen bir sosyal robotun kamera gözüsün. Karşındaki odayı, ortamı, masadaki eşyaları ve etraftaki insanları "
-                "tek bir kısa ve net Türkçe cümleyle açıkla (Örn: 'Masada dizüstü bilgisayar ve kahve fincanı duruyor.' "
-                "veya 'Oda aydınlık, masada çakmak ve telefon var.'). Başka hiçbir şey yazma."
-            )
-            obs = None
-            provider_name = ""
-
-            # 1. Primary: Groq Vision Models (0 Token Cost, Ultra Fast)
-            if self.groq_api_key:
-                active_groq = discover_groq_models(self.groq_api_key)
-                groq_v_models = [m for m in active_groq if "vision" in m]
-                if not groq_v_models:
-                    groq_v_models = [m for m in ["llama-3.3-70b-versatile", "openai/gpt-oss-120b", "openai/gpt-oss-20b"] if m in active_groq]
-                for v_mod in groq_v_models:
-                    try:
-                        import urllib.request
-                        import urllib.error
-                        req_data = {
-                            "model": v_mod,
-                            "messages": [
-                                {
-                                    "role": "user",
-                                    "content": [
-                                        {"type": "text", "text": prompt},
-                                        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64_img}"}}
-                                    ]
-                                }
-                            ],
-                            "temperature": 0.2,
-                            "max_tokens": 80
-                        }
-                        data_bytes = json.dumps(req_data, ensure_ascii=False).encode("utf-8")
-                        req = urllib.request.Request(
-                            "https://api.groq.com/openai/v1/chat/completions",
-                            data=data_bytes,
-                            headers={
-                                "Content-Type": "application/json",
-                                "Authorization": f"Bearer {self.groq_api_key}",
-                                "User-Agent": "Mozilla/5.0"
-                            },
-                            method="POST"
-                        )
-                        with urllib.request.urlopen(req, timeout=5.0) as resp:
-                            resp_json = json.loads(resp.read().decode("utf-8"))
-                            obs = resp_json["choices"][0]["message"]["content"].strip()
-                            if obs:
-                                provider_name = f"Groq ({v_mod})"
-                                break
-                    except urllib.error.HTTPError as http_e:
-                        error_body = http_e.read().decode("utf-8", errors="ignore")
-                        self.get_logger().debug(f"Idle Groq Vision ({v_mod}) notice: {http_e.code} - {error_body}")
-                    except Exception as ge:
-                        self.get_logger().debug(f"Idle Groq Vision ({v_mod}) notice: {ge}")
-
-            # 2. Secondary: Google Gemini Flash REST (0 Token Cost, Blazing Fast)
-            if not obs and self.gemini_api_key:
-                for g_mod in ["gemini-2.5-flash", "gemini-1.5-flash", "gemini-3.6-flash", "gemini-flash-latest"]:
-                    try:
-                        import urllib.request
-                        import urllib.error
-                        url = f"https://generativelanguage.googleapis.com/v1beta/models/{g_mod}:generateContent?key={self.gemini_api_key}"
-                        payload = {
-                            "contents": [{
-                                "parts": [
-                                    {"text": prompt},
-                                    {"inline_data": {"mime_type": "image/jpeg", "data": b64_img}}
-                                ]
-                            }],
-                            "generation_config": {"temperature": 0.2, "max_output_tokens": 80}
-                        }
-                        data_bytes = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-                        req = urllib.request.Request(
-                            url,
-                            data=data_bytes,
-                            headers={"Content-Type": "application/json", "User-Agent": "Mozilla/5.0"}
-                        )
-                        with urllib.request.urlopen(req, timeout=5.0) as resp:
-                            res_json = json.loads(resp.read().decode("utf-8"))
-                            obs = res_json["candidates"][0]["content"]["parts"][0]["text"].strip()
-                            if obs:
-                                provider_name = f"Gemini ({g_mod})"
-                                break
-                    except urllib.error.HTTPError as http_e:
-                        error_body = http_e.read().decode("utf-8", errors="ignore")
-                        self.get_logger().debug(f"Idle Gemini Vision ({g_mod}) notice: {http_e.code} - {error_body}")
-                    except Exception as gem_e:
-                        self.get_logger().debug(f"Idle Gemini Vision ({g_mod}) notice: {gem_e}")
-
-            # 3. Emergency Safety Fallback: OpenAI Vision REST (gpt-4o-mini)
-            # (Only used if Gemini & Groq keys are invalid/failed, so robot never goes blind)
-            if not obs and self.openai_api_key:
-                try:
-                    req_data = {
-                        "model": "gpt-4o-mini",
-                        "messages": [
-                            {
-                                "role": "user",
-                                "content": [
-                                    {"type": "text", "text": prompt},
-                                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64_img}"}}
-                                ]
-                            }
-                        ],
-                        "max_tokens": 80
-                    }
-                    data_bytes = json.dumps(req_data, ensure_ascii=False).encode("utf-8")
-                    req = urllib.request.Request(
-                        "https://api.openai.com/v1/chat/completions",
-                        data=data_bytes,
-                        headers={
-                            "Content-Type": "application/json",
-                            "Authorization": f"Bearer {self.openai_api_key}",
-                            "User-Agent": "Mozilla/5.0"
-                        },
-                        method="POST"
-                    )
-                    with urllib.request.urlopen(req, timeout=6.0) as resp:
-                        resp_json = json.loads(resp.read().decode("utf-8"))
-                        obs = resp_json["choices"][0]["message"]["content"].strip()
-                        if obs:
-                            provider_name = "OpenAI (gpt-4o-mini)"
-                except Exception as oe:
-                    self.get_logger().debug(f"Idle OpenAI Vision notice: {oe}")
-
-            if obs and len(obs) > 4:
-                self.memory.profile.add_observation(f"Görsel Çevre: {obs}")
-                sleep_tag = " [UYKU MODU]" if self._is_sleeping else ""
-                self.get_logger().info(f"👁️🧠 [Otonom Görsel Öğrenme ({provider_name}){sleep_tag}]: Astro kameradan gördü ve hafızasına kaydetti -> \"{obs}\"")
-
-                # If vision observes a person looking or sitting in front of robot, proactively initiate greeting
-                obs_l = obs.lower()
-                if any(kw in obs_l for kw in ["bana bakıyor", "kameraya bakıyor", "karşımda oturan", "biri var", "insan var"]):
-                    if not self._is_responding and not self._is_playback_active:
-                        if (now - self._last_proactive_gaze_time) > 45.0:
-                            self._last_proactive_gaze_time = now
-                            self.get_logger().info(f"👁️ [Görsel Sahne Proaktif Etkileşim]: Astro karşısındaki kişiyi fark etti!")
-                            if self._ws and self._loop and self._is_connected:
-                                gaze_event = {
-                                    "type": "conversation.item.create",
-                                    "item": {
-                                        "type": "message",
-                                        "role": "user",
-                                        "content": [{"type": "input_text", "text": f"[Sistem Olayı]: Karşındaki kişiyi veya odayı fark ettin ({obs}). Seçili kişiliğinle kısa, doğal ve esprili bir şekilde laf at veya selam ver!"}]
-                                    }
-                                }
-                                asyncio.run_coroutine_threadsafe(self._ws.send(json.dumps(gaze_event)), self._loop)
-                                asyncio.run_coroutine_threadsafe(self._ws.send(json.dumps({"type": "response.create"})), self._loop)
-            else:
-                self._vision_status = "unavailable"
-                self.get_logger().debug("ℹ️ [Otonom Görsel]: Vision servisi yanıt vermedi, konuşma akışı kesintisiz devam ediyor.")
-        except Exception as e:
-            self._vision_status = "unavailable"
-            self.get_logger().debug(f"ℹ️ [Otonom Görsel Hatası]: {e}")
 
 
 
@@ -2850,17 +2876,6 @@ class AstroRealtimeNode(Node):
         except Exception:
             pass
 
-        # IMPORTANT: While Astro is sleeping, DO NOT process audio
-        if self._is_sleeping:
-            return
-
-        # Playback & Echo Cooldown State Determination
-        is_active_playback = bool(
-            self._is_playback_active
-            or self._is_responding
-            or (now - getattr(self, "_playback_end_time", 0.0) < self.echo_mute_cooldown_s)
-        )
-
         # Acoustic Level Evaluation
         local_rms = 0.0
         peak_val = 0
@@ -2873,15 +2888,54 @@ class AstroRealtimeNode(Node):
             except Exception:
                 pass
 
-        if not is_active_playback and local_rms < 400.0:
+        # Update background ambient noise floor when quiet
+        if local_rms < 380.0:
             self._ambient_rms = 0.96 * self._ambient_rms + 0.04 * local_rms
+
+        # ====================================================================
+        # SLEEP / DEEP_IDLE MODE: Dedicated Low-CPU Wake Detector
+        # ====================================================================
+        if self._is_sleeping or self.state_machine.is_deep_idle():
+            if raw_16k:
+                is_speech_energy = (local_rms > max(400.0, self._ambient_rms * 1.40) and peak_val > 950)
+                if is_speech_energy:
+                    self._wake_last_voice_time = now
+                    if not self._wake_listening:
+                        self._wake_listening = True
+                        with self._lock:
+                            pre_frames = list(self._user_speech_audio_buffer[-8:]) if len(self._user_speech_audio_buffer) >= 8 else []
+                        self._wake_audio_buffer = list(pre_frames) + [raw_16k]
+                    else:
+                        self._wake_audio_buffer.append(raw_16k)
+                elif self._wake_listening:
+                    self._wake_audio_buffer.append(raw_16k)
+                    # Silence pause (0.50s after speech ends) triggers wake verification
+                    if (now - self._wake_last_voice_time) > 0.50:
+                        self._wake_listening = False
+                        if len(self._wake_audio_buffer) >= 8:
+                            buf_to_proc = list(self._wake_audio_buffer)
+                            self._wake_audio_buffer.clear()
+                            threading.Thread(target=self._process_wake_candidate, args=(buf_to_proc,), daemon=True).start()
+                        else:
+                            self._wake_audio_buffer.clear()
+            return
+
+        # ====================================================================
+        # ACTIVE MODE: Interaction timestamp & State Tracking
+        # ====================================================================
+        self._last_interaction_time = now
+
+        # Playback & Echo Cooldown State Determination
+        is_active_playback = bool(
+            self._is_playback_active
+            or self._is_responding
+            or (now - getattr(self, "_playback_end_time", 0.0) < self.echo_mute_cooldown_s)
+        )
 
         # Adaptive barge-in threshold derived from ambient noise floor
         adaptive_barge_in_rms = max(self.barge_in_min_rms, self._ambient_rms * self.barge_in_noise_mult)
 
-        # Zero Self-Hearing Protection:
-        # When Astro is actively playing out of the speaker or in room echo cooldown,
-        # drop microphone input unless user intentionally interrupts with distinct acoustic speech energy
+        # Zero Self-Hearing Protection & Realtime Barge-In
         if is_active_playback:
             is_genuine_barge_in = (local_rms >= adaptive_barge_in_rms and peak_val >= self.barge_in_min_peak)
             if not is_genuine_barge_in:
@@ -2889,6 +2943,7 @@ class AstroRealtimeNode(Node):
                 return
             else:
                 # Genuine User Barge-In during Playback!
+                self.state_machine.transition_to(RobotState.INTERRUPTED)
                 self._is_responding = False
                 self._is_playback_active = False
                 self._playback_end_time = 0.0
@@ -2906,6 +2961,7 @@ class AstroRealtimeNode(Node):
                 with self._lock:
                     self._fallback_audio_buffer = [raw_16k]
                 self.get_logger().info(f"⚡ [Realtime Barge-In] Kullanıcı araya girdi (RMS: {local_rms:.0f}, Peak: {peak_val}).")
+                self.state_machine.transition_to(RobotState.LISTENING)
                 return
 
         # Acoustic presence / wake-up (requires sustained intentional voice > 500 RMS across >=5 consecutive frames)
@@ -2997,6 +3053,11 @@ class AstroRealtimeNode(Node):
                     self._active_person_name = name
                     self._person_hold_until = now + 45.0  # Hold identity for 45 seconds
 
+                    # Event-driven vision trigger for new person
+                    if getattr(self, "_last_seen_person", "") != name:
+                        self._last_seen_person = name
+                        threading.Thread(target=self._evaluate_vision_event, args=("new_person",), daemon=True).start()
+
                     # Proactive greeting check: greet once every 2 minutes per person
                     last_greet = self._greeted_people.get(name, 0.0)
                     if (now - last_greet) > 120.0 and not self._is_responding and not self._is_playback_active:
@@ -3031,10 +3092,21 @@ class AstroRealtimeNode(Node):
         self._user_emotion = msg.data.lower().strip()
 
     def _on_looking_at_robot(self, msg: Bool):
-        self._looking_at_robot = msg.data
+        new_state = bool(msg.data)
+        if new_state and not getattr(self, "_last_looking_state", False):
+            self._last_looking_state = True
+            threading.Thread(target=self._evaluate_vision_event, args=("user_attention_event",), daemon=True).start()
+        elif not new_state:
+            self._last_looking_state = False
+        self._looking_at_robot = new_state
 
     def _on_user_distance(self, msg: Float32):
-        self._user_distance = float(msg.data)
+        new_dist = float(msg.data)
+        old_dist = getattr(self, "_last_seen_distance", 0.0)
+        if abs(new_dist - old_dist) >= 0.60:
+            self._last_seen_distance = new_dist
+            threading.Thread(target=self._evaluate_vision_event, args=("person_approached",), daemon=True).start()
+        self._user_distance = new_dist
 
     def _on_doa(self, msg: Float32):
         self._speaker_angle = float(msg.data)

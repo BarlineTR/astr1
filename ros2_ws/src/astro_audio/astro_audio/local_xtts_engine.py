@@ -130,7 +130,7 @@ class LocalXttsEngine(BaseTTSEngine):
             config=cfg,
             vocab=voc,
             speakers=spks,
-            logger=logger,
+            logger=self._safe_log,
         )
 
         self._state = "STOPPED"  # STOPPED, STARTING, READY, DEGRADED, CRASHED, STOPPING
@@ -149,6 +149,17 @@ class LocalXttsEngine(BaseTTSEngine):
             "is_finetuned": bool(self.client.custom_model and self.client.custom_model.get("checkpoint")),
         }
 
+    def _safe_log(self, lvl: str, msg: str) -> None:
+        """Safely dispatches log message without letting ROS2 severity context errors bubble up."""
+        try:
+            if self._log:
+                self._log(lvl, msg)
+        except Exception:
+            try:
+                print(f"[{lvl.upper()}] {msg}", flush=True)
+            except Exception:
+                pass
+
     @property
     def name(self) -> str:
         return "xtts_gpu"
@@ -162,14 +173,14 @@ class LocalXttsEngine(BaseTTSEngine):
         """Starts the persistent XTTS worker and verifies GPU warm-up. Guarantees single worker process."""
         with self._state_lock:
             if self._state == "READY" and self.client.is_alive and self.client.is_ready:
-                self._log("debug", f"LocalXttsEngine is already READY (PID: {getattr(self.client.proc, 'pid', None)}).")
+                self._safe_log("debug", f"LocalXttsEngine is already READY (PID: {getattr(self.client.proc, 'pid', None)}).")
                 return
             if self._state == "STARTING" and self.client.is_alive:
-                self._log("debug", f"LocalXttsEngine is already in STARTING state (PID: {getattr(self.client.proc, 'pid', None)}). Reusing worker.")
+                self._safe_log("debug", f"LocalXttsEngine is already in STARTING state (PID: {getattr(self.client.proc, 'pid', None)}). Reusing worker.")
                 return
             self._state = "STARTING"
 
-        self._log("info", f"🚀 [LocalXttsEngine] GPU XTTS başlatılıyor... (Referans: {self.speaker_wav}, Home: {self.home}, Cihaz: {self.device})")
+        self._safe_log("info", f"🚀 [LocalXttsEngine] GPU XTTS başlatılıyor... (Referans: {self.speaker_wav}, Home: {self.home}, Cihaz: {self.device})")
         
         if not os.path.exists(self.home):
             with self._state_lock:
@@ -177,7 +188,7 @@ class LocalXttsEngine(BaseTTSEngine):
             raise XttsError(f"XTTS dizini yok: {self.home} — Lütfen './scripts/install_xtts.sh' betiğini çalıştırın.")
 
         if not os.path.exists(self.speaker_wav):
-            self._log("warn", f"⚠️ [LocalXttsEngine] Referans ses dosyası bulunamadı ({self.speaker_wav}), standart sentez denenecek.")
+            self._safe_log("warn", f"⚠️ [LocalXttsEngine] Referans ses dosyası bulunamadı ({self.speaker_wav}), standart sentez denenecek.")
 
         self.client.start()
         try:
@@ -193,7 +204,7 @@ class LocalXttsEngine(BaseTTSEngine):
                 "ready": True,
                 "state": "READY",
             })
-            self._log(
+            self._safe_log(
                 "info",
                 f"✅ [LocalXttsEngine] XTTS GPU Resident Hazır! ({info.get('gpu')}, PID: {worker_pid}, "
                 f"VRAM: {info.get('gpu_memory_mb')}MB, FP16: {info.get('half')})"
@@ -203,7 +214,7 @@ class LocalXttsEngine(BaseTTSEngine):
                 self._state = "CRASHED"
             self._last_telemetry["ready"] = False
             self._last_telemetry["state"] = "CRASHED"
-            self._log("error", f"❌ [LocalXttsEngine] XTTS başlatılamadı: {e}")
+            self._safe_log("error", f"❌ [LocalXttsEngine] XTTS başlatılamadı: {e}")
             raise
 
     def is_ready(self) -> bool:
@@ -250,13 +261,13 @@ class LocalXttsEngine(BaseTTSEngine):
             return pcm_bytes
 
         except Exception as exc:
-            self._log("warn", f"⚠️ [LocalXttsEngine] Sentez hatası: {exc}")
+            self._safe_log("warn", f"⚠️ [LocalXttsEngine] Sentez hatası: {exc}")
             if not self.client.is_alive:
                 with self._state_lock:
                     self._state = "CRASHED"
                 self._last_telemetry["ready"] = False
                 self._last_telemetry["state"] = "CRASHED"
-                self._log("error", "❌ [LocalXttsEngine] XTTS worker süreci çökmüş! Arka planda yeniden başlatılıyor...")
+                self._safe_log("error", "❌ [LocalXttsEngine] XTTS worker süreci çökmüş! Arka planda yeniden başlatılıyor...")
                 threading.Thread(target=self._try_auto_restart, daemon=True).start()
             return None
 
@@ -270,7 +281,7 @@ class LocalXttsEngine(BaseTTSEngine):
         except Exception as e:
             with self._state_lock:
                 self._state = "CRASHED"
-            self._log("error", f"❌ [LocalXttsEngine] Yeniden başlatma başarısız: {e}")
+            self._safe_log("error", f"❌ [LocalXttsEngine] Yeniden başlatma başarısız: {e}")
 
     def cancel(self, generation_id: int) -> None:
         self.client.interrupt(generation_id)

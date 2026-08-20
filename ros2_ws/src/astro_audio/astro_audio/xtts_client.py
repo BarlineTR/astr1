@@ -77,6 +77,17 @@ class XttsClient:
         self._req_id = 0
         self._current_gen_id = 0
 
+    def _safe_log(self, lvl: str, msg: str) -> None:
+        """Safely dispatches log message without letting ROS2 severity context errors bubble up."""
+        try:
+            if self._log:
+                self._log(lvl, msg)
+        except Exception:
+            try:
+                print(f"[{lvl.upper()}] {msg}", flush=True)
+            except Exception:
+                pass
+
     @staticmethod
     def _resolve_custom_model(model_dir, checkpoint, config, vocab, speakers):
         explicit = {
@@ -142,9 +153,9 @@ class XttsClient:
             # 1. If already alive and ready OR alive and in progress of starting, reuse existing worker!
             if self.is_alive:
                 if self.is_ready:
-                    self._log("debug", f"XTTS worker already running (PID {self.proc.pid}).")
+                    self._safe_log("debug", f"XTTS worker already running (PID {self.proc.pid}).")
                     return
-                self._log("debug", f"XTTS worker is currently starting (PID {self.proc.pid}). Waiting for initialization.")
+                self._safe_log("debug", f"XTTS worker is currently starting (PID {self.proc.pid}). Waiting for initialization.")
                 return
 
             # 2. Ensure any lingering or crashed process is fully stopped first
@@ -207,12 +218,12 @@ class XttsClient:
             line = line.rstrip("\n")
             if not line.startswith(PREFIX):
                 if line.strip():
-                    self._log("debug", f"[xtts] {line}")
+                    self._safe_log("debug", f"[xtts] {line}")
                 continue
             try:
                 msg = json.loads(line[len(PREFIX):])
             except json.JSONDecodeError:
-                self._log("warn", f"[xtts] JSON parsing error: {line}")
+                self._safe_log("warn", f"[xtts] JSON parsing error: {line}")
                 continue
 
             event = msg.get("event")
@@ -327,7 +338,7 @@ class XttsClient:
         if proc is None:
             return
 
-        self._log("debug", f"Stopping XTTS worker (PID {proc.pid})...")
+        self._safe_log("debug", f"Stopping XTTS worker (PID {proc.pid})...")
         try:
             if proc.poll() is None and proc.stdin:
                 try:
@@ -353,7 +364,7 @@ class XttsClient:
                 except subprocess.TimeoutExpired:
                     pass
         except Exception as e:
-            self._log("warn", f"Notice while stopping XTTS worker: {e}")
+            self._safe_log("warn", f"Notice while stopping XTTS worker: {e}")
         finally:
             self.proc = None
             self.info = {}
