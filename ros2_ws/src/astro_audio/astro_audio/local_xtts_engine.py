@@ -375,10 +375,10 @@ class LocalXttsEngine(BaseTTSEngine):
         if self.client.proc:
             info["worker_pid"] = self.client.proc.pid
         info["ready"] = self.is_ready()
-        info["xtts_reference_wav"] = self.client.info.get("xtts_reference_wav", self.speaker_wav)
-        info["xtts_model_path"] = self.client.info.get("xtts_model_path", self.client.model)
+        info["xtts_reference_wav"] = self.client.info.get("xtts_reference_wav", self.ft_paths.get("speaker_wav", self.speaker_wav))
+        info["xtts_model_path"] = self.client.info.get("xtts_model_path", self.ft_paths.get("checkpoint", self.client.model))
         info["xtts_checkpoint_sha256"] = self.client.info.get("xtts_checkpoint_sha256", "none")
-        info["is_finetuned"] = bool(self.client.custom_model and self.client.custom_model.get("checkpoint"))
+        info["is_finetuned"] = bool(self.ft_paths.get("checkpoint_exists", False))
         with self._state_lock:
             info["state"] = self._state
         return info

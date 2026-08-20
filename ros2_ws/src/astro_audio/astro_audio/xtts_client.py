@@ -182,12 +182,22 @@ class XttsClient:
             cmd = [
                 str(self.python_path),
                 str(self.worker_path),
-                "--speaker-wav", self.speaker_wav,
+                "--speaker-wav", str(self.speaker_wav),
+            ]
+
+            if self.custom_model and self.custom_model.get("checkpoint"):
+                for key, flag in (("checkpoint", "--checkpoint"), ("config", "--config"),
+                                  ("vocab", "--vocab"), ("speakers", "--speakers")):
+                    if self.custom_model.get(key):
+                        cmd += [flag, str(self.custom_model[key])]
+            else:
+                cmd += ["--model", str(self.model)]
+
+            cmd += [
                 "--language", self.language,
                 "--device", self.device,
                 "--half", "1" if self.half else "0",
                 "--batch-size", str(self.batch_size),
-                "--model", self.model,
                 "--temperature", str(os.getenv("TTS_XTTS_TEMPERATURE", "0.50")),
                 "--length-penalty", str(os.getenv("TTS_XTTS_LENGTH_PENALTY", "1.0")),
                 "--repetition-penalty", str(os.getenv("TTS_XTTS_REPETITION_PENALTY", "4.0")),
@@ -195,12 +205,8 @@ class XttsClient:
                 "--top-p", str(os.getenv("TTS_XTTS_TOP_P", "0.65")),
                 "--speed", str(os.getenv("TTS_XTTS_SPEED", "1.05")),
             ]
-
-            if self.custom_model:
-                for key, flag in (("checkpoint", "--checkpoint"), ("config", "--config"),
-                                  ("vocab", "--vocab"), ("speakers", "--speakers")):
-                    if self.custom_model.get(key):
-                        cmd += [flag, str(self.custom_model[key])]
+            if os.getenv("TTS_XTTS_NO_WARMUP", "0") in ("1", "true", "True"):
+                cmd.append("--no-warmup")
 
             self._cmd = cmd
             self._stderr_lines = []
@@ -333,7 +339,7 @@ class XttsClient:
         generation_id: int = 0,
         return_pcm: bool = True,
         out_path: Optional[str] = None,
-        timeout: float = 30.0,
+        timeout: float = 45.0,
         language: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Synthesizes text clause and returns dictionary containing raw PCM bytes and telemetry."""
@@ -349,6 +355,7 @@ class XttsClient:
             req = {
                 "id": req_id,
                 "gen_id": generation_id,
+                "generation_id": generation_id,
                 "text": text,
                 "out": os.path.abspath(str(out_path)) if out_path else "",
                 "return_pcm": return_pcm,
