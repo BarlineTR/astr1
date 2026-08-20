@@ -863,12 +863,15 @@ class TestRealtimeArchitectureInvariants(unittest.TestCase):
         loud_msg.data = base64.b64encode(loud_pcm_16k).decode("ascii")
 
         with patch("astro_ai.astro_realtime_node.resample_24k_to_16k", return_value=loud_pcm_16k):
-            # 1st loud frame -> Triggers barge-in & sets _barge_in_latched = True
+            # Frame 1 & 2: Building persistence
+            node._on_input_pcm(loud_msg)
+            node._on_input_pcm(loud_msg)
+            # Frame 3: Persistence reached -> Triggers barge-in & sets _barge_in_latched = True
             node._on_input_pcm(loud_msg)
             self.assertTrue(node._barge_in_latched)
             self.assertEqual(node.pub_interrupt.publish.call_count, 1)
 
-            # 2nd loud frame in same generation -> Debounced / Ignored
+            # 4th loud frame in same generation -> Debounced by latch
             node._on_input_pcm(loud_msg)
             self.assertEqual(node.pub_interrupt.publish.call_count, 1)
 
@@ -900,6 +903,29 @@ class TestRealtimeArchitectureInvariants(unittest.TestCase):
             self.assertTrue(node._is_sleeping)
             self.assertEqual(node.state_machine.current_state, RobotState.DEEP_IDLE)
             mock_turn.assert_not_called()
+
+        # 3. Substring non-exact match 'E astro'
+        with patch.object(node, "_transcribe_groq_whisper", return_value="E astro"), \
+             patch.object(node, "_process_fallback_turn") as mock_turn:
+            node._process_wake_candidate(audio_chunks)
+            self.assertTrue(node._is_sleeping)
+            self.assertEqual(node.state_machine.current_state, RobotState.DEEP_IDLE)
+            mock_turn.assert_not_called()
+
+    def test_xtts_environment_proof_and_resolution(self):
+        """Fine-tuned XTTS model paths and existence are checked at startup."""
+        from astro_audio.local_xtts_engine import resolve_fine_tune_paths
+
+        res = resolve_fine_tune_paths(
+            checkpoint="/non/existent/model.pth",
+            config="/non/existent/config.json",
+            vocab="/non/existent/vocab.json",
+            speakers="/non/existent/speakers.pth",
+            speaker_wav="/non/existent/ref.wav",
+        )
+        self.assertFalse(res["checkpoint_exists"])
+        self.assertFalse(res["config_exists"])
+        self.assertFalse(res["all_required_exist"])
 
     def test_speaker_recognition_temporal_smoothing(self):
         """Low confidence scores (0.42) do NOT overwrite existing speaker context; tentative requires 2 observations."""

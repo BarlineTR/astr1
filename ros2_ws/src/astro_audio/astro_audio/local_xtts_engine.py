@@ -89,6 +89,58 @@ def resolve_xtts_speaker_wav(preferred_wav: str = "") -> str:
     return os.path.expanduser("~/.astro/tts/Recording.wav")
 
 
+def resolve_fine_tune_paths(
+    checkpoint: Optional[str] = None,
+    config: Optional[str] = None,
+    vocab: Optional[str] = None,
+    speakers: Optional[str] = None,
+    speaker_wav: Optional[str] = None,
+    model_dir: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Resolves and validates all required paths for the fine-tuned XTTS model."""
+    root_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..", ".."))
+    base_dirs = [
+        model_dir,
+        os.getenv("TTS_XTTS_MODEL_DIR"),
+        "/home/okistech/Desktop/astr1/models/xtts_finetune_ready_v2",
+        os.path.join(root_dir, "models", "xtts_finetune_ready_v2"),
+        os.path.abspath("./models/xtts_finetune_ready_v2"),
+        os.path.expanduser("~/.astro/models/xtts_finetune_ready_v2"),
+    ]
+    resolved_dir = None
+    for bd in base_dirs:
+        if bd and os.path.exists(bd) and os.path.exists(os.path.join(bd, "model.pth")):
+            resolved_dir = os.path.abspath(bd)
+            break
+
+    ckpt_path = checkpoint or os.getenv("TTS_XTTS_CHECKPOINT") or (os.path.join(resolved_dir, "model.pth") if resolved_dir else None)
+    cfg_path = config or os.getenv("TTS_XTTS_CONFIG") or (os.path.join(resolved_dir, "config.json") if resolved_dir else None)
+    voc_path = vocab or os.getenv("TTS_XTTS_VOCAB") or (os.path.join(resolved_dir, "vocab.json") if resolved_dir else None)
+    spk_path = speakers or os.getenv("TTS_XTTS_SPEAKERS") or (os.path.join(resolved_dir, "speakers_xtts.pth") if resolved_dir else None)
+    ref_path = speaker_wav or os.getenv("TTS_XTTS_SPEAKER_WAV") or (os.path.join(resolved_dir, "reference.wav") if resolved_dir else None)
+
+    ckpt_exists = bool(ckpt_path and os.path.exists(ckpt_path))
+    cfg_exists = bool(cfg_path and os.path.exists(cfg_path))
+    voc_exists = bool(voc_path and os.path.exists(voc_path))
+    spk_exists = bool(spk_path and os.path.exists(spk_path))
+    ref_exists = bool(ref_path and os.path.exists(ref_path))
+
+    return {
+        "model_dir": resolved_dir,
+        "checkpoint": os.path.abspath(ckpt_path) if ckpt_path else None,
+        "config": os.path.abspath(cfg_path) if cfg_path else None,
+        "vocab": os.path.abspath(voc_path) if voc_path else None,
+        "speakers": os.path.abspath(spk_path) if spk_path else None,
+        "speaker_wav": os.path.abspath(ref_path) if ref_path else None,
+        "checkpoint_exists": ckpt_exists,
+        "config_exists": cfg_exists,
+        "vocab_exists": voc_exists,
+        "speakers_exists": spk_exists,
+        "reference_exists": ref_exists,
+        "all_required_exist": bool(ckpt_exists and cfg_exists and voc_exists and ref_exists),
+    }
+
+
 class LocalXttsEngine(BaseTTSEngine):
     """Local Coqui XTTS v2 Engine running resident on CUDA GPU."""
 
@@ -108,16 +160,31 @@ class LocalXttsEngine(BaseTTSEngine):
     ):
         self._log = logger or (lambda lvl, msg: None)
         self.home = resolve_xtts_home(home or "")
-        self.speaker_wav = resolve_xtts_speaker_wav(speaker_wav or "")
         self.language = language
         self.device = device
         self.half = half
 
-        ckpt = checkpoint or os.getenv("TTS_XTTS_CHECKPOINT") or None
-        cfg = config or os.getenv("TTS_XTTS_CONFIG") or None
-        voc = vocab or os.getenv("TTS_XTTS_VOCAB") or None
-        spks = speakers or os.getenv("TTS_XTTS_SPEAKERS") or None
-        md = model_dir or os.getenv("TTS_XTTS_MODEL_DIR") or None
+        # Resolve and proof all fine-tuned checkpoint files
+        self.ft_paths = resolve_fine_tune_paths(
+            checkpoint=checkpoint,
+            config=config,
+            vocab=vocab,
+            speakers=speakers,
+            speaker_wav=speaker_wav,
+            model_dir=model_dir,
+        )
+        self.speaker_wav = self.ft_paths["speaker_wav"] or resolve_xtts_speaker_wav(speaker_wav or "")
+
+        # Log Environment Proof immediately on startup
+        self._safe_log(
+            "info",
+            f"🔍 [XTTS Environment Proof]:\n"
+            f"  TTS_XTTS_CHECKPOINT={self.ft_paths['checkpoint']} (exists={self.ft_paths['checkpoint_exists']})\n"
+            f"  TTS_XTTS_CONFIG={self.ft_paths['config']} (exists={self.ft_paths['config_exists']})\n"
+            f"  TTS_XTTS_VOCAB={self.ft_paths['vocab']} (exists={self.ft_paths['vocab_exists']})\n"
+            f"  TTS_XTTS_SPEAKERS={self.ft_paths['speakers']} (exists={self.ft_paths['speakers_exists']})\n"
+            f"  TTS_XTTS_SPEAKER_WAV={self.ft_paths['speaker_wav']} (exists={self.ft_paths['reference_exists']})"
+        )
 
         self.client = XttsClient(
             speaker_wav=self.speaker_wav,
@@ -125,11 +192,11 @@ class LocalXttsEngine(BaseTTSEngine):
             language=language,
             device=device,
             half=half,
-            model_dir=md,
-            checkpoint=ckpt,
-            config=cfg,
-            vocab=voc,
-            speakers=spks,
+            model_dir=self.ft_paths["model_dir"],
+            checkpoint=self.ft_paths["checkpoint"],
+            config=self.ft_paths["config"],
+            vocab=self.ft_paths["vocab"],
+            speakers=self.ft_paths["speakers"],
             logger=self._safe_log,
         )
 
@@ -146,7 +213,10 @@ class LocalXttsEngine(BaseTTSEngine):
             "worker_pid": None,
             "ready": False,
             "state": "STOPPED",
-            "is_finetuned": bool(self.client.custom_model and self.client.custom_model.get("checkpoint")),
+            "is_finetuned": bool(self.ft_paths["checkpoint_exists"]),
+            "xtts_model_path": self.ft_paths["checkpoint"] or "none",
+            "xtts_checkpoint_sha256": "none",
+            "error": "none" if self.ft_paths["all_required_exist"] else "missing_fine_tuned_files",
         }
 
     def _safe_log(self, lvl: str, msg: str) -> None:

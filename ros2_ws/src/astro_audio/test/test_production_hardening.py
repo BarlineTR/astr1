@@ -528,17 +528,73 @@ class TestSTTValidationAndEchoImmunity(unittest.TestCase):
             self.assertEqual(val, word)
             self.assertFalse(meta["stt_rejected"])
 
-    def test_stt_buffer_flushing_on_state_transition(self):
-        """Buffer flush must clear accumulators without memory bleed into future turns."""
-        self.node._fallback_audio_buffer = [b"123" * 100, b"456" * 100]
-        self.node._fallback_speaking = True
-        self.node._consecutive_loud_frames = 10
+    def test_distinct_rejection_counters_semantics(self):
+        """Each rejection reason increments strictly its own dedicated counter without cross-pollution."""
+        self.node.false_transcript_count = 0
+        self.node.self_voice_rejection_count = 0
+        self.node.no_speech_rejection_count = 0
+        self.node.stale_audio_rejection_count = 0
 
-        self.node._flush_audio_buffers("test_transition")
+        # 1. No speech (silent audio)
+        silent_pcm = self._generate_pcm(0.30, rms_target=50.0)
+        self.node._validate_stt_transcript(transcript="test", raw_pcm=silent_pcm, is_playback_active=False, is_echo_cooldown=False)
+        self.assertEqual(self.node.no_speech_rejection_count, 1)
+        self.assertEqual(self.node.self_voice_rejection_count, 0)
+        self.assertEqual(self.node.false_transcript_count, 0)
 
-        self.assertEqual(len(self.node._fallback_audio_buffer), 0)
-        self.assertFalse(self.node._fallback_speaking)
-        self.assertEqual(self.node._consecutive_loud_frames, 0)
+        # 2. Self voice (echo during playback)
+        self.node._recent_robot_phrases = ["merhaba baran nasılsın"]
+        speech_pcm = self._generate_pcm(0.50, rms_target=500.0)
+        self.node._validate_stt_transcript(transcript="merhaba baran nasılsın", raw_pcm=speech_pcm, is_playback_active=True, is_echo_cooldown=False)
+        self.assertEqual(self.node.self_voice_rejection_count, 1)
+        self.assertEqual(self.node.no_speech_rejection_count, 1)
+        self.assertEqual(self.node.false_transcript_count, 0)
+
+        # 3. False transcript / Low quality hallucination (single random word with low speech duration)
+        weak_speech_pcm = self._generate_pcm(0.12, rms_target=420.0)
+        self.node._recent_robot_phrases.clear()
+        self.node._validate_stt_transcript(transcript="rastgele", raw_pcm=weak_speech_pcm, is_playback_active=False, is_echo_cooldown=False)
+        self.assertEqual(self.node.false_transcript_count, 1)
+        self.assertEqual(self.node.self_voice_rejection_count, 1)
+        self.assertEqual(self.node.no_speech_rejection_count, 1)
+
+    def test_barge_in_requires_multi_frame_persistence(self):
+        """Single loud frame impulse is ignored; >=3 consecutive frames trigger single latched barge-in."""
+        from unittest.mock import MagicMock, patch
+        from astro_ai.state_machine import RobotState
+        import base64
+
+        self.node._is_sleeping = False
+        self.node._is_playback_active = True
+        self.node._is_responding = True
+        self.node.state_machine.transition_to(RobotState.SPEAKING)
+        self.node._barge_in_latched = False
+        self.node._barge_in_consecutive_frames = 0
+        self.node.pub_interrupt = MagicMock()
+
+        loud_pcm_16k = self._generate_pcm(0.02, rms_target=2200.0)
+        loud_msg = MagicMock()
+        loud_msg.data = base64.b64encode(loud_pcm_16k).decode("ascii")
+
+        with patch("astro_ai.astro_realtime_node.resample_24k_to_16k", return_value=loud_pcm_16k):
+            # Frame 1: impulse noise -> Not enough persistence
+            self.node._on_input_pcm(loud_msg)
+            self.assertFalse(self.node._barge_in_latched)
+            self.assertEqual(self.node.pub_interrupt.publish.call_count, 0)
+
+            # Frame 2: still pending
+            self.node._on_input_pcm(loud_msg)
+            self.assertFalse(self.node._barge_in_latched)
+            self.assertEqual(self.node.pub_interrupt.publish.call_count, 0)
+
+            # Frame 3: Persistence reached -> Triggers barge-in & latches!
+            self.node._on_input_pcm(loud_msg)
+            self.assertTrue(self.node._barge_in_latched)
+            self.assertEqual(self.node.pub_interrupt.publish.call_count, 1)
+
+            # Frame 4 in same generation: Debounced by latch
+            self.node._on_input_pcm(loud_msg)
+            self.assertEqual(self.node.pub_interrupt.publish.call_count, 1)
 
 
 if __name__ == "__main__":
