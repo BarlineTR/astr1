@@ -233,11 +233,12 @@ def main() -> int:
                     req_spk_emb,
                     temperature=float(req.get("temperature", 0.75)),
                     length_penalty=float(req.get("length_penalty", 1.0)),
-                    repetition_penalty=float(req.get("repetition_penalty", 2.0)),
+                    repetition_penalty=float(req.get("repetition_penalty", 5.0)),
                     top_k=int(req.get("top_k", 50)),
                     top_p=float(req.get("top_p", 0.85)),
                     speed=float(req.get("speed", 1.05)),
-                    enable_text_splitting=False,  # Sentence chunker already handles splitting
+                    # Sentence chunker already splits, so the client normally sends False here.
+                    enable_text_splitting=bool(req.get("enable_text_splitting", False)),
                     batch_size=args.batch_size,
                 )
             t_infer_end = time.perf_counter()

@@ -260,7 +260,8 @@ def main(args=None):
         if node.local_xtts:
             node.local_xtts.stop()
         node.destroy_node()
-        rclpy.shutdown()
+        if rclpy.ok():
+            rclpy.shutdown()
 
 
 if __name__ == "__main__":

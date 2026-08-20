@@ -114,11 +114,19 @@ def find_sounddevice_output_index(preferred: str = "") -> Tuple[Optional[int], s
         return None, str(e)
 
 
-def resolve_output_backend(preferred: str, sd_dev_name: str) -> str:
-    """Seçilen çıkış cihazına göre 'sounddevice' mi 'aplay' mi kullanılacağına karar verir."""
+def resolve_output_backend(preferred: str, sd_dev_name: str, sd_available: bool = True) -> str:
+    """Seçilen çıkış cihazına göre 'sounddevice' mi 'aplay' mi kullanılacağına karar verir.
+
+    sounddevice hiç kurulu değilse (ör. düğüm proje venv'i olmadan başlatıldıysa)
+    PortAudio yolu tamamen kullanılamaz; bu durumda aplay tek seçenektir.
+    """
     choice = (preferred or "auto").strip().lower()
-    if choice in ("sounddevice", "aplay"):
-        return choice
+    if choice == "aplay":
+        return "aplay"
+    if choice == "sounddevice" and sd_available:
+        return "sounddevice"
+    if not sd_available:
+        return "aplay"
     name = (sd_dev_name or "").strip().lower()
     if any(name == n or name.startswith(n) for n in PULSE_BRIDGE_NAMES):
         return "aplay"
@@ -145,9 +153,15 @@ class AudioOutputManager:
             self.alsa_device = find_alsa_respeaker_device()
             self.sd_dev_idx, self.sd_dev_name = find_sounddevice_output_index(preferred_device)
             self.has_aplay = shutil.which("aplay") is not None
-            self.backend = resolve_output_backend(os.getenv("AUDIO_OUTPUT_BACKEND", "auto"), self.sd_dev_name)
+            self.backend = resolve_output_backend(
+                os.getenv("AUDIO_OUTPUT_BACKEND", "auto"),
+                self.sd_dev_name,
+                sd_available=sd is not None,
+            )
             if self.backend == "aplay" and not self.has_aplay:
                 self.backend = "sounddevice"
+            if self.backend == "sounddevice" and sd is None:
+                self._log("error", "❌ [AudioOutputManager] Ne sounddevice ne aplay var — ses çıkışı yok!")
         else:
             self.alsa_device = "mock"
             self.sd_dev_idx, self.sd_dev_name = None, "Mock In-Memory Audio Device"
