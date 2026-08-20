@@ -13,6 +13,7 @@ from typing import Any, Callable, Dict, List, Optional
 
 from astro_audio.base_tts_engine import BaseTTSEngine
 from astro_audio.xtts_client import XttsClient, XttsError
+from astro_audio.memory_guard import get_system_memory_guard, SystemMemoryGuard
 
 
 def resolve_xtts_home(preferred_home: str = "") -> str:
@@ -200,11 +201,13 @@ class LocalXttsEngine(BaseTTSEngine):
             logger=self._safe_log,
         )
 
-        self._state = "STOPPED"  # STOPPED, STARTING, READY, CRASHED, COOLDOWN, STOPPING
+        self.memory_guard = get_system_memory_guard()
+        self._state = "STOPPED"  # STOPPED, STARTING, READY, CRASHED, COOLDOWN, DEGRADED, STOPPING
         self._state_lock = threading.Lock()
         self._cooldown_duration = float(os.getenv("XTTS_COOLDOWN_S", "60.0"))
         self._cooldown_until = 0.0
 
+        mem_snap = self.memory_guard.get_memory_snapshot()
         self._last_telemetry: Dict[str, Any] = {
             "device": device,
             "cuda_available": False,
@@ -219,7 +222,10 @@ class LocalXttsEngine(BaseTTSEngine):
             "xtts_model_path": self.ft_paths["checkpoint"] or "none",
             "xtts_checkpoint_sha256": "none",
             "error": "none" if self.ft_paths["all_required_exist"] else "missing_fine_tuned_files",
+            "xtts_admission_decision": "PENDING",
+            "xtts_admission_reject_reason": "none",
         }
+        self._last_telemetry.update(mem_snap)
 
     def _safe_log(self, lvl: str, msg: str) -> None:
         """Safely dispatches log message without letting ROS2 severity context errors bubble up."""
@@ -244,7 +250,7 @@ class LocalXttsEngine(BaseTTSEngine):
             return self._state
 
     def start(self) -> None:
-        """Starts the persistent XTTS worker and verifies GPU warm-up. Guarantees single worker process."""
+        """Starts the persistent XTTS worker after system resource admission control."""
         with self._state_lock:
             if self._state == "READY" and self.client.is_alive and self.client.is_ready:
                 self._safe_log("debug", f"LocalXttsEngine is already READY (PID: {getattr(self.client.proc, 'pid', None)}).")
@@ -252,11 +258,37 @@ class LocalXttsEngine(BaseTTSEngine):
             if self._state == "STARTING" and self.client.is_alive:
                 self._safe_log("debug", f"LocalXttsEngine is already in STARTING state (PID: {getattr(self.client.proc, 'pid', None)}). Reusing worker.")
                 return
+            if self._state == "DEGRADED":
+                self._safe_log("warn", "⛔ [LocalXttsEngine] State is DEGRADED (Memory pressure / OOM quarantine). Spawn refused. Local offline TTS remains active.")
+                return
             now_m = time.monotonic()
             if self._state == "COOLDOWN" and now_m < self._cooldown_until:
                 rem_s = self._cooldown_until - now_m
                 self._safe_log("warn", f"⏳ [LocalXttsEngine] XTTS is in COOLDOWN ({rem_s:.1f}s remaining). Spawn refused.")
                 return
+
+            # Resource Admission Control check BEFORE spawning worker subprocess
+            admitted, reject_reason, mem_snap = self.memory_guard.check_xtts_admission()
+            self._last_telemetry.update(mem_snap)
+            self._last_telemetry["xtts_admission_decision"] = "GRANTED" if admitted else "REJECTED"
+            self._last_telemetry["xtts_admission_reject_reason"] = reject_reason
+
+            if not admitted:
+                self._state = "DEGRADED"
+                self._last_telemetry["ready"] = False
+                self._last_telemetry["state"] = "DEGRADED"
+                self._last_telemetry["error"] = f"admission_rejected: {reject_reason}"
+                self._safe_log(
+                    "warn",
+                    f"⛔ [XTTS Admission Control REJECTED]:\n"
+                    f"  reason={reject_reason}\n"
+                    f"  available_ram_mb={mem_snap.get('system_available_ram_mb')}\n"
+                    f"  swap_used_mb={mem_snap.get('swap_used_mb')}\n"
+                    f"  swap_used_percent={mem_snap.get('swap_used_percent')}%\n"
+                    f"  action=degraded_mode_local_offline_tts_active"
+                )
+                return
+
             self._state = "STARTING"
 
         self._safe_log("info", f"🚀 [LocalXttsEngine] GPU XTTS başlatılıyor... (Referans: {self.speaker_wav}, Home: {self.home}, Cihaz: {self.device})")
@@ -331,15 +363,32 @@ class LocalXttsEngine(BaseTTSEngine):
                 f"  PID={worker_pid}"
             )
         except XttsError as e:
-            with self._state_lock:
-                self._state = "CRASHED"
-                self._cooldown_until = time.monotonic() + self._cooldown_duration
-            self._last_telemetry["ready"] = False
-            self._last_telemetry["state"] = "CRASHED"
-            self._last_telemetry["error"] = str(e)
-            self._safe_log("error", f"❌ [LocalXttsEngine] XTTS başlatılamadı (CRASHED -> COOLDOWN {self._cooldown_duration:.0f}s): {e}")
-            with self._state_lock:
-                self._state = "COOLDOWN"
+            # Check if process was terminated by Linux OOM killer
+            proc_code = getattr(self.client.proc, "returncode", None) if self.client.proc else None
+            is_oom = (proc_code in (-9, 137, -15)) or self.memory_guard.is_oom_quarantined
+            if is_oom:
+                self.memory_guard.record_oom_kill(pid=getattr(self.client.proc, "pid", None), details=str(e))
+                with self._state_lock:
+                    self._state = "DEGRADED"
+                self._last_telemetry["state"] = "DEGRADED"
+                self._last_telemetry["ready"] = False
+                self._last_telemetry["error"] = f"oom_killed (exit_code={proc_code})"
+                self._safe_log(
+                    "error",
+                    f"🚨 [XTTS OOM KILL DETECTED]: Worker process terminated by Linux OOM Killer (exit_code={proc_code})!\n"
+                    f"⛔ [XTTS Retry Storm Prevented]: XTTS permanently set to DEGRADED for this session.\n"
+                    f"🛡️ [Critical Path Shielded]: Realtime audio, STT, LLM, and local offline TTS remain fully functional."
+                )
+            else:
+                with self._state_lock:
+                    self._state = "CRASHED"
+                    self._cooldown_until = time.monotonic() + self._cooldown_duration
+                self._last_telemetry["ready"] = False
+                self._last_telemetry["state"] = "CRASHED"
+                self._last_telemetry["error"] = str(e)
+                self._safe_log("error", f"❌ [LocalXttsEngine] XTTS başlatılamadı (CRASHED -> COOLDOWN {self._cooldown_duration:.0f}s): {e}")
+                with self._state_lock:
+                    self._state = "COOLDOWN"
             raise
 
     def is_ready(self) -> bool:
@@ -393,20 +442,34 @@ class LocalXttsEngine(BaseTTSEngine):
         except Exception as exc:
             self._safe_log("warn", f"⚠️ [LocalXttsEngine] Sentez hatası: {exc}")
             if not self.client.is_alive:
-                with self._state_lock:
-                    self._state = "CRASHED"
-                    self._cooldown_until = time.monotonic() + self._cooldown_duration
-                self._last_telemetry["ready"] = False
-                self._last_telemetry["state"] = "CRASHED"
-                self._last_telemetry["error"] = str(exc)
-                self._safe_log("error", f"❌ [LocalXttsEngine] XTTS worker süreci çökmüş! Cooldown başlatıldı ({self._cooldown_duration:.0f}s).")
-                with self._state_lock:
-                    self._state = "COOLDOWN"
+                proc_code = getattr(self.client.proc, "returncode", None) if self.client.proc else None
+                is_oom = (proc_code in (-9, 137, -15))
+                if is_oom:
+                    self.memory_guard.record_oom_kill(pid=getattr(self.client.proc, "pid", None), details=str(exc))
+                    with self._state_lock:
+                        self._state = "DEGRADED"
+                    self._last_telemetry["state"] = "DEGRADED"
+                    self._last_telemetry["ready"] = False
+                    self._last_telemetry["error"] = f"oom_killed (exit_code={proc_code})"
+                    self._safe_log("error", f"🚨 [LocalXttsEngine] XTTS worker OOM killed (exit_code={proc_code}) during synthesis! Transitioning to DEGRADED.")
+                else:
+                    with self._state_lock:
+                        self._state = "CRASHED"
+                        self._cooldown_until = time.monotonic() + self._cooldown_duration
+                    self._last_telemetry["ready"] = False
+                    self._last_telemetry["state"] = "CRASHED"
+                    self._last_telemetry["error"] = str(exc)
+                    self._safe_log("error", f"❌ [LocalXttsEngine] XTTS worker süreci çökmüş! Cooldown başlatıldı ({self._cooldown_duration:.0f}s).")
+                    with self._state_lock:
+                        self._state = "COOLDOWN"
             return None
 
     def _try_auto_restart(self) -> None:
         try:
             with self._state_lock:
+                if self._state == "DEGRADED":
+                    self._safe_log("warn", "⛔ [LocalXttsEngine] Auto-restart skipped: XTTS is in DEGRADED state.")
+                    return
                 self._state = "STOPPING"
             self.client.stop()
             time.sleep(0.5)
@@ -421,10 +484,13 @@ class LocalXttsEngine(BaseTTSEngine):
 
     def get_telemetry(self) -> Dict[str, Any]:
         info = dict(self._last_telemetry)
+        worker_pid = self.client.proc.pid if self.client.proc else None
+        mem_snap = self.memory_guard.get_memory_snapshot(xtts_pid=worker_pid)
+        info.update(mem_snap)
         if self.client.ready_info:
             info.update(self.client.ready_info)
-        if self.client.proc:
-            info["worker_pid"] = self.client.proc.pid
+        if worker_pid:
+            info["worker_pid"] = worker_pid
         is_ready_val = self.is_ready()
         is_ft = bool(self.client.ready_info.get("is_finetuned", self.ft_paths.get("checkpoint_exists", False)))
         info["ready"] = is_ready_val
@@ -434,6 +500,8 @@ class LocalXttsEngine(BaseTTSEngine):
         info["xtts_model_path"] = self.client.ready_info.get("checkpoint") or self.client.ready_info.get("xtts_model_path", self.ft_paths.get("checkpoint", self.client.model))
         info["xtts_checkpoint_sha256"] = self.client.ready_info.get("sha256") or self.client.ready_info.get("xtts_checkpoint_sha256", "none")
         info["xtts_batch_size"] = self.client.ready_info.get("batch_size", getattr(self.client, "batch_size", 1))
+        info["xtts_admission_decision"] = self._last_telemetry.get("xtts_admission_decision", "GRANTED" if is_ready_val else "REJECTED")
+        info["xtts_admission_reject_reason"] = self._last_telemetry.get("xtts_admission_reject_reason", "none")
         with self._state_lock:
             info["state"] = self._state
         return info

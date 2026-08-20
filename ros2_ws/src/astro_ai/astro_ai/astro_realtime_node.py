@@ -2376,13 +2376,18 @@ class AstroRealtimeNode(Node):
             try:
                 self.local_xtts.start()
                 info = self.local_xtts.get_telemetry()
-                m_type = "Fine-tuned XTTS" if info.get("is_finetuned") else "Generic XTTS v2"
-                self.get_logger().info(
-                    f"✅ [Astro Realtime] {m_type} (cuda:0, FP16) hazır!\n"
-                    f"   [XTTS Runtime] checkpoint={info.get('xtts_model_path')} | sha256={info.get('xtts_checkpoint_sha256')} | "
-                    f"reference={info.get('xtts_reference_wav')} | temp={info.get('temperature')} | "
-                    f"rep_pen={info.get('repetition_penalty')} | top_k={info.get('top_k')} | speed={info.get('speed')}"
-                )
+                if self.local_xtts.is_ready():
+                    self.get_logger().info(
+                        f"✅ [Astro Realtime] Fine-tuned XTTS (cuda:0, FP16) hazır!\n"
+                        f"   [XTTS Runtime] checkpoint={info.get('xtts_model_path')} | sha256={info.get('xtts_checkpoint_sha256')} | "
+                        f"reference={info.get('xtts_reference_wav')} | admission={info.get('xtts_admission_decision')}"
+                    )
+                else:
+                    self.get_logger().warn(
+                        f"⚠️ [Astro Realtime] XTTS hazır değil (State: {self.local_xtts.state}, "
+                        f"Admission: {info.get('xtts_admission_decision')}, Reason: {info.get('xtts_admission_reject_reason')}). "
+                        f"Yerel offline TTS (eSpeak) aktif."
+                    )
             except Exception as e:
                 self.get_logger().error(f"❌ [Astro Realtime] Local XTTS GPU başlatılamadı: {e}")
 
@@ -3289,6 +3294,13 @@ class AstroRealtimeNode(Node):
                     f"tts_total_ms={int(total_synth_ms)} | xtts_infer_ms={int(total_gpu_ms)} | "
                     f"xtts_queue_wait_ms={int(total_queue_wait_ms)} | "
                     f"xtts_worker_pid={worker_pid} | xtts_gpu={gpu_name_str} | "
+                    f"system_available_ram_mb={xtts_info.get('system_available_ram_mb', 'null')} | system_used_ram_mb={xtts_info.get('system_used_ram_mb', 'null')} | "
+                    f"swap_used_mb={xtts_info.get('swap_used_mb', 'null')} | swap_free_mb={xtts_info.get('swap_free_mb', 'null')} | "
+                    f"astro_rss_mb={xtts_info.get('astro_rss_mb', 'null')} | xtts_rss_mb={xtts_info.get('xtts_rss_mb', 'null')} | "
+                    f"oak_rss_mb={xtts_info.get('oak_rss_mb', 'null')} | vision_rss_mb={xtts_info.get('vision_rss_mb', 'null')} | "
+                    f"audio_rss_mb={xtts_info.get('audio_rss_mb', 'null')} | "
+                    f"xtts_admission_decision={xtts_info.get('xtts_admission_decision', 'GRANTED' if is_xtts_actually_ready else 'REJECTED')} | "
+                    f"xtts_admission_reject_reason={xtts_info.get('xtts_admission_reject_reason', 'none')} | "
                     f"total_ttfa_ms={int(first_audio_ms if first_audio_played else total_turn_ms)} | "
                     f"oak_connection_state={oak_state} | oak_last_frame_age_ms={oak_frame_age} | "
                     f"oak_last_camera_info_age_ms={oak_info_age} | oak_xlink_error_count={self._oak_xlink_error_count} | "
