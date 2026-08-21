@@ -185,8 +185,36 @@ def extract_spoken_turkish_sentence(raw_text: str) -> str:
     return last_line
 
 
+def remove_repetitive_loops(text: str) -> str:
+    """Detects and truncates repetitive degenerate LLM text loops and character stuttering (e.g. zızızızı...)."""
+    if not text:
+        return ""
+    # 1. Truncate character or syllable stuttering loops (e.g., 'zı', 'ız', 'nı' repeated 3+ times)
+    text = re.sub(r'([a-zA-ZçğıöşüÇĞİÖŞÜ]{1,4})\1{4,}', r'\1', text)
+    
+    # 2. Strip repeated sentences or sub-phrases (e.g., 15+ char block appearing 2+ times)
+    pattern = re.compile(r'(.{15,})\1+', re.DOTALL)
+    match = pattern.search(text)
+    if match:
+        text = text[:match.start() + len(match.group(1))]
+    
+    # 3. Remove excessive repeated word chunks
+    words = text.split()
+    if len(words) > 20:
+        seen_chunks = set()
+        clean_words = []
+        for i in range(0, len(words), 3):
+            chunk = " ".join(words[i:i+3]).lower()
+            if chunk in seen_chunks:
+                break
+            seen_chunks.add(chunk)
+            clean_words.extend(words[i:i+3])
+        text = " ".join(clean_words)
+    return text.strip()
+
+
 def clean_tts_text(text: str) -> str:
-    """Prepares text for TTS reading (strips markdown, emojis, asterisks)."""
+    """Prepares text for TTS reading (strips markdown, emojis, asterisks, and repetitive loops)."""
     if not text:
         return ""
     text = extract_spoken_turkish_sentence(text)
@@ -198,6 +226,7 @@ def clean_tts_text(text: str) -> str:
     text = re.sub(r'[\*\_\~\#\<\>]', '', text)
     text = " ".join(text.split())
     text = re.sub(r'\s+([,.:;?!])', r'\1', text)
+    text = remove_repetitive_loops(text)
     return text.strip()
 
 

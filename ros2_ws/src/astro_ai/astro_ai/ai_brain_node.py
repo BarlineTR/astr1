@@ -1040,7 +1040,9 @@ class AiBrainNode(Node):
                             messages=messages,
                             model=m,
                             temperature=self._temperature,
-                            max_tokens=self._max_tokens,
+                            max_tokens=min(150, self._max_tokens),
+                            presence_penalty=0.5,
+                            frequency_penalty=0.5,
                             stream=True,
                         )
                         for chunk in stream_resp:
@@ -1051,6 +1053,9 @@ class AiBrainNode(Node):
                                 first_token_time = time.monotonic()
                                 self.state_machine.transition_to(RobotState.SPEAKING)
                             full_text += delta
+                            # Early break if LLM stutters or repeats character sequences (e.g. 'zızızızı...')
+                            if re.search(r'([a-zA-ZçğıöşüÇĞİÖŞÜ]{1,4})\1{5,}', full_text):
+                                break
                         if full_text:
                             break
                     except Exception as stream_err:
@@ -1072,7 +1077,9 @@ class AiBrainNode(Node):
                         messages=messages,
                         model="gpt-4o-mini",
                         temperature=self._temperature,
-                        max_tokens=self._max_tokens,
+                        max_tokens=min(150, self._max_tokens),
+                        presence_penalty=0.5,
+                        frequency_penalty=0.5,
                         stream=True,
                     )
                     for chunk in stream_resp:

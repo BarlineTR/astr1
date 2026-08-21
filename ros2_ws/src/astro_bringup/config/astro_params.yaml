@@ -52,7 +52,7 @@ tts_node:
       i_enable_imu: false
     i_pipeline_type: "RGBD"
     rgb:
-      i_resolution: "720P"
+      i_resolution: "1080P"
       i_fps: 30.0
       i_publish_topic: true
     stereo:
