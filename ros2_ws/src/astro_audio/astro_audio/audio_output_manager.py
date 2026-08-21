@@ -284,8 +284,13 @@ class AudioOutputManager:
     def _stop_active_processes_locked(self) -> None:
         if self._current_process is not None:
             try:
+                if self._current_process.stdin:
+                    try:
+                        self._current_process.stdin.close()
+                    except Exception:
+                        pass
                 self._current_process.terminate()
-                self._current_process.wait(timeout=0.1)
+                self._current_process.wait(timeout=0.15)
             except Exception:
                 try:
                     self._current_process.kill()
@@ -296,7 +301,7 @@ class AudioOutputManager:
     def _open_output_stream(self):
         """aplay arka ucunda akış açılmaz; aksi hâlde donanım DAC akışı açılır."""
         if self.backend == "aplay":
-            self._log("info", f"🔈 [AudioOutputManager] Çalma aplay ile yapılacak (cihaz: {self.alsa_device}).")
+            self._log("info", f"🔈 [AudioOutputManager] Çalma aplay akışı ile yapılacak (cihaz: {self.alsa_device}).")
             return None
         try:
             stream = sd.RawOutputStream(
@@ -313,8 +318,37 @@ class AudioOutputManager:
             self._log("warn", f"⚠️ [AudioOutputManager] Sounddevice OutputStream başlatılamadı: {e}. ALSA aplay fallback kullanılacak.")
             return None
 
+    def _play_chunk_via_aplay_pipe(self, chunk: bytes, gen: int) -> bool:
+        """Writes PCM chunk to a persistent, streaming aplay pipe per generation."""
+        with self._lock:
+            if gen < self._current_generation:
+                return False
+            
+            # Start persistent streaming aplay process if not already running
+            if self._current_process is None or self._current_process.poll() is not None:
+                try:
+                    cmd = ["aplay", "-D", self.alsa_device, "-r", str(HW_SAMPLE_RATE), "-f", "S16_LE", "-c", "1", "-q"]
+                    self._current_process = subprocess.Popen(cmd, stdin=subprocess.PIPE)
+                except Exception as e:
+                    self._log("error", f"❌ [AudioOutputManager] aplay akışı başlatılamadı: {e}")
+                    self._current_process = None
+                    return False
+
+            proc = self._current_process
+
+        try:
+            if proc and proc.stdin:
+                proc.stdin.write(chunk)
+                proc.stdin.flush()
+                return True
+        except Exception as e:
+            self._log("warn", f"⚠️ [AudioOutputManager] aplay akışına yazma hatası: {e}")
+            with self._lock:
+                self._stop_active_processes_locked()
+            return False
+
     def _playback_loop(self) -> None:
-        """Dedicated playback thread (hardware DAC stream or aplay subprocess)."""
+        """Dedicated playback thread (hardware DAC stream or streaming aplay subprocess)."""
         if self.mock_playback:
             while True:
                 try:
@@ -347,16 +381,19 @@ class AudioOutputManager:
 
         while True:
             try:
-                gen, chunk = self._play_queue.get(timeout=0.1)
+                gen, chunk = self._play_queue.get(timeout=0.15)
             except queue.Empty:
                 if self._is_playing:
-                    self._is_playing = False
+                    with self._lock:
+                        self._is_playing = False
+                        self._stop_active_processes_locked()
                     if self._on_state_change:
                         self._on_state_change(False)
                 continue
 
             with self._lock:
                 if gen < self._current_generation:
+                    self._stop_active_processes_locked()
                     continue  # Discard stale generation chunk
                 self._is_playing = True
                 self._last_playback_time = time.monotonic()
@@ -369,30 +406,11 @@ class AudioOutputManager:
                     if self._on_state_change:
                         self._on_state_change(True)
 
-            # Write chunk directly to hardware DAC
+            # Write chunk directly to hardware DAC or streaming aplay pipe
             if stream is not None and stream.active:
                 try:
                     stream.write(chunk)
                 except Exception as e:
                     self._log("warn", f"⚠️ [AudioOutputManager] DAC yazma hatası: {e}")
             else:
-                # Fallback to direct aplay pipe
-                self._play_chunk_via_aplay(chunk)
-
-    def _play_chunk_via_aplay(self, chunk: bytes) -> None:
-        # Zaman aşımı sesin kendi süresinden türetilir: sabit 2 sn, iki saniyeden uzun
-        # her cümleyi ortasından kesiyordu.
-        audio_s = len(chunk) / 2.0 / float(HW_SAMPLE_RATE)
-        try:
-            cmd = ["aplay", "-D", self.alsa_device, "-r", str(HW_SAMPLE_RATE), "-f", "S16_LE", "-c", "1", "-q"]
-            proc = subprocess.Popen(cmd, stdin=subprocess.PIPE)
-            with self._lock:
-                self._current_process = proc
-            proc.communicate(input=chunk, timeout=audio_s + 5.0)
-        except subprocess.TimeoutExpired:
-            self._log("warn", f"⚠️ [AudioOutputManager] aplay {audio_s:.1f}sn'lik sesi zamanında bitiremedi.")
-        except Exception as e:
-            self._log("warn", f"⚠️ [AudioOutputManager] aplay çalma hatası: {e}")
-        finally:
-            with self._lock:
-                self._current_process = None
+                self._play_chunk_via_aplay_pipe(chunk, gen)
