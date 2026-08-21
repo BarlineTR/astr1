@@ -673,7 +673,12 @@ class AstroRealtimeNode(Node):
                     from astro_audio.realtime_engine import classify_realtime_error, RealtimeState
                     _, failure_reason = classify_realtime_error(getattr(e, "code", None), err_str)
                 except Exception:
-                    failure_reason = "realtime_quota_exhausted" if ("quota" in err_str or "1013" in err_str) else "realtime_network_unavailable"
+                    if "insufficient_quota" in err_str or "credit_balance_exhausted" in err_str or "402" in err_str or ("quota" in err_str and "exhaust" in err_str):
+                        failure_reason = "realtime_quota_exhausted"
+                    elif "1013" in err_str:
+                        failure_reason = "realtime_temporary_1013"
+                    else:
+                        failure_reason = "realtime_network_unavailable"
 
                 self.get_logger().warn(
                     f"🚨 [REALTIME DEGRADED]\n"
@@ -682,8 +687,16 @@ class AstroRealtimeNode(Node):
                     f"  fallback_provider=edge_tts"
                 )
 
-                if "insufficient_quota" in err_str or "credit_balance_exhausted" in err_str or "1013" in err_str or "quota" in err_str:
+                # 1. Strict Quota Exhaustion (402, insufficient_quota, credit_balance_exhausted)
+                is_quota = (
+                    "insufficient_quota" in err_str
+                    or "credit_balance_exhausted" in err_str
+                    or "402" in err_str
+                    or ("quota" in err_str and ("exhaust" in err_str or "exceed" in err_str or "zero" in err_str or "balance" in err_str))
+                )
+                if is_quota and "1013" not in err_str:
                     self.get_logger().error(
+                        "🚨 [OPENAI QUOTA EXHAUSTED]\n"
                         "🚨 [REALTIME QUOTA EXHAUSTED]\n"
                         "  state=EXHAUSTED\n"
                         "  action=NOTIFYING_GLOBAL_CIRCUIT_BREAKER"
@@ -700,6 +713,21 @@ class AstroRealtimeNode(Node):
                         self._fallback_mode = True
                         self.get_logger().warn("🚀 [0-Maliyetli Groq & Edge-TTS Modu Devrede]: OpenAI Realtime kredisi tükendi. Astro kesintisiz olarak 0-Token Groq LLM + Edge-TTS modunda çalışıyor!")
                     await asyncio.sleep(86400.0)
+
+                # 2. WebSocket 1013 Temporary Failure (Overload / Server degradation)
+                elif "1013" in err_str or getattr(e, "code", None) == 1013:
+                    self.get_logger().warn(
+                        "⚠️ [REALTIME TEMPORARY FAILURE] code=1013\n"
+                        "⚠️ [REALTIME COOLDOWN] duration=15.0s"
+                    )
+                    try:
+                        from astro_ai.circuit_breaker import get_global_circuit_breaker, RequestErrorClass
+                        cb = get_global_circuit_breaker()
+                        if cb:
+                            cb.record_error("openai", sub_provider="openai_realtime", error_class=RequestErrorClass.REALTIME_TEMPORARY_FAILURE, error_msg="WS 1013 Temporary Overload")
+                    except Exception:
+                        pass
+                    await asyncio.sleep(15.0)
                 elif "4004" in err_str or "model_not_found" in err_str:
                     self.get_logger().warn(f"⚠️ [Realtime Model Bulunamadı] '{current_model}' modeline erişilemedi, bir sonraki modele geçiliyor...")
                     model_idx += 1

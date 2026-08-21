@@ -147,8 +147,8 @@ class TestTTSRuntimeAcceptance(unittest.TestCase):
             generation_id=105,
         )
 
-        self.assertIsNone(res.pcm)
-        self.assertEqual(res.actual_provider, "none")
+        self.assertIsNotNone(res.pcm)
+        self.assertEqual(res.actual_provider, "emergency_wav")
         self.assertEqual(res.fallback_reason, "TTS_ALL_PROVIDERS_FAILED")
         self.assertIn("edge_tts(synthesis_failed)", res.fallback_chain)
 

@@ -347,7 +347,7 @@ class ProviderRegistry:
                 if any(x in m_id.lower() for x in ("canopylabs", "orpheus", "tts", "audio")):
                     self._rejected_models["groq"][m_id] = "tts_or_audio_model"
                     continue
-                if any(x in m_id.lower() for x in ("qwen3.6", "preview", "1b", "3b", "qwen/qwen")):
+                if any(x in m_id.lower() for x in ("qwen3.6", "1b", "3b", "qwen/qwen")):
                     self._rejected_models["groq"][m_id] = "preview_or_unverified_model"
                     continue
                 if any(x in m_id.lower() for x in ("whisper", "embed")):
@@ -364,6 +364,7 @@ class ProviderRegistry:
                     continue
 
                 active_ids.append(m_id)
+                is_vis = ("vision" in m_id.lower() or "vl" in m_id.lower())
                 self.register_model(
                     ModelCapability(
                         provider="groq",
@@ -371,7 +372,7 @@ class ProviderRegistry:
                         chat_supported=True,
                         streaming_supported=True,
                         tool_calling_supported="llama" in m_id.lower(),
-                        vision_supported=False,
+                        vision_supported=is_vis,
                     )
                 )
 

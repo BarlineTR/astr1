@@ -66,6 +66,11 @@ try:
         GEMINI_PRODUCTION_MODELS,
         OPENAI_PRODUCTION_MODELS,
     )
+    from astro_ai.multimodal_perception import (
+        MultimodalPerceptionState,
+        SocialContextEngine,
+        SocialContextState,
+    )
     from astro_audio.local_audio_resources import get_local_audio_resources
 except ImportError:
     from state_machine import StateMachine, RobotState
@@ -91,10 +96,18 @@ except ImportError:
             GEMINI_PRODUCTION_MODELS,
             OPENAI_PRODUCTION_MODELS,
         )
+        from multimodal_perception import (
+            MultimodalPerceptionState,
+            SocialContextEngine,
+            SocialContextState,
+        )
         from local_audio_resources import get_local_audio_resources
     except ImportError:
         get_global_circuit_breaker = lambda: None
         ProviderRegistry = None
+        MultimodalPerceptionState = None
+        SocialContextEngine = None
+        SocialContextState = None
         get_local_audio_resources = lambda: None
 
 
@@ -263,23 +276,6 @@ class AiBrainNode(Node):
             self._enabled = True
             self.get_logger().info("✅ [AI Brain] Google Gemini REST metin motoru hazır.")
 
-    def _play_local_ack(self, ack_pcm: bytes, generation_id: int = 0):
-        """Plays low-latency pre-generated local ACK WAV via AudioOutputManager or local aplay."""
-        try:
-            from astro_audio.audio_output_manager import AudioOutputManager
-            out_mgr = AudioOutputManager.get_instance()
-            if out_mgr and ack_pcm:
-                out_mgr.play_pcm_chunk(ack_pcm, sample_rate=16000, generation_id=generation_id, provenance={"source": "thinking_ack_local"})
-                return
-        except Exception:
-            pass
-        try:
-            if ack_pcm:
-                import subprocess
-                subprocess.Popen(["aplay", "-q", "-r", "16000", "-f", "S16_LE", "-c", "1"], stdin=subprocess.PIPE, stderr=subprocess.DEVNULL).communicate(ack_pcm, timeout=0.4)
-        except Exception:
-            pass
-
         if not self._enabled:
             self.get_logger().error(
                 "❌ [AI Brain] GROQ_API_KEY / OPENAI_API_KEY / GEMINI_API_KEY bulunamadı! LLM devre dışı."
@@ -288,6 +284,7 @@ class AiBrainNode(Node):
         # Perception & Hardware State
         self._lock = threading.Lock()
         self._is_processing = False
+        self._processing_start_time = 0.0
         self._tts_speaking = False
         self._person_detected = False
         self._looking_at_robot = False
@@ -306,6 +303,8 @@ class AiBrainNode(Node):
         self._latest_frame = None
         self._latest_frame_time = 0.0
 
+        # Multimodal Perception & Social Context Engine
+        self.social_context_engine = SocialContextEngine() if SocialContextEngine else None
 
         # ROS 2 Publishers
         self.pub_tts = self.create_publisher(String, "/tts/say", 10)
@@ -334,14 +333,31 @@ class AiBrainNode(Node):
         self.create_timer(1.0, self._check_session_lifecycle)
         self.create_timer(1.0, self._check_reminders)
 
-        # Idle Learning (Powered 100% by Groq, 0 OpenAI token cost)
+        # Idle Learning (Powered 100% by Groq/Gemini, 0 OpenAI token cost)
         if self._enable_idle_learning:
             self._start_idle_learning()
-            self.get_logger().info("🤖 [AI Brain] Groq Tabanlı Otonom Boşta Öğrenme ve Bellek Güçlendirme Aktif!")
+            self.get_logger().info("🤖 [AI Brain] Groq/Gemini Tabanlı Otonom Boşta Öğrenme ve Bellek Güçlendirme Aktif!")
 
         self.get_logger().info(
             f"🧠 [AI Brain Node] Modüler Mimari Hazır! Kişilik: [{self.persona_engine.current_persona.upper()}]"
         )
+
+    def _play_local_ack(self, ack_pcm: bytes, generation_id: int = 0):
+        """Plays low-latency pre-generated local ACK WAV via AudioOutputManager or local aplay."""
+        try:
+            from astro_audio.audio_output_manager import AudioOutputManager
+            out_mgr = AudioOutputManager.get_instance()
+            if out_mgr and ack_pcm:
+                out_mgr.play_pcm_chunk(ack_pcm, sample_rate=16000, generation_id=generation_id, provenance={"source": "thinking_ack_local"})
+                return
+        except Exception:
+            pass
+        try:
+            if ack_pcm:
+                import subprocess
+                subprocess.Popen(["aplay", "-q", "-r", "16000", "-f", "S16_LE", "-c", "1"], stdin=subprocess.PIPE, stderr=subprocess.DEVNULL).communicate(ack_pcm, timeout=0.4)
+        except Exception:
+            pass
 
     def _discover_active_groq_models(self) -> List[str]:
         """Dynamically queries active chat models from Groq, prioritizing top conversational models and excluding reasoning models."""
@@ -457,23 +473,33 @@ class AiBrainNode(Node):
         self._person_detected = msg.data
         if msg.data:
             self._last_person_seen_time = time.monotonic()
+        if self.social_context_engine:
+            self.social_context_engine.update_visual(person_detected=msg.data, person_count=1 if msg.data else 0)
 
     def _on_user_distance(self, msg: Float32):
         self._user_distance = float(msg.data)
+        if self.social_context_engine:
+            self.social_context_engine.update_visual(face_distance_m=float(msg.data))
 
     def _on_user_emotion(self, msg: String):
         self._user_emotion = msg.data.lower().strip()
+        if self.social_context_engine:
+            self.social_context_engine.update_visual(emotion=self._user_emotion)
 
     def _on_speaker_gender(self, msg: String):
         self._speaker_gender = msg.data.lower().strip()
 
     def _on_doa(self, msg: Float32):
         self._speaker_angle = float(msg.data)
+        if self.social_context_engine:
+            self.social_context_engine.update_audio(doa_angle_deg=float(msg.data))
 
     def _on_looking_at_robot(self, msg: Bool):
         is_looking = msg.data
         now = time.monotonic()
         self.session.update_gaze(is_looking)
+        if self.social_context_engine:
+            self.social_context_engine.update_visual(looking_at_robot=is_looking)
         with self._gaze_lock:
             if is_looking:
                 if not self._looking_at_robot:
@@ -677,17 +703,19 @@ class AiBrainNode(Node):
         }
 
     def _on_speech(self, msg: String):
+        self.get_logger().info(f"[TURN RECEIVED] text=\"{msg.data}\"")
         if not self._enabled:
+            self.get_logger().warn("[TURN DROPPED] reason=node_disabled")
             return
 
         raw_text = normalize_turkish_speech_input(re.sub(r"^['\"`´“”‘’]+|['\"`´“”‘’]+$", "", msg.data.strip()).strip())
         if not raw_text:
+            self.get_logger().warn("[TURN DROPPED] reason=empty_text")
             return
-
 
         now = time.monotonic()
         if (now - getattr(self, '_last_llm_turn_time', 0.0)) < 0.35:
-            self.get_logger().debug("Debouncing rapid speech message")
+            self.get_logger().warn(f"[TURN DROPPED] reason=debounced_rapid_speech text=\"{raw_text}\"")
             return
         self._last_llm_turn_time = now
 
@@ -720,6 +748,7 @@ class AiBrainNode(Node):
             self._publish_tts(ack_map.get(persona, "Kişiliğim güncellendi!"))
             self.session.activate_session(reason="persona_switch")
             self.state_machine.transition_to(RobotState.LISTENING)
+            self.get_logger().info(f"[SESSION STARTED] reason=persona_switch raw_text=\"{raw_text}\"")
             return
 
         # Handle ongoing interactive multi-turn biometric enrollment
@@ -728,8 +757,13 @@ class AiBrainNode(Node):
             self._publish_interrupt()
             with self._lock:
                 if self._is_processing:
-                    return
+                    if (now - getattr(self, '_processing_start_time', 0.0)) > 12.0:
+                        self._is_processing = False
+                    else:
+                        self.get_logger().warn(f"[TURN DROPPED] reason=already_processing text=\"{raw_text}\"")
+                        return
                 self._is_processing = True
+                self._processing_start_time = now
                 captured_frame = None
                 if self._latest_frame is not None and (now - self._latest_frame_time) < 4.0:
                     captured_frame = self._latest_frame.copy()
@@ -737,20 +771,20 @@ class AiBrainNode(Node):
             threading.Thread(target=self._process_llm, args=(raw_text, captured_frame, t_vad_start), daemon=True).start()
             return
 
-
         has_wake_word, clean_prompt = self.session.is_wake_word(raw_text, self._wake_word)
 
-        # If IDLE: Only activate on Explicit Wake Word ("Hey Astro") OR Direct Gaze (Looking at Robot)
-        if self.state_machine.is_idle():
-            if has_wake_word or self._looking_at_robot:
-                activation_reason = "wake_word" if has_wake_word else "gaze"
-                self.session.activate_session(reason=activation_reason)
-                self.state_machine.transition_to(RobotState.LISTENING)
-                persona = self.persona_engine.current_persona
-                self.get_logger().info(f"✨ [AI] Etkileşim Başlatıldı ({persona.upper()} - {activation_reason}): '{raw_text}'")
-                self._publish_emotion(persona)
-                self._publish_gesture("nod")
+        if has_wake_word:
+            self.session.activate_session(reason="wake_word")
+            self.state_machine.transition_to(RobotState.LISTENING)
+            persona = self.persona_engine.current_persona
+            self.get_logger().info(f"[SESSION STARTED] reason=wake_word raw_text=\"{raw_text}\"")
+            self._publish_emotion(persona)
+            self._publish_gesture("nod")
 
+            pure_greetings = ["merhaba", "merhabalar", "selam", "selamlar", "günaydın", "iyi günler", "iyi akşamlar", "efendim", "hoş bulduk", "hoş geldiniz", "selamün aleyküm", "selamun aleykum", "hey"]
+            is_pure_greeting = (raw_text.lower().strip(" .,!?:;") in pure_greetings) or (not clean_prompt) or (len(clean_prompt) < 2)
+
+            if is_pure_greeting:
                 greeting_map = {
                     "flirt": "Buyur güzellik, bütün algılarım seninle..." if self._speaker_gender == "female" else "Söyle bakalım kral, seni dinliyorum!",
                     "playful": "Merhaba! Seni dinliyorum, nasıl yardımcı olabilirim?",
@@ -761,19 +795,28 @@ class AiBrainNode(Node):
                     "rude": "Ne var birader, kısa kes!"
                 }
                 greeting = greeting_map.get(persona, "Merhaba! Seni dinliyorum, nasıl yardımcı olabilirim?")
-                pure_greetings = ["merhaba", "merhabalar", "selam", "selamlar", "günaydın", "iyi günler", "iyi akşamlar", "efendim", "hoş bulduk", "hoş geldiniz", "selamün aleyküm", "selamun aleykum", "hey"]
-                is_pure_greeting = (raw_text.lower().strip(" .,!?:;") in pure_greetings) or (not clean_prompt) or (len(clean_prompt) < 3)
-
-                if is_pure_greeting:
-                    t_done = time.monotonic()
-                    turn_ms = (t_done - t_vad_start) * 1000.0
-                    self.session.latency_tracker.record_turn(0.0, turn_ms, turn_ms)
-                    stats = self.session.latency_tracker.get_stats()
-                    self.get_logger().info(f"⚡ [Latency] Hızlı Yanıt: {turn_ms:.0f}ms (Doğrudan Selamlama) | p50: {stats['p50_total_ms']}ms, p95: {stats['p95_total_ms']}ms")
-                    self._publish_tts(greeting)
-                    return
-                else:
-                    raw_text = clean_prompt
+                t_done = time.monotonic()
+                turn_ms = (t_done - t_vad_start) * 1000.0
+                self.session.latency_tracker.record_turn(0.0, turn_ms, turn_ms)
+                stats = self.session.latency_tracker.get_stats()
+                self.get_logger().info(f"⚡ [Latency] Hızlı Yanıt: {turn_ms:.0f}ms (Doğrudan Selamlama) | p50: {stats['p50_total_ms']}ms, p95: {stats['p95_total_ms']}ms")
+                self._publish_tts(greeting)
+                return
+            else:
+                raw_text = clean_prompt
+        elif self.session.is_active():
+            # In an active conversation turn
+            pass
+        elif self.state_machine.is_idle():
+            # In IDLE without wake word: Check Gaze or Social Context
+            social_ctx = self.social_context_engine.get_state().social_context if self.social_context_engine else SocialContextState.ISOLATED_IDLE
+            if self._looking_at_robot or social_ctx == SocialContextState.DIRECT_INTERACTION:
+                self.session.activate_session(reason="gaze")
+                self.state_machine.transition_to(RobotState.LISTENING)
+                self.get_logger().info(f"[SESSION STARTED] reason=gaze raw_text=\"{raw_text}\"")
+                persona = self.persona_engine.current_persona
+                self._publish_emotion(persona)
+                self._publish_gesture("nod")
             else:
                 self.get_logger().info(f"🕵️ [Arka Plan]: '{raw_text}' sosyal filtrede inceleniyor...")
                 if self._evaluate_social_barge_in(raw_text):
@@ -781,8 +824,9 @@ class AiBrainNode(Node):
                     self.session.activate_session(reason="social_barge_in")
                     self.session.metadata["tts_engine"] = "edge-tts"
                     self.state_machine.transition_to(RobotState.LISTENING)
+                    self.get_logger().info(f"[SESSION STARTED] reason=social_barge_in raw_text=\"{raw_text}\"")
                 else:
-                    self.get_logger().info(f"🔇 [Arka Plan]: '{raw_text}' yok sayıldı (İlgisiz).")
+                    self.get_logger().info(f"[TURN DROPPED] reason=social_filter text=\"{raw_text}\"")
                     return
 
         # Active Session Turn
@@ -791,8 +835,14 @@ class AiBrainNode(Node):
 
         with self._lock:
             if self._is_processing:
-                return
+                if (now - getattr(self, '_processing_start_time', 0.0)) > 12.0:
+                    self.get_logger().warn("⚠️ [AI] Önceki LLM işlemi zaman aşımına uğradı (>12s), kilit sıfırlanıyor.")
+                    self._is_processing = False
+                else:
+                    self.get_logger().warn(f"[TURN DROPPED] reason=already_processing text=\"{raw_text}\"")
+                    return
             self._is_processing = True
+            self._processing_start_time = now
 
             captured_frame = None
             if self._latest_frame is not None and (now - self._latest_frame_time) < 4.0:
@@ -1117,6 +1167,7 @@ class AiBrainNode(Node):
                     if not self.circuit_breaker.is_available("groq", model_id=m):
                         continue
                     provider_attempts += 1
+                    self.get_logger().info(f"[LLM ROUTE] provider=groq model={m} reason=primary")
                     try:
                         stream_resp = self._groq.chat.completions.create(
                             messages=messages,
@@ -1169,6 +1220,7 @@ class AiBrainNode(Node):
             gemini_available = self.circuit_breaker.is_available("gemini", sub_provider="gemini_text") if self.circuit_breaker else True
             if not full_text and self._ai_api_key and gemini_available:
                 provider_attempts += 1
+                self.get_logger().info("[LLM ROUTE] provider=gemini model=gemini-2.0-flash reason=fallback")
                 try:
                     gemini_text = self._query_gemini_text_rest(system_prompt, user_text, self.memory.episodic.get_messages())
                     if gemini_text and not is_canned_refusal(gemini_text):
@@ -1185,6 +1237,7 @@ class AiBrainNode(Node):
             # Step 4: Tertiary Emergency Fallback: OpenAI Client (Only if healthy & available)
             if not full_text and self._openai and self.circuit_breaker and self.circuit_breaker.is_available("openai", sub_provider="openai_rest"):
                 provider_attempts += 1
+                self.get_logger().info("[LLM ROUTE] provider=openai model=gpt-4o-mini reason=tertiary_fallback")
                 try:
                     stream_resp = self._openai.chat.completions.create(
                         messages=messages,
@@ -1233,6 +1286,7 @@ class AiBrainNode(Node):
                 llm_provider = "emergency_local_persona"
                 fallback_chain.append("emergency_local_persona")
 
+            self.get_logger().info(f"[LLM RESPONSE] provider={llm_provider} length={len(clean_full)} text=\"{clean_full}\"")
             self.cloud_mgr.record_llm_success()
             self.get_logger().info(f"🤖 [Astro]: \"{clean_full}\"")
             self.memory.episodic.add_message("assistant", clean_full)
@@ -1867,7 +1921,7 @@ class AiBrainNode(Node):
 
     def _idle_learning_loop(self):
         cycle_count = 0
-        last_person_state = False
+        last_snap = None
         while rclpy.ok():
             time.sleep(5)
             if not self._enable_idle_learning:
@@ -1885,41 +1939,52 @@ class AiBrainNode(Node):
                 # 1. Background Cognitive Memory Reflection
                 self._idle_memory_reflection()
 
-                # 2. Perception Change Gating (OAK-D Camera, Person, Voice DOA)
+                # 2. Multimodal Perception Snapshot & Change Gating
+                current_snap = self.social_context_engine.get_snapshot() if self.social_context_engine else {
+                    "lidar": {"nearest_distance_m": 0.0, "nearest_angle_deg": 0.0, "obstacle_count": 0, "motion_detected": False, "timestamp": now},
+                    "audio": {"doa_angle_deg": self._speaker_angle, "voice_activity": False, "speech_detected": False, "speaker_confidence": 0.0, "audio_event": False, "timestamp": now},
+                    "visual": {"person_detected": self._person_detected, "person_count": 1 if self._person_detected else 0, "face_distance_m": self._user_distance, "gaze_direction": 0.0, "looking_at_robot": self._looking_at_robot, "emotion": self._user_emotion, "scene_signature": "", "object_candidates": [], "timestamp": now},
+                    "social_context": "ISOLATED_IDLE",
+                    "timestamp": now,
+                }
+
                 captured_frame = None
                 with self._lock:
                     if self._latest_frame is not None and (now - self._latest_frame_time) < 4.0:
                         captured_frame = self._latest_frame.copy()
 
-                person_changed = (self._person_detected != last_person_state)
-                last_person_state = self._person_detected
-                scene_changed = person_changed or (captured_frame is not None and getattr(self, '_idle_frame_seen', False) is False)
-                audio_event = False  # Tracked by VAD energy in speech node
+                has_change = True
+                trigger = "initial_cycle"
+                if last_snap is not None and self.social_context_engine:
+                    has_change, trigger = self.social_context_engine.has_perception_change(last_snap, current_snap)
+                elif last_snap is not None:
+                    has_change = (current_snap["visual"]["person_detected"] != last_snap["visual"]["person_detected"])
+                    trigger = "person_change" if has_change else "none"
+
+                last_snap = current_snap
 
                 # Gating Check: If NO perception change, skip cloud LLM completely!
-                if not scene_changed and not person_changed and not audio_event:
+                if not has_change:
                     idle_latency_ms = (time.monotonic() - t_cycle_start) * 1000.0
                     self.get_logger().info(
                         f"\n[ASTRO IDLE]\n"
                         f"cycle_id={cycle_id}\n"
-                        f"camera=true\n"
-                        f"radar=true\n"
-                        f"microphone=true\n"
-                        f"persons={1 if self._person_detected else 0}\n"
-                        f"scene_changed=false\n"
-                        f"audio_event=false\n"
+                        f"lidar={current_snap['lidar']}\n"
+                        f"doa={current_snap['audio']}\n"
+                        f"camera={current_snap['visual']}\n"
+                        f"social_context={current_snap['social_context']}\n"
+                        f"perception_trigger=none\n"
                         f"llm_used=false\n"
-                        f"llm_provider=none\n"
-                        f"memory_candidate=false\n"
-                        f"memory_written=false\n"
-                        f"latency_ms={idle_latency_ms:.1f}\n"
-                        f"skip_reason=no_perception_change"
+                        f"confidence=0.00\n"
+                        f"persisted=false\n"
+                        f"skip_reason=no_perception_change\n"
+                        f"latency_ms={idle_latency_ms:.1f}"
                     )
                     continue
 
                 self._idle_frame_seen = True
 
-                # 3. Room Scene Observation via Groq/Gemini Vision ONLY
+                # 3. Room Scene Observation via Groq/Gemini Vision ONLY (OpenAI is 100% Forbidden)
                 if captured_frame is not None:
                     base64_img = frame_to_base64_jpeg(captured_frame, max_dim=512)
                     if base64_img:
@@ -1927,9 +1992,10 @@ class AiBrainNode(Node):
                         prompt = "Kameradaki odayı, ortamı veya nesneleri Türkçe olarak tek bir kısa cümleyle açıkla. Açıklama harici hiçbir şey yazma. Örnek: 'Masada bir bilgisayar var.' veya 'Oda aydınlık ve sakin.'"
                         obs = self._query_groq_vision_for_idle(prompt, base64_img)
                         memory_written = False
+                        confidence = 0.85
                         if obs:
                             # Memory Write Gating: confidence check (>= 0.70)
-                            self.memory.profile.add_observation(obs, confidence=0.85)
+                            self.memory.profile.add_observation(obs, confidence=confidence)
                             memory_written = True
                             self.get_logger().info(f"🧠 [Otonom Boşta Gözlem]: {obs}")
 
@@ -1953,18 +2019,17 @@ class AiBrainNode(Node):
                         self.get_logger().info(
                             f"\n[ASTRO IDLE]\n"
                             f"cycle_id={cycle_id}\n"
-                            f"camera=true\n"
-                            f"radar=true\n"
-                            f"microphone=true\n"
-                            f"persons={1 if self._person_detected else 0}\n"
-                            f"scene_changed=true\n"
-                            f"audio_event={audio_event}\n"
+                            f"lidar={current_snap['lidar']}\n"
+                            f"doa={current_snap['audio']}\n"
+                            f"camera={current_snap['visual']}\n"
+                            f"social_context={current_snap['social_context']}\n"
+                            f"perception_trigger={trigger}\n"
                             f"llm_used=true\n"
-                            f"llm_provider=groq/vision\n"
-                            f"memory_candidate=true\n"
-                            f"memory_written={memory_written}\n"
-                            f"latency_ms={idle_latency_ms:.1f}\n"
-                            f"skip_reason=none"
+                            f"provider=groq/vision\n"
+                            f"confidence={confidence:.2f}\n"
+                            f"persisted={memory_written}\n"
+                            f"reason=scene_observation\n"
+                            f"latency_ms={idle_latency_ms:.1f}"
                         )
 
     def _is_visual_query(self, text: str) -> bool:
@@ -2160,6 +2225,8 @@ class AiBrainNode(Node):
         last_u = getattr(self.session, "last_user_text", "")
         clean = response_length_gate(text, user_query=last_u, max_words=35, max_sentences=2)
         if clean:
+            tts_engine = self.session.metadata.get("tts_engine", "edge-tts")
+            self.get_logger().info(f"[TTS REQUESTED] provider={tts_engine} text=\"{clean}\"")
             msg = String()
             if self.session.metadata.get("tts_engine") == "edge-tts":
                 payload = {"text": clean, "engine": "edge-tts"}
@@ -2167,6 +2234,7 @@ class AiBrainNode(Node):
             else:
                 msg.data = clean
             self.pub_tts.publish(msg)
+            self.get_logger().info("[PLAYBACK STARTED]")
 
     def _publish_interrupt(self):
         msg = Bool()

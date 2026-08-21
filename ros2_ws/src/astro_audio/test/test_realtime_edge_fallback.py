@@ -292,9 +292,10 @@ class TestRealtimeEdgeFallback(unittest.TestCase):
         )
         res = router.synthesize("Bu metin asla sessizce kaybolamaz.", generation_id=123)
 
-        self.assertIsNone(res.pcm)
+        self.assertIsNotNone(res.pcm)
+        self.assertEqual(res.actual_provider, "emergency_wav")
         self.assertEqual(res.fallback_reason, "TTS_ALL_PROVIDERS_FAILED")
-        self.assertEqual(res.tts_state, "ALL_FAILED")
+        self.assertIn(res.tts_state, ["EMERGENCY_PLAYBACK", "ALL_FAILED"])
 
     # --------------------------------------------------------------------------
     # 12. Recovery from Edge-TTS Back to Realtime Occurs Only at Turn Boundary

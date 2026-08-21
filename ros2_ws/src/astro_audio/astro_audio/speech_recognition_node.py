@@ -444,31 +444,35 @@ class SpeechRecognitionNode(Node):
                 return
             text_lower = text.lower().strip(" .,!?:;")
 
+            is_wake_contained = any(w in text_lower for w in ["astro", "hey astro", "astor", "aston", "asistan"])
+
             # Hallucination Filter: Ignore known Whisper silence phantom phrases
             silence_hallucinations = [
                 "altyazı m.k.", "altyazı m.k", "altyazı:", "altyazı", "altyazi", "amara.org",
-                "iyi misin", "teşekkür ederim", "teşekkürler", "abone ol",
-                "abone olmayı unutmayın", "videoyu beğenmeyi",
+                "abone ol", "abone olmayı unutmayın", "videoyu beğenmeyi",
                 "izlediğiniz için teşekkürler", "izlediginiz icin tesekkurler",
                 "görüşmek üzere", "hoşça kalın", "hoşçakalın", "sağ olun", "kalbimde sizle geldim",
                 "merhaba, kalbimde sizle geldim", "sizle geldim", "ben ali", "merhaba, ben ali",
                 "sıfır tutu", "gizletme üzerime", "yanıldım gözlerimde"
             ]
-            if any(sh in text_lower for sh in silence_hallucinations) and (total_rms < 600.0 or voice_ratio < 0.35):
-                self.get_logger().info(f'🔇 [Whisper Hallucination Filtrelendi (RMS: {total_rms:.1f})]: "{text}"')
+            if not is_wake_contained and any(sh in text_lower for sh in silence_hallucinations) and (total_rms < 600.0 or voice_ratio < 0.35):
+                self.get_logger().info(f'[STT FILTER] text="{text}" rms={total_rms:.1f} decision=reject reason=whisper_hallucination')
                 return
 
             # Reject isolated 'merhaba' if voice energy is low or voice duration under 0.5s
-            if text_lower in ["merhaba", "merhabalar"] and (total_rms < 480.0 or total_voice_duration < 0.45):
+            if not is_wake_contained and text_lower in ["merhaba", "merhabalar"] and (total_rms < 480.0 or total_voice_duration < 0.45):
+                self.get_logger().info(f'[STT FILTER] text="{text}" rms={total_rms:.1f} decision=reject reason=low_energy_merhaba')
                 return
 
             # Context-aware single-word filter: Only reject when NO active conversation session
             # During active session, "evet"/"hayır"/"tamam" are legitimate user responses
             always_hallucinations = ["hı hı", "hı", "cık", "çık", "eee", "ııı", "hmm"]
             session_dependent = ["evet", "hayır", "tamam"]
-            if text_lower in always_hallucinations:
+            if not is_wake_contained and text_lower in always_hallucinations:
+                self.get_logger().info(f'[STT FILTER] text="{text}" rms={total_rms:.1f} decision=reject reason=filler_hallucination')
                 return
-            if text_lower in session_dependent and not self._session_active:
+            if not is_wake_contained and text_lower in session_dependent and not self._session_active:
+                self.get_logger().info(f'[STT FILTER] text="{text}" rms={total_rms:.1f} decision=reject reason=inactive_session_single_word')
                 return
 
             # Filter empty / junk / phantom noise when acoustic evidence is weak
@@ -477,11 +481,12 @@ class SpeechRecognitionNode(Node):
                 "you", "thank you", "bye", "subtitles", "watching", "amara.org",
                 "kalbimde", "sizle geldim", "sıfır tutu", "gizletme üzerime", "diz"
             ]
-            if any(junk in text_lower for junk in junk_filters) and (total_rms < 450.0 or voice_ratio < 0.30 or total_voice_duration < 0.30):
-                self.get_logger().info(f'🔇 [Phantom Gürültü Filtrelendi (RMS: {total_rms:.1f})]: "{text}"')
+            if not is_wake_contained and any(junk in text_lower for junk in junk_filters) and (total_rms < 450.0 or voice_ratio < 0.30 or total_voice_duration < 0.30):
+                self.get_logger().info(f'[STT FILTER] text="{text}" rms={total_rms:.1f} decision=reject reason=phantom_noise')
                 return
 
-            if len(text_lower) < 3 and text_lower not in ["ne", "su", "al", "ev", "on", "dur", "hey", "lan"]:
+            if not is_wake_contained and len(text_lower) < 3 and text_lower not in ["ne", "su", "al", "ev", "on", "dur", "hey", "lan"]:
+                self.get_logger().info(f'[STT FILTER] text="{text}" rms={total_rms:.1f} decision=reject reason=too_short')
                 return
 
             # ── Self-Echo Immunity Check ──────────────────────────────────────────
@@ -491,13 +496,13 @@ class SpeechRecognitionNode(Node):
                 for past_phrase, past_time in self._recent_tts_phrases:
                     if (now - past_time) < 8.0:
                         if text_lower in past_phrase or past_phrase in text_lower:
-                            self.get_logger().info(f'🔇 [Yankı / Robot Kendi Sesini Duydu — Filtrelendi]: "{text}"')
+                            self.get_logger().info(f'[STT FILTER] text="{text}" rms={total_rms:.1f} decision=reject reason=self_echo_match')
                             return
                         # Check word overlap
                         words_heard = set(text_lower.split())
                         words_spoken = set(past_phrase.split())
                         if len(words_heard) >= 2 and len(words_heard.intersection(words_spoken)) >= len(words_heard) * 0.75:
-                            self.get_logger().info(f'🔇 [Yankı / Robot Kendi Sesini Duydu — Filtrelendi]: "{text}"')
+                            self.get_logger().info(f'[STT FILTER] text="{text}" rms={total_rms:.1f} decision=reject reason=self_echo_overlap')
                             return
 
             if text and text not in [".", "...", ",", "!", "?"]:
@@ -508,6 +513,7 @@ class SpeechRecognitionNode(Node):
 
                 audio_s = len(arr) / float(self._sample_rate)
                 rtf = (stt_ms / 1000.0) / audio_s if audio_s > 0 else 0.0
+                self.get_logger().info(f'[STT FILTER] text="{text}" rms={total_rms:.1f} decision=accept reason=valid_speech')
                 self.get_logger().info(
                     f'🎤 [Duyulan]: "{text}" '
                     f'(STT: {stt_ms:.0f}ms | motor: {stt_engine_used} | ses: {audio_s:.1f}sn | RTF: {rtf:.2f})'

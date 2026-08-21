@@ -25,6 +25,7 @@ class ProviderState(str, Enum):
 class RequestErrorClass(str, Enum):
     NONE = "none"
     QUOTA_EXHAUSTED = "quota_exhausted"
+    REALTIME_TEMPORARY_FAILURE = "realtime_temporary_failure"
     RATE_LIMITED = "rate_limited"
     NETWORK_ERROR = "network_error"
     TIMEOUT = "timeout"
@@ -140,16 +141,19 @@ class GlobalProviderCircuitBreaker:
         """Deterministically classifies any exception or status code into RequestErrorClass."""
         raw = f"{err_msg} {str(exc) if exc else ''}".lower()
 
-        # Quota Exhaustion
+        # Quota Exhaustion (Strictly for HTTP 402, insufficient_quota, credit_balance_exhausted, explicit billing error)
         if (
             status_code == 402
             or "insufficient_quota" in raw
             or "credit_balance_exhausted" in raw
-            or "quota" in raw and ("exhaust" in raw or "exceed" in raw or "zero" in raw)
+            or ("quota" in raw and ("exhaust" in raw or "exceed" in raw or "zero" in raw or "balance" in raw or "insufficient" in raw))
             or "billing" in raw
-            or "1013" in raw
         ):
             return RequestErrorClass.QUOTA_EXHAUSTED
+
+        # Realtime Temporary Failure (Close code 1013, server overloaded, temporary failure)
+        if "1013" in raw or "realtime_temporary" in raw or "server overloaded" in raw or "try again later" in raw:
+            return RequestErrorClass.REALTIME_TEMPORARY_FAILURE
 
         # Rate Limiting
         if (
@@ -282,6 +286,7 @@ class GlobalProviderCircuitBreaker:
                 p_rec.state = ProviderState.EXHAUSTED
                 self._log(
                     "error",
+                    f"🚨 [OPENAI QUOTA EXHAUSTED]\n"
                     f"🚨 [PROVIDER CIRCUIT BREAKER]\n"
                     f"  provider={parent_key}\n"
                     f"  state=EXHAUSTED\n"
@@ -295,6 +300,23 @@ class GlobalProviderCircuitBreaker:
                         sub_rec.last_error = error_msg
                         sub_rec.last_error_class = error_class
                 return ProviderState.EXHAUSTED
+
+            # REALTIME TEMPORARY FAILURE (1013): Cooldown on openai_realtime only, parent stays AVAILABLE
+            if error_class == RequestErrorClass.REALTIME_TEMPORARY_FAILURE:
+                sub_k = sub_provider.lower() if sub_provider else "openai_realtime"
+                if sub_k in self._sub_providers:
+                    _, s_rec = self._sub_providers[sub_k]
+                    s_rec.state = ProviderState.COOLDOWN
+                    s_rec.cooldown_until = now + 15.0
+                    s_rec.last_error = error_msg
+                    s_rec.last_error_class = error_class
+                self._log(
+                    "warn",
+                    f"⚠️ [REALTIME TEMPORARY FAILURE] code=1013\n"
+                    f"  [REALTIME COOLDOWN] duration=15.0s\n"
+                    f"  parent={parent_key} (remains AVAILABLE)"
+                )
+                return ProviderState.COOLDOWN
 
             # RATE LIMITED: Enforce Cooldown
             if error_class == RequestErrorClass.RATE_LIMITED:
