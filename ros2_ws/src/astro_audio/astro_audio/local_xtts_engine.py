@@ -161,6 +161,7 @@ class LocalXttsEngine(BaseTTSEngine):
         vocab: Optional[str] = None,
         speakers: Optional[str] = None,
         logger: Optional[Callable[[str, str], None]] = None,
+        mock: bool = False,
     ):
         self._log = logger or (lambda lvl, msg: None)
         self.home = resolve_xtts_home(home or "")
@@ -240,6 +241,12 @@ class LocalXttsEngine(BaseTTSEngine):
             "error": "none" if self.ft_paths["all_required_exist"] else "missing_fine_tuned_files",
             "xtts_admission_decision": "PENDING",
             "xtts_admission_reject_reason": "none",
+            "xtts_queue_wait_ms": 0.0,
+            "xtts_model_load_ms": 0.0,
+            "xtts_infer_ms": 0.0,
+            "xtts_ttfa_ms": 0.0,
+            "xtts_total_ms": 0.0,
+            "fallback_reason": "none",
         }
         self._last_telemetry.update(mem_snap)
 
@@ -493,34 +500,57 @@ class LocalXttsEngine(BaseTTSEngine):
             return None
 
         t_start = time.perf_counter()
+        synth_timeout = float(os.getenv("TTS_XTTS_SYNTHESIS_TIMEOUT_S", "45.0"))
         try:
             res = self.client.synthesize_chunk(
                 text=text,
                 generation_id=generation_id,
                 return_pcm=True,
                 language=language or self.language,
-                timeout=20.0,
+                timeout=synth_timeout,
             )
 
             if res.get("cancelled") or not res.get("ok"):
                 return None
 
             pcm_bytes = res.get("pcm_bytes")
-            gpu_ms = res.get("gpu_inference_ms", 0.0)
+            tot_ms = (time.perf_counter() - t_start) * 1000.0
+            gpu_ms = res.get("gpu_inference_ms", tot_ms)
+            q_wait = max(0.0, tot_ms - gpu_ms)
             rtf = res.get("rtf", 0.0)
             vram = res.get("gpu_memory_mb", 0.0)
 
             self._last_telemetry.update({
-                "last_infer_ms": gpu_ms,
+                "xtts_queue_wait_ms": round(q_wait, 1),
+                "xtts_model_load_ms": 0.0,
+                "xtts_infer_ms": round(gpu_ms, 1),
+                "xtts_ttfa_ms": round(tot_ms, 1),
+                "xtts_total_ms": round(tot_ms, 1),
+                "last_infer_ms": round(gpu_ms, 1),
                 "rtf": rtf,
                 "gpu_memory_mb": vram,
                 "ready": True,
                 "state": "READY",
+                "fallback_reason": "none",
             })
 
             return pcm_bytes
 
         except Exception as exc:
+            tot_ms = (time.perf_counter() - t_start) * 1000.0
+            is_timeout = "timed out" in str(exc).lower()
+            self._last_telemetry["fallback_reason"] = "xtts_timeout" if is_timeout else str(exc)
+
+            if is_timeout:
+                self._safe_log("warn", f"⏳ [LocalXttsEngine] XTTS sentez zaman aşımı ({tot_ms:.0f}ms > {synth_timeout:.0f}s): {exc} — Worker canlı tutuluyor, generation emergency fallback'e geçiyor.")
+                with self._state_lock:
+                    self._degraded_until = time.monotonic() + 15.0
+                    self._state = "DEGRADED"
+                self._last_telemetry["ready"] = False
+                self._last_telemetry["state"] = "DEGRADED"
+                self._last_telemetry["error"] = f"fallback_reason=xtts_timeout ({exc})"
+                return None
+
             self._safe_log("warn", f"⚠️ [LocalXttsEngine] Sentez hatası: {exc}")
             if not self.client.is_alive:
                 proc_code = getattr(self.client.proc, "returncode", None) if self.client.proc else None
@@ -528,7 +558,6 @@ class LocalXttsEngine(BaseTTSEngine):
                 if is_oom:
                     self.memory_guard.record_oom_kill(pid=getattr(self.client.proc, "pid", None), details=str(exc))
                     with self._state_lock:
-                        # Gerçek OOM ölümü kalıcı karantinadır — süre dolumu yok.
                         self._degraded_until = time.monotonic() + _PERMANENT_S
                         self._state = "DEGRADED"
                     self._last_telemetry["state"] = "DEGRADED"

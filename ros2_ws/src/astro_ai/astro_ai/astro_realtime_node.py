@@ -2909,18 +2909,77 @@ class AstroRealtimeNode(Node):
             active_engine = turn_tts_engine
             if active_engine == "xtts_gpu":
                 tts_source_name = "xtts_worker"
+                tts_model_name = "xtts_finetuned"
             elif active_engine == "elevenlabs":
                 tts_source_name = "elevenlabs_cloud"
+                tts_model_name = "eleven_multilingual_v2"
             elif active_engine == "local_offline_tts":
                 tts_source_name = "local_offline_synth"
+                tts_model_name = "piper_espeak"
             else:
                 tts_source_name = "edge_tts_cloud"
+                tts_model_name = "tr_tr_ahmet"
+
+            self.get_logger().info(
+                f"🏷️ [TTS Provider Selection Contract]\n"
+                f"  generation_id={self._fallback_generation_id}\n"
+                f"  selected_tts_provider={active_engine}\n"
+                f"  selected_tts_model={tts_model_name}\n"
+                f"  tts_source={tts_source_name}\n"
+                f"  playback_source={getattr(self.audio_output_manager, 'backend', 'aplay')}\n"
+                f"  tts_state={tts_mode_str}\n"
+                f"  tts_ready={tts_ready_flag}\n"
+                f"  fallback_reason=none"
+            )
 
             def _synthesize_turn_clause(clause_text: str) -> Tuple[Optional[bytes], float, float, float]:
                 clean_text = clean_tts_text(clause_text)
                 if not clean_text:
                     return None, 0.0, 0.0, 0.0
-                if turn_tts_engine == "elevenlabs" and self.elevenlabs_engine and self.elevenlabs_engine.is_ready():
+
+                nonlocal active_engine, tts_source_name, tts_model_name
+
+                if active_engine == "xtts_gpu" and self.local_xtts and self.local_xtts.is_ready():
+                    try:
+                        t_s = time.perf_counter()
+                        pcm_res = self.local_xtts.synthesize_sentence(clean_text, generation_id=self._fallback_generation_id)
+                        tot_ms = (time.perf_counter() - t_s) * 1000.0
+                        telem = self.local_xtts.get_telemetry()
+                        gpu_ms = telem.get("last_infer_ms", tot_ms)
+                        q_wait = telem.get("xtts_queue_wait_ms", max(0.0, tot_ms - gpu_ms))
+
+                        if pcm_res:
+                            return pcm_res, tot_ms, gpu_ms, q_wait
+
+                        # XTTS returned None (timeout or degraded) -> Deterministic Emergency Fallback without changing generation_id
+                        fb_reason = telem.get("fallback_reason", "xtts_timeout")
+                        self.get_logger().warn(
+                            f"⚠️ [XTTS Fallback Triggered]: generation_id={self._fallback_generation_id} | "
+                            f"fallback_reason={fb_reason} | "
+                            f"action=deterministic_emergency_fallback"
+                        )
+                    except Exception as ex_xtts:
+                        self.get_logger().warn(f"⚠️ [XTTS Exception Fallback]: generation_id={self._fallback_generation_id} | error={ex_xtts}")
+
+                    # Fallback to local offline TTS or Edge-TTS using SAME generation_id
+                    if self.local_offline_tts and self.local_offline_tts.is_ready():
+                        active_engine = "local_offline_tts"
+                        tts_source_name = "local_offline_synth"
+                        tts_model_name = "piper_espeak"
+                        t_s = time.perf_counter()
+                        pcm_res = self.local_offline_tts.synthesize_sentence(clean_text, generation_id=self._fallback_generation_id)
+                        ms = (time.perf_counter() - t_s) * 1000.0
+                        return pcm_res, ms, 0.0, 0.0
+                    else:
+                        active_engine = "edge_tts"
+                        tts_source_name = "edge_tts_cloud"
+                        tts_model_name = "tr_tr_ahmet"
+                        t_s = time.perf_counter()
+                        pcm_res = self._synthesize_edge_tts_pcm24k(clean_text)
+                        ms = (time.perf_counter() - t_s) * 1000.0
+                        return pcm_res, ms, 0.0, 0.0
+
+                elif active_engine == "elevenlabs" and self.elevenlabs_engine and self.elevenlabs_engine.is_ready():
                     try:
                         t_s = time.perf_counter()
                         pcm_res = self.elevenlabs_engine.synthesize_sentence(clean_text, generation_id=self._fallback_generation_id)
@@ -2928,18 +2987,8 @@ class AstroRealtimeNode(Node):
                         return pcm_res, ms, 0.0, 0.0
                     except Exception:
                         pass
-                elif turn_tts_engine == "xtts_gpu" and self.local_xtts and self.local_xtts.is_ready():
-                    try:
-                        t_s = time.perf_counter()
-                        pcm_res = self.local_xtts.synthesize_sentence(clean_text, generation_id=self._fallback_generation_id)
-                        tot_ms = (time.perf_counter() - t_s) * 1000.0
-                        telem = self.local_xtts.get_telemetry()
-                        gpu_ms = telem.get("last_infer_ms", tot_ms)
-                        q_wait = max(0.0, tot_ms - gpu_ms)
-                        return pcm_res, tot_ms, gpu_ms, q_wait
-                    except Exception:
-                        pass
-                elif turn_tts_engine == "local_offline_tts" and self.local_offline_tts and self.local_offline_tts.is_ready():
+
+                elif active_engine == "local_offline_tts" and self.local_offline_tts and self.local_offline_tts.is_ready():
                     try:
                         t_s = time.perf_counter()
                         pcm_res = self.local_offline_tts.synthesize_sentence(clean_text, generation_id=self._fallback_generation_id)
@@ -2947,7 +2996,8 @@ class AstroRealtimeNode(Node):
                         return pcm_res, ms, 0.0, 0.0
                     except Exception:
                         pass
-                # Network fallback to in-memory Edge-TTS
+
+                # Default Network fallback
                 t_s = time.perf_counter()
                 pcm_res = self._synthesize_edge_tts_pcm24k(clean_text)
                 ms = (time.perf_counter() - t_s) * 1000.0
@@ -2956,7 +3006,7 @@ class AstroRealtimeNode(Node):
             def _handle_and_play_clause_audio(pcm_audio: bytes):
                 if not pcm_audio:
                     return
-                # Debug WAV generation on first XTTS synthesis
+                # Debug WAV & verification log on first real XTTS synthesis
                 if active_engine == "xtts_gpu" and not getattr(self, "_first_xtts_debug_wav_written", False):
                     self._first_xtts_debug_wav_written = True
                     try:
@@ -2970,16 +3020,19 @@ class AstroRealtimeNode(Node):
                             wf.writeframes(pcm_audio)
                         audio_sha256 = hashlib.sha256(pcm_audio).hexdigest()
                         duration_ms = int((len(pcm_audio) / 2 / 24000.0) * 1000.0)
+                        telem = self.local_xtts.get_telemetry() if self.local_xtts else {}
                         self.get_logger().info(
                             f"🎵 [XTTS OUTPUT VERIFIED]\n"
                             f"  generation_id={self._fallback_generation_id}\n"
                             f"  provider=xtts_gpu\n"
                             f"  model=xtts_finetuned\n"
+                            f"  checkpoint={telem.get('xtts_model_path', 'default')}\n"
+                            f"  reference={telem.get('xtts_reference_wav', 'default')}\n"
+                            f"  sha256={telem.get('xtts_checkpoint_sha256', audio_sha256)}\n"
                             f"  sample_rate=24000\n"
                             f"  audio_bytes={len(pcm_audio)}\n"
                             f"  duration_ms={duration_ms}\n"
-                            f"  sha256={audio_sha256}\n"
-                            f"  file={wav_path}"
+                            f"  infer_ms={telem.get('last_infer_ms', 0.0)}"
                         )
                     except Exception as ex_w:
                         self.get_logger().debug(f"XTTS debug WAV write notice: {ex_w}")
@@ -2988,7 +3041,7 @@ class AstroRealtimeNode(Node):
                     pcm_audio,
                     generation_id=self._fallback_generation_id,
                     tts_provider=active_engine,
-                    tts_model=tts_model_name if "tts_model_name" in locals() else "xtts_finetuned",
+                    tts_model=tts_model_name,
                     tts_source=tts_source_name,
                 )
 

@@ -20,7 +20,7 @@ import subprocess
 import threading
 import time
 import wave
-from typing import Callable, Optional, Tuple
+from typing import Any, Callable, Dict, Optional, Tuple
 
 import numpy as np
 
@@ -228,7 +228,13 @@ class AudioOutputManager:
         self._log("debug", f"⚡ [AudioOutputManager] Barge-In Interrupt -> Generation: {gen_id}")
         return gen_id
 
-    def play_pcm_chunk(self, pcm_data: bytes, sample_rate: int = 16000, generation_id: Optional[int] = None) -> bool:
+    def play_pcm_chunk(
+        self,
+        pcm_data: bytes,
+        sample_rate: int = 16000,
+        generation_id: Optional[int] = None,
+        provenance: Optional[Dict[str, Any]] = None,
+    ) -> bool:
         """Enqueues raw int16 PCM data for streaming playback."""
         if not pcm_data:
             return False
@@ -247,13 +253,19 @@ class AudioOutputManager:
             raw_16k = pcm_data
 
         try:
-            self._play_queue.put_nowait((gen, raw_16k))
+            item = {
+                "gen": gen,
+                "pcm": raw_16k,
+                "provenance": provenance or {},
+                "raw_len": len(pcm_data),
+            }
+            self._play_queue.put_nowait(item)
             return True
         except queue.Full:
             self._log("warn", "⚠️ [AudioOutputManager] Çalma kuyruğu dolu, blok atlandı!")
             return False
 
-    def play_wav_file(self, wav_path: str, generation_id: Optional[int] = None, blocking: bool = False) -> bool:
+    def play_wav_file(self, wav_path: str, generation_id: Optional[int] = None, blocking: bool = False, provenance: Optional[Dict[str, Any]] = None) -> bool:
         """Plays a WAV file through hardware output with generation check."""
         if not os.path.exists(wav_path):
             return False
@@ -269,7 +281,7 @@ class AudioOutputManager:
                 sr = wf.getframerate()
                 n_frames = wf.getnframes()
                 raw_bytes = wf.readframes(n_frames)
-                return self.play_pcm_chunk(raw_bytes, sample_rate=sr, generation_id=gen)
+                return self.play_pcm_chunk(raw_bytes, sample_rate=sr, generation_id=gen, provenance=provenance)
         except Exception as e:
             self._log("warn", f"WAV çalma hatası ({wav_path}): {e}")
             return False
@@ -330,7 +342,7 @@ class AudioOutputManager:
                     cmd = ["aplay", "-D", self.alsa_device, "-r", str(HW_SAMPLE_RATE), "-f", "S16_LE", "-c", "1", "-q"]
                     self._current_process = subprocess.Popen(cmd, stdin=subprocess.PIPE)
                 except Exception as e:
-                    self._log("error", f"❌ [AudioOutputManager] aplay akışı başlatılamadı: {e}")
+                    self._log("error", f"❌ [AudioOutputManager] alsa_write_error={e}")
                     self._current_process = None
                     return False
 
@@ -345,14 +357,15 @@ class AudioOutputManager:
                     return True
             except OSError as e:
                 if getattr(e, "errno", None) == errno.EINTR:
+                    self._log("debug", f"⚡ [AudioOutputManager] alsa_write_retry_reason=EINTR (attempt {attempt+1}/3)")
                     time.sleep(0.01)
                     continue
-                self._log("warn", f"⚠️ [AudioOutputManager] aplay akışına yazma hatası: {e}")
+                self._log("warn", f"⚠️ [AudioOutputManager] alsa_write_error={e}")
                 with self._lock:
                     self._stop_active_processes_locked()
                 return False
             except Exception as e:
-                self._log("warn", f"⚠️ [AudioOutputManager] aplay akışına yazma hatası: {e}")
+                self._log("warn", f"⚠️ [AudioOutputManager] alsa_write_error={e}")
                 with self._lock:
                     self._stop_active_processes_locked()
                 return False
@@ -363,13 +376,20 @@ class AudioOutputManager:
         if self.mock_playback:
             while True:
                 try:
-                    gen, chunk = self._play_queue.get(timeout=0.05)
+                    raw_item = self._play_queue.get(timeout=0.05)
                 except queue.Empty:
                     if self._is_playing:
                         self._is_playing = False
                         if self._on_state_change:
                             self._on_state_change(False)
                     continue
+
+                if isinstance(raw_item, tuple):
+                    gen, chunk = raw_item[0], raw_item[1]
+                    prov = {}
+                else:
+                    gen, chunk = raw_item["gen"], raw_item["pcm"]
+                    prov = raw_item.get("provenance", {})
 
                 with self._lock:
                     if gen < self._current_generation:
@@ -392,7 +412,7 @@ class AudioOutputManager:
 
         while True:
             try:
-                gen, chunk = self._play_queue.get(timeout=0.15)
+                raw_item = self._play_queue.get(timeout=0.15)
             except queue.Empty:
                 if self._is_playing:
                     with self._lock:
@@ -402,6 +422,13 @@ class AudioOutputManager:
                         self._on_state_change(False)
                 continue
 
+            if isinstance(raw_item, tuple):
+                gen, chunk = raw_item[0], raw_item[1]
+                prov = {}
+            else:
+                gen, chunk = raw_item["gen"], raw_item["pcm"]
+                prov = raw_item.get("provenance", {})
+
             with self._lock:
                 if gen < self._current_generation:
                     self._stop_active_processes_locked()
@@ -409,9 +436,20 @@ class AudioOutputManager:
                 self._is_playing = True
                 self._last_playback_time = time.monotonic()
 
-                # Trigger first audio timestamp callback
+                # Trigger first audio timestamp callback & provenance logging
                 if self._first_audio_emitted_for_gen != gen:
                     self._first_audio_emitted_for_gen = gen
+                    self._log(
+                        "info",
+                        f"🔊 [Playback Started]\n"
+                        f"  generation_id={gen}\n"
+                        f"  tts_provider={prov.get('tts_provider', 'xtts_gpu')}\n"
+                        f"  tts_model={prov.get('tts_model', 'xtts_finetuned')}\n"
+                        f"  tts_source={prov.get('tts_source', 'xtts_worker')}\n"
+                        f"  playback_source={prov.get('playback_source', self.backend)}\n"
+                        f"  audio_bytes={len(chunk)}\n"
+                        f"  device={self.alsa_device}"
+                    )
                     if self._on_first_audio:
                         self._on_first_audio(gen, self._last_playback_time)
                     if self._on_state_change:
@@ -422,6 +460,6 @@ class AudioOutputManager:
                 try:
                     stream.write(chunk)
                 except Exception as e:
-                    self._log("warn", f"⚠️ [AudioOutputManager] DAC yazma hatası: {e}")
+                    self._log("warn", f"⚠️ [AudioOutputManager] alsa_write_error={e}")
             else:
                 self._play_chunk_via_aplay_pipe(chunk, gen)

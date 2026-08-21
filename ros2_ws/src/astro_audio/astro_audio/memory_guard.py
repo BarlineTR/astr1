@@ -75,9 +75,9 @@ class SystemMemoryGuard:
     def oom_killed_count(self) -> int:
         return self._oom_killed_count
 
-    def get_process_rss_mb(self, pid: int) -> float:
+    def get_process_rss_mb(self, pid: Any) -> float:
         """Returns RSS memory of given PID in megabytes."""
-        if pid <= 0:
+        if not isinstance(pid, int) or pid <= 0:
             return 0.0
         try:
             # Fast Linux /proc lookup

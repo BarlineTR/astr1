@@ -454,12 +454,16 @@ class XttsClient:
         generation_id: int = 0,
         return_pcm: bool = True,
         out_path: Optional[str] = None,
-        timeout: float = 45.0,
+        timeout: Optional[float] = None,
         language: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Synthesizes text clause and returns dictionary containing raw PCM bytes and telemetry."""
         if not self.is_alive:
             raise XttsError(f"XTTS worker is not alive (code {self.returncode})")
+
+        ttfa_timeout = float(os.getenv("TTS_XTTS_TTFA_TIMEOUT_S", "30.0"))
+        synth_timeout = float(os.getenv("TTS_XTTS_SYNTHESIS_TIMEOUT_S", "45.0"))
+        effective_timeout = timeout if timeout is not None else synth_timeout
 
         with self._req_lock:
             if generation_id > 0 and generation_id < self._current_gen_id:
@@ -484,11 +488,13 @@ class XttsClient:
             except (BrokenPipeError, ValueError) as exc:
                 raise XttsError(f"Failed writing to XTTS worker: {exc}") from exc
 
+            t_req_start = time.monotonic()
             while True:
                 try:
-                    msg = self._responses.get(timeout=timeout)
+                    msg = self._responses.get(timeout=effective_timeout)
                 except queue.Empty as exc:
-                    raise XttsError(f"XTTS timed out after {timeout:.1f}s") from exc
+                    elapsed = time.monotonic() - t_req_start
+                    raise XttsError(f"XTTS synthesis timed out after {elapsed:.1f}s (TTFA max {ttfa_timeout:.0f}s, Full max {synth_timeout:.0f}s)") from exc
                 if msg.get("id") == req_id:
                     break
 

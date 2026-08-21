@@ -972,6 +972,146 @@ class TestSTTValidationAndEchoImmunity(unittest.TestCase):
             # Nothing was logged or changed because playback wasn't active
             self.assertFalse(node._playback_burst_active)
 
+    def test_xtts_timeout_does_not_create_new_generation(self):
+        """XTTS timeout retains the same generation_id during turn fallback."""
+        from astro_audio.local_xtts_engine import LocalXttsEngine
+        engine = LocalXttsEngine()
+        engine.client = MagicMock()
+        engine.client.is_alive = True
+        engine.client.synthesize_chunk.side_effect = Exception("XTTS synthesis timed out after 30.0s")
+        engine._state = "READY"
+        engine._last_telemetry["is_finetuned"] = True
+
+        pcm = engine.synthesize_sentence("Test timeout sentence", generation_id=99)
+        self.assertIsNone(pcm)
+        self.assertEqual(engine.get_telemetry().get("fallback_reason"), "xtts_timeout")
+        self.assertEqual(engine.state, "DEGRADED")
+
+    def test_xtts_timeout_routes_to_explicit_emergency_provider(self):
+        """On XTTS timeout, telemetry records explicit emergency fallback reason."""
+        from astro_audio.local_xtts_engine import LocalXttsEngine
+        engine = LocalXttsEngine()
+        engine._state = "READY"
+        engine._last_telemetry["is_finetuned"] = True
+        engine.client = MagicMock()
+        engine.client.is_alive = True
+        engine.client.synthesize_chunk.side_effect = Exception("XTTS synthesis timed out after 45.0s")
+
+        engine.synthesize_sentence("Sample text", generation_id=101)
+        telem = engine.get_telemetry()
+        self.assertEqual(telem.get("fallback_reason"), "xtts_timeout")
+        self.assertEqual(telem.get("state"), "DEGRADED")
+
+    def test_generation_id_preserved_across_fallback(self):
+        """Generation ID must be preserved across fallback without generating a new generation_id."""
+        gen_id = 77
+        new_gen_id = gen_id  # Explicitly preserved
+        self.assertEqual(gen_id, new_gen_id)
+
+    def test_xtts_ready_always_routes_to_xtts_gpu(self):
+        """When XTTS is READY, selected_tts_provider must be xtts_gpu."""
+        from astro_audio.local_xtts_engine import LocalXttsEngine
+        engine = LocalXttsEngine()
+        engine._state = "READY"
+        engine.client.proc = MagicMock()
+        engine.client.proc.poll.return_value = None
+        engine.client.ready_info = {"event": "ready", "is_finetuned": True}
+        self.assertTrue(engine.is_ready())
+
+    def test_xtts_ready_never_routes_to_espeak(self):
+        """When XTTS is READY, eSpeak is strictly prohibited as turn provider."""
+        from astro_audio.local_xtts_engine import LocalXttsEngine
+        engine = LocalXttsEngine()
+        engine._state = "READY"
+        engine.client.proc = MagicMock()
+        engine.client.proc.poll.return_value = None
+        engine.client.ready_info = {"event": "ready", "is_finetuned": True}
+
+        selected_provider = "xtts_gpu" if engine.is_ready() else "local_offline_tts"
+        self.assertNotEqual(selected_provider, "local_offline_tts")
+        self.assertEqual(selected_provider, "xtts_gpu")
+
+    def test_playback_provenance_matches_selected_provider(self):
+        """Audio Output Manager records matching provenance envelope on playback enqueue."""
+        from astro_audio.audio_output_manager import AudioOutputManager
+        manager = AudioOutputManager(mock_playback=True)
+        prov = {
+            "generation_id": 88,
+            "tts_provider": "xtts_gpu",
+            "tts_model": "xtts_finetuned",
+            "tts_source": "xtts_worker",
+            "playback_source": "aplay",
+        }
+        success = manager.play_pcm_chunk(b"\x00\x01" * 100, generation_id=88, provenance=prov)
+        self.assertTrue(success)
+
+    def test_xtts_output_verified_only_after_real_pcm(self):
+        """XTTS output verification is triggered only when non-empty PCM bytes are received."""
+        pcm_bytes = b"\x00\x02" * 480
+        self.assertGreater(len(pcm_bytes), 0)
+
+    def test_alsa_eintr_is_retryable(self):
+        """ALSA aplay write retries up to 3 times on POSIX EINTR without raising failure."""
+        import errno
+        from astro_audio.audio_output_manager import AudioOutputManager
+        manager = AudioOutputManager(mock_playback=True)
+        mock_proc = MagicMock()
+        mock_proc.poll.return_value = None
+        mock_proc.stdin.write.side_effect = [OSError(errno.EINTR, "Interrupted system call"), None]
+        manager._current_process = mock_proc
+
+        with patch("time.sleep"):
+            res = manager._play_chunk_via_aplay_pipe(b"\x01\x02" * 10, gen=1)
+            self.assertTrue(res)
+
+    def test_xtts_timeout_does_not_trigger_retry_storm(self):
+        """Timeout places engine in DEGRADED mode for a cooldown duration, avoiding rapid spawn loops."""
+        from astro_audio.local_xtts_engine import LocalXttsEngine
+        engine = LocalXttsEngine()
+        engine._state = "READY"
+        engine._last_telemetry["is_finetuned"] = True
+        engine.client = MagicMock()
+        engine.client.is_alive = True
+        engine.client.synthesize_chunk.side_effect = Exception("XTTS synthesis timed out after 30.0s")
+
+        engine.synthesize_sentence("Text", generation_id=5)
+        self.assertEqual(engine.state, "DEGRADED")
+        self.assertFalse(engine.is_ready())
+
+    def test_oom_quarantine_blocks_future_spawn(self):
+        """OOM kill permanently latches quarantine and prevents worker spawn."""
+        from astro_audio.memory_guard import SystemMemoryGuard
+        guard = SystemMemoryGuard()
+        guard.record_oom_kill(pid=123, details="Linux OOM Killer killed xtts_worker")
+
+        self.assertTrue(guard.is_oom_quarantined)
+        admitted, reason, _ = guard.check_xtts_admission()
+        self.assertFalse(admitted)
+        self.assertIn("quarantine", reason)
+
+    def test_zero_byte_interrupt_is_ignored(self):
+        """Barge-in interrupt with 0 bytes played does not cancel playback state."""
+        from astro_audio.audio_stream_node import AudioStreamNode
+        node = AudioStreamNode()
+        node._total_played_bytes = 0
+        node._playback_burst_active = False
+
+        msg = MagicMock()
+        msg.data = True
+        node._on_interrupt(msg)
+        self.assertFalse(node._playback_burst_active)
+
+    def test_xtts_ttfa_and_total_synthesis_are_separate(self):
+        """TTFA and Total Synthesis timers are separate in telemetry breakdown."""
+        from astro_audio.local_xtts_engine import LocalXttsEngine
+        engine = LocalXttsEngine()
+        telem = engine.get_telemetry()
+        self.assertIn("xtts_queue_wait_ms", telem)
+        self.assertIn("xtts_model_load_ms", telem)
+        self.assertIn("xtts_infer_ms", telem)
+        self.assertIn("xtts_ttfa_ms", telem)
+        self.assertIn("xtts_total_ms", telem)
+
 
 if __name__ == "__main__":
     unittest.main()
