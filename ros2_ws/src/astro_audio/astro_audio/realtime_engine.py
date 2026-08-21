@@ -33,22 +33,8 @@ def classify_realtime_error(err_code: Any, err_msg: str) -> Tuple[RealtimeState,
     msg_str = str(err_msg or "").lower()
     combined = f"{code_str} {msg_str}"
 
-    # 1. Temporary overload (1013) — NOT quota exhaustion
-    if "1013" in combined or "server overloaded" in combined or "try again later" in combined:
-        return RealtimeState.REALTIME_DEGRADED, "realtime_temporary_1013"
-
-    # 2. Quota & Credit exhaustion (strict billing signals only)
-    if any(
-        k in combined
-        for k in (
-            "insufficient_quota",
-            "quota_exhausted",
-            "credit_balance_exhausted",
-            "exceeded your current quota",
-            "billing",
-            "payment required",
-        )
-    ) or code_str in ("402", "insufficient_quota"):
+    # 1. Quota & Credit exhaustion
+    if any(k in combined for k in ("1013", "insufficient_quota", "quota_exhausted", "credit_balance_exhausted", "exceeded your current quota", "billing")):
         return RealtimeState.REALTIME_QUOTA_EXHAUSTED, "realtime_quota_exhausted"
 
     # 2. Authentication / Authorization failure
