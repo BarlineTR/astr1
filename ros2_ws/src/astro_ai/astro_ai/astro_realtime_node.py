@@ -683,6 +683,19 @@ class AstroRealtimeNode(Node):
                 )
 
                 if "insufficient_quota" in err_str or "credit_balance_exhausted" in err_str or "1013" in err_str or "quota" in err_str:
+                    self.get_logger().error(
+                        "🚨 [REALTIME QUOTA EXHAUSTED]\n"
+                        "  state=EXHAUSTED\n"
+                        "  action=NOTIFYING_GLOBAL_CIRCUIT_BREAKER"
+                    )
+                    try:
+                        from astro_ai.circuit_breaker import get_global_circuit_breaker, RequestErrorClass
+                        cb = get_global_circuit_breaker()
+                        if cb:
+                            cb.record_error("openai", sub_provider="openai_realtime", error_class=RequestErrorClass.QUOTA_EXHAUSTED, error_msg=err_str)
+                    except Exception:
+                        pass
+
                     if not self._fallback_mode:
                         self._fallback_mode = True
                         self.get_logger().warn("🚀 [0-Maliyetli Groq & Edge-TTS Modu Devrede]: OpenAI Realtime kredisi tükendi. Astro kesintisiz olarak 0-Token Groq LLM + Edge-TTS modunda çalışıyor!")

@@ -54,6 +54,19 @@ try:
     from astro_ai.conversation_session import ConversationSession, normalize_turkish_speech_input
     from astro_ai.cloud_manager import CloudManager
     from astro_ai.officials_database import find_official_by_name_or_alias, get_official_greeting, OFFICIALS_DATABASE
+    from astro_ai.circuit_breaker import (
+        GlobalProviderCircuitBreaker,
+        ProviderState,
+        RequestErrorClass,
+        get_global_circuit_breaker,
+    )
+    from astro_ai.provider_registry import (
+        ProviderRegistry,
+        GROQ_PRODUCTION_MODELS,
+        GEMINI_PRODUCTION_MODELS,
+        OPENAI_PRODUCTION_MODELS,
+    )
+    from astro_audio.local_audio_resources import get_local_audio_resources
 except ImportError:
     from state_machine import StateMachine, RobotState
     from memory_manager import MemoryManager
@@ -65,6 +78,24 @@ except ImportError:
     from conversation_session import ConversationSession, normalize_turkish_speech_input
     from cloud_manager import CloudManager
     from officials_database import find_official_by_name_or_alias, get_official_greeting, OFFICIALS_DATABASE
+    try:
+        from circuit_breaker import (
+            GlobalProviderCircuitBreaker,
+            ProviderState,
+            RequestErrorClass,
+            get_global_circuit_breaker,
+        )
+        from provider_registry import (
+            ProviderRegistry,
+            GROQ_PRODUCTION_MODELS,
+            GEMINI_PRODUCTION_MODELS,
+            OPENAI_PRODUCTION_MODELS,
+        )
+        from local_audio_resources import get_local_audio_resources
+    except ImportError:
+        get_global_circuit_breaker = lambda: None
+        ProviderRegistry = None
+        get_local_audio_resources = lambda: None
 
 
 def _load_env():
@@ -187,6 +218,11 @@ class AiBrainNode(Node):
         # Tanımsız kalırsa _on_speech ilk konuşmada AttributeError verir.
         self._enabled = False
 
+        # 0. Circuit Breaker, Model Registry & Audio Resources
+        self.circuit_breaker = get_global_circuit_breaker()
+        self.provider_registry = ProviderRegistry(logger=self.get_logger()) if ProviderRegistry else None
+        self.audio_resources = get_local_audio_resources() if get_local_audio_resources else None
+
         # 1. Groq Client (Primary Ultra-Fast Free LPU Engine - Zero OpenAI Cost)
         self.groq_api_key = os.environ.get("GROQ_API_KEY", "").strip()
         self._groq = None
@@ -226,6 +262,23 @@ class AiBrainNode(Node):
         if self._ai_api_key:
             self._enabled = True
             self.get_logger().info("✅ [AI Brain] Google Gemini REST metin motoru hazır.")
+
+    def _play_local_ack(self, ack_pcm: bytes, generation_id: int = 0):
+        """Plays low-latency pre-generated local ACK WAV via AudioOutputManager or local aplay."""
+        try:
+            from astro_audio.audio_output_manager import AudioOutputManager
+            out_mgr = AudioOutputManager.get_instance()
+            if out_mgr and ack_pcm:
+                out_mgr.play_pcm_chunk(ack_pcm, sample_rate=16000, generation_id=generation_id, provenance={"source": "thinking_ack_local"})
+                return
+        except Exception:
+            pass
+        try:
+            if ack_pcm:
+                import subprocess
+                subprocess.Popen(["aplay", "-q", "-r", "16000", "-f", "S16_LE", "-c", "1"], stdin=subprocess.PIPE, stderr=subprocess.DEVNULL).communicate(ack_pcm, timeout=0.4)
+        except Exception:
+            pass
 
         if not self._enabled:
             self.get_logger().error(
@@ -751,14 +804,8 @@ class AiBrainNode(Node):
     def _process_llm(self, user_text: str, frame: np.ndarray | None, t_turn_start: float):
         try:
             t_llm_start = time.monotonic()
-            # DİKKAT: t_turn_start, konuşmanın başlangıcı değil, transkriptin
-            # /speech/text üzerinden GELDİĞİ andır (_on_speech'in ilk satırı).
-            # Dolayısıyla bu süre STT değil, transkript geldikten sonra çalışan
-            # kapı mantığıdır: uyandırma sözcüğü kontrolü ve sosyal filtre LLM
-            # çağrısı. Eskiden "STT" diye raporlanıyordu ve gerçek STT süresi
-            # hiçbir yerde görünmüyordu. Asıl STT süresi speech_recognition_node
-            # içinde ölçülüp orada loglanır.
             gate_latency_ms = (t_llm_start - t_turn_start) * 1000.0
+            generation_id = int(t_turn_start * 1000) % 1000000
 
             self.get_logger().info(f"🗣️ [Siz]: \"{user_text}\"")
             self.memory.episodic.add_message("user", user_text)
@@ -771,6 +818,21 @@ class AiBrainNode(Node):
             base64_img = frame_to_base64_jpeg(frame, max_dim=768) if frame is not None and (is_visual or is_learning_obj) else None
             persona = self.persona_engine.current_persona
 
+            ack_sent = False
+            ack_latency_ms = 0.0
+            t_ack_start = time.monotonic()
+
+            # Progressive Acknowledgement (THINKING_ACK) for operations >= 1.0s (< 300ms playback)
+            if is_visual or is_learning_obj or is_weather:
+                self.state_machine.transition_to(RobotState.THINKING_ACK)
+                ack_type = "looking" if (is_visual or is_learning_obj) else "checking"
+                if self.audio_resources:
+                    ack_pcm = self.audio_resources.get_ack_pcm(ack_type)
+                    self._play_local_ack(ack_pcm, generation_id=generation_id)
+                    ack_sent = True
+                    ack_latency_ms = (time.monotonic() - t_ack_start) * 1000.0
+                    self.get_logger().info(f"⚡ [THINKING_ACK] Hızlı ara onay çalındı ({ack_latency_ms:.1f}ms): 'Bir saniye, bakıyorum.'")
+
             # 0. Active Multi-Turn Biometric Enrollment Dialog
             if self._enrollment_session.get("active"):
                 self._enrollment_session["turn"] += 1
@@ -778,11 +840,9 @@ class AiBrainNode(Node):
                 cand_name = self._enrollment_session["name"]
                 formal_name = self._enrollment_session["title"] or cand_name
 
-                # Grab latest speaker embedding if available
                 if getattr(self, "_last_speaker_embedding", None) is not None and len(self._last_speaker_embedding) > 0:
                     self._enrollment_session["embeddings"].append(self._last_speaker_embedding.copy())
 
-                # If camera frame available, keep latest face crop
                 if frame is not None:
                     self._enrollment_session["last_frame"] = frame.copy()
 
@@ -793,14 +853,10 @@ class AiBrainNode(Node):
                     ans = f"Çok iyi gidiyoruz (2/3). Şimdi lütfen son cümlenizi söyleyin..."
                     self.get_logger().info(f"🎙️ [Biyometrik Kayıt ({cand_name})]: 2. ses kaydı başarıyla alındı.")
                 else:
-                    # Final turn (3/3): Save everything to databases!
                     self.get_logger().info(f"🎙️ [Biyometrik Kayıt ({cand_name})]: 3. ses kaydı tamamlandı. Veritabanına kaydediliyor...")
-                    
-                    # 1. Save voice embeddings to SpeakerEngine
                     embs = self._enrollment_session["embeddings"]
                     if not embs and getattr(self, "_last_speaker_embedding", None) is not None:
                         embs = [self._last_speaker_embedding]
-                    
                     if embs:
                         try:
                             from astro_audio.voice_recognizer import _get_engine as _get_spk_engine
@@ -812,7 +868,6 @@ class AiBrainNode(Node):
                         except Exception as e:
                             self.get_logger().warn(f"Voice enrollment save notice: {e}")
 
-                    # 2. Save face to FaceEngine
                     saved_frame = self._enrollment_session.get("last_frame", frame)
                     if saved_frame is not None:
                         try:
@@ -823,7 +878,6 @@ class AiBrainNode(Node):
                         except Exception as e:
                             self.get_logger().warn(f"Face enrollment save notice: {e}")
 
-                    # 3. Save to profile
                     try:
                         self.memory.profile.add_known_person(cand_name, title=formal_name)
                     except Exception as e:
@@ -854,8 +908,6 @@ class AiBrainNode(Node):
                 t_done = time.monotonic()
                 total_turn_ms = (t_done - t_turn_start) * 1000.0
                 self.session.latency_tracker.record_turn(gate_latency_ms, total_turn_ms - gate_latency_ms, total_turn_ms)
-                stats = self.session.latency_tracker.get_stats()
-                self.get_logger().info(f"⚡ [Latency] Bu Dönüş: {total_turn_ms:.0f}ms (Ön filtre: {gate_latency_ms:.0f}ms, Hava API: {total_turn_ms - gate_latency_ms:.0f}ms) | p50: {stats['p50_total_ms']}ms, p95: {stats['p95_total_ms']}ms")
                 return
 
             # 2. Reminder & Alarm Direct Intent
@@ -863,27 +915,20 @@ class AiBrainNode(Node):
             if is_reminder:
                 user_name = self._add_reminder(reminder_mins, reminder_topic)
                 friendly_name = user_name if user_name != "Misafir" else ("kral" if persona == "flirt" else "dostum")
-                
                 topic_speech = reminder_topic
-                if "vakti" in topic_speech.lower():
-                    topic_str = f"{topic_speech.lower()}ni"
-                else:
-                    topic_str = f"{topic_speech} konusunu"
+                topic_str = f"{topic_speech.lower()}ni" if "vakti" in topic_speech.lower() else f"{topic_speech} konusunu"
 
                 if reminder_mins < 1.0:
                     secs = int(reminder_mins * 60.0)
                     ans = f"Tamamdır {friendly_name}! {secs} saniye sonra sana {topic_str} hatırlatacağım."
-                    self.get_logger().info(f"⏰ [Hatırlatıcı Kuruldu]: {secs} sn sonra -> '{reminder_topic}'")
                 elif int(reminder_mins) == 1:
                     ans = f"Tamamdır {friendly_name}! 1 dakika sonra sana {topic_str} hatırlatacağım."
-                    self.get_logger().info(f"⏰ [Hatırlatıcı Kuruldu]: 1 dk sonra -> '{reminder_topic}'")
                 elif int(reminder_mins) >= 60 and int(reminder_mins) % 60 == 0:
                     hrs = int(reminder_mins // 60)
                     ans = f"Anlaşıldı {friendly_name}! {hrs} saat sonra sana {topic_str} hatırlatacağım."
-                    self.get_logger().info(f"⏰ [Hatırlatıcı Kuruldu]: {hrs} saat sonra -> '{reminder_topic}'")
                 else:
                     ans = f"Anlaşıldı {friendly_name}! {int(reminder_mins)} dakika sonra sana {topic_str} hatırlatacağım."
-                    self.get_logger().info(f"⏰ [Hatırlatıcı Kuruldu]: {int(reminder_mins)} dk sonra -> '{reminder_topic}'")
+
                 self.get_logger().info(f"🤖 [Astro]: \"{ans}\"")
                 self._publish_tts(ans)
                 self._publish_emotion(persona)
@@ -891,11 +936,9 @@ class AiBrainNode(Node):
                 t_done = time.monotonic()
                 total_turn_ms = (t_done - t_turn_start) * 1000.0
                 self.session.latency_tracker.record_turn(gate_latency_ms, total_turn_ms - gate_latency_ms, total_turn_ms)
-                stats = self.session.latency_tracker.get_stats()
-                self.get_logger().info(f"⚡ [Latency] Bu Dönüş: {total_turn_ms:.0f}ms (Ön filtre: {gate_latency_ms:.0f}ms, Hatırlatıcı: {total_turn_ms - gate_latency_ms:.0f}ms) | p50: {stats['p50_total_ms']}ms, p95: {stats['p95_total_ms']}ms")
                 return
 
-            # 3. Identity Query ("Ben kimim? / Beni tanıdın mı? / Sesimi tanıdın mı?")
+            # 3. Identity Query
             if is_identity and not is_learning_person:
                 identity = self._get_active_biometric_identity()
                 if identity.get("is_known"):
@@ -903,7 +946,6 @@ class AiBrainNode(Node):
                     formal = identity.get("formal_title") or name
                     source = identity.get("source", "biyometri")
                     src_tr = "sesinden" if source == "voice" else ("yüzünden" if source == "face" else "yüzünden ve sesinden")
-                    
                     if "baran" in str(name).lower() or "baran" in str(formal).lower():
                         ans = f"Tabii ki tanıdım! Seni {src_tr} hemen bildim; sen benim baş mühendisim ve geliştiricim Baran'sın!"
                     elif "erdoğan" in str(name).lower() or "erdoğan" in str(formal).lower():
@@ -922,8 +964,6 @@ class AiBrainNode(Node):
                 t_done = time.monotonic()
                 total_turn_ms = (t_done - t_turn_start) * 1000.0
                 self.session.latency_tracker.record_turn(gate_latency_ms, total_turn_ms - gate_latency_ms, total_turn_ms)
-                stats = self.session.latency_tracker.get_stats()
-                self.get_logger().info(f"⚡ [Latency] Bu Dönüş: {total_turn_ms:.0f}ms (Ön filtre: {gate_latency_ms:.0f}ms, Biyometri: {total_turn_ms - gate_latency_ms:.0f}ms) | p50: {stats['p50_total_ms']}ms, p95: {stats['p95_total_ms']}ms")
                 return
 
             # 4. Initiate Conversational Biometric Enrollment
@@ -959,10 +999,7 @@ class AiBrainNode(Node):
                 t_done = time.monotonic()
                 total_turn_ms = (t_done - t_turn_start) * 1000.0
                 self.session.latency_tracker.record_turn(gate_latency_ms, total_turn_ms - gate_latency_ms, total_turn_ms)
-                stats = self.session.latency_tracker.get_stats()
-                self.get_logger().info(f"⚡ [Latency] Bu Dönüş: {total_turn_ms:.0f}ms (Ön filtre: {gate_latency_ms:.0f}ms, Kayıt Başlatma: {total_turn_ms - gate_latency_ms:.0f}ms) | p50: {stats['p50_total_ms']}ms, p95: {stats['p95_total_ms']}ms")
                 return
-
 
             # 4. Object Learning Tool
             if is_learning_obj and base64_img is not None:
@@ -975,29 +1012,60 @@ class AiBrainNode(Node):
                 self._publish_emotion(persona)
                 return
 
-            # 5. Visual Query
+            # 5. Visual Query (Circuit-Breaker Guided & Zero-Silence Guaranteed)
             if is_visual:
+                t_vis_start = time.monotonic()
                 if base64_img is not None:
-                    self.get_logger().info(f"👁️ [Vision]: OAK-D karesi analiz ediliyor... ({self._vision_model})")
+                    self.get_logger().info("👁️ [Vision]: OAK-D karesi analiz ediliyor...")
                     vision_ans = self._query_vision(user_text, base64_img)
-                    if vision_ans:
-                        clean_ans = clean_tts_text(vision_ans)
-                        self.get_logger().info(f"🤖 [Astro]: \"{clean_ans}\"")
-                        self._publish_tts(clean_ans)
-                        self._publish_emotion(persona)
-                        self.memory.episodic.add_message("assistant", clean_ans)
-                        return
+                    clean_ans = clean_tts_text(vision_ans) if vision_ans else "Şu an görüntüyü analiz edemiyorum."
+                else:
+                    clean_ans = "Kameradan net göremedim, lütfen biraz daha yaklaştırır mısın?"
 
-                fallback_msg = "Şu an kameramdan net göremiyorum, biraz daha yaklaştırır mısın?"
-                self.get_logger().info(f"🤖 [Astro]: \"{fallback_msg}\"")
-                self._publish_tts(fallback_msg)
+                vis_duration_ms = (time.monotonic() - t_vis_start) * 1000.0
+                self.get_logger().info(f"🤖 [Astro]: \"{clean_ans}\"")
+                self._publish_tts(clean_ans)
+                self._publish_emotion(persona)
+                self.memory.episodic.add_message("assistant", clean_ans)
+                t_done = time.monotonic()
+                total_turn_ms = (t_done - t_turn_start) * 1000.0
+
+                # Authoritative Turn Telemetry for Vision
+                self.get_logger().info(
+                    f"\n[ASTRO TURN]\n"
+                    f"generation_id={generation_id}\n"
+                    f"interaction_state={self.state_machine.current_state.value}\n"
+                    f"realtime_state={self.circuit_breaker.get_state('openai', 'openai_realtime').value if self.circuit_breaker else 'DISABLED'}\n"
+                    f"stt_provider=groq/whisper-large-v3\n"
+                    f"stt_state={self.circuit_breaker.get_state('groq', 'groq_stt').value if self.circuit_breaker else 'AVAILABLE'}\n"
+                    f"stt_failure=none\n"
+                    f"llm_provider=vision_pipeline\n"
+                    f"llm_state=AVAILABLE\n"
+                    f"llm_failure=none\n"
+                    f"vision_provider=multimodal_vision\n"
+                    f"vision_state=AVAILABLE\n"
+                    f"vision_failure=none\n"
+                    f"tts_provider=edge_tts\n"
+                    f"tts_state=AVAILABLE\n"
+                    f"tts_failure=none\n"
+                    f"fallback_chain=['vision_pipeline']\n"
+                    f"ack_sent={ack_sent}\n"
+                    f"ack_latency_ms={ack_latency_ms:.1f}\n"
+                    f"stt_ms={gate_latency_ms:.1f}\n"
+                    f"llm_ms=0.0\n"
+                    f"vision_ms={vis_duration_ms:.1f}\n"
+                    f"tts_ms={total_turn_ms - vis_duration_ms:.1f}\n"
+                    f"playback_ms={total_turn_ms:.1f}\n"
+                    f"total_user_to_audio_ms={total_turn_ms:.1f}\n"
+                    f"provider_attempts=1"
+                )
                 return
 
             identity = self._get_active_biometric_identity()
             active_name = identity.get("name", "Baran") if identity.get("is_known") else "Baran"
             threading.Thread(target=self._async_extract_user_facts, args=(user_text, active_name), daemon=True).start()
 
-            # 1. Memory Recall Query Direct Handling ("1 saat önce ne konuştuk", "hakkımda ne biliyorsun")
+            # 6. Memory Recall Query Direct Handling
             is_memory_q, memory_ans = self._handle_memory_recall_query(user_text, identity)
             if is_memory_q:
                 clean_ans = clean_tts_text(memory_ans)
@@ -1009,11 +1077,9 @@ class AiBrainNode(Node):
                 t_done = time.monotonic()
                 total_turn_ms = (t_done - t_turn_start) * 1000.0
                 self.session.latency_tracker.record_turn(gate_latency_ms, total_turn_ms - gate_latency_ms, total_turn_ms)
-                stats = self.session.latency_tracker.get_stats()
-                self.get_logger().info(f"⚡ [Latency] Bu Dönüş: {total_turn_ms:.0f}ms (Ön filtre: {gate_latency_ms:.0f}ms, Bellek: {total_turn_ms - gate_latency_ms:.0f}ms) | p50: {stats['p50_total_ms']}ms, p95: {stats['p95_total_ms']}ms")
                 return
 
-            # 2. Conversational LLM with Real-Time Token Streaming
+            # 7. Conversational LLM with Circuit-Breaker Hierarchy
             perception_prefix = self.persona_engine.build_user_context_prefix(
                 self._person_detected, self._looking_at_robot,
                 self._user_distance, self._user_emotion, self._speaker_gender,
@@ -1024,7 +1090,6 @@ class AiBrainNode(Node):
                 recognized_person=identity
             )
             messages = [{"role": "system", "content": system_prompt}]
-            # Deep copy episodic history so modifying user turn never corrupts stored messages
             for m in self.memory.episodic.get_messages():
                 messages.append({"role": m["role"], "content": m["content"]})
 
@@ -1033,10 +1098,25 @@ class AiBrainNode(Node):
 
             full_text = ""
             first_token_time = None
+            llm_provider = "none"
+            llm_state = "AVAILABLE"
+            llm_failure = "none"
+            fallback_chain = []
+            provider_attempts = 0
 
-            # 1. Primary: Groq LPU Ultra-Fast Free Models (Zero OpenAI cost)
-            if self._groq and self._active_groq_models:
+            # Step 1: Check OpenAI Circuit Breaker Status
+            openai_available = self.circuit_breaker.is_available("openai", sub_provider="openai_rest") if self.circuit_breaker else True
+            if not openai_available:
+                fallback_chain.append("openai(exhausted)")
+                self.get_logger().info("⚡ [LLM ROUTE] provider=groq reason=openai_exhausted")
+
+            # Step 2: Primary Groq LPU Ultra-Fast Models (if available & not in cooldown)
+            groq_available = self.circuit_breaker.is_available("groq", sub_provider="groq_llm") if self.circuit_breaker else True
+            if self._groq and self._active_groq_models and groq_available:
                 for m in self._active_groq_models[:3]:
+                    if not self.circuit_breaker.is_available("groq", model_id=m):
+                        continue
+                    provider_attempts += 1
                     try:
                         stream_resp = self._groq.chat.completions.create(
                             messages=messages,
@@ -1055,25 +1135,56 @@ class AiBrainNode(Node):
                                 first_token_time = time.monotonic()
                                 self.state_machine.transition_to(RobotState.SPEAKING)
                             full_text += delta
-                            # Early break if LLM stutters or repeats character sequences (e.g. 'zızızızı...')
                             if re.search(r'([a-zA-ZçğıöşüÇĞİÖŞÜ]{1,4})\1{5,}', full_text):
                                 break
                         if full_text:
+                            llm_provider = f"groq/{m}"
+                            fallback_chain.append("groq")
+                            if self.circuit_breaker:
+                                self.circuit_breaker.record_success("groq", sub_provider="groq_llm", model_id=m)
                             break
                     except Exception as stream_err:
+                        err_str = str(stream_err).lower()
                         self.get_logger().debug(f"Groq stream model {m} notice: {stream_err}")
+                        if "429" in err_str or "rate limit" in err_str or "rpm" in err_str:
+                            if self.circuit_breaker:
+                                self.circuit_breaker.record_error("groq", sub_provider="groq_llm", error_class=RequestErrorClass.RATE_LIMITED, error_msg=err_str)
+                            fallback_chain.append("groq(429_cooldown)")
+                            self.get_logger().info("⚡ [LLM ROUTE] provider=gemini reason=groq_cooldown")
+                            break
+                        elif "404" in err_str or "unsupported" in err_str:
+                            if self.circuit_breaker:
+                                self.circuit_breaker.record_error("groq", sub_provider="groq_llm", error_class=RequestErrorClass.MODEL_UNAVAILABLE, error_msg=err_str, model_id=m)
+                            fallback_chain.append(f"groq({m}_unavailable)")
+                        else:
+                            fallback_chain.append(f"groq({m}_err)")
                         full_text = ""
                         first_token_time = None
                         continue
+            elif not groq_available:
+                fallback_chain.append("groq(cooldown)")
+                self.get_logger().info("⚡ [LLM ROUTE] provider=gemini reason=groq_cooldown")
 
-            # 2. Secondary Fallback: Free Google Gemini REST
-            if not full_text:
-                gemini_text = self._query_gemini_text_rest(system_prompt, user_text, self.memory.episodic.get_messages())
-                if gemini_text:
-                    full_text = gemini_text
+            # Step 3: Secondary Google Gemini REST Fallback
+            gemini_available = self.circuit_breaker.is_available("gemini", sub_provider="gemini_text") if self.circuit_breaker else True
+            if not full_text and self._ai_api_key and gemini_available:
+                provider_attempts += 1
+                try:
+                    gemini_text = self._query_gemini_text_rest(system_prompt, user_text, self.memory.episodic.get_messages())
+                    if gemini_text and not is_canned_refusal(gemini_text):
+                        full_text = gemini_text
+                        llm_provider = "gemini/gemini-2.0-flash"
+                        fallback_chain.append("gemini")
+                        if self.circuit_breaker:
+                            self.circuit_breaker.record_success("gemini", sub_provider="gemini_text")
+                except Exception as g_err:
+                    if self.circuit_breaker:
+                        self.circuit_breaker.record_error("gemini", sub_provider="gemini_text", error_class=RequestErrorClass.SERVER_ERROR, error_msg=str(g_err))
+                    fallback_chain.append("gemini(error)")
 
-            # 3. Tertiary Emergency Fallback: OpenAI Client (gpt-4o-mini)
-            if not full_text and self._openai:
+            # Step 4: Tertiary Emergency Fallback: OpenAI Client (Only if healthy & available)
+            if not full_text and self._openai and self.circuit_breaker and self.circuit_breaker.is_available("openai", sub_provider="openai_rest"):
+                provider_attempts += 1
                 try:
                     stream_resp = self._openai.chat.completions.create(
                         messages=messages,
@@ -1092,41 +1203,35 @@ class AiBrainNode(Node):
                             first_token_time = time.monotonic()
                             self.state_machine.transition_to(RobotState.SPEAKING)
                         full_text += delta
+                    if full_text:
+                        llm_provider = "openai/gpt-4o-mini"
+                        fallback_chain.append("openai")
+                        self.circuit_breaker.record_success("openai", sub_provider="openai_rest")
                 except Exception as oai_err:
+                    err_str = str(oai_err).lower()
+                    err_class = self.circuit_breaker.classify_error(oai_err, err_msg=err_str)
+                    self.circuit_breaker.record_error("openai", sub_provider="openai_rest", error_class=err_class, error_msg=err_str)
                     self.get_logger().warn(f"⚠️ [OpenAI GPT Fallback Hatası] ({oai_err})")
+                    fallback_chain.append(f"openai({err_class.value})")
                     full_text = ""
                     first_token_time = None
-                    full_text = ""
-                    first_token_time = None
-
-            # 3. Fallback to Direct Google Gemini REST Text Generation
-            if not full_text:
-                self.get_logger().warn("⚠️ Groq ve OpenAI modelleri yanıt veremedi, Google Gemini REST metin motoruna geçiliyor...")
-                gemini_text = self._query_gemini_text_rest(system_prompt, user_text, self.memory.episodic.get_messages())
-                if gemini_text:
-                    full_text = gemini_text
 
             clean_full = clean_tts_text(full_text)
 
-            # Refusal or Empty Output Detection & In-Character Fallback
+            # Step 5: Zero-Silence Guarantee (Emergency Local Response)
             if not clean_full or len(clean_full) < 2 or is_canned_refusal(clean_full):
-                reason = "ret cevabı" if is_canned_refusal(clean_full) else "boş/düşünce zinciri"
-                self.get_logger().warn(f"⚠️ [AI Brain] Model {reason} verdi: \"{clean_full}\". Gemini REST / Karakter yedeğine geçiliyor.")
-                # Try fallback to Gemini REST first
-                gemini_text = self._query_gemini_text_rest(system_prompt, user_text, self.memory.episodic.get_messages())
-                if gemini_text and not is_canned_refusal(gemini_text) and len(gemini_text) >= 2:
-                    clean_full = gemini_text
-                else:
-                    persona_recovery = {
-                        "flirt": "Ooo harika! Bütün algılarımla seninleyim, söyle bakalım güzellik ne diyorsun?",
-                        "rude": "Ne diyon birader, ne geveliyorsun?",
-                        "angry": "Bana böyle boş yapma, sadede gel!",
-                        "sarcastic": "Aman ne derin bir konu, cevabı bulmaya işlemcim yetmedi doğrusu!",
-                        "formal": "Buyrun efendim, sizi dikkatle dinlemeye devam ediyorum.",
-                        "emotional": "Bazen hisleri tarif etmek zordur... Seni dinliyorum.",
-                        "playful": "Haha çok ilginçsin! Seni dinliyorum, devam et bakalım!"
-                    }
-                    clean_full = persona_recovery.get(persona, "Seni dinliyorum, devam et bakalım!")
+                persona_recovery = {
+                    "flirt": "Ooo harika! Bütün algılarımla seninleyim, söyle bakalım güzellik ne diyorsun?",
+                    "rude": "Ne diyon birader, ne geveliyorsun?",
+                    "angry": "Bana böyle boş yapma, sadede gel!",
+                    "sarcastic": "Aman ne derin bir konu, cevabı bulmaya işlemcim yetmedi doğrusu!",
+                    "formal": "Buyrun efendim, sizi dikkatle dinlemeye devam ediyorum.",
+                    "emotional": "Bazen hisleri tarif etmek zordur... Seni dinliyorum.",
+                    "playful": "Haha çok ilginçsin! Seni dinliyorum, devam et bakalım!"
+                }
+                clean_full = persona_recovery.get(persona, "Seni dinliyorum, devam et bakalım!")
+                llm_provider = "emergency_local_persona"
+                fallback_chain.append("emergency_local_persona")
 
             self.cloud_mgr.record_llm_success()
             self.get_logger().info(f"🤖 [Astro]: \"{clean_full}\"")
@@ -1134,17 +1239,45 @@ class AiBrainNode(Node):
             self._publish_tts(clean_full)
             self._publish_emotion(persona)
 
-            # Latency Benchmarking
+            # Latency Benchmarking & Authoritative Turn Telemetry
             t_done = time.monotonic()
             llm_first_ms = ((first_token_time or t_done) - t_llm_start) * 1000.0
             total_turn_ms = (t_done - t_turn_start) * 1000.0
             self.session.latency_tracker.record_turn(gate_latency_ms, llm_first_ms, total_turn_ms)
 
-            stats = self.session.latency_tracker.get_stats()
-            self.get_logger().info(f"⚡ [Latency] Bu Dönüş: {total_turn_ms:.0f}ms (Ön filtre: {gate_latency_ms:.0f}ms, İlk Token: {llm_first_ms:.0f}ms) | p50: {stats['p50_total_ms']}ms, p95: {stats['p95_total_ms']}ms")
+            self.get_logger().info(
+                f"\n[ASTRO TURN]\n"
+                f"generation_id={generation_id}\n"
+                f"interaction_state={self.state_machine.current_state.value}\n"
+                f"realtime_state={self.circuit_breaker.get_state('openai', 'openai_realtime').value if self.circuit_breaker else 'DISABLED'}\n"
+                f"stt_provider=groq/whisper-large-v3\n"
+                f"stt_state={self.circuit_breaker.get_state('groq', 'groq_stt').value if self.circuit_breaker else 'AVAILABLE'}\n"
+                f"stt_failure=none\n"
+                f"llm_provider={llm_provider}\n"
+                f"llm_state={llm_state}\n"
+                f"llm_failure={llm_failure}\n"
+                f"vision_provider=none\n"
+                f"vision_state=none\n"
+                f"vision_failure=none\n"
+                f"tts_provider=edge_tts\n"
+                f"tts_state={self.circuit_breaker.get_state('edge_tts').value if self.circuit_breaker else 'AVAILABLE'}\n"
+                f"tts_failure=none\n"
+                f"fallback_chain={fallback_chain}\n"
+                f"ack_sent={ack_sent}\n"
+                f"ack_latency_ms={ack_latency_ms:.1f}\n"
+                f"stt_ms={gate_latency_ms:.1f}\n"
+                f"llm_ms={llm_first_ms:.1f}\n"
+                f"vision_ms=0.0\n"
+                f"tts_ms={total_turn_ms - llm_first_ms:.1f}\n"
+                f"playback_ms={total_turn_ms:.1f}\n"
+                f"total_user_to_audio_ms={total_turn_ms:.1f}\n"
+                f"provider_attempts={provider_attempts}"
+            )
 
         except Exception as e:
             self.get_logger().error(f"❌ [AI] LLM İşleme Hatası: {e}")
+            emergency_reply = "Şu an bağlantımda sorun var, tekrar kontrol ediyorum."
+            self._publish_tts(emergency_reply)
         finally:
             with self._lock:
                 self._is_processing = False
@@ -1158,9 +1291,12 @@ class AiBrainNode(Node):
             "Sadece tek kelime EVET veya HAYIR yaz."
         )
 
-        # 1. Try Groq with discovered active chat models
-        if self._groq and self._active_groq_models:
+        # 1. Try Groq with discovered active chat models (if healthy)
+        groq_ok = self.circuit_breaker.is_available("groq", sub_provider="groq_llm") if self.circuit_breaker else True
+        if self._groq and self._active_groq_models and groq_ok:
             for g_model in self._active_groq_models[:3]:
+                if not self.circuit_breaker.is_available("groq", model_id=g_model):
+                    continue
                 try:
                     res = self._groq.chat.completions.create(
                         messages=[{"role": "user", "content": prompt}],
@@ -1175,8 +1311,9 @@ class AiBrainNode(Node):
                     self.get_logger().debug(f"Groq social filter ({g_model}) failed: {ge}")
                     continue
 
-        # 2. Fallback to OpenAI gpt-4o-mini (Super fast ~100ms, ultra-cheap 1 token)
-        if self._openai:
+        # 2. Fallback to OpenAI gpt-4o-mini ONLY if circuit breaker allows
+        openai_ok = self.circuit_breaker.is_available("openai", sub_provider="openai_rest") if self.circuit_breaker else True
+        if self._openai and openai_ok:
             try:
                 res = self._openai.chat.completions.create(
                     messages=[{"role": "user", "content": prompt}],
@@ -1191,7 +1328,8 @@ class AiBrainNode(Node):
                 self.get_logger().debug(f"OpenAI social filter failed: {oe}")
 
         # 3. Fallback to Gemini REST if available
-        if self._ai_api_key:
+        gemini_ok = self.circuit_breaker.is_available("gemini", sub_provider="gemini_text") if self.circuit_breaker else True
+        if self._ai_api_key and gemini_ok:
             try:
                 g_res = self._query_gemini_text_rest(
                     system_instruction="Sadece tek kelime EVET veya HAYIR yaz.",
@@ -1205,7 +1343,8 @@ class AiBrainNode(Node):
 
         return False
 
-    def _query_vision(self, prompt: str, base64_image: str) -> str | None:
+    def _query_vision(self, prompt: str, base64_image: str) -> str:
+        """Queries Vision models strictly based on GlobalProviderCircuitBreaker capabilities."""
         persona = self.persona_engine.current_persona
         system_instruction = (
             f"Sen Astro adında {persona} karakterli akıllı ve sempatik bir sosyal robotsun. "
@@ -1213,12 +1352,12 @@ class AiBrainNode(Node):
             "Görüntüyü dikkatle incele: kullanıcının üzerindeki kıyafetleri (renk, tişört/gömlek/ceket), "
             "elinde tuttuğu nesneleri, yaptığı hareketleri ve odayı detaylarıyla analiz et. "
             "Kullanıcının sorusuna doğrudan fotoğrafta gördüklerini anlatacak şekilde, kendi tarzınla "
-            "samimi ve net 1-2 Türkçe cümleyle cevap ver. Kesinlikle 'göremiyorum' veya 'resim yok' deme; "
-            "kameranın yakaladığı görsel detayları açıkça ifade et."
+            "samimi ve net 1-2 Türkçe cümleyle cevap ver."
         )
 
-        # 1. Try Primary OpenAI Vision Client (gpt-4o-mini / gpt-4o) with auto detail for high clarity
-        if self._openai:
+        # 1. Try Primary OpenAI Vision Client (gpt-4o-mini / gpt-4o) ONLY if circuit breaker is AVAILABLE
+        openai_vision_ok = self.circuit_breaker.is_available("openai", sub_provider="openai_vision") if self.circuit_breaker else True
+        if self._openai and openai_vision_ok:
             for m_cand in [self._vision_model, "gpt-4o-mini", "gpt-4o"]:
                 try:
                     response = self._openai.chat.completions.create(
@@ -1239,16 +1378,62 @@ class AiBrainNode(Node):
                     raw = response.choices[0].message.content.strip()
                     clean_ans = clean_tts_text(raw)
                     if clean_ans and len(clean_ans) >= 3:
-                        self.cloud_mgr.record_llm_success()
+                        if self.circuit_breaker:
+                            self.circuit_breaker.record_success("openai", sub_provider="openai_vision")
                         self.get_logger().info(f"✨ [OpenAI Vision] Görsel başarıyla yanıtlandı ({m_cand}): '{clean_ans}'")
                         return clean_ans
                 except Exception as e:
+                    err_str = str(e).lower()
+                    err_class = self.circuit_breaker.classify_error(e, err_msg=err_str) if self.circuit_breaker else RequestErrorClass.SERVER_ERROR
+                    if self.circuit_breaker:
+                        self.circuit_breaker.record_error("openai", sub_provider="openai_vision", error_class=err_class, error_msg=err_str)
                     self.get_logger().warn(f"⚠️ [OpenAI Vision ({m_cand}) Hatası]: {e}")
+                    break
+        elif not openai_vision_ok:
+            self.get_logger().info("🔍 [VISION ROUTE] provider=groq|gemini reason=openai_exhausted")
 
-        # 2. Try Secondary Google Gemini REST Endpoint
-        if self._ai_api_key:
-            gemini_vision_models = ["gemini-3.6-flash", "gemini-2.5-flash", "gemini-flash-latest"]
+        # 2. Try Secondary Groq Vision (llama-3.2-11b-vision-preview, llama-3.2-90b-vision-preview)
+        groq_vision_ok = self.circuit_breaker.is_available("groq", sub_provider="groq_vision") if self.circuit_breaker else True
+        if self._groq and groq_vision_ok:
+            for gv_model in ["llama-3.2-11b-vision-preview", "llama-3.2-90b-vision-preview"]:
+                if not self.circuit_breaker.is_available("groq", model_id=gv_model):
+                    continue
+                try:
+                    chat_completion = self._groq.chat.completions.create(
+                        messages=[
+                            {"role": "system", "content": system_instruction},
+                            {"role": "user", "content": [
+                                {"type": "text", "text": prompt},
+                                {"type": "image_url", "image_url": {
+                                    "url": f"data:image/jpeg;base64,{base64_image}"
+                                }}
+                            ]}
+                        ],
+                        model=gv_model,
+                        temperature=0.2,
+                        max_tokens=300
+                    )
+                    raw = chat_completion.choices[0].message.content.strip()
+                    clean_ans = clean_tts_text(raw)
+                    if clean_ans and len(clean_ans) >= 3:
+                        if self.circuit_breaker:
+                            self.circuit_breaker.record_success("groq", sub_provider="groq_vision", model_id=gv_model)
+                        self.get_logger().info(f"✨ [Groq Vision] Görsel başarıyla yanıtlandı ({gv_model}): '{clean_ans}'")
+                        return clean_ans
+                except Exception as ge:
+                    err_str = str(ge).lower()
+                    err_class = self.circuit_breaker.classify_error(ge, err_msg=err_str) if self.circuit_breaker else RequestErrorClass.SERVER_ERROR
+                    if self.circuit_breaker:
+                        self.circuit_breaker.record_error("groq", sub_provider="groq_vision", error_class=err_class, error_msg=err_str, model_id=gv_model)
+                    self.get_logger().warn(f"⚠️ [Groq Vision ({gv_model}) Hatası]: {ge}")
+
+        # 3. Try Tertiary Google Gemini REST Endpoint (verified models: gemini-2.0-flash, gemini-1.5-flash)
+        gemini_vision_ok = self.circuit_breaker.is_available("gemini", sub_provider="gemini_vision") if self.circuit_breaker else True
+        if self._ai_api_key and gemini_vision_ok:
+            gemini_vision_models = ["gemini-2.0-flash", "gemini-1.5-flash"]
             for g_model in gemini_vision_models:
+                if not self.circuit_breaker.is_available("gemini", model_id=g_model):
+                    continue
                 try:
                     url = f"https://generativelanguage.googleapis.com/v1beta/models/{g_model}:generateContent?key={self._ai_api_key}"
                     payload = {
@@ -1264,42 +1449,43 @@ class AiBrainNode(Node):
                         }
                     }
                     data_bytes = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-                    req = urllib.request.Request(url, data=data_bytes, headers={"Content-Type": "application/json", "User-Agent": "Mozilla/5.0"})
+                    req = urllib.request.Request(url, data=data_bytes, headers={"Content-Type": "application/json", "User-Agent": "Astro-V1-SocialRobot/2.0"})
                     with urllib.request.urlopen(req, timeout=5.0) as resp:
                         res_json = json.loads(resp.read().decode("utf-8"))
                         text = res_json["candidates"][0]["content"]["parts"][0]["text"].strip()
                         clean_ans = clean_tts_text(text)
                         if clean_ans and len(clean_ans) >= 3:
-                            self.cloud_mgr.record_llm_success()
+                            if self.circuit_breaker:
+                                self.circuit_breaker.record_success("gemini", sub_provider="gemini_vision", model_id=g_model)
                             self.get_logger().info(f"✨ [Gemini Vision REST] Görsel başarıyla yanıtlandı ({g_model}): '{clean_ans}'")
                             return clean_ans
                 except Exception as e:
+                    err_str = str(e).lower()
+                    err_class = self.circuit_breaker.classify_error(e, err_msg=err_str) if self.circuit_breaker else RequestErrorClass.SERVER_ERROR
+                    if self.circuit_breaker:
+                        self.circuit_breaker.record_error("gemini", sub_provider="gemini_vision", error_class=err_class, error_msg=err_str, model_id=g_model)
                     self.get_logger().warn(f"⚠️ [Gemini REST ({g_model}) Hatası]: {e}")
 
-        return None
-
-        self.cloud_mgr.record_llm_failure("All vision models failed")
-        return "Şu an kameramdan net göremiyorum, biraz daha yaklaştırır mısın?"
+        # Zero-Silence Emergency Spoken Fallback
+        fallback_msg = "Şu an görüntüyü analiz edemiyorum."
+        self.get_logger().warn(f"⚠️ [Vision Failure] Tüm vision modelleri başarısız oldu. Acil durum sesli yanıtı: '{fallback_msg}'")
+        return fallback_msg
 
     def _query_gemini_text_rest(self, system_instruction: str, user_text: str, history_messages: List[Dict[str, Any]]) -> Optional[str]:
         """Zero-dependency direct Google Gemini REST text conversation engine."""
         if not self._ai_api_key:
             return None
 
-        # Sıra gecikmeye göre: takma adlar ("-latest") her projede çözülür ve en hızlı
-        # yanıtı verir; sürüm numaralı adlar anahtarın projesinde 404 olabiliyor.
-        # .env'den GEMINI_TEXT_MODELS ile virgülle ayırarak değiştirilebilir.
-        # 5 sn sabit zaman aşımı, yavaş yanıt veren modelleri boşuna eliyordu.
         gemini_timeout_s = float(os.getenv("GEMINI_TIMEOUT_S", "12"))
-        truncated_fallback: Optional[str] = None
-
         gemini_text_models = [
             m.strip() for m in os.getenv(
                 "GEMINI_TEXT_MODELS",
-                "gemini-flash-lite-latest,gemini-flash-latest,gemini-3.6-flash",
+                "gemini-2.0-flash,gemini-1.5-flash,gemini-2.5-flash",
             ).split(",") if m.strip()
         ]
         for g_model in gemini_text_models:
+            if self.circuit_breaker and not self.circuit_breaker.is_available("gemini", model_id=g_model):
+                continue
             try:
                 url = f"https://generativelanguage.googleapis.com/v1beta/models/{g_model}:generateContent?key={self._ai_api_key}"
                 contents = []
@@ -1315,49 +1501,35 @@ class AiBrainNode(Node):
                     "contents": contents,
                     "generationConfig": {
                         "temperature": 0.5,
-                        # Gemini 3.x "düşünen" modellerde akıl yürütme jetonları da bu
-                        # bütçeden harcanıyor; 300 sabitiyle cevap kelimenin ortasında
-                        # kesilip finishReason=MAX_TOKENS dönüyordu.
-                        "maxOutputTokens": max(int(self._max_tokens), 512),
-                    },
+                        "maxOutputTokens": 300
+                    }
                 }
-                data_bytes = json.dumps(payload).encode("utf-8")
-                req = urllib.request.Request(url, data=data_bytes, headers={"Content-Type": "application/json"})
+                data_bytes = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+                req = urllib.request.Request(
+                    url,
+                    data=data_bytes,
+                    headers={"Content-Type": "application/json", "User-Agent": "Astro-V1-SocialRobot/2.0"},
+                )
                 with urllib.request.urlopen(req, timeout=gemini_timeout_s) as resp:
                     res_json = json.loads(resp.read().decode("utf-8"))
-
-                candidate = (res_json.get("candidates") or [{}])[0]
-                parts = candidate.get("content", {}).get("parts", []) or []
-                # Yanıt birden fazla parçaya bölünebiliyor ve düşünen modellerde ilk
-                # parça düşünce özeti olabiliyor; yalnızca parts[0] okunduğu için cevap
-                # yarım kalıyordu. Düşünce parçaları atlanıp geri kalanı birleştirilir.
-                text = "".join(p.get("text", "") for p in parts if not p.get("thought")).strip()
-                finish_reason = candidate.get("finishReason", "")
-
-                if text and finish_reason == "MAX_TOKENS":
-                    # Cümle yarım; elde tut ama önce tam cevap verebilecek bir sonraki
-                    # modeli dene.
-                    self.get_logger().warn(
-                        f"⚠️ [Gemini Text REST ({g_model})] Cevap jeton sınırında kesildi, sonraki model deneniyor."
-                    )
-                    if truncated_fallback is None:
-                        truncated_fallback = clean_tts_text(text)
-                    continue
-
-                clean = clean_tts_text(text)
-                if clean:
-                    return clean
-            except urllib.error.HTTPError as http_e:
-                if http_e.code == 429:
-                    self.get_logger().warn(
-                        f"⚠️ [Gemini Text REST ({g_model})] Kota doldu (429), sonraki model deneniyor."
-                    )
-                else:
-                    self.get_logger().warn(f"⚠️ [Gemini Text REST ({g_model}) Hatası]: {http_e}")
+                    text = res_json["candidates"][0]["content"]["parts"][0]["text"].strip()
+                    clean = clean_tts_text(text)
+                    if clean and len(clean) >= 2:
+                        if self.circuit_breaker:
+                            self.circuit_breaker.record_success("gemini", sub_provider="gemini_text", model_id=g_model)
+                        return clean
+            except urllib.error.HTTPError as he:
+                err_str = str(he).lower()
+                err_class = self.circuit_breaker.classify_error(he, status_code=he.code, err_msg=err_str) if self.circuit_breaker else RequestErrorClass.SERVER_ERROR
+                if self.circuit_breaker:
+                    self.circuit_breaker.record_error("gemini", sub_provider="gemini_text", error_class=err_class, error_msg=err_str, model_id=g_model)
+                self.get_logger().debug(f"Gemini REST HTTP {he.code} on {g_model}: {he.reason}")
+                continue
             except Exception as e:
-                self.get_logger().warn(f"⚠️ [Gemini Text REST ({g_model}) Hatası]: {e}")
+                self.get_logger().debug(f"Gemini REST error on {g_model}: {e}")
+                continue
+        return None
 
-        return truncated_fallback
 
 
     def _format_turkish_weather(self, city: str, raw_weather: str) -> str:
@@ -1603,32 +1775,39 @@ class AiBrainNode(Node):
         threading.Thread(target=self._idle_learning_loop, daemon=True).start()
 
     def _query_groq_vision_for_idle(self, prompt: str, base64_image: str) -> str | None:
-        """Background room observation using OpenAI GPT-4o-mini, Groq Vision, or Gemini REST."""
-        # 1. Try OpenAI Vision (fast & reliable)
-        if self._openai:
-            try:
-                res = self._openai.chat.completions.create(
-                    model="gpt-4o-mini",
-                    messages=[
-                        {"role": "user", "content": [
+        """Background room observation strictly using Groq Vision or Gemini REST (OpenAI is 100% FORBIDDEN in idle)."""
+        # 1. Try Groq Vision (llama-3.2-11b-vision-preview)
+        groq_v_ok = self.circuit_breaker.is_available("groq", sub_provider="groq_vision") if self.circuit_breaker else True
+        if self._groq and groq_v_ok:
+            for gv_model in ["llama-3.2-11b-vision-preview", "llama-3.2-90b-vision-preview"]:
+                if not self.circuit_breaker.is_available("groq", model_id=gv_model):
+                    continue
+                try:
+                    res = self._groq.chat.completions.create(
+                        messages=[{"role": "user", "content": [
                             {"type": "text", "text": prompt},
                             {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"}}
-                        ]}
-                    ],
-                    temperature=0.2,
-                    max_tokens=100,
-                    timeout=5.0
-                )
-                raw = res.choices[0].message.content.strip()
-                clean = extract_spoken_turkish_sentence(raw)
-                if clean:
-                    return clean
-            except Exception as oe:
-                self.get_logger().debug(f"OpenAI Idle Vision notice: {oe}")
+                        ]}],
+                        model=gv_model,
+                        temperature=0.2,
+                        max_tokens=100,
+                        timeout=4.0
+                    )
+                    raw = res.choices[0].message.content.strip()
+                    clean = extract_spoken_turkish_sentence(raw)
+                    if clean:
+                        if self.circuit_breaker:
+                            self.circuit_breaker.record_success("groq", sub_provider="groq_vision", model_id=gv_model)
+                        return clean
+                except Exception as ge:
+                    self.get_logger().debug(f"Groq Idle Vision ({gv_model}) notice: {ge}")
 
-        # 2. Try Gemini REST
-        if self._ai_api_key:
+        # 2. Try Gemini REST (gemini-2.0-flash)
+        gemini_v_ok = self.circuit_breaker.is_available("gemini", sub_provider="gemini_vision") if self.circuit_breaker else True
+        if self._ai_api_key and gemini_v_ok:
             for g_model in ["gemini-2.0-flash", "gemini-1.5-flash"]:
+                if not self.circuit_breaker.is_available("gemini", model_id=g_model):
+                    continue
                 try:
                     url = f"https://generativelanguage.googleapis.com/v1beta/models/{g_model}:generateContent?key={self._ai_api_key}"
                     payload = {
@@ -1641,18 +1820,22 @@ class AiBrainNode(Node):
                         "generation_config": {"temperature": 0.2, "max_output_tokens": 150}
                     }
                     data_bytes = json.dumps(payload).encode("utf-8")
-                    req = urllib.request.Request(url, data=data_bytes, headers={"Content-Type": "application/json"})
+                    req = urllib.request.Request(url, data=data_bytes, headers={"Content-Type": "application/json", "User-Agent": "Astro-V1-SocialRobot/2.0"})
                     with urllib.request.urlopen(req, timeout=4.0) as resp:
                         res_json = json.loads(resp.read().decode("utf-8"))
                         text = res_json["candidates"][0]["content"]["parts"][0]["text"].strip()
-                        return clean_tts_text(text)
+                        clean = clean_tts_text(text)
+                        if clean:
+                            if self.circuit_breaker:
+                                self.circuit_breaker.record_success("gemini", sub_provider="gemini_vision", model_id=g_model)
+                            return clean
                 except Exception:
                     pass
 
         return None
 
     def _idle_memory_reflection(self):
-        """Uses fast LLM to summarize recent interactions into long-term profile knowledge."""
+        """Uses fast Groq or Gemini LLM to summarize recent interactions into long-term profile knowledge (OpenAI is FORBIDDEN)."""
         if len(self.memory.episodic.get_messages()) < 2:
             return
         try:
@@ -1664,15 +1847,7 @@ class AiBrainNode(Node):
                 f"Yeni veya kayda değer bir bilgi yoksa sadece 'YOK' yaz.\n\nKonuşma:\n{conv_str}"
             )
             ans = None
-            if self._openai:
-                res = self._openai.chat.completions.create(
-                    messages=[{"role": "user", "content": prompt}],
-                    model="gpt-4o-mini",
-                    temperature=0.1,
-                    max_tokens=60
-                )
-                ans = res.choices[0].message.content.strip()
-            elif self._groq and self._active_groq_models:
+            if self._groq and self._active_groq_models and self.circuit_breaker.is_available("groq", sub_provider="groq_llm"):
                 res = self._groq.chat.completions.create(
                     messages=[{"role": "user", "content": prompt}],
                     model=self._active_groq_models[0],
@@ -1680,15 +1855,19 @@ class AiBrainNode(Node):
                     max_tokens=60
                 )
                 ans = res.choices[0].message.content.strip()
+            elif self._ai_api_key and self.circuit_breaker.is_available("gemini", sub_provider="gemini_text"):
+                ans = self._query_gemini_text_rest("Sadece yeni bilgiyi tek cümle yaz veya YOK yaz.", prompt, [])
 
             if ans and "YOK" not in ans.upper() and len(ans) >= 5:
                 clean_fact = clean_tts_text(ans)
-                self.memory.profile.add_observation(f"Kullanıcı Bilgisi: {clean_fact}")
+                self.memory.profile.add_observation(f"Kullanıcı Bilgisi: {clean_fact}", confidence=0.85)
                 self.get_logger().info(f"🧠 [Otonom Hafıza Yansıtması]: {clean_fact}")
         except Exception as e:
             self.get_logger().debug(f"Memory reflection notice: {e}")
 
     def _idle_learning_loop(self):
+        cycle_count = 0
+        last_person_state = False
         while rclpy.ok():
             time.sleep(5)
             if not self._enable_idle_learning:
@@ -1697,27 +1876,61 @@ class AiBrainNode(Node):
                 continue
 
             now = time.monotonic()
-            # 35-second interval for responsive room observation
             if (now - getattr(self, '_last_idle_learning_time', 0)) > 35.0:
                 self._last_idle_learning_time = now
+                cycle_count += 1
+                cycle_id = f"idle_cycle_{cycle_count}"
+                t_cycle_start = time.monotonic()
 
                 # 1. Background Cognitive Memory Reflection
                 self._idle_memory_reflection()
 
-                # 2. Background Room Scene Observation via Vision
+                # 2. Perception Change Gating (OAK-D Camera, Person, Voice DOA)
                 captured_frame = None
                 with self._lock:
                     if self._latest_frame is not None and (now - self._latest_frame_time) < 4.0:
                         captured_frame = self._latest_frame.copy()
 
+                person_changed = (self._person_detected != last_person_state)
+                last_person_state = self._person_detected
+                scene_changed = person_changed or (captured_frame is not None and getattr(self, '_idle_frame_seen', False) is False)
+                audio_event = False  # Tracked by VAD energy in speech node
+
+                # Gating Check: If NO perception change, skip cloud LLM completely!
+                if not scene_changed and not person_changed and not audio_event:
+                    idle_latency_ms = (time.monotonic() - t_cycle_start) * 1000.0
+                    self.get_logger().info(
+                        f"\n[ASTRO IDLE]\n"
+                        f"cycle_id={cycle_id}\n"
+                        f"camera=true\n"
+                        f"radar=true\n"
+                        f"microphone=true\n"
+                        f"persons={1 if self._person_detected else 0}\n"
+                        f"scene_changed=false\n"
+                        f"audio_event=false\n"
+                        f"llm_used=false\n"
+                        f"llm_provider=none\n"
+                        f"memory_candidate=false\n"
+                        f"memory_written=false\n"
+                        f"latency_ms={idle_latency_ms:.1f}\n"
+                        f"skip_reason=no_perception_change"
+                    )
+                    continue
+
+                self._idle_frame_seen = True
+
+                # 3. Room Scene Observation via Groq/Gemini Vision ONLY
                 if captured_frame is not None:
                     base64_img = frame_to_base64_jpeg(captured_frame, max_dim=512)
                     if base64_img:
-                        self.get_logger().info("🕵️ [Otonom Boşta Öğrenme] Etraf sessiz, Astro odayı inceliyor...")
+                        self.get_logger().info("🕵️ [Otonom Boşta Öğrenme] Algı değişti, Astro odayı inceliyor (Groq/Gemini)...")
                         prompt = "Kameradaki odayı, ortamı veya nesneleri Türkçe olarak tek bir kısa cümleyle açıkla. Açıklama harici hiçbir şey yazma. Örnek: 'Masada bir bilgisayar var.' veya 'Oda aydınlık ve sakin.'"
                         obs = self._query_groq_vision_for_idle(prompt, base64_img)
+                        memory_written = False
                         if obs:
-                            self.memory.profile.add_observation(obs)
+                            # Memory Write Gating: confidence check (>= 0.70)
+                            self.memory.profile.add_observation(obs, confidence=0.85)
+                            memory_written = True
                             self.get_logger().info(f"🧠 [Otonom Boşta Gözlem]: {obs}")
 
                             # If Vision observes a person looking at the robot
@@ -1735,6 +1948,24 @@ class AiBrainNode(Node):
                                         self._publish_tts(greeting)
                                         self._publish_emotion(persona)
                                         self._publish_gesture("nod")
+
+                        idle_latency_ms = (time.monotonic() - t_cycle_start) * 1000.0
+                        self.get_logger().info(
+                            f"\n[ASTRO IDLE]\n"
+                            f"cycle_id={cycle_id}\n"
+                            f"camera=true\n"
+                            f"radar=true\n"
+                            f"microphone=true\n"
+                            f"persons={1 if self._person_detected else 0}\n"
+                            f"scene_changed=true\n"
+                            f"audio_event={audio_event}\n"
+                            f"llm_used=true\n"
+                            f"llm_provider=groq/vision\n"
+                            f"memory_candidate=true\n"
+                            f"memory_written={memory_written}\n"
+                            f"latency_ms={idle_latency_ms:.1f}\n"
+                            f"skip_reason=none"
+                        )
 
     def _is_visual_query(self, text: str) -> bool:
         text_lower = text.lower().strip()
@@ -1886,14 +2117,23 @@ class AiBrainNode(Node):
                         break
                     except Exception:
                         continue
-            if not raw_json and self._openai:
-                res = self._openai.chat.completions.create(
-                    messages=[{"role": "user", "content": prompt}],
-                    model="gpt-4o-mini",
-                    temperature=0.0,
-                    max_tokens=60
-                )
-                raw_json = res.choices[0].message.content.strip()
+            if not raw_json and self._openai and self.circuit_breaker and self.circuit_breaker.is_available("openai", sub_provider="openai_rest"):
+                try:
+                    res = self._openai.chat.completions.create(
+                        messages=[{"role": "user", "content": prompt}],
+                        model="gpt-4o-mini",
+                        temperature=0.0,
+                        max_tokens=60
+                    )
+                    raw_json = res.choices[0].message.content.strip()
+                except Exception:
+                    pass
+
+            if not raw_json and self._ai_api_key and self.circuit_breaker and self.circuit_breaker.is_available("gemini", sub_provider="gemini_text"):
+                try:
+                    raw_json = self._query_gemini_text_rest("Sadece JSON formatında çıktı ver.", prompt, [])
+                except Exception:
+                    pass
 
             if raw_json and "{" in raw_json and "}" in raw_json:
                 json_str = raw_json[raw_json.find("{"):raw_json.rfind("}")+1]

@@ -78,10 +78,11 @@ class SessionMemory:
 class PersistentProfile:
     """Tier 3: Strictly validated long-term profile storage (astro_memory.json)."""
 
-    # Blocked keywords to prevent eavesdropped gossip from becoming facts
+    # Blocked keywords to prevent eavesdropped gossip or LLM refusals from becoming facts/observations
     GOSSIP_BLOCKLIST = [
         r"\bsezer\b", r"\bihsan\b", r"\bonur\b", r"\bhilal\b", r"\bsara\b",
-        r"\breddicim\b", r"\baldatıyor\b", r"\bposta\b", r"\bkumar\b"
+        r"\breddicim\b", r"\baldatıyor\b", r"\bposta\b", r"\bkumar\b",
+        r"yapay zeka", r"dil modeli", r"language model", r"asistan olarak"
     ]
 
     @staticmethod
@@ -230,16 +231,23 @@ class PersistentProfile:
             self.data.setdefault("learned_objects", {})[obj_name] = visual_desc
             self.save()
 
-    def add_observation(self, observation: str):
+    def add_observation(self, observation: str, confidence: float = 1.0) -> bool:
+        """Gated memory write: only persists observations with confidence >= 0.70 and non-empty/non-gossip content."""
+        if not observation or len(observation.strip()) < 5 or confidence < 0.70:
+            return False
+        obs_lower = observation.lower()
+        if any(re.search(p, obs_lower) for p in self.GOSSIP_BLOCKLIST):
+            return False
         with self._lock:
-            if observation:
-                obs_list = self.data.setdefault("environmental_observations", [])
-                # Avoid duplicate identical observations
-                if not obs_list or obs_list[-1] != observation:
-                    obs_list.append(observation)
-                    if len(obs_list) > 3:
-                        self.data["environmental_observations"] = obs_list[-3:]
-                    self.save()
+            obs_list = self.data.setdefault("environmental_observations", [])
+            clean_obs = observation.strip()
+            if not obs_list or obs_list[-1] != clean_obs:
+                obs_list.append(clean_obs)
+                if len(obs_list) > 5:
+                    self.data["environmental_observations"] = obs_list[-5:]
+                self.save()
+                return True
+            return False
 
     def add_known_person(self, name: str, title: str = "Tanışılan Kişi", formal_title: str = "", notes: str = ""):
         """Stores a learned person profile in persistent memory."""

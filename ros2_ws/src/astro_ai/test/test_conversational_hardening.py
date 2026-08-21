@@ -50,6 +50,13 @@ from astro_audio.tts_router import TTSRouter
 class TestConversationalHardening(unittest.TestCase):
     """Verifies conversational response brevity, prompt guards, and fallback robustness."""
 
+    def setUp(self):
+        try:
+            from astro_ai.circuit_breaker import GlobalProviderCircuitBreaker
+            GlobalProviderCircuitBreaker.get_instance().reset_all()
+        except Exception:
+            pass
+
     def test_short_social_response_policy(self):
         """Social responses must be short (<= 35 words, 1-2 sentences)."""
         long_response = (

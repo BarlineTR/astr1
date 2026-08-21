@@ -24,6 +24,22 @@ from enum import Enum
 from typing import Any, Dict, Generator, List, Optional, Set, Tuple
 
 
+try:
+    from astro_ai.circuit_breaker import (
+        GlobalProviderCircuitBreaker,
+        ProviderState,
+        RequestErrorClass,
+        get_global_circuit_breaker,
+    )
+except ImportError:
+    from circuit_breaker import (
+        GlobalProviderCircuitBreaker,
+        ProviderState,
+        RequestErrorClass,
+        get_global_circuit_breaker,
+    )
+
+
 class ErrorClass(str, Enum):
     NONE = "none"
     QUOTA_EXHAUSTED = "quota_exhausted"
@@ -75,12 +91,14 @@ class ModelCapability:
     last_latency_ms: float = 0.0
 
 
-# Approved Production Chat LLM Models (Strict Whitelist among discovered models)
+# Approved Production Chat & Vision LLM Models (Strict Whitelist)
 GROQ_PRODUCTION_MODELS: Set[str] = {
     "openai/gpt-oss-20b",
     "openai/gpt-oss-120b",
     "llama-3.3-70b-versatile",
     "llama-3.1-8b-instant",
+    "llama-3.2-11b-vision-preview",
+    "llama-3.2-90b-vision-preview",
 }
 
 GROQ_PREFERENCE_ORDER: List[str] = [
@@ -91,16 +109,26 @@ GROQ_PREFERENCE_ORDER: List[str] = [
 ]
 
 GEMINI_PRODUCTION_MODELS: Set[str] = {
+    "gemini-2.0-flash",
+    "gemini-1.5-flash",
+    "gemini-1.5-pro",
     "gemini-2.5-flash",
     "gemini-2.5-flash-lite",
     "gemini-2.5-pro",
 }
 
 GEMINI_PREFERENCE_ORDER: List[str] = [
+    "gemini-2.0-flash",
+    "gemini-1.5-flash",
     "gemini-2.5-flash",
     "gemini-2.5-flash-lite",
-    "gemini-2.5-pro",
 ]
+
+OPENAI_PRODUCTION_MODELS: Set[str] = {
+    "gpt-4o-mini",
+    "gpt-4o",
+    "gpt-4o-realtime-preview-2024-10-01",
+}
 
 
 class ProviderRegistry:
@@ -108,25 +136,72 @@ class ProviderRegistry:
 
     def __init__(self, logger: Optional[Any] = None):
         self.logger = logger
+        self.circuit_breaker = get_global_circuit_breaker()
         self._models: Dict[str, ModelCapability] = {}
         self._provider_health: Dict[str, ProviderHealth] = {
             "groq": ProviderHealth.UNINITIALIZED,
             "gemini": ProviderHealth.UNINITIALIZED,
-            "openai": ProviderHealth.UNINITIALIZED,
+            "openai": ProviderHealth.HEALTHY,
             "local": ProviderHealth.HEALTHY,
         }
         self._discovered_raw: Dict[str, List[str]] = {
             "groq": [],
             "gemini": [],
+            "openai": list(OPENAI_PRODUCTION_MODELS),
         }
         self._routeable_models: Dict[str, List[str]] = {
-            "groq": [],
-            "gemini": [],
+            "groq": list(GROQ_PREFERENCE_ORDER),
+            "gemini": list(GEMINI_PREFERENCE_ORDER),
+            "openai": ["gpt-4o-mini", "gpt-4o"],
         }
         self._rejected_models: Dict[str, Dict[str, str]] = {
             "groq": {},
             "gemini": {},
+            "openai": {},
         }
+
+        # Initialize base model capabilities
+        self._register_default_models()
+
+    def _register_default_models(self):
+        """Pre-populates verified capability records for production models."""
+        # Groq
+        for m in GROQ_PRODUCTION_MODELS:
+            is_vis = "vision" in m.lower()
+            self.register_model(
+                ModelCapability(
+                    provider="groq",
+                    model_id=m,
+                    chat_supported=True,
+                    streaming_supported=True,
+                    tool_calling_supported="llama" in m.lower(),
+                    vision_supported=is_vis,
+                )
+            )
+        # Gemini
+        for m in GEMINI_PRODUCTION_MODELS:
+            self.register_model(
+                ModelCapability(
+                    provider="gemini",
+                    model_id=m,
+                    chat_supported=True,
+                    streaming_supported=True,
+                    tool_calling_supported=True,
+                    vision_supported=True,
+                )
+            )
+        # OpenAI
+        for m in OPENAI_PRODUCTION_MODELS:
+            self.register_model(
+                ModelCapability(
+                    provider="openai",
+                    model_id=m,
+                    chat_supported=True,
+                    streaming_supported=True,
+                    tool_calling_supported=True,
+                    vision_supported=True,
+                )
+            )
 
     def _log(self, level: str, msg: str) -> None:
         if not self.logger:
@@ -158,8 +233,15 @@ class ProviderRegistry:
     def get_model(self, provider: str, model_id: str) -> Optional[ModelCapability]:
         return self._models.get(f"{provider}:{model_id}")
 
+    def get_all_models(self) -> List[ModelCapability]:
+        return list(self._models.values())
+
     def is_routeable(self, provider: str, model_id: str) -> bool:
         """Returns True if the provider is healthy and the model is discovered, routeable, not blacklisted, and not under cooldown."""
+        # 1. Check Global Circuit Breaker
+        if not self.circuit_breaker.is_available(provider, model_id=model_id):
+            return False
+
         health = self.get_provider_health(provider)
         if health in (ProviderHealth.DISCOVERY_UNAVAILABLE, ProviderHealth.AUTHENTICATION_FAILED, ProviderHealth.DISABLED):
             return False
@@ -176,6 +258,31 @@ class ProviderRegistry:
             return False
 
         return True
+
+    def find_routeable_model(
+        self,
+        capability: str = "chat",
+        preferred_providers: Optional[List[str]] = None,
+    ) -> Optional[Tuple[str, str]]:
+        """Finds the best available (provider, model_id) matching the capability with circuit breaker awareness."""
+        providers = preferred_providers or ["openai", "groq", "gemini"]
+        for p in providers:
+            if not self.circuit_breaker.is_available(p):
+                continue
+            candidates = self.get_available_models(p)
+            for m_id in candidates:
+                model = self.get_model(p, m_id)
+                if not model:
+                    continue
+                if capability == "vision" and not model.vision_supported:
+                    continue
+                if capability == "streaming" and not model.streaming_supported:
+                    continue
+                if capability == "tool_calling" and not model.tool_calling_supported:
+                    continue
+                if self.circuit_breaker.is_available(p, model_id=m_id):
+                    return (p, m_id)
+        return None
 
     def get_discovery_stats(self, provider: str) -> Dict[str, int]:
         """Returns structured statistics: discovered, routeable, rejected, blacklisted."""
@@ -452,18 +559,23 @@ class ProviderRegistry:
         if error_class in (ErrorClass.UNSUPPORTED_MODEL, ErrorClass.MODEL_NOT_FOUND, ErrorClass.AUTHENTICATION_ERROR):
             model.is_blacklisted = True
             model.available = False
+            self.circuit_breaker.record_error(provider, error_class=RequestErrorClass.MODEL_UNAVAILABLE, error_msg=f"{provider}/{model_id} unavailable", model_id=model_id)
             self._log("error", f"⛔ [ProviderRegistry] Model permanently blacklisted ({error_class.value}): {provider}/{model_id}")
         elif error_class == ErrorClass.QUOTA_EXHAUSTED:
             model.cooldown_until = now + (cooldown or 300.0)
             self.set_provider_health(provider, ProviderHealth.RATE_LIMITED)
+            self.circuit_breaker.record_error(provider, error_class=RequestErrorClass.QUOTA_EXHAUSTED, error_msg=f"{provider} quota exhausted", model_id=model_id)
             self._log("warn", f"⏳ [ProviderRegistry] Quota exhausted ({provider}/{model_id}): {cooldown or 300.0}s cooldown.")
         elif error_class == ErrorClass.RATE_LIMITED:
             model.cooldown_until = now + (cooldown or 45.0)
+            self.circuit_breaker.record_error(provider, error_class=RequestErrorClass.RATE_LIMITED, error_msg=f"{provider} rate limit", model_id=model_id)
             self._log("warn", f"⏳ [ProviderRegistry] Rate limit ({provider}/{model_id}): {cooldown or 45.0}s cooldown.")
         elif error_class == ErrorClass.SERVER_ERROR:
             model.cooldown_until = now + (cooldown or 20.0)
+            self.circuit_breaker.record_error(provider, error_class=RequestErrorClass.SERVER_ERROR, error_msg=f"{provider} server error", model_id=model_id)
         elif error_class in (ErrorClass.TIMEOUT, ErrorClass.NETWORK_ERROR):
             model.cooldown_until = now + (cooldown or 10.0)
+            self.circuit_breaker.record_error(provider, error_class=RequestErrorClass.NETWORK_ERROR, error_msg=f"{provider} network error", model_id=model_id)
 
     def record_error(self, provider: str, model_id: str, error_class: ErrorClass, error_msg: str) -> None:
         """Legacy helper recording error message and marking unavailable."""
@@ -484,6 +596,7 @@ class ProviderRegistry:
             model.last_latency_ms = latency_ms
             model.cooldown_until = 0.0
         self.set_provider_health(provider, ProviderHealth.HEALTHY)
+        self.circuit_breaker.record_success(provider, model_id=model_id)
 
     def get_available_models(self, provider: str) -> List[str]:
         """Returns list of currently available, non-blacklisted routeable models for provider."""

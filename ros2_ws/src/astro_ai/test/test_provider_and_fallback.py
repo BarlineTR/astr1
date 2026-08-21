@@ -37,6 +37,11 @@ class TestProviderRegistry(unittest.TestCase):
     """Tests for Provider & Model Capability Registry."""
 
     def setUp(self):
+        try:
+            from astro_ai.circuit_breaker import GlobalProviderCircuitBreaker
+            GlobalProviderCircuitBreaker.get_instance().reset_all()
+        except Exception:
+            pass
         self.registry = ProviderRegistry()
 
     def test_error_classification(self):
@@ -329,6 +334,11 @@ class TestProductionEdgeScenarios(unittest.TestCase):
     """Tests simulating real-world hardware & network failure scenarios."""
 
     def setUp(self):
+        try:
+            from astro_ai.circuit_breaker import GlobalProviderCircuitBreaker
+            GlobalProviderCircuitBreaker.get_instance().reset_all()
+        except Exception:
+            pass
         self.registry = ProviderRegistry()
         self.guard = RepetitionGuard()
 
@@ -439,6 +449,11 @@ class TestContextualFallbackAndTelemetry(unittest.TestCase):
     """Tests for Acceptance Criteria A-H (Semantic Fallbacks, Routing Hierarchy, and Telemetry)."""
 
     def setUp(self):
+        try:
+            from astro_ai.circuit_breaker import GlobalProviderCircuitBreaker
+            GlobalProviderCircuitBreaker.get_instance().reset_all()
+        except Exception:
+            pass
         self.registry = ProviderRegistry()
         self.guard = RepetitionGuard(history_size=10)
 

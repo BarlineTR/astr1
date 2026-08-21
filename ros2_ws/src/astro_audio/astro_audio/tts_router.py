@@ -18,8 +18,28 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional
 
+try:
+    from astro_ai.circuit_breaker import (
+        GlobalProviderCircuitBreaker,
+        ProviderState,
+        RequestErrorClass,
+        get_global_circuit_breaker,
+    )
+except ImportError:
+    try:
+        from circuit_breaker import (
+            GlobalProviderCircuitBreaker,
+            ProviderState,
+            RequestErrorClass,
+            get_global_circuit_breaker,
+        )
+    except ImportError:
+        GlobalProviderCircuitBreaker = None
+        get_global_circuit_breaker = lambda: None
+
 from astro_audio.audio_output_manager import AudioOutputManager
 from astro_audio.edge_tts_engine import EdgeTTSEngine
+from astro_audio.local_audio_resources import get_local_audio_resources
 from astro_audio.local_offline_tts_engine import LocalOfflineTTSEngine
 from astro_audio.local_xtts_engine import LocalXttsEngine
 
@@ -67,6 +87,8 @@ class TTSRouter:
         self.edge_tts_enabled = edge_tts_enabled
         self.output_manager = output_manager
         self._log = logger or (lambda lvl, msg: None)
+        self.circuit_breaker = get_global_circuit_breaker()
+        self.audio_resources = get_local_audio_resources()
 
         self.edge_timeout_s = float(os.getenv("TTS_EDGE_SYNTHESIS_TIMEOUT_S", os.getenv("EDGE_TTS_TIMEOUT_S", str(self.DEFAULT_EDGE_TTS_TIMEOUT_S))))
         self.playback_deadline_ms = float(os.getenv("TTS_PLAYBACK_START_DEADLINE_MS", str(self.DEFAULT_PLAYBACK_DEADLINE_MS)))
@@ -85,7 +107,7 @@ class TTSRouter:
             "info",
             f"🎯 [TTSRouter] Production Hiyerarşi Aktif: OpenAI Realtime (Primary) -> "
             f"Edge-TTS (Primary Fallback, timeout={self.edge_timeout_s}s) -> "
-            f"Local Offline TTS (Emergency Fallback)"
+            f"Local Offline TTS (Emergency Fallback) -> Pre-generated Emergency WAV"
         )
 
     def _safe_log(self, lvl: str, msg: str):
@@ -104,7 +126,7 @@ class TTSRouter:
         language: str = "tr",
         realtime_fallback_reason: str = "realtime_quota_exhausted",
     ) -> TTSRouteResult:
-        """Synthesizes speech through the strict Realtime Fallback -> Edge-TTS -> Local Offline chain."""
+        """Synthesizes speech through the strict Realtime Fallback -> Edge-TTS -> Local Offline -> Emergency WAV chain."""
         if not text or not text.strip():
             return TTSRouteResult(
                 pcm=None,
@@ -119,21 +141,18 @@ class TTSRouter:
             )
 
         clean_text = text.strip()
-        self._safe_log("info", f'[TTS REQUESTED] generation_id={generation_id} requested_provider=openai_realtime text="{clean_text}"')
-
         fallback_chain: List[str] = []
         t_start = time.perf_counter()
 
-        # Emit Realtime-to-Fallback Transition Log
-        self._safe_log(
-            "warn",
-            f"🔄 [TTS FALLBACK]\n"
-            f"  generation_id={generation_id}\n"
-            f"  from=openai_realtime\n"
-            f"  to=edge_tts\n"
-            f"  reason={realtime_fallback_reason}"
-        )
-        fallback_chain.append(f"openai_realtime({realtime_fallback_reason})")
+        # Check Global Circuit Breaker for Realtime Availability
+        realtime_available = self.circuit_breaker.is_available("openai", sub_provider="openai_realtime") if self.circuit_breaker else False
+
+        if realtime_available:
+            self._safe_log("info", f'[TTS REQUESTED] generation_id={generation_id} requested_provider=openai_realtime text="{clean_text}"')
+            fallback_chain.append("openai_realtime")
+        else:
+            self._safe_log("info", f'[TTS ROUTE] provider=edge_tts reason=realtime_unavailable generation_id={generation_id}')
+            fallback_chain.append(f"openai_realtime({realtime_fallback_reason})")
 
         # -------------------------------------------------------------
         # STEP 1: Local XTTS Engine (Only if explicitly enabled and ready in test mode)
@@ -294,24 +313,31 @@ class TTSRouter:
                 self._safe_log("error", f"❌ [Local Offline TTS Error]: {e}")
 
         # -------------------------------------------------------------
-        # STEP 3: Zero-Silence Contract Violation Alarm
+        # STEP 3: Pre-Generated Emergency Audio Fallback (Zero-Silence Contract)
         # -------------------------------------------------------------
         self._safe_log(
-            "error",
-            f"🚨 [TTS_ALL_PROVIDERS_FAILED]: All TTS providers failed for generation_id={generation_id}! Chain={fallback_chain}"
+            "warn",
+            f"⚠️ [TTS ZERO SILENCE FALLBACK]: Activating pre-generated local emergency audio for generation_id={generation_id}! Chain={fallback_chain}"
         )
+        emergency_pcm = self.audio_resources.get_emergency_fallback_pcm()
+        fallback_chain.append("pregenerated_emergency_wav")
+        tot_ms = (time.perf_counter() - t_start) * 1000.0
+
         return TTSRouteResult(
-            pcm=None,
-            selected_provider="none",
-            actual_provider="none",
-            model_name="none",
-            source_name="none",
-            tts_state="ALL_FAILED",
-            tts_ready=False,
-            tts_healthy=False,
+            pcm=emergency_pcm,
+            selected_provider="emergency_wav",
+            actual_provider="emergency_wav",
+            model_name="pregenerated_wav",
+            source_name="local_resource_cache",
+            tts_state="EMERGENCY_PLAYBACK",
+            tts_ready=True,
+            tts_healthy=True,
             fallback_reason="TTS_ALL_PROVIDERS_FAILED",
             fallback_chain=fallback_chain,
-            duration_ms=(time.perf_counter() - t_start) * 1000.0,
+            duration_ms=tot_ms,
+            ttfa_ms=tot_ms,
+            infer_ms=0.0,
+            queue_wait_ms=0.0,
         )
 
     def synthesize_and_play(
@@ -332,6 +358,7 @@ class TTSRouter:
         out_mgr = output_manager or self.output_manager
 
         if res.pcm and out_mgr:
+            sample_rate = 16000 if res.actual_provider == "emergency_wav" else 24000
             provenance = {
                 "tts_provider": res.actual_provider,
                 "tts_model": res.model_name,
@@ -340,7 +367,7 @@ class TTSRouter:
             }
             out_mgr.play_pcm_chunk(
                 res.pcm,
-                sample_rate=24000,
+                sample_rate=sample_rate,
                 generation_id=generation_id,
                 provenance=provenance,
             )

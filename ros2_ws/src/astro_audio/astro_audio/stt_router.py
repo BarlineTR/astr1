@@ -23,6 +23,26 @@ import numpy as np
 from astro_audio.memory_guard import get_system_memory_guard
 
 
+try:
+    from astro_ai.circuit_breaker import (
+        GlobalProviderCircuitBreaker,
+        ProviderState,
+        RequestErrorClass,
+        get_global_circuit_breaker,
+    )
+except ImportError:
+    try:
+        from circuit_breaker import (
+            GlobalProviderCircuitBreaker,
+            ProviderState,
+            RequestErrorClass,
+            get_global_circuit_breaker,
+        )
+    except ImportError:
+        GlobalProviderCircuitBreaker = None
+        get_global_circuit_breaker = lambda: None
+
+
 class STTProviderState(Enum):
     AVAILABLE = "AVAILABLE"
     DEGRADED = "DEGRADED"
@@ -48,7 +68,7 @@ class STTRouteResult:
 
 
 class STTRouter:
-    """Unified STT Router managing Groq, OpenAI, and Local Faster-Whisper."""
+    """Unified STT Router managing Groq, OpenAI, and Local Faster-Whisper with Global Circuit Breaker."""
 
     def __init__(
         self,
@@ -61,6 +81,7 @@ class STTRouter:
         self.openai_client = openai_client
         self.local_whisper_model = local_whisper_model
         self._log = logger or (lambda lvl, msg: None)
+        self.circuit_breaker = get_global_circuit_breaker()
 
         self.groq_state = STTProviderState.AVAILABLE if groq_client else STTProviderState.DISABLED
         self.groq_cooldown_until = 0.0
@@ -93,7 +114,8 @@ class STTRouter:
         fallback_chain: List[str] = []
 
         # 1. Attempt Groq Whisper Large V3 (if not in cooldown or disabled)
-        if self.groq_client and self.groq_state != STTProviderState.DISABLED:
+        groq_cb_available = self.circuit_breaker.is_available("groq", sub_provider="groq_stt") if self.circuit_breaker else True
+        if self.groq_client and self.groq_state != STTProviderState.DISABLED and groq_cb_available:
             if self.groq_state == STTProviderState.COOLDOWN and now < self.groq_cooldown_until:
                 remaining = self.groq_cooldown_until - now
                 fallback_chain.append(f"groq(cooldown_{remaining:.1f}s)")
@@ -110,6 +132,8 @@ class STTRouter:
                     text = str(res).strip()
                     self.groq_state = STTProviderState.AVAILABLE
                     self.groq_consecutive_failures = 0
+                    if self.circuit_breaker:
+                        self.circuit_breaker.record_success("groq", sub_provider="groq_stt")
                     fallback_chain.append("groq")
                     return STTRouteResult(
                         text=text,
@@ -126,14 +150,27 @@ class STTRouter:
                         self.groq_state = STTProviderState.COOLDOWN
                         cooldown_s = 30.0 if self.groq_consecutive_failures <= 1 else 60.0
                         self.groq_cooldown_until = time.monotonic() + cooldown_s
+                        if self.circuit_breaker:
+                            self.circuit_breaker.record_error("groq", sub_provider="groq_stt", error_class=RequestErrorClass.RATE_LIMITED, error_msg=err_str)
                         self._safe_log("warn", f"⚠️ [STTRouter] Groq 429 RPM Sınırı. {cooldown_s:.0f} saniye COOLDOWN başlatıldı (No retry storm).")
                         fallback_chain.append("groq(429_cooldown)")
                     else:
                         self.groq_state = STTProviderState.DEGRADED
+                        if self.circuit_breaker:
+                            self.circuit_breaker.record_error("groq", sub_provider="groq_stt", error_class=RequestErrorClass.SERVER_ERROR, error_msg=err_str)
                         fallback_chain.append(f"groq(error:{exc})")
+        elif not groq_cb_available:
+            st = self.circuit_breaker.get_state("groq", "groq_stt") if self.circuit_breaker else ProviderState.DISABLED
+            if st == ProviderState.COOLDOWN:
+                fallback_chain.append("groq(cooldown)")
+            elif st == ProviderState.EXHAUSTED:
+                fallback_chain.append("groq(exhausted)")
+            else:
+                fallback_chain.append("groq(circuit_breaker_disabled)")
 
         # 2. Attempt OpenAI Whisper-1 (if not exhausted or disabled)
-        if self.openai_client and self.openai_state not in (STTProviderState.DISABLED, STTProviderState.EXHAUSTED):
+        openai_cb_available = self.circuit_breaker.is_available("openai", sub_provider="openai_stt") if self.circuit_breaker else True
+        if self.openai_client and self.openai_state not in (STTProviderState.DISABLED, STTProviderState.EXHAUSTED) and openai_cb_available:
             if self.openai_state == STTProviderState.COOLDOWN and now < self.openai_cooldown_until:
                 remaining = self.openai_cooldown_until - now
                 fallback_chain.append(f"openai(cooldown_{remaining:.1f}s)")
@@ -150,6 +187,8 @@ class STTRouter:
                     text = str(res).strip()
                     self.openai_state = STTProviderState.AVAILABLE
                     self.openai_consecutive_failures = 0
+                    if self.circuit_breaker:
+                        self.circuit_breaker.record_success("openai", sub_provider="openai_stt")
                     fallback_chain.append("openai")
                     return STTRouteResult(
                         text=text,
@@ -163,16 +202,22 @@ class STTRouter:
                     err_str = str(exc).lower()
                     self.openai_consecutive_failures += 1
                     if "insufficient_quota" in err_str or "quota" in err_str or "402" in err_str:
-                        self.openai_state = STTProviderState.DISABLED
-                        self._safe_log("error", "🚨 [STTRouter] OpenAI Kota Yetersiz (insufficient_quota). Session boyunca DISABLED yapıldı.")
-                        fallback_chain.append("openai(quota_disabled)")
+                        self.openai_state = STTProviderState.EXHAUSTED
+                        if self.circuit_breaker:
+                            self.circuit_breaker.record_error("openai", sub_provider="openai_stt", error_class=RequestErrorClass.QUOTA_EXHAUSTED, error_msg=err_str)
+                        self._safe_log("error", "🚨 [STTRouter] OpenAI Kota Yetersiz (insufficient_quota). Session boyunca EXHAUSTED yapıldı.")
+                        fallback_chain.append("openai(quota_exhausted)")
                     elif "429" in err_str:
                         self.openai_state = STTProviderState.COOLDOWN
                         self.openai_cooldown_until = time.monotonic() + 15.0
+                        if self.circuit_breaker:
+                            self.circuit_breaker.record_error("openai", sub_provider="openai_stt", error_class=RequestErrorClass.RATE_LIMITED, error_msg=err_str)
                         fallback_chain.append("openai(429_cooldown)")
                     else:
                         self.openai_state = STTProviderState.DEGRADED
                         fallback_chain.append(f"openai(error:{exc})")
+        elif not openai_cb_available:
+            fallback_chain.append("openai(circuit_breaker_exhausted)")
 
         # 3. Attempt Local Faster-Whisper
         if self.local_whisper_model:
