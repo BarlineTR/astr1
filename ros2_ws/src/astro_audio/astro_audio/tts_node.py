@@ -98,25 +98,8 @@ class TtsNode(Node):
             logger=self._log,
         )
 
-        # 3. Initialize Local XTTS GPU Engine (Warm Fallback)
-        xtts_home = resolve_xtts_home(os.getenv("TTS_XTTS_HOME", ""))
-        speaker_wav = resolve_xtts_speaker_wav(os.getenv("TTS_XTTS_SPEAKER_WAV", ""))
+        # 3. XTTS is DORMANT / DISABLED by production policy (0 spawn, 0 RAM overhead)
         self.local_xtts = None
-
-        try:
-            self.local_xtts = LocalXttsEngine(
-                speaker_wav=speaker_wav,
-                language=self.tts_language,
-                device=os.getenv("TTS_XTTS_DEVICE", "cuda"),
-                half=os.getenv("TTS_XTTS_HALF", "1") not in ("0", "false", "False"),
-                home=xtts_home,
-                model_dir=os.getenv("TTS_XTTS_MODEL_DIR", "") or None,
-                logger=self._log,
-            )
-            # Start worker in background thread to avoid blocking ROS node initialization
-            threading.Thread(target=self._start_xtts_background, daemon=True).start()
-        except Exception as e:
-            self.get_logger().warn(f"⚠️ [TTS Node] Yerel XTTS hazırlığı uyarısı: {e}")
 
         # 4. Initialize Local Offline TTS & Edge-TTS engines
         from astro_audio.edge_tts_engine import EdgeTTSEngine
@@ -130,7 +113,7 @@ class TtsNode(Node):
             logger=self._log,
         )
 
-        # 5. Initialize TTS Orchestrator with Authoritative Fallback Chain
+        # 5. Initialize TTS Orchestrator with Authoritative Fallback Chain (Realtime -> Edge-TTS -> Local Offline)
         self.orchestrator = TTSOrchestrator(
             output_manager=self.output_manager,
             realtime_engine=self.realtime_engine,

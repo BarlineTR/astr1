@@ -206,7 +206,8 @@ class LocalXttsEngine(BaseTTSEngine):
         )
 
         self.memory_guard = get_system_memory_guard()
-        self._state = "STOPPED"  # STOPPED, STARTING, READY, CRASHED, COOLDOWN, DEGRADED, STOPPING
+        self.runtime_enabled = os.getenv("TTS_XTTS_ENABLED", "0").lower() in ("1", "true", "yes")
+        self._state = "STOPPED" if self.runtime_enabled else "DISABLED"
         self._state_lock = threading.Lock()
         self._cooldown_duration = float(os.getenv("XTTS_COOLDOWN_S", "60.0"))
         self._cooldown_until = 0.0
@@ -328,6 +329,20 @@ class LocalXttsEngine(BaseTTSEngine):
 
     def start(self) -> None:
         """Starts the persistent XTTS worker after system resource admission control."""
+        if not self.runtime_enabled:
+            with self._state_lock:
+                self._state = "DISABLED"
+                self._last_telemetry["state"] = "DISABLED"
+                self._last_telemetry["ready"] = False
+            self._safe_log(
+                "info",
+                "ℹ️ [XTTS] Runtime disabled by production policy\n"
+                "  model_retained=True\n"
+                "  worker_spawn=False\n"
+                "  reason=production_runtime_disabled"
+            )
+            return
+
         with self._state_lock:
             if self._state == "READY" and self.client.is_alive and self.client.is_ready:
                 self._safe_log("debug", f"LocalXttsEngine is already READY (PID: {getattr(self.client.proc, 'pid', None)}).")
@@ -500,13 +515,15 @@ class LocalXttsEngine(BaseTTSEngine):
 
     def is_ready(self) -> bool:
         with self._state_lock:
-            return self._state == "READY" and self.client.is_ready
+            if not getattr(self, "runtime_enabled", False) and self._state != "READY":
+                return False
+            return self._state == "READY" and (self.client.is_ready or getattr(self.client, "is_alive", False))
 
     def is_healthy(self) -> bool:
         if not self.is_ready():
             return False
         with self._state_lock:
-            if self._state in ("DEGRADED", "TIMEOUT", "FAILED", "QUARANTINED", "CRASHED", "COOLDOWN"):
+            if self._state in ("DEGRADED", "TIMEOUT", "FAILED", "QUARANTINED", "CRASHED", "COOLDOWN", "DISABLED"):
                 return False
         if self._consecutive_failures > 0:
             return False

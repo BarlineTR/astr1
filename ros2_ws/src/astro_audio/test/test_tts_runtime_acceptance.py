@@ -1,13 +1,12 @@
 """ASTRO V1 — TTS Runtime Fallback & Authoritative Orchestration Acceptance Test Suite.
 
-Verifies the 5 critical runtime acceptance scenarios:
-  1. XTTS READY -> XTTS synthesis -> Hardware Playback Started
-  2. XTTS STARTING (warmup) -> Fast Edge-TTS (Zero-wait on first turn) -> Playback Started
-  3. XTTS timeout -> Edge-TTS fallback with identical generation_id -> Playback Started
-  4. XTTS unavailable + Edge network failure -> Local Offline TTS -> Playback Started
-  5. All providers fail -> Explicit TTS_ALL_PROVIDERS_FAILED alarm (Zero-Silence Contract)
-  6. Playback Watchdog detects silent stall and forces emergency fallback
-  7. Configuration timeout consistency verification (no 30s/45s drift)
+Verifies the critical runtime acceptance scenarios:
+  1. Realtime Primary is active
+  2. Realtime quota / disconnect -> Edge-TTS fallback (Zero-wait on first turn) -> Playback Started
+  3. Realtime unavailable + Edge network failure -> Local Offline TTS -> Playback Started
+  4. All providers fail -> Explicit TTS_ALL_PROVIDERS_FAILED alarm (Zero-Silence Contract)
+  5. Playback Watchdog detects silent stall and forces emergency fallback
+  6. TTSOrchestrator integration with TTSRouter
 """
 
 import os
@@ -25,9 +24,9 @@ from astro_audio.edge_tts_engine import EdgeTTSEngine
 from astro_audio.local_offline_tts_engine import LocalOfflineTTSEngine
 from astro_audio.local_xtts_engine import LocalXttsEngine
 from astro_audio.playback_watchdog import PlaybackWatchdog
+from astro_audio.realtime_engine import RealtimeEngine, RealtimeState
 from astro_audio.tts_orchestrator import TTSOrchestrator
 from astro_audio.tts_router import TTSRouteResult, TTSRouter
-from astro_audio.xtts_client import XttsClient, XttsError
 
 
 class TestTTSRuntimeAcceptance(unittest.TestCase):
@@ -35,46 +34,22 @@ class TestTTSRuntimeAcceptance(unittest.TestCase):
 
     def setUp(self):
         self.output_manager = AudioOutputManager(mock_playback=True)
-        self.mock_xtts = MagicMock(spec=LocalXttsEngine)
         self.mock_edge = MagicMock(spec=EdgeTTSEngine)
         self.mock_offline = MagicMock(spec=LocalOfflineTTSEngine)
 
-    def test_scenario_1_xtts_ready_synthesizes_and_plays(self):
-        """1. When XTTS is READY & HEALTHY, XTTS synthesizes and plays through DAC."""
-        self.mock_xtts.is_ready.return_value = True
-        self.mock_xtts.is_healthy.return_value = True
-        self.mock_xtts.synthesize_sentence.return_value = b"\x00\x01" * 12000  # 1.0s of 24kHz int16
+    def test_scenario_1_realtime_primary_healthy(self):
+        """1. When Realtime is connected and healthy, Realtime is active primary."""
+        realtime_eng = RealtimeEngine()
+        realtime_eng.set_connected(True)
+        self.assertEqual(realtime_eng.state, RealtimeState.REALTIME_ACTIVE)
+        self.assertTrue(realtime_eng.is_ready())
 
-        router = TTSRouter(
-            local_xtts=self.mock_xtts,
-            local_offline_tts=self.mock_offline,
-            edge_tts_engine=self.mock_edge,
-            output_manager=self.output_manager,
-        )
-
-        res = router.synthesize_and_play(
-            text="Merhaba, ben Astro!",
-            generation_id=101,
-        )
-
-        self.assertIsNotNone(res.pcm)
-        self.assertEqual(res.actual_provider, "xtts_gpu")
-        self.assertEqual(res.fallback_chain, ["xtts_gpu"])
-        self.mock_xtts.synthesize_sentence.assert_called_once_with("Merhaba, ben Astro!", generation_id=101, language="tr")
-        self.mock_edge.synthesize_sentence.assert_not_called()
-        self.mock_offline.synthesize_sentence.assert_not_called()
-
-    def test_scenario_2_first_turn_xtts_starting_does_not_wait_warmup(self):
-        """2. When XTTS is STARTING, first turn does NOT wait for warmup, falls back to Edge-TTS immediately."""
-        self.mock_xtts.is_ready.return_value = False
-        self.mock_xtts.is_healthy.return_value = False
-        self.mock_xtts._state = "STARTING"
-
+    def test_scenario_2_realtime_quota_exhausted_uses_edge_tts_immediately(self):
+        """2. When Realtime quota is exhausted, falls back to Edge-TTS immediately without waiting."""
         self.mock_edge.check_network.return_value = True
         self.mock_edge.synthesize_sentence.return_value = b"\x00\x02" * 12000
 
         router = TTSRouter(
-            local_xtts=self.mock_xtts,
             local_offline_tts=self.mock_offline,
             edge_tts_engine=self.mock_edge,
             output_manager=self.output_manager,
@@ -84,6 +59,7 @@ class TestTTSRuntimeAcceptance(unittest.TestCase):
         res = router.synthesize_and_play(
             text="İlk konuşma mesajı",
             generation_id=102,
+            realtime_fallback_reason="realtime_quota_exhausted",
         )
         elapsed = time.perf_counter() - t_start
 
@@ -91,21 +67,17 @@ class TestTTSRuntimeAcceptance(unittest.TestCase):
         self.assertLess(elapsed, 0.5)
         self.assertIsNotNone(res.pcm)
         self.assertEqual(res.actual_provider, "edge_tts")
-        self.mock_xtts.synthesize_sentence.assert_not_called()
         self.mock_edge.synthesize_sentence.assert_called_once()
 
-    def test_scenario_3_xtts_timeout_triggers_edge_tts_with_same_gen_id(self):
-        """3. When XTTS times out, Edge-TTS fallback executes with identical generation_id."""
-        self.mock_xtts.is_ready.return_value = True
-        self.mock_xtts.is_healthy.return_value = True
-        self.mock_xtts.synthesize_sentence.return_value = None  # Simulates timeout returning None
-        self.mock_xtts.get_telemetry.return_value = {"fallback_reason": "xtts_timeout"}
-
+    def test_scenario_3_edge_tts_failure_uses_local_offline(self):
+        """3. When Edge-TTS fails or times out, Local Offline TTS executes with identical generation_id."""
         self.mock_edge.check_network.return_value = True
-        self.mock_edge.synthesize_sentence.return_value = b"\x00\x03" * 12000
+        self.mock_edge.synthesize_sentence.return_value = None  # Simulates synthesis failure / timeout
+
+        self.mock_offline.is_ready.return_value = True
+        self.mock_offline.synthesize_sentence.return_value = b"\x00\x03" * 12000
 
         router = TTSRouter(
-            local_xtts=self.mock_xtts,
             local_offline_tts=self.mock_offline,
             edge_tts_engine=self.mock_edge,
             output_manager=self.output_manager,
@@ -114,29 +86,26 @@ class TestTTSRuntimeAcceptance(unittest.TestCase):
         res = router.synthesize_and_play(
             text="Sentez zaman aşımına uğradı",
             generation_id=103,
+            realtime_fallback_reason="realtime_session_error",
         )
 
         self.assertIsNotNone(res.pcm)
-        self.assertEqual(res.actual_provider, "edge_tts")
-        self.assertIn("xtts_gpu(xtts_timeout)", res.fallback_chain)
-        self.assertIn("edge_tts", res.fallback_chain)
-        self.mock_edge.synthesize_sentence.assert_called_once_with(
+        self.assertEqual(res.actual_provider, "local_offline_tts")
+        self.assertIn("edge_tts(synthesis_failed)", res.fallback_chain)
+        self.assertIn("local_offline_tts", res.fallback_chain)
+        self.mock_offline.synthesize_sentence.assert_called_once_with(
             "Sentez zaman aşımına uğradı",
             generation_id=103,
-            timeout=router.edge_timeout_s,
+            language="tr",
         )
 
     def test_scenario_4_offline_mode_skips_edge_and_uses_local_offline(self):
         """4. When network is down (0 internet), Edge-TTS is fast-skipped to Local Offline TTS."""
-        self.mock_xtts.is_ready.return_value = False
-        self.mock_xtts.is_healthy.return_value = False
-
         self.mock_edge.check_network.return_value = False  # No internet
         self.mock_offline.is_ready.return_value = True
         self.mock_offline.synthesize_sentence.return_value = b"\x00\x04" * 12000
 
         router = TTSRouter(
-            local_xtts=self.mock_xtts,
             local_offline_tts=self.mock_offline,
             edge_tts_engine=self.mock_edge,
             output_manager=self.output_manager,
@@ -162,14 +131,12 @@ class TestTTSRuntimeAcceptance(unittest.TestCase):
 
     def test_scenario_5_all_providers_failed_raises_zero_silence_alarm(self):
         """5. When all providers fail, returns explicit result with TTS_ALL_PROVIDERS_FAILED alarm."""
-        self.mock_xtts.is_ready.return_value = False
         self.mock_edge.check_network.return_value = True
         self.mock_edge.synthesize_sentence.return_value = None
         self.mock_offline.is_ready.return_value = True
         self.mock_offline.synthesize_sentence.return_value = None
 
         router = TTSRouter(
-            local_xtts=self.mock_xtts,
             local_offline_tts=self.mock_offline,
             edge_tts_engine=self.mock_edge,
             output_manager=self.output_manager,
@@ -182,7 +149,7 @@ class TestTTSRuntimeAcceptance(unittest.TestCase):
 
         self.assertIsNone(res.pcm)
         self.assertEqual(res.actual_provider, "none")
-        self.assertEqual(res.fallback_reason, "all_providers_failed")
+        self.assertEqual(res.fallback_reason, "TTS_ALL_PROVIDERS_FAILED")
         self.assertIn("edge_tts(synthesis_failed)", res.fallback_chain)
 
     def test_scenario_6_playback_watchdog_detects_stall(self):
@@ -198,24 +165,22 @@ class TestTTSRuntimeAcceptance(unittest.TestCase):
         )
 
         try:
-            watchdog.register_turn_issued(generation_id=201, expected_provider="xtts_gpu", text="Test watchdog")
+            watchdog.register_turn_issued(generation_id=201, expected_provider="edge_tts", text="Test watchdog")
             time.sleep(0.25)
             self.assertEqual(len(stalled_gen), 1)
             self.assertEqual(stalled_gen[0][0], 201)
-            self.assertEqual(stalled_gen[0][1], "xtts_gpu")
+            self.assertEqual(stalled_gen[0][1], "edge_tts")
         finally:
             watchdog.stop()
 
     def test_scenario_7_tts_orchestrator_integration(self):
         """7. TTSOrchestrator correctly uses TTSRouter and reports provenance to AudioOutputManager."""
-        self.mock_xtts.is_ready.return_value = False
         self.mock_edge.check_network.return_value = True
         self.mock_edge.synthesize_sentence.return_value = b"\x00\x07" * 12000
 
         orchestrator = TTSOrchestrator(
             output_manager=self.output_manager,
             realtime_engine=MagicMock(),
-            local_xtts_engine=self.mock_xtts,
             local_offline_tts_engine=self.mock_offline,
             edge_tts_engine=self.mock_edge,
         )

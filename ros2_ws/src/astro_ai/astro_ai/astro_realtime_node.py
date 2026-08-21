@@ -494,28 +494,15 @@ class AstroRealtimeNode(Node):
                 except Exception as e:
                     self.get_logger().warn(f"⚠️ [ElevenLabs TTS] Başlatma uyarısı: {e}")
 
-        # Local XTTS GPU Fallback Engine (Warm & Resident on cuda:0)
+        # XTTS is DORMANT / DISABLED by production policy (0 spawn, 0 RAM overhead)
         self.local_xtts: Optional[LocalXttsEngine] = None
-        if LocalXttsEngine:
-            xtts_home = resolve_xtts_home(os.getenv("TTS_XTTS_HOME", ""))
-            spk_wav = resolve_xtts_speaker_wav(os.getenv("TTS_XTTS_SPEAKER_WAV", ""))
-            try:
-                self.local_xtts = LocalXttsEngine(
-                    speaker_wav=spk_wav,
-                    language=os.getenv("TTS_LANGUAGE", "tr"),
-                    device=os.getenv("TTS_XTTS_DEVICE", "cuda"),
-                    half=os.getenv("TTS_XTTS_HALF", "1") not in ("0", "false", "False"),
-                    home=xtts_home,
-                    model_dir=os.getenv("TTS_XTTS_MODEL_DIR", "") or None,
-                    checkpoint=os.getenv("TTS_XTTS_CHECKPOINT", "") or None,
-                    config=os.getenv("TTS_XTTS_CONFIG", "") or None,
-                    vocab=os.getenv("TTS_XTTS_VOCAB", "") or None,
-                    speakers=os.getenv("TTS_XTTS_SPEAKERS", "") or None,
-                    logger=self._safe_log,
-                )
-                threading.Thread(target=self._start_local_xtts_background, daemon=True).start()
-            except Exception as e:
-                self.get_logger().warn(f"⚠️ [Astro Realtime] Local XTTS GPU hazırlık uyarısı: {e}")
+        self._safe_log(
+            "info",
+            "ℹ️ [XTTS] Runtime disabled by production policy\n"
+            "  model_retained=True\n"
+            "  worker_spawn=False\n"
+            "  reason=production_runtime_disabled"
+        )
 
         # Local Offline Backup TTS Engine (Zero internet local resilience fallback)
         self.local_offline_tts: Optional[LocalOfflineTTSEngine] = None
@@ -692,10 +679,24 @@ class AstroRealtimeNode(Node):
                 self._is_responding = False
                 self._is_playback_active = False
                 err_str = str(e)
-                if "insufficient_quota" in err_str or "credit_balance_exhausted" in err_str or "1013" in err_str:
+
+                try:
+                    from astro_audio.realtime_engine import classify_realtime_error, RealtimeState
+                    _, failure_reason = classify_realtime_error(getattr(e, "code", None), err_str)
+                except Exception:
+                    failure_reason = "realtime_quota_exhausted" if ("quota" in err_str or "1013" in err_str) else "realtime_network_unavailable"
+
+                self.get_logger().warn(
+                    f"🚨 [REALTIME DEGRADED]\n"
+                    f"  reason={failure_reason}\n"
+                    f"  previous_state=REALTIME_ACTIVE\n"
+                    f"  fallback_provider=edge_tts"
+                )
+
+                if "insufficient_quota" in err_str or "credit_balance_exhausted" in err_str or "1013" in err_str or "quota" in err_str:
                     if not self._fallback_mode:
                         self._fallback_mode = True
-                        self.get_logger().warn("🚀 [0-Maliyetli Groq & Edge-TTS Modu Devrede]: OpenAI Realtime kredisi tükendi. Astro kesintisiz olarak 0-Token Groq LLM + Hızlı TTS modunda çalışıyor!")
+                        self.get_logger().warn("🚀 [0-Maliyetli Groq & Edge-TTS Modu Devrede]: OpenAI Realtime kredisi tükendi. Astro kesintisiz olarak 0-Token Groq LLM + Edge-TTS modunda çalışıyor!")
                     await asyncio.sleep(86400.0)
                 elif "4004" in err_str or "model_not_found" in err_str:
                     self.get_logger().warn(f"⚠️ [Realtime Model Bulunamadı] '{current_model}' modeline erişilemedi, bir sonraki modele geçiliyor...")
@@ -2898,37 +2899,27 @@ class AstroRealtimeNode(Node):
             speaker_display = spk_name if spk_name else "null"
             self.get_logger().info(f"👤 [Speaker Context] speaker={speaker_display} confidence={spk_score:.2f} source={spk_source}")
 
-            # 5. Select Atomic TTS Owner for this turn (Single Turn = Single TTS Owner, Zero-Wait)
-            if self.local_xtts and self.local_xtts.is_ready() and getattr(self.local_xtts, "is_healthy", lambda: True)():
-                turn_tts_engine = "xtts_gpu"
-                tts_ready_flag = True
-                tts_mode_str = "local_gpu"
-            elif getattr(self, "edge_tts_enabled", True):
+            # 5. Select Atomic TTS Owner for this turn (Realtime Fallback -> Edge-TTS -> Local Offline)
+            if getattr(self, "edge_tts_enabled", True):
                 turn_tts_engine = "edge_tts"
-                tts_ready_flag = False
+                tts_ready_flag = True
                 tts_mode_str = "network_cloud"
+                tts_source_name = "edge_tts_cloud"
+                tts_model_name = "tr_tr_ahmet"
             elif self.local_offline_tts and self.local_offline_tts.is_ready():
                 turn_tts_engine = "local_offline_tts"
                 tts_ready_flag = True
                 tts_mode_str = "local_offline"
+                tts_source_name = "local_offline_synth"
+                tts_model_name = "piper_espeak"
             else:
                 turn_tts_engine = "none"
                 tts_ready_flag = False
                 tts_mode_str = "none"
+                tts_source_name = "none"
+                tts_model_name = "none"
 
             active_engine = turn_tts_engine
-            if active_engine == "xtts_gpu":
-                tts_source_name = "xtts_worker"
-                tts_model_name = "xtts_finetuned"
-            elif active_engine == "elevenlabs":
-                tts_source_name = "elevenlabs_cloud"
-                tts_model_name = "eleven_multilingual_v2"
-            elif active_engine == "local_offline_tts":
-                tts_source_name = "local_offline_synth"
-                tts_model_name = "piper_espeak"
-            else:
-                tts_source_name = "edge_tts_cloud"
-                tts_model_name = "tr_tr_ahmet"
 
             self.get_logger().info(
                 f"🏷️ [TTS Provider Selection Contract]\n"
@@ -2939,7 +2930,7 @@ class AstroRealtimeNode(Node):
                 f"  playback_source={getattr(self.audio_output_manager, 'backend', 'aplay')}\n"
                 f"  tts_state={tts_mode_str}\n"
                 f"  tts_ready={tts_ready_flag}\n"
-                f"  fallback_reason=none"
+                f"  fallback_reason=realtime_unavailable"
             )
 
             def _synthesize_turn_clause(clause_text: str) -> Tuple[Optional[bytes], float, float, float]:

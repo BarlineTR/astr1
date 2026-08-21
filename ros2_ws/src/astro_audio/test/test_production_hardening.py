@@ -659,6 +659,7 @@ class TestSTTValidationAndEchoImmunity(unittest.TestCase):
         from astro_audio.xtts_client import XttsError
 
         engine = LocalXttsEngine(speaker_wav="test.wav", home="/tmp/fake_xtts")
+        engine.runtime_enabled = True
         engine._cooldown_duration = 5.0
         with patch("os.path.exists", return_value=True), \
              patch.object(engine.client, "start"), \
