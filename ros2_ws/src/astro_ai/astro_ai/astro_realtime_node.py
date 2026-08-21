@@ -2885,14 +2885,14 @@ class AstroRealtimeNode(Node):
             self.get_logger().info(f"👤 [Speaker Context] speaker={speaker_display} confidence={spk_score:.2f} source={spk_source}")
 
             # 5. Select Atomic TTS Owner for this turn (Single Turn = Single TTS Owner, Zero-Wait)
-            if self.elevenlabs_engine and self.elevenlabs_engine.is_ready():
-                turn_tts_engine = "elevenlabs"
-                tts_ready_flag = True
-                tts_mode_str = "remote_cloud"
-            elif self.local_xtts and self.local_xtts.is_ready():
+            if self.local_xtts and self.local_xtts.is_ready():
                 turn_tts_engine = "xtts_gpu"
                 tts_ready_flag = True
                 tts_mode_str = "local_gpu"
+            elif self.elevenlabs_engine and self.elevenlabs_engine.is_ready():
+                turn_tts_engine = "elevenlabs"
+                tts_ready_flag = True
+                tts_mode_str = "remote_cloud"
             elif self.local_offline_tts and self.local_offline_tts.is_ready():
                 turn_tts_engine = "local_offline_tts"
                 tts_ready_flag = True

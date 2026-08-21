@@ -336,16 +336,27 @@ class AudioOutputManager:
 
             proc = self._current_process
 
-        try:
-            if proc and proc.stdin:
-                proc.stdin.write(chunk)
-                proc.stdin.flush()
-                return True
-        except Exception as e:
-            self._log("warn", f"⚠️ [AudioOutputManager] aplay akışına yazma hatası: {e}")
-            with self._lock:
-                self._stop_active_processes_locked()
-            return False
+        import errno
+        for attempt in range(3):
+            try:
+                if proc and proc.stdin:
+                    proc.stdin.write(chunk)
+                    proc.stdin.flush()
+                    return True
+            except OSError as e:
+                if getattr(e, "errno", None) == errno.EINTR:
+                    time.sleep(0.01)
+                    continue
+                self._log("warn", f"⚠️ [AudioOutputManager] aplay akışına yazma hatası: {e}")
+                with self._lock:
+                    self._stop_active_processes_locked()
+                return False
+            except Exception as e:
+                self._log("warn", f"⚠️ [AudioOutputManager] aplay akışına yazma hatası: {e}")
+                with self._lock:
+                    self._stop_active_processes_locked()
+                return False
+        return False
 
     def _playback_loop(self) -> None:
         """Dedicated playback thread (hardware DAC stream or streaming aplay subprocess)."""

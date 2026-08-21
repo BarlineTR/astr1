@@ -30,17 +30,17 @@ class SystemMemoryGuard:
         self.min_available_ram_mb = float(
             min_available_ram_mb
             if min_available_ram_mb is not None
-            else os.getenv("XTTS_MIN_AVAILABLE_RAM_MB", "1800.0")
+            else os.getenv("XTTS_MIN_AVAILABLE_RAM_MB", "2200.0")
         )
         self.max_swap_used_percent = float(
             max_swap_used_percent
             if max_swap_used_percent is not None
-            else os.getenv("XTTS_MAX_SWAP_USED_PERCENT", "80.0")
+            else os.getenv("XTTS_MAX_SWAP_USED_PERCENT", "70.0")
         )
         self.max_ram_used_percent = float(
             max_ram_used_percent
             if max_ram_used_percent is not None
-            else os.getenv("XTTS_MAX_RAM_USED_PERCENT", "85.0")
+            else os.getenv("XTTS_MAX_RAM_USED_PERCENT", "80.0")
         )
         # Çekirdeğin bildirdiği bellek duraklama oranı (PSI). "full avg60", son 60
         # saniyede TÜM görevlerin bellek beklerken durduğu sürenin yüzdesi — anlık
