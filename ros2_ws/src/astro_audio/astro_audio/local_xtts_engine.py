@@ -220,6 +220,7 @@ class LocalXttsEngine(BaseTTSEngine):
         self._first_retry_delay = float(os.getenv("XTTS_FIRST_RETRY_S", "20.0"))
         self._max_retries = int(float(os.getenv("XTTS_MAX_ADMISSION_RETRIES", "10")))
         self._retry_count = 0
+        self._consecutive_failures = 0
         self._next_retry_delay = 0.0
         self._supervisor: Optional[threading.Thread] = None
         self._supervisor_stop = threading.Event()
@@ -501,6 +502,19 @@ class LocalXttsEngine(BaseTTSEngine):
         with self._state_lock:
             return self._state == "READY" and self.client.is_ready
 
+    def is_healthy(self) -> bool:
+        if not self.is_ready():
+            return False
+        with self._state_lock:
+            if self._state in ("DEGRADED", "TIMEOUT", "FAILED", "QUARANTINED", "CRASHED", "COOLDOWN"):
+                return False
+        if self._consecutive_failures > 0:
+            return False
+        last_infer = self._last_telemetry.get("last_infer_ms", 0.0)
+        if last_infer > 5000.0:
+            return False
+        return True
+
     def synthesize_sentence(
         self,
         text: str,
@@ -518,7 +532,7 @@ class LocalXttsEngine(BaseTTSEngine):
             return None
 
         t_start = time.perf_counter()
-        synth_timeout = float(os.getenv("TTS_XTTS_SYNTHESIS_TIMEOUT_S", "45.0"))
+        synth_timeout = float(os.getenv("TTS_XTTS_SYNTHESIS_TIMEOUT_S", "8.0"))
         try:
             res = self.client.synthesize_chunk(
                 text=text,
@@ -529,6 +543,7 @@ class LocalXttsEngine(BaseTTSEngine):
             )
 
             if res.get("cancelled") or not res.get("ok"):
+                self._consecutive_failures += 1
                 return None
 
             pcm_bytes = res.get("pcm_bytes")
@@ -538,6 +553,7 @@ class LocalXttsEngine(BaseTTSEngine):
             rtf = res.get("rtf", 0.0)
             vram = res.get("gpu_memory_mb", 0.0)
 
+            self._consecutive_failures = 0
             self._last_telemetry.update({
                 "xtts_queue_wait_ms": round(q_wait, 1),
                 "xtts_model_load_ms": 0.0,
@@ -555,6 +571,7 @@ class LocalXttsEngine(BaseTTSEngine):
             return pcm_bytes
 
         except Exception as exc:
+            self._consecutive_failures += 1
             tot_ms = (time.perf_counter() - t_start) * 1000.0
             is_timeout = "timed out" in str(exc).lower()
             self._last_telemetry["fallback_reason"] = "xtts_timeout" if is_timeout else str(exc)

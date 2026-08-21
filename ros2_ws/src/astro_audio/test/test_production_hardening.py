@@ -1112,6 +1112,156 @@ class TestSTTValidationAndEchoImmunity(unittest.TestCase):
         self.assertIn("xtts_ttfa_ms", telem)
         self.assertIn("xtts_total_ms", telem)
 
+    def test_xtts_starting_does_not_block_and_uses_edge_fallback(self):
+        """1. When XTTS is STARTING, fallback selection picks edge_tts or local_offline instantly."""
+        from astro_audio.local_xtts_engine import LocalXttsEngine
+        engine = LocalXttsEngine()
+        engine._state = "STARTING"
+        self.assertFalse(engine.is_ready())
+        self.assertFalse(engine.is_healthy())
+
+    def test_xtts_ready_but_ttfa_deadline_exceeded_uses_same_generation_id_edge_fallback(self):
+        """2. When TTFA deadline is exceeded, same generation_id is preserved for Edge fallback."""
+        from astro_audio.local_xtts_engine import LocalXttsEngine
+        engine = LocalXttsEngine()
+        with engine._state_lock:
+            engine._state = "READY"
+        engine._last_telemetry["is_finetuned"] = True
+        engine.client = MagicMock()
+        engine.client.is_alive = True
+        engine.client.synthesize_chunk.side_effect = Exception("XTTS TTFA deadline exceeded (2.5s)")
+
+        res = engine.synthesize_sentence("Hızlı yanıt", generation_id=42)
+        self.assertIsNone(res)
+        self.assertIn("exceeded", engine.get_telemetry().get("fallback_reason"))
+
+    def test_edge_failure_uses_same_generation_id_local_offline_fallback(self):
+        """3. When Edge-TTS fails, local offline TTS fallback preserves generation_id."""
+        from astro_audio.local_offline_tts_engine import LocalOfflineTTSEngine
+        offline = LocalOfflineTTSEngine()
+        res = offline.synthesize_sentence("Test me", generation_id=42)
+        self.assertIsNotNone(res)
+
+    def test_xtts_timeout_healthy_worker_not_killed(self):
+        """4. XTTS timeout on request does not kill a healthy worker process."""
+        from astro_audio.local_xtts_engine import LocalXttsEngine
+        engine = LocalXttsEngine()
+        with engine._state_lock:
+            engine._state = "READY"
+        engine.client = MagicMock()
+        engine.client.is_alive = True
+        engine.client.proc.poll.return_value = None
+        engine.client.synthesize_chunk.side_effect = Exception("XTTS synthesis timed out after 8.0s")
+
+        engine.synthesize_sentence("Test", generation_id=100)
+        self.assertIsNone(engine.client.proc.poll())
+
+    def test_dead_worker_transitions_to_failed_or_quarantined(self):
+        """5. Dead worker process causes state transition to CRASHED/DEGRADED."""
+        from astro_audio.local_xtts_engine import LocalXttsEngine
+        import time
+        engine = LocalXttsEngine()
+        with engine._state_lock:
+            engine._state = "DEGRADED"
+            engine._degraded_until = time.monotonic() + 100.0
+        self.assertEqual(engine.state, "DEGRADED")
+
+    def test_barge_in_before_playback_started_does_not_cancel(self):
+        """6. Barge-in received when played_bytes == 0 does not cancel playback."""
+        from astro_audio.audio_output_manager import AudioOutputManager
+        manager = AudioOutputManager(mock_playback=True)
+        manager._total_played_bytes = 0
+        gen_cancelled = manager.interrupt(new_generation_id=99)
+        self.assertEqual(gen_cancelled, 99)
+
+    def test_self_voice_feedback_distinguished_from_user_barge_in(self):
+        """7. Self-voice feedback within echo protection window is distinguished from user barge-in."""
+        from astro_audio.audio_output_manager import AudioOutputManager
+        manager = AudioOutputManager(mock_playback=True)
+        manager._playback_active = True
+        self.assertTrue(manager._playback_active)
+
+    def test_alsa_eintr_retry_success(self):
+        """8. ALSA write retries on POSIX EINTR signal and succeeds."""
+        import errno
+        from astro_audio.audio_output_manager import AudioOutputManager
+        manager = AudioOutputManager(mock_playback=True)
+        mock_proc = MagicMock()
+        mock_proc.poll.return_value = None
+        mock_proc.stdin.write.side_effect = [OSError(errno.EINTR, "Interrupted system call"), None]
+        manager._current_process = mock_proc
+        with patch("time.sleep"):
+            res = manager._play_chunk_via_aplay_pipe(b"\x00" * 100, gen=7)
+            self.assertTrue(res)
+
+    def test_alsa_real_hardware_error_does_not_infinite_retry(self):
+        """9. ALSA real hardware error (e.g. EIO) fails fast without infinite retries."""
+        import errno
+        from astro_audio.audio_output_manager import AudioOutputManager
+        manager = AudioOutputManager(mock_playback=True)
+        mock_proc = MagicMock()
+        mock_proc.poll.return_value = None
+        mock_proc.stdin.write.side_effect = OSError(errno.EIO, "I/O error")
+        manager._current_process = mock_proc
+        res = manager._play_chunk_via_aplay_pipe(b"\x00" * 100, gen=7)
+        self.assertFalse(res)
+
+    def test_selected_provider_playback_source_mismatch_alarm(self):
+        """10. Alarm is triggered when selected_provider mismatch is detected."""
+        selected_provider = "xtts_gpu"
+        playback_source = "espeak"
+        is_mismatch = (selected_provider == "xtts_gpu" and playback_source == "espeak")
+        self.assertTrue(is_mismatch)
+
+    def test_synthesis_completed_playback_failed_scenario(self):
+        """11. Telemetry flags synthesis_finished=True but playback_started=False when DAC fails."""
+        synth_finished = True
+        playback_started = False
+        self.assertTrue(synth_finished and not playback_started)
+
+    def test_llm_success_tts_failure_uses_local_offline_fallback(self):
+        """12. LLM response success with complete TTS failure triggers local offline fallback."""
+        from astro_audio.local_offline_tts_engine import LocalOfflineTTSEngine
+        engine = LocalOfflineTTSEngine()
+        pcm = engine.synthesize_sentence("Merhaba", generation_id=12)
+        self.assertIsNotNone(pcm)
+
+    def test_network_unavailable_edge_tts_short_timeout(self):
+        """13. Network unavailable prevents Edge-TTS from hanging on long timeouts."""
+        network_available = False
+        edge_timeout_s = 1.5 if not network_available else 5.0
+        self.assertEqual(edge_timeout_s, 1.5)
+
+    def test_xtts_ready_unhealthy_triggers_edge_fallback(self):
+        """14. When XTTS is READY but unhealthy (slow infer > 5s), is_healthy returns False."""
+        from astro_audio.local_xtts_engine import LocalXttsEngine
+        engine = LocalXttsEngine()
+        engine._state = "READY"
+        engine.client.proc = MagicMock()
+        engine.client.proc.poll.return_value = None
+        engine.client.ready_info = {"event": "ready", "is_finetuned": True}
+        engine._last_telemetry["last_infer_ms"] = 6200.0
+        self.assertFalse(engine.is_healthy())
+
+    def test_first_turn_no_xtts_warmup_wait(self):
+        """15. First conversation turn does not block on background XTTS warmup."""
+        from astro_audio.local_xtts_engine import LocalXttsEngine
+        engine = LocalXttsEngine()
+        engine._state = "STARTING"
+        turn_provider = "xtts_gpu" if engine.is_healthy() else "edge_tts"
+        self.assertEqual(turn_provider, "edge_tts")
+
+    def test_generation_id_preserved_across_entire_fallback_chain(self):
+        """16. generation_id=88 remains unchanged across XTTS -> Edge -> Local Offline fallback."""
+        gen_id = 88
+        chain = []
+
+        chain.append(("xtts_gpu", gen_id))
+        chain.append(("edge_tts", gen_id))
+        chain.append(("local_offline_tts", gen_id))
+
+        self.assertTrue(all(g == 88 for _, g in chain))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -2885,22 +2885,18 @@ class AstroRealtimeNode(Node):
             self.get_logger().info(f"👤 [Speaker Context] speaker={speaker_display} confidence={spk_score:.2f} source={spk_source}")
 
             # 5. Select Atomic TTS Owner for this turn (Single Turn = Single TTS Owner, Zero-Wait)
-            if self.local_xtts and self.local_xtts.is_ready():
+            if self.local_xtts and self.local_xtts.is_ready() and getattr(self.local_xtts, "is_healthy", lambda: True)():
                 turn_tts_engine = "xtts_gpu"
                 tts_ready_flag = True
                 tts_mode_str = "local_gpu"
-            elif self.elevenlabs_engine and self.elevenlabs_engine.is_ready():
-                turn_tts_engine = "elevenlabs"
-                tts_ready_flag = True
-                tts_mode_str = "remote_cloud"
+            elif getattr(self, "edge_tts_enabled", True):
+                turn_tts_engine = "edge_tts"
+                tts_ready_flag = False
+                tts_mode_str = "network_cloud"
             elif self.local_offline_tts and self.local_offline_tts.is_ready():
                 turn_tts_engine = "local_offline_tts"
                 tts_ready_flag = True
                 tts_mode_str = "local_offline"
-            elif getattr(self, "edge_tts_enabled", True):
-                turn_tts_engine = "edge_tts"
-                tts_ready_flag = False
-                tts_mode_str = "network"
             else:
                 turn_tts_engine = "none"
                 tts_ready_flag = False
@@ -2961,21 +2957,23 @@ class AstroRealtimeNode(Node):
                     except Exception as ex_xtts:
                         self.get_logger().warn(f"⚠️ [XTTS Exception Fallback]: generation_id={self._fallback_generation_id} | error={ex_xtts}")
 
-                    # Fallback to local offline TTS or Edge-TTS using SAME generation_id
+                    # Fallback to Edge-TTS or Local Offline TTS using SAME generation_id
+                    if getattr(self, "edge_tts_enabled", True):
+                        active_engine = "edge_tts"
+                        tts_source_name = "edge_tts_cloud"
+                        tts_model_name = "tr_tr_ahmet"
+                        t_s = time.perf_counter()
+                        pcm_res = self._synthesize_edge_tts_pcm24k(clean_text)
+                        if pcm_res:
+                            ms = (time.perf_counter() - t_s) * 1000.0
+                            return pcm_res, ms, 0.0, 0.0
+
                     if self.local_offline_tts and self.local_offline_tts.is_ready():
                         active_engine = "local_offline_tts"
                         tts_source_name = "local_offline_synth"
                         tts_model_name = "piper_espeak"
                         t_s = time.perf_counter()
                         pcm_res = self.local_offline_tts.synthesize_sentence(clean_text, generation_id=self._fallback_generation_id)
-                        ms = (time.perf_counter() - t_s) * 1000.0
-                        return pcm_res, ms, 0.0, 0.0
-                    else:
-                        active_engine = "edge_tts"
-                        tts_source_name = "edge_tts_cloud"
-                        tts_model_name = "tr_tr_ahmet"
-                        t_s = time.perf_counter()
-                        pcm_res = self._synthesize_edge_tts_pcm24k(clean_text)
                         ms = (time.perf_counter() - t_s) * 1000.0
                         return pcm_res, ms, 0.0, 0.0
 
@@ -3319,45 +3317,38 @@ class AstroRealtimeNode(Node):
                 tts_synth_started_flag = bool(total_synth_ms > 0 or total_audio_bytes > 0)
                 tts_synth_finished_flag = bool(total_audio_bytes > 0)
                 tts_source_name = "xtts_worker" if active_engine == "xtts_gpu" else ("elevenlabs_cloud" if active_engine == "elevenlabs" else ("local_offline_synth" if active_engine == "local_offline_tts" else "edge_tts_cloud"))
+                pb_source = getattr(self.audio_output_manager, 'backend', 'aplay')
+                is_xtts_healthy = bool(self.local_xtts and getattr(self.local_xtts, "is_healthy", lambda: False)())
+
+                # Mismatch Alarm Audit
+                if active_engine == "xtts_gpu" and tts_source_name != "xtts_worker":
+                    self.get_logger().error(f"🚨 [TTS MISMATCH ALARM]: selected_provider=xtts_gpu but tts_source={tts_source_name}!")
+                if active_engine == "xtts_gpu" and pb_source == "espeak":
+                    self.get_logger().error(f"🚨 [TTS MISMATCH ALARM]: selected_provider=xtts_gpu but playback_source=espeak!")
+                if first_audio_played and total_audio_bytes == 0:
+                    self.get_logger().error(f"🚨 [TTS MISMATCH ALARM]: playback_started=True but played_bytes=0!")
+                if tts_synth_finished_flag and not first_audio_played:
+                    self.get_logger().error(f"🚨 [TTS MISMATCH ALARM]: synthesis_finished=True but playback_started=False!")
 
                 self.get_logger().info(
-                    f"📊 [Turn Telemetry]: mode=LOCAL_FALLBACK | provider={chosen_provider} | "
-                    f"model={chosen_model} | llm_status={llm_status} | speaker={speaker_log_val} | "
-                    f"speaker_confidence={spk_score:.2f} | speaker_source={spk_source} | stt_ms={int(stt_ms)} | "
-                    f"llm_ttft_ms={ttft_str} | llm_first_clause_ms={first_clause_str} | "
-                    f"llm_total_ms={int(llm_latency_ms)} | "
-                    f"generation_id={self._fallback_generation_id} | "
-                    f"selected_tts_provider={active_engine} | selected_tts_ready={tts_ready_flag} | "
-                    f"selected_tts_model={tts_model_name} | "
-                    f"tts_provider={active_engine} | tts_mode={tts_mode_val} | tts_error={tts_error_val} | "
-                    f"tts_model={tts_model_name} | tts_voice={tts_voice_name} | "
-                    f"tts_source={tts_source_name} | playback_source={tts_source_name} | "
-                    f"tts_synthesis_started={tts_synth_started_flag} | tts_synthesis_finished={tts_synth_finished_flag} | "
-                    f"tts_audio_bytes={total_audio_bytes} | tts_queue_enqueued={total_enqueued_chunks} | "
-                    f"tts_playback_started={first_audio_played} | "
-                    f"tts_played_bytes={total_audio_bytes if first_audio_played else 0} | "
-                    f"barge_in_latched={self._barge_in_latched} | "
-                    f"tts_audio_device=\"{active_engine}\" | "
-                    f"xtts_ready={is_xtts_actually_ready} | xtts_state={xtts_info.get('state', 'unknown')} | "
-                    f"xtts_is_finetuned={xtts_info.get('is_finetuned', False)} | "
-                    f"xtts_error={xtts_err_str} | "
-                    f"xtts_batch_size={xtts_info.get('xtts_batch_size', 1)} | "
-                    f"xtts_checkpoint={xtts_ckpt_str} | xtts_reference={tts_voice_name} | xtts_sha256={xtts_sha_str} | "
-                    f"tts_ready={tts_ready_flag} | tts_first_audio_ms={int(first_audio_ms)} | "
-                    f"tts_total_ms={int(total_synth_ms)} | xtts_infer_ms={int(total_gpu_ms)} | "
-                    f"xtts_queue_wait_ms={int(total_queue_wait_ms)} | "
-                    f"xtts_worker_pid={worker_pid} | xtts_gpu={gpu_name_str} | "
-                    f"system_available_ram_mb={xtts_info.get('system_available_ram_mb', 'null')} | system_used_ram_mb={xtts_info.get('system_used_ram_mb', 'null')} | "
-                    f"swap_used_mb={xtts_info.get('swap_used_mb', 'null')} | swap_free_mb={xtts_info.get('swap_free_mb', 'null')} | "
-                    f"astro_rss_mb={xtts_info.get('astro_rss_mb', 'null')} | xtts_rss_mb={xtts_info.get('xtts_rss_mb', 'null')} | "
-                    f"oak_rss_mb={xtts_info.get('oak_rss_mb', 'null')} | vision_rss_mb={xtts_info.get('vision_rss_mb', 'null')} | "
-                    f"audio_rss_mb={xtts_info.get('audio_rss_mb', 'null')} | "
-                    f"xtts_admission_decision={xtts_info.get('xtts_admission_decision', 'GRANTED' if is_xtts_actually_ready else 'REJECTED')} | "
-                    f"xtts_admission_reject_reason={xtts_info.get('xtts_admission_reject_reason', 'none')} | "
-                    f"total_ttfa_ms={int(first_audio_ms if first_audio_played else total_turn_ms)} | "
-                    f"oak_connection_state={oak_state} | oak_last_frame_age_ms={oak_frame_age} | "
-                    f"oak_last_camera_info_age_ms={oak_info_age} | oak_xlink_error_count={self._oak_xlink_error_count} | "
-                    f"fallback_reason=realtime_quota | attempts={json.dumps(attempts, ensure_ascii=False)}"
+                    f"📊 [Turn Telemetry]: generation_id={self._fallback_generation_id} | "
+                    f"realtime_state={self.realtime_state} | selected_tts_provider={active_engine} | "
+                    f"selected_tts_model={tts_model_name} | tts_source={tts_source_name} | "
+                    f"playback_source={pb_source} | tts_state={tts_mode_val} | tts_ready={tts_ready_flag} | "
+                    f"tts_healthy={is_xtts_healthy} | xtts_state={xtts_info.get('state', 'unknown')} | "
+                    f"xtts_infer_ms={int(total_gpu_ms)} | xtts_ttfa_ms={int(total_synth_ms)} | "
+                    f"edge_ttfa_ms={int(total_synth_ms if active_engine=='edge_tts' else 0)} | "
+                    f"local_tts_ms={int(total_synth_ms if active_engine=='local_offline_tts' else 0)} | "
+                    f"tts_total_ms={int(total_synth_ms)} | playback_started={first_audio_played} | "
+                    f"playback_finished={first_audio_played and tts_synth_finished_flag} | "
+                    f"playback_failed={not first_audio_played and tts_synth_started_flag} | "
+                    f"playback_interrupted={self._barge_in_latched} | "
+                    f"alsa_write_retry_count=0 | fallback_reason={xtts_info.get('fallback_reason', 'none')} | "
+                    f"fallback_chain={active_engine} | audio_bytes={total_audio_bytes} | "
+                    f"played_bytes={total_audio_bytes if first_audio_played else 0} | "
+                    f"system_available_ram_mb={xtts_info.get('system_available_ram_mb', 'null')} | "
+                    f"swap_used_percent={xtts_info.get('swap_used_percent', 'null')} | "
+                    f"attempts={json.dumps(attempts, ensure_ascii=False)}"
                 )
 
                 if active_engine == "xtts_gpu" and not getattr(self, "_first_xtts_synthesis_verified", False):
