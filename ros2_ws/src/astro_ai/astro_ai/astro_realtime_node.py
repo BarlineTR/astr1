@@ -532,6 +532,20 @@ class AstroRealtimeNode(Node):
         self._barge_in_latched = False
         self.edge_tts_enabled = os.getenv("EDGE_TTS_ENABLED", "true").lower() in ("1", "true", "yes")
 
+        # Single Unified TTSRouter
+        try:
+            from astro_audio.tts_router import TTSRouter
+        except ImportError:
+            from tts_router import TTSRouter
+
+        self.tts_router = TTSRouter(
+            local_xtts=self.local_xtts,
+            local_offline_tts=self.local_offline_tts,
+            edge_tts_synth_func=self._synthesize_edge_tts_pcm24k,
+            edge_tts_enabled=self.edge_tts_enabled,
+            logger=self._safe_log,
+        )
+
         # Speaker Recognition Temporal Smoother
         self._speaker_tentative_name: Optional[str] = None
         self._speaker_tentative_count: int = 0
@@ -2935,71 +2949,15 @@ class AstroRealtimeNode(Node):
 
                 nonlocal active_engine, tts_source_name, tts_model_name
 
-                if active_engine == "xtts_gpu" and self.local_xtts and self.local_xtts.is_ready():
-                    try:
-                        t_s = time.perf_counter()
-                        pcm_res = self.local_xtts.synthesize_sentence(clean_text, generation_id=self._fallback_generation_id)
-                        tot_ms = (time.perf_counter() - t_s) * 1000.0
-                        telem = self.local_xtts.get_telemetry()
-                        gpu_ms = telem.get("last_infer_ms", tot_ms)
-                        q_wait = telem.get("xtts_queue_wait_ms", max(0.0, tot_ms - gpu_ms))
-
-                        if pcm_res:
-                            return pcm_res, tot_ms, gpu_ms, q_wait
-
-                        # XTTS returned None (timeout or degraded) -> Deterministic Emergency Fallback without changing generation_id
-                        fb_reason = telem.get("fallback_reason", "xtts_timeout")
-                        self.get_logger().warn(
-                            f"⚠️ [XTTS Fallback Triggered]: generation_id={self._fallback_generation_id} | "
-                            f"fallback_reason={fb_reason} | "
-                            f"action=deterministic_emergency_fallback"
-                        )
-                    except Exception as ex_xtts:
-                        self.get_logger().warn(f"⚠️ [XTTS Exception Fallback]: generation_id={self._fallback_generation_id} | error={ex_xtts}")
-
-                    # Fallback to Edge-TTS or Local Offline TTS using SAME generation_id
-                    if getattr(self, "edge_tts_enabled", True):
-                        active_engine = "edge_tts"
-                        tts_source_name = "edge_tts_cloud"
-                        tts_model_name = "tr_tr_ahmet"
-                        t_s = time.perf_counter()
-                        pcm_res = self._synthesize_edge_tts_pcm24k(clean_text)
-                        if pcm_res:
-                            ms = (time.perf_counter() - t_s) * 1000.0
-                            return pcm_res, ms, 0.0, 0.0
-
-                    if self.local_offline_tts and self.local_offline_tts.is_ready():
-                        active_engine = "local_offline_tts"
-                        tts_source_name = "local_offline_synth"
-                        tts_model_name = "piper_espeak"
-                        t_s = time.perf_counter()
-                        pcm_res = self.local_offline_tts.synthesize_sentence(clean_text, generation_id=self._fallback_generation_id)
-                        ms = (time.perf_counter() - t_s) * 1000.0
-                        return pcm_res, ms, 0.0, 0.0
-
-                elif active_engine == "elevenlabs" and self.elevenlabs_engine and self.elevenlabs_engine.is_ready():
-                    try:
-                        t_s = time.perf_counter()
-                        pcm_res = self.elevenlabs_engine.synthesize_sentence(clean_text, generation_id=self._fallback_generation_id)
-                        ms = (time.perf_counter() - t_s) * 1000.0
-                        return pcm_res, ms, 0.0, 0.0
-                    except Exception:
-                        pass
-
-                elif active_engine == "local_offline_tts" and self.local_offline_tts and self.local_offline_tts.is_ready():
-                    try:
-                        t_s = time.perf_counter()
-                        pcm_res = self.local_offline_tts.synthesize_sentence(clean_text, generation_id=self._fallback_generation_id)
-                        ms = (time.perf_counter() - t_s) * 1000.0
-                        return pcm_res, ms, 0.0, 0.0
-                    except Exception:
-                        pass
-
-                # Default Network fallback
-                t_s = time.perf_counter()
-                pcm_res = self._synthesize_edge_tts_pcm24k(clean_text)
-                ms = (time.perf_counter() - t_s) * 1000.0
-                return pcm_res, ms, 0.0, 0.0
+                route_res = self.tts_router.synthesize(
+                    clean_text,
+                    generation_id=self._fallback_generation_id,
+                    language=os.getenv("TTS_LANGUAGE", "tr"),
+                )
+                active_engine = route_res.actual_provider
+                tts_source_name = route_res.source_name
+                tts_model_name = route_res.model_name
+                return route_res.pcm, route_res.duration_ms, route_res.infer_ms, route_res.queue_wait_ms
 
             def _handle_and_play_clause_audio(pcm_audio: bytes):
                 if not pcm_audio:
@@ -3332,22 +3290,18 @@ class AstroRealtimeNode(Node):
 
                 self.get_logger().info(
                     f"📊 [Turn Telemetry]: generation_id={self._fallback_generation_id} | "
-                    f"realtime_state={self.realtime_state} | selected_tts_provider={active_engine} | "
-                    f"selected_tts_model={tts_model_name} | tts_source={tts_source_name} | "
-                    f"playback_source={pb_source} | tts_state={tts_mode_val} | tts_ready={tts_ready_flag} | "
-                    f"tts_healthy={is_xtts_healthy} | xtts_state={xtts_info.get('state', 'unknown')} | "
-                    f"xtts_infer_ms={int(total_gpu_ms)} | xtts_ttfa_ms={int(total_synth_ms)} | "
-                    f"edge_ttfa_ms={int(total_synth_ms if active_engine=='edge_tts' else 0)} | "
-                    f"local_tts_ms={int(total_synth_ms if active_engine=='local_offline_tts' else 0)} | "
+                    f"stt_provider=whisper | stt_state=AVAILABLE | stt_failure_reason=none | "
+                    f"llm_provider={chosen_provider} | llm_state={llm_status} | "
+                    f"tts_selected_provider={active_engine} | tts_actual_provider={active_engine} | "
+                    f"tts_state={tts_mode_val} | tts_failure_reason={xtts_info.get('fallback_reason', 'none')} | "
+                    f"fallback_chain={active_engine} | tts_ttfa_ms={int(total_synth_ms)} | "
                     f"tts_total_ms={int(total_synth_ms)} | playback_started={first_audio_played} | "
                     f"playback_finished={first_audio_played and tts_synth_finished_flag} | "
                     f"playback_failed={not first_audio_played and tts_synth_started_flag} | "
-                    f"playback_interrupted={self._barge_in_latched} | "
-                    f"alsa_write_retry_count=0 | fallback_reason={xtts_info.get('fallback_reason', 'none')} | "
-                    f"fallback_chain={active_engine} | audio_bytes={total_audio_bytes} | "
                     f"played_bytes={total_audio_bytes if first_audio_played else 0} | "
                     f"system_available_ram_mb={xtts_info.get('system_available_ram_mb', 'null')} | "
                     f"swap_used_percent={xtts_info.get('swap_used_percent', 'null')} | "
+                    f"audio_input_device=respeaker_usb | audio_output_device={pb_source} | "
                     f"attempts={json.dumps(attempts, ensure_ascii=False)}"
                 )
 

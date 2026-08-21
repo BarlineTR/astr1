@@ -16,9 +16,14 @@ import threading
 import time
 import numpy as np
 
-import rclpy
-from rclpy.node import Node
-from std_msgs.msg import Bool, Float32, Int16MultiArray
+try:
+    import rclpy
+    from rclpy.node import Node
+    from std_msgs.msg import Bool, Float32, Int16MultiArray
+except ImportError:
+    rclpy = None
+    Node = object
+    Bool = Float32 = Int16MultiArray = None
 
 try:
     import sounddevice as sd
@@ -73,7 +78,7 @@ class ReSpeakerHID:
         return float(self._read_param(PARAM_DOA_ANGLE))
 
 
-RESPEAKER_NAME_HINTS = ("respeaker", "uac1", "seeed", "arrayuac")
+RESPEAKER_NAME_HINTS = ("respeaker", "uac1", "seeed", "arrayuac", "4 mic array", "array uac")
 
 
 def list_input_devices() -> list[tuple[int, str]]:
@@ -189,6 +194,12 @@ class AudioCaptureNode(Node):
             "first": "ReSpeaker ve varsayılan yok, ilk giriş cihazı",
             "none": "kullanılabilir mikrofon yok",
         }[source]
+
+        if source in ("default", "first"):
+            self.get_logger().warn(
+                f"⚠️ [AUDIO_DEVICE_FALLBACK]: ReSpeaker donanımı bulunamadı! "
+                f"Seçilen cihaz: [{dev_id}] {dev_name} ({reason})"
+            )
 
         if dev_id is None:
             self.get_logger().error(f"❌ [Mikrofon] {reason} — ses yakalama devre dışı")

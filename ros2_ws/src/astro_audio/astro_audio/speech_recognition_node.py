@@ -149,6 +149,18 @@ class SpeechRecognitionNode(Node):
             self.enabled = False
             return
 
+        try:
+            from astro_audio.stt_router import STTRouter
+        except ImportError:
+            from stt_router import STTRouter
+
+        self.stt_router = STTRouter(
+            groq_client=self.groq_client,
+            openai_client=self.openai_client,
+            local_whisper_model=self.fw_model,
+            logger=lambda lvl, msg: getattr(self.get_logger(), lvl)(msg),
+        )
+
         # Parameters (Ultra-fast responsive conversational turn-taking: 0.38s silence pause tolerance)
         self.declare_parameter('silence_timeout_s', 0.38)
         self.declare_parameter('sample_rate', 16000)
@@ -422,53 +434,11 @@ class SpeechRecognitionNode(Node):
             text = None
             # Gerçek STT süresi burada ölçülür. ai_brain_node'un "Bu Dönüş" satırı
             # transkript GELDİKTEN sonrasını ölçer, dolayısıyla bu süreyi göremez.
-            stt_engine_used = "none"
-            t_stt_start = time.monotonic()
-
-            # 1. Ultra-Fast Groq Whisper Large V3 (80ms Latency - Primary Free STT)
-            if self.groq_client:
-                try:
-                    result = self.groq_client.audio.transcriptions.create(
-                        file=("speech.wav", wav_bytes),
-                        model="whisper-large-v3",
-                        language="tr",
-                        temperature=0.0,
-                        response_format="text"
-                    )
-                    text = str(result).strip()
-                    stt_engine_used = "groq/whisper-large-v3"
-                except Exception as ge:
-                    self.get_logger().warn(f"⚠️ [Groq Whisper] Hatası ({ge}), yedek motorlara geçiliyor...")
-
-            # 2. OpenAI Whisper-1 Fallback
-            if not text and self.openai_client:
-                try:
-                    res = self.openai_client.audio.transcriptions.create(
-                        model="whisper-1",
-                        file=("speech.wav", wav_bytes),
-                        language="tr",
-                        temperature=0.0,
-                        response_format="text"
-                    )
-                    text = str(res).strip()
-                    stt_engine_used = "openai/whisper-1"
-                except Exception as oe:
-                    self.get_logger().warn(f"⚠️ [OpenAI Whisper] Hatası: {oe}")
-
-            # 3. Yerel Faster-Whisper (Yalnızca bulut motorlar başarısız olursa)
-            if not text and self.fw_model is not None:
-                try:
-                    audio_f32 = arr.astype(np.float32) / 32768.0
-                    segments, _info = self.fw_model.transcribe(
-                        audio_f32, beam_size=1, language="tr"
-                    )
-                    text = "".join(seg.text for seg in segments).strip()
-                    stt_engine_used = f"faster-whisper/{self._fw_model_name}@{self._fw_device}"
-                except Exception as fe:
-                    self.get_logger().warn(f"⚠️ [Faster-Whisper] Hatası ({fe})")
-
-
-            stt_ms = (time.monotonic() - t_stt_start) * 1000.0
+            # Unified STTRouter Transcription
+            route_res = self.stt_router.transcribe(arr, wav_bytes, self._sample_rate)
+            text = route_res.text
+            stt_engine_used = route_res.provider
+            stt_ms = route_res.duration_ms
 
             if not text:
                 return

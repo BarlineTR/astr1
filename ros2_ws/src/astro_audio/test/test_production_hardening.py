@@ -1262,6 +1262,149 @@ class TestSTTValidationAndEchoImmunity(unittest.TestCase):
 
         self.assertTrue(all(g == 88 for _, g in chain))
 
+    def test_acceptance_a_xtts_rejected_due_ram_uses_edge_tts(self):
+        """A. XTTS rejected due to RAM admission -> routes to Edge-TTS."""
+        from astro_audio.tts_router import TTSRouter
+        from astro_audio.local_xtts_engine import LocalXttsEngine
+        xtts = LocalXttsEngine()
+        with xtts._state_lock:
+            xtts._state = "DEGRADED"
+            xtts._degraded_until = time.monotonic() + 100.0
+        router = TTSRouter(
+            local_xtts=xtts,
+            edge_tts_synth_func=lambda text: b"\x00\x01" * 100,
+            edge_tts_enabled=True,
+        )
+        res = router.synthesize("Merhaba", generation_id=101)
+        self.assertEqual(res.actual_provider, "edge_tts")
+        self.assertIsNotNone(res.pcm)
+
+    def test_acceptance_b_xtts_rejected_edge_unavailable_uses_local_offline(self):
+        """B. XTTS rejected and Edge-TTS unavailable -> routes to Local Offline."""
+        from astro_audio.tts_router import TTSRouter
+        from astro_audio.local_xtts_engine import LocalXttsEngine
+        from astro_audio.local_offline_tts_engine import LocalOfflineTTSEngine
+        xtts = LocalXttsEngine()
+        with xtts._state_lock:
+            xtts._state = "DEGRADED"
+            xtts._degraded_until = time.monotonic() + 100.0
+        offline = LocalOfflineTTSEngine()
+        router = TTSRouter(
+            local_xtts=xtts,
+            local_offline_tts=offline,
+            edge_tts_synth_func=lambda text: None,
+            edge_tts_enabled=True,
+        )
+        res = router.synthesize("Merhaba", generation_id=102)
+        self.assertEqual(res.actual_provider, "local_offline_tts")
+        self.assertIsNotNone(res.pcm)
+
+    def test_acceptance_c_groq_stt_429_cooldown_routes_to_local_stt(self):
+        """C. Groq STT 429 initiates cooldown and falls back to Local STT."""
+        from astro_audio.stt_router import STTRouter, STTProviderState
+        mock_groq = MagicMock()
+        mock_groq.audio.transcriptions.create.side_effect = Exception("429 Rate limit / RPM exceeded")
+        mock_whisper = MagicMock()
+        mock_seg = MagicMock()
+        mock_seg.text = "Yerel ses tanıma"
+        mock_whisper.transcribe.return_value = ([mock_seg], None)
+
+        router = STTRouter(
+            groq_client=mock_groq,
+            openai_client=None,
+            local_whisper_model=mock_whisper,
+        )
+        res = router.transcribe(np.zeros(1600, dtype=np.int16), b"dummy_wav")
+        self.assertEqual(router.groq_state, STTProviderState.COOLDOWN)
+        self.assertEqual(res.provider, "local_whisper")
+        self.assertEqual(res.text, "Yerel ses tanıma")
+
+    def test_acceptance_d_openai_insufficient_quota_disables_session_routes_to_local_stt(self):
+        """D. OpenAI STT insufficient_quota disables OpenAI for session and falls back to Local STT."""
+        from astro_audio.stt_router import STTRouter, STTProviderState
+        mock_openai = MagicMock()
+        mock_openai.audio.transcriptions.create.side_effect = Exception("insufficient_quota: You exceeded your current quota")
+        mock_whisper = MagicMock()
+        mock_seg = MagicMock()
+        mock_seg.text = "Yerel STT aktif"
+        mock_whisper.transcribe.return_value = ([mock_seg], None)
+
+        router = STTRouter(
+            groq_client=None,
+            openai_client=mock_openai,
+            local_whisper_model=mock_whisper,
+        )
+        res = router.transcribe(np.zeros(1600, dtype=np.int16), b"dummy_wav")
+        self.assertEqual(router.openai_state, STTProviderState.DISABLED)
+        self.assertEqual(res.provider, "local_whisper")
+        self.assertEqual(res.text, "Yerel STT aktif")
+
+    def test_acceptance_e_respeaker_exists_never_chooses_default(self):
+        """E. When ReSpeaker is present, find_input_device never falls back to default."""
+        import sys
+        if "rclpy" not in sys.modules:
+            sys.modules["rclpy"] = MagicMock()
+            sys.modules["rclpy.node"] = MagicMock()
+        import astro_audio.audio_capture_node as acn
+        with patch.object(acn, "sd", MagicMock()), patch.object(acn, "list_input_devices", return_value=[(0, "ReSpeaker 4 Mic Array (UAC1.0)"), (1, "HDA Intel Default")]):
+            dev_id, dev_name, source = acn.find_input_device()
+            self.assertEqual(dev_id, 0)
+            self.assertEqual(source, "respeaker")
+
+    def test_acceptance_f_ram_under_1500mb_rejects_heavy_model_startup(self):
+        """F. RAM < 1500 MB rejects heavy model startup via SystemMemoryGuard."""
+        from astro_audio.memory_guard import SystemMemoryGuard
+        guard = SystemMemoryGuard()
+        with patch.object(guard, "get_memory_snapshot") as mock_snap:
+            mock_snap.return_value = {"system_available_ram_mb": 1100.0}
+            admitted, reason, _ = guard.check_heavy_model_admission("xtts_heavy")
+            self.assertFalse(admitted)
+            self.assertIn("1500MB", reason)
+
+    def test_acceptance_g_llm_success_xtts_edge_failure_local_tts_success(self):
+        """G. LLM success with XTTS + Edge failure falls back to Local TTS success."""
+        from astro_audio.tts_router import TTSRouter
+        from astro_audio.local_xtts_engine import LocalXttsEngine
+        from astro_audio.local_offline_tts_engine import LocalOfflineTTSEngine
+        xtts = LocalXttsEngine()
+        with xtts._state_lock:
+            xtts._state = "DEGRADED"
+            xtts._degraded_until = time.monotonic() + 100.0
+        offline = LocalOfflineTTSEngine()
+        router = TTSRouter(
+            local_xtts=xtts,
+            local_offline_tts=offline,
+            edge_tts_synth_func=lambda text: None,
+            edge_tts_enabled=True,
+        )
+        res = router.synthesize("LLM cevabı", generation_id=200)
+        self.assertEqual(res.actual_provider, "local_offline_tts")
+        self.assertIsNotNone(res.pcm)
+
+    def test_acceptance_h_all_tts_providers_fail_emits_explicit_alarm(self):
+        """H. If all TTS providers fail, TTSRouter emits explicit TTS_ALL_PROVIDERS_FAILED."""
+        from astro_audio.tts_router import TTSRouter
+        from astro_audio.local_xtts_engine import LocalXttsEngine
+        from astro_audio.local_offline_tts_engine import LocalOfflineTTSEngine
+        xtts = LocalXttsEngine()
+        with xtts._state_lock:
+            xtts._state = "DEGRADED"
+            xtts._degraded_until = time.monotonic() + 100.0
+        offline = LocalOfflineTTSEngine()
+        offline._mode = "none"
+        offline._piper_bin = None
+        offline._espeak_bin = None
+        with patch.object(offline, "synthesize_sentence", return_value=None):
+            router = TTSRouter(
+                local_xtts=xtts,
+                local_offline_tts=offline,
+                edge_tts_synth_func=lambda text: None,
+                edge_tts_enabled=True,
+            )
+            res = router.synthesize("Test", generation_id=300)
+            self.assertEqual(res.fallback_reason, "TTS_ALL_PROVIDERS_FAILED")
+            self.assertIsNone(res.pcm)
+
 
 if __name__ == "__main__":
     unittest.main()

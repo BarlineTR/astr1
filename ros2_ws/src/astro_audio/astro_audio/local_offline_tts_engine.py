@@ -21,6 +21,11 @@ from astro_audio.base_tts_engine import BaseTTSEngine
 class LocalOfflineTTSEngine(BaseTTSEngine):
     """Zero-Internet Local Offline Backup TTS Engine ensuring ASTRO always has a voice."""
 
+    STATE_STARTING = "LOCAL_TTS_STARTING"
+    STATE_READY = "LOCAL_TTS_READY"
+    STATE_DEGRADED = "LOCAL_TTS_DEGRADED"
+    STATE_FAILED = "LOCAL_TTS_FAILED"
+
     def __init__(
         self,
         language: str = "tr",
@@ -30,11 +35,13 @@ class LocalOfflineTTSEngine(BaseTTSEngine):
         self.language = language
         self._log = logger or (lambda lvl, msg: None)
         self._current_generation_id = 0
+        self._state = self.STATE_STARTING
         self._piper_bin = shutil.which("piper") or self._find_piper_binary()
         self._espeak_bin = shutil.which("espeak-ng") or shutil.which("espeak")
         self._piper_model = piper_model_path or os.getenv("TTS_PIPER_MODEL", "")
         self._mode = self._detect_best_engine()
-        self._safe_log("info", f"🔊 [LocalOfflineTTS] Hazır (Motor: {self._mode.upper()}, Dil: {self.language})")
+        self._state = self.STATE_READY
+        self._safe_log("info", f"🔊 [LocalOfflineTTS] Hazır (Motor: {self._mode.upper()}, Dil: {self.language}, Durum: {self._state})")
 
     def _safe_log(self, lvl: str, msg: str):
         try:
@@ -50,8 +57,12 @@ class LocalOfflineTTSEngine(BaseTTSEngine):
     def name(self) -> str:
         return "local_offline_tts"
 
+    @property
+    def state(self) -> str:
+        return self._state
+
     def is_ready(self) -> bool:
-        return True  # Always ready as the indestructible offline fallback
+        return self._state == self.STATE_READY
 
     def _find_piper_binary(self) -> Optional[str]:
         candidates = [

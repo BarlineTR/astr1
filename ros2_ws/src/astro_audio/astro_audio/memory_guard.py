@@ -311,7 +311,16 @@ class SystemMemoryGuard:
             )
             return False, reason, snapshot
 
-        return True, "none", snapshot
+        return True, "admission_granted", snapshot
+
+    def check_heavy_model_admission(self, model_name: str = "general_heavy") -> Tuple[bool, str, Dict[str, Any]]:
+        """Evaluates whether system memory allows heavy models (XTTS, Faster-Whisper large, heavy vision)."""
+        snapshot = self.get_memory_snapshot()
+        avail_ram = snapshot.get("system_available_ram_mb", 0.0)
+        if avail_ram < 1500.0:
+            reason = f"high_memory_pressure_rejection ({avail_ram:.0f}MB < 1500MB threshold)"
+            return False, reason, snapshot
+        return True, "admission_granted", snapshot
 
 
 # Global default instance
