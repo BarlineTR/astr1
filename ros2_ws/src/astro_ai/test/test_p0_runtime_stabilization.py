@@ -756,23 +756,144 @@ class TestP0WeatherLocationRouting(unittest.TestCase):
         self.assertEqual(city, "Bitlis")
 
 
-class TestP0PlaybackTelemetrySemantics(unittest.TestCase):
-    """Test Suite verifying AudioOutputManager is single authoritative source of playback telemetry."""
+class TestP0RealtimeActivationAndQuotaState(unittest.TestCase):
+    """Test Suite verifying OpenAI Realtime Runtime Activation, Zero Stale Quota State, and Telemetry."""
 
-    def test_playback_telemetry_reports_actual_played_bytes(self):
-        """AudioOutputManager accurately tracks played_bytes per generation."""
-        from astro_audio.audio_output_manager import AudioOutputManager
+    def setUp(self):
+        self.cb = GlobalProviderCircuitBreaker.reset_instance()
+
+    def test_new_process_resets_openai_quota_state(self):
+        """A new process starts with clean AVAILABLE state for all OpenAI surfaces, clearing any past quota exhaustion."""
+        # Simulate previous session exhaustion
+        self.cb.record_error("openai", sub_provider="openai_realtime", error_class=RequestErrorClass.QUOTA_EXHAUSTED, error_msg="insufficient_quota")
+        self.assertTrue(self.cb.is_exhausted("openai"))
+        self.assertFalse(self.cb.is_available("openai", "openai_realtime"))
+
+        # Simulate new process start / circuit breaker instantiation
+        new_cb = GlobalProviderCircuitBreaker.reset_instance()
+        self.assertEqual(new_cb.get_state("openai"), ProviderState.AVAILABLE)
+        self.assertEqual(new_cb.get_state("openai", "openai_realtime"), ProviderState.AVAILABLE)
+        self.assertEqual(new_cb.get_state("openai", "openai_rest"), ProviderState.AVAILABLE)
+        self.assertEqual(new_cb.get_state("openai", "openai_vision"), ProviderState.AVAILABLE)
+        self.assertEqual(new_cb.get_state("openai", "openai_stt"), ProviderState.AVAILABLE)
+        self.assertTrue(new_cb.is_available("openai"))
+        self.assertTrue(new_cb.is_available("openai", "openai_realtime"))
+
+    def test_realtime_connects_when_quota_available(self):
+        """When OpenAI quota is available, Realtime Node starts in AVAILABLE state and connects."""
+        self.assertTrue(self.cb.is_available("openai", "openai_realtime"))
+
+        # Instantiate AstroRealtimeNode in test mode
+        with patch.dict(os.environ, {"OPENAI_API_KEY": "sk-test", "REALTIME_MODEL": "gpt-realtime"}):
+            from astro_ai.astro_realtime_node import AstroRealtimeNode
+            node = AstroRealtimeNode()
+            self.assertEqual(node.realtime_provider_state, "AVAILABLE")
+            self.assertFalse(node._fallback_mode)
+
+    def test_realtime_audio_delta_received(self):
+        """Realtime audio delta events update realtime_audio_received, audio length, and publish to output PCM."""
+        import base64
+        import asyncio
+        from astro_ai.astro_realtime_node import AstroRealtimeNode
+
+        with patch.dict(os.environ, {"OPENAI_API_KEY": "sk-test"}):
+            node = AstroRealtimeNode()
+            node.pub_output_pcm = MagicMock()
+
+            # Create a response and stream audio delta
+            dummy_pcm = b"\x01\x02\x03\x04" * 400  # 1600 bytes
+            dummy_b64 = base64.b64encode(dummy_pcm).decode("utf-8")
+
+            # Simulate response created
+            asyncio.run(node._handle_realtime_event(None, {"type": "response.created"}))
+            self.assertEqual(node.realtime_response_state, "GENERATING")
+            self.assertEqual(node.realtime_current_generation_id, 1)
+            self.assertFalse(node.realtime_audio_received)
+
+            # Simulate audio delta
+            asyncio.run(node._handle_realtime_event(None, {"type": "response.audio.delta", "delta": dummy_b64}))
+            self.assertTrue(node.realtime_audio_received)
+            self.assertEqual(node.realtime_response_state, "STREAMING")
+            node.pub_output_pcm.publish.assert_called_once()
+
+            # Simulate response done
+            asyncio.run(node._handle_realtime_event(None, {"type": "response.done"}))
+            self.assertEqual(node.realtime_response_state, "IDLE")
+
+    def test_realtime_available_does_not_route_to_edge(self):
+        """When OpenAI Realtime is AVAILABLE, synthesis does NOT trigger false realtime_quota_exhausted fallback reason."""
+        self.assertTrue(self.cb.is_available("openai", "openai_realtime"))
+
+        logs = []
+        mock_edge_synth = MagicMock(return_value=b"\x00" * 16000)
+        tts = TTSRouter(
+            edge_tts_synth_func=mock_edge_synth,
+            logger=lambda lvl, msg: logs.append(msg),
+        )
+
+        res = tts.synthesize("Merhaba Astro", generation_id=1)
+        all_logs = " ".join(logs)
+
+        # Must NOT log false quota exhaustion
+        self.assertNotIn("reason=realtime_quota_exhausted", all_logs)
+        self.assertNotIn("trigger=realtime_quota_exhausted", all_logs)
+        self.assertIn("requested_provider=openai_realtime", all_logs)
+
+    def test_realtime_quota_error_routes_to_groq_edge(self):
+        """When an actual QUOTA_EXHAUSTED error occurs, circuit breaker and TTSRouter route to Edge-TTS with realtime_quota_exhausted."""
+        self.cb.record_error("openai", sub_provider="openai_realtime", error_class=RequestErrorClass.QUOTA_EXHAUSTED, error_msg="insufficient_quota")
+        self.assertTrue(self.cb.is_exhausted("openai"))
+        self.assertFalse(self.cb.is_available("openai", "openai_realtime"))
+
+        logs = []
+        mock_edge_synth = MagicMock(return_value=b"\x00" * 16000)
+        tts = TTSRouter(
+            edge_tts_synth_func=mock_edge_synth,
+            logger=lambda lvl, msg: logs.append(msg),
+        )
+
+        res = tts.synthesize("Merhaba Astro", generation_id=2)
+        all_logs = " ".join(logs)
+
+        self.assertEqual(res.actual_provider, "edge_tts")
+        self.assertEqual(res.fallback_reason, "realtime_quota_exhausted")
+        self.assertIn("requested_provider=edge_tts", all_logs)
+        self.assertIn("trigger=realtime_quota_exhausted", all_logs)
+
+    def test_realtime_1013_does_not_exhaust_parent_openai(self):
+        """WebSocket 1013 temporary failure sets COOLDOWN on openai_realtime only, leaving parent openai and rest AVAILABLE."""
+        from astro_audio.realtime_engine import classify_realtime_error, RealtimeState
+        state, reason = classify_realtime_error(1013, "WebSocket closed with 1013")
+        self.assertEqual(state, RealtimeState.REALTIME_DEGRADED)
+        self.assertEqual(reason, "realtime_temporary_1013")
+
+        self.cb.record_error("openai", sub_provider="openai_realtime", error_class=RequestErrorClass.REALTIME_TEMPORARY_FAILURE, error_msg="1013")
+        self.assertEqual(self.cb.get_state("openai", "openai_realtime"), ProviderState.COOLDOWN)
+        self.assertFalse(self.cb.is_exhausted("openai"))
+        self.assertTrue(self.cb.is_available("openai"))
+        self.assertTrue(self.cb.is_available("openai", "openai_rest"))
+
+    def test_stale_exhausted_state_not_persisted(self):
+        """Circuit breaker maintains zero disk persistence, ensuring fresh memory state across processes."""
+        import glob
+        # Verify no .circuit_breaker or quota cache file exists in filesystem
+        cb_files = glob.glob(os.path.join(pkg_root, "**", "*.circuit_breaker*"), recursive=True)
+        self.assertEqual(len(cb_files), 0, "No circuit breaker disk cache files should exist")
+
+    def test_realtime_response_produces_authoritative_playback(self):
+        """Realtime audio streaming outputs to AudioOutputManager and produces authoritative playback tracking."""
+        from astro_audio.audio_output_manager import AudioOutputManager, resample_24k_to_16k
         output_mgr = AudioOutputManager(mock_playback=True)
         gen = output_mgr.new_generation()
 
-        dummy_pcm = b"\x00\x01" * 1600  # 3200 bytes
-        output_mgr.play_pcm_chunk(dummy_pcm, sample_rate=16000, generation_id=gen)
-
-        # Allow worker thread a brief slice to process mock playback
+        # Simulate 24kHz realtime audio chunk playback
+        realtime_chunk = b"\x00\x02" * 2400  # 4800 bytes of 24k PCM
+        output_mgr.play_pcm_chunk(realtime_chunk, sample_rate=24000, generation_id=gen)
         time.sleep(0.1)
 
         played = output_mgr._played_bytes_for_gen.get(gen, 0)
-        self.assertEqual(played, len(dummy_pcm))
+        expected_dac_bytes = len(resample_24k_to_16k(realtime_chunk))
+        self.assertEqual(played, expected_dac_bytes)
 
 
 if __name__ == "__main__":

@@ -176,16 +176,16 @@ def frame_to_base64_jpeg(frame: np.ndarray, max_dim: int = 640) -> Optional[str]
 
 
 
-REALTIME_WS_URL = "wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-12-17"
+REALTIME_WS_URL = "wss://api.openai.com/v1/realtime?model=gpt-realtime"
 VALID_REALTIME_VOICES = {"alloy", "ash", "ballad", "coral", "echo", "sage", "shimmer", "verse", "fable", "onyx"}
 
 
 def discover_realtime_models(api_key: str, preferred: str = "") -> list[str]:
     flagship_realtime_models = [
         "gpt-realtime",
+        "gpt-realtime-mini",
         "gpt-4o-realtime-preview-2024-12-17",
         "gpt-4o-realtime-preview",
-        "gpt-realtime-mini",
         "gpt-4o-mini-realtime-preview"
     ]
     candidates = []
@@ -401,7 +401,14 @@ class AstroRealtimeNode(Node):
         self._last_sync_time = time.monotonic()
         self._active_person_name = "Misafir"
         self._person_hold_until = 0.0
-        self._greeted_people: Dict[str, float] = {}
+        # Realtime State Tracking (Socket, Session, and Generation Lifecycle)
+        self.realtime_provider_state = "AVAILABLE"
+        self.realtime_connection_state = "DISCONNECTED"
+        self.realtime_session_state = "NOT_READY"
+        self.realtime_response_state = "IDLE"
+        self.realtime_audio_received = False
+        self.realtime_current_generation_id = 0
+        self.realtime_session_id = ""
 
         # Configurable Acoustic Echo & Barge-In Parameters
         self.echo_mute_cooldown_s = float(os.getenv("ECHO_MUTE_COOLDOWN_S", "0.65"))
@@ -643,17 +650,28 @@ class AstroRealtimeNode(Node):
         self.get_logger().info(f"📋 [Realtime Modelleri]: Kullanılabilir modeller: {candidate_models}")
         model_idx = 0
 
-        while rclpy.ok():
+        while (rclpy.ok() if (rclpy is not None and hasattr(rclpy, "ok")) else True):
             current_model = candidate_models[model_idx % len(candidate_models)]
             ws_url = f"wss://api.openai.com/v1/realtime?model={current_model}"
             try:
-                self.get_logger().info(f"🌐 [Realtime WS] OpenAI Realtime API'ye bağlanılıyor: {ws_url}")
+                self.realtime_connection_state = "CONNECTING"
+                self.get_logger().info(
+                    f"[REALTIME CONNECTING]\n"
+                    f"model={current_model}"
+                )
                 async with websockets.connect(ws_url, **connect_kwargs) as ws:
                     self._ws = ws
                     self._is_connected = True
                     self._is_responding = False
                     self._is_playback_active = False
-                    self.get_logger().info(f"✅ [Realtime WS] Bağlantı Başarılı ({current_model})! Oturum parametreleri gönderiliyor...")
+                    self.realtime_connection_state = "CONNECTED"
+                    self.realtime_session_state = "READY"
+                    self.realtime_provider_state = "AVAILABLE"
+                    self.get_logger().info(
+                        f"[REALTIME CONNECTED]\n"
+                        f"session_id={self.realtime_session_id or 'sess_init'}\n"
+                        f"state=AVAILABLE"
+                    )
 
                     # Send Initial Session Update
                     await self._send_session_update(ws)
@@ -667,6 +685,9 @@ class AstroRealtimeNode(Node):
                 self._ws = None
                 self._is_responding = False
                 self._is_playback_active = False
+                self.realtime_connection_state = "DISCONNECTED"
+                self.realtime_session_state = "NOT_READY"
+                self.realtime_response_state = "IDLE"
                 err_str = str(e)
 
                 try:
@@ -680,13 +701,6 @@ class AstroRealtimeNode(Node):
                     else:
                         failure_reason = "realtime_network_unavailable"
 
-                self.get_logger().warn(
-                    f"🚨 [REALTIME DEGRADED]\n"
-                    f"  reason={failure_reason}\n"
-                    f"  previous_state=REALTIME_ACTIVE\n"
-                    f"  fallback_provider=edge_tts"
-                )
-
                 # 1. Strict Quota Exhaustion (402, insufficient_quota, credit_balance_exhausted)
                 is_quota = (
                     "insufficient_quota" in err_str
@@ -695,11 +709,18 @@ class AstroRealtimeNode(Node):
                     or ("quota" in err_str and ("exhaust" in err_str or "exceed" in err_str or "zero" in err_str or "balance" in err_str))
                 )
                 if is_quota and "1013" not in err_str:
+                    self.realtime_provider_state = "EXHAUSTED"
                     self.get_logger().error(
-                        "🚨 [OPENAI QUOTA EXHAUSTED]\n"
-                        "🚨 [REALTIME QUOTA EXHAUSTED]\n"
-                        "  state=EXHAUSTED\n"
-                        "  action=NOTIFYING_GLOBAL_CIRCUIT_BREAKER"
+                        f"[REALTIME ERROR]\n"
+                        f"generation_id={self.realtime_current_generation_id}\n"
+                        f"error_class=QUOTA_EXHAUSTED"
+                    )
+                    self.get_logger().warn(
+                        f"[REALTIME FALLBACK]\n"
+                        f"generation_id={self.realtime_current_generation_id}\n"
+                        f"from=openai_realtime\n"
+                        f"to=groq\n"
+                        f"reason=quota_exhausted"
                     )
                     try:
                         from astro_ai.circuit_breaker import get_global_circuit_breaker, RequestErrorClass
@@ -716,6 +737,7 @@ class AstroRealtimeNode(Node):
 
                 # 2. WebSocket 1013 Temporary Failure (Overload / Server degradation)
                 elif "1013" in err_str or getattr(e, "code", None) == 1013:
+                    self.realtime_provider_state = "COOLDOWN"
                     self.get_logger().warn(
                         "⚠️ [REALTIME TEMPORARY FAILURE] code=1013\n"
                         "⚠️ [REALTIME COOLDOWN] duration=15.0s"
@@ -917,9 +939,19 @@ class AstroRealtimeNode(Node):
         """Dispatches Realtime WebSocket server events."""
         event_type = event.get("type", "")
 
-        # 0. Session Update Acknowledged
-        if event_type == "session.updated":
-            self.get_logger().debug("✅ [Realtime WS] Oturum parametreleri başarıyla güncellendi.")
+        # 0. Session Created or Updated
+        if event_type in ("session.created", "session.updated"):
+            sess = event.get("session", {})
+            if "id" in sess and sess["id"]:
+                self.realtime_session_id = sess["id"]
+            self.realtime_session_state = "READY"
+            self.realtime_connection_state = "CONNECTED"
+            self.realtime_provider_state = "AVAILABLE"
+            self.get_logger().info(
+                f"[REALTIME CONNECTED]\n"
+                f"session_id={self.realtime_session_id or 'sess_init'}\n"
+                f"state=AVAILABLE"
+            )
 
         # 1. Real-Time Streaming Audio Output (GA & Preview names)
         elif event_type in ("response.audio.delta", "response.output_audio.delta"):
@@ -928,6 +960,14 @@ class AstroRealtimeNode(Node):
                 out_msg = String()
                 out_msg.data = delta_b64
                 self.pub_output_pcm.publish(out_msg)
+                self.realtime_audio_received = True
+                self.realtime_response_state = "STREAMING"
+                delta_len = len(delta_b64) * 3 // 4
+                self.get_logger().info(
+                    f"[REALTIME AUDIO DELTA]\n"
+                    f"generation_id={self.realtime_current_generation_id}\n"
+                    f"audio_bytes={delta_len}"
+                )
 
         # 2. Real-Time Streaming Audio Transcript
         elif event_type in ("response.audio_transcript.delta", "response.output_audio_transcript.delta", "response.text.delta"):
@@ -973,12 +1013,23 @@ class AstroRealtimeNode(Node):
         # 3c. Response Created
         elif event_type == "response.created":
             self._is_responding = True
+            self.realtime_response_state = "GENERATING"
             self._response_start_time = time.monotonic()
-            self.get_logger().info("🎙️ [Realtime] Astro sesli yanıt üretmeye başladı...")
+            self.realtime_current_generation_id += 1
+            self.realtime_audio_received = False
+            self.get_logger().info(
+                f"[REALTIME RESPONSE STARTED]\n"
+                f"generation_id={self.realtime_current_generation_id}"
+            )
 
         # 3d. Response Done / Cancelled
         elif event_type in ("response.done", "response.cancelled"):
             self._is_responding = False
+            self.realtime_response_state = "IDLE"
+            self.get_logger().info(
+                f"[REALTIME RESPONSE DONE]\n"
+                f"generation_id={self.realtime_current_generation_id}"
+            )
 
         # 4. User Speech Transcription Completed
         elif event_type in ("conversation.item.input_audio_transcription.completed", "conversation.item.input_audio_transcription.done"):

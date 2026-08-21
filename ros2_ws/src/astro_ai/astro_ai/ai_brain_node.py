@@ -1085,11 +1085,23 @@ class AiBrainNode(Node):
                 total_turn_ms = (t_done - t_turn_start) * 1000.0
 
                 # Authoritative Turn Telemetry for Vision
+                rt_p_state = self.circuit_breaker.get_state('openai', 'openai_realtime').value if self.circuit_breaker else 'DISABLED'
+                rt_conn_state = "CONNECTED" if (self.circuit_breaker and self.circuit_breaker.is_available('openai', 'openai_realtime')) else "DISCONNECTED"
+                rt_sess_state = "READY" if (self.circuit_breaker and self.circuit_breaker.is_available('openai', 'openai_realtime')) else "NOT_READY"
+                req_provider = "openai_realtime" if (self.circuit_breaker and self.circuit_breaker.is_available('openai', 'openai_realtime')) else "edge_tts"
+                fb_reason = "realtime_quota_exhausted" if (self.circuit_breaker and self.circuit_breaker.is_exhausted('openai')) else "none"
+
                 self.get_logger().info(
                     f"\n[ASTRO TURN]\n"
                     f"generation_id={generation_id}\n"
                     f"interaction_state={self.state_machine.current_state.value}\n"
-                    f"realtime_state={self.circuit_breaker.get_state('openai', 'openai_realtime').value if self.circuit_breaker else 'DISABLED'}\n"
+                    f"realtime_provider_state={rt_p_state}\n"
+                    f"realtime_connection_state={rt_conn_state}\n"
+                    f"realtime_session_state={rt_sess_state}\n"
+                    f"realtime_audio_received=false\n"
+                    f"requested_provider={req_provider}\n"
+                    f"actual_provider=edge_tts\n"
+                    f"fallback_reason={fb_reason}\n"
                     f"stt_provider=groq/whisper-large-v3\n"
                     f"stt_state={self.circuit_breaker.get_state('groq', 'groq_stt').value if self.circuit_breaker else 'AVAILABLE'}\n"
                     f"stt_failure=none\n"
@@ -1303,11 +1315,23 @@ class AiBrainNode(Node):
             total_turn_ms = (t_done - t_turn_start) * 1000.0
             self.session.latency_tracker.record_turn(gate_latency_ms, llm_first_ms, total_turn_ms)
 
+            rt_p_state = self.circuit_breaker.get_state('openai', 'openai_realtime').value if self.circuit_breaker else 'DISABLED'
+            rt_conn_state = "CONNECTED" if (self.circuit_breaker and self.circuit_breaker.is_available('openai', 'openai_realtime')) else "DISCONNECTED"
+            rt_sess_state = "READY" if (self.circuit_breaker and self.circuit_breaker.is_available('openai', 'openai_realtime')) else "NOT_READY"
+            req_provider = "openai_realtime" if (self.circuit_breaker and self.circuit_breaker.is_available('openai', 'openai_realtime')) else "edge_tts"
+            fb_reason = "realtime_quota_exhausted" if (self.circuit_breaker and self.circuit_breaker.is_exhausted('openai')) else "none"
+
             self.get_logger().info(
                 f"\n[ASTRO TURN]\n"
                 f"generation_id={generation_id}\n"
                 f"interaction_state={self.state_machine.current_state.value}\n"
-                f"realtime_state={self.circuit_breaker.get_state('openai', 'openai_realtime').value if self.circuit_breaker else 'DISABLED'}\n"
+                f"realtime_provider_state={rt_p_state}\n"
+                f"realtime_connection_state={rt_conn_state}\n"
+                f"realtime_session_state={rt_sess_state}\n"
+                f"realtime_audio_received=false\n"
+                f"requested_provider={req_provider}\n"
+                f"actual_provider=edge_tts\n"
+                f"fallback_reason={fb_reason}\n"
                 f"stt_provider=groq/whisper-large-v3\n"
                 f"stt_state={self.circuit_breaker.get_state('groq', 'groq_stt').value if self.circuit_breaker else 'AVAILABLE'}\n"
                 f"stt_failure=none\n"

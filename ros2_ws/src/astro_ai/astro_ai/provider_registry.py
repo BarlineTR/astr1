@@ -127,7 +127,8 @@ GEMINI_PREFERENCE_ORDER: List[str] = [
 OPENAI_PRODUCTION_MODELS: Set[str] = {
     "gpt-4o-mini",
     "gpt-4o",
-    "gpt-4o-realtime-preview-2024-10-01",
+    "gpt-realtime",
+    "gpt-realtime-mini",
 }
 
 

@@ -124,7 +124,7 @@ class TTSRouter:
         text: str,
         generation_id: int,
         language: str = "tr",
-        realtime_fallback_reason: str = "realtime_quota_exhausted",
+        realtime_fallback_reason: Optional[str] = None,
     ) -> TTSRouteResult:
         """Synthesizes speech through the strict Realtime Fallback -> Edge-TTS -> Local Offline -> Emergency WAV chain."""
         if not text or not text.strip():
@@ -147,11 +147,20 @@ class TTSRouter:
         # Check Global Circuit Breaker for Realtime Availability
         realtime_available = self.circuit_breaker.is_available("openai", sub_provider="openai_realtime") if self.circuit_breaker else False
 
+        if realtime_fallback_reason is not None:
+            effective_fallback_reason = realtime_fallback_reason
+        elif realtime_available:
+            effective_fallback_reason = "none"
+        elif self.circuit_breaker and self.circuit_breaker.is_exhausted("openai"):
+            effective_fallback_reason = "realtime_quota_exhausted"
+        else:
+            effective_fallback_reason = "openai_realtime_unavailable"
+
         if realtime_available:
             self._safe_log("info", f'[TTS REQUESTED] generation_id={generation_id} requested_provider=openai_realtime text="{clean_text}"')
             fallback_chain.append("openai_realtime")
         else:
-            self._safe_log("info", f'[TTS REQUESTED] generation_id={generation_id} requested_provider=edge_tts selection_reason=openai_realtime_exhausted text="{clean_text}"')
+            self._safe_log("info", f'[TTS REQUESTED] generation_id={generation_id} requested_provider=edge_tts selection_reason={effective_fallback_reason} text="{clean_text}"')
             fallback_chain.append("edge_tts")
 
         # -------------------------------------------------------------
@@ -171,7 +180,7 @@ class TTSRouter:
                         tts_state="local_gpu",
                         tts_ready=True,
                         tts_healthy=True,
-                        fallback_reason=realtime_fallback_reason,
+                        fallback_reason=effective_fallback_reason,
                         fallback_chain=fallback_chain,
                         duration_ms=(time.perf_counter() - t_start) * 1000.0,
                     )
@@ -182,13 +191,14 @@ class TTSRouter:
         # STEP 2: Edge-TTS Cloud Neural Service (Primary Fallback)
         # -------------------------------------------------------------
         if self.edge_tts_enabled:
-            self._safe_log(
-                "info",
-                f"🌐 [EDGE-TTS FALLBACK ACTIVE]\n"
-                f"  generation_id={generation_id}\n"
-                f"  trigger={realtime_fallback_reason}\n"
-                f"  voice={getattr(self.edge_tts_engine, 'voice', 'tr-TR-AhmetNeural')}"
-            )
+            if effective_fallback_reason != "none":
+                self._safe_log(
+                    "info",
+                    f"🌐 [EDGE-TTS FALLBACK ACTIVE]\n"
+                    f"  generation_id={generation_id}\n"
+                    f"  trigger={effective_fallback_reason}\n"
+                    f"  voice={getattr(self.edge_tts_engine, 'voice', 'tr-TR-AhmetNeural')}"
+                )
             t_edge_start = time.perf_counter()
             pcm = None
 
@@ -243,7 +253,7 @@ class TTSRouter:
                     tts_state="network_cloud",
                     tts_ready=True,
                     tts_healthy=True,
-                    fallback_reason=realtime_fallback_reason,
+                    fallback_reason=effective_fallback_reason,
                     fallback_chain=fallback_chain,
                     duration_ms=tot_ms,
                     ttfa_ms=tot_ms,
@@ -346,7 +356,7 @@ class TTSRouter:
         generation_id: int,
         output_manager: Optional[AudioOutputManager] = None,
         language: str = "tr",
-        realtime_fallback_reason: str = "realtime_quota_exhausted",
+        realtime_fallback_reason: Optional[str] = None,
     ) -> TTSRouteResult:
         """Synthesizes text and immediately queues it to the unified hardware playback manager."""
         res = self.synthesize(

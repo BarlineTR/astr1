@@ -33,23 +33,27 @@ def classify_realtime_error(err_code: Any, err_msg: str) -> Tuple[RealtimeState,
     msg_str = str(err_msg or "").lower()
     combined = f"{code_str} {msg_str}"
 
-    # 1. Quota & Credit exhaustion
-    if any(k in combined for k in ("1013", "insufficient_quota", "quota_exhausted", "credit_balance_exhausted", "exceeded your current quota", "billing")):
+    # 1. Quota & Credit exhaustion (402, insufficient_quota, credit_balance_exhausted, quota_exhausted, billing)
+    if any(k in combined for k in ("402", "insufficient_quota", "quota_exhausted", "credit_balance_exhausted", "exceeded your current quota", "exceeded your credit", "billing", "quota")):
         return RealtimeState.REALTIME_QUOTA_EXHAUSTED, "realtime_quota_exhausted"
 
-    # 2. Authentication / Authorization failure
+    # 2. Temporary overload / WS 1013 without quota error (Server overload, NOT Quota Exhaustion)
+    if "1013" in combined or "temporary" in combined or "try again later" in combined or "overloaded" in combined:
+        return RealtimeState.REALTIME_DEGRADED, "realtime_temporary_1013"
+
+    # 3. Authentication / Authorization failure
     if any(k in combined for k in ("401", "403", "invalid_api_key", "unauthorized", "forbidden", "auth_error")):
         return RealtimeState.REALTIME_FAILED, "realtime_auth_error"
 
-    # 3. Network / DNS / WebSocket disconnect
+    # 4. Network / DNS / WebSocket disconnect
     if any(k in combined for k in ("1006", "connection timeout", "timed out", "connection reset", "broken pipe", "dns", "getaddrinfo", "network", "websocket closed")):
         return RealtimeState.REALTIME_OFFLINE, "realtime_network_unavailable"
 
-    # 4. Rate limiting (429 RPM / TPM)
+    # 5. Rate limiting (429 RPM / TPM)
     if "429" in combined or "rate" in combined:
         return RealtimeState.REALTIME_DEGRADED, "realtime_rate_limited"
 
-    # 5. Generic session / server error
+    # 6. Generic session / server error
     return RealtimeState.REALTIME_DEGRADED, "realtime_session_error"
 
 
