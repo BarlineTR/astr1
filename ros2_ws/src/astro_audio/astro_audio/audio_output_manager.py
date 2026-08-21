@@ -331,12 +331,11 @@ class AudioOutputManager:
             return None
 
     def _play_chunk_via_aplay_pipe(self, chunk: bytes, gen: int) -> bool:
-        """Writes PCM chunk to a persistent, streaming aplay pipe per generation."""
+        """Writes PCM chunk to an aplay subprocess, closes stdin to flush, and lets it play to completion."""
         with self._lock:
             if gen < self._current_generation:
                 return False
             
-            # Start persistent streaming aplay process if not already running
             if self._current_process is None or self._current_process.poll() is not None:
                 try:
                     cmd = ["aplay", "-D", self.alsa_device, "-r", str(HW_SAMPLE_RATE), "-f", "S16_LE", "-c", "1", "-q"]
@@ -354,6 +353,10 @@ class AudioOutputManager:
                 if proc and proc.stdin:
                     proc.stdin.write(chunk)
                     proc.stdin.flush()
+                    try:
+                        proc.stdin.close()
+                    except Exception:
+                        pass
                     return True
             except OSError as e:
                 if getattr(e, "errno", None) == errno.EINTR:
@@ -411,13 +414,25 @@ class AudioOutputManager:
         stream = self._open_output_stream()
 
         while True:
+            # Check if active process is still playing before resetting state
+            if self._current_process is not None:
+                if self._current_process.poll() is None:
+                    # aplay is still playing through hardware DAC
+                    try:
+                        raw_item = self._play_queue.get(timeout=0.05)
+                    except queue.Empty:
+                        continue
+                else:
+                    self._current_process = None
+
             try:
-                raw_item = self._play_queue.get(timeout=0.15)
+                raw_item = self._play_queue.get(timeout=0.05)
             except queue.Empty:
+                if self._current_process is not None and self._current_process.poll() is None:
+                    continue
                 if self._is_playing:
                     with self._lock:
                         self._is_playing = False
-                        self._stop_active_processes_locked()
                     if self._on_state_change:
                         self._on_state_change(False)
                 continue
