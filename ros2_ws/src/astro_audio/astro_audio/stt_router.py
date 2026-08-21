@@ -31,6 +31,12 @@ class STTProviderState(Enum):
     DISABLED = "DISABLED"
 
 
+TURKISH_STT_PROMPT = (
+    "Astro, robot asistan Astro. Hey Astro, Selam Astro, Astro nasılsın. "
+    "Baran, Baran Bey, Ahlat, Bitlis, hava durumu, saat kaç, ne haber, tamam, evet, hayır, dur."
+)
+
+
 @dataclass
 class STTRouteResult:
     text: Optional[str] = None
@@ -97,6 +103,7 @@ class STTRouter:
                         file=("speech.wav", wav_bytes),
                         model="whisper-large-v3",
                         language="tr",
+                        prompt=TURKISH_STT_PROMPT,
                         temperature=0.0,
                         response_format="text",
                     )
@@ -136,6 +143,7 @@ class STTRouter:
                         model="whisper-1",
                         file=("speech.wav", wav_bytes),
                         language="tr",
+                        prompt=TURKISH_STT_PROMPT,
                         temperature=0.0,
                         response_format="text",
                     )
@@ -170,7 +178,9 @@ class STTRouter:
         if self.local_whisper_model:
             try:
                 audio_f32 = audio_arr.astype(np.float32) / 32768.0
-                segments, _ = self.local_whisper_model.transcribe(audio_f32, beam_size=1, language="tr")
+                segments, _ = self.local_whisper_model.transcribe(
+                    audio_f32, beam_size=1, language="tr", initial_prompt=TURKISH_STT_PROMPT
+                )
                 text = "".join(seg.text for seg in segments).strip()
                 fallback_chain.append("local_whisper")
                 return STTRouteResult(

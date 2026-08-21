@@ -51,7 +51,7 @@ try:
         clean_tts_text, extract_spoken_turkish_sentence,
         response_length_gate, is_self_identity_query
     )
-    from astro_ai.conversation_session import ConversationSession
+    from astro_ai.conversation_session import ConversationSession, normalize_turkish_speech_input
     from astro_ai.cloud_manager import CloudManager
     from astro_ai.officials_database import find_official_by_name_or_alias, get_official_greeting, OFFICIALS_DATABASE
 except ImportError:
@@ -62,7 +62,7 @@ except ImportError:
         clean_tts_text, extract_spoken_turkish_sentence,
         response_length_gate, is_self_identity_query
     )
-    from conversation_session import ConversationSession
+    from conversation_session import ConversationSession, normalize_turkish_speech_input
     from cloud_manager import CloudManager
     from officials_database import find_official_by_name_or_alias, get_official_greeting, OFFICIALS_DATABASE
 
@@ -627,7 +627,7 @@ class AiBrainNode(Node):
         if not self._enabled:
             return
 
-        raw_text = re.sub(r"^['\"`´“”‘’]+|['\"`´“”‘’]+$", "", msg.data.strip()).strip()
+        raw_text = normalize_turkish_speech_input(re.sub(r"^['\"`´“”‘’]+|['\"`´“”‘’]+$", "", msg.data.strip()).strip())
         if not raw_text:
             return
 

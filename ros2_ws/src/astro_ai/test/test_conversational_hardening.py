@@ -203,6 +203,39 @@ class TestConversationalHardening(unittest.TestCase):
         mock_groq.audio.transcriptions.create.assert_not_called()
         self.assertIn("cooldown", res2.fallback_chain[0])
 
+    def test_phonetic_speech_normalization(self):
+        """Phonetically mis-transcribed wake phrases (Ey Aston, Heya sonuç ısın) are normalized."""
+        from astro_ai.conversation_session import ConversationSession, normalize_turkish_speech_input
+
+        session = ConversationSession()
+        test_inputs = [
+            ("Ey Aston nasılsın?", "Hey Astro nasılsın?"),
+            ("Heya sonuç ısın", "Hey Astro nasılsın"),
+            ("Ahvatta hava nasıl?", "Ahlat'ta hava nasıl?"),
+            ("Astor nasılsın", "Astro nasılsın"),
+        ]
+        for corrupted, expected in test_inputs:
+            norm = normalize_turkish_speech_input(corrupted)
+            self.assertEqual(norm, expected)
+            has_wake, clean = session.is_wake_word(corrupted)
+            if "Astro" in expected:
+                self.assertTrue(has_wake)
+
+    def test_whisper_prompt_biasing(self):
+        """STTRouter includes domain vocabulary prompt in API calls."""
+        from astro_audio.stt_router import TURKISH_STT_PROMPT, STTRouter
+        mock_groq = MagicMock()
+        mock_groq.audio.transcriptions.create.return_value = "Hey Astro nasılsın"
+        router = STTRouter(groq_client=mock_groq)
+
+        fake_audio = np.zeros(16000, dtype=np.int16)
+        fake_wav = b"RIFFfake"
+        res = router.transcribe(fake_audio, fake_wav)
+        self.assertEqual(res.text, "Hey Astro nasılsın")
+        mock_groq.audio.transcriptions.create.assert_called_once()
+        _, kwargs = mock_groq.audio.transcriptions.create.call_args
+        self.assertEqual(kwargs.get("prompt"), TURKISH_STT_PROMPT)
+
 
 if __name__ == "__main__":
     unittest.main()

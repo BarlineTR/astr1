@@ -51,6 +51,30 @@ class LatencyTracker:
             }
 
 
+def normalize_turkish_speech_input(text: str) -> str:
+    """Corrects common Turkish acoustic STT phonetic mis-transcriptions for ASTRO."""
+    if not text:
+        return ""
+    t = text
+    # Fix common Astro wake phrase corruptions
+    t = re.sub(r"(?i)\b(?:heya\s+sonuç\s+ısın|heya\s+sonuç|heya\s+sonuc)\b", "Hey Astro nasılsın", t)
+    t = re.sub(r"(?i)\b(?:ey|ay|hey|he)\s+aston\b", "Hey Astro", t)
+    t = re.sub(r"(?i)\b(?:ey|ay|hey|he)\s+asto\b", "Hey Astro", t)
+    t = re.sub(r"(?i)\b(?:ey|ay|hey|he)\s+asro\b", "Hey Astro", t)
+    t = re.sub(r"(?i)\b(?:ey|ay|he)\s+astro\b", "Hey Astro", t)
+    t = re.sub(r"(?i)\baston\b", "Astro", t)
+    t = re.sub(r"(?i)\bastor\b", "Astro", t)
+    t = re.sub(r"(?i)\bastıro\b", "Astro", t)
+    t = re.sub(r"(?i)\basro\b", "Astro", t)
+    t = re.sub(r"(?i)\basto\b", "Astro", t)
+    t = re.sub(r"(?i)\bastrom\b", "Astro", t)
+    # Fix common location / name mis-transcriptions
+    t = re.sub(r"(?i)\bahvatta\b", "Ahlat'ta", t)
+    t = re.sub(r"(?i)\bahlatta\b", "Ahlat'ta", t)
+    t = re.sub(r"(?i)\bahlatın\b", "Ahlat'ın", t)
+    return t.strip()
+
+
 class ConversationSession:
     """Manages adaptive conversation sessions, wake-word triggering, and turn timeouts."""
 
@@ -147,13 +171,13 @@ class ConversationSession:
 
     def is_wake_word(self, text: str, wake_word: str = "hey astro") -> tuple[bool, str]:
         """Detects explicit robot wake words with Turkish phonetic variations, returning (has_wake_word, clean_text)."""
-        clean_input = re.sub(r"^['\"`´“”‘’]+|['\"`´“”‘’]+$", "", text.strip())
+        clean_input = normalize_turkish_speech_input(re.sub(r"^['\"`´“”‘’]+|['\"`´“”‘’]+$", "", text.strip()))
         text_lower = clean_input.lower().strip()
 
-        # Regex pattern captures Turkish phonetic variations: astro, astıro, astor, asro, asu, astrocum, astro'cum, etc.
+        # Regex pattern captures Turkish phonetic variations: astro, astıro, astor, asro, asu, astrocum, aston, asto, etc.
         wake_pattern = re.compile(
-            r'(?:h[ea]y\s*|merhaba\s+|selam\s+|robot\s+)?'  # optional prefix
-            r'(?:ast[ıi]?ro[\'’]?\w*|astor[\'’]?\w*|asro[\'’]?\w*|asu[\'’]?\w*|asistan\w*)', # core robot name + suffixes
+            r'(?:h[ea]y\s*|merhaba\s+|selam\s+|robot\s+|ey\s+|ay\s+|heya\s+)?'  # optional prefix
+            r'(?:ast[ıi]?ro[\'’]?\w*|ast[ıi]?on[\'’]?\w*|astor[\'’]?\w*|asro[\'’]?\w*|asto[\'’]?\w*|asu[\'’]?\w*|asistan\w*)', # core robot name + suffixes
             re.IGNORECASE
         )
         has_wake = bool(wake_pattern.search(text_lower)) or wake_word.lower() in text_lower
