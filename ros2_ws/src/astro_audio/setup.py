@@ -23,7 +23,6 @@ setup(
     maintainer_email="baran@example.com",
     description="ASTRO V1 ReSpeaker audio capture, STT and TTS",
     license="Apache-2.0",
-    tests_require=["pytest"],
     entry_points={
         "console_scripts": [
             "audio_capture_node = astro_audio.audio_capture_node:main",

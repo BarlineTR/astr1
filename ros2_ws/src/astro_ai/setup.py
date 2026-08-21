@@ -20,7 +20,6 @@ setup(
     maintainer_email='baran@example.com',
     description='ASTRO V1 AI Brain for LLM interactions',
     license='Apache-2.0',
-    tests_require=['pytest'],
     entry_points={
         'console_scripts': [
             'ai_brain_node = astro_ai.ai_brain_node:main',
