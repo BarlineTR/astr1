@@ -472,8 +472,8 @@ class XttsClient:
         if not self.is_alive:
             raise XttsError(f"XTTS worker is not alive (code {self.returncode})")
 
-        ttfa_timeout = float(os.getenv("TTS_XTTS_TTFA_TIMEOUT_S", "30.0"))
-        synth_timeout = float(os.getenv("TTS_XTTS_SYNTHESIS_TIMEOUT_S", "45.0"))
+        ttfa_timeout = float(os.getenv("TTS_XTTS_TTFA_TIMEOUT_S", "2.5"))
+        synth_timeout = float(os.getenv("TTS_XTTS_SYNTHESIS_TIMEOUT_S", "8.0"))
         effective_timeout = timeout if timeout is not None else synth_timeout
 
         with self._req_lock:
@@ -505,7 +505,7 @@ class XttsClient:
                     msg = self._responses.get(timeout=effective_timeout)
                 except queue.Empty as exc:
                     elapsed = time.monotonic() - t_req_start
-                    raise XttsError(f"XTTS synthesis timed out after {elapsed:.1f}s (TTFA max {ttfa_timeout:.0f}s, Full max {synth_timeout:.0f}s)") from exc
+                    raise XttsError(f"XTTS synthesis timed out after {elapsed:.1f}s (effective_timeout={effective_timeout:.1f}s)") from exc
                 if msg.get("id") == req_id:
                     break
 

@@ -577,9 +577,9 @@ class LocalXttsEngine(BaseTTSEngine):
             self._last_telemetry["fallback_reason"] = "xtts_timeout" if is_timeout else str(exc)
 
             if is_timeout:
-                self._safe_log("warn", f"⏳ [LocalXttsEngine] XTTS sentez zaman aşımı ({tot_ms:.0f}ms > {synth_timeout:.0f}s): {exc} — Worker canlı tutuluyor, generation emergency fallback'e geçiyor.")
+                self._safe_log("warn", f"⏳ [LocalXttsEngine] XTTS sentez zaman aşımı ({tot_ms:.0f}ms > {synth_timeout:.0f}s): {exc} — Worker canlı tutuluyor, XTTS 30s DEGRADED moduna alınıyor, acil fallback devreye giriyor.")
                 with self._state_lock:
-                    self._degraded_until = time.monotonic() + 15.0
+                    self._degraded_until = time.monotonic() + 30.0
                     self._state = "DEGRADED"
                 self._last_telemetry["ready"] = False
                 self._last_telemetry["state"] = "DEGRADED"

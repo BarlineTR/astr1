@@ -1,21 +1,22 @@
-#!/usr/bin/env python3
-"""ASTRO V1 — Single Unified TTSRouter.
+"""ASTRO V1 — Authoritative Production TTSRouter.
 
-Centralizes all TTS provider selection, health verification, deadline enforcement,
-deterministic fallback chaining, and immutable generation_id tracking.
+Centralizes all speech synthesis provider selection, health verification,
+pre-flight network checks, timeout enforcement, fallback chaining, and hardware playback provenance.
 
-Hierarchy:
-  1. XTTS (if READY + HEALTHY)
-  2. Edge-TTS (if network available & enabled)
-  3. Local Offline TTS (Piper / espeak-ng / Acoustic Synth)
-  4. Explicit TTS_ALL_PROVIDERS_FAILED (Zero-Silence Contract)
+Authoritative Fallback Hierarchy:
+  1. XTTS (GPU + READY + HEALTHY)
+  2. Edge-TTS (Cloud + Network Reachable)
+  3. Local Offline TTS (Piper / espeak-ng / Local Synth)
+  4. TTS_ALL_PROVIDERS_FAILED Alarm (Zero-Silence Contract)
 """
 
 import os
 import time
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional
 
+from astro_audio.audio_output_manager import AudioOutputManager
+from astro_audio.edge_tts_engine import EdgeTTSEngine
 from astro_audio.local_offline_tts_engine import LocalOfflineTTSEngine
 from astro_audio.local_xtts_engine import LocalXttsEngine
 
@@ -39,26 +40,47 @@ class TTSRouteResult:
 
 
 class TTSRouter:
-    """Single authoritative TTS Router for ASTRO V1."""
+    """Single authoritative TTS Router and Playback Orchestrator."""
+
+    # Authoritative Timeouts
+    DEFAULT_XTTS_TIMEOUT_S = 8.0
+    DEFAULT_EDGE_TTS_TIMEOUT_S = 4.0
+    DEFAULT_PLAYBACK_DEADLINE_MS = 1500.0
 
     def __init__(
         self,
         local_xtts: Optional[LocalXttsEngine] = None,
         local_offline_tts: Optional[LocalOfflineTTSEngine] = None,
+        edge_tts_engine: Optional[EdgeTTSEngine] = None,
         edge_tts_synth_func: Optional[Callable[[str], Optional[bytes]]] = None,
         edge_tts_enabled: bool = True,
+        output_manager: Optional[AudioOutputManager] = None,
         logger: Optional[Callable[[str, str], None]] = None,
     ):
         self.local_xtts = local_xtts
         self.local_offline_tts = local_offline_tts
-        self._edge_tts_synth = edge_tts_synth_func
+        self.edge_tts_engine = edge_tts_engine or (EdgeTTSEngine(logger=logger) if (edge_tts_enabled and not edge_tts_synth_func) else None)
+        self._edge_tts_synth_func = edge_tts_synth_func
         self.edge_tts_enabled = edge_tts_enabled
+        self.output_manager = output_manager
         self._log = logger or (lambda lvl, msg: None)
+
+        self.xtts_timeout_s = float(os.getenv("TTS_XTTS_SYNTHESIS_TIMEOUT_S", str(self.DEFAULT_XTTS_TIMEOUT_S)))
+        self.edge_timeout_s = float(os.getenv("EDGE_TTS_TIMEOUT_S", str(self.DEFAULT_EDGE_TTS_TIMEOUT_S)))
+        self.playback_deadline_ms = float(os.getenv("TTS_PLAYBACK_START_DEADLINE_MS", str(self.DEFAULT_PLAYBACK_DEADLINE_MS)))
+
+        self._safe_log(
+            "info",
+            f"🎯 [TTSRouter] Deterministik Hiyerarşi Aktif: XTTS (timeout={self.xtts_timeout_s}s) -> "
+            f"Edge-TTS (timeout={self.edge_timeout_s}s) -> Local Offline TTS"
+        )
 
     def _safe_log(self, lvl: str, msg: str):
         try:
             if self._log:
                 self._log(lvl, msg)
+            else:
+                print(f"[{lvl.upper()}] {msg}", flush=True)
         except Exception:
             pass
 
@@ -68,10 +90,7 @@ class TTSRouter:
         generation_id: int,
         language: str = "tr",
     ) -> TTSRouteResult:
-        """Synthesizes text through the deterministic TTS fallback chain.
-        
-        Guarantees that generation_id is preserved throughout all fallback hops.
-        """
+        """Synthesizes speech through the strict fallback hierarchy without blocking on warmup."""
         if not text or not text.strip():
             return TTSRouteResult(
                 pcm=None,
@@ -85,19 +104,40 @@ class TTSRouter:
                 fallback_reason="empty_text",
             )
 
+        clean_text = text.strip()
+        self._safe_log("info", f'[TTS REQUESTED] generation_id={generation_id} text="{clean_text}"')
+
         fallback_chain: List[str] = []
         t_start = time.perf_counter()
 
-        # Step 1: Check Local GPU XTTS (Ready + Healthy)
-        if self.local_xtts and self.local_xtts.is_ready() and getattr(self.local_xtts, "is_healthy", lambda: True)():
-            try:
-                pcm = self.local_xtts.synthesize_sentence(text, generation_id=generation_id, language=language)
-                tot_ms = (time.perf_counter() - t_start) * 1000.0
-                telem = self.local_xtts.get_telemetry()
-                infer_ms = telem.get("last_infer_ms", tot_ms)
-                q_wait = telem.get("xtts_queue_wait_ms", max(0.0, tot_ms - infer_ms))
+        # -------------------------------------------------------------
+        # STEP 1: Local Fine-Tuned XTTS on GPU (cuda:0)
+        # -------------------------------------------------------------
+        xtts_ready = bool(self.local_xtts and self.local_xtts.is_ready())
+        xtts_healthy = bool(self.local_xtts and getattr(self.local_xtts, "is_healthy", lambda: xtts_ready)())
 
-                if pcm:
+        if xtts_ready and xtts_healthy:
+            self._safe_log(
+                "info",
+                f"[TTS SYNTHESIS ATTEMPT] generation_id={generation_id} provider=xtts_gpu timeout={self.xtts_timeout_s}s"
+            )
+            t_xtts_start = time.perf_counter()
+            try:
+                pcm = self.local_xtts.synthesize_sentence(
+                    clean_text,
+                    generation_id=generation_id,
+                    language=language,
+                )
+                tot_ms = (time.perf_counter() - t_start) * 1000.0
+                infer_ms = (time.perf_counter() - t_xtts_start) * 1000.0
+
+                if pcm and len(pcm) > 100:
+                    fallback_chain.append("xtts_gpu")
+                    self._safe_log(
+                        "info",
+                        f"✅ [TTS SYNTHESIS COMPLETED] generation_id={generation_id} actual_provider=xtts_gpu "
+                        f"audio_bytes={len(pcm)} infer_ms={infer_ms:.1f} total_ms={tot_ms:.1f}"
+                    )
                     return TTSRouteResult(
                         pcm=pcm,
                         selected_provider="xtts_gpu",
@@ -108,66 +148,172 @@ class TTSRouter:
                         tts_ready=True,
                         tts_healthy=True,
                         fallback_reason="none",
-                        fallback_chain=["xtts_gpu"],
-                        duration_ms=tot_ms,
-                        ttfa_ms=tot_ms,
-                        infer_ms=infer_ms,
-                        queue_wait_ms=q_wait,
-                    )
-                else:
-                    fb_reason = telem.get("fallback_reason", "xtts_timeout")
-                    fallback_chain.append(f"xtts_gpu({fb_reason})")
-                    self._safe_log("warn", f"⚠️ [TTSRouter] XTTS sentez başarısız ({fb_reason}), Edge-TTS fallback'e geçiliyor...")
-            except Exception as e:
-                fallback_chain.append(f"xtts_gpu(error:{e})")
-                self._safe_log("warn", f"⚠️ [TTSRouter] XTTS istisna hatası ({e}), Edge-TTS fallback'e geçiliyor...")
-        else:
-            xtts_reason = "xtts_not_ready" if not (self.local_xtts and self.local_xtts.is_ready()) else "xtts_unhealthy"
-            fallback_chain.append(f"xtts_gpu({xtts_reason})")
-
-        # Step 2: Fallback to Edge-TTS Cloud Service
-        if self.edge_tts_enabled and self._edge_tts_synth:
-            t_edge_start = time.perf_counter()
-            try:
-                pcm = self._edge_tts_synth(text)
-                tot_edge_ms = (time.perf_counter() - t_edge_start) * 1000.0
-                tot_ms = (time.perf_counter() - t_start) * 1000.0
-                if pcm:
-                    fallback_chain.append("edge_tts")
-                    return TTSRouteResult(
-                        pcm=pcm,
-                        selected_provider="edge_tts",
-                        actual_provider="edge_tts",
-                        model_name="tr_tr_ahmet",
-                        source_name="edge_tts_cloud",
-                        tts_state="network_cloud",
-                        tts_ready=True,
-                        tts_healthy=True,
-                        fallback_reason="xtts_unavailable",
                         fallback_chain=fallback_chain,
                         duration_ms=tot_ms,
                         ttfa_ms=tot_ms,
-                        infer_ms=tot_edge_ms,
-                        queue_wait_ms=0.0,
+                        infer_ms=infer_ms,
+                        queue_wait_ms=max(0.0, tot_ms - infer_ms),
                     )
                 else:
-                    fallback_chain.append("edge_tts(synthesis_failed)")
-                    self._safe_log("warn", "⚠️ [TTSRouter] Edge-TTS sentez başarısız, Local Offline TTS fallback'e geçiliyor...")
+                    telem = self.local_xtts.get_telemetry() if self.local_xtts else {}
+                    fb_reason = telem.get("fallback_reason", "xtts_timeout")
+                    fallback_chain.append(f"xtts_gpu({fb_reason})")
+                    self._safe_log(
+                        "warn",
+                        f"[TTS FALLBACK ATTEMPT] generation_id={generation_id} provider=edge_tts reason={fb_reason}"
+                    )
             except Exception as e:
-                fallback_chain.append(f"edge_tts(error:{e})")
-                self._safe_log("warn", f"⚠️ [TTSRouter] Edge-TTS istisna hatası ({e}), Local Offline TTS fallback'e geçiliyor...")
+                fallback_chain.append(f"xtts_gpu(error:{e})")
+                self._safe_log(
+                    "warn",
+                    f"[TTS FALLBACK ATTEMPT] generation_id={generation_id} provider=edge_tts reason=xtts_exception({e})"
+                )
         else:
-            fallback_chain.append("edge_tts(disabled_or_unavailable)")
+            reason = "xtts_warmup_starting" if (self.local_xtts and getattr(self.local_xtts, "_state", "") == "STARTING") else ("xtts_not_ready" if not xtts_ready else "xtts_unhealthy")
+            fallback_chain.append(f"xtts_gpu({reason})")
+            self._safe_log(
+                "info",
+                f"[TTS FALLBACK ATTEMPT] generation_id={generation_id} provider=edge_tts reason={reason} (0ms fast_skip)"
+            )
 
-        # Step 3: Fallback to Local Offline TTS (Piper / espeak-ng)
+        # -------------------------------------------------------------
+        # STEP 2: Edge-TTS Cloud Neural Service
+        # -------------------------------------------------------------
+        if self.edge_tts_enabled:
+            if self._edge_tts_synth_func:
+                self._safe_log(
+                    "info",
+                    f"[TTS SYNTHESIS ATTEMPT] generation_id={generation_id} provider=edge_tts timeout={self.edge_timeout_s}s"
+                )
+                t_edge_start = time.perf_counter()
+                try:
+                    pcm = self._edge_tts_synth_func(clean_text)
+                    tot_edge_ms = (time.perf_counter() - t_edge_start) * 1000.0
+                    tot_ms = (time.perf_counter() - t_start) * 1000.0
+
+                    if pcm and len(pcm) > 10:
+                        fallback_chain.append("edge_tts")
+                        self._safe_log(
+                            "info",
+                            f"✅ [TTS SYNTHESIS COMPLETED] generation_id={generation_id} actual_provider=edge_tts "
+                            f"audio_bytes={len(pcm)} infer_ms={tot_edge_ms:.1f} total_ms={tot_ms:.1f}"
+                        )
+                        return TTSRouteResult(
+                            pcm=pcm,
+                            selected_provider="edge_tts",
+                            actual_provider="edge_tts",
+                            model_name="tr_tr_ahmet",
+                            source_name="edge_tts_cloud",
+                            tts_state="network_cloud",
+                            tts_ready=True,
+                            tts_healthy=True,
+                            fallback_reason="xtts_unavailable",
+                            fallback_chain=fallback_chain,
+                            duration_ms=tot_ms,
+                            ttfa_ms=tot_ms,
+                            infer_ms=tot_edge_ms,
+                            queue_wait_ms=0.0,
+                        )
+                    else:
+                        fallback_chain.append("edge_tts(synthesis_failed)")
+                        self._safe_log(
+                            "warn",
+                            f"[TTS FALLBACK ATTEMPT] generation_id={generation_id} provider=local_offline_tts reason=edge_tts_failed"
+                        )
+                except Exception as e:
+                    fallback_chain.append(f"edge_tts(error:{e})")
+                    self._safe_log(
+                        "warn",
+                        f"[TTS FALLBACK ATTEMPT] generation_id={generation_id} provider=local_offline_tts reason=edge_tts_exception({e})"
+                    )
+            elif self.edge_tts_engine:
+                net_ok = self.edge_tts_engine.check_network(timeout_s=0.3)
+                if net_ok:
+                    self._safe_log(
+                        "info",
+                        f"[TTS SYNTHESIS ATTEMPT] generation_id={generation_id} provider=edge_tts timeout={self.edge_timeout_s}s"
+                    )
+                    t_edge_start = time.perf_counter()
+                    try:
+                        pcm = self.edge_tts_engine.synthesize_sentence(
+                            clean_text,
+                            generation_id=generation_id,
+                            timeout=self.edge_timeout_s,
+                        )
+                        tot_edge_ms = (time.perf_counter() - t_edge_start) * 1000.0
+                        tot_ms = (time.perf_counter() - t_start) * 1000.0
+
+                        if pcm and len(pcm) > 10:
+                            fallback_chain.append("edge_tts")
+                            self._safe_log(
+                                "info",
+                                f"✅ [TTS SYNTHESIS COMPLETED] generation_id={generation_id} actual_provider=edge_tts "
+                                f"audio_bytes={len(pcm)} infer_ms={tot_edge_ms:.1f} total_ms={tot_ms:.1f}"
+                            )
+                            return TTSRouteResult(
+                                pcm=pcm,
+                                selected_provider="edge_tts",
+                                actual_provider="edge_tts",
+                                model_name="tr_tr_ahmet",
+                                source_name="edge_tts_cloud",
+                                tts_state="network_cloud",
+                                tts_ready=True,
+                                tts_healthy=True,
+                                fallback_reason="xtts_unavailable",
+                                fallback_chain=fallback_chain,
+                                duration_ms=tot_ms,
+                                ttfa_ms=tot_ms,
+                                infer_ms=tot_edge_ms,
+                                queue_wait_ms=0.0,
+                            )
+                        else:
+                            fallback_chain.append("edge_tts(synthesis_failed)")
+                            self._safe_log(
+                                "warn",
+                                f"[TTS FALLBACK ATTEMPT] generation_id={generation_id} provider=local_offline_tts reason=edge_tts_failed"
+                            )
+                    except Exception as e:
+                        fallback_chain.append(f"edge_tts(error:{e})")
+                        self._safe_log(
+                            "warn",
+                            f"[TTS FALLBACK ATTEMPT] generation_id={generation_id} provider=local_offline_tts reason=edge_tts_exception({e})"
+                        )
+                else:
+                    fallback_chain.append("edge_tts(network_unavailable)")
+                    self._safe_log(
+                        "warn",
+                        f"[TTS FALLBACK ATTEMPT] generation_id={generation_id} provider=local_offline_tts reason=network_unavailable (0ms fast_skip)"
+                    )
+            else:
+                fallback_chain.append("edge_tts(unavailable)")
+        else:
+            fallback_chain.append("edge_tts(disabled)")
+
+        # -------------------------------------------------------------
+        # STEP 3: Local Offline Backup TTS (Piper / espeak-ng / synth)
+        # -------------------------------------------------------------
         if self.local_offline_tts and self.local_offline_tts.is_ready():
+            self._safe_log(
+                "info",
+                f"[TTS SYNTHESIS ATTEMPT] generation_id={generation_id} provider=local_offline_tts"
+            )
             t_offline_start = time.perf_counter()
             try:
-                pcm = self.local_offline_tts.synthesize_sentence(text, generation_id=generation_id, language=language)
+                pcm = self.local_offline_tts.synthesize_sentence(
+                    clean_text,
+                    generation_id=generation_id,
+                    language=language,
+                )
                 tot_off_ms = (time.perf_counter() - t_offline_start) * 1000.0
                 tot_ms = (time.perf_counter() - t_start) * 1000.0
-                if pcm:
+
+                if pcm and len(pcm) > 10:
                     fallback_chain.append("local_offline_tts")
+                    self._safe_log(
+                        "info",
+                        f"✅ [TTS SYNTHESIS COMPLETED] generation_id={generation_id} actual_provider=local_offline_tts "
+                        f"audio_bytes={len(pcm)} infer_ms={tot_off_ms:.1f} total_ms={tot_ms:.1f}"
+                    )
                     return TTSRouteResult(
                         pcm=pcm,
                         selected_provider="local_offline_tts",
@@ -188,7 +334,9 @@ class TTSRouter:
                 fallback_chain.append(f"local_offline_tts(error:{e})")
                 self._safe_log("error", f"❌ [TTSRouter] Local Offline TTS hatası: {e}")
 
-        # Step 4: Zero-Silence Contract — Explicit Alarm
+        # -------------------------------------------------------------
+        # STEP 4: Zero-Silence Contract Violation Alarm
+        # -------------------------------------------------------------
         self._safe_log(
             "error",
             f"🚨 [TTS_ALL_PROVIDERS_FAILED]: All TTS providers failed for generation_id={generation_id}! Chain={fallback_chain}"
@@ -199,10 +347,36 @@ class TTSRouter:
             actual_provider="none",
             model_name="none",
             source_name="none",
-            tts_state="FAILED",
+            tts_state="ALL_FAILED",
             tts_ready=False,
             tts_healthy=False,
             fallback_reason="TTS_ALL_PROVIDERS_FAILED",
             fallback_chain=fallback_chain,
             duration_ms=(time.perf_counter() - t_start) * 1000.0,
         )
+
+    def synthesize_and_play(
+        self,
+        text: str,
+        generation_id: int,
+        output_manager: Optional[AudioOutputManager] = None,
+        language: str = "tr",
+    ) -> TTSRouteResult:
+        """Synthesizes text and immediately queues it to the unified hardware playback manager."""
+        res = self.synthesize(text, generation_id=generation_id, language=language)
+        out_mgr = output_manager or self.output_manager
+
+        if res.pcm and out_mgr:
+            provenance = {
+                "tts_provider": res.actual_provider,
+                "tts_model": res.model_name,
+                "tts_source": res.source_name,
+                "playback_source": out_mgr.backend,
+            }
+            out_mgr.play_pcm_chunk(
+                res.pcm,
+                sample_rate=24000,
+                generation_id=generation_id,
+                provenance=provenance,
+            )
+        return res

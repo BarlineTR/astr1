@@ -118,11 +118,25 @@ class TtsNode(Node):
         except Exception as e:
             self.get_logger().warn(f"⚠️ [TTS Node] Yerel XTTS hazırlığı uyarısı: {e}")
 
-        # 4. Initialize TTS Orchestrator
+        # 4. Initialize Local Offline TTS & Edge-TTS engines
+        from astro_audio.edge_tts_engine import EdgeTTSEngine
+        from astro_audio.local_offline_tts_engine import LocalOfflineTTSEngine
+
+        self.local_offline_tts = LocalOfflineTTSEngine(
+            language=self.tts_language,
+            logger=self._log,
+        )
+        self.edge_tts = EdgeTTSEngine(
+            logger=self._log,
+        )
+
+        # 5. Initialize TTS Orchestrator with Authoritative Fallback Chain
         self.orchestrator = TTSOrchestrator(
             output_manager=self.output_manager,
             realtime_engine=self.realtime_engine,
             local_xtts_engine=self.local_xtts,
+            local_offline_tts_engine=self.local_offline_tts,
+            edge_tts_engine=self.edge_tts,
             logger=self._log,
             on_state_change=self._on_orchestrator_state_change,
         )
@@ -229,8 +243,7 @@ class TtsNode(Node):
             gen_id = self.output_manager.new_generation()
             self.orchestrator.start_turn(turn_id=f"say_{gen_id}", generation_id=gen_id, user_turn_end_t=t_req)
 
-            # Synthesize sentence/clauses
-            self.get_logger().info(f'🔊 [TTS Okuyor]: "{text}"')
+            # Synthesize sentence/clauses with deterministic fallback and playback
             self.orchestrator.synthesize_clause(text, generation_id=gen_id, auto_play=True)
 
     def _publish_status_heartbeat(self):

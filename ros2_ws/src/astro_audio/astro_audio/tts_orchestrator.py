@@ -1,27 +1,25 @@
-#!/usr/bin/env python3
 """ASTRO V1 — Hybrid Production TTS Orchestrator & Circuit Breaker.
 
-Coordinates between Primary (OpenAI Realtime API) and Fallback (Local GPU XTTS v2)
-with zero-latency barge-in, low-latency sentence chunking, and comprehensive telemetry.
-
-State Machine:
-  - REALTIME_ACTIVE   : Primary OpenAI WebSocket stream active
-  - REALTIME_DEGRADED : Connection/quota errors detected; prepping failover
-  - XTTS_FALLBACK     : Local GPU XTTS v2 active with pipelined clause synthesis
-  - RECOVERING        : Probing Realtime connectivity in background without turn blocking
+Coordinates between Primary (OpenAI Realtime API) and Authoritative Fallback Chain
+(Local GPU XTTS v2 -> Edge-TTS -> Local Offline TTS) via TTSRouter with zero-latency
+barge-in, hardware playback provenance, and comprehensive telemetry.
 """
 
 import enum
+import os
 import threading
 import time
 from typing import Any, Callable, Dict, List, Optional
 
 from astro_audio.audio_output_manager import AudioOutputManager
+from astro_audio.edge_tts_engine import EdgeTTSEngine
 from astro_audio.elevenlabs_engine import ElevenLabsEngine
+from astro_audio.local_offline_tts_engine import LocalOfflineTTSEngine
 from astro_audio.local_xtts_engine import LocalXttsEngine
 from astro_audio.realtime_engine import RealtimeEngine
 from astro_audio.sentence_chunker import SentenceChunker
 from astro_audio.tts_metrics import TurnTelemetry
+from astro_audio.tts_router import TTSRouteResult, TTSRouter
 
 
 class OrchestratorState(enum.Enum):
@@ -32,14 +30,17 @@ class OrchestratorState(enum.Enum):
 
 
 class TTSOrchestrator:
-    """Production hybrid TTS Orchestrator with Circuit Breaker and Pipelined Fallback."""
+    """Production hybrid TTS Orchestrator with Circuit Breaker and Authoritative Fallback."""
 
     def __init__(
         self,
         output_manager: AudioOutputManager,
         realtime_engine: RealtimeEngine,
         local_xtts_engine: Optional[LocalXttsEngine] = None,
+        local_offline_tts_engine: Optional[LocalOfflineTTSEngine] = None,
+        edge_tts_engine: Optional[EdgeTTSEngine] = None,
         elevenlabs_engine: Optional[ElevenLabsEngine] = None,
+        tts_router: Optional[TTSRouter] = None,
         logger=None,
         on_state_change: Optional[Callable[[OrchestratorState], None]] = None,
     ):
@@ -47,8 +48,19 @@ class TTSOrchestrator:
         self.output_manager = output_manager
         self.realtime_engine = realtime_engine
         self.xtts_engine = local_xtts_engine
+        self.local_offline_tts = local_offline_tts_engine
+        self.edge_tts_engine = edge_tts_engine
         self.elevenlabs_engine = elevenlabs_engine
         self._on_state_change_cb = on_state_change
+
+        # Unified Authoritative TTSRouter
+        self.router = tts_router or TTSRouter(
+            local_xtts=self.xtts_engine,
+            local_offline_tts=self.local_offline_tts,
+            edge_tts_engine=self.edge_tts_engine,
+            output_manager=self.output_manager,
+            logger=logger,
+        )
 
         self._state = OrchestratorState.REALTIME_ACTIVE
         self._state_lock = threading.Lock()
@@ -110,7 +122,7 @@ class TTSOrchestrator:
 
     # ------------------------------------------------------------- Circuit Breaker
     def trip_to_fallback(self, reason: str = "") -> None:
-        """Immediately trips the circuit breaker to local XTTS GPU fallback."""
+        """Immediately trips the circuit breaker to authoritative fallback."""
         t_failover_start = time.monotonic()
         with self._state_lock:
             self._consecutive_failures += 1
@@ -122,9 +134,13 @@ class TTSOrchestrator:
         with self._telemetry_lock:
             if self._current_telemetry:
                 self._current_telemetry.realtime_to_xtts_failover_ms = failover_ms
-                self._current_telemetry.active_tts_engine = "xtts_gpu"
+                self._current_telemetry.active_tts_engine = "fallback"
 
-        self._log("warn", f"🚨 [TTSOrchestrator Circuit Breaker] Realtime API kesintisi ({reason}). Hızlı Local XTTS GPU Fallback Aktif ({failover_ms:.1f}ms geçiş süresi)!")
+        self._log(
+            "warn",
+            f"🚨 [TTSOrchestrator Circuit Breaker] Realtime API kesintisi ({reason}). "
+            f"Hızlı Deterministik Fallback Aktif ({failover_ms:.1f}ms geçiş süresi)!"
+        )
 
     def report_realtime_success(self) -> None:
         """Reports healthy response from OpenAI Realtime API."""
@@ -147,7 +163,7 @@ class TTSOrchestrator:
         generation_id: int,
         language: str = "tr",
     ) -> List[bytes]:
-        """Pipelined synthesis for incoming LLM tokens. Emits synthesized PCM chunks as clauses complete."""
+        """Pipelined synthesis for incoming LLM tokens."""
         if not token:
             return []
 
@@ -179,56 +195,60 @@ class TTSOrchestrator:
         language: str = "tr",
         auto_play: bool = True,
     ) -> Optional[bytes]:
-        """Synthesizes a single clause using ElevenLabs (Primary) or Local XTTS (Fallback) and enqueues to speaker."""
-        if not text:
+        """Synthesizes text clause through authoritative TTSRouter with provenance tracking."""
+        if not text or not text.strip():
             return None
 
-        pcm = None
-        sample_rate = 24000
-        engine_name = "none"
-
-        # 1. Primary Remote: ElevenLabs Flash v2.5
+        # 1. ElevenLabs remote (optional)
         if self.elevenlabs_engine and self.elevenlabs_engine.is_ready():
-            t_synth_start = time.perf_counter()
-            with self._telemetry_lock:
-                if self._current_telemetry and self._current_telemetry.t2_first_xtts_inference_start == 0.0:
-                    self._current_telemetry.mark_xtts_inference_start()
             try:
                 pcm = self.elevenlabs_engine.synthesize_sentence(text, generation_id=generation_id, language=language)
-                engine_name = "elevenlabs"
+                if pcm and len(pcm) > 100:
+                    if auto_play:
+                        prov = {
+                            "tts_provider": "elevenlabs",
+                            "tts_model": "elevenlabs_flash_v2_5",
+                            "tts_source": "elevenlabs_cloud",
+                            "playback_source": self.output_manager.backend,
+                        }
+                        self.output_manager.play_pcm_chunk(pcm, sample_rate=24000, generation_id=generation_id, provenance=prov)
+                    return pcm
             except Exception as e:
-                self._log("warn", f"⚠️ [TTSOrchestrator] ElevenLabs hatası, XTTS fallback'e geçiliyor: {e}")
+                self._log("warn", f"⚠️ [TTSOrchestrator] ElevenLabs hatası, TTSRouter fallback'e geçiliyor: {e}")
 
-        # 2. Local GPU Fallback: Local XTTS
-        if pcm is None and self.xtts_engine and self.xtts_engine.is_ready():
-            t_synth_start = time.perf_counter()
-            with self._telemetry_lock:
-                if self._current_telemetry and self._current_telemetry.t2_first_xtts_inference_start == 0.0:
-                    self._current_telemetry.mark_xtts_inference_start()
-            pcm = self.xtts_engine.synthesize_sentence(text, generation_id=generation_id, language=language)
-            sample_rate = getattr(getattr(self.xtts_engine, "client", None), "info", {}).get("sample_rate", 24000)
-            engine_name = "xtts_gpu"
+        # 2. Authoritative Fallback Chain via TTSRouter
+        res: TTSRouteResult = self.router.synthesize(text, generation_id=generation_id, language=language)
 
-        if pcm:
-            t_synth_end = time.perf_counter()
-            synth_ms = (t_synth_end - t_synth_start) * 1000.0
-            audio_sec = (len(pcm) / 2) / sample_rate
+        if res.pcm:
+            sample_rate = 24000
+            audio_sec = (len(res.pcm) / 2) / sample_rate
 
             with self._telemetry_lock:
                 if self._current_telemetry:
                     if self._current_telemetry.t3_first_synthesized_audio == 0.0:
                         self._current_telemetry.mark_synthesized_audio_ready()
-                    self._current_telemetry.record_synthesis(synth_ms, audio_sec)
+                    self._current_telemetry.record_synthesis(res.infer_ms, audio_sec)
                     self._current_telemetry.sentence_count += 1
-                    self._current_telemetry.active_tts_engine = engine_name
+                    self._current_telemetry.active_tts_engine = res.actual_provider
 
             if auto_play:
                 with self._telemetry_lock:
                     if self._current_telemetry and self._current_telemetry.t4_audio_manager_submitted == 0.0:
                         self._current_telemetry.mark_audio_manager_submitted()
-                self.output_manager.play_pcm_chunk(pcm, sample_rate=sample_rate, generation_id=generation_id)
+                prov = {
+                    "tts_provider": res.actual_provider,
+                    "tts_model": res.model_name,
+                    "tts_source": res.source_name,
+                    "playback_source": self.output_manager.backend,
+                }
+                self.output_manager.play_pcm_chunk(
+                    res.pcm,
+                    sample_rate=sample_rate,
+                    generation_id=generation_id,
+                    provenance=prov,
+                )
 
-            return pcm
+            return res.pcm
 
         return None
 
