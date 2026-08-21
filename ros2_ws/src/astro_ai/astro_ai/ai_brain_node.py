@@ -343,19 +343,23 @@ class AiBrainNode(Node):
         )
 
     def _play_local_ack(self, ack_pcm: bytes, generation_id: int = 0):
-        """Plays low-latency pre-generated local ACK WAV via AudioOutputManager or local aplay."""
+        """Plays low-latency pre-generated local ACK WAV via AudioOutputManager or non-blocking aplay."""
+        if not ack_pcm:
+            return
         try:
             from astro_audio.audio_output_manager import AudioOutputManager
             out_mgr = AudioOutputManager.get_instance()
-            if out_mgr and ack_pcm:
-                out_mgr.play_pcm_chunk(ack_pcm, sample_rate=16000, generation_id=generation_id, provenance={"source": "thinking_ack_local"})
+            if out_mgr:
+                out_mgr.play_pcm_chunk(ack_pcm, sample_rate=16000, generation_id=generation_id, provenance={"source": "thinking_ack_local", "tts_provider": "local_pcm", "playback_source": "hardware_dac"})
                 return
         except Exception:
             pass
         try:
-            if ack_pcm:
-                import subprocess
-                subprocess.Popen(["aplay", "-q", "-r", "16000", "-f", "S16_LE", "-c", "1"], stdin=subprocess.PIPE, stderr=subprocess.DEVNULL).communicate(ack_pcm, timeout=0.4)
+            import subprocess
+            proc = subprocess.Popen(["aplay", "-q", "-r", "16000", "-f", "S16_LE", "-c", "1"], stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            if proc.stdin:
+                proc.stdin.write(ack_pcm)
+                proc.stdin.close()
         except Exception:
             pass
 
@@ -1789,22 +1793,138 @@ class AiBrainNode(Node):
 
 
     def _is_weather_query(self, text: str) -> Tuple[bool, str]:
-        text_l = text.lower()
-        if any(w in text_l for w in ["hava nasıl", "hava durumu", "hava kaç derece", "havalar nasıl", "yağmur var mı", "kar var mı", "sıcaklık kaç", "ahlattı hava"]):
-            if "ahlat" in text_l or "ahlattı" in text_l:
-                return True, "Ahlat"
-            if "bitlis" in text_l:
-                return True, "Bitlis"
-            if "tatvan" in text_l:
-                return True, "Tatvan"
-            if "istanbul" in text_l:
-                return True, "Istanbul"
-            if "ankara" in text_l:
-                return True, "Ankara"
-            if "izmir" in text_l:
-                return True, "Izmir"
-            return True, "Bitlis"
-        return False, ""
+        """Robust Turkish weather intent and city extraction supporting all 81 provinces, districts, and case-folding."""
+        text_norm = text.replace("İ", "i").replace("I", "ı").replace("i̇", "i").lower()
+        weather_triggers = [
+            "hava nasıl", "hava durumu", "hava kaç derece", "havalar nasıl",
+            "yağmur var mı", "kar var mı", "sıcaklık kaç", "hava", "sıcaklık",
+            "sicaklik", "derece", "yağmur", "yagmur", "kar durumu", "hava raporu"
+        ]
+        if not any(w in text_norm for w in weather_triggers):
+            return False, ""
+
+        cities = [
+            ("istanbul", "Istanbul"),
+            ("ahlat", "Ahlat"),
+            ("tatvan", "Tatvan"),
+            ("bitlis", "Bitlis"),
+            ("ankara", "Ankara"),
+            ("izmir", "Izmir"),
+            ("bursa", "Bursa"),
+            ("antalya", "Antalya"),
+            ("adana", "Adana"),
+            ("konya", "Konya"),
+            ("gaziantep", "Gaziantep"),
+            ("antep", "Gaziantep"),
+            ("şanlıurfa", "Sanliurfa"),
+            ("sanliurfa", "Sanliurfa"),
+            ("urfa", "Sanliurfa"),
+            ("kocaeli", "Kocaeli"),
+            ("izmit", "Kocaeli"),
+            ("mersin", "Mersin"),
+            ("diyarbakır", "Diyarbakir"),
+            ("diyarbakir", "Diyarbakir"),
+            ("hatay", "Hatay"),
+            ("antakya", "Hatay"),
+            ("manisa", "Manisa"),
+            ("kayseri", "Kayseri"),
+            ("samsun", "Samsun"),
+            ("balıkesir", "Balikesir"),
+            ("balikesir", "Balikesir"),
+            ("kahramanmaraş", "Kahramanmaras"),
+            ("maras", "Kahramanmaras"),
+            ("maraş", "Kahramanmaras"),
+            ("van", "Van"),
+            ("aydın", "Aydin"),
+            ("aydin", "Aydin"),
+            ("denizli", "Denizli"),
+            ("sakarya", "Sakarya"),
+            ("adapazarı", "Sakarya"),
+            ("erzurum", "Erzurum"),
+            ("muğla", "Mugla"),
+            ("mugla", "Mugla"),
+            ("bodrum", "Bodrum"),
+            ("eskişehir", "Eskisehir"),
+            ("eskisehir", "Eskisehir"),
+            ("trabzon", "Trabzon"),
+            ("elazığ", "Elazig"),
+            ("elazig", "Elazig"),
+            ("malatya", "Malatya"),
+            ("sivas", "Sivas"),
+            ("batman", "Batman"),
+            ("muş", "Mus"),
+            ("mus", "Mus"),
+            ("hakkari", "Hakkari"),
+            ("siirt", "Siirt"),
+            ("bingöl", "Bingol"),
+            ("bingol", "Bingol"),
+            ("ağrı", "Agri"),
+            ("agri", "Agri"),
+            ("kars", "Kars"),
+            ("ığdır", "Igdir"),
+            ("igdir", "Igdir"),
+            ("ardahan", "Ardahan"),
+            ("güroymak", "Guroymak"),
+            ("guroymak", "Guroymak"),
+            ("adilcevaz", "Adilcevaz"),
+            ("mutki", "Mutki"),
+            ("hizan", "Hizan"),
+            ("çanakkale", "Canakkale"),
+            ("canakkale", "Canakkale"),
+            ("edirne", "Edirne"),
+            ("tekirdağ", "Tekirdag"),
+            ("rize", "Rize"),
+            ("ordu", "Ordu"),
+            ("giresun", "Giresun"),
+            ("artvin", "Artvin"),
+            ("yalova", "Yalova"),
+            ("düzce", "Duzce"),
+            ("bolu", "Bolu"),
+            ("zonguldak", "Zonguldak"),
+            ("karabük", "Karabuk"),
+            ("bartın", "Bartin"),
+            ("kastamonu", "Kastamonu"),
+            ("sinop", "Sinop"),
+            ("çorum", "Corum"),
+            ("amasya", "Amasya"),
+            ("tokat", "Tokat"),
+            ("gümüşhane", "Gumushane"),
+            ("bayburt", "Bayburt"),
+            ("yozgat", "Yozgat"),
+            ("kırşehir", "Kirsehir"),
+            ("nevşehir", "Nevsehir"),
+            ("niğde", "Nigde"),
+            ("aksaray", "Aksaray"),
+            ("karaman", "Karaman"),
+            ("kırıkkale", "Kirikkale"),
+            ("çankırı", "Cankiri"),
+            ("uşak", "Usak"),
+            ("kütahya", "Kutahya"),
+            ("afyonkarahisar", "Afyonkarahisar"),
+            ("afyon", "Afyonkarahisar"),
+            ("isparta", "Isparta"),
+            ("burdur", "Burdur"),
+            ("bilecik", "Bilecik"),
+            ("kilis", "Kilis"),
+            ("osmaniye", "Osmaniye"),
+            ("adıyaman", "Adiyaman"),
+            ("tunceli", "Tunceli"),
+            ("dersim", "Tunceli"),
+            ("şırnak", "Sirnak"),
+        ]
+
+        for key, city_name in cities:
+            pattern = rf"\b{re.escape(key)}(?:['’]?(?:da|de|ta|te|daki|deki|taki|teki|ya|ye|a|e|ın|in|un|ün|dan|den|tan|ten|ti|tı|tu|tü))?\b"
+            if re.search(pattern, text_norm):
+                return True, city_name
+
+        if "ahlattı" in text_norm or "ahlatta" in text_norm:
+            return True, "Ahlat"
+        if "tatvanda" in text_norm or "tatvanta" in text_norm:
+            return True, "Tatvan"
+
+        default_city = os.environ.get("DEFAULT_WEATHER_CITY", "Bitlis").strip() or "Bitlis"
+        return True, default_city
 
     def _is_identity_query(self, text: str) -> bool:
         text_l = text.lower()
@@ -2225,16 +2345,22 @@ class AiBrainNode(Node):
         last_u = getattr(self.session, "last_user_text", "")
         clean = response_length_gate(text, user_query=last_u, max_words=35, max_sentences=2)
         if clean:
-            tts_engine = self.session.metadata.get("tts_engine", "edge-tts")
-            self.get_logger().info(f"[TTS REQUESTED] provider={tts_engine} text=\"{clean}\"")
+            openai_realtime_ok = self.circuit_breaker.is_available("openai", sub_provider="openai_realtime") if self.circuit_breaker else True
+            if openai_realtime_ok and self.session.metadata.get("tts_engine") != "edge-tts":
+                tts_engine = "openai_realtime"
+                reason = "realtime_available"
+            else:
+                tts_engine = "edge_tts"
+                reason = "openai_realtime_exhausted" if not openai_realtime_ok else "session_edge_tts"
+
+            self.get_logger().info(f"[TTS REQUESTED] requested_provider={tts_engine} selection_reason={reason} text=\"{clean}\"")
             msg = String()
-            if self.session.metadata.get("tts_engine") == "edge-tts":
+            if tts_engine == "edge_tts" or self.session.metadata.get("tts_engine") == "edge-tts":
                 payload = {"text": clean, "engine": "edge-tts"}
                 msg.data = json.dumps(payload)
             else:
                 msg.data = clean
             self.pub_tts.publish(msg)
-            self.get_logger().info("[PLAYBACK STARTED]")
 
     def _publish_interrupt(self):
         msg = Bool()

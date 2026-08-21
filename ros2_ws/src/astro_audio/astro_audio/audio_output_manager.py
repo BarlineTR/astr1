@@ -174,6 +174,7 @@ class AudioOutputManager:
         self._is_playing = False
         self._last_playback_time = 0.0
         self._first_audio_emitted_for_gen = -1
+        self._played_bytes_for_gen: Dict[int, int] = {}
 
         self._current_process: Optional[subprocess.Popen] = None
         self._output_stream = None
@@ -382,7 +383,21 @@ class AudioOutputManager:
                     raw_item = self._play_queue.get(timeout=0.05)
                 except queue.Empty:
                     if self._is_playing:
-                        self._is_playing = False
+                        with self._lock:
+                            self._is_playing = False
+                            finished_gen = self._first_audio_emitted_for_gen
+                            total_played = self._played_bytes_for_gen.get(finished_gen, 0)
+                        if finished_gen >= 0:
+                            self._log(
+                                "info",
+                                f"🔊 [PLAYBACK FINISHED]\n"
+                                f"  generation_id={finished_gen}\n"
+                                f"  playback_started=true\n"
+                                f"  playback_finished=true\n"
+                                f"  playback_failed=false\n"
+                                f"  played_bytes={total_played}\n"
+                                f"  device={self.alsa_device}"
+                            )
                         if self._on_state_change:
                             self._on_state_change(False)
                     continue
@@ -399,8 +414,22 @@ class AudioOutputManager:
                         continue
                     self._is_playing = True
                     self._last_playback_time = time.monotonic()
+                    self._played_bytes_for_gen[gen] = self._played_bytes_for_gen.get(gen, 0) + len(chunk)
                     if self._first_audio_emitted_for_gen != gen:
                         self._first_audio_emitted_for_gen = gen
+                        self._log(
+                            "info",
+                            f"🔊 [PLAYBACK STARTED]\n"
+                            f"  generation_id={gen}\n"
+                            f"  playback_started=true\n"
+                            f"  playback_finished=false\n"
+                            f"  playback_failed=false\n"
+                            f"  tts_provider={prov.get('tts_provider', 'mock')}\n"
+                            f"  tts_source={prov.get('tts_source', 'mock')}\n"
+                            f"  playback_source={prov.get('playback_source', self.backend)}\n"
+                            f"  played_bytes={len(chunk)}\n"
+                            f"  device={self.alsa_device}"
+                        )
                         if self._on_first_audio:
                             self._on_first_audio(gen, self._last_playback_time)
                         if self._on_state_change:
@@ -433,6 +462,19 @@ class AudioOutputManager:
                 if self._is_playing:
                     with self._lock:
                         self._is_playing = False
+                        finished_gen = self._first_audio_emitted_for_gen
+                        total_played = self._played_bytes_for_gen.get(finished_gen, 0)
+                    if finished_gen >= 0:
+                        self._log(
+                            "info",
+                            f"🔊 [PLAYBACK FINISHED]\n"
+                            f"  generation_id={finished_gen}\n"
+                            f"  playback_started=true\n"
+                            f"  playback_finished=true\n"
+                            f"  playback_failed=false\n"
+                            f"  played_bytes={total_played}\n"
+                            f"  device={self.alsa_device}"
+                        )
                     if self._on_state_change:
                         self._on_state_change(False)
                 continue
@@ -450,19 +492,23 @@ class AudioOutputManager:
                     continue  # Discard stale generation chunk
                 self._is_playing = True
                 self._last_playback_time = time.monotonic()
+                self._played_bytes_for_gen[gen] = self._played_bytes_for_gen.get(gen, 0) + len(chunk)
 
                 # Trigger first audio timestamp callback & provenance logging
                 if self._first_audio_emitted_for_gen != gen:
                     self._first_audio_emitted_for_gen = gen
                     self._log(
                         "info",
-                        f"🔊 [Playback Started]\n"
+                        f"🔊 [PLAYBACK STARTED]\n"
                         f"  generation_id={gen}\n"
-                        f"  tts_provider={prov.get('tts_provider', 'xtts_gpu')}\n"
-                        f"  tts_model={prov.get('tts_model', 'xtts_finetuned')}\n"
-                        f"  tts_source={prov.get('tts_source', 'xtts_worker')}\n"
+                        f"  playback_started=true\n"
+                        f"  playback_finished=false\n"
+                        f"  playback_failed=false\n"
+                        f"  tts_provider={prov.get('tts_provider', 'edge_tts')}\n"
+                        f"  tts_model={prov.get('tts_model', 'edge_neural')}\n"
+                        f"  tts_source={prov.get('tts_source', 'cloud')}\n"
                         f"  playback_source={prov.get('playback_source', self.backend)}\n"
-                        f"  audio_bytes={len(chunk)}\n"
+                        f"  played_bytes={len(chunk)}\n"
                         f"  device={self.alsa_device}"
                     )
                     if self._on_first_audio:

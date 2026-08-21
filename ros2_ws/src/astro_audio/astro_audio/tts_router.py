@@ -151,8 +151,8 @@ class TTSRouter:
             self._safe_log("info", f'[TTS REQUESTED] generation_id={generation_id} requested_provider=openai_realtime text="{clean_text}"')
             fallback_chain.append("openai_realtime")
         else:
-            self._safe_log("info", f'[TTS ROUTE] provider=edge_tts reason=realtime_unavailable generation_id={generation_id}')
-            fallback_chain.append(f"openai_realtime({realtime_fallback_reason})")
+            self._safe_log("info", f'[TTS REQUESTED] generation_id={generation_id} requested_provider=edge_tts selection_reason=openai_realtime_exhausted text="{clean_text}"')
+            fallback_chain.append("edge_tts")
 
         # -------------------------------------------------------------
         # STEP 1: Local XTTS Engine (Only if explicitly enabled and ready in test mode)
