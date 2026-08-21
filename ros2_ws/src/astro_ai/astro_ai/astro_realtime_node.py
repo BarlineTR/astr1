@@ -643,17 +643,40 @@ class AstroRealtimeNode(Node):
         self.get_logger().info(f"📋 [Realtime Modelleri]: Kullanılabilir modeller: {candidate_models}")
         model_idx = 0
 
+        # Realtime telemetry state fields (exposed for turn telemetry)
+        self._realtime_connection_state = "DISCONNECTED"
+        self._realtime_session_state = "NOT_READY"
+        self._realtime_audio_received = False
+        self._realtime_current_generation_id = None
+
         while rclpy.ok():
             current_model = candidate_models[model_idx % len(candidate_models)]
             ws_url = f"wss://api.openai.com/v1/realtime?model={current_model}"
             try:
-                self.get_logger().info(f"🌐 [Realtime WS] OpenAI Realtime API'ye bağlanılıyor: {ws_url}")
+                # === [REALTIME CONNECTING] ===
+                self._realtime_connection_state = "CONNECTING"
+                self.get_logger().info(
+                    f"[REALTIME CONNECTING]\n"
+                    f"  model={current_model}\n"
+                    f"  url={ws_url}\n"
+                    f"  connection_state=CONNECTING"
+                )
                 async with websockets.connect(ws_url, **connect_kwargs) as ws:
                     self._ws = ws
                     self._is_connected = True
                     self._is_responding = False
                     self._is_playback_active = False
-                    self.get_logger().info(f"✅ [Realtime WS] Bağlantı Başarılı ({current_model})! Oturum parametreleri gönderiliyor...")
+                    self._realtime_connection_state = "CONNECTED"
+                    self._realtime_session_state = "READY"
+                    self._realtime_audio_received = False
+
+                    # === [REALTIME CONNECTED] ===
+                    self.get_logger().info(
+                        f"[REALTIME CONNECTED]\n"
+                        f"  model={current_model}\n"
+                        f"  connection_state=CONNECTED\n"
+                        f"  session_state=READY"
+                    )
 
                     # Send Initial Session Update
                     await self._send_session_update(ws)
@@ -667,6 +690,8 @@ class AstroRealtimeNode(Node):
                 self._ws = None
                 self._is_responding = False
                 self._is_playback_active = False
+                self._realtime_connection_state = "DISCONNECTED"
+                self._realtime_session_state = "NOT_READY"
                 err_str = str(e)
 
                 try:
@@ -680,11 +705,13 @@ class AstroRealtimeNode(Node):
                     else:
                         failure_reason = "realtime_network_unavailable"
 
+                # === [REALTIME DISCONNECTED] ===
+                gen_id = getattr(self, '_realtime_current_generation_id', None) or "unknown"
                 self.get_logger().warn(
-                    f"🚨 [REALTIME DEGRADED]\n"
+                    f"[REALTIME DISCONNECTED]\n"
+                    f"  generation_id={gen_id}\n"
                     f"  reason={failure_reason}\n"
-                    f"  previous_state=REALTIME_ACTIVE\n"
-                    f"  fallback_provider=edge_tts"
+                    f"  connection_state=DISCONNECTED"
                 )
 
                 # 1. Strict Quota Exhaustion (402, insufficient_quota, credit_balance_exhausted)
@@ -708,6 +735,15 @@ class AstroRealtimeNode(Node):
                             cb.record_error("openai", sub_provider="openai_realtime", error_class=RequestErrorClass.QUOTA_EXHAUSTED, error_msg=err_str)
                     except Exception:
                         pass
+
+                    # === [REALTIME FALLBACK] ===
+                    self.get_logger().warn(
+                        f"[REALTIME FALLBACK]\n"
+                        f"  generation_id={gen_id}\n"
+                        f"  from=openai_realtime\n"
+                        f"  to=groq\n"
+                        f"  reason=quota_exhausted"
+                    )
 
                     if not self._fallback_mode:
                         self._fallback_mode = True
@@ -928,6 +964,13 @@ class AstroRealtimeNode(Node):
                 out_msg = String()
                 out_msg.data = delta_b64
                 self.pub_output_pcm.publish(out_msg)
+                # Track audio received for telemetry
+                self._realtime_audio_received = True
+                audio_bytes = len(delta_b64) * 3 // 4  # approximate decoded size
+                gen_id = getattr(self, '_realtime_current_generation_id', None) or "active"
+                self.get_logger().debug(
+                    f"[REALTIME AUDIO DELTA] generation_id={gen_id} audio_bytes={audio_bytes}"
+                )
 
         # 2. Real-Time Streaming Audio Transcript
         elif event_type in ("response.audio_transcript.delta", "response.output_audio_transcript.delta", "response.text.delta"):
@@ -974,11 +1017,24 @@ class AstroRealtimeNode(Node):
         elif event_type == "response.created":
             self._is_responding = True
             self._response_start_time = time.monotonic()
-            self.get_logger().info("🎙️ [Realtime] Astro sesli yanıt üretmeye başladı...")
+            self._realtime_audio_received = False
+            self._fallback_generation_id += 1
+            self._realtime_current_generation_id = self._fallback_generation_id
+            gen_id = self._realtime_current_generation_id
+            # === [REALTIME RESPONSE STARTED] ===
+            self.get_logger().info(
+                f"[REALTIME RESPONSE STARTED] generation_id={gen_id}"
+            )
 
         # 3d. Response Done / Cancelled
         elif event_type in ("response.done", "response.cancelled"):
             self._is_responding = False
+            gen_id = getattr(self, '_realtime_current_generation_id', None) or "unknown"
+            audio_received = getattr(self, '_realtime_audio_received', False)
+            # === [REALTIME RESPONSE DONE] ===
+            self.get_logger().info(
+                f"[REALTIME RESPONSE DONE] generation_id={gen_id} audio_received={audio_received}"
+            )
 
         # 4. User Speech Transcription Completed
         elif event_type in ("conversation.item.input_audio_transcription.completed", "conversation.item.input_audio_transcription.done"):

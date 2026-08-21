@@ -281,8 +281,27 @@ class GlobalProviderCircuitBreaker:
             p_rec.last_updated = now
             p_rec.failure_count += 1
 
-            # QUOTA EXHAUSTED: Marks parent and all its sub-providers as EXHAUSTED session-wide
+            # QUOTA EXHAUSTED: session-scoped; sub-provider errors do not blanket-disable parent OpenAI
             if error_class == RequestErrorClass.QUOTA_EXHAUSTED:
+                if sub_provider:
+                    sub_key = sub_provider.lower()
+                    if sub_key in self._sub_providers:
+                        _, sub_rec = self._sub_providers[sub_key]
+                        sub_rec.state = ProviderState.EXHAUSTED
+                        sub_rec.last_error = error_msg
+                        sub_rec.last_error_class = error_class
+                    self._log(
+                        "error",
+                        f"🚨 [OPENAI QUOTA EXHAUSTED]\n"
+                        f"🚨 [PROVIDER CIRCUIT BREAKER]\n"
+                        f"  provider={parent_key}\n"
+                        f"  sub_provider={sub_key}\n"
+                        f"  state=EXHAUSTED\n"
+                        f"  reason={error_msg or error_class.value}\n"
+                        f"  action=SUBPROVIDER_DISABLED_SESSION_WIDE"
+                    )
+                    return ProviderState.EXHAUSTED
+
                 p_rec.state = ProviderState.EXHAUSTED
                 self._log(
                     "error",
@@ -293,7 +312,6 @@ class GlobalProviderCircuitBreaker:
                     f"  reason={error_msg or error_class.value}\n"
                     f"  action=ALL_SUBPROVIDERS_DISABLED_SESSION_WIDE"
                 )
-                # Propagate to all sub-providers of this parent
                 for sub_k, (parent_name, sub_rec) in self._sub_providers.items():
                     if parent_name == parent_key:
                         sub_rec.state = ProviderState.EXHAUSTED
@@ -375,9 +393,11 @@ class GlobalProviderCircuitBreaker:
                 sub_key = sub_provider.lower()
                 if sub_key in self._sub_providers:
                     _, s_rec = self._sub_providers[sub_key]
-                    if s_rec.state == ProviderState.COOLDOWN:
+                    if s_rec.state in (ProviderState.COOLDOWN, ProviderState.EXHAUSTED):
                         s_rec.state = ProviderState.AVAILABLE
                     s_rec.failure_count = 0
+                    s_rec.last_error = ""
+                    s_rec.last_error_class = RequestErrorClass.NONE
                     s_rec.last_updated = now
 
             if model_id:
