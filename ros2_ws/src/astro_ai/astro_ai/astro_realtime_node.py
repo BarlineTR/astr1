@@ -92,34 +92,23 @@ EMOJI_RE = re.compile(
     flags=re.UNICODE
 )
 
-def clean_tts_text(text: str) -> str:
-    if not text:
-        return ""
-    if "<think>" in text:
-        if "</think>" in text:
-            text = text.split("</think>")[-1].strip()
-        else:
-            text = re.sub(r"(?i)<think>[\s\S]*", "", text).strip()
-    text = re.sub(r"(?i)<\/?think>", "", text)
-    text = EMOJI_RE.sub("", text)
-    text = re.sub(r'```.*?```', '', text, flags=re.DOTALL)
-    text = re.sub(r'`.*?`', '', text)
-    text = re.sub(r'[\*\_\~\#\<\>]', '', text)
-    text = " ".join(text.split())
-    text = re.sub(r'\s+([,.:;?!])', r'\1', text)
-    return text.strip()
-
 try:
     from astro_ai.conversation_session import ConversationSession
     from astro_ai.memory_manager import MemoryManager
-    from astro_ai.persona_engine import PersonaEngine, PERSONA_PROMPTS
+    from astro_ai.persona_engine import (
+        PersonaEngine, PERSONA_PROMPTS, clean_tts_text,
+        response_length_gate, is_self_identity_query
+    )
     from astro_ai.state_machine import RobotState, StateMachine
     from astro_ai.provider_registry import ProviderRegistry, ProviderError, ErrorClass
     from astro_ai.repetition_guard import RepetitionGuard
 except ImportError:
     from conversation_session import ConversationSession
     from memory_manager import MemoryManager
-    from persona_engine import PersonaEngine, PERSONA_PROMPTS
+    from persona_engine import (
+        PersonaEngine, PERSONA_PROMPTS, clean_tts_text,
+        response_length_gate, is_self_identity_query
+    )
     from state_machine import RobotState, StateMachine
     from provider_registry import ProviderRegistry, ProviderError, ErrorClass
     from repetition_guard import RepetitionGuard
@@ -2934,7 +2923,7 @@ class AstroRealtimeNode(Node):
             )
 
             def _synthesize_turn_clause(clause_text: str) -> Tuple[Optional[bytes], float, float, float]:
-                clean_text = clean_tts_text(clause_text)
+                clean_text = response_length_gate(clause_text, user_query=user_text, max_words=35, max_sentences=2)
                 if not clean_text:
                     return None, 0.0, 0.0, 0.0
 
@@ -3279,21 +3268,26 @@ class AstroRealtimeNode(Node):
                 if tts_synth_finished_flag and not first_audio_played:
                     self.get_logger().error(f"🚨 [TTS MISMATCH ALARM]: synthesis_finished=True but playback_started=False!")
 
+                resp_chars = len(full_reply_str)
+                resp_words = len(full_reply_str.split())
+                rt_state = getattr(self.realtime_engine, "state", None)
+                rt_state_name = rt_state.value if hasattr(rt_state, "value") else "OFFLINE"
+                rt_fail_reason = getattr(self.realtime_engine, "_last_degradation_reason", "none")
+
                 self.get_logger().info(
-                    f"📊 [Turn Telemetry]: generation_id={self._fallback_generation_id} | "
-                    f"stt_provider=whisper | stt_state=AVAILABLE | stt_failure_reason=none | "
-                    f"llm_provider={chosen_provider} | llm_state={llm_status} | "
-                    f"tts_selected_provider={active_engine} | tts_actual_provider={active_engine} | "
-                    f"tts_state={tts_mode_val} | tts_failure_reason={xtts_info.get('fallback_reason', 'none')} | "
-                    f"fallback_chain={active_engine} | tts_ttfa_ms={int(total_synth_ms)} | "
-                    f"tts_total_ms={int(total_synth_ms)} | playback_started={first_audio_played} | "
-                    f"playback_finished={first_audio_played and tts_synth_finished_flag} | "
-                    f"playback_failed={not first_audio_played and tts_synth_started_flag} | "
-                    f"played_bytes={total_audio_bytes if first_audio_played else 0} | "
-                    f"system_available_ram_mb={xtts_info.get('system_available_ram_mb', 'null')} | "
-                    f"swap_used_percent={xtts_info.get('swap_used_percent', 'null')} | "
-                    f"audio_input_device=respeaker_usb | audio_output_device={pb_source} | "
-                    f"attempts={json.dumps(attempts, ensure_ascii=False)}"
+                    f"[Turn Telemetry]\n"
+                    f"generation_id={self._fallback_generation_id}\n"
+                    f"realtime_state={rt_state_name}\n"
+                    f"realtime_failure_reason={rt_fail_reason}\n"
+                    f"requested_provider=openai_realtime\n"
+                    f"actual_provider={active_engine}\n"
+                    f"response_chars={resp_chars}\n"
+                    f"response_words={resp_words}\n"
+                    f"tts_ttfa_ms={int(total_synth_ms)}\n"
+                    f"tts_total_ms={int(total_synth_ms)}\n"
+                    f"playback_started={first_audio_played}\n"
+                    f"playback_finished={first_audio_played and tts_synth_finished_flag}\n"
+                    f"playback_failed={not first_audio_played and tts_synth_started_flag}"
                 )
 
                 if active_engine == "xtts_gpu" and not getattr(self, "_first_xtts_synthesis_verified", False):

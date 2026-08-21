@@ -48,7 +48,8 @@ try:
     from astro_ai.memory_manager import MemoryManager
     from astro_ai.persona_engine import (
         PersonaEngine, ROBOT_TOOLS, PERSONA_PROMPTS,
-        clean_tts_text, extract_spoken_turkish_sentence
+        clean_tts_text, extract_spoken_turkish_sentence,
+        response_length_gate, is_self_identity_query
     )
     from astro_ai.conversation_session import ConversationSession
     from astro_ai.cloud_manager import CloudManager
@@ -58,7 +59,8 @@ except ImportError:
     from memory_manager import MemoryManager
     from persona_engine import (
         PersonaEngine, ROBOT_TOOLS, PERSONA_PROMPTS,
-        clean_tts_text, extract_spoken_turkish_sentence
+        clean_tts_text, extract_spoken_turkish_sentence,
+        response_length_gate, is_self_identity_query
     )
     from conversation_session import ConversationSession
     from cloud_manager import CloudManager
@@ -1915,7 +1917,8 @@ class AiBrainNode(Node):
 
     def _publish_tts(self, text: str):
         import json
-        clean = clean_tts_text(text)
+        last_u = getattr(self.session, "last_user_text", "")
+        clean = response_length_gate(text, user_query=last_u, max_words=35, max_sentences=2)
         if clean:
             msg = String()
             if self.session.metadata.get("tts_engine") == "edge-tts":

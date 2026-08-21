@@ -117,8 +117,9 @@ class STTRouter:
                     self.groq_consecutive_failures += 1
                     if "429" in err_str or "rate limit" in err_str or "rpm" in err_str:
                         self.groq_state = STTProviderState.COOLDOWN
-                        self.groq_cooldown_until = time.monotonic() + 15.0
-                        self._safe_log("warn", "⚠️ [STTRouter] Groq 429 RPM Sınırı. 15 saniye COOLDOWN başlatıldı.")
+                        cooldown_s = 30.0 if self.groq_consecutive_failures <= 1 else 60.0
+                        self.groq_cooldown_until = time.monotonic() + cooldown_s
+                        self._safe_log("warn", f"⚠️ [STTRouter] Groq 429 RPM Sınırı. {cooldown_s:.0f} saniye COOLDOWN başlatıldı (No retry storm).")
                         fallback_chain.append("groq(429_cooldown)")
                     else:
                         self.groq_state = STTProviderState.DEGRADED

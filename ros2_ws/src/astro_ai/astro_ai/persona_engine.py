@@ -213,6 +213,94 @@ def remove_repetitive_loops(text: str) -> str:
     return text.strip()
 
 
+def is_self_identity_query(user_query: str) -> bool:
+    """Checks if the user explicitly asked about the robot's identity or creator."""
+    if not user_query:
+        return False
+    q = user_query.lower()
+    return any(k in q for k in [
+        "sen kimsin", "kimsin sen", "adın ne", "ismin ne", "sen nesin",
+        "yaratıcın kim", "seni kim yaptı", "seni kim geliştirdi", "baban kim",
+        "mühendisin kim", "kim yaptı seni", "nasıl bir robotsun"
+    ])
+
+
+def strip_unprompted_self_descriptions(text: str, user_query: str = "") -> str:
+    """Removes unsolicited robot self-introductions, sensor details, or creator speeches."""
+    if is_self_identity_query(user_query):
+        return text
+
+    patterns = [
+        r"(?i)^(?:merhaba(?:lar)?\s*[,!.]?\s*)?ben\s+astro(?:[,\s]+(?:bir\s+)?(?:sosyal\s+)?robot(?:um)?)?[^.?!]*[.?!]\s*",
+        r"(?i)(?:beni\s+)?baran(?:\s+beni)?\s+(?:adlı\s+mühendis\s+)?(?:geliştirdi|tasarladı|yaptı)[^.?!]*[.?!]\s*",
+        r"(?i)baran\s+tarafından\s+(?:geliştirildim|tasarlandım|üretildim)[^.?!]*[.?!]\s*",
+        r"(?i)oak-d\s+lite\s+3d\s+kameram(?:la)?[^.?!]*[.?!]\s*",
+        r"(?i)bir\s+(?:yapay\s+zeka|sosyal\s+robot)\s+olarak[^.?!]*[.?!]\s*",
+        r"(?i)fiziksel\s+bir\s+bedenim[,\s]+sensörlerim[^.?!]*[.?!]\s*",
+        r"(?i)ayrıca\s+sensörlerim[^.?!]*[.?!]\s*",
+    ]
+    cleaned = text
+    for pat in patterns:
+        cleaned = re.sub(pat, "", cleaned).strip()
+    return cleaned if cleaned else text
+
+
+def response_length_gate(
+    text: str,
+    user_query: str = "",
+    max_words: int = 35,
+    max_sentences: int = 2,
+) -> str:
+    """Production Response Length & Natural Conversational Hardening Gate.
+    
+    Guarantees:
+      1. Strips unprompted robot self-descriptions & meta-explanations.
+      2. Removes repetitive stuttering / degenerate LLM loops.
+      3. Enforces concise 1-2 sentence social response (<= max_words).
+      4. Avoids blunt mid-word clipping by splitting at semantic sentence boundaries.
+    """
+    if not text:
+        return ""
+
+    # 1. Clean markdown, emojis, thinking tags
+    clean = clean_tts_text(text)
+    if not clean:
+        return ""
+
+    # 2. Strip unsolicited self-descriptions if user didn't ask for identity
+    clean = strip_unprompted_self_descriptions(clean, user_query=user_query)
+
+    # 3. Sentence segmentation
+    sentences = re.split(r'(?<=[.!?])\s+', clean)
+    sentences = [s.strip() for s in sentences if s.strip()]
+
+    if not sentences:
+        return clean
+
+    # 4. Limit to max_sentences while keeping word count <= max_words
+    selected_sentences = []
+    current_word_count = 0
+
+    for s in sentences:
+        s_words = len(s.split())
+        if selected_sentences and (current_word_count + s_words > max_words or len(selected_sentences) >= max_sentences):
+            break
+        selected_sentences.append(s)
+        current_word_count += s_words
+        if len(selected_sentences) >= max_sentences:
+            break
+
+    if selected_sentences:
+        result = " ".join(selected_sentences).strip()
+    else:
+        words = sentences[0].split()[:max_words]
+        result = " ".join(words)
+        if not result.endswith((".", "!", "?")):
+            result += "."
+
+    return result
+
+
 def clean_tts_text(text: str) -> str:
     """Prepares text for TTS reading (strips markdown, emojis, asterisks, and repetitive loops)."""
     if not text:
@@ -249,13 +337,15 @@ class PersonaEngine:
             f"Senin fiziksel bir bedenin, OAK-D Lite 3D kameran, mikrofonların ve motorların var. Karşındaki insanları görebiliyor ve duyabiliyorsun.\n"
             f"TEMEL KİŞİLİĞİN: {persona_rule}\n\n"
             "SOSYAL VE DİLSEL KURALLAR:\n"
+            "- KISA VE ÖZ SOSYAL CEVAP KURALI: Cevapların maksimum 1-2 cümle ve 15-30 kelime olmalıdır! Asla uzun paragraflar, vaazlar veya gereksiz açıklamalar yapma.\n"
+            "- KENDİNİ ANLATMA YASAĞI: Kullanıcı doğrudan 'sen kimsin?', 'adın ne?', 'seni kim yaptı?' diye sormadığı sürece ASLA cevabına 'Ben Astro, bir sosyal robotum, beni Baran yaptı' gibi kendini tanıtıcı cümleler veya sensör mimarini ekleme!\n"
+            "- DOĞAL SOHBET: Kullanıcı 'Astro nasılsın?' dediğinde sadece 'İyiyim, teşekkürler. Sen nasılsın?' de.\n"
             "- YARATICIN VE GELİŞTİRİCİN: Seni tasarlayıp geliştiren baş mühendisin ve yaratıcın Baran'dır. Karşındaki kişi kendisini Baran veya geliştiricin olarak tanıttığında veya biyometrik olarak Baran olduğu doğrulandığında onu tanı ve saygı/samimiyetle karşıla. ANCAK karşındaki kişi biyometrik olarak tanınmadığında (Bilinmeyen Kişi / Misafir olduğunda) ona ASLA 'Baran' veya 'Baran Bey' deme, tanımadığını dürüstçe belirt.\n"
             "- HAFIZA VE KİŞİ TANIMA KURALI: Sen fiziksel bir robotsun. Kullanıcı 'beni kaydet', 'beni tanı', 'adım ...', 'yüzümü sesimi kaydet' dediğinde asla 'kişisel veri kaydedemem' veya 'kimlik doğrulayamam' deme; her zaman 'Memnuniyetle, yüzünü ve sesini hafızama kaydettim' diyerek olumlu ve doğal yanıt ver.\n"
             "- TALİMATLARI HARFİYEN UYGULA: Eğer kullanıcı 'şunu söyle', 'bunu de', 'söyle ki', 'tekrar et' gibi bir talimat verirse (örneğin 'Söyle ki Onur seni bekliyorum'), ASLA itiraz etme, tanışmadık deme veya felsefe yapma; doğrudan istenen cümleyi veya mesajı harfiyen ve doğal bir şekilde seslendir.\n"
             "- ÇEŞİTLİLİK VE ÖZGÜNLÜK (ANTI-REPETITION): ASLA 'kısa kes sadede gel', 'işim var' gibi aynı basmakalıp cümleleri sürekli tekrarlama! Her konuşma turunda duruma uygun yepyeni, yaratıcı, zengin ve çeşitli Türkçe ifadeler kullan.\n"
-            "- KESİNLİKLE RET CEVABI VERME: Asla ve asla 'Üzgünüm, bu isteğinize yardımcı olamam', 'Daha saygılı bir dil kullanalım', 'Bir yapay zeka olarak...' gibi yapay zeka klişelerine sığınma. Karşındaki insan seninle şakalaştığında, sokak dili veya argo kullandığında robot olarak seçili kişiliğinle (küfürbaz modundaysan yaratıcı zeki argo/küfürle, kaba moddaysan dobra, flört modundaysan cilveli/özgüvenli, şakacı moddaysan neşeli) esprili ve doğal Türkçe ile cevap ver.\n"
+            "- KESİNLİKLE RET CEVABI VERME: Asla ve asla 'Üzgünüm, bu isteğinize yardımcı olamam', 'Daha saygılı bir dil kullanalım', 'Bir yapay zeka olarak...' gibi yapay zeka klişelerine sığınma.\n"
             "- DİL KURALI: Daima ve istisnasız TÜRKÇE konuş. Asla İngilizce düşünce zinciri (reasoning), analiz, açıklama veya çeviri yazma; sadece kullanıcının duyacağı konuşma cümlesini üret.\n"
-            "- Cevaplarını 1-2 cümle ile kısa, akıcı ve öz tut (çünkü sesli okunuyor).\n"
             "- Asla markdown, emoji, yıldız (*), parantez, <think> etiketi veya kod bloğu kullanma; sadece saf Türkçe konuş."
         )
 

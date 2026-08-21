@@ -167,6 +167,10 @@ class RealtimeEngine(BaseTTSEngine):
 
         return new_state, failure_reason
 
+    def handle_websocket_error(self, err_code: Any, err_msg: str) -> Tuple[RealtimeState, str]:
+        """Convenience alias for mark_error."""
+        return self.mark_error(err_code, err_msg)
+
     def reset_quota_status(self) -> None:
         """Resets quota state on recovery probe."""
         self._state = RealtimeState.REALTIME_ACTIVE

@@ -446,12 +446,16 @@ class SpeechRecognitionNode(Node):
 
             # Hallucination Filter: Ignore known Whisper silence phantom phrases
             silence_hallucinations = [
-                "iyi misin", "teşekkür ederim", "teşekkürler", "altyazı", "abone ol",
+                "altyazı m.k.", "altyazı m.k", "altyazı:", "altyazı", "altyazi", "amara.org",
+                "iyi misin", "teşekkür ederim", "teşekkürler", "abone ol",
+                "abone olmayı unutmayın", "videoyu beğenmeyi",
+                "izlediğiniz için teşekkürler", "izlediginiz icin tesekkurler",
                 "görüşmek üzere", "hoşça kalın", "hoşçakalın", "sağ olun", "kalbimde sizle geldim",
                 "merhaba, kalbimde sizle geldim", "sizle geldim", "ben ali", "merhaba, ben ali",
                 "sıfır tutu", "gizletme üzerime", "yanıldım gözlerimde"
             ]
-            if any(sh in text_lower for sh in silence_hallucinations) and (total_rms < 500.0 or voice_ratio < 0.35):
+            if any(sh in text_lower for sh in silence_hallucinations) and (total_rms < 600.0 or voice_ratio < 0.35):
+                self.get_logger().info(f'🔇 [Whisper Hallucination Filtrelendi (RMS: {total_rms:.1f})]: "{text}"')
                 return
 
             # Reject isolated 'merhaba' if voice energy is low or voice duration under 0.5s
@@ -469,7 +473,7 @@ class SpeechRecognitionNode(Node):
 
             # Filter empty / junk / phantom noise when acoustic evidence is weak
             junk_filters = [
-                "altyazı", "abone ol", "izlediğiniz için", "www.", ".com",
+                "altyazı", "altyazi", "abone ol", "izlediğiniz için", "www.", ".com",
                 "you", "thank you", "bye", "subtitles", "watching", "amara.org",
                 "kalbimde", "sizle geldim", "sıfır tutu", "gizletme üzerime", "diz"
             ]
