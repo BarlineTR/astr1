@@ -448,24 +448,41 @@ class LocalXttsEngine(BaseTTSEngine):
                 f"  PID={worker_pid}"
             )
         except XttsError as e:
-            # Check if process was terminated by Linux OOM killer
+            err_text = str(e).lower()
             proc_code = getattr(self.client.proc, "returncode", None) if self.client.proc else None
-            is_oom = (proc_code in (-9, 137, -15)) or self.memory_guard.is_oom_quarantined
-            if is_oom:
+            is_kernel_oom = (proc_code in (-9, 137, -15))
+            is_cuda_alloc_fail = "cuda_allocation_failure" in err_text or any(k in err_text for k in ("cudasynchronize", "cudacachingallocator", "nvmapmemalloc", "error 12", "nvml_success"))
+
+            if is_kernel_oom:
                 self.memory_guard.record_oom_kill(pid=getattr(self.client.proc, "pid", None), details=str(e))
                 with self._state_lock:
-                    # Gerçek OOM ölümü kalıcı karantinadır — süre dolumu yok.
                     self._degraded_until = time.monotonic() + _PERMANENT_S
                     self._state = "DEGRADED"
                 self._last_telemetry["state"] = "DEGRADED"
                 self._last_telemetry["ready"] = False
                 self._last_telemetry["error"] = f"oom_killed (exit_code={proc_code})"
+                self._last_telemetry["fallback_reason"] = "OOM_KERNEL_KILL"
                 self._safe_log(
                     "error",
                     f"🚨 [XTTS OOM KILL DETECTED]: Worker process terminated by Linux OOM Killer (exit_code={proc_code})!\n"
                     f"⛔ [XTTS Retry Storm Prevented]: XTTS permanently set to DEGRADED for this session.\n"
                     f"🛡️ [Critical Path Shielded]: Realtime audio, STT, LLM, and local offline TTS remain fully functional."
                 )
+            elif is_cuda_alloc_fail:
+                with self._state_lock:
+                    self._degraded_until = time.monotonic() + self._cooldown_duration
+                    self._state = "DEGRADED"
+                self._last_telemetry["state"] = "DEGRADED"
+                self._last_telemetry["ready"] = False
+                self._last_telemetry["error"] = f"cuda_allocation_failure: {e}"
+                self._last_telemetry["fallback_reason"] = "CUDA_ALLOCATION_FAILURE"
+                self._safe_log(
+                    "error",
+                    f"🚨 [XTTS CUDA ALLOCATION FAILURE DETECTED]: PyTorch CUDA Allocator / NvMap allocation error: {e}\n"
+                    f"⚠️ [Emergency Fallback Triggered]: Transitioning to DEGRADED mode for {self._cooldown_duration:.0f}s. Emergency TTS activated instantly."
+                )
+                with self._state_lock:
+                    self._arm_supervisor(self._cooldown_duration + 1.0)
             else:
                 with self._state_lock:
                     self._state = "CRASHED"
@@ -473,6 +490,7 @@ class LocalXttsEngine(BaseTTSEngine):
                 self._last_telemetry["ready"] = False
                 self._last_telemetry["state"] = "CRASHED"
                 self._last_telemetry["error"] = str(e)
+                self._last_telemetry["fallback_reason"] = "UNKNOWN"
                 self._safe_log("error", f"❌ [LocalXttsEngine] XTTS başlatılamadı (CRASHED -> COOLDOWN {self._cooldown_duration:.0f}s): {e}")
                 with self._state_lock:
                     self._state = "COOLDOWN"

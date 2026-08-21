@@ -283,9 +283,25 @@ def main() -> int:
             if os.path.exists(cand_spk):
                 speakers_path = cand_spk
 
+        # Environment & CUDA Diagnostics Logging
+        cvd = os.getenv("CUDA_VISIBLE_DEVICES")
+        cvd_str = "<unset>" if cvd is None or cvd == "" else cvd
+        sys.stderr.write(
+            f"📌 [XTTS CUDA ENV]\n"
+            f"  CUDA_VISIBLE_DEVICES={cvd_str}\n"
+            f"  torch_version={torch.__version__}\n"
+            f"  torch_cuda_version={getattr(torch.version, 'cuda', 'none')}\n"
+            f"  torch_file={torch.__file__}\n"
+            f"  python_executable={sys.executable}\n"
+            f"  LD_LIBRARY_PATH={os.getenv('LD_LIBRARY_PATH', '<unset>')}\n"
+        )
+        sys.stderr.flush()
+
         config = XttsConfig()
         config.load_json(cfg_path)
         model = Xtts.init_from_config(config)
+
+        capture_memory_snapshot("before_checkpoint_load")
         model.load_checkpoint(
             config,
             checkpoint_path=args.checkpoint,
@@ -294,7 +310,43 @@ def main() -> int:
             eval=True,
             use_deepspeed=False,
         )
-        model.to(device)
+        capture_memory_snapshot("after_checkpoint_load_cpu")
+
+        sample_rate = model.config.audio.output_sample_rate
+
+        # FP16 Half Precision on CPU BEFORE CUDA transfer to minimize peak VRAM allocation
+        half = args.half not in ("0", "false", "False", "") and device == "cuda"
+        if half:
+            capture_memory_snapshot("before_half_conversion")
+            model.use_half_precision()
+            import gc
+            gc.collect()
+            capture_memory_snapshot("after_half_conversion")
+
+        model.eval()
+
+        capture_memory_snapshot("before_cuda_transfer")
+        if device == "cuda":
+            torch.cuda.empty_cache()
+            try:
+                model.to(device)
+            except Exception as cuda_exc:
+                tb_cuda = traceback.format_exc()
+                err_msg = f"CUDA transfer failed (model.to('cuda')): {cuda_exc}"
+                sys.stderr.write(f"❌ [XTTS Worker CUDA Allocation Error]:\n{tb_cuda}\n")
+                sys.stderr.flush()
+                emit({
+                    "event": "error",
+                    "stage": "model_cuda_transfer",
+                    "failure_reason": "CUDA_ALLOCATION_FAILURE",
+                    "message": err_msg,
+                    "diagnostics": diag,
+                    "traceback": tb_cuda,
+                })
+                return 1
+
+        capture_memory_snapshot("after_cuda_transfer")
+
         model_label = "xtts_finetuned"
         is_finetuned = True
         checkpoint_sha = compute_file_sha256(args.checkpoint)
@@ -302,18 +354,7 @@ def main() -> int:
         args.vocab = vocab_path
         args.speakers = speakers_path
 
-        sample_rate = model.config.audio.output_sample_rate
-
-        # FP16 Half Precision
-        half = args.half not in ("0", "false", "False", "") and device == "cuda"
-        if half:
-            model.use_half_precision()
-
-        model.eval()
-        if device == "cuda":
-            torch.cuda.empty_cache()
-
-        diag["memory_snapshot_model_loaded"] = capture_memory_snapshot("model_loaded")
+        capture_memory_snapshot("after_model_ready")
 
         # 4. Extract and Cache Speaker Conditioning Latents
         def get_or_extract_latents(spk_path: str):

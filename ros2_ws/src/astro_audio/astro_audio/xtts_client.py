@@ -282,10 +282,21 @@ class XttsClient:
             env["PATH"] = f"{self.python_path.parent}{os.pathsep}{env.get('PATH', '')}"
             env["VIRTUAL_ENV"] = str(self.python_path.parent.parent)
 
-            # Preserve CUDA and Torch library locations
-            cuda_lib = "/usr/local/cuda/lib64"
-            if os.path.exists(cuda_lib):
-                env["LD_LIBRARY_PATH"] = cuda_lib + (os.pathsep + env.get("LD_LIBRARY_PATH", "") if env.get("LD_LIBRARY_PATH") else "")
+            # Sanitize CUDA_VISIBLE_DEVICES (remove empty or 'all' to ensure native Jetson Orin device discovery)
+            cvd = os.getenv("CUDA_VISIBLE_DEVICES")
+            if cvd is None or cvd.strip().lower() in ("", "all", "none"):
+                env.pop("CUDA_VISIBLE_DEVICES", None)
+            else:
+                env["CUDA_VISIBLE_DEVICES"] = cvd.strip()
+
+            self._safe_log(
+                "info",
+                f"📌 [XTTS CUDA ENV]\n"
+                f"  CUDA_VISIBLE_DEVICES={env.get('CUDA_VISIBLE_DEVICES', '<unset>')}\n"
+                f"  python_executable={self.python_path}\n"
+                f"  worker_path={self.worker_path}\n"
+                f"  speaker_wav={self.speaker_wav}"
+            )
 
             # STAGE 1: Log Pre-Start Hardware & Memory Snapshot
             try:
