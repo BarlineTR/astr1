@@ -135,6 +135,10 @@ class TestConversationalHardening(unittest.TestCase):
         )
 
         with patch("socket.create_connection", side_effect=OSError("Network unreachable")):
+            # check_network 5 sn önbellekli ve kurucu ağı zaten "açık" işaretledi;
+            # önbellek sıfırlanmazsa mock hiç devreye girmez ve test yalnızca
+            # internetsiz makinede geçerdi.
+            edge._last_network_check_ts = 0.0
             res = router.synthesize("Merhaba dostum!", generation_id=101)
             self.assertEqual(res.actual_provider, "local_offline_tts")
             self.assertTrue(len(res.pcm) > 0)

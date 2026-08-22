@@ -61,10 +61,10 @@ class EdgeTTSEngine:
 
         self._last_network_check_ts = now
         try:
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.settimeout(timeout_s)
-            # Fast DNS probe to Google/Cloudflare DNS
-            sock.connect(("8.8.8.8", 53))
+            # socket.create_connection: idiomatik yol; ayrıca testlerin mock'ladığı
+            # API bu (eskiden socket.socket().connect() kullanılıyordu ve
+            # test_edge_tts_to_local_offline'ın ağ mock'u hiç devreye girmiyordu).
+            sock = socket.create_connection(("8.8.8.8", 53), timeout=timeout_s)
             sock.close()
             self._last_network_ok = True
             return True
@@ -115,46 +115,25 @@ class EdgeTTSEngine:
         )
 
         t_start = time.perf_counter()
+
+        # ── 1) MP3 sentezi (asyncio) ─────────────────────────────────────────
+        # Event loop try/finally ile kapatılmalı: eskiden loop.close() yalnızca
+        # başarı yolundaydı, her timeout/hata bir epoll fd + self-pipe sızdırıyordu
+        # ve uzun çalıştırmalar "EMFILE: too many open files" ile bitiyordu.
+        loop = asyncio.new_event_loop()
+
+        async def _run_edge_tts():
+            communicate = edge_tts.Communicate(clean_text, v, rate=r)
+            buf = bytearray()
+            async for chunk in communicate.stream():
+                if chunk["type"] == "audio":
+                    buf.extend(chunk["data"])
+            return bytes(buf)
+
         try:
-            loop = asyncio.new_event_loop()
-
-            async def _run_edge_tts():
-                communicate = edge_tts.Communicate(clean_text, v, rate=r)
-                buf = bytearray()
-                async for chunk in communicate.stream():
-                    if chunk["type"] == "audio":
-                        buf.extend(chunk["data"])
-                return bytes(buf)
-
             mp3_bytes = loop.run_until_complete(
                 asyncio.wait_for(_run_edge_tts(), timeout=t_limit)
             )
-            loop.close()
-
-            if not mp3_bytes:
-                self._safe_log("warn", f"⚠️ [Edge-TTS SYNTHESIS FAILED] generation_id={generation_id} reason=empty_audio")
-                return None
-
-            # Convert MP3 to 24000Hz 16-bit mono raw PCM via ffmpeg
-            ff_proc = subprocess.Popen(
-                ["ffmpeg", "-i", "pipe:0", "-f", "s16le", "-acodec", "pcm_s16le", "-ac", "1", "-ar", "24000", "pipe:1"],
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL,
-            )
-            pcm_bytes, _ = ff_proc.communicate(input=mp3_bytes, timeout=4.0)
-
-            tot_ms = (time.perf_counter() - t_start) * 1000.0
-            if pcm_bytes and len(pcm_bytes) > 100:
-                self._safe_log(
-                    "info",
-                    f"✅ [Edge-TTS SYNTHESIS SUCCESS] generation_id={generation_id} audio_bytes={len(pcm_bytes)} ttfa_ms={tot_ms:.1f} total_ms={tot_ms:.1f}"
-                )
-                return pcm_bytes
-            else:
-                self._safe_log("warn", f"⚠️ [Edge-TTS SYNTHESIS FAILED] generation_id={generation_id} reason=ffmpeg_conversion_failed")
-                return None
-
         except asyncio.TimeoutError:
             tot_ms = (time.perf_counter() - t_start) * 1000.0
             self._safe_log(
@@ -169,3 +148,64 @@ class EdgeTTSEngine:
                 f"❌ [Edge-TTS SYNTHESIS FAILED] generation_id={generation_id} reason=exception exception={exc} duration_ms={tot_ms:.1f}"
             )
             return None
+        finally:
+            # communicate.stream() bir async generator; timeout'ta iptal edilir,
+            # kapatmadan önce düzgünce sonlandırılmalı.
+            try:
+                loop.run_until_complete(loop.shutdown_asyncgens())
+            except Exception as _exc:
+                self._safe_log("debug", f"synthesize_sentence: yok sayılan hata ({_exc})")
+            loop.close()
+
+        if not mp3_bytes:
+            self._safe_log("warn", f"⚠️ [Edge-TTS SYNTHESIS FAILED] generation_id={generation_id} reason=empty_audio")
+            return None
+
+        # ── 2) MP3 -> 24kHz 16-bit mono ham PCM (ffmpeg) ─────────────────────
+        try:
+            ff_proc = subprocess.Popen(
+                ["ffmpeg", "-i", "pipe:0", "-f", "s16le", "-acodec", "pcm_s16le", "-ac", "1", "-ar", "24000", "pipe:1"],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+            )
+        except Exception as exc:
+            self._safe_log(
+                "warn",
+                f"❌ [Edge-TTS SYNTHESIS FAILED] generation_id={generation_id} reason=ffmpeg_spawn_failed exception={exc}"
+            )
+            return None
+
+        try:
+            pcm_bytes, _ = ff_proc.communicate(input=mp3_bytes, timeout=4.0)
+        except subprocess.TimeoutExpired:
+            # communicate() zaman aşımında alt süreci ÖLDÜRMEZ; elle temizlenmeli,
+            # aksi hâlde her hatada arkada bir ffmpeg süreci kalıyordu.
+            ff_proc.kill()
+            ff_proc.communicate()
+            tot_ms = (time.perf_counter() - t_start) * 1000.0
+            self._safe_log(
+                "warn",
+                f"⏳ [Edge-TTS SYNTHESIS FAILED] generation_id={generation_id} reason=ffmpeg_timeout duration_ms={tot_ms:.1f}"
+            )
+            return None
+        except Exception as exc:
+            ff_proc.kill()
+            ff_proc.communicate()
+            tot_ms = (time.perf_counter() - t_start) * 1000.0
+            self._safe_log(
+                "warn",
+                f"❌ [Edge-TTS SYNTHESIS FAILED] generation_id={generation_id} reason=exception exception={exc} duration_ms={tot_ms:.1f}"
+            )
+            return None
+
+        tot_ms = (time.perf_counter() - t_start) * 1000.0
+        if pcm_bytes and len(pcm_bytes) > 100:
+            self._safe_log(
+                "info",
+                f"✅ [Edge-TTS SYNTHESIS SUCCESS] generation_id={generation_id} audio_bytes={len(pcm_bytes)} ttfa_ms={tot_ms:.1f} total_ms={tot_ms:.1f}"
+            )
+            return pcm_bytes
+
+        self._safe_log("warn", f"⚠️ [Edge-TTS SYNTHESIS FAILED] generation_id={generation_id} reason=ffmpeg_conversion_failed")
+        return None
