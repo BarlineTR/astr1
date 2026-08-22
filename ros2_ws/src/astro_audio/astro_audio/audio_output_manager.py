@@ -113,6 +113,26 @@ def find_sounddevice_output_index(preferred: str = "") -> Tuple[Optional[int], s
             if any(h in name.lower() for h in RESPEAKER_NAME_HINTS):
                 return i, name
 
+        # ReSpeaker yoksa ALSA'nın plug/köprü cihazını seç, ham hw: cihazını DEĞİL.
+        #
+        # Eskiden burada devs[0] dönülüyordu; bu makinede o
+        # "HDA Intel PCH: ALC294 Analog (hw:0,0)". Ham hw: cihazı ALSA'nın plug
+        # katmanını atlar ve yalnızca donanımın kendi hızlarını kabul eder;
+        # ALC294 44100/48000 destekliyor, çıkış akışı ise 16000 istiyor:
+        #   Error opening RawOutputStream: Invalid sample rate [PaErrorCode -9997]
+        # Sonuç: ses hiç çıkmıyordu.
+        #
+        # Bir plug cihazı seçmek aynı zamanda resolve_output_backend'i "aplay"a
+        # yönlendirir — bu ISTENEN davranıştır: yukarıdaki PULSE_BRIDGE_NAMES
+        # notunda yazdığı gibi, başka bir süreç yakalama akışı tutarken
+        # PortAudio'nun Pulse köprüsü Pa_WriteStream içinde kilitleniyor.
+        # aplay hem plug katmanını kullanır (16 kHz sorunsuz) hem de o kilidi
+        # tamamen atlar. Mikrofon açıkken tam olarak bu durumdayız.
+        for i, name, _ in devs:
+            low = name.strip().lower()
+            if any(low == n or low.startswith(n) for n in PULSE_BRIDGE_NAMES):
+                return i, name
+
         return devs[0][0], devs[0][1]
     except Exception as e:
         return None, str(e)
@@ -332,7 +352,18 @@ class AudioOutputManager:
             self._output_stream = stream
             return stream
         except Exception as e:
-            self._log("warn", f"⚠️ [AudioOutputManager] Sounddevice OutputStream başlatılamadı: {e}. ALSA aplay fallback kullanılacak.")
+            # backend'i GERÇEKTEN değiştir. Eskiden yalnızca bu satır loglanıyor
+            # ama self.backend "sounddevice" kalıyordu; begin_realtime_stream de
+            # aplay alt sürecini yalnızca backend=="aplay" iken başlattığı için
+            # hiçbir yol ses üretmiyordu — günlükte söz verilen yedek hiç devreye
+            # girmiyordu.
+            if self.has_aplay:
+                self.backend = "aplay"
+                self._log("warn", f"⚠️ [AudioOutputManager] Sounddevice OutputStream başlatılamadı: {e}. "
+                                  f"Arka uç aplay'e ÇEVRİLDİ (cihaz: {self.alsa_device}).")
+            else:
+                self._log("error", f"❌ [AudioOutputManager] Sounddevice OutputStream başlatılamadı: {e} "
+                                   f"ve aplay da yok — ses çıkışı YOK.")
             return None
 
     def begin_realtime_stream(self, generation_id: int, sample_rate: int = 24000) -> bool:

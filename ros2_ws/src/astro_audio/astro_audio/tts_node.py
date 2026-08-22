@@ -297,10 +297,19 @@ class TtsNode(Node):
             raw_str = msg.data.strip()
             if not raw_str:
                 return
-            if raw_str.startswith("{") and "pcm" in raw_str:
+            # SESİN GELMEME SEBEBİ BURASIYDI. Yayıncı
+            # (astro_realtime_node._play_pcm_chunks) base64 sesi "data"
+            # anahtarıyla gönderiyor, burada ise "pcm" aranıyordu:
+            #   - `"pcm" in raw_str` gövdede hiç geçmediği için False oluyor,
+            #   - akış else dalına düşüp TÜM JSON metnini base64 sanıyor,
+            #   - çözme patlıyor ve hata `except ... debug` içinde yutuluyordu.
+            # Sessiz, izsiz ve tam bir ses kaybı. audio_stream_node'un aynı
+            # topic'i okuyan eşdeğeri zaten "data" kullanıyor.
+            # Artık JSON ise ikisi de kabul ediliyor, substring tahmini yok.
+            if raw_str.startswith("{"):
                 data = json.loads(raw_str)
                 gen_id = data.get("generation_id", self.output_manager.current_generation)
-                pcm_bytes = base64.b64decode(data.get("pcm", ""))
+                pcm_bytes = base64.b64decode(data.get("data") or data.get("pcm") or "")
             else:
                 gen_id = self.output_manager.current_generation
                 pcm_bytes = base64.b64decode(raw_str)

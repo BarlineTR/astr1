@@ -195,6 +195,11 @@ class AudioStreamNode(Node):
         self._playback_worker_error = "none"
         self._callback_exception_count = 0
         self._last_input_callback_time = time.monotonic()
+        # tts_node'dan en son çalma parçasının geldiği an (bkz. _on_output_pcm).
+        self._last_output_chunk_time = 0.0
+        # Son parçanın köken zarfı (generation_id, sağlayıcı, model, kaynak).
+        # Kuyruk yerine tek kayıt: birikmiyor ama telemetri/izlenebilirlik duruyor.
+        self._last_output_envelope: Optional[dict] = None
         self._last_cb_err_log_time = 0.0
 
         # Streams & Worker States
@@ -314,7 +319,7 @@ class AudioStreamNode(Node):
             is_active_playback = (
                 self._is_playing
                 or (now - self._last_playback_time < self.echo_mute_cooldown_s)
-                or not self._play_queue.empty()
+                or (now - self._last_output_chunk_time < self.echo_mute_cooldown_s)
             )
 
             if not is_active_playback and rms < 400.0:
@@ -393,7 +398,17 @@ class AudioStreamNode(Node):
                     "tts_source": payload.get("tts_source", "realtime_openai"),
                     "playback_source": payload.get("playback_source", payload.get("tts_source", "realtime_openai")),
                 }
-                self._play_queue.put_nowait(item)
+                # KUYRUĞA KONMUYOR. 7e25270 çalma sahipliğini tts_node'a
+                # taşırken bu düğümdeki çalma iş parçacığını kaldırdı ama
+                # abonelik ve kuyruğa doldurma kaldı: kuyruğu artık kimse
+                # boşaltmıyordu. Sonuç, /audio/playback_active'in
+                # `not _play_queue.empty()` üzerinden SONSUZA KADAR True
+                # kalmasıydı — astro_realtime_node bu bayrağa bakıp dinlemeyi
+                # atladığı için robot ilk cevaptan sonra sağır kalıyordu.
+                # Sesin gerçekten çalınıp çalınmadığını artık son parçanın
+                # ne zaman geldiğine bakarak anlıyoruz.
+                self._last_output_chunk_time = time.monotonic()
+                self._last_output_envelope = item
                 self._total_enqueued_bytes += len(raw_16k)
         except (queue.Full, Exception) as e:
             self.get_logger().debug(f"PCM enqueue notice: {e}")
@@ -548,7 +563,10 @@ class AudioStreamNode(Node):
 
     def _publish_status(self):
         msg = Bool()
-        msg.data = bool(self._is_playing or not self._play_queue.empty())
+        msg.data = bool(
+            self._is_playing
+            or (time.monotonic() - self._last_output_chunk_time) < self.echo_mute_cooldown_s
+        )
         self.pub_playback_active.publish(msg)
 
     def destroy_node(self):

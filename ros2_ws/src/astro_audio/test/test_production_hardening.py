@@ -949,8 +949,11 @@ class TestSTTValidationAndEchoImmunity(unittest.TestCase):
         with patch("astro_audio.audio_stream_node.resample_24k_to_16k", return_value=raw_pcm):
             node._on_output_pcm(msg)
 
-        self.assertFalse(node._play_queue.empty())
-        item = node._play_queue.get_nowait()
+        # Kuyruk yerine son-zarf kaydı: çalma sahibi tts_node olduğu için
+        # bu düğüm artık kuyruk doldurmuyor (doldurunca kimse boşaltmadığından
+        # /audio/playback_active sonsuza kadar True kalıyordu).
+        item = node._last_output_envelope
+        self.assertIsNotNone(item)
         self.assertIsInstance(item, dict)
         self.assertEqual(item["generation_id"], 42)
         self.assertEqual(item["tts_provider"], "xtts_gpu")
