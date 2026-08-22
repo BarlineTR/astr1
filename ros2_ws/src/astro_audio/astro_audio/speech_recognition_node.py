@@ -16,6 +16,10 @@ Features:
 """
 
 import os
+import logging
+
+_LOG = logging.getLogger(__name__)
+
 import time
 import io
 import wave
@@ -62,8 +66,6 @@ def _load_env():
         os.path.abspath(os.path.join(os.getcwd(), ".env.production")),
         os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..", "..", ".env")),
         os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..", "..", ".env.production")),
-        os.path.expanduser("~/Desktop/astr1/.env"),
-        os.path.expanduser("~/Desktop/astr1/.env.production"),
         os.path.expanduser("~/.env")
     ]
     for c in candidates:
@@ -75,8 +77,8 @@ def _load_env():
         if env_path:
             load_dotenv(dotenv_path=env_path, override=True)
             return env_path
-    except Exception:
-        pass
+    except Exception as _exc:
+        _LOG.debug("_load_env: yok sayılan hata (%s)", _exc)
     return None
 
 
@@ -106,8 +108,8 @@ def estimate_pitch_and_gender(audio_arr: np.ndarray, sample_rate: int = 16000) -
                     return float(pitch_hz), "female"
                 elif pitch_hz >= 75.0:
                     return float(pitch_hz), "male"
-    except Exception:
-        pass
+    except Exception as _exc:
+        _LOG.debug("estimate_pitch_and_gender: yok sayılan hata (%s)", _exc)
     return 0.0, "unknown"
 
 
@@ -213,7 +215,16 @@ class SpeechRecognitionNode(Node):
         # Timer (0.05s resolution)
         self.create_timer(0.05, self._silence_tick)
 
-        self.get_logger().info("✅ [STT] Groq Whisper-large-v3 + Self-Echo Immunity + Bağlam Duyarlı Filtre Hazır.")
+        # Banner GERÇEK durumu yansıtmalı: eskiden motor ne olursa olsun sabit
+        # "Groq Whisper-large-v3 ... Hazır" basıyordu ve hata ayıklarken yanıltıyordu.
+        engines = []
+        if self.openai_client: engines.append("openai/whisper-1")
+        if self.groq_client: engines.append("groq/whisper-large-v3")
+        if self.fw_model: engines.append(f"yerel/faster-whisper({getattr(self, '_fw_model_name', '?')}/{getattr(self, '_fw_device', '?')})")
+        self.get_logger().info(
+            f"✅ [STT] Hazır | zincir: {' -> '.join(engines) if engines else 'YOK'} "
+            f"| STT_ENGINE={self.stt_engine} | Self-Echo Immunity + Bağlam Duyarlı Filtre aktif"
+        )
 
     def _session_active_cb(self, msg: Bool):
         self._session_active = msg.data
@@ -531,8 +542,8 @@ def main(args=None):
     node = SpeechRecognitionNode()
     try:
         rclpy.spin(node)
-    except KeyboardInterrupt:
-        pass
+    except KeyboardInterrupt as _exc:
+        _LOG.debug("main: yok sayılan hata (%s)", _exc)
     finally:
         node.destroy_node()
         if rclpy.ok():
