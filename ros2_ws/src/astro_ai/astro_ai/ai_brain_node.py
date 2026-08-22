@@ -10,6 +10,10 @@ Coordinates:
 """
 
 import base64
+import logging
+
+_LOG = logging.getLogger(__name__)
+
 import json
 import os
 import re
@@ -23,7 +27,9 @@ import cv2
 import numpy as np
 
 import rclpy
+from rclpy.callback_groups import MutuallyExclusiveCallbackGroup, ReentrantCallbackGroup
 from rclpy.node import Node
+from rclpy.qos import qos_profile_sensor_data
 from sensor_msgs.msg import Image
 from std_msgs.msg import Bool, Float32, String
 
@@ -119,8 +125,6 @@ def _load_env():
         os.path.abspath(os.path.join(os.getcwd(), ".env.production")),
         os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..", "..", ".env")),
         os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..", "..", ".env.production")),
-        os.path.expanduser("~/Desktop/astr1/.env"),
-        os.path.expanduser("~/Desktop/astr1/.env.production"),
         os.path.expanduser("~/.env")
     ]
     for c in candidates:
@@ -132,8 +136,8 @@ def _load_env():
         if env_path:
             load_dotenv(dotenv_path=env_path, override=True)
             return env_path
-    except Exception:
-        pass
+    except Exception as _exc:
+        _LOG.debug("_load_env: yok sayılan hata (%s)", _exc)
     return None
 
 
@@ -147,8 +151,8 @@ def imgmsg_to_bgr(msg: Image) -> np.ndarray | None:
         elif msg.encoding in ("mono8", "8UC1"):
             data = np.frombuffer(msg.data, dtype=np.uint8).reshape(msg.height, msg.width)
             return cv2.cvtColor(data, cv2.COLOR_GRAY2BGR) if cv2 else np.stack([data]*3, axis=-1)
-    except Exception:
-        pass
+    except Exception as _exc:
+        _LOG.debug("imgmsg_to_bgr: yok sayılan hata (%s)", _exc)
     return None
 
 
@@ -237,6 +241,19 @@ class AiBrainNode(Node):
         self.audio_resources = get_local_audio_resources() if get_local_audio_resources else None
 
         # 1. Groq Client (Primary Ultra-Fast Free LPU Engine - Zero OpenAI Cost)
+        # ── Sağlayıcı seçimi (LLM_PROVIDER) ──────────────────────────────
+        # Yerleşik zincir sırası: groq -> gemini -> openai.
+        # LLM_PROVIDER="openai" gibi bir değer verilirse o sağlayıcıdan ÖNCE
+        # gelenler tamamen atlanır; sonrakiler yedek olarak kalır.
+        # LLM_FALLBACK_ENABLED="false" ile yalnızca seçilen sağlayıcı denenir.
+        # (Eskiden LLM_PROVIDER .env.example'da belgeliydi ama kodda hiç okunmuyordu.)
+        self._provider_chain = ("groq", "gemini", "openai")
+        self._primary_provider = os.environ.get("LLM_PROVIDER", "").strip().strip("\"'").lower()
+        if self._primary_provider not in self._provider_chain:
+            self._primary_provider = ""
+        self._llm_fallback_enabled = os.environ.get(
+            "LLM_FALLBACK_ENABLED", "true").strip().strip("\"'").lower() not in ("false", "0", "no")
+
         self.groq_api_key = os.environ.get("GROQ_API_KEY", "").strip()
         self._groq = None
         self._active_groq_models = []
@@ -314,24 +331,51 @@ class AiBrainNode(Node):
         self.pub_look_target = self.create_publisher(Float32, "/robot/look_target", 10)
         self.pub_session_active = self.create_publisher(Bool, "/ai/session_active", 10)
 
+        # ── Callback grupları ────────────────────────────────────────────
+        # rclpy'de grup belirtilmezse HER abonelik ve timer düğümün tek varsayılan
+        # MutuallyExclusiveCallbackGroup'una girer; o zaman tek bir yavaş/bloke
+        # callback bütün düğümü (tüm sensörler + tüm timer'lar) dondurur.
+        # Üç gruba ayırıyoruz ki biri tıkansa diğerleri çalışmaya devam etsin:
+        #   • konuşma  — turlar kendi aralarında sıralı kalmalı (yarış olmasın)
+        #   • timer    — oturum yaşam döngüsü ve hatırlatıcılar hiç durmamalı
+        #   • algı     — küçük, kilit korumalı durum güncellemeleri; paralel olabilir
+        self._cbg_speech = MutuallyExclusiveCallbackGroup()
+        self._cbg_timers = MutuallyExclusiveCallbackGroup()
+        self._cbg_perception = ReentrantCallbackGroup()
+
         # ROS 2 Subscribers
-        self.create_subscription(String, "/speech/text", self._on_speech, 10)
-        self.create_subscription(String, "/audio/speaker_gender", self._on_speaker_gender, 10)
-        self.create_subscription(String, "/audio/speaker_id", self._on_speaker_id, 10)
-        self.create_subscription(Bool, "/tts/speaking", self._on_tts_speaking, 10)
-        self.create_subscription(Bool, "/tts/interrupt", self._on_tts_interrupt, 10)
-        self.create_subscription(Bool, "/vision/person_detected", self._on_person_detected, 10)
-        self.create_subscription(Bool, "/vision/looking_at_robot", self._on_looking_at_robot, 10)
-        self.create_subscription(String, "/vision/recognized_person", self._on_recognized_person, 10)
-        self.create_subscription(Float32, "/vision/user_distance", self._on_user_distance, 10)
-        self.create_subscription(String, "/vision/user_emotion", self._on_user_emotion, 10)
-        self.create_subscription(Float32, "/audio/doa", self._on_doa, 10)
-        self.create_subscription(Image, "/oak/rgb/image_raw", self._on_camera_image, 10)
+        self.create_subscription(String, "/speech/text", self._on_speech, 10,
+                                 callback_group=self._cbg_speech)
+        self.create_subscription(String, "/audio/speaker_gender", self._on_speaker_gender, 10,
+                                 callback_group=self._cbg_perception)
+        self.create_subscription(String, "/audio/speaker_id", self._on_speaker_id, 10,
+                                 callback_group=self._cbg_perception)
+        self.create_subscription(Bool, "/tts/speaking", self._on_tts_speaking, 10,
+                                 callback_group=self._cbg_perception)
+        self.create_subscription(Bool, "/tts/interrupt", self._on_tts_interrupt, 10,
+                                 callback_group=self._cbg_perception)
+        self.create_subscription(Bool, "/vision/person_detected", self._on_person_detected, 10,
+                                 callback_group=self._cbg_perception)
+        self.create_subscription(Bool, "/vision/looking_at_robot", self._on_looking_at_robot, 10,
+                                 callback_group=self._cbg_perception)
+        self.create_subscription(String, "/vision/recognized_person", self._on_recognized_person, 10,
+                                 callback_group=self._cbg_perception)
+        self.create_subscription(Float32, "/vision/user_distance", self._on_user_distance, 10,
+                                 callback_group=self._cbg_perception)
+        self.create_subscription(String, "/vision/user_emotion", self._on_user_emotion, 10,
+                                 callback_group=self._cbg_perception)
+        self.create_subscription(Float32, "/audio/doa", self._on_doa, 10,
+                                 callback_group=self._cbg_perception)
+        # Görüntü akışları sensör QoS'u (BEST_EFFORT) kullanır: kare kaybı, geciken
+        # kareler için retransmission yapmaktan iyidir. BEST_EFFORT abone RELIABLE
+        # yayıncıdan da veri alabilir, bu yüzden depthai_ros_driver ile uyumludur.
+        self.create_subscription(Image, "/oak/rgb/image_raw", self._on_camera_image, qos_profile_sensor_data,
+                                 callback_group=self._cbg_perception)
 
         # Timers
-        self.create_timer(0.15, self._check_proactive_gaze)
-        self.create_timer(1.0, self._check_session_lifecycle)
-        self.create_timer(1.0, self._check_reminders)
+        self.create_timer(0.15, self._check_proactive_gaze, callback_group=self._cbg_timers)
+        self.create_timer(1.0, self._check_session_lifecycle, callback_group=self._cbg_timers)
+        self.create_timer(1.0, self._check_reminders, callback_group=self._cbg_timers)
 
         # Idle Learning (Powered 100% by Groq/Gemini, 0 OpenAI token cost)
         if self._enable_idle_learning:
@@ -352,16 +396,16 @@ class AiBrainNode(Node):
             if out_mgr:
                 out_mgr.play_pcm_chunk(ack_pcm, sample_rate=16000, generation_id=generation_id, provenance={"source": "thinking_ack_local", "tts_provider": "local_pcm", "playback_source": "hardware_dac"})
                 return
-        except Exception:
-            pass
+        except Exception as _exc:
+            self.get_logger().debug(f"_play_local_ack: yok sayılan hata ({_exc})")
         try:
             import subprocess
             proc = subprocess.Popen(["aplay", "-q", "-r", "16000", "-f", "S16_LE", "-c", "1"], stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             if proc.stdin:
                 proc.stdin.write(ack_pcm)
                 proc.stdin.close()
-        except Exception:
-            pass
+        except Exception as _exc:
+            self.get_logger().debug(f"_play_local_ack: yok sayılan hata ({_exc})")
 
     def _discover_active_groq_models(self) -> List[str]:
         """Dynamically queries active chat models from Groq, prioritizing top conversational models and excluding reasoning models."""
@@ -393,9 +437,31 @@ class AiBrainNode(Node):
             for cand in available:
                 if any(v_kw in cand.lower() for v_kw in ["vision", "scout", "vl"]):
                     return cand
-        except Exception:
-            pass
+        except Exception as _exc:
+            self.get_logger().debug(f"_discover_vision_model: yok sayılan hata ({_exc})")
         return None
+
+    def _route_reason(self, name: str) -> str:
+        """Log etiketi gerçeği söylesin: 'tertiary_fallback' sabitti ve OpenAI
+        birincil sağlayıcı olarak yapılandırıldığında bile öyle yazıyordu."""
+        if self._primary_provider:
+            return "configured_primary" if name == self._primary_provider else "configured_fallback"
+        idx = self._provider_chain.index(name)
+        return ("primary", "secondary_fallback", "tertiary_fallback")[idx]
+
+    def _provider_enabled(self, name: str) -> bool:
+        """LLM_PROVIDER / LLM_FALLBACK_ENABLED ayarlarına göre sağlayıcı denensin mi?"""
+        if not self._primary_provider:
+            return True                      # ayar yok -> yerleşik zincirin tamamı
+        if name == self._primary_provider:
+            return True
+        if not self._llm_fallback_enabled:
+            return False                     # katı mod: yalnızca seçilen sağlayıcı
+        # Yedeklere yalnızca seçilenden SONRA gelenler dahil
+        try:
+            return self._provider_chain.index(name) > self._provider_chain.index(self._primary_provider)
+        except ValueError:
+            return False
 
     def _on_session_timed_out(self):
         self.state_machine.transition_to(RobotState.IDLE)
@@ -545,8 +611,8 @@ class AiBrainNode(Node):
                             self.get_logger().info(f"👤 [Proaktif Yüz Karşılama] ({p_name}): \"{proactive_greeting}\"")
                             self._publish_gesture("nod")
                             self._publish_tts(proactive_greeting)
-        except Exception:
-            pass
+        except Exception as _exc:
+            self.get_logger().debug(f"_on_recognized_person: yok sayılan hata ({_exc})")
 
     def _on_speaker_id(self, msg: String):
         try:
@@ -556,8 +622,8 @@ class AiBrainNode(Node):
                 raw_emb = data.get("embedding")
                 if raw_emb and len(raw_emb) > 0:
                     self._last_speaker_embedding = np.array(raw_emb, dtype=np.float32)
-        except Exception:
-            pass
+        except Exception as _exc:
+            self.get_logger().debug(f"_on_speaker_id: yok sayılan hata ({_exc})")
 
 
 
@@ -757,22 +823,7 @@ class AiBrainNode(Node):
 
         # Handle ongoing interactive multi-turn biometric enrollment
         if self._enrollment_session.get("active"):
-            self.session.record_user_speech()
-            self._publish_interrupt()
-            with self._lock:
-                if self._is_processing:
-                    if (now - getattr(self, '_processing_start_time', 0.0)) > 12.0:
-                        self._is_processing = False
-                    else:
-                        self.get_logger().warn(f"[TURN DROPPED] reason=already_processing text=\"{raw_text}\"")
-                        return
-                self._is_processing = True
-                self._processing_start_time = now
-                captured_frame = None
-                if self._latest_frame is not None and (now - self._latest_frame_time) < 4.0:
-                    captured_frame = self._latest_frame.copy()
-            self.state_machine.transition_to(RobotState.THINKING)
-            threading.Thread(target=self._process_llm, args=(raw_text, captured_frame, t_vad_start), daemon=True).start()
+            self._dispatch_turn(raw_text, t_vad_start)
             return
 
         has_wake_word, clean_prompt = self.session.is_wake_word(raw_text, self._wake_word)
@@ -823,19 +874,26 @@ class AiBrainNode(Node):
                 self._publish_gesture("nod")
             else:
                 self.get_logger().info(f"🕵️ [Arka Plan]: '{raw_text}' sosyal filtrede inceleniyor...")
-                if self._evaluate_social_barge_in(raw_text):
-                    self.get_logger().info("🎯 [Sosyal Fırsat]: Arka plan konuşmasına dâhil olunuyor!")
-                    self.session.activate_session(reason="social_barge_in")
-                    self.session.metadata["tts_engine"] = "edge-tts"
-                    self.state_machine.transition_to(RobotState.LISTENING)
-                    self.get_logger().info(f"[SESSION STARTED] reason=social_barge_in raw_text=\"{raw_text}\"")
-                else:
-                    self.get_logger().info(f"[TURN DROPPED] reason=social_filter text=\"{raw_text}\"")
-                    return
+                # Bulut çağrısı callback'i bloke etmesin: thread'e devret ve çık.
+                threading.Thread(
+                    target=self._social_filter_then_dispatch,
+                    args=(raw_text, t_vad_start),
+                    daemon=True,
+                ).start()
+                return
 
         # Active Session Turn
+        self._dispatch_turn(raw_text, t_vad_start)
+
+    def _dispatch_turn(self, raw_text: str, t_vad_start: float) -> None:
+        """Turu LLM işleme thread'ine gönderir (eşzamanlılık kilidi burada tutulur).
+
+        _on_speech ve sosyal filtre thread'i ortak bu yolu kullanır; böylece
+        "zaten işleniyor" mantığı tek yerde durur.
+        """
         self.session.record_user_speech()
         self._publish_interrupt()
+        now = time.monotonic()
 
         with self._lock:
             if self._is_processing:
@@ -854,6 +912,26 @@ class AiBrainNode(Node):
 
         self.state_machine.transition_to(RobotState.THINKING)
         threading.Thread(target=self._process_llm, args=(raw_text, captured_frame, t_vad_start), daemon=True).start()
+
+    def _social_filter_then_dispatch(self, raw_text: str, t_vad_start: float) -> None:
+        """Sosyal barge-in değerlendirmesi — ROS callback'i DEĞİL, ayrı thread.
+
+        _evaluate_social_barge_in sırayla 3 bulut LLM'ine kadar senkron çağrı
+        yapabiliyor. Eskiden bu doğrudan _on_speech içinde çalışıyordu ve o süre
+        boyunca konuşma callback'i bloke oluyordu.
+        """
+        try:
+            if self._evaluate_social_barge_in(raw_text):
+                self.get_logger().info("🎯 [Sosyal Fırsat]: Arka plan konuşmasına dâhil olunuyor!")
+                self.session.activate_session(reason="social_barge_in")
+                self.session.metadata["tts_engine"] = "edge-tts"
+                self.state_machine.transition_to(RobotState.LISTENING)
+                self.get_logger().info(f"[SESSION STARTED] reason=social_barge_in raw_text=\"{raw_text}\"")
+                self._dispatch_turn(raw_text, t_vad_start)
+            else:
+                self.get_logger().info(f"[TURN DROPPED] reason=social_filter text=\"{raw_text}\"")
+        except Exception as e:
+            self.get_logger().error(f"❌ [AI] Sosyal filtre hatası: {e}")
 
     def _process_llm(self, user_text: str, frame: np.ndarray | None, t_turn_start: float):
         try:
@@ -1178,12 +1256,12 @@ class AiBrainNode(Node):
 
             # Step 2: Primary Groq LPU Ultra-Fast Models (if available & not in cooldown)
             groq_available = self.circuit_breaker.is_available("groq", sub_provider="groq_llm") if self.circuit_breaker else True
-            if self._groq and self._active_groq_models and groq_available:
+            if self._provider_enabled("groq") and self._groq and self._active_groq_models and groq_available:
                 for m in self._active_groq_models[:3]:
                     if not self.circuit_breaker.is_available("groq", model_id=m):
                         continue
                     provider_attempts += 1
-                    self.get_logger().info(f"[LLM ROUTE] provider=groq model={m} reason=primary")
+                    self.get_logger().info(f"[LLM ROUTE] provider=groq model={m} reason={self._route_reason('groq')}")
                     try:
                         stream_resp = self._groq.chat.completions.create(
                             messages=messages,
@@ -1234,9 +1312,9 @@ class AiBrainNode(Node):
 
             # Step 3: Secondary Google Gemini REST Fallback
             gemini_available = self.circuit_breaker.is_available("gemini", sub_provider="gemini_text") if self.circuit_breaker else True
-            if not full_text and self._ai_api_key and gemini_available:
+            if self._provider_enabled("gemini") and not full_text and self._ai_api_key and gemini_available:
                 provider_attempts += 1
-                self.get_logger().info("[LLM ROUTE] provider=gemini model=gemini-2.0-flash reason=fallback")
+                self.get_logger().info(f"[LLM ROUTE] provider=gemini model=gemini-2.0-flash reason={self._route_reason('gemini')}")
                 try:
                     gemini_text = self._query_gemini_text_rest(system_prompt, user_text, self.memory.episodic.get_messages())
                     if gemini_text and not is_canned_refusal(gemini_text):
@@ -1251,9 +1329,9 @@ class AiBrainNode(Node):
                     fallback_chain.append("gemini(error)")
 
             # Step 4: Tertiary Emergency Fallback: OpenAI Client (Only if healthy & available)
-            if not full_text and self._openai and self.circuit_breaker and self.circuit_breaker.is_available("openai", sub_provider="openai_rest"):
+            if self._provider_enabled("openai") and not full_text and self._openai and self.circuit_breaker and self.circuit_breaker.is_available("openai", sub_provider="openai_rest"):
                 provider_attempts += 1
-                self.get_logger().info("[LLM ROUTE] provider=openai model=gpt-4o-mini reason=tertiary_fallback")
+                self.get_logger().info(f"[LLM ROUTE] provider=openai model=gpt-4o-mini reason={self._route_reason('openai')}")
                 try:
                     stream_resp = self._openai.chat.completions.create(
                         messages=messages,
@@ -1420,8 +1498,8 @@ class AiBrainNode(Node):
                 )
                 if g_res:
                     return "evet" in g_res.lower()
-            except Exception:
-                pass
+            except Exception as _exc:
+                self.get_logger().debug(f"_evaluate_social_barge_in: yok sayılan hata ({_exc})")
 
         return False
 
@@ -2027,8 +2105,8 @@ class AiBrainNode(Node):
                             if self.circuit_breaker:
                                 self.circuit_breaker.record_success("gemini", sub_provider="gemini_vision", model_id=g_model)
                             return clean
-                except Exception:
-                    pass
+                except Exception as _exc:
+                    self.get_logger().debug(f"_query_groq_vision_for_idle: yok sayılan hata ({_exc})")
 
         return None
 
@@ -2335,14 +2413,14 @@ class AiBrainNode(Node):
                         max_tokens=60
                     )
                     raw_json = res.choices[0].message.content.strip()
-                except Exception:
-                    pass
+                except Exception as _exc:
+                    self.get_logger().debug(f"_async_extract_user_facts: yok sayılan hata ({_exc})")
 
             if not raw_json and self._ai_api_key and self.circuit_breaker and self.circuit_breaker.is_available("gemini", sub_provider="gemini_text"):
                 try:
                     raw_json = self._query_gemini_text_rest("Sadece JSON formatında çıktı ver.", prompt, [])
-                except Exception:
-                    pass
+                except Exception as _exc:
+                    self.get_logger().debug(f"_async_extract_user_facts: yok sayılan hata ({_exc})")
 
             if raw_json and "{" in raw_json and "}" in raw_json:
                 json_str = raw_json[raw_json.find("{"):raw_json.rfind("}")+1]
@@ -2406,12 +2484,16 @@ def main(args=None):
     rclpy.init(args=args)
     node = AiBrainNode()
     from rclpy.executors import MultiThreadedExecutor
-    executor = MultiThreadedExecutor(num_threads=4)
+
+    # Düğüm callback'leri üç ayrı gruba dağıtılmış durumda (bkz. AiBrainNode.__init__):
+    # konuşma / timer / algı. Bu thread'ler ancak gruplar gerçekten ayrıldığı için
+    # işe yarıyor — tek varsayılan grupla hepsi sıraya girerdi.
+    executor = MultiThreadedExecutor(num_threads=6)
     executor.add_node(node)
     try:
         executor.spin()
-    except KeyboardInterrupt:
-        pass
+    except KeyboardInterrupt as _exc:
+        _LOG.debug("main: yok sayılan hata (%s)", _exc)
     finally:
         node.destroy_node()
         if rclpy.ok():
