@@ -1,0 +1,215 @@
+<?xml version="1.0" ?>
+<!--
+  ASTRO V1 — haritalama test dünyası (Gazebo Harmonic / gz-sim 8)
+
+  Kapalı bir daire planı: koridor + üç oda + serbest duran mobilya.
+  Haritalama için bilinçli olarak böyle kuruldu:
+    - Duvarlar kapalı bir çevre oluşturur; SLAM döngü kapatabilsin diye
+      koridor bir halka değil, çıkmaz uçlu odalar içerir (daha zor senaryo).
+    - Oda kapıları 0.9 m; robotun genişliği 0.25 m, yani geçiş yeteneği
+      sınanabilir ama imkânsız değil.
+    - Silindir/kutu mobilyalar LiDAR'a farklı yansıma profilleri verir;
+      hepsi duvar olsaydı tarama eşleştirme gerçekçi olmayacak kadar kolay olurdu.
+    - Duvar yüksekliği 1.0 m: LiDAR düzlemi (z ~ 0.19 m) her zaman duvarı görür.
+
+  Sensör eklentileri (gpu_lidar, imu, camera) DÜNYA düzeyinde tanımlanmalı;
+  robot SDF'indeki <sensor> etiketleri bu sistemler yüklü değilse sessizce
+  hiçbir veri üretmez.
+-->
+<sdf version="1.10">
+  <world name="astro_indoor">
+
+    <physics name="1ms" type="ignored">
+      <max_step_size>0.001</max_step_size>
+      <real_time_factor>1.0</real_time_factor>
+    </physics>
+
+    <plugin filename="gz-sim-physics-system"
+            name="gz::sim::systems::Physics"/>
+    <plugin filename="gz-sim-user-commands-system"
+            name="gz::sim::systems::UserCommands"/>
+    <plugin filename="gz-sim-scene-broadcaster-system"
+            name="gz::sim::systems::SceneBroadcaster"/>
+    <!-- gpu_lidar ve camera bu sistem olmadan veri üretmez -->
+    <plugin filename="gz-sim-sensors-system"
+            name="gz::sim::systems::Sensors">
+      <render_engine>ogre2</render_engine>
+    </plugin>
+    <!-- imu sensörü için ayrı sistem -->
+    <plugin filename="gz-sim-imu-system"
+            name="gz::sim::systems::Imu"/>
+    <plugin filename="gz-sim-contact-system"
+            name="gz::sim::systems::Contact"/>
+
+    <gravity>0 0 -9.8</gravity>
+
+    <scene>
+      <ambient>0.6 0.6 0.6 1</ambient>
+      <background>0.75 0.82 0.88 1</background>
+      <shadows>true</shadows>
+      <grid>false</grid>
+    </scene>
+
+    <light type="directional" name="sun">
+      <cast_shadows>true</cast_shadows>
+      <pose>0 0 10 0 0 0</pose>
+      <diffuse>0.9 0.9 0.9 1</diffuse>
+      <specular>0.2 0.2 0.2 1</specular>
+      <direction>-0.4 0.3 -0.9</direction>
+    </light>
+
+    <!-- ═══════════════════════ Zemin ═══════════════════════ -->
+    <model name="ground_plane">
+      <static>true</static>
+      <link name="link">
+        <collision name="collision">
+          <geometry><plane><normal>0 0 1</normal><size>60 60</size></plane></geometry>
+          <surface>
+            <friction><ode><mu>1.0</mu><mu2>1.0</mu2></ode></friction>
+          </surface>
+        </collision>
+        <visual name="visual">
+          <geometry><plane><normal>0 0 1</normal><size>60 60</size></plane></geometry>
+          <material>
+            <ambient>0.45 0.45 0.47 1</ambient>
+            <diffuse>0.55 0.55 0.58 1</diffuse>
+          </material>
+        </visual>
+      </link>
+    </model>
+
+    <!--
+      ═════════════════════ Duvarlar ═════════════════════
+      Plan (üstten, metre):
+
+          (-6,5)┌──────────────────────────────┐(8,5)
+                │   ODA A        │   ODA B     │
+                │                │             │
+                ├────────┤  ┌────┴────┐        │
+                │        koridor              │
+                ├─────────────────┬───────────┤
+                │     ODA C       │  (açık alan)
+          (-6,-5)└─────────────────┴───────────┘(8,-5)
+
+      Her duvar 0.15 m kalın, 1.0 m yüksek, statik.
+    -->
+    <model name="walls">
+      <static>true</static>
+      <link name="link">
+
+        <!-- Dış çevre: kuzey / güney / batı / doğu -->
+        <collision name="c_north"><pose>1 5 0.5 0 0 0</pose>
+          <geometry><box><size>14.15 0.15 1.0</size></box></geometry></collision>
+        <visual name="v_north"><pose>1 5 0.5 0 0 0</pose>
+          <geometry><box><size>14.15 0.15 1.0</size></box></geometry>
+          <material><ambient>0.75 0.72 0.68 1</ambient><diffuse>0.85 0.82 0.78 1</diffuse></material></visual>
+
+        <collision name="c_south"><pose>1 -5 0.5 0 0 0</pose>
+          <geometry><box><size>14.15 0.15 1.0</size></box></geometry></collision>
+        <visual name="v_south"><pose>1 -5 0.5 0 0 0</pose>
+          <geometry><box><size>14.15 0.15 1.0</size></box></geometry>
+          <material><ambient>0.75 0.72 0.68 1</ambient><diffuse>0.85 0.82 0.78 1</diffuse></material></visual>
+
+        <collision name="c_west"><pose>-6 0 0.5 0 0 0</pose>
+          <geometry><box><size>0.15 10.15 1.0</size></box></geometry></collision>
+        <visual name="v_west"><pose>-6 0 0.5 0 0 0</pose>
+          <geometry><box><size>0.15 10.15 1.0</size></box></geometry>
+          <material><ambient>0.75 0.72 0.68 1</ambient><diffuse>0.85 0.82 0.78 1</diffuse></material></visual>
+
+        <collision name="c_east"><pose>8 0 0.5 0 0 0</pose>
+          <geometry><box><size>0.15 10.15 1.0</size></box></geometry></collision>
+        <visual name="v_east"><pose>8 0 0.5 0 0 0</pose>
+          <geometry><box><size>0.15 10.15 1.0</size></box></geometry>
+          <material><ambient>0.75 0.72 0.68 1</ambient><diffuse>0.85 0.82 0.78 1</diffuse></material></visual>
+
+        <!-- Koridorun kuzey duvarı: -6..-1 ve 0.9 m kapı, sonra 0..3 -->
+        <collision name="c_corr_n1"><pose>-3.5 1.5 0.5 0 0 0</pose>
+          <geometry><box><size>5.0 0.15 1.0</size></box></geometry></collision>
+        <visual name="v_corr_n1"><pose>-3.5 1.5 0.5 0 0 0</pose>
+          <geometry><box><size>5.0 0.15 1.0</size></box></geometry>
+          <material><ambient>0.7 0.7 0.72 1</ambient><diffuse>0.8 0.8 0.82 1</diffuse></material></visual>
+
+        <collision name="c_corr_n2"><pose>1.95 1.5 0.5 0 0 0</pose>
+          <geometry><box><size>3.1 0.15 1.0</size></box></geometry></collision>
+        <visual name="v_corr_n2"><pose>1.95 1.5 0.5 0 0 0</pose>
+          <geometry><box><size>3.1 0.15 1.0</size></box></geometry>
+          <material><ambient>0.7 0.7 0.72 1</ambient><diffuse>0.8 0.8 0.82 1</diffuse></material></visual>
+
+        <!-- ODA A ile ODA B arası bölme -->
+        <collision name="c_ab"><pose>0.4 3.3 0.5 0 0 0</pose>
+          <geometry><box><size>0.15 3.5 1.0</size></box></geometry></collision>
+        <visual name="v_ab"><pose>0.4 3.3 0.5 0 0 0</pose>
+          <geometry><box><size>0.15 3.5 1.0</size></box></geometry>
+          <material><ambient>0.7 0.7 0.72 1</ambient><diffuse>0.8 0.8 0.82 1</diffuse></material></visual>
+
+        <!-- Koridorun güney duvarı: kapı 3.0..3.9 -->
+        <collision name="c_corr_s1"><pose>-1.5 -1.5 0.5 0 0 0</pose>
+          <geometry><box><size>9.0 0.15 1.0</size></box></geometry></collision>
+        <visual name="v_corr_s1"><pose>-1.5 -1.5 0.5 0 0 0</pose>
+          <geometry><box><size>9.0 0.15 1.0</size></box></geometry>
+          <material><ambient>0.7 0.7 0.72 1</ambient><diffuse>0.8 0.8 0.82 1</diffuse></material></visual>
+
+        <collision name="c_corr_s2"><pose>5.95 -1.5 0.5 0 0 0</pose>
+          <geometry><box><size>4.1 0.15 1.0</size></box></geometry></collision>
+        <visual name="v_corr_s2"><pose>5.95 -1.5 0.5 0 0 0</pose>
+          <geometry><box><size>4.1 0.15 1.0</size></box></geometry>
+          <material><ambient>0.7 0.7 0.72 1</ambient><diffuse>0.8 0.8 0.82 1</diffuse></material></visual>
+
+        <!-- ODA C'nin doğu duvarı -->
+        <collision name="c_c_east"><pose>2.5 -3.3 0.5 0 0 0</pose>
+          <geometry><box><size>0.15 3.5 1.0</size></box></geometry></collision>
+        <visual name="v_c_east"><pose>2.5 -3.3 0.5 0 0 0</pose>
+          <geometry><box><size>0.15 3.5 1.0</size></box></geometry>
+          <material><ambient>0.7 0.7 0.72 1</ambient><diffuse>0.8 0.8 0.82 1</diffuse></material></visual>
+
+      </link>
+    </model>
+
+    <!-- ═══════════════ Mobilya (tarama eşleştirmeye doku katar) ═══════════════ -->
+    <model name="furniture">
+      <static>true</static>
+      <link name="link">
+        <!-- ODA A: masa + iki silindir -->
+        <collision name="c_table_a"><pose>-3.5 3.2 0.35 0 0 0</pose>
+          <geometry><box><size>1.4 0.8 0.7</size></box></geometry></collision>
+        <visual name="v_table_a"><pose>-3.5 3.2 0.35 0 0 0</pose>
+          <geometry><box><size>1.4 0.8 0.7</size></box></geometry>
+          <material><ambient>0.45 0.30 0.18 1</ambient><diffuse>0.55 0.36 0.22 1</diffuse></material></visual>
+
+        <collision name="c_pillar_a"><pose>-1.2 3.8 0.5 0 0 0</pose>
+          <geometry><cylinder><radius>0.18</radius><length>1.0</length></cylinder></geometry></collision>
+        <visual name="v_pillar_a"><pose>-1.2 3.8 0.5 0 0 0</pose>
+          <geometry><cylinder><radius>0.18</radius><length>1.0</length></cylinder></geometry>
+          <material><ambient>0.6 0.6 0.62 1</ambient><diffuse>0.7 0.7 0.72 1</diffuse></material></visual>
+
+        <!-- ODA B: raf -->
+        <collision name="c_shelf_b"><pose>5.5 3.5 0.4 0 0 0</pose>
+          <geometry><box><size>2.2 0.45 0.8</size></box></geometry></collision>
+        <visual name="v_shelf_b"><pose>5.5 3.5 0.4 0 0 0</pose>
+          <geometry><box><size>2.2 0.45 0.8</size></box></geometry>
+          <material><ambient>0.35 0.35 0.40 1</ambient><diffuse>0.45 0.45 0.50 1</diffuse></material></visual>
+
+        <!-- ODA C: iki kutu -->
+        <collision name="c_box_c1"><pose>-4.0 -3.0 0.25 0 0 0.3</pose>
+          <geometry><box><size>0.6 0.6 0.5</size></box></geometry></collision>
+        <visual name="v_box_c1"><pose>-4.0 -3.0 0.25 0 0 0.3</pose>
+          <geometry><box><size>0.6 0.6 0.5</size></box></geometry>
+          <material><ambient>0.5 0.42 0.25 1</ambient><diffuse>0.62 0.52 0.32 1</diffuse></material></visual>
+
+        <collision name="c_box_c2"><pose>0.8 -3.6 0.3 0 0 -0.4</pose>
+          <geometry><box><size>0.8 0.5 0.6</size></box></geometry></collision>
+        <visual name="v_box_c2"><pose>0.8 -3.6 0.3 0 0 -0.4</pose>
+          <geometry><box><size>0.8 0.5 0.6</size></box></geometry>
+          <material><ambient>0.5 0.42 0.25 1</ambient><diffuse>0.62 0.52 0.32 1</diffuse></material></visual>
+
+        <!-- Açık alan: sütun -->
+        <collision name="c_pillar_e"><pose>6.0 -3.2 0.5 0 0 0</pose>
+          <geometry><cylinder><radius>0.22</radius><length>1.0</length></cylinder></geometry></collision>
+        <visual name="v_pillar_e"><pose>6.0 -3.2 0.5 0 0 0</pose>
+          <geometry><cylinder><radius>0.22</radius><length>1.0</length></cylinder></geometry>
+          <material><ambient>0.6 0.6 0.62 1</ambient><diffuse>0.7 0.7 0.72 1</diffuse></material></visual>
+      </link>
+    </model>
+
+  </world>
+</sdf>
