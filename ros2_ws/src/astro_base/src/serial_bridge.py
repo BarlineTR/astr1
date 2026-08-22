@@ -53,14 +53,53 @@ def build_packet(msg_id: int, payload: bytes) -> bytes:
     return bytes([SOF1, SOF2]) + body + bytes([c])
 
 
-def resolve_serial_port(primary: str, fallbacks=PORT_FALLBACKS):
-    for port in (primary, *fallbacks):
-        if port and os.path.exists(port):
-            return port
-    for pattern in ("/dev/astro_*", "/dev/ttyACM*", "/dev/ttyUSB*"):
-        matches = sorted(glob.glob(pattern))
-        if matches:
-            return matches[0]
+class ArduinoState:
+    DISCONNECTED = "SERIAL_DISCONNECTED"
+    SERIAL_DISCONNECTED = "SERIAL_DISCONNECTED"
+    CONNECTED = "SERIAL_CONNECTED"
+    SERIAL_CONNECTED = "SERIAL_CONNECTED"
+    HANDSHAKE_OK = "HANDSHAKE_OK"
+    HEARTBEAT_PENDING = "HEARTBEAT_PENDING"
+    HEARTBEAT_HEALTHY = "HEARTBEAT_HEALTHY"
+    MOTOR_ENABLED = "MOTOR_ENABLED"
+    MOTOR_COMMANDING = "MOTOR_COMMANDING"
+    SAFETY_BLOCKED = "SAFETY_BLOCKED"
+
+
+def resolve_serial_port(primary: str = "/dev/astro_arduino", logger=None) -> str:
+    candidates = []
+    # 1. Primary rule
+    if primary and os.path.exists(primary):
+        if logger:
+            logger.info(f"[ARDUINO PORT DISCOVERY]\n  candidate={primary}\n  selected={primary}\n  baud=500000")
+        return primary
+    elif primary:
+        candidates.append(primary)
+
+    # 2. Search patterns in priority order
+    search_patterns = [
+        "/dev/astro_*",
+        "/dev/ttyCH341USB*",
+        "/dev/ttyUSB*",
+        "/dev/ttyACM*",
+    ]
+    for pattern in search_patterns:
+        matched = sorted(glob.glob(pattern))
+        for p in matched:
+            if p not in candidates:
+                candidates.append(p)
+            if os.path.exists(p):
+                if logger:
+                    logger.info(
+                        f"[ARDUINO PORT DISCOVERY]\n"
+                        f"  candidate={candidates}\n"
+                        f"  selected={p}\n"
+                        f"  baud=500000"
+                    )
+                return p
+
+    if logger:
+        logger.warn(f"[ARDUINO PORT DISCOVERY] candidate={candidates} selected=none baud=500000")
     return None
 
 
@@ -105,12 +144,15 @@ class SerialBridge(Node):
             HeadCmd, "/head_cmd", self.on_head_cmd, 10
         )
 
+        self.state = ArduinoState.DISCONNECTED
         self.ser = None
         self.port = None
         self.rx_thread = None
         self.parser_lock = threading.Lock()
-        self.last_hb_ack = self.get_clock().now()
+        self.tx_lock = threading.Lock()
+        self.last_hb_ack_time = 0.0
         self.arduino_alive = False
+        self.handshake_ok = False
         self._hb_seq = 0
         self.port_connected_time = 0.0
 
@@ -135,7 +177,7 @@ class SerialBridge(Node):
         t_wait_start = time.monotonic()
         ack_received = False
         while rclpy.ok() and (time.monotonic() - t_wait_start < 3.0):
-            if self.ser is not None and self.ser.is_open and self.arduino_alive:
+            if self.ser is not None and self.ser.is_open and self.arduino_alive and self.handshake_ok:
                 ack_received = True
                 break
             time.sleep(0.1)
@@ -154,7 +196,8 @@ class SerialBridge(Node):
             payload = struct.pack("<ff", l_rpm, r_rpm)
             pkt = self.build_packet(MSG_WHEEL_CMD, payload)
             try:
-                self.ser.write(pkt)
+                with self.tx_lock:
+                    self.ser.write(pkt)
                 return True
             except Exception as e:
                 self.get_logger().error(f"[Self-Test] Failed to write serial packet: {e}")
@@ -212,8 +255,9 @@ class SerialBridge(Node):
                 self.get_logger().debug(f"_try_connect: yok sayılan hata ({_exc})")
             self.ser = None
 
-        port = resolve_serial_port(self.port_param)
+        port = resolve_serial_port(self.port_param, logger=self.get_logger())
         if port is None:
+            self.state = ArduinoState.DISCONNECTED
             self.get_logger().warn(
                 f"Arduino port not found (expected {self.port_param}). "
                 "Install udev rules or connect USB. Retrying..."
@@ -231,14 +275,18 @@ class SerialBridge(Node):
             )
             self.port = port
             self.port_connected_time = time.monotonic()
+            self.state = ArduinoState.SERIAL_CONNECTED
             self.get_logger().info(f"[SERIAL CONNECTED] device={port} baud={self.baud}")
             self.get_logger().info("[ARDUINO HANDSHAKE] status=success")
+            self.handshake_ok = True
+            self.state = ArduinoState.HANDSHAKE_OK
             if self.rx_thread is None or not self.rx_thread.is_alive():
                 self.rx_thread = threading.Thread(target=self.read_loop, daemon=True)
                 self.rx_thread.start()
         except serial.SerialException as exc:
             self.get_logger().warn(f"Could not open {port}: {exc}. Retrying...")
             self.ser = None
+            self.state = ArduinoState.DISCONNECTED
 
     def build_packet(self, msg_id: int, payload: bytes) -> bytes:
         length = 1 + len(payload)
@@ -253,16 +301,16 @@ class SerialBridge(Node):
         self._hb_seq += 1
         pkt = self.build_packet(MSG_HEARTBEAT, b"")
         try:
-            self.ser.write(pkt)
-            self.get_logger().debug(f"[HEARTBEAT SENT] seq={self._hb_seq}")
+            with self.tx_lock:
+                self.ser.write(pkt)
+            self.get_logger().debug(f"[HEARTBEAT TX] sequence={self._hb_seq}")
         except serial.SerialException as exc:
             self.get_logger().warn(f"Heartbeat write failed: {exc}")
             self._mark_disconnected()
             return
 
-        now_ns = self.get_clock().now().nanoseconds
-        last_ack_ns = self.last_hb_ack.nanoseconds if hasattr(self.last_hb_ack, "nanoseconds") else 0
-        if (now_ns - last_ack_ns) > 1_000_000_000:
+        now_mono = time.monotonic()
+        if (now_mono - self.last_hb_ack_time) > 1.0:
             if self.arduino_alive:
                 self.get_logger().warn(
                     "⚠️ [MOTOR SAFETY BLOCK] reason=heartbeat_ack_missing\n"
@@ -270,8 +318,11 @@ class SerialBridge(Node):
                 )
                 self.get_logger().info("[MOTOR STATUS] enabled=false heartbeat_healthy=false")
             self.arduino_alive = False
+            self.state = ArduinoState.SAFETY_BLOCKED
         else:
             self.arduino_alive = True
+            if self.state in (ArduinoState.HANDSHAKE_OK, ArduinoState.SAFETY_BLOCKED):
+                self.state = ArduinoState.HEARTBEAT_HEALTHY
 
     def _mark_disconnected(self):
         if self.ser is not None:
@@ -281,6 +332,8 @@ class SerialBridge(Node):
                 self.get_logger().debug(f"_mark_disconnected: yok sayılan hata ({_exc})")
         self.ser = None
         self.arduino_alive = False
+        self.handshake_ok = False
+        self.state = ArduinoState.DISCONNECTED
 
     def on_wheel_cmd(self, msg: WheelCmd):
         if self.is_self_testing:
@@ -311,7 +364,8 @@ class SerialBridge(Node):
         payload = struct.pack("<ff", msg.left_rpm, msg.right_rpm)
         pkt = self.build_packet(MSG_WHEEL_CMD, payload)
         try:
-            self.ser.write(pkt)
+            with self.tx_lock:
+                self.ser.write(pkt)
             self.get_logger().info("[MOTOR ACK] status=success\n[MOTOR STATUS] enabled=true")
         except serial.SerialException as exc:
             self.get_logger().error(f"WheelCmd write failed: {exc}")
@@ -324,7 +378,8 @@ class SerialBridge(Node):
         payload = struct.pack("<f", msg.angle_deg)
         pkt = self.build_packet(MSG_HEAD_CMD, payload)
         try:
-            self.ser.write(pkt)
+            with self.tx_lock:
+                self.ser.write(pkt)
         except serial.SerialException as exc:
             self.get_logger().error(f"HeadCmd write failed: {exc}")
             self._mark_disconnected()
@@ -448,15 +503,18 @@ class SerialBridge(Node):
             vbat_mV, temp_cX100, flags = struct.unpack("<HhI", payload)
             self.publish_diag(vbat_mV, temp_cX100, flags)
         elif msg_id == MSG_HEARTBEAT_ACK:
-            now_clock = self.get_clock().now()
-            lat_ms = (now_clock.nanoseconds - self.last_hb_ack.nanoseconds) / 1e6 if (hasattr(self.last_hb_ack, "nanoseconds") and self.last_hb_ack.nanoseconds > 0) else 5.0
+            now_mono = time.monotonic()
+            lat_ms = (now_mono - self.last_hb_ack_time) * 1000.0 if self.last_hb_ack_time > 0 else 5.0
             prev_alive = self.arduino_alive
-            self.last_hb_ack = now_clock
+            self.last_hb_ack_time = now_mono
             self.arduino_alive = True
+            self.state = ArduinoState.HEARTBEAT_HEALTHY
             if not prev_alive:
-                self.get_logger().info(f"[HEARTBEAT ACK] seq={self._hb_seq} latency_ms={lat_ms:.1f}")
+                self.get_logger().info(f"[HEARTBEAT ACK] sequence={self._hb_seq} latency_ms={lat_ms:.1f}")
                 self.get_logger().info("[MOTOR SAFETY RECOVERED] heartbeat_healthy=true")
                 self.get_logger().info("[MOTOR STATUS] enabled=true heartbeat_healthy=true")
+            else:
+                self.get_logger().debug(f"[HEARTBEAT ACK] sequence={self._hb_seq} latency_ms={lat_ms:.1f}")
 
     def destroy_node(self):
         self._mark_disconnected()

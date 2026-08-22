@@ -701,10 +701,10 @@ class AstroRealtimeNode(Node):
             resp_event = {
                 "type": "response.create",
                 "response": {
-                    "modalities": ["audio", "text"],
                     "instructions": f"Cevabını doğrudan Türkçe olarak seslendir: {text}"
                 }
             }
+            self.get_logger().debug(f"[REALTIME PAYLOAD OUT] event=response.create payload={json.dumps(resp_event)}")
             asyncio.run_coroutine_threadsafe(self._ws.send(json.dumps(turn_event)), self._loop)
             asyncio.run_coroutine_threadsafe(self._ws.send(json.dumps(resp_event)), self._loop)
 
@@ -782,11 +782,11 @@ class AstroRealtimeNode(Node):
                     self._is_responding = False
                     self._is_playback_active = False
                     self.realtime_connection_state = "CONNECTED"
-                    self.realtime_session_state = "READY"
+                    self.realtime_session_state = "NOT_READY"
                     self.realtime_provider_state = "AVAILABLE"
                     self.get_logger().info(
                         f"[REALTIME CONNECTED]\n"
-                        f"session_id={self.realtime_session_id or 'sess_init'}\n"
+                        f"model={current_model}\n"
                         f"state=AVAILABLE"
                     )
                     self._publish_realtime_state("CONNECTED")
@@ -1067,7 +1067,7 @@ class AstroRealtimeNode(Node):
             self.realtime_connection_state = "CONNECTED"
             self.realtime_provider_state = "AVAILABLE"
             self.get_logger().info(
-                f"[REALTIME CONNECTED]\n"
+                f"[REALTIME SESSION READY]\n"
                 f"session_id={self.realtime_session_id or 'sess_init'}\n"
                 f"state=AVAILABLE"
             )
@@ -1229,10 +1229,40 @@ class AstroRealtimeNode(Node):
         # 7. Error Handling
         elif event_type == "error":
             self._is_responding = False
+            self.realtime_response_state = "IDLE"
             err = event.get("error", {})
-            msg = err.get("message", "")
-            if "no active response found" not in msg and "already has an active response" not in msg:
-                self.get_logger().error(f"❌ [Realtime WS Hatası]: {msg}")
+            err_type = err.get("type", "unknown_error")
+            err_code = err.get("code", "none")
+            err_msg = err.get("message", "")
+            err_class = f"{err_type}:{err_code}" if err_code != "none" else err_type
+
+            self.get_logger().error(
+                f"[REALTIME ERROR]\n"
+                f"error_class={err_class}\n"
+                f"message={err_msg}\n"
+                f"generation_id={self.realtime_current_generation_id}"
+            )
+
+            # Trigger immediate fallback to Edge-TTS if there was an active turn request
+            if getattr(self, "_last_requested_text", "") and not self.realtime_audio_received:
+                self.get_logger().warn(
+                    f"[REALTIME NO AUDIO]\n"
+                    f"generation_id={self.realtime_current_generation_id}\n"
+                    f"reason=server_error\n"
+                    f"[TTS FALLBACK]\n"
+                    f"from=openai_realtime\n"
+                    f"to=edge_tts\n"
+                    f"reason=realtime_server_error"
+                )
+                fb_msg = String()
+                fb_msg.data = json.dumps({
+                    "text": self._last_requested_text,
+                    "engine": "edge-tts",
+                    "generation_id": self.realtime_current_generation_id,
+                    "fallback_reason": "realtime_server_error",
+                })
+                self.pub_tts_say.publish(fb_msg)
+                self._last_requested_text = ""
 
 
 

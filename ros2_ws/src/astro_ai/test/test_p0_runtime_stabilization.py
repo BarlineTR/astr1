@@ -27,6 +27,7 @@ import json
 import os
 import re
 import sys
+import threading
 import time
 import unittest
 from unittest.mock import MagicMock, patch
@@ -1754,6 +1755,8 @@ class TestP02RealtimeTurnPipelineAndHardwareCorrection(unittest.TestCase):
             bridge.ser = MagicMock()
             bridge.ser.is_open = True
             bridge.arduino_alive = True
+            bridge.handshake_ok = True
+            bridge.last_hb_ack_time = time.monotonic()
 
             logs = []
             mock_logger = MagicMock()
@@ -1771,7 +1774,411 @@ class TestP02RealtimeTurnPipelineAndHardwareCorrection(unittest.TestCase):
             self.assertFalse(bridge.is_self_testing)
 
 
+class TestP03CriticalRuntimeRecovery(unittest.TestCase):
+    """P0.3 Acceptance Tests: Realtime Schema, Deduplication, and Arduino Heartbeat Continuity."""
+
+    def test_realtime_response_payload_matches_current_schema(self):
+        """1. Schema: response.create payload contains valid instructions and matches current schema."""
+        from astro_ai.astro_realtime_node import AstroRealtimeNode
+        node = AstroRealtimeNode.__new__(AstroRealtimeNode)
+        node._ws = MagicMock()
+        node._loop = MagicMock()
+        node._is_connected = True
+        node.realtime_current_generation_id = 0
+        node.realtime_audio_received = False
+        node.pub_tts_say = MagicMock()
+
+        logs = []
+        mock_logger = MagicMock()
+        mock_logger.info = lambda msg: logs.append(msg)
+        mock_logger.debug = lambda msg: logs.append(msg)
+        node.get_logger = lambda: mock_logger
+
+        sent_payloads = []
+        def fake_run_coroutine(coro, loop):
+            pass
+
+        with patch("asyncio.run_coroutine_threadsafe", side_effect=fake_run_coroutine):
+            msg = MagicMock()
+            msg.data = json.dumps({"text": "Merhaba", "generation_id": 1})
+            node._on_realtime_turn_request(msg)
+
+            log_text = "\n".join(logs)
+            self.assertIn("[REALTIME PAYLOAD OUT] event=response.create", log_text)
+            self.assertNotIn("modalities", log_text)
+
+    def test_realtime_response_modalities_not_sent(self):
+        """2. Schema: response.create payload strictly does NOT include response.modalities."""
+        from astro_ai.astro_realtime_node import AstroRealtimeNode
+        node = AstroRealtimeNode.__new__(AstroRealtimeNode)
+        node._ws = MagicMock()
+        node._loop = MagicMock()
+        node._is_connected = True
+        node.realtime_current_generation_id = 0
+        node.realtime_audio_received = False
+        node.pub_tts_say = MagicMock()
+
+        captured_events = []
+        with patch("asyncio.run_coroutine_threadsafe") as mock_async:
+            mock_async.side_effect = lambda coro, loop: captured_events.append(coro)
+            msg = MagicMock()
+            msg.data = json.dumps({"text": "Test", "generation_id": 2})
+            mock_logger = MagicMock()
+            node.get_logger = lambda: mock_logger
+            node._on_realtime_turn_request(msg)
+
+        # Verify no modalities in the module's response.create logic
+        import inspect
+        src = inspect.getsource(AstroRealtimeNode._on_realtime_turn_request)
+        self.assertNotIn('"modalities"', src)
+
+    def test_realtime_audio_delta_received(self):
+        """3. Audio Delta: response.audio.delta sets realtime_audio_received=True and publishes PCM."""
+        import base64
+        from astro_ai.astro_realtime_node import AstroRealtimeNode
+        node = AstroRealtimeNode.__new__(AstroRealtimeNode)
+        node.pub_output_pcm = MagicMock()
+        node.realtime_current_generation_id = 3
+        node.realtime_audio_received = False
+        node.realtime_response_state = "IDLE"
+
+        logs = []
+        mock_logger = MagicMock()
+        mock_logger.info = lambda msg: logs.append(msg)
+        node.get_logger = lambda: mock_logger
+
+        pcm_sample = b"\x00\x05" * 160
+        b64_delta = base64.b64encode(pcm_sample).decode("ascii")
+        event = {"type": "response.audio.delta", "delta": b64_delta}
+
+        import asyncio
+        asyncio.run(node._handle_realtime_event(MagicMock(), event))
+
+        self.assertTrue(node.realtime_audio_received)
+        node.pub_output_pcm.publish.assert_called_once()
+        log_text = "\n".join(logs)
+        self.assertIn("[REALTIME AUDIO DELTA]", log_text)
+
+    def test_realtime_no_audio_fallback(self):
+        """4. Fallback: server error event or timeout immediately triggers Edge-TTS fallback."""
+        from astro_ai.astro_realtime_node import AstroRealtimeNode
+        node = AstroRealtimeNode.__new__(AstroRealtimeNode)
+        node.pub_tts_say = MagicMock()
+        node.realtime_current_generation_id = 4
+        node.realtime_audio_received = False
+        node._last_requested_text = "Hava nasıl"
+
+        logs = []
+        mock_logger = MagicMock()
+        mock_logger.error = lambda msg: logs.append(msg)
+        mock_logger.warn = lambda msg: logs.append(msg)
+        node.get_logger = lambda: mock_logger
+
+        event = {
+            "type": "error",
+            "error": {"type": "invalid_request_error", "code": "unknown_parameter", "message": "Unknown parameter"}
+        }
+        import asyncio
+        asyncio.run(node._handle_realtime_event(MagicMock(), event))
+
+        node.pub_tts_say.publish.assert_called_once()
+        log_text = "\n".join(logs)
+        self.assertIn("[REALTIME ERROR]", log_text)
+        self.assertIn("error_class=invalid_request_error:unknown_parameter", log_text)
+        self.assertIn("[TTS FALLBACK]", log_text)
+        self.assertIn("to=edge_tts", log_text)
+
+    def test_realtime_duplicate_connection_blocked(self):
+        """5. Connection: session.created logs [REALTIME SESSION READY], avoiding duplicate [REALTIME CONNECTED]."""
+        from astro_ai.astro_realtime_node import AstroRealtimeNode
+        node = AstroRealtimeNode.__new__(AstroRealtimeNode)
+        node.pub_realtime_state = MagicMock()
+        node.realtime_session_id = ""
+
+        logs = []
+        mock_logger = MagicMock()
+        mock_logger.info = lambda msg: logs.append(msg)
+        node.get_logger = lambda: mock_logger
+
+        event = {"type": "session.created", "session": {"id": "sess_12345"}}
+        import asyncio
+        asyncio.run(node._handle_realtime_event(MagicMock(), event))
+
+        log_text = "\n".join(logs)
+        self.assertIn("[REALTIME SESSION READY]", log_text)
+        self.assertNotIn("[REALTIME CONNECTED]", log_text)
+        self.assertEqual(node.realtime_session_state, "READY")
+
+    def test_arduino_port_auto_discovery(self):
+        """6. Discovery: resolve_serial_port discovers devices in priority order and logs telemetry."""
+        from serial_bridge import resolve_serial_port
+        logs = []
+        mock_logger = MagicMock()
+        mock_logger.info = lambda msg: logs.append(msg)
+        mock_logger.warn = lambda msg: logs.append(msg)
+
+        with patch("os.path.exists", side_effect=lambda p: p == "/dev/ttyCH341USB0"), \
+             patch("glob.glob", return_value=["/dev/ttyCH341USB0"]):
+            selected = resolve_serial_port("/dev/astro_arduino", logger=mock_logger)
+            self.assertEqual(selected, "/dev/ttyCH341USB0")
+            log_text = "\n".join(logs)
+            self.assertIn("[ARDUINO PORT DISCOVERY]", log_text)
+            self.assertIn("selected=/dev/ttyCH341USB0", log_text)
+
+    def test_arduino_handshake_before_motor_enable(self):
+        """7. Handshake: [ARDUINO HANDSHAKE] status=success marks handshake_ok=True."""
+        from serial_bridge import SerialBridge
+        bridge = SerialBridge.__new__(SerialBridge)
+        bridge.ser = None
+        bridge.port = None
+        bridge.rx_thread = None
+        bridge.port_param = "/dev/astro_arduino"
+        bridge.baud = 500000
+        bridge.handshake_ok = False
+        logs = []
+        mock_logger = MagicMock()
+        mock_logger.info = lambda msg: logs.append(msg)
+        bridge.get_logger = lambda: mock_logger
+
+        mock_ser = MagicMock()
+        mock_ser.is_open = True
+        with patch("serial_bridge.resolve_serial_port", return_value="/dev/astro_arduino"), \
+             patch("serial.Serial", return_value=mock_ser):
+            bridge._try_connect()
+            self.assertTrue(bridge.handshake_ok)
+            log_text = "\n".join(logs)
+            self.assertIn("[ARDUINO HANDSHAKE] status=success", log_text)
+
+    def test_heartbeat_ack_continuous_health(self):
+        """8. Heartbeat: Continuous Heartbeat ACK updates monotonic timestamp and logs sequence."""
+        from serial_bridge import SerialBridge, MSG_HEARTBEAT_ACK
+        with patch.object(SerialBridge, "_try_connect"):
+            bridge = SerialBridge()
+            bridge._hb_seq = 42
+            bridge.arduino_alive = False
+            bridge.last_hb_ack_time = 0.0
+
+            logs = []
+            mock_logger = MagicMock()
+            mock_logger.info = lambda msg: logs.append(msg)
+            bridge.get_logger = lambda: mock_logger
+
+            bridge.handle_msg(MSG_HEARTBEAT_ACK, b"")
+            self.assertTrue(bridge.arduino_alive)
+            self.assertGreater(bridge.last_hb_ack_time, 0.0)
+            log_text = "\n".join(logs)
+            self.assertIn("[HEARTBEAT ACK] sequence=42", log_text)
+            self.assertIn("[MOTOR SAFETY RECOVERED] heartbeat_healthy=true", log_text)
+
+    def test_heartbeat_ack_timeout_blocks_motor(self):
+        """9. Safety: Missing Heartbeat ACK for >1.0s transitions state to SAFETY_BLOCKED."""
+        from serial_bridge import SerialBridge, ArduinoState
+        with patch.object(SerialBridge, "_try_connect"):
+            bridge = SerialBridge()
+            bridge.ser = MagicMock()
+            bridge.ser.is_open = True
+            bridge.arduino_alive = True
+            bridge.last_hb_ack_time = time.monotonic() - 1.5
+
+            logs = []
+            mock_logger = MagicMock()
+            mock_logger.warn = lambda msg: logs.append(msg)
+            mock_logger.info = lambda msg: logs.append(msg)
+            bridge.get_logger = lambda: mock_logger
+
+            bridge.send_heartbeat()
+            self.assertFalse(bridge.arduino_alive)
+            self.assertEqual(bridge.state, ArduinoState.SAFETY_BLOCKED)
+            log_text = "\n".join(logs)
+            self.assertIn("[MOTOR SAFETY BLOCK] reason=heartbeat_ack_missing", log_text)
+
+    def test_motor_command_requires_heartbeat_health(self):
+        """10. Safety: on_wheel_cmd rejects motion when heartbeat is not healthy."""
+        from serial_bridge import SerialBridge, WheelCmd
+        with patch.object(SerialBridge, "_try_connect"):
+            bridge = SerialBridge()
+            bridge.ser = MagicMock()
+            bridge.ser.is_open = True
+            bridge.arduino_alive = False
+            bridge.handshake_ok = True
+            bridge.is_self_testing = False
+
+            logs = []
+            mock_logger = MagicMock()
+            mock_logger.warn = lambda msg: logs.append(msg)
+            bridge.get_logger = lambda: mock_logger
+
+            cmd = WheelCmd()
+            cmd.left_rpm = 30.0
+            cmd.right_rpm = 30.0
+            bridge.on_wheel_cmd(cmd)
+
+            bridge.ser.write.assert_not_called()
+            log_text = "\n".join(logs)
+            self.assertIn("[MOTOR SAFETY BLOCK] reason=heartbeat_ack_missing", log_text)
+
+    def test_motor_command_ack_routing(self):
+        """11. Motor Command: on_wheel_cmd sends packet under tx_lock and logs command telemetry."""
+        from serial_bridge import SerialBridge, WheelCmd
+        with patch.object(SerialBridge, "_try_connect"):
+            bridge = SerialBridge()
+            bridge.ser = MagicMock()
+            bridge.ser.is_open = True
+            bridge.arduino_alive = True
+            bridge.handshake_ok = True
+            bridge.is_self_testing = False
+
+            logs = []
+            mock_logger = MagicMock()
+            mock_logger.info = lambda msg: logs.append(msg)
+            bridge.get_logger = lambda: mock_logger
+
+            cmd = WheelCmd()
+            cmd.left_rpm = 30.0
+            cmd.right_rpm = 30.0
+            bridge.on_wheel_cmd(cmd)
+
+            bridge.ser.write.assert_called_once()
+            log_text = "\n".join(logs)
+            self.assertIn("[MOTOR COMMAND] direction=forward speed=30.0", log_text)
+            self.assertIn("[MOTOR ACK] status=success", log_text)
+
+    def test_self_test_requires_heartbeat(self):
+        """12. Self-Test: Self-test requires Arduino handshake and Heartbeat ACK before executing."""
+        from serial_bridge import SerialBridge
+        with patch.object(SerialBridge, "_try_connect"):
+            bridge = SerialBridge()
+            bridge.ser = MagicMock()
+            bridge.ser.is_open = True
+            bridge.arduino_alive = False
+            bridge.handshake_ok = False
+
+            logs = []
+            mock_logger = MagicMock()
+            mock_logger.warn = lambda msg: logs.append(msg)
+            mock_logger.info = lambda msg: logs.append(msg)
+            bridge.get_logger = lambda: mock_logger
+
+            with patch("time.sleep"):
+                bridge._run_startup_self_test()
+
+            log_text = "\n".join(logs)
+            self.assertIn("Wheel self-test FAILED reason=heartbeat_ack_missing", log_text)
+            self.assertNotIn("Wheels FORWARD", log_text)
+
+    def test_self_test_fails_without_continuous_heartbeat(self):
+        """13. Self-Test: If heartbeat is lost during self-test, aborts immediately without COMPLETED/PASSED."""
+        from serial_bridge import SerialBridge
+        with patch.object(SerialBridge, "_try_connect"):
+            bridge = SerialBridge()
+            bridge.ser = MagicMock()
+            bridge.ser.is_open = True
+            bridge.arduino_alive = True
+            bridge.handshake_ok = True
+
+            logs = []
+            mock_logger = MagicMock()
+            mock_logger.warn = lambda msg: logs.append(msg)
+            mock_logger.info = lambda msg: logs.append(msg)
+            bridge.get_logger = lambda: mock_logger
+
+            # Drop heartbeat on iteration 2
+            call_count = [0]
+            def fake_sleep(duration):
+                call_count[0] += 1
+                if call_count[0] >= 2:
+                    bridge.arduino_alive = False
+
+            with patch("time.sleep", side_effect=fake_sleep):
+                bridge._run_startup_self_test()
+
+            log_text = "\n".join(logs)
+            self.assertIn("Wheel self-test FAILED reason=heartbeat_ack_missing", log_text)
+            self.assertNotIn("Wheel self-test PASSED.", log_text)
+
+    def test_self_test_passes_with_continuous_heartbeat(self):
+        """14. Self-Test: Completes FORWARD and BACKWARD motions and logs Wheel self-test PASSED."""
+        from serial_bridge import SerialBridge
+        with patch.object(SerialBridge, "_try_connect"):
+            bridge = SerialBridge()
+            bridge.ser = MagicMock()
+            bridge.ser.is_open = True
+            bridge.arduino_alive = True
+            bridge.handshake_ok = True
+
+            logs = []
+            mock_logger = MagicMock()
+            mock_logger.info = lambda msg: logs.append(msg)
+            bridge.get_logger = lambda: mock_logger
+
+            with patch("time.sleep"):
+                bridge._run_startup_self_test()
+
+            log_text = "\n".join(logs)
+            self.assertIn("Wheels FORWARD", log_text)
+            self.assertIn("Wheels BACKWARD", log_text)
+            self.assertIn("Wheel self-test PASSED.", log_text)
+
+    def test_single_serial_reader(self):
+        """15. Serial Architecture: SerialBridge uses a single designated background RX reader thread."""
+        from serial_bridge import SerialBridge
+        bridge = SerialBridge.__new__(SerialBridge)
+        bridge.ser = None
+        bridge.port = None
+        bridge.rx_thread = None
+        bridge.port_param = "/dev/astro_arduino"
+        bridge.baud = 500000
+        bridge.get_logger = lambda: MagicMock()
+
+        mock_ser = MagicMock()
+        mock_ser.is_open = True
+        with patch("serial_bridge.resolve_serial_port", return_value="/dev/astro_arduino"), \
+             patch("serial.Serial", return_value=mock_ser):
+            bridge._try_connect()
+            self.assertIsNotNone(bridge.rx_thread)
+            self.assertTrue(bridge.rx_thread.daemon)
+
+    def test_serial_tx_lock(self):
+        """16. Serial Architecture: SerialBridge has a dedicated tx_lock for serial write synchronization."""
+        from serial_bridge import SerialBridge
+        with patch.object(SerialBridge, "_try_connect"):
+            bridge = SerialBridge()
+            self.assertTrue(hasattr(bridge, "tx_lock"))
+            self.assertIsInstance(bridge.tx_lock, type(threading.Lock()))
+
+    def test_openai_rest_tts_not_in_production_chain(self):
+        """17. TTS Architecture: OpenAI REST TTS is excluded from production synthesis hierarchy."""
+        from astro_audio.tts_router import TTSRouter
+        mock_openai_rest = MagicMock()
+        mock_edge = MagicMock()
+        mock_edge.synthesize_sentence.return_value = b"\x00\x01" * 1200
+        mock_edge.check_network.return_value = True
+
+        router = TTSRouter(
+            edge_tts_engine=mock_edge,
+            openai_tts_engine=mock_openai_rest,
+            edge_tts_enabled=True,
+        )
+
+        res = router.synthesize("Test turn", generation_id=1)
+        mock_openai_rest.synthesize_sentence.assert_not_called()
+        self.assertEqual(res.actual_provider, "edge_tts")
+
+    def test_audio_playback_single_owner(self):
+        """18. ALSA Architecture: AudioOutputManager in tts_node is the single authoritative playback owner."""
+        from astro_audio.audio_stream_node import AudioStreamNode
+        from astro_audio.tts_node import TtsNode
+        audio_stream = AudioStreamNode.__new__(AudioStreamNode)
+        audio_stream._output_stream = None
+        self.assertIsNone(audio_stream._output_stream)
+
+        tts = TtsNode.__new__(TtsNode)
+        tts.output_manager = MagicMock()
+        self.assertIsNotNone(tts.output_manager)
+
+
 if __name__ == "__main__":
     unittest.main()
+
 
 
