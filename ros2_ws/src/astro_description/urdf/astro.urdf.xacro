@@ -133,27 +133,64 @@
   <xacro:drive_wheel prefix="left"  y_sign="1"/>
   <xacro:drive_wheel prefix="right" y_sign="-1"/>
 
-  <!-- ═══════════════════ Denge tekerlekleri ═══════════════════ -->
-  <!-- İki tahrik tekerleği tek başına devrilir; ön ve arkaya birer küre
-       konuyor. Küre merkezi z = caster_radius olacak şekilde yerleştirilir. -->
+  <!-- ═══════════════════ Döner denge tekerlekleri ═══════════════════ -->
+  <!--
+    İki tahrik tekerleği tek başına devrilir. Önce sabit küre denendi, ama
+    sabit küre yanlış model: sürtünmesi düşük olursa (mu=0.02) gövde yerinde
+    dönüşte ataletle kayıp odometriyi %14 aşıyor, yüksek olursa (mu=0.2) küre
+    direnip tahrik tekerleklerini patinaja sokuyor ve bu kez odometri %14
+    fazla okuyor. İşaretin tersine dönmesi, hatanın sürtünme katsayısında
+    değil kinematikte olduğunu gösterdi.
+
+    Gerçek robotta olduğu gibi döner teker: dikey döndürme ekseni + yuvarlanan
+    tekerlek, tekerlek teması döndürme ekseninin TRAIL kadar arkasında.
+    Bu geometri tekerleğin hareket yönüne kendiliğinden hizalanmasını sağlar
+    ve sürtünerek sürüklenme (scrub) tamamen ortadan kalkar.
+  -->
+  <xacro:property name="caster_trail" value="0.015"/>
+
   <xacro:macro name="caster" params="prefix x_sign">
-    <link name="${prefix}_caster_link">
+    <!-- Döndürme (swivel) mili -->
+    <link name="${prefix}_caster_swivel_link">
       <visual>
-        <geometry><sphere radius="${caster_radius}"/></geometry>
+        <geometry><cylinder radius="0.012" length="0.03"/></geometry>
         <material name="dark_grey"/>
       </visual>
-      <collision>
-        <geometry><sphere radius="${caster_radius}"/></geometry>
-      </collision>
-      <xacro:inertial_sphere mass="0.15" radius="${caster_radius}">
+      <xacro:inertial_cylinder mass="0.03" radius="0.012" length="0.03">
         <origin xyz="0 0 0" rpy="0 0 0"/>
-      </xacro:inertial_sphere>
+      </xacro:inertial_cylinder>
     </link>
 
-    <joint name="${prefix}_caster_joint" type="fixed">
+    <joint name="${prefix}_caster_swivel_joint" type="continuous">
       <parent link="base_link"/>
-      <child link="${prefix}_caster_link"/>
-      <origin xyz="${x_sign * caster_x_offset} 0 ${caster_radius - wheel_radius}" rpy="0 0 0"/>
+      <child link="${prefix}_caster_swivel_link"/>
+      <origin xyz="${x_sign * caster_x_offset} 0 ${caster_radius - wheel_radius + 0.02}" rpy="0 0 0"/>
+      <axis xyz="0 0 1"/>
+      <dynamics damping="0.001" friction="0.0"/>
+    </joint>
+
+    <!-- Yuvarlanan tekerlek: milin TRAIL kadar arkasında -->
+    <link name="${prefix}_caster_wheel_link">
+      <visual>
+        <origin xyz="0 0 0" rpy="${pi/2} 0 0"/>
+        <geometry><cylinder radius="${caster_radius}" length="0.02"/></geometry>
+        <material name="black"/>
+      </visual>
+      <collision>
+        <origin xyz="0 0 0" rpy="${pi/2} 0 0"/>
+        <geometry><cylinder radius="${caster_radius}" length="0.02"/></geometry>
+      </collision>
+      <xacro:inertial_cylinder mass="0.05" radius="${caster_radius}" length="0.02">
+        <origin xyz="0 0 0" rpy="${pi/2} 0 0"/>
+      </xacro:inertial_cylinder>
+    </link>
+
+    <joint name="${prefix}_caster_wheel_joint" type="continuous">
+      <parent link="${prefix}_caster_swivel_link"/>
+      <child link="${prefix}_caster_wheel_link"/>
+      <origin xyz="${-caster_trail} 0 -0.02" rpy="0 0 0"/>
+      <axis xyz="0 1 0"/>
+      <dynamics damping="0.001" friction="0.0"/>
     </joint>
   </xacro:macro>
 

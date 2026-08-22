@@ -31,17 +31,19 @@
   <xacro:wheel_surface link="left_wheel_link"/>
   <xacro:wheel_surface link="right_wheel_link"/>
 
+  <!-- Döner teker artık yuvarlanıyor, sürüklenmiyor: gerçek lastik gibi
+       tutunabilir. Düşük sürtünmeye gerek yok. -->
   <xacro:macro name="caster_surface" params="link">
     <gazebo reference="${link}">
-      <mu1>0.02</mu1>
-      <mu2>0.02</mu2>
+      <mu1>0.8</mu1>
+      <mu2>0.8</mu2>
       <kp>1000000.0</kp>
       <kd>100.0</kd>
     </gazebo>
   </xacro:macro>
 
-  <xacro:caster_surface link="front_caster_link"/>
-  <xacro:caster_surface link="rear_caster_link"/>
+  <xacro:caster_surface link="front_caster_wheel_link"/>
+  <xacro:caster_surface link="rear_caster_wheel_link"/>
 
   <gazebo reference="base_link">
     <material>
@@ -84,6 +86,10 @@
       <joint_name>left_wheel_joint</joint_name>
       <joint_name>right_wheel_joint</joint_name>
       <joint_name>head_yaw_joint</joint_name>
+      <joint_name>front_caster_swivel_joint</joint_name>
+      <joint_name>front_caster_wheel_joint</joint_name>
+      <joint_name>rear_caster_swivel_joint</joint_name>
+      <joint_name>rear_caster_wheel_joint</joint_name>
     </plugin>
   </gazebo>
 
