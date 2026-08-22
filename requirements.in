@@ -44,5 +44,10 @@ numpy==1.26.4 ; platform_machine == "aarch64"
 # NOT: requirements.txt x86_64 için çözüldüğünden bu marker kilide yansımaz;
 # aarch64 sabitlemesini scripts/install.sh açıkça uygular.
 
+# ── Test ────────────────────────────────────────────────────
+# Sistem pytest'i (/usr/lib/python3/dist-packages) venv'deki anyio eklentisiyle
+# çakışıyor ("No module named '_pytest.scope'"); pytest venv'de olmalı.
+pytest
+
 # ── Görü ────────────────────────────────────────────────────
 opencv-python<5         # face_detector_node Haar cascade kullanıyor (bkz. yukarıdaki not)
