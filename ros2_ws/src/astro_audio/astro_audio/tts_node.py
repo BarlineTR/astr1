@@ -134,22 +134,14 @@ class TtsNode(Node):
             logger=self._log,
         )
 
-        # 4.5 OpenAI Speech API motoru (TTS_ENGINE="openai" ile etkinleşir).
-        # Realtime düğümü (astro_realtime_node) klasik robot.launch.py boru hattında
-        # çalışmadığı için, TTS'in OpenAI üzerinden geçmesinin tek yolu budur.
+        # 4.5 OpenAI REST TTS motoru — Üretim zincirinden tamamen çıkarıldı.
+        # Yalnızca açıkça ENABLE_OPENAI_REST_TTS=true verilirse test amaçlı kurulur.
         self.openai_tts = None
-        if self.tts_engine_pref in ("openai", "openai-tts", "openai_tts"):
+        if os.getenv("ENABLE_OPENAI_REST_TTS", "false").strip().lower() in ("1", "true", "yes"):
             from astro_audio.openai_tts_engine import OpenAITTSEngine
-
             engine = OpenAITTSEngine(voice=self.openai_voice, logger=self._log)
             if engine.is_installed:
                 self.openai_tts = engine
-            else:
-                self._log(
-                    "warn",
-                    "⚠️ [TTS] TTS_ENGINE=openai ama OpenAI istemcisi kurulamadı "
-                    "(OPENAI_API_KEY eksik/geçersiz olabilir) — Edge-TTS'e düşülecek.",
-                )
 
         # 4.6 ElevenLabs — TTS_ENGINE="elevenlabs" veya ELEVENLABS_ENABLED=true ile kurulur.
         # Motor 330 satırdı ama hiçbir yerde örneklenmiyordu; artık zincire bağlı.
@@ -187,6 +179,7 @@ class TtsNode(Node):
         self.sub_say = self.create_subscription(String, "/tts/say", self._on_say, 20)
         self.sub_interrupt = self.create_subscription(Bool, "/tts/interrupt", self._on_interrupt, 10)
         self.sub_emotion = self.create_subscription(String, "/robot/emotion", self._on_emotion, 10)
+        self.sub_realtime_pcm = self.create_subscription(String, "/audio/realtime_output_pcm", self._on_realtime_output_pcm, 50)
 
         # Internal Queue for /tts/say requests
         self._say_queue: queue.Queue[dict] = queue.Queue(maxsize=100)
@@ -274,6 +267,19 @@ class TtsNode(Node):
                 except queue.Empty:
                     break
             self.orchestrator.interrupt()
+
+    def _on_realtime_output_pcm(self, msg: String):
+        """Streams Realtime 24kHz int16 PCM directly into AudioOutputManager for ALSA playback."""
+        try:
+            import base64
+            raw_b64 = msg.data.strip()
+            if not raw_b64:
+                return
+            pcm_bytes = base64.b64decode(raw_b64)
+            if pcm_bytes:
+                self.output_manager.play_pcm_chunk(pcm_bytes, sample_rate=24000)
+        except Exception as e:
+            self._log("debug", f"_on_realtime_output_pcm notice: {e}")
 
     def _process_say_queue(self):
         while rclpy.ok():

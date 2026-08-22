@@ -109,19 +109,11 @@ class TTSRouter:
                 "  reason=production_runtime_disabled"
             )
 
-        el_label = (
-            f"ElevenLabs ({self.elevenlabs_engine.model_id}) -> " if self.elevenlabs_engine else ""
-        )
-        openai_tts_label = (
-            f"OpenAI TTS ({self.openai_tts_engine.model}, Primary Fallback) -> "
-            if self.openai_tts_engine else ""
-        )
         self._safe_log(
             "info",
-            f"🎯 [TTSRouter] Production Hiyerarşi Aktif: OpenAI Realtime (Primary) -> "
-            f"{el_label}{openai_tts_label}"
-            f"Edge-TTS (timeout={self.edge_timeout_s}s) -> "
-            f"Local Offline TTS (Emergency Fallback) -> Pre-generated Emergency WAV"
+            f"[TTS ROUTER] OpenAI Realtime (Primary) -> "
+            f"Edge-TTS (Primary Fallback, timeout={self.edge_timeout_s}s) -> "
+            f"Local Offline TTS (Emergency Fallback) -> Emergency WAV"
         )
 
     def _safe_log(self, lvl: str, msg: str):

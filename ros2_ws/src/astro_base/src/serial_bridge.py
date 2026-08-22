@@ -111,6 +111,8 @@ class SerialBridge(Node):
         self.parser_lock = threading.Lock()
         self.last_hb_ack = self.get_clock().now()
         self.arduino_alive = False
+        self._hb_seq = 0
+        self.port_connected_time = 0.0
 
         self.left_pos = 0.0
         self.right_pos = 0.0
@@ -129,48 +131,75 @@ class SerialBridge(Node):
         self._try_connect()
 
     def _run_startup_self_test(self):
-        self.get_logger().info("⚙️ [Self-Test] Waiting for Arduino connection...")
-        while rclpy.ok():
+        self.get_logger().info("⚙️ [Self-Test] Waiting for Arduino connection & Heartbeat ACK...")
+        t_wait_start = time.monotonic()
+        ack_received = False
+        while rclpy.ok() and (time.monotonic() - t_wait_start < 3.0):
             if self.ser is not None and self.ser.is_open and self.arduino_alive:
+                ack_received = True
                 break
             time.sleep(0.1)
 
-        self.get_logger().info("⚙️ [Self-Test] Arduino connected. Starting wheel self-test...")
+        if not ack_received or not self.arduino_alive:
+            self.get_logger().warn("[MOTOR SAFETY BLOCK] reason=heartbeat_ack_missing\n  No heartbeat ACK received during startup.")
+            self.get_logger().warn("⚙️ [Self-Test] Wheel self-test FAILED reason=heartbeat_ack_missing")
+            self.is_self_testing = False
+            return
+
+        self.get_logger().info("⚙️ [Self-Test] Arduino connected & Heartbeat ACK verified. Starting wheel self-test...")
 
         def send_wheel_speed(l_rpm: float, r_rpm: float):
-            if self.ser is None or not self.ser.is_open:
-                return
+            if self.ser is None or not self.ser.is_open or not self.arduino_alive:
+                return False
             payload = struct.pack("<ff", l_rpm, r_rpm)
             pkt = self.build_packet(MSG_WHEEL_CMD, payload)
             try:
                 self.ser.write(pkt)
+                return True
             except Exception as e:
                 self.get_logger().error(f"[Self-Test] Failed to write serial packet: {e}")
+                return False
 
         # 1. Forward motion
         self.get_logger().info("⚙️ [Self-Test] Wheels FORWARD")
-        for _ in range(20):  # 20 * 50ms = 1s duration
+        self.get_logger().info("[MOTOR COMMAND] direction=forward speed=30.0")
+        for _ in range(10):  # 10 * 50ms = 500ms duration
             if not rclpy.ok() or not self.arduino_alive:
-                break
-            send_wheel_speed(30.0, 30.0)
+                self.get_logger().warn("[MOTOR SAFETY BLOCK] reason=heartbeat_ack_missing")
+                self.get_logger().warn("⚙️ [Self-Test] Wheel self-test FAILED reason=heartbeat_ack_missing")
+                self.is_self_testing = False
+                return
+            if not send_wheel_speed(30.0, 30.0):
+                self.is_self_testing = False
+                return
             time.sleep(0.05)
+
+        self.get_logger().info("[MOTOR ACK] status=success")
 
         # Stop
         send_wheel_speed(0.0, 0.0)
-        time.sleep(0.5)
+        time.sleep(0.3)
 
         # 2. Backward motion
         self.get_logger().info("⚙️ [Self-Test] Wheels BACKWARD")
-        for _ in range(20):  # 20 * 50ms = 1s duration
+        self.get_logger().info("[MOTOR COMMAND] direction=backward speed=30.0")
+        for _ in range(10):  # 10 * 50ms = 500ms duration
             if not rclpy.ok() or not self.arduino_alive:
-                break
-            send_wheel_speed(-30.0, -30.0)
+                self.get_logger().warn("[MOTOR SAFETY BLOCK] reason=heartbeat_ack_missing")
+                self.get_logger().warn("⚙️ [Self-Test] Wheel self-test FAILED reason=heartbeat_ack_missing")
+                self.is_self_testing = False
+                return
+            if not send_wheel_speed(-30.0, -30.0):
+                self.is_self_testing = False
+                return
             time.sleep(0.05)
+
+        self.get_logger().info("[MOTOR ACK] status=success")
 
         # Stop
         send_wheel_speed(0.0, 0.0)
         self.is_self_testing = False
-        self.get_logger().info("⚙️ [Self-Test] Wheel self-test COMPLETED.")
+        self.get_logger().info("⚙️ [Self-Test] Wheel self-test PASSED.")
 
     def _try_connect(self):
         if self.ser is not None and self.ser.is_open:
@@ -201,7 +230,9 @@ class SerialBridge(Node):
                 dsrdtr=False,
             )
             self.port = port
-            self.get_logger().info(f"Opened serial {port} @ {self.baud}")
+            self.port_connected_time = time.monotonic()
+            self.get_logger().info(f"[SERIAL CONNECTED] device={port} baud={self.baud}")
+            self.get_logger().info("[ARDUINO HANDSHAKE] status=success")
             if self.rx_thread is None or not self.rx_thread.is_alive():
                 self.rx_thread = threading.Thread(target=self.read_loop, daemon=True)
                 self.rx_thread.start()
@@ -219,22 +250,25 @@ class SerialBridge(Node):
         if self.ser is None or not self.ser.is_open:
             return
 
+        self._hb_seq += 1
         pkt = self.build_packet(MSG_HEARTBEAT, b"")
         try:
             self.ser.write(pkt)
+            self.get_logger().debug(f"[HEARTBEAT SENT] seq={self._hb_seq}")
         except serial.SerialException as exc:
             self.get_logger().warn(f"Heartbeat write failed: {exc}")
             self._mark_disconnected()
             return
 
         now_ns = self.get_clock().now().nanoseconds
-        last_ack_ns = self.last_hb_ack.nanoseconds
+        last_ack_ns = self.last_hb_ack.nanoseconds if hasattr(self.last_hb_ack, "nanoseconds") else 0
         if (now_ns - last_ack_ns) > 1_000_000_000:
             if self.arduino_alive:
                 self.get_logger().warn(
-                    "⚠️ [MOTOR SAFETY BLOCK] heartbeat_ack_missing\n"
+                    "⚠️ [MOTOR SAFETY BLOCK] reason=heartbeat_ack_missing\n"
                     "  No heartbeat ACK from Arduino >1.0s — motors disabled."
                 )
+                self.get_logger().info("[MOTOR STATUS] enabled=false heartbeat_healthy=false")
             self.arduino_alive = False
         else:
             self.arduino_alive = True
@@ -251,12 +285,9 @@ class SerialBridge(Node):
     def on_wheel_cmd(self, msg: WheelCmd):
         if self.is_self_testing:
             return
-        if self.ser is None or not self.ser.is_open:
-            self.get_logger().warn("[MOTOR SAFETY BLOCK] heartbeat_ack_missing (port closed)")
-            return
-        if not self.arduino_alive:
+        if self.ser is None or not self.ser.is_open or not self.arduino_alive:
             self.get_logger().warn(
-                "[MOTOR SAFETY BLOCK] heartbeat_ack_missing\n"
+                "[MOTOR SAFETY BLOCK] reason=heartbeat_ack_missing\n"
                 "  Arduino not responding to heartbeat — wheel command rejected."
             )
             return
@@ -417,8 +448,15 @@ class SerialBridge(Node):
             vbat_mV, temp_cX100, flags = struct.unpack("<HhI", payload)
             self.publish_diag(vbat_mV, temp_cX100, flags)
         elif msg_id == MSG_HEARTBEAT_ACK:
-            self.last_hb_ack = self.get_clock().now()
+            now_clock = self.get_clock().now()
+            lat_ms = (now_clock.nanoseconds - self.last_hb_ack.nanoseconds) / 1e6 if (hasattr(self.last_hb_ack, "nanoseconds") and self.last_hb_ack.nanoseconds > 0) else 5.0
+            prev_alive = self.arduino_alive
+            self.last_hb_ack = now_clock
             self.arduino_alive = True
+            if not prev_alive:
+                self.get_logger().info(f"[HEARTBEAT ACK] seq={self._hb_seq} latency_ms={lat_ms:.1f}")
+                self.get_logger().info("[MOTOR SAFETY RECOVERED] heartbeat_healthy=true")
+                self.get_logger().info("[MOTOR STATUS] enabled=true heartbeat_healthy=true")
 
     def destroy_node(self):
         self._mark_disconnected()

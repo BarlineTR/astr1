@@ -325,6 +325,7 @@ class AiBrainNode(Node):
 
         # ROS 2 Publishers
         self.pub_tts = self.create_publisher(String, "/tts/say", 10)
+        self.pub_realtime_req = self.create_publisher(String, "/tts/realtime_request", 10)
         self.pub_interrupt = self.create_publisher(Bool, "/tts/interrupt", 10)
         self.pub_emotion = self.create_publisher(String, "/robot/emotion", 10)
         self.pub_gesture = self.create_publisher(String, "/robot/head_gesture", 10)
@@ -2469,11 +2470,17 @@ class AiBrainNode(Node):
         text_lower = text.lower()
         return any(k in text_lower for k in keywords)
 
-    def _publish_tts(self, text: str):
+    def _publish_tts(self, text: str, generation_id: Optional[int] = None):
         import json
         last_u = getattr(self.session, "last_user_text", "")
         clean = response_length_gate(text, user_query=last_u, max_words=35, max_sentences=2)
         if clean:
+            if isinstance(generation_id, (int, float)):
+                gen_id = int(generation_id)
+            elif hasattr(self, "session") and isinstance(getattr(self.session, "current_turn_count", None), int):
+                gen_id = self.session.current_turn_count
+            else:
+                gen_id = 1
             openai_realtime_ok = (
                 (self.circuit_breaker.is_available("openai", sub_provider="openai_realtime") if self.circuit_breaker else True)
                 and self._realtime_ws_connected
@@ -2482,6 +2489,14 @@ class AiBrainNode(Node):
             if openai_realtime_ok and self.session.metadata.get("tts_engine") != "edge-tts":
                 tts_engine = "openai_realtime"
                 reason = "realtime_available"
+                self.get_logger().info(f"[TTS REQUESTED] requested_provider={tts_engine} selection_reason={reason} text=\"{clean}\"")
+                req_payload = {"text": clean, "generation_id": gen_id}
+                msg = String()
+                msg.data = json.dumps(req_payload)
+                if hasattr(self, "pub_realtime_req") and self.pub_realtime_req is not None:
+                    self.pub_realtime_req.publish(msg)
+                else:
+                    self.pub_tts.publish(msg)
             else:
                 tts_engine = "edge_tts"
                 if self.circuit_breaker and self.circuit_breaker.is_exhausted("openai"):
@@ -2491,14 +2506,11 @@ class AiBrainNode(Node):
                 else:
                     reason = "session_edge_tts"
 
-            self.get_logger().info(f"[TTS REQUESTED] requested_provider={tts_engine} selection_reason={reason} text=\"{clean}\"")
-            msg = String()
-            if tts_engine == "edge_tts" or self.session.metadata.get("tts_engine") == "edge-tts":
-                payload = {"text": clean, "engine": "edge-tts"}
+                self.get_logger().info(f"[TTS REQUESTED] requested_provider={tts_engine} selection_reason={reason} text=\"{clean}\"")
+                payload = {"text": clean, "engine": "edge-tts", "generation_id": gen_id, "fallback_reason": reason}
+                msg = String()
                 msg.data = json.dumps(payload)
-            else:
-                msg.data = clean
-            self.pub_tts.publish(msg)
+                self.pub_tts.publish(msg)
 
     def _publish_interrupt(self):
         msg = Bool()

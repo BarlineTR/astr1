@@ -178,33 +178,27 @@ class AudioStreamNode(Node):
         self._last_input_callback_time = time.monotonic()
         self._last_cb_err_log_time = 0.0
 
-        # Streams
+        # Streams & Worker States
         self._input_stream = None
         self._output_stream = None
+        self._input_stream_alive = False
 
-        # Start Playback Worker Thread
-        self._play_thread = threading.Thread(target=self._playback_worker, daemon=True)
-        self._play_thread.start()
-
-        # Start Input Capture Stream
+        # Start Input Capture Stream (Single-owner capture)
         self._start_input_stream()
 
         # Playback status ticker timer
-        self.create_timer(0.05, self._publish_status)
-
-        self.get_logger().info(
-            f"🔊 [AUDIO READY]\n"
-            f"  input_device=[{self._in_dev_idx}] {self._in_device_name}\n"
-            f"  output_device=[{self._out_dev_idx}] {self._out_device_name}\n"
-            f"  input_callback=alive\n"
-            f"  playback_worker=alive\n"
-            f"  audio_input_callback_alive=True\n"
-            f"  audio_playback_worker_alive=True"
-        )
+        self.create_timer(0.1, self._publish_status)
 
     def _start_input_stream(self):
         if sd is None:
+            self._input_stream_alive = False
             self.get_logger().error("sounddevice kütüphanesi eksik! Canlı ses yakalanamıyor.")
+            self.get_logger().error(
+                f"[AUDIO ERROR]\n"
+                f"  direction=input\n"
+                f"  device=[{self._in_dev_idx}] {self._in_device_name}\n"
+                f"  reason=sounddevice_missing"
+            )
             return
 
         try:
@@ -217,18 +211,49 @@ class AudioStreamNode(Node):
                 callback=self._input_callback,
             )
             self._input_stream.start()
+            self._input_stream_alive = True
             self.get_logger().info("✅ [Realtime Audio] 16kHz Canlı Mikrofon Akışı Başlatıldı (20ms/blok).")
+            self.get_logger().info(
+                f"🔊 [AUDIO READY]\n"
+                f"  input_device=[{self._in_dev_idx}] {self._in_device_name}\n"
+                f"  input_callback=alive\n"
+                f"  audio_input_callback_alive=True"
+            )
         except Exception as e:
-            self.get_logger().error(f"❌ [Realtime Audio] Giriş akışı başlatılamadı: {e}")
+            self._input_stream_alive = False
+            self.get_logger().warn(
+                f"[AUDIO ERROR]\n"
+                f"  direction=input\n"
+                f"  device=[{self._in_dev_idx}] {self._in_device_name}\n"
+                f"  reason=device_unavailable\n"
+                f"  error={e}"
+            )
+            # Subscribe to audio_capture_node's /audio/speech_audio as fallback input transport
+            try:
+                from std_msgs.msg import Int16MultiArray
+                self.sub_fallback_audio = self.create_subscription(
+                    Int16MultiArray, "/audio/speech_audio", self._on_fallback_audio_msg, 20
+                )
+            except Exception:
+                pass
+
+    def _on_fallback_audio_msg(self, msg):
+        """Receives 16kHz int16 PCM from audio_capture_node when direct hardware capture is occupied."""
+        try:
+            raw_bytes = np.array(msg.data, dtype=np.int16).tobytes()
+            self._process_raw_audio_chunk(raw_bytes)
+        except Exception:
+            pass
 
     def _input_callback(self, indata, frames, time_info, status):
         """Audio hardware callback triggered every 20ms with 320 16-bit PCM samples."""
-        try:
-            self._last_input_callback_time = time.monotonic()
-            if status:
-                pass
+        self._last_input_callback_time = time.monotonic()
+        raw_bytes = bytes(indata) if indata is not None else b""
+        self._process_raw_audio_chunk(raw_bytes)
 
-            raw_bytes = bytes(indata)
+    def _process_raw_audio_chunk(self, raw_bytes: bytes):
+        """Processes 16kHz int16 PCM chunk (VAD, software echo mute, 24kHz upsampling, base64 publishing)."""
+        try:
             if not raw_bytes:
                 return
 
@@ -295,6 +320,7 @@ class AudioStreamNode(Node):
             now_cb = time.monotonic()
             if (now_cb - self._last_cb_err_log_time) > 2.0:
                 self._last_cb_err_log_time = now_cb
+                self.get_logger().debug(f"Input processing exception: {exc}")
                 self.get_logger().error(
                     f"❌ [Realtime Audio Callback Error]: callback_exception={type(exc).__name__}: {exc} | "
                     f"callback_exception_count={self._callback_exception_count} | audio_input_alive=True"
