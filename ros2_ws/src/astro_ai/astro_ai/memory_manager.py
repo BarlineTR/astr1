@@ -8,6 +8,10 @@ Tiers:
 """
 
 import json
+import logging
+
+_LOG = logging.getLogger(__name__)
+
 import os
 import re
 import threading
@@ -90,11 +94,12 @@ class PersistentProfile:
         """Çalışılan depoya ait astro_memory.json yolunu bulur.
 
         Eskiden ilk aday modül konumundan üç seviye yukarısıydı (kurulu pakette
-        hiç var olmayan bir yol) ve hemen ardından sabit ~/Desktop/astr1 geliyordu:
+        hiç var olmayan bir yol) ve hemen ardından başka bir geliştiricinin makinesine
+        ait sabit yollar geliyordu:
         makinede eski bir kopya duruyorsa tüm kalıcı bellek — tanınan kişiler dahil —
         çalışan depoya değil o kopyaya yazılıyordu. Artık modülün bulunduğu yerden
-        yukarı yürüyüp ros2_ws içeren gerçek depo kökü aranır; sabit yollar yalnızca
-        en sonda, geriye dönük uyumluluk için denenir.
+        yukarı yürüyüp ros2_ws içeren gerçek depo kökü aranır; makineye özel sabit
+        yollar tamamen kaldırıldı.
         """
         here = os.path.dirname(os.path.abspath(__file__))
 
@@ -113,8 +118,6 @@ class PersistentProfile:
                 return candidate
 
         legacy = [
-            os.path.expanduser("~/Desktop/astr1/ros2_ws/astro_memory.json"),
-            os.path.expanduser("~/Desktop/astr1/astro_memory.json"),
             os.path.abspath("./astro_memory.json"),
         ]
         for c in legacy:
@@ -133,7 +136,12 @@ class PersistentProfile:
             self.filepath = filepath
 
 
-        self._lock = threading.Lock()
+        # RLock ZORUNLU: add_person_fact / add_person_preference /
+        # add_person_session_summary kilidi tutarken add_known_person'ı çağırıyor.
+        # Düz Lock ile bu, thread'i kalıcı olarak kilitliyordu; 1 sn'lik
+        # _check_reminders timer'ı da aynı kilitte bloke olunca ai_brain_node'un
+        # tüm callback grubu donuyor ve robot kalıcı olarak sağırlaşıyordu.
+        self._lock = threading.RLock()
         self.data: Dict[str, Any] = {
             "robot_name": "Astro",
             "owner_name": "Baran",
@@ -152,13 +160,22 @@ class PersistentProfile:
 
     def load(self):
         with self._lock:
-            if os.path.exists(self.filepath):
+            source = self.filepath
+            if not os.path.exists(source):
+                # Çalışma dosyası depoda TAKİP EDİLMEZ (her çalıştırmada değişir ve
+                # kişisel veri içerir). İlk açılışta yanındaki tohum şablonundan
+                # başlatılır; şablon da yoksa koddaki varsayılanlar kullanılır.
+                seed = os.path.join(os.path.dirname(source), "astro_memory.seed.json")
+                if os.path.exists(seed):
+                    source = seed
+
+            if os.path.exists(source):
                 try:
-                    with open(self.filepath, "r", encoding="utf-8") as f:
+                    with open(source, "r", encoding="utf-8") as f:
                         saved = json.load(f)
                         self.data.update(saved)
-                except Exception:
-                    pass
+                except Exception as _exc:
+                    _LOG.debug("load: yok sayılan hata (%s)", _exc)
 
             # Sanitize any polluted data
             self._sanitize()
@@ -196,8 +213,8 @@ class PersistentProfile:
             try:
                 if os.path.exists(tmp_path):
                     os.remove(tmp_path)
-            except Exception:
-                pass
+            except Exception as _exc:
+                _LOG.debug("save: yok sayılan hata (%s)", _exc)
 
     def add_verified_fact(self, fact: str) -> bool:
         """Adds a fact only if it passes strict validation against hallucinations."""

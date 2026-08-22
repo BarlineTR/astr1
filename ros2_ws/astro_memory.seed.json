@@ -8,13 +8,10 @@
     "Robotun geliştiricisinin ve üreticisinin adı Baran.",
     "Robotik ve yazılımla ilgileniyor."
   ],
-  "learned_objects": {},
+  "learned_objects": [],
   "environmental_observations": [],
   "last_interaction": null,
-  "user_facts": [
-    "Robotun geliştiricisi",
-    "Adı Baran"
-  ],
+  "user_facts": [],
   "active_reminders": [],
   "known_people": {}
 }
