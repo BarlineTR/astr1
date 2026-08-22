@@ -298,36 +298,48 @@ tersi değil.
 | `odom_frame` | `odom` | aynı | §4'teki düğüm bunu üretmeli |
 | `max_laser_range` | `12.0` | aynı | RPLIDAR A1'in gerçek menzili |
 | `resolution` | `0.05` | aynı | 0.9 m kapı = 18 hücre |
-| `minimum_travel_distance` | **`0.0`** | **`0.0`** | ⚠️ sıfır olmak zorunda — aşağıdaki nota bakın |
-| `minimum_travel_heading` | `0.1` rad | aynı | Tarama akışını asıl bu sınırlar |
+| `minimum_travel_distance` | `0.2` | aynı | ⚠️ ancak EKF varsa güvenli — aşağıdaki nota bakın |
+| `minimum_travel_heading` | `0.2` rad | aynı | |
 
-> ### ⚠️ `minimum_travel_distance` neden sıfır olmalı
+> ### ⚠️ Yerinde dönüş, odometri ve EKF
+>
+> Diferansiyel bir taban dönerken tahrik tekerleklerini yanlamasına sürtmek
+> zorundadır. Ölçüm: düz gidişte hata ~%3, **yerinde dönüşte ~%8** ve birikir.
 >
 > slam_toolbox'ın `shouldProcessScan()` kapısı **tabanın yer değiştirmesine**
-> bakar. Robot yerinde döndüğünde taban hiç yer değiştirmez; bu değer sıfırdan
-> büyükse dönüş boyunca **tek bir tarama bile işlenmez**. Sonuç: `map -> odom`
-> donar, SLAM odometriyi aynen geçirir ve odometrinin yerinde dönüşteki ~%8
-> açı hatası hiç düzeltilmeden birikir. Görünen belirti, robot döndükçe
-> **haritanın tamamının dönmesi** ve başlangıca dönünce robotun başka bir
-> yerdeymiş gibi davranmasıdır.
+> bakar; yerinde dönüşte taban hareket etmediği için dönüş boyunca tarama
+> işlenmez ve bu hata düzeltilmez. Görünen belirti, robot döndükçe haritanın
+> dönmesi ve başlangıca dönünce robotun başka yerdeymiş gibi davranmasıdır.
 >
-> Ölçüm (4 × 90° yerinde dönüş, SLAM ile gerçek arasındaki açı farkı):
+> **Eşiği sıfırlamak çözüm DEĞİL.** Denendi: dönüş düzeldi ama robot dururken
+> bile düğüm eklendiği için poz grafiği neredeyse-aynı binlerce düğümle doldu,
+> döngü kapatma sahte eşleşmeler buldu ve **harita iç içe geçmiş kopyalara
+> ayrıldı**.
 >
-> | `minimum_travel_distance` | Hata |
-> |---|---|
-> | `0.2` | +14°, +20°, +33°, +46° — birikiyor |
-> | `0.05` | değişmedi, hâlâ düzeltmiyor |
-> | **`0.0`** | −2.0°, −2.7°, −2.5°, −2.3° — sınırlı |
+> **Doğru çözüm hatayı kaynağında gidermek:** `robot_localization` EKF'i
+> tekerlekten doğrusal hızı, IMU jiroskopundan açısal hızı alır ve
+> `odom -> base_footprint` tf'ini yayınlar. Yapılandırma:
+> `astro_sim/config/ekf.yaml`.
 >
-> Doğrudan doğrulama: 10 sn'lik yerinde dönüş boyunca `map -> odom` tam olarak
-> `(0, 0, 0)` kaldı ve ancak robot ileri gidince güncellenmeye başladı.
-
-Gerçek robotta çağrı:
-
-```bash
-ros2 launch astro_navigation slam.launch.py \
-  use_sim_time:=false scan_topic:=/scan_filtered
-```
+> 4 × 90° yerinde dönüşte SLAM ile gerçek arasındaki açı farkı:
+>
+> | Yapılandırma | Hata | Harita |
+> |---|---|---|
+> | Yalnız tekerlek odometrisi | +14°, +20°, +33°, +46° | biriken sapma |
+> | Kapı kapalı (`0.0`) | −2.0°, −2.7°, −2.5°, −2.3° | **bozuk, iç içe kopyalar** |
+> | **EKF + kapı `0.2`** | −3.9°, −4.0°, −3.8°, −4.2° | **temiz** |
+>
+> Dört tam tur eklenmiş tam rota sonunda: gerçekle fark **4 mm ve 0.02°**,
+> duvarlar 1–4 cm içinde.
+>
+> **🚨 `odom -> base_footprint` tek yayıncı:** EKF bunu yayınladığı için
+> Gazebo DiffDrive eklentisinin tf çıkışı kullanılmayan bir topic'e
+> yönlendirildi. Gerçek robotta da `base_bridge` ile EKF aynı anda bu
+> dönüşümü yayınlamamalıdır.
+>
+> **ekf.yaml düzenlerken:** rcl karışık tamsayı/ondalık diziyi reddeder
+> (`Sequence should be of same type`); `process_noise_covariance`'ın her
+> elemanı ondalık yazılmalıdır (`0.0`, `0` değil).
 
 ### 5.5 Nav2 — `astro_navigation/config/nav2_params.yaml`
 
@@ -417,8 +429,16 @@ pozu gerçekten yalnızca **5 mm ve 0.04°** uzaktı.
 1. **RViz `Fixed Frame`** `map` olmalı. `odom` seçiliyse harita `map -> odom`
    üzerinden çizilir ve SLAM her düzeltme yaptığında ekranda döner/kayar;
    robot ise sürüklenmiş odom pozunda pürüzsüz görünür.
-2. **`minimum_travel_distance`** sıfırdan büyükse yerinde dönüşte hiç tarama
-   işlenmez (yukarıdaki nota bakın) — bu, görünen değil *gerçek* bir hatadır.
+2. **Odometri dönüş hatası.** EKF çalışmıyorsa yerinde dönüşte açı hatası
+   düzeltilmeden birikir (§5.4'teki nota bakın). Kontrol:
+   `ros2 topic hz /odometry/filtered` — 50 Hz olmalı.
+
+### Harita iç içe geçmiş kopyalara ayrılıyor
+
+Poz grafiğine sahte döngü kapatma kısıtları girmiştir. En yaygın sebep
+`minimum_travel_distance`'ın çok küçük olması: robot dururken bile düğüm
+eklenir, neredeyse-aynı düğümler birbiriyle eşleşir ve grafik yırtılır.
+`0.2`'de bırakın; dönüş hatasını EKF ile çözün, eşiği düşürerek değil.
 
 ### `use_sim_time` uyuşmazlığı
 
