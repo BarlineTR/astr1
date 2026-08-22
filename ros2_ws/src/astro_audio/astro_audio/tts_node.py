@@ -266,18 +266,25 @@ class TtsNode(Node):
                     self._say_queue.get_nowait()
                 except queue.Empty:
                     break
+            self.output_manager.abort_realtime_stream(self.output_manager.current_generation)
             self.orchestrator.interrupt()
 
     def _on_realtime_output_pcm(self, msg: String):
         """Streams Realtime 24kHz int16 PCM directly into AudioOutputManager for ALSA playback."""
         try:
             import base64
-            raw_b64 = msg.data.strip()
-            if not raw_b64:
+            raw_str = msg.data.strip()
+            if not raw_str:
                 return
-            pcm_bytes = base64.b64decode(raw_b64)
+            if raw_str.startswith("{") and "pcm" in raw_str:
+                data = json.loads(raw_str)
+                gen_id = data.get("generation_id", self.output_manager.current_generation)
+                pcm_bytes = base64.b64decode(data.get("pcm", ""))
+            else:
+                gen_id = self.output_manager.current_generation
+                pcm_bytes = base64.b64decode(raw_str)
             if pcm_bytes:
-                self.output_manager.play_pcm_chunk(pcm_bytes, sample_rate=24000)
+                self.output_manager.write_realtime_pcm(gen_id, pcm_bytes, sample_rate=24000)
         except Exception as e:
             self._log("debug", f"_on_realtime_output_pcm notice: {e}")
 

@@ -335,13 +335,51 @@ class AudioOutputManager:
             self._log("warn", f"⚠️ [AudioOutputManager] Sounddevice OutputStream başlatılamadı: {e}. ALSA aplay fallback kullanılacak.")
             return None
 
+    def begin_realtime_stream(self, generation_id: int, sample_rate: int = 24000) -> bool:
+        """Explicitly begins a realtime streaming session for generation_id."""
+        with self._lock:
+            self._current_generation = generation_id
+            self._flush_queue_locked()
+            self._stop_active_processes_locked()
+            self._is_playing = True
+            self._last_playback_time = time.monotonic()
+            self._first_audio_emitted_for_gen = -1
+            if self.backend == "aplay" and not self.mock_playback:
+                try:
+                    cmd = ["aplay", "-D", self.alsa_device, "-r", str(HW_SAMPLE_RATE), "-f", "S16_LE", "-c", "1", "-q"]
+                    self._current_process = subprocess.Popen(cmd, stdin=subprocess.PIPE)
+                except Exception as e:
+                    self._log("error", f"❌ [AudioOutputManager] alsa_open_error={e}")
+                    self._current_process = None
+        return True
+
+    def write_realtime_pcm(self, generation_id: int, pcm: bytes, sample_rate: int = 24000) -> bool:
+        """Enqueues a Realtime PCM chunk for serialized playback."""
+        return self.play_pcm_chunk(
+            pcm,
+            sample_rate=sample_rate,
+            generation_id=generation_id,
+            provenance={"tts_provider": "openai_realtime", "tts_model": "gpt-realtime", "playback_source": self.backend}
+        )
+
+    def end_realtime_stream(self, generation_id: int) -> bool:
+        """Signals end of Realtime PCM streaming for generation_id."""
+        with self._lock:
+            if generation_id < self._current_generation:
+                return False
+        return True
+
+    def abort_realtime_stream(self, generation_id: int) -> bool:
+        """Barge-in / interrupt for active Realtime stream."""
+        return bool(self.interrupt(new_generation_id=generation_id + 1))
+
     def _play_chunk_via_aplay_pipe(self, chunk: bytes, gen: int) -> bool:
-        """Writes PCM chunk to an aplay subprocess, closes stdin to flush, and lets it play to completion."""
+        """Writes PCM chunk to a continuous aplay subprocess pipe without prematurely closing stdin."""
         with self._lock:
             if gen < self._current_generation:
                 return False
             
-            if self._current_process is None or self._current_process.poll() is not None:
+            if self._current_process is None or self._current_process.poll() is not None or self._current_process.stdin is None or self._current_process.stdin.closed:
                 try:
                     cmd = ["aplay", "-D", self.alsa_device, "-r", str(HW_SAMPLE_RATE), "-f", "S16_LE", "-c", "1", "-q"]
                     self._current_process = subprocess.Popen(cmd, stdin=subprocess.PIPE)
@@ -355,13 +393,9 @@ class AudioOutputManager:
         import errno
         for attempt in range(3):
             try:
-                if proc and proc.stdin:
+                if proc and proc.stdin and not proc.stdin.closed:
                     proc.stdin.write(chunk)
                     proc.stdin.flush()
-                    try:
-                        proc.stdin.close()
-                    except Exception as _exc:
-                        self._log("debug", f"_play_chunk_via_aplay_pipe: yok sayılan hata ({_exc})")
                     return True
             except OSError as e:
                 if getattr(e, "errno", None) == errno.EINTR:
@@ -461,9 +495,19 @@ class AudioOutputManager:
             try:
                 raw_item = self._play_queue.get(timeout=0.05)
             except queue.Empty:
-                if self._current_process is not None and self._current_process.poll() is None:
-                    continue
-                if self._is_playing:
+                if self._current_process is not None:
+                    if (time.monotonic() - self._last_playback_time) > 0.40:
+                        try:
+                            if self._current_process.stdin and not self._current_process.stdin.closed:
+                                self._current_process.stdin.close()
+                            self._current_process.wait(timeout=0.2)
+                        except Exception:
+                            pass
+                        self._current_process = None
+                    else:
+                        continue
+
+                if self._is_playing and (time.monotonic() - self._last_playback_time > 0.20):
                     with self._lock:
                         self._is_playing = False
                         finished_gen = self._first_audio_emitted_for_gen
