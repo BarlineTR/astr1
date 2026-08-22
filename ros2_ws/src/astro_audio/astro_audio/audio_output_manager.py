@@ -385,7 +385,16 @@ class AudioOutputManager:
         return True
 
     def write_realtime_pcm(self, generation_id: int, pcm: bytes, sample_rate: int = 24000) -> bool:
-        """Enqueues a Realtime PCM chunk for serialized playback."""
+        """Enqueues a Realtime PCM chunk for serialized playback with generation isolation."""
+        with self._lock:
+            if generation_id < self._current_generation:
+                self._log(
+                    "warn",
+                    f"⚠️ [REALTIME PLAYBACK DROP]\n"
+                    f"  expected_generation={self._current_generation}\n"
+                    f"  received_generation={generation_id}"
+                )
+                return False
         return self.play_pcm_chunk(
             pcm,
             sample_rate=sample_rate,
@@ -410,7 +419,8 @@ class AudioOutputManager:
             if gen < self._current_generation:
                 return False
             
-            if self._current_process is None or self._current_process.poll() is not None or self._current_process.stdin is None or self._current_process.stdin.closed:
+            stdin_closed = (getattr(self._current_process.stdin, "closed", False) is True) if (self._current_process and self._current_process.stdin is not None) else True
+            if self._current_process is None or self._current_process.poll() is not None or self._current_process.stdin is None or stdin_closed:
                 try:
                     cmd = ["aplay", "-D", self.alsa_device, "-r", str(HW_SAMPLE_RATE), "-f", "S16_LE", "-c", "1", "-q"]
                     self._current_process = subprocess.Popen(cmd, stdin=subprocess.PIPE)
@@ -424,7 +434,7 @@ class AudioOutputManager:
         import errno
         for attempt in range(3):
             try:
-                if proc and proc.stdin and not proc.stdin.closed:
+                if proc and proc.stdin and not (getattr(proc.stdin, "closed", False) is True):
                     proc.stdin.write(chunk)
                     proc.stdin.flush()
                     return True

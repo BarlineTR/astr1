@@ -309,12 +309,27 @@ class TtsNode(Node):
             if raw_str.startswith("{"):
                 data = json.loads(raw_str)
                 gen_id = data.get("generation_id", self.output_manager.current_generation)
-                pcm_bytes = base64.b64decode(data.get("data") or data.get("pcm") or "")
+                is_first = data.get("is_first", False)
+                is_done = data.get("is_done", False)
+                # "data" ÖNCE denenir: yayıncının gerçekte gönderdiği anahtar o.
+                # "pcm" geriye dönük uyumluluk için korunuyor.
+                b64_pcm = data.get("data") or data.get("pcm") or ""
+                pcm_bytes = base64.b64decode(b64_pcm) if b64_pcm else b""
             else:
                 gen_id = self.output_manager.current_generation
+                is_first = False
+                is_done = False
                 pcm_bytes = base64.b64decode(raw_str)
+
+            if is_first:
+                self.output_manager.begin_realtime_stream(gen_id, sample_rate=24000)
+
             if pcm_bytes:
                 self.output_manager.write_realtime_pcm(gen_id, pcm_bytes, sample_rate=24000)
+
+            if is_done:
+                self.output_manager.end_realtime_stream(gen_id)
+
         except Exception as e:
             self._log("debug", f"_on_realtime_output_pcm notice: {e}")
 
