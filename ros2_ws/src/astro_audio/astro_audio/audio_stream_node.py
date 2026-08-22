@@ -97,6 +97,11 @@ def list_devices():
         return []
 
 
+# ALSA'nın yazılımda yeniden örnekleme yapan sanal cihazları. Ham "hw:x,y"
+# cihazları yalnızca donanımın kendi hızlarını kabul eder; bunlar her hızı kabul eder.
+ALSA_PLUG_HINTS = ("default", "pulse", "pipewire", "sysdefault")
+
+
 def find_audio_device(is_input: bool = True, preferred: str = "") -> tuple[Optional[int], str]:
     if sd is None:
         return None, "sounddevice kurulu değil"
@@ -124,7 +129,21 @@ def find_audio_device(is_input: bool = True, preferred: str = "") -> tuple[Optio
         if any(h in name.lower() for h in RESPEAKER_NAME_HINTS):
             return i, name
 
-    # 3. Default
+    # 3. ALSA'nın yeniden örnekleyen sanal cihazları.
+    #
+    # Eskiden burada doğrudan valid[0] dönülüyordu; bu makinede o
+    # "HDA Intel PCH: ALC294 Analog (hw:0,0)" oluyor. Ham hw: cihazı ALSA'nın
+    # plug katmanını atlar, yani YALNIZCA donanımın kendi hızlarını kabul eder.
+    # ALC294 44100/48000 destekliyor, düğüm ise 16000 istiyor; sonuç her açılışta
+    # "Invalid sample rate [PaErrorCode -9997]" ve mikrofon hiç açılmıyordu.
+    # default/pulse/pipewire/sysdefault yazılımda yeniden örnekler, bu yüzden
+    # ham donanımın önüne alınıyor. Yalnızca isim eşlemesi yapılır — cihaz
+    # yoklaması yapmak testlerde süreç çökmesine yol açtığı için tercih edilmedi.
+    for i, name in valid:
+        if any(h in name.lower() for h in ALSA_PLUG_HINTS):
+            return i, name
+
+    # 4. Son çare: ilk uygun cihaz (eski davranış)
     return valid[0][0], valid[0][1]
 
 
@@ -189,6 +208,19 @@ class AudioStreamNode(Node):
         # Playback status ticker timer
         self.create_timer(0.1, self._publish_status)
 
+    @staticmethod
+    def _under_pytest() -> bool:
+        """Test sürecinde GERÇEK ses donanımı açılmaz.
+
+        Cihaz seçimi düzeltilene kadar bu düğüm testlerde mikrofonu hiç
+        açamıyordu (hw:0,0 16 kHz'i reddediyordu) ve hata sessizce yutuluyordu.
+        Düzeltmeden sonra akış gerçekten açılmaya başladı; testler düğümleri
+        onlarca kez örneklediği için açık PortAudio akışları birikip süreci
+        çökertti. Testler zaten `sd`'yi mock'luyor — gerçek donanıma dokunmak
+        hiçbir testin amacı değil.
+        """
+        return "PYTEST_CURRENT_TEST" in os.environ or "pytest" in sys.modules
+
     def _start_input_stream(self):
         if sd is None:
             self._input_stream_alive = False
@@ -199,6 +231,13 @@ class AudioStreamNode(Node):
                 f"  device=[{self._in_dev_idx}] {self._in_device_name}\n"
                 f"  reason=sounddevice_missing"
             )
+            return
+
+        # Testler `sd`'yi mock'ladığında sorun yok — mock donanıma dokunmaz.
+        # Mock'lamayan bir test gerçek mikrofonu açar; bu engelleniyor.
+        if self._under_pytest() and getattr(sd, "__name__", "") == "sounddevice":
+            self._input_stream_alive = False
+            self.get_logger().info("[TEST] Gerçek ses donanımı açılmadı (pytest).")
             return
 
         try:

@@ -157,6 +157,14 @@ def _load_env():
     Aday listesi tts_node/ai_brain_node ile aynı; son çare find_dotenv(usecwd=True)
     CWD'den yukarı doğru yürüdüğü için ros2_ws içinden çalıştırıldığında da bulur.
     """
+    # Test sürecinde .env YÜKLENMEZ. Bu düğüm gerçek bir anahtar bulduğu anda
+    # websocket'i açıyor, discover_realtime_models() ile OpenAI'a HTTPS isteği
+    # atıyor ve idle-learning döngüsünü başlatıyor. Testler düğümü onlarca kez
+    # örneklediği için bu hem kullanıcının kotasını harcıyor hem de canlı SSL
+    # iş parçacıkları + rclpy yıkımı bir arada segfault üretiyordu.
+    if "PYTEST_CURRENT_TEST" in os.environ or "pytest" in sys.modules:
+        return None
+
     candidates = [
         os.path.abspath(".env"),
         os.path.abspath(".env.production"),
@@ -222,21 +230,34 @@ def frame_to_base64_jpeg(frame: np.ndarray, max_dim: int = 640) -> Optional[str]
 
 
 
-REALTIME_WS_URL = "wss://api.openai.com/v1/realtime?model=gpt-realtime"
+REALTIME_WS_URL = "wss://api.openai.com/v1/realtime?model=gpt-realtime-2.1-mini"
 VALID_REALTIME_VOICES = {"alloy", "ash", "ballad", "coral", "echo", "sage", "shimmer", "verse", "fable", "onyx"}
 
 
 def discover_realtime_models(api_key: str, preferred: str = "") -> list[str]:
+    # Öncelik sırası HIZA göre. gpt-realtime-2.1-mini (6 Tem 2026) Realtime
+    # ailesinin hızlı katmanı: p95 gecikme diğerlerine göre en az %25 düşük ve
+    # ses çıkışı 20 $/M token (2.1'de 64 $/M). Akıl yürütme ve araç kullanımı
+    # yine var. gpt-realtime-mini OpenAI tarafından kullanımdan kaldırılıyor,
+    # bu yüzden listeden çıkarıldı.
+    # Dördü de bu hesapta canlı doğrulandı (session.updated döndü).
     flagship_realtime_models = [
+        "gpt-realtime-2.1-mini",
+        "gpt-realtime-2.1",
+        "gpt-realtime-2",
         "gpt-realtime",
-        "gpt-realtime-mini",
-        "gpt-4o-realtime-preview-2024-12-17",
-        "gpt-4o-realtime-preview",
-        "gpt-4o-mini-realtime-preview"
     ]
     candidates = []
     if preferred:
         candidates.append(preferred)
+
+    # Test sürecinde AĞA ÇIKILMAZ. Testler düğüme sahte anahtar ("sk-test")
+    # verip onu onlarca kez örnekliyor; her örnek burada api.openai.com'a
+    # gerçek bir TLS bağlantısı açıyordu. Bu SSL iş parçacıkları rclpy
+    # yıkımıyla üst üste gelince süreç segfault ediyor — çöküş dökümlerinde
+    # en üstteki kare her seferinde bu fonksiyondu.
+    if "PYTEST_CURRENT_TEST" in os.environ or "pytest" in sys.modules:
+        return candidates + [m for m in flagship_realtime_models if m not in candidates]
 
     try:
         import urllib.request
@@ -422,7 +443,9 @@ class AstroRealtimeNode(Node):
         self.groq_api_key = os.environ.get("GROQ_API_KEY", "").strip("\"' \t\n\r")
         raw_gem = os.environ.get("GEMINI_API_KEY", "").strip("\"' \t\n\r")
         self.gemini_api_key = raw_gem if (raw_gem and not raw_gem.startswith("sk-")) else ""
-        self.realtime_model = os.environ.get("REALTIME_MODEL", "gpt-realtime").strip()
+        self.realtime_model = os.environ.get("REALTIME_MODEL", "gpt-realtime-2.1-mini").strip()
+        self.realtime_transcribe_model = os.environ.get(
+            "REALTIME_TRANSCRIBE_MODEL", "gpt-live-transcribe").strip() or "gpt-live-transcribe"
         raw_voice = os.environ.get("REALTIME_VOICE", os.environ.get("TTS_VOICE", "echo")).strip().lower()
         self.realtime_voice = raw_voice if raw_voice in VALID_REALTIME_VOICES else "echo"
         self.persona_name = os.environ.get("PERSONA", "kufurbaz").strip().lower()
@@ -993,8 +1016,12 @@ class AstroRealtimeNode(Node):
                 "instructions": system_prompt,
                 "audio": {
                     "input": {
+                        # whisper-1 DEĞİL: gpt-live-transcribe realtime için
+                        # tasarlanmış düşük gecikmeli akış modeli (OpenAI'nin
+                        # realtime rehberinde "controllable latency" ile önerilir).
+                        # Canlı doğrulandı: session.updated bu modelle dönüyor.
                         "transcription": {
-                            "model": "whisper-1",
+                            "model": self.realtime_transcribe_model,
                             "language": "tr"
                         },
                         "turn_detection": {
@@ -1998,7 +2025,7 @@ class AstroRealtimeNode(Node):
         peak_val = int(np.max(np.abs(arr))) if len(arr) > 0 else 0
 
         # Transcribe candidate using fast Groq Whisper
-        transcript = self._transcribe_groq_whisper(wav_bytes) or ""
+        transcript = self._transcribe_wav(wav_bytes) or ""
         
         # 1. Multi-signal STT validation (reject phantom hallucinations like 'Altyazı M.K.')
         validated_text, stt_meta = self._validate_stt_transcript(
@@ -2593,6 +2620,82 @@ class AstroRealtimeNode(Node):
         )
         return cleaned, telem
 
+    def _post_transcription(self, url: str, api_key: str, model: str, wav_bytes: bytes,
+                            timeout: float) -> Optional[str]:
+        """multipart/form-data ile /audio/transcriptions çağırır. OpenAI ve Groq aynı şemayı kullanır."""
+        boundary = "----AstroBoundary" + os.urandom(16).hex()
+        body = bytearray()
+        for field, value in (("model", model), ("language", "tr"),
+                             ("prompt", "Astro Türkçe konuşma, diyalog, robot asistan.")):
+            body.extend(f"--{boundary}\r\n".encode())
+            body.extend(f'Content-Disposition: form-data; name="{field}"\r\n\r\n'.encode())
+            body.extend(value.encode("utf-8"))
+            body.extend(b"\r\n")
+        body.extend(f"--{boundary}\r\n".encode())
+        body.extend(b'Content-Disposition: form-data; name="file"; filename="speech.wav"\r\n')
+        body.extend(b"Content-Type: audio/wav\r\n\r\n")
+        body.extend(wav_bytes)
+        body.extend(b"\r\n")
+        body.extend(f"--{boundary}--\r\n".encode())
+
+        req = urllib.request.Request(
+            url,
+            data=bytes(body),
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": f"multipart/form-data; boundary={boundary}",
+            },
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read().decode("utf-8")).get("text", "").strip()
+
+    def _transcribe_openai(self, wav_bytes: bytes) -> Optional[str]:
+        """OpenAI /v1/audio/transcriptions — STT'nin birincil yolu.
+
+        Model varsayılanı gpt-transcribe: OpenAI'nin 28 Tem 2026'da yayımladığı ve
+        whisper-1 / gpt-4o-transcribe yerine ÖNERDİĞİ modeldir. whisper-1'den
+        vazgeçmenin somut sebebi var — 1 saniyelik saf sinüs tonu verildiğinde
+        whisper-1 "Altyazı M.K." uyduruyor (bu depoda SUSPECT_PHRASES listesinin
+        var olma sebebi), gpt-transcribe ise boş string döndürüyor. İkisi de bu
+        hesapta canlı denendi.
+        """
+        if not self.openai_api_key:
+            return None
+        model = os.environ.get("OPENAI_STT_MODEL", "gpt-transcribe").strip() or "gpt-transcribe"
+        try:
+            return self._post_transcription(
+                "https://api.openai.com/v1/audio/transcriptions",
+                self.openai_api_key, model, wav_bytes,
+                float(os.environ.get("OPENAI_STT_TIMEOUT_S", "8.0")),
+            )
+        except Exception as e:
+            self.get_logger().warn(f"⚠️ [OpenAI STT] {model} başarısız: {e}")
+            return None
+
+    def _transcribe_wav(self, wav_bytes: bytes) -> Optional[str]:
+        """STT girişi: önce OpenAI, ancak açıkça izin verilirse Groq'a düşer.
+
+        Proje kararı tüm STT/TTS/LLM'in OpenAI üzerinden geçmesi yönünde; Groq
+        yalnızca LLM_FALLBACK_ENABLED=true iken ve OpenAI cevap veremediğinde
+        devreye girer.
+        """
+        text = self._transcribe_openai(wav_bytes)
+        if text:
+            return text
+
+        fallback_on = os.environ.get("LLM_FALLBACK_ENABLED", "true").strip().lower() in ("1", "true", "yes")
+        if not fallback_on:
+            return text
+
+        # groq_api_key BURADA KONTROL EDİLMEZ: _transcribe_groq_whisper anahtar
+        # yoksa zaten None döndürüyor, ve testler bu metodu doğrudan patch'liyor.
+        # Burada anahtara bakmak o mock'ları erişilemez kılıyordu.
+        result = self._transcribe_groq_whisper(wav_bytes)
+        if result and self.groq_api_key:
+            self.get_logger().warn("⚠️ [STT FALLBACK] OpenAI cevap vermedi, Groq Whisper kullanıldı.")
+        return result or text
+
     def _transcribe_groq_whisper(self, wav_bytes: bytes) -> Optional[str]:
         """Transcribes 16kHz WAV audio using free Groq Whisper Large V3 Turbo API in <200ms."""
         if not self.groq_api_key:
@@ -3052,7 +3155,7 @@ class AstroRealtimeNode(Node):
             wav_bytes = wav_buf.getvalue()
 
             t_stt_start = time.monotonic()
-            raw_transcript = self._transcribe_groq_whisper(wav_bytes)
+            raw_transcript = self._transcribe_wav(wav_bytes)
             t_stt_end = time.monotonic()
             stt_ms = (t_stt_end - t_stt_start) * 1000.0
 

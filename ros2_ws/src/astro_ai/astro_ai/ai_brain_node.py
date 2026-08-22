@@ -16,6 +16,7 @@ _LOG = logging.getLogger(__name__)
 
 import json
 import os
+import sys
 import re
 import threading
 import time
@@ -118,6 +119,13 @@ except ImportError:
 
 
 def _load_env():
+    # Test sürecinde .env YÜKLENMEZ: aksi hâlde testler kullanıcının gerçek
+    # anahtarlarını alıp canlı API çağrıları yapıyor (astro_realtime_node
+    # websocket'i gerçekten açıyor, kota harcanıyor) ve testler ".env yok"
+    # varsayımıyla yazıldığı için sonuçlar çalıştırma ortamına göre değişiyor.
+    if "PYTEST_CURRENT_TEST" in os.environ or "pytest" in sys.modules:
+        return None
+
     candidates = [
         os.path.abspath(".env"),
         os.path.abspath(".env.production"),

@@ -694,7 +694,8 @@ class TestRealtimeArchitectureInvariants(unittest.TestCase):
         self.assertIn("gpt-realtime", candidates)
 
         node = AstroRealtimeNode()
-        self.assertEqual(node.realtime_model, "gpt-realtime")
+        # Varsayılan artık Realtime ailesinin hızlı katmanı (bkz. .env.example).
+        self.assertEqual(node.realtime_model, "gpt-realtime-2.1-mini")
         self.assertFalse(node._fallback_mode)
 
     def test_realtime_audio_streaming_flow_unchanged(self):

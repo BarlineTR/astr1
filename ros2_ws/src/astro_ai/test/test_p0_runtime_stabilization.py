@@ -1458,10 +1458,17 @@ class TestP0LaunchIntegrationAndRealtimePrimaryVoice(unittest.TestCase):
         self.assertIn("requested_provider=edge_tts", log_text)
         self.assertIn("selection_reason=realtime_unavailable", log_text)
 
-    def test_openai_tts_rest_not_in_production_chain(self):
-        """11. Production Hierarchy: OpenAI REST TTS is excluded from synthesis execution chain."""
+    def test_openai_tts_rest_precedes_edge_in_production_chain(self):
+        """11. Üretim hiyerarşisi: OpenAI Speech API, Edge-TTS'ten ÖNCE denenir.
+
+        Bu test eskiden bunun TERSİNİ doğruluyordu (REST TTS zincir dışı).
+        Proje kararı değişti: tüm TTS/STT/LLM trafiği OpenAI üzerinden geçmeli.
+        Adım zincir dışıyken Realtime düştüğü an ses YEREL espeak'e iniyordu.
+        """
         from astro_audio.tts_router import TTSRouter
         mock_openai_rest = MagicMock()
+        mock_openai_rest.synthesize_sentence.return_value = b"\x00\x01" * 1200
+        mock_openai_rest.model = "gpt-4o-mini-tts"
         mock_edge = MagicMock()
         mock_edge.synthesize_sentence.return_value = b"\x00\x01" * 1200
         mock_edge.check_network.return_value = True
@@ -1473,8 +1480,9 @@ class TestP0LaunchIntegrationAndRealtimePrimaryVoice(unittest.TestCase):
         )
 
         res = router.synthesize("Test", generation_id=1)
-        mock_openai_rest.synthesize_sentence.assert_not_called()
-        self.assertEqual(res.actual_provider, "edge_tts")
+        mock_openai_rest.synthesize_sentence.assert_called_once()
+        mock_edge.synthesize_sentence.assert_not_called()
+        self.assertEqual(res.actual_provider, "openai_tts")
 
 
 class TestP02RealtimeTurnPipelineAndHardwareCorrection(unittest.TestCase):
@@ -2148,10 +2156,15 @@ class TestP03CriticalRuntimeRecovery(unittest.TestCase):
             self.assertTrue(hasattr(bridge, "tx_lock"))
             self.assertIsInstance(bridge.tx_lock, type(threading.Lock()))
 
-    def test_openai_rest_tts_not_in_production_chain(self):
-        """17. TTS Architecture: OpenAI REST TTS is excluded from production synthesis hierarchy."""
+    def test_openai_rest_tts_is_in_production_chain(self):
+        """17. TTS mimarisi: OpenAI Speech API üretim hiyerarşisinin İÇİNDE.
+
+        Edge-TTS yalnızca OpenAI cevap veremezse devreye girer.
+        """
         from astro_audio.tts_router import TTSRouter
         mock_openai_rest = MagicMock()
+        mock_openai_rest.synthesize_sentence.return_value = b"\x00\x01" * 1200
+        mock_openai_rest.model = "gpt-4o-mini-tts"
         mock_edge = MagicMock()
         mock_edge.synthesize_sentence.return_value = b"\x00\x01" * 1200
         mock_edge.check_network.return_value = True
@@ -2163,8 +2176,12 @@ class TestP03CriticalRuntimeRecovery(unittest.TestCase):
         )
 
         res = router.synthesize("Test turn", generation_id=1)
-        mock_openai_rest.synthesize_sentence.assert_not_called()
-        self.assertEqual(res.actual_provider, "edge_tts")
+        self.assertEqual(res.actual_provider, "openai_tts")
+
+        # OpenAI başarısız olursa Edge-TTS devralır
+        mock_openai_rest.synthesize_sentence.return_value = b""
+        res2 = router.synthesize("Test turn", generation_id=2)
+        self.assertEqual(res2.actual_provider, "edge_tts")
 
     def test_audio_playback_single_owner(self):
         """18. ALSA Architecture: AudioOutputManager in tts_node is the single authoritative playback owner."""

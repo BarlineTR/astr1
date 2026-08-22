@@ -15,6 +15,7 @@ import logging
 _LOG = logging.getLogger(__name__)
 
 import os
+import sys
 import queue
 import threading
 import time
@@ -38,6 +39,13 @@ except ImportError:
 
 
 def _load_env():
+    # Test sürecinde .env YÜKLENMEZ: aksi hâlde testler kullanıcının gerçek
+    # anahtarlarını alıp canlı API çağrıları yapıyor (astro_realtime_node
+    # websocket'i gerçekten açıyor, kota harcanıyor) ve testler ".env yok"
+    # varsayımıyla yazıldığı için sonuçlar çalıştırma ortamına göre değişiyor.
+    if "PYTEST_CURRENT_TEST" in os.environ or "pytest" in sys.modules:
+        return None
+
     candidates = [
         os.path.abspath(".env"),
         os.path.abspath(".env.production"),
@@ -134,14 +142,27 @@ class TtsNode(Node):
             logger=self._log,
         )
 
-        # 4.5 OpenAI REST TTS motoru — Üretim zincirinden tamamen çıkarıldı.
-        # Yalnızca açıkça ENABLE_OPENAI_REST_TTS=true verilirse test amaçlı kurulur.
+        # 4.5 OpenAI Speech API (REST) motoru.
+        # TTS_ENGINE="openai" ARTIK GERÇEKTEN BU ANLAMA GELİYOR. Önceden ayar
+        # yalnızca "xtts"/"elevenlabs" ile karşılaştırılıyordu, "openai" yazmak
+        # hiçbir şey yapmıyordu; motor da ENABLE_OPENAI_REST_TTS bayrağının
+        # arkasındaydı ve o bayrak hiçbir yerde belgelenmemişti. Sonuç: Realtime
+        # düştüğü anda zincir yerel espeak'e iniyordu.
+        # ENABLE_OPENAI_REST_TTS hâlâ çalışıyor (TTS_ENGINE başka bir değerdeyken
+        # motoru yine de açmak için).
         self.openai_tts = None
-        if os.getenv("ENABLE_OPENAI_REST_TTS", "false").strip().lower() in ("1", "true", "yes"):
+        openai_rest_on = (
+            self.tts_engine_pref == "openai"
+            or os.getenv("ENABLE_OPENAI_REST_TTS", "false").strip().strip('"\'').lower() in ("1", "true", "yes")
+        )
+        if openai_rest_on:
             from astro_audio.openai_tts_engine import OpenAITTSEngine
             engine = OpenAITTSEngine(voice=self.openai_voice, logger=self._log)
             if engine.is_installed:
                 self.openai_tts = engine
+            else:
+                self._log("warn", "⚠️ [OpenAI-TTS] TTS_ENGINE=openai ama motor kurulamadı "
+                                  "(openai paketi veya OPENAI_API_KEY eksik).")
 
         # 4.6 ElevenLabs — TTS_ENGINE="elevenlabs" veya ELEVENLABS_ENABLED=true ile kurulur.
         # Motor 330 satırdı ama hiçbir yerde örneklenmiyordu; artık zincire bağlı.
