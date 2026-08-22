@@ -148,7 +148,6 @@ class XttsClient:
         if not resolved_model_dir and not any(explicit.values()):
             # Auto-discover standard fine-tuned model directories if present on system
             candidates = [
-                "/home/okistech/Desktop/astr1/models/xtts_finetune_ready_v2",
                 os.path.abspath("./models/xtts_finetune_ready_v2"),
                 os.path.expanduser("~/.astro/models/xtts_finetune_ready_v2"),
                 os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..", "..", "models", "xtts_finetune_ready_v2")),
@@ -309,8 +308,8 @@ class XttsClient:
                     f"sys_total_mb={round(mem.total / (1024 * 1024), 1)} | "
                     f"sys_percent={mem.percent}%"
                 )
-            except Exception:
-                pass
+            except Exception as _exc:
+                self._safe_log("debug", f"start: yok sayılan hata ({_exc})")
 
             self._ready.clear()
             self._startup_error = None
@@ -456,8 +455,8 @@ class XttsClient:
                     req = {"cmd": "interrupt", "gen_id": generation_id}
                     self.proc.stdin.write(json.dumps(req) + "\n")
                     self.proc.stdin.flush()
-                except Exception:
-                    pass
+                except Exception as _exc:
+                    self._safe_log("debug", f"interrupt: yok sayılan hata ({_exc})")
 
     def synthesize_chunk(
         self,
@@ -518,8 +517,8 @@ class XttsClient:
         if msg.get("pcm_base64"):
             try:
                 pcm_bytes = base64.b64decode(msg["pcm_base64"].encode("ascii"))
-            except Exception:
-                pass
+            except Exception as _exc:
+                self._safe_log("debug", f"synthesize_chunk: yok sayılan hata ({_exc})")
         msg["pcm_bytes"] = pcm_bytes
         return msg
 
@@ -536,24 +535,24 @@ class XttsClient:
                     proc.stdin.write(json.dumps({"cmd": "quit"}) + "\n")
                     proc.stdin.flush()
                     proc.wait(timeout=1.5)
-                except Exception:
-                    pass
+                except Exception as _exc:
+                    self._safe_log("debug", f"stop: yok sayılan hata ({_exc})")
 
             # If still running after quit command, send SIGTERM
             if proc.poll() is None:
                 proc.terminate()
                 try:
                     proc.wait(timeout=1.5)
-                except subprocess.TimeoutExpired:
-                    pass
+                except subprocess.TimeoutExpired as _exc:
+                    self._safe_log("debug", f"stop: yok sayılan hata ({_exc})")
 
             # If still running after SIGTERM, send SIGKILL
             if proc.poll() is None:
                 proc.kill()
                 try:
                     proc.wait(timeout=1.5)
-                except subprocess.TimeoutExpired:
-                    pass
+                except subprocess.TimeoutExpired as _exc:
+                    self._safe_log("debug", f"stop: yok sayılan hata ({_exc})")
         except Exception as e:
             self._safe_log("warn", f"Notice while stopping XTTS worker: {e}")
         finally:

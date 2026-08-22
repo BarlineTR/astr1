@@ -1,4 +1,8 @@
 import os
+import logging
+
+_LOG = logging.getLogger(__name__)
+
 
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
@@ -14,15 +18,13 @@ def generate_launch_description():
         for env_path in [
             os.path.abspath(".env"),
             os.path.abspath(".env.production"),
-            os.path.expanduser("~/Desktop/astr1/.env"),
-            os.path.expanduser("~/Desktop/astr1/.env.production"),
             os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..", "..", ".env")),
             os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..", "..", ".env.production")),
         ]:
             if os.path.exists(env_path):
                 load_dotenv(env_path, override=True)
-    except Exception:
-        pass
+    except Exception as _exc:
+        _LOG.debug("generate_launch_description: yok sayılan hata (%s)", _exc)
 
     lidar_pkg = get_package_share_directory("astro_lidar")
     audio_pkg = get_package_share_directory("astro_audio")

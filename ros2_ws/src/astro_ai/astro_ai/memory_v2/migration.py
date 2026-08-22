@@ -1,6 +1,10 @@
 """ASTRO V1 — Seamless JSON to SQLite Migration & Dual-Write Engine."""
 
 import json
+import logging
+
+_LOG = logging.getLogger(__name__)
+
 import os
 import shutil
 import time
@@ -33,8 +37,6 @@ class MemoryMigrator:
 
     def _find_legacy_json_path(self) -> str:
         candidates = [
-            os.path.expanduser("~/Desktop/astr1/ros2_ws/astro_memory.json"),
-            os.path.expanduser("~/Desktop/astr1/astro_memory.json"),
             os.path.abspath("./astro_memory.json"),
             os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..", "..", "astro_memory.json")),
         ]
@@ -59,8 +61,8 @@ class MemoryMigrator:
         if not os.path.exists(bak_path):
             try:
                 shutil.copy2(self.json_path, bak_path)
-            except Exception:
-                pass
+            except Exception as _exc:
+                _LOG.debug("migrate_if_needed: yok sayılan hata (%s)", _exc)
 
         # 1. Migrate Verified Facts
         facts = data.get("verified_facts", [])
@@ -131,5 +133,5 @@ class MemoryMigrator:
             with open(tmp_path, "w", encoding="utf-8") as f:
                 json.dump(data, f, ensure_ascii=False, indent=2)
             os.replace(tmp_path, self.json_path)
-        except Exception:
-            pass
+        except Exception as _exc:
+            _LOG.debug("sync_to_json_mirror: yok sayılan hata (%s)", _exc)

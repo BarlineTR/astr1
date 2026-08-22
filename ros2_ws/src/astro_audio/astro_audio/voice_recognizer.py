@@ -9,6 +9,10 @@ Features:
 """
 
 import json
+import logging
+
+_LOG = logging.getLogger(__name__)
+
 import os
 import re
 import threading
@@ -54,8 +58,6 @@ class VoiceRecognizer:
         if data_dir is None:
             candidates = [
                 os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "data", "known_voices")),
-                os.path.expanduser("~/Desktop/astr1/ros2_ws/src/astro_audio/data/known_voices"),
-                os.path.expanduser("~/Desktop/astr1/data/known_voices"),
                 os.path.abspath("./data/known_voices")
             ]
             self.data_dir = candidates[0]
@@ -117,8 +119,8 @@ class VoiceRecognizer:
         if engine is not None:
             try:
                 engine.load()
-            except Exception:
-                pass
+            except Exception as _exc:
+                _LOG.debug("reload_voiceprints: yok sayılan hata (%s)", _exc)
 
         with self._lock:
             self._known_voiceprints.clear()
@@ -144,8 +146,8 @@ class VoiceRecognizer:
                         try:
                             emb = np.load(os.path.join(self.data_dir, f))
                             self._known_voiceprints.setdefault(norm, []).append(emb)
-                        except Exception:
-                            pass
+                        except Exception as _exc:
+                            _LOG.debug("reload_voiceprints: yok sayılan hata (%s)", _exc)
 
     def enroll_voice(self, name: str, audio_arr: np.ndarray, sample_rate: int = 16000, title: Optional[str] = None) -> bool:
         """Dynamically learns and saves a speaker voiceprint."""
@@ -171,8 +173,8 @@ class VoiceRecognizer:
             try:
                 save_path = os.path.join(self.data_dir, f"{norm_name}.npy")
                 np.save(save_path, emb)
-            except Exception:
-                pass
+            except Exception as _exc:
+                _LOG.debug("enroll_voice: yok sayılan hata (%s)", _exc)
 
             # Save to SpeakerEngine database
             engine = _get_engine()
@@ -180,8 +182,8 @@ class VoiceRecognizer:
                 try:
                     engine.add_person(name, [emb])
                     engine.save()
-                except Exception:
-                    pass
+                except Exception as _exc:
+                    _LOG.debug("enroll_voice: yok sayılan hata (%s)", _exc)
             return True
 
     def recognize_voice(self, audio_arr: np.ndarray, sample_rate: int = 16000, threshold: float = VOICE_MATCH_THRESHOLD) -> Tuple[Optional[str], float, Dict[str, Any]]:
@@ -228,8 +230,8 @@ class VoiceRecognizer:
                             "formal_title": matched_name
                         })
                         all_scores.append((norm, float(sim), eng_meta))
-            except Exception:
-                pass
+            except Exception as _exc:
+                _LOG.debug("recognize_voice: yok sayılan hata (%s)", _exc)
 
         if not all_scores:
             return None, 0.0, {}
@@ -274,16 +276,16 @@ class VoiceRecognizer:
             npy_path = os.path.join(self.data_dir, f"{norm_name}.npy")
             if os.path.exists(npy_path):
                 os.remove(npy_path)
-        except Exception:
-            pass
+        except Exception as _exc:
+            _LOG.debug("delete_speaker: yok sayılan hata (%s)", _exc)
 
         engine = _get_engine()
         if engine is not None:
             try:
                 engine.remove_person(name)
                 engine.save()
-            except Exception:
-                pass
+            except Exception as _exc:
+                _LOG.debug("delete_speaker: yok sayılan hata (%s)", _exc)
         return True
 
 

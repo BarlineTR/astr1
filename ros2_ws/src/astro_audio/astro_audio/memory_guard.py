@@ -7,6 +7,10 @@ critical paths from XTTS worker memory exhaustion on Jetson Orin Nano (8GB Unifi
 """
 
 import os
+import logging
+
+_LOG = logging.getLogger(__name__)
+
 import sys
 import glob
 import time
@@ -93,8 +97,8 @@ class SystemMemoryGuard:
             if psutil is not None:
                 p = psutil.Process(pid)
                 return p.memory_info().rss / (1024.0 * 1024.0)
-        except Exception:
-            pass
+        except Exception as _exc:
+            _LOG.debug("get_process_rss_mb: yok sayılan hata (%s)", _exc)
         return 0.0
 
     @staticmethod
@@ -108,8 +112,8 @@ class SystemMemoryGuard:
                     for field in line.split():
                         if field.startswith("avg60="):
                             return float(field.split("=", 1)[1])
-        except Exception:
-            pass
+        except Exception as _exc:
+            _LOG.debug("read_mem_psi_full_avg60: yok sayılan hata (%s)", _exc)
         return None
 
     def read_swap_in_rate(self) -> Optional[float]:
@@ -173,8 +177,8 @@ class SystemMemoryGuard:
                 swap_total_mb = meminfo.get("SwapTotal", 0.0) / 1024.0
                 swap_free_mb = meminfo.get("SwapFree", 0.0) / 1024.0
                 swap_used_mb = max(0.0, swap_total_mb - swap_free_mb)
-            except Exception:
-                pass
+            except Exception as _exc:
+                _LOG.debug("get_memory_snapshot: yok sayılan hata (%s)", _exc)
 
         # 2. psutil fallback (if /proc/meminfo unavailable or incomplete)
         if mem_total_mb == 0.0 and psutil is not None:
@@ -187,8 +191,8 @@ class SystemMemoryGuard:
                 swap_total_mb = sm.total / (1024.0 * 1024.0)
                 swap_free_mb = sm.free / (1024.0 * 1024.0)
                 swap_used_mb = sm.used / (1024.0 * 1024.0)
-            except Exception:
-                pass
+            except Exception as _exc:
+                _LOG.debug("get_memory_snapshot: yok sayılan hata (%s)", _exc)
 
         # Default fallback for virtual/test environments
         if mem_total_mb == 0.0:
@@ -234,8 +238,8 @@ class SystemMemoryGuard:
                             audio_rss_mb += self.get_process_rss_mb(p_id)
                     except Exception:
                         continue
-            except Exception:
-                pass
+            except Exception as _exc:
+                _LOG.debug("get_memory_snapshot: yok sayılan hata (%s)", _exc)
 
         mem_psi_full_avg60 = self.read_mem_psi_full_avg60()
         swap_in_rate = self.read_swap_in_rate()

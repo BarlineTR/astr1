@@ -142,8 +142,6 @@ class SpeakerEngine:
         model_candidates = [
             (self.model_dir / MODEL_FILE),
             Path(os.path.expanduser("~/.astro/models")) / MODEL_FILE,
-            Path("/home/okistech/Desktop/astr1/models") / MODEL_FILE,
-            Path("/home/okistech/.astro/models") / MODEL_FILE,
             Path(os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..", "..", "models"))) / MODEL_FILE,
             Path(os.path.abspath("./models")) / MODEL_FILE,
         ]
@@ -165,8 +163,6 @@ class SpeakerEngine:
             self.db_path,
             Path(os.path.expanduser("~/.astro/voices/speakers.json")),
             Path(os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "data", "known_voices", "speakers.json"))),
-            Path("/home/okistech/Desktop/astr1/ros2_ws/src/astro_audio/data/known_voices/speakers.json"),
-            Path("/home/okistech/Desktop/astr1/data/known_voices/speakers.json"),
         ]
         for cand in db_candidates:
             if cand and cand.exists():

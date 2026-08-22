@@ -2,6 +2,10 @@
 """ASTRO V1 — Real-Time Performance & Diagnostics ROS 2 Node."""
 
 import json
+import logging
+
+_LOG = logging.getLogger(__name__)
+
 import rclpy
 from rclpy.node import Node
 from std_msgs.msg import String
@@ -35,8 +39,8 @@ def main(args=None):
     node = ProfilerNode()
     try:
         rclpy.spin(node)
-    except KeyboardInterrupt:
-        pass
+    except KeyboardInterrupt as _exc:
+        _LOG.debug("main: yok sayılan hata (%s)", _exc)
     finally:
         node.destroy_node()
         if rclpy.ok():

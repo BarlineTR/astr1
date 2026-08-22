@@ -2,6 +2,10 @@
 """ASTRO V1 — Finite State Machine for Conversational States."""
 
 import enum
+import logging
+
+_LOG = logging.getLogger(__name__)
+
 import threading
 import time
 from typing import Callable, Optional
@@ -65,8 +69,8 @@ class StateMachine:
         for listener in listeners_snapshot:
             try:
                 listener(old_state, new_state)
-            except Exception:
-                pass
+            except Exception as _exc:
+                _LOG.debug("transition_to: yok sayılan hata (%s)", _exc)
 
         return True
 

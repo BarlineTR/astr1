@@ -11,6 +11,10 @@ ai_brain_node'da hiçbir şey değişmeden çalışır.
 OAK-D takılıyken bu düğümü çalıştırmayın: aynı konuya iki yayıncı olur.
 """
 import cv2
+import logging
+
+_LOG = logging.getLogger(__name__)
+
 import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import Image
@@ -84,8 +88,8 @@ def main():
     node = WebcamPublisherNode()
     try:
         rclpy.spin(node)
-    except KeyboardInterrupt:
-        pass
+    except KeyboardInterrupt as _exc:
+        _LOG.debug("main: yok sayılan hata (%s)", _exc)
     finally:
         node.destroy_node()
         if rclpy.ok():

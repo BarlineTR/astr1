@@ -8,6 +8,10 @@ Features:
 """
 
 import collections
+import logging
+
+_LOG = logging.getLogger(__name__)
+
 import re
 import threading
 import time
@@ -121,8 +125,8 @@ class ConversationSession:
                 if self.on_session_start:
                     try:
                         self.on_session_start()
-                    except Exception:
-                        pass
+                    except Exception as _exc:
+                        _LOG.debug("activate_session: yok sayılan hata (%s)", _exc)
 
     def record_user_speech(self):
         with self._lock:
@@ -164,8 +168,8 @@ class ConversationSession:
                 if self.on_session_end:
                     try:
                         self.on_session_end()
-                    except Exception:
-                        pass
+                    except Exception as _exc:
+                        _LOG.debug("check_and_update_session_lifecycle: yok sayılan hata (%s)", _exc)
                 return True  # Timed out
             return False
 

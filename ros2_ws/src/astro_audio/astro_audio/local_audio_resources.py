@@ -10,6 +10,10 @@ Guarantees playback_started <= 300ms with ZERO network dependency.
 """
 
 import io
+import logging
+
+_LOG = logging.getLogger(__name__)
+
 import math
 import os
 import struct
@@ -93,8 +97,8 @@ class LocalAudioResources:
                             n_out = int(len(arr) * (16000.0 / 22050.0))
                             resampled = np.interp(np.linspace(0, len(arr) - 1, n_out), np.arange(len(arr)), arr.astype(np.float32)).astype(np.int16)
                             return resampled.tobytes()
-            except Exception:
-                pass
+            except Exception as _exc:
+                _LOG.debug("_synthesize_local_espeak: yok sayılan hata (%s)", _exc)
         return None
 
     def _initialize_resources(self):

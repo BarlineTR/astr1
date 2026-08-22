@@ -10,6 +10,10 @@ Features:
 """
 
 import json
+import logging
+
+_LOG = logging.getLogger(__name__)
+
 import os
 import re
 import threading
@@ -61,8 +65,6 @@ class FaceRecognizer:
             # Check default workspace paths
             candidates = [
                 os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "data", "known_faces")),
-                os.path.expanduser("~/Desktop/astr1/ros2_ws/src/astro_vision/data/known_faces"),
-                os.path.expanduser("~/Desktop/astr1/data/known_faces"),
                 os.path.abspath("./data/known_faces")
             ]
             self.data_dir = candidates[0]
@@ -150,8 +152,8 @@ class FaceRecognizer:
         if engine is not None:
             try:
                 engine.load()
-            except Exception:
-                pass
+            except Exception as _exc:
+                _LOG.debug("reload_gallery: yok sayılan hata (%s)", _exc)
 
         with self._lock:
             self._known_embeddings.clear()
@@ -223,8 +225,8 @@ class FaceRecognizer:
                 os.makedirs(person_dir, exist_ok=True)
                 filename = f"face_{int(np.random.randint(1000, 9999))}.jpg"
                 cv2.imwrite(os.path.join(person_dir, filename), face_bgr)
-            except Exception:
-                pass
+            except Exception as _exc:
+                _LOG.debug("enroll_face: yok sayılan hata (%s)", _exc)
 
             # Save to FaceEngine database
             engine = _get_engine()
@@ -232,8 +234,8 @@ class FaceRecognizer:
                 try:
                     engine.add_person(name, [emb])
                     engine.save()
-                except Exception:
-                    pass
+                except Exception as _exc:
+                    _LOG.debug("enroll_face: yok sayılan hata (%s)", _exc)
             return True
 
     def recognize_face(self, face_bgr: np.ndarray, threshold: float = FACE_MATCH_THRESHOLD) -> Tuple[Optional[str], float, Dict[str, Any]]:
@@ -254,8 +256,8 @@ class FaceRecognizer:
                     return meta["name"], round(float(sim), 2), meta
                 elif sim is not None and sim > 0:
                     return None, round(float(sim), 2), {}
-            except Exception:
-                pass
+            except Exception as _exc:
+                _LOG.debug("recognize_face: yok sayılan hata (%s)", _exc)
 
         # 2. Fallback to in-memory matching
         emb = self.extract_embedding(face_bgr)

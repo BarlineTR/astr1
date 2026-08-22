@@ -9,6 +9,10 @@ Matches TTS/hey_groq_assistant.py hardware capture pipeline:
 """
 
 import os
+import logging
+
+_LOG = logging.getLogger(__name__)
+
 import re
 import struct
 import subprocess
@@ -135,8 +139,8 @@ def find_input_device(preferred: str = "") -> tuple[int | None, str, str]:
             for i, name in inputs:
                 if i == default_in:
                     return i, name, "default"
-    except Exception:
-        pass
+    except Exception as _exc:
+        _LOG.debug("find_input_device: yok sayılan hata (%s)", _exc)
 
     # 4. Varsayılan da yoksa ilk giriş cihazı
     return inputs[0][0], inputs[0][1], "first"
@@ -247,8 +251,8 @@ class AudioCaptureNode(Node):
             for i, name in list_input_devices():
                 if i == default_in:
                     return i, name
-        except Exception:
-            pass
+        except Exception as _exc:
+            self.get_logger().debug(f"_default_device: yok sayılan hata ({_exc})")
         return None
 
     def _open_stream(self, dev_id: int, dev_name: str) -> bool:
@@ -321,8 +325,8 @@ class AudioCaptureNode(Node):
                 msg = Float32()
                 msg.data = angle
                 self.pub_doa.publish(msg)
-            except Exception:
-                pass
+            except Exception as _exc:
+                self.get_logger().debug(f"_publish_hid: yok sayılan hata ({_exc})")
 
     def destroy_node(self):
         if self.stream:
@@ -339,8 +343,8 @@ def main(args=None):
     node = AudioCaptureNode()
     try:
         rclpy.spin(node)
-    except KeyboardInterrupt:
-        pass
+    except KeyboardInterrupt as _exc:
+        _LOG.debug("main: yok sayılan hata (%s)", _exc)
     finally:
         node.destroy_node()
         if rclpy.ok():

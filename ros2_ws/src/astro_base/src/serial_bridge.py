@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
 import glob
+import logging
+
+_LOG = logging.getLogger(__name__)
+
 import math
 import os
 import struct
@@ -168,8 +172,8 @@ class SerialBridge(Node):
         if self.ser is not None:
             try:
                 self.ser.close()
-            except serial.SerialException:
-                pass
+            except serial.SerialException as _exc:
+                self.get_logger().debug(f"_try_connect: yok sayılan hata ({_exc})")
             self.ser = None
 
         port = resolve_serial_port(self.port_param)
@@ -229,8 +233,8 @@ class SerialBridge(Node):
         if self.ser is not None:
             try:
                 self.ser.close()
-            except serial.SerialException:
-                pass
+            except serial.SerialException as _exc:
+                self.get_logger().debug(f"_mark_disconnected: yok sayılan hata ({_exc})")
         self.ser = None
         self.arduino_alive = False
 
@@ -394,8 +398,8 @@ def main():
     node = SerialBridge()
     try:
         rclpy.spin(node)
-    except KeyboardInterrupt:
-        pass
+    except KeyboardInterrupt as _exc:
+        _LOG.debug("main: yok sayılan hata (%s)", _exc)
     finally:
         node.destroy_node()
         if rclpy.ok():

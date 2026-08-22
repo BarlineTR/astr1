@@ -10,6 +10,10 @@ Collects:
 """
 
 import json
+import logging
+
+_LOG = logging.getLogger(__name__)
+
 import os
 import re
 import subprocess
@@ -48,8 +52,8 @@ class PerformanceProfiler:
                     mem_available = int(line.split()[1]) // 1024
             metrics["ram_total_mb"] = float(mem_total)
             metrics["ram_used_mb"] = float(mem_total - mem_available)
-        except Exception:
-            pass
+        except Exception as _exc:
+            _LOG.debug("get_hardware_metrics: yok sayılan hata (%s)", _exc)
 
         # 2. CPU Temperature from /sys/class/thermal
         try:
@@ -66,8 +70,8 @@ class PerformanceProfiler:
                             temps.append(val)
             if temps:
                 metrics["cpu_temp_c"] = round(max(temps), 1)
-        except Exception:
-            pass
+        except Exception as _exc:
+            _LOG.debug("get_hardware_metrics: yok sayılan hata (%s)", _exc)
 
         # 3. Jetson GPU usage via tegrastats or sysfs
         gpu_load_path = "/sys/devices/gpu.0/load"
@@ -76,8 +80,8 @@ class PerformanceProfiler:
                 with open(gpu_load_path, "r") as f:
                     val = float(f.read().strip()) / 10.0  # 0-1000 -> 0-100%
                     metrics["gpu_usage_pct"] = round(val, 1)
-            except Exception:
-                pass
+            except Exception as _exc:
+                _LOG.debug("get_hardware_metrics: yok sayılan hata (%s)", _exc)
 
         # 4. CPU usage via /proc/stat
         try:
@@ -91,8 +95,8 @@ class PerformanceProfiler:
                 if total_diff > 0:
                     metrics["cpu_usage_pct"] = round(100.0 * (1.0 - idle_diff / total_diff), 1)
             self._last_cpu_times = cpu_times
-        except Exception:
-            pass
+        except Exception as _exc:
+            _LOG.debug("get_hardware_metrics: yok sayılan hata (%s)", _exc)
 
         return metrics
 

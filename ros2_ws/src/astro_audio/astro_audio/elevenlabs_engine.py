@@ -9,6 +9,10 @@ CLI Usage:
 """
 
 import argparse
+import logging
+
+_LOG = logging.getLogger(__name__)
+
 import io
 import json
 import os
@@ -293,8 +297,8 @@ def _cli_voices():
             load_dotenv(env_path)
         else:
             load_dotenv()
-    except ImportError:
-        pass
+    except ImportError as _exc:
+        _LOG.debug("_cli_voices: yok sayılan hata (%s)", _exc)
 
     key = os.environ.get("ELEVENLABS_API_KEY", "")
     if not key:

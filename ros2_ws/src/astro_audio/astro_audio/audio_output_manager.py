@@ -13,6 +13,10 @@ Features:
 """
 
 import os
+import logging
+
+_LOG = logging.getLogger(__name__)
+
 import queue
 import re
 import shutil
@@ -73,8 +77,8 @@ def find_alsa_respeaker_device() -> str:
                 m = re.search(r"card\s+(\d+):", line)
                 if m:
                     return f"plughw:{m.group(1)},0"
-    except Exception:
-        pass
+    except Exception as _exc:
+        _LOG.debug("find_alsa_respeaker_device: yok sayılan hata (%s)", _exc)
     return "default"
 
 
@@ -300,15 +304,15 @@ class AudioOutputManager:
                 if self._current_process.stdin:
                     try:
                         self._current_process.stdin.close()
-                    except Exception:
-                        pass
+                    except Exception as _exc:
+                        self._log("debug", f"_stop_active_processes_locked: yok sayılan hata ({_exc})")
                 self._current_process.terminate()
                 self._current_process.wait(timeout=0.15)
             except Exception:
                 try:
                     self._current_process.kill()
-                except Exception:
-                    pass
+                except Exception as _exc:
+                    self._log("debug", f"_stop_active_processes_locked: yok sayılan hata ({_exc})")
             self._current_process = None
 
     def _open_output_stream(self):
@@ -356,8 +360,8 @@ class AudioOutputManager:
                     proc.stdin.flush()
                     try:
                         proc.stdin.close()
-                    except Exception:
-                        pass
+                    except Exception as _exc:
+                        self._log("debug", f"_play_chunk_via_aplay_pipe: yok sayılan hata ({_exc})")
                     return True
             except OSError as e:
                 if getattr(e, "errno", None) == errno.EINTR:

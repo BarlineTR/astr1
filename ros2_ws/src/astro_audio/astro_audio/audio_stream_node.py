@@ -9,6 +9,10 @@ Features:
 """
 
 import base64
+import logging
+
+_LOG = logging.getLogger(__name__)
+
 import json
 import os
 import queue
@@ -504,8 +508,8 @@ def main(args=None):
     node = AudioStreamNode()
     try:
         rclpy.spin(node)
-    except KeyboardInterrupt:
-        pass
+    except KeyboardInterrupt as _exc:
+        _LOG.debug("main: yok sayılan hata (%s)", _exc)
     finally:
         node.destroy_node()
         if rclpy.ok():

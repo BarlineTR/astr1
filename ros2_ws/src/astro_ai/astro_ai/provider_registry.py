@@ -13,6 +13,10 @@ Features:
 """
 
 import argparse
+import logging
+
+_LOG = logging.getLogger(__name__)
+
 import json
 import os
 import sys
@@ -690,8 +694,8 @@ class ProviderRegistry:
                         token = delta.get("content", "")
                         if token:
                             yield token
-                    except Exception:
-                        pass
+                    except Exception as _exc:
+                        self._log("debug", f"stream_groq_completion: yok sayılan hata ({_exc})")
         except urllib.error.HTTPError as http_e:
             err_body = http_e.read().decode("utf-8", errors="ignore")
             err_class = self.classify_error(http_e.code, err_body, http_e)
@@ -762,8 +766,8 @@ def _cli_discover():
             load_dotenv(env_path)
         else:
             load_dotenv()
-    except ImportError:
-        pass
+    except ImportError as _exc:
+        _LOG.debug("_cli_discover: yok sayılan hata (%s)", _exc)
 
     groq_key = os.environ.get("GROQ_API_KEY", "")
     gemini_key = os.environ.get("GEMINI_API_KEY", "")

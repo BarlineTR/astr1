@@ -230,7 +230,6 @@ def main() -> int:
     if not args.checkpoint:
         cand_ckpts = [
             os.getenv("TTS_XTTS_CHECKPOINT"),
-            "/home/okistech/Desktop/astr1/models/xtts_finetune_ready_v2/model.pth",
             os.path.abspath("./models/xtts_finetune_ready_v2/model.pth"),
             os.path.expanduser("~/.astro/models/xtts_finetune_ready_v2/model.pth"),
             os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..", "..", "models", "xtts_finetune_ready_v2", "model.pth")),

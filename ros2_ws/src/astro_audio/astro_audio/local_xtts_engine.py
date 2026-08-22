@@ -6,6 +6,10 @@ with cached speaker conditioning latents and zero-copy int16 PCM output.
 """
 
 import os
+import logging
+
+_LOG = logging.getLogger(__name__)
+
 import threading
 import time
 from pathlib import Path
@@ -22,8 +26,6 @@ def resolve_xtts_home(preferred_home: str = "") -> str:
         preferred_home,
         os.getenv("TTS_XTTS_HOME", ""),
         os.path.expanduser("~/.astro/tts"),
-        "/home/okistech/.astro/tts",
-        os.path.expanduser("~/Desktop/astr1/tts"),
         os.path.abspath("./tts"),
     ]
     for cand in candidates:
@@ -58,7 +60,6 @@ def resolve_xtts_speaker_wav(preferred_wav: str = "") -> str:
     # Standard fine-tune directory locations
     root_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..", ".."))
     candidates.extend([
-        "/home/okistech/Desktop/astr1/models/xtts_finetune_ready_v2/reference.wav",
         os.path.join(root_dir, "models", "xtts_finetune_ready_v2", "reference.wav"),
         os.path.expanduser("~/.astro/models/xtts_finetune_ready_v2/reference.wav"),
         os.path.abspath("./models/xtts_finetune_ready_v2/reference.wav"),
@@ -68,8 +69,8 @@ def resolve_xtts_speaker_wav(preferred_wav: str = "") -> str:
         from ament_index_python.packages import get_package_share_directory
         share_wav = os.path.join(get_package_share_directory("astro_audio"), "voices", "astro.wav")
         candidates.append(share_wav)
-    except Exception:
-        pass
+    except Exception as _exc:
+        _LOG.debug("resolve_xtts_speaker_wav: yok sayılan hata (%s)", _exc)
 
     # Source and install directory candidates
     candidates.extend([
@@ -78,8 +79,6 @@ def resolve_xtts_speaker_wav(preferred_wav: str = "") -> str:
         os.path.expanduser("~/.astro/tts/Recording.wav"),
         os.path.expanduser("~/.astro/tts/voices/astro.wav"),
         os.path.expanduser("~/.astro/voices/astro.wav"),
-        "/home/okistech/Desktop/astr1/ros2_ws/install/astro_audio/share/astro_audio/voices/astro.wav",
-        "/home/okistech/Desktop/astr1/ros2_ws/src/astro_audio/voices/astro.wav",
     ])
 
     for cand in candidates:
@@ -103,7 +102,6 @@ def resolve_fine_tune_paths(
     base_dirs = [
         model_dir,
         os.getenv("TTS_XTTS_MODEL_DIR"),
-        "/home/okistech/Desktop/astr1/models/xtts_finetune_ready_v2",
         os.path.join(root_dir, "models", "xtts_finetune_ready_v2"),
         os.path.abspath("./models/xtts_finetune_ready_v2"),
         os.path.expanduser("~/.astro/models/xtts_finetune_ready_v2"),
