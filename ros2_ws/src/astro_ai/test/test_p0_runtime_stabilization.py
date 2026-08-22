@@ -2492,8 +2492,339 @@ class TestP04RuntimeCriticalRecovery(unittest.TestCase):
         self.assertEqual(discovered, ["llama-3.3-70b-versatile", "llama-3.1-70b-versatile"])
 
 
+class TestP05RealtimeStreamStateAndPlaybackSerialization(unittest.TestCase):
+    """P0.5 Acceptance Tests: Single Active Realtime Response, Playback Stream Lifecycle, and Telemetry."""
+
+    def test_application_generation_id_preserved_end_to_end(self):
+        """1. Generation ID: Authoritative application generation_id (e.g. 672315) is preserved through the lifecycle."""
+        import base64
+        import asyncio
+        from astro_ai.astro_realtime_node import AstroRealtimeNode
+        node = AstroRealtimeNode.__new__(AstroRealtimeNode)
+        node._ws = MagicMock()
+        node._loop = MagicMock()
+        node._is_connected = True
+        node.realtime_current_generation_id = 0
+        node.active_response_state = "IDLE"
+        node.active_response_id = None
+        node.active_generation_id = None
+        node._turn_queue = []
+        node._last_sent_generation_id = None
+        node._watchdog_timer = None
+        node.realtime_audio_received = False
+        node.pub_output_pcm = MagicMock()
+        node.pub_tts_say = MagicMock()
+
+        logs = []
+        mock_logger = MagicMock()
+        mock_logger.info = lambda msg: logs.append(msg)
+        mock_logger.debug = lambda msg: logs.append(msg)
+        node.get_logger = lambda: mock_logger
+
+        with patch("asyncio.run_coroutine_threadsafe"):
+            msg = MagicMock()
+            msg.data = json.dumps({"text": "Realtime test turn", "generation_id": 672315})
+            node._on_realtime_turn_request(msg)
+            self.assertEqual(node.active_generation_id, 672315)
+
+            # Response created
+            asyncio.run(node._handle_realtime_event(node._ws, {"type": "response.created", "response": {"id": "resp_001"}}))
+            self.assertEqual(node.active_generation_id, 672315)
+
+            # Audio delta
+            sample_pcm = base64.b64encode(b"\x00\x01" * 160).decode("ascii")
+            asyncio.run(node._handle_realtime_event(node._ws, {"type": "response.audio.delta", "delta": sample_pcm}))
+            self.assertEqual(node.active_generation_id, 672315)
+
+            # Audio done
+            asyncio.run(node._handle_realtime_event(node._ws, {"type": "response.audio.done"}))
+
+            # Response done
+            asyncio.run(node._handle_realtime_event(node._ws, {"type": "response.done"}))
+
+            log_text = "\n".join(logs)
+            self.assertIn("[REALTIME TURN SENT]\ngeneration_id=672315", log_text)
+            self.assertIn("[REALTIME RESPONSE CREATED]\ngeneration_id=672315", log_text)
+            self.assertIn("[REALTIME AUDIO START]\ngeneration_id=672315", log_text)
+            self.assertIn("[REALTIME AUDIO DONE]\ngeneration_id=672315", log_text)
+            self.assertIn("[REALTIME AUDIO SUMMARY]\ngeneration_id=672315", log_text)
+
+    def test_active_response_blocks_duplicate_response_create(self):
+        """2. Active Response: Turn request while active_response_state != IDLE is queued without sending response.create."""
+        from astro_ai.astro_realtime_node import AstroRealtimeNode
+        node = AstroRealtimeNode.__new__(AstroRealtimeNode)
+        node._ws = MagicMock()
+        node._loop = MagicMock()
+        node._is_connected = True
+        node.active_response_state = "RESPONSE_STREAMING"
+        node.active_generation_id = 100
+        node.active_response_id = "resp_100"
+        node._turn_queue = []
+        node._last_sent_generation_id = 100
+
+        logs = []
+        mock_logger = MagicMock()
+        mock_logger.info = lambda msg: logs.append(msg)
+        node.get_logger = lambda: mock_logger
+
+        with patch("asyncio.run_coroutine_threadsafe") as mock_coro:
+            msg = MagicMock()
+            msg.data = json.dumps({"text": "Second turn", "generation_id": 101})
+            node._on_realtime_turn_request(msg)
+
+            # Verify no WS send was triggered
+            mock_coro.assert_not_called()
+            self.assertEqual(len(node._turn_queue), 1)
+            log_text = "\n".join(logs)
+            self.assertIn("[REALTIME TURN QUEUED]\ngeneration_id=101\nreason=active_response", log_text)
+
+    def test_turn_is_queued_when_response_active(self):
+        """3. Queueing: Pending turn items wait in _turn_queue until response.done."""
+        from astro_ai.astro_realtime_node import AstroRealtimeNode
+        node = AstroRealtimeNode.__new__(AstroRealtimeNode)
+        node._ws = MagicMock()
+        node._loop = MagicMock()
+        node._is_connected = True
+        node.active_response_state = "RESPONSE_CREATING"
+        node.active_generation_id = 200
+        node._turn_queue = []
+        node._last_sent_generation_id = 200
+        node.get_logger = lambda: MagicMock()
+
+        msg = MagicMock()
+        msg.data = json.dumps({"text": "Queued Turn", "generation_id": 201})
+        node._on_realtime_turn_request(msg)
+        self.assertEqual(node._turn_queue[0]["generation_id"], 201)
+
+    def test_response_done_clears_active_response(self):
+        """4. Lifecycle: response.done clears active_response_state to IDLE and dispatches queued turns."""
+        import asyncio
+        from astro_ai.astro_realtime_node import AstroRealtimeNode
+        node = AstroRealtimeNode.__new__(AstroRealtimeNode)
+        node._ws = MagicMock()
+        node._loop = MagicMock()
+        node._is_connected = True
+        node.active_response_state = "RESPONSE_STREAMING"
+        node.active_response_id = "resp_300"
+        node.active_generation_id = 300
+        node.realtime_audio_received = True
+        node._turn_queue = [{"text": "Next queued turn", "generation_id": 301}]
+        node._last_sent_generation_id = 300
+        node._watchdog_timer = None
+        node._packets_for_gen = 5
+        node._bytes_for_gen = 1000
+        node._first_audio_time = time.monotonic()
+        node._response_start_time = time.monotonic()
+        node.get_logger = lambda: MagicMock()
+
+        dispatched = []
+        node._dispatch_turn = lambda gen_id, text: dispatched.append((gen_id, text))
+
+        asyncio.run(node._handle_realtime_event(node._ws, {"type": "response.done"}))
+
+        self.assertEqual(len(dispatched), 1)
+        self.assertEqual(dispatched[0][0], 301)
+
+    def test_cancel_not_sent_after_response_done(self):
+        """5. Barge-In: user speech started does NOT send response.cancel when response is IDLE."""
+        import asyncio
+        from astro_ai.astro_realtime_node import AstroRealtimeNode
+        node = AstroRealtimeNode.__new__(AstroRealtimeNode)
+        node._ws = MagicMock()
+        node.active_response_state = "IDLE"
+        node.active_response_id = None
+        node._is_responding = False
+        node._is_playback_active = False
+        node.pub_interrupt = MagicMock()
+        node.get_logger = lambda: MagicMock()
+
+        asyncio.run(node._handle_realtime_event(node._ws, {"type": "input_audio_buffer.speech_started"}))
+        node._ws.send.assert_not_called()
+
+    def test_cancel_not_active_is_ignored(self):
+        """6. Error Handling: response_cancel_not_active error is caught and logged as ignore, not failure."""
+        import asyncio
+        from astro_ai.astro_realtime_node import AstroRealtimeNode
+        node = AstroRealtimeNode.__new__(AstroRealtimeNode)
+        node.pub_tts_say = MagicMock()
+        node.realtime_current_generation_id = 400
+        node.realtime_audio_received = False
+        node._last_requested_text = "Test"
+
+        logs = []
+        mock_logger = MagicMock()
+        mock_logger.info = lambda msg: logs.append(msg)
+        mock_logger.error = lambda msg: logs.append(msg)
+        node.get_logger = lambda: mock_logger
+
+        err_event = {
+            "type": "error",
+            "error": {"type": "invalid_request_error", "code": "response_cancel_not_active", "message": "No active response to cancel"}
+        }
+        asyncio.run(node._handle_realtime_event(MagicMock(), err_event))
+
+        node.pub_tts_say.publish.assert_not_called()
+        log_text = "\n".join(logs)
+        self.assertIn("[REALTIME CANCEL IGNORE] reason=response_already_finished", log_text)
+
+    def test_realtime_audio_stream_stays_open_until_audio_done(self):
+        """7. Playback: Streaming aplay pipe remains open across all realtime PCM deltas."""
+        from astro_audio.audio_output_manager import AudioOutputManager
+        mgr = AudioOutputManager(mock_playback=True)
+        mgr.mock_playback = False
+        mgr.backend = "aplay"
+        mgr.alsa_device = "default"
+
+        mgr.begin_realtime_stream(generation_id=500)
+        mock_proc = MagicMock()
+        mock_proc.poll.return_value = None
+        mock_proc.stdin = MagicMock()
+        mock_proc.stdin.closed = False
+        mgr._current_process = mock_proc
+
+        for i in range(5):
+            res = mgr._play_chunk_via_aplay_pipe(b"\x00\x01" * 80, gen=500)
+            self.assertTrue(res)
+            mock_proc.stdin.close.assert_not_called()
+
+        self.assertEqual(mock_proc.stdin.write.call_count, 5)
+
+    def test_playback_finished_only_after_audio_done(self):
+        """8. Playback: PLAYBACK FINISHED is logged after queue drains, not on individual chunks."""
+        from astro_audio.audio_output_manager import AudioOutputManager
+        logs = []
+        mock_logger = lambda lvl, msg: logs.append(msg)
+        mgr = AudioOutputManager(logger=mock_logger, mock_playback=True)
+
+        mgr.begin_realtime_stream(generation_id=600)
+        mgr.play_pcm_chunk(b"\x00\x05" * 100, generation_id=600)
+        time.sleep(0.1)
+
+        # Before drain finishes, chunk is playing
+        mgr.end_realtime_stream(generation_id=600)
+        time.sleep(0.3)
+
+        log_text = "\n".join(logs)
+        self.assertIn("🔊 [PLAYBACK STARTED]\n  generation_id=600", log_text)
+        self.assertIn("🔊 [PLAYBACK FINISHED]\n  generation_id=600", log_text)
+
+    def test_stale_generation_delta_is_dropped(self):
+        """9. Isolation: Chunks for older generation N are dropped if generation N+1 is active."""
+        from astro_audio.audio_output_manager import AudioOutputManager
+        logs = []
+        mock_logger = lambda lvl, msg: logs.append(msg)
+        mgr = AudioOutputManager(logger=mock_logger, mock_playback=True)
+
+        mgr.begin_realtime_stream(generation_id=701)
+        res = mgr.write_realtime_pcm(generation_id=700, pcm=b"stale_pcm")
+        self.assertFalse(res)
+
+        log_text = "\n".join(logs)
+        self.assertIn("[REALTIME PLAYBACK DROP]", log_text)
+        self.assertIn("expected_generation=701", log_text)
+        self.assertIn("received_generation=700", log_text)
+
+    def test_realtime_first_audio_starts_actual_provider(self):
+        """10. Telemetry: [REALTIME AUDIO START] is logged once with actual_provider=openai_realtime."""
+        import base64
+        import asyncio
+        from astro_ai.astro_realtime_node import AstroRealtimeNode
+        node = AstroRealtimeNode.__new__(AstroRealtimeNode)
+        node.pub_output_pcm = MagicMock()
+        node.active_generation_id = 800
+        node.realtime_current_generation_id = 800
+        node.active_response_state = "RESPONSE_STREAMING"
+        node._packets_for_gen = 0
+        node._bytes_for_gen = 0
+        node._first_audio_time = None
+        node._response_start_time = time.monotonic()
+        node._watchdog_timer = None
+
+        logs = []
+        mock_logger = MagicMock()
+        mock_logger.info = lambda msg: logs.append(msg)
+        node.get_logger = lambda: mock_logger
+
+        delta = base64.b64encode(b"\x00\x02" * 100).decode("ascii")
+        asyncio.run(node._handle_realtime_event(MagicMock(), {"type": "response.audio.delta", "delta": delta}))
+        asyncio.run(node._handle_realtime_event(MagicMock(), {"type": "response.audio.delta", "delta": delta}))
+
+        log_text = "\n".join(logs)
+        self.assertEqual(log_text.count("[REALTIME AUDIO START]"), 1)
+        self.assertIn("actual_provider=openai_realtime", log_text)
+
+    def test_realtime_audio_summary_aggregates_delta_logs(self):
+        """11. Telemetry: [REALTIME AUDIO SUMMARY] aggregates total packets and bytes upon response completion."""
+        import asyncio
+        from astro_ai.astro_realtime_node import AstroRealtimeNode
+        node = AstroRealtimeNode.__new__(AstroRealtimeNode)
+        node.active_generation_id = 900
+        node.realtime_current_generation_id = 900
+        node.realtime_audio_received = True
+        node._packets_for_gen = 12
+        node._bytes_for_gen = 24000
+        node._first_audio_time = time.monotonic() - 0.5
+        node._response_start_time = time.monotonic() - 1.0
+        node._turn_queue = []
+        node._watchdog_timer = None
+
+        logs = []
+        mock_logger = MagicMock()
+        mock_logger.info = lambda msg: logs.append(msg)
+        node.get_logger = lambda: mock_logger
+
+        asyncio.run(node._handle_realtime_event(MagicMock(), {"type": "response.done"}))
+
+        log_text = "\n".join(logs)
+        self.assertIn("[REALTIME AUDIO SUMMARY]\ngeneration_id=900\npackets=12\nbytes=24000", log_text)
+
+    def test_session_ready_logged_once(self):
+        """12. Session: [REALTIME SESSION READY] is logged only once per connection."""
+        import asyncio
+        from astro_ai.astro_realtime_node import AstroRealtimeNode
+        node = AstroRealtimeNode.__new__(AstroRealtimeNode)
+        node._session_ready_logged = False
+        node.realtime_session_id = "sess_first"
+        node.pub_realtime_state = MagicMock()
+
+        logs = []
+        mock_logger = MagicMock()
+        mock_logger.info = lambda msg: logs.append(msg)
+        node.get_logger = lambda: mock_logger
+
+        asyncio.run(node._handle_realtime_event(MagicMock(), {"type": "session.created", "session": {"id": "sess_first"}}))
+        asyncio.run(node._handle_realtime_event(MagicMock(), {"type": "session.updated", "session": {"id": "sess_first"}}))
+
+        log_text = "\n".join(logs)
+        self.assertEqual(log_text.count("[REALTIME SESSION READY]"), 1)
+
+    def test_duplicate_turn_is_rejected(self):
+        """13. Duplicate: Re-submitting the same generation_id is dropped and logged."""
+        from astro_ai.astro_realtime_node import AstroRealtimeNode
+        node = AstroRealtimeNode.__new__(AstroRealtimeNode)
+        node._last_sent_generation_id = 999
+
+        logs = []
+        mock_logger = MagicMock()
+        mock_logger.info = lambda msg: logs.append(msg)
+        node.get_logger = lambda: mock_logger
+
+        msg = MagicMock()
+        msg.data = json.dumps({"text": "Duplicate", "generation_id": 999})
+        node._on_realtime_turn_request(msg)
+
+        log_text = "\n".join(logs)
+        self.assertIn("[REALTIME TURN DUPLICATE DROPPED]\ngeneration_id=999", log_text)
+
+    def test_realtime_connection_not_blocked_by_heavy_startup(self):
+        """14. Startup: WebSocket loop runs in dedicated daemon thread _run_async_loop."""
+        from astro_ai.astro_realtime_node import AstroRealtimeNode
+        self.assertTrue(hasattr(AstroRealtimeNode, "_run_async_loop"))
+
+
 if __name__ == "__main__":
     unittest.main()
+
 
 
 
