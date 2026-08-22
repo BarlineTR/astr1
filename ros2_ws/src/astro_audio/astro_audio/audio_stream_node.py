@@ -210,6 +210,11 @@ class AudioStreamNode(Node):
         # Start Input Capture Stream (Single-owner capture)
         self._start_input_stream()
 
+        # Start Playback Worker (Single-owner DAC playback)
+        if not self._under_pytest() and sd is not None:
+            self._playback_thread = threading.Thread(target=self._playback_worker, daemon=True)
+            self._playback_thread.start()
+
         # Playback status ticker timer
         self.create_timer(0.1, self._publish_status)
 
@@ -380,7 +385,7 @@ class AudioStreamNode(Node):
             if raw_str.startswith("{") and raw_str.endswith("}"):
                 try:
                     payload = json.loads(raw_str)
-                    b64_pcm = payload.get("data", "")
+                    b64_pcm = payload.get("pcm") or payload.get("data", "")
                 except Exception:
                     b64_pcm = raw_str
             else:
@@ -398,15 +403,7 @@ class AudioStreamNode(Node):
                     "tts_source": payload.get("tts_source", "realtime_openai"),
                     "playback_source": payload.get("playback_source", payload.get("tts_source", "realtime_openai")),
                 }
-                # KUYRUĞA KONMUYOR. 7e25270 çalma sahipliğini tts_node'a
-                # taşırken bu düğümdeki çalma iş parçacığını kaldırdı ama
-                # abonelik ve kuyruğa doldurma kaldı: kuyruğu artık kimse
-                # boşaltmıyordu. Sonuç, /audio/playback_active'in
-                # `not _play_queue.empty()` üzerinden SONSUZA KADAR True
-                # kalmasıydı — astro_realtime_node bu bayrağa bakıp dinlemeyi
-                # atladığı için robot ilk cevaptan sonra sağır kalıyordu.
-                # Sesin gerçekten çalınıp çalınmadığını artık son parçanın
-                # ne zaman geldiğine bakarak anlıyoruz.
+                self._play_queue.put_nowait(item)
                 self._last_output_chunk_time = time.monotonic()
                 self._last_output_envelope = item
                 self._total_enqueued_bytes += len(raw_16k)
@@ -565,6 +562,7 @@ class AudioStreamNode(Node):
         msg = Bool()
         msg.data = bool(
             self._is_playing
+            or not self._play_queue.empty()
             or (time.monotonic() - self._last_output_chunk_time) < self.echo_mute_cooldown_s
         )
         self.pub_playback_active.publish(msg)

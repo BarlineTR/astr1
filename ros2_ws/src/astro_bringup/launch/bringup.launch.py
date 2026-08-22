@@ -5,7 +5,7 @@ from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription, SetEnvironmentVariable
 from launch.conditions import IfCondition
 from launch.launch_description_sources import PythonLaunchDescriptionSource
-from launch.substitutions import LaunchConfiguration
+from launch.substitutions import LaunchConfiguration, PythonExpression
 
 
 def _dotenv_launch_actions():
@@ -59,8 +59,15 @@ def generate_launch_description():
     enable_audio = LaunchConfiguration("enable_audio")
     enable_vision = LaunchConfiguration("enable_vision")
     enable_ai = LaunchConfiguration("enable_ai")
+    voice_engine = LaunchConfiguration("voice_engine")
     use_realtime = LaunchConfiguration("use_realtime")
     camera_source = LaunchConfiguration("camera_source")
+
+    # In Realtime mode, single hardware ownership dictates that audio_stream_node
+    # owns both input and output. Legacy audio and AI brain nodes are disabled.
+    is_realtime = PythonExpression(["'", voice_engine, "' == 'realtime' and '", use_realtime, "' == 'true'"])
+    is_cascaded_audio = PythonExpression(["'false' if (", is_realtime, ") else '", enable_audio, "'"])
+    is_cascaded_ai = PythonExpression(["'false' if (", is_realtime, ") else '", enable_ai, "'"])
 
     return LaunchDescription(
         _dotenv_launch_actions()
@@ -69,6 +76,11 @@ def generate_launch_description():
                 "use_sim_time",
                 default_value="false",
                 description="Use simulation clock",
+            ),
+            DeclareLaunchArgument(
+                "voice_engine",
+                default_value="realtime",
+                description="Voice engine mode: realtime (OpenAI S2S) | cascaded (Whisper+LLM+Edge-TTS)",
             ),
             DeclareLaunchArgument(
                 "enable_description",
@@ -88,7 +100,7 @@ def generate_launch_description():
             DeclareLaunchArgument(
                 "enable_audio",
                 default_value="true",
-                description="Start ReSpeaker audio pipeline",
+                description="Start ReSpeaker audio pipeline in cascaded mode",
             ),
             DeclareLaunchArgument(
                 "enable_vision",
@@ -103,7 +115,7 @@ def generate_launch_description():
             DeclareLaunchArgument(
                 "enable_ai",
                 default_value="true",
-                description="Start AI Brain for NLP processing",
+                description="Start AI Brain for NLP processing in cascaded mode",
             ),
             DeclareLaunchArgument(
                 "use_realtime",
@@ -131,13 +143,13 @@ def generate_launch_description():
                 launch_arguments={
                     "use_sim_time": use_sim_time,
                     "enable_lidar": enable_lidar,
-                    "enable_audio": enable_audio,
+                    "enable_audio": is_cascaded_audio,
                     "enable_vision": enable_vision,
-                    "enable_ai": enable_ai,
+                    "enable_ai": is_cascaded_ai,
                     "camera_source": camera_source,
                 }.items(),
             ),
-            # OpenAI Realtime WebSocket Node (production default: enabled)
+            # OpenAI Realtime WebSocket Node (production default: enabled via single audio owner)
             IncludeLaunchDescription(
                 PythonLaunchDescriptionSource(
                     os.path.join(bringup_pkg, "launch", "realtime_sensors.launch.py")

@@ -35,6 +35,7 @@ try:
     from rclpy.qos import qos_profile_sensor_data
     from sensor_msgs.msg import Image, CameraInfo
     from std_msgs.msg import Bool, Float32, String
+    from geometry_msgs.msg import Twist
 except ImportError:
     rclpy = None
     qos_profile_sensor_data = 10  # rclpy yoksa (mock/test modu) düz derinlik
@@ -52,6 +53,15 @@ except ImportError:
             return None
     class _MockMsg:
         data: Any = None
+    class Twist:  # type: ignore
+        class Vector3:
+            def __init__(self, x=0.0, y=0.0, z=0.0):
+                self.x = float(x)
+                self.y = float(y)
+                self.z = float(z)
+        def __init__(self):
+            self.linear = Twist.Vector3()
+            self.angular = Twist.Vector3()
     Image = CameraInfo = Bool = Float32 = String = _MockMsg  # type: ignore
 
 try:
@@ -666,6 +676,7 @@ class AstroRealtimeNode(Node):
         self.pub_output_pcm = self.create_publisher(String, "/audio/realtime_output_pcm", 50)
         self.pub_realtime_state = self.create_publisher(String, "/realtime/state", 10)
         self.pub_tts_say = self.create_publisher(String, "/tts/say", 10)
+        self.pub_cmd_vel = self.create_publisher(Twist, "/cmd_vel", 10)
 
         self.pub_interrupt = self.create_publisher(Bool, "/tts/interrupt", 10)
         self.pub_emotion = self.create_publisher(String, "/robot/emotion", 10)
@@ -1087,10 +1098,10 @@ class AstroRealtimeNode(Node):
                         },
                         "turn_detection": {
                             "type": "server_vad",
-                            "threshold": 0.72,
+                            "threshold": 0.70,
                             "prefix_padding_ms": 300,
-                            "silence_duration_ms": 600,
-                            "create_response": False
+                            "silence_duration_ms": 500,
+                            "create_response": True
                         }
                     },
                     "output": {
@@ -1138,6 +1149,18 @@ class AstroRealtimeNode(Node):
                     },
                     {
                         "type": "function",
+                        "name": "search_memory",
+                        "description": "Kullanıcı geçmiş sohbetler, önceki tercihler veya kaydedilmiş bilgiler hakkında soru sorduğunda kalıcı hafızada arama yapar.",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "query": {"type": "string", "description": "Aranacak konu, anahtar kelime veya soru"}
+                            },
+                            "required": ["query"]
+                        }
+                    },
+                    {
+                        "type": "function",
                         "name": "inspect_camera_view",
                         "description": "Kullanıcı 'ne görüyorsun?', 'elimde ne var?', 'bana bak', 'görebiliyor musun?', 'elimdeki ne renk?', 'bu ne?' veya kameranın önündeki eşyaları sorduğunda OAK-D kamerasından canlı görüntü alıp inceler.",
                         "parameters": {
@@ -1146,6 +1169,24 @@ class AstroRealtimeNode(Node):
                                 "focus": {"type": "string", "description": "İncelenmesi istenen nesne, detay, renk veya durum (örn: 'elimdeki nesne', 'kıyafet', 'çevre')"}
                             },
                             "required": ["focus"]
+                        }
+                    },
+                    {
+                        "type": "function",
+                        "name": "move_robot",
+                        "description": "Kullanıcı robotun hareket etmesini istediğinde çağrılır ('ileri git', 'geri gel', 'dur', 'sağa dön', 'sola dön').",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "direction": {
+                                    "type": "string",
+                                    "enum": ["forward", "backward", "left", "right", "stop"],
+                                    "description": "Hareket yönü"
+                                },
+                                "speed": {"type": "number", "description": "Hız (0.1 - 0.5 m/s)"},
+                                "duration": {"type": "number", "description": "Kaç saniye hareket edeceği"}
+                            },
+                            "required": ["direction"]
                         }
                     },
                     {
@@ -1305,21 +1346,11 @@ class AstroRealtimeNode(Node):
         elif event_type == "input_audio_buffer.speech_stopped":
             if self._is_sleeping:
                 return
-            self.get_logger().info("🤫 [Realtime] Cümle bitti, biyometri doğrulanıyor ve yanıt üretiliyor...")
-            self._run_voice_identification()
-            current_prompt = self._build_current_system_prompt()
-            resp_event = {
-                "type": "response.create",
-                "response": {
-                    "instructions": current_prompt
-                }
-            }
-            if self.active_response_state == "IDLE":
-                try:
-                    self.get_logger().info(f"[REALTIME TURN SENT] generation_id={self.realtime_current_generation_id}")
-                    await ws.send(json.dumps(resp_event))
-                except Exception as se:
-                    self.get_logger().error(f"Response create notice: {se}")
+            self.get_logger().info("🤫 [Realtime] Cümle bitti, dinleme tamamlandı...")
+            try:
+                asyncio.create_task(asyncio.to_thread(self._run_voice_identification))
+            except Exception:
+                threading.Thread(target=self._run_voice_identification, daemon=True).start()
 
         # 3c. Response Created
         elif event_type == "response.created":
@@ -1425,7 +1456,7 @@ class AstroRealtimeNode(Node):
 
             self.get_logger().info(f"🛠️ [Realtime Tool]: {func_name}({args}) çalıştırılıyor...")
             try:
-                tool_result = self._execute_realtime_tool(func_name, args)
+                tool_result = await asyncio.to_thread(self._execute_realtime_tool, func_name, args)
             except Exception as te:
                 self.get_logger().error(f"❌ [Tool Hatası]: {te}")
                 tool_result = {"status": "error", "message": str(te)}
@@ -1584,9 +1615,70 @@ class AstroRealtimeNode(Node):
             self.memory.profile.set_user_fact(name_p, key, val)
             return {"status": "success", "message": f"'{key}: {val}' bilgisi hafızaya kaydedildi."}
 
+        elif name == "search_memory":
+            query = args.get("query", "")
+            results = []
+            try:
+                if hasattr(self.memory, "episodic") and hasattr(self.memory.episodic, "search"):
+                    search_res = self.memory.episodic.search(query, top_k=3)
+                    if isinstance(search_res, list):
+                        results.extend(search_res)
+                if hasattr(self.memory, "profile") and hasattr(self.memory.profile, "get_user_facts"):
+                    identity = self._get_active_biometric_identity()
+                    name_p = identity.get("name", "Baran")
+                    facts = self.memory.profile.get_user_facts(name_p)
+                    if isinstance(facts, dict):
+                        for k, v in facts.items():
+                            if query.lower() in k.lower() or query.lower() in str(v).lower():
+                                results.append(f"{k}: {v}")
+            except Exception as se:
+                self.get_logger().debug(f"Memory search error: {se}")
+            res_text = "\n".join(str(r) for r in results) if results else "Hafızada bu konuyla ilgili özel bir kayıt bulunamadı."
+            return {"status": "success", "query": query, "memory_context": res_text}
+
         elif name == "inspect_camera_view":
             focus = args.get("focus", "kullanıcının elindeki nesne, rengi ve çevre")
             return self._inspect_camera_view(focus)
+
+        elif name == "move_robot":
+            direction = args.get("direction", "stop").lower().strip()
+            speed = float(args.get("speed", 0.2))
+            speed = max(0.05, min(speed, 0.4))
+            duration = float(args.get("duration", 1.5))
+            duration = max(0.5, min(duration, 5.0))
+
+            pub = getattr(self, "pub_cmd_vel", None)
+            if pub:
+                try:
+                    tw = Twist()
+                    if direction == "forward":
+                        tw.linear.x = speed
+                    elif direction == "backward":
+                        tw.linear.x = -speed
+                    elif direction == "left":
+                        tw.angular.z = speed * 2.0
+                    elif direction == "right":
+                        tw.angular.z = -speed * 2.0
+                    elif direction == "stop":
+                        tw.linear.x = 0.0
+                        tw.angular.z = 0.0
+
+                    pub.publish(tw)
+
+                    if direction != "stop":
+                        def _stop_later():
+                            time.sleep(duration)
+                            try:
+                                stop_tw = Twist()
+                                pub.publish(stop_tw)
+                            except Exception:
+                                pass
+                        threading.Thread(target=_stop_later, daemon=True).start()
+
+                    return {"status": "success", "action": f"Robot {direction} yönünde {speed} m/s hızla hareket ettirildi."}
+                except Exception as me:
+                    return {"status": "error", "message": f"Hareket komutu verilemedi: {me}"}
+            return {"status": "error", "message": "/cmd_vel yayıncısı hazır değil."}
 
         elif name == "enroll_user_biometrics":
             name_param = args.get("name", "")

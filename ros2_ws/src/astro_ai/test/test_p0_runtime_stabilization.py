@@ -2833,10 +2833,93 @@ class TestP05RealtimeStreamStateAndPlaybackSerialization(unittest.TestCase):
         log_text = "\n".join(logs)
         self.assertIn("[REALTIME TURN DUPLICATE DROPPED]\ngeneration_id=999", log_text)
 
-    def test_realtime_connection_not_blocked_by_heavy_startup(self):
-        """14. Startup: WebSocket loop runs in dedicated daemon thread _run_async_loop."""
+    def test_server_vad_configuration(self):
+        """15. Realtime S2S: Session config configures server_vad with native create_response=True."""
+        import asyncio
         from astro_ai.astro_realtime_node import AstroRealtimeNode
-        self.assertTrue(hasattr(AstroRealtimeNode, "_run_async_loop"))
+        node = AstroRealtimeNode.__new__(AstroRealtimeNode)
+        node._get_active_biometric_identity = lambda: {"name": "Baran", "is_known": True}
+        node._build_current_system_prompt = lambda: "Astro Persona Instructions"
+        node.realtime_transcribe_model = "gpt-live-transcribe"
+        node.realtime_voice = "alloy"
+        node.persona_name = "playful"
+        node.get_logger = lambda: MagicMock()
+
+        sent_payloads = []
+        mock_ws = MagicMock()
+        async def _mock_send(payload):
+            sent_payloads.append(json.loads(payload))
+        mock_ws.send = _mock_send
+
+        asyncio.run(node._send_session_update(mock_ws))
+        self.assertTrue(len(sent_payloads) > 0)
+        session_cfg = sent_payloads[0]["session"]
+        turn_det = session_cfg["audio"]["input"]["turn_detection"]
+        self.assertEqual(turn_det["type"], "server_vad")
+        self.assertTrue(turn_det["create_response"])
+        self.assertEqual(turn_det["silence_duration_ms"], 500)
+
+    def test_no_manual_response_create_for_normal_turn(self):
+        """16. Realtime S2S: speech_stopped does NOT send manual response.create (native turn detection)."""
+        import asyncio
+        from astro_ai.astro_realtime_node import AstroRealtimeNode
+        node = AstroRealtimeNode.__new__(AstroRealtimeNode)
+        node._is_sleeping = False
+        node.get_logger = lambda: MagicMock()
+        node._run_voice_identification = MagicMock()
+
+        sent_events = []
+        mock_ws = MagicMock()
+        mock_ws.send = lambda payload: sent_events.append(json.loads(payload))
+
+        asyncio.run(node._handle_realtime_event(mock_ws, {"type": "input_audio_buffer.speech_stopped"}))
+        # No manual response.create sent on speech_stopped
+        self.assertEqual(len(sent_events), 0)
+
+    def test_motion_and_memory_tools_execution(self):
+        """17. Tools: move_robot publishes Twist to /cmd_vel and search_memory queries storage."""
+        from astro_ai.astro_realtime_node import AstroRealtimeNode
+        node = AstroRealtimeNode.__new__(AstroRealtimeNode)
+        mock_cmd_vel = MagicMock()
+        node.pub_cmd_vel = mock_cmd_vel
+        node.memory = MagicMock()
+        node.memory.profile.get_user_facts.return_value = {"favorite_color": "mavi"}
+        node._get_active_biometric_identity = lambda: {"name": "Baran"}
+        node.get_logger = lambda: MagicMock()
+
+        # Test move_robot
+        res_move = node._execute_realtime_tool("move_robot", {"direction": "forward", "speed": 0.2, "duration": 1.0})
+        self.assertEqual(res_move["status"], "success")
+        self.assertTrue(mock_cmd_vel.publish.called)
+
+        # Test search_memory
+        res_mem = node._execute_realtime_tool("search_memory", {"query": "favorite_color"})
+        self.assertEqual(res_mem["status"], "success")
+        self.assertIn("mavi", res_mem["memory_context"])
+
+    def test_audio_stream_node_single_owner_playback(self):
+        """18. Single Ownership: audio_stream_node receives output PCM, enqueues to DAC, and updates status."""
+        import base64
+        from astro_audio.audio_stream_node import AudioStreamNode
+        node = AudioStreamNode.__new__(AudioStreamNode)
+        import queue
+        node._play_queue = queue.Queue(maxsize=500)
+        node._last_output_chunk_time = 0.0
+        node._total_enqueued_bytes = 0
+        node._is_playing = False
+        node.echo_mute_cooldown_s = 0.65
+        node.pub_playback_active = MagicMock()
+        node.get_logger = lambda: MagicMock()
+
+        dummy_pcm_24k = b"\x00\x01" * 480
+        dummy_b64 = base64.b64encode(dummy_pcm_24k).decode("ascii")
+
+        msg = MagicMock()
+        msg.data = json.dumps({"generation_id": 42, "pcm": dummy_b64})
+        node._on_output_pcm(msg)
+
+        self.assertEqual(node._play_queue.qsize(), 1)
+        self.assertTrue(node._total_enqueued_bytes > 0)
 
 
 if __name__ == "__main__":
