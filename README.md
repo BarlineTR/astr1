@@ -288,6 +288,11 @@ A Gazebo Harmonic simulation of the robot, used to develop LiDAR mapping and
 navigation without hardware. Packages: `astro_sim` (world, spawn, ros_gz bridge)
 and `astro_navigation` (slam_toolbox, Nav2).
 
+> **Full reference: [docs/simulasyon-ve-gercek-robot.md](docs/simulasyon-ve-gercek-robot.md)** —
+> every parameter with its simulation and real-robot value, the calibration
+> procedure, troubleshooting, and what is still missing before the stack can run
+> on the physical robot.
+
 ### Prerequisites
 
 ```bash
