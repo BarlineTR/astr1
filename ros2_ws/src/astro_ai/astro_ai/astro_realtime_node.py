@@ -10,6 +10,10 @@ Features:
 """
 
 import asyncio
+import logging
+
+_LOG = logging.getLogger(__name__)
+
 import base64
 import inspect
 import io
@@ -28,10 +32,12 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 try:
     import rclpy
     from rclpy.node import Node
+    from rclpy.qos import qos_profile_sensor_data
     from sensor_msgs.msg import Image, CameraInfo
     from std_msgs.msg import Bool, Float32, String
 except ImportError:
     rclpy = None
+    qos_profile_sensor_data = 10  # rclpy yoksa (mock/test modu) düz derinlik
     class Node:  # type: ignore
         def __init__(self, *args, **kwargs):
             pass
@@ -155,8 +161,8 @@ def imgmsg_to_bgr(msg: Image) -> Optional[np.ndarray]:
         elif msg.encoding in ("mono8", "8UC1"):
             data = np.frombuffer(msg.data, dtype=np.uint8).reshape(msg.height, msg.width)
             return cv2.cvtColor(data, cv2.COLOR_GRAY2BGR)
-    except Exception:
-        pass
+    except Exception as _exc:
+        _LOG.debug("imgmsg_to_bgr: yok sayılan hata (%s)", _exc)
     return None
 
 
@@ -205,8 +211,8 @@ def discover_realtime_models(api_key: str, preferred: str = "") -> list[str]:
             for mid in avail_ids:
                 if mid not in candidates:
                     candidates.append(mid)
-    except Exception:
-        pass
+    except Exception as _exc:
+        _LOG.debug("discover_realtime_models: yok sayılan hata (%s)", _exc)
 
     for m in flagship_realtime_models:
         if m not in candidates:
@@ -360,8 +366,8 @@ class AstroRealtimeNode(Node):
         if rclpy is not None and hasattr(rclpy, "ok") and not rclpy.ok():
             try:
                 rclpy.init()
-            except Exception:
-                pass
+            except Exception as _exc:
+                self.get_logger().debug(f"__init__: yok sayılan hata ({_exc})")
         super().__init__("astro_realtime_node")
 
         # Startup timestamp & Grace Period tracking
@@ -567,8 +573,11 @@ class AstroRealtimeNode(Node):
         self.create_subscription(Bool, "/vision/looking_at_robot", self._on_looking_at_robot, 10)
         self.create_subscription(Float32, "/vision/user_distance", self._on_user_distance, 10)
         self.create_subscription(Float32, "/audio/doa", self._on_doa, 10)
-        self.create_subscription(Image, "/oak/rgb/image_raw", self._on_camera_image, 10)
-        self.create_subscription(CameraInfo, "/oak/rgb/camera_info", self._on_camera_info, 10)
+        # Görüntü akışları sensör QoS'u (BEST_EFFORT): kare kaybı, geciken kareler
+        # için retransmission yapmaktan iyidir. BEST_EFFORT abone RELIABLE
+        # yayıncıdan da veri alır, bu yüzden depthai_ros_driver ile uyumlu.
+        self.create_subscription(Image, "/oak/rgb/image_raw", self._on_camera_image, qos_profile_sensor_data)
+        self.create_subscription(CameraInfo, "/oak/rgb/camera_info", self._on_camera_info, qos_profile_sensor_data)
 
         # Tool execution deduplication
         self._executed_tool_calls: set[str] = set()
@@ -770,8 +779,8 @@ class AstroRealtimeNode(Node):
         if self.voice_recognizer:
             try:
                 known_speakers = [k for k, v in self.voice_recognizer._known_voiceprints.items() if len(v) > 0 and k.lower() != "misafir"]
-            except Exception:
-                pass
+            except Exception as _exc:
+                self.get_logger().debug(f"_build_current_system_prompt: yok sayılan hata ({_exc})")
         known_str = ", ".join(known_speakers) if known_speakers else "Baran"
         room_context = f"\n[KAYITLI KİŞİLER]: {known_str}\n"
 
@@ -1258,8 +1267,8 @@ class AstroRealtimeNode(Node):
                 if self.face_recognizer:
                     self.face_recognizer.delete_face(bad)
                 self.memory.profile.remove_known_person(bad)
-            except Exception:
-                pass
+            except Exception as _exc:
+                self.get_logger().debug(f"_purge_corrupted_biometrics: yok sayılan hata ({_exc})")
         self.get_logger().info("🧹 [Biyometrik Temizlik]: Hatalı/uygunsuz kayıtlar (Yarram, Astronun Kocası vb.) veri tabanından tamamen silindi.")
 
     def _delete_user_biometrics(self, name: str) -> Dict[str, Any]:
@@ -1746,8 +1755,8 @@ class AstroRealtimeNode(Node):
                         self._ws.send(json.dumps({"type": "input_audio_buffer.clear"})),
                         self._loop
                     )
-                except Exception:
-                    pass
+                except Exception as _exc:
+                    self.get_logger().debug(f"_wake_up: yok sayılan hata ({_exc})")
 
             # 2. Restore persona emotion
             if self.pub_emotion is not None:
@@ -2049,8 +2058,8 @@ class AstroRealtimeNode(Node):
                             if candidate_ans:
                                 ans = candidate_ans
                                 break
-                    except Exception:
-                        pass
+                    except Exception as _exc:
+                        self.get_logger().debug(f"_idle_memory_reflection: yok sayılan hata ({_exc})")
 
             # 2. Try Gemini REST (0 Token Cost fallback)
             if not ans and self.gemini_api_key:
@@ -2066,8 +2075,8 @@ class AstroRealtimeNode(Node):
                             if candidate_ans:
                                 ans = candidate_ans
                                 break
-                    except Exception:
-                        pass
+                    except Exception as _exc:
+                        self.get_logger().debug(f"_idle_memory_reflection: yok sayılan hata ({_exc})")
 
             if ans and "YOK" not in ans.upper() and len(ans) >= 5:
                 identity = self._get_active_biometric_identity()
@@ -2152,8 +2161,8 @@ class AstroRealtimeNode(Node):
                 with urllib.request.urlopen(req, timeout=4.0) as resp:
                     resp_json = json.loads(resp.read().decode("utf-8"))
                     summary = resp_json["choices"][0]["message"]["content"].strip()
-            except Exception:
-                pass
+            except Exception as _exc:
+                self.get_logger().debug(f"_async_summarize_and_save_session: yok sayılan hata ({_exc})")
 
         # 2. Try Gemini REST (0 Token Cost fallback)
         if not summary and self.gemini_api_key:
@@ -2165,8 +2174,8 @@ class AstroRealtimeNode(Node):
                 with urllib.request.urlopen(req, timeout=4.0) as resp:
                     res_json = json.loads(resp.read().decode("utf-8"))
                     summary = res_json["candidates"][0]["content"]["parts"][0]["text"].strip()
-            except Exception:
-                pass
+            except Exception as _exc:
+                self.get_logger().debug(f"_async_summarize_and_save_session: yok sayılan hata ({_exc})")
 
         if summary and len(summary) > 5:
             self.memory.profile.add_person_session_summary(person_name, summary)
@@ -2198,8 +2207,8 @@ class AstroRealtimeNode(Node):
             if self._ws and self._loop and self._is_connected:
                 try:
                     asyncio.run_coroutine_threadsafe(self._ws.send(json.dumps({"type": "input_audio_buffer.clear"})), self._loop)
-                except Exception:
-                    pass
+                except Exception as _exc:
+                    self.get_logger().debug(f"_on_playback_active: yok sayılan hata ({_exc})")
             self.get_logger().info("👂 [Astro Dinliyor]: Mikrofon aktif, sizi dinliyor...")
 
     def _validate_stt_transcript(
@@ -3430,8 +3439,8 @@ class AstroRealtimeNode(Node):
                 if len(arr) > 0:
                     local_rms = float(np.sqrt(np.mean(arr.astype(np.float32) ** 2)))
                     peak_val = int(np.max(np.abs(arr)))
-        except Exception:
-            pass
+        except Exception as _exc:
+            self.get_logger().debug(f"_on_input_pcm: yok sayılan hata ({_exc})")
 
         # Update background ambient noise floor when quiet
         if local_rms < 380.0:
@@ -3591,8 +3600,8 @@ class AstroRealtimeNode(Node):
                                 else:
                                     self.no_speech_rejection_count += 1
                                     self._fallback_audio_buffer.clear()
-                except Exception:
-                    pass
+                except Exception as _exc:
+                    self.get_logger().debug(f"_on_input_pcm: yok sayılan hata ({_exc})")
             return
 
         # --- Standard OpenAI Realtime Mode ---
@@ -3602,8 +3611,8 @@ class AstroRealtimeNode(Node):
         }
         try:
             asyncio.run_coroutine_threadsafe(self._ws.send(json.dumps(payload)), self._loop)
-        except Exception:
-            pass
+        except Exception as _exc:
+            self.get_logger().debug(f"_on_input_pcm: yok sayılan hata ({_exc})")
 
 
     def _trigger_proactive_greeting(self, name: str, formal_title: str):
@@ -3627,8 +3636,8 @@ class AstroRealtimeNode(Node):
         try:
             asyncio.run_coroutine_threadsafe(self._ws.send(json.dumps(greeting_event)), self._loop)
             asyncio.run_coroutine_threadsafe(self._ws.send(json.dumps({"type": "response.create"})), self._loop)
-        except Exception:
-            pass
+        except Exception as _exc:
+            self.get_logger().debug(f"_trigger_proactive_greeting: yok sayılan hata ({_exc})")
 
     def _on_recognized_person(self, msg: String):
         try:
@@ -3658,8 +3667,8 @@ class AstroRealtimeNode(Node):
                         self._trigger_proactive_greeting(name, formal_title)
 
             self._sync_perception_to_session()
-        except Exception:
-            pass
+        except Exception as _exc:
+            self.get_logger().debug(f"_on_recognized_person: yok sayılan hata ({_exc})")
 
     def _on_speaker_id(self, msg: String):
         try:
@@ -3677,8 +3686,8 @@ class AstroRealtimeNode(Node):
                     self._active_person_name = data.get("name")
                     self._person_hold_until = time.monotonic() + 45.0
             self._sync_perception_to_session()
-        except Exception:
-            pass
+        except Exception as _exc:
+            self.get_logger().debug(f"_on_speaker_id: yok sayılan hata ({_exc})")
 
     def _on_user_emotion(self, msg: String):
         self._user_emotion = msg.data.lower().strip()
@@ -3773,8 +3782,8 @@ class AstroRealtimeNode(Node):
                 }
             }
             asyncio.run_coroutine_threadsafe(self._ws.send(json.dumps(notice_event)), self._loop)
-        except Exception:
-            pass
+        except Exception as _exc:
+            self.get_logger().debug(f"_sync_perception_to_session: yok sayılan hata ({_exc})")
 
 
 
@@ -3786,8 +3795,8 @@ def main(args=None):
     node = AstroRealtimeNode()
     try:
         rclpy.spin(node)
-    except KeyboardInterrupt:
-        pass
+    except KeyboardInterrupt as _exc:
+        _LOG.debug("main: yok sayılan hata (%s)", _exc)
     finally:
         node.destroy_node()
         if rclpy.ok():
