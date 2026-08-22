@@ -1078,14 +1078,17 @@ class AstroRealtimeNode(Node):
             delta_b64 = event.get("delta", "")
             if delta_b64:
                 out_msg = String()
-                out_msg.data = delta_b64
+                out_msg.data = json.dumps({
+                    "generation_id": self.realtime_current_generation_id,
+                    "pcm": delta_b64
+                })
                 self.pub_output_pcm.publish(out_msg)
                 self.realtime_audio_received = True
                 self.realtime_response_state = "STREAMING"
                 delta_len = len(delta_b64) * 3 // 4
                 self.get_logger().info(
-                    f"[REALTIME AUDIO DELTA] bytes={delta_len}\n"
-                    f"generation_id={self.realtime_current_generation_id}"
+                    f"[REALTIME AUDIO DELTA] generation_id={self.realtime_current_generation_id} bytes={delta_len}\n"
+                    f"actual_provider=openai_realtime"
                 )
 
         # 2. Real-Time Streaming Audio Transcript
@@ -1124,7 +1127,7 @@ class AstroRealtimeNode(Node):
                 }
             }
             try:
-                self.get_logger().info(f"[REALTIME TURN SENT] generation_id={self.realtime_current_generation_id + 1}")
+                self.get_logger().info(f"[REALTIME TURN SENT] generation_id={self.realtime_current_generation_id}")
                 await ws.send(json.dumps(resp_event))
             except Exception as se:
                 self.get_logger().error(f"Response create notice: {se}")
@@ -1134,8 +1137,8 @@ class AstroRealtimeNode(Node):
             self._is_responding = True
             self.realtime_response_state = "GENERATING"
             self._response_start_time = time.monotonic()
-            self.realtime_current_generation_id += 1
-            self.realtime_audio_received = False
+            if self.realtime_current_generation_id == 0:
+                self.realtime_current_generation_id = 1
             self.get_logger().info(
                 f"[REALTIME RESPONSE CREATED]\n"
                 f"generation_id={self.realtime_current_generation_id}"

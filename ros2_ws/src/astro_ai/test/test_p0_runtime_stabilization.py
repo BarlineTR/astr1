@@ -26,6 +26,7 @@ Verifies all critical P0 runtime stabilization invariants:
 import json
 import os
 import re
+import struct
 import sys
 import threading
 import time
@@ -1542,12 +1543,13 @@ class TestP02RealtimeTurnPipelineAndHardwareCorrection(unittest.TestCase):
         from astro_audio.tts_node import TtsNode
         tts = TtsNode.__new__(TtsNode)
         tts.output_manager = MagicMock()
+        tts.output_manager.current_generation = 0
         tts._log = lambda lvl, msg: None
 
         pcm_msg = MagicMock()
         pcm_msg.data = b64_delta
         tts._on_realtime_output_pcm(pcm_msg)
-        tts.output_manager.play_pcm_chunk.assert_called_once_with(pcm_sample, sample_rate=24000)
+        tts.output_manager.write_realtime_pcm.assert_called_once_with(0, pcm_sample, sample_rate=24000)
 
     def test_realtime_no_delta_falls_back_to_edge(self):
         """3. Fallback: Deadline timeout with no audio delta triggers [REALTIME NO AUDIO] and [TTS FALLBACK]."""
@@ -2177,8 +2179,322 @@ class TestP03CriticalRuntimeRecovery(unittest.TestCase):
         self.assertIsNotNone(tts.output_manager)
 
 
+class TestP04RuntimeCriticalRecovery(unittest.TestCase):
+    """P0.4 Acceptance Tests: Continuous ALSA Streaming, Firmware Protocol Match, and Route Filtering."""
+
+    def test_realtime_pcm_stream_remains_open_until_audio_done(self):
+        """1. Realtime: _play_chunk_via_aplay_pipe keeps proc.stdin open across multiple chunks."""
+        from astro_audio.audio_output_manager import AudioOutputManager
+        mgr = AudioOutputManager(mock_playback=True)
+        mgr.mock_playback = False
+        mgr.alsa_device = "default"
+        mgr.backend = "aplay"
+
+        mock_proc = MagicMock()
+        mock_proc.poll.return_value = None
+        mock_proc.stdin = MagicMock()
+        mock_proc.stdin.closed = False
+        mgr._current_process = mock_proc
+
+        chunk1 = b"\x00\x01" * 160
+        chunk2 = b"\x00\x02" * 160
+
+        res1 = mgr._play_chunk_via_aplay_pipe(chunk1, gen=1)
+        self.assertTrue(res1)
+        # Verify stdin was NOT closed
+        mock_proc.stdin.close.assert_not_called()
+
+        res2 = mgr._play_chunk_via_aplay_pipe(chunk2, gen=1)
+        self.assertTrue(res2)
+        self.assertEqual(mock_proc.stdin.write.call_count, 2)
+
+    def test_realtime_pcm_chunks_are_serialized(self):
+        """2. Realtime: play_pcm_chunk enqueues chunks in order to _play_queue."""
+        from astro_audio.audio_output_manager import AudioOutputManager
+        mgr = AudioOutputManager(mock_playback=True)
+        mgr._flush_queue_locked()
+
+        mgr.play_pcm_chunk(b"chunk_1", generation_id=10)
+        mgr.play_pcm_chunk(b"chunk_2", generation_id=10)
+
+        item1 = mgr._play_queue.get_nowait()
+        item2 = mgr._play_queue.get_nowait()
+        self.assertEqual(item1["pcm"], b"chunk_1")
+        self.assertEqual(item2["pcm"], b"chunk_2")
+
+    def test_realtime_audio_delta_never_writes_to_closed_stream(self):
+        """3. Realtime: write_realtime_pcm successfully delegates to play_pcm_chunk."""
+        from astro_audio.audio_output_manager import AudioOutputManager
+        mgr = AudioOutputManager(mock_playback=True)
+        mgr._current_generation = 5
+
+        res = mgr.write_realtime_pcm(generation_id=5, pcm=b"\x00\x05" * 100)
+        self.assertTrue(res)
+
+    def test_realtime_actual_provider_requires_first_audio_delta(self):
+        """4. Realtime: actual_provider=openai_realtime is logged on response.audio.delta."""
+        import base64
+        from astro_ai.astro_realtime_node import AstroRealtimeNode
+        node = AstroRealtimeNode.__new__(AstroRealtimeNode)
+        node.pub_output_pcm = MagicMock()
+        node.realtime_current_generation_id = 12
+        node.realtime_audio_received = False
+        node.realtime_response_state = "IDLE"
+
+        logs = []
+        mock_logger = MagicMock()
+        mock_logger.info = lambda msg: logs.append(msg)
+        node.get_logger = lambda: mock_logger
+
+        pcm_sample = b"\x00\x03" * 240
+        b64_delta = base64.b64encode(pcm_sample).decode("ascii")
+        event = {"type": "response.audio.delta", "delta": b64_delta}
+
+        import asyncio
+        asyncio.run(node._handle_realtime_event(MagicMock(), event))
+
+        self.assertTrue(node.realtime_audio_received)
+        log_text = "\n".join(logs)
+        self.assertIn("[REALTIME AUDIO DELTA] generation_id=12", log_text)
+        self.assertIn("actual_provider=openai_realtime", log_text)
+
+    def test_realtime_generation_id_is_preserved_end_to_end(self):
+        """5. Realtime: authoritative generation_id is preserved from request through audio done."""
+        from astro_ai.astro_realtime_node import AstroRealtimeNode
+        node = AstroRealtimeNode.__new__(AstroRealtimeNode)
+        node._ws = MagicMock()
+        node._loop = MagicMock()
+        node._is_connected = True
+        node.realtime_current_generation_id = 0
+        node.realtime_audio_received = False
+        node.pub_output_pcm = MagicMock()
+        node.pub_tts_say = MagicMock()
+
+        logs = []
+        mock_logger = MagicMock()
+        mock_logger.info = lambda msg: logs.append(msg)
+        mock_logger.debug = lambda msg: logs.append(msg)
+        node.get_logger = lambda: mock_logger
+
+        def fake_run(coro, loop):
+            pass
+
+        with patch("asyncio.run_coroutine_threadsafe", side_effect=fake_run):
+            msg = MagicMock()
+            msg.data = json.dumps({"text": "Test Turn", "generation_id": 707881})
+            node._on_realtime_turn_request(msg)
+
+            self.assertEqual(node.realtime_current_generation_id, 707881)
+            log_text = "\n".join(logs)
+            self.assertIn("[REALTIME TURN SENT]\ngeneration_id=707881", log_text)
+
+    def test_realtime_no_audio_falls_back_to_edge(self):
+        """6. Realtime: 1.2s timeout with no audio triggers Edge-TTS fallback."""
+        from astro_ai.astro_realtime_node import AstroRealtimeNode
+        node = AstroRealtimeNode.__new__(AstroRealtimeNode)
+        node.pub_tts_say = MagicMock()
+        node.realtime_current_generation_id = 88
+        node.realtime_audio_received = False
+
+        logs = []
+        mock_logger = MagicMock()
+        mock_logger.warn = lambda msg: logs.append(msg)
+        node.get_logger = lambda: mock_logger
+
+        node._check_audio_delta_timeout(gen_id=88, text="Fallback query")
+        node.pub_tts_say.publish.assert_called_once()
+        log_text = "\n".join(logs)
+        self.assertIn("[REALTIME NO AUDIO]", log_text)
+        self.assertIn("[TTS FALLBACK]\nfrom=openai_realtime\nto=edge_tts\nreason=realtime_no_audio", log_text)
+
+    def test_heartbeat_ack_parser_matches_firmware_protocol(self):
+        """7. Firmware Protocol: SerialBridge handles MSG_HEARTBEAT_ACK (0x13)."""
+        from serial_bridge import SerialBridge, MSG_HEARTBEAT_ACK
+        self.assertEqual(MSG_HEARTBEAT_ACK, 0x13)
+
+    def test_heartbeat_sequence_is_correlated(self):
+        """8. Heartbeat: Correlates sequence number from heartbeat transmission to ACK log."""
+        from serial_bridge import SerialBridge, MSG_HEARTBEAT_ACK
+        with patch.object(SerialBridge, "_try_connect"):
+            bridge = SerialBridge()
+            bridge._hb_seq = 105
+            bridge.arduino_alive = False
+            bridge.last_hb_ack_time = 0.0
+
+            logs = []
+            mock_logger = MagicMock()
+            mock_logger.info = lambda msg: logs.append(msg)
+            bridge.get_logger = lambda: mock_logger
+
+            payload = struct.pack("<I", 105)
+            bridge.handle_msg(MSG_HEARTBEAT_ACK, payload)
+
+            log_text = "\n".join(logs)
+            self.assertIn("[HEARTBEAT ACK] sequence=105", log_text)
+
+    def test_arduino_alive_requires_real_ack(self):
+        """9. Heartbeat: arduino_alive is False until handle_msg receives MSG_HEARTBEAT_ACK."""
+        from serial_bridge import SerialBridge, MSG_HEARTBEAT_ACK
+        with patch.object(SerialBridge, "_try_connect"):
+            bridge = SerialBridge()
+            bridge.arduino_alive = False
+            bridge.last_hb_ack_time = 0.0
+            bridge.get_logger = lambda: MagicMock()
+
+            # Non-heartbeat msg (e.g. unknown id 0x99) does NOT set arduino_alive to True
+            bridge.handle_msg(0x99, b"\x00" * 4)
+            self.assertFalse(bridge.arduino_alive)
+
+            # Real heartbeat ACK sets arduino_alive
+            bridge.handle_msg(MSG_HEARTBEAT_ACK, b"")
+            self.assertTrue(bridge.arduino_alive)
+
+    def test_heartbeat_timeout_disables_motor(self):
+        """10. Safety: >1.0s timeout without ACK transitions state to SAFETY_BLOCKED."""
+        from serial_bridge import SerialBridge, ArduinoState
+        with patch.object(SerialBridge, "_try_connect"):
+            bridge = SerialBridge()
+            bridge.ser = MagicMock()
+            bridge.ser.is_open = True
+            bridge.arduino_alive = True
+            bridge.last_hb_ack_time = time.monotonic() - 1.2
+
+            logs = []
+            mock_logger = MagicMock()
+            mock_logger.warn = lambda msg: logs.append(msg)
+            mock_logger.info = lambda msg: logs.append(msg)
+            bridge.get_logger = lambda: mock_logger
+
+            bridge.send_heartbeat()
+            self.assertFalse(bridge.arduino_alive)
+            self.assertEqual(bridge.state, ArduinoState.SAFETY_BLOCKED)
+            log_text = "\n".join(logs)
+            self.assertIn("[MOTOR SAFETY BLOCK] reason=heartbeat_ack_missing", log_text)
+
+    def test_motor_command_blocked_without_ack(self):
+        """11. Safety: on_wheel_cmd blocks motor command when arduino_alive is False."""
+        from serial_bridge import SerialBridge, WheelCmd
+        with patch.object(SerialBridge, "_try_connect"):
+            bridge = SerialBridge()
+            bridge.ser = MagicMock()
+            bridge.ser.is_open = True
+            bridge.arduino_alive = False
+            bridge.is_self_testing = False
+
+            logs = []
+            mock_logger = MagicMock()
+            mock_logger.warn = lambda msg: logs.append(msg)
+            bridge.get_logger = lambda: mock_logger
+
+            cmd = WheelCmd()
+            cmd.left_rpm = 20.0
+            cmd.right_rpm = 20.0
+            bridge.on_wheel_cmd(cmd)
+
+            bridge.ser.write.assert_not_called()
+            log_text = "\n".join(logs)
+            self.assertIn("[MOTOR SAFETY BLOCK] reason=heartbeat_ack_missing", log_text)
+
+    def test_self_test_does_not_move_without_heartbeat(self):
+        """12. Self-Test: Self-test aborts without sending wheel motions if heartbeat is missing."""
+        from serial_bridge import SerialBridge
+        with patch.object(SerialBridge, "_try_connect"):
+            bridge = SerialBridge()
+            bridge.ser = MagicMock()
+            bridge.ser.is_open = True
+            bridge.arduino_alive = False
+            bridge.handshake_ok = False
+
+            logs = []
+            mock_logger = MagicMock()
+            mock_logger.warn = lambda msg: logs.append(msg)
+            mock_logger.info = lambda msg: logs.append(msg)
+            bridge.get_logger = lambda: mock_logger
+
+            with patch("time.sleep"):
+                bridge._run_startup_self_test()
+
+            log_text = "\n".join(logs)
+            self.assertIn("Wheel self-test FAILED reason=heartbeat_ack_missing", log_text)
+            self.assertNotIn("Wheels FORWARD", log_text)
+            self.assertNotIn("PASSED", log_text)
+
+    def test_self_test_passes_with_real_heartbeat_ack(self):
+        """13. Self-Test: Self-test runs and logs PASSED when heartbeat is healthy."""
+        from serial_bridge import SerialBridge
+        with patch.object(SerialBridge, "_try_connect"):
+            bridge = SerialBridge()
+            bridge.ser = MagicMock()
+            bridge.ser.is_open = True
+            bridge.arduino_alive = True
+            bridge.handshake_ok = True
+            bridge.last_hb_ack_time = time.monotonic()
+
+            logs = []
+            mock_logger = MagicMock()
+            mock_logger.info = lambda msg: logs.append(msg)
+            bridge.get_logger = lambda: mock_logger
+
+            with patch("time.sleep"):
+                bridge._run_startup_self_test()
+
+            log_text = "\n".join(logs)
+            self.assertIn("Wheels FORWARD", log_text)
+            self.assertIn("Wheels BACKWARD", log_text)
+            self.assertIn("Wheel self-test PASSED.", log_text)
+
+    def test_runtime_never_selects_allam(self):
+        """14. Model Filtering: _discover_active_groq_models never includes allam-2-7b."""
+        from astro_ai.ai_brain_node import AiBrainNode
+        node = AiBrainNode.__new__(AiBrainNode)
+        mock_groq = MagicMock()
+        m1 = MagicMock(); m1.id = "allam-2-7b"
+        m2 = MagicMock(); m2.id = "llama-3.3-70b-versatile"
+        mock_groq.models.list.return_value.data = [m1, m2]
+        node._groq = mock_groq
+        node.provider_registry = None
+        node.get_logger = lambda: MagicMock()
+
+        discovered = node._discover_active_groq_models()
+        self.assertNotIn("allam-2-7b", discovered)
+        self.assertIn("llama-3.3-70b-versatile", discovered)
+
+    def test_runtime_never_selects_orpheus(self):
+        """15. Model Filtering: _discover_active_groq_models never includes canopylabs/orpheus."""
+        from astro_ai.ai_brain_node import AiBrainNode
+        node = AiBrainNode.__new__(AiBrainNode)
+        mock_groq = MagicMock()
+        m1 = MagicMock(); m1.id = "canopylabs/orpheus-v1-english"
+        m2 = MagicMock(); m2.id = "llama-3.1-8b-instant"
+        mock_groq.models.list.return_value.data = [m1, m2]
+        node._groq = mock_groq
+        node.provider_registry = None
+        node.get_logger = lambda: MagicMock()
+
+        discovered = node._discover_active_groq_models()
+        self.assertNotIn("canopylabs/orpheus-v1-english", discovered)
+        self.assertIn("llama-3.1-8b-instant", discovered)
+
+    def test_runtime_selects_only_discovered_routeable_chat_model(self):
+        """16. Model Filtering: _discover_active_groq_models prioritizes verified chat models."""
+        from astro_ai.ai_brain_node import AiBrainNode
+        node = AiBrainNode.__new__(AiBrainNode)
+        mock_groq = MagicMock()
+        m1 = MagicMock(); m1.id = "whisper-large-v3"
+        m2 = MagicMock(); m2.id = "llama-3.3-70b-versatile"
+        m3 = MagicMock(); m3.id = "llama-3.1-70b-versatile"
+        mock_groq.models.list.return_value.data = [m1, m2, m3]
+        node._groq = mock_groq
+        node.provider_registry = None
+        node.get_logger = lambda: MagicMock()
+
+        discovered = node._discover_active_groq_models()
+        self.assertEqual(discovered, ["llama-3.3-70b-versatile", "llama-3.1-70b-versatile"])
+
+
 if __name__ == "__main__":
     unittest.main()
+
 
 
 

@@ -460,6 +460,8 @@ class SerialBridge(Node):
                 if not chunk:
                     continue
 
+                self.get_logger().debug(f"[SERIAL RX RAW] bytes={len(chunk)} hex={chunk[:16].hex()}")
+
                 for b in chunk:
                     if state == 0 and b == SOF1:
                         state = 1
@@ -509,12 +511,20 @@ class SerialBridge(Node):
             self.last_hb_ack_time = now_mono
             self.arduino_alive = True
             self.state = ArduinoState.HEARTBEAT_HEALTHY
+            
+            ack_seq = self._hb_seq
+            if len(payload) >= 4:
+                try:
+                    ack_seq = struct.unpack("<I", payload[:4])[0]
+                except Exception:
+                    pass
+            elif len(payload) >= 1:
+                ack_seq = payload[0]
+
+            self.get_logger().info(f"[HEARTBEAT ACK] sequence={ack_seq} latency_ms={lat_ms:.1f}")
             if not prev_alive:
-                self.get_logger().info(f"[HEARTBEAT ACK] sequence={self._hb_seq} latency_ms={lat_ms:.1f}")
                 self.get_logger().info("[MOTOR SAFETY RECOVERED] heartbeat_healthy=true")
                 self.get_logger().info("[MOTOR STATUS] enabled=true heartbeat_healthy=true")
-            else:
-                self.get_logger().debug(f"[HEARTBEAT ACK] sequence={self._hb_seq} latency_ms={lat_ms:.1f}")
 
     def destroy_node(self):
         self._mark_disconnected()

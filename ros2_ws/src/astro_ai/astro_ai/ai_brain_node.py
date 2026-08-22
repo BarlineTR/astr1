@@ -415,8 +415,14 @@ class AiBrainNode(Node):
             self.get_logger().debug(f"_play_local_ack: yok sayılan hata ({_exc})")
 
     def _discover_active_groq_models(self) -> List[str]:
-        """Dynamically queries active chat models from Groq, prioritizing top conversational models and excluding reasoning models."""
+        """Dynamically queries active chat models from Groq, prioritizing top conversational models and excluding non-chat models."""
         preferred = ["llama-3.3-70b-versatile", "llama-3.1-70b-versatile", "llama3-70b-8192", "llama-3.1-8b-instant"]
+        if hasattr(self, "provider_registry") and self.provider_registry:
+            reg_models = self.provider_registry.get_routeable_models("groq")
+            if reg_models:
+                filtered = [m for m in reg_models if not any(x in m.lower() for x in ("allam", "orpheus", "canopylabs", "vision", "audio", "whisper", "specdec", "compound"))]
+                if filtered:
+                    return filtered
         if not self._groq:
             return preferred
         try:
@@ -425,7 +431,7 @@ class AiBrainNode(Node):
             chat_models = [m for m in preferred if m in available]
             for m in available:
                 mid_l = m.lower()
-                if any(x in mid_l for x in ["whisper", "embedding", "guard", "moderation", "tts", "distill", "r1", "deepseek", "qwen"]):
+                if any(x in mid_l for x in ["whisper", "embedding", "guard", "moderation", "tts", "distill", "r1", "deepseek", "qwen", "allam", "orpheus", "canopylabs", "vision", "audio", "specdec", "compound"]):
                     continue
                 if m not in chat_models:
                     chat_models.append(m)
