@@ -87,7 +87,12 @@ boşluktur.
 | `headless` | `false` | `gz sim -s` — pencere yok, sunucu var |
 | `x` / `y` / `z` / `yaw` | `-4.0` / `0.0` / `0.10` / `0.0` | Doğma konumu |
 
-Sürmek için:
+**Sürmek — Gazebo penceresindeki Teleop paneli (önerilen).** Sağ panelde
+ileri/geri/sağ/sol düğmeleri ve hız kaydırıcıları vardır; doğrudan `/cmd_vel`'e
+yayın yapar, ek terminal gerekmez. Panel `astro_sim/config/astro_gui.config`
+ile gelir (stok Gazebo düzeni + `Teleop` eklentisi, `--gui-config` ile geçilir).
+
+**Alternatif — klavye:**
 
 ```bash
 ros2 run teleop_twist_keyboard teleop_twist_keyboard
@@ -293,7 +298,29 @@ tersi değil.
 | `odom_frame` | `odom` | aynı | §4'teki düğüm bunu üretmeli |
 | `max_laser_range` | `12.0` | aynı | RPLIDAR A1'in gerçek menzili |
 | `resolution` | `0.05` | aynı | 0.9 m kapı = 18 hücre |
-| `minimum_travel_distance` | `0.2` m | aynı | |
+| `minimum_travel_distance` | **`0.0`** | **`0.0`** | ⚠️ sıfır olmak zorunda — aşağıdaki nota bakın |
+| `minimum_travel_heading` | `0.1` rad | aynı | Tarama akışını asıl bu sınırlar |
+
+> ### ⚠️ `minimum_travel_distance` neden sıfır olmalı
+>
+> slam_toolbox'ın `shouldProcessScan()` kapısı **tabanın yer değiştirmesine**
+> bakar. Robot yerinde döndüğünde taban hiç yer değiştirmez; bu değer sıfırdan
+> büyükse dönüş boyunca **tek bir tarama bile işlenmez**. Sonuç: `map -> odom`
+> donar, SLAM odometriyi aynen geçirir ve odometrinin yerinde dönüşteki ~%8
+> açı hatası hiç düzeltilmeden birikir. Görünen belirti, robot döndükçe
+> **haritanın tamamının dönmesi** ve başlangıca dönünce robotun başka bir
+> yerdeymiş gibi davranmasıdır.
+>
+> Ölçüm (4 × 90° yerinde dönüş, SLAM ile gerçek arasındaki açı farkı):
+>
+> | `minimum_travel_distance` | Hata |
+> |---|---|
+> | `0.2` | +14°, +20°, +33°, +46° — birikiyor |
+> | `0.05` | değişmedi, hâlâ düzeltmiyor |
+> | **`0.0`** | −2.0°, −2.7°, −2.5°, −2.3° — sınırlı |
+>
+> Doğrudan doğrulama: 10 sn'lik yerinde dönüş boyunca `map -> odom` tam olarak
+> `(0, 0, 0)` kaldı ve ancak robot ileri gidince güncellenmeye başladı.
 
 Gerçek robotta çağrı:
 
@@ -382,6 +409,16 @@ pozu gerçekten yalnızca **5 mm ve 0.04°** uzaktı.
 ---
 
 ## 7. Sorun giderme
+
+### Robot dönünce harita da dönüyor
+
+İki ayrı sebebi olabilir, ikisi de bu depoda düzeltildi:
+
+1. **RViz `Fixed Frame`** `map` olmalı. `odom` seçiliyse harita `map -> odom`
+   üzerinden çizilir ve SLAM her düzeltme yaptığında ekranda döner/kayar;
+   robot ise sürüklenmiş odom pozunda pürüzsüz görünür.
+2. **`minimum_travel_distance`** sıfırdan büyükse yerinde dönüşte hiç tarama
+   işlenmez (yukarıdaki nota bakın) — bu, görünen değil *gerçek* bir hatadır.
 
 ### `use_sim_time` uyuşmazlığı
 

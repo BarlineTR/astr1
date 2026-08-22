@@ -326,8 +326,11 @@ Sensors publish to the same topics as the hardware (`/scan`, `/imu`,
 
 ```bash
 ros2 launch astro_navigation slam.launch.py                    # 2nd terminal
-ros2 run teleop_twist_keyboard teleop_twist_keyboard           # 3rd, drive around
 ```
+
+Drive from the **Teleop panel** in the Gazebo window — buttons and speed
+sliders, no extra terminal. `ros2 run teleop_twist_keyboard teleop_twist_keyboard`
+still works if you prefer keys.
 
 Drive through every room, and return to where you started so slam_toolbox can
 close the loop. Then save:
