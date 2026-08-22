@@ -558,6 +558,7 @@ class AstroRealtimeNode(Node):
 
         # ROS 2 Publishers
         self.pub_output_pcm = self.create_publisher(String, "/audio/realtime_output_pcm", 50)
+        self.pub_realtime_state = self.create_publisher(String, "/realtime/state", 10)
 
         self.pub_interrupt = self.create_publisher(Bool, "/tts/interrupt", 10)
         self.pub_emotion = self.create_publisher(String, "/robot/emotion", 10)
@@ -581,6 +582,9 @@ class AstroRealtimeNode(Node):
 
         # Tool execution deduplication
         self._executed_tool_calls: set[str] = set()
+
+        # Publish initial realtime state (DISCONNECTED / NOT_READY)
+        self._publish_realtime_state("DISCONNECTED", "init")
 
         # Sleep Mode (Default: Start in Sleeping / DEEP_IDLE State)
         self._node_start_time = time.monotonic()
@@ -623,6 +627,22 @@ class AstroRealtimeNode(Node):
                 self.get_logger().info(f"[{str(lvl).upper()}] {msg}")
             except Exception:
                 print(f"[{str(lvl).upper()}] {msg}", flush=True)
+
+    def _publish_realtime_state(self, state: str, reason: str = "none"):
+        """Publishes realtime WebSocket state to /realtime/state for ai_brain_node consumption."""
+        try:
+            import json as _json
+            msg = String()
+            msg.data = _json.dumps({
+                "state": state,
+                "reason": reason,
+                "connection": self.realtime_connection_state,
+                "session": self.realtime_session_state,
+                "provider": self.realtime_provider_state,
+            })
+            self.pub_realtime_state.publish(msg)
+        except Exception:
+            pass
 
     def _run_async_loop(self):
         self._loop = asyncio.new_event_loop()
@@ -668,6 +688,7 @@ class AstroRealtimeNode(Node):
                     f"[REALTIME CONNECTING]\n"
                     f"model={current_model}"
                 )
+                self._publish_realtime_state("CONNECTING")
                 async with websockets.connect(ws_url, **connect_kwargs) as ws:
                     self._ws = ws
                     self._is_connected = True
@@ -681,6 +702,7 @@ class AstroRealtimeNode(Node):
                         f"session_id={self.realtime_session_id or 'sess_init'}\n"
                         f"state=AVAILABLE"
                     )
+                    self._publish_realtime_state("CONNECTED")
 
                     # Send Initial Session Update
                     await self._send_session_update(ws)
@@ -697,6 +719,7 @@ class AstroRealtimeNode(Node):
                 self.realtime_connection_state = "DISCONNECTED"
                 self.realtime_session_state = "NOT_READY"
                 self.realtime_response_state = "IDLE"
+                self._publish_realtime_state("DISCONNECTED", "error")
                 err_str = str(e)
 
                 try:
@@ -961,6 +984,7 @@ class AstroRealtimeNode(Node):
                 f"session_id={self.realtime_session_id or 'sess_init'}\n"
                 f"state=AVAILABLE"
             )
+            self._publish_realtime_state("SESSION_READY")
 
         # 1. Real-Time Streaming Audio Output (GA & Preview names)
         elif event_type in ("response.audio.delta", "response.output_audio.delta"):

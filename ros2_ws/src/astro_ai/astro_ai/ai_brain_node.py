@@ -371,6 +371,12 @@ class AiBrainNode(Node):
         # yayıncıdan da veri alabilir, bu yüzden depthai_ros_driver ile uyumludur.
         self.create_subscription(Image, "/oak/rgb/image_raw", self._on_camera_image, qos_profile_sensor_data,
                                  callback_group=self._cbg_perception)
+        # Realtime WebSocket state tracking (source of truth: astro_realtime_node)
+        self._realtime_ws_connected = False
+        self._realtime_session_ready = False
+        self._realtime_audio_received = False
+        self.create_subscription(String, "/realtime/state", self._on_realtime_state, 10,
+                                 callback_group=self._cbg_perception)
 
         # Timers
         self.create_timer(0.15, self._check_proactive_gaze, callback_group=self._cbg_timers)
@@ -563,6 +569,27 @@ class AiBrainNode(Node):
         self._speaker_angle = float(msg.data)
         if self.social_context_engine:
             self.social_context_engine.update_audio(doa_angle_deg=float(msg.data))
+
+    def _on_realtime_state(self, msg: String):
+        """Receives actual WebSocket state from astro_realtime_node."""
+        try:
+            import json
+            data = json.loads(msg.data)
+            state = data.get("state", "")
+            if state == "CONNECTED":
+                self._realtime_ws_connected = True
+            elif state == "SESSION_READY":
+                self._realtime_ws_connected = True
+                self._realtime_session_ready = True
+            elif state == "DISCONNECTED":
+                self._realtime_ws_connected = False
+                self._realtime_session_ready = False
+                self._realtime_audio_received = False
+            elif state == "CONNECTING":
+                self._realtime_ws_connected = False
+                self._realtime_session_ready = False
+        except Exception:
+            pass
 
     def _on_looking_at_robot(self, msg: Bool):
         is_looking = msg.data
@@ -1164,10 +1191,10 @@ class AiBrainNode(Node):
 
                 # Authoritative Turn Telemetry for Vision
                 rt_p_state = self.circuit_breaker.get_state('openai', 'openai_realtime').value if self.circuit_breaker else 'DISABLED'
-                rt_conn_state = "CONNECTED" if (self.circuit_breaker and self.circuit_breaker.is_available('openai', 'openai_realtime')) else "DISCONNECTED"
-                rt_sess_state = "READY" if (self.circuit_breaker and self.circuit_breaker.is_available('openai', 'openai_realtime')) else "NOT_READY"
-                req_provider = "openai_realtime" if (self.circuit_breaker and self.circuit_breaker.is_available('openai', 'openai_realtime')) else "edge_tts"
-                fb_reason = "realtime_quota_exhausted" if (self.circuit_breaker and self.circuit_breaker.is_exhausted('openai')) else "none"
+                rt_conn_state = "CONNECTED" if self._realtime_ws_connected else "DISCONNECTED"
+                rt_sess_state = "READY" if self._realtime_session_ready else "NOT_READY"
+                req_provider = "openai_realtime" if (self._realtime_ws_connected and self._realtime_session_ready) else "edge_tts"
+                fb_reason = "realtime_quota_exhausted" if (self.circuit_breaker and self.circuit_breaker.is_exhausted('openai')) else ("realtime_unavailable" if not self._realtime_ws_connected else "none")
 
                 self.get_logger().info(
                     f"\n[ASTRO TURN]\n"
@@ -1394,10 +1421,10 @@ class AiBrainNode(Node):
             self.session.latency_tracker.record_turn(gate_latency_ms, llm_first_ms, total_turn_ms)
 
             rt_p_state = self.circuit_breaker.get_state('openai', 'openai_realtime').value if self.circuit_breaker else 'DISABLED'
-            rt_conn_state = "CONNECTED" if (self.circuit_breaker and self.circuit_breaker.is_available('openai', 'openai_realtime')) else "DISCONNECTED"
-            rt_sess_state = "READY" if (self.circuit_breaker and self.circuit_breaker.is_available('openai', 'openai_realtime')) else "NOT_READY"
-            req_provider = "openai_realtime" if (self.circuit_breaker and self.circuit_breaker.is_available('openai', 'openai_realtime')) else "edge_tts"
-            fb_reason = "realtime_quota_exhausted" if (self.circuit_breaker and self.circuit_breaker.is_exhausted('openai')) else "none"
+            rt_conn_state = "CONNECTED" if self._realtime_ws_connected else "DISCONNECTED"
+            rt_sess_state = "READY" if self._realtime_session_ready else "NOT_READY"
+            req_provider = "openai_realtime" if (self._realtime_ws_connected and self._realtime_session_ready) else "edge_tts"
+            fb_reason = "realtime_quota_exhausted" if (self.circuit_breaker and self.circuit_breaker.is_exhausted('openai')) else ("realtime_unavailable" if not self._realtime_ws_connected else "none")
 
             self.get_logger().info(
                 f"\n[ASTRO TURN]\n"
@@ -2447,13 +2474,22 @@ class AiBrainNode(Node):
         last_u = getattr(self.session, "last_user_text", "")
         clean = response_length_gate(text, user_query=last_u, max_words=35, max_sentences=2)
         if clean:
-            openai_realtime_ok = self.circuit_breaker.is_available("openai", sub_provider="openai_realtime") if self.circuit_breaker else True
+            openai_realtime_ok = (
+                (self.circuit_breaker.is_available("openai", sub_provider="openai_realtime") if self.circuit_breaker else True)
+                and self._realtime_ws_connected
+                and self._realtime_session_ready
+            )
             if openai_realtime_ok and self.session.metadata.get("tts_engine") != "edge-tts":
                 tts_engine = "openai_realtime"
                 reason = "realtime_available"
             else:
                 tts_engine = "edge_tts"
-                reason = "openai_realtime_exhausted" if not openai_realtime_ok else "session_edge_tts"
+                if self.circuit_breaker and self.circuit_breaker.is_exhausted("openai"):
+                    reason = "openai_realtime_exhausted"
+                elif not self._realtime_ws_connected:
+                    reason = "realtime_unavailable"
+                else:
+                    reason = "session_edge_tts"
 
             self.get_logger().info(f"[TTS REQUESTED] requested_provider={tts_engine} selection_reason={reason} text=\"{clean}\"")
             msg = String()

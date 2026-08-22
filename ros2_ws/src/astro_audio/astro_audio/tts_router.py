@@ -163,6 +163,8 @@ class TTSRouter:
 
         if realtime_fallback_reason is not None:
             effective_fallback_reason = realtime_fallback_reason
+            if realtime_fallback_reason in ("realtime_no_audio", "realtime_unavailable", "realtime_quota_exhausted"):
+                realtime_available = False
         elif realtime_available:
             effective_fallback_reason = "none"
         elif self.circuit_breaker and self.circuit_breaker.is_exhausted("openai"):

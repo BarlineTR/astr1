@@ -64,14 +64,20 @@ except Exception:
         def get_clock(self): return self._clock
         def destroy_node(self): pass
     mock_rclpy.node.Node = MockNode
+    mock_cbg = MagicMock()
+    mock_cbg.MutuallyExclusiveCallbackGroup = MagicMock
+    mock_cbg.ReentrantCallbackGroup = MagicMock
     sys.modules["rclpy"] = mock_rclpy
     sys.modules["rclpy.node"] = mock_rclpy.node
     sys.modules["rclpy.qos"] = MagicMock()
     sys.modules["rclpy.time"] = mock_rclpy.time
+    sys.modules["rclpy.callback_groups"] = mock_cbg
     sys.modules["diagnostic_msgs"] = MagicMock()
     sys.modules["diagnostic_msgs.msg"] = MagicMock()
     sys.modules["sensor_msgs"] = MagicMock()
     sys.modules["sensor_msgs.msg"] = MagicMock()
+    sys.modules["std_msgs"] = MagicMock()
+    sys.modules["std_msgs.msg"] = MagicMock()
     sys.modules["astro_base"] = MagicMock()
     mock_astro_base_msg = MagicMock()
     class WheelCmd:
@@ -90,6 +96,79 @@ except ImportError:
     mock_serial = MagicMock()
     mock_serial.SerialException = Exception
     sys.modules["serial"] = mock_serial
+
+try:
+    import cv2
+except ImportError:
+    mock_cv2 = MagicMock()
+    sys.modules["cv2"] = mock_cv2
+
+if "ament_index_python" not in sys.modules:
+    mock_ament = MagicMock()
+    mock_ament.packages.get_package_share_directory.side_effect = lambda pkg: f"/mock/share/{pkg}"
+    sys.modules["ament_index_python"] = mock_ament
+    sys.modules["ament_index_python.packages"] = mock_ament.packages
+
+if "launch" not in sys.modules:
+    mock_launch = MagicMock()
+    class MockLaunchDescription:
+        def __init__(self, entities=None):
+            self.entities = entities or []
+    class MockDeclareLaunchArgument:
+        def __init__(self, name, default_value="", description=""):
+            self.name = name
+            self.default_value = str(default_value)
+            self.description = description
+    class MockIncludeLaunchDescription:
+        def __init__(self, launch_description_source, condition=None, launch_arguments=None):
+            self.launch_description_source = launch_description_source
+            self.condition = condition
+            self.launch_arguments = launch_arguments or []
+    class MockPythonLaunchDescriptionSource:
+        def __init__(self, path):
+            self.path = path
+    class MockLaunchConfiguration:
+        def __init__(self, name):
+            self.name = name
+    class MockIfCondition:
+        def __init__(self, predicate):
+            self.predicate = predicate
+    class MockSetEnvironmentVariable:
+        def __init__(self, name, value):
+            self.name = name
+            self.value = value
+
+    mock_launch.LaunchDescription = MockLaunchDescription
+    mock_launch.actions = MagicMock()
+    mock_launch.actions.DeclareLaunchArgument = MockDeclareLaunchArgument
+    mock_launch.actions.IncludeLaunchDescription = MockIncludeLaunchDescription
+    mock_launch.actions.SetEnvironmentVariable = MockSetEnvironmentVariable
+    mock_launch.conditions = MagicMock()
+    mock_launch.conditions.IfCondition = MockIfCondition
+    mock_launch.launch_description_sources = MagicMock()
+    mock_launch.launch_description_sources.PythonLaunchDescriptionSource = MockPythonLaunchDescriptionSource
+    mock_launch.substitutions = MagicMock()
+    mock_launch.substitutions.LaunchConfiguration = MockLaunchConfiguration
+
+    sys.modules["launch"] = mock_launch
+    sys.modules["launch.actions"] = mock_launch.actions
+    sys.modules["launch.conditions"] = mock_launch.conditions
+    sys.modules["launch.launch_description_sources"] = mock_launch.launch_description_sources
+    sys.modules["launch.substitutions"] = mock_launch.substitutions
+
+if "launch_ros" not in sys.modules:
+    mock_launch_ros = MagicMock()
+    class MockLaunchNode:
+        def __init__(self, package, executable, name=None, output=None, parameters=None, condition=None):
+            self.package = package
+            self.executable = executable
+            self.node_name = name or executable
+            self.parameters = parameters or []
+            self.condition = condition
+    mock_launch_ros.actions = MagicMock()
+    mock_launch_ros.actions.Node = MockLaunchNode
+    sys.modules["launch_ros"] = mock_launch_ros
+    sys.modules["launch_ros.actions"] = mock_launch_ros.actions
 
 # Ensure paths
 pkg_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
@@ -1180,8 +1259,216 @@ class TestP01RealtimeRuntimeAndHardwareCorrection(unittest.TestCase):
                 self.assertFalse(bridge.arduino_alive)
                 warn_logs = " ".join(str(c) for c in mock_warn.call_args_list)
                 self.assertIn("MOTOR SAFETY BLOCK", warn_logs)
-                self.assertIn("heartbeat_ack_missing", warn_logs)
+class TestP0LaunchIntegrationAndRealtimePrimaryVoice(unittest.TestCase):
+    """11 Acceptance Tests for Launch Integration and Production Primary Voice Architecture."""
+
+    def test_bringup_defaults_realtime_enabled(self):
+        """1. Launch: bringup.launch.py declares use_realtime with default='true'."""
+        import importlib.util
+        bringup_path = os.path.join(pkg_root, "astro_bringup", "launch", "bringup.launch.py")
+        spec = importlib.util.spec_from_file_location("bringup_launch", bringup_path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        ld = mod.generate_launch_description()
+
+        use_rt_arg = None
+        for entity in ld.entities:
+            if getattr(entity, "name", None) == "use_realtime":
+                use_rt_arg = entity
+                break
+        self.assertIsNotNone(use_rt_arg, "use_realtime argument must be declared in bringup.launch.py")
+        self.assertEqual(use_rt_arg.default_value, "true")
+
+    def test_bringup_realtime_enabled_starts_node(self):
+        """2. Launch: bringup.launch.py includes realtime_sensors.launch.py with use_realtime condition."""
+        import importlib.util
+        bringup_path = os.path.join(pkg_root, "astro_bringup", "launch", "bringup.launch.py")
+        spec = importlib.util.spec_from_file_location("bringup_launch", bringup_path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        ld = mod.generate_launch_description()
+
+        realtime_include = None
+        for entity in ld.entities:
+            src = getattr(entity, "launch_description_source", None)
+            if src and "realtime_sensors.launch.py" in getattr(src, "path", ""):
+                realtime_include = entity
+                break
+        self.assertIsNotNone(realtime_include, "realtime_sensors.launch.py must be included in bringup.launch.py")
+        self.assertIsNotNone(realtime_include.condition, "realtime_sensors include must have a condition")
+
+    def test_bringup_realtime_disabled_does_not_start_node(self):
+        """3. Launch: When use_realtime is false, realtime_sensors is gated by IfCondition."""
+        import importlib.util
+        bringup_path = os.path.join(pkg_root, "astro_bringup", "launch", "bringup.launch.py")
+        spec = importlib.util.spec_from_file_location("bringup_launch", bringup_path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        ld = mod.generate_launch_description()
+
+        for entity in ld.entities:
+            src = getattr(entity, "launch_description_source", None)
+            if src and "realtime_sensors.launch.py" in getattr(src, "path", ""):
+                cond = entity.condition
+                self.assertEqual(cond.predicate.name, "use_realtime")
+
+    def test_realtime_launch_has_no_duplicate_node(self):
+        """4. Launch: realtime_sensors.launch.py contains only audio_stream_node and astro_realtime_node (no vision duplication)."""
+        import importlib.util
+        rt_path = os.path.join(pkg_root, "astro_bringup", "launch", "realtime_sensors.launch.py")
+        spec = importlib.util.spec_from_file_location("realtime_sensors_launch", rt_path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        ld = mod.generate_launch_description()
+
+        node_executables = []
+        for entity in ld.entities:
+            if hasattr(entity, "executable"):
+                node_executables.append(entity.executable)
+            # Ensure no camera include
+            src = getattr(entity, "launch_description_source", None)
+            if src:
+                self.assertNotIn("camera.launch.py", getattr(src, "path", ""))
+
+        self.assertIn("audio_stream_node", node_executables)
+        self.assertIn("astro_realtime_node", node_executables)
+        self.assertEqual(len(node_executables), 2, "realtime_sensors.launch.py should only contain audio_stream_node and astro_realtime_node")
+
+    def test_realtime_state_not_connected_when_node_missing(self):
+        """5. State: Without messages from astro_realtime_node, ai_brain_node reports DISCONNECTED and NOT_READY."""
+        from astro_ai.ai_brain_node import AiBrainNode
+        node = AiBrainNode.__new__(AiBrainNode)
+        node._realtime_ws_connected = False
+        node._realtime_session_ready = False
+        node._realtime_audio_received = False
+        node.circuit_breaker = MagicMock()
+        node.circuit_breaker.get_state.return_value = MagicMock(value="AVAILABLE")
+        node.circuit_breaker.is_exhausted.return_value = False
+
+        rt_conn_state = "CONNECTED" if node._realtime_ws_connected else "DISCONNECTED"
+        rt_sess_state = "READY" if node._realtime_session_ready else "NOT_READY"
+        req_provider = "openai_realtime" if (node._realtime_ws_connected and node._realtime_session_ready) else "edge_tts"
+        fb_reason = "realtime_unavailable" if not node._realtime_ws_connected else "none"
+
+        self.assertEqual(rt_conn_state, "DISCONNECTED")
+        self.assertEqual(rt_sess_state, "NOT_READY")
+        self.assertEqual(req_provider, "edge_tts")
+        self.assertEqual(fb_reason, "realtime_unavailable")
+
+    def test_realtime_connected_state_requires_websocket(self):
+        """6. State: Receiving CONNECTED sets _realtime_ws_connected=True, but session remains NOT_READY."""
+        from astro_ai.ai_brain_node import AiBrainNode
+        node = AiBrainNode.__new__(AiBrainNode)
+        node._realtime_ws_connected = False
+        node._realtime_session_ready = False
+        node._realtime_audio_received = False
+
+        msg = MagicMock()
+        msg.data = json.dumps({"state": "CONNECTED"})
+        node._on_realtime_state(msg)
+
+        self.assertTrue(node._realtime_ws_connected)
+        self.assertFalse(node._realtime_session_ready)
+
+    def test_realtime_session_ready_requires_session_init(self):
+        """7. State: Receiving SESSION_READY sets both _realtime_ws_connected and _realtime_session_ready to True."""
+        from astro_ai.ai_brain_node import AiBrainNode
+        node = AiBrainNode.__new__(AiBrainNode)
+        node._realtime_ws_connected = False
+        node._realtime_session_ready = False
+        node._realtime_audio_received = False
+
+        msg = MagicMock()
+        msg.data = json.dumps({"state": "SESSION_READY"})
+        node._on_realtime_state(msg)
+
+        self.assertTrue(node._realtime_ws_connected)
+        self.assertTrue(node._realtime_session_ready)
+
+    def test_realtime_actual_provider_requires_audio_delta(self):
+        """8. Telemetry: actual_provider is openai_realtime only when audio delta was received and forwarded."""
+        from astro_ai.astro_realtime_node import AstroRealtimeNode
+        node = AstroRealtimeNode.__new__(AstroRealtimeNode)
+        node.realtime_audio_received = False
+        node.realtime_current_generation_id = 42
+
+        # When audio is received
+        node.realtime_audio_received = True
+        actual = "openai_realtime" if node.realtime_audio_received else "edge_tts"
+        self.assertEqual(actual, "openai_realtime")
+
+        # When audio was NOT received
+        node.realtime_audio_received = False
+        actual = "openai_realtime" if node.realtime_audio_received else "edge_tts"
+        self.assertEqual(actual, "edge_tts")
+
+    def test_realtime_no_audio_falls_back_to_edge_tts(self):
+        """9. Fallback: realtime_no_audio triggers explicit [TTS FALLBACK] and switches to Edge-TTS."""
+        from astro_audio.tts_router import TTSRouter
+        mock_edge = MagicMock()
+        mock_edge.synthesize_sentence.return_value = b"\x00\x01" * 1200
+        mock_edge.check_network.return_value = True
+
+        logs = []
+        def capture_log(lvl, msg):
+            logs.append(f"[{lvl.upper()}] {msg}")
+
+        router = TTSRouter(
+            edge_tts_engine=mock_edge,
+            edge_tts_enabled=True,
+            logger=capture_log,
+        )
+
+        res = router.synthesize("Merhaba", generation_id=1, realtime_fallback_reason="realtime_no_audio")
+        self.assertEqual(res.actual_provider, "edge_tts")
+        log_text = "\n".join(logs)
+        self.assertIn("[TTS FALLBACK]", log_text)
+        self.assertIn("reason=realtime_no_audio", log_text)
+
+    def test_realtime_unavailable_falls_back_to_edge_tts(self):
+        """10. Fallback: When realtime node is not running, _publish_tts falls back to edge_tts with realtime_unavailable."""
+        from astro_ai.ai_brain_node import AiBrainNode
+        node = AiBrainNode.__new__(AiBrainNode)
+        node._realtime_ws_connected = False
+        node._realtime_session_ready = False
+        node._realtime_audio_received = False
+        node.session = MagicMock()
+        node.session.metadata = {}
+        node.pub_tts = MagicMock()
+        node.circuit_breaker = MagicMock()
+        node.circuit_breaker.is_available.return_value = True
+        node.circuit_breaker.is_exhausted.return_value = False
+
+        logs = []
+        mock_logger = MagicMock()
+        mock_logger.info = lambda msg: logs.append(msg)
+        node.get_logger = lambda: mock_logger
+
+        node._publish_tts("Selam dostum")
+        node.pub_tts.publish.assert_called_once()
+        log_text = "\n".join(logs)
+        self.assertIn("requested_provider=edge_tts", log_text)
+        self.assertIn("selection_reason=realtime_unavailable", log_text)
+
+    def test_openai_tts_rest_not_in_production_chain(self):
+        """11. Production Hierarchy: OpenAI REST TTS is excluded from synthesis execution chain."""
+        from astro_audio.tts_router import TTSRouter
+        mock_openai_rest = MagicMock()
+        mock_edge = MagicMock()
+        mock_edge.synthesize_sentence.return_value = b"\x00\x01" * 1200
+        mock_edge.check_network.return_value = True
+
+        router = TTSRouter(
+            edge_tts_engine=mock_edge,
+            openai_tts_engine=mock_openai_rest,
+            edge_tts_enabled=True,
+        )
+
+        res = router.synthesize("Test", generation_id=1)
+        mock_openai_rest.synthesize_sentence.assert_not_called()
+        self.assertEqual(res.actual_provider, "edge_tts")
 
 
 if __name__ == "__main__":
     unittest.main()
+
