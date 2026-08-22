@@ -18,17 +18,16 @@ from launch_ros.actions import Node
 
 
 def generate_launch_description():
+    # .env'i CWD'den ve bu dosyanın konumundan YUKARI DOĞRU yürüyerek ara.
+    # Eski hâli yalnızca os.path.abspath(".env")'e bakıyordu; `ros2 launch` komutu
+    # repo kökü dışından (ör. ros2_ws içinden) verildiğinde hiçbir aday tutmuyor,
+    # anahtarlar çocuk süreçlere geçmiyor ve düğümler "OPENAI_API_KEY eksik"
+    # diyordu. env_utils.find_env_file() bringup.launch.py ile aynı aramayı yapar.
     try:
-        from dotenv import load_dotenv
-        for env_path in [
-            os.path.abspath(".env"),
-            os.path.abspath(".env.production"),
-            os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..", "..", ".env")),
-        ]:
-            if os.path.exists(env_path):
-                load_dotenv(env_path, override=True)
+        from astro_bringup.env_utils import load_astro_env
+        load_astro_env()
     except Exception as _exc:
-        _LOG.debug("generate_launch_description: yok sayılan hata (%s)", _exc)
+        _LOG.debug("generate_launch_description: .env yüklenemedi (%s)", _exc)
 
     use_sim_time = LaunchConfiguration("use_sim_time")
 

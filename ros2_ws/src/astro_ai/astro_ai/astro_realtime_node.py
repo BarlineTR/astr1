@@ -137,6 +137,46 @@ except ImportError:
     except ImportError:
         FaceRecognizer = None
 
+try:
+    from dotenv import find_dotenv, load_dotenv
+except ImportError:
+    def find_dotenv(*args, **kwargs): return ""
+    def load_dotenv(*args, **kwargs): pass
+
+
+def _load_env():
+    """astr1/.env dosyasını os.environ'a yükler; bulunan yolu döndürür.
+
+    Bu düğüm daha önce .env'i HİÇ okumuyordu, yalnızca os.environ'a bakıyordu.
+    Yani anahtarlar yalnızca onu başlatan sürecin ortamına konmuşsa çalışıyordu:
+    bringup.launch.py bunu SetEnvironmentVariable ile yapıyor, ama
+    realtime_sensors.launch.py .env'i yalnızca CWD repo köküyse buluyor ve
+    `ros2 run astro_ai astro_realtime_node` hiçbir şey yüklemiyor. Üçünde de
+    sonuç "❌ OPENAI_API_KEY eksik" oluyordu.
+
+    Aday listesi tts_node/ai_brain_node ile aynı; son çare find_dotenv(usecwd=True)
+    CWD'den yukarı doğru yürüdüğü için ros2_ws içinden çalıştırıldığında da bulur.
+    """
+    candidates = [
+        os.path.abspath(".env"),
+        os.path.abspath(".env.production"),
+        os.path.abspath(os.path.join(os.getcwd(), ".env")),
+        os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..", "..", ".env")),
+        os.path.expanduser("~/.env"),
+    ]
+    for c in candidates:
+        if os.path.exists(c):
+            load_dotenv(dotenv_path=c, override=True)
+            return c
+    try:
+        env_path = find_dotenv(usecwd=True)
+        if env_path:
+            load_dotenv(dotenv_path=env_path, override=True)
+            return env_path
+    except Exception as _exc:
+        _LOG.debug("_load_env: yok sayılan hata (%s)", _exc)
+    return None
+
 
 def resample_24k_to_16k(raw_24k_bytes: bytes) -> bytes:
     """Ultra-fast 24kHz -> 16kHz int16 PCM downsampling (480 -> 320 samples)."""
@@ -375,6 +415,9 @@ class AstroRealtimeNode(Node):
         self.xtts_startup_grace_s = float(os.getenv("XTTS_STARTUP_GRACE_S", "60.0"))
 
         # Load environment variables (sanitized of quotes/whitespace)
+        # _load_env() anahtarlar OKUNMADAN ÖNCE çağrılmalı; aksi halde düğüm
+        # yalnızca kendisini başlatan sürecin ortamına bağımlı kalır.
+        _loaded_env = _load_env()
         self.openai_api_key = os.environ.get("OPENAI_API_KEY", "").strip("\"' \t\n\r")
         self.groq_api_key = os.environ.get("GROQ_API_KEY", "").strip("\"' \t\n\r")
         raw_gem = os.environ.get("GEMINI_API_KEY", "").strip("\"' \t\n\r")
@@ -383,6 +426,17 @@ class AstroRealtimeNode(Node):
         raw_voice = os.environ.get("REALTIME_VOICE", os.environ.get("TTS_VOICE", "echo")).strip().lower()
         self.realtime_voice = raw_voice if raw_voice in VALID_REALTIME_VOICES else "echo"
         self.persona_name = os.environ.get("PERSONA", "kufurbaz").strip().lower()
+
+        # Anahtarın nereden geldiğini başlangıçta söyle. "eksik" hatası alındığında
+        # ilk soru her zaman "hangi .env okundu" oluyor; cevabı burada.
+        self.get_logger().info(
+            "[ENV] dotenv={} | OPENAI_API_KEY={} | GROQ={} | GEMINI={}".format(
+                _loaded_env or "BULUNAMADI",
+                f"var (…{self.openai_api_key[-4:]})" if self.openai_api_key else "YOK",
+                "var" if self.groq_api_key else "yok",
+                "var" if self.gemini_api_key else "yok",
+            )
+        )
 
 
         # Modular Cognitive Subsystems

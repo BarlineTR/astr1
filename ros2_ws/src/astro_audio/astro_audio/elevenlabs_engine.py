@@ -54,9 +54,14 @@ class ElevenLabsEngine(BaseTTSEngine):
         logger: Optional[Any] = None,
     ):
         self._enabled = (enabled if enabled is not None else os.getenv("ELEVENLABS_ENABLED", "false").lower() in ("1", "true", "yes"))
-        self._api_key = api_key or os.getenv("ELEVENLABS_API_KEY", "")
-        self._voice_id = voice_id or os.getenv("ELEVENLABS_VOICE_ID", "")
-        self._model_id = model_id or os.getenv("ELEVENLABS_MODEL", "eleven_flash_v2_5")
+        # `or` DEĞİL `is None`: imza Optional[str] olduğuna göre None "ortamdan al"
+        # demektir, "" ise "kimlik bilgisi YOK" demektir. `or` kullanıldığında açıkça
+        # verilen "" sessizce ortam değişkeniyle doldurulup motoru hazır gösteriyordu
+        # — çağıranın açık niyetinin tersi. Ortamda ELEVENLABS_API_KEY bulunduğu anda
+        # ortaya çıkan gerçek bir hataydı.
+        self._api_key = os.getenv("ELEVENLABS_API_KEY", "") if api_key is None else api_key
+        self._voice_id = os.getenv("ELEVENLABS_VOICE_ID", "") if voice_id is None else voice_id
+        self._model_id = os.getenv("ELEVENLABS_MODEL", "eleven_flash_v2_5") if model_id is None else model_id
         self.logger = logger
 
         self._active_gen_id = 0
