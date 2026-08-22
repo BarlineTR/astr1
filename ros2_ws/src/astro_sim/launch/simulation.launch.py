@@ -93,6 +93,9 @@ def generate_launch_description():
                     " -r ",          # başlar başlamaz fiziği çalıştır
                     " -v 2 ",        # uyarı seviyesi log
                     " ", headless_flag,
+                    # Teleop panelini içeren GUI yapılandırması: Gazebo
+                    # penceresinden düğmeyle sürmek için (klavye şart değil).
+                    " --gui-config ", os.path.join(pkg_sim, "config", "astro_gui.config"),
                 ],
                 "on_exit_shutdown": "true",
             }.items(),
