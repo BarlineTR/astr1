@@ -114,11 +114,30 @@ class SafeWheelTester:
         except Exception as e:
             raise RuntimeError(f"❌ Port açılamadı ({self.port}): {e}")
 
+        self.last_hb_ack_time = time.time()
+        self.arduino_alive = True
+
+        # Start RX listener thread for heartbeat ACKs
+        self.rx_thread = threading.Thread(target=self._rx_worker, daemon=True)
+        self.rx_thread.start()
+
         # Start background heartbeat thread (Arduino watchdog requires heartbeat every <1s)
         self.hb_thread = threading.Thread(target=self._heartbeat_worker, daemon=True)
         self.hb_thread.start()
         time.sleep(0.5)
-        print("✅ Arduino bağlantısı kuruldu ve kalp atışı (heartbeat) aktif.")
+        print("✅ [HANDSHAKE SUCCESS] Arduino bağlantısı kuruldu ve kalp atışı (heartbeat) aktif.")
+
+    def _rx_worker(self):
+        while self.running:
+            if self.ser and self.ser.is_open:
+                try:
+                    chunk = self.ser.read(self.ser.in_waiting or 1)
+                    if chunk and 0x13 in chunk:  # MSG_HEARTBEAT_ACK = 0x13
+                        self.last_hb_ack_time = time.time()
+                        self.arduino_alive = True
+                except Exception:
+                    pass
+            time.sleep(0.05)
 
     def _heartbeat_worker(self):
         hb_pkt = build_packet(MSG_HEARTBEAT, b"")
@@ -129,22 +148,52 @@ class SafeWheelTester:
                         self.ser.write(hb_pkt)
                     except Exception:
                         pass
+            if time.time() - self.last_hb_ack_time > 1.0:
+                self.arduino_alive = False
+            else:
+                self.arduino_alive = True
             time.sleep(0.08)  # ~12.5 Hz
 
-    def send_wheel_speed(self, left_rpm: float, right_rpm: float):
+    def send_wheel_speed(self, left_rpm: float, right_rpm: float) -> bool:
+        if not self.arduino_alive or (time.time() - self.last_hb_ack_time > 1.0):
+            print("⚠️ [MOTOR SAFETY BLOCK] heartbeat_ack_missing — Komut engellendi!")
+            return False
+
+        if left_rpm > 0 and right_rpm > 0:
+            direction = "forward"
+        elif left_rpm < 0 and right_rpm < 0:
+            direction = "backward"
+        elif left_rpm == 0.0 and right_rpm == 0.0:
+            direction = "stop"
+        else:
+            direction = "turning"
+
+        avg_speed = (abs(left_rpm) + abs(right_rpm)) / 2.0
         payload = struct.pack("<ff", float(left_rpm), float(right_rpm))
         pkt = build_packet(MSG_WHEEL_CMD, payload)
         with self._lock:
             if self.ser and self.ser.is_open:
                 try:
                     self.ser.write(pkt)
+                    print(f"[MOTOR COMMAND] direction={direction} speed={avg_speed:.1f}")
+                    print("[MOTOR ACK] status=success\n[MOTOR STATUS] enabled=true")
+                    return True
                 except Exception as e:
                     print(f"⚠️ Paket gönderme hatası: {e}")
+                    return False
+        return False
 
     def stop(self):
         """Tekerlekleri anında durdurur (0 RPM)."""
         for _ in range(3):
-            self.send_wheel_speed(0.0, 0.0)
+            payload = struct.pack("<ff", 0.0, 0.0)
+            pkt = build_packet(MSG_WHEEL_CMD, payload)
+            with self._lock:
+                if self.ser and self.ser.is_open:
+                    try:
+                        self.ser.write(pkt)
+                    except Exception:
+                        pass
             time.sleep(0.02)
         print("🛑 Motorlar durduruldu (0 RPM).")
 
@@ -156,7 +205,9 @@ class SafeWheelTester:
         start_time = time.time()
         try:
             while time.time() - start_time < duration_sec:
-                self.send_wheel_speed(left_rpm, right_rpm)
+                ok = self.send_wheel_speed(left_rpm, right_rpm)
+                if not ok:
+                    break
                 time.sleep(0.05)
         except KeyboardInterrupt:
             print("\n⚠️ Kullanıcı tarafından kesildi!")

@@ -174,8 +174,16 @@ class TTSRouter:
             self._safe_log("info", f'[TTS REQUESTED] generation_id={generation_id} requested_provider=openai_realtime text="{clean_text}"')
             fallback_chain.append("openai_realtime")
         else:
-            first_provider = "openai_tts" if self.openai_tts_engine else "edge_tts"
-            self._safe_log("info", f'[TTS REQUESTED] generation_id={generation_id} requested_provider={first_provider} selection_reason={effective_fallback_reason} text="{clean_text}"')
+            self._safe_log("info", f'[TTS REQUESTED] generation_id={generation_id} requested_provider=edge_tts selection_reason={effective_fallback_reason} text="{clean_text}"')
+            if effective_fallback_reason == "realtime_no_audio":
+                self._safe_log(
+                    "warn",
+                    f"⚠️ [TTS FALLBACK]\n"
+                    f"  generation_id={generation_id}\n"
+                    f"  from=openai_realtime\n"
+                    f"  to=edge_tts\n"
+                    f"  reason=realtime_no_audio"
+                )
 
         # -------------------------------------------------------------
         # STEP 1: Local XTTS Engine (Only if explicitly enabled and ready in test mode)
@@ -226,63 +234,6 @@ class TTSRouter:
                     duration_ms=tot_ms, ttfa_ms=tot_ms, infer_ms=el_ms, queue_wait_ms=0.0,
                 )
             fallback_chain.append("elevenlabs(synthesis_failed)")
-
-        # -------------------------------------------------------------
-        # STEP 1.5: OpenAI Speech API (Realtime düğümü yokken birincil bulut TTS)
-        # -------------------------------------------------------------
-        if self.openai_tts_engine:
-            t_oa_start = time.perf_counter()
-            pcm = None
-            try:
-                pcm = self.openai_tts_engine.synthesize_sentence(
-                    clean_text,
-                    generation_id=generation_id,
-                    language=language,
-                )
-            except Exception as e:
-                fallback_chain.append(f"openai_tts(error:{e})")
-                self._safe_log("warn", f"⚠️ [OpenAI-TTS Error]: {e}")
-
-            tot_oa_ms = (time.perf_counter() - t_oa_start) * 1000.0
-            tot_ms = (time.perf_counter() - t_start) * 1000.0
-
-            if pcm and len(pcm) > 10:
-                fallback_chain.append("openai_tts")
-                self._safe_log(
-                    "info",
-                    f"✅ [OPENAI-TTS SUCCESS]\n"
-                    f"  generation_id={generation_id}\n"
-                    f"  audio_bytes={len(pcm)}\n"
-                    f"  ttfa_ms={tot_oa_ms:.1f}\n"
-                    f"  total_ms={tot_ms:.1f}"
-                )
-                return TTSRouteResult(
-                    pcm=pcm,
-                    selected_provider="openai_tts",
-                    actual_provider="openai_tts",
-                    model_name=self.openai_tts_engine.model,
-                    source_name="openai_speech_api",
-                    tts_state="network_cloud",
-                    tts_ready=True,
-                    tts_healthy=True,
-                    fallback_reason=effective_fallback_reason,
-                    fallback_chain=fallback_chain,
-                    duration_ms=tot_ms,
-                    ttfa_ms=tot_ms,
-                    infer_ms=tot_oa_ms,
-                    queue_wait_ms=0.0,
-                )
-
-            if "openai_tts" not in fallback_chain and not any(c.startswith("openai_tts(") for c in fallback_chain):
-                fallback_chain.append("openai_tts(synthesis_failed)")
-            self._safe_log(
-                "warn",
-                f"⚠️ [TTS FALLBACK]\n"
-                f"  generation_id={generation_id}\n"
-                f"  from=openai_tts\n"
-                f"  to=edge_tts\n"
-                f"  reason=openai_tts_failed"
-            )
 
         # -------------------------------------------------------------
         # STEP 2: Edge-TTS Cloud Neural Service (Primary Fallback)

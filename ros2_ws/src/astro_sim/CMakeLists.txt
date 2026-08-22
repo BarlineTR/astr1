@@ -3,7 +3,7 @@ project(astro_sim)
 
 find_package(ament_cmake REQUIRED)
 
-install(DIRECTORY worlds launch config rviz
+install(DIRECTORY worlds launch rviz
         DESTINATION share/${PROJECT_NAME})
 
 if(BUILD_TESTING)
