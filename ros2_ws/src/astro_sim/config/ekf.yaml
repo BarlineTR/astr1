@@ -1,0 +1,80 @@
+# ASTRO V1 — tekerlek odometrisi + IMU füzyonu (robot_localization EKF)
+#
+# NEDEN GEREKLİ
+# ------------
+# Diferansiyel sürüşte tekerlek odometrisi düz gidişte iyidir (ölçüldü: ~%3)
+# ama yerinde dönüşte kötüdür (~%8 açı hatası), çünkü tahrik tekerlekleri
+# dönerken yanlamasına sürtünmek zorundadır. Bu hata birikir.
+#
+# İlk çözüm denemesi SLAM'in bunu düzeltmesini sağlamaktı
+# (minimum_travel_distance: 0.0). İşe yaradı ama yeni bir sorun doğurdu:
+# robot dururken bile her taramada düğüm eklendiği için poz grafiği
+# neredeyse-aynı binlerce düğümle doldu, döngü kapatma bunlar arasında SAHTE
+# eşleşmeler buldu ve harita iç içe geçmiş kopyalara ayrıldı.
+#
+# Doğru çözüm hatayı KAYNAĞINDA gidermek: IMU'nun jiroskopu açısal hızı çok
+# daha doğru ölçer. EKF, tekerlek odometrisinden DOĞRUSAL hızı, IMU'dan
+# AÇISAL hızı alır. Böylece slam_toolbox normal eşiğinde (0.2 m) kalabilir.
+#
+# Aynı yapılandırma gerçek robotta da geçerlidir; oradaki IMU /imu/data_raw
+# topic'ine yayınlar (bkz. docs/simulasyon-ve-gercek-robot.md §4).
+
+ekf_filter_node:
+  ros__parameters:
+    frequency: 50.0
+    sensor_timeout: 0.2
+    two_d_mode: true              # zemin robotu: z, roll, pitch sabit
+    publish_tf: true              # odom -> base_footprint'i ARTIK BU yayınlar
+    print_diagnostics: false
+
+    map_frame: map
+    odom_frame: odom
+    base_link_frame: base_footprint
+    world_frame: odom             # odom seviyesi füzyon (map'i SLAM sağlar)
+
+    # ── Tekerlek odometrisi: yalnızca DOĞRUSAL hız ────────────────────
+    # Konum (x, y) ve açı (yaw) alınmaz: bunlar zaten hızın integralidir ve
+    # aynı bilgiyi iki kez vermek filtreyi aşırı güvenli yapar. Açısal hız da
+    # alınmaz — düzeltmek istediğimiz hata tam olarak orada.
+    odom0: /odom
+    odom0_config: [false, false, false,     # x,    y,     z
+                   false, false, false,     # roll, pitch, yaw
+                   true,  true,  false,     # vx,   vy,    vz
+                   false, false, false,     # vroll,vpitch,vyaw
+                   false, false, false]     # ax,   ay,    az
+    odom0_differential: false
+    odom0_relative: false
+    odom0_queue_size: 10
+
+    # ── IMU: yalnızca AÇISAL hız (jiroskop z) ─────────────────────────
+    # Yönelim (orientation) alınmaz: manyetometre olmadan mutlak yaw
+    # sürüklenir. Jiroskopun açısal hızı ise kısa vadede çok doğrudur ve
+    # tekerlek patinajından etkilenmez.
+    imu0: /imu
+    imu0_config: [false, false, false,
+                  false, false, false,
+                  false, false, false,
+                  false, false, true,       # vyaw
+                  false, false, false]
+    imu0_differential: false
+    imu0_relative: false
+    imu0_queue_size: 10
+    imu0_remove_gravitational_acceleration: true
+
+    # ── Süreç gürültüsü ───────────────────────────────────────────────
+    # yaw (indeks 5) ve vyaw (indeks 11) düşük tutuldu: IMU'ya güveniyoruz.
+    process_noise_covariance: [0.0500, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+                               0.0, 0.0500, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+                               0.0, 0.0, 0.0600, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+                               0.0, 0.0, 0.0, 0.0300, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+                               0.0, 0.0, 0.0, 0.0, 0.0300, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+                               0.0, 0.0, 0.0, 0.0, 0.0, 0.0200, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+                               0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0250, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+                               0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0250, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+                               0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0400, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+                               0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0100, 0.0, 0.0, 0.0, 0.0, 0.0,
+                               0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0100, 0.0, 0.0, 0.0, 0.0,
+                               0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0100, 0.0, 0.0, 0.0,
+                               0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0100, 0.0, 0.0,
+                               0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0100, 0.0,
+                               0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0150]

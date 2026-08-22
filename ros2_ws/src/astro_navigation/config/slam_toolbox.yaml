@@ -34,19 +34,22 @@ slam_toolbox:
     # ── Tarama işleme ────────────────────────────────────────────────
     # Robot yavaş; harita güncellemesi için eşikler küçük tutuldu, yoksa
     # dar koridorda düğüm eklenmeden önce çok yol alınıyor ve odometri kayıyor.
-    # ⚠️ minimum_travel_distance SIFIR OLMALI.
-    # slam_toolbox'ın kendi shouldProcessScan() kapısı TABANIN yer değiştirmesine
-    # bakar. Yerinde dönüşte taban hiç yer değiştirmez, dolayısıyla bu değer
-    # sıfırdan büyük olduğunda dönüş sırasında TEK BİR tarama bile işlenmez:
-    # map->odom donar, SLAM sadece odometriyi aynen geçirir ve odometrinin
-    # yerinde dönüşteki ~%8'lik açı hatası hiç düzeltilmeden birikir.
-    # Ölçüm (4 x 90° yerinde dönüş, SLAM ile gerçek arasındaki açı farkı):
-    #     0.2 -> +14°, +20°, +33°, +46°   (birikiyor, harita ekranda dönüyor)
-    #     0.0 ->  -2.0°, -2.7°, -2.5°, -2.3°  (sınırlı kalıyor)
-    # Sıfırda tarama akışını minimum_travel_heading ve minimum_time_interval
-    # sınırlar; ikisi birlikte düğüm ekleme hızını makul tutar.
-    minimum_travel_distance: 0.0      # m   — bkz. yukarıdaki not
-    minimum_travel_heading: 0.1       # rad (~5.7°)
+    # Bu eşikler ANCAK odometri düzgünse güvenlidir.
+    # slam_toolbox'ın shouldProcessScan() kapısı TABANIN yer değiştirmesine
+    # bakar; yerinde dönüşte taban hiç hareket etmediği için dönüş boyunca
+    # tarama işlenmez ve odometrinin açı hatası düzeltilmeden birikir.
+    #
+    # Bunu eşiği sıfırlayarak çözmek DENENDİ ve harita bozuldu: robot dururken
+    # bile düğüm eklendiği için poz grafiği neredeyse-aynı binlerce düğümle
+    # doldu, döngü kapatma sahte eşleşmeler bulup haritayı iç içe geçmiş
+    # kopyalara ayırdı.
+    #
+    # Doğru çözüm: odometriyi kaynağında düzeltmek. EKF (robot_localization)
+    # tekerlekten doğrusal hızı, IMU jiroskopundan açısal hızı alır; böylece
+    # dönüş hatası SLAM'e hiç ulaşmaz ve bu eşikler normal kalabilir.
+    # Bkz. astro_sim/config/ekf.yaml
+    minimum_travel_distance: 0.2      # m
+    minimum_travel_heading: 0.2       # rad (~11°)
     scan_buffer_size: 20
     scan_buffer_maximum_scan_distance: 12.0
     link_match_minimum_response_fine: 0.12

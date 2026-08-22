@@ -64,7 +64,6 @@ def generate_launch_description():
         "/clock@rosgraph_msgs/msg/Clock[gz.msgs.Clock",
         "/cmd_vel@geometry_msgs/msg/Twist]gz.msgs.Twist",
         "/odom@nav_msgs/msg/Odometry[gz.msgs.Odometry",
-        "/tf@tf2_msgs/msg/TFMessage[gz.msgs.Pose_V",
         "/scan@sensor_msgs/msg/LaserScan[gz.msgs.LaserScan",
         "/imu@sensor_msgs/msg/Imu[gz.msgs.IMU",
         "/joint_states@sensor_msgs/msg/JointState[gz.msgs.Model",
@@ -144,6 +143,20 @@ def generate_launch_description():
             output="screen",
             arguments=["/oak/rgb/image_raw"],
             parameters=[{"use_sim_time": True}],
+        ),
+
+        # 4.5) Tekerlek odometrisi + IMU füzyonu.
+        # odom -> base_footprint tf'ini BU yayınlar (DiffDrive değil).
+        # Gerekçe için config/ekf.yaml başındaki nota bakın.
+        Node(
+            package="robot_localization",
+            executable="ekf_node",
+            name="ekf_filter_node",
+            output="screen",
+            parameters=[
+                os.path.join(pkg_sim, "config", "ekf.yaml"),
+                {"use_sim_time": True},
+            ],
         ),
 
         # 5) RViz
