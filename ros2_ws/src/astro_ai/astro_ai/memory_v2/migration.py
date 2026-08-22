@@ -77,21 +77,51 @@ class MemoryMigrator:
 
         # 2. Migrate Learned Objects
         learned_objs = data.get("learned_objects", {})
-        for name, desc in learned_objs.items():
-            self.spatial.store_landmark(
-                name=name,
-                category="object",
-                x_m=1.0,
-                y_m=0.0,
-                description=str(desc),
-            )
+        if isinstance(learned_objs, dict):
+            for name, desc in learned_objs.items():
+                self.spatial.store_landmark(
+                    name=name,
+                    category="object",
+                    x_m=1.0,
+                    y_m=0.0,
+                    description=str(desc),
+                )
+        elif isinstance(learned_objs, list):
+            for item in learned_objs:
+                if isinstance(item, dict):
+                    name = item.get("name", "object")
+                    desc = item.get("description", str(item))
+                else:
+                    name = str(item)
+                    desc = str(item)
+                self.spatial.store_landmark(
+                    name=name,
+                    category="object",
+                    x_m=1.0,
+                    y_m=0.0,
+                    description=str(desc),
+                )
 
         # 3. Migrate Known People & Preferences
         known_people = data.get("known_people", {})
-        for name, info in known_people.items():
-            p_name = info.get("name", name)
-            formal = info.get("formal_title", p_name)
-            self.relationship.get_or_create_profile(p_name, formal_title=formal)
+        if isinstance(known_people, dict):
+            for name, info in known_people.items():
+                if isinstance(info, dict):
+                    p_name = info.get("name", name)
+                    formal = info.get("formal_title", p_name)
+                else:
+                    p_name = str(name)
+                    formal = str(info)
+                self.relationship.get_or_create_profile(p_name, formal_title=formal)
+        elif isinstance(known_people, list):
+            for item in known_people:
+                if isinstance(item, dict):
+                    p_name = item.get("name", "user")
+                    formal = item.get("formal_title", p_name)
+                else:
+                    p_name = str(item)
+                    formal = str(item)
+                self.relationship.get_or_create_profile(p_name, formal_title=formal)
 
             # Person Facts
             for pf in info.get("learned_facts", []):

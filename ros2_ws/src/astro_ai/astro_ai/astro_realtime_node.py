@@ -558,6 +558,8 @@ class AstroRealtimeNode(Node):
 
         # ROS 2 Publishers
         self.pub_output_pcm = self.create_publisher(String, "/audio/realtime_output_pcm", 50)
+        self.pub_realtime_state = self.create_publisher(String, "/realtime/state", 10)
+        self.pub_tts_say = self.create_publisher(String, "/tts/say", 10)
 
         self.pub_interrupt = self.create_publisher(Bool, "/tts/interrupt", 10)
         self.pub_emotion = self.create_publisher(String, "/robot/emotion", 10)
@@ -565,6 +567,7 @@ class AstroRealtimeNode(Node):
         self.pub_transcript = self.create_publisher(String, "/speech/text", 10)
 
         # ROS 2 Subscribers
+        self.create_subscription(String, "/tts/realtime_request", self._on_realtime_turn_request, 10)
         self.create_subscription(String, "/audio/realtime_input_pcm", self._on_input_pcm, 50)
         self.create_subscription(Bool, "/audio/playback_active", self._on_playback_active, 10)
         self.create_subscription(String, "/vision/recognized_person", self._on_recognized_person, 10)
@@ -581,6 +584,9 @@ class AstroRealtimeNode(Node):
 
         # Tool execution deduplication
         self._executed_tool_calls: set[str] = set()
+
+        # Publish initial realtime state (DISCONNECTED / NOT_READY)
+        self._publish_realtime_state("DISCONNECTED", "init")
 
         # Sleep Mode (Default: Start in Sleeping / DEEP_IDLE State)
         self._node_start_time = time.monotonic()
@@ -623,6 +629,107 @@ class AstroRealtimeNode(Node):
                 self.get_logger().info(f"[{str(lvl).upper()}] {msg}")
             except Exception:
                 print(f"[{str(lvl).upper()}] {msg}", flush=True)
+
+    def _publish_realtime_state(self, state: str, reason: str = "none"):
+        """Publishes realtime WebSocket state to /realtime/state for ai_brain_node consumption."""
+        try:
+            import json as _json
+            msg = String()
+            msg.data = _json.dumps({
+                "state": state,
+                "reason": reason,
+                "connection": self.realtime_connection_state,
+                "session": self.realtime_session_state,
+                "provider": self.realtime_provider_state,
+            })
+            self.pub_realtime_state.publish(msg)
+        except Exception:
+            pass
+
+    def _on_realtime_turn_request(self, msg: String):
+        """Receives conversational turn request from ai_brain_node and sends it over Realtime WebSocket."""
+        try:
+            raw = msg.data.strip()
+            if not raw:
+                return
+            if raw.startswith("{") and "text" in raw:
+                data = json.loads(raw)
+                text = data.get("text", "")
+                gen_id = data.get("generation_id", self.realtime_current_generation_id + 1)
+            else:
+                text = raw
+                gen_id = self.realtime_current_generation_id + 1
+
+            if not text:
+                return
+
+            self.realtime_current_generation_id = gen_id
+            self.realtime_audio_received = False
+            self._last_requested_text = text
+
+            if not self._ws or not self._loop or not self._is_connected:
+                self.get_logger().warn(
+                    f"[REALTIME NO AUDIO]\ngeneration_id={gen_id}\nreason=websocket_not_connected\n"
+                    f"[TTS FALLBACK]\nfrom=openai_realtime\nto=edge_tts\nreason=realtime_unavailable"
+                )
+                # Forward to tts_node for Edge-TTS fallback
+                fb_msg = String()
+                fb_msg.data = json.dumps({
+                    "text": text,
+                    "engine": "edge-tts",
+                    "generation_id": gen_id,
+                    "fallback_reason": "realtime_unavailable",
+                })
+                self.pub_tts_say.publish(fb_msg)
+                return
+
+            self.get_logger().info(f"[REALTIME TURN SENT]\ngeneration_id={gen_id}\ntext=\"{text}\"")
+
+            turn_event = {
+                "type": "conversation.item.create",
+                "item": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_text",
+                            "text": f"Lütfen şu cevabı tam olarak seslendir: {text}"
+                        }
+                    ]
+                }
+            }
+            resp_event = {
+                "type": "response.create",
+                "response": {
+                    "instructions": f"Cevabını doğrudan Türkçe olarak seslendir: {text}"
+                }
+            }
+            self.get_logger().debug(f"[REALTIME PAYLOAD OUT] event=response.create payload={json.dumps(resp_event)}")
+            asyncio.run_coroutine_threadsafe(self._ws.send(json.dumps(turn_event)), self._loop)
+            asyncio.run_coroutine_threadsafe(self._ws.send(json.dumps(resp_event)), self._loop)
+
+            # Start watchdog timer for first-packet audio delta deadline (1.2s)
+            threading.Timer(1.2, self._check_audio_delta_timeout, args=[gen_id, text]).start()
+
+        except Exception as e:
+            self.get_logger().error(f"Error in _on_realtime_turn_request: {e}")
+
+    def _check_audio_delta_timeout(self, gen_id: int, text: str):
+        """Watchdog: If no audio delta arrives within 1.2s, triggers fallback to Edge-TTS."""
+        if self.realtime_current_generation_id == gen_id and not self.realtime_audio_received:
+            self.get_logger().warn(
+                f"[REALTIME NO AUDIO]\ngeneration_id={gen_id}\nreason=no_audio_delta\n"
+                f"[TTS FALLBACK]\nfrom=openai_realtime\nto=edge_tts\nreason=realtime_no_audio"
+            )
+            # Send to /tts/say for Edge-TTS fallback
+            fb_msg = String()
+            fb_msg.data = json.dumps({
+                "text": text,
+                "engine": "edge-tts",
+                "generation_id": gen_id,
+                "fallback_reason": "realtime_no_audio",
+            })
+            self.pub_tts_say.publish(fb_msg)
 
     def _run_async_loop(self):
         self._loop = asyncio.new_event_loop()
@@ -668,19 +775,21 @@ class AstroRealtimeNode(Node):
                     f"[REALTIME CONNECTING]\n"
                     f"model={current_model}"
                 )
+                self._publish_realtime_state("CONNECTING")
                 async with websockets.connect(ws_url, **connect_kwargs) as ws:
                     self._ws = ws
                     self._is_connected = True
                     self._is_responding = False
                     self._is_playback_active = False
                     self.realtime_connection_state = "CONNECTED"
-                    self.realtime_session_state = "READY"
+                    self.realtime_session_state = "NOT_READY"
                     self.realtime_provider_state = "AVAILABLE"
                     self.get_logger().info(
                         f"[REALTIME CONNECTED]\n"
-                        f"session_id={self.realtime_session_id or 'sess_init'}\n"
+                        f"model={current_model}\n"
                         f"state=AVAILABLE"
                     )
+                    self._publish_realtime_state("CONNECTED")
 
                     # Send Initial Session Update
                     await self._send_session_update(ws)
@@ -697,6 +806,7 @@ class AstroRealtimeNode(Node):
                 self.realtime_connection_state = "DISCONNECTED"
                 self.realtime_session_state = "NOT_READY"
                 self.realtime_response_state = "IDLE"
+                self._publish_realtime_state("DISCONNECTED", "error")
                 err_str = str(e)
 
                 try:
@@ -957,10 +1067,11 @@ class AstroRealtimeNode(Node):
             self.realtime_connection_state = "CONNECTED"
             self.realtime_provider_state = "AVAILABLE"
             self.get_logger().info(
-                f"[REALTIME CONNECTED]\n"
+                f"[REALTIME SESSION READY]\n"
                 f"session_id={self.realtime_session_id or 'sess_init'}\n"
                 f"state=AVAILABLE"
             )
+            self._publish_realtime_state("SESSION_READY")
 
         # 1. Real-Time Streaming Audio Output (GA & Preview names)
         elif event_type in ("response.audio.delta", "response.output_audio.delta"):
@@ -1118,10 +1229,40 @@ class AstroRealtimeNode(Node):
         # 7. Error Handling
         elif event_type == "error":
             self._is_responding = False
+            self.realtime_response_state = "IDLE"
             err = event.get("error", {})
-            msg = err.get("message", "")
-            if "no active response found" not in msg and "already has an active response" not in msg:
-                self.get_logger().error(f"❌ [Realtime WS Hatası]: {msg}")
+            err_type = err.get("type", "unknown_error")
+            err_code = err.get("code", "none")
+            err_msg = err.get("message", "")
+            err_class = f"{err_type}:{err_code}" if err_code != "none" else err_type
+
+            self.get_logger().error(
+                f"[REALTIME ERROR]\n"
+                f"error_class={err_class}\n"
+                f"message={err_msg}\n"
+                f"generation_id={self.realtime_current_generation_id}"
+            )
+
+            # Trigger immediate fallback to Edge-TTS if there was an active turn request
+            if getattr(self, "_last_requested_text", "") and not self.realtime_audio_received:
+                self.get_logger().warn(
+                    f"[REALTIME NO AUDIO]\n"
+                    f"generation_id={self.realtime_current_generation_id}\n"
+                    f"reason=server_error\n"
+                    f"[TTS FALLBACK]\n"
+                    f"from=openai_realtime\n"
+                    f"to=edge_tts\n"
+                    f"reason=realtime_server_error"
+                )
+                fb_msg = String()
+                fb_msg.data = json.dumps({
+                    "text": self._last_requested_text,
+                    "engine": "edge-tts",
+                    "generation_id": self.realtime_current_generation_id,
+                    "fallback_reason": "realtime_server_error",
+                })
+                self.pub_tts_say.publish(fb_msg)
+                self._last_requested_text = ""
 
 
 

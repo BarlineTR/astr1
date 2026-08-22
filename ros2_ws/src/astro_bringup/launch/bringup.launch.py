@@ -59,6 +59,7 @@ def generate_launch_description():
     enable_audio = LaunchConfiguration("enable_audio")
     enable_vision = LaunchConfiguration("enable_vision")
     enable_ai = LaunchConfiguration("enable_ai")
+    use_realtime = LaunchConfiguration("use_realtime")
     camera_source = LaunchConfiguration("camera_source")
 
     return LaunchDescription(
@@ -104,6 +105,11 @@ def generate_launch_description():
                 default_value="true",
                 description="Start AI Brain for NLP processing",
             ),
+            DeclareLaunchArgument(
+                "use_realtime",
+                default_value="true",
+                description="Start OpenAI Realtime WebSocket node (production default: enabled)",
+            ),
             IncludeLaunchDescription(
                 PythonLaunchDescriptionSource(
                     os.path.join(description_pkg, "launch", "description.launch.py")
@@ -131,5 +137,14 @@ def generate_launch_description():
                     "camera_source": camera_source,
                 }.items(),
             ),
+            # OpenAI Realtime WebSocket Node (production default: enabled)
+            IncludeLaunchDescription(
+                PythonLaunchDescriptionSource(
+                    os.path.join(bringup_pkg, "launch", "realtime_sensors.launch.py")
+                ),
+                condition=IfCondition(use_realtime),
+                launch_arguments={"use_sim_time": use_sim_time}.items(),
+            ),
         ]
     )
+

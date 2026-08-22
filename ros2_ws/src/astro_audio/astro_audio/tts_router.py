@@ -109,19 +109,11 @@ class TTSRouter:
                 "  reason=production_runtime_disabled"
             )
 
-        el_label = (
-            f"ElevenLabs ({self.elevenlabs_engine.model_id}) -> " if self.elevenlabs_engine else ""
-        )
-        openai_tts_label = (
-            f"OpenAI TTS ({self.openai_tts_engine.model}, Primary Fallback) -> "
-            if self.openai_tts_engine else ""
-        )
         self._safe_log(
             "info",
-            f"🎯 [TTSRouter] Production Hiyerarşi Aktif: OpenAI Realtime (Primary) -> "
-            f"{el_label}{openai_tts_label}"
-            f"Edge-TTS (timeout={self.edge_timeout_s}s) -> "
-            f"Local Offline TTS (Emergency Fallback) -> Pre-generated Emergency WAV"
+            f"[TTS ROUTER] OpenAI Realtime (Primary) -> "
+            f"Edge-TTS (Primary Fallback, timeout={self.edge_timeout_s}s) -> "
+            f"Local Offline TTS (Emergency Fallback) -> Emergency WAV"
         )
 
     def _safe_log(self, lvl: str, msg: str):
@@ -163,6 +155,8 @@ class TTSRouter:
 
         if realtime_fallback_reason is not None:
             effective_fallback_reason = realtime_fallback_reason
+            if realtime_fallback_reason in ("realtime_no_audio", "realtime_unavailable", "realtime_quota_exhausted"):
+                realtime_available = False
         elif realtime_available:
             effective_fallback_reason = "none"
         elif self.circuit_breaker and self.circuit_breaker.is_exhausted("openai"):
