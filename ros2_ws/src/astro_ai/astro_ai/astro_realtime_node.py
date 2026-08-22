@@ -973,9 +973,8 @@ class AstroRealtimeNode(Node):
                 self.realtime_response_state = "STREAMING"
                 delta_len = len(delta_b64) * 3 // 4
                 self.get_logger().info(
-                    f"[REALTIME AUDIO DELTA]\n"
-                    f"generation_id={self.realtime_current_generation_id}\n"
-                    f"audio_bytes={delta_len}"
+                    f"[REALTIME AUDIO DELTA] bytes={delta_len}\n"
+                    f"generation_id={self.realtime_current_generation_id}"
                 )
 
         # 2. Real-Time Streaming Audio Transcript
@@ -1014,10 +1013,10 @@ class AstroRealtimeNode(Node):
                 }
             }
             try:
+                self.get_logger().info(f"[REALTIME TURN SENT] generation_id={self.realtime_current_generation_id + 1}")
                 await ws.send(json.dumps(resp_event))
             except Exception as se:
                 self.get_logger().error(f"Response create notice: {se}")
-
 
         # 3c. Response Created
         elif event_type == "response.created":
@@ -1027,18 +1026,26 @@ class AstroRealtimeNode(Node):
             self.realtime_current_generation_id += 1
             self.realtime_audio_received = False
             self.get_logger().info(
-                f"[REALTIME RESPONSE STARTED]\n"
+                f"[REALTIME RESPONSE CREATED]\n"
                 f"generation_id={self.realtime_current_generation_id}"
             )
 
         # 3d. Response Done / Cancelled
         elif event_type in ("response.done", "response.cancelled"):
+            elapsed_ms = (time.monotonic() - getattr(self, "_response_start_time", time.monotonic())) * 1000.0
+            if not self.realtime_audio_received:
+                self.get_logger().warn(
+                    f"[REALTIME NO AUDIO] generation_id={self.realtime_current_generation_id} elapsed_ms={elapsed_ms:.1f}\n"
+                    f"[TTS FALLBACK] from=openai_realtime to=edge_tts reason=realtime_no_audio"
+                )
+            else:
+                self.get_logger().info(
+                    f"[REALTIME AUDIO DONE]\n"
+                    f"generation_id={self.realtime_current_generation_id}\n"
+                    f"elapsed_ms={elapsed_ms:.1f}"
+                )
             self._is_responding = False
             self.realtime_response_state = "IDLE"
-            self.get_logger().info(
-                f"[REALTIME RESPONSE DONE]\n"
-                f"generation_id={self.realtime_current_generation_id}"
-            )
 
         # 4. User Speech Transcription Completed
         elif event_type in ("conversation.item.input_audio_transcription.completed", "conversation.item.input_audio_transcription.done"):

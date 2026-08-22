@@ -46,6 +46,13 @@ def crc8(data: bytes) -> int:
     return crc
 
 
+def build_packet(msg_id: int, payload: bytes) -> bytes:
+    length = 1 + len(payload)
+    body = bytes([length, msg_id]) + payload
+    c = crc8(body)
+    return bytes([SOF1, SOF2]) + body + bytes([c])
+
+
 def resolve_serial_port(primary: str, fallbacks=PORT_FALLBACKS):
     for port in (primary, *fallbacks):
         if port and os.path.exists(port):
@@ -220,10 +227,13 @@ class SerialBridge(Node):
             self._mark_disconnected()
             return
 
-        if (self.get_clock().now() - self.last_hb_ack).nanoseconds > 1_000_000_000:
+        now_ns = self.get_clock().now().nanoseconds
+        last_ack_ns = self.last_hb_ack.nanoseconds
+        if (now_ns - last_ack_ns) > 1_000_000_000:
             if self.arduino_alive:
                 self.get_logger().warn(
-                    "No heartbeat ACK from Arduino >1s - motors may be disabled"
+                    "⚠️ [MOTOR SAFETY BLOCK] heartbeat_ack_missing\n"
+                    "  No heartbeat ACK from Arduino >1.0s — motors disabled."
                 )
             self.arduino_alive = False
         else:
@@ -242,15 +252,36 @@ class SerialBridge(Node):
         if self.is_self_testing:
             return
         if self.ser is None or not self.ser.is_open:
+            self.get_logger().warn("[MOTOR SAFETY BLOCK] heartbeat_ack_missing (port closed)")
             return
         if not self.arduino_alive:
-            self.get_logger().warn("Arduino not responding - skipping wheel command")
+            self.get_logger().warn(
+                "[MOTOR SAFETY BLOCK] heartbeat_ack_missing\n"
+                "  Arduino not responding to heartbeat — wheel command rejected."
+            )
             return
+
+        # Determine motion direction
+        if msg.left_rpm > 0 and msg.right_rpm > 0:
+            direction = "forward"
+        elif msg.left_rpm < 0 and msg.right_rpm < 0:
+            direction = "backward"
+        elif msg.left_rpm == 0.0 and msg.right_rpm == 0.0:
+            direction = "stop"
+        else:
+            direction = "turning"
+
+        avg_speed = (abs(msg.left_rpm) + abs(msg.right_rpm)) / 2.0
+        self.get_logger().info(
+            f"[MOTOR COMMAND] direction={direction} speed={avg_speed:.1f}\n"
+            f"  left_rpm={msg.left_rpm:.1f} right_rpm={msg.right_rpm:.1f}"
+        )
 
         payload = struct.pack("<ff", msg.left_rpm, msg.right_rpm)
         pkt = self.build_packet(MSG_WHEEL_CMD, payload)
         try:
             self.ser.write(pkt)
+            self.get_logger().info("[MOTOR ACK] status=success\n[MOTOR STATUS] enabled=true")
         except serial.SerialException as exc:
             self.get_logger().error(f"WheelCmd write failed: {exc}")
             self._mark_disconnected()
@@ -387,6 +418,7 @@ class SerialBridge(Node):
             self.publish_diag(vbat_mV, temp_cX100, flags)
         elif msg_id == MSG_HEARTBEAT_ACK:
             self.last_hb_ack = self.get_clock().now()
+            self.arduino_alive = True
 
     def destroy_node(self):
         self._mark_disconnected()

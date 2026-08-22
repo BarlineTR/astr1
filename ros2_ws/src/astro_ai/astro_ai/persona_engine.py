@@ -226,23 +226,28 @@ def is_self_identity_query(user_query: str) -> bool:
 
 
 def strip_unprompted_self_descriptions(text: str, user_query: str = "") -> str:
-    """Removes unsolicited robot self-introductions, sensor details, or creator speeches."""
+    """Removes unsolicited robot self-introductions, sensor details, creator speeches, and system leaks."""
     if is_self_identity_query(user_query):
         return text
 
     patterns = [
         r"(?i)^(?:merhaba(?:lar)?\s*[,!.]?\s*)?ben\s+astro(?:[,\s]+(?:bir\s+)?(?:sosyal\s+)?robot(?:um)?)?[^.?!]*[.?!]\s*",
-        r"(?i)(?:beni\s+)?baran(?:\s+beni)?\s+(?:adlı\s+mühendis\s+)?(?:geliştirdi|tasarladı|yaptı)[^.?!]*[.?!]\s*",
-        r"(?i)baran\s+tarafından\s+(?:geliştirildim|tasarlandım|üretildim)[^.?!]*[.?!]\s*",
+        r"(?i)ben\s+(?:astro\s+adlı\s+)?(?:bir\s+)?sosyal\s+robot(?:um)?[^.?!]*[.?!]\s*",
+        r"(?i)baran(?:\s+benim|\s+adlı)?\s+(?:geliştiricim|üreticim|mühendisim)[^.?!]*[.?!]\s*",
+        r"(?i)(?:ben\s+)?baran['’]?[ıi]n\s+(?:geliştiricisi\s+ve\s+üreticisi|geliştirdiği|tasarladığı|ürettiği)[^.?!]*[.?!]\s*",
+        r"(?i)(?:beni\s+)?baran(?:\s+beni)?\s+(?:adlı\s+mühendis\s+)?(?:geliştirdi|tasarladı|yaptı|üretti)[^.?!]*[.?!]\s*",
+        r"(?i)baran\s+tarafından\s+(?:geliştirildim|tasarlandım|üretildim|yapıldım)[^.?!]*[.?!]\s*",
         r"(?i)oak-d\s+lite\s+3d\s+kameram(?:la)?[^.?!]*[.?!]\s*",
+        r"(?i)respeaker\s+(?:4\s+mic|mikrofon)?[^.?!]*[.?!]\s*",
         r"(?i)bir\s+(?:yapay\s+zeka|sosyal\s+robot)\s+olarak[^.?!]*[.?!]\s*",
         r"(?i)fiziksel\s+bir\s+bedenim[,\s]+sensörlerim[^.?!]*[.?!]\s*",
         r"(?i)ayrıca\s+sensörlerim[^.?!]*[.?!]\s*",
+        r"(?i)(?:sistem\s+yönergesi|rolün|kurallar|as\s+an\s+ai|yapay\s+zeka\s+olarak)[^.?!]*[.?!]\s*",
     ]
     cleaned = text
     for pat in patterns:
         cleaned = re.sub(pat, "", cleaned).strip()
-    return cleaned if cleaned else text
+    return cleaned if cleaned else ""
 
 
 def response_length_gate(
@@ -250,6 +255,7 @@ def response_length_gate(
     user_query: str = "",
     max_words: int = 35,
     max_sentences: int = 2,
+    fallback_default: str = "Buradayım. Seni dinliyorum.",
 ) -> str:
     """Production Response Length & Natural Conversational Hardening Gate.
     
@@ -257,25 +263,27 @@ def response_length_gate(
       1. Strips unprompted robot self-descriptions & meta-explanations.
       2. Removes repetitive stuttering / degenerate LLM loops.
       3. Enforces concise 1-2 sentence social response (<= max_words).
-      4. Avoids blunt mid-word clipping by splitting at semantic sentence boundaries.
+      4. Quality guard: Returns deterministic concise fallback on corrupted / leaking / empty output.
     """
-    if not text:
-        return ""
+    if not text or not str(text).strip():
+        return fallback_default
 
     # 1. Clean markdown, emojis, thinking tags
     clean = clean_tts_text(text)
     if not clean:
-        return ""
+        return fallback_default
 
     # 2. Strip unsolicited self-descriptions if user didn't ask for identity
     clean = strip_unprompted_self_descriptions(clean, user_query=user_query)
+    if not clean or len(clean.strip()) < 2:
+        return fallback_default
 
     # 3. Sentence segmentation
     sentences = re.split(r'(?<=[.!?])\s+', clean)
     sentences = [s.strip() for s in sentences if s.strip()]
 
     if not sentences:
-        return clean
+        return fallback_default
 
     # 4. Limit to max_sentences while keeping word count <= max_words
     selected_sentences = []
@@ -297,6 +305,9 @@ def response_length_gate(
         result = " ".join(words)
         if not result.endswith((".", "!", "?")):
             result += "."
+
+    if not result or len(result.split()) > max_words + 5:
+        return fallback_default
 
     return result
 

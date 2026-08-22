@@ -86,6 +86,7 @@ class ModelCapability:
     streaming_supported: bool = True
     tool_calling_supported: bool = False
     vision_supported: bool = False
+    realtime_audio_supported: bool = False
     available: bool = True
     is_blacklisted: bool = False
     cooldown_until: float = 0.0
@@ -133,6 +134,7 @@ OPENAI_PRODUCTION_MODELS: Set[str] = {
     "gpt-4o",
     "gpt-realtime",
     "gpt-realtime-mini",
+    "gpt-4o-realtime-preview",
 }
 
 
@@ -157,7 +159,7 @@ class ProviderRegistry:
         self._routeable_models: Dict[str, List[str]] = {
             "groq": list(GROQ_PREFERENCE_ORDER),
             "gemini": list(GEMINI_PREFERENCE_ORDER),
-            "openai": ["gpt-4o-mini", "gpt-4o"],
+            "openai": ["gpt-4o-mini", "gpt-4o", "gpt-realtime", "gpt-realtime-mini"],
         }
         self._rejected_models: Dict[str, Dict[str, str]] = {
             "groq": {},
@@ -181,6 +183,7 @@ class ProviderRegistry:
                     streaming_supported=True,
                     tool_calling_supported="llama" in m.lower(),
                     vision_supported=is_vis,
+                    realtime_audio_supported=False,
                 )
             )
         # Gemini
@@ -193,10 +196,12 @@ class ProviderRegistry:
                     streaming_supported=True,
                     tool_calling_supported=True,
                     vision_supported=True,
+                    realtime_audio_supported=False,
                 )
             )
         # OpenAI
         for m in OPENAI_PRODUCTION_MODELS:
+            is_rt = "realtime" in m.lower()
             self.register_model(
                 ModelCapability(
                     provider="openai",
@@ -205,6 +210,7 @@ class ProviderRegistry:
                     streaming_supported=True,
                     tool_calling_supported=True,
                     vision_supported=True,
+                    realtime_audio_supported=is_rt,
                 )
             )
 
@@ -278,6 +284,8 @@ class ProviderRegistry:
             for m_id in candidates:
                 model = self.get_model(p, m_id)
                 if not model:
+                    continue
+                if capability == "realtime_audio" and not getattr(model, "realtime_audio_supported", False):
                     continue
                 if capability == "vision" and not model.vision_supported:
                     continue
