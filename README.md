@@ -282,6 +282,84 @@ ros2 launch astro_lidar lidar.launch.py
 ros2 launch astro_audio audio.launch.py
 ```
 
+## 🗺️ Simulation, mapping and navigation
+
+A Gazebo Harmonic simulation of the robot, used to develop LiDAR mapping and
+navigation without hardware. Packages: `astro_sim` (world, spawn, ros_gz bridge)
+and `astro_navigation` (slam_toolbox, Nav2).
+
+### Prerequisites
+
+```bash
+sudo apt install -y ros-humble-slam-toolbox ros-humble-nav2-bringup \
+  ros-humble-nav2-common ros-humble-robot-localization \
+  ros-humble-joint-state-publisher ros-humble-twist-mux
+```
+
+Gazebo Harmonic (`gz sim`, package `ros-humble-ros-gzharmonic`) is the simulator.
+Gazebo Classic and Ignition Fortress use different plugin filenames and will not
+load this robot.
+
+### 1. Run the simulation
+
+```bash
+ros2 launch astro_sim simulation.launch.py
+ros2 launch astro_sim simulation.launch.py rviz:=false headless:=true   # no GUI
+ros2 launch astro_sim simulation.launch.py x:=0 y:=-3                   # spawn elsewhere
+```
+
+The world is an indoor plan: a corridor, three rooms behind 0.9 m doorways, and
+furniture that gives scan matching something to lock onto. The robot spawns in
+the corridor at (-4, 0).
+
+Simulation-only parts of the description live in `astro_gazebo.xacro` and are
+included only under `sim_mode:=true`, so the real robot's tf tree is unchanged.
+Sensors publish to the same topics as the hardware (`/scan`, `/imu`,
+`/oak/rgb/image_raw`), which is what lets the same nodes run in both worlds.
+
+### 2. Build a map
+
+```bash
+ros2 launch astro_navigation slam.launch.py                    # 2nd terminal
+ros2 run teleop_twist_keyboard teleop_twist_keyboard           # 3rd, drive around
+```
+
+Drive through every room, and return to where you started so slam_toolbox can
+close the loop. Then save:
+
+```bash
+ros2 run nav2_map_server map_saver_cli \
+  -f ros2_ws/src/astro_navigation/maps/astro_indoor --ros-args -p use_sim_time:=true
+```
+
+### 3. Navigate on the saved map
+
+```bash
+ros2 launch astro_navigation navigation.launch.py
+```
+
+AMCL starts at the map origin, which is the simulation spawn point. On the real
+robot, or after moving the robot by hand, give it a starting estimate with
+RViz's **2D Pose Estimate** before sending a goal — an unlocalised AMCL makes
+the planner produce nonsense. Then use **Nav2 Goal**, or send one directly:
+
+```bash
+ros2 action send_goal /navigate_to_pose nav2_msgs/action/NavigateToPose \
+  "{pose: {header: {frame_id: map}, pose: {position: {x: 6.0, y: 0.0}}}}"
+```
+
+### On the real robot
+
+Both launch files take `use_sim_time:=false`. `astro_lidar`'s `scan_filter_node`
+strips NaN and out-of-range returns and republishes on `/scan_filtered`; point
+SLAM at it with `scan_topic:=/scan_filtered`. The simulated LiDAR is already
+clean, so `/scan` is the default.
+
+> **One odom publisher at a time.** In simulation the DiffDrive plugin publishes
+> `/odom` and `odom -> base_footprint`; on the real robot `serial_bridge` does.
+> Running both puts two publishers on the same transform and tf becomes
+> unusable.
+
 ## 🧪 Tests & CI
 
 ```bash
