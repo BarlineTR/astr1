@@ -42,6 +42,8 @@ from astro_audio.edge_tts_engine import EdgeTTSEngine
 from astro_audio.local_audio_resources import get_local_audio_resources
 from astro_audio.local_offline_tts_engine import LocalOfflineTTSEngine
 from astro_audio.local_xtts_engine import LocalXttsEngine
+from astro_audio.elevenlabs_engine import ElevenLabsEngine
+from astro_audio.openai_tts_engine import OpenAITTSEngine
 
 
 @dataclass
@@ -77,6 +79,8 @@ class TTSRouter:
         edge_tts_engine: Optional[EdgeTTSEngine] = None,
         edge_tts_synth_func: Optional[Callable[[str], Optional[bytes]]] = None,
         edge_tts_enabled: bool = True,
+        openai_tts_engine: Optional[OpenAITTSEngine] = None,
+        elevenlabs_engine: Optional[ElevenLabsEngine] = None,
         output_manager: Optional[AudioOutputManager] = None,
         logger: Optional[Callable[[str, str], None]] = None,
     ):
@@ -85,6 +89,8 @@ class TTSRouter:
         self.edge_tts_engine = edge_tts_engine or (EdgeTTSEngine(logger=logger) if (edge_tts_enabled and not edge_tts_synth_func) else None)
         self._edge_tts_synth_func = edge_tts_synth_func
         self.edge_tts_enabled = edge_tts_enabled
+        self.openai_tts_engine = openai_tts_engine
+        self.elevenlabs_engine = elevenlabs_engine
         self.output_manager = output_manager
         self._log = logger or (lambda lvl, msg: None)
         self.circuit_breaker = get_global_circuit_breaker()
@@ -103,10 +109,18 @@ class TTSRouter:
                 "  reason=production_runtime_disabled"
             )
 
+        el_label = (
+            f"ElevenLabs ({self.elevenlabs_engine.model_id}) -> " if self.elevenlabs_engine else ""
+        )
+        openai_tts_label = (
+            f"OpenAI TTS ({self.openai_tts_engine.model}, Primary Fallback) -> "
+            if self.openai_tts_engine else ""
+        )
         self._safe_log(
             "info",
             f"🎯 [TTSRouter] Production Hiyerarşi Aktif: OpenAI Realtime (Primary) -> "
-            f"Edge-TTS (Primary Fallback, timeout={self.edge_timeout_s}s) -> "
+            f"{el_label}{openai_tts_label}"
+            f"Edge-TTS (timeout={self.edge_timeout_s}s) -> "
             f"Local Offline TTS (Emergency Fallback) -> Pre-generated Emergency WAV"
         )
 
@@ -160,8 +174,8 @@ class TTSRouter:
             self._safe_log("info", f'[TTS REQUESTED] generation_id={generation_id} requested_provider=openai_realtime text="{clean_text}"')
             fallback_chain.append("openai_realtime")
         else:
-            self._safe_log("info", f'[TTS REQUESTED] generation_id={generation_id} requested_provider=edge_tts selection_reason={effective_fallback_reason} text="{clean_text}"')
-            fallback_chain.append("edge_tts")
+            first_provider = "openai_tts" if self.openai_tts_engine else "edge_tts"
+            self._safe_log("info", f'[TTS REQUESTED] generation_id={generation_id} requested_provider={first_provider} selection_reason={effective_fallback_reason} text="{clean_text}"')
 
         # -------------------------------------------------------------
         # STEP 1: Local XTTS Engine (Only if explicitly enabled and ready in test mode)
@@ -186,6 +200,89 @@ class TTSRouter:
                     )
             except Exception as e:
                 fallback_chain.append(f"xtts_gpu(error:{e})")
+
+        # -------------------------------------------------------------
+        # STEP 1.4: ElevenLabs (yalnızca açıkça etkinleştirildiyse kurulur)
+        # -------------------------------------------------------------
+        if self.elevenlabs_engine and self.elevenlabs_engine.is_ready():
+            t_el = time.perf_counter()
+            pcm = None
+            try:
+                pcm = self.elevenlabs_engine.synthesize_sentence(
+                    clean_text, generation_id=generation_id, language=language)
+            except Exception as e:
+                fallback_chain.append(f"elevenlabs(error:{e})")
+                self._safe_log("warn", f"⚠️ [ElevenLabs Error]: {e}")
+            el_ms = (time.perf_counter() - t_el) * 1000.0
+            tot_ms = (time.perf_counter() - t_start) * 1000.0
+            if pcm and len(pcm) > 10:
+                fallback_chain.append("elevenlabs")
+                self._safe_log("info", f"✅ [ELEVENLABS SUCCESS] generation_id={generation_id} audio_bytes={len(pcm)} ttfa_ms={el_ms:.1f}")
+                return TTSRouteResult(
+                    pcm=pcm, selected_provider="elevenlabs", actual_provider="elevenlabs",
+                    model_name=self.elevenlabs_engine.model_id, source_name="elevenlabs_cloud",
+                    tts_state="network_cloud", tts_ready=True, tts_healthy=True,
+                    fallback_reason=effective_fallback_reason, fallback_chain=fallback_chain,
+                    duration_ms=tot_ms, ttfa_ms=tot_ms, infer_ms=el_ms, queue_wait_ms=0.0,
+                )
+            fallback_chain.append("elevenlabs(synthesis_failed)")
+
+        # -------------------------------------------------------------
+        # STEP 1.5: OpenAI Speech API (Realtime düğümü yokken birincil bulut TTS)
+        # -------------------------------------------------------------
+        if self.openai_tts_engine:
+            t_oa_start = time.perf_counter()
+            pcm = None
+            try:
+                pcm = self.openai_tts_engine.synthesize_sentence(
+                    clean_text,
+                    generation_id=generation_id,
+                    language=language,
+                )
+            except Exception as e:
+                fallback_chain.append(f"openai_tts(error:{e})")
+                self._safe_log("warn", f"⚠️ [OpenAI-TTS Error]: {e}")
+
+            tot_oa_ms = (time.perf_counter() - t_oa_start) * 1000.0
+            tot_ms = (time.perf_counter() - t_start) * 1000.0
+
+            if pcm and len(pcm) > 10:
+                fallback_chain.append("openai_tts")
+                self._safe_log(
+                    "info",
+                    f"✅ [OPENAI-TTS SUCCESS]\n"
+                    f"  generation_id={generation_id}\n"
+                    f"  audio_bytes={len(pcm)}\n"
+                    f"  ttfa_ms={tot_oa_ms:.1f}\n"
+                    f"  total_ms={tot_ms:.1f}"
+                )
+                return TTSRouteResult(
+                    pcm=pcm,
+                    selected_provider="openai_tts",
+                    actual_provider="openai_tts",
+                    model_name=self.openai_tts_engine.model,
+                    source_name="openai_speech_api",
+                    tts_state="network_cloud",
+                    tts_ready=True,
+                    tts_healthy=True,
+                    fallback_reason=effective_fallback_reason,
+                    fallback_chain=fallback_chain,
+                    duration_ms=tot_ms,
+                    ttfa_ms=tot_ms,
+                    infer_ms=tot_oa_ms,
+                    queue_wait_ms=0.0,
+                )
+
+            if "openai_tts" not in fallback_chain and not any(c.startswith("openai_tts(") for c in fallback_chain):
+                fallback_chain.append("openai_tts(synthesis_failed)")
+            self._safe_log(
+                "warn",
+                f"⚠️ [TTS FALLBACK]\n"
+                f"  generation_id={generation_id}\n"
+                f"  from=openai_tts\n"
+                f"  to=edge_tts\n"
+                f"  reason=openai_tts_failed"
+            )
 
         # -------------------------------------------------------------
         # STEP 2: Edge-TTS Cloud Neural Service (Primary Fallback)

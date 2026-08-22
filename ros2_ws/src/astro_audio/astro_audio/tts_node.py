@@ -10,6 +10,10 @@ Features:
 """
 
 import json
+import logging
+
+_LOG = logging.getLogger(__name__)
+
 import os
 import queue
 import threading
@@ -39,7 +43,6 @@ def _load_env():
         os.path.abspath(".env.production"),
         os.path.abspath(os.path.join(os.getcwd(), ".env")),
         os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..", "..", ".env")),
-        os.path.expanduser("~/Desktop/astr1/.env"),
         os.path.expanduser("~/.env"),
     ]
     for c in candidates:
@@ -51,8 +54,8 @@ def _load_env():
         if env_path:
             load_dotenv(dotenv_path=env_path, override=True)
             return env_path
-    except Exception:
-        pass
+    except Exception as _exc:
+        _LOG.debug("_load_env: yok sayılan hata (%s)", _exc)
     return None
 
 
@@ -98,8 +101,26 @@ class TtsNode(Node):
             logger=self._log,
         )
 
-        # 3. XTTS is DORMANT / DISABLED by production policy (0 spawn, 0 RAM overhead)
+        # 3. Yerel XTTS — yalnızca TTS_ENGINE="xtts" (veya TTS_XTTS_ENABLED=true) ile kurulur.
+        # Eskiden burada koşulsuz "self.local_xtts = None" vardı: 1.816 satırlık XTTS
+        # kodu hiçbir ayarla erişilemiyordu. Varsayılan hâlâ KAPALI (0 süreç, 0 RAM).
         self.local_xtts = None
+        xtts_on = (self.tts_engine_pref == "xtts"
+                   or os.getenv("TTS_XTTS_ENABLED", "false").strip().strip('"\'').lower() in ("1", "true", "yes"))
+        if xtts_on:
+            try:
+                self.local_xtts = LocalXttsEngine(
+                    speaker_wav=resolve_xtts_speaker_wav(os.getenv("TTS_XTTS_SPEAKER_WAV", "")),
+                    language=self.tts_language,
+                    device=os.getenv("TTS_XTTS_DEVICE", "cuda"),
+                    half=os.getenv("TTS_XTTS_HALF", "1").strip() not in ("0", "false", "no"),
+                    home=resolve_xtts_home(os.getenv("TTS_XTTS_HOME", "")),
+                    logger=self._log,
+                )
+                self._log("info", "🎙️ [TTS] Yerel XTTS etkin (TTS_ENGINE=xtts)")
+            except Exception as exc:
+                self.local_xtts = None
+                self._log("warn", f"⚠️ [TTS] XTTS başlatılamadı ({exc}) — zincirdeki sonraki motora düşülecek.")
 
         # 4. Initialize Local Offline TTS & Edge-TTS engines
         from astro_audio.edge_tts_engine import EdgeTTSEngine
@@ -113,6 +134,38 @@ class TtsNode(Node):
             logger=self._log,
         )
 
+        # 4.5 OpenAI Speech API motoru (TTS_ENGINE="openai" ile etkinleşir).
+        # Realtime düğümü (astro_realtime_node) klasik robot.launch.py boru hattında
+        # çalışmadığı için, TTS'in OpenAI üzerinden geçmesinin tek yolu budur.
+        self.openai_tts = None
+        if self.tts_engine_pref in ("openai", "openai-tts", "openai_tts"):
+            from astro_audio.openai_tts_engine import OpenAITTSEngine
+
+            engine = OpenAITTSEngine(voice=self.openai_voice, logger=self._log)
+            if engine.is_installed:
+                self.openai_tts = engine
+            else:
+                self._log(
+                    "warn",
+                    "⚠️ [TTS] TTS_ENGINE=openai ama OpenAI istemcisi kurulamadı "
+                    "(OPENAI_API_KEY eksik/geçersiz olabilir) — Edge-TTS'e düşülecek.",
+                )
+
+        # 4.6 ElevenLabs — TTS_ENGINE="elevenlabs" veya ELEVENLABS_ENABLED=true ile kurulur.
+        # Motor 330 satırdı ama hiçbir yerde örneklenmiyordu; artık zincire bağlı.
+        self.elevenlabs = None
+        el_on = (self.tts_engine_pref == "elevenlabs"
+                 or os.getenv("ELEVENLABS_ENABLED", "false").strip().strip('"\'').lower() in ("1", "true", "yes"))
+        if el_on:
+            from astro_audio.elevenlabs_engine import ElevenLabsEngine
+
+            engine = ElevenLabsEngine(enabled=True, logger=self._log)
+            if engine.is_ready():
+                self.elevenlabs = engine
+                self._log("info", f"🎧 [TTS] ElevenLabs etkin (model: {engine.model_id})")
+            else:
+                self._log("warn", "⚠️ [TTS] ElevenLabs istendi ama API anahtarı/ses kimliği eksik — atlanıyor.")
+
         # 5. Initialize TTS Orchestrator with Authoritative Fallback Chain (Realtime -> Edge-TTS -> Local Offline)
         self.orchestrator = TTSOrchestrator(
             output_manager=self.output_manager,
@@ -120,6 +173,8 @@ class TtsNode(Node):
             local_xtts_engine=self.local_xtts,
             local_offline_tts_engine=self.local_offline_tts,
             edge_tts_engine=self.edge_tts,
+            openai_tts_engine=self.openai_tts,
+            elevenlabs_engine=self.elevenlabs,
             logger=self._log,
             on_state_change=self._on_orchestrator_state_change,
         )
@@ -141,7 +196,16 @@ class TtsNode(Node):
         # Status timer (1Hz)
         self.create_timer(1.0, self._publish_status_heartbeat)
 
-        self.get_logger().info("🚀 [TTS Node] Hybrid Realtime & XTTS GPU Orchestrator Hazır!")
+        # Gerçek zinciri yaz; XTTS kapalıyken "XTTS GPU Orchestrator" demek yanıltıcıydı.
+        chain = []
+        if self.realtime_engine: chain.append("openai_realtime")
+        if self.openai_tts: chain.append(f"openai_tts({self.openai_tts.model})")
+        if self.local_xtts: chain.append("xtts_gpu")
+        if self.edge_tts: chain.append("edge_tts")
+        if self.local_offline_tts: chain.append("espeak")
+        self.get_logger().info(
+            f"🚀 [TTS Node] Hazır | TTS_ENGINE={self.tts_engine_pref} | zincir: {' -> '.join(chain)}"
+        )
 
     def _resolve_speaker_wav(self, xtts_home: str) -> str:
         configured = os.getenv("TTS_XTTS_SPEAKER_WAV", "")
@@ -152,8 +216,8 @@ class TtsNode(Node):
             packaged = os.path.join(get_package_share_directory("astro_audio"), "voices", "astro.wav")
             if os.path.exists(packaged):
                 return packaged
-        except Exception:
-            pass
+        except Exception as _exc:
+            self.get_logger().debug(f"_resolve_speaker_wav: yok sayılan hata ({_exc})")
         return os.path.join(xtts_home, "Recording.wav") if xtts_home else ""
 
     def _start_xtts_background(self):
@@ -191,8 +255,8 @@ class TtsNode(Node):
             parsed = json.loads(text_data)
             if isinstance(parsed, dict) and "text" in parsed:
                 text_data = parsed.get("text", "")
-        except Exception:
-            pass
+        except Exception as _exc:
+            self.get_logger().debug(f"_on_say: yok sayılan hata ({_exc})")
 
         clean_text = clean_text_for_tts(text_data)
         if clean_text:
@@ -250,8 +314,8 @@ def main(args=None):
     node = TtsNode()
     try:
         rclpy.spin(node)
-    except KeyboardInterrupt:
-        pass
+    except KeyboardInterrupt as _exc:
+        _LOG.debug("main: yok sayılan hata (%s)", _exc)
     finally:
         if node.local_xtts:
             node.local_xtts.stop()

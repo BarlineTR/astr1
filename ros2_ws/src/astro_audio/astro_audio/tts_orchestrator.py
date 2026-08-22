@@ -16,6 +16,7 @@ from astro_audio.edge_tts_engine import EdgeTTSEngine
 from astro_audio.elevenlabs_engine import ElevenLabsEngine
 from astro_audio.local_offline_tts_engine import LocalOfflineTTSEngine
 from astro_audio.local_xtts_engine import LocalXttsEngine
+from astro_audio.openai_tts_engine import OpenAITTSEngine
 from astro_audio.realtime_engine import RealtimeEngine
 from astro_audio.sentence_chunker import SentenceChunker
 from astro_audio.tts_metrics import TurnTelemetry
@@ -39,6 +40,7 @@ class TTSOrchestrator:
         local_xtts_engine: Optional[LocalXttsEngine] = None,
         local_offline_tts_engine: Optional[LocalOfflineTTSEngine] = None,
         edge_tts_engine: Optional[EdgeTTSEngine] = None,
+        openai_tts_engine: Optional[OpenAITTSEngine] = None,
         elevenlabs_engine: Optional[ElevenLabsEngine] = None,
         tts_router: Optional[TTSRouter] = None,
         logger=None,
@@ -50,6 +52,7 @@ class TTSOrchestrator:
         self.xtts_engine = local_xtts_engine
         self.local_offline_tts = local_offline_tts_engine
         self.edge_tts_engine = edge_tts_engine
+        self.openai_tts_engine = openai_tts_engine
         self.elevenlabs_engine = elevenlabs_engine
         self._on_state_change_cb = on_state_change
 
@@ -58,6 +61,8 @@ class TTSOrchestrator:
             local_xtts=self.xtts_engine,
             local_offline_tts=self.local_offline_tts,
             edge_tts_engine=self.edge_tts_engine,
+            openai_tts_engine=self.openai_tts_engine,
+            elevenlabs_engine=self.elevenlabs_engine,
             output_manager=self.output_manager,
             logger=logger,
         )
