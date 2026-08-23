@@ -435,10 +435,7 @@ class AstroRealtimeNode(Node):
     active_response_id: Optional[str] = None
     active_generation_id: Optional[int] = None
     active_response_state: str = "IDLE"
-    _turn_queue: List[Dict[str, Any]] = []
-    _last_sent_generation_id: Optional[int] = None
     _session_ready_logged: bool = False
-    _watchdog_timer: Optional[threading.Timer] = None
     _packets_for_gen: int = 0
     _bytes_for_gen: int = 0
     _first_audio_time: Optional[float] = None
@@ -524,9 +521,6 @@ class AstroRealtimeNode(Node):
         self.active_response_id: Optional[str] = None
         self.active_generation_id: Optional[int] = None
         self.active_response_state: str = "IDLE"  # IDLE, RESPONSE_CREATING, RESPONSE_STREAMING, RESPONSE_CANCELLING, COMPLETED
-        self._turn_queue: List[Dict[str, Any]] = []
-        self._last_sent_generation_id: Optional[int] = None
-        self._watchdog_timer: Optional[threading.Timer] = None
         self._packets_for_gen: int = 0
         self._bytes_for_gen: int = 0
         self._first_audio_time: Optional[float] = None
@@ -684,7 +678,6 @@ class AstroRealtimeNode(Node):
         self.pub_transcript = self.create_publisher(String, "/speech/text", 10)
 
         # ROS 2 Subscribers
-        self.create_subscription(String, "/tts/realtime_request", self._on_realtime_turn_request, 10)
         self.create_subscription(String, "/audio/realtime_input_pcm", self._on_input_pcm, 50)
         self.create_subscription(Bool, "/audio/playback_active", self._on_playback_active, 10)
         self.create_subscription(String, "/vision/recognized_person", self._on_recognized_person, 10)
@@ -762,123 +755,6 @@ class AstroRealtimeNode(Node):
             self.pub_realtime_state.publish(msg)
         except Exception:
             pass
-
-    def _on_realtime_turn_request(self, msg: String):
-        """Receives conversational turn request from ai_brain_node and manages single active response."""
-        try:
-            raw = msg.data.strip()
-            if not raw:
-                return
-            if raw.startswith("{") and "text" in raw:
-                data = json.loads(raw)
-                text = data.get("text", "")
-                gen_id = data.get("generation_id", self.realtime_current_generation_id + 1 if self.realtime_current_generation_id else 1)
-            else:
-                text = raw
-                gen_id = self.realtime_current_generation_id + 1 if self.realtime_current_generation_id else 1
-
-            if not text:
-                return
-
-            if gen_id == self._last_sent_generation_id:
-                self.get_logger().info(f"[REALTIME TURN DUPLICATE DROPPED]\ngeneration_id={gen_id}")
-                return
-
-            if not self._ws or not self._loop or not self._is_connected:
-                self.realtime_current_generation_id = gen_id
-                self.get_logger().warn(
-                    f"[REALTIME NO AUDIO]\ngeneration_id={gen_id}\nreason=websocket_not_connected\n"
-                    f"[TTS FALLBACK]\nfrom=openai_realtime\nto=edge_tts\nreason=realtime_unavailable"
-                )
-                # Forward to tts_node for Edge-TTS fallback
-                fb_msg = String()
-                fb_msg.data = json.dumps({
-                    "text": text,
-                    "engine": "edge-tts",
-                    "generation_id": gen_id,
-                    "fallback_reason": "realtime_unavailable",
-                })
-                self.pub_tts_say.publish(fb_msg)
-                return
-
-            if self.active_response_state != "IDLE":
-                self.get_logger().info(f"[REALTIME TURN QUEUED]\ngeneration_id={gen_id}\nreason=active_response")
-                self._turn_queue.append({"text": text, "generation_id": gen_id})
-                return
-
-            self._dispatch_turn(gen_id, text)
-
-        except Exception as e:
-            self.get_logger().error(f"Error in _on_realtime_turn_request: {e}")
-
-    def _dispatch_turn(self, gen_id: int, text: str):
-        """Dispatches a single conversational turn to Realtime WebSocket."""
-        self.realtime_current_generation_id = gen_id
-        self.active_generation_id = gen_id
-        self._last_sent_generation_id = gen_id
-        self.active_response_state = "RESPONSE_CREATING"
-        self.active_response_id = None
-        self.realtime_audio_received = False
-        self._last_requested_text = text
-        self._packets_for_gen = 0
-        self._bytes_for_gen = 0
-        self._first_audio_time = None
-        self._response_start_time = time.monotonic()
-
-        self.get_logger().info(f"[REALTIME TURN SENT]\ngeneration_id={gen_id}\ntext=\"{text}\"")
-
-        turn_event = {
-            "type": "conversation.item.create",
-            "item": {
-                "type": "message",
-                "role": "user",
-                "content": [
-                    {
-                        "type": "input_text",
-                        "text": f"Lütfen şu cevabı tam olarak seslendir: {text}"
-                    }
-                ]
-            }
-        }
-        resp_event = {
-            "type": "response.create",
-            "response": {
-                "instructions": f"Cevabını doğrudan Türkçe olarak seslendir: {text}"
-            }
-        }
-        self.get_logger().debug(f"[REALTIME PAYLOAD OUT] event=response.create payload={json.dumps(resp_event)}")
-        asyncio.run_coroutine_threadsafe(self._ws.send(json.dumps(turn_event)), self._loop)
-        asyncio.run_coroutine_threadsafe(self._ws.send(json.dumps(resp_event)), self._loop)
-
-        # Start watchdog timer for first-packet audio delta deadline (1.2s)
-        if self._watchdog_timer:
-            try:
-                self._watchdog_timer.cancel()
-            except Exception:
-                pass
-        self._watchdog_timer = threading.Timer(1.2, self._check_audio_delta_timeout, args=[gen_id, text])
-        self._watchdog_timer.start()
-
-    def _check_audio_delta_timeout(self, gen_id: int, text: str):
-        """Watchdog: If no audio delta arrives within 1.2s, triggers fallback to Edge-TTS."""
-        active_gen = getattr(self, "active_generation_id", None)
-        curr_gen = getattr(self, "realtime_current_generation_id", None)
-        audio_rec = getattr(self, "realtime_audio_received", False)
-        if (active_gen == gen_id or curr_gen == gen_id) and not audio_rec:
-            self.get_logger().warn(
-                f"[REALTIME NO AUDIO]\ngeneration_id={gen_id}\nreason=no_audio_delta\n"
-                f"[TTS FALLBACK]\nfrom=openai_realtime\nto=edge_tts\nreason=realtime_no_audio"
-            )
-            # Send to /tts/say for Edge-TTS fallback
-            if hasattr(self, "pub_tts_say") and self.pub_tts_say:
-                fb_msg = String()
-                fb_msg.data = json.dumps({
-                    "text": text,
-                    "engine": "edge-tts",
-                    "generation_id": gen_id,
-                    "fallback_reason": "realtime_no_audio",
-                })
-                self.pub_tts_say.publish(fb_msg)
 
     def _run_async_loop(self):
         self._loop = asyncio.new_event_loop()
@@ -1262,12 +1138,6 @@ class AstroRealtimeNode(Node):
         elif event_type in ("response.audio.delta", "response.output_audio.delta"):
             delta_b64 = event.get("delta", "")
             if delta_b64:
-                if self._watchdog_timer:
-                    try:
-                        self._watchdog_timer.cancel()
-                    except Exception:
-                        pass
-                    self._watchdog_timer = None
                 self.active_response_state = "RESPONSE_STREAMING"
                 self.realtime_audio_received = True
                 self.realtime_response_state = "STREAMING"
@@ -1373,12 +1243,6 @@ class AstroRealtimeNode(Node):
 
         # 3d. Response Done / Cancelled
         elif event_type in ("response.done", "response.cancelled"):
-            if self._watchdog_timer:
-                try:
-                    self._watchdog_timer.cancel()
-                except Exception:
-                    pass
-                self._watchdog_timer = None
             total_audio_ms = (time.monotonic() - getattr(self, "_response_start_time", time.monotonic())) * 1000.0
             first_ms = (self._first_audio_time - getattr(self, "_response_start_time", self._first_audio_time)) * 1000.0 if self._first_audio_time else 0.0
             if not self.realtime_audio_received:
@@ -1400,11 +1264,6 @@ class AstroRealtimeNode(Node):
             self.active_response_id = None
             self.active_generation_id = None
             self.active_response_state = "IDLE"
-
-            # Check if there are queued turns waiting to be dispatched
-            if self._turn_queue:
-                next_turn = self._turn_queue.pop(0)
-                self._dispatch_turn(next_turn["generation_id"], next_turn["text"])
 
         # 4. User Speech Transcription Completed
         elif event_type in ("conversation.item.input_audio_transcription.completed", "conversation.item.input_audio_transcription.done"):

@@ -1488,35 +1488,6 @@ class TestP0LaunchIntegrationAndRealtimePrimaryVoice(unittest.TestCase):
 class TestP02RealtimeTurnPipelineAndHardwareCorrection(unittest.TestCase):
     """P0.2 Acceptance Tests: Realtime Turn Pipeline, Single-Owner Audio, and Arduino Safety Protocol."""
 
-    def test_realtime_turn_is_sent_to_websocket(self):
-        """1. Turn Pipeline: /tts/realtime_request sends conversation.item.create & response.create to WS."""
-        from astro_ai.astro_realtime_node import AstroRealtimeNode
-        node = AstroRealtimeNode.__new__(AstroRealtimeNode)
-        node._ws = MagicMock()
-        node._loop = MagicMock()
-        node._is_connected = True
-        node.realtime_current_generation_id = 0
-        node.realtime_audio_received = False
-        node.pub_tts_say = MagicMock()
-
-        logs = []
-        mock_logger = MagicMock()
-        mock_logger.info = lambda msg: logs.append(msg)
-        mock_logger.warn = lambda msg: logs.append(msg)
-        mock_logger.error = lambda msg: logs.append(msg)
-        node.get_logger = lambda: mock_logger
-
-        with patch("asyncio.run_coroutine_threadsafe") as mock_async:
-            msg = MagicMock()
-            msg.data = json.dumps({"text": "Merhaba robot", "generation_id": 5})
-            node._on_realtime_turn_request(msg)
-
-            self.assertEqual(node.realtime_current_generation_id, 5)
-            self.assertEqual(mock_async.call_count, 2)  # item.create + response.create
-            log_text = "\n".join(logs)
-            self.assertIn("[REALTIME TURN SENT]", log_text)
-            self.assertIn("generation_id=5", log_text)
-            self.assertIn('text="Merhaba robot"', log_text)
 
     def test_realtime_audio_delta_reaches_audio_output(self):
         """2. Audio Stream: response.audio.delta publishes to /audio/realtime_output_pcm and reaches AudioOutputManager."""
@@ -1559,33 +1530,6 @@ class TestP02RealtimeTurnPipelineAndHardwareCorrection(unittest.TestCase):
         tts._on_realtime_output_pcm(pcm_msg)
         tts.output_manager.write_realtime_pcm.assert_called_once_with(0, pcm_sample, sample_rate=24000)
 
-    def test_realtime_no_delta_falls_back_to_edge(self):
-        """3. Fallback: Deadline timeout with no audio delta triggers [REALTIME NO AUDIO] and [TTS FALLBACK]."""
-        from astro_ai.astro_realtime_node import AstroRealtimeNode
-        node = AstroRealtimeNode.__new__(AstroRealtimeNode)
-        node.pub_tts_say = MagicMock()
-        node.realtime_current_generation_id = 9
-        node.realtime_audio_received = False
-
-        logs = []
-        mock_logger = MagicMock()
-        mock_logger.warn = lambda msg: logs.append(msg)
-        node.get_logger = lambda: mock_logger
-
-        node._check_audio_delta_timeout(gen_id=9, text="Görüşürüz")
-
-        node.pub_tts_say.publish.assert_called_once()
-        sent_payload = json.loads(node.pub_tts_say.publish.call_args[0][0].data)
-        self.assertEqual(sent_payload["engine"], "edge-tts")
-        self.assertEqual(sent_payload["generation_id"], 9)
-        self.assertEqual(sent_payload["fallback_reason"], "realtime_no_audio")
-
-        log_text = "\n".join(logs)
-        self.assertIn("[REALTIME NO AUDIO]", log_text)
-        self.assertIn("reason=no_audio_delta", log_text)
-        self.assertIn("[TTS FALLBACK]", log_text)
-        self.assertIn("from=openai_realtime", log_text)
-        self.assertIn("to=edge_tts", log_text)
 
     def test_realtime_connected_without_turn_is_not_actual_provider(self):
         """4. Telemetry: Connected without audio delta produces actual_provider=edge_tts."""
@@ -1787,60 +1731,7 @@ class TestP02RealtimeTurnPipelineAndHardwareCorrection(unittest.TestCase):
 class TestP03CriticalRuntimeRecovery(unittest.TestCase):
     """P0.3 Acceptance Tests: Realtime Schema, Deduplication, and Arduino Heartbeat Continuity."""
 
-    def test_realtime_response_payload_matches_current_schema(self):
-        """1. Schema: response.create payload contains valid instructions and matches current schema."""
-        from astro_ai.astro_realtime_node import AstroRealtimeNode
-        node = AstroRealtimeNode.__new__(AstroRealtimeNode)
-        node._ws = MagicMock()
-        node._loop = MagicMock()
-        node._is_connected = True
-        node.realtime_current_generation_id = 0
-        node.realtime_audio_received = False
-        node.pub_tts_say = MagicMock()
 
-        logs = []
-        mock_logger = MagicMock()
-        mock_logger.info = lambda msg: logs.append(msg)
-        mock_logger.debug = lambda msg: logs.append(msg)
-        node.get_logger = lambda: mock_logger
-
-        sent_payloads = []
-        def fake_run_coroutine(coro, loop):
-            pass
-
-        with patch("asyncio.run_coroutine_threadsafe", side_effect=fake_run_coroutine):
-            msg = MagicMock()
-            msg.data = json.dumps({"text": "Merhaba", "generation_id": 1})
-            node._on_realtime_turn_request(msg)
-
-            log_text = "\n".join(logs)
-            self.assertIn("[REALTIME PAYLOAD OUT] event=response.create", log_text)
-            self.assertNotIn("modalities", log_text)
-
-    def test_realtime_response_modalities_not_sent(self):
-        """2. Schema: response.create payload strictly does NOT include response.modalities."""
-        from astro_ai.astro_realtime_node import AstroRealtimeNode
-        node = AstroRealtimeNode.__new__(AstroRealtimeNode)
-        node._ws = MagicMock()
-        node._loop = MagicMock()
-        node._is_connected = True
-        node.realtime_current_generation_id = 0
-        node.realtime_audio_received = False
-        node.pub_tts_say = MagicMock()
-
-        captured_events = []
-        with patch("asyncio.run_coroutine_threadsafe") as mock_async:
-            mock_async.side_effect = lambda coro, loop: captured_events.append(coro)
-            msg = MagicMock()
-            msg.data = json.dumps({"text": "Test", "generation_id": 2})
-            mock_logger = MagicMock()
-            node.get_logger = lambda: mock_logger
-            node._on_realtime_turn_request(msg)
-
-        # Verify no modalities in the module's response.create logic
-        import inspect
-        src = inspect.getsource(AstroRealtimeNode._on_realtime_turn_request)
-        self.assertNotIn('"modalities"', src)
 
     def test_realtime_audio_delta_received(self):
         """3. Audio Delta: response.audio.delta sets realtime_audio_received=True and publishes PCM."""
@@ -2275,54 +2166,7 @@ class TestP04RuntimeCriticalRecovery(unittest.TestCase):
         self.assertIn("[REALTIME AUDIO DELTA] generation_id=12", log_text)
         self.assertIn("actual_provider=openai_realtime", log_text)
 
-    def test_realtime_generation_id_is_preserved_end_to_end(self):
-        """5. Realtime: authoritative generation_id is preserved from request through audio done."""
-        from astro_ai.astro_realtime_node import AstroRealtimeNode
-        node = AstroRealtimeNode.__new__(AstroRealtimeNode)
-        node._ws = MagicMock()
-        node._loop = MagicMock()
-        node._is_connected = True
-        node.realtime_current_generation_id = 0
-        node.realtime_audio_received = False
-        node.pub_output_pcm = MagicMock()
-        node.pub_tts_say = MagicMock()
 
-        logs = []
-        mock_logger = MagicMock()
-        mock_logger.info = lambda msg: logs.append(msg)
-        mock_logger.debug = lambda msg: logs.append(msg)
-        node.get_logger = lambda: mock_logger
-
-        def fake_run(coro, loop):
-            pass
-
-        with patch("asyncio.run_coroutine_threadsafe", side_effect=fake_run):
-            msg = MagicMock()
-            msg.data = json.dumps({"text": "Test Turn", "generation_id": 707881})
-            node._on_realtime_turn_request(msg)
-
-            self.assertEqual(node.realtime_current_generation_id, 707881)
-            log_text = "\n".join(logs)
-            self.assertIn("[REALTIME TURN SENT]\ngeneration_id=707881", log_text)
-
-    def test_realtime_no_audio_falls_back_to_edge(self):
-        """6. Realtime: 1.2s timeout with no audio triggers Edge-TTS fallback."""
-        from astro_ai.astro_realtime_node import AstroRealtimeNode
-        node = AstroRealtimeNode.__new__(AstroRealtimeNode)
-        node.pub_tts_say = MagicMock()
-        node.realtime_current_generation_id = 88
-        node.realtime_audio_received = False
-
-        logs = []
-        mock_logger = MagicMock()
-        mock_logger.warn = lambda msg: logs.append(msg)
-        node.get_logger = lambda: mock_logger
-
-        node._check_audio_delta_timeout(gen_id=88, text="Fallback query")
-        node.pub_tts_say.publish.assert_called_once()
-        log_text = "\n".join(logs)
-        self.assertIn("[REALTIME NO AUDIO]", log_text)
-        self.assertIn("[TTS FALLBACK]\nfrom=openai_realtime\nto=edge_tts\nreason=realtime_no_audio", log_text)
 
     def test_heartbeat_ack_parser_matches_firmware_protocol(self):
         """7. Firmware Protocol: SerialBridge handles MSG_HEARTBEAT_ACK (0x13)."""
@@ -2512,135 +2356,9 @@ class TestP04RuntimeCriticalRecovery(unittest.TestCase):
 class TestP05RealtimeStreamStateAndPlaybackSerialization(unittest.TestCase):
     """P0.5 Acceptance Tests: Single Active Realtime Response, Playback Stream Lifecycle, and Telemetry."""
 
-    def test_application_generation_id_preserved_end_to_end(self):
-        """1. Generation ID: Authoritative application generation_id (e.g. 672315) is preserved through the lifecycle."""
-        import base64
-        import asyncio
-        from astro_ai.astro_realtime_node import AstroRealtimeNode
-        node = AstroRealtimeNode.__new__(AstroRealtimeNode)
-        node._ws = MagicMock()
-        node._loop = MagicMock()
-        node._is_connected = True
-        node.realtime_current_generation_id = 0
-        node.active_response_state = "IDLE"
-        node.active_response_id = None
-        node.active_generation_id = None
-        node._turn_queue = []
-        node._last_sent_generation_id = None
-        node._watchdog_timer = None
-        node.realtime_audio_received = False
-        node.pub_output_pcm = MagicMock()
-        node.pub_tts_say = MagicMock()
 
-        logs = []
-        mock_logger = MagicMock()
-        mock_logger.info = lambda msg: logs.append(msg)
-        mock_logger.debug = lambda msg: logs.append(msg)
-        node.get_logger = lambda: mock_logger
 
-        with patch("asyncio.run_coroutine_threadsafe"):
-            msg = MagicMock()
-            msg.data = json.dumps({"text": "Realtime test turn", "generation_id": 672315})
-            node._on_realtime_turn_request(msg)
-            self.assertEqual(node.active_generation_id, 672315)
 
-            # Response created
-            asyncio.run(node._handle_realtime_event(node._ws, {"type": "response.created", "response": {"id": "resp_001"}}))
-            self.assertEqual(node.active_generation_id, 672315)
-
-            # Audio delta
-            sample_pcm = base64.b64encode(b"\x00\x01" * 160).decode("ascii")
-            asyncio.run(node._handle_realtime_event(node._ws, {"type": "response.audio.delta", "delta": sample_pcm}))
-            self.assertEqual(node.active_generation_id, 672315)
-
-            # Audio done
-            asyncio.run(node._handle_realtime_event(node._ws, {"type": "response.audio.done"}))
-
-            # Response done
-            asyncio.run(node._handle_realtime_event(node._ws, {"type": "response.done"}))
-
-            log_text = "\n".join(logs)
-            self.assertIn("[REALTIME TURN SENT]\ngeneration_id=672315", log_text)
-            self.assertIn("[REALTIME RESPONSE CREATED]\ngeneration_id=672315", log_text)
-            self.assertIn("[REALTIME AUDIO START]\ngeneration_id=672315", log_text)
-            self.assertIn("[REALTIME AUDIO DONE]\ngeneration_id=672315", log_text)
-            self.assertIn("[REALTIME AUDIO SUMMARY]\ngeneration_id=672315", log_text)
-
-    def test_active_response_blocks_duplicate_response_create(self):
-        """2. Active Response: Turn request while active_response_state != IDLE is queued without sending response.create."""
-        from astro_ai.astro_realtime_node import AstroRealtimeNode
-        node = AstroRealtimeNode.__new__(AstroRealtimeNode)
-        node._ws = MagicMock()
-        node._loop = MagicMock()
-        node._is_connected = True
-        node.active_response_state = "RESPONSE_STREAMING"
-        node.active_generation_id = 100
-        node.active_response_id = "resp_100"
-        node._turn_queue = []
-        node._last_sent_generation_id = 100
-
-        logs = []
-        mock_logger = MagicMock()
-        mock_logger.info = lambda msg: logs.append(msg)
-        node.get_logger = lambda: mock_logger
-
-        with patch("asyncio.run_coroutine_threadsafe") as mock_coro:
-            msg = MagicMock()
-            msg.data = json.dumps({"text": "Second turn", "generation_id": 101})
-            node._on_realtime_turn_request(msg)
-
-            # Verify no WS send was triggered
-            mock_coro.assert_not_called()
-            self.assertEqual(len(node._turn_queue), 1)
-            log_text = "\n".join(logs)
-            self.assertIn("[REALTIME TURN QUEUED]\ngeneration_id=101\nreason=active_response", log_text)
-
-    def test_turn_is_queued_when_response_active(self):
-        """3. Queueing: Pending turn items wait in _turn_queue until response.done."""
-        from astro_ai.astro_realtime_node import AstroRealtimeNode
-        node = AstroRealtimeNode.__new__(AstroRealtimeNode)
-        node._ws = MagicMock()
-        node._loop = MagicMock()
-        node._is_connected = True
-        node.active_response_state = "RESPONSE_CREATING"
-        node.active_generation_id = 200
-        node._turn_queue = []
-        node._last_sent_generation_id = 200
-        node.get_logger = lambda: MagicMock()
-
-        msg = MagicMock()
-        msg.data = json.dumps({"text": "Queued Turn", "generation_id": 201})
-        node._on_realtime_turn_request(msg)
-        self.assertEqual(node._turn_queue[0]["generation_id"], 201)
-
-    def test_response_done_clears_active_response(self):
-        """4. Lifecycle: response.done clears active_response_state to IDLE and dispatches queued turns."""
-        import asyncio
-        from astro_ai.astro_realtime_node import AstroRealtimeNode
-        node = AstroRealtimeNode.__new__(AstroRealtimeNode)
-        node._ws = MagicMock()
-        node._loop = MagicMock()
-        node._is_connected = True
-        node.active_response_state = "RESPONSE_STREAMING"
-        node.active_response_id = "resp_300"
-        node.active_generation_id = 300
-        node.realtime_audio_received = True
-        node._turn_queue = [{"text": "Next queued turn", "generation_id": 301}]
-        node._last_sent_generation_id = 300
-        node._watchdog_timer = None
-        node._packets_for_gen = 5
-        node._bytes_for_gen = 1000
-        node._first_audio_time = time.monotonic()
-        node._response_start_time = time.monotonic()
-        node.get_logger = lambda: MagicMock()
-
-        dispatched = []
-        node._dispatch_turn = lambda gen_id, text: dispatched.append((gen_id, text))
-
-        asyncio.run(node._handle_realtime_event(node._ws, {"type": "response.done"}))
-
-        self.assertEqual(len(dispatched), 1)
-        self.assertEqual(dispatched[0][0], 301)
 
     def test_cancel_not_sent_after_response_done(self):
         """5. Barge-In: user speech started does NOT send response.cancel when response is IDLE."""
@@ -2815,23 +2533,6 @@ class TestP05RealtimeStreamStateAndPlaybackSerialization(unittest.TestCase):
         log_text = "\n".join(logs)
         self.assertEqual(log_text.count("[REALTIME SESSION READY]"), 1)
 
-    def test_duplicate_turn_is_rejected(self):
-        """13. Duplicate: Re-submitting the same generation_id is dropped and logged."""
-        from astro_ai.astro_realtime_node import AstroRealtimeNode
-        node = AstroRealtimeNode.__new__(AstroRealtimeNode)
-        node._last_sent_generation_id = 999
-
-        logs = []
-        mock_logger = MagicMock()
-        mock_logger.info = lambda msg: logs.append(msg)
-        node.get_logger = lambda: mock_logger
-
-        msg = MagicMock()
-        msg.data = json.dumps({"text": "Duplicate", "generation_id": 999})
-        node._on_realtime_turn_request(msg)
-
-        log_text = "\n".join(logs)
-        self.assertIn("[REALTIME TURN DUPLICATE DROPPED]\ngeneration_id=999", log_text)
 
     def test_server_vad_configuration(self):
         """15. Realtime S2S: Session config configures server_vad with native create_response=True."""
@@ -2925,7 +2626,25 @@ class TestP05RealtimeStreamStateAndPlaybackSerialization(unittest.TestCase):
 if __name__ == "__main__":
     unittest.main()
 
-
-
-
-
+# ---------------------------------------------------------------------------
+# SİLİNEN TESTLER — cascaded metin enjeksiyon hattının kontratını test ediyorlardı
+# (/tts/realtime_request -> _on_realtime_turn_request -> _dispatch_turn).
+# O hat Spec #1'de söküldü: Realtime saf S2S motorudur, metin seslendiren bir
+# TTS değil. Bkz. docs/superpowers/specs/2026-08-23-realtime-s2s-voice-core-design.md §5.1
+#
+# Korunan garantiler nereye taşındı:
+#   generation_id korunması        -> test_turn_machine.TestHappyPath
+#                                     .test_generation_id_increments_per_response
+#   aktif response'ta çift create   -> test_turn_machine.TestNeverCreatesResponse
+#                                     (FSM hiçbir koşulda response.create üretmez)
+#   response.done aktifi temizler    -> test_turn_machine.TestHappyPath.test_full_turn_cycle
+#   eski generation delta'sı düşer   -> test_turn_machine.TestGenerationIsolation
+#
+# Karşılığı OLMAYAN, bilerek kaldırılan davranışlar:
+#   turn kuyruğu / çift turn reddi   -> Dışarıdan turn enjekte edilmediği için
+#                                       kuyruğa alınacak turn yok.
+#   audio-delta watchdog -> Edge-TTS -> Saf S2S'te geri düşülecek bir METİN yok;
+#                                       ses hiç üretilmediyse seslendirilecek bir
+#                                       şey de yoktur. Ağ kaybı EngineState
+#                                       FALLBACK_ACTIVE ile ele alınır (Spec #3).
+# ---------------------------------------------------------------------------

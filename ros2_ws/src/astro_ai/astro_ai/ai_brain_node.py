@@ -333,7 +333,6 @@ class AiBrainNode(Node):
 
         # ROS 2 Publishers
         self.pub_tts = self.create_publisher(String, "/tts/say", 10)
-        self.pub_realtime_req = self.create_publisher(String, "/tts/realtime_request", 10)
         self.pub_interrupt = self.create_publisher(Bool, "/tts/interrupt", 10)
         self.pub_emotion = self.create_publisher(String, "/robot/emotion", 10)
         self.pub_gesture = self.create_publisher(String, "/robot/head_gesture", 10)
@@ -2501,16 +2500,18 @@ class AiBrainNode(Node):
                 and self._realtime_session_ready
             )
             if openai_realtime_ok and self.session.metadata.get("tts_engine") != "edge-tts":
-                tts_engine = "openai_realtime"
-                reason = "realtime_available"
+                # Realtime'a METİN ENJEKTE EDİLMEZ. /tts/realtime_request hattı
+                # kaldırıldı: Realtime saf S2S motorudur, metin seslendiren bir
+                # TTS değil. ai_brain_node cascaded modun beynidir ve sesini her
+                # zaman tts_node üzerinden çıkarır.
+                # Bkz. docs/superpowers/specs/2026-08-23-realtime-s2s-voice-core-design.md §5.1
+                tts_engine = "tts_node_default"
+                reason = "cascaded_tts"
                 self.get_logger().info(f"[TTS REQUESTED] requested_provider={tts_engine} selection_reason={reason} text=\"{clean}\"")
                 req_payload = {"text": clean, "generation_id": gen_id}
                 msg = String()
                 msg.data = json.dumps(req_payload)
-                if hasattr(self, "pub_realtime_req") and self.pub_realtime_req is not None:
-                    self.pub_realtime_req.publish(msg)
-                else:
-                    self.pub_tts.publish(msg)
+                self.pub_tts.publish(msg)
             else:
                 tts_engine = "edge_tts"
                 if self.circuit_breaker and self.circuit_breaker.is_exhausted("openai"):
