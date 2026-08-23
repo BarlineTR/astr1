@@ -456,6 +456,9 @@ class AstroRealtimeNode(Node):
     #: Kullanıcı deşifresi response.done'dan sonra gelebiliyor (canlı logda
     #: 330 ms sonra geldi). Kurtarmayı bu kadar bekletip tekrar deniyoruz.
     SILENT_RECOVERY_GRACE_S = 0.8
+
+    #: Rate limit mesajında süre yoksa bu kadar bekle.
+    FALLBACK_DEFAULT_COOLDOWN_S = 90.0
     active_response_id: Optional[str] = None
     active_generation_id: Optional[int] = None
     active_response_state: str = "IDLE"
@@ -731,6 +734,9 @@ class AstroRealtimeNode(Node):
         self._assistant_text_buffer: str = ""
         #: Kullanıcı deşifresi response.done'dan SONRA gelebiliyor.
         self._last_user_transcript: str = ""
+        #: Bu ana kadar Realtime'a yeniden bağlanma DENENMEZ. Rate limit'te
+        #: bağlanmak yalnızca aynı duvara toslar ve log'u doldurur.
+        self._fallback_until: float = 0.0
         self.engine_state = EngineStateTracker()
         self.get_logger().info(
             f"[VOICE ENGINE STATE]\n"
@@ -860,6 +866,26 @@ class AstroRealtimeNode(Node):
         model_idx = 0
 
         while (rclpy.ok() if (rclpy is not None and hasattr(rclpy, "ok")) else True):
+            # Fallback modundayken Realtime'a asılmayı bırak. Rate limit kalıcı
+            # bir engel: her deneme aynı hatayla dönüp 1013 soğuma döngüsünü
+            # besliyor, log'u dolduruyor ve hiçbir işe yaramıyor. Bekleme
+            # süresi dolunca tek bir deneme yapılır.
+            if not self._should_attempt_realtime_connect():
+                _left = max(0.0, self._fallback_until - time.monotonic())
+                if not getattr(self, "_fallback_hold_logged", False):
+                    self.get_logger().info(
+                        f"[REALTIME HOLD]\nreason=fallback_active\n"
+                        f"retry_in_s={_left:.0f}\nengine=edge_tts"
+                    )
+                    self._fallback_hold_logged = True
+                await asyncio.sleep(min(5.0, max(1.0, _left)))
+                continue
+            if getattr(self, "_fallback_hold_logged", False):
+                self._fallback_hold_logged = False
+                self.get_logger().info(
+                    "[REALTIME RETRY] reason=fallback_cooldown_elapsed — tek deneme yapılıyor."
+                )
+
             current_model = candidate_models[model_idx % len(candidate_models)]
             ws_url = f"wss://api.openai.com/v1/realtime?model={current_model}"
             try:
@@ -1337,11 +1363,10 @@ class AstroRealtimeNode(Node):
                     f"failure_kind={failure.value}\n"
                     f"detail={_details.get('error', _details) or 'none'}"
                 )
-                if should_enter_fallback_mode(failure) and not self._fallback_mode:
-                    self._fallback_mode = True
-                    self.engine_state.transition_to(EngineState.FALLBACK_ACTIVE)
-                    self.get_logger().warn(
-                        f"[VOICE ENGINE STATE] state=FALLBACK_ACTIVE reason={failure.value.lower()}"
+                if should_enter_fallback_mode(failure):
+                    _detail_msg = str((_details.get("error") or {}).get("message", ""))
+                    self._enter_fallback_mode(
+                        failure.value.lower(), self._parse_retry_after_s(_detail_msg)
                     )
                 self._recover_silent_response(failure)
             else:
@@ -1453,15 +1478,10 @@ class AstroRealtimeNode(Node):
             # düşüyor; robot çoğu turda sessiz kalıyor.
             _err_blob = f"{err_code} {err_type} {err_msg}".lower()
             if "rate_limit" in _err_blob or "rate limit" in _err_blob or "429" in _err_blob:
-                if not self._fallback_mode:
-                    self._fallback_mode = True
-                    self.engine_state.transition_to(EngineState.FALLBACK_ACTIVE)
-                    self.get_logger().warn(
-                        f"[REALTIME RATE LIMITED]\n"
-                        f"error_class={err_type}:{err_code}\n"
-                        f"[VOICE ENGINE STATE] state=FALLBACK_ACTIVE\n"
-                        f"[TTS FALLBACK] from=openai_realtime to=edge_tts reason=rate_limit_exceeded"
-                    )
+                self.get_logger().warn(f"[REALTIME RATE LIMITED] error_class={err_type}:{err_code}")
+                self._enter_fallback_mode(
+                    "rate_limit_exceeded", self._parse_retry_after_s(str(err_msg))
+                )
 
             self._is_responding = False
             self.realtime_response_state = "IDLE"
@@ -3266,6 +3286,42 @@ class AstroRealtimeNode(Node):
         self.repetition_guard.record_response(default_resp)
         return default_resp
 
+    @staticmethod
+    def _parse_retry_after_s(message: str) -> Optional[float]:
+        """OpenAI'nin "Please try again in 1m26.4s." metninden saniye çıkarır."""
+        if not message:
+            return None
+        m = re.search(r"try again in\s+(?:(\d+)m)?\s*([\d.]+)s", message, re.IGNORECASE)
+        if not m:
+            return None
+        minutes = float(m.group(1)) if m.group(1) else 0.0
+        seconds = float(m.group(2))
+        return minutes * 60.0 + seconds
+
+    def _should_attempt_realtime_connect(self) -> bool:
+        """Realtime'a yeniden bağlanmayı denemeli miyiz?
+
+        Fallback modundayken ve bekleme süresi dolmamışken HAYIR: rate limit
+        kalıcı bir engel, her deneme aynı hatayla dönüp 1013 soğuma döngüsünü
+        besliyor ve robot boşuna Realtime'a asılıyor.
+        """
+        if not self._fallback_mode:
+            return True
+        return time.monotonic() >= self._fallback_until
+
+    def _enter_fallback_mode(self, reason: str, cooldown_s: Optional[float] = None):
+        """Fallback moduna geçer ve Realtime'a dönmeden önce beklenecek süreyi kurar."""
+        wait_s = cooldown_s if cooldown_s and cooldown_s > 0 else self.FALLBACK_DEFAULT_COOLDOWN_S
+        self._fallback_until = time.monotonic() + wait_s
+        if not self._fallback_mode:
+            self._fallback_mode = True
+            self.engine_state.transition_to(EngineState.FALLBACK_ACTIVE)
+        self.get_logger().warn(
+            f"[VOICE ENGINE STATE]\nstate=FALLBACK_ACTIVE\nreason={reason}\n"
+            f"realtime_retry_in_s={wait_s:.0f}\n"
+            f"[TTS FALLBACK] engine=edge_tts (Realtime bu süre boyunca DENENMEYECEK)"
+        )
+
     def _recover_silent_response(self, failure: "FailureKind"):
         """Yanıt kuruldu ama ses gelmedi — gerçekten konuş.
 
@@ -3315,16 +3371,36 @@ class AstroRealtimeNode(Node):
             )
 
     def _speak_fallback_text(self, text: str):
-        """Metni TTS zinciriyle sentezleyip çalma yoluna verir."""
+        """Metni TTS zinciriyle sentezleyip çalma yoluna verir.
+
+        BÖLÜNMEZ — ve bu ölçümle verilmiş bir karar. Cümlelere bölüp ilk cümleyi
+        erken çalmayı denedik; gerçek Edge-TTS ile 6'şar örnekte:
+
+            44 karakter  -> medyan 631 ms (521-687)
+            152 karakter -> medyan 764 ms (639-820)
+
+        Uzunluk neredeyse etkisiz: süre Microsoft'a sabit gidiş-dönüş maliyeti.
+        Bölmenin kazancı ~130 ms, ama her cümle AYRI bir gidiş-dönüş ödüyor —
+        yani çoğu zaman daha yavaş. Üstelik cevaplar response_length_gate ile
+        ~35 kelimeye kırpılıyor, dolayısıyla uzun metin pratikte oluşmuyor.
+        """
         try:
+            text = (text or "").strip()
+            if not text:
+                return
             self._fallback_generation_id += 1
             gen = self._fallback_generation_id
+            t0 = time.monotonic()
+
             pcm, engine_name, ms, _ready = self._synthesize_speech_pcm(text)
             if not pcm:
-                self.get_logger().error(
-                    "[TTS FALLBACK FAILED] reason=no_engine_produced_audio"
-                )
+                self.get_logger().error("[TTS FALLBACK FAILED] reason=no_engine_produced_audio")
                 return
+
+            self.get_logger().info(
+                f"[TTS FALLBACK FIRST AUDIO]\nengine={engine_name}\n"
+                f"latency_ms={(time.monotonic() - t0) * 1000:.0f}"
+            )
             self._play_pcm_chunks(
                 pcm,
                 generation_id=gen,
@@ -3334,7 +3410,7 @@ class AstroRealtimeNode(Node):
             )
             self.get_logger().info(
                 f"[TTS FALLBACK SPOKEN]\nengine={engine_name}\n"
-                f"latency_ms={ms:.0f}\ngeneration_id={gen}"
+                f"generation_id={gen}\ntotal_ms={(time.monotonic() - t0) * 1000:.0f}"
             )
         except Exception as exc:
             self.get_logger().error(f"[TTS FALLBACK FAILED] error={exc}")

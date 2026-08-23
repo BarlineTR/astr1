@@ -82,6 +82,12 @@ class TestSilentResponseSpeaksAssistantText(unittest.TestCase):
             ))
         synth.assert_called_once()
         self.assertIn("Bugün hava çok güzel.", synth.call_args.args[0])
+        # Seslendirme daemon thread'de: yayının gelmesini sınırlı süre bekle.
+        import time as _t
+        for _ in range(100):
+            if self.node.pub_output_pcm.publish.call_count:
+                break
+            _t.sleep(0.02)
         self.assertGreater(self.node.pub_output_pcm.publish.call_count, 0)
 
     def test_cancelled_response_triggers_no_recovery(self):
