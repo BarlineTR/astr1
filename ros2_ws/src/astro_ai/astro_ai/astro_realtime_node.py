@@ -959,17 +959,22 @@ class AstroRealtimeNode(Node):
             connect_kwargs["extra_headers"] = headers
 
         candidate_models = discover_realtime_models(self.openai_api_key, self.realtime_model)
-        self.get_logger().info(f"📋 [Realtime Modelleri]: Kullanılabilir modeller: {candidate_models}")
+        self.get_logger().info(f"📋 [Realtime Modelleri]: available_models={candidate_models} selected_model={self.realtime_model}")
         model_idx = 0
 
         while (rclpy.ok() if (rclpy is not None and hasattr(rclpy, "ok")) else True):
+            if getattr(self, "_fallback_mode", False) or getattr(self, "realtime_provider_state", "") == "EXHAUSTED":
+                await asyncio.sleep(86400.0)
+                continue
+
             current_model = candidate_models[model_idx % len(candidate_models)]
             ws_url = f"wss://api.openai.com/v1/realtime?model={current_model}"
             try:
                 self.realtime_connection_state = "CONNECTING"
                 self.get_logger().info(
                     f"[REALTIME CONNECTING]\n"
-                    f"model={current_model}"
+                    f"model={current_model}\n"
+                    f"selected_model={self.realtime_model}"
                 )
                 self._publish_realtime_state("CONNECTING")
                 async with websockets.connect(ws_url, **connect_kwargs) as ws:
@@ -3441,13 +3446,15 @@ class AstroRealtimeNode(Node):
         tts_model: str = "xtts_finetuned",
         tts_source: str = "xtts_worker",
     ):
-        """Streams 24kHz int16 PCM audio chunks directly to audio output node with smooth 20ms pacing and full provenance."""
+        """Streams 24kHz int16 PCM audio chunks directly to audio output node with smooth 20ms pacing, end sentinel, and drain synchronization."""
         if not pcm_data:
             return
         self._is_playback_active = True
         self._playback_start_monotonic = time.monotonic()
         self.state_machine.transition_to(RobotState.SPEAKING)
         chunk_size = 960  # 480 samples @ 24kHz int16 = 20ms
+        effective_gen_id = generation_id or self._fallback_generation_id
+        pcm_dur_s = (len(pcm_data) / 2) / 24000.0
         try:
             for i in range(0, len(pcm_data), chunk_size):
                 if self._barge_in_latched:
@@ -3456,17 +3463,41 @@ class AstroRealtimeNode(Node):
                 if chunk:
                     b64_str = base64.b64encode(chunk).decode("ascii")
                     msg_dict = {
-                        "generation_id": generation_id or self._fallback_generation_id,
+                        "generation_id": effective_gen_id,
                         "tts_provider": tts_provider,
                         "tts_model": tts_model,
                         "tts_source": tts_source,
                         "playback_source": tts_source,
+                        "is_done": False,
                         "data": b64_str,
                     }
                     out_msg = String()
                     out_msg.data = json.dumps(msg_dict)
                     self.pub_output_pcm.publish(out_msg)
                     time.sleep(0.018)
+
+            # Send end sentinel if not interrupted by barge-in
+            if not self._barge_in_latched:
+                end_dict = {
+                    "generation_id": effective_gen_id,
+                    "tts_provider": tts_provider,
+                    "tts_model": tts_model,
+                    "tts_source": tts_source,
+                    "playback_source": tts_source,
+                    "is_done": True,
+                    "data": "",
+                }
+                end_msg = String()
+                end_msg.data = json.dumps(end_dict)
+                self.pub_output_pcm.publish(end_msg)
+
+                # Drain synchronization: wait for physical DAC playback completion up to calculated duration
+                t_drain_start = time.monotonic()
+                drain_timeout = max(0.2, pcm_dur_s * 0.5)
+                while self._is_playback_active and (time.monotonic() - t_drain_start < drain_timeout):
+                    if self._barge_in_latched:
+                        break
+                    time.sleep(0.02)
         finally:
             self._is_playback_active = False
             self._playback_end_time = time.monotonic()
@@ -4140,36 +4171,28 @@ class AstroRealtimeNode(Node):
         # P0-7: Barge-in is only evaluated during active audio playback
         is_active_playback = bool(self._is_playback_active)
 
-        # In Fallback mode (Edge-TTS / local synth), completely mute mic input during playback and echo cooldown to prevent self-interruption
-        if getattr(self, "_fallback_mode", False):
-            if is_active_playback:
-                return
-            if (now - getattr(self, "_playback_end_time", 0.0)) < 0.45:
-                return
-
-        # Adaptive barge-in threshold derived from ambient noise floor
-        adaptive_barge_in_rms = max(self.barge_in_min_rms, self._ambient_rms * self.barge_in_noise_mult)
-
         # Zero Self-Hearing Protection & Multi-Signal Persistent Barge-In
         if is_active_playback:
             playback_start = getattr(self, "_playback_start_monotonic", 0.0)
 
-            # 1. Acoustic Protection Window: Strictly suppress self-voice feedback during initial burst (e.g. 350ms)
+            # 1. Acoustic Protection Window: Strictly suppress self-voice feedback during initial burst (e.g. 150ms)
             if playback_start > 0.0 and ((now - playback_start) * 1000.0 < self.barge_in_protection_ms):
                 self._barge_in_consecutive_frames = 0
                 return
 
-            # Adaptive barge-in threshold derived from ambient noise floor
-            adaptive_barge_in_rms = max(self.barge_in_min_rms, self._ambient_rms * self.barge_in_noise_mult)
+            # Target barge-in threshold: During speaker playback, robot speaker creates acoustic baseline of 1000-3500 RMS.
+            # User barge-in requires energetic intentional speech (>4000 RMS / >12000 peak)
+            target_barge_in_rms = self.barge_in_playback_min_rms if getattr(self, "_fallback_mode", False) else max(self.barge_in_min_rms, self._ambient_rms * self.barge_in_noise_mult)
+            target_barge_in_peak = self.barge_in_playback_min_peak if getattr(self, "_fallback_mode", False) else self.barge_in_min_peak
 
-            # 2. Distinguish loud acoustic voice from background
-            is_loud = (local_rms >= adaptive_barge_in_rms and peak_val >= self.barge_in_min_peak)
+            # 2. Distinguish genuine loud user speech from robot's own speaker output
+            is_loud = (local_rms >= target_barge_in_rms and peak_val >= target_barge_in_peak)
             if is_loud:
                 self._barge_in_consecutive_frames += 1
             else:
                 self._barge_in_consecutive_frames = max(0, self._barge_in_consecutive_frames - 1)
 
-            # Require persistent speech across multiple consecutive frames (>= 3 frames = 60ms) to avoid impulse noise
+            # Require persistent speech across multiple consecutive frames (>= 2 frames = 40ms) to avoid impulse noise
             if self._barge_in_consecutive_frames < self.barge_in_min_consecutive_frames:
                 return
 

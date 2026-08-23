@@ -446,9 +446,14 @@ class AudioStreamNode(Node):
         self._last_playback_time = 0.0
         self._playback_drop_until = time.monotonic() + 0.15
         prov = getattr(self, "_active_provenance", {})
+        cancelled_gen = prov.get('generation_id', 0)
+        if not hasattr(self, "_cancelled_gen_ids"):
+            self._cancelled_gen_ids = set()
+        self._cancelled_gen_ids.add(cancelled_gen)
+
         self.get_logger().info(
             f"⚡ [Playback Telemetry]: tts_playback_cancelled=True | "
-            f"generation_id={prov.get('generation_id', 0)} | "
+            f"generation_id={cancelled_gen} | "
             f"playback_source={prov.get('playback_source', 'unknown')} | "
             f"tts_provider={prov.get('tts_provider', 'unknown')} | "
             f"tts_model={prov.get('tts_model', 'unknown')} | "
@@ -496,6 +501,9 @@ class AudioStreamNode(Node):
         gen_played_bytes = 0
         gen_prov = {}
 
+        if not hasattr(self, "_cancelled_gen_ids"):
+            self._cancelled_gen_ids = set()
+
         while not self._stop_event.is_set():
             try:
                 item = self._play_queue.get(timeout=0.05)
@@ -518,8 +526,8 @@ class AudioStreamNode(Node):
 
                 # Check if this is a new generation
                 if (gen_id != active_gen_id) or (not gen_started):
-                    if gen_started and active_gen_id is not None:
-                        # Close prior generation if any
+                    if gen_started and active_gen_id is not None and active_gen_id not in self._cancelled_gen_ids:
+                        # Close prior generation cleanly if not cancelled
                         burst_dur_ms = (time.monotonic() - gen_start_time) * 1000.0
                         self.get_logger().info(
                             f"🔊 [Playback Telemetry]: tts_playback_finished=True | "
@@ -557,12 +565,15 @@ class AudioStreamNode(Node):
                 if is_done:
                     gen_done_seen = True
 
+                # Discard chunks if generation was cancelled by barge-in
+                if active_gen_id in self._cancelled_gen_ids:
+                    continue
+
                 if chunk and len(chunk) > 0:
                     t_w_start = time.perf_counter()
                     with self._playback_lock:
                         out_stream.write(chunk)
                     t_w_end = time.perf_counter()
-                    write_ms = (t_w_end - t_w_start) * 1000.0
 
                     self._is_playing = True
                     self._last_playback_time = time.monotonic()
@@ -575,16 +586,17 @@ class AudioStreamNode(Node):
                     self._playback_burst_active = False
                     gen_started = False
                     burst_dur_ms = (time.monotonic() - gen_start_time) * 1000.0
-                    self.get_logger().info(
-                        f"🔊 [Playback Telemetry]: tts_playback_finished=True | "
-                        f"generation_id={active_gen_id} | "
-                        f"playback_source={gen_prov.get('playback_source', 'unknown')} | "
-                        f"tts_provider={gen_prov.get('tts_provider', 'unknown')} | "
-                        f"tts_model={gen_prov.get('tts_model', 'unknown')} | "
-                        f"tts_played_bytes={gen_played_bytes} | "
-                        f"total_playback_bytes={self._total_played_bytes} | "
-                        f"playback_duration_ms={int(burst_dur_ms)}"
-                    )
+                    if active_gen_id not in self._cancelled_gen_ids:
+                        self.get_logger().info(
+                            f"🔊 [Playback Telemetry]: tts_playback_finished=True | "
+                            f"generation_id={active_gen_id} | "
+                            f"playback_source={gen_prov.get('playback_source', 'unknown')} | "
+                            f"tts_provider={gen_prov.get('tts_provider', 'unknown')} | "
+                            f"tts_model={gen_prov.get('tts_model', 'unknown')} | "
+                            f"tts_played_bytes={gen_played_bytes} | "
+                            f"total_playback_bytes={self._total_played_bytes} | "
+                            f"playback_duration_ms={int(burst_dur_ms)}"
+                        )
                     active_gen_id = None
 
             except queue.Empty:
@@ -593,33 +605,35 @@ class AudioStreamNode(Node):
                     self._playback_burst_active = False
                     gen_started = False
                     burst_dur_ms = (time.monotonic() - gen_start_time) * 1000.0
-                    self.get_logger().info(
-                        f"🔊 [Playback Telemetry]: tts_playback_finished=True | "
-                        f"generation_id={active_gen_id} | "
-                        f"playback_source={gen_prov.get('playback_source', 'unknown')} | "
-                        f"tts_provider={gen_prov.get('tts_provider', 'unknown')} | "
-                        f"tts_model={gen_prov.get('tts_model', 'unknown')} | "
-                        f"tts_played_bytes={gen_played_bytes} | "
-                        f"total_playback_bytes={self._total_played_bytes} | "
-                        f"playback_duration_ms={int(burst_dur_ms)}"
-                    )
+                    if active_gen_id not in self._cancelled_gen_ids:
+                        self.get_logger().info(
+                            f"🔊 [Playback Telemetry]: tts_playback_finished=True | "
+                            f"generation_id={active_gen_id} | "
+                            f"playback_source={gen_prov.get('playback_source', 'unknown')} | "
+                            f"tts_provider={gen_prov.get('tts_provider', 'unknown')} | "
+                            f"tts_model={gen_prov.get('tts_model', 'unknown')} | "
+                            f"tts_played_bytes={gen_played_bytes} | "
+                            f"total_playback_bytes={self._total_played_bytes} | "
+                            f"playback_duration_ms={int(burst_dur_ms)}"
+                        )
                     active_gen_id = None
-                elif gen_started and (time.monotonic() - self._last_playback_time) > 4.0:
+                elif gen_started and (time.monotonic() - self._last_playback_time) > 2.0:
                     # Stream timed out without is_done (e.g. dropped connection)
                     self._is_playing = False
                     self._playback_burst_active = False
                     gen_started = False
                     burst_dur_ms = (time.monotonic() - gen_start_time) * 1000.0
-                    self.get_logger().info(
-                        f"🔊 [Playback Telemetry]: tts_playback_finished=True | "
-                        f"generation_id={active_gen_id} | "
-                        f"playback_source={gen_prov.get('playback_source', 'unknown')} | "
-                        f"tts_provider={gen_prov.get('tts_provider', 'unknown')} | "
-                        f"tts_model={gen_prov.get('tts_model', 'unknown')} | "
-                        f"tts_played_bytes={gen_played_bytes} | "
-                        f"total_playback_bytes={self._total_played_bytes} | "
-                        f"playback_duration_ms={int(burst_dur_ms)} | reason=stream_timeout"
-                    )
+                    if active_gen_id not in self._cancelled_gen_ids:
+                        self.get_logger().info(
+                            f"🔊 [Playback Telemetry]: tts_playback_finished=True | "
+                            f"generation_id={active_gen_id} | "
+                            f"playback_source={gen_prov.get('playback_source', 'unknown')} | "
+                            f"tts_provider={gen_prov.get('tts_provider', 'unknown')} | "
+                            f"tts_model={gen_prov.get('tts_model', 'unknown')} | "
+                            f"tts_played_bytes={gen_played_bytes} | "
+                            f"total_playback_bytes={self._total_played_bytes} | "
+                            f"playback_duration_ms={int(burst_dur_ms)} | reason=stream_timeout"
+                        )
                     active_gen_id = None
                 if (time.monotonic() - self._last_playback_time) > 0.35:
                     self._is_playing = False

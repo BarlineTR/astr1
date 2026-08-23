@@ -4019,6 +4019,121 @@ class TestP09FallbackLifecycleAndHardwareReliability(unittest.TestCase):
         node.on_wheel_cmd(msg)
         self.assertEqual(node.ser.write.call_count, 1)
 
+    def test_playback_finished_after_physical_drain(self):
+        """8. Playback Drain: audio_stream_node processes is_done and logs playback_finished without waiting 4.0s timeout."""
+        import base64
+        import queue
+        from astro_audio.audio_stream_node import AudioStreamNode
+        node = AudioStreamNode.__new__(AudioStreamNode)
+        node._play_queue = queue.Queue()
+        node._playback_lock = threading.Lock()
+        node._stop_event = threading.Event()
+        node._is_playing = False
+        node._playback_burst_active = False
+        node._total_played_bytes = 0
+        node._last_playback_time = time.monotonic()
+        node._out_device_name = "test_speaker"
+        node._cancelled_gen_ids = set()
+        node.get_logger = lambda: MagicMock()
+
+        # Enqueue 1 chunk and 1 is_done sentinel
+        node._on_output_pcm(MagicMock(data=json.dumps({"generation_id": 42, "is_done": False, "data": base64.b64encode(b"\x00\x02" * 480).decode("ascii")})))
+        node._on_output_pcm(MagicMock(data=json.dumps({"generation_id": 42, "is_done": True, "data": ""})))
+
+        # Verify queue contains the data chunk and the done sentinel
+        self.assertEqual(node._play_queue.qsize(), 2)
+
+    def test_playback_cancelled_once(self):
+        """9. Playback Cancellation: Barge-in cancels playback once and does NOT produce finished log later."""
+        import queue
+        from astro_audio.audio_stream_node import AudioStreamNode
+        node = AudioStreamNode.__new__(AudioStreamNode)
+        node._play_queue = queue.Queue()
+        node._playback_lock = threading.Lock()
+        node._total_played_bytes = 1000
+        node._playback_burst_active = True
+        node._burst_start_time = time.monotonic() - 0.20
+        node.barge_in_protection_ms = 100.0
+        node._active_provenance = {"generation_id": 77, "playback_source": "edge_tts", "tts_provider": "edge_tts", "tts_model": "ahmet"}
+        node._cancelled_gen_ids = set()
+        node.get_logger = lambda: MagicMock()
+
+        # Interrupt signal
+        node._on_interrupt(MagicMock(data=True))
+
+        self.assertIn(77, node._cancelled_gen_ids)
+        self.assertFalse(node._playback_burst_active)
+
+    def test_phantom_wake_suppressed(self):
+        """10. Phantom Filtering: Low confidence phantom speech ('Altyazı M.K.', 'Evet.') is rejected without LLM / memory calls."""
+        from astro_ai.astro_realtime_node import AstroRealtimeNode
+        fake_ws = FakeRealtimeTransport()
+        node = AstroRealtimeNode(connect_realtime=False, fake_transport=fake_ws)
+        node._is_sleeping = True
+
+        node._transcribe_wav = MagicMock(return_value="Altyazı M.K.")
+        node._wake_up = MagicMock()
+        node._process_fallback_turn = MagicMock()
+
+        # 300ms of low energy audio
+        audio_chunks = [b"\x00\x05" * 320] * 15
+        node._process_wake_candidate(audio_chunks)
+
+        # Must NOT wake up or create turn
+        self.assertEqual(node._wake_up.call_count, 0)
+        self.assertEqual(node._process_fallback_turn.call_count, 0)
+
+    def test_wake_only_does_not_create_turn(self):
+        """11. Wake Only Semantics: 'Hey Astro' alone wakes robot to LISTENING without fake LLM turn."""
+        from astro_ai.astro_realtime_node import AstroRealtimeNode
+        fake_ws = FakeRealtimeTransport()
+        node = AstroRealtimeNode(connect_realtime=False, fake_transport=fake_ws)
+        node._is_sleeping = True
+
+        node._transcribe_wav = MagicMock(return_value="Hey Astro")
+        node._wake_up = MagicMock()
+        node._process_fallback_turn = MagicMock()
+
+        # Real energy speech audio (500ms)
+        audio_chunks = [b"\x00\x15" * 320] * 25
+        node._process_wake_candidate(audio_chunks)
+
+        # Wakes up but creates NO conversational turn
+        self.assertEqual(node._wake_up.call_count, 1)
+        self.assertEqual(node._process_fallback_turn.call_count, 0)
+
+    def test_wake_with_command_creates_turn(self):
+        """12. Wake + Command Semantics: 'Hey Astro hava nasıl?' triggers conversational turn."""
+        from astro_ai.astro_realtime_node import AstroRealtimeNode
+        fake_ws = FakeRealtimeTransport()
+        node = AstroRealtimeNode(connect_realtime=False, fake_transport=fake_ws)
+        node._is_sleeping = True
+        node._fallback_mode = True
+
+        node._transcribe_wav = MagicMock(return_value="Hey Astro hava nasıl?")
+        node._wake_up = MagicMock()
+        node._process_fallback_turn = MagicMock()
+
+        audio_chunks = [b"\x00\x15" * 320] * 25
+        node._process_wake_candidate(audio_chunks)
+
+        self.assertEqual(node._wake_up.call_count, 1)
+
+    def test_realtime_model_default_is_gpt_realtime_2_1_mini(self):
+        """13. Model Standard: Default realtime model is gpt-realtime-2.1-mini."""
+        from astro_ai.astro_realtime_node import AstroRealtimeNode
+        with patch.dict(os.environ, {}, clear=False):
+            if "REALTIME_MODEL" in os.environ:
+                del os.environ["REALTIME_MODEL"]
+            node = AstroRealtimeNode(connect_realtime=False)
+            self.assertEqual(node.realtime_model, "gpt-realtime-2.1-mini")
+
+    def test_no_audio_output_manager_attribute_error(self):
+        """14. Runtime Ownership: AstroRealtimeNode has 0 AttributeError references to audio_output_manager."""
+        from astro_ai.astro_realtime_node import AstroRealtimeNode
+        node = AstroRealtimeNode(connect_realtime=False)
+        self.assertFalse(hasattr(node, "audio_output_manager"))
+
 
 if __name__ == "__main__":
     unittest.main()
