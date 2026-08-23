@@ -15,16 +15,17 @@ kablolamayı doğrulamak için kullanın.
 | Sol motor RPWM / LPWM | **5 / 6** | Timer3A / Timer4A |
 | Sağ motor RPWM / LPWM | **9 / 10** | Timer2B / Timer2A |
 | Kafa motoru RPWM / LPWM | **44 / 45** | Timer5C / Timer5B |
-| Sol enkoder A / B | 2 (INT0) / 4 | — |
-| Sağ enkoder A / B | 3 (INT1) / **22** | — |
+| Sol enkoder A / B | 2 (INT0) / 3 (INT1) | — |
+| Sağ enkoder A / B | 18 (INT5) / 19 (INT4) | — |
 | Kafa enkoder A / B | 20 (INT3) / 21 (INT2) | — |
 
-> ⚠️ **Sağ enkoder B kablosu 9'dan 22'ye taşınmalı.** Pin 9 artık sağ motor
-> sürücüsünün RPWM'i. Eski `pins.h` sağ enkoder B'yi 9'da tanımlıyordu.
+> Pin haritası `arduino/astro_firmware/include/pins.h` ile birebir aynıdır —
+> ikisi birlikte güncellenmelidir.
 
-> ⚠️ **Kafa enkoderi 20/21 = I2C (SDA/SCL).** Bu test sketch'i I2C kullanmadığı
-> için burada sorun çıkmaz. Ana firmware'de MPU-6050 aynı hatta olduğundan
-> çakışır — orada kafa enkoderi 18/19'a taşınmalı.
+> ⚠️ Mega'nın 6 dış kesme pininin **tamamı** (2, 3, 18, 19, 20, 21) enkoderlere
+> ayrıldı. Bunun iki sonucu var: 20/21 = I2C olduğu için **MPU-6050 IMU**, 18/19 =
+> Serial1 olduğu için **TMC2209** kullanılamaz. Ana firmware'den ikisi de
+> kaldırıldı.
 
 BTS7960'ların `R_EN`/`L_EN` uçları 5V'a sabitlenmiş: sürücüler her zaman aktif,
 MCU tarafından donanımsal olarak kesilemiyor. Durdurma yalnızca PWM = 0 ile.

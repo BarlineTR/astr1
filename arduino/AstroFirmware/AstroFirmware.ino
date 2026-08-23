@@ -1,49 +1,38 @@
 /*
  * AstroFirmware - Arduino IDE sürümü
  * ----------------------------------
- * Bu sketch, arduino/astro_firmware (PlatformIO) projesinin Arduino IDE kopyasıdır.
+ * arduino/astro_firmware (PlatformIO) projesinin Arduino IDE kopyası.
+ * Kontrol mantığı main.cpp ile birebir aynıdır; farkı Serial Monitor'e
+ * okunabilir açılış/durum mesajı basmasıdır.
  *
  * Kart      : Arduino Mega 2560
  * Seri hız  : 115200 baud (Serial Monitor da 115200 olmalı)
+ * Kütüphane : gerekmiyor (sadece Arduino core)
  *
- * Gerekli kütüphaneler (Sketch > Include Library > Manage Libraries):
- *   - TMCStepper   (teemuatlut)
- *   - AccelStepper (Mike McCauley)
- *   - Wire         (Arduino AVR core ile birlikte gelir)
+ * - İki tekerlek: BTS7960 + enkoder, 50 Hz hız PID'i (RPM)
+ * - Kafa: BTS7960 + enkoderli DC motor, 50 Hz konum PID'i (derece)
+ * - Host ile ikili paket protokolü (bkz. protocol.h)
+ *
+ * IMU YOK: 20/21 (I2C) kafa enkoderine verildi, bkz. pins.h.
+ * TMC2209 YOK: kafa artık DC motor, Serial1 sağ enkodere verildi.
  */
 
 #include <Arduino.h>
-#include <Wire.h>
-#include <TMCStepper.h>
-#include <AccelStepper.h>
 #include <avr/wdt.h>
 
 #include "pins.h"
 #include "protocol.h"
 
-// Arduino IDE otomatik prototip uretir, ancak referans parametreli
-// fonksiyonlar icin acik prototip vermek daha guvenlidir.
-int pidStep(float target_rpm, float meas_rpm, float& e_i, float& e_prev, uint32_t dt_ms);
-
-// I2C'den big-endian int16 oku (Wire.read() sirasi garanti altina alinir)
-static inline int16_t readInt16BE() {
-  int16_t h = Wire.read();
-  int16_t l = Wire.read();
-  return (int16_t)((h << 8) | l);
-}
-
 // ====== Seri ekran (Serial Monitor) mesajları ======
-// 1 = açılışta banner bas, 0 = tamamen sessiz (sadece binary protokol)
-#define ENABLE_TEXT_BANNER 1
-// 1 = host bağlı değilken periyodik durum satırı bas
-#define ENABLE_TEXT_STATUS 1
+#define ENABLE_TEXT_BANNER 1      // açılışta banner bas
+#define ENABLE_TEXT_STATUS 1      // host bağlı değilken periyodik durum satırı
 #define TEXT_STATUS_PERIOD_MS 2000UL
 
 #define FW_NAME    "AstroFirmware"
-#define FW_VERSION "1.0.0-ino"
+#define FW_VERSION "2.0.0-ino"
 
 // ====== Parametreler ======
-static const uint32_t SERIAL_BAUD = 115200; // standart baud (host ile ayni olmali)
+static const uint32_t SERIAL_BAUD = 115200; // CH340/CH341 ve Linux Kernel stabil standart baud
 static const float CONTROL_HZ = 50.0f;
 static const uint32_t CONTROL_DT_MS = (uint32_t)(1000.0f / CONTROL_HZ);
 
@@ -55,11 +44,32 @@ static const float WHEEL_R_R = 0.06f;
 
 static const float KP = 0.6f, KI = 0.2f, KD = 0.0f; // 50 Hz PID için örnek
 static const int PWM_MAX = 255;
-static const float PID_INTEGRAL_LIMIT = 50.0f; // anti-windup limiti
+static const float PID_INTEGRAL_LIMIT = 50.0f;
+
+// ====== Kafa (BTS7960 + enkoderli DC motor) ======
+// ⚠ KALİBRE EDİLMELİ: MotorTest sketch'indeki 'c <derece>' komutuyla ölçün.
+static const float HEAD_TICKS_PER_DEG = 14.667f;
+
+static const float HEAD_MIN_DEG = -90.0f;
+static const float HEAD_MAX_DEG =  90.0f;
+
+static const int HEAD_PWM_LIMIT = 100;  // 1000 rpm motor, tam PWM'de savrulur
+static const int HEAD_PWM_MIN   = 30;   // statik sürtünme eşiği
+
+static const float HEAD_KP = 1.8f, HEAD_KD = 0.08f;
+static const int32_t HEAD_DEADBAND_TICKS = 8;
+static const uint32_t HEAD_STALL_MS = 400;
+
+// ====== Diagnostik bayrakları ======
+static const uint32_t FLAG_WATCHDOG_TIMEOUT = 0x01;
+static const uint32_t FLAG_RESERVED_IMU     = 0x02; // eski IMU_READ_FAIL
+static const uint32_t FLAG_HEAD_STALL       = 0x04;
+static const uint32_t FLAG_HEAD_LIMIT       = 0x08;
 
 // ====== Global Durum ======
 volatile int32_t g_left_ticks = 0;
 volatile int32_t g_right_ticks = 0;
+volatile int32_t g_head_ticks = 0;
 
 static int32_t g_left_last_ticks = 0;
 static int32_t g_right_last_ticks = 0;
@@ -70,6 +80,12 @@ static float g_right_target_rpm = 0.0f;
 static float g_left_err_i = 0.0f, g_right_err_i = 0.0f;
 static float g_left_err_prev = 0.0f, g_right_err_prev = 0.0f;
 
+static int32_t g_head_target_ticks = 0;
+static int32_t g_head_err_prev = 0;
+static int g_head_pwm = 0;
+static int32_t g_head_stall_ref = 0;
+static uint32_t g_head_stall_ms = 0;
+
 static uint32_t g_last_control_ms = 0;
 static uint32_t g_last_heartbeat_ms = 0;
 static uint32_t g_last_text_ms = 0;
@@ -78,127 +94,37 @@ static bool g_host_seen = false; // host'tan en az bir paket geldi mi?
 static bool g_motors_enabled = true;
 static uint32_t g_diag_flags = 0;
 
-static bool g_imu_ok = false;
-static bool g_tmc_ok = false;
-
-// IMU ham değerleri -> m/s2, rad/s dönüştürülecek
-static float ax, ay, az, gx, gy, gz;
-static uint32_t imu_last_us = 0;
-
-// TMC2209 (UART üzerinden konfigürasyon)
-TMC2209Stepper tmc2209(&TMC2209_SERIAL, 0.11f, TMC2209_ADDRESS); // 0.11 ohm örnek Rsense
-AccelStepper head_stepper(AccelStepper::DRIVER, HEAD_STEP_PIN, HEAD_DIR_PIN);
-
 // ====== Yardımcılar ======
-inline void setMotorPWM(int pwm_fwd_pin, int pwm_rev_pin, int val) {
-  val = constrain(val, -PWM_MAX, PWM_MAX);
+inline void setMotorPWM(int pwm_fwd_pin, int pwm_rev_pin, int val, int limit) {
+  val = constrain(val, -limit, limit);
   if (val >= 0) {
-    analogWrite(pwm_fwd_pin, val);
     analogWrite(pwm_rev_pin, 0);
+    analogWrite(pwm_fwd_pin, val);
   } else {
     analogWrite(pwm_fwd_pin, 0);
     analogWrite(pwm_rev_pin, -val);
   }
 }
 
-inline void setLeftPWM(int v) { setMotorPWM(L_MOTOR_PWM_FWD, L_MOTOR_PWM_REV, v); }
-inline void setRightPWM(int v){ setMotorPWM(R_MOTOR_PWM_FWD, R_MOTOR_PWM_REV, v); }
+inline void setLeftPWM(int v)  { setMotorPWM(L_MOTOR_PWM_FWD, L_MOTOR_PWM_REV, v, PWM_MAX); }
+inline void setRightPWM(int v) { setMotorPWM(R_MOTOR_PWM_FWD, R_MOTOR_PWM_REV, v, PWM_MAX); }
 
-void leftEncA() {
-  // Quadrature yön tespiti
-  bool b = digitalRead(L_ENC_B);
-  g_left_ticks += b ? -1 : +1;
-}
-void rightEncA() {
-  bool b = digitalRead(R_ENC_B);
-  g_right_ticks += b ? -1 : +1;
+inline void setHeadPWM(int v) {
+  g_head_pwm = constrain(v, -HEAD_PWM_LIMIT, HEAD_PWM_LIMIT);
+  setMotorPWM(HEAD_MOTOR_PWM_FWD, HEAD_MOTOR_PWM_REV, g_head_pwm, HEAD_PWM_LIMIT);
 }
 
-bool imuInit() {
-  Wire.begin();
-  // I2C timeout (5 ms) - hatalı hatta takılıp kalmayı önler
-  Wire.setWireTimeout(5000, true);
-
-  delay(50);
-  // MPU-6050: power management 0x6B = 0x00
-  Wire.beginTransmission(IMU_I2C_ADDR);
-  Wire.write(0x6B); Wire.write(0x00);
-  bool ok = (Wire.endTransmission() == 0);
-
-  // Gyro full-scale = ±2000 dps (0x1B=0x18), Accel ±2g (0x1C=0x00)
-  Wire.beginTransmission(IMU_I2C_ADDR);
-  Wire.write(0x1B); Wire.write(0x18);
-  Wire.endTransmission();
-
-  Wire.beginTransmission(IMU_I2C_ADDR);
-  Wire.write(0x1C); Wire.write(0x00);
-  Wire.endTransmission();
-
-  return ok;
+inline int32_t readTicks(volatile int32_t& src) {
+  int32_t v;
+  noInterrupts();
+  v = src;
+  interrupts();
+  return v;
 }
 
-bool imuRead() {
-  // Okuma: ACCEL_XOUT_H (0x3B) -> 14 byte
-  Wire.beginTransmission(IMU_I2C_ADDR);
-  Wire.write(0x3B);
-  if (Wire.endTransmission(false) != 0) {
-    g_diag_flags |= 0x02; // IMU_READ_FAIL flag
-    return false;
-  }
-
-  uint8_t n = Wire.requestFrom((uint8_t)IMU_I2C_ADDR, (uint8_t)14, (uint8_t)true);
-  if (n != 14) {
-    g_diag_flags |= 0x02; // IMU_READ_FAIL flag
-    return false;
-  }
-
-  int16_t axr = readInt16BE();
-  int16_t ayr = readInt16BE();
-  int16_t azr = readInt16BE();
-  int16_t tmp = readInt16BE(); (void)tmp;
-  int16_t gxr = readInt16BE();
-  int16_t gyr = readInt16BE();
-  int16_t gzr = readInt16BE();
-
-  // Dönüşümler
-  // Accel: ±2g -> LSB/g = 16384, g=9.80665
-  const float A_SCALE = 9.80665f / 16384.0f;
-  // Gyro: ±2000 dps -> 16.4 LSB/(°/s); rad/s = dps * pi/180
-  const float G_SCALE = (PI / 180.0f) / 16.4f;
-
-  ax = axr * A_SCALE;
-  ay = ayr * A_SCALE;
-  az = azr * A_SCALE;
-  gx = gxr * G_SCALE;
-  gy = gyr * G_SCALE;
-  gz = gzr * G_SCALE;
-
-  imu_last_us = micros();
-  g_diag_flags &= ~0x02; // Clear IMU_READ_FAIL flag
-  return true;
-}
-
-bool tmcInit() {
-  pinMode(HEAD_EN_PIN, OUTPUT);
-  digitalWrite(HEAD_EN_PIN, LOW); // enable low active olabilir, donanıma göre ayarlayın
-
-  // Not: bu USB/Serial Monitor portu DEĞİL, sürücüye giden ayrı UART (Serial1).
-  TMC2209_SERIAL.begin(500000); // TMC2209 için yüksek baudrate önerilir
-  delay(50);
-  tmc2209.begin();
-  tmc2209.pdn_disable(true);
-  tmc2209.I_scale_analog(false);
-  tmc2209.rms_current(500); // mA
-  tmc2209.microsteps(16);
-  tmc2209.en_spreadCycle(false);
-  tmc2209.TCOOLTHRS(0xFFFFF);
-
-  head_stepper.setMaxSpeed(2000);     // steps/s
-  head_stepper.setAcceleration(2000); // steps/s^2
-
-  // UART üzerinden sürücüye ulaşabiliyor muyuz?
-  return tmc2209.test_connection() == 0;
-}
+void leftEncA()  { g_left_ticks  += digitalRead(L_ENC_B)    ? -1 : +1; }
+void rightEncA() { g_right_ticks += digitalRead(R_ENC_B)    ? -1 : +1; }
+void headEncA()  { g_head_ticks  += digitalRead(HEAD_ENC_B) ? -1 : +1; }
 
 void setupIO() {
   pinMode(STATUS_LED, OUTPUT);
@@ -206,22 +132,33 @@ void setupIO() {
   pinMode(L_MOTOR_PWM_REV, OUTPUT);
   pinMode(R_MOTOR_PWM_FWD, OUTPUT);
   pinMode(R_MOTOR_PWM_REV, OUTPUT);
+  pinMode(HEAD_MOTOR_PWM_FWD, OUTPUT);
+  pinMode(HEAD_MOTOR_PWM_REV, OUTPUT);
 
   pinMode(L_ENC_A, INPUT_PULLUP);
   pinMode(L_ENC_B, INPUT_PULLUP);
   pinMode(R_ENC_A, INPUT_PULLUP);
   pinMode(R_ENC_B, INPUT_PULLUP);
+  pinMode(HEAD_ENC_A, INPUT_PULLUP);
+  pinMode(HEAD_ENC_B, INPUT_PULLUP);
 
-  attachInterrupt(digitalPinToInterrupt(L_ENC_A), leftEncA, RISING);
-  attachInterrupt(digitalPinToInterrupt(R_ENC_A), rightEncA, RISING);
+  attachInterrupt(digitalPinToInterrupt(L_ENC_A),    leftEncA,  RISING);
+  attachInterrupt(digitalPinToInterrupt(R_ENC_A),    rightEncA, RISING);
+  attachInterrupt(digitalPinToInterrupt(HEAD_ENC_A), headEncA,  RISING);
 
-  // PWM frekansını artır (Mega Timer 4: pin 6,7,8 -> 31.25 kHz)
+  // PWM frekansı -> 8-bit phase-correct, prescaler 1: 16MHz/(1*510) = 31.37 kHz
+  // Timer2: pin 9,10 (sağ)   Timer3: pin 5 (sol ileri)
+  // Timer4: pin 6 (sol geri) Timer5: pin 44,45 (kafa)
+  TCCR2B = (TCCR2B & 0xF8) | 0x01;
+  TCCR3B = (TCCR3B & 0xF8) | 0x01;
   TCCR4B = (TCCR4B & 0xF8) | 0x01;
+  TCCR5B = (TCCR5B & 0xF8) | 0x01;
 }
 
 void stopMotors() {
   setLeftPWM(0);
   setRightPWM(0);
+  setHeadPWM(0);
 }
 
 // ====== Seri ekran metin çıktıları ======
@@ -233,18 +170,22 @@ void printBanner() {
   Serial.print (F("  v")); Serial.println(F(FW_VERSION));
   Serial.println(F("  Arduino Mega 2560 - Astro robot alt kontrol"));
   Serial.println(F("=============================================="));
-  Serial.print  (F("  Derleme      : ")); Serial.print(F(__DATE__));
+  Serial.print  (F("  Derleme   : ")); Serial.print(F(__DATE__));
   Serial.print  (F(" ")); Serial.println(F(__TIME__));
-  Serial.print  (F("  Seri hiz     : ")); Serial.print(SERIAL_BAUD); Serial.println(F(" baud"));
-  Serial.print  (F("  Kontrol      : ")); Serial.print((int)CONTROL_HZ); Serial.println(F(" Hz"));
-  Serial.print  (F("  IMU (0x")); Serial.print(IMU_I2C_ADDR, HEX); Serial.print(F(")  : "));
-  Serial.println(g_imu_ok ? F("OK") : F("YOK / cevap vermiyor"));
-  Serial.print  (F("  TMC2209      : "));
-  Serial.println(g_tmc_ok ? F("OK (UART)") : F("YOK / UART cevap vermiyor"));
+  Serial.print  (F("  Seri hiz  : ")); Serial.print(SERIAL_BAUD); Serial.println(F(" baud"));
+  Serial.print  (F("  Kontrol   : ")); Serial.print((int)CONTROL_HZ); Serial.println(F(" Hz"));
   Serial.println(F("----------------------------------------------"));
+  Serial.println(F("  Motor  : sol 5/6   sag 9/10   kafa 44/45"));
+  Serial.println(F("  Enkoder: sol 2/3   sag 18/19  kafa 20/21"));
+  Serial.print  (F("  Kafa   : "));
+  Serial.print(HEAD_TICKS_PER_DEG, 3); Serial.print(F(" tick/derece, limit "));
+  Serial.print((int)HEAD_MIN_DEG); Serial.print(F("/"));
+  Serial.print((int)HEAD_MAX_DEG); Serial.println(F(" derece"));
+  Serial.println(F("  IMU    : YOK (I2C pinleri kafa enkoderinde)"));
+  Serial.println(F("  TMC2209: YOK (kafa artik DC motor)"));
+  Serial.println(F("----------------------------------------------"));
+  Serial.println(F("  Kafa acilis konumu 0 derece kabul edildi."));
   Serial.println(F("  Hazir. Host'tan HEARTBEAT bekleniyor..."));
-  Serial.println(F("  Not: veri akisi ikili (binary) protokoldur;"));
-  Serial.println(F("       ekranda anlamsiz karakterler gorursunuz."));
   Serial.println(F("=============================================="));
   Serial.flush();
 #endif
@@ -258,23 +199,17 @@ void printStatusLine() {
   Serial.print(g_motors_enabled ? F("ON") : F("OFF"));
   Serial.print(F("  encL="));
   Serial.print(g_left_last_ticks);
-  Serial.print(F("  encR="));
+  Serial.print(F(" encR="));
   Serial.print(g_right_last_ticks);
-  Serial.print(F("  imu="));
-  Serial.print((g_diag_flags & 0x02) ? F("FAIL") : F("OK"));
+  Serial.print(F(" kafa="));
+  Serial.print(readTicks(g_head_ticks) / HEAD_TICKS_PER_DEG, 1);
+  Serial.print(F("deg"));
   Serial.print(F("  flags=0x"));
   Serial.print(g_diag_flags, HEX);
+  if (g_diag_flags & FLAG_HEAD_STALL) Serial.print(F(" [KAFA STALL]"));
+  if (g_diag_flags & FLAG_HEAD_LIMIT) Serial.print(F(" [KAFA LIMIT]"));
   Serial.println(F("  (host bagli degil)"));
 #endif
-}
-
-void publishIMU() {
-  uint8_t payload[6 * 4 + 4];
-  // floatları little-endian olarak kopyala
-  float vals[6] = {ax, ay, az, gx, gy, gz};
-  memcpy(&payload[0], vals, sizeof(vals));
-  memcpy(&payload[6 * 4], &imu_last_us, 4);
-  Proto::writePacket(Serial, Proto::IMU_DATA, payload, sizeof(payload));
 }
 
 void publishEncoders(uint32_t dt_us, int32_t dl, int32_t dr) {
@@ -293,6 +228,57 @@ void publishDiag(uint16_t vbat_mV, int16_t temp_cX100, uint32_t flags) {
   Proto::writePacket(Serial, Proto::DIAGNOSTICS, payload, sizeof(payload));
 }
 
+// Kafa konum PID'i. Limit switch olmadığı için stall koruması şart.
+void headControl(uint32_t dt_ms) {
+  int32_t pos = readTicks(g_head_ticks);
+  int32_t err = g_head_target_ticks - pos;
+
+  if (!g_motors_enabled) {
+    setHeadPWM(0);
+    g_head_err_prev = err;
+    g_head_stall_ref = pos;
+    g_head_stall_ms = millis();
+    return;
+  }
+
+  if (abs(err) <= HEAD_DEADBAND_TICKS) {
+    setHeadPWM(0);
+    g_head_err_prev = err;
+    g_head_stall_ref = pos;
+    g_head_stall_ms = millis();
+    // NOT: FLAG_HEAD_STALL burada temizlenmez. Stall sonrasi hedef mevcut
+    // konuma cekildigi icin hemen bu dala duseriz; bayragi burada silersek
+    // host stall'i hic goremez. Temizleme yalnizca yeni HEAD_CMD'de olur.
+    return;
+  }
+
+  float de = (float)(err - g_head_err_prev) / (dt_ms / 1000.0f);
+  g_head_err_prev = err;
+
+  float u = HEAD_KP * (float)err + HEAD_KD * de;
+  int pwm = (int)constrain(u, (float)-HEAD_PWM_LIMIT, (float)HEAD_PWM_LIMIT);
+
+  // Statik sürtünme: çok küçük PWM motoru döndürmez, sadece ısıtır
+  if (pwm > 0 && pwm < HEAD_PWM_MIN) pwm = HEAD_PWM_MIN;
+  if (pwm < 0 && pwm > -HEAD_PWM_MIN) pwm = -HEAD_PWM_MIN;
+
+  setHeadPWM(pwm);
+
+  // Stall tespiti: PWM veriliyor ama enkoder kımıldamıyor
+  if (pos != g_head_stall_ref) {
+    g_head_stall_ref = pos;
+    g_head_stall_ms = millis();
+  } else if (millis() - g_head_stall_ms > HEAD_STALL_MS) {
+    setHeadPWM(0);
+    g_head_target_ticks = pos; // dayanağı zorlamayı bırak
+    g_head_err_prev = 0;
+    g_diag_flags |= FLAG_HEAD_STALL;
+#if ENABLE_TEXT_BANNER
+    if (!g_host_seen) Serial.println(F("[STALL] Kafa donmuyor -> motor kesildi."));
+#endif
+  }
+}
+
 void loopControl() {
   uint32_t now = millis();
   if (now - g_last_control_ms < CONTROL_DT_MS) return;
@@ -303,18 +289,15 @@ void loopControl() {
   if (now - g_last_heartbeat_ms > 500) {
     g_motors_enabled = false;
     stopMotors();
-    g_diag_flags |= 0x01; // WATCHDOG_TIMEOUT flag
+    g_diag_flags |= FLAG_WATCHDOG_TIMEOUT;
   } else {
     g_motors_enabled = true;
-    g_diag_flags &= ~0x01; // Clear WATCHDOG_TIMEOUT flag
+    g_diag_flags &= ~FLAG_WATCHDOG_TIMEOUT;
   }
 
   // Enkoder okuma atomik (AVR'de int32_t atomik değil)
-  int32_t l_ticks, r_ticks;
-  noInterrupts();
-  l_ticks = g_left_ticks;
-  r_ticks = g_right_ticks;
-  interrupts();
+  int32_t l_ticks = readTicks(g_left_ticks);
+  int32_t r_ticks = readTicks(g_right_ticks);
 
   int32_t dl = l_ticks - g_left_last_ticks;
   int32_t dr = r_ticks - g_right_last_ticks;
@@ -325,55 +308,49 @@ void loopControl() {
   float l_rpm_meas = (dl / (float)TICKS_PER_REV_L) / dt_min;
   float r_rpm_meas = (dr / (float)TICKS_PER_REV_R) / dt_min;
 
+  // PID: stiction feedforward + conditional integration anti-windup
+  auto pid_step = [&](float target_rpm, float meas_rpm, float& e_i, float& e_prev)->int {
+    if (abs(target_rpm) < 0.01f) {
+      e_i = 0.0f;
+      e_prev = 0.0f;
+      return 0;
+    }
+    float e = target_rpm - meas_rpm;
+    float de = (e - e_prev) / (dt_ms / 1000.0f);
+    e_prev = e;
+
+    // Feedforward: motor statik sürtünme (stiction) eşiğini aşmak için minimum PWM tabanı
+    float ff = (target_rpm > 0.0f) ? 25.0f : -25.0f;
+    float u = ff + (KP * 2.0f * e) + (KI * e_i) + (KD * de);
+    int pwm = (int)constrain(u, -PWM_MAX, PWM_MAX);
+
+    // Conditional integration: sadece PWM saturate olmadığında integral artır
+    if (abs(pwm) < PWM_MAX) {
+      e_i += e * (dt_ms / 1000.0f);
+      e_i = constrain(e_i, -PID_INTEGRAL_LIMIT, PID_INTEGRAL_LIMIT);
+    }
+
+    return pwm;
+  };
+
   int l_pwm = 0, r_pwm = 0;
   if (g_motors_enabled) {
-    l_pwm = pidStep(g_left_target_rpm,  l_rpm_meas, g_left_err_i,  g_left_err_prev,  dt_ms);
-    r_pwm = pidStep(g_right_target_rpm, r_rpm_meas, g_right_err_i, g_right_err_prev, dt_ms);
+    l_pwm = pid_step(g_left_target_rpm, l_rpm_meas, g_left_err_i, g_left_err_prev);
+    r_pwm = pid_step(g_right_target_rpm, r_rpm_meas, g_right_err_i, g_right_err_prev);
   }
   setLeftPWM(l_pwm);
   setRightPWM(r_pwm);
 
-  // IMU oku (50 Hz)
-  imuRead();
+  // Kafa konum kontrolü (aynı 50 Hz döngüde)
+  headControl(dt_ms);
 
   // Host bağlıysa binary telemetri gönder; değilse seri ekranı kirletme
   if (g_host_seen) {
-    publishIMU();
     publishEncoders(dt_ms * 1000u, dl, dr);
-
-    // Basit diagnostik: bayraklar
     uint16_t vbat = 12000; // mV (örn. gelecekte ADC ile ölç)
     int16_t temp = 2500;   // 25.00 C
     publishDiag(vbat, temp, g_diag_flags);
   }
-}
-
-// PID adımı - stiction feedforward + conditional integration ile anti-windup
-// (main.cpp'deki pid_step ile birebir aynı davranış)
-int pidStep(float target_rpm, float meas_rpm, float& e_i, float& e_prev, uint32_t dt_ms) {
-  // Hedef sıfırsa motoru tamamen bırak, integrali de temizle
-  if (abs(target_rpm) < 0.01f) {
-    e_i = 0.0f;
-    e_prev = 0.0f;
-    return 0;
-  }
-
-  float e = target_rpm - meas_rpm;
-  float de = (e - e_prev) / (dt_ms / 1000.0f);
-  e_prev = e;
-
-  // Feedforward: motor statik sürtünme (stiction) eşiğini aşmak için minimum PWM tabanı
-  float ff = (target_rpm > 0.0f) ? 25.0f : -25.0f;
-  float u = ff + (KP * 2.0f * e) + (KI * e_i) + (KD * de);
-  int pwm = (int)constrain(u, -PWM_MAX, PWM_MAX);
-
-  // Sadece PWM saturate olmadığında integral artır
-  if (abs(pwm) < PWM_MAX) {
-    e_i += e * (dt_ms / 1000.0f);
-    e_i = constrain(e_i, -PID_INTEGRAL_LIMIT, PID_INTEGRAL_LIMIT);
-  }
-
-  return pwm;
 }
 
 void processPacket(uint8_t msg_id, const uint8_t* pl, uint8_t len) {
@@ -401,12 +378,15 @@ void processPacket(uint8_t msg_id, const uint8_t* pl, uint8_t len) {
       if (len < 4) break;
       float angle_deg;
       memcpy(&angle_deg, &pl[0], 4);
-      // steps/degree hesabı: motor_steps_per_rev * microsteps / 360
-      const float motor_steps_per_rev = 200.0f; // 1.8 derece stepper
-      const float micro = 16.0f; // tmc ayarında
-      float steps_per_deg = (motor_steps_per_rev * micro) / 360.0f;
-      long target_steps = lroundf(angle_deg * steps_per_deg);
-      head_stepper.moveTo(target_steps);
+
+      // Yazılımsal limit: limit switch yok, mekanik dayanağa gitmeyi engelle
+      float clamped = constrain(angle_deg, HEAD_MIN_DEG, HEAD_MAX_DEG);
+      if (clamped != angle_deg) g_diag_flags |= FLAG_HEAD_LIMIT;
+      else                      g_diag_flags &= ~FLAG_HEAD_LIMIT;
+
+      g_head_target_ticks = (int32_t)lroundf(clamped * HEAD_TICKS_PER_DEG);
+      g_diag_flags &= ~FLAG_HEAD_STALL;
+      g_head_stall_ms = millis();
       g_last_heartbeat_ms = millis();
     } break;
   }
@@ -414,12 +394,10 @@ void processPacket(uint8_t msg_id, const uint8_t* pl, uint8_t len) {
 
 void setup() {
   setupIO();
+  stopMotors();
 
   Serial.begin(SERIAL_BAUD);
   delay(200); // Serial Monitor'ün açılmasına küçük bir pay
-
-  g_imu_ok = imuInit();
-  g_tmc_ok = tmcInit();
 
   printBanner();
 
@@ -429,6 +407,10 @@ void setup() {
     delay(80);
   }
   digitalWrite(STATUS_LED, LOW);
+
+  // Açılıştaki kafa konumu 0° kabul edilir (limit switch / homing yok)
+  g_head_target_ticks = 0;
+  g_head_stall_ms = millis();
 
   g_last_control_ms = millis();
   g_last_heartbeat_ms = millis();
@@ -441,9 +423,6 @@ void setup() {
 void loop() {
   // Watchdog besle
   wdt_reset();
-
-  // TMC/Stepper güncelle
-  head_stepper.run();
 
   // Seri parser
   static Proto::Parser parser;

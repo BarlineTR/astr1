@@ -146,7 +146,7 @@ void printHelp() {
   Serial.println(F("  m           anlik durum"));
   Serial.println(F("----------------------------------------------"));
   Serial.println(F("  Pinler: sol 5/6  sag 9/10  kafa 44/45"));
-  Serial.println(F("  Enkoder: sol 2/4  sag 3/22  kafa 20/21"));
+  Serial.println(F("  Enkoder: sol 2/3  sag 18/19  kafa 20/21"));
   Serial.println(F("----------------------------------------------"));
   Serial.println(F("  UYARI: tekerlekleri havada test edin!"));
   Serial.print  (F("  Elle komutta ")); Serial.print(IDLE_TIMEOUT_MS / 1000UL);
