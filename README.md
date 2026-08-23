@@ -385,23 +385,54 @@ container: apt deps → uv venv → `scripts/build.sh` → `pytest` → `scripts
 
 ## 🎙️ Realtime mode (OpenAI speech-to-speech)
 
-A second, **alternative** pipeline sends microphone audio straight to the OpenAI Realtime
-API over a WebSocket and plays the returned audio — no local STT or TTS in the loop:
+Microphone audio goes straight to the OpenAI Realtime API over a WebSocket and the
+returned audio is played back — no local STT or TTS in the loop.
+
+### Voice engine selection
+
+The robot has exactly one audio hardware owner: `audio_stream_node`. Which brain sits
+behind it is chosen with `voice_engine`:
 
 ```bash
-ros2 launch astro_bringup realtime_sensors.launch.py
+# Pure speech-to-speech (default). audio_capture_node, speech_recognition_node,
+# tts_node and ai_brain_node are NOT started.
+ros2 launch astro_bringup bringup.launch.py voice_engine:=realtime
+
+# Classic cascaded pipeline (Whisper -> LLM -> Edge-TTS).
+ros2 launch astro_bringup bringup.launch.py voice_engine:=cascaded
 ```
 
-It starts `audio_stream_node` (24 kHz) + `astro_realtime_node` + the camera. It is **not**
-an add-on to `robot.launch.py`: both publish `/speech/text` and both capture the
-microphone, so running them together gives you two brains fighting over one robot. Pick one.
+The two pipelines can no longer fight over the microphone: the launch file starts only
+one of them, and `tts_node` no longer subscribes to the realtime PCM topic at all, so
+single ownership holds even if you override the launch flags.
 
-| | `robot.launch.py` | `realtime_sensors.launch.py` |
+| | `voice_engine:=realtime` | `voice_engine:=cascaded` |
 |---|---|---|
-| Speech path | STT → LLM → TTS (separate calls) | single WebSocket, audio in / audio out |
-| Latency | higher | lowest |
-| Persona, long-term memory, reminders | `ai_brain_node` | `astro_realtime_node` (separate implementation) |
-| Base, LiDAR | yes | no |
+| Speech path | single WebSocket, audio in / audio out | STT → LLM → TTS (separate calls) |
+| Latency | lowest | higher |
+| Turn taking & barge-in | OpenAI server VAD | local VAD |
+| Persona, memory, reminders | `astro_realtime_node` | `ai_brain_node` |
+
+Turn taking and barge-in belong to the OpenAI server VAD (`create_response` +
+`interrupt_response`). Tune it in `.env` via `REALTIME_VAD_TYPE`,
+`REALTIME_VAD_SILENCE_MS` and `REALTIME_VAD_EAGERNESS`. The client never sends
+`response.create` on `speech_stopped`.
+
+### Motion safety
+
+`move_robot` refuses to move until Arduino health is proven on `/arduino/diagnostics`
+(`serial_connected`, `handshake`, `heartbeat_healthy`, `motor_enabled`, all fresher than
+2 s). It also refuses with `no_motion_backend` while `ASTRO_MOTION_BACKEND` is empty,
+because nothing consumes `/cmd_vel` on the real robot yet — `serial_bridge` listens on
+`/wheel_cmds`. Stop commands are always allowed.
+
+### Acceptance run
+
+```bash
+ros2 launch astro_bringup bringup.launch.py 2>&1 | tee /tmp/astro_run.log
+# talk, interrupt it mid-sentence, ask what it sees, tell it a fact, ask it to move
+./scripts/acceptance_p0.sh /tmp/astro_run.log
+```
 
 ## ⚙️ Configuration
 

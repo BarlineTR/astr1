@@ -215,6 +215,16 @@ class AudioStreamNode(Node):
             self._playback_thread = threading.Thread(target=self._playback_worker, daemon=True)
             self._playback_thread.start()
 
+        # Kapı 2 kabul kriterinin kanıtı: bu düğüm hem girişin hem çıkışın
+        # tek sahibidir. Log'da iki satır da görünmüyorsa sahiplik bozulmuştur.
+        self.get_logger().info(
+            f"[AUDIO OWNERSHIP]\n"
+            f"audio_input_owner=audio_stream_node\n"
+            f"audio_output_owner=audio_stream_node\n"
+            f"input_device=[{self._in_dev_idx}] {self._in_device_name}\n"
+            f"output_device=[{self._out_dev_idx}] {self._out_device_name}"
+        )
+
         # Playback status ticker timer
         self.create_timer(0.1, self._publish_status)
 

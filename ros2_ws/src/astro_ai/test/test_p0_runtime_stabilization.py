@@ -1324,7 +1324,13 @@ class TestP0LaunchIntegrationAndRealtimePrimaryVoice(unittest.TestCase):
         self.assertIsNotNone(realtime_include.condition, "realtime_sensors include must have a condition")
 
     def test_bringup_realtime_disabled_does_not_start_node(self):
-        """3. Launch: When use_realtime is false, realtime_sensors is gated by IfCondition."""
+        """3. Launch: realtime_sensors bir IfCondition ile gate'li ve koşul HEM
+        voice_engine HEM use_realtime'a bakıyor.
+
+        Eskiden koşul yalnızca use_realtime idi; o hâlde
+        `voice_engine:=cascaded use_realtime:=true` her iki ses hattını birden
+        açıyor ve aynı ALSA cihazına iki süreç dokunuyordu (Spec #1 §5.4).
+        """
         import importlib.util
         bringup_path = os.path.join(pkg_root, "astro_bringup", "launch", "bringup.launch.py")
         spec = importlib.util.spec_from_file_location("bringup_launch", bringup_path)
@@ -1332,11 +1338,24 @@ class TestP0LaunchIntegrationAndRealtimePrimaryVoice(unittest.TestCase):
         spec.loader.exec_module(mod)
         ld = mod.generate_launch_description()
 
+        found = False
         for entity in ld.entities:
             src = getattr(entity, "launch_description_source", None)
             if src and "realtime_sensors.launch.py" in getattr(src, "path", ""):
-                cond = entity.condition
-                self.assertEqual(cond.predicate.name, "use_realtime")
+                found = True
+                self.assertIsNotNone(entity.condition, "realtime_sensors gate'siz")
+
+        self.assertTrue(found, "realtime_sensors include'ı bulunamadı")
+
+        # Koşulun her iki bayrağa da baktığını kaynaktan doğrula: IfCondition
+        # içindeki PythonExpression çalışma zamanında çözülmeden okunamıyor.
+        with open(bringup_path, "r", encoding="utf-8") as fh:
+            launch_src = fh.read()
+        idx = launch_src.index("realtime_sensors.launch.py")
+        window = launch_src[idx: idx + 400]
+        self.assertIn("is_realtime", window)
+        self.assertIn("voice_engine", launch_src)
+        self.assertIn("use_realtime", launch_src)
 
     def test_realtime_launch_has_no_duplicate_node(self):
         """4. Launch: realtime_sensors.launch.py contains only audio_stream_node and astro_realtime_node (no vision duplication)."""
