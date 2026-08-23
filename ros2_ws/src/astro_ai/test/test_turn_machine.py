@@ -70,9 +70,48 @@ class TestGenerationIsolation(unittest.TestCase):
             [Action.DROP_AUDIO],
         )
 
-    def test_should_publish_audio_false_without_active_response(self):
+    def test_audio_is_dropped_by_state_after_done_even_if_id_matches(self):
+        """Bayatlığı durum yakalar: RESPONSE_STREAMING değilsek ses düşer."""
         self.m.on_event("response.done")
-        self.assertFalse(self.m.should_publish_audio("resp_new"))
+        self.assertEqual(self.m.state, TurnState.IDLE)
+        self.assertEqual(
+            self.m.on_event("response.output_audio.delta", "resp_new"),
+            [Action.DROP_AUDIO],
+        )
+
+    def test_publishes_when_event_carries_no_response_id(self):
+        """Kimlik taşımayan delta bayat sayılmaz — kanıt yokken susmayız."""
+        self.assertEqual(
+            self.m.on_event("response.output_audio.delta", None),
+            [Action.PUBLISH_AUDIO],
+        )
+
+
+class TestGateOpensOnlyAfterFirstResponse(unittest.TestCase):
+    """Hiç yanıt gözlemlenmemişken ses düşürülmez — robot desync yüzünden susmaz."""
+
+    def test_bare_delta_before_any_response_is_published(self):
+        m = TurnMachine()
+        self.assertEqual(m.generation_id, 0)
+        self.assertEqual(
+            m.on_event("response.output_audio.delta", "resp_unknown"),
+            [Action.PUBLISH_AUDIO],
+        )
+
+    def test_should_publish_audio_true_before_any_response(self):
+        self.assertTrue(TurnMachine().should_publish_audio("resp_unknown"))
+
+    def test_gate_engages_after_first_response(self):
+        m = TurnMachine()
+        m.on_event("input_audio_buffer.speech_started")
+        m.on_event("input_audio_buffer.speech_stopped")
+        m.on_event("response.created", "resp_1")
+        m.on_event("response.done")
+        # Artık bir yanıt gözlemlendi: kapı devrede, eski ses düşer.
+        self.assertEqual(
+            m.on_event("response.output_audio.delta", "resp_1"),
+            [Action.DROP_AUDIO],
+        )
 
 
 class TestCancelGuard(unittest.TestCase):
@@ -179,6 +218,39 @@ class TestBargeIn(unittest.TestCase):
         self.assertIsNone(m.active_response_id)
 
 
+class TestServerInitiatedResponse(unittest.TestCase):
+    """Her yanıt kullanıcı konuşmasını takip etmez.
+
+    _trigger_proactive_greeting kullanıcı hiç konuşmadan response.create
+    gönderir. Makine bunu takip etmezse selamlama boyunca desync kalır ve o
+    sırada barge-in çalışmaz.
+    """
+
+    def test_proactive_response_created_from_idle_is_tracked(self):
+        m = TurnMachine()
+        self.assertEqual(m.on_event("response.created", "resp_greeting"), [])
+        self.assertEqual(m.state, TurnState.RESPONSE_STREAMING)
+        self.assertEqual(m.active_response_id, "resp_greeting")
+        self.assertEqual(m.generation_id, 1)
+
+    def test_barge_in_works_during_proactive_response(self):
+        m = TurnMachine()
+        m.on_event("response.created", "resp_greeting")
+        self.assertEqual(
+            m.on_event("input_audio_buffer.speech_started"),
+            [Action.STOP_PLAYBACK],
+        )
+        self.assertEqual(m.state, TurnState.RESPONSE_CANCELLING)
+
+    def test_proactive_audio_is_published(self):
+        m = TurnMachine()
+        m.on_event("response.created", "resp_greeting")
+        self.assertEqual(
+            m.on_event("response.output_audio.delta", "resp_greeting"),
+            [Action.PUBLISH_AUDIO],
+        )
+
+
 class TestToolFlow(unittest.TestCase):
     def test_tool_call_cycle(self):
         m = TurnMachine()
@@ -208,12 +280,6 @@ class TestInvalidTransitions(unittest.TestCase):
         m = TurnMachine()
         self.assertEqual(m.on_event("input_audio_buffer.speech_stopped"), [Action.IGNORE])
         self.assertEqual(m.state, TurnState.IDLE)
-
-    def test_response_created_while_idle_ignored(self):
-        m = TurnMachine()
-        self.assertEqual(m.on_event("response.created", "resp_x"), [Action.IGNORE])
-        self.assertEqual(m.state, TurnState.IDLE)
-        self.assertIsNone(m.active_response_id)
 
     def test_unknown_event_ignored(self):
         m = TurnMachine()

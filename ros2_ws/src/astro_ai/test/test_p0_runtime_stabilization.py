@@ -213,6 +213,24 @@ from astro_ai.memory_manager import MemoryManager
 from astro_ai.state_machine import StateMachine, RobotState
 
 
+def _bare_realtime_node():
+    """__init__ çalıştırmadan AstroRealtimeNode örneği üretir.
+
+    Bu testler düğümün iç durumunu elle kurduğu için __init__'i atlıyor; ancak
+    düğüm artık turn_machine / engine_state ortaklarına bağlı. Onları burada
+    TAZE olarak veriyoruz — sınıf seviyesinde paylaşılan bir örnek testler
+    arasında durum sızdırırdı.
+    """
+    from astro_ai.astro_realtime_node import AstroRealtimeNode
+    from astro_ai.realtime.engine_state import EngineStateTracker
+    from astro_ai.realtime.turn_machine import TurnMachine
+
+    node = AstroRealtimeNode.__new__(AstroRealtimeNode)
+    node.turn_machine = TurnMachine(client_side_cancel=False)
+    node.engine_state = EngineStateTracker()
+    return node
+
+
 class TestP0GlobalCircuitBreaker(unittest.TestCase):
     """Test Suite for GlobalProviderCircuitBreaker Invariants."""
 
@@ -1396,7 +1414,7 @@ class TestP0LaunchIntegrationAndRealtimePrimaryVoice(unittest.TestCase):
     def test_realtime_actual_provider_requires_audio_delta(self):
         """8. Telemetry: actual_provider is openai_realtime only when audio delta was received and forwarded."""
         from astro_ai.astro_realtime_node import AstroRealtimeNode
-        node = AstroRealtimeNode.__new__(AstroRealtimeNode)
+        node = _bare_realtime_node()
         node.realtime_audio_received = False
         node.realtime_current_generation_id = 42
 
@@ -1493,7 +1511,7 @@ class TestP02RealtimeTurnPipelineAndHardwareCorrection(unittest.TestCase):
         """2. Audio Stream: response.audio.delta publishes to /audio/realtime_output_pcm and reaches AudioOutputManager."""
         import base64
         from astro_ai.astro_realtime_node import AstroRealtimeNode
-        node = AstroRealtimeNode.__new__(AstroRealtimeNode)
+        node = _bare_realtime_node()
         node.pub_output_pcm = MagicMock()
         node.realtime_current_generation_id = 7
         node.realtime_audio_received = False
@@ -1518,23 +1536,31 @@ class TestP02RealtimeTurnPipelineAndHardwareCorrection(unittest.TestCase):
         self.assertIn("[REALTIME AUDIO DELTA]", log_text)
         self.assertIn("generation_id=7", log_text)
 
-        # Verify tts_node forwards it to AudioOutputManager
-        from astro_audio.tts_node import TtsNode
-        tts = TtsNode.__new__(TtsNode)
-        tts.output_manager = MagicMock()
-        tts.output_manager.current_generation = 0
-        tts._log = lambda lvl, msg: None
+        # Sesin TEK SAHİBİ audio_stream_node'dur; tts_node artık bu topic'i
+        # dinlemez (Spec #1 §5.2). Delta'nın gerçekten çıkış sahibine
+        # ulaştığını orada doğruluyoruz.
+        import queue as _queue
+        from astro_audio.audio_stream_node import AudioStreamNode
+
+        stream = AudioStreamNode.__new__(AudioStreamNode)
+        stream._play_queue = _queue.Queue(maxsize=100)
+        stream._last_output_chunk_time = 0.0
+        stream._last_output_envelope = None
+        stream._total_enqueued_bytes = 0
+        stream.get_logger = lambda: MagicMock()
 
         pcm_msg = MagicMock()
         pcm_msg.data = b64_delta
-        tts._on_realtime_output_pcm(pcm_msg)
-        tts.output_manager.write_realtime_pcm.assert_called_once_with(0, pcm_sample, sample_rate=24000)
+        stream._on_output_pcm(pcm_msg)
+
+        self.assertFalse(stream._play_queue.empty(), "PCM çalma kuyruğuna girmedi")
+        self.assertGreater(stream._total_enqueued_bytes, 0)
 
 
     def test_realtime_connected_without_turn_is_not_actual_provider(self):
         """4. Telemetry: Connected without audio delta produces actual_provider=edge_tts."""
         from astro_ai.astro_realtime_node import AstroRealtimeNode
-        node = AstroRealtimeNode.__new__(AstroRealtimeNode)
+        node = _bare_realtime_node()
         node.realtime_audio_received = False
         actual = "openai_realtime" if node.realtime_audio_received else "edge_tts"
         self.assertEqual(actual, "edge_tts")
@@ -1737,7 +1763,7 @@ class TestP03CriticalRuntimeRecovery(unittest.TestCase):
         """3. Audio Delta: response.audio.delta sets realtime_audio_received=True and publishes PCM."""
         import base64
         from astro_ai.astro_realtime_node import AstroRealtimeNode
-        node = AstroRealtimeNode.__new__(AstroRealtimeNode)
+        node = _bare_realtime_node()
         node.pub_output_pcm = MagicMock()
         node.realtime_current_generation_id = 3
         node.realtime_audio_received = False
@@ -1763,7 +1789,7 @@ class TestP03CriticalRuntimeRecovery(unittest.TestCase):
     def test_realtime_no_audio_fallback(self):
         """4. Fallback: server error event or timeout immediately triggers Edge-TTS fallback."""
         from astro_ai.astro_realtime_node import AstroRealtimeNode
-        node = AstroRealtimeNode.__new__(AstroRealtimeNode)
+        node = _bare_realtime_node()
         node.pub_tts_say = MagicMock()
         node.realtime_current_generation_id = 4
         node.realtime_audio_received = False
@@ -1792,7 +1818,7 @@ class TestP03CriticalRuntimeRecovery(unittest.TestCase):
     def test_realtime_duplicate_connection_blocked(self):
         """5. Connection: session.created logs [REALTIME SESSION READY], avoiding duplicate [REALTIME CONNECTED]."""
         from astro_ai.astro_realtime_node import AstroRealtimeNode
-        node = AstroRealtimeNode.__new__(AstroRealtimeNode)
+        node = _bare_realtime_node()
         node.pub_realtime_state = MagicMock()
         node.realtime_session_id = ""
 
@@ -2143,7 +2169,7 @@ class TestP04RuntimeCriticalRecovery(unittest.TestCase):
         """4. Realtime: actual_provider=openai_realtime is logged on response.audio.delta."""
         import base64
         from astro_ai.astro_realtime_node import AstroRealtimeNode
-        node = AstroRealtimeNode.__new__(AstroRealtimeNode)
+        node = _bare_realtime_node()
         node.pub_output_pcm = MagicMock()
         node.realtime_current_generation_id = 12
         node.realtime_audio_received = False
@@ -2364,7 +2390,7 @@ class TestP05RealtimeStreamStateAndPlaybackSerialization(unittest.TestCase):
         """5. Barge-In: user speech started does NOT send response.cancel when response is IDLE."""
         import asyncio
         from astro_ai.astro_realtime_node import AstroRealtimeNode
-        node = AstroRealtimeNode.__new__(AstroRealtimeNode)
+        node = _bare_realtime_node()
         node._ws = MagicMock()
         node.active_response_state = "IDLE"
         node.active_response_id = None
@@ -2380,7 +2406,7 @@ class TestP05RealtimeStreamStateAndPlaybackSerialization(unittest.TestCase):
         """6. Error Handling: response_cancel_not_active error is caught and logged as ignore, not failure."""
         import asyncio
         from astro_ai.astro_realtime_node import AstroRealtimeNode
-        node = AstroRealtimeNode.__new__(AstroRealtimeNode)
+        node = _bare_realtime_node()
         node.pub_tts_say = MagicMock()
         node.realtime_current_generation_id = 400
         node.realtime_audio_received = False
@@ -2464,7 +2490,7 @@ class TestP05RealtimeStreamStateAndPlaybackSerialization(unittest.TestCase):
         import base64
         import asyncio
         from astro_ai.astro_realtime_node import AstroRealtimeNode
-        node = AstroRealtimeNode.__new__(AstroRealtimeNode)
+        node = _bare_realtime_node()
         node.pub_output_pcm = MagicMock()
         node.active_generation_id = 800
         node.realtime_current_generation_id = 800
@@ -2492,7 +2518,7 @@ class TestP05RealtimeStreamStateAndPlaybackSerialization(unittest.TestCase):
         """11. Telemetry: [REALTIME AUDIO SUMMARY] aggregates total packets and bytes upon response completion."""
         import asyncio
         from astro_ai.astro_realtime_node import AstroRealtimeNode
-        node = AstroRealtimeNode.__new__(AstroRealtimeNode)
+        node = _bare_realtime_node()
         node.active_generation_id = 900
         node.realtime_current_generation_id = 900
         node.realtime_audio_received = True
@@ -2517,7 +2543,7 @@ class TestP05RealtimeStreamStateAndPlaybackSerialization(unittest.TestCase):
         """12. Session: [REALTIME SESSION READY] is logged only once per connection."""
         import asyncio
         from astro_ai.astro_realtime_node import AstroRealtimeNode
-        node = AstroRealtimeNode.__new__(AstroRealtimeNode)
+        node = _bare_realtime_node()
         node._session_ready_logged = False
         node.realtime_session_id = "sess_first"
         node.pub_realtime_state = MagicMock()
@@ -2538,7 +2564,7 @@ class TestP05RealtimeStreamStateAndPlaybackSerialization(unittest.TestCase):
         """15. Realtime S2S: Session config configures server_vad with native create_response=True."""
         import asyncio
         from astro_ai.astro_realtime_node import AstroRealtimeNode
-        node = AstroRealtimeNode.__new__(AstroRealtimeNode)
+        node = _bare_realtime_node()
         node._get_active_biometric_identity = lambda: {"name": "Baran", "is_known": True}
         node._build_current_system_prompt = lambda: "Astro Persona Instructions"
         node.realtime_transcribe_model = "gpt-live-transcribe"
@@ -2564,7 +2590,7 @@ class TestP05RealtimeStreamStateAndPlaybackSerialization(unittest.TestCase):
         """16. Realtime S2S: speech_stopped does NOT send manual response.create (native turn detection)."""
         import asyncio
         from astro_ai.astro_realtime_node import AstroRealtimeNode
-        node = AstroRealtimeNode.__new__(AstroRealtimeNode)
+        node = _bare_realtime_node()
         node._is_sleeping = False
         node.get_logger = lambda: MagicMock()
         node._run_voice_identification = MagicMock()
@@ -2580,7 +2606,7 @@ class TestP05RealtimeStreamStateAndPlaybackSerialization(unittest.TestCase):
     def test_motion_and_memory_tools_execution(self):
         """17. Tools: move_robot publishes Twist to /cmd_vel and search_memory queries storage."""
         from astro_ai.astro_realtime_node import AstroRealtimeNode
-        node = AstroRealtimeNode.__new__(AstroRealtimeNode)
+        node = _bare_realtime_node()
         mock_cmd_vel = MagicMock()
         node.pub_cmd_vel = mock_cmd_vel
         node.memory = MagicMock()

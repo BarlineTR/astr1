@@ -720,24 +720,72 @@ class TestRealtimeArchitectureInvariants(unittest.TestCase):
             self.assertTrue(mock_async_send.called)
             node._ws.send.assert_called_once_with(json.dumps({"type": "input_audio_buffer.append", "audio": "AQIDBA=="}))
 
-    def test_realtime_barge_in_preserves_semantics(self):
-        """User speech event during playback triggers instant playback abort and response.cancel."""
+    def test_realtime_barge_in_stops_playback_without_client_cancel(self):
+        """Sunucu tarafı barge-in: interrupt_response=true iken istemci response.cancel GÖNDERMEZ.
+
+        Eski kontrat istemcinin cancel göndermesini bekliyordu. Kesme otoritesi
+        artık sunucuda (session.audio.input.turn_detection.interrupt_response),
+        istemcinin tek işi çalmayı durdurmak.
+        """
         from astro_ai.astro_realtime_node import AstroRealtimeNode
-        from unittest.mock import AsyncMock
+        from astro_ai.realtime.turn_machine import TurnState
 
         node = AstroRealtimeNode()
-        node._is_responding = True
+        node.turn_machine._client_side_cancel = False
         node._is_playback_active = True
         node.pub_interrupt = MagicMock()
 
+        # Sunucu bir yanıt akıtıyor
+        node.turn_machine.on_event("input_audio_buffer.speech_started")
+        node.turn_machine.on_event("input_audio_buffer.speech_stopped")
+        node.turn_machine.on_event("response.created", "resp_1")
+
         mock_ws = AsyncMock()
-        event = {"type": "input_audio_buffer.speech_started"}
+        asyncio.run(node._handle_realtime_event(
+            mock_ws, {"type": "input_audio_buffer.speech_started"}
+        ))
 
-        asyncio.run(node._handle_realtime_event(mock_ws, event))
+        self.assertEqual(node.turn_machine.state, TurnState.RESPONSE_CANCELLING)
+        node.pub_interrupt.publish.assert_called_once()
+        mock_ws.send.assert_not_called()
 
-        self.assertFalse(node._is_responding)
+    def test_realtime_barge_in_client_fallback_sends_cancel(self):
+        """REALTIME_INTERRUPT_RESPONSE=false yedek yolu: istemci cancel gönderir."""
+        from astro_ai.astro_realtime_node import AstroRealtimeNode
+
+        node = AstroRealtimeNode()
+        node.turn_machine._client_side_cancel = True
+        node._is_playback_active = True
+        node.pub_interrupt = MagicMock()
+
+        node.turn_machine.on_event("input_audio_buffer.speech_started")
+        node.turn_machine.on_event("input_audio_buffer.speech_stopped")
+        node.turn_machine.on_event("response.created", "resp_1")
+
+        mock_ws = AsyncMock()
+        asyncio.run(node._handle_realtime_event(
+            mock_ws, {"type": "input_audio_buffer.speech_started"}
+        ))
+
         node.pub_interrupt.publish.assert_called_once()
         mock_ws.send.assert_called_once_with(json.dumps({"type": "response.cancel"}))
+
+    def test_realtime_never_sends_manual_response_create_on_speech_stopped(self):
+        """create_response=true: yanıtı sunucu üretir, istemci response.create göndermez."""
+        from astro_ai.astro_realtime_node import AstroRealtimeNode
+
+        node = AstroRealtimeNode()
+        node._is_sleeping = False
+        node.turn_machine.on_event("input_audio_buffer.speech_started")
+
+        mock_ws = AsyncMock()
+        asyncio.run(node._handle_realtime_event(
+            mock_ws, {"type": "input_audio_buffer.speech_stopped"}
+        ))
+
+        for call in mock_ws.send.call_args_list:
+            self.assertNotIn("response.create", str(call))
+
 
     def test_vision_failures_completely_isolated_from_realtime(self):
         """Vision timeouts or HTTP errors never alter Realtime connection or fallback mode."""

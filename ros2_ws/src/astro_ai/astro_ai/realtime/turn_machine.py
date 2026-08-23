@@ -62,10 +62,21 @@ class TurnMachine:
         return self.active_response_id is not None and self.state in _CANCELLABLE
 
     def should_publish_audio(self, response_id: Optional[str] = None) -> bool:
-        """Gelen audio delta'nın hoparlöre gitmesi gerekip gerekmediği."""
-        if self.active_response_id is None:
-            return False
-        if response_id is None:
+        """Gelen audio delta'nın hoparlöre gitmesi gerekip gerekmediği.
+
+        Makine henüz hiç ``response.created`` görmemişse (``generation_id == 0``)
+        kapı KAPALIDIR: geçersiz kılınacak bir önceki yanıt yoktur, dolayısıyla
+        elenecek bir şey de yoktur. Bu durumda sesi düşürmek, karakterize bile
+        edemediğimiz bir desync yüzünden robotu tamamen susturmak olurdu.
+        Generation isolation ilk yanıt gözlemlendiği anda devreye girer.
+        """
+        if self.generation_id == 0:
+            return True
+        if response_id is None or self.active_response_id is None:
+            # Karşılaştıracak kimlik yok: sesin BAYAT olduğunu kanıtlayamayız.
+            # Kanıtlanamayan şüphe yüzünden susmak yerine çalıyoruz; gerçek
+            # bayatlık zaten durum kontrolüyle (RESPONSE_STREAMING değilse
+            # düşür) ve kimlikler mevcutken karşılaştırmayla yakalanır.
             return True
         return response_id == self.active_response_id
 
@@ -114,7 +125,13 @@ class TurnMachine:
         return []
 
     def _on_response_created(self, response_id: Optional[str]) -> List[Action]:
-        if self.state == TurnState.RESPONSE_PENDING:
+        if self.state in (TurnState.RESPONSE_PENDING, TurnState.IDLE):
+            # IDLE de meşrudur: her yanıt kullanıcı konuşmasını takip etmez.
+            # Proaktif selamlama (_trigger_proactive_greeting) ve tool sonrası
+            # devam yanıtı istemci tarafından başlatılır; sunucu da kendi
+            # inisiyatifiyle yanıt kurabilir. Makinenin işi sunucuyu TAKİP
+            # etmektir, ne yapabileceğine karar vermek değil. Bunu yok saymak
+            # selamlama boyunca makineyi desync bırakır ve barge-in'i öldürür.
             self.active_response_id = response_id
             self.generation_id += 1
             self.state = TurnState.RESPONSE_STREAMING
@@ -130,6 +147,9 @@ class TurnMachine:
         return [Action.IGNORE]
 
     def _on_audio_delta(self, response_id: Optional[str]) -> List[Action]:
+        # Hiç yanıt gözlemlenmemişken kapı kapalı — bkz. should_publish_audio.
+        if self.generation_id == 0:
+            return [Action.PUBLISH_AUDIO]
         if self.state == TurnState.RESPONSE_STREAMING and self.should_publish_audio(
             response_id
         ):

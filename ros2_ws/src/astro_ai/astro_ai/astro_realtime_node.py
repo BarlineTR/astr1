@@ -64,6 +64,10 @@ except ImportError:
             self.angular = Twist.Vector3()
     Image = CameraInfo = Bool = Float32 = String = _MockMsg  # type: ignore
 
+# S2S çekirdeği: ROS'suz, ağsız, donanımsız saf Python modüller.
+from astro_ai.realtime.engine_state import EngineState, EngineStateTracker
+from astro_ai.realtime.turn_machine import Action, TurnMachine, TurnState
+
 try:
     import cv2
 except ImportError:
@@ -673,6 +677,17 @@ class AstroRealtimeNode(Node):
         self.pub_cmd_vel = self.create_publisher(Twist, "/cmd_vel", 10)
 
         self.pub_interrupt = self.create_publisher(Bool, "/tts/interrupt", 10)
+
+        # Kesme otoritesi sunucuda; istemci yedek yolu yalnızca
+        # REALTIME_INTERRUPT_RESPONSE=false iken devreye girer.
+        _client_cancel = os.getenv("REALTIME_INTERRUPT_RESPONSE", "true").strip().lower() == "false"
+        self.turn_machine = TurnMachine(client_side_cancel=_client_cancel)
+        self.engine_state = EngineStateTracker()
+        self.get_logger().info(
+            f"[VOICE ENGINE STATE]\n"
+            f"state={self.engine_state.state.value}\n"
+            f"cancel_authority={'client' if _client_cancel else 'server'}"
+        )
         self.pub_emotion = self.create_publisher(String, "/robot/emotion", 10)
         self.pub_gesture = self.create_publisher(String, "/robot/head_gesture", 10)
         self.pub_transcript = self.create_publisher(String, "/speech/text", 10)
@@ -741,6 +756,10 @@ class AstroRealtimeNode(Node):
                 print(f"[{str(lvl).upper()}] {msg}", flush=True)
 
     def _publish_realtime_state(self, state: str, reason: str = "none"):
+        self.get_logger().debug(
+            f"[VOICE ENGINE STATE] engine={self.engine_state.state.value} "
+            f"turn={self.turn_machine.state.value}"
+        )
         """Publishes realtime WebSocket state to /realtime/state for ai_brain_node consumption."""
         try:
             import json as _json
@@ -808,6 +827,7 @@ class AstroRealtimeNode(Node):
                     self._is_playback_active = False
                     self.realtime_connection_state = "CONNECTED"
                     self.realtime_session_state = "NOT_READY"
+                    self.engine_state.transition_to(EngineState.REALTIME_PRIMARY)
                     self.realtime_provider_state = "AVAILABLE"
                     self.get_logger().info(
                         f"[REALTIME CONNECTED]\n"
@@ -829,6 +849,7 @@ class AstroRealtimeNode(Node):
                 self._is_responding = False
                 self._is_playback_active = False
                 self.realtime_connection_state = "DISCONNECTED"
+                self.engine_state.transition_to(EngineState.RECONNECTING)
                 self.realtime_session_state = "NOT_READY"
                 self.realtime_response_state = "IDLE"
                 self._publish_realtime_state("DISCONNECTED", "error")
@@ -876,6 +897,7 @@ class AstroRealtimeNode(Node):
 
                     if not self._fallback_mode:
                         self._fallback_mode = True
+                        self.engine_state.transition_to(EngineState.FALLBACK_ACTIVE)
                         self.get_logger().warn("🚀 [0-Maliyetli Groq & Edge-TTS Modu Devrede]: OpenAI Realtime kredisi tükendi. Astro kesintisiz olarak 0-Token Groq LLM + Edge-TTS modunda çalışıyor!")
                     await asyncio.sleep(86400.0)
 
@@ -953,165 +975,155 @@ class AstroRealtimeNode(Node):
         )
 
     async def _send_session_update(self, ws):
-        """Sends comprehensive session configuration with persona prompt, tools, and turn detection."""
+        """Persona, tool'lar ve turn detection ile oturumu yapılandırır."""
+        from astro_ai.realtime.session_config import build_session_update
+
         identity = self._get_active_biometric_identity()
         system_prompt = self._build_current_system_prompt()
 
-        session_config = {
-            "type": "session.update",
-            "session": {
-                "type": "realtime",
-                "instructions": system_prompt,
-                "audio": {
-                    "input": {
-                        # whisper-1 DEĞİL: gpt-live-transcribe realtime için
-                        # tasarlanmış düşük gecikmeli akış modeli (OpenAI'nin
-                        # realtime rehberinde "controllable latency" ile önerilir).
-                        # Canlı doğrulandı: session.updated bu modelle dönüyor.
-                        "transcription": {
-                            "model": self.realtime_transcribe_model,
-                            "language": "tr"
+        tools = [
+            {
+                "type": "function",
+                "name": "get_live_weather",
+                "description": "Bitlis, Ahlat, Tatvan, İstanbul veya istenen bir şehrin canlı anlık hava durumu ve sıcaklık bilgisini getirir.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "city": {"type": "string", "description": "Hava durumu sorgulanan şehir (örn: Ahlat, Bitlis, Ankara)"}
+                    },
+                    "required": ["city"]
+                }
+            },
+            {
+                "type": "function",
+                "name": "set_reminder",
+                "description": "Kullanıcı için belirli bir dakika sonra hatırlatıcı / alarm kurar.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "minutes": {"type": "number", "description": "Kaç dakika sonra hatırlatılacağı"},
+                        "topic": {"type": "string", "description": "Hatırlatılacak konu veya görev"}
+                    },
+                    "required": ["minutes", "topic"]
+                }
+            },
+            {
+                "type": "function",
+                "name": "save_user_memory",
+                "description": "Kullanıcının tercihlerini, sevdiği şeyleri veya önemli bilgileri kalıcı hafızaya kaydeder.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "key": {"type": "string", "description": "Bilgi başlığı"},
+                        "value": {"type": "string", "description": "Detaylı bilgi"}
+                    },
+                    "required": ["key", "value"]
+                }
+            },
+            {
+                "type": "function",
+                "name": "search_memory",
+                "description": "Kullanıcı geçmiş sohbetler, önceki tercihler veya kaydedilmiş bilgiler hakkında soru sorduğunda kalıcı hafızada arama yapar.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string", "description": "Aranacak konu, anahtar kelime veya soru"}
+                    },
+                    "required": ["query"]
+                }
+            },
+            {
+                "type": "function",
+                "name": "inspect_camera_view",
+                "description": "Kullanıcı 'ne görüyorsun?', 'elimde ne var?', 'bana bak', 'görebiliyor musun?', 'elimdeki ne renk?', 'bu ne?' veya kameranın önündeki eşyaları sorduğunda OAK-D kamerasından canlı görüntü alıp inceler.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "focus": {"type": "string", "description": "İncelenmesi istenen nesne, detay, renk veya durum (örn: 'elimdeki nesne', 'kıyafet', 'çevre')"}
+                    },
+                    "required": ["focus"]
+                }
+            },
+            {
+                "type": "function",
+                "name": "move_robot",
+                "description": "Kullanıcı robotun hareket etmesini istediğinde çağrılır ('ileri git', 'geri gel', 'dur', 'sağa dön', 'sola dön').",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "direction": {
+                            "type": "string",
+                            "enum": ["forward", "backward", "left", "right", "stop"],
+                            "description": "Hareket yönü"
                         },
-                        "turn_detection": {
-                            "type": "server_vad",
-                            "threshold": 0.70,
-                            "prefix_padding_ms": 300,
-                            "silence_duration_ms": 500,
-                            "create_response": True
+                        "speed": {"type": "number", "description": "Hız (0.1 - 0.5 m/s)"},
+                        "duration": {"type": "number", "description": "Kaç saniye hareket edeceği"}
+                    },
+                    "required": ["direction"]
+                }
+            },
+            {
+                "type": "function",
+                "name": "enroll_user_biometrics",
+                "description": "SADECE VE SADECE kullanıcı KENDİ İSMİNİ tanıttığında ('Benim adım Onur', 'Adım Mehmet', 'Bana Ali de') çağrılır. Başka birisi hakkında soru sorulduğunda ('Onur nerede?', 'Onur kim?', 'Onur\\'u ne diye kaydetsin?') KESİNLİKLE ÇAĞRILMAZ.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string", "description": "Kullanıcının adı (örn: Baran, Batuhan, Mehmet)"},
+                        "formal_title": {"type": "string", "description": "Kullanıcıya hitap şekli (örn: Baran Bey, Sayın Müdürüm)"}
+                    },
+                    "required": ["name"]
+                }
+            },
+            {
+                "type": "function",
+                "name": "change_persona",
+                "description": "Kullanıcı robotun kişiliğini veya konuşma modunu değiştirmek istediğinde çağrılır (Örn: 'kaba moda geç', 'küfürbaz moda geç', 'neşeli moda geç', 'resmi moda geç', 'flört moduna geç', 'sarkastik moda geç', 'sinirli moda geç', 'duygusal moda geç').",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "persona": {
+                            "type": "string",
+                            "enum": ["kufurbaz", "flirt", "playful", "emotional", "formal", "sarcastic", "angry", "rude"],
+                            "description": "Hedef kişilik modu: kufurbaz, flirt, playful, emotional, formal, sarcastic, angry, rude"
                         }
                     },
-                    "output": {
-                        "voice": self.realtime_voice
-                    }
-                },
-                "tools": [
-                    {
-                        "type": "function",
-                        "name": "get_live_weather",
-                        "description": "Bitlis, Ahlat, Tatvan, İstanbul veya istenen bir şehrin canlı anlık hava durumu ve sıcaklık bilgisini getirir.",
-                        "parameters": {
-                            "type": "object",
-                            "properties": {
-                                "city": {"type": "string", "description": "Hava durumu sorgulanan şehir (örn: Ahlat, Bitlis, Ankara)"}
-                            },
-                            "required": ["city"]
-                        }
+                    "required": ["persona"]
+                }
+            },
+            {
+                "type": "function",
+                "name": "delete_user_biometrics",
+                "description": "Kullanıcı 'beni hafızandan sil', '[isim] kaydını sil' dediğinde veya hatalı bir kayıt silinmek istendiğinde çağrılır.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string", "description": "Silinecek kişinin adı (örn: Yarram, Onur, Mehmet)"}
                     },
-                    {
-                        "type": "function",
-                        "name": "set_reminder",
-                        "description": "Kullanıcı için belirli bir dakika sonra hatırlatıcı / alarm kurar.",
-                        "parameters": {
-                            "type": "object",
-                            "properties": {
-                                "minutes": {"type": "number", "description": "Kaç dakika sonra hatırlatılacağı"},
-                                "topic": {"type": "string", "description": "Hatırlatılacak konu veya görev"}
-                            },
-                            "required": ["minutes", "topic"]
-                        }
-                    },
-                    {
-                        "type": "function",
-                        "name": "save_user_memory",
-                        "description": "Kullanıcının tercihlerini, sevdiği şeyleri veya önemli bilgileri kalıcı hafızaya kaydeder.",
-                        "parameters": {
-                            "type": "object",
-                            "properties": {
-                                "key": {"type": "string", "description": "Bilgi başlığı"},
-                                "value": {"type": "string", "description": "Detaylı bilgi"}
-                            },
-                            "required": ["key", "value"]
-                        }
-                    },
-                    {
-                        "type": "function",
-                        "name": "search_memory",
-                        "description": "Kullanıcı geçmiş sohbetler, önceki tercihler veya kaydedilmiş bilgiler hakkında soru sorduğunda kalıcı hafızada arama yapar.",
-                        "parameters": {
-                            "type": "object",
-                            "properties": {
-                                "query": {"type": "string", "description": "Aranacak konu, anahtar kelime veya soru"}
-                            },
-                            "required": ["query"]
-                        }
-                    },
-                    {
-                        "type": "function",
-                        "name": "inspect_camera_view",
-                        "description": "Kullanıcı 'ne görüyorsun?', 'elimde ne var?', 'bana bak', 'görebiliyor musun?', 'elimdeki ne renk?', 'bu ne?' veya kameranın önündeki eşyaları sorduğunda OAK-D kamerasından canlı görüntü alıp inceler.",
-                        "parameters": {
-                            "type": "object",
-                            "properties": {
-                                "focus": {"type": "string", "description": "İncelenmesi istenen nesne, detay, renk veya durum (örn: 'elimdeki nesne', 'kıyafet', 'çevre')"}
-                            },
-                            "required": ["focus"]
-                        }
-                    },
-                    {
-                        "type": "function",
-                        "name": "move_robot",
-                        "description": "Kullanıcı robotun hareket etmesini istediğinde çağrılır ('ileri git', 'geri gel', 'dur', 'sağa dön', 'sola dön').",
-                        "parameters": {
-                            "type": "object",
-                            "properties": {
-                                "direction": {
-                                    "type": "string",
-                                    "enum": ["forward", "backward", "left", "right", "stop"],
-                                    "description": "Hareket yönü"
-                                },
-                                "speed": {"type": "number", "description": "Hız (0.1 - 0.5 m/s)"},
-                                "duration": {"type": "number", "description": "Kaç saniye hareket edeceği"}
-                            },
-                            "required": ["direction"]
-                        }
-                    },
-                    {
-                        "type": "function",
-                        "name": "enroll_user_biometrics",
-                        "description": "SADECE VE SADECE kullanıcı KENDİ İSMİNİ tanıttığında ('Benim adım Onur', 'Adım Mehmet', 'Bana Ali de') çağrılır. Başka birisi hakkında soru sorulduğunda ('Onur nerede?', 'Onur kim?', 'Onur\\'u ne diye kaydetsin?') KESİNLİKLE ÇAĞRILMAZ.",
-                        "parameters": {
-                            "type": "object",
-                            "properties": {
-                                "name": {"type": "string", "description": "Kullanıcının adı (örn: Baran, Batuhan, Mehmet)"},
-                                "formal_title": {"type": "string", "description": "Kullanıcıya hitap şekli (örn: Baran Bey, Sayın Müdürüm)"}
-                            },
-                            "required": ["name"]
-                        }
-                    },
-                    {
-                        "type": "function",
-                        "name": "change_persona",
-                        "description": "Kullanıcı robotun kişiliğini veya konuşma modunu değiştirmek istediğinde çağrılır (Örn: 'kaba moda geç', 'küfürbaz moda geç', 'neşeli moda geç', 'resmi moda geç', 'flört moduna geç', 'sarkastik moda geç', 'sinirli moda geç', 'duygusal moda geç').",
-                        "parameters": {
-                            "type": "object",
-                            "properties": {
-                                "persona": {
-                                    "type": "string",
-                                    "enum": ["kufurbaz", "flirt", "playful", "emotional", "formal", "sarcastic", "angry", "rude"],
-                                    "description": "Hedef kişilik modu: kufurbaz, flirt, playful, emotional, formal, sarcastic, angry, rude"
-                                }
-                            },
-                            "required": ["persona"]
-                        }
-                    },
-                    {
-                        "type": "function",
-                        "name": "delete_user_biometrics",
-                        "description": "Kullanıcı 'beni hafızandan sil', '[isim] kaydını sil' dediğinde veya hatalı bir kayıt silinmek istendiğinde çağrılır.",
-                        "parameters": {
-                            "type": "object",
-                            "properties": {
-                                "name": {"type": "string", "description": "Silinecek kişinin adı (örn: Yarram, Onur, Mehmet)"}
-                            },
-                            "required": ["name"]
-                        }
-                    }
-                ]
+                    "required": ["name"]
+                }
             }
-        }
+        ]
+
+        session_config = build_session_update(
+            instructions=system_prompt,
+            voice=self.realtime_voice,
+            tools=tools,
+            transcribe_model=self.realtime_transcribe_model,
+            language="tr",
+        )
 
         await ws.send(json.dumps(session_config))
         self.get_logger().info(f"✨ [Realtime WS] Oturum Yapılandırıldı. Kişilik: [{self.persona_name.upper()}], Ses: [{self.realtime_voice}], Kimlik: [{identity.get('name')}]")
+        td = session_config["session"]["audio"]["input"]["turn_detection"]
+        self.get_logger().info(
+            f"[REALTIME VAD]\n"
+            f"type={td['type']}\n"
+            f"create_response={td['create_response']}\n"
+            f"interrupt_response={td['interrupt_response']}\n"
+            f"silence_duration_ms={td.get('silence_duration_ms', 'n/a')}\n"
+            f"eagerness={td.get('eagerness', 'n/a')}"
+        )
 
     async def _handle_realtime_event(self, ws, event: Dict[str, Any]):
         """Dispatches Realtime WebSocket server events."""
@@ -1137,6 +1149,15 @@ class AstroRealtimeNode(Node):
         # 1. Real-Time Streaming Audio Output (GA & Preview names)
         elif event_type in ("response.audio.delta", "response.output_audio.delta"):
             delta_b64 = event.get("delta", "")
+            _rid = event.get("response_id")
+            if delta_b64 and Action.PUBLISH_AUDIO not in self.turn_machine.on_event(
+                "response.output_audio.delta", _rid
+            ):
+                self.get_logger().debug(
+                    f"[REALTIME AUDIO DROPPED] response_id={_rid} "
+                    f"active={self.turn_machine.active_response_id}"
+                )
+                return
             if delta_b64:
                 self.active_response_state = "RESPONSE_STREAMING"
                 self.realtime_audio_received = True
@@ -1192,31 +1213,31 @@ class AstroRealtimeNode(Node):
 
         # 3. User Speech Started
         elif event_type == "input_audio_buffer.speech_started":
-            # ONLY trigger barge-in interruption if Astro was ACTUALLY playing audio or generating a response
-            if self._is_responding or self._is_playback_active:
-                self.get_logger().info("⚡ [Realtime Barge-In] Kullanıcı lafa girdi — Çalma anında durduruluyor...")
+            actions = self.turn_machine.on_event("input_audio_buffer.speech_started")
+            if Action.STOP_PLAYBACK in actions:
+                self.get_logger().info(
+                    "⚡ [Realtime Barge-In] Kullanıcı lafa girdi — çalma durduruluyor "
+                    "(kesmeyi sunucu yapıyor)."
+                )
                 self._is_responding = False
+                self.active_response_state = "RESPONSE_CANCELLING"
                 intr_msg = Bool()
                 intr_msg.data = True
                 self.pub_interrupt.publish(intr_msg)
-
-                # ONLY send response.cancel if there is an active creating/streaming response
-                if self.active_response_id is not None and self.active_response_state in ("RESPONSE_CREATING", "RESPONSE_STREAMING"):
-                    self.active_response_state = "RESPONSE_CANCELLING"
-                    try:
-                        await ws.send(json.dumps({"type": "response.cancel"}))
-                    except Exception:
-                        pass
-                else:
-                    self.get_logger().debug("[REALTIME CANCEL IGNORE] reason=response_already_finished")
-            else:
+            if Action.SEND_CANCEL in actions:
+                try:
+                    await ws.send(json.dumps({"type": "response.cancel"}))
+                except Exception as ce:
+                    self.get_logger().debug(f"response.cancel gönderilemedi: {ce}")
+            if not actions:
                 self.get_logger().debug("🎤 [Realtime] Kullanıcı konuşmaya başladı...")
 
         # 3b. User Speech Stopped
         elif event_type == "input_audio_buffer.speech_stopped":
             if self._is_sleeping:
                 return
-            self.get_logger().info("🤫 [Realtime] Cümle bitti, dinleme tamamlandı...")
+            self.turn_machine.on_event("input_audio_buffer.speech_stopped")
+            self.get_logger().info("🤫 [Realtime] Cümle bitti, yanıtı sunucu üretecek...")
             try:
                 asyncio.create_task(asyncio.to_thread(self._run_voice_identification))
             except Exception:
@@ -1224,7 +1245,16 @@ class AstroRealtimeNode(Node):
 
         # 3c. Response Created
         elif event_type == "response.created":
-            self.active_response_id = event.get("response", {}).get("id")
+            _rid = event.get("response", {}).get("id")
+            _actions = self.turn_machine.on_event("response.created", _rid)
+            if Action.SEND_CANCEL in _actions:
+                try:
+                    await ws.send(json.dumps({"type": "response.cancel"}))
+                except Exception as ce:
+                    self.get_logger().debug(f"response.cancel gönderilemedi: {ce}")
+            self.active_response_id = _rid
+            self.active_generation_id = self.turn_machine.generation_id
+            self.realtime_current_generation_id = self.turn_machine.generation_id
             self.active_response_state = "RESPONSE_STREAMING"
             self._is_responding = True
             self.realtime_response_state = "GENERATING"
@@ -1232,10 +1262,6 @@ class AstroRealtimeNode(Node):
             self._packets_for_gen = 0
             self._bytes_for_gen = 0
             self._first_audio_time = None
-            if self.active_generation_id is None:
-                self.active_generation_id = self.realtime_current_generation_id or 1
-            if self.realtime_current_generation_id == 0:
-                self.realtime_current_generation_id = self.active_generation_id
             self.get_logger().info(
                 f"[REALTIME RESPONSE CREATED]\n"
                 f"generation_id={self.active_generation_id}"
@@ -1259,6 +1285,7 @@ class AstroRealtimeNode(Node):
                     f"first_audio_ms={first_ms:.1f}\n"
                     f"total_audio_ms={total_audio_ms:.1f}"
                 )
+            self.turn_machine.on_event("response.done")
             self._is_responding = False
             self.realtime_response_state = "IDLE"
             self.active_response_id = None
@@ -1313,6 +1340,7 @@ class AstroRealtimeNode(Node):
             except Exception:
                 args = {}
 
+            self.turn_machine.on_event("response.function_call_arguments.done")
             self.get_logger().info(f"🛠️ [Realtime Tool]: {func_name}({args}) çalıştırılıyor...")
             try:
                 tool_result = await asyncio.to_thread(self._execute_realtime_tool, func_name, args)
@@ -1330,8 +1358,11 @@ class AstroRealtimeNode(Node):
                 }
             }
             await ws.send(json.dumps(tool_output_event))
-            # Trigger response generation with tool output
+            # create_response=true kuralının TEK meşru istisnası: sunucu VAD
+            # yalnızca kullanıcı konuşmasının bitişinde yanıt üretir; tool
+            # sonucundan sonraki devam yanıtını istemci istemek zorundadır.
             await ws.send(json.dumps({"type": "response.create"}))
+            self.turn_machine.on_event("tool_result_sent")
 
         # 7. Error Handling
         elif event_type == "error":
@@ -3925,30 +3956,46 @@ class AstroRealtimeNode(Node):
             self._barge_in_consecutive_frames = 0
             barge_in_after_ms = int((now - playback_start) * 1000.0) if playback_start > 0.0 else int(self.barge_in_protection_ms + 100)
 
-            # Genuine User Barge-In during Playback!
-            self.state_machine.transition_to(RobotState.INTERRUPTED)
-            self._is_responding = False
-            self._is_playback_active = False
-            self._fallback_speaking = True
-            self._fallback_speech_start = now
+            # AKUSTİK YANKI KORUMASI — konuşma mantığı değil.
+            #
+            # Realtime modunda turn ve kesme otoritesi SUNUCUDADIR
+            # (turn_detection.interrupt_response). Burada yapılan tek iş
+            # çalmayı durdurmak: robot kendi sesini duyup kendini kesmesin.
+            # Durum geçişleri sunucunun speech_started olayıyla
+            # _handle_realtime_event içinde yapılır.
+            #
+            # Fallback modunda ise sunucu VAD yoktur; orada bu blok gerçekten
+            # tek barge-in otoritesidir ve tam davranışını sürdürür.
+            # Bkz. docs/superpowers/specs/2026-08-23-realtime-s2s-voice-core-design.md §5.1
+            local_authority = bool(self._fallback_mode or not self._is_connected)
+
             self._last_speech_time = now
-            self._fallback_generation_id += 1
-            if self.elevenlabs_engine:
-                self.elevenlabs_engine.cancel(self._fallback_generation_id)
-            if self.local_xtts:
-                self.local_xtts.cancel(self._fallback_generation_id)
-            if self.local_offline_tts:
-                self.local_offline_tts.cancel(self._fallback_generation_id)
             int_msg = Bool()
             int_msg.data = True
             self.pub_interrupt.publish(int_msg)
-            with self._lock:
-                self._fallback_audio_buffer = [raw_16k]
+
+            if local_authority:
+                self.state_machine.transition_to(RobotState.INTERRUPTED)
+                self._is_responding = False
+                self._is_playback_active = False
+                self._fallback_speaking = True
+                self._fallback_speech_start = now
+                self._fallback_generation_id += 1
+                if self.elevenlabs_engine:
+                    self.elevenlabs_engine.cancel(self._fallback_generation_id)
+                if self.local_xtts:
+                    self.local_xtts.cancel(self._fallback_generation_id)
+                if self.local_offline_tts:
+                    self.local_offline_tts.cancel(self._fallback_generation_id)
+                with self._lock:
+                    self._fallback_audio_buffer = [raw_16k]
+                self.state_machine.transition_to(RobotState.LISTENING)
+
             self.get_logger().info(
-                f"⚡ [Realtime Barge-In] Kullanıcı araya girdi (RMS: {local_rms:.0f}, Peak: {peak_val}, "
-                f"barge_in_after_ms={barge_in_after_ms}, Latch: True)."
+                f"⚡ [Akustik Yankı Koruması] Yerel eşik aşıldı — çalma durduruluyor. "
+                f"authority={'local' if local_authority else 'server'} "
+                f"(RMS: {local_rms:.0f}, Peak: {peak_val}, barge_in_after_ms={barge_in_after_ms})"
             )
-            self.state_machine.transition_to(RobotState.LISTENING)
             return
 
         # Acoustic presence / wake-up (requires sustained intentional voice > 500 RMS across >=5 consecutive frames)
