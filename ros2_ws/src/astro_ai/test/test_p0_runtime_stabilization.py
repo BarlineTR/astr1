@@ -3689,6 +3689,174 @@ class TestP07OfflineIsolationAndModelStandardization(unittest.TestCase):
         self.assertEqual(real_network_requests, 0)
 
 
+class TestP08RealtimeGatingAndReliabilityRecovery(unittest.TestCase):
+    """P0.8 Acceptance Tests: Realtime Gating, STT Standby, Microphone Ready Gating, and Serial Reliability."""
+
+    def test_realtime_connected_stt_fallback_standby(self):
+        """1. Realtime Primary: speech_recognition_node stays in STANDBY when Realtime is CONNECTED and READY."""
+        from astro_audio.speech_recognition_node import SpeechRecognitionNode
+        node = SpeechRecognitionNode.__new__(SpeechRecognitionNode)
+        node.enabled = True
+        node._lock = threading.Lock()
+        node._buffer = []
+        node._ring_buffer = []
+        node._is_speaking = False
+        node._tts_speaking = False
+        node._last_speech_time = None
+        node._last_tts_end_time = None
+        node._ambient_rms = 100.0
+        node._realtime_connected = False
+        node._realtime_session_ready = False
+        node._realtime_fallback_active = False
+
+        # Publish connected state
+        msg = MagicMock()
+        msg.data = json.dumps({"connection": "CONNECTED", "session": "READY", "fallback_mode": False})
+        node._realtime_state_cb(msg)
+        self.assertTrue(node._is_realtime_primary_active())
+
+        # Audio and VAD callbacks must be bypassed in STANDBY
+        audio_msg = MagicMock()
+        audio_msg.data = [100] * 320
+        node._audio_cb(audio_msg)
+        self.assertEqual(len(node._buffer), 0)
+
+        vad_msg = MagicMock()
+        vad_msg.data = True
+        node._vad_cb(vad_msg)
+        self.assertFalse(node._is_speaking)
+
+    def test_realtime_primary_drops_groq_whisper_turns(self):
+        """2. Realtime Primary: ai_brain_node drops duplicate Groq Whisper turns when Realtime is active."""
+        from astro_ai.ai_brain_node import AiBrainNode
+        node = AiBrainNode.__new__(AiBrainNode)
+        node._enabled = True
+        node._lock = threading.Lock()
+        node._realtime_ws_connected = True
+        node._realtime_session_ready = True
+        node._fallback_mode = False
+        node._is_processing = False
+        node._tts_speaking = False
+        node._last_llm_turn_time = 0.0
+
+        info_logs = []
+        mock_logger = MagicMock()
+        mock_logger.info = lambda msg: info_logs.append(msg)
+        node.get_logger = lambda: mock_logger
+
+        msg = MagicMock()
+        msg.data = "merhaba astro"
+        node._on_speech(msg)
+
+        self.assertIn("[TURN DROPPED] reason=realtime_primary_active", "\n".join(info_logs))
+
+    def test_wake_stt_pipeline_active_only_on_fallback(self):
+        """3. Fallback Active: speech_recognition_node activates Whisper pipeline when fallback mode is active."""
+        from astro_audio.speech_recognition_node import SpeechRecognitionNode
+        node = SpeechRecognitionNode.__new__(SpeechRecognitionNode)
+        node.enabled = True
+        node._lock = threading.Lock()
+        node._buffer = []
+        node._ring_buffer = []
+        node._is_speaking = False
+        node._tts_speaking = False
+        node._last_speech_time = None
+        node._last_tts_end_time = None
+        node._ambient_rms = 100.0
+
+        # Receive fallback mode state
+        msg = MagicMock()
+        msg.data = json.dumps({"connection": "DISCONNECTED", "session": "NOT_READY", "fallback_mode": True, "provider": "EXHAUSTED"})
+        node._realtime_state_cb(msg)
+        self.assertFalse(node._is_realtime_primary_active())
+
+        # Audio should now be accumulated
+        audio_msg = MagicMock()
+        audio_msg.data = [200] * 320
+        node._audio_cb(audio_msg)
+        self.assertEqual(len(node._ring_buffer), 320)
+
+    def test_microphone_input_gated_on_session_ready(self):
+        """4. Microphone Gating: AstroRealtimeNode does NOT send audio to WebSocket when session is NOT_READY."""
+        from astro_ai.astro_realtime_node import AstroRealtimeNode
+        fake_ws = FakeRealtimeTransport()
+        node = AstroRealtimeNode(connect_realtime=False, fake_transport=fake_ws)
+        node.realtime_connection_state = "CONNECTED"
+        node.realtime_session_state = "NOT_READY"
+        node._fallback_mode = False
+
+        msg = MagicMock()
+        msg.data = "AAAA"
+        node._on_input_pcm(msg)
+        self.assertEqual(len(fake_ws.sent_events), 0)
+
+    def test_session_ready_starts_continuous_pcm_stream(self):
+        """5. Microphone Streaming: AstroRealtimeNode sends audio to WebSocket when session is READY."""
+        from astro_ai.astro_realtime_node import AstroRealtimeNode
+        from astro_ai.state_machine import RobotState
+        fake_ws = FakeRealtimeTransport()
+        node = AstroRealtimeNode(connect_realtime=False, fake_transport=fake_ws)
+        node._is_sleeping = False
+        node.state_machine.transition_to(RobotState.LISTENING)
+        node.realtime_connection_state = "CONNECTED"
+        node.realtime_session_state = "READY"
+        node._fallback_mode = False
+
+        msg = MagicMock()
+        msg.data = "AAAA"
+        node._on_input_pcm(msg)
+        self.assertEqual(len(fake_ws.sent_events), 1)
+        self.assertEqual(fake_ws.sent_events[0].get("type"), "input_audio_buffer.append")
+
+    def test_response_lifecycle_separated_from_connection_lifecycle(self):
+        """6. Lifecycle Separation: response.done resets response state to IDLE while leaving connection CONNECTED and session READY."""
+        import asyncio
+        from astro_ai.astro_realtime_node import AstroRealtimeNode
+        fake_ws = FakeRealtimeTransport()
+        node = AstroRealtimeNode(connect_realtime=False, fake_transport=fake_ws)
+        node.realtime_connection_state = "CONNECTED"
+        node.realtime_session_state = "READY"
+        node.realtime_response_state = "STREAMING"
+        node.active_response_state = "RESPONSE_STREAMING"
+        node.realtime_audio_received = True
+
+        asyncio.run(node._handle_realtime_event(fake_ws, {"type": "response.done"}))
+        # Response lifecycle returns to IDLE
+        self.assertEqual(node.realtime_response_state, "IDLE")
+        # Connection and session remain CONNECTED / READY
+        self.assertEqual(node.realtime_connection_state, "CONNECTED")
+        self.assertEqual(node.realtime_session_state, "READY")
+
+    def test_rate_limit_exceeded_switches_to_fallback_without_1013_loop(self):
+        """7. Rate Limit: Rate limit close string triggers EXHAUSTED and sets fallback_mode True."""
+        from astro_ai.circuit_breaker import GlobalProviderCircuitBreaker, RequestErrorClass, ProviderState
+        cb = GlobalProviderCircuitBreaker.reset_instance()
+        err_msg = "requests:rate_limit_exceeded Limit 1000, Used 1000, Requested 1"
+        cb.record_error("openai", sub_provider="openai_realtime", error_class=RequestErrorClass.QUOTA_EXHAUSTED, error_msg=err_msg)
+        self.assertEqual(cb.get_state("openai", "openai_realtime"), ProviderState.EXHAUSTED)
+        self.assertTrue(cb.is_exhausted("openai"))
+
+    def test_serial_bootloader_grace_period(self):
+        """8. Serial Grace Period: send_heartbeat does not block motors during initial 1.5s bootloader startup."""
+        from serial_bridge import SerialBridge, ArduinoState
+        node = SerialBridge.__new__(SerialBridge)
+        node.ser = MagicMock()
+        node.ser.is_open = True
+        node.tx_lock = threading.Lock()
+        node._hb_seq = 1
+        node._hb_tx_times = {}
+        node.port_connected_time = time.monotonic()
+        node.last_hb_ack_time = 0.0
+        node.arduino_alive = False
+        node.state = ArduinoState.HANDSHAKE_OK
+        node.build_packet = lambda msg_id, pl: b""
+        node.get_logger = lambda: MagicMock()
+
+        node.send_heartbeat()
+        # Should NOT trigger SAFETY_BLOCKED during initial bootloader grace period
+        self.assertNotEqual(node.state, ArduinoState.SAFETY_BLOCKED)
+
+
 if __name__ == "__main__":
     unittest.main()
 

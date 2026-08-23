@@ -790,7 +790,7 @@ class AstroRealtimeNode(Node):
                 print(f"[{str(lvl).upper()}] {msg}", flush=True)
 
     def _publish_realtime_state(self, state: str, reason: str = "none"):
-        """Publishes realtime WebSocket state to /realtime/state for ai_brain_node consumption."""
+        """Publishes realtime WebSocket state to /realtime/state for ai_brain_node and speech_recognition_node consumption."""
         try:
             import json as _json
             msg = String()
@@ -800,6 +800,7 @@ class AstroRealtimeNode(Node):
                 "connection": self.realtime_connection_state,
                 "session": self.realtime_session_state,
                 "provider": self.realtime_provider_state,
+                "fallback_mode": bool(getattr(self, "_fallback_mode", False)),
             })
             self.pub_realtime_state.publish(msg)
         except Exception:
@@ -1002,32 +1003,41 @@ class AstroRealtimeNode(Node):
                 self.realtime_session_state = "NOT_READY"
                 self.realtime_response_state = "IDLE"
                 self._publish_realtime_state("DISCONNECTED", "error")
-                err_str = str(e)
+
+                close_code = getattr(e, "code", None)
+                close_reason = getattr(e, "reason", "") or getattr(getattr(e, "response", None), "reason", "")
+                err_str = f"{str(e)} {close_reason}".strip()
 
                 try:
                     from astro_audio.realtime_engine import classify_realtime_error, RealtimeState
-                    _, failure_reason = classify_realtime_error(getattr(e, "code", None), err_str)
+                    _, failure_reason = classify_realtime_error(close_code, err_str)
                 except Exception:
                     if "insufficient_quota" in err_str or "credit_balance_exhausted" in err_str or "402" in err_str or ("quota" in err_str and "exhaust" in err_str):
                         failure_reason = "realtime_quota_exhausted"
-                    elif "1013" in err_str:
+                    elif "1013" in err_str or close_code == 1013:
                         failure_reason = "realtime_temporary_1013"
                     else:
                         failure_reason = "realtime_network_unavailable"
 
-                # 1. Strict Quota Exhaustion (402, insufficient_quota, credit_balance_exhausted)
-                is_quota = (
-                    "insufficient_quota" in err_str
-                    or "credit_balance_exhausted" in err_str
+                # 1. Rate Limit Exceeded / Quota Exhaustion (402, rate_limit_exceeded, insufficient_quota, credit_balance_exhausted)
+                is_rate_limit_or_quota = (
+                    "rate_limit_exceeded" in err_str.lower()
+                    or "requests:rate_limit_exceeded" in err_str.lower()
+                    or "limit 1000" in err_str.lower()
+                    or "insufficient_quota" in err_str.lower()
+                    or "credit_balance_exhausted" in err_str.lower()
                     or "402" in err_str
-                    or ("quota" in err_str and ("exhaust" in err_str or "exceed" in err_str or "zero" in err_str or "balance" in err_str))
+                    or ("quota" in err_str.lower() and ("exhaust" in err_str.lower() or "exceed" in err_str.lower() or "zero" in err_str.lower() or "balance" in err_str.lower()))
                 )
-                if is_quota and "1013" not in err_str:
+                if is_rate_limit_or_quota:
                     self.realtime_provider_state = "EXHAUSTED"
+                    self._fallback_mode = True
+                    self._publish_realtime_state("EXHAUSTED", "quota_exhausted")
                     self.get_logger().error(
                         f"[REALTIME ERROR]\n"
                         f"generation_id={self.realtime_current_generation_id}\n"
-                        f"error_class=QUOTA_EXHAUSTED"
+                        f"error_class=QUOTA_EXHAUSTED\n"
+                        f"reason={err_str}"
                     )
                     self.get_logger().warn(
                         f"[REALTIME FALLBACK]\n"
@@ -1043,26 +1053,27 @@ class AstroRealtimeNode(Node):
                             cb.record_error("openai", sub_provider="openai_realtime", error_class=RequestErrorClass.QUOTA_EXHAUSTED, error_msg=err_str)
                     except Exception:
                         pass
-
-                    if not self._fallback_mode:
-                        self._fallback_mode = True
-                        self.get_logger().warn("🚀 [0-Maliyetli Groq & Edge-TTS Modu Devrede]: OpenAI Realtime kredisi tükendi. Astro kesintisiz olarak 0-Token Groq LLM + Edge-TTS modunda çalışıyor!")
+                    self.get_logger().warn("🚀 [0-Maliyetli Groq & Edge-TTS Modu Devrede]: OpenAI Realtime kredisi tükendi. Astro kesintisiz olarak 0-Token Groq LLM + Edge-TTS modunda çalışıyor!")
+                    # Terminate reconnect attempts session-wide
                     await asyncio.sleep(86400.0)
 
                 # 2. WebSocket 1013 Temporary Failure (Overload / Server degradation)
-                elif "1013" in err_str or getattr(e, "code", None) == 1013:
+                elif close_code == 1013 or "1013" in err_str:
                     self.realtime_provider_state = "COOLDOWN"
+                    self._publish_realtime_state("COOLDOWN", "1013_temporary_failure")
                     self.get_logger().warn(
-                        "⚠️ [REALTIME TEMPORARY FAILURE] code=1013\n"
-                        "⚠️ [REALTIME COOLDOWN] duration=15.0s"
+                        f"⚠️ [REALTIME TEMPORARY FAILURE] code=1013 reason={close_reason or 'server_overload'}\n"
+                        f"⚠️ [REALTIME COOLDOWN] duration=15.0s\n"
+                        f"  parent=openai (remains AVAILABLE)"
                     )
                     try:
                         from astro_ai.circuit_breaker import get_global_circuit_breaker, RequestErrorClass
                         cb = get_global_circuit_breaker()
                         if cb:
-                            cb.record_error("openai", sub_provider="openai_realtime", error_class=RequestErrorClass.REALTIME_TEMPORARY_FAILURE, error_msg="WS 1013 Temporary Overload")
+                            cb.record_error("openai", sub_provider="openai_realtime", error_class=RequestErrorClass.REALTIME_TEMPORARY_FAILURE, error_msg=f"WS 1013: {close_reason or 'Overload'}")
                     except Exception:
                         pass
+                    # Strictly wait for 15.0s cooldown with NO socket open
                     await asyncio.sleep(15.0)
                 elif "4004" in err_str or "model_not_found" in err_str:
                     self.get_logger().warn(f"⚠️ [Realtime Model Bulunamadı] '{current_model}' modeline erişilemedi, bir sonraki modele geçiliyor...")
@@ -3697,7 +3708,7 @@ class AstroRealtimeNode(Node):
                 f"  selected_tts_provider={active_engine}\n"
                 f"  selected_tts_model={tts_model_name}\n"
                 f"  tts_source={tts_source_name}\n"
-                f"  playback_source={getattr(self.audio_output_manager, 'backend', 'aplay')}\n"
+                f"  playback_source=audio_stream_node\n"
                 f"  tts_state={tts_mode_str}\n"
                 f"  tts_ready={tts_ready_flag}\n"
                 f"  fallback_reason=realtime_unavailable"
@@ -4036,7 +4047,7 @@ class AstroRealtimeNode(Node):
                 tts_synth_started_flag = bool(total_synth_ms > 0 or total_audio_bytes > 0)
                 tts_synth_finished_flag = bool(total_audio_bytes > 0)
                 tts_source_name = "xtts_worker" if active_engine == "xtts_gpu" else ("elevenlabs_cloud" if active_engine == "elevenlabs" else ("local_offline_synth" if active_engine == "local_offline_tts" else "edge_tts_cloud"))
-                pb_source = getattr(self.audio_output_manager, 'backend', 'aplay')
+                pb_source = "audio_stream_node"
                 is_xtts_healthy = bool(self.local_xtts and getattr(self.local_xtts, "is_healthy", lambda: False)())
 
                 # Mismatch Alarm Audit
@@ -4241,7 +4252,7 @@ class AstroRealtimeNode(Node):
                 self._wake_up()
 
         # --- 0-Cost Fallback Mode (Groq STT + Groq LLM + Edge-TTS) ---
-        if self._fallback_mode or not self._is_connected or not self._ws or not self._loop:
+        if self._fallback_mode or (not self._is_connected and self._ws is None):
             if raw_16k:
                 try:
                     speech_start_condition = (local_rms > max(380.0, self._ambient_rms * 1.40) and peak_val > 900)
@@ -4285,14 +4296,27 @@ class AstroRealtimeNode(Node):
             return
 
         # --- Standard OpenAI Realtime Mode ---
-        payload = {
-            "type": "input_audio_buffer.append",
-            "audio": msg.data
-        }
-        try:
-            asyncio.run_coroutine_threadsafe(self._ws.send(json.dumps(payload)), self._loop)
-        except Exception as _exc:
-            self.get_logger().debug(f"_on_input_pcm: yok sayılan hata ({_exc})")
+        # Gating: Microphone PCM is strictly streamed ONLY when WebSocket is CONNECTED and session is READY
+        if (
+            self.realtime_connection_state == "CONNECTED"
+            and self.realtime_session_state == "READY"
+            and self._ws is not None
+            and not getattr(self, "_fallback_mode", False)
+        ):
+            payload = {
+                "type": "input_audio_buffer.append",
+                "audio": msg.data
+            }
+            try:
+                if self._loop is not None:
+                    asyncio.run_coroutine_threadsafe(self._ws.send(json.dumps(payload)), self._loop)
+                elif hasattr(self._ws, "send"):
+                    # Test fake transport sync/async support
+                    res = self._ws.send(json.dumps(payload))
+                    if inspect.iscoroutine(res):
+                        asyncio.run(res)
+            except Exception as _exc:
+                self.get_logger().debug(f"_on_input_pcm: yok sayılan hata ({_exc})")
 
 
     def _trigger_proactive_greeting(self, name: str, formal_title: str):

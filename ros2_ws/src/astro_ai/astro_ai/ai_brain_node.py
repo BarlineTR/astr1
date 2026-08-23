@@ -591,17 +591,17 @@ class AiBrainNode(Node):
             import json
             data = json.loads(msg.data)
             state = data.get("state", "")
-            if state == "CONNECTED":
+            conn = data.get("connection", state)
+            sess = data.get("session", "")
+            provider = data.get("provider", "")
+            self._fallback_mode = bool(data.get("fallback_mode", False) or provider in ("EXHAUSTED", "COOLDOWN"))
+            if conn == "CONNECTED" or state in ("CONNECTED", "SESSION_READY"):
                 self._realtime_ws_connected = True
-            elif state == "SESSION_READY":
-                self._realtime_ws_connected = True
+            else:
+                self._realtime_ws_connected = False
+            if sess == "READY" or state == "SESSION_READY":
                 self._realtime_session_ready = True
-            elif state == "DISCONNECTED":
-                self._realtime_ws_connected = False
-                self._realtime_session_ready = False
-                self._realtime_audio_received = False
-            elif state == "CONNECTING":
-                self._realtime_ws_connected = False
+            elif sess == "NOT_READY" or state in ("DISCONNECTED", "CONNECTING"):
                 self._realtime_session_ready = False
         except Exception:
             pass
@@ -818,6 +818,11 @@ class AiBrainNode(Node):
         self.get_logger().info(f"[TURN RECEIVED] text=\"{msg.data}\"")
         if not self._enabled:
             self.get_logger().warn("[TURN DROPPED] reason=node_disabled")
+            return
+
+        # Realtime primary S2S active: drop secondary STT turns to prevent duplicate Groq LLM responses
+        if self._realtime_ws_connected and self._realtime_session_ready and not getattr(self, "_fallback_mode", False):
+            self.get_logger().info(f"[TURN DROPPED] reason=realtime_primary_active text=\"{msg.data}\"")
             return
 
         raw_text = normalize_turkish_speech_input(re.sub(r"^['\"`´“”‘’]+|['\"`´“”‘’]+$", "", msg.data.strip()).strip())

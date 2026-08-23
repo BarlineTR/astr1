@@ -273,8 +273,14 @@ class SerialBridge(Node):
                 rtscts=False,
                 dsrdtr=False,
             )
+            try:
+                self.ser.reset_input_buffer()
+                self.ser.reset_output_buffer()
+            except Exception:
+                pass
             self.port = port
             self.port_connected_time = time.monotonic()
+            self.last_hb_ack_time = time.monotonic()
             self.state = ArduinoState.SERIAL_CONNECTED
             self.get_logger().info(f"[SERIAL CONNECTED] device={port} baud={self.baud}")
             self.get_logger().info("[ARDUINO HANDSHAKE] status=success")
@@ -319,7 +325,9 @@ class SerialBridge(Node):
         for k in stale_keys:
             self._hb_tx_times.pop(k, None)
 
-        if (now_mono - self.last_hb_ack_time) > 1.0:
+        time_since_connect = now_mono - getattr(self, "port_connected_time", 0.0)
+        time_since_ack = now_mono - self.last_hb_ack_time
+        if time_since_ack > 1.0 and time_since_connect > 1.5:
             if self.arduino_alive:
                 self.get_logger().warn(
                     "⚠️ [MOTOR SAFETY BLOCK] reason=heartbeat_ack_missing\n"
@@ -328,8 +336,7 @@ class SerialBridge(Node):
                 self.get_logger().info("[MOTOR STATUS] enabled=false heartbeat_healthy=false")
             self.arduino_alive = False
             self.state = ArduinoState.SAFETY_BLOCKED
-        else:
-            self.arduino_alive = True
+        elif self.arduino_alive:
             if self.state in (ArduinoState.HANDSHAKE_OK, ArduinoState.SAFETY_BLOCKED):
                 self.state = ArduinoState.HEARTBEAT_HEALTHY
 
@@ -472,10 +479,16 @@ class SerialBridge(Node):
                 self.get_logger().debug(f"[SERIAL RX RAW] bytes={len(chunk)} hex={chunk[:16].hex()}")
 
                 for b in chunk:
-                    if state == 0 and b == SOF1:
-                        state = 1
+                    if state == 0:
+                        if b == SOF1:
+                            state = 1
                     elif state == 1:
-                        state = 2 if b == SOF2 else 0
+                        if b == SOF2:
+                            state = 2
+                        elif b == SOF1:
+                            state = 1
+                        else:
+                            state = 0
                     elif state == 2:
                         expected_len = b or 1
                         buf = bytearray()
@@ -491,7 +504,9 @@ class SerialBridge(Node):
                         if c == b or msg_id == MSG_HEARTBEAT_ACK:
                             payload = bytes(buf[1:])
                             self.handle_msg(msg_id, payload)
-                        state = 0
+                            state = 0
+                        else:
+                            state = 1 if b == SOF1 else 0
             except serial.SerialException as exc:
                 self.get_logger().error(f"Serial read error: {exc}")
                 self._mark_disconnected()

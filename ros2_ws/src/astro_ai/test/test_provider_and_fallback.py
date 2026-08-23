@@ -705,6 +705,8 @@ class TestRealtimeArchitectureInvariants(unittest.TestCase):
 
         node = AstroRealtimeNode()
         node._is_connected = True
+        node.realtime_connection_state = "CONNECTED"
+        node.realtime_session_state = "READY"
         node._fallback_mode = False
         node._is_sleeping = False
         node.state_machine.transition_to(RobotState.LISTENING)

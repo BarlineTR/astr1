@@ -202,6 +202,7 @@ class SpeechRecognitionNode(Node):
         self.create_subscription(Bool, '/tts/speaking', self._tts_speaking_cb, 10)
         self.create_subscription(String, '/tts/say', self._tts_say_cb, 10)
         self.create_subscription(Bool, '/ai/session_active', self._session_active_cb, 10)
+        self.create_subscription(String, '/realtime/state', self._realtime_state_cb, 10)
 
         # Internal state
         self._lock = threading.Lock()
@@ -215,6 +216,11 @@ class SpeechRecognitionNode(Node):
         self._session_active: bool = False
         self._ambient_rms: float = 100.0
         self._recent_tts_phrases: list[tuple[str, float]] = []  # (phrase_lower, timestamp)
+
+        # Realtime primary S2S gating (STT pipeline is STANDBY when Realtime is CONNECTED and READY)
+        self._realtime_connected: bool = False
+        self._realtime_session_ready: bool = False
+        self._realtime_fallback_active: bool = False
 
         # Guards against concurrent / out-of-order transcription results
         self._transcribe_lock = threading.Lock()
@@ -233,6 +239,21 @@ class SpeechRecognitionNode(Node):
             f"✅ [STT] Hazır | zincir: {' -> '.join(engines) if engines else 'YOK'} "
             f"| STT_ENGINE={self.stt_engine} | Self-Echo Immunity + Bağlam Duyarlı Filtre aktif"
         )
+
+    def _realtime_state_cb(self, msg: String):
+        try:
+            data = json.loads(msg.data)
+            conn = data.get("connection", data.get("state", ""))
+            sess = data.get("session", "")
+            self._realtime_connected = (conn == "CONNECTED")
+            self._realtime_session_ready = (sess == "READY" or data.get("state") == "SESSION_READY")
+            self._realtime_fallback_active = bool(data.get("fallback_mode", False) or data.get("provider") in ("EXHAUSTED", "COOLDOWN"))
+        except Exception:
+            pass
+
+    def _is_realtime_primary_active(self) -> bool:
+        """Returns True if OpenAI Realtime Speech-to-Speech is connected and active."""
+        return bool(self._realtime_connected and self._realtime_session_ready and not self._realtime_fallback_active)
 
     def _session_active_cb(self, msg: Bool):
         self._session_active = msg.data
@@ -273,6 +294,13 @@ class SpeechRecognitionNode(Node):
             return
 
         with self._lock:
+            # Standby Gating: If OpenAI Realtime S2S is active, do NOT accumulate STT buffers
+            if self._is_realtime_primary_active():
+                if self._buffer:
+                    self._buffer.clear()
+                self._is_speaking = False
+                return
+
             # While robot is speaking, do NOT record speaker audio into buffer!
             if self._tts_speaking:
                 return
@@ -297,6 +325,10 @@ class SpeechRecognitionNode(Node):
             return
 
         with self._lock:
+            # Standby Gating: Ignore VAD triggers while Realtime is primary
+            if self._is_realtime_primary_active():
+                return
+
             # Ignore VAD while robot is actively speaking to prevent echolalia
             if self._tts_speaking:
                 return
@@ -315,6 +347,10 @@ class SpeechRecognitionNode(Node):
 
     def _silence_tick(self):
         if not self.enabled:
+            return
+
+        # Standby Gating: Do not process silence ticks while Realtime is primary
+        if self._is_realtime_primary_active():
             return
 
         audio_data = None
