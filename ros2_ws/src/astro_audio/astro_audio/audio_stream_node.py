@@ -391,13 +391,23 @@ class AudioStreamNode(Node):
             else:
                 b64_pcm = raw_str
 
-            raw_24k = base64.b64decode(b64_pcm.encode("ascii"))
-            if raw_24k:
-                # Resample 24kHz -> 16kHz for hardware ReSpeaker DAC
-                raw_16k = resample_24k_to_16k(raw_24k)
+            is_done = bool(payload.get("is_done", False))
+            is_first = bool(payload.get("is_first", False))
+            gen_id = payload.get("generation_id", 0)
+
+            raw_16k = b""
+            if b64_pcm:
+                raw_24k = base64.b64decode(b64_pcm.encode("ascii"))
+                if raw_24k:
+                    # Resample 24kHz -> 16kHz for hardware ReSpeaker DAC
+                    raw_16k = resample_24k_to_16k(raw_24k)
+
+            if raw_16k or is_done:
                 item = {
                     "pcm": raw_16k,
-                    "generation_id": payload.get("generation_id", 0),
+                    "generation_id": gen_id,
+                    "is_first": is_first,
+                    "is_done": is_done,
                     "tts_provider": payload.get("tts_provider", "openai"),
                     "tts_model": payload.get("tts_model", "gpt-4o-realtime"),
                     "tts_source": payload.get("tts_source", "realtime_openai"),
@@ -479,12 +489,20 @@ class AudioStreamNode(Node):
             )
             return
 
+        active_gen_id = None
+        gen_started = False
+        gen_done_seen = False
+        gen_start_time = 0.0
+        gen_played_bytes = 0
+        gen_prov = {}
+
         while not self._stop_event.is_set():
             try:
                 item = self._play_queue.get(timeout=0.05)
                 if isinstance(item, dict):
                     chunk = item["pcm"]
                     gen_id = item.get("generation_id", 0)
+                    is_done = item.get("is_done", False)
                     tts_provider = item.get("tts_provider", "openai")
                     tts_model = item.get("tts_model", "unknown")
                     tts_source = item.get("tts_source", "unknown")
@@ -492,59 +510,117 @@ class AudioStreamNode(Node):
                 else:
                     chunk = item
                     gen_id = 0
+                    is_done = False
                     tts_provider = "openai"
                     tts_model = "gpt-4o-realtime"
                     tts_source = "realtime_openai"
                     playback_source = "realtime_openai"
 
-                # Provenance sanity assertion
-                if (tts_provider == "xtts_gpu" and playback_source in ("local_offline_tts", "espeak")) or (tts_model == "xtts_finetuned" and playback_source == "espeak"):
-                    self.get_logger().error(f"🚨 [Provenance Mismatch]: Invalid combination tts_provider={tts_provider}, playback_source={playback_source}")
-
-                t_w_start = time.perf_counter()
-                with self._playback_lock:
-                    out_stream.write(chunk)
-                t_w_end = time.perf_counter()
-                write_ms = (t_w_end - t_w_start) * 1000.0
-
-                self._is_playing = True
-                self._last_playback_time = time.monotonic()
-                self._total_played_bytes += len(chunk)
-
-                if not self._playback_burst_active:
-                    self._playback_burst_active = True
-                    self._burst_start_time = time.monotonic()
-                    self._active_provenance = {
+                # Check if this is a new generation
+                if (gen_id != active_gen_id) or (not gen_started):
+                    if gen_started and active_gen_id is not None:
+                        # Close prior generation if any
+                        burst_dur_ms = (time.monotonic() - gen_start_time) * 1000.0
+                        self.get_logger().info(
+                            f"🔊 [Playback Telemetry]: tts_playback_finished=True | "
+                            f"generation_id={active_gen_id} | "
+                            f"playback_source={gen_prov.get('playback_source', 'unknown')} | "
+                            f"tts_provider={gen_prov.get('tts_provider', 'unknown')} | "
+                            f"tts_model={gen_prov.get('tts_model', 'unknown')} | "
+                            f"tts_played_bytes={gen_played_bytes} | "
+                            f"total_playback_bytes={self._total_played_bytes} | "
+                            f"playback_duration_ms={int(burst_dur_ms)}"
+                        )
+                    active_gen_id = gen_id
+                    gen_started = True
+                    gen_done_seen = False
+                    gen_start_time = time.monotonic()
+                    gen_played_bytes = 0
+                    gen_prov = {
                         "generation_id": gen_id,
                         "playback_source": playback_source,
                         "tts_provider": tts_provider,
                         "tts_model": tts_model,
                         "tts_source": tts_source,
                     }
+                    self._playback_burst_active = True
+                    self._burst_start_time = gen_start_time
+                    self._active_provenance = gen_prov
                     self.get_logger().info(
                         f"🔊 [Playback Telemetry]: tts_playback_started=True | "
                         f"generation_id={gen_id} | playback_source={playback_source} | "
                         f"tts_provider={tts_provider} | tts_model={tts_model} | "
                         f"tts_source={tts_source} | audio_bytes={len(chunk)} | "
-                        f"tts_audio_device=\"{self._out_device_name}\" | "
-                        f"tts_audio_write_ms={write_ms:.1f} | "
-                        f"chunk_bytes={len(chunk)}"
+                        f"tts_audio_device=\"{self._out_device_name}\""
                     )
-            except queue.Empty:
-                if self._playback_burst_active and (time.monotonic() - self._last_playback_time) > 0.20:
+
+                if is_done:
+                    gen_done_seen = True
+
+                if chunk and len(chunk) > 0:
+                    t_w_start = time.perf_counter()
+                    with self._playback_lock:
+                        out_stream.write(chunk)
+                    t_w_end = time.perf_counter()
+                    write_ms = (t_w_end - t_w_start) * 1000.0
+
+                    self._is_playing = True
+                    self._last_playback_time = time.monotonic()
+                    gen_played_bytes += len(chunk)
+                    self._total_played_bytes += len(chunk)
+
+                # If done signal received and queue is now empty, finish generation playback
+                if gen_done_seen and self._play_queue.empty():
+                    self._is_playing = False
                     self._playback_burst_active = False
-                    burst_dur_ms = (time.monotonic() - self._burst_start_time) * 1000.0
-                    prov = getattr(self, "_active_provenance", {})
+                    gen_started = False
+                    burst_dur_ms = (time.monotonic() - gen_start_time) * 1000.0
                     self.get_logger().info(
                         f"🔊 [Playback Telemetry]: tts_playback_finished=True | "
-                        f"generation_id={prov.get('generation_id', 0)} | "
-                        f"playback_source={prov.get('playback_source', 'unknown')} | "
-                        f"tts_provider={prov.get('tts_provider', 'unknown')} | "
-                        f"tts_model={prov.get('tts_model', 'unknown')} | "
-                        f"tts_played_bytes={self._total_played_bytes} | "
+                        f"generation_id={active_gen_id} | "
+                        f"playback_source={gen_prov.get('playback_source', 'unknown')} | "
+                        f"tts_provider={gen_prov.get('tts_provider', 'unknown')} | "
+                        f"tts_model={gen_prov.get('tts_model', 'unknown')} | "
+                        f"tts_played_bytes={gen_played_bytes} | "
                         f"total_playback_bytes={self._total_played_bytes} | "
                         f"playback_duration_ms={int(burst_dur_ms)}"
                     )
+                    active_gen_id = None
+
+            except queue.Empty:
+                if gen_started and gen_done_seen:
+                    self._is_playing = False
+                    self._playback_burst_active = False
+                    gen_started = False
+                    burst_dur_ms = (time.monotonic() - gen_start_time) * 1000.0
+                    self.get_logger().info(
+                        f"🔊 [Playback Telemetry]: tts_playback_finished=True | "
+                        f"generation_id={active_gen_id} | "
+                        f"playback_source={gen_prov.get('playback_source', 'unknown')} | "
+                        f"tts_provider={gen_prov.get('tts_provider', 'unknown')} | "
+                        f"tts_model={gen_prov.get('tts_model', 'unknown')} | "
+                        f"tts_played_bytes={gen_played_bytes} | "
+                        f"total_playback_bytes={self._total_played_bytes} | "
+                        f"playback_duration_ms={int(burst_dur_ms)}"
+                    )
+                    active_gen_id = None
+                elif gen_started and (time.monotonic() - self._last_playback_time) > 4.0:
+                    # Stream timed out without is_done (e.g. dropped connection)
+                    self._is_playing = False
+                    self._playback_burst_active = False
+                    gen_started = False
+                    burst_dur_ms = (time.monotonic() - gen_start_time) * 1000.0
+                    self.get_logger().info(
+                        f"🔊 [Playback Telemetry]: tts_playback_finished=True | "
+                        f"generation_id={active_gen_id} | "
+                        f"playback_source={gen_prov.get('playback_source', 'unknown')} | "
+                        f"tts_provider={gen_prov.get('tts_provider', 'unknown')} | "
+                        f"tts_model={gen_prov.get('tts_model', 'unknown')} | "
+                        f"tts_played_bytes={gen_played_bytes} | "
+                        f"total_playback_bytes={self._total_played_bytes} | "
+                        f"playback_duration_ms={int(burst_dur_ms)} | reason=stream_timeout"
+                    )
+                    active_gen_id = None
                 if (time.monotonic() - self._last_playback_time) > 0.35:
                     self._is_playing = False
             except Exception as exc:

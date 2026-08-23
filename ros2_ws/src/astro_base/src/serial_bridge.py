@@ -298,18 +298,27 @@ class SerialBridge(Node):
         if self.ser is None or not self.ser.is_open:
             return
 
-        self._hb_seq += 1
-        pkt = self.build_packet(MSG_HEARTBEAT, b"")
+        self._hb_seq = (self._hb_seq + 1) & 0xFFFFFFFF
+        now_mono = time.monotonic()
+        if not hasattr(self, "_hb_tx_times"):
+            self._hb_tx_times = {}
+        self._hb_tx_times[self._hb_seq] = now_mono
+        payload = struct.pack("<I", self._hb_seq)
+        pkt = self.build_packet(MSG_HEARTBEAT, payload)
         try:
             with self.tx_lock:
                 self.ser.write(pkt)
-            self.get_logger().debug(f"[HEARTBEAT TX] sequence={self._hb_seq}")
+            self.get_logger().info(f"[HEARTBEAT TX] sequence={self._hb_seq}")
         except serial.SerialException as exc:
             self.get_logger().warn(f"Heartbeat write failed: {exc}")
             self._mark_disconnected()
             return
 
-        now_mono = time.monotonic()
+        # Prune old tx timestamps older than 5.0s
+        stale_keys = [k for k, t in self._hb_tx_times.items() if (now_mono - t) > 5.0]
+        for k in stale_keys:
+            self._hb_tx_times.pop(k, None)
+
         if (now_mono - self.last_hb_ack_time) > 1.0:
             if self.arduino_alive:
                 self.get_logger().warn(
@@ -506,12 +515,6 @@ class SerialBridge(Node):
             self.publish_diag(vbat_mV, temp_cX100, flags)
         elif msg_id == MSG_HEARTBEAT_ACK:
             now_mono = time.monotonic()
-            lat_ms = (now_mono - self.last_hb_ack_time) * 1000.0 if self.last_hb_ack_time > 0 else 5.0
-            prev_alive = self.arduino_alive
-            self.last_hb_ack_time = now_mono
-            self.arduino_alive = True
-            self.state = ArduinoState.HEARTBEAT_HEALTHY
-            
             ack_seq = self._hb_seq
             if len(payload) >= 4:
                 try:
@@ -520,6 +523,15 @@ class SerialBridge(Node):
                     pass
             elif len(payload) >= 1:
                 ack_seq = payload[0]
+
+            if not hasattr(self, "_hb_tx_times"):
+                self._hb_tx_times = {}
+            tx_time = self._hb_tx_times.pop(ack_seq, self.last_hb_ack_time or (now_mono - 0.005))
+            lat_ms = (now_mono - tx_time) * 1000.0 if tx_time > 0 else 5.0
+            prev_alive = self.arduino_alive
+            self.last_hb_ack_time = now_mono
+            self.arduino_alive = True
+            self.state = ArduinoState.HEARTBEAT_HEALTHY
 
             self.get_logger().info(f"[HEARTBEAT ACK] sequence={ack_seq} latency_ms={lat_ms:.1f}")
             if not prev_alive:

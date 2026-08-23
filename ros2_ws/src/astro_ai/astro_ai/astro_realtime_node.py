@@ -33,9 +33,10 @@ try:
     import rclpy
     from rclpy.node import Node
     from rclpy.qos import qos_profile_sensor_data
-    from sensor_msgs.msg import Image, CameraInfo
+    from sensor_msgs.msg import Image, CameraInfo, LaserScan
     from std_msgs.msg import Bool, Float32, String
     from geometry_msgs.msg import Twist
+    from diagnostic_msgs.msg import DiagnosticArray
 except ImportError:
     rclpy = None
     qos_profile_sensor_data = 10  # rclpy yoksa (mock/test modu) düz derinlik
@@ -53,6 +54,8 @@ except ImportError:
             return None
     class _MockMsg:
         data: Any = None
+        status: List[Any] = []
+        ranges: List[float] = []
     class Twist:  # type: ignore
         class Vector3:
             def __init__(self, x=0.0, y=0.0, z=0.0):
@@ -62,7 +65,7 @@ except ImportError:
         def __init__(self):
             self.linear = Twist.Vector3()
             self.angular = Twist.Vector3()
-    Image = CameraInfo = Bool = Float32 = String = _MockMsg  # type: ignore
+    Image = CameraInfo = Bool = Float32 = String = DiagnosticArray = LaserScan = _MockMsg  # type: ignore
 
 try:
     import cv2
@@ -521,6 +524,7 @@ class AstroRealtimeNode(Node):
         self.realtime_session_id = ""
 
         # Single Active Response State Machine
+        self._global_generation_counter: int = 1000
         self.active_response_id: Optional[str] = None
         self.active_generation_id: Optional[int] = None
         self.active_response_state: str = "IDLE"  # IDLE, RESPONSE_CREATING, RESPONSE_STREAMING, RESPONSE_CANCELLING, COMPLETED
@@ -530,7 +534,15 @@ class AstroRealtimeNode(Node):
         self._packets_for_gen: int = 0
         self._bytes_for_gen: int = 0
         self._first_audio_time: Optional[float] = None
+        self._vad_end_time: Optional[float] = None
+        self._response_start_time: Optional[float] = None
+        self._last_ready_session_id: str = ""
         self._session_ready_logged: bool = False
+
+        # Hardware & Mobility Safety State
+        self._arduino_heartbeat_healthy: bool = False
+        self._last_heartbeat_ack_time: float = 0.0
+        self._obstacle_detected: bool = False
 
         # Configurable Acoustic Echo & Barge-In Parameters
         self.echo_mute_cooldown_s = float(os.getenv("ECHO_MUTE_COOLDOWN_S", "0.65"))
@@ -698,6 +710,8 @@ class AstroRealtimeNode(Node):
         # yayıncıdan da veri alır, bu yüzden depthai_ros_driver ile uyumlu.
         self.create_subscription(Image, "/oak/rgb/image_raw", self._on_camera_image, qos_profile_sensor_data)
         self.create_subscription(CameraInfo, "/oak/rgb/camera_info", self._on_camera_info, qos_profile_sensor_data)
+        self.create_subscription(DiagnosticArray, "/arduino/diagnostics", self._on_arduino_diag, 10)
+        self.create_subscription(LaserScan, "/scan", self._on_laser_scan, qos_profile_sensor_data)
 
         # Tool execution deduplication
         self._executed_tool_calls: set[str] = set()
@@ -772,10 +786,14 @@ class AstroRealtimeNode(Node):
             if raw.startswith("{") and "text" in raw:
                 data = json.loads(raw)
                 text = data.get("text", "")
-                gen_id = data.get("generation_id", self.realtime_current_generation_id + 1 if self.realtime_current_generation_id else 1)
+                gen_id = data.get("generation_id")
+                if not gen_id:
+                    self._global_generation_counter += 1
+                    gen_id = self._global_generation_counter
             else:
                 text = raw
-                gen_id = self.realtime_current_generation_id + 1 if self.realtime_current_generation_id else 1
+                self._global_generation_counter += 1
+                gen_id = self._global_generation_counter
 
             if not text:
                 return
@@ -1249,11 +1267,12 @@ class AstroRealtimeNode(Node):
             self.realtime_session_state = "READY"
             self.realtime_connection_state = "CONNECTED"
             self.realtime_provider_state = "AVAILABLE"
-            if not self._session_ready_logged:
-                self._session_ready_logged = True
+            curr_sid = self.realtime_session_id or "sess_init"
+            if curr_sid != getattr(self, "_last_ready_session_id", ""):
+                self._last_ready_session_id = curr_sid
                 self.get_logger().info(
                     f"[REALTIME SESSION READY]\n"
-                    f"session_id={self.realtime_session_id or 'sess_init'}\n"
+                    f"session_id={curr_sid}\n"
                     f"state=AVAILABLE"
                 )
                 self._publish_realtime_state("SESSION_READY")
@@ -1278,11 +1297,15 @@ class AstroRealtimeNode(Node):
                 is_first = (self._packets_for_gen == 1)
                 if is_first:
                     self._first_audio_time = time.monotonic()
-                    first_audio_ms = (self._first_audio_time - getattr(self, "_response_start_time", self._first_audio_time)) * 1000.0
+                    created_start = getattr(self, "_response_start_time", None) or self._first_audio_time
+                    vad_start = getattr(self, "_vad_end_time", None) or created_start
+                    created_to_first_audio_ms = (self._first_audio_time - created_start) * 1000.0 if (self._first_audio_time and created_start) else 0.0
+                    first_audio_ms = (self._first_audio_time - vad_start) * 1000.0 if (self._first_audio_time and vad_start) else 0.0
                     self.get_logger().info(
                         f"[REALTIME AUDIO START]\n"
                         f"generation_id={self.active_generation_id or self.realtime_current_generation_id}\n"
                         f"actual_provider=openai_realtime\n"
+                        f"created_to_first_audio_ms={created_to_first_audio_ms:.1f}\n"
                         f"first_audio_ms={first_audio_ms:.1f}"
                     )
 
@@ -1295,7 +1318,7 @@ class AstroRealtimeNode(Node):
                 })
                 self.pub_output_pcm.publish(out_msg)
 
-                self.get_logger().info(
+                self.get_logger().debug(
                     f"[REALTIME AUDIO DELTA] generation_id={self.active_generation_id or self.realtime_current_generation_id} bytes={delta_len}"
                 )
 
@@ -1330,15 +1353,14 @@ class AstroRealtimeNode(Node):
                 intr_msg.data = True
                 self.pub_interrupt.publish(intr_msg)
 
-                # ONLY send response.cancel if there is an active creating/streaming response
-                if self.active_response_id is not None and self.active_response_state in ("RESPONSE_CREATING", "RESPONSE_STREAMING"):
-                    self.active_response_state = "RESPONSE_CANCELLING"
+                self.active_response_state = "RESPONSE_CANCELLING"
+                if ws and hasattr(ws, "send"):
                     try:
-                        await ws.send(json.dumps({"type": "response.cancel"}))
+                        res = ws.send(json.dumps({"type": "response.cancel"}))
+                        if asyncio.iscoroutine(res):
+                            await res
                     except Exception:
                         pass
-                else:
-                    self.get_logger().debug("[REALTIME CANCEL IGNORE] reason=response_already_finished")
             else:
                 self.get_logger().debug("🎤 [Realtime] Kullanıcı konuşmaya başladı...")
 
@@ -1346,6 +1368,7 @@ class AstroRealtimeNode(Node):
         elif event_type == "input_audio_buffer.speech_stopped":
             if self._is_sleeping:
                 return
+            self._vad_end_time = time.monotonic()
             self.get_logger().info("🤫 [Realtime] Cümle bitti, dinleme tamamlandı...")
             try:
                 asyncio.create_task(asyncio.to_thread(self._run_voice_identification))
@@ -1362,44 +1385,74 @@ class AstroRealtimeNode(Node):
             self._packets_for_gen = 0
             self._bytes_for_gen = 0
             self._first_audio_time = None
-            if self.active_generation_id is None:
-                self.active_generation_id = self.realtime_current_generation_id or 1
-            if self.realtime_current_generation_id == 0:
+            
+            # Monotonic application generation ID
+            if getattr(self, "active_generation_id", None) is None:
+                counter = getattr(self, "_global_generation_counter", 1000) + 1
+                self._global_generation_counter = counter
+                self.active_generation_id = counter
+            if getattr(self, "realtime_current_generation_id", 0) == 0:
                 self.realtime_current_generation_id = self.active_generation_id
+
+            vad_start = getattr(self, "_vad_end_time", None) or self._response_start_time
+            vad_to_created_ms = (self._response_start_time - vad_start) * 1000.0 if (self._response_start_time and vad_start) else 0.0
+
             self.get_logger().info(
                 f"[REALTIME RESPONSE CREATED]\n"
-                f"generation_id={self.active_generation_id}"
+                f"generation_id={self.active_generation_id}\n"
+                f"response_id={self.active_response_id}\n"
+                f"vad_to_created_ms={vad_to_created_ms:.1f}"
             )
 
         # 3d. Response Done / Cancelled
         elif event_type in ("response.done", "response.cancelled"):
-            if self._watchdog_timer:
+            if getattr(self, "_watchdog_timer", None):
                 try:
                     self._watchdog_timer.cancel()
                 except Exception:
                     pass
                 self._watchdog_timer = None
-            total_audio_ms = (time.monotonic() - getattr(self, "_response_start_time", time.monotonic())) * 1000.0
-            first_ms = (self._first_audio_time - getattr(self, "_response_start_time", self._first_audio_time)) * 1000.0 if self._first_audio_time else 0.0
+            now_mono = time.monotonic()
+            resp_start = getattr(self, "_response_start_time", None) or now_mono
+            vad_start = getattr(self, "_vad_end_time", None) or resp_start
+            server_stream_elapsed_ms = (now_mono - resp_start) * 1000.0 if (now_mono and resp_start) else 0.0
+            vad_to_created_ms = (resp_start - vad_start) * 1000.0 if (resp_start and vad_start) else 0.0
+            first_ms = (self._first_audio_time - resp_start) * 1000.0 if getattr(self, "_first_audio_time", None) else 0.0
+            total_first_audio_ms = (self._first_audio_time - vad_start) * 1000.0 if getattr(self, "_first_audio_time", None) else 0.0
+            audio_dur_ms = (getattr(self, "_bytes_for_gen", 0) / (24000 * 2)) * 1000.0
+
             if not self.realtime_audio_received:
                 self.get_logger().warn(
-                    f"[REALTIME NO AUDIO] generation_id={self.active_generation_id or self.realtime_current_generation_id} elapsed_ms={total_audio_ms:.1f}\n"
+                    f"[REALTIME NO AUDIO] generation_id={self.active_generation_id or self.realtime_current_generation_id} elapsed_ms={server_stream_elapsed_ms:.1f}\n"
                     f"[TTS FALLBACK] from=openai_realtime to=edge_tts reason=realtime_no_audio"
                 )
             else:
+                self.get_logger().info(
+                    f"[REALTIME TURN]\n"
+                    f"generation_id={self.active_generation_id or self.realtime_current_generation_id}\n"
+                    f"response_id={self.active_response_id}\n"
+                    f"vad_to_created_ms={vad_to_created_ms:.1f}\n"
+                    f"created_to_first_audio_ms={first_ms:.1f}\n"
+                    f"first_audio_ms={total_first_audio_ms:.1f}\n"
+                    f"server_stream_elapsed_ms={server_stream_elapsed_ms:.1f}\n"
+                    f"audio_duration_ms={audio_dur_ms:.1f}\n"
+                    f"audio_packets={self._packets_for_gen}\n"
+                    f"audio_bytes={self._bytes_for_gen}"
+                )
                 self.get_logger().info(
                     f"[REALTIME AUDIO SUMMARY]\n"
                     f"generation_id={self.active_generation_id or self.realtime_current_generation_id}\n"
                     f"packets={self._packets_for_gen}\n"
                     f"bytes={self._bytes_for_gen}\n"
-                    f"first_audio_ms={first_ms:.1f}\n"
-                    f"total_audio_ms={total_audio_ms:.1f}"
+                    f"first_audio_ms={total_first_audio_ms:.1f}\n"
+                    f"total_audio_ms={server_stream_elapsed_ms:.1f}"
                 )
             self._is_responding = False
             self.realtime_response_state = "IDLE"
             self.active_response_id = None
             self.active_generation_id = None
             self.active_response_state = "IDLE"
+            self._vad_end_time = None
 
             # Check if there are queued turns waiting to be dispatched
             if self._turn_queue:
@@ -1646,6 +1699,25 @@ class AstroRealtimeNode(Node):
             speed = max(0.05, min(speed, 0.4))
             duration = float(args.get("duration", 1.5))
             duration = max(0.5, min(duration, 5.0))
+
+            if direction != "stop":
+                # 1. Heartbeat Health Gate
+                hb_ok = getattr(self, "_arduino_heartbeat_healthy", False)
+                last_ack = getattr(self, "_last_heartbeat_ack_time", 0.0)
+                if not hb_ok or (time.monotonic() - last_ack) > 2.0:
+                    return {
+                        "status": "blocked",
+                        "reason": "heartbeat_unhealthy",
+                        "message": "Arduino bağlantısı veya heartbeat aktif değil, güvenlik için hareket engellendi."
+                    }
+
+                # 2. Obstacle Detection Gate
+                if direction == "forward" and getattr(self, "_obstacle_detected", False):
+                    return {
+                        "status": "blocked",
+                        "reason": "obstacle_detected",
+                        "message": "Robotun önünde engel tespit edildi, hareket güvenlik nedeniyle engellendi."
+                    }
 
             pub = getattr(self, "pub_cmd_vel", None)
             if pub:
@@ -2355,6 +2427,41 @@ class AstroRealtimeNode(Node):
         if frame is not None:
             with self._lock:
                 self._latest_camera_frame = frame
+
+    def _on_arduino_diag(self, msg: Any):
+        """Monitors Arduino hardware & heartbeat diagnostics."""
+        try:
+            statuses = getattr(msg, "status", [])
+            for st in statuses:
+                if getattr(st, "name", "") == "arduino":
+                    for kv in getattr(st, "values", []):
+                        k = getattr(kv, "key", "")
+                        v = str(getattr(kv, "value", "")).lower()
+                        if k == "arduino_alive" and v in ("true", "1"):
+                            self._arduino_heartbeat_healthy = True
+                            self._last_heartbeat_ack_time = time.monotonic()
+                        elif k == "flags":
+                            try:
+                                flags_val = int(v, 16)
+                                if flags_val & 0x01:  # WATCHDOG_TIMEOUT flag
+                                    self._arduino_heartbeat_healthy = False
+                            except Exception:
+                                pass
+        except Exception as _exc:
+            self.get_logger().debug(f"_on_arduino_diag: {_exc}")
+
+    def _on_laser_scan(self, msg: Any):
+        """Monitors forward obstacle field via 2D LiDAR."""
+        try:
+            ranges = getattr(msg, "ranges", [])
+            if not ranges:
+                return
+            n = len(ranges)
+            forward_samples = ranges[: max(1, n // 8)] + ranges[- max(1, n // 8) :]
+            valid = [r for r in forward_samples if 0.05 < r < 0.45]
+            self._obstacle_detected = (len(valid) >= 3)
+        except Exception as _exc:
+            self.get_logger().debug(f"_on_laser_scan: {_exc}")
 
     def _evaluate_vision_event(self, event_type: str, focus: str = "", explicit: bool = False) -> Optional[Dict[str, Any]]:
         """Event-driven vision gating: evaluates frame difference, cooldown, budget, and semantic filters."""

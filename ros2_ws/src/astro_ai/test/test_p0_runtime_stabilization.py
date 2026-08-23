@@ -958,7 +958,7 @@ class TestP0RealtimeActivationAndQuotaState(unittest.TestCase):
             # Simulate response created
             asyncio.run(node._handle_realtime_event(None, {"type": "response.created"}))
             self.assertEqual(node.realtime_response_state, "GENERATING")
-            self.assertEqual(node.realtime_current_generation_id, 1)
+            self.assertGreater(node.realtime_current_generation_id, 0)
             self.assertFalse(node.realtime_audio_received)
 
             # Simulate audio delta
@@ -1531,6 +1531,7 @@ class TestP02RealtimeTurnPipelineAndHardwareCorrection(unittest.TestCase):
         logs = []
         mock_logger = MagicMock()
         mock_logger.info = lambda msg: logs.append(msg)
+        mock_logger.debug = lambda msg: logs.append(msg)
         node.get_logger = lambda: mock_logger
 
         pcm_sample = b"\x00\x02" * 240
@@ -1855,6 +1856,7 @@ class TestP03CriticalRuntimeRecovery(unittest.TestCase):
         logs = []
         mock_logger = MagicMock()
         mock_logger.info = lambda msg: logs.append(msg)
+        mock_logger.debug = lambda msg: logs.append(msg)
         node.get_logger = lambda: mock_logger
 
         pcm_sample = b"\x00\x05" * 160
@@ -2261,6 +2263,7 @@ class TestP04RuntimeCriticalRecovery(unittest.TestCase):
         logs = []
         mock_logger = MagicMock()
         mock_logger.info = lambda msg: logs.append(msg)
+        mock_logger.debug = lambda msg: logs.append(msg)
         node.get_logger = lambda: mock_logger
 
         pcm_sample = b"\x00\x03" * 240
@@ -2882,6 +2885,9 @@ class TestP05RealtimeStreamStateAndPlaybackSerialization(unittest.TestCase):
         node = AstroRealtimeNode.__new__(AstroRealtimeNode)
         mock_cmd_vel = MagicMock()
         node.pub_cmd_vel = mock_cmd_vel
+        node._arduino_heartbeat_healthy = True
+        node._last_heartbeat_ack_time = time.monotonic()
+        node._obstacle_detected = False
         node.memory = MagicMock()
         node.memory.profile.get_user_facts.return_value = {"favorite_color": "mavi"}
         node._get_active_biometric_identity = lambda: {"name": "Baran"}
@@ -2920,6 +2926,435 @@ class TestP05RealtimeStreamStateAndPlaybackSerialization(unittest.TestCase):
 
         self.assertEqual(node._play_queue.qsize(), 1)
         self.assertTrue(node._total_enqueued_bytes > 0)
+
+
+class TestP06ProductionRealtimeAndHumanLikeStabilization(unittest.TestCase):
+    """P0.6 Acceptance Tests: Continuous Realtime Stream, Natural Persona, Telemetry, and Mobility Safety."""
+
+    def test_p06_continuous_playback_single_start_and_single_finish(self):
+        """1. Playback: 30 continuous audio deltas produce exactly 1 PLAYBACK STARTED and 1 PLAYBACK FINISHED."""
+        import base64
+        import queue
+        from astro_audio.audio_stream_node import AudioStreamNode
+        node = AudioStreamNode.__new__(AudioStreamNode)
+        node._play_queue = queue.Queue(maxsize=500)
+        node._stop_event = threading.Event()
+        node._playback_lock = threading.Lock()
+        node._out_dev_idx = None
+        node._out_device_name = "test_speaker"
+        node._total_played_bytes = 0
+        node._total_enqueued_bytes = 0
+        node._last_output_chunk_time = 0.0
+        node._last_playback_time = 0.0
+        node._playback_burst_active = False
+        node._is_playing = False
+        node.echo_mute_cooldown_s = 0.65
+        node.barge_in_protection_ms = 350.0
+
+        logs = []
+        mock_logger = MagicMock()
+        mock_logger.info = lambda msg: logs.append(msg)
+        mock_logger.debug = lambda msg: logs.append(msg)
+        mock_logger.error = lambda msg: logs.append(msg)
+        node.get_logger = lambda: mock_logger
+
+        # Mock out_stream
+        mock_stream = MagicMock()
+        node._output_stream = mock_stream
+
+        # Enqueue 30 audio chunks for generation 8888
+        pcm_chunk = b"\x00\x02" * 160
+        b64_chunk = base64.b64encode(pcm_chunk).decode("ascii")
+
+        for i in range(30):
+            msg = MagicMock()
+            msg.data = json.dumps({
+                "generation_id": 8888,
+                "pcm": b64_chunk,
+                "is_first": (i == 0),
+                "is_done": False,
+                "tts_provider": "openai",
+                "tts_model": "gpt-4o-realtime",
+                "tts_source": "realtime_openai"
+            })
+            node._on_output_pcm(msg)
+
+        # Enqueue is_done sentinel
+        done_msg = MagicMock()
+        done_msg.data = json.dumps({
+            "generation_id": 8888,
+            "pcm": "",
+            "is_first": False,
+            "is_done": True,
+            "tts_provider": "openai",
+            "tts_model": "gpt-4o-realtime",
+            "tts_source": "realtime_openai"
+        })
+        node._on_output_pcm(done_msg)
+
+        # Process all items in playback loop logic directly
+        with patch("sounddevice.RawOutputStream", return_value=mock_stream):
+            # Run worker in thread and stop when queue is empty
+            worker_thread = threading.Thread(target=node._playback_worker, daemon=True)
+            worker_thread.start()
+            # Wait for queue to drain
+            t0 = time.monotonic()
+            while not node._play_queue.empty() and time.monotonic() - t0 < 3.0:
+                time.sleep(0.02)
+            time.sleep(0.1)
+            node._stop_event.set()
+            worker_thread.join(timeout=1.0)
+
+        started_count = sum(1 for l in logs if "tts_playback_started=True" in l and "generation_id=8888" in l)
+        finished_count = sum(1 for l in logs if "tts_playback_finished=True" in l and "generation_id=8888" in l)
+        self.assertEqual(started_count, 1, f"Expected exactly 1 start log, got {started_count}")
+        self.assertEqual(finished_count, 1, f"Expected exactly 1 finish log, got {finished_count}")
+
+    def test_p06_monotonic_application_generation_id_uniqueness(self):
+        """2. Generation ID: 100 sequential turns produce 100 strictly unique, monotonic generation IDs."""
+        import asyncio
+        from astro_ai.astro_realtime_node import AstroRealtimeNode
+        node = AstroRealtimeNode.__new__(AstroRealtimeNode)
+        node._global_generation_counter = 1000
+        node.active_generation_id = None
+        node.realtime_current_generation_id = 0
+        node.active_response_id = None
+        node._turn_queue = []
+        node.get_logger = lambda: MagicMock()
+
+        gen_ids = []
+        for i in range(100):
+            node.active_generation_id = None
+            node.realtime_current_generation_id = 0
+            asyncio.run(node._handle_realtime_event(None, {"type": "response.created", "response": {"id": f"resp_{i}"}}))
+            gen_ids.append(node.active_generation_id)
+            asyncio.run(node._handle_realtime_event(None, {"type": "response.done"}))
+
+        self.assertEqual(len(gen_ids), 100)
+        self.assertEqual(len(set(gen_ids)), 100, "All generation IDs must be strictly unique")
+        # Verify strict monotonic increase
+        for i in range(len(gen_ids) - 1):
+            self.assertLess(gen_ids[i], gen_ids[i + 1], "Generation IDs must be strictly monotonically increasing")
+
+    def test_p06_realtime_turn_separated_latency_metrics(self):
+        """3. Latency: [REALTIME TURN] separates and calculates distinct network & processing latencies."""
+        import asyncio
+        import base64
+        from astro_ai.astro_realtime_node import AstroRealtimeNode
+        node = AstroRealtimeNode.__new__(AstroRealtimeNode)
+        node._global_generation_counter = 5000
+        node.active_generation_id = None
+        node.realtime_current_generation_id = 0
+        node._turn_queue = []
+        node.pub_output_pcm = MagicMock()
+        node._is_sleeping = False
+        node._run_voice_identification = MagicMock()
+
+        logs = []
+        mock_logger = MagicMock()
+        mock_logger.info = lambda msg: logs.append(msg)
+        mock_logger.debug = lambda msg: logs.append(msg)
+        node.get_logger = lambda: mock_logger
+
+        # 1. Speech stopped (VAD end)
+        asyncio.run(node._handle_realtime_event(None, {"type": "input_audio_buffer.speech_stopped"}))
+        self.assertIsNotNone(node._vad_end_time)
+
+        # 2. Response created
+        asyncio.run(node._handle_realtime_event(None, {"type": "response.created", "response": {"id": "resp_lat_01"}}))
+        self.assertIsNotNone(node._response_start_time)
+
+        # 3. First audio delta
+        dummy_pcm = b"\x00\x02" * 240
+        b64_delta = base64.b64encode(dummy_pcm).decode("ascii")
+        asyncio.run(node._handle_realtime_event(None, {"type": "response.audio.delta", "delta": b64_delta}))
+        self.assertIsNotNone(node._first_audio_time)
+
+        # 4. Response done
+        asyncio.run(node._handle_realtime_event(None, {"type": "response.done"}))
+
+        log_text = "\n".join(logs)
+        self.assertIn("[REALTIME TURN]", log_text)
+        self.assertIn("vad_to_created_ms=", log_text)
+        self.assertIn("created_to_first_audio_ms=", log_text)
+        self.assertIn("first_audio_ms=", log_text)
+        self.assertIn("server_stream_elapsed_ms=", log_text)
+        self.assertIn("audio_duration_ms=", log_text)
+        self.assertIn("audio_packets=1", log_text)
+
+    def test_p06_audio_delta_debug_level_no_info_spam(self):
+        """4. Log Refactor: [REALTIME AUDIO DELTA] is logged at DEBUG, leaving INFO stream clean."""
+        import asyncio
+        import base64
+        from astro_ai.astro_realtime_node import AstroRealtimeNode
+        node = AstroRealtimeNode.__new__(AstroRealtimeNode)
+        node._global_generation_counter = 7000
+        node.active_generation_id = 7001
+        node.realtime_current_generation_id = 7001
+        node.pub_output_pcm = MagicMock()
+        node._packets_for_gen = 0
+        node._bytes_for_gen = 0
+        node.realtime_audio_received = False
+        node.active_response_state = "RESPONSE_STREAMING"
+
+        info_logs = []
+        debug_logs = []
+        mock_logger = MagicMock()
+        mock_logger.info = lambda msg: info_logs.append(msg)
+        mock_logger.debug = lambda msg: debug_logs.append(msg)
+        node.get_logger = lambda: mock_logger
+
+        dummy_pcm = b"\x00\x02" * 240
+        b64_delta = base64.b64encode(dummy_pcm).decode("ascii")
+
+        for _ in range(10):
+            asyncio.run(node._handle_realtime_event(None, {"type": "response.audio.delta", "delta": b64_delta}))
+
+        # Assert no AUDIO DELTA in INFO logs
+        info_text = "\n".join(info_logs)
+        debug_text = "\n".join(debug_logs)
+        self.assertNotIn("[REALTIME AUDIO DELTA]", info_text)
+        self.assertIn("[REALTIME AUDIO DELTA]", debug_text)
+
+    def test_p06_session_ready_deduplicated_per_session_id(self):
+        """5. Telemetry: [REALTIME SESSION READY] is logged strictly once per session ID."""
+        import asyncio
+        from astro_ai.astro_realtime_node import AstroRealtimeNode
+        node = AstroRealtimeNode.__new__(AstroRealtimeNode)
+        node._last_ready_session_id = ""
+        node.realtime_session_id = ""
+        node.pub_realtime_state = MagicMock()
+
+        logs = []
+        mock_logger = MagicMock()
+        mock_logger.info = lambda msg: logs.append(msg)
+        node.get_logger = lambda: mock_logger
+
+        # Trigger session.created and multiple session.updated with same session id
+        asyncio.run(node._handle_realtime_event(None, {"type": "session.created", "session": {"id": "sess_uniq_99"}}))
+        for _ in range(5):
+            asyncio.run(node._handle_realtime_event(None, {"type": "session.updated", "session": {"id": "sess_uniq_99"}}))
+
+        log_text = "\n".join(logs)
+        self.assertEqual(log_text.count("[REALTIME SESSION READY]"), 1)
+
+    def test_p06_arduino_heartbeat_tx_and_ack_latency(self):
+        """6. Arduino Bridge: Heartbeat sends sequence payload and calculates exact round-trip latency on ACK."""
+        from serial_bridge import SerialBridge, MSG_HEARTBEAT_ACK
+        node = SerialBridge.__new__(SerialBridge)
+        node.ser = MagicMock()
+        node.ser.is_open = True
+        node.tx_lock = threading.Lock()
+        node._hb_seq = 200
+        node._hb_tx_times = {}
+        node.last_hb_ack_time = 0.0
+        node.arduino_alive = False
+        node.state = "INIT"
+        node.build_packet = lambda msg_id, payload: bytes([0xAA, 0x55, 1 + len(payload), msg_id]) + payload + b"\x00"
+
+        logs = []
+        mock_logger = MagicMock()
+        mock_logger.info = lambda msg: logs.append(msg)
+        mock_logger.debug = lambda msg: logs.append(msg)
+        node.get_logger = lambda: mock_logger
+
+        # Send heartbeat
+        node.send_heartbeat()
+        self.assertEqual(node._hb_seq, 201)
+        self.assertIn(201, node._hb_tx_times)
+
+        # Receive ACK for sequence 201
+        ack_payload = struct.pack("<I", 201)
+        node.handle_msg(MSG_HEARTBEAT_ACK, ack_payload)
+        self.assertTrue(node.arduino_alive)
+
+        log_text = "\n".join(logs)
+        self.assertIn("[HEARTBEAT TX] sequence=201", log_text)
+        self.assertIn("[HEARTBEAT ACK] sequence=201 latency_ms=", log_text)
+
+    def test_p06_move_robot_blocked_when_heartbeat_unhealthy(self):
+        """7. Safety Gate: move_robot strictly returns status=blocked reason=heartbeat_unhealthy when heartbeat is dead."""
+        from astro_ai.astro_realtime_node import AstroRealtimeNode
+        node = AstroRealtimeNode.__new__(AstroRealtimeNode)
+        node.pub_cmd_vel = MagicMock()
+        node.get_logger = lambda: MagicMock()
+
+        # Case 1: _arduino_heartbeat_healthy is False
+        node._arduino_heartbeat_healthy = False
+        node._last_heartbeat_ack_time = time.monotonic()
+        res1 = node._execute_realtime_tool("move_robot", {"direction": "forward", "speed": 0.2})
+        self.assertEqual(res1["status"], "blocked")
+        self.assertEqual(res1["reason"], "heartbeat_unhealthy")
+        self.assertFalse(node.pub_cmd_vel.publish.called)
+
+        # Case 2: _last_heartbeat_ack_time is stale (>2.0s)
+        node._arduino_heartbeat_healthy = True
+        node._last_heartbeat_ack_time = time.monotonic() - 3.0
+        res2 = node._execute_realtime_tool("move_robot", {"direction": "forward", "speed": 0.2})
+        self.assertEqual(res2["status"], "blocked")
+        self.assertEqual(res2["reason"], "heartbeat_unhealthy")
+        self.assertFalse(node.pub_cmd_vel.publish.called)
+
+    def test_p06_move_robot_blocked_when_obstacle_detected(self):
+        """8. Safety Gate: move_robot forward is blocked when LiDAR detects front obstacle."""
+        from astro_ai.astro_realtime_node import AstroRealtimeNode
+        node = AstroRealtimeNode.__new__(AstroRealtimeNode)
+        node.pub_cmd_vel = MagicMock()
+        node.get_logger = lambda: MagicMock()
+        node._arduino_heartbeat_healthy = True
+        node._last_heartbeat_ack_time = time.monotonic()
+        node._obstacle_detected = True
+
+        res = node._execute_realtime_tool("move_robot", {"direction": "forward", "speed": 0.2})
+        self.assertEqual(res["status"], "blocked")
+        self.assertEqual(res["reason"], "obstacle_detected")
+        self.assertFalse(node.pub_cmd_vel.publish.called)
+
+    def test_p06_move_robot_allowed_when_healthy_and_clear(self):
+        """9. Mobility: move_robot executes and publishes to /cmd_vel when heartbeat is healthy and path is clear."""
+        from astro_ai.astro_realtime_node import AstroRealtimeNode
+        node = AstroRealtimeNode.__new__(AstroRealtimeNode)
+        mock_cmd_vel = MagicMock()
+        node.pub_cmd_vel = mock_cmd_vel
+        node.get_logger = lambda: MagicMock()
+        node._arduino_heartbeat_healthy = True
+        node._last_heartbeat_ack_time = time.monotonic()
+        node._obstacle_detected = False
+
+        res = node._execute_realtime_tool("move_robot", {"direction": "forward", "speed": 0.2, "duration": 1.0})
+        self.assertEqual(res["status"], "success")
+        self.assertTrue(mock_cmd_vel.publish.called)
+
+    def test_p06_laser_scan_obstacle_detection_gating(self):
+        """10. LiDAR Gating: _on_laser_scan detects forward obstacles < 0.45m."""
+        from astro_ai.astro_realtime_node import AstroRealtimeNode
+        node = AstroRealtimeNode.__new__(AstroRealtimeNode)
+        node.get_logger = lambda: MagicMock()
+
+        # Obstacle close in front
+        scan_msg = MagicMock()
+        scan_msg.ranges = [0.30] * 20 + [2.0] * 100 + [0.25] * 20
+        node._on_laser_scan(scan_msg)
+        self.assertTrue(node._obstacle_detected)
+
+        # Clear path
+        scan_clear = MagicMock()
+        scan_clear.ranges = [1.50] * 140
+        node._on_laser_scan(scan_clear)
+        self.assertFalse(node._obstacle_detected)
+
+    def test_p06_persona_dimensions_and_zero_meta_disclaimers(self):
+        """11. Persona: All 8 personas define all 12 behavioral dimensions with zero-disclaimer prompts."""
+        from astro_ai.persona_engine import PERSONA_DIMENSIONS, PERSONA_PROMPTS, PersonaEngine
+        expected_dims = [
+            "tone", "formality", "humor_level", "reaction_frequency",
+            "interjection_frequency", "laughter_style", "sentence_length",
+            "pause_style", "teasing_level", "slang_level", "profanity_tendency",
+            "emotional_reactivity", "micro_reactions"
+        ]
+        for name, dims in PERSONA_DIMENSIONS.items():
+            for dim in expected_dims:
+                self.assertIn(dim, dims, f"Persona '{name}' must define behavioral dimension '{dim}'")
+
+        # Test prompt construction
+        engine = PersonaEngine(current_persona="kufurbaz")
+        prompt = engine.build_system_prompt()
+        self.assertIn("BEHAVIORAL DIMENSIONS", prompt)
+        self.assertIn("SIFIR ROBOTİK DİSCLAIMER", prompt)
+        self.assertIn("kufurbaz", PERSONA_PROMPTS)
+
+    def test_p06_barge_in_instant_cancel_and_flush(self):
+        """12. Barge-In: speech_started on active response cancels server stream and flushes audio playback queue."""
+        import asyncio
+        from astro_ai.astro_realtime_node import AstroRealtimeNode
+        node = AstroRealtimeNode.__new__(AstroRealtimeNode)
+        node._is_responding = True
+        node._is_playback_active = True
+        node.active_response_id = "resp_to_cancel_01"
+        node.active_response_state = "RESPONSE_STREAMING"
+        node.pub_interrupt = MagicMock()
+        node.get_logger = lambda: MagicMock()
+
+        sent_payloads = []
+        mock_ws = MagicMock()
+        async def _mock_send(payload):
+            sent_payloads.append(json.loads(payload))
+        mock_ws.send = _mock_send
+
+        asyncio.run(node._handle_realtime_event(mock_ws, {"type": "input_audio_buffer.speech_started"}))
+
+        self.assertFalse(node._is_responding)
+        self.assertEqual(node.active_response_state, "RESPONSE_CANCELLING")
+        node.pub_interrupt.publish.assert_called_once()
+        self.assertEqual(len(sent_payloads), 1)
+        self.assertEqual(sent_payloads[0]["type"], "response.cancel")
+
+    def test_p06_move_robot_parameter_clamping(self):
+        """13. Safety: move_robot clamps speed to max 0.4 m/s and duration to max 5.0s."""
+        from astro_ai.astro_realtime_node import AstroRealtimeNode
+        node = AstroRealtimeNode.__new__(AstroRealtimeNode)
+        mock_cmd_vel = MagicMock()
+        node.pub_cmd_vel = mock_cmd_vel
+        node.get_logger = lambda: MagicMock()
+        node._arduino_heartbeat_healthy = True
+        node._last_heartbeat_ack_time = time.monotonic()
+        node._obstacle_detected = False
+
+        res = node._execute_realtime_tool("move_robot", {"direction": "forward", "speed": 10.0, "duration": 100.0})
+        self.assertEqual(res["status"], "success")
+        published_twist = mock_cmd_vel.publish.call_args[0][0]
+        self.assertAlmostEqual(published_twist.linear.x, 0.4, places=2)
+
+    def test_p06_arduino_diagnostics_watchdog_flag_blocks_mobility(self):
+        """14. Safety: WATCHDOG_TIMEOUT flag in Arduino diagnostics sets heartbeat unhealthy."""
+        from astro_ai.astro_realtime_node import AstroRealtimeNode
+        node = AstroRealtimeNode.__new__(AstroRealtimeNode)
+        node._arduino_heartbeat_healthy = True
+        node._last_heartbeat_ack_time = time.monotonic()
+        node.get_logger = lambda: MagicMock()
+
+        diag_msg = MagicMock()
+        status_item = MagicMock()
+        status_item.name = "arduino"
+        kv_alive = MagicMock()
+        kv_alive.key = "arduino_alive"
+        kv_alive.value = "true"
+        kv_flags = MagicMock()
+        kv_flags.key = "flags"
+        kv_flags.value = "0x0001"  # Watchdog timeout flag set
+        status_item.values = [kv_alive, kv_flags]
+        diag_msg.status = [status_item]
+
+        node._on_arduino_diag(diag_msg)
+        self.assertFalse(node._arduino_heartbeat_healthy)
+
+    def test_p06_session_update_realtime_voice_and_tools(self):
+        """15. Realtime Config: Session update provides full tool registry and Turkish gpt-live-transcribe."""
+        import asyncio
+        from astro_ai.astro_realtime_node import AstroRealtimeNode
+        node = AstroRealtimeNode.__new__(AstroRealtimeNode)
+        node._get_active_biometric_identity = lambda: {"name": "Baran", "is_known": True}
+        node._build_current_system_prompt = lambda: "Astro Persona Instructions"
+        node.realtime_transcribe_model = "gpt-live-transcribe"
+        node.realtime_voice = "ash"
+        node.persona_name = "kufurbaz"
+        node.get_logger = lambda: MagicMock()
+
+        sent_payloads = []
+        mock_ws = MagicMock()
+        async def _mock_send(payload):
+            sent_payloads.append(json.loads(payload))
+        mock_ws.send = _mock_send
+
+        asyncio.run(node._send_session_update(mock_ws))
+        self.assertTrue(len(sent_payloads) > 0)
+        session_cfg = sent_payloads[0]["session"]
+        self.assertEqual(session_cfg["audio"]["output"]["voice"], "ash")
+        tools = session_cfg["tools"]
+        tool_names = [t.get("name") for t in tools]
+        self.assertIn("move_robot", tool_names)
+        self.assertIn("search_memory", tool_names)
+        self.assertIn("inspect_camera_view", tool_names)
 
 
 if __name__ == "__main__":

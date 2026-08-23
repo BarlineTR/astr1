@@ -283,7 +283,7 @@ void processPacket(uint8_t msg_id, const uint8_t* pl, uint8_t len) {
   switch (msg_id) {
     case Proto::HEARTBEAT: {
       g_last_heartbeat_ms = millis();
-      Proto::writePacket(Serial, Proto::HEARTBEAT_ACK, nullptr, 0);
+      Proto::writePacket(Serial, Proto::HEARTBEAT_ACK, pl, len);
       digitalWrite(STATUS_LED, !digitalRead(STATUS_LED));
     } break;
     case Proto::WHEEL_CMD: {

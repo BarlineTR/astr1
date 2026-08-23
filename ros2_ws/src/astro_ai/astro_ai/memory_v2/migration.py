@@ -104,27 +104,35 @@ class MemoryMigrator:
 
         # 3. Migrate Known People & Preferences
         known_people = data.get("known_people", {})
+        people_list = []
         if isinstance(known_people, dict):
             for name, info in known_people.items():
                 if isinstance(info, dict):
                     p_name = info.get("name", name)
                     formal = info.get("formal_title", p_name)
+                    p_info = info
                 else:
                     p_name = str(name)
                     formal = str(info)
-                self.relationship.get_or_create_profile(p_name, formal_title=formal)
+                    p_info = {}
+                people_list.append((p_name, formal, p_info))
         elif isinstance(known_people, list):
             for item in known_people:
                 if isinstance(item, dict):
                     p_name = item.get("name", "user")
                     formal = item.get("formal_title", p_name)
+                    p_info = item
                 else:
                     p_name = str(item)
                     formal = str(item)
-                self.relationship.get_or_create_profile(p_name, formal_title=formal)
+                    p_info = {}
+                people_list.append((p_name, formal, p_info))
+
+        for p_name, formal, p_info in people_list:
+            self.relationship.get_or_create_profile(p_name, formal_title=formal)
 
             # Person Facts
-            for pf in info.get("learned_facts", []):
+            for pf in p_info.get("learned_facts", []):
                 self.semantic.store_fact(
                     subject=p_name,
                     predicate="fact",
@@ -133,7 +141,7 @@ class MemoryMigrator:
                 )
 
             # Preferences
-            for k, v in info.get("preferences", {}).items():
+            for k, v in p_info.get("preferences", {}).items():
                 self.semantic.store_fact(
                     subject=p_name,
                     predicate=str(k),
