@@ -656,6 +656,11 @@ class AstroRealtimeNode(Node):
 
         # Generation-level Barge-In Debounce State
         self._barge_in_latched = False
+        #: Aynı anda TEK konuşmacı. İki yol (tam tur ve sessiz-yanıt
+        #: kurtarması) aynı anda çalınca ses iç içe geçiyor ve ilk biten
+        #: yol _is_playback_active'i False yapıp yankı susturmasını
+        #: kaldırıyor — robot kendi sesini duyup kendini kesiyordu.
+        self._speak_lock = threading.RLock()
         self.edge_tts_enabled = os.getenv("EDGE_TTS_ENABLED", "true").lower() in ("1", "true", "yes")
         # Sağlamlaştırılmış Edge-TTS motoru: ağ ön-kontrolü, asyncio.wait_for
         # timeout'u, try/finally ile event loop kapatma, timeout'ta ffmpeg.kill().
@@ -3328,6 +3333,14 @@ class AstroRealtimeNode(Node):
         Eskiden burada yalnızca "[TTS FALLBACK] to=edge_tts" LOGLANIYORDU;
         hiçbir sentez çalışmıyordu. Log yalan söylüyor, robot susuyordu.
         """
+        # Tam tur (_process_fallback_turn) zaten bir cevap üretiyorsa ikinci
+        # bir cevap üretme: iki ses aynı anda çalar ve birbirini keser.
+        if self._is_processing_fallback:
+            self.get_logger().info(
+                "[TTS FALLBACK SKIPPED] reason=full_turn_already_answering"
+            )
+            return
+
         tier = choose_recovery(
             assistant_text=self._assistant_text_buffer,
             user_transcript=self._last_user_transcript,
@@ -3510,6 +3523,24 @@ class AstroRealtimeNode(Node):
         """Streams 24kHz int16 PCM audio chunks directly to audio output node with smooth 20ms pacing and full provenance."""
         if not pcm_data:
             return
+
+        # Aynı anda tek konuşmacı: ikinci çağrı birincinin bitmesini bekler.
+        with self._speak_lock:
+            self._play_pcm_chunks_locked(pcm_data, generation_id, tts_provider, tts_model, tts_source)
+
+    def _play_pcm_chunks_locked(
+        self,
+        pcm_data: bytes,
+        generation_id: int,
+        tts_provider: str,
+        tts_model: str,
+        tts_source: str,
+    ):
+        """_play_pcm_chunks'ın kilit altındaki gövdesi."""
+        # Bu konuşma için yeni bir barge-in penceresi başlıyor. Mandal eskiden
+        # yalnızca _process_fallback_turn'de sıfırlanıyordu; kurtarma yolundan
+        # gelen her konuşma ilk parçada kesiliyordu.
+        self._barge_in_latched = False
         self._is_playback_active = True
         self._playback_start_monotonic = time.monotonic()
         self.state_machine.transition_to(RobotState.SPEAKING)

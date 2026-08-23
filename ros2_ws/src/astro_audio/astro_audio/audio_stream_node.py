@@ -188,6 +188,8 @@ class AudioStreamNode(Node):
         self._playback_lock = threading.Lock()
         self._stop_event = threading.Event()
         self._total_enqueued_bytes = 0
+        self._dropped_chunks = 0
+        self._last_drop_log_time = 0.0
         self._total_played_bytes = 0
         self._playback_burst_active = False
         self._burst_start_time = 0.0
@@ -417,7 +419,20 @@ class AudioStreamNode(Node):
                 self._last_output_chunk_time = time.monotonic()
                 self._last_output_envelope = item
                 self._total_enqueued_bytes += len(raw_16k)
-        except (queue.Full, Exception) as e:
+        except queue.Full:
+            # Parça kaybı = duyulabilir kesilme. Sessizce yutulmamalı.
+            self._dropped_chunks += 1
+            now_d = time.monotonic()
+            if (now_d - self._last_drop_log_time) > 1.0:
+                self._last_drop_log_time = now_d
+                self.get_logger().error(
+                    f"[PLAYBACK CHUNK DROPPED]\n"
+                    f"reason=queue_full\n"
+                    f"dropped_total={self._dropped_chunks}\n"
+                    f"queue_size={self._play_queue.qsize()}\n"
+                    f"Ses kesik çıkacak — çalma işçisi üretimin gerisinde kaldı."
+                )
+        except Exception as e:
             self.get_logger().debug(f"PCM enqueue notice: {e}")
 
     def _on_interrupt(self, msg: Bool):
