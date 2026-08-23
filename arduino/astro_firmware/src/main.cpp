@@ -8,7 +8,7 @@
 #include "protocol.h"
 
 // ====== Parametreler ======
-static constexpr uint32_t SERIAL_BAUD = 500000; // 500k baud production
+static constexpr uint32_t SERIAL_BAUD = 115200; // CH340/CH341 ve Linux Kernel stabil standart baud
 static constexpr float CONTROL_HZ = 50.0f;
 static constexpr uint32_t CONTROL_DT_MS = (uint32_t)(1000.0f / CONTROL_HZ);
 
@@ -243,12 +243,19 @@ void loopControl() {
   float r_rpm_meas = (dr / (float)TICKS_PER_REV_R) / dt_min;
 
   // ✅ FIX: PID anti-windup iyileştirildi (conditional integration)
-  auto pid_step = [&](float target_rpm, float meas_rpm, float& e_i, float& e_prev, int pwm_out)->int {
+  auto pid_step = [&](float target_rpm, float meas_rpm, float& e_i, float& e_prev)->int {
+    if (abs(target_rpm) < 0.01f) {
+      e_i = 0.0f;
+      e_prev = 0.0f;
+      return 0;
+    }
     float e = target_rpm - meas_rpm;
     float de = (e - e_prev) / (dt_ms / 1000.0f);
     e_prev = e;
     
-    float u = KP * e + KI * e_i + KD * de;
+    // Feedforward: motor statik sürtünme (stiction) eşiğini aşmak için minimum PWM tabanı
+    float ff = (target_rpm > 0.0f) ? 25.0f : -25.0f;
+    float u = ff + (KP * 2.0f * e) + (KI * e_i) + (KD * de);
     int pwm = (int)constrain(u, -PWM_MAX, PWM_MAX);
     
     // Conditional integration: sadece PWM saturate olmadığında integral artır
@@ -262,8 +269,8 @@ void loopControl() {
 
   int l_pwm = 0, r_pwm = 0;
   if (g_motors_enabled) {
-    l_pwm = pid_step(g_left_target_rpm, l_rpm_meas, g_left_err_i, g_left_err_prev, l_pwm);
-    r_pwm = pid_step(g_right_target_rpm, r_rpm_meas, g_right_err_i, g_right_err_prev, r_pwm);
+    l_pwm = pid_step(g_left_target_rpm, l_rpm_meas, g_left_err_i, g_left_err_prev);
+    r_pwm = pid_step(g_right_target_rpm, r_rpm_meas, g_right_err_i, g_right_err_prev);
   }
   setLeftPWM(l_pwm);
   setRightPWM(r_pwm);

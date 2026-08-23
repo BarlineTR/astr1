@@ -66,12 +66,12 @@ class ArduinoState:
     SAFETY_BLOCKED = "SAFETY_BLOCKED"
 
 
-def resolve_serial_port(primary: str = "/dev/astro_arduino", logger=None) -> str:
+def resolve_serial_port(primary: str = "/dev/astro_arduino", logger=None, baud: int = 115200) -> str:
     candidates = []
     # 1. Primary rule
     if primary and os.path.exists(primary):
         if logger:
-            logger.info(f"[ARDUINO PORT DISCOVERY]\n  candidate={primary}\n  selected={primary}\n  baud=500000")
+            logger.info(f"[ARDUINO PORT DISCOVERY]\n  candidate={primary}\n  selected={primary}\n  baud={baud}")
         return primary
     elif primary:
         candidates.append(primary)
@@ -94,12 +94,12 @@ def resolve_serial_port(primary: str = "/dev/astro_arduino", logger=None) -> str
                         f"[ARDUINO PORT DISCOVERY]\n"
                         f"  candidate={candidates}\n"
                         f"  selected={p}\n"
-                        f"  baud=500000"
+                        f"  baud={baud}"
                     )
                 return p
 
     if logger:
-        logger.warn(f"[ARDUINO PORT DISCOVERY] candidate={candidates} selected=none baud=500000")
+        logger.warn(f"[ARDUINO PORT DISCOVERY] candidate={candidates} selected=none baud={baud}")
     return None
 
 
@@ -107,7 +107,7 @@ class SerialBridge(Node):
     def __init__(self):
         super().__init__("serial_bridge")
         self.declare_parameter("port", "/dev/astro_arduino")
-        self.declare_parameter("baud", 500000)
+        self.declare_parameter("baud", 115200)
         self.declare_parameter("connect_retry_sec", 2.0)
         self.declare_parameter("frame_id_imu", "imu_link")
         self.declare_parameter("ticks_per_rev_left", 2048.0)
