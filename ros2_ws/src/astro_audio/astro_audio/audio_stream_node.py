@@ -189,6 +189,8 @@ class AudioStreamNode(Node):
         self._stop_event = threading.Event()
         self._total_enqueued_bytes = 0
         self._total_played_bytes = 0
+        self._current_gen_played_bytes = 0
+        self._cancelled_gen_ids = set()
         self._playback_burst_active = False
         self._burst_start_time = 0.0
         self._playback_worker_alive = True
@@ -436,17 +438,20 @@ class AudioStreamNode(Node):
                 except queue.Empty:
                     break
 
-        barge_in_after_ms = int((time.monotonic() - self._burst_start_time) * 1000.0) if self._burst_start_time > 0 else 0
+        now_mono = time.monotonic()
+        barge_in_after_ms = int((now_mono - self._burst_start_time) * 1000.0) if self._burst_start_time > 0 else 0
         barge_in_source = "self_voice" if (self._burst_start_time > 0 and barge_in_after_ms < int(self.barge_in_protection_ms)) else "user"
         self._is_playing = False
         self._playback_burst_active = False
         self._last_playback_time = 0.0
-        self._playback_drop_until = time.monotonic() + 0.15
+        self._playback_drop_until = now_mono + 0.15
         prov = getattr(self, "_active_provenance", {})
         cancelled_gen = prov.get('generation_id', 0)
         if not hasattr(self, "_cancelled_gen_ids"):
             self._cancelled_gen_ids = set()
         self._cancelled_gen_ids.add(cancelled_gen)
+
+        gen_bytes = getattr(self, "_current_gen_played_bytes", self._total_played_bytes)
 
         self.get_logger().info(
             f"⚡ [Playback Telemetry]: tts_playback_cancelled=True | "
@@ -454,8 +459,9 @@ class AudioStreamNode(Node):
             f"playback_source={prov.get('playback_source', 'unknown')} | "
             f"tts_provider={prov.get('tts_provider', 'unknown')} | "
             f"tts_model={prov.get('tts_model', 'unknown')} | "
-            f"tts_played_bytes={self._total_played_bytes} | "
+            f"tts_played_bytes={gen_bytes} | "
             f"tts_remaining_bytes={discarded_bytes} | "
+            f"total_playback_bytes={self._total_played_bytes} | "
             f"playback_duration_ms={barge_in_after_ms} | "
             f"barge_in_after_ms={barge_in_after_ms} | "
             f"barge_in_source={barge_in_source} | "
@@ -541,6 +547,7 @@ class AudioStreamNode(Node):
                     gen_done_seen = False
                     gen_start_time = time.monotonic()
                     gen_played_bytes = 0
+                    self._current_gen_played_bytes = 0
                     gen_prov = {
                         "generation_id": gen_id,
                         "playback_source": playback_source,
@@ -575,6 +582,7 @@ class AudioStreamNode(Node):
                     self._is_playing = True
                     self._last_playback_time = time.monotonic()
                     gen_played_bytes += len(chunk)
+                    self._current_gen_played_bytes = gen_played_bytes
                     self._total_played_bytes += len(chunk)
 
                 # If done signal received and queue is now empty, finish generation playback

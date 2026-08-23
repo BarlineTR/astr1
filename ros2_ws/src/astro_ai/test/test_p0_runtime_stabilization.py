@@ -5199,6 +5199,292 @@ class TestP0EndToEndRPDExhaustionAndFallbackTurn(unittest.TestCase):
         self.assertEqual(node.active_generation_id, 1002)
 
 
+
+class TestP012BargeInPlaybackLifecycleStabilization(unittest.TestCase):
+    """Authoritative P0.12 Barge-In, Playback Lifecycle & Turn Transition Acceptance Tests."""
+
+    def setUp(self):
+        from astro_ai.circuit_breaker import get_global_circuit_breaker
+        from astro_ai.astro_realtime_node import reset_openai_hard_disabled_for_test
+        reset_openai_hard_disabled_for_test()
+        self.cb = get_global_circuit_breaker()
+        if self.cb:
+            self.cb.reset_all()
+
+    def _create_synthetic_pcm_msg(self, amplitude: int, length_samples: int = 320):
+        from std_msgs.msg import String
+        raw = np.full(length_samples, amplitude, dtype=np.int16).tobytes()
+        msg = String()
+        msg.data = base64.b64encode(raw).decode("ascii")
+        return msg
+
+    def test_01_single_high_rms_frame_does_not_cancel(self):
+        """1. Single high RMS acoustic spike does NOT cancel playback."""
+        from astro_ai.astro_realtime_node import AstroRealtimeNode
+        from astro_ai.state_machine import RobotState
+        fake_ws = FakeRealtimeTransport()
+        node = AstroRealtimeNode(connect_realtime=False, fake_transport=fake_ws)
+        node._is_sleeping = False
+        node.state_machine.transition_to(RobotState.SPEAKING)
+        node._is_playback_active = True
+        node._playback_start_monotonic = time.monotonic() - 1.0  # past protection window
+        node._barge_in_latched = False
+
+        # 1 loud spike frame (e.g. table tap / transient click > 5000 RMS, > 15000 Peak)
+        spike_msg = self._create_synthetic_pcm_msg(amplitude=16000, length_samples=320)
+        node._on_input_pcm(spike_msg)
+
+        # Barge in must NOT be latched
+        self.assertFalse(node._barge_in_latched)
+        self.assertTrue(node._is_playback_active)
+
+    def test_02_three_short_frames_do_not_cancel(self):
+        """2. Three short frames (< 4 frames hysteresis) do NOT cancel playback."""
+        from astro_ai.astro_realtime_node import AstroRealtimeNode
+        from astro_ai.state_machine import RobotState
+        fake_ws = FakeRealtimeTransport()
+        node = AstroRealtimeNode(connect_realtime=False, fake_transport=fake_ws)
+        node._is_sleeping = False
+        node.state_machine.transition_to(RobotState.SPEAKING)
+        node._is_playback_active = True
+        node._playback_start_monotonic = time.monotonic() - 1.0
+        node._barge_in_latched = False
+
+        # 2 short frames (below min persistence of 3 frames)
+        for _ in range(2):
+            msg = self._create_synthetic_pcm_msg(amplitude=16000, length_samples=320)
+            node._on_input_pcm(msg)
+
+        self.assertFalse(node._barge_in_latched)
+        self.assertTrue(node._is_playback_active)
+
+    def test_03_four_confirmed_frames_trigger_barge_in_cancel(self):
+        """3. 4+ confirmed frames (80ms sustained voice) trigger confirmed barge-in."""
+        from astro_ai.astro_realtime_node import AstroRealtimeNode
+        from astro_ai.state_machine import RobotState
+        fake_ws = FakeRealtimeTransport()
+        node = AstroRealtimeNode(connect_realtime=False, fake_transport=fake_ws)
+        node._is_sleeping = False
+        node.state_machine.transition_to(RobotState.SPEAKING)
+        node._is_playback_active = True
+        node._playback_start_monotonic = time.monotonic() - 1.0
+        node._barge_in_latched = False
+
+        # Send 4 sustained loud frames
+        for _ in range(4):
+            msg = self._create_synthetic_pcm_msg(amplitude=16000, length_samples=320)
+            node._on_input_pcm(msg)
+
+        # Barge-in MUST be latched and playback cancelled
+        self.assertTrue(node._barge_in_latched)
+        self.assertFalse(node._is_playback_active)
+
+    def test_04_robot_self_voice_does_not_cancel(self):
+        """4. High self_voice_score suppresses false barge-in."""
+        from astro_ai.astro_realtime_node import AstroRealtimeNode
+        from astro_ai.state_machine import RobotState
+        from unittest.mock import MagicMock
+        fake_ws = FakeRealtimeTransport()
+        node = AstroRealtimeNode(connect_realtime=False, fake_transport=fake_ws)
+        node._is_sleeping = False
+        node.state_machine.transition_to(RobotState.SPEAKING)
+        node._is_playback_active = True
+        node._playback_start_monotonic = time.monotonic() - 1.0
+        node._barge_in_latched = False
+
+        # Mock voice recognizer returning self_voice_score = 0.95 (robot speaker voice)
+        mock_vr = MagicMock()
+        mock_vr.score_self_voice.return_value = 0.95
+        node.voice_recognizer = mock_vr
+
+        for _ in range(6):
+            msg = self._create_synthetic_pcm_msg(amplitude=16000, length_samples=320)
+            node._on_input_pcm(msg)
+
+        # Barge in must NOT be latched due to self-voice score
+        self.assertFalse(node._barge_in_latched)
+        self.assertTrue(node._is_playback_active)
+
+    def test_05_confirmed_user_speech_cancels_playback(self):
+        """5. Confirmed user speech (self_voice_score < 0.70) cancels playback."""
+        from astro_ai.astro_realtime_node import AstroRealtimeNode
+        from astro_ai.state_machine import RobotState
+        from unittest.mock import MagicMock
+        fake_ws = FakeRealtimeTransport()
+        node = AstroRealtimeNode(connect_realtime=False, fake_transport=fake_ws)
+        node._is_sleeping = False
+        node.state_machine.transition_to(RobotState.SPEAKING)
+        node._is_playback_active = True
+        node._playback_start_monotonic = time.monotonic() - 1.0
+        node._barge_in_latched = False
+
+        mock_vr = MagicMock()
+        mock_vr.score_self_voice.return_value = 0.15  # genuine human user
+        node.voice_recognizer = mock_vr
+
+        for _ in range(4):
+            msg = self._create_synthetic_pcm_msg(amplitude=16000, length_samples=320)
+            node._on_input_pcm(msg)
+
+        self.assertTrue(node._barge_in_latched)
+        self.assertFalse(node._is_playback_active)
+
+    def test_06_no_response_cancel_after_response_audio_done(self):
+        """6. After response.audio.done (state=AUDIO_DONE), user speech does NOT send response.cancel to OpenAI."""
+        from astro_ai.astro_realtime_node import AstroRealtimeNode
+        fake_ws = FakeRealtimeTransport()
+        node = AstroRealtimeNode(connect_realtime=False, fake_transport=fake_ws)
+        node.realtime_connection_state = "CONNECTED"
+        node.realtime_session_state = "READY"
+        node.active_response_state = "AUDIO_DONE"
+        node._is_playback_active = True
+
+        fake_ws.sent_events.clear()
+
+        # Trigger speech_started from server VAD while audio is already done
+        asyncio.run(node._handle_realtime_event(fake_ws, {
+            "type": "input_audio_buffer.speech_started"
+        }))
+
+        # Verify NO response.cancel was sent to OpenAI
+        self.assertNotIn("response.cancel", fake_ws.get_sent_types())
+        self.assertFalse(node._is_playback_active)
+
+    def test_07_no_response_cancel_after_response_done(self):
+        """7. After response.done (state=IDLE), user speech does NOT send response.cancel to OpenAI."""
+        from astro_ai.astro_realtime_node import AstroRealtimeNode
+        fake_ws = FakeRealtimeTransport()
+        node = AstroRealtimeNode(connect_realtime=False, fake_transport=fake_ws)
+        node.realtime_connection_state = "CONNECTED"
+        node.realtime_session_state = "READY"
+        node.active_response_state = "IDLE"
+        node._is_playback_active = False
+
+        fake_ws.sent_events.clear()
+
+        # Trigger speech_started
+        asyncio.run(node._handle_realtime_event(fake_ws, {
+            "type": "input_audio_buffer.speech_started"
+        }))
+
+        self.assertNotIn("response.cancel", fake_ws.get_sent_types())
+
+    def test_08_old_generation_event_does_not_mutate_current_playback(self):
+        """8. Event from Generation N does not cancel or mutate Generation N+1 playback."""
+        from astro_ai.astro_realtime_node import AstroRealtimeNode
+        fake_ws = FakeRealtimeTransport()
+        node = AstroRealtimeNode(connect_realtime=False, fake_transport=fake_ws)
+
+        node.active_generation_id = 1002
+        node.active_response_id = "resp_current_1002"
+        node.active_response_state = "GENERATING"
+
+        # Late cancellation event for old generation 1001
+        asyncio.run(node._handle_realtime_event(fake_ws, {
+            "type": "response.cancelled",
+            "response": {"id": "resp_old_1001"}
+        }))
+
+        # Generation 1002 state must remain unaffected
+        self.assertEqual(node.active_generation_id, 1002)
+        self.assertEqual(node.active_response_id, "resp_current_1002")
+        self.assertEqual(node.active_response_state, "GENERATING")
+
+    def test_09_fallback_playback_cancels_on_genuine_user_speech(self):
+        """9. In Fallback mode, 4+ confirmed user speech frames cancel playback cleanly."""
+        from astro_ai.astro_realtime_node import AstroRealtimeNode
+        from astro_ai.state_machine import RobotState
+        fake_ws = FakeRealtimeTransport()
+        node = AstroRealtimeNode(connect_realtime=False, fake_transport=fake_ws)
+        node._is_sleeping = False
+        node.state_machine.transition_to(RobotState.SPEAKING)
+        node._fallback_mode = True
+        node._is_playback_active = True
+        node._playback_start_monotonic = time.monotonic() - 1.0
+        node._barge_in_latched = False
+
+        for _ in range(4):
+            msg = self._create_synthetic_pcm_msg(amplitude=16000, length_samples=320)
+            node._on_input_pcm(msg)
+
+        self.assertTrue(node._barge_in_latched)
+        self.assertFalse(node._is_playback_active)
+
+    def test_10_fallback_playback_continues_on_single_spike(self):
+        """10. In Fallback mode, single acoustic spike does not cancel playback."""
+        from astro_ai.astro_realtime_node import AstroRealtimeNode
+        from astro_ai.state_machine import RobotState
+        fake_ws = FakeRealtimeTransport()
+        node = AstroRealtimeNode(connect_realtime=False, fake_transport=fake_ws)
+        node._is_sleeping = False
+        node.state_machine.transition_to(RobotState.SPEAKING)
+        node._fallback_mode = True
+        node._is_playback_active = True
+        node._playback_start_monotonic = time.monotonic() - 1.0
+        node._barge_in_latched = False
+
+        msg = self._create_synthetic_pcm_msg(amplitude=16000, length_samples=320)
+        node._on_input_pcm(msg)
+
+        self.assertFalse(node._barge_in_latched)
+        self.assertTrue(node._is_playback_active)
+
+    def test_11_wake_response_interruptible_without_corrupting_next_turn(self):
+        """11. Wake acknowledgment playback can be interrupted cleanly without corrupting the next turn."""
+        from astro_ai.astro_realtime_node import AstroRealtimeNode
+        fake_ws = FakeRealtimeTransport()
+        node = AstroRealtimeNode(connect_realtime=False, fake_transport=fake_ws)
+        node.realtime_connection_state = "CONNECTED"
+        node.realtime_session_state = "READY"
+        node._is_sleeping = False
+
+        # Trigger wake ack
+        node._is_playback_active = True
+        node._playback_start_monotonic = time.monotonic() - 0.5
+        node.active_response_state = "STREAMING"
+
+        # User speaks "Naber?"
+        asyncio.run(node._handle_realtime_event(fake_ws, {
+            "type": "input_audio_buffer.speech_started"
+        }))
+
+        # Wake audio playback is interrupted
+        self.assertFalse(node._is_responding)
+
+        # New user turn request arrives cleanly
+        from std_msgs.msg import String
+        turn_msg = String()
+        turn_msg.data = json.dumps({"text": "Naber?", "generation_id": 5001})
+        node._on_realtime_turn_request(turn_msg)
+
+        # Verified new turn is accepted and processed
+        self.assertEqual(node.realtime_current_generation_id, 5001)
+
+    def test_12_normal_response_interruptible_and_starts_new_turn(self):
+        """12. Normal response is interruptible and transitions seamlessly into the new conversation turn."""
+        from astro_ai.astro_realtime_node import AstroRealtimeNode
+        fake_ws = FakeRealtimeTransport()
+        node = AstroRealtimeNode(connect_realtime=False, fake_transport=fake_ws)
+        node.realtime_connection_state = "CONNECTED"
+        node.realtime_session_state = "READY"
+        node.active_generation_id = 6001
+        node.active_response_state = "STREAMING"
+        node._is_playback_active = True
+
+        # User interrupts
+        asyncio.run(node._handle_realtime_event(fake_ws, {
+            "type": "input_audio_buffer.speech_started"
+        }))
+
+        # Next user turn arrives
+        from std_msgs.msg import String
+        turn_msg = String()
+        turn_msg.data = json.dumps({"text": "Yeni soru", "generation_id": 6002})
+        node._on_realtime_turn_request(turn_msg)
+
+        self.assertEqual(node.realtime_current_generation_id, 6002)
+
+
 if __name__ == "__main__":
     unittest.main()
 

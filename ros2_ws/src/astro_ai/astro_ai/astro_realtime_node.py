@@ -592,10 +592,10 @@ class AstroRealtimeNode(Node):
         self.barge_in_playback_min_rms = float(os.getenv("BARGE_IN_PLAYBACK_MIN_RMS", "4500.0"))
         self.barge_in_noise_mult = float(os.getenv("BARGE_IN_NOISE_MULTIPLIER", "3.5"))
         self.barge_in_min_peak = int(os.getenv("BARGE_IN_MIN_PEAK", "2800"))
-        self.barge_in_playback_min_peak = int(os.getenv("BARGE_IN_PLAYBACK_MIN_PEAK", "14000"))
+        self.barge_in_playback_min_peak = int(os.getenv("BARGE_IN_PLAYBACK_MIN_PEAK", "9000"))
         self._barge_in_consecutive_frames = 0
         self.barge_in_min_consecutive_frames = int(os.getenv("BARGE_IN_MIN_CONSECUTIVE_FRAMES", "3"))
-        self.barge_in_playback_min_consecutive_frames = int(os.getenv("BARGE_IN_PLAYBACK_CONSECUTIVE_FRAMES", "6"))
+        self.barge_in_playback_min_consecutive_frames = int(os.getenv("BARGE_IN_PLAYBACK_CONSECUTIVE_FRAMES", "3"))
         self._playback_start_monotonic = 0.0
         self._ambient_rms = 120.0
         self._recent_robot_phrases: List[str] = []
@@ -1536,9 +1536,12 @@ class AstroRealtimeNode(Node):
 
         # 3. User Speech Started
         elif event_type == "input_audio_buffer.speech_started":
-            # Barge-in response.cancel only when actively STREAMING or playing back audio
-            if self.active_response_state in ("STREAMING", "RESPONSE_STREAMING") or (self._is_responding and self._is_playback_active):
-                self.get_logger().info("⚡ [Realtime Barge-In] Kullanıcı lafa girdi — Çalma / stream iptal ediliyor...")
+            is_active_streaming = (
+                self.active_response_state in ("STREAMING", "RESPONSE_STREAMING")
+                or (self._is_responding and self.active_response_state not in ("AUDIO_DONE", "COMPLETED", "CANCELLED", "FAILED", "GENERATING"))
+            )
+            if is_active_streaming and self._can_use_openai("realtime"):
+                self.get_logger().info("⚡ [Realtime Barge-In] Kullanıcı lafa girdi — Sunucu akışı ve hoparlör iptal ediliyor...")
                 self.active_response_state = "RESPONSE_CANCELLING"
                 self._is_responding = False
                 intr_msg = Bool()
@@ -1553,15 +1556,17 @@ class AstroRealtimeNode(Node):
                             await res
                     except Exception:
                         pass
-            elif self._is_playback_active and self.active_response_state in ("AUDIO_DONE", "IDLE"):
-                # Playback is draining on DAC, but OpenAI response is already done on server side
+            elif self._is_playback_active and self.active_response_state in ("AUDIO_DONE", "IDLE", "COMPLETED", "CANCELLED", "FAILED"):
+                # Playback is draining on DAC, but OpenAI response is already done on server side: ONLY cancel DAC, DO NOT send response.cancel to OpenAI!
                 self.get_logger().info("⚡ [Playback Interrupted] Kullanıcı konuştu — Kalan DAC çalması durduruluyor (Server cancel yok)...")
                 intr_msg = Bool()
                 intr_msg.data = True
                 if getattr(self, "pub_interrupt", None):
                     self.pub_interrupt.publish(intr_msg)
                 self._is_playback_active = False
+                self._is_responding = False
             else:
+                self._is_responding = False
                 self.get_logger().debug(f"🎤 [Realtime] Kullanıcı konuşmaya başladı (response_state={self.active_response_state})...")
 
         # 3b. User Speech Stopped
@@ -4570,25 +4575,33 @@ class AstroRealtimeNode(Node):
         if is_active_playback:
             playback_start = getattr(self, "_playback_start_monotonic", 0.0)
 
-            # 1. Acoustic Protection Window: Strictly suppress self-voice feedback during initial burst (e.g. 150ms)
+            # 1. Acoustic Protection Window: Strictly suppress self-voice feedback during initial burst (e.g. 350ms)
             if playback_start > 0.0 and ((now - playback_start) * 1000.0 < self.barge_in_protection_ms):
                 self._barge_in_consecutive_frames = 0
                 return
 
-            # Target barge-in threshold: During speaker playback, robot speaker creates acoustic baseline of 1000-3500 RMS.
-            # User barge-in requires energetic intentional speech (>4000 RMS / >12000 peak)
-            target_barge_in_rms = self.barge_in_playback_min_rms if getattr(self, "_fallback_mode", False) else max(self.barge_in_min_rms, self._ambient_rms * self.barge_in_noise_mult)
-            target_barge_in_peak = self.barge_in_playback_min_peak if getattr(self, "_fallback_mode", False) else self.barge_in_min_peak
+            # Target barge-in threshold: Requires intentional voice exceeding baseline ambient
+            target_barge_in_rms = max(self.barge_in_min_rms, self._ambient_rms * self.barge_in_noise_mult)
+            target_barge_in_peak = self.barge_in_min_peak
+
+            # Self-voice rejection score check: if voice recognizer is active, check self-voice score
+            self_voice_score = 0.0
+            if getattr(self, "voice_recognizer", None) and hasattr(self.voice_recognizer, "score_self_voice"):
+                try:
+                    self_voice_score = self.voice_recognizer.score_self_voice(raw_16k)
+                except Exception:
+                    self_voice_score = 0.0
 
             # 2. Distinguish genuine loud user speech from robot's own speaker output
-            is_loud = (local_rms >= target_barge_in_rms and peak_val >= target_barge_in_peak)
+            is_loud = (local_rms >= target_barge_in_rms and peak_val >= target_barge_in_peak and self_voice_score < 0.70)
             if is_loud:
                 self._barge_in_consecutive_frames += 1
             else:
                 self._barge_in_consecutive_frames = max(0, self._barge_in_consecutive_frames - 1)
 
-            # Require persistent speech across multiple consecutive frames (>= 2 frames = 40ms) to avoid impulse noise
-            if self._barge_in_consecutive_frames < self.barge_in_min_consecutive_frames:
+            # Require persistent speech across multiple consecutive frames (>= 3 frames = 60ms) to avoid impulse noise
+            min_frames = getattr(self, "barge_in_min_consecutive_frames", 3)
+            if self._barge_in_consecutive_frames < min_frames:
                 return
 
             # Barge-In latch: Only one logical barge-in transition per generation
@@ -4618,7 +4631,7 @@ class AstroRealtimeNode(Node):
                     self._fallback_audio_buffer = [raw_16k]
             else:
                 # Realtime primary S2S mode: cancel streaming response on WebSocket ONLY if it is actively streaming
-                if self.active_response_state == "STREAMING":
+                if self.active_response_state in ("STREAMING", "RESPONSE_STREAMING"):
                     self.active_response_state = "CANCELLED"
                     if self._ws is not None and self._can_use_openai("realtime"):
                         try:
@@ -4633,7 +4646,8 @@ class AstroRealtimeNode(Node):
 
             int_msg = Bool()
             int_msg.data = True
-            self.pub_interrupt.publish(int_msg)
+            if getattr(self, "pub_interrupt", None):
+                self.pub_interrupt.publish(int_msg)
             self.get_logger().info(
                 f"⚡ [Realtime Barge-In] Kullanıcı araya girdi (RMS: {local_rms:.0f}, Peak: {peak_val}, "
                 f"barge_in_after_ms={barge_in_after_ms}, Latch: True)."
