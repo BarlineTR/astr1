@@ -149,12 +149,15 @@ def generate_launch_description():
                     "camera_source": camera_source,
                 }.items(),
             ),
-            # OpenAI Realtime WebSocket Node (production default: enabled via single audio owner)
+            # OpenAI Realtime WebSocket Node — yalnızca voice_engine=realtime iken.
+            # use_realtime tek başına yetmez: voice_engine:=cascaded use_realtime:=true
+            # denirse her iki ses hattı birden açılır ve aynı ALSA cihazına iki
+            # süreç dokunur.
             IncludeLaunchDescription(
                 PythonLaunchDescriptionSource(
                     os.path.join(bringup_pkg, "launch", "realtime_sensors.launch.py")
                 ),
-                condition=IfCondition(use_realtime),
+                condition=IfCondition(is_realtime),
                 launch_arguments={"use_sim_time": use_sim_time}.items(),
             ),
         ]
