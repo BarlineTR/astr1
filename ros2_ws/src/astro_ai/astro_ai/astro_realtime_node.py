@@ -557,10 +557,10 @@ class AstroRealtimeNode(Node):
         self.echo_mute_cooldown_s = float(os.getenv("ECHO_MUTE_COOLDOWN_S", "0.65"))
         self.barge_in_protection_ms = float(os.getenv("TTS_BARGE_IN_PROTECTION_MS", "350.0"))
         self.barge_in_min_rms = float(os.getenv("BARGE_IN_MIN_RMS", "1200.0"))
-        self.barge_in_playback_min_rms = float(os.getenv("BARGE_IN_PLAYBACK_MIN_RMS", "4500.0"))
+        self.barge_in_playback_min_rms = float(os.getenv("BARGE_IN_PLAYBACK_MIN_RMS", "800.0"))
         self.barge_in_noise_mult = float(os.getenv("BARGE_IN_NOISE_MULTIPLIER", "3.5"))
         self.barge_in_min_peak = int(os.getenv("BARGE_IN_MIN_PEAK", "2800"))
-        self.barge_in_playback_min_peak = int(os.getenv("BARGE_IN_PLAYBACK_MIN_PEAK", "14000"))
+        self.barge_in_playback_min_peak = int(os.getenv("BARGE_IN_PLAYBACK_MIN_PEAK", "6000"))
         self._barge_in_consecutive_frames = 0
         self.barge_in_min_consecutive_frames = int(os.getenv("BARGE_IN_MIN_CONSECUTIVE_FRAMES", "3"))
         self.barge_in_playback_min_consecutive_frames = int(os.getenv("BARGE_IN_PLAYBACK_CONSECUTIVE_FRAMES", "6"))
@@ -661,6 +661,16 @@ class AstroRealtimeNode(Node):
         #: yol _is_playback_active'i False yapıp yankı susturmasını
         #: kaldırıyor — robot kendi sesini duyup kendini kesiyordu.
         self._speak_lock = threading.RLock()
+        #: Çalma tek işçili bir kuyruğa devredilir: sıra korunur, üst üste
+        #: binmez ve sentez döngüsü çalmanın bitmesini BEKLEMEZ. Eskiden
+        #: _play_pcm_chunks bloke ettiği için sonraki cümlenin sentezi ancak
+        #: öncekinin tamamı yayınlandıktan sonra başlıyordu — cümleler arasında
+        #: ~500 ms sessizlik oluşuyor, konuşma parça parça duyuluyordu.
+        import concurrent.futures as _cf
+        self._playback_pool = _cf.ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="astro-playback"
+        )
+        self._playback_futures: List[Any] = []
         self.edge_tts_enabled = os.getenv("EDGE_TTS_ENABLED", "true").lower() in ("1", "true", "yes")
         # Sağlamlaştırılmış Edge-TTS motoru: ağ ön-kontrolü, asyncio.wait_for
         # timeout'u, try/finally ile event loop kapatma, timeout'ta ffmpeg.kill().
@@ -3428,6 +3438,60 @@ class AstroRealtimeNode(Node):
         except Exception as exc:
             self.get_logger().error(f"[TTS FALLBACK FAILED] error={exc}")
 
+    def _enqueue_playback(
+        self,
+        pcm_data: bytes,
+        generation_id: int = 0,
+        tts_provider: str = "edge_tts",
+        tts_model: str = "edge_tts",
+        tts_source: str = "edge_tts",
+    ):
+        """Sesi çalma kuyruğuna koyar ve HEMEN döner.
+
+        Sıra tek işçiyle korunur; çağıran bir sonraki cümleyi sentezlemeye
+        devam edebilir.
+        """
+        if not pcm_data:
+            return
+        fut = self._playback_pool.submit(
+            self._play_pcm_chunks, pcm_data, generation_id, tts_provider, tts_model, tts_source
+        )
+        self._playback_futures.append(fut)
+
+    def _drain_playback(self, timeout: float = 60.0):
+        """Kuyruğa konmuş tüm çalmaların bitmesini bekler."""
+        deadline = time.monotonic() + timeout
+        pending, self._playback_futures = self._playback_futures, []
+        for fut in pending:
+            left = deadline - time.monotonic()
+            if left <= 0:
+                break
+            try:
+                fut.result(timeout=left)
+            except Exception as exc:
+                self.get_logger().debug(f"_drain_playback: yok sayılan hata ({exc})")
+
+    def _is_barge_in_energy(self, rms: float, peak: int, during_playback: bool) -> bool:
+        """Bu ses seviyesi GERÇEK kullanıcı konuşması mı?
+
+        Çalma sırasında çok daha katı eşik uygulanır. Sebep ölçümle sabit:
+        hoparlör ve mikrofon aynı cihazdayken (donanımsal yankı iptali yok)
+        robotun KENDİ sesi mikrofonda RMS 1300-2000 / peak 3300-5400 okunuyor.
+        Gevşek eşik (1200/2800) bunu "kullanıcı araya girdi" sayıp her cümleyi
+        yarıda kesiyordu. Gerçek kullanıcı konuşması ise aynı logda
+        RMS 5700-8600 / peak 15000+ seviyesinde — katı eşiği rahatça aşıyor.
+
+        BARGE_IN_PLAYBACK_MIN_RMS ve BARGE_IN_PLAYBACK_MIN_PEAK bu iş için
+        zaten tanımlanmıştı ama hiçbir yerde okunmuyordu.
+        """
+        if during_playback:
+            floor_rms = max(self.barge_in_playback_min_rms, self._ambient_rms * self.barge_in_noise_mult)
+            floor_peak = self.barge_in_playback_min_peak
+        else:
+            floor_rms = max(self.barge_in_min_rms, self._ambient_rms * self.barge_in_noise_mult)
+            floor_peak = self.barge_in_min_peak
+        return rms >= floor_rms and peak >= floor_peak
+
     def _playback_source_name(self) -> str:
         """Sesi fiilen donanıma yazan bileşenin adı.
 
@@ -3864,7 +3928,9 @@ class AstroRealtimeNode(Node):
                     except Exception as ex_w:
                         self.get_logger().debug(f"XTTS debug WAV write notice: {ex_w}")
 
-                self._play_pcm_chunks(
+                # Kuyruğa koy ve HEMEN dön: sonraki cümlenin sentezi bu cümle
+                # çalarken başlasın, aralarda sessizlik kalmasın.
+                self._enqueue_playback(
                     pcm_audio,
                     generation_id=self._fallback_generation_id,
                     tts_provider=active_engine,
@@ -4086,7 +4152,10 @@ class AstroRealtimeNode(Node):
                     total_enqueued_chunks += (len(pcm) + 959) // 960
                     first_audio_ms = (time.monotonic() - t_turn_start) * 1000.0
                     first_audio_played = True
-                    self._play_pcm_chunks(pcm)
+                    self._enqueue_playback(pcm)
+
+            # Telemetri gerçek bitişi yansıtsın: kuyruktaki tüm cümleler çalsın.
+            self._drain_playback(timeout=60.0)
 
             t_total_end = time.monotonic()
             total_turn_ms = (t_total_end - t_turn_start) * 1000.0
@@ -4295,11 +4364,8 @@ class AstroRealtimeNode(Node):
                 self._barge_in_consecutive_frames = 0
                 return
 
-            # Adaptive barge-in threshold derived from ambient noise floor
-            adaptive_barge_in_rms = max(self.barge_in_min_rms, self._ambient_rms * self.barge_in_noise_mult)
-
-            # 2. Distinguish loud acoustic voice from background
-            is_loud = (local_rms >= adaptive_barge_in_rms and peak_val >= self.barge_in_min_peak)
+            # Çalma sırasında KATI eşik: robotun kendi sesi kullanıcı sanılmasın.
+            is_loud = self._is_barge_in_energy(local_rms, peak_val, during_playback=True)
             if is_loud:
                 self._barge_in_consecutive_frames += 1
             else:

@@ -17,6 +17,8 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 SRC = ROOT / "ros2_ws" / "src"
+ENV_KEY_RE = re.compile(r"[A-Z][A-Z0-9_]{2,}")
+
 EXAMPLE = ROOT / ".env.example"
 
 # Kod tarafından okunan ama .env'e ait olmayan işletim sistemi değişkenleri
@@ -36,17 +38,26 @@ def keys_read_by_code() -> dict[str, set[str]]:
             if not isinstance(node, ast.Call) or not node.args:
                 continue
             fn = node.func
-            is_env = (
-                isinstance(fn, ast.Attribute)
-                and (
-                    fn.attr == "getenv"
-                    or (fn.attr == "get" and isinstance(fn.value, ast.Attribute) and fn.value.attr == "environ")
-                )
-            )
-            if not is_env:
+            if not isinstance(fn, ast.Attribute):
                 continue
             arg = node.args[0]
-            if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
+            if not (isinstance(arg, ast.Constant) and isinstance(arg.value, str)):
+                continue
+
+            is_env = (
+                fn.attr == "getenv"
+                or (fn.attr == "get" and isinstance(fn.value, ast.Attribute) and fn.value.attr == "environ")
+            )
+            # Ek biçim: enjekte edilebilir bir ortam mapping'i üzerinden okuma.
+            # session_config.build_turn_detection(env=...) test edilebilirlik için
+            # os.environ'ı parametre olarak alıyor ve `src.get("ANAHTAR", ...)`
+            # diyor. Yalnızca os.getenv aranırsa bu anahtarlar "ölü ayar" diye
+            # yanlış raporlanıyordu. ORTAM_ANAHTARI biçimindeki (BÜYÜK_HARF)
+            # sabit anahtarlı .get() çağrıları da okuma sayılır.
+            if not is_env and fn.attr == "get" and ENV_KEY_RE.fullmatch(arg.value):
+                is_env = True
+
+            if is_env:
                 found.setdefault(arg.value, set()).add(f.name)
     return found
 

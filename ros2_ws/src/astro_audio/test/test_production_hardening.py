@@ -575,7 +575,9 @@ class TestSTTValidationAndEchoImmunity(unittest.TestCase):
         self.node._barge_in_consecutive_frames = 0
         self.node.pub_interrupt = MagicMock()
 
-        loud_pcm_16k = self._generate_pcm(0.02, rms_target=2200.0)
+        # peak, çalma sırası eşiğinin (6000) üstünde olmalı: kendi sesi
+        # peak 5348'e kadar çıktığı için altındaki her şey kendi sesi sayılır.
+        loud_pcm_16k = (np.ones(320, dtype=np.int16) * 9000).tobytes()
         loud_msg = MagicMock()
         loud_msg.data = base64.b64encode(loud_pcm_16k).decode("ascii")
 
@@ -842,8 +844,12 @@ class TestSTTValidationAndEchoImmunity(unittest.TestCase):
         self.node._barge_in_consecutive_frames = 0
         self.node.barge_in_min_consecutive_frames = 3
 
-        # Loud user voice (RMS 5000, Peak 15000)
-        user_pcm = (np.ones(320, dtype=np.int16) * 5000).tobytes()
+        # Gerçekten yüksek kullanıcı sesi.
+        # DİKKAT: eski hâli np.ones(320)*5000 idi — RMS 5000 ama PEAK de 5000.
+        # Ölçüm (canlı log): robotun KENDİ sesi peak 5348'e kadar çıkıyor, yani
+        # peak 5000'lik bir sinyal kendi sesinden ayırt edilemez ve artık
+        # bilerek barge-in saymıyor. Bkz. BARGE_IN_PLAYBACK_MIN_PEAK.
+        user_pcm = (np.ones(320, dtype=np.int16) * 9000).tobytes()
         mock_msg = MagicMock()
         mock_msg.data = base64.b64encode(user_pcm).decode("ascii")
 

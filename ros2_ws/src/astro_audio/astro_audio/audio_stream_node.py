@@ -174,10 +174,10 @@ class AudioStreamNode(Node):
         self.echo_mute_cooldown_s = float(os.getenv("ECHO_MUTE_COOLDOWN_S", "0.65"))
         self.barge_in_protection_ms = float(os.getenv("TTS_BARGE_IN_PROTECTION_MS", "350.0"))
         self.barge_in_min_rms = float(os.getenv("BARGE_IN_MIN_RMS", "1200.0"))
-        self.barge_in_playback_min_rms = float(os.getenv("BARGE_IN_PLAYBACK_MIN_RMS", "4500.0"))
+        self.barge_in_playback_min_rms = float(os.getenv("BARGE_IN_PLAYBACK_MIN_RMS", "800.0"))
         self.barge_in_noise_mult = float(os.getenv("BARGE_IN_NOISE_MULTIPLIER", "3.5"))
         self.barge_in_min_peak = int(os.getenv("BARGE_IN_MIN_PEAK", "2800"))
-        self.barge_in_playback_min_peak = int(os.getenv("BARGE_IN_PLAYBACK_MIN_PEAK", "14000"))
+        self.barge_in_playback_min_peak = int(os.getenv("BARGE_IN_PLAYBACK_MIN_PEAK", "6000"))
         self._ambient_rms = 120.0
         self._playback_drop_until = 0.0
 
@@ -351,12 +351,8 @@ class AudioStreamNode(Node):
                 if self._playback_burst_active and burst_start > 0.0 and ((now - burst_start) * 1000.0 < self.barge_in_protection_ms):
                     return
 
-                # Adaptive barge-in threshold derived from ambient noise floor
-                adaptive_barge_in_rms = max(self.barge_in_min_rms, self._ambient_rms * self.barge_in_noise_mult)
-
-                # 2. Distinguish loud speech energy during active playback
-                is_genuine_barge_in = (rms >= adaptive_barge_in_rms and peak >= self.barge_in_min_peak)
-                if not is_genuine_barge_in:
+                # Çalma sırasında KATI eşik: kendi sesimizi beyne/OpenAI'a iletmeyelim.
+                if not self._is_barge_in_energy(rms, peak, during_playback=True):
                     return
 
             # Energy gate: do not stream dead room silence (saves bandwidth and prevents Whisper hallucination)
@@ -386,6 +382,27 @@ class AudioStreamNode(Node):
                     f"❌ [Realtime Audio Callback Error]: callback_exception={type(exc).__name__}: {exc} | "
                     f"callback_exception_count={self._callback_exception_count} | audio_input_alive=True"
                 )
+
+    def _is_barge_in_energy(self, rms: float, peak: int, during_playback: bool) -> bool:
+        """Bu ses seviyesi GERÇEK kullanıcı konuşması mı?
+
+        Çalma sırasında çok daha katı eşik uygulanır. Sebep ölçümle sabit:
+        hoparlör ve mikrofon aynı cihazdayken (donanımsal yankı iptali yok)
+        robotun KENDİ sesi mikrofonda RMS 1300-2000 / peak 3300-5400 okunuyor.
+        Gevşek eşik (1200/2800) bunu "kullanıcı araya girdi" sayıp her cümleyi
+        yarıda kesiyordu. Gerçek kullanıcı konuşması ise aynı logda
+        RMS 5700-8600 / peak 15000+ seviyesinde — katı eşiği rahatça aşıyor.
+
+        BARGE_IN_PLAYBACK_MIN_RMS ve BARGE_IN_PLAYBACK_MIN_PEAK bu iş için
+        zaten tanımlanmıştı ama hiçbir yerde okunmuyordu.
+        """
+        if during_playback:
+            floor_rms = max(self.barge_in_playback_min_rms, self._ambient_rms * self.barge_in_noise_mult)
+            floor_peak = self.barge_in_playback_min_peak
+        else:
+            floor_rms = max(self.barge_in_min_rms, self._ambient_rms * self.barge_in_noise_mult)
+            floor_peak = self.barge_in_min_peak
+        return rms >= floor_rms and peak >= floor_peak
 
     def _on_output_pcm(self, msg: String):
         """Incoming 24kHz PCM audio chunk from OpenAI Realtime API or Fallback TTS (base64 or JSON)."""
