@@ -318,6 +318,7 @@ def main():
         controller.close()
         return
 
+    # Manuel hareket komutları
     user_speed = args.speed if args.speed is not None else 20.0
     duration = args.duration if args.duration is not None else 1.5
 
@@ -330,14 +331,38 @@ def main():
     elif cmd == "right":
         l_rpm, r_rpm = abs(user_speed), -abs(user_speed)
 
-    print(f"🚀 Komut yürütülüyor: {cmd.upper()} (Sol={l_rpm:.1f} RPM, Sağ={r_rpm:.1f} RPM, Süre={duration:.1f}s)...")
+    init_left_ticks = controller.left_ticks
+    init_right_ticks = controller.right_ticks
+
+    print(f"\n🚀 [KOMUT GÖNDERİLİYOR]: {cmd.upper()} (Sol={l_rpm:.1f} RPM, Sağ={r_rpm:.1f} RPM, Süre={duration:.1f}s)...")
     t_end = time.time() + duration
+    cmd_count = 0
     while time.time() < t_end:
         controller.send_wheel_speed(l_rpm, r_rpm)
-        time.sleep(0.04)
+        cmd_count += 1
+        time.sleep(0.04) # 25 Hz
 
     controller.stop()
-    print("✅ Hareket tamamlandı ve motorlar durduruldu.")
+    time.sleep(0.2)
+
+    delta_left = controller.left_ticks - init_left_ticks
+    delta_right = controller.right_ticks - init_right_ticks
+
+    print("\n📋 --- HAREKET TEŞHİS RAPORU ---")
+    print(f"  • SERIAL         : ACK ALINDI (Arduino Canlı)")
+    print(f"  • FIRMWARE       : {cmd_count} komut paketi iletildi")
+    print(f"  • SOL ENKODER    : Delta = {delta_left:+d} tick ({'DÖNDÜ' if abs(delta_left) > 5 else 'DÖNMEDİ'})")
+    print(f"  • SAĞ ENKODER    : Delta = {delta_right:+d} tick ({'DÖNDÜ' if abs(delta_right) > 5 else 'DÖNMEDİ'})")
+    
+    if abs(delta_left) > 5 and abs(delta_right) > 5:
+        print("  🎉 [PHYSICAL]: HER İKİ MOTOR DA FİZİKSEL OLARAK DÖNÜYOR!")
+    elif abs(delta_left) > 5:
+        print("  ⚠️ [PHYSICAL]: SADECE SOL MOTOR DÖNDÜ! Sağ motor güç/sürücü hattını kontrol edin.")
+    elif abs(delta_right) > 5:
+        print("  ⚠️ [PHYSICAL]: SADECE SAĞ MOTOR DÖNDÜ! Sol motor güç/sürücü hattını kontrol edin.")
+    else:
+        print("  ❌ [PHYSICAL]: HİÇBİR MOTOR DÖNMEDİ! (BTS7960 12V besleme, Enable pinleri veya GND ortaklamasını kontrol edin)")
+
     controller.close()
 
 
