@@ -3423,12 +3423,25 @@ class AstroRealtimeNode(Node):
             loop.close()
 
             if mp3_data:
-                ff_proc = subprocess.Popen(
-                    ["ffmpeg", "-i", "pipe:0", "-f", "s16le", "-acodec", "pcm_s16le", "-ac", "1", "-ar", "24000", "pipe:1"],
-                    stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
-                )
-                pcm_data, _ = ff_proc.communicate(input=mp3_data, timeout=8.0)
-                return pcm_data
+                try:
+                    ff_proc = subprocess.Popen(
+                        ["ffmpeg", "-y", "-i", "pipe:0", "-f", "s16le", "-acodec", "pcm_s16le", "-ac", "1", "-ar", "24000", "pipe:1"],
+                        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
+                    )
+                    pcm_data, _ = ff_proc.communicate(input=mp3_data, timeout=8.0)
+                    if pcm_data:
+                        return pcm_data
+                except Exception:
+                    pass
+
+                try:
+                    import io
+                    from pydub import AudioSegment
+                    seg = AudioSegment.from_file(io.BytesIO(mp3_data), format="mp3")
+                    seg = seg.set_frame_rate(24000).set_channels(1).set_sample_width(2)
+                    return seg.raw_data
+                except Exception:
+                    pass
         except Exception as e:
             self.get_logger().warn(f"⚠️ [Edge-TTS Hatası]: {e}")
         return b""
@@ -3669,9 +3682,9 @@ class AstroRealtimeNode(Node):
                 if pcm_el:
                     return pcm_el, "elevenlabs", el_ms, True
             except Exception as e:
-                self.get_logger().warn(f"⚠️ [ElevenLabs Failover] XTTS GPU'ya düşülüyor: {e}")
+                self.get_logger().warn(f"⚠️ [ElevenLabs Failover] XTTS / Edge-TTS'e düşülüyor: {e}")
 
-        # 2. Primary Local GPU Engine: Fine-tuned Coqui XTTS on CUDA GPU (Resident & Warm, TTFA < 500ms)
+        # 2. Local GPU Engine: Fine-tuned Coqui XTTS on CUDA GPU (Only if configured & ready)
         is_xtts_ready = bool(self.local_xtts and self.local_xtts.is_ready())
         if is_xtts_ready:
             try:
@@ -3681,9 +3694,18 @@ class AstroRealtimeNode(Node):
                 if pcm:
                     return pcm, "xtts_gpu", gpu_ms, True
             except Exception as e:
-                self.get_logger().warn(f"⚠️ [XTTS GPU Failover] Yerel yedek TTS'e düşülüyor: {e}")
+                self.get_logger().warn(f"⚠️ [XTTS GPU Failover] Edge-TTS'e düşülüyor: {e}")
 
-        # 3. Local Offline Backup TTS Engine (Zero internet local resilience fallback)
+        # 3. Primary High-Quality Cloud Fallback: Edge-TTS In-Memory PCM24k (Fast, High Quality Neural TR)
+        if getattr(self, "edge_tts_enabled", True):
+            try:
+                pcm_edge = self._synthesize_edge_tts_pcm24k(clean_text)
+                if pcm_edge:
+                    return pcm_edge, "edge_tts", 0.0, True
+            except Exception as e:
+                self.get_logger().warn(f"⚠️ [Edge-TTS Failover] Yerel TTS'e düşülüyor: {e}")
+
+        # 4. Local Offline Backup TTS Engine (Zero internet local resilience fallback)
         if self.local_offline_tts and self.local_offline_tts.is_ready():
             try:
                 t_s = time.perf_counter()
@@ -3693,16 +3715,6 @@ class AstroRealtimeNode(Node):
                     return pcm_loc, "local_offline_tts", loc_ms, True
             except Exception as e:
                 self.get_logger().warn(f"⚠️ [Local Offline TTS Failover]: {e}")
-
-        # 4. Optional Network Fallback: Edge-TTS In-Memory PCM24k (Network required)
-        if getattr(self, "edge_tts_enabled", True):
-            try:
-                self.get_logger().warn("🚨 [EDGE_NETWORK_FALLBACK] İsteğe bağlı ağ ses motoru (Edge-TTS) kullanılıyor.")
-                pcm_edge = self._synthesize_edge_tts_pcm24k(clean_text)
-                if pcm_edge:
-                    return pcm_edge, "edge_tts", 0.0, False
-            except Exception as e:
-                self.get_logger().debug(f"Edge-TTS notice: {e}")
 
         return b"", "none", 0.0, False
 

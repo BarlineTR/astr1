@@ -598,8 +598,16 @@ class TestContextualFallbackAndTelemetry(unittest.TestCase):
         self.assertTrue(is_ready)
         self.assertEqual(pcm, b"\x02\x02" * 480)
 
-        # Case 3: XTTS unavailable -> Fallback to Local Offline TTS (0 Internet)
+        # Case 3: XTTS unavailable -> Fallback to Edge-TTS (Primary Network Fallback)
         mock_xtts.is_ready.return_value = False
+        node.edge_tts_enabled = True
+        pcm, eng_name, latency, is_ready = AstroRealtimeNode._synthesize_speech_pcm(node, "Merhaba Baran")
+        self.assertEqual(eng_name, "edge_tts")
+        self.assertTrue(is_ready)
+        self.assertEqual(pcm, b"\x00\x00" * 480)
+
+        # Case 4: Edge-TTS unavailable -> Fallback to Local Offline TTS (0 Internet Emergency)
+        node.edge_tts_enabled = False
         mock_offline = MagicMock()
         mock_offline.is_ready.return_value = True
         mock_offline.synthesize_sentence.return_value = b"\x03\x03" * 480
@@ -608,14 +616,6 @@ class TestContextualFallbackAndTelemetry(unittest.TestCase):
         self.assertEqual(eng_name, "local_offline_tts")
         self.assertTrue(is_ready)
         self.assertEqual(pcm, b"\x03\x03" * 480)
-
-        # Case 4: Local offline unavailable -> Network fallback to Edge-TTS
-        mock_offline.is_ready.return_value = False
-        node.edge_tts_enabled = True
-        pcm, eng_name, latency, is_ready = AstroRealtimeNode._synthesize_speech_pcm(node, "Merhaba Baran")
-        self.assertEqual(eng_name, "edge_tts")
-        self.assertFalse(is_ready)
-        self.assertEqual(pcm, b"\x00\x00" * 480)
 
     def test_speaker_context_in_system_prompt_eliminates_unknown_speaker_claims(self):
         """Test that verified speaker context prevents 'Seni ilk kez duyuyorum' hallucinations."""
