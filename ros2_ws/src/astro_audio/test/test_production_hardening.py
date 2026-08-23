@@ -694,8 +694,15 @@ class TestSTTValidationAndEchoImmunity(unittest.TestCase):
             client = XttsClient(speaker_wav="test.wav", home="/tmp/fake_xtts")
             self.assertEqual(client.batch_size, 1)
 
-    def test_ready_local_offline_tts_eliminates_15s_grace_delay(self):
-        """When LocalOfflineTTS is ready and XTTS is STARTING, synthesis happens immediately without 15s wait."""
+    def test_starting_xtts_does_not_block_synthesis(self):
+        """XTTS STARTING durumundayken sentez 15 saniyelik bekleme bloğuna TAKILMAZ.
+
+        Zincir Edge-TTS ile başladığı için XTTS'in grace bekleme koduna zaten
+        hiç girilmez. Eşik 0.5 s değil 3.0 s: Edge-TTS gerçek bir ağ çağrısı
+        yapıyor (tipik 0.7-1.3 s) ve bu bilinçli bir takas — sesin kalitesi
+        espeak'in robotik sesine tercih edildi. Korunan garanti "anında dönmek"
+        değil, "15 saniye beklememek".
+        """
         self.node.local_xtts = MagicMock()
         self.node.local_xtts.is_ready.return_value = False
         self.node.local_xtts.state = "STARTING"
@@ -705,13 +712,33 @@ class TestSTTValidationAndEchoImmunity(unittest.TestCase):
         self.node.local_offline_tts.synthesize_sentence.return_value = b"\x00\x00" * 480
 
         t_start = time.monotonic()
-        pcm, eng_name, latency, is_ready = self.node._synthesize_speech_pcm("Merhaba Astro")
+        _pcm, eng_name, _latency, is_ready = self.node._synthesize_speech_pcm("Merhaba Astro")
         elapsed = time.monotonic() - t_start
 
-        self.assertLess(elapsed, 0.5, "Turn TTFA must not be blocked by 15s grace wait when local offline TTS is ready!")
+        self.assertLess(elapsed, 3.0, "Sentez 15 s grace beklemesine takılmamalı!")
+        self.assertTrue(is_ready)
+        self.assertIn(eng_name, ("edge_tts", "local_offline_tts"))
+        self.assertNotEqual(eng_name, "xtts_gpu", "STARTING durumundaki XTTS kullanılmamalı")
+
+    def test_offline_tts_used_when_edge_unavailable(self):
+        """Edge-TTS kapalıyken zincir yerel motora düşer ve ANINDA döner."""
+        self.node.edge_tts_enabled = False
+        self.node.local_xtts = MagicMock()
+        self.node.local_xtts.is_ready.return_value = False
+
+        self.node.local_offline_tts = MagicMock()
+        self.node.local_offline_tts.is_ready.return_value = True
+        self.node.local_offline_tts.synthesize_sentence.return_value = b"\x00\x00" * 480
+
+        t_start = time.monotonic()
+        pcm, eng_name, _latency, is_ready = self.node._synthesize_speech_pcm("Merhaba Astro")
+        elapsed = time.monotonic() - t_start
+
+        self.assertLess(elapsed, 0.5, "Yerel motor ağ gecikmesi yaşamamalı")
         self.assertEqual(eng_name, "local_offline_tts")
         self.assertTrue(is_ready)
         self.assertEqual(len(pcm), 960)
+
 
     def test_oak_camera_stability_tracking(self):
         """OAK camera info and image frames update timestamps and connection state without blocking audio."""

@@ -88,6 +88,7 @@ try:
     from astro_audio.elevenlabs_engine import ElevenLabsEngine, ElevenLabsError
     from astro_audio.local_xtts_engine import LocalXttsEngine, resolve_xtts_home, resolve_xtts_speaker_wav
     from astro_audio.local_offline_tts_engine import LocalOfflineTTSEngine
+    from astro_audio.edge_tts_engine import EdgeTTSEngine
     from astro_audio.tts_metrics import TurnTelemetry
     from astro_audio.sentence_chunker import SentenceChunker
 except ImportError:
@@ -642,6 +643,17 @@ class AstroRealtimeNode(Node):
         # Generation-level Barge-In Debounce State
         self._barge_in_latched = False
         self.edge_tts_enabled = os.getenv("EDGE_TTS_ENABLED", "true").lower() in ("1", "true", "yes")
+        # Sağlamlaştırılmış Edge-TTS motoru: ağ ön-kontrolü, asyncio.wait_for
+        # timeout'u, try/finally ile event loop kapatma, timeout'ta ffmpeg.kill().
+        # Bu düğümdeki eski satır içi kopya her hatada bir epoll fd sızdırıyor ve
+        # ffmpeg alt sürecini timeout'ta öldürmüyordu.
+        try:
+            self.edge_tts_engine = EdgeTTSEngine(
+                logger=lambda lvl, msg: self._safe_log(lvl, msg)
+            )
+        except Exception as _exc:
+            self.edge_tts_engine = None
+            self.get_logger().warn(f"⚠️ [Edge-TTS] Motor kurulamadı: {_exc}")
 
         # Single Unified TTSRouter
         try:
@@ -2942,45 +2954,52 @@ class AstroRealtimeNode(Node):
             self.get_logger().debug(f"Groq Whisper transcription notice: {e}")
             return None
 
+    #: Kişilik → (ses, hız) eşlemesi. Edge-TTS motoru bunları çağrı başına alır.
+    EDGE_TTS_PERSONA_VOICES = {
+        "flirt": ("tr-TR-EmelNeural", "+12%"),
+        "emotional": ("tr-TR-EmelNeural", "+12%"),
+    }
+    EDGE_TTS_FAST_PERSONAS = ("kufurbaz", "playful", "angry", "rude")
+
+    def _edge_tts_voice_for_persona(self) -> Tuple[str, str]:
+        """Aktif kişilik için (ses, hız) döndürür."""
+        p = str(getattr(self, "persona_name", "") or "").lower()
+        if p in self.EDGE_TTS_PERSONA_VOICES:
+            return self.EDGE_TTS_PERSONA_VOICES[p]
+        rate = "+20%" if p in self.EDGE_TTS_FAST_PERSONAS else "+8%"
+        return "tr-TR-AhmetNeural", rate
+
     def _synthesize_edge_tts_pcm24k(self, text: str) -> bytes:
-        """Synthesizes Turkish speech via Python edge-tts and converts to 24kHz int16 mono raw PCM for playback."""
+        """Edge-TTS ile 24 kHz int16 mono PCM üretir.
+
+        Sentezin kendisini astro_audio.EdgeTTSEngine yapar: ağ ön-kontrolü,
+        timeout, event loop temizliği ve ffmpeg süreç yönetimi orada. Burada
+        yalnızca kişilik → ses eşlemesi ve bytes sözleşmesi var (motor None
+        döner, çağıranlar bytes bekler).
+        """
         if not text:
             return b""
         clean_text = clean_tts_text(text)
         if not clean_text:
             return b""
 
-        p = self.persona_name.lower()
-        if p in ("flirt", "emotional"):
-            voice = "tr-TR-EmelNeural"
-            rate = "+12%"
-        else:
-            voice = "tr-TR-AhmetNeural"
-            rate = "+20%" if p in ("kufurbaz", "playful", "angry", "rude") else "+8%"
+        engine = getattr(self, "edge_tts_engine", None)
+        if engine is None:
+            self.get_logger().warn("⚠️ [Edge-TTS] Motor yok — seslendirilemiyor.")
+            return b""
 
+        voice, rate = self._edge_tts_voice_for_persona()
         try:
-            import edge_tts
-            loop = asyncio.new_event_loop()
-            async def _get_mp3():
-                communicate = edge_tts.Communicate(clean_text, voice, rate=rate)
-                buf = bytearray()
-                async for chunk in communicate.stream():
-                    if chunk["type"] == "audio":
-                        buf.extend(chunk["data"])
-                return bytes(buf)
-            mp3_data = loop.run_until_complete(_get_mp3())
-            loop.close()
-
-            if mp3_data:
-                ff_proc = subprocess.Popen(
-                    ["ffmpeg", "-i", "pipe:0", "-f", "s16le", "-acodec", "pcm_s16le", "-ac", "1", "-ar", "24000", "pipe:1"],
-                    stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
-                )
-                pcm_data, _ = ff_proc.communicate(input=mp3_data, timeout=8.0)
-                return pcm_data
+            pcm = engine.synthesize_sentence(
+                clean_text,
+                generation_id=self._fallback_generation_id,
+                voice=voice,
+                rate=rate,
+            )
         except Exception as e:
             self.get_logger().warn(f"⚠️ [Edge-TTS Hatası]: {e}")
-        return b""
+            return b""
+        return pcm or b""
 
     def _discover_providers_background(self):
         """Discovers active capability-verified models for Groq and Gemini in background."""
@@ -3194,11 +3213,17 @@ class AstroRealtimeNode(Node):
         return default_resp
 
     def _synthesize_speech_pcm(self, text: str) -> Tuple[bytes, str, float, bool]:
-        """Synthesizes speech to int16 PCM using:
-        1. ElevenLabs Flash v2.5 (Primary Remote TTS ~75ms)
-        2. Local Coqui XTTS on CUDA GPU (Local / Offline Fallback)
-        3. Edge-TTS in-memory (Emergency Fallback)
-        
+        """Fallback konuşmasını int16 PCM'e sentezler.
+
+        Zincir:
+          1. Edge-TTS  — ağ gerekir, ama OpenAI rate limit'inden ETKİLENMEZ.
+                         Fallback'in birincil motoru budur.
+          2. XTTS      — gerçek yerel motor (GPU). Yalnızca Edge-TTS düşerse.
+          3. espeak    — her zaman çalışır; robotik ama robot sessiz kalmaz.
+
+        ElevenLabs bilerek zincirde DEĞİL: o da bulut ve ücretli, yani bir
+        bulut kesintisinde Edge-TTS'ten fazla güvence vermiyor.
+
         Returns: (pcm_bytes, active_engine_name, infer_ms, is_ready)
         """
         if not text:
@@ -3207,50 +3232,53 @@ class AstroRealtimeNode(Node):
         if not clean_text:
             return b"", "none", 0.0, False
 
-        # 1. Primary Remote TTS: ElevenLabs Flash v2.5 (Only if configured and ready)
-        if self.elevenlabs_engine and self.elevenlabs_engine.is_ready():
+        # 1. Edge-TTS (birincil fallback motoru)
+        if getattr(self, "edge_tts_enabled", True):
             try:
                 t_s = time.perf_counter()
-                pcm_el = self.elevenlabs_engine.synthesize_sentence(clean_text, generation_id=self._fallback_generation_id)
-                el_ms = (time.perf_counter() - t_s) * 1000.0
-                if pcm_el:
-                    return pcm_el, "elevenlabs", el_ms, True
+                pcm_edge = self._synthesize_edge_tts_pcm24k(clean_text)
+                edge_ms = (time.perf_counter() - t_s) * 1000.0
+                if pcm_edge:
+                    self.get_logger().info(
+                        f"[TTS FALLBACK ENGINE]\nengine=edge_tts\nlatency_ms={edge_ms:.0f}\nbytes={len(pcm_edge)}"
+                    )
+                    return pcm_edge, "edge_tts", edge_ms, True
+                self.get_logger().warn("⚠️ [Edge-TTS] Ses üretmedi — yerel motorlara düşülüyor.")
             except Exception as e:
-                self.get_logger().warn(f"⚠️ [ElevenLabs Failover] XTTS GPU'ya düşülüyor: {e}")
+                self.get_logger().warn(f"⚠️ [Edge-TTS Failover] Yerel motorlara düşülüyor: {e}")
 
-        # 2. Primary Local GPU Engine: Fine-tuned Coqui XTTS on CUDA GPU (Resident & Warm, TTFA < 500ms)
-        is_xtts_ready = bool(self.local_xtts and self.local_xtts.is_ready())
-        if is_xtts_ready:
+        # 2. Yerel GPU motoru: XTTS
+        if self.local_xtts and self.local_xtts.is_ready():
             try:
                 t_s = time.perf_counter()
                 pcm = self.local_xtts.synthesize_sentence(clean_text, generation_id=self._fallback_generation_id)
                 gpu_ms = (time.perf_counter() - t_s) * 1000.0
                 if pcm:
+                    self.get_logger().info(
+                        f"[TTS FALLBACK ENGINE]\nengine=xtts_gpu\nlatency_ms={gpu_ms:.0f}\nbytes={len(pcm)}"
+                    )
                     return pcm, "xtts_gpu", gpu_ms, True
             except Exception as e:
-                self.get_logger().warn(f"⚠️ [XTTS GPU Failover] Yerel yedek TTS'e düşülüyor: {e}")
+                self.get_logger().warn(f"⚠️ [XTTS GPU Failover] espeak'e düşülüyor: {e}")
 
-        # 3. Local Offline Backup TTS Engine (Zero internet local resilience fallback)
+        # 3. Son çare: espeak (internetsiz de çalışır)
         if self.local_offline_tts and self.local_offline_tts.is_ready():
             try:
                 t_s = time.perf_counter()
                 pcm_loc = self.local_offline_tts.synthesize_sentence(clean_text, generation_id=self._fallback_generation_id)
                 loc_ms = (time.perf_counter() - t_s) * 1000.0
                 if pcm_loc:
+                    self.get_logger().info(
+                        f"[TTS FALLBACK ENGINE]\nengine=local_offline_tts\nlatency_ms={loc_ms:.0f}\nbytes={len(pcm_loc)}"
+                    )
                     return pcm_loc, "local_offline_tts", loc_ms, True
             except Exception as e:
                 self.get_logger().warn(f"⚠️ [Local Offline TTS Failover]: {e}")
 
-        # 4. Optional Network Fallback: Edge-TTS In-Memory PCM24k (Network required)
-        if getattr(self, "edge_tts_enabled", True):
-            try:
-                self.get_logger().warn("🚨 [EDGE_NETWORK_FALLBACK] İsteğe bağlı ağ ses motoru (Edge-TTS) kullanılıyor.")
-                pcm_edge = self._synthesize_edge_tts_pcm24k(clean_text)
-                if pcm_edge:
-                    return pcm_edge, "edge_tts", 0.0, False
-            except Exception as e:
-                self.get_logger().debug(f"Edge-TTS notice: {e}")
-
+        self.get_logger().error(
+            "[TTS FALLBACK ENGINE]\nengine=none\nreason=all_engines_failed\n"
+            "Robot bu tur sessiz kalıyor."
+        )
         return b"", "none", 0.0, False
 
     def _play_pcm_chunks(

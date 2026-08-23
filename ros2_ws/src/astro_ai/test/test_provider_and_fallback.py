@@ -566,56 +566,75 @@ class TestContextualFallbackAndTelemetry(unittest.TestCase):
         self.assertIn("lan", resp_chat.lower())
         self.assertTrue(any(w in resp_chat.lower() for w in ["olur lan", "hadi bakalım", "ne konuşuyoruz", "sohbet edelim", "dinliyorum"]))
 
-    def test_tts_hierarchy_elevenlabs_xtts_edgetts(self):
-        """Test TTS hierarchy: ElevenLabs (Primary) -> Local XTTS GPU (Fallback) -> Edge-TTS (Emergency)."""
+    def test_tts_hierarchy_edge_first_then_local(self):
+        """TTS zinciri: Edge-TTS (birincil) -> XTTS GPU -> espeak.
+
+        Eski sıra ElevenLabs -> XTTS -> espeak -> Edge idi. Fallback'in amacı
+        OpenAI kesintisinde konuşabilmek; ElevenLabs de bulut ve ücretli
+        olduğu için zincirden çıkarıldı, Edge-TTS başa alındı.
+        """
         from astro_ai.astro_realtime_node import AstroRealtimeNode
 
         node = MagicMock()
         node._fallback_generation_id = 1
         node.get_logger = MagicMock()
-        node._synthesize_edge_tts_pcm24k = MagicMock(return_value=b"\x00\x00" * 480)
-
-        # Case 1: ElevenLabs is ready -> Selected as primary
-        mock_el = MagicMock()
-        mock_el.is_ready.return_value = True
-        mock_el.synthesize_sentence.return_value = b"\x01\x01" * 480
-        node.elevenlabs_engine = mock_el
+        node.edge_tts_enabled = True
 
         mock_xtts = MagicMock()
         mock_xtts.is_ready.return_value = True
         mock_xtts.synthesize_sentence.return_value = b"\x02\x02" * 480
         node.local_xtts = mock_xtts
 
-        pcm, eng_name, latency, is_ready = AstroRealtimeNode._synthesize_speech_pcm(node, "Merhaba Baran")
-        self.assertEqual(eng_name, "elevenlabs")
-        self.assertTrue(is_ready)
-        self.assertEqual(pcm, b"\x01\x01" * 480)
-
-        # Case 2: ElevenLabs is unavailable -> Fallback to XTTS GPU
-        mock_el.is_ready.return_value = False
-        pcm, eng_name, latency, is_ready = AstroRealtimeNode._synthesize_speech_pcm(node, "Merhaba Baran")
-        self.assertEqual(eng_name, "xtts_gpu")
-        self.assertTrue(is_ready)
-        self.assertEqual(pcm, b"\x02\x02" * 480)
-
-        # Case 3: XTTS unavailable -> Fallback to Local Offline TTS (0 Internet)
-        mock_xtts.is_ready.return_value = False
         mock_offline = MagicMock()
         mock_offline.is_ready.return_value = True
         mock_offline.synthesize_sentence.return_value = b"\x03\x03" * 480
         node.local_offline_tts = mock_offline
-        pcm, eng_name, latency, is_ready = AstroRealtimeNode._synthesize_speech_pcm(node, "Merhaba Baran")
-        self.assertEqual(eng_name, "local_offline_tts")
+
+        # 1. Edge-TTS ses üretiyor -> birincil, XTTS'e hiç gidilmiyor
+        node._synthesize_edge_tts_pcm24k = MagicMock(return_value=b"\x00\x00" * 480)
+        pcm, eng_name, _lat, is_ready = AstroRealtimeNode._synthesize_speech_pcm(node, "Merhaba Baran")
+        self.assertEqual(eng_name, "edge_tts")
         self.assertTrue(is_ready)
+        self.assertEqual(pcm, b"\x00\x00" * 480)
+        mock_xtts.synthesize_sentence.assert_not_called()
+
+        # 2. Edge-TTS boş dönüyor -> XTTS
+        node._synthesize_edge_tts_pcm24k = MagicMock(return_value=b"")
+        pcm, eng_name, _lat, is_ready = AstroRealtimeNode._synthesize_speech_pcm(node, "Merhaba Baran")
+        self.assertEqual(eng_name, "xtts_gpu")
+        self.assertEqual(pcm, b"\x02\x02" * 480)
+
+        # 3. XTTS de yok -> espeak (internetsiz son çare)
+        mock_xtts.is_ready.return_value = False
+        pcm, eng_name, _lat, is_ready = AstroRealtimeNode._synthesize_speech_pcm(node, "Merhaba Baran")
+        self.assertEqual(eng_name, "local_offline_tts")
         self.assertEqual(pcm, b"\x03\x03" * 480)
 
-        # Case 4: Local offline unavailable -> Network fallback to Edge-TTS
+        # 4. Hiçbiri yok -> sessizlik, ama patlamadan
         mock_offline.is_ready.return_value = False
-        node.edge_tts_enabled = True
-        pcm, eng_name, latency, is_ready = AstroRealtimeNode._synthesize_speech_pcm(node, "Merhaba Baran")
-        self.assertEqual(eng_name, "edge_tts")
+        pcm, eng_name, _lat, is_ready = AstroRealtimeNode._synthesize_speech_pcm(node, "Merhaba Baran")
+        self.assertEqual(eng_name, "none")
+        self.assertEqual(pcm, b"")
         self.assertFalse(is_ready)
-        self.assertEqual(pcm, b"\x00\x00" * 480)
+
+    def test_elevenlabs_is_no_longer_consulted(self):
+        """ElevenLabs hazır olsa bile fallback zinciri onu çağırmaz."""
+        from astro_ai.astro_realtime_node import AstroRealtimeNode
+
+        node = MagicMock()
+        node._fallback_generation_id = 1
+        node.get_logger = MagicMock()
+        node.edge_tts_enabled = True
+        node._synthesize_edge_tts_pcm24k = MagicMock(return_value=b"\x00\x00" * 480)
+
+        mock_el = MagicMock()
+        mock_el.is_ready.return_value = True
+        node.elevenlabs_engine = mock_el
+
+        _pcm, eng_name, _lat, _ready = AstroRealtimeNode._synthesize_speech_pcm(node, "Merhaba")
+        self.assertEqual(eng_name, "edge_tts")
+        mock_el.synthesize_sentence.assert_not_called()
+
 
     def test_speaker_context_in_system_prompt_eliminates_unknown_speaker_claims(self):
         """Test that verified speaker context prevents 'Seni ilk kez duyuyorum' hallucinations."""
