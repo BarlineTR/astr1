@@ -71,6 +71,13 @@ except ImportError:
 
 # S2S çekirdeği: ROS'suz, ağsız, donanımsız saf Python modüller.
 from astro_ai.realtime.engine_state import EngineState, EngineStateTracker
+from astro_ai.realtime.fallback_policy import (
+    FailureKind,
+    RecoveryTier,
+    choose_recovery,
+    classify_response_done,
+    should_enter_fallback_mode,
+)
 from astro_ai.realtime.turn_machine import Action, TurnMachine, TurnState
 
 try:
@@ -445,6 +452,10 @@ class AstroRealtimeNode(Node):
 
     #: Bu süreden eski sağlık mesajı hareketi yetkilendirmez.
     MOTOR_HEALTH_STALE_S = 2.0
+
+    #: Kullanıcı deşifresi response.done'dan sonra gelebiliyor (canlı logda
+    #: 330 ms sonra geldi). Kurtarmayı bu kadar bekletip tekrar deniyoruz.
+    SILENT_RECOVERY_GRACE_S = 0.8
     active_response_id: Optional[str] = None
     active_generation_id: Optional[int] = None
     active_response_state: str = "IDLE"
@@ -715,6 +726,11 @@ class AstroRealtimeNode(Node):
         # REALTIME_INTERRUPT_RESPONSE=false iken devreye girer.
         _client_cancel = os.getenv("REALTIME_INTERRUPT_RESPONSE", "true").strip().lower() == "false"
         self.turn_machine = TurnMachine(client_side_cancel=_client_cancel)
+        #: Realtime asistanın kendi sözlerini metin olarak da akıtıyor.
+        #: Ses gelmezse söylemek istediği cümle burada duruyor.
+        self._assistant_text_buffer: str = ""
+        #: Kullanıcı deşifresi response.done'dan SONRA gelebiliyor.
+        self._last_user_transcript: str = ""
         self.engine_state = EngineStateTracker()
         self.get_logger().info(
             f"[VOICE ENGINE STATE]\n"
@@ -1242,6 +1258,9 @@ class AstroRealtimeNode(Node):
         # 2. Real-Time Streaming Audio Transcript
         elif event_type in ("response.audio_transcript.delta", "response.output_audio_transcript.delta", "response.text.delta"):
             text_delta = event.get("delta", "")
+            if text_delta:
+                # Ses gelmezse seslendirilecek metin bu. Eskiden atılıyordu.
+                self._assistant_text_buffer += text_delta
             # Streaming token
 
         # 3. User Speech Started
@@ -1289,6 +1308,7 @@ class AstroRealtimeNode(Node):
             self.active_generation_id = self.turn_machine.generation_id
             self.realtime_current_generation_id = self.turn_machine.generation_id
             self.active_response_state = "RESPONSE_STREAMING"
+            self._assistant_text_buffer = ""
             self._is_responding = True
             self.realtime_response_state = "GENERATING"
             self._response_start_time = time.monotonic()
@@ -1304,11 +1324,26 @@ class AstroRealtimeNode(Node):
         elif event_type in ("response.done", "response.cancelled"):
             total_audio_ms = (time.monotonic() - getattr(self, "_response_start_time", time.monotonic())) * 1000.0
             first_ms = (self._first_audio_time - getattr(self, "_response_start_time", self._first_audio_time)) * 1000.0 if self._first_audio_time else 0.0
-            if not self.realtime_audio_received:
+            resp_obj = event.get("response", {}) or {}
+            failure = classify_response_done(resp_obj, self.realtime_audio_received)
+            if failure not in (FailureKind.NONE,):
+                _gen = self.active_generation_id or self.realtime_current_generation_id
+                _details = resp_obj.get("status_details") or {}
                 self.get_logger().warn(
-                    f"[REALTIME NO AUDIO] generation_id={self.active_generation_id or self.realtime_current_generation_id} elapsed_ms={total_audio_ms:.1f}\n"
-                    f"[TTS FALLBACK] from=openai_realtime to=edge_tts reason=realtime_no_audio"
+                    f"[REALTIME NO AUDIO]\n"
+                    f"generation_id={_gen}\n"
+                    f"elapsed_ms={total_audio_ms:.1f}\n"
+                    f"response_status={resp_obj.get('status', 'unknown')}\n"
+                    f"failure_kind={failure.value}\n"
+                    f"detail={_details.get('error', _details) or 'none'}"
                 )
+                if should_enter_fallback_mode(failure) and not self._fallback_mode:
+                    self._fallback_mode = True
+                    self.engine_state.transition_to(EngineState.FALLBACK_ACTIVE)
+                    self.get_logger().warn(
+                        f"[VOICE ENGINE STATE] state=FALLBACK_ACTIVE reason={failure.value.lower()}"
+                    )
+                self._recover_silent_response(failure)
             else:
                 self.get_logger().info(
                     f"[REALTIME AUDIO SUMMARY]\n"
@@ -1328,6 +1363,9 @@ class AstroRealtimeNode(Node):
         # 4. User Speech Transcription Completed
         elif event_type in ("conversation.item.input_audio_transcription.completed", "conversation.item.input_audio_transcription.done"):
             user_transcript = event.get("transcript", "").strip()
+            if user_transcript:
+                # response.done'dan SONRA gelebiliyor; kurtarma buna bakıyor.
+                self._last_user_transcript = user_transcript
             # Filter out known Whisper background noise / YouTube subtitle hallucinations
             whisper_hallucinations = [
                 "çeviri ve altyazı", "altyazı m.k.", "altyazı:", "çeviren:", "abone ol", 
@@ -3227,6 +3265,79 @@ class AstroRealtimeNode(Node):
         default_resp = f"Dinliyorum lan{spk}, anlatmaya devam et." if "kufurbaz" in p else f"Seni dinliyorum{spk}, anlatmaya devam edebilirsin."
         self.repetition_guard.record_response(default_resp)
         return default_resp
+
+    def _recover_silent_response(self, failure: "FailureKind"):
+        """Yanıt kuruldu ama ses gelmedi — gerçekten konuş.
+
+        Eskiden burada yalnızca "[TTS FALLBACK] to=edge_tts" LOGLANIYORDU;
+        hiçbir sentez çalışmıyordu. Log yalan söylüyor, robot susuyordu.
+        """
+        tier = choose_recovery(
+            assistant_text=self._assistant_text_buffer,
+            user_transcript=self._last_user_transcript,
+            kind=failure,
+        )
+        if tier == RecoveryTier.NONE:
+            return
+
+        if tier == RecoveryTier.SPEAK_ASSISTANT_TEXT:
+            text = self._assistant_text_buffer.strip()
+            reason = "assistant_text"
+        elif tier == RecoveryTier.ANSWER_USER_TEXT:
+            text = self._generate_contextual_persona_fallback(self._last_user_transcript)
+            reason = "user_transcript"
+        else:
+            # Ne asistan ne kullanıcı metni var. Deşifre gecikmeli gelebilir;
+            # kısa bir bekleyişten sonra tekrar dene.
+            self.get_logger().info(
+                "[TTS FALLBACK DEFERRED] reason=awaiting_transcript"
+            )
+            threading.Timer(
+                self.SILENT_RECOVERY_GRACE_S, self._retry_silent_recovery, args=[failure]
+            ).start()
+            return
+
+        if not text:
+            return
+        self.get_logger().warn(
+            f"[TTS FALLBACK]\nfrom=openai_realtime\nto=edge_tts\n"
+            f"reason={reason}\ntext=\"{text[:120]}\""
+        )
+        threading.Thread(target=self._speak_fallback_text, args=(text,), daemon=True).start()
+
+    def _retry_silent_recovery(self, failure: "FailureKind"):
+        """Gecikmeli deşifre geldiyse kurtarmayı tekrar dene."""
+        if self._last_user_transcript.strip() or self._assistant_text_buffer.strip():
+            self._recover_silent_response(failure)
+        else:
+            self.get_logger().warn(
+                "[TTS FALLBACK ABANDONED] reason=no_text_available — robot bu tur sessiz kalıyor."
+            )
+
+    def _speak_fallback_text(self, text: str):
+        """Metni TTS zinciriyle sentezleyip çalma yoluna verir."""
+        try:
+            self._fallback_generation_id += 1
+            gen = self._fallback_generation_id
+            pcm, engine_name, ms, _ready = self._synthesize_speech_pcm(text)
+            if not pcm:
+                self.get_logger().error(
+                    "[TTS FALLBACK FAILED] reason=no_engine_produced_audio"
+                )
+                return
+            self._play_pcm_chunks(
+                pcm,
+                generation_id=gen,
+                tts_provider=engine_name,
+                tts_model=engine_name,
+                tts_source=f"{engine_name}_fallback",
+            )
+            self.get_logger().info(
+                f"[TTS FALLBACK SPOKEN]\nengine={engine_name}\n"
+                f"latency_ms={ms:.0f}\ngeneration_id={gen}"
+            )
+        except Exception as exc:
+            self.get_logger().error(f"[TTS FALLBACK FAILED] error={exc}")
 
     def _playback_source_name(self) -> str:
         """Sesi fiilen donanıma yazan bileşenin adı.

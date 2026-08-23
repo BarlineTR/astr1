@@ -1081,7 +1081,14 @@ class TestP01RealtimeRuntimeAndHardwareCorrection(unittest.TestCase):
             node.pub_output_pcm.publish.assert_called_once()
 
     def test_02_realtime_connected_no_audio_triggers_fallback(self):
-        """2. Realtime: CONNECTED but NO AUDIO_DELTA triggers REALTIME_NO_AUDIO and fallback."""
+        """2. Realtime: CONNECTED ama AUDIO_DELTA yok -> telemetri + GERÇEK kurtarma.
+
+        Eski sözleşme yalnızca "reason=realtime_no_audio" METNİNİ arıyordu.
+        O log bir yalandı: "to=edge_tts" yazıyor ama hiçbir sentez
+        çalışmıyordu (canlı logda robot sessiz kaldı). Yeni sözleşme
+        başarısızlık türünün loglanmasını VE kurtarmanın fiilen
+        çalıştırılmasını şart koşar.
+        """
         import asyncio
         from astro_ai.astro_realtime_node import AstroRealtimeNode
 
@@ -1090,14 +1097,26 @@ class TestP01RealtimeRuntimeAndHardwareCorrection(unittest.TestCase):
             asyncio.run(node._handle_realtime_event(None, {"type": "response.created"}))
             self.assertFalse(node.realtime_audio_received)
 
-            # Response finishes without any audio delta
-            with patch.object(node.get_logger(), "warn") as mock_warn:
+            # Kurtarmanın konuşacağı bir metin olsun.
+            node._assistant_text_buffer = "Merhaba."
+
+            with patch.object(node, "_speak_fallback_text") as mock_speak, \
+                 patch.object(node.get_logger(), "warn") as mock_warn:
                 asyncio.run(node._handle_realtime_event(None, {"type": "response.done"}))
-                self.assertFalse(node.realtime_audio_received)
-                # Must emit REALTIME NO AUDIO telemetry
+
                 warn_calls = " ".join(str(c) for c in mock_warn.call_args_list)
                 self.assertIn("REALTIME NO AUDIO", warn_calls)
-                self.assertIn("reason=realtime_no_audio", warn_calls)
+                self.assertIn("failure_kind=SILENT_RESPONSE", warn_calls)
+
+                # Asıl garanti: gerçekten seslendirme denendi.
+                for _ in range(50):
+                    if mock_speak.call_count:
+                        break
+                    time.sleep(0.02)
+                self.assertGreater(
+                    mock_speak.call_count, 0,
+                    "Ses gelmedi ama hiçbir kurtarma çalıştırılmadı",
+                )
 
     def test_03_quota_exhaustion_cascades_and_blocks_retries(self):
         """3. Realtime: HTTP 402 / insufficient_quota marks parent openai EXHAUSTED across all surfaces."""
