@@ -2639,15 +2639,47 @@ class AstroRealtimeNode(Node):
 
         if is_only_wake_word or not valid_cmd:
             # Pure Wake Phrase, Wake + Phantom, or Wake + Catalog/Repetitive Hallucination:
-            # Wakes robot up, flushes buffers, transitions to LISTENING. NO fake LLM / TTS turn!
+            # Wakes robot up, flushes buffers, transitions to LISTENING, and gives verbal acknowledgment.
             self._wake_up()
+            p = self.persona_name.lower()
+            if p == "kufurbaz":
+                wake_replies = ["Ne var lan?", "Söyle dinliyorum!", "He söyle?", "Söyle bakalım!"]
+            elif p == "flirt":
+                wake_replies = ["Efendim canım?", "Dinliyorum tatlım.", "Söyle aşkım?"]
+            elif p == "formal":
+                wake_replies = ["Buyrun efendim, sizi dinliyorum.", "Evet efendim, buradayım."]
+            elif p == "playful":
+                wake_replies = ["Buradayım! Ne yapıyoruz?", "Söyle bakalım!"]
+            elif p == "sarcastic":
+                wake_replies = ["Yine ne oldu?", "Dinliyorum, anlat bakalım."]
+            elif p == "angry":
+                wake_replies = ["Ne var yine?!", "Söyle hemen!"]
+            else:
+                wake_replies = ["Efendim?", "Dinliyorum?", "Buradayım!"]
+
+            import random
+            reply = random.choice(wake_replies)
+            self.get_logger().info(f"🤖 [Astro Wake Cevabı]: \"{reply}\"")
+            if self._ws and self._loop and self._is_connected and not self._fallback_mode:
+                self._dispatch_turn(int(time.time() * 1000) % 100000, reply)
+            else:
+                fb_msg = String()
+                fb_msg.data = json.dumps({
+                    "text": reply,
+                    "engine": "edge-tts",
+                    "generation_id": int(time.time() * 1000) % 100000,
+                    "fallback_reason": "wake_ack",
+                })
+                if hasattr(self, "pub_tts_say") and self.pub_tts_say:
+                    self.pub_tts_say.publish(fb_msg)
+
             self.get_logger().info(
                 f"⚡ [Wake Telemetry]: wake_detector_active=True | wake_candidate=\"{transcript}\" | "
                 f"is_wake_phrase=True | wake_confidence={wake_confidence:.2f} | vad_confidence={vad_confidence:.2f} | "
                 f"stt_started=True | stt_finished=True | transcript=\"{transcript}\" | "
                 f"extracted_command=\"{extracted_cmd}\" | command_invalid={not valid_cmd} | "
                 f"command_reject_reason={cmd_reason if not valid_cmd else 'none'} | "
-                f"wake_only=True | wake_rejected=False | conversation_turn_created=False | llm_started=False | tts_started=False"
+                f"wake_only=True | wake_rejected=False | conversation_turn_created=True | llm_started=False | tts_started=True"
             )
         else:
             # Wake + Attached Genuine Command (e.g. "Hey Astro hava nasıl?"): Strip wake phrase and forward command
@@ -2660,7 +2692,19 @@ class AstroRealtimeNode(Node):
                 f"command_reject_reason=none | "
                 f"wake_only=False | wake_rejected=False | conversation_turn_created=True | llm_started=True | tts_started=True"
             )
-            if self._fallback_mode or not self._is_connected:
+            if self._ws and self._loop and self._is_connected and not self._fallback_mode:
+                turn_event = {
+                    "type": "conversation.item.create",
+                    "item": {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": extracted_cmd}]
+                    }
+                }
+                resp_event = {"type": "response.create"}
+                asyncio.run_coroutine_threadsafe(self._ws.send(json.dumps(turn_event)), self._loop)
+                asyncio.run_coroutine_threadsafe(self._ws.send(json.dumps(resp_event)), self._loop)
+            else:
                 threading.Thread(target=self._process_fallback_turn, args=(audio_chunks,), daemon=True).start()
 
     def _on_camera_info(self, msg: Any):
@@ -3272,7 +3316,7 @@ class AstroRealtimeNode(Node):
         ):
             return None
 
-        model = os.environ.get("OPENAI_STT_MODEL", "gpt-transcribe").strip() or "gpt-transcribe"
+        model = os.environ.get("OPENAI_STT_MODEL", "whisper-1").strip() or "whisper-1"
         try:
             return self._post_transcription(
                 "https://api.openai.com/v1/audio/transcriptions",
