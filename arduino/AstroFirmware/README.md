@@ -22,7 +22,7 @@ AstroFirmware/
 |------|-------|
 | Board | Arduino Mega or Mega 2560 |
 | Processor | ATmega2560 (Mega 2560) |
-| Serial Monitor hızı | **500000 baud** |
+| Serial Monitor hızı | **115200 baud** |
 
 ## Gerekli kütüphaneler
 
@@ -42,7 +42,7 @@ Kart açılır açılmaz Serial Monitor'e şu banner basılır:
   Arduino Mega 2560 - Astro robot alt kontrol
 ==============================================
   Derleme      : Aug 23 2026 18:57:00
-  Seri hiz     : 500000 baud
+  Seri hiz     : 115200 baud
   Kontrol      : 50 Hz
   IMU (0x68)   : OK
   TMC2209      : OK (UART)
@@ -89,3 +89,8 @@ Tamamen sessiz (yalnızca binary protokol) çalışma için ikisini de `0` yapı
 
 Firmware davranışı (PID katsayıları, 50 Hz kontrol, 500 ms komut watchdog'u,
 2 s donanım watchdog'u, 31.25 kHz PWM, protokol paketleri) değişmedi.
+
+## İlgili
+
+Motorların dönüp dönmediğini bu firmware'i yüklemeden önce denemek için:
+`arduino/MotorTest/MotorTest.ino` (bkz. `arduino/MotorTest/README.md`).

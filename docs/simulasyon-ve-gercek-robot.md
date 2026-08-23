@@ -272,7 +272,7 @@ tersi değil.
 | Parametre | Varsayılan | Not |
 |---|---|---|
 | `port` | `/dev/astro_arduino` | udev sembolik bağı |
-| `baud` | `500000` | Firmware ile aynı olmalı |
+| `baud` | `115200` | Firmware ile aynı olmalı |
 | `connect_retry_sec` | `2.0` | Arduino yokken yeniden deneme aralığı |
 | `frame_id_imu` | `imu_link` | URDF'teki link adıyla aynı olmalı |
 | `ticks_per_rev_left/right` | `2048.0` | **Kalibre edilmeli** — bkz. §6 |

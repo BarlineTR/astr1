@@ -4,7 +4,7 @@
  * Bu sketch, arduino/astro_firmware (PlatformIO) projesinin Arduino IDE kopyasıdır.
  *
  * Kart      : Arduino Mega 2560
- * Seri hız  : 500000 baud (Serial Monitor'ü da 500000'e ayarlayın)
+ * Seri hız  : 115200 baud (Serial Monitor da 115200 olmalı)
  *
  * Gerekli kütüphaneler (Sketch > Include Library > Manage Libraries):
  *   - TMCStepper   (teemuatlut)
@@ -43,7 +43,7 @@ static inline int16_t readInt16BE() {
 #define FW_VERSION "1.0.0-ino"
 
 // ====== Parametreler ======
-static const uint32_t SERIAL_BAUD = 500000; // 500k baud production
+static const uint32_t SERIAL_BAUD = 115200; // standart baud (host ile ayni olmali)
 static const float CONTROL_HZ = 50.0f;
 static const uint32_t CONTROL_DT_MS = (uint32_t)(1000.0f / CONTROL_HZ);
 
@@ -182,6 +182,7 @@ bool tmcInit() {
   pinMode(HEAD_EN_PIN, OUTPUT);
   digitalWrite(HEAD_EN_PIN, LOW); // enable low active olabilir, donanıma göre ayarlayın
 
+  // Not: bu USB/Serial Monitor portu DEĞİL, sürücüye giden ayrı UART (Serial1).
   TMC2209_SERIAL.begin(500000); // TMC2209 için yüksek baudrate önerilir
   delay(50);
   tmc2209.begin();

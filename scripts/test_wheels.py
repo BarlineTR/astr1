@@ -89,7 +89,7 @@ def find_serial_port(preferred_port=None) -> str:
 
 
 class SafeWheelTester:
-    def __init__(self, port=None, baud=500000):
+    def __init__(self, port=None, baud=115200):
         self.port = find_serial_port(port)
         self.baud = baud
         self.ser = None
@@ -278,7 +278,7 @@ def interactive_mode(tester: SafeWheelTester):
 def main():
     parser = argparse.ArgumentParser(description="ASTRO Bağımsız Tekerlek Test Aracı")
     parser.add_argument("--port", type=str, default=None, help="Arduino seri portu (örn /dev/ttyACM0)")
-    parser.add_argument("--baud", type=int, default=500000, help="Baud rate (varsayılan 500000)")
+    parser.add_argument("--baud", type=int, default=115200, help="Baud rate (varsayılan 115200)")
     parser.add_argument("--left", type=float, default=None, help="Sol tekerlek RPM değeri")
     parser.add_argument("--right", type=float, default=None, help="Sağ tekerlek RPM değeri")
     parser.add_argument("--duration", type=float, default=1.0, help="Çalışma süresi (sn, varsayılan 1.0)")

@@ -100,7 +100,7 @@ except Exception:
         def get_parameter(self, name):
             m = MagicMock()
             m.get_parameter_value.return_value.string_value = "/dev/astro_arduino"
-            m.get_parameter_value.return_value.integer_value = 500000
+            m.get_parameter_value.return_value.integer_value = 115200
             m.value = 0.06
             return m
         def create_publisher(self, *args, **kwargs): return MagicMock()
@@ -1684,7 +1684,7 @@ class TestP02RealtimeTurnPipelineAndHardwareCorrection(unittest.TestCase):
         bridge.port = None
         bridge.rx_thread = None
         bridge.port_param = "/dev/astro_arduino"
-        bridge.baud = 500000
+        bridge.baud = 115200
         logs = []
         mock_logger = MagicMock()
         mock_logger.info = lambda msg: logs.append(msg)
@@ -1990,7 +1990,7 @@ class TestP03CriticalRuntimeRecovery(unittest.TestCase):
         bridge.port = None
         bridge.rx_thread = None
         bridge.port_param = "/dev/astro_arduino"
-        bridge.baud = 500000
+        bridge.baud = 115200
         bridge.handshake_ok = False
         logs = []
         mock_logger = MagicMock()
@@ -2185,7 +2185,7 @@ class TestP03CriticalRuntimeRecovery(unittest.TestCase):
         bridge.port = None
         bridge.rx_thread = None
         bridge.port_param = "/dev/astro_arduino"
-        bridge.baud = 500000
+        bridge.baud = 115200
         bridge.get_logger = lambda: MagicMock()
 
         mock_ser = MagicMock()

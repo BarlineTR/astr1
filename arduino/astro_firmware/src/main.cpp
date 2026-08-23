@@ -146,6 +146,7 @@ void tmcInit() {
   pinMode(HEAD_EN_PIN, OUTPUT);
   digitalWrite(HEAD_EN_PIN, LOW); // enable low active olabilir, donanıma göre ayarlayın
 
+  // Not: bu USB/Serial Monitor portu DEĞİL, sürücüye giden ayrı UART (Serial1).
   TMC2209_SERIAL.begin(500000); // TMC2209 için yüksek baudrate önerilir
   delay(50);
   tmc2209.begin();
