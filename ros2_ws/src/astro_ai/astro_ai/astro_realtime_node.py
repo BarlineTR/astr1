@@ -2,7 +2,7 @@
 """ASTRO V1 — OpenAI Realtime Audio-to-Audio (WebSocket E2E) Bridge Node.
 
 Features:
-  - Direct full-duplex WebSocket connection to OpenAI Realtime API (gpt-4o-realtime-preview)
+  - Direct full-duplex WebSocket connection to OpenAI Realtime API (gpt-realtime-2.1-mini)
   - End-to-end 24kHz raw PCM streaming input & output (< 450ms total turn latency)
   - Server-side VAD & Zero-Latency Barge-In (instant response cancellation on user speech)
   - Full modular Persona Engine & Biometric Perception integration via dynamic session.update
@@ -568,6 +568,8 @@ class AstroRealtimeNode(Node):
         self._arduino_heartbeat_healthy: bool = False
         self._last_heartbeat_ack_time: float = 0.0
         self._obstacle_detected: bool = False
+        self._last_laser_scan_time: float = 0.0
+        self._lidar_health: str = "UNHEALTHY"
 
         # Configurable Acoustic Echo & Barge-In Parameters
         self.echo_mute_cooldown_s = float(os.getenv("ECHO_MUTE_COOLDOWN_S", "0.65"))
@@ -1331,7 +1333,7 @@ class AstroRealtimeNode(Node):
                     except Exception:
                         pass
                     self._watchdog_timer = None
-                self.active_response_state = "RESPONSE_STREAMING"
+                self.active_response_state = "STREAMING"
                 self.realtime_audio_received = True
                 self.realtime_response_state = "STREAMING"
                 delta_len = len(delta_b64) * 3 // 4
@@ -1360,7 +1362,8 @@ class AstroRealtimeNode(Node):
                     "is_first": is_first,
                     "is_done": False,
                 })
-                self.pub_output_pcm.publish(out_msg)
+                if getattr(self, "pub_output_pcm", None):
+                    self.pub_output_pcm.publish(out_msg)
 
                 self.get_logger().debug(
                     f"[REALTIME AUDIO DELTA] generation_id={self.active_generation_id or self.realtime_current_generation_id} bytes={delta_len}"
@@ -1368,7 +1371,7 @@ class AstroRealtimeNode(Node):
 
         # 1b. Real-Time Audio Done
         elif event_type in ("response.audio.done", "response.output_audio.done"):
-            self.active_response_state = "COMPLETED"
+            self.active_response_state = "AUDIO_DONE"
             out_msg = String()
             out_msg.data = json.dumps({
                 "generation_id": self.active_generation_id or self.realtime_current_generation_id,
@@ -1376,7 +1379,8 @@ class AstroRealtimeNode(Node):
                 "is_first": False,
                 "is_done": True,
             })
-            self.pub_output_pcm.publish(out_msg)
+            if getattr(self, "pub_output_pcm", None):
+                self.pub_output_pcm.publish(out_msg)
             self.get_logger().info(
                 f"[REALTIME AUDIO DONE]\n"
                 f"generation_id={self.active_generation_id or self.realtime_current_generation_id}"
@@ -1389,15 +1393,16 @@ class AstroRealtimeNode(Node):
 
         # 3. User Speech Started
         elif event_type == "input_audio_buffer.speech_started":
-            # ONLY trigger barge-in interruption if Astro was ACTUALLY playing audio or generating a response
-            if self._is_responding or self._is_playback_active:
-                self.get_logger().info("⚡ [Realtime Barge-In] Kullanıcı lafa girdi — Çalma anında durduruluyor...")
+            # Barge-in response.cancel only when actively STREAMING or playing back audio
+            if self.active_response_state in ("STREAMING", "RESPONSE_STREAMING") or (self._is_responding and self._is_playback_active):
+                self.get_logger().info("⚡ [Realtime Barge-In] Kullanıcı lafa girdi — Çalma / stream iptal ediliyor...")
+                self.active_response_state = "RESPONSE_CANCELLING"
                 self._is_responding = False
                 intr_msg = Bool()
                 intr_msg.data = True
-                self.pub_interrupt.publish(intr_msg)
+                if getattr(self, "pub_interrupt", None):
+                    self.pub_interrupt.publish(intr_msg)
 
-                self.active_response_state = "RESPONSE_CANCELLING"
                 if ws and hasattr(ws, "send"):
                     try:
                         res = ws.send(json.dumps({"type": "response.cancel"}))
@@ -1405,8 +1410,16 @@ class AstroRealtimeNode(Node):
                             await res
                     except Exception:
                         pass
+            elif self._is_playback_active and self.active_response_state in ("AUDIO_DONE", "IDLE"):
+                # Playback is draining on DAC, but OpenAI response is already done on server side
+                self.get_logger().info("⚡ [Playback Interrupted] Kullanıcı konuştu — Kalan DAC çalması durduruluyor (Server cancel yok)...")
+                intr_msg = Bool()
+                intr_msg.data = True
+                if getattr(self, "pub_interrupt", None):
+                    self.pub_interrupt.publish(intr_msg)
+                self._is_playback_active = False
             else:
-                self.get_logger().debug("🎤 [Realtime] Kullanıcı konuşmaya başladı...")
+                self.get_logger().debug(f"🎤 [Realtime] Kullanıcı konuşmaya başladı (response_state={self.active_response_state})...")
 
         # 3b. User Speech Stopped
         elif event_type == "input_audio_buffer.speech_stopped":
@@ -1422,13 +1435,14 @@ class AstroRealtimeNode(Node):
         # 3c. Response Created
         elif event_type == "response.created":
             self.active_response_id = event.get("response", {}).get("id")
-            self.active_response_state = "RESPONSE_STREAMING"
+            self.active_response_state = "GENERATING"
             self._is_responding = True
             self.realtime_response_state = "GENERATING"
             self._response_start_time = time.monotonic()
             self._packets_for_gen = 0
             self._bytes_for_gen = 0
             self._first_audio_time = None
+            self.realtime_audio_received = False
             
             # Monotonic application generation ID
             if getattr(self, "active_generation_id", None) is None:
@@ -1465,23 +1479,45 @@ class AstroRealtimeNode(Node):
             total_first_audio_ms = (self._first_audio_time - vad_start) * 1000.0 if getattr(self, "_first_audio_time", None) else 0.0
             audio_dur_ms = (getattr(self, "_bytes_for_gen", 0) / (24000 * 2)) * 1000.0
 
-            if not self.realtime_audio_received:
+            resp_obj = event.get("response", {})
+            resp_status = resp_obj.get("status", "completed" if event_type == "response.done" else "cancelled")
+            resp_status_details = resp_obj.get("status_details", {})
+            status_reason = resp_status_details.get("reason", "") if isinstance(resp_status_details, dict) else str(resp_status_details)
+            audio_generated = (getattr(self, "_packets_for_gen", 0) > 0 or getattr(self, "_bytes_for_gen", 0) > 0)
+            response_empty = not audio_generated
+
+            if response_empty:
                 self.get_logger().warn(
                     f"[REALTIME NO AUDIO] generation_id={self.active_generation_id or self.realtime_current_generation_id} elapsed_ms={server_stream_elapsed_ms:.1f}\n"
                     f"[TTS FALLBACK] from=openai_realtime to=edge_tts reason=realtime_no_audio"
+                )
+                self.get_logger().info(
+                    f"[REALTIME RESPONSE EMPTY]\n"
+                    f"generation_id={self.active_generation_id or self.realtime_current_generation_id}\n"
+                    f"response_id={self.active_response_id}\n"
+                    f"response_status={resp_status}\n"
+                    f"response_status_details={status_reason or 'none'}\n"
+                    f"audio_packets=0\n"
+                    f"audio_bytes=0\n"
+                    f"audio_generated=false\n"
+                    f"response_empty=true"
                 )
             else:
                 self.get_logger().info(
                     f"[REALTIME TURN]\n"
                     f"generation_id={self.active_generation_id or self.realtime_current_generation_id}\n"
                     f"response_id={self.active_response_id}\n"
+                    f"response_status={resp_status}\n"
                     f"vad_to_created_ms={vad_to_created_ms:.1f}\n"
                     f"created_to_first_audio_ms={first_ms:.1f}\n"
                     f"first_audio_ms={total_first_audio_ms:.1f}\n"
                     f"server_stream_elapsed_ms={server_stream_elapsed_ms:.1f}\n"
                     f"audio_duration_ms={audio_dur_ms:.1f}\n"
                     f"audio_packets={self._packets_for_gen}\n"
-                    f"audio_bytes={self._bytes_for_gen}"
+                    f"audio_bytes={self._bytes_for_gen}\n"
+                    f"openai_audio_done=true\n"
+                    f"audio_generated=true\n"
+                    f"response_empty=false"
                 )
                 self.get_logger().info(
                     f"[REALTIME AUDIO SUMMARY]\n"
@@ -1755,13 +1791,26 @@ class AstroRealtimeNode(Node):
                         "message": "Arduino bağlantısı veya heartbeat aktif değil, güvenlik için hareket engellendi."
                     }
 
-                # 2. Obstacle Detection Gate
+                # 2. Obstacle Detection Gate (Immediate proximity block)
                 if direction == "forward" and getattr(self, "_obstacle_detected", False):
                     return {
                         "status": "blocked",
                         "reason": "obstacle_detected",
                         "message": "Robotun önünde engel tespit edildi, hareket güvenlik nedeniyle engellendi."
                     }
+
+                # 3. LiDAR Health & Freshness Watchdog Gate
+                last_scan_time = getattr(self, "_last_laser_scan_time", 0.0)
+                now_mono = time.monotonic()
+                is_lidar_stale = (now_mono - last_scan_time) > 2.0
+                if is_lidar_stale:
+                    self._lidar_health = "UNHEALTHY"
+                    if direction == "forward":
+                        return {
+                            "status": "blocked",
+                            "reason": "lidar_stale_or_disconnected",
+                            "message": "LiDAR tarama verisi alınamıyor veya güncel değil, güvenlik nedeniyle ileri hareket engellendi."
+                        }
 
             pub = getattr(self, "pub_cmd_vel", None)
             if pub:
@@ -2495,8 +2544,10 @@ class AstroRealtimeNode(Node):
             self.get_logger().debug(f"_on_arduino_diag: {_exc}")
 
     def _on_laser_scan(self, msg: Any):
-        """Monitors forward obstacle field via 2D LiDAR."""
+        """Monitors forward obstacle field via 2D LiDAR and updates health watchdog."""
         try:
+            self._last_laser_scan_time = time.monotonic()
+            self._lidar_health = "HEALTHY"
             ranges = getattr(msg, "ranges", [])
             if not ranges:
                 return
@@ -4207,21 +4258,38 @@ class AstroRealtimeNode(Node):
             self.state_machine.transition_to(RobotState.INTERRUPTED)
             self._is_responding = False
             self._is_playback_active = False
-            self._fallback_speaking = True
-            self._fallback_speech_start = now
-            self._last_speech_time = now
-            self._fallback_generation_id += 1
-            if self.elevenlabs_engine:
-                self.elevenlabs_engine.cancel(self._fallback_generation_id)
-            if self.local_xtts:
-                self.local_xtts.cancel(self._fallback_generation_id)
-            if self.local_offline_tts:
-                self.local_offline_tts.cancel(self._fallback_generation_id)
+
+            if getattr(self, "_fallback_mode", False):
+                self._fallback_speaking = True
+                self._fallback_speech_start = now
+                self._last_speech_time = now
+                self._fallback_generation_id += 1
+                if self.elevenlabs_engine:
+                    self.elevenlabs_engine.cancel(self._fallback_generation_id)
+                if self.local_xtts:
+                    self.local_xtts.cancel(self._fallback_generation_id)
+                if self.local_offline_tts:
+                    self.local_offline_tts.cancel(self._fallback_generation_id)
+                with self._lock:
+                    self._fallback_audio_buffer = [raw_16k]
+            else:
+                # Realtime primary S2S mode: cancel streaming response on WebSocket ONLY if it is actively streaming
+                if self.active_response_state == "STREAMING":
+                    self.active_response_state = "CANCELLED"
+                    if self._ws is not None:
+                        try:
+                            if self._loop is not None:
+                                asyncio.run_coroutine_threadsafe(self._ws.send(json.dumps({"type": "response.cancel"})), self._loop)
+                            elif hasattr(self._ws, "send"):
+                                res = self._ws.send(json.dumps({"type": "response.cancel"}))
+                                if inspect.iscoroutine(res):
+                                    asyncio.run(res)
+                        except Exception:
+                            pass
+
             int_msg = Bool()
             int_msg.data = True
             self.pub_interrupt.publish(int_msg)
-            with self._lock:
-                self._fallback_audio_buffer = [raw_16k]
             self.get_logger().info(
                 f"⚡ [Realtime Barge-In] Kullanıcı araya girdi (RMS: {local_rms:.0f}, Peak: {peak_val}, "
                 f"barge_in_after_ms={barge_in_after_ms}, Latch: True)."

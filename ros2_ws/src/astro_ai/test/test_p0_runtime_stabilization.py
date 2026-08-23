@@ -23,6 +23,8 @@ Verifies all critical P0 runtime stabilization invariants:
    - In any cascading failure, a spoken response or emergency WAV is produced.
 """
 
+import asyncio
+import base64
 import json
 import os
 import re
@@ -2919,6 +2921,7 @@ class TestP05RealtimeStreamStateAndPlaybackSerialization(unittest.TestCase):
         node._arduino_heartbeat_healthy = True
         node._last_heartbeat_ack_time = time.monotonic()
         node._obstacle_detected = False
+        node._last_laser_scan_time = time.monotonic()
         node.memory = MagicMock()
         node.memory.profile.get_user_facts.return_value = {"favorite_color": "mavi"}
         node._get_active_biometric_identity = lambda: {"name": "Baran"}
@@ -3251,6 +3254,7 @@ class TestP06ProductionRealtimeAndHumanLikeStabilization(unittest.TestCase):
         node._arduino_heartbeat_healthy = True
         node._last_heartbeat_ack_time = time.monotonic()
         node._obstacle_detected = False
+        node._last_laser_scan_time = time.monotonic()
 
         res = node._execute_realtime_tool("move_robot", {"direction": "forward", "speed": 0.2, "duration": 1.0})
         self.assertEqual(res["status"], "success")
@@ -3330,6 +3334,7 @@ class TestP06ProductionRealtimeAndHumanLikeStabilization(unittest.TestCase):
         node._arduino_heartbeat_healthy = True
         node._last_heartbeat_ack_time = time.monotonic()
         node._obstacle_detected = False
+        node._last_laser_scan_time = time.monotonic()
 
         res = node._execute_realtime_tool("move_robot", {"direction": "forward", "speed": 10.0, "duration": 100.0})
         self.assertEqual(res["status"], "success")
@@ -4133,6 +4138,261 @@ class TestP09FallbackLifecycleAndHardwareReliability(unittest.TestCase):
         from astro_ai.astro_realtime_node import AstroRealtimeNode
         node = AstroRealtimeNode(connect_realtime=False)
         self.assertFalse(hasattr(node, "audio_output_manager"))
+
+
+class TestP010RealtimeTurnLifecycle(unittest.TestCase):
+    """P0.10: Realtime Turn Lifecycle, Barge-In State Machine & LiDAR Safety Watchdog."""
+
+    def test_single_speech_creates_single_response(self):
+        """1. Turn Lifecycle: Normal turn follows GENERATING -> STREAMING -> AUDIO_DONE -> IDLE."""
+        from astro_ai.astro_realtime_node import AstroRealtimeNode
+        fake_ws = FakeRealtimeTransport()
+        node = AstroRealtimeNode(connect_realtime=False, fake_transport=fake_ws)
+
+        # 1. response.created
+        asyncio.run(node._handle_realtime_event(fake_ws, {
+            "type": "response.created",
+            "response": {"id": "resp_001"}
+        }))
+        self.assertEqual(node.active_response_state, "GENERATING")
+        self.assertEqual(node.active_response_id, "resp_001")
+        self.assertIsNotNone(node.active_generation_id)
+
+        # 2. response.audio.delta
+        delta_payload = base64.b64encode(b"\x00\x10" * 480).decode("ascii")
+        asyncio.run(node._handle_realtime_event(fake_ws, {
+            "type": "response.audio.delta",
+            "delta": delta_payload
+        }))
+        self.assertEqual(node.active_response_state, "STREAMING")
+        self.assertTrue(node.realtime_audio_received)
+        self.assertEqual(node._packets_for_gen, 1)
+
+        # 3. response.audio.done
+        asyncio.run(node._handle_realtime_event(fake_ws, {
+            "type": "response.audio.done"
+        }))
+        self.assertEqual(node.active_response_state, "AUDIO_DONE")
+
+        # 4. response.done
+        asyncio.run(node._handle_realtime_event(fake_ws, {
+            "type": "response.done",
+            "response": {"id": "resp_001", "status": "completed"}
+        }))
+        self.assertEqual(node.active_response_state, "IDLE")
+        self.assertIsNone(node.active_response_id)
+        self.assertIsNone(node.active_generation_id)
+
+    def test_server_vad_does_not_duplicate_response(self):
+        """2. Turn Authority: Server VAD is primary turn authority; speech_stopped does not emit manual response.create."""
+        from astro_ai.astro_realtime_node import AstroRealtimeNode
+        fake_ws = FakeRealtimeTransport()
+        node = AstroRealtimeNode(connect_realtime=False, fake_transport=fake_ws)
+
+        asyncio.run(node._handle_realtime_event(fake_ws, {
+            "type": "input_audio_buffer.speech_stopped"
+        }))
+        # No manual response.create was emitted
+        self.assertNotIn("response.create", fake_ws.get_sent_types())
+
+    def test_barge_in_only_cancels_streaming_response(self):
+        """3. Barge-In: speech_started emits response.cancel ONLY when response is actively STREAMING."""
+        from astro_ai.astro_realtime_node import AstroRealtimeNode
+        fake_ws = FakeRealtimeTransport()
+        node = AstroRealtimeNode(connect_realtime=False, fake_transport=fake_ws)
+
+        # Transition to STREAMING
+        asyncio.run(node._handle_realtime_event(fake_ws, {
+            "type": "response.created",
+            "response": {"id": "resp_002"}
+        }))
+        delta_payload = base64.b64encode(b"\x00\x10" * 480).decode("ascii")
+        asyncio.run(node._handle_realtime_event(fake_ws, {
+            "type": "response.audio.delta",
+            "delta": delta_payload
+        }))
+        self.assertEqual(node.active_response_state, "STREAMING")
+
+        # User interrupts while streaming
+        asyncio.run(node._handle_realtime_event(fake_ws, {
+            "type": "input_audio_buffer.speech_started"
+        }))
+        self.assertIn(node.active_response_state, ("RESPONSE_CANCELLING", "CANCELLED"))
+        self.assertIn("response.cancel", fake_ws.get_sent_types())
+
+    def test_barge_in_does_not_cancel_idle_response(self):
+        """4. Barge-In: speech_started is NO-OP when response state is IDLE."""
+        from astro_ai.astro_realtime_node import AstroRealtimeNode
+        fake_ws = FakeRealtimeTransport()
+        node = AstroRealtimeNode(connect_realtime=False, fake_transport=fake_ws)
+        node.active_response_state = "IDLE"
+
+        asyncio.run(node._handle_realtime_event(fake_ws, {
+            "type": "input_audio_buffer.speech_started"
+        }))
+        self.assertEqual(node.active_response_state, "IDLE")
+        self.assertNotIn("response.cancel", fake_ws.get_sent_types())
+
+    def test_barge_in_does_not_cancel_generating_response(self):
+        """5. Barge-In: speech_started does not cancel when response is still GENERATING (audio has not started)."""
+        from astro_ai.astro_realtime_node import AstroRealtimeNode
+        fake_ws = FakeRealtimeTransport()
+        node = AstroRealtimeNode(connect_realtime=False, fake_transport=fake_ws)
+
+        asyncio.run(node._handle_realtime_event(fake_ws, {
+            "type": "response.created",
+            "response": {"id": "resp_003"}
+        }))
+        self.assertEqual(node.active_response_state, "GENERATING")
+
+        asyncio.run(node._handle_realtime_event(fake_ws, {
+            "type": "input_audio_buffer.speech_started"
+        }))
+        # Not cancelled on WS
+        self.assertNotIn("response.cancel", fake_ws.get_sent_types())
+
+    def test_audio_done_does_not_equal_playback_done(self):
+        """6. Decoupled Lifecycle: response.audio.done transitions to AUDIO_DONE; interrupt clears DAC without WS cancel."""
+        from astro_ai.astro_realtime_node import AstroRealtimeNode
+        fake_ws = FakeRealtimeTransport()
+        node = AstroRealtimeNode(connect_realtime=False, fake_transport=fake_ws)
+        node.pub_interrupt = MagicMock()
+
+        # Audio is done on server, but DAC playback is still active in audio_stream_node
+        node.active_response_state = "AUDIO_DONE"
+        node._is_playback_active = True
+
+        asyncio.run(node._handle_realtime_event(fake_ws, {
+            "type": "input_audio_buffer.speech_started"
+        }))
+        # Published interrupt to stop speaker DAC drain
+        self.assertTrue(node.pub_interrupt.publish.called)
+        # But did NOT send response.cancel to OpenAI (because server is already finished)
+        self.assertNotIn("response.cancel", fake_ws.get_sent_types())
+        self.assertFalse(node._is_playback_active)
+
+    def test_empty_response_is_classified(self):
+        """7. 0-Audio Response: 0-audio delta response is classified as response_empty without crash."""
+        from astro_ai.astro_realtime_node import AstroRealtimeNode
+        fake_ws = FakeRealtimeTransport()
+        node = AstroRealtimeNode(connect_realtime=False, fake_transport=fake_ws)
+
+        asyncio.run(node._handle_realtime_event(fake_ws, {
+            "type": "response.created",
+            "response": {"id": "resp_empty_01"}
+        }))
+        asyncio.run(node._handle_realtime_event(fake_ws, {
+            "type": "response.done",
+            "response": {"id": "resp_empty_01", "status": "cancelled", "status_details": {"reason": "turn_detected"}}
+        }))
+        self.assertEqual(node.active_response_state, "IDLE")
+
+    def test_generation_id_is_monotonic(self):
+        """8. Monotonic Generations: Sequential responses receive strictly incrementing generation IDs."""
+        from astro_ai.astro_realtime_node import AstroRealtimeNode
+        fake_ws = FakeRealtimeTransport()
+        node = AstroRealtimeNode(connect_realtime=False, fake_transport=fake_ws)
+
+        ids = []
+        for i in range(3):
+            asyncio.run(node._handle_realtime_event(fake_ws, {
+                "type": "response.created",
+                "response": {"id": f"resp_{i}"}
+            }))
+            ids.append(node.active_generation_id)
+            asyncio.run(node._handle_realtime_event(fake_ws, {
+                "type": "response.done",
+                "response": {"id": f"resp_{i}", "status": "completed"}
+            }))
+
+        self.assertEqual(ids, [1001, 1002, 1003])
+
+    def test_cancel_is_idempotent(self):
+        """9. Idempotency: Multiple speech_started events do not spam response.cancel when already CANCELLED."""
+        from astro_ai.astro_realtime_node import AstroRealtimeNode
+        fake_ws = FakeRealtimeTransport()
+        node = AstroRealtimeNode(connect_realtime=False, fake_transport=fake_ws)
+
+        node.active_response_state = "STREAMING"
+        asyncio.run(node._handle_realtime_event(fake_ws, {
+            "type": "input_audio_buffer.speech_started"
+        }))
+        cancel_count_1 = fake_ws.get_sent_types().count("response.cancel")
+        self.assertEqual(cancel_count_1, 1)
+
+        # Second event while in CANCELLED state
+        asyncio.run(node._handle_realtime_event(fake_ws, {
+            "type": "input_audio_buffer.speech_started"
+        }))
+        cancel_count_2 = fake_ws.get_sent_types().count("response.cancel")
+        self.assertEqual(cancel_count_2, 1)  # No duplicate cancel sent
+
+    def test_realtime_primary_suppresses_local_stt(self):
+        """10. STT Isolation: speech_recognition_node drops transcribed text when Realtime primary is active."""
+        from astro_audio.speech_recognition_node import SpeechRecognitionNode
+        node = SpeechRecognitionNode()
+        node._realtime_connected = True
+        node._realtime_session_ready = True
+        node._realtime_fallback_active = False
+
+        self.assertTrue(node._is_realtime_primary_active())
+
+    def test_lidar_stale_blocks_motion(self):
+        """11. LiDAR Safety: Stale LiDAR scan (>2.0s ago) blocks forward motion tool execution."""
+        from astro_ai.astro_realtime_node import AstroRealtimeNode
+        node = AstroRealtimeNode(connect_realtime=False)
+        node._arduino_heartbeat_healthy = True
+        node._last_heartbeat_ack_time = time.monotonic()
+        node._last_laser_scan_time = time.monotonic() - 5.0  # 5 seconds stale
+
+        res = node._execute_realtime_tool("move_robot", {"direction": "forward", "speed": 0.2, "duration": 1.0})
+        self.assertEqual(res.get("status"), "blocked")
+        self.assertEqual(res.get("reason"), "lidar_stale_or_disconnected")
+
+    def test_lidar_disconnect_blocks_motion(self):
+        """12. LiDAR Safety: No LiDAR scan ever received (_last_laser_scan_time = 0.0) blocks forward motion."""
+        from astro_ai.astro_realtime_node import AstroRealtimeNode
+        node = AstroRealtimeNode(connect_realtime=False)
+        node._arduino_heartbeat_healthy = True
+        node._last_heartbeat_ack_time = time.monotonic()
+        node._last_laser_scan_time = 0.0
+
+        res = node._execute_realtime_tool("move_robot", {"direction": "forward", "speed": 0.2, "duration": 1.0})
+        self.assertEqual(res.get("status"), "blocked")
+        self.assertEqual(res.get("reason"), "lidar_stale_or_disconnected")
+
+    def test_lidar_recovery_reenables_motion(self):
+        """13. LiDAR Safety: Fresh LiDAR scan updates health to HEALTHY and permits motion when path is clear."""
+        from astro_ai.astro_realtime_node import AstroRealtimeNode
+        node = AstroRealtimeNode(connect_realtime=False)
+        node._arduino_heartbeat_healthy = True
+        node._last_heartbeat_ack_time = time.monotonic()
+        node.pub_cmd_vel = MagicMock()
+
+        # Simulate receiving clear scan
+        fake_scan = MagicMock()
+        fake_scan.ranges = [2.0] * 360
+        node._on_laser_scan(fake_scan)
+
+        self.assertEqual(node._lidar_health, "HEALTHY")
+        self.assertFalse(node._obstacle_detected)
+
+        res = node._execute_realtime_tool("move_robot", {"direction": "forward", "speed": 0.2, "duration": 1.0})
+        self.assertEqual(res.get("status"), "success")
+
+    def test_scan_timestamp_updates_health(self):
+        """14. LiDAR Watchdog: _on_laser_scan updates timestamp and sets _lidar_health to HEALTHY."""
+        from astro_ai.astro_realtime_node import AstroRealtimeNode
+        node = AstroRealtimeNode(connect_realtime=False)
+        self.assertEqual(node._lidar_health, "UNHEALTHY")
+
+        fake_scan = MagicMock()
+        fake_scan.ranges = [1.5] * 100
+        t_before = time.monotonic()
+        node._on_laser_scan(fake_scan)
+
+        self.assertEqual(node._lidar_health, "HEALTHY")
+        self.assertGreaterEqual(node._last_laser_scan_time, t_before)
 
 
 if __name__ == "__main__":

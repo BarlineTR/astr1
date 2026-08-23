@@ -11,11 +11,15 @@ serial_bridge:
 
 rplidar_node:
   ros__parameters:
+    channel_type: "serial"
     serial_port: "/dev/astro_lidar"
     serial_baudrate: 115200
     frame_id: "laser_frame"
+    inverted: false
     angle_compensate: true
     scan_mode: "Standard"
+    scan_frequency: 10.0
+    auto_standby: false
 
 scan_filter_node:
   ros__parameters:

@@ -561,6 +561,11 @@ class SpeechRecognitionNode(Node):
                             return
 
             if text and text not in [".", "...", ",", "!", "?"]:
+                # Standby Gating: If OpenAI Realtime S2S is active, do NOT publish STT turns
+                if self._is_realtime_primary_active():
+                    self.get_logger().debug(f'[STT STANDBY] text="{text}" dropped because Realtime S2S is active')
+                    return
+
                 # Discard stale results
                 with self._transcribe_lock:
                     if seq != self._stt_sequence:
