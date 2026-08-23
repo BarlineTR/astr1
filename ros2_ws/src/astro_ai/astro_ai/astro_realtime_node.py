@@ -1409,6 +1409,22 @@ class AstroRealtimeNode(Node):
                 self.get_logger().info("[REALTIME CANCEL IGNORE] reason=response_already_finished")
                 return
 
+            # Rate limit, quota gibi KALICI bir engeldir: yeniden bağlanmak
+            # aynı duvara toslar. Fallback moduna geçilmezse _on_input_pcm
+            # yalnızca bağlantının koptuğu kısa pencerelerde yedek hatta
+            # düşüyor; robot çoğu turda sessiz kalıyor.
+            _err_blob = f"{err_code} {err_type} {err_msg}".lower()
+            if "rate_limit" in _err_blob or "rate limit" in _err_blob or "429" in _err_blob:
+                if not self._fallback_mode:
+                    self._fallback_mode = True
+                    self.engine_state.transition_to(EngineState.FALLBACK_ACTIVE)
+                    self.get_logger().warn(
+                        f"[REALTIME RATE LIMITED]\n"
+                        f"error_class={err_type}:{err_code}\n"
+                        f"[VOICE ENGINE STATE] state=FALLBACK_ACTIVE\n"
+                        f"[TTS FALLBACK] from=openai_realtime to=edge_tts reason=rate_limit_exceeded"
+                    )
+
             self._is_responding = False
             self.realtime_response_state = "IDLE"
             self.active_response_id = None
@@ -3212,6 +3228,21 @@ class AstroRealtimeNode(Node):
         self.repetition_guard.record_response(default_resp)
         return default_resp
 
+    def _playback_source_name(self) -> str:
+        """Sesi fiilen donanıma yazan bileşenin adı.
+
+        Bu düğümün AudioOutputManager'ı YOKTUR ve olmamalıdır: sesin tek sahibi
+        audio_stream_node'dur (Spec #1 §5.2). Düğüm ona
+        /audio/realtime_output_pcm üzerinden yayın yapar.
+
+        Eski kod `getattr(self.audio_output_manager, "backend", "aplay")`
+        yazıyordu; getattr'ın varsayılanı nesnenin EKSİK ATTRIBUTE'unu karşılar,
+        nesnenin kendisinin yokluğunu değil. Erişim daha getattr çalışmadan
+        AttributeError atıyor, hata except içinde yutuluyor ve fallback turu
+        sessizce ölüyordu — rate limit'te robot tamamen susuyordu.
+        """
+        return "audio_stream_node"
+
     def _synthesize_speech_pcm(self, text: str) -> Tuple[bytes, str, float, bool]:
         """Fallback konuşmasını int16 PCM'e sentezler.
 
@@ -3558,7 +3589,7 @@ class AstroRealtimeNode(Node):
                 f"  selected_tts_provider={active_engine}\n"
                 f"  selected_tts_model={tts_model_name}\n"
                 f"  tts_source={tts_source_name}\n"
-                f"  playback_source={getattr(self.audio_output_manager, 'backend', 'aplay')}\n"
+                f"  playback_source={self._playback_source_name()}\n"
                 f"  tts_state={tts_mode_str}\n"
                 f"  tts_ready={tts_ready_flag}\n"
                 f"  fallback_reason=realtime_unavailable"
@@ -3897,7 +3928,7 @@ class AstroRealtimeNode(Node):
                 tts_synth_started_flag = bool(total_synth_ms > 0 or total_audio_bytes > 0)
                 tts_synth_finished_flag = bool(total_audio_bytes > 0)
                 tts_source_name = "xtts_worker" if active_engine == "xtts_gpu" else ("elevenlabs_cloud" if active_engine == "elevenlabs" else ("local_offline_synth" if active_engine == "local_offline_tts" else "edge_tts_cloud"))
-                pb_source = getattr(self.audio_output_manager, 'backend', 'aplay')
+                pb_source = self._playback_source_name()
                 is_xtts_healthy = bool(self.local_xtts and getattr(self.local_xtts, "is_healthy", lambda: False)())
 
                 # Mismatch Alarm Audit
@@ -3912,9 +3943,12 @@ class AstroRealtimeNode(Node):
 
                 resp_chars = len(full_reply_str)
                 resp_words = len(full_reply_str.split())
-                rt_state = getattr(self.realtime_engine, "state", None)
-                rt_state_name = rt_state.value if hasattr(rt_state, "value") else "OFFLINE"
-                rt_fail_reason = getattr(self.realtime_engine, "_last_degradation_reason", "none")
+                # Ses motorunun durumu artık EngineState'te tutuluyor; ayrı bir
+                # realtime_engine nesnesi YOK. Eskiden getattr(self.realtime_engine, ...)
+                # yazıyordu ve nesne olmadığı için AttributeError atıp turun
+                # sonundaki telemetriyi sessizce öldürüyordu.
+                rt_state_name = self.engine_state.state.value
+                rt_fail_reason = getattr(self, "_last_degradation_reason", "none")
 
                 self.get_logger().info(
                     f"[Turn Telemetry]\n"
