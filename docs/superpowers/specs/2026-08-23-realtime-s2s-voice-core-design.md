@@ -554,6 +554,13 @@ ele alınacaktır:
 |---|---|
 | `test_21_migration_from_legacy_json` | Legacy JSON migration 0 fact üretiyor, 1 bekleniyor (`memory_v2`) |
 | `test_xtts_client_batch_size_default_is_one` | Tek başına geçiyor → test kirliliği, sıra bağımlı (`xtts_client`) |
+| `test_wake_with_command_forwards_turn` | **Dalgalı** — tam suite'te ~3 koşudan 2'sinde düşer, tek başına geçer |
+
+> **Ölçüm notu:** Bu liste tek bir koşuya değil, `bab0512` üzerinde tekrarlanan
+> koşulara dayanır. İlk ölçüm 4 fail göstermişti; `test_wake_with_command_forwards_turn`
+> o koşuda tesadüfen geçmişti. Baseline'ı tek koşuyla sabitlemek yanıltıcıdır —
+> bu suite sıra bağımlı durum sızdırıyor. Kabul kriteri bu yüzden "en fazla 3 fail,
+> hepsi bu tabloda" biçiminde okunmalıdır.
 
 > **Test çalıştırma notu:** Workspace source edilmeden `pytest` 36 fail verir;
 > 32'si `ModuleNotFoundError: astro_base` / `LookupError: astro_bringup` yani

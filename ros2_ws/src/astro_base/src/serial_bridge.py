@@ -165,6 +165,10 @@ class SerialBridge(Node):
 
         self.connect_timer = self.create_timer(self.connect_retry_sec, self._try_connect)
         self.hb_timer = self.create_timer(0.1, self.send_heartbeat)
+        # Arduino sussa bile sağlık durumu yayınlanmalı: aksi hâlde tüketiciler
+        # son 'sağlıklı' mesajı sonsuza kadar taze sanır ve bayat veriye
+        # dayanarak hareket yetkilendirilir.
+        self.diag_timer = self.create_timer(0.5, self._publish_heartbeat_diag)
         
         # Start startup wheel self-test in a background thread
         self.self_test_thread = threading.Thread(target=self._run_startup_self_test, daemon=True)
@@ -435,15 +439,34 @@ class SerialBridge(Node):
             st.level = DiagnosticStatus.ERROR
             st.message = "IMU_READ_FAIL"
 
+        motors_disabled = bool(flags & 0x01)
         st.values = [
             KeyValue(key="vbat_mV", value=str(vbat_mV)),
             KeyValue(key="mcu_temp_c", value=str(temp_cX100 / 100.0)),
             KeyValue(key="flags", value=hex(flags)),
             KeyValue(key="arduino_alive", value=str(self.arduino_alive)),
             KeyValue(key="port", value=str(self.port or "disconnected")),
+            # move_robot güvenlik kapısının okuduğu dört alan
+            # (astro_realtime_node._motor_health_ok):
+            KeyValue(
+                key="serial_connected",
+                value=str(bool(self.ser is not None and self.ser.is_open)),
+            ),
+            KeyValue(key="handshake", value=str(bool(self.handshake_ok))),
+            KeyValue(key="heartbeat_healthy", value=str(bool(self.arduino_alive))),
+            KeyValue(
+                key="motor_enabled",
+                value=str(bool(self.arduino_alive and not motors_disabled)),
+            ),
         ]
         da.status = [st]
         self.pub_diag.publish(da)
+
+    def _publish_heartbeat_diag(self):
+        """Bağlantı kopukken bile sağlık durumunu yayınlar (0.5 s)."""
+        if self.arduino_alive:
+            return  # Canlıyken STATUS paketleri zaten publish_diag'ı çağırıyor.
+        self.publish_diag(0, 0, 0x01)
 
     def read_loop(self):
         state = 0

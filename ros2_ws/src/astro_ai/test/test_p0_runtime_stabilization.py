@@ -2628,6 +2628,19 @@ class TestP05RealtimeStreamStateAndPlaybackSerialization(unittest.TestCase):
         node._get_active_biometric_identity = lambda: {"name": "Baran"}
         node.get_logger = lambda: MagicMock()
 
+        # move_robot artık motor sağlığı kanıtlanmadan hareket etmez
+        # (Spec #1 §5.1). Bu test tool'un ÇALIŞTIĞINI ölçtüğü için sağlıklı
+        # motor durumunu kuruyoruz; kapının kendisi test_move_robot_safety.py'de.
+        import time as _time
+        node.has_motion_backend = True
+        node.motor_health = {
+            "serial_connected": True,
+            "handshake": True,
+            "heartbeat_healthy": True,
+            "motor_enabled": True,
+            "updated_at": _time.monotonic(),
+        }
+
         # Test move_robot
         res_move = node._execute_realtime_tool("move_robot", {"direction": "forward", "speed": 0.2, "duration": 1.0})
         self.assertEqual(res_move["status"], "success")

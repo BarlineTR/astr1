@@ -64,6 +64,11 @@ except ImportError:
             self.angular = Twist.Vector3()
     Image = CameraInfo = Bool = Float32 = String = _MockMsg  # type: ignore
 
+try:
+    from diagnostic_msgs.msg import DiagnosticArray
+except ImportError:
+    DiagnosticArray = None  # type: ignore
+
 # S2S çekirdeği: ROS'suz, ağsız, donanımsız saf Python modüller.
 from astro_ai.realtime.engine_state import EngineState, EngineStateTracker
 from astro_ai.realtime.turn_machine import Action, TurnMachine, TurnState
@@ -436,6 +441,9 @@ def is_valid_user_command(command: str) -> Tuple[bool, str]:
 
 class AstroRealtimeNode(Node):
     """ROS 2 Node bridging Astro sensors & audio streams to OpenAI Realtime WebSocket."""
+
+    #: Bu süreden eski sağlık mesajı hareketi yetkilendirmez.
+    MOTOR_HEALTH_STALE_S = 2.0
     active_response_id: Optional[str] = None
     active_generation_id: Optional[int] = None
     active_response_state: str = "IDLE"
@@ -675,6 +683,19 @@ class AstroRealtimeNode(Node):
         self.pub_realtime_state = self.create_publisher(String, "/realtime/state", 10)
         self.pub_tts_say = self.create_publisher(String, "/tts/say", 10)
         self.pub_cmd_vel = self.create_publisher(Twist, "/cmd_vel", 10)
+
+        #: Motor sağlığı kanıtlanmadan hareket yok. Alanlar
+        #: /arduino/diagnostics'ten gelir (serial_bridge.publish_diag).
+        self.motor_health: Dict[str, Any] = {}
+        #: base_bridge yoksa /cmd_vel'i kimse dinlemiyor demektir; serial_bridge
+        #: /wheel_cmds bekler. Bkz. docs/simulasyon-ve-gercek-robot.md §4.
+        self.has_motion_backend = os.getenv("ASTRO_MOTION_BACKEND", "").strip().lower() in (
+            "base_bridge", "nav2", "sim",
+        )
+        if DiagnosticArray is not None:
+            self.create_subscription(
+                DiagnosticArray, "/arduino/diagnostics", self._on_arduino_diagnostics, 10
+            )
 
         self.pub_interrupt = self.create_publisher(Bool, "/tts/interrupt", 10)
 
@@ -1483,6 +1504,45 @@ class AstroRealtimeNode(Node):
             return True, "Ahlat"
         return False, ""
 
+    def _on_arduino_diagnostics(self, msg: Any):
+        """/arduino/diagnostics'ten motor sağlık alanlarını okur."""
+        try:
+            for status in (getattr(msg, "status", None) or []):
+                values = {kv.key: kv.value for kv in (getattr(status, "values", None) or [])}
+                if "heartbeat_healthy" not in values:
+                    continue
+                self.motor_health = {
+                    "serial_connected": values.get("serial_connected", "False") == "True",
+                    "handshake": values.get("handshake", "False") == "True",
+                    "heartbeat_healthy": values.get("heartbeat_healthy", "False") == "True",
+                    "motor_enabled": values.get("motor_enabled", "False") == "True",
+                    "updated_at": time.monotonic(),
+                }
+                return
+        except Exception as exc:
+            self.get_logger().debug(f"_on_arduino_diagnostics: yok sayılan hata ({exc})")
+
+    def _motor_health_ok(self) -> Tuple[bool, str]:
+        """Hareketin güvenli olup olmadığını ve değilse sebebini döndürür.
+
+        FAIL-CLOSED: alanlar hiç kurulmamışsa (ör. düğüm __init__'siz
+        örneklendiyse) exception atmaz, hareketi REDDEDER. Bir güvenlik
+        kapısının kendi eksikliği yüzünden patlaması, çağıranın hatayı yutup
+        motoru sürmesine kapı aralar.
+        """
+        if not getattr(self, "has_motion_backend", False):
+            return False, "no_motion_backend"
+        health = getattr(self, "motor_health", None) or {}
+        if not health:
+            return False, "motor_health_unproven"
+        age = time.monotonic() - float(health.get("updated_at", 0.0))
+        if age > self.MOTOR_HEALTH_STALE_S:
+            return False, "motor_health_stale"
+        for key in ("serial_connected", "handshake", "heartbeat_healthy", "motor_enabled"):
+            if not health.get(key, False):
+                return False, "motor_health_unproven"
+        return True, "ok"
+
     def _execute_realtime_tool(self, name: str, args: Dict[str, Any]) -> Dict[str, Any]:
         """Executes integrated robot tools in real time."""
         if name == "get_live_weather":
@@ -1532,6 +1592,26 @@ class AstroRealtimeNode(Node):
 
         elif name == "move_robot":
             direction = args.get("direction", "stop").lower().strip()
+
+            # Durmak her zaman güvenlidir; kapıya takılmaz.
+            if direction != "stop":
+                ok, reason = self._motor_health_ok()
+                if not ok:
+                    self.get_logger().warn(
+                        f"[MOTOR SAFETY BLOCK]\nreason={reason}\ntool=move_robot\n"
+                        f"direction={direction}"
+                    )
+                    messages = {
+                        "no_motion_backend": "Hareket sürücüm bağlı değil, tekerleklerimi süremiyorum.",
+                        "motor_health_stale": "Arduino'dan sağlık bilgisi gelmiyor, güvenlik için hareket etmiyorum.",
+                        "motor_health_unproven": "Motor sağlığım doğrulanmadı, güvenlik için hareket etmiyorum.",
+                    }
+                    return {
+                        "status": "rejected",
+                        "reason": reason,
+                        "message": messages.get(reason, "Güvenlik için hareket etmiyorum."),
+                    }
+
             speed = float(args.get("speed", 0.2))
             speed = max(0.05, min(speed, 0.4))
             duration = float(args.get("duration", 1.5))
