@@ -4757,32 +4757,47 @@ class TestZeroLiveAPIRealtimeContract(unittest.TestCase):
             self.assertTrue(node._fallback_mode)
 
     def test_session_update_schema_is_valid(self):
-        """6. Schema Validator: Local validator enforces session.type='realtime' and rejects missing type."""
+        """6. Schema Validator: Local validator enforces session.type='realtime', rejects modalities, validates audio."""
         from astro_ai.astro_realtime_node import AstroRealtimeNode
         valid_payload = {
             "type": "session.update",
             "session": {
                 "type": "realtime",
-                "modalities": ["text", "audio"],
                 "instructions": "Test prompt",
-                "voice": "alloy",
+                "audio": {
+                    "input": {
+                        "transcription": {"model": "gpt-live-transcribe", "language": "tr"},
+                        "turn_detection": {"type": "server_vad", "create_response": True}
+                    },
+                    "output": {"voice": "alloy"}
+                },
                 "tools": [],
-                "turn_detection": {"type": "server_vad", "create_response": True}
+                "tool_choice": "auto"
             }
         }
         is_val, msg = AstroRealtimeNode.validate_session_update_schema(valid_payload)
         self.assertTrue(is_val)
         self.assertEqual(msg, "valid")
 
+        # Invalid: contains session.modalities (unknown parameter in OpenAI Realtime)
+        invalid_modalities_payload = {
+            "type": "session.update",
+            "session": {
+                "type": "realtime",
+                "modalities": ["text", "audio"],
+                "tools": []
+            }
+        }
+        is_val, msg = AstroRealtimeNode.validate_session_update_schema(invalid_modalities_payload)
+        self.assertFalse(is_val)
+        self.assertIn("session.modalities", msg)
+
         # Missing session.type
         invalid_payload = {
             "type": "session.update",
             "session": {
-                "modalities": ["text", "audio"],
                 "instructions": "Test prompt",
-                "voice": "alloy",
-                "tools": [],
-                "turn_detection": {"type": "server_vad", "create_response": True}
+                "tools": []
             }
         }
         is_val, msg = AstroRealtimeNode.validate_session_update_schema(invalid_payload)

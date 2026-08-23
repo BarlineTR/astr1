@@ -1153,15 +1153,25 @@ class AstroRealtimeNode(Node):
             return False, "Missing required 'session' dictionary"
         if session.get("type") != "realtime":
             return False, "Missing required parameter: 'session.type' must be 'realtime'"
-        if "modalities" not in session or not isinstance(session["modalities"], list):
-            return False, "Missing required 'session.modalities' list"
-        if not session.get("voice"):
-            return False, "Missing required 'session.voice'"
+        if "modalities" in session:
+            return False, "Unknown parameter: 'session.modalities' is not allowed in type=realtime session"
         if not isinstance(session.get("tools"), list):
             return False, "Missing required 'session.tools' list"
-        turn_det = session.get("turn_detection")
-        if not isinstance(turn_det, dict) or turn_det.get("type") != "server_vad":
-            return False, "Missing or invalid 'session.turn_detection' with type='server_vad'"
+
+        audio = session.get("audio")
+        if isinstance(audio, dict):
+            audio_out = audio.get("output", {})
+            if not audio_out.get("voice"):
+                return False, "Missing required 'session.audio.output.voice'"
+            turn_det = audio.get("input", {}).get("turn_detection")
+            if not isinstance(turn_det, dict) or turn_det.get("type") != "server_vad":
+                return False, "Missing or invalid 'session.audio.input.turn_detection' with type='server_vad'"
+        else:
+            if not session.get("voice"):
+                return False, "Missing required 'session.voice'"
+            turn_det = session.get("turn_detection")
+            if not isinstance(turn_det, dict) or turn_det.get("type") != "server_vad":
+                return False, "Missing or invalid 'session.turn_detection' with type='server_vad'"
         return True, "valid"
 
     async def _send_session_update(self, ws):
@@ -1173,20 +1183,24 @@ class AstroRealtimeNode(Node):
             "type": "session.update",
             "session": {
                 "type": "realtime",
-                "modalities": ["text", "audio"],
                 "instructions": system_prompt,
-                "voice": self.realtime_voice,
-                "input_audio_format": "pcm16",
-                "output_audio_format": "pcm16",
-                "input_audio_transcription": {
-                    "model": "whisper-1"
-                },
-                "turn_detection": {
-                    "type": "server_vad",
-                    "threshold": 0.60,
-                    "prefix_padding_ms": 300,
-                    "silence_duration_ms": 500,
-                    "create_response": True
+                "audio": {
+                    "input": {
+                        "transcription": {
+                            "model": self.realtime_transcribe_model or "gpt-live-transcribe",
+                            "language": "tr"
+                        },
+                        "turn_detection": {
+                            "type": "server_vad",
+                            "threshold": 0.60,
+                            "prefix_padding_ms": 300,
+                            "silence_duration_ms": 500,
+                            "create_response": True
+                        }
+                    },
+                    "output": {
+                        "voice": self.realtime_voice
+                    }
                 },
                 "tools": [
                     {
@@ -1311,8 +1325,7 @@ class AstroRealtimeNode(Node):
                         }
                     }
                 ],
-                "tool_choice": "auto",
-                "temperature": 0.8
+                "tool_choice": "auto"
             }
         }
 
