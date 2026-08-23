@@ -308,7 +308,7 @@ class SerialBridge(Node):
         try:
             with self.tx_lock:
                 self.ser.write(pkt)
-            self.get_logger().info(f"[HEARTBEAT TX] sequence={self._hb_seq}")
+            self.get_logger().debug(f"[HEARTBEAT TX] sequence={self._hb_seq}")
         except serial.SerialException as exc:
             self.get_logger().warn(f"Heartbeat write failed: {exc}")
             self._mark_disconnected()
@@ -533,7 +533,7 @@ class SerialBridge(Node):
             self.arduino_alive = True
             self.state = ArduinoState.HEARTBEAT_HEALTHY
 
-            self.get_logger().info(f"[HEARTBEAT ACK] sequence={ack_seq} latency_ms={lat_ms:.1f}")
+            self.get_logger().debug(f"[HEARTBEAT ACK] sequence={ack_seq} latency_ms={lat_ms:.1f}")
             if not prev_alive:
                 self.get_logger().info("[MOTOR SAFETY RECOVERED] heartbeat_healthy=true")
                 self.get_logger().info("[MOTOR STATUS] enabled=true heartbeat_healthy=true")

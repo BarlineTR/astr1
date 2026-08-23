@@ -104,7 +104,7 @@ class TtsNode(Node):
 
         # 2. Initialize Realtime Engine (Primary)
         self.realtime_engine = RealtimeEngine(
-            model=os.getenv("REALTIME_MODEL", "gpt-realtime"),
+            model=os.getenv("REALTIME_MODEL", "gpt-realtime-2.1-mini"),
             voice=self.openai_voice,
             logger=self._log,
         )

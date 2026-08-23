@@ -132,8 +132,10 @@ GEMINI_PREFERENCE_ORDER: List[str] = [
 OPENAI_PRODUCTION_MODELS: Set[str] = {
     "gpt-4o-mini",
     "gpt-4o",
+    "gpt-realtime-2.1-mini",
+    "gpt-realtime-2.1",
+    "gpt-realtime-2",
     "gpt-realtime",
-    "gpt-realtime-mini",
     "gpt-4o-realtime-preview",
 }
 
@@ -159,7 +161,7 @@ class ProviderRegistry:
         self._routeable_models: Dict[str, List[str]] = {
             "groq": list(GROQ_PREFERENCE_ORDER),
             "gemini": list(GEMINI_PREFERENCE_ORDER),
-            "openai": ["gpt-4o-mini", "gpt-4o", "gpt-realtime", "gpt-realtime-mini"],
+            "openai": ["gpt-4o-mini", "gpt-4o", "gpt-realtime-2.1-mini", "gpt-realtime-2.1", "gpt-realtime"],
         }
         self._rejected_models: Dict[str, Dict[str, str]] = {
             "groq": {},

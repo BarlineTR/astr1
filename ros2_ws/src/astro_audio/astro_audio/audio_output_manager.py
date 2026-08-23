@@ -399,7 +399,7 @@ class AudioOutputManager:
             pcm,
             sample_rate=sample_rate,
             generation_id=generation_id,
-            provenance={"tts_provider": "openai_realtime", "tts_model": "gpt-realtime", "playback_source": self.backend}
+            provenance={"tts_provider": "openai_realtime", "tts_model": "gpt-realtime-2.1-mini", "playback_source": self.backend}
         )
 
     def end_realtime_stream(self, generation_id: int) -> bool:

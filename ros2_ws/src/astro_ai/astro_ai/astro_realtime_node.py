@@ -265,11 +265,16 @@ def discover_realtime_models(api_key: str, preferred: str = "") -> list[str]:
         candidates.append(preferred)
 
     # Test sürecinde AĞA ÇIKILMAZ. Testler düğüme sahte anahtar ("sk-test")
-    # verip onu onlarca kez örnekliyor; her örnek burada api.openai.com'a
-    # gerçek bir TLS bağlantısı açıyordu. Bu SSL iş parçacıkları rclpy
-    # yıkımıyla üst üste gelince süreç segfault ediyor — çöküş dökümlerinde
-    # en üstteki kare her seferinde bu fonksiyondu.
-    if "PYTEST_CURRENT_TEST" in os.environ or "pytest" in sys.modules:
+    # verip onu onlarca kez örnekliyor; testlerde kesinlikle ağa çıkılmaz.
+    if (
+        os.environ.get("ASTRO_TEST_MODE", "0") in ("1", "true", "True")
+        or "unittest" in sys.modules
+        or "pytest" in sys.modules
+        or "PYTEST_CURRENT_TEST" in os.environ
+        or not api_key
+        or api_key.startswith("sk-test")
+        or api_key.startswith("test_")
+    ):
         return candidates + [m for m in flagship_realtime_models if m not in candidates]
 
     try:
@@ -297,7 +302,15 @@ def discover_realtime_models(api_key: str, preferred: str = "") -> list[str]:
 
 def discover_groq_models(api_key: str) -> list[str]:
     """Dynamically queries Groq /models API to discover currently active models."""
-    if not api_key:
+    if (
+        os.environ.get("ASTRO_TEST_MODE", "0") in ("1", "true", "True")
+        or "unittest" in sys.modules
+        or "pytest" in sys.modules
+        or "PYTEST_CURRENT_TEST" in os.environ
+        or not api_key
+        or api_key.startswith("sk-test")
+        or api_key.startswith("test_")
+    ):
         return []
     try:
         import urllib.request
@@ -453,7 +466,7 @@ class AstroRealtimeNode(Node):
     realtime_session_state: str = "NOT_READY"
     realtime_session_id: str = ""
 
-    def __init__(self):
+    def __init__(self, connect_realtime: bool = True, fake_transport: Optional[Any] = None):
         if rclpy is not None and hasattr(rclpy, "ok") and not rclpy.ok():
             try:
                 rclpy.init()
@@ -477,6 +490,18 @@ class AstroRealtimeNode(Node):
         self.realtime_transcribe_model = os.environ.get(
             "REALTIME_TRANSCRIBE_MODEL", "gpt-live-transcribe").strip() or "gpt-live-transcribe"
         raw_voice = os.environ.get("REALTIME_VOICE", os.environ.get("TTS_VOICE", "echo")).strip().lower()
+
+        # Test mode isolation guard
+        is_test_mode = (
+            os.environ.get("ASTRO_TEST_MODE", "0") in ("1", "true", "True")
+            or "unittest" in sys.modules
+            or "pytest" in sys.modules
+            or "PYTEST_CURRENT_TEST" in os.environ
+            or self.openai_api_key.startswith("sk-test")
+            or self.openai_api_key.startswith("test_")
+        )
+        self.connect_realtime = bool(connect_realtime and not is_test_mode)
+        self.fake_transport = fake_transport
         self.realtime_voice = raw_voice if raw_voice in VALID_REALTIME_VOICES else "echo"
         self.persona_name = os.environ.get("PERSONA", "kufurbaz").strip().lower()
 
@@ -737,14 +762,17 @@ class AstroRealtimeNode(Node):
         # Purge any corrupted / profanity records
         self._purge_corrupted_biometrics()
 
-        # Async WebSocket Loop in background thread
-        self._ws = None
+        # Async WebSocket Loop in background thread (Production only)
+        self._ws = self.fake_transport
         self._loop = None
         self._is_connected = False
-        self._ws_thread = threading.Thread(target=self._run_async_loop, daemon=True)
-        self._ws_thread.start()
-
-        self.get_logger().info(f"🚀 [Astro Realtime Node] OpenAI Realtime WebSocket Başlatılıyor... Ses: [{self.realtime_voice}], Kişilik: [{self.persona_name.upper()}]")
+        if self.connect_realtime:
+            self._ws_thread = threading.Thread(target=self._run_async_loop, daemon=True)
+            self._ws_thread.start()
+            self.get_logger().info(f"🚀 [Astro Realtime Node] OpenAI Realtime WebSocket Başlatılıyor... Ses: [{self.realtime_voice}], Kişilik: [{self.persona_name.upper()}]")
+        else:
+            self._ws_thread = None
+            self.get_logger().info("🧪 [Astro Realtime Node] Offline/Test modu aktif — Arka plan WebSocket başlatılmadı.")
         self.get_logger().info("💤 [Astro Uyku Modu]: Düğüm başlatıldı — Astro DEEP_IDLE modunda (😴). Wake listener aktif.")
 
     def _safe_log(self, lvl: str, msg: str):
@@ -3121,9 +3149,11 @@ class AstroRealtimeNode(Node):
 
     def _discover_providers_background(self):
         """Discovers active capability-verified models for Groq and Gemini in background."""
-        if self.groq_api_key:
+        if not getattr(self, "connect_realtime", True) or os.environ.get("ASTRO_TEST_MODE", "0") in ("1", "true", "True"):
+            return
+        if self.groq_api_key and not self.groq_api_key.startswith("sk-test"):
             self.provider_registry.discover_models("groq", self.groq_api_key)
-        if self.gemini_api_key:
+        if self.gemini_api_key and not self.gemini_api_key.startswith("sk-test"):
             self.provider_registry.discover_models("gemini", self.gemini_api_key)
 
     def _start_local_xtts_background(self):

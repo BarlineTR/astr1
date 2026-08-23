@@ -687,11 +687,11 @@ class TestRealtimeArchitectureInvariants(unittest.TestCase):
             pass
 
     def test_realtime_model_default_and_candidates(self):
-        """OpenAI Realtime model defaults to gpt-realtime and WebSocket connection targets gpt-realtime."""
+        """OpenAI Realtime model defaults to gpt-realtime-2.1-mini and candidate models include flagship versions."""
         from astro_ai.astro_realtime_node import AstroRealtimeNode, discover_realtime_models
 
         candidates = discover_realtime_models("test_key")
-        self.assertIn("gpt-realtime", candidates)
+        self.assertIn("gpt-realtime-2.1-mini", candidates)
 
         node = AstroRealtimeNode()
         # Varsayılan artık Realtime ailesinin hızlı katmanı (bkz. .env.example).

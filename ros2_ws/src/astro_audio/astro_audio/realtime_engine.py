@@ -62,7 +62,7 @@ class RealtimeEngine(BaseTTSEngine):
 
     def __init__(
         self,
-        model: str = "gpt-realtime",
+        model: str = "gpt-realtime-2.1-mini",
         voice: str = "echo",
         logger: Optional[Callable[[str, str], None]] = None,
         on_state_change: Optional[Callable[[RealtimeState, str], None]] = None,
