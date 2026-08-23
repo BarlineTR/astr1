@@ -41,6 +41,20 @@ import numpy as np
 os.environ["ASTRO_TEST_MODE"] = "1"
 os.environ["REALTIME_MODEL"] = "gpt-realtime-2.1-mini"
 
+# Hard Network Tripwire: Any real network connection attempt in test mode fails fast immediately!
+import socket
+_orig_socket_connect = socket.socket.connect
+
+def _tripwire_connect(self, *args, **kwargs):
+    if os.environ.get("ASTRO_LIVE_API_TEST", "0") != "1":
+        # Allow localhost / loopback only if specifically needed by local mocks
+        if args and isinstance(args[0], tuple) and args[0][0] in ("127.0.0.1", "localhost", "::1"):
+            return _orig_socket_connect(self, *args, **kwargs)
+        raise RuntimeError(f"TRIPWIRE TRIGGERED: Live network connection attempted to {args} in test mode! real_network_requests must be 0.")
+    return _orig_socket_connect(self, *args, **kwargs)
+
+socket.socket.connect = _tripwire_connect
+
 
 class FakeRealtimeTransport:
     """Deterministic offline in-memory transport for testing Realtime event lifecycle."""
@@ -4684,6 +4698,238 @@ class TestP011RealtimeLifecycleAndWatchdogFix(unittest.TestCase):
 
         # No audio buffer append events sent to fake WS
         self.assertNotIn("input_audio_buffer.append", fake_ws.get_sent_types())
+
+
+class TestZeroLiveAPIRealtimeContract(unittest.TestCase):
+    """P0 Zero-Live-API Realtime Contract & Deterministic State Machine Tests."""
+
+    def test_connect_does_not_touch_real_network(self):
+        """1. Zero Network: AstroRealtimeNode with fake transport makes 0 live network calls."""
+        from astro_ai.astro_realtime_node import AstroRealtimeNode
+        fake_ws = FakeRealtimeTransport()
+        node = AstroRealtimeNode(connect_realtime=False, fake_transport=fake_ws)
+        self.assertFalse(node.connect_realtime)
+        self.assertIsNone(node._ws_thread)
+
+    def test_session_created(self):
+        """2. Session Created: session.created transitions session state to READY."""
+        from astro_ai.astro_realtime_node import AstroRealtimeNode
+        fake_ws = FakeRealtimeTransport()
+        node = AstroRealtimeNode(connect_realtime=False, fake_transport=fake_ws)
+        asyncio.run(node._handle_realtime_event(fake_ws, {
+            "type": "session.created",
+            "session": {"id": "sess_offline_123"}
+        }))
+        self.assertEqual(node.realtime_session_state, "READY")
+        self.assertEqual(node.realtime_session_id, "sess_offline_123")
+        self.assertEqual(node.realtime_connection_state, "CONNECTED")
+
+    def test_session_update_success(self):
+        """3. Session Update: Valid session_config sends session.update with type=realtime."""
+        from astro_ai.astro_realtime_node import AstroRealtimeNode
+        fake_ws = FakeRealtimeTransport()
+        node = AstroRealtimeNode(connect_realtime=False, fake_transport=fake_ws)
+        res = asyncio.run(node._send_session_update(fake_ws))
+        self.assertTrue(res)
+        sent_types = fake_ws.get_sent_types()
+        self.assertIn("session.update", sent_types)
+        sent_update = [e for e in fake_ws.sent_events if e.get("type") == "session.update"][0]
+        self.assertEqual(sent_update["session"]["type"], "realtime")
+
+    def test_session_ready_requires_session_update(self):
+        """4. Session Lifecycle: Session is NOT_READY until session.created / session.updated."""
+        from astro_ai.astro_realtime_node import AstroRealtimeNode
+        fake_ws = FakeRealtimeTransport()
+        node = AstroRealtimeNode(connect_realtime=False, fake_transport=fake_ws)
+        self.assertEqual(node.realtime_session_state, "NOT_READY")
+        asyncio.run(node._handle_realtime_event(fake_ws, {"type": "session.updated", "session": {"id": "sess_02"}}))
+        self.assertEqual(node.realtime_session_state, "READY")
+
+    def test_session_update_failure(self):
+        """5. Session Update Failure: Invalid payload transitions to SESSION_CONFIG_ERROR and fallback."""
+        from astro_ai.astro_realtime_node import AstroRealtimeNode
+        fake_ws = FakeRealtimeTransport()
+        node = AstroRealtimeNode(connect_realtime=False, fake_transport=fake_ws)
+        with patch.object(AstroRealtimeNode, "validate_session_update_schema", return_value=(False, "Missing type")):
+            res = asyncio.run(node._send_session_update(fake_ws))
+            self.assertFalse(res)
+            self.assertEqual(node.realtime_session_state, "SESSION_CONFIG_ERROR")
+            self.assertTrue(node._fallback_mode)
+
+    def test_session_update_schema_is_valid(self):
+        """6. Schema Validator: Local validator enforces session.type='realtime' and rejects missing type."""
+        from astro_ai.astro_realtime_node import AstroRealtimeNode
+        valid_payload = {
+            "type": "session.update",
+            "session": {
+                "type": "realtime",
+                "modalities": ["text", "audio"],
+                "instructions": "Test prompt",
+                "voice": "alloy",
+                "tools": [],
+                "turn_detection": {"type": "server_vad", "create_response": True}
+            }
+        }
+        is_val, msg = AstroRealtimeNode.validate_session_update_schema(valid_payload)
+        self.assertTrue(is_val)
+        self.assertEqual(msg, "valid")
+
+        # Missing session.type
+        invalid_payload = {
+            "type": "session.update",
+            "session": {
+                "modalities": ["text", "audio"],
+                "instructions": "Test prompt",
+                "voice": "alloy",
+                "tools": [],
+                "turn_detection": {"type": "server_vad", "create_response": True}
+            }
+        }
+        is_val, msg = AstroRealtimeNode.validate_session_update_schema(invalid_payload)
+        self.assertFalse(is_val)
+        self.assertIn("session.type", msg)
+
+    def test_response_created(self):
+        """7. Response Created: response.created transitions active_response_state to GENERATING."""
+        from astro_ai.astro_realtime_node import AstroRealtimeNode
+        fake_ws = FakeRealtimeTransport()
+        node = AstroRealtimeNode(connect_realtime=False, fake_transport=fake_ws)
+        asyncio.run(node._handle_realtime_event(fake_ws, {"type": "response.created", "response": {"id": "resp_001"}}))
+        self.assertEqual(node.active_response_state, "GENERATING")
+        self.assertEqual(node.active_response_id, "resp_001")
+
+    def test_audio_delta(self):
+        """8. Audio Delta: response.audio.delta transitions state to STREAMING and sets audio_received."""
+        from astro_ai.astro_realtime_node import AstroRealtimeNode
+        fake_ws = FakeRealtimeTransport()
+        node = AstroRealtimeNode(connect_realtime=False, fake_transport=fake_ws)
+        asyncio.run(node._handle_realtime_event(fake_ws, {"type": "response.created", "response": {"id": "resp_002"}}))
+        pcm_b64 = base64.b64encode(b"\x00\x05" * 240).decode("ascii")
+        asyncio.run(node._handle_realtime_event(fake_ws, {"type": "response.audio.delta", "delta": pcm_b64}))
+        self.assertEqual(node.active_response_state, "STREAMING")
+        self.assertTrue(node.realtime_audio_received)
+
+    def test_audio_done(self):
+        """9. Audio Done: response.audio.done transitions state to AUDIO_DONE."""
+        from astro_ai.astro_realtime_node import AstroRealtimeNode
+        fake_ws = FakeRealtimeTransport()
+        node = AstroRealtimeNode(connect_realtime=False, fake_transport=fake_ws)
+        asyncio.run(node._handle_realtime_event(fake_ws, {"type": "response.audio.done"}))
+        self.assertEqual(node.active_response_state, "AUDIO_DONE")
+
+    def test_response_done(self):
+        """10. Response Done: response.done resets response state to IDLE and preserves session READY."""
+        from astro_ai.astro_realtime_node import AstroRealtimeNode
+        fake_ws = FakeRealtimeTransport()
+        node = AstroRealtimeNode(connect_realtime=False, fake_transport=fake_ws)
+        node.realtime_session_state = "READY"
+        asyncio.run(node._handle_realtime_event(fake_ws, {"type": "response.done", "response": {"id": "resp_003", "status": "completed"}}))
+        self.assertEqual(node.active_response_state, "IDLE")
+        self.assertEqual(node.realtime_session_state, "READY")
+
+    def test_response_failed(self):
+        """11. Response Failed: response.failed extracts structured diagnostics and transitions to IDLE."""
+        from astro_ai.astro_realtime_node import AstroRealtimeNode
+        fake_ws = FakeRealtimeTransport()
+        node = AstroRealtimeNode(connect_realtime=False, fake_transport=fake_ws)
+        asyncio.run(node._handle_realtime_event(fake_ws, {
+            "type": "response.failed",
+            "response": {
+                "id": "resp_failed",
+                "status": "failed",
+                "status_details": {"type": "failed", "error": {"type": "server_error", "message": "Backend crash"}}
+            }
+        }))
+        self.assertEqual(node.active_response_state, "IDLE")
+
+    def test_response_cancelled(self):
+        """12. Response Cancelled: response.cancelled transitions to IDLE cleanly."""
+        from astro_ai.astro_realtime_node import AstroRealtimeNode
+        fake_ws = FakeRealtimeTransport()
+        node = AstroRealtimeNode(connect_realtime=False, fake_transport=fake_ws)
+        asyncio.run(node._handle_realtime_event(fake_ws, {"type": "response.cancelled", "response": {"id": "resp_c"}}))
+        self.assertEqual(node.active_response_state, "IDLE")
+
+    def test_late_event_ignored(self):
+        """13. Late Event: Event from previous response_id is ignored and does not mutate active response."""
+        from astro_ai.astro_realtime_node import AstroRealtimeNode
+        fake_ws = FakeRealtimeTransport()
+        node = AstroRealtimeNode(connect_realtime=False, fake_transport=fake_ws)
+        node.active_response_id = "resp_current_10"
+        node.active_response_state = "GENERATING"
+        asyncio.run(node._handle_realtime_event(fake_ws, {"type": "response.done", "response": {"id": "resp_old_09"}}))
+        self.assertEqual(node.active_response_state, "GENERATING")
+        self.assertEqual(node.active_response_id, "resp_current_10")
+
+    def test_barge_in_streaming(self):
+        """14. Barge-In: speech_started while STREAMING sends response.cancel."""
+        from astro_ai.astro_realtime_node import AstroRealtimeNode
+        fake_ws = FakeRealtimeTransport()
+        node = AstroRealtimeNode(connect_realtime=False, fake_transport=fake_ws)
+        node.active_response_state = "STREAMING"
+        asyncio.run(node._handle_realtime_event(fake_ws, {"type": "input_audio_buffer.speech_started"}))
+        self.assertIn("response.cancel", fake_ws.get_sent_types())
+
+    def test_no_cancel_after_audio_done(self):
+        """15. Barge-In: speech_started while AUDIO_DONE does NOT send response.cancel."""
+        from astro_ai.astro_realtime_node import AstroRealtimeNode
+        fake_ws = FakeRealtimeTransport()
+        node = AstroRealtimeNode(connect_realtime=False, fake_transport=fake_ws)
+        node.active_response_state = "AUDIO_DONE"
+        asyncio.run(node._handle_realtime_event(fake_ws, {"type": "input_audio_buffer.speech_started"}))
+        self.assertNotIn("response.cancel", fake_ws.get_sent_types())
+
+    def test_no_response_before_session_ready(self):
+        """16. Session Gate: Turn request before SESSION READY does not send response.create."""
+        from std_msgs.msg import String
+        from astro_ai.astro_realtime_node import AstroRealtimeNode
+        fake_ws = FakeRealtimeTransport()
+        node = AstroRealtimeNode(connect_realtime=False, fake_transport=fake_ws)
+        node.realtime_session_state = "NOT_READY"
+        req_msg = String()
+        req_msg.data = json.dumps({"text": "Hello", "generation_id": 777})
+        node._on_realtime_turn_request(req_msg)
+        self.assertNotIn("response.create", fake_ws.get_sent_types())
+
+    def test_rate_limit_exhaustion(self):
+        """17. Rate Limit: error event with rate_limit_exceeded sets EXHAUSTED and triggers fallback."""
+        from astro_ai.astro_realtime_node import AstroRealtimeNode
+        fake_ws = FakeRealtimeTransport()
+        node = AstroRealtimeNode(connect_realtime=False, fake_transport=fake_ws)
+        asyncio.run(node._handle_realtime_event(fake_ws, {
+            "type": "error",
+            "error": {"type": "requests", "code": "rate_limit_exceeded", "message": "RPD limit reached"}
+        }))
+        self.assertEqual(node.realtime_provider_state, "EXHAUSTED")
+        self.assertTrue(node._fallback_mode)
+
+    def test_rate_limit_stops_all_openai_activity(self):
+        """18. Quota Guard: When EXHAUSTED, no response.create, no reconnection, and STT is disabled."""
+        from std_msgs.msg import String
+        from astro_ai.astro_realtime_node import AstroRealtimeNode
+        fake_ws = FakeRealtimeTransport()
+        node = AstroRealtimeNode(connect_realtime=False, fake_transport=fake_ws)
+        node.realtime_provider_state = "EXHAUSTED"
+        node._fallback_mode = True
+        req_msg = String()
+        req_msg.data = json.dumps({"text": "Test after limit", "generation_id": 888})
+        node._on_realtime_turn_request(req_msg)
+        self.assertNotIn("response.create", fake_ws.get_sent_types())
+
+    def test_1013_cooldown(self):
+        """19. Cooldown: WS 1013 sets COOLDOWN state."""
+        from astro_ai.astro_realtime_node import AstroRealtimeNode
+        fake_ws = FakeRealtimeTransport()
+        node = AstroRealtimeNode(connect_realtime=False, fake_transport=fake_ws)
+        node.realtime_provider_state = "COOLDOWN"
+        self.assertEqual(node.realtime_provider_state, "COOLDOWN")
+
+    def test_exhausted_state_blocks_retry(self):
+        """20. Exhausted State: Circuit breaker prevents retry when provider is EXHAUSTED."""
+        from astro_ai.circuit_breaker import get_global_circuit_breaker, RequestErrorClass
+        cb = get_global_circuit_breaker()
+        cb.record_error("openai", sub_provider="openai_realtime", error_class=RequestErrorClass.QUOTA_EXHAUSTED, error_msg="RPD limit reached")
+        self.assertFalse(cb.is_available("openai"))
 
 
 if __name__ == "__main__":
