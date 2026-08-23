@@ -3857,6 +3857,169 @@ class TestP08RealtimeGatingAndReliabilityRecovery(unittest.TestCase):
         self.assertNotEqual(node.state, ArduinoState.SAFETY_BLOCKED)
 
 
+class TestP09FallbackLifecycleAndHardwareReliability(unittest.TestCase):
+    """P0.9 Acceptance Tests: Fallback single generation, self-voice immunity, 0 AttributeError, and deterministic serial protocol."""
+
+    def test_fallback_single_generation_per_logical_turn(self):
+        """1. Fallback Generation: Single user turn produces exactly ONE logical response and generation ID."""
+        from astro_ai.astro_realtime_node import AstroRealtimeNode
+        fake_ws = FakeRealtimeTransport()
+        node = AstroRealtimeNode(connect_realtime=False, fake_transport=fake_ws)
+        node._fallback_mode = True
+        node._is_processing_fallback = False
+        node.groq_api_key = "gsk-test"
+
+        # Mock STT to return validated text
+        node._transcribe_wav = MagicMock(return_value="ne haber")
+        # Mock LLM stream to yield multi-token reply
+        node.provider_registry.stream_groq_completion = MagicMock(return_value=iter(["Siktir, ", "ne haber? ", "Hadi detay ver!"]))
+        # Mock TTS Router synthesis
+        mock_route_res = MagicMock()
+        mock_route_res.actual_provider = "edge_tts"
+        mock_route_res.source_name = "edge_tts_cloud"
+        mock_route_res.model_name = "tr_tr_ahmet"
+        mock_route_res.pcm = b"\x00\x02" * 960 * 5  # 5 chunks
+        mock_route_res.duration_ms = 100.0
+        mock_route_res.infer_ms = 50.0
+        mock_route_res.queue_wait_ms = 5.0
+        node.tts_router.synthesize = MagicMock(return_value=mock_route_res)
+        node._play_pcm_chunks = MagicMock()
+
+        gen_before = node._fallback_generation_id
+        # Provide 1 second of 16kHz speech
+        audio_chunks = [b"\x00\x10" * 320] * 50
+        node._process_fallback_turn(audio_chunks)
+
+        # Assert exactly ONE generation increment and ONE TTS synthesis call
+        self.assertEqual(node._fallback_generation_id, gen_before + 1)
+        self.assertEqual(node.tts_router.synthesize.call_count, 1)
+
+    def test_fallback_self_hearing_immunity_during_playback(self):
+        """2. Self-Hearing Immunity: Incoming mic audio during fallback playback is suppressed and does NOT trigger false barge-in."""
+        import base64
+        from astro_ai.astro_realtime_node import AstroRealtimeNode
+        from astro_ai.state_machine import RobotState
+        fake_ws = FakeRealtimeTransport()
+        node = AstroRealtimeNode(connect_realtime=False, fake_transport=fake_ws)
+        node._fallback_mode = True
+        node._is_sleeping = False
+        node.state_machine.transition_to(RobotState.LISTENING)
+        node._is_playback_active = True
+        node._fallback_audio_buffer = []
+
+        # Loud incoming audio (speaker echo)
+        mock_msg = MagicMock()
+        mock_msg.data = base64.b64encode(b"\x00\x10" * 320).decode("ascii")
+
+        node._on_input_pcm(mock_msg)
+        # Fallback audio buffer must remain empty (self-voice suppressed)
+        self.assertEqual(len(node._fallback_audio_buffer), 0)
+        self.assertFalse(node._barge_in_latched)
+
+    def test_no_realtime_engine_attribute_error(self):
+        """3. Runtime Ownership: AstroRealtimeNode has 0 AttributeError references to realtime_engine."""
+        from astro_ai.astro_realtime_node import AstroRealtimeNode
+        node = AstroRealtimeNode(connect_realtime=False)
+        self.assertFalse(hasattr(node, "realtime_engine"))
+        # Realtime telemetry fields are natively accessible
+        self.assertTrue(hasattr(node, "realtime_provider_state"))
+        self.assertTrue(hasattr(node, "realtime_connection_state"))
+
+    def test_openai_exhausted_routes_stt_directly_to_groq(self):
+        """4. Circuit Isolation: When OpenAI is exhausted, _transcribe_wav routes directly to Groq without calling OpenAI."""
+        from astro_ai.astro_realtime_node import AstroRealtimeNode
+        from astro_ai.circuit_breaker import GlobalProviderCircuitBreaker, RequestErrorClass
+        cb = GlobalProviderCircuitBreaker.reset_instance()
+        cb.record_error("openai", sub_provider="openai_realtime", error_class=RequestErrorClass.QUOTA_EXHAUSTED, error_msg="quota exceeded")
+
+        node = AstroRealtimeNode(connect_realtime=False)
+        node.circuit_breaker = cb
+        node._fallback_mode = True
+        node.groq_api_key = "gsk-test"
+
+        node._transcribe_openai = MagicMock(return_value="openai_text")
+        node._transcribe_groq_whisper = MagicMock(return_value="groq_transcript")
+
+        res = node._transcribe_wav(b"RIFF...")
+        self.assertEqual(res, "groq_transcript")
+        # OpenAI STT must NOT be called
+        self.assertEqual(node._transcribe_openai.call_count, 0)
+
+    def test_heartbeat_packet_format_and_roundtrip(self):
+        """5. Serial Protocol: Python build_packet creates exact frame format parseable by Arduino and decodable by Python."""
+        from serial_bridge import build_packet, crc8, SOF1, SOF2, MSG_HEARTBEAT, MSG_HEARTBEAT_ACK
+        seq = 12345
+        payload = struct.pack("<I", seq)
+        pkt = build_packet(MSG_HEARTBEAT, payload)
+
+        # Verify SOF and framing
+        self.assertEqual(pkt[0], SOF1)
+        self.assertEqual(pkt[1], SOF2)
+        self.assertEqual(pkt[2], 1 + len(payload))  # len = 5
+        self.assertEqual(pkt[3], MSG_HEARTBEAT)
+        self.assertEqual(pkt[4:8], payload)
+        self.assertEqual(pkt[8], crc8(pkt[2:8]))
+
+        # Simulate Arduino HEARTBEAT_ACK response
+        ack_pkt = build_packet(MSG_HEARTBEAT_ACK, payload)
+        self.assertEqual(ack_pkt[0], SOF1)
+        self.assertEqual(ack_pkt[1], SOF2)
+        self.assertEqual(ack_pkt[2], 5)
+        self.assertEqual(ack_pkt[3], MSG_HEARTBEAT_ACK)
+        self.assertEqual(struct.unpack("<I", ack_pkt[4:8])[0], seq)
+
+    def test_heartbeat_timeout_and_automatic_recovery(self):
+        """6. Safety & Recovery: Heartbeat loss triggers SAFETY_BLOCKED, and subsequent ACK automatically recovers to HEARTBEAT_HEALTHY."""
+        from serial_bridge import SerialBridge, ArduinoState
+        node = SerialBridge.__new__(SerialBridge)
+        node.ser = MagicMock()
+        node.ser.is_open = True
+        node.tx_lock = threading.Lock()
+        node._hb_seq = 100
+        node._hb_tx_times = {}
+        node.port_connected_time = time.monotonic() - 10.0  # Connected 10s ago (outside grace period)
+        node.last_hb_ack_time = time.monotonic() - 2.0     # Last ACK was 2.0s ago (> 1.0s timeout)
+        node.arduino_alive = True
+        node.state = ArduinoState.HEARTBEAT_HEALTHY
+        node.build_packet = lambda msg_id, pl: b""
+        node.get_logger = lambda: MagicMock()
+
+        # 1. Timeout triggers safety block
+        node.send_heartbeat()
+        self.assertFalse(node.arduino_alive)
+        self.assertEqual(node.state, ArduinoState.SAFETY_BLOCKED)
+
+        # 2. Receiving ACK recovers healthy state
+        node.handle_msg(0x13, struct.pack("<I", 100))
+        self.assertTrue(node.arduino_alive)
+        self.assertEqual(node.state, ArduinoState.HEARTBEAT_HEALTHY)
+
+    def test_motion_blocked_when_unhealthy_and_allowed_when_healthy(self):
+        """7. Motion Gating: on_wheel_cmd rejects motion when arduino_alive=False and transmits packet when arduino_alive=True."""
+        from serial_bridge import SerialBridge, WheelCmd
+        node = SerialBridge.__new__(SerialBridge)
+        node.ser = MagicMock()
+        node.ser.is_open = True
+        node.tx_lock = threading.Lock()
+        node.is_self_testing = False
+        node.arduino_alive = False
+        node.build_packet = lambda msg_id, pl: b"PACKET"
+        node.get_logger = lambda: MagicMock()
+
+        msg = WheelCmd()
+        msg.left_rpm = 25.0
+        msg.right_rpm = 25.0
+
+        # Unhealthy: command rejected (0 writes)
+        node.on_wheel_cmd(msg)
+        self.assertEqual(node.ser.write.call_count, 0)
+
+        # Healthy: command transmitted
+        node.arduino_alive = True
+        node.on_wheel_cmd(msg)
+        self.assertEqual(node.ser.write.call_count, 1)
+
+
 if __name__ == "__main__":
     unittest.main()
 

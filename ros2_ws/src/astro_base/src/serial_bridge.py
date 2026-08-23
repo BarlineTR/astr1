@@ -176,7 +176,7 @@ class SerialBridge(Node):
         self.get_logger().info("⚙️ [Self-Test] Waiting for Arduino connection & Heartbeat ACK...")
         t_wait_start = time.monotonic()
         ack_received = False
-        while rclpy.ok() and (time.monotonic() - t_wait_start < 3.0):
+        while rclpy.ok() and (time.monotonic() - t_wait_start < 6.0):
             if self.ser is not None and self.ser.is_open and self.arduino_alive and self.handshake_ok:
                 ack_received = True
                 break
@@ -327,7 +327,7 @@ class SerialBridge(Node):
 
         time_since_connect = now_mono - getattr(self, "port_connected_time", 0.0)
         time_since_ack = now_mono - self.last_hb_ack_time
-        if time_since_ack > 1.0 and time_since_connect > 1.5:
+        if time_since_ack > 1.0 and time_since_connect > 5.0:
             if self.arduino_alive:
                 self.get_logger().warn(
                     "⚠️ [MOTOR SAFETY BLOCK] reason=heartbeat_ack_missing\n"
@@ -548,10 +548,12 @@ class SerialBridge(Node):
             self.arduino_alive = True
             self.state = ArduinoState.HEARTBEAT_HEALTHY
 
-            self.get_logger().debug(f"[HEARTBEAT ACK] sequence={ack_seq} latency_ms={lat_ms:.1f}")
             if not prev_alive:
+                self.get_logger().info(f"[HEARTBEAT ACK] sequence={ack_seq} latency_ms={lat_ms:.1f} status=healthy")
                 self.get_logger().info("[MOTOR SAFETY RECOVERED] heartbeat_healthy=true")
                 self.get_logger().info("[MOTOR STATUS] enabled=true heartbeat_healthy=true")
+            else:
+                self.get_logger().debug(f"[HEARTBEAT ACK] sequence={ack_seq} latency_ms={lat_ms:.1f}")
 
     def destroy_node(self):
         self._mark_disconnected()

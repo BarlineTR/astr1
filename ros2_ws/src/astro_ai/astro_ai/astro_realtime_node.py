@@ -3061,6 +3061,11 @@ class AstroRealtimeNode(Node):
         yalnızca LLM_FALLBACK_ENABLED=true iken ve OpenAI cevap veremediğinde
         devreye girer.
         """
+        # If OpenAI is exhausted or in fallback mode, directly use Groq Whisper
+        cb = getattr(self, "circuit_breaker", None)
+        if getattr(self, "_fallback_mode", False) or (cb and cb.is_exhausted("openai")):
+            return self._transcribe_groq_whisper(wav_bytes) or ""
+
         text = self._transcribe_openai(wav_bytes)
         if text:
             return text
@@ -3069,11 +3074,8 @@ class AstroRealtimeNode(Node):
         if not fallback_on:
             return text
 
-        # groq_api_key BURADA KONTROL EDİLMEZ: _transcribe_groq_whisper anahtar
-        # yoksa zaten None döndürüyor, ve testler bu metodu doğrudan patch'liyor.
-        # Burada anahtara bakmak o mock'ları erişilemez kılıyordu.
         result = self._transcribe_groq_whisper(wav_bytes)
-        if result and self.groq_api_key:
+        if result and self.groq_api_key and not getattr(self, "_fallback_mode", False):
             self.get_logger().warn("⚠️ [STT FALLBACK] OpenAI cevap vermedi, Groq Whisper kullanıldı.")
         return result or text
 
@@ -3824,15 +3826,12 @@ class AstroRealtimeNode(Node):
                     try:
                         t_model_start = time.monotonic()
                         first_token_seen = False
-                        clause_count = 0
-                        if chunker:
-                            chunker.reset()
 
                         for token in self.provider_registry.stream_groq_completion(
                             self.groq_api_key,
                             target_model,
                             messages,
-                            max_tokens=80,
+                            max_tokens=60,
                             temperature=0.65,
                             timeout=2.5,
                         ):
@@ -3841,48 +3840,6 @@ class AstroRealtimeNode(Node):
                                 first_token_seen = True
 
                             full_reply_parts.append(token)
-
-                            if chunker:
-                                clauses = chunker.feed(token)
-                                for cl in clauses:
-                                    clause_count += 1
-                                    if llm_first_clause_ms is None:
-                                        llm_first_clause_ms = (time.monotonic() - t_model_start) * 1000.0
-                                    pcm, s_ms, g_ms, q_ms = _synthesize_turn_clause(cl)
-                                    total_synth_ms += s_ms
-                                    total_gpu_ms += g_ms
-                                    total_queue_wait_ms += q_ms
-                                    if pcm:
-                                        total_audio_sec += (len(pcm) / 2) / 24000.0
-                                        total_audio_bytes += len(pcm)
-                                        total_enqueued_chunks += (len(pcm) + 959) // 960
-                                        if not first_audio_played:
-                                             first_audio_ms = (time.monotonic() - t_turn_start) * 1000.0
-                                             first_audio_played = True
-                                        _handle_and_play_clause_audio(pcm)
-
-                            # Stop policy: Limit social robot conversational response to 2-3 concise sentences
-                            if clause_count >= 3 and len("".join(full_reply_parts)) > 60:
-                                break
-
-                        # Flush any remaining text in chunker buffer
-                        if chunker:
-                            rem_cl = chunker.flush()
-                            if rem_cl:
-                                if llm_first_clause_ms is None:
-                                    llm_first_clause_ms = (time.monotonic() - t_model_start) * 1000.0
-                                pcm, s_ms, g_ms, q_ms = _synthesize_turn_clause(rem_cl)
-                                total_synth_ms += s_ms
-                                total_gpu_ms += g_ms
-                                total_queue_wait_ms += q_ms
-                                if pcm:
-                                    total_audio_sec += (len(pcm) / 2) / 24000.0
-                                    total_audio_bytes += len(pcm)
-                                    total_enqueued_chunks += (len(pcm) + 959) // 960
-                                    if not first_audio_played:
-                                        first_audio_ms = (time.monotonic() - t_turn_start) * 1000.0
-                                        first_audio_played = True
-                                    _handle_and_play_clause_audio(pcm)
 
                         if full_reply_parts:
                             chosen_model = target_model
@@ -3921,7 +3878,7 @@ class AstroRealtimeNode(Node):
                             g_mod,
                             system_prompt,
                             messages,
-                            max_tokens=80,
+                            max_tokens=60,
                             temperature=0.65,
                             timeout=4.0,
                         )
@@ -3969,25 +3926,27 @@ class AstroRealtimeNode(Node):
             else:
                 self.repetition_guard.record_response(full_reply_str)
 
+            # Clean and gate conversational length
+            full_reply_str = response_length_gate(full_reply_str, user_query=user_text, max_words=30, max_sentences=2) or full_reply_str
+
             # Record assistant reply for self-voice echo correlation
             with self._lock:
                 self._recent_robot_phrases.append(full_reply_str.lower())
                 if len(self._recent_robot_phrases) > 10:
                     self._recent_robot_phrases = self._recent_robot_phrases[-10:]
 
-            # Synthesize full response if not already streamed in chunks
-            if not first_audio_played and full_reply_str:
+            # Synthesize ONE single unified TTS generation for this logical turn
+            if full_reply_str:
                 pcm, s_ms, g_ms, q_ms = _synthesize_turn_clause(full_reply_str)
                 total_synth_ms += s_ms
                 total_gpu_ms += g_ms
                 total_queue_wait_ms += q_ms
                 if pcm:
-                    total_audio_sec += (len(pcm) / 2) / 24000.0
-                    total_audio_bytes += len(pcm)
-                    total_enqueued_chunks += (len(pcm) + 959) // 960
+                    total_audio_sec = (len(pcm) / 2) / 24000.0
+                    total_audio_bytes = len(pcm)
                     first_audio_ms = (time.monotonic() - t_turn_start) * 1000.0
                     first_audio_played = True
-                    self._play_pcm_chunks(pcm)
+                    _handle_and_play_clause_audio(pcm)
 
             t_total_end = time.monotonic()
             total_turn_ms = (t_total_end - t_turn_start) * 1000.0
@@ -4062,9 +4021,9 @@ class AstroRealtimeNode(Node):
 
                 resp_chars = len(full_reply_str)
                 resp_words = len(full_reply_str.split())
-                rt_state = getattr(self.realtime_engine, "state", None)
-                rt_state_name = rt_state.value if hasattr(rt_state, "value") else "OFFLINE"
-                rt_fail_reason = getattr(self.realtime_engine, "_last_degradation_reason", "none")
+                rt_state = getattr(self, "realtime_provider_state", "AVAILABLE")
+                rt_state_name = rt_state if isinstance(rt_state, str) else (rt_state.value if hasattr(rt_state, "value") else "AVAILABLE")
+                rt_fail_reason = "quota_exhausted" if getattr(self, "_fallback_mode", False) else "none"
 
                 self.get_logger().info(
                     f"[Turn Telemetry]\n"
@@ -4180,6 +4139,13 @@ class AstroRealtimeNode(Node):
         # Playback & Echo Cooldown State Determination
         # P0-7: Barge-in is only evaluated during active audio playback
         is_active_playback = bool(self._is_playback_active)
+
+        # In Fallback mode (Edge-TTS / local synth), completely mute mic input during playback and echo cooldown to prevent self-interruption
+        if getattr(self, "_fallback_mode", False):
+            if is_active_playback:
+                return
+            if (now - getattr(self, "_playback_end_time", 0.0)) < 0.45:
+                return
 
         # Adaptive barge-in threshold derived from ambient noise floor
         adaptive_barge_in_rms = max(self.barge_in_min_rms, self._ambient_rms * self.barge_in_noise_mult)
