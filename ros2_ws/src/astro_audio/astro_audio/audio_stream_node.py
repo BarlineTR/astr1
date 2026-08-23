@@ -220,16 +220,13 @@ class AudioStreamNode(Node):
 
     @staticmethod
     def _under_pytest() -> bool:
-        """Test sürecinde GERÇEK ses donanımı açılmaz.
-
-        Cihaz seçimi düzeltilene kadar bu düğüm testlerde mikrofonu hiç
-        açamıyordu (hw:0,0 16 kHz'i reddediyordu) ve hata sessizce yutuluyordu.
-        Düzeltmeden sonra akış gerçekten açılmaya başladı; testler düğümleri
-        onlarca kez örneklediği için açık PortAudio akışları birikip süreci
-        çökertti. Testler zaten `sd`'yi mock'luyor — gerçek donanıma dokunmak
-        hiçbir testin amacı değil.
-        """
-        return "PYTEST_CURRENT_TEST" in os.environ or "pytest" in sys.modules
+        """Test sürecinde GERÇEK ses donanımı açılmaz."""
+        return (
+            "PYTEST_CURRENT_TEST" in os.environ
+            or "pytest" in sys.modules
+            or "unittest" in sys.modules
+            or os.environ.get("ASTRO_TEST_MODE", "0") in ("1", "true", "True")
+        )
 
     def _start_input_stream(self):
         if sd is None:

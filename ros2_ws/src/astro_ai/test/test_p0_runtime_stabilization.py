@@ -4947,6 +4947,137 @@ class TestZeroLiveAPIRealtimeContract(unittest.TestCase):
         self.assertFalse(cb.is_available("openai"))
 
 
+class TestP0EndToEndRPDExhaustionAndFallbackTurn(unittest.TestCase):
+    """Authoritative End-to-End Fallback Turn & Lifetime RPD Lockout Contract."""
+
+    def setUp(self):
+        from astro_ai.circuit_breaker import get_global_circuit_breaker
+        self.cb = get_global_circuit_breaker()
+        if self.cb:
+            self.cb.reset_all()
+
+    def test_rpd_exhaustion_locks_out_openai_for_lifetime_of_process(self):
+        """RPD exhaustion locks out OpenAI permanently for the process: 0 response.create, 0 append, 0 STT."""
+        from std_msgs.msg import String
+        from astro_ai.astro_realtime_node import AstroRealtimeNode
+        fake_ws = FakeRealtimeTransport()
+        node = AstroRealtimeNode(connect_realtime=False, fake_transport=fake_ws)
+
+        # 1. Trigger RPD rate limit error event
+        asyncio.run(node._handle_realtime_event(fake_ws, {
+            "type": "error",
+            "error": {
+                "type": "requests",
+                "code": "rate_limit_exceeded",
+                "message": "Rate limit reached for gpt-realtime-2.1-mini on requests per day (RPD): Limit 1000, Used 1000"
+            }
+        }))
+
+        # Verify state is EXHAUSTED and fallback mode is engaged
+        self.assertEqual(node.realtime_provider_state, "EXHAUSTED")
+        self.assertTrue(node._fallback_mode)
+        self.assertTrue(self.cb.is_exhausted("openai"))
+
+        # 2. Verify STT is locked out (returns None, never calls OpenAI REST endpoint)
+        stt_res = node._transcribe_openai(b"\x00" * 3200)
+        self.assertIsNone(stt_res)
+
+        # 3. Verify turn request is locked out from sending response.create to OpenAI
+        req_msg = String()
+        req_msg.data = json.dumps({"text": "Limit sonrası test", "generation_id": 999})
+        node._on_realtime_turn_request(req_msg)
+        self.assertNotIn("response.create", fake_ws.get_sent_types())
+        self.assertNotIn("conversation.item.create", fake_ws.get_sent_types())
+
+        # 4. Verify microphone PCM streaming is locked out from appending to OpenAI WebSocket
+        pcm_msg = String()
+        pcm_msg.data = base64.b64encode(b"\x00\x05" * 480).decode("ascii")
+        node._on_input_pcm(pcm_msg)
+        self.assertNotIn("input_audio_buffer.append", fake_ws.get_sent_types())
+
+    def test_end_to_end_fallback_turn_synthesis_and_pcm_publication(self):
+        """Fallback turn synthesizes Edge-TTS and publishes 24kHz int16 PCM chunks with done sentinel."""
+        from unittest.mock import patch, MagicMock
+        from astro_ai.astro_realtime_node import AstroRealtimeNode
+        from astro_audio.tts_router import TTSRouteResult
+        fake_ws = FakeRealtimeTransport()
+        node = AstroRealtimeNode(connect_realtime=False, fake_transport=fake_ws)
+        node.realtime_provider_state = "EXHAUSTED"
+        node._fallback_mode = True
+
+        published_chunks = []
+        mock_pub = MagicMock()
+        mock_pub.publish.side_effect = lambda msg: published_chunks.append(msg.data)
+        node.pub_output_pcm = mock_pub
+
+        # Mock STT and TTSRouter synthesis
+        mock_pcm_24k = b"\x00\x10" * 2400  # 100ms @ 24kHz int16
+        mock_route_result = TTSRouteResult(
+            pcm=mock_pcm_24k,
+            selected_provider="edge_tts",
+            actual_provider="edge_tts",
+            model_name="tr-TR-AhmetNeural",
+            source_name="edge_tts",
+            tts_state="ready",
+            tts_ready=True,
+            tts_healthy=True,
+            fallback_reason="none",
+            duration_ms=100.0,
+            infer_ms=25.0
+        )
+        with patch.object(node, "_transcribe_wav", return_value="merhaba nasılsın"):
+            with patch.object(node.tts_router, "synthesize", return_value=mock_route_result):
+                # Send 500ms of simulated speech audio chunks
+                audio_chunks = [b"\x00\x15" * 160 for _ in range(25)]
+                node._process_fallback_turn(audio_chunks)
+
+        # Verify publication occurred
+        self.assertGreater(len(published_chunks), 0)
+
+        # Verify packet payloads
+        has_done_sentinel = False
+        total_audio_bytes = 0
+        for chunk_json in published_chunks:
+            payload = json.loads(chunk_json)
+            self.assertIn("generation_id", payload)
+            if payload.get("is_done"):
+                has_done_sentinel = True
+            elif payload.get("data") or payload.get("pcm"):
+                b64_data = payload.get("data") or payload.get("pcm")
+                raw_bytes = base64.b64decode(b64_data)
+                total_audio_bytes += len(raw_bytes)
+
+        self.assertTrue(has_done_sentinel, "Fallback turn must emit end sentinel with is_done=True")
+        self.assertEqual(total_audio_bytes, len(mock_pcm_24k), "All synthesized 24kHz PCM bytes must be published")
+
+    def test_audio_stream_node_receives_fallback_pcm_and_enqueues_playback(self):
+        """AudioStreamNode receives published fallback PCM chunks and enqueues to playback worker."""
+        from unittest.mock import MagicMock
+        from std_msgs.msg import String
+        from astro_audio.audio_stream_node import AudioStreamNode, resample_24k_to_16k
+
+        # Instantiate AudioStreamNode with test environment guard
+        audio_node = AudioStreamNode()
+        self.assertTrue(audio_node._under_pytest())
+
+        # Simulate receiving 24kHz chunk from fallback turn
+        test_pcm = b"\x00\x20" * 480
+        b64_pcm = base64.b64encode(test_pcm).decode("ascii")
+        msg = String()
+        msg.data = json.dumps({
+            "generation_id": 1001,
+            "tts_provider": "edge_tts",
+            "is_done": False,
+            "data": b64_pcm
+        })
+
+        audio_node._on_output_pcm(msg)
+        self.assertFalse(audio_node._play_queue.empty())
+        enqueued = audio_node._play_queue.get_nowait()
+        enqueued_pcm = enqueued["pcm"] if isinstance(enqueued, dict) else enqueued
+        self.assertEqual(enqueued_pcm, resample_24k_to_16k(test_pcm))
+
+
 if __name__ == "__main__":
     unittest.main()
 

@@ -833,10 +833,17 @@ class AstroRealtimeNode(Node):
                 self.get_logger().info(f"[REALTIME TURN DUPLICATE DROPPED]\ngeneration_id={gen_id}")
                 return
 
-            if not self._ws or not self._loop or not self._is_connected:
+            cb = getattr(self, "circuit_breaker", None)
+            is_openai_locked_out = (
+                getattr(self, "_fallback_mode", False)
+                or getattr(self, "realtime_provider_state", "") == "EXHAUSTED"
+                or (cb and cb.is_exhausted("openai"))
+            )
+
+            if not self._ws or not self._loop or not self._is_connected or is_openai_locked_out:
                 self.realtime_current_generation_id = gen_id
                 self.get_logger().warn(
-                    f"[REALTIME NO AUDIO]\ngeneration_id={gen_id}\nreason=websocket_not_connected\n"
+                    f"[REALTIME NO AUDIO]\ngeneration_id={gen_id}\nreason={'openai_exhausted' if is_openai_locked_out else 'websocket_not_connected'}\n"
                     f"[TTS FALLBACK]\nfrom=openai_realtime\nto=edge_tts\nreason=realtime_unavailable"
                 )
                 # Forward to tts_node for Edge-TTS fallback
@@ -845,9 +852,10 @@ class AstroRealtimeNode(Node):
                     "text": text,
                     "engine": "edge-tts",
                     "generation_id": gen_id,
-                    "fallback_reason": "realtime_unavailable",
+                    "fallback_reason": "openai_exhausted" if is_openai_locked_out else "realtime_unavailable",
                 })
-                self.pub_tts_say.publish(fb_msg)
+                if hasattr(self, "pub_tts_say") and self.pub_tts_say:
+                    self.pub_tts_say.publish(fb_msg)
                 return
 
             if self.active_response_state != "IDLE":
@@ -862,6 +870,14 @@ class AstroRealtimeNode(Node):
 
     def _dispatch_turn(self, gen_id: int, text: str):
         """Dispatches a single conversational turn to Realtime WebSocket."""
+        cb = getattr(self, "circuit_breaker", None)
+        if (
+            getattr(self, "_fallback_mode", False)
+            or getattr(self, "realtime_provider_state", "") == "EXHAUSTED"
+            or (cb and cb.is_exhausted("openai"))
+            or not self._ws
+        ):
+            return
         self.realtime_current_generation_id = gen_id
         self.active_generation_id = gen_id
         self._last_sent_generation_id = gen_id
@@ -3305,11 +3321,15 @@ class AstroRealtimeNode(Node):
 
     def _transcribe_openai(self, wav_bytes: bytes) -> Optional[str]:
         """OpenAI /v1/audio/transcriptions — STT'nin birincil yolu."""
+        cb = getattr(self, "circuit_breaker", None)
         if (
             os.environ.get("ASTRO_TEST_MODE", "0") in ("1", "true", "True")
             or "unittest" in sys.modules
             or "pytest" in sys.modules
             or "PYTEST_CURRENT_TEST" in os.environ
+            or getattr(self, "_fallback_mode", False)
+            or getattr(self, "realtime_provider_state", "") == "EXHAUSTED"
+            or (cb and cb.is_exhausted("openai"))
             or not self.openai_api_key
             or self.openai_api_key.startswith("sk-test")
             or self.openai_api_key.startswith("test_")
@@ -4582,12 +4602,18 @@ class AstroRealtimeNode(Node):
             return
 
         # --- Standard OpenAI Realtime Mode ---
-        # Gating: Microphone PCM is strictly streamed ONLY when WebSocket is CONNECTED and session is READY
+        # Gating: Microphone PCM is strictly streamed ONLY when WebSocket is CONNECTED, session is READY, and OpenAI is NOT exhausted
+        cb = getattr(self, "circuit_breaker", None)
+        is_openai_locked_out = (
+            getattr(self, "_fallback_mode", False)
+            or getattr(self, "realtime_provider_state", "") == "EXHAUSTED"
+            or (cb and cb.is_exhausted("openai"))
+        )
         if (
-            self.realtime_connection_state == "CONNECTED"
+            not is_openai_locked_out
+            and self.realtime_connection_state == "CONNECTED"
             and self.realtime_session_state == "READY"
             and self._ws is not None
-            and not getattr(self, "_fallback_mode", False)
         ):
             payload = {
                 "type": "input_audio_buffer.append",
