@@ -348,13 +348,23 @@ void loopControl() {
   }
 }
 
-// PID adımı - conditional integration ile anti-windup
+// PID adımı - stiction feedforward + conditional integration ile anti-windup
+// (main.cpp'deki pid_step ile birebir aynı davranış)
 int pidStep(float target_rpm, float meas_rpm, float& e_i, float& e_prev, uint32_t dt_ms) {
+  // Hedef sıfırsa motoru tamamen bırak, integrali de temizle
+  if (abs(target_rpm) < 0.01f) {
+    e_i = 0.0f;
+    e_prev = 0.0f;
+    return 0;
+  }
+
   float e = target_rpm - meas_rpm;
   float de = (e - e_prev) / (dt_ms / 1000.0f);
   e_prev = e;
 
-  float u = KP * e + KI * e_i + KD * de;
+  // Feedforward: motor statik sürtünme (stiction) eşiğini aşmak için minimum PWM tabanı
+  float ff = (target_rpm > 0.0f) ? 25.0f : -25.0f;
+  float u = ff + (KP * 2.0f * e) + (KI * e_i) + (KD * de);
   int pwm = (int)constrain(u, -PWM_MAX, PWM_MAX);
 
   // Sadece PWM saturate olmadığında integral artır
