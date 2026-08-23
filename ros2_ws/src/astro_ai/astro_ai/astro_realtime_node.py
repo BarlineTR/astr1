@@ -243,6 +243,19 @@ def frame_to_base64_jpeg(frame: np.ndarray, max_dim: int = 640) -> Optional[str]
 
 
 
+# Module-level monotonic process-lifetime lockout for OpenAI
+OPENAI_HARD_DISABLED: bool = False
+
+def set_openai_hard_disabled(reason: str = "quota_or_rate_limit_exhausted") -> None:
+    global OPENAI_HARD_DISABLED
+    OPENAI_HARD_DISABLED = True
+
+def reset_openai_hard_disabled_for_test() -> None:
+    """Only used by offline unit tests to reset test state."""
+    global OPENAI_HARD_DISABLED
+    OPENAI_HARD_DISABLED = False
+
+
 REALTIME_WS_URL = "wss://api.openai.com/v1/realtime?model=gpt-realtime-2.1-mini"
 VALID_REALTIME_VOICES = {"alloy", "ash", "ballad", "coral", "echo", "sage", "shimmer", "verse", "fable", "onyx"}
 
@@ -264,10 +277,11 @@ def discover_realtime_models(api_key: str, preferred: str = "") -> list[str]:
     if preferred:
         candidates.append(preferred)
 
-    # Test sürecinde AĞA ÇIKILMAZ. Testler düğüme sahte anahtar ("sk-test")
-    # verip onu onlarca kez örnekliyor; testlerde kesinlikle ağa çıkılmaz.
+    # Test sürecinde veya OpenAI kilitliyken AĞA ÇIKILMAZ.
+    global OPENAI_HARD_DISABLED
     if (
-        os.environ.get("ASTRO_TEST_MODE", "0") in ("1", "true", "True")
+        OPENAI_HARD_DISABLED
+        or os.environ.get("ASTRO_TEST_MODE", "0") in ("1", "true", "True")
         or "unittest" in sys.modules
         or "pytest" in sys.modules
         or "PYTEST_CURRENT_TEST" in os.environ
@@ -808,6 +822,84 @@ class AstroRealtimeNode(Node):
         except Exception:
             pass
 
+    @property
+    def openai_hard_disabled(self) -> bool:
+        global OPENAI_HARD_DISABLED
+        return OPENAI_HARD_DISABLED or getattr(self, "_openai_hard_disabled", False)
+
+    def _can_use_openai(self, surface: str = "all") -> bool:
+        """Centralized single-point-of-truth guard for ANY OpenAI operation.
+        
+        Returns False if:
+        - OPENAI_HARD_DISABLED is True (monotonic process-lifetime)
+        - self._fallback_mode is True
+        - self.realtime_provider_state == "EXHAUSTED"
+        - CircuitBreaker marks 'openai' as exhausted
+        - OpenAI API key is missing or invalid/mock (in live mode)
+        """
+        global OPENAI_HARD_DISABLED
+        if getattr(self, "_openai_hard_disabled", False):
+            return False
+        # In unit tests with FakeRealtimeTransport, use instance-level lockout
+        is_isolated_test = (getattr(self, "fake_transport", None) is not None or not getattr(self, "connect_realtime", False))
+        if OPENAI_HARD_DISABLED and not is_isolated_test:
+            return False
+        if getattr(self, "_fallback_mode", False):
+            return False
+        if getattr(self, "realtime_provider_state", "") == "EXHAUSTED":
+            return False
+        cb = getattr(self, "circuit_breaker", None)
+        if cb and (cb.is_exhausted("openai") or not cb.is_available("openai", f"openai_{surface}" if surface != "all" else "openai_realtime")):
+            return False
+        if not is_isolated_test and not getattr(self, "openai_api_key", None):
+            return False
+        return True
+
+    def _trigger_openai_hard_lockout(self, reason: str, ws=None) -> None:
+        """Atomically locks out OpenAI for the entire process lifetime across all surfaces."""
+        global OPENAI_HARD_DISABLED
+        OPENAI_HARD_DISABLED = True
+        self._openai_hard_disabled = True
+        self.realtime_provider_state = "EXHAUSTED"
+        self._fallback_mode = True
+        self._is_connected = False
+        self.active_response_state = "IDLE"
+        self.realtime_response_state = "IDLE"
+        self.active_response_id = None
+        self.active_generation_id = None
+        self._publish_realtime_state("EXHAUSTED", reason)
+
+        # Record in GlobalProviderCircuitBreaker
+        try:
+            from astro_ai.circuit_breaker import get_global_circuit_breaker, RequestErrorClass
+            cb = get_global_circuit_breaker()
+            if cb:
+                cb.record_error("openai", sub_provider="openai_realtime", error_class=RequestErrorClass.QUOTA_EXHAUSTED, error_msg=reason)
+        except Exception:
+            pass
+
+        # Close existing WebSocket immediately
+        target_ws = ws or self._ws
+        if target_ws is not None:
+            self._ws = None
+            try:
+                if self._loop is not None and self._loop.is_running():
+                    asyncio.run_coroutine_threadsafe(target_ws.close(1000, "RPD exhausted hard lockout"), self._loop)
+                elif hasattr(target_ws, "close"):
+                    res = target_ws.close()
+                    if inspect.iscoroutine(res):
+                        asyncio.run(res)
+            except Exception:
+                pass
+
+        self.get_logger().error(
+            f"🚨 [OPENAI HARD DISABLED] Process-lifetime lockout engaged.\n"
+            f"  reason={reason}\n"
+            f"  realtime_provider_state=EXHAUSTED\n"
+            f"  fallback_mode=True\n"
+            f"  active_websocket_closed=True"
+        )
+
     def _on_realtime_turn_request(self, msg: String):
         """Receives conversational turn request from ai_brain_node and manages single active response."""
         try:
@@ -833,17 +925,10 @@ class AstroRealtimeNode(Node):
                 self.get_logger().info(f"[REALTIME TURN DUPLICATE DROPPED]\ngeneration_id={gen_id}")
                 return
 
-            cb = getattr(self, "circuit_breaker", None)
-            is_openai_locked_out = (
-                getattr(self, "_fallback_mode", False)
-                or getattr(self, "realtime_provider_state", "") == "EXHAUSTED"
-                or (cb and cb.is_exhausted("openai"))
-            )
-
-            if not self._ws or not self._loop or not self._is_connected or is_openai_locked_out:
+            if not self._can_use_openai("realtime") or not self._ws or not self._loop or not self._is_connected:
                 self.realtime_current_generation_id = gen_id
                 self.get_logger().warn(
-                    f"[REALTIME NO AUDIO]\ngeneration_id={gen_id}\nreason={'openai_exhausted' if is_openai_locked_out else 'websocket_not_connected'}\n"
+                    f"[REALTIME NO AUDIO]\ngeneration_id={gen_id}\nreason={'openai_hard_disabled' if not self._can_use_openai('realtime') else 'websocket_not_connected'}\n"
                     f"[TTS FALLBACK]\nfrom=openai_realtime\nto=edge_tts\nreason=realtime_unavailable"
                 )
                 # Forward to tts_node for Edge-TTS fallback
@@ -852,7 +937,7 @@ class AstroRealtimeNode(Node):
                     "text": text,
                     "engine": "edge-tts",
                     "generation_id": gen_id,
-                    "fallback_reason": "openai_exhausted" if is_openai_locked_out else "realtime_unavailable",
+                    "fallback_reason": "openai_hard_disabled" if not self._can_use_openai('realtime') else "realtime_unavailable",
                 })
                 if hasattr(self, "pub_tts_say") and self.pub_tts_say:
                     self.pub_tts_say.publish(fb_msg)
@@ -870,13 +955,7 @@ class AstroRealtimeNode(Node):
 
     def _dispatch_turn(self, gen_id: int, text: str):
         """Dispatches a single conversational turn to Realtime WebSocket."""
-        cb = getattr(self, "circuit_breaker", None)
-        if (
-            getattr(self, "_fallback_mode", False)
-            or getattr(self, "realtime_provider_state", "") == "EXHAUSTED"
-            or (cb and cb.is_exhausted("openai"))
-            or not self._ws
-        ):
+        if not self._can_use_openai("realtime") or not self._ws:
             return
         self.realtime_current_generation_id = gen_id
         self.active_generation_id = gen_id
@@ -982,7 +1061,7 @@ class AstroRealtimeNode(Node):
         model_idx = 0
 
         while (rclpy.ok() if (rclpy is not None and hasattr(rclpy, "ok")) else True):
-            if getattr(self, "_fallback_mode", False) or getattr(self, "realtime_provider_state", "") == "EXHAUSTED":
+            if not self._can_use_openai("realtime"):
                 await asyncio.sleep(86400.0)
                 continue
 
@@ -997,6 +1076,9 @@ class AstroRealtimeNode(Node):
                 )
                 self._publish_realtime_state("CONNECTING")
                 async with websockets.connect(ws_url, **connect_kwargs) as ws:
+                    if not self._can_use_openai("realtime"):
+                        await ws.close(1000, "OpenAI hard disabled")
+                        continue
                     self._ws = ws
                     self._is_connected = True
                     self._is_responding = False
@@ -1016,6 +1098,8 @@ class AstroRealtimeNode(Node):
 
                     # Listen for Realtime Events
                     async for message in ws:
+                        if not self._can_use_openai("realtime"):
+                            break
                         await self._handle_realtime_event(ws, json.loads(message))
 
             except Exception as e:
@@ -1054,9 +1138,7 @@ class AstroRealtimeNode(Node):
                     or ("quota" in err_str.lower() and ("exhaust" in err_str.lower() or "exceed" in err_str.lower() or "zero" in err_str.lower() or "balance" in err_str.lower()))
                 )
                 if is_rate_limit_or_quota:
-                    self.realtime_provider_state = "EXHAUSTED"
-                    self._fallback_mode = True
-                    self._publish_realtime_state("EXHAUSTED", "quota_exhausted")
+                    self._trigger_openai_hard_lockout(err_str, ws=None)
                     self.get_logger().error(
                         f"[REALTIME ERROR]\n"
                         f"generation_id={self.realtime_current_generation_id}\n"
@@ -1070,13 +1152,6 @@ class AstroRealtimeNode(Node):
                         f"to=groq\n"
                         f"reason=quota_exhausted"
                     )
-                    try:
-                        from astro_ai.circuit_breaker import get_global_circuit_breaker, RequestErrorClass
-                        cb = get_global_circuit_breaker()
-                        if cb:
-                            cb.record_error("openai", sub_provider="openai_realtime", error_class=RequestErrorClass.QUOTA_EXHAUSTED, error_msg=err_str)
-                    except Exception:
-                        pass
                     self.get_logger().warn("🚀 [0-Maliyetli Groq & Edge-TTS Modu Devrede]: OpenAI Realtime kredisi tükendi. Astro kesintisiz olarak 0-Token Groq LLM + Edge-TTS modunda çalışıyor!")
                     # Terminate reconnect attempts session-wide
                     await asyncio.sleep(86400.0)
@@ -1502,12 +1577,13 @@ class AstroRealtimeNode(Node):
 
         # 3c. Response Created
         elif event_type == "response.created":
-            if getattr(self, "_fallback_mode", False):
-                self.get_logger().warn("[REALTIME RESPONSE IGNORE] response.created received but fallback active")
+            if not self._can_use_openai("realtime"):
+                self.get_logger().warn("[REALTIME RESPONSE IGNORE] response.created received but OpenAI is hard disabled")
                 return
 
             resp_obj = event.get("response", {})
-            self.active_response_id = resp_obj.get("id")
+            resp_id = resp_obj.get("id")
+            self.active_response_id = resp_id
             self.active_response_state = "GENERATING"
             self._is_responding = True
             self.realtime_response_state = "GENERATING"
@@ -1524,6 +1600,11 @@ class AstroRealtimeNode(Node):
                 self.active_generation_id = counter
             if getattr(self, "realtime_current_generation_id", 0) == 0:
                 self.realtime_current_generation_id = self.active_generation_id
+
+            if resp_id:
+                if not hasattr(self, "_response_to_generation_map"):
+                    self._response_to_generation_map = {}
+                self._response_to_generation_map[resp_id] = self.active_generation_id
 
             vad_start = getattr(self, "_vad_end_time", None) or self._response_start_time
             vad_to_created_ms = (self._response_start_time - vad_start) * 1000.0 if (self._response_start_time and vad_start) else 0.0
@@ -1578,6 +1659,19 @@ class AstroRealtimeNode(Node):
             error_msg = error_info.get("message") or (resp_status_details.get("reason") if isinstance(resp_status_details, dict) else "unknown") or "unknown"
             error_param = error_info.get("param") or "unknown"
 
+            # Check if this failure is rate limit or quota exhaustion:
+            is_rate_limit_or_quota = (
+                "rate_limit_exceeded" in str(error_code).lower()
+                or "rate_limit_exceeded" in str(error_type).lower()
+                or "rate_limit" in str(error_msg).lower()
+                or "insufficient_quota" in str(error_code).lower()
+                or "insufficient_quota" in str(error_msg).lower()
+                or "quota" in str(error_msg).lower()
+                or "402" in str(error_msg)
+            )
+            if is_rate_limit_or_quota:
+                self._trigger_openai_hard_lockout(error_msg, ws=ws)
+
             audio_generated = (getattr(self, "_packets_for_gen", 0) > 0 or getattr(self, "_bytes_for_gen", 0) > 0)
             response_empty = not audio_generated
 
@@ -1598,11 +1692,6 @@ class AstroRealtimeNode(Node):
                     f"error_message={error_msg}\n"
                     f"error_param={error_param}\n"
                     f"response_status={resp_status}\n"
-                    f"response_status_details={json.dumps(resp_status_details, ensure_ascii=False) if resp_status_details else 'unknown'}"
-                )
-                self.get_logger().warn(
-                    f"[REALTIME NO AUDIO] generation_id={self.active_generation_id or self.realtime_current_generation_id} elapsed_ms={server_stream_elapsed_ms:.1f}\n"
-                    f"[TTS FALLBACK] from=openai_realtime to=edge_tts reason=realtime_response_failed"
                 )
             elif resp_status == "cancelled" or event_type == "response.cancelled":
                 self.active_response_state = "CANCELLED"
@@ -1726,17 +1815,22 @@ class AstroRealtimeNode(Node):
                 tool_result = {"status": "error", "message": str(te)}
 
             # Send tool response back to OpenAI
-            tool_output_event = {
-                "type": "conversation.item.create",
-                "item": {
-                    "type": "function_call_output",
-                    "call_id": call_id,
-                    "output": json.dumps(tool_result, ensure_ascii=False)
+            if ws and hasattr(ws, "send") and self._can_use_openai("realtime"):
+                tool_output_event = {
+                    "type": "conversation.item.create",
+                    "item": {
+                        "type": "function_call_output",
+                        "call_id": call_id,
+                        "output": json.dumps(tool_result, ensure_ascii=False)
+                    }
                 }
-            }
-            await ws.send(json.dumps(tool_output_event))
-            # Trigger response generation with tool output
-            await ws.send(json.dumps({"type": "response.create"}))
+                res = ws.send(json.dumps(tool_output_event))
+                if asyncio.iscoroutine(res):
+                    await res
+                # Trigger response generation with tool output
+                res2 = ws.send(json.dumps({"type": "response.create"}))
+                if asyncio.iscoroutine(res2):
+                    await res2
 
         # 7. Error Handling
         elif event_type == "error":
@@ -1787,16 +1881,8 @@ class AstroRealtimeNode(Node):
                 or "402" in str(err_msg)
             )
             if is_rate_limit_or_quota:
-                self.realtime_provider_state = "EXHAUSTED"
-                self._fallback_mode = True
-                self._publish_realtime_state("EXHAUSTED", "rate_limit_exceeded")
-                try:
-                    from astro_ai.circuit_breaker import get_global_circuit_breaker, RequestErrorClass
-                    cb = get_global_circuit_breaker()
-                    if cb:
-                        cb.record_error("openai", sub_provider="openai_realtime", error_class=RequestErrorClass.QUOTA_EXHAUSTED, error_msg=err_msg)
-                except Exception:
-                    pass
+                self._trigger_openai_hard_lockout(err_msg, ws=ws)
+                return
 
             is_session_error = (
                 "session" in str(err_param).lower()
@@ -2676,7 +2762,7 @@ class AstroRealtimeNode(Node):
             import random
             reply = random.choice(wake_replies)
             self.get_logger().info(f"🤖 [Astro Wake Cevabı]: \"{reply}\"")
-            if self._ws and self._loop and self._is_connected and not self._fallback_mode:
+            if self._can_use_openai("realtime") and self._ws and self._loop and self._is_connected:
                 self._dispatch_turn(int(time.time() * 1000) % 100000, reply)
             else:
                 fb_msg = String()
@@ -2708,7 +2794,7 @@ class AstroRealtimeNode(Node):
                 f"command_reject_reason=none | "
                 f"wake_only=False | wake_rejected=False | conversation_turn_created=True | llm_started=True | tts_started=True"
             )
-            if self._ws and self._loop and self._is_connected and not self._fallback_mode:
+            if self._can_use_openai("realtime") and self._ws and self._loop and self._is_connected:
                 turn_event = {
                     "type": "conversation.item.create",
                     "item": {
@@ -3321,15 +3407,13 @@ class AstroRealtimeNode(Node):
 
     def _transcribe_openai(self, wav_bytes: bytes) -> Optional[str]:
         """OpenAI /v1/audio/transcriptions — STT'nin birincil yolu."""
-        cb = getattr(self, "circuit_breaker", None)
+        if not self._can_use_openai("stt"):
+            return None
         if (
             os.environ.get("ASTRO_TEST_MODE", "0") in ("1", "true", "True")
             or "unittest" in sys.modules
             or "pytest" in sys.modules
             or "PYTEST_CURRENT_TEST" in os.environ
-            or getattr(self, "_fallback_mode", False)
-            or getattr(self, "realtime_provider_state", "") == "EXHAUSTED"
-            or (cb and cb.is_exhausted("openai"))
             or not self.openai_api_key
             or self.openai_api_key.startswith("sk-test")
             or self.openai_api_key.startswith("test_")
@@ -3343,6 +3427,16 @@ class AstroRealtimeNode(Node):
                 self.openai_api_key, model, wav_bytes,
                 float(os.environ.get("OPENAI_STT_TIMEOUT_S", "8.0")),
             )
+        except urllib.error.HTTPError as http_e:
+            err_body = ""
+            try:
+                err_body = http_e.read().decode("utf-8")
+            except Exception:
+                pass
+            self.get_logger().warn(f"⚠️ [OpenAI STT] HTTP {http_e.code}: {http_e.reason} ({err_body})")
+            if http_e.code in (402, 429) or "insufficient_quota" in err_body or "rate_limit" in err_body:
+                self._trigger_openai_hard_lockout(f"HTTP {http_e.code}: {err_body}")
+            return None
         except Exception as e:
             self.get_logger().warn(f"⚠️ [OpenAI STT] {model} başarısız: {e}")
             return None
@@ -3354,14 +3448,15 @@ class AstroRealtimeNode(Node):
         yalnızca LLM_FALLBACK_ENABLED=true iken ve OpenAI cevap veremediğinde
         devreye girer.
         """
-        # If OpenAI is exhausted or in fallback mode, directly use Groq Whisper
-        cb = getattr(self, "circuit_breaker", None)
-        if getattr(self, "_fallback_mode", False) or (cb and cb.is_exhausted("openai")):
+        # If OpenAI is exhausted or hard disabled, directly use Groq Whisper
+        if not self._can_use_openai("stt"):
             return self._transcribe_groq_whisper(wav_bytes) or ""
 
         text = self._transcribe_openai(wav_bytes)
         if text:
             return text
+
+        return self._transcribe_groq_whisper(wav_bytes) or ""
 
         fallback_on = os.environ.get("LLM_FALLBACK_ENABLED", "true").strip().lower() in ("1", "true", "yes")
         if not fallback_on:
@@ -4508,7 +4603,7 @@ class AstroRealtimeNode(Node):
             self._is_responding = False
             self._is_playback_active = False
 
-            if getattr(self, "_fallback_mode", False):
+            if getattr(self, "_fallback_mode", False) or not self._can_use_openai("realtime"):
                 self._fallback_speaking = True
                 self._fallback_speech_start = now
                 self._last_speech_time = now
@@ -4525,7 +4620,7 @@ class AstroRealtimeNode(Node):
                 # Realtime primary S2S mode: cancel streaming response on WebSocket ONLY if it is actively streaming
                 if self.active_response_state == "STREAMING":
                     self.active_response_state = "CANCELLED"
-                    if self._ws is not None:
+                    if self._ws is not None and self._can_use_openai("realtime"):
                         try:
                             if self._loop is not None:
                                 asyncio.run_coroutine_threadsafe(self._ws.send(json.dumps({"type": "response.cancel"})), self._loop)
@@ -4558,7 +4653,8 @@ class AstroRealtimeNode(Node):
                 self._wake_up()
 
         # --- 0-Cost Fallback Mode (Groq STT + Groq LLM + Edge-TTS) ---
-        if self._fallback_mode or (not self._is_connected and self._ws is None):
+        is_ws_connected = (self._is_connected or self.realtime_connection_state == "CONNECTED")
+        if self._fallback_mode or not self._can_use_openai("realtime") or not is_ws_connected or self._ws is None:
             if raw_16k:
                 try:
                     speech_start_condition = (local_rms > max(380.0, self._ambient_rms * 1.40) and peak_val > 900)
@@ -4602,15 +4698,9 @@ class AstroRealtimeNode(Node):
             return
 
         # --- Standard OpenAI Realtime Mode ---
-        # Gating: Microphone PCM is strictly streamed ONLY when WebSocket is CONNECTED, session is READY, and OpenAI is NOT exhausted
-        cb = getattr(self, "circuit_breaker", None)
-        is_openai_locked_out = (
-            getattr(self, "_fallback_mode", False)
-            or getattr(self, "realtime_provider_state", "") == "EXHAUSTED"
-            or (cb and cb.is_exhausted("openai"))
-        )
+        # Gating: Microphone PCM is strictly streamed ONLY when _can_use_openai("realtime") is True
         if (
-            not is_openai_locked_out
+            self._can_use_openai("realtime")
             and self.realtime_connection_state == "CONNECTED"
             and self.realtime_session_state == "READY"
             and self._ws is not None

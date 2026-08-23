@@ -4952,6 +4952,8 @@ class TestP0EndToEndRPDExhaustionAndFallbackTurn(unittest.TestCase):
 
     def setUp(self):
         from astro_ai.circuit_breaker import get_global_circuit_breaker
+        from astro_ai.astro_realtime_node import reset_openai_hard_disabled_for_test
+        reset_openai_hard_disabled_for_test()
         self.cb = get_global_circuit_breaker()
         if self.cb:
             self.cb.reset_all()
@@ -5076,6 +5078,125 @@ class TestP0EndToEndRPDExhaustionAndFallbackTurn(unittest.TestCase):
         enqueued = audio_node._play_queue.get_nowait()
         enqueued_pcm = enqueued["pcm"] if isinstance(enqueued, dict) else enqueued
         self.assertEqual(enqueued_pcm, resample_24k_to_16k(test_pcm))
+
+    def test_subsequent_100_turns_produce_zero_openai_calls(self):
+        """Subsequent 100 turns produce 0 response.create, 0 conversation.item.create, 0 reconnects."""
+        from std_msgs.msg import String
+        from astro_ai.astro_realtime_node import AstroRealtimeNode, reset_openai_hard_disabled_for_test
+        from unittest.mock import MagicMock
+
+        reset_openai_hard_disabled_for_test()
+        fake_ws = FakeRealtimeTransport()
+        node = AstroRealtimeNode(connect_realtime=False, fake_transport=fake_ws)
+
+        # Trigger RPD exhaustion
+        asyncio.run(node._handle_realtime_event(fake_ws, {
+            "type": "error",
+            "error": {
+                "type": "requests",
+                "code": "rate_limit_exceeded",
+                "message": "Rate limit reached for gpt-realtime-2.1-mini: Limit 1000, Used 1000"
+            }
+        }))
+
+        self.assertTrue(node.openai_hard_disabled)
+        self.assertFalse(node._can_use_openai())
+
+        # Clear any initial setup messages from fake_ws
+        fake_ws.sent_events.clear()
+
+        # Mock fallback publication to collect fallback turns
+        fallback_published = []
+        mock_pub_say = MagicMock()
+        mock_pub_say.publish.side_effect = lambda m: fallback_published.append(m.data)
+        node.pub_tts_say = mock_pub_say
+
+        # Fire 100 consecutive turn requests
+        for i in range(1, 101):
+            req_msg = String()
+            req_msg.data = json.dumps({"text": f"Kullanıcı mesajı {i}", "generation_id": 2000 + i})
+            node._on_realtime_turn_request(req_msg)
+
+        # Invariant checks:
+        self.assertEqual(len(fake_ws.get_sent_types()), 0, "0 messages sent to OpenAI WebSocket across 100 turns")
+        self.assertNotIn("response.create", fake_ws.get_sent_types())
+        self.assertNotIn("conversation.item.create", fake_ws.get_sent_types())
+        self.assertNotIn("input_audio_buffer.append", fake_ws.get_sent_types())
+        self.assertEqual(len(fallback_published), 100, "All 100 turns routed cleanly to Edge-TTS fallback")
+
+    def test_no_response_created_emitted_when_hard_disabled(self):
+        """When OpenAI is hard disabled, response.created events are ignored and do not emit REALTIME RESPONSE CREATED."""
+        from astro_ai.astro_realtime_node import AstroRealtimeNode, reset_openai_hard_disabled_for_test
+        from unittest.mock import MagicMock
+
+        reset_openai_hard_disabled_for_test()
+        fake_ws = FakeRealtimeTransport()
+        node = AstroRealtimeNode(connect_realtime=False, fake_transport=fake_ws)
+
+        # Trigger RPD exhaustion
+        asyncio.run(node._handle_realtime_event(fake_ws, {
+            "type": "error",
+            "error": {
+                "type": "requests",
+                "code": "rate_limit_exceeded",
+                "message": "Limit 1000 Used 1000"
+            }
+        }))
+
+        # Capture logs
+        captured_logs = []
+        mock_logger = MagicMock()
+        mock_logger.info.side_effect = lambda m: captured_logs.append(str(m))
+        mock_logger.warn.side_effect = lambda m: captured_logs.append(str(m))
+        mock_logger.error.side_effect = lambda m: captured_logs.append(str(m))
+        mock_logger.debug.side_effect = lambda m: captured_logs.append(str(m))
+        node.get_logger = lambda: mock_logger
+
+        # Deliver stray server response.created event
+        asyncio.run(node._handle_realtime_event(fake_ws, {
+            "type": "response.created",
+            "response": {"id": "resp_stray_999"}
+        }))
+
+        # Verify NO "[REALTIME RESPONSE CREATED]" was logged
+        all_logs = "\n".join(captured_logs)
+        self.assertNotIn("[REALTIME RESPONSE CREATED]", all_logs)
+
+    def test_generation_id_isolation_and_ownership_race(self):
+        """Late response events matching response_id resp_1 do not mutate generation state for resp_2."""
+        from astro_ai.astro_realtime_node import AstroRealtimeNode, reset_openai_hard_disabled_for_test
+
+        reset_openai_hard_disabled_for_test()
+        fake_ws = FakeRealtimeTransport()
+        node = AstroRealtimeNode(connect_realtime=False, fake_transport=fake_ws)
+
+        # Simulate Generation 1001 with resp_1
+        node.active_generation_id = 1001
+        asyncio.run(node._handle_realtime_event(fake_ws, {
+            "type": "response.created",
+            "response": {"id": "resp_gen1"}
+        }))
+        self.assertEqual(node.active_response_id, "resp_gen1")
+        self.assertEqual(node.active_response_state, "GENERATING")
+
+        # Simulate Generation 1002 starting
+        node.active_generation_id = 1002
+        asyncio.run(node._handle_realtime_event(fake_ws, {
+            "type": "response.created",
+            "response": {"id": "resp_gen2"}
+        }))
+        self.assertEqual(node.active_response_id, "resp_gen2")
+
+        # Late arrival of response.done for old resp_gen1
+        asyncio.run(node._handle_realtime_event(fake_ws, {
+            "type": "response.done",
+            "response": {"id": "resp_gen1", "status": "completed"}
+        }))
+
+        # Verify active generation 1002 state was NOT corrupted/cleared by late resp_gen1 event
+        self.assertEqual(node.active_response_id, "resp_gen2")
+        self.assertEqual(node.active_response_state, "GENERATING")
+        self.assertEqual(node.active_generation_id, 1002)
 
 
 if __name__ == "__main__":
