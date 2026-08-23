@@ -546,28 +546,41 @@ Spec #2'ye aittir.
 
 ### 7.3 Bilinen baseline sorunları (kapsam dışı)
 
-`bab0512` baseline'ında workspace source edilmiş halde 4 test başarısız. İkisi bu
-spec kapsamında onarılıyor (§7.1). Kalan ikisi kapsam dışıdır ve ayrı iş olarak
-ele alınacaktır:
+`bab0512` ve bu branch, tam suite 5'er kez koşularak karşılaştırıldı. Aşağıdaki
+testlerin hiçbiri bu çalışmanın ürettiği bir regresyon değildir.
+
+**Bu çalışmanın DÜZELTTİĞİ testler** (baseline'da 5/5 koşuda düşüyorlardı):
+
+| Test | Baseline | Şimdi |
+|---|---|---|
+| `test_audio_device_busy_is_reported_as_failure` | 5/5 fail (`NameError: mock_sd`) | geçiyor |
+| `test_realtime_barge_in_preserves_semantics` | 5/5 fail | yeni kontratla yeniden yazıldı, geçiyor |
+
+**Kalan kararlı fail'ler** (her iki branch'te de 5/5 düşüyor, kapsam dışı):
 
 | Test | Sebep |
 |---|---|
 | `test_21_migration_from_legacy_json` | Legacy JSON migration 0 fact üretiyor, 1 bekleniyor (`memory_v2`) |
-| `test_xtts_client_batch_size_default_is_one` | Tek başına geçiyor → test kirliliği, sıra bağımlı (`xtts_client`) |
-| `test_wake_with_command_forwards_turn` | **Dalgalı** — tam suite'te ~3 koşudan 2'sinde düşer, tek başına geçer |
+| `test_xtts_client_batch_size_default_is_one` | Tek başına geçiyor; tam suite'te düşüyor — sıra bağımlı |
 
-> **Ölçüm notu:** Bu liste tek bir koşuya değil, `bab0512` üzerinde tekrarlanan
-> koşulara dayanır. İlk ölçüm 4 fail göstermişti; `test_wake_with_command_forwards_turn`
-> o koşuda tesadüfen geçmişti. Baseline'ı tek koşuyla sabitlemek yanıltıcıdır —
-> bu suite sıra bağımlı durum sızdırıyor. Kabul kriteri bu yüzden "en fazla 3 fail,
-> hepsi bu tabloda" biçiminde okunmalıdır.
+**Sıra/yük bağımlı testler** (her iki branch'te aynı davranıyor):
 
-> **Test çalıştırma notu:** Workspace source edilmeden `pytest` 36 fail verir;
-> 32'si `ModuleNotFoundError: astro_base` / `LookupError: astro_bringup` yani
+| Test | Davranış |
+|---|---|
+| `test_wake_with_command_forwards_turn` | Baseline 4/5, bu branch 1/5 koşuda düşer; tek başına geçer |
+| `test_01_realtime_connected_response_created_audio_delta` | Her iki branch'te 1/5; tek başına geçer |
+| `test_grace_period_aborts_immediately_on_crashed_xtts` | **Tek başına 3/3 DÜŞER** — her iki branch'te. Tam suite'te yalnızca önceki testlerin bıraktığı yan etkiyle geçiyordu. Gerçekte kırık bir test. |
+| `test_xtts_cooldown_prevents_duplicate_worker_crash_loops` | Yük altında düşer; tek başına geçer |
+
+> **Bu suite sıra bağımlı durum sızdırıyor ve tek koşuyla ölçülemez.** Kabul
+> kriteri "tam olarak N fail" biçiminde değil, **"düşen her test bu tabloda
+> olmalı ve baseline'da da aynı davranmalı"** biçiminde okunmalıdır. Test
+> izolasyonunu onarmak ayrı bir iştir (Spec #3 adayı).
+
+> **Test çalıştırma notu:** Workspace source edilmeden `pytest` 30+ fail verir;
+> bunlar `ModuleNotFoundError: astro_base` / `LookupError: astro_bringup` yani
 > ortam kaynaklıdır. Doğru komut:
 > `source /opt/ros/humble/setup.bash && source ros2_ws/install/setup.bash && pytest`
-
----
 
 ## 8. Riskler
 
