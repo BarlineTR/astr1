@@ -200,7 +200,11 @@ class TtsNode(Node):
         self.sub_say = self.create_subscription(String, "/tts/say", self._on_say, 20)
         self.sub_interrupt = self.create_subscription(Bool, "/tts/interrupt", self._on_interrupt, 10)
         self.sub_emotion = self.create_subscription(String, "/robot/emotion", self._on_emotion, 10)
-        self.sub_realtime_pcm = self.create_subscription(String, "/audio/realtime_output_pcm", self._on_realtime_output_pcm, 50)
+        # /audio/realtime_output_pcm'e BİLEREK abone olunmuyor. Realtime PCM'in
+        # tek sahibi audio_stream_node'dur (giriş de çıkış da). Buraya bir
+        # abonelik geri eklenirse aynı ALSA cihazına iki süreç yazar ve
+        # "Device or resource busy" / "write to closed file" hataları döner.
+        # Bkz. docs/superpowers/specs/2026-08-23-realtime-s2s-voice-core-design.md §5.2
 
         # Internal Queue for /tts/say requests
         self._say_queue: queue.Queue[dict] = queue.Queue(maxsize=100)
@@ -290,48 +294,6 @@ class TtsNode(Node):
             self.output_manager.abort_realtime_stream(self.output_manager.current_generation)
             self.orchestrator.interrupt()
 
-    def _on_realtime_output_pcm(self, msg: String):
-        """Streams Realtime 24kHz int16 PCM directly into AudioOutputManager for ALSA playback."""
-        try:
-            import base64
-            raw_str = msg.data.strip()
-            if not raw_str:
-                return
-            # SESİN GELMEME SEBEBİ BURASIYDI. Yayıncı
-            # (astro_realtime_node._play_pcm_chunks) base64 sesi "data"
-            # anahtarıyla gönderiyor, burada ise "pcm" aranıyordu:
-            #   - `"pcm" in raw_str` gövdede hiç geçmediği için False oluyor,
-            #   - akış else dalına düşüp TÜM JSON metnini base64 sanıyor,
-            #   - çözme patlıyor ve hata `except ... debug` içinde yutuluyordu.
-            # Sessiz, izsiz ve tam bir ses kaybı. audio_stream_node'un aynı
-            # topic'i okuyan eşdeğeri zaten "data" kullanıyor.
-            # Artık JSON ise ikisi de kabul ediliyor, substring tahmini yok.
-            if raw_str.startswith("{"):
-                data = json.loads(raw_str)
-                gen_id = data.get("generation_id", self.output_manager.current_generation)
-                is_first = data.get("is_first", False)
-                is_done = data.get("is_done", False)
-                # "data" ÖNCE denenir: yayıncının gerçekte gönderdiği anahtar o.
-                # "pcm" geriye dönük uyumluluk için korunuyor.
-                b64_pcm = data.get("data") or data.get("pcm") or ""
-                pcm_bytes = base64.b64decode(b64_pcm) if b64_pcm else b""
-            else:
-                gen_id = self.output_manager.current_generation
-                is_first = False
-                is_done = False
-                pcm_bytes = base64.b64decode(raw_str)
-
-            if is_first:
-                self.output_manager.begin_realtime_stream(gen_id, sample_rate=24000)
-
-            if pcm_bytes:
-                self.output_manager.write_realtime_pcm(gen_id, pcm_bytes, sample_rate=24000)
-
-            if is_done:
-                self.output_manager.end_realtime_stream(gen_id)
-
-        except Exception as e:
-            self._log("debug", f"_on_realtime_output_pcm notice: {e}")
 
     def _process_say_queue(self):
         while rclpy.ok():
