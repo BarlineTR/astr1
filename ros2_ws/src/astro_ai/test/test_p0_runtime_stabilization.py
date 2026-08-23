@@ -1579,26 +1579,40 @@ class TestP02RealtimeTurnPipelineAndHardwareCorrection(unittest.TestCase):
         self.assertIsNotNone(node.output_manager)
 
     def test_audio_device_busy_is_reported_as_failure(self):
-        """7. Error Handling: Device busy/unavailable logs [AUDIO ERROR] direction=input reason=device_unavailable."""
+        """7. Error Handling: Cihaz meşgulse [AUDIO ERROR] direction=input reason=device_unavailable loglanır."""
+        import astro_audio.audio_stream_node as asn
         from astro_audio.audio_stream_node import AudioStreamNode
+
         node = AudioStreamNode.__new__(AudioStreamNode)
         node._in_dev_idx = 0
         node._in_device_name = "ReSpeaker 4 Mic Array (hw:0,0)"
+        node._input_stream = None
+        node._input_stream_alive = False
 
         logs = []
         mock_logger = MagicMock()
         mock_logger.warn = lambda msg: logs.append(msg)
         mock_logger.error = lambda msg: logs.append(msg)
+        mock_logger.info = lambda msg: logs.append(msg)
         node.get_logger = lambda: mock_logger
         node.create_subscription = MagicMock()
 
-        with patch.object(mock_sd, "RawInputStream", side_effect=Exception("Device or resource busy")):
+        fake_sd = MagicMock()
+        # __name__ bilerek "sounddevice" DEĞİL: _start_input_stream, pytest
+        # altında gerçek donanıma dokunmamak için o ada bakıp erken çıkıyor
+        # (audio_stream_node.py:_under_pytest). Sahte adla o koruma devre dışı
+        # kalır ve hata yolu gerçekten test edilir.
+        fake_sd.__name__ = "fake_sounddevice"
+        fake_sd.RawInputStream.side_effect = Exception("Device or resource busy")
+
+        with patch.object(asn, "sd", fake_sd):
             node._start_input_stream()
-            self.assertFalse(node._input_stream_alive)
-            log_text = "\n".join(logs)
-            self.assertIn("[AUDIO ERROR]", log_text)
-            self.assertIn("direction=input", log_text)
-            self.assertIn("reason=device_unavailable", log_text)
+
+        self.assertFalse(node._input_stream_alive)
+        log_text = "\n".join(logs)
+        self.assertIn("[AUDIO ERROR]", log_text)
+        self.assertIn("direction=input", log_text)
+        self.assertIn("reason=device_unavailable", log_text)
 
     def test_arduino_handshake_required_before_motor_enable(self):
         """8. Safety: [SERIAL CONNECTED] and [ARDUINO HANDSHAKE] status=success logged on connection."""
