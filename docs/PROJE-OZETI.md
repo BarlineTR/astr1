@@ -182,15 +182,22 @@ modelin dünya modelini bozar.
 - `voice_engine` launch ayrımı (`bab0512`)
 - Sunucu tarafı `create_response`, tool çağrılarının event loop'tan çıkarılması (`bab0512`)
 
-### Devam eden — Spec #1: Realtime S2S Ses Çekirdeği
+### Spec #1: Realtime S2S Ses Çekirdeği — Kapı 1 tamamlandı
 
 Branch: `feat/realtime-s2s-voice-core`
 
-- Turn ve session mantığının ROS'suz modüllere çıkarılması
-- `interrupt_response` ile barge-in otoritesinin sunucuya devri
-- Cascaded metin enjeksiyon hattının sökülmesi
-- `tts_node`'un realtime PCM aboneliğinin kaldırılması
-- `move_robot` güvenlik kapısı
+- ✅ Turn, session ve motor durumu ROS'suz modüllere çıkarıldı (`astro_ai/realtime/`)
+- ✅ `interrupt_response` eklendi; barge-in otoritesi sunucuya devredildi
+- ✅ Cascaded metin enjeksiyon hattı söküldü (`ai_brain_node` korundu)
+- ✅ `tts_node`'un realtime PCM aboneliği koddan kaldırıldı
+- ✅ `move_robot` motor sağlığı kanıtlanmadan reddediyor (fail-closed)
+- ✅ `realtime_sensors` `voice_engine`'e bağlandı
+- ⏳ **Kapı 2 bekliyor** — Jetson'da `scripts/acceptance_p0.sh`
+
+Uygulama sırasında testlerin yakaladığı iki gerçek tasarım hatası düzeltildi:
+`response.created` `IDLE` durumunda yok sayılıyordu (proaktif selamlama boyunca
+makine desync kalır, barge-in ölürdü), ve kimlik karşılaştırılamadığında ses
+düşürülüyordu (bayatlık kanıtlanamazken susmak robotu gereksiz susturur).
 
 Tasarım: `docs/superpowers/specs/2026-08-23-realtime-s2s-voice-core-design.md`
 Plan: `docs/superpowers/plans/2026-08-23-realtime-s2s-voice-core.md`
@@ -236,6 +243,10 @@ hatası değildir.
 |---|---|
 | `test_21_migration_from_legacy_json` | Legacy JSON migration 0 fact üretiyor (`memory_v2`) |
 | `test_xtts_client_batch_size_default_is_one` | Tek başına geçiyor → test kirliliği, sıra bağımlı |
+| `test_wake_with_command_forwards_turn` | **Dalgalı** — ~4 koşudan 1'inde düşer, tek başına geçer |
+
+> Bu suite sıra bağımlı durum sızdırıyor; baseline'ı tek koşuyla ölçmek
+> yanıltıcıdır. Üç tanesi de `bab0512` üzerinde de mevcuttu.
 
 ---
 
