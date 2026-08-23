@@ -899,21 +899,22 @@ class AstroRealtimeNode(Node):
         asyncio.run_coroutine_threadsafe(self._ws.send(json.dumps(turn_event)), self._loop)
         asyncio.run_coroutine_threadsafe(self._ws.send(json.dumps(resp_event)), self._loop)
 
-        # Start watchdog timer for first-packet audio delta deadline (1.2s)
+        # Safety watchdog timer for truly stuck response deadline (15.0s)
         if self._watchdog_timer:
             try:
                 self._watchdog_timer.cancel()
             except Exception:
                 pass
-        self._watchdog_timer = threading.Timer(1.2, self._check_audio_delta_timeout, args=[gen_id, text])
+        self._watchdog_timer = threading.Timer(15.0, self._check_audio_delta_timeout, args=[gen_id, text])
         self._watchdog_timer.start()
 
     def _check_audio_delta_timeout(self, gen_id: int, text: str):
-        """Watchdog: If no audio delta arrives within 1.2s, triggers fallback to Edge-TTS."""
+        """Safety Watchdog: If no audio delta arrives within safety deadline (15.0s), triggers fallback to Edge-TTS."""
         active_gen = getattr(self, "active_generation_id", None)
         curr_gen = getattr(self, "realtime_current_generation_id", None)
         audio_rec = getattr(self, "realtime_audio_received", False)
         if (active_gen == gen_id or curr_gen == gen_id) and not audio_rec:
+            self.active_response_state = "FAILED"
             self.get_logger().warn(
                 f"[REALTIME NO AUDIO]\ngeneration_id={gen_id}\nreason=no_audio_delta\n"
                 f"[TTS FALLBACK]\nfrom=openai_realtime\nto=edge_tts\nreason=realtime_no_audio"
@@ -1148,29 +1149,20 @@ class AstroRealtimeNode(Node):
         session_config = {
             "type": "session.update",
             "session": {
-                "type": "realtime",
+                "modalities": ["text", "audio"],
                 "instructions": system_prompt,
-                "audio": {
-                    "input": {
-                        # whisper-1 DEĞİL: gpt-live-transcribe realtime için
-                        # tasarlanmış düşük gecikmeli akış modeli (OpenAI'nin
-                        # realtime rehberinde "controllable latency" ile önerilir).
-                        # Canlı doğrulandı: session.updated bu modelle dönüyor.
-                        "transcription": {
-                            "model": self.realtime_transcribe_model,
-                            "language": "tr"
-                        },
-                        "turn_detection": {
-                            "type": "server_vad",
-                            "threshold": 0.70,
-                            "prefix_padding_ms": 300,
-                            "silence_duration_ms": 500,
-                            "create_response": True
-                        }
-                    },
-                    "output": {
-                        "voice": self.realtime_voice
-                    }
+                "voice": self.realtime_voice,
+                "input_audio_format": "pcm16",
+                "output_audio_format": "pcm16",
+                "input_audio_transcription": {
+                    "model": "whisper-1"
+                },
+                "turn_detection": {
+                    "type": "server_vad",
+                    "threshold": 0.60,
+                    "prefix_padding_ms": 300,
+                    "silence_duration_ms": 500,
+                    "create_response": True
                 },
                 "tools": [
                     {
@@ -1294,7 +1286,9 @@ class AstroRealtimeNode(Node):
                             "required": ["name"]
                         }
                     }
-                ]
+                ],
+                "tool_choice": "auto",
+                "temperature": 0.8
             }
         }
 
@@ -1434,7 +1428,12 @@ class AstroRealtimeNode(Node):
 
         # 3c. Response Created
         elif event_type == "response.created":
-            self.active_response_id = event.get("response", {}).get("id")
+            if getattr(self, "_fallback_mode", False):
+                self.get_logger().warn("[REALTIME RESPONSE IGNORE] response.created received but fallback active")
+                return
+
+            resp_obj = event.get("response", {})
+            self.active_response_id = resp_obj.get("id")
             self.active_response_state = "GENERATING"
             self._is_responding = True
             self.realtime_response_state = "GENERATING"
@@ -1458,18 +1457,27 @@ class AstroRealtimeNode(Node):
             self.get_logger().info(
                 f"[REALTIME RESPONSE CREATED]\n"
                 f"generation_id={self.active_generation_id}\n"
-                f"response_id={self.active_response_id}\n"
+                f"response_id={self.active_response_id or 'unknown'}\n"
                 f"vad_to_created_ms={vad_to_created_ms:.1f}"
             )
 
-        # 3d. Response Done / Cancelled
-        elif event_type in ("response.done", "response.cancelled"):
+        # 3d. Response Done / Cancelled / Failed
+        elif event_type in ("response.done", "response.cancelled", "response.failed"):
             if getattr(self, "_watchdog_timer", None):
                 try:
                     self._watchdog_timer.cancel()
                 except Exception:
                     pass
                 self._watchdog_timer = None
+
+            resp_obj = event.get("response", {})
+            resp_id = resp_obj.get("id") or self.active_response_id
+            
+            # Late event filtering: If event specifies response_id and it does not match active_response_id, ignore state mutation
+            if resp_id and self.active_response_id and resp_id != self.active_response_id:
+                self.get_logger().debug(f"[REALTIME LATE EVENT IGNORE] event={event_type} event_resp_id={resp_id} active_resp_id={self.active_response_id}")
+                return
+
             now_mono = time.monotonic()
             resp_start = getattr(self, "_response_start_time", None) or now_mono
             vad_start = getattr(self, "_vad_end_time", None) or resp_start
@@ -1479,54 +1487,103 @@ class AstroRealtimeNode(Node):
             total_first_audio_ms = (self._first_audio_time - vad_start) * 1000.0 if getattr(self, "_first_audio_time", None) else 0.0
             audio_dur_ms = (getattr(self, "_bytes_for_gen", 0) / (24000 * 2)) * 1000.0
 
-            resp_obj = event.get("response", {})
-            resp_status = resp_obj.get("status", "completed" if event_type == "response.done" else "cancelled")
-            resp_status_details = resp_obj.get("status_details", {})
-            status_reason = resp_status_details.get("reason", "") if isinstance(resp_status_details, dict) else str(resp_status_details)
+            resp_status = resp_obj.get("status", "completed" if event_type == "response.done" else ("cancelled" if event_type == "response.cancelled" else "failed"))
+            resp_status_details = resp_obj.get("status_details") or {}
+            
+            # Error extraction across all possible OpenAI error structures
+            error_info = {}
+            if isinstance(resp_status_details, dict):
+                error_info = resp_status_details.get("error") or {}
+            if not error_info and isinstance(resp_obj.get("error"), dict):
+                error_info = resp_obj.get("error")
+            if not error_info and isinstance(event.get("error"), dict):
+                error_info = event.get("error")
+                
+            error_type = error_info.get("type") or (resp_status_details.get("type") if isinstance(resp_status_details, dict) else "unknown") or "unknown"
+            error_code = error_info.get("code") or "unknown"
+            error_msg = error_info.get("message") or (resp_status_details.get("reason") if isinstance(resp_status_details, dict) else "unknown") or "unknown"
+            error_param = error_info.get("param") or "unknown"
+
             audio_generated = (getattr(self, "_packets_for_gen", 0) > 0 or getattr(self, "_bytes_for_gen", 0) > 0)
             response_empty = not audio_generated
 
-            if response_empty:
+            if resp_status == "failed" or event_type == "response.failed":
+                self.active_response_state = "FAILED"
+                self.get_logger().error(
+                    f"[REALTIME ERROR]\n"
+                    f"error_class={error_type}:{error_code}\n"
+                    f"message={error_msg}\n"
+                    f"generation_id={self.realtime_current_generation_id}"
+                )
+                self.get_logger().error(
+                    f"[REALTIME RESPONSE FAILED]\n"
+                    f"generation_id={self.active_generation_id or self.realtime_current_generation_id}\n"
+                    f"response_id={resp_id or 'unknown'}\n"
+                    f"error_type={error_type}\n"
+                    f"error_code={error_code}\n"
+                    f"error_message={error_msg}\n"
+                    f"error_param={error_param}\n"
+                    f"response_status={resp_status}\n"
+                    f"response_status_details={json.dumps(resp_status_details, ensure_ascii=False) if resp_status_details else 'unknown'}"
+                )
                 self.get_logger().warn(
                     f"[REALTIME NO AUDIO] generation_id={self.active_generation_id or self.realtime_current_generation_id} elapsed_ms={server_stream_elapsed_ms:.1f}\n"
-                    f"[TTS FALLBACK] from=openai_realtime to=edge_tts reason=realtime_no_audio"
+                    f"[TTS FALLBACK] from=openai_realtime to=edge_tts reason=realtime_response_failed"
                 )
+            elif resp_status == "cancelled" or event_type == "response.cancelled":
+                self.active_response_state = "CANCELLED"
                 self.get_logger().info(
-                    f"[REALTIME RESPONSE EMPTY]\n"
+                    f"[REALTIME RESPONSE CANCELLED]\n"
                     f"generation_id={self.active_generation_id or self.realtime_current_generation_id}\n"
-                    f"response_id={self.active_response_id}\n"
-                    f"response_status={resp_status}\n"
-                    f"response_status_details={status_reason or 'none'}\n"
-                    f"audio_packets=0\n"
-                    f"audio_bytes=0\n"
-                    f"audio_generated=false\n"
-                    f"response_empty=true"
+                    f"response_id={resp_id or 'unknown'}\n"
+                    f"server_stream_elapsed_ms={server_stream_elapsed_ms:.1f}\n"
+                    f"audio_packets={self._packets_for_gen}"
                 )
             else:
-                self.get_logger().info(
-                    f"[REALTIME TURN]\n"
-                    f"generation_id={self.active_generation_id or self.realtime_current_generation_id}\n"
-                    f"response_id={self.active_response_id}\n"
-                    f"response_status={resp_status}\n"
-                    f"vad_to_created_ms={vad_to_created_ms:.1f}\n"
-                    f"created_to_first_audio_ms={first_ms:.1f}\n"
-                    f"first_audio_ms={total_first_audio_ms:.1f}\n"
-                    f"server_stream_elapsed_ms={server_stream_elapsed_ms:.1f}\n"
-                    f"audio_duration_ms={audio_dur_ms:.1f}\n"
-                    f"audio_packets={self._packets_for_gen}\n"
-                    f"audio_bytes={self._bytes_for_gen}\n"
-                    f"openai_audio_done=true\n"
-                    f"audio_generated=true\n"
-                    f"response_empty=false"
-                )
-                self.get_logger().info(
-                    f"[REALTIME AUDIO SUMMARY]\n"
-                    f"generation_id={self.active_generation_id or self.realtime_current_generation_id}\n"
-                    f"packets={self._packets_for_gen}\n"
-                    f"bytes={self._bytes_for_gen}\n"
-                    f"first_audio_ms={total_first_audio_ms:.1f}\n"
-                    f"total_audio_ms={server_stream_elapsed_ms:.1f}"
-                )
+                # Completed
+                if response_empty:
+                    self.get_logger().warn(
+                        f"[REALTIME NO AUDIO] generation_id={self.active_generation_id or self.realtime_current_generation_id} elapsed_ms={server_stream_elapsed_ms:.1f}\n"
+                        f"[TTS FALLBACK] from=openai_realtime to=edge_tts reason=realtime_no_audio"
+                    )
+                    self.get_logger().info(
+                        f"[REALTIME RESPONSE EMPTY]\n"
+                        f"generation_id={self.active_generation_id or self.realtime_current_generation_id}\n"
+                        f"response_id={resp_id or 'unknown'}\n"
+                        f"response_status={resp_status}\n"
+                        f"response_status_details={json.dumps(resp_status_details, ensure_ascii=False) if resp_status_details else 'unknown'}\n"
+                        f"audio_packets=0\n"
+                        f"audio_bytes=0\n"
+                        f"audio_generated=false\n"
+                        f"response_empty=true"
+                    )
+                else:
+                    self.get_logger().info(
+                        f"[REALTIME TURN]\n"
+                        f"generation_id={self.active_generation_id or self.realtime_current_generation_id}\n"
+                        f"response_id={resp_id or 'unknown'}\n"
+                        f"actual_provider=openai_realtime\n"
+                        f"response_status={resp_status}\n"
+                        f"vad_to_created_ms={vad_to_created_ms:.1f}\n"
+                        f"created_to_first_audio_ms={first_ms:.1f}\n"
+                        f"first_audio_ms={total_first_audio_ms:.1f}\n"
+                        f"server_stream_elapsed_ms={server_stream_elapsed_ms:.1f}\n"
+                        f"audio_duration_ms={audio_dur_ms:.1f}\n"
+                        f"audio_packets={self._packets_for_gen}\n"
+                        f"audio_bytes={self._bytes_for_gen}\n"
+                        f"openai_audio_done=true\n"
+                        f"audio_generated=true\n"
+                        f"response_empty=false"
+                    )
+                    self.get_logger().info(
+                        f"[REALTIME AUDIO SUMMARY]\n"
+                        f"generation_id={self.active_generation_id or self.realtime_current_generation_id}\n"
+                        f"packets={self._packets_for_gen}\n"
+                        f"bytes={self._bytes_for_gen}\n"
+                        f"first_audio_ms={total_first_audio_ms:.1f}\n"
+                        f"total_audio_ms={server_stream_elapsed_ms:.1f}"
+                    )
+
             self._is_responding = False
             self.realtime_response_state = "IDLE"
             self.active_response_id = None
@@ -1610,9 +1667,10 @@ class AstroRealtimeNode(Node):
         # 7. Error Handling
         elif event_type == "error":
             err = event.get("error", {})
-            err_type = err.get("type", "unknown_error")
-            err_code = err.get("code", "none")
-            err_msg = err.get("message", "")
+            err_type = err.get("type", "unknown")
+            err_code = err.get("code", "unknown")
+            err_msg = err.get("message", "unknown")
+            err_param = err.get("param", "unknown")
 
             # Check for response_cancel_not_active or already completed responses
             if "response_cancel_not_active" in str(err_code) or "response_cancel_not_active" in str(err_msg) or "cancel" in str(err_msg).lower():
@@ -1623,15 +1681,26 @@ class AstroRealtimeNode(Node):
             self.realtime_response_state = "IDLE"
             self.active_response_id = None
             self.active_generation_id = None
-            self.active_response_state = "IDLE"
+            self.active_response_state = "FAILED"
 
-            err_class = f"{err_type}:{err_code}" if err_code != "none" else err_type
+            err_class = f"{err_type}:{err_code}" if err_code != "unknown" else err_type
 
             self.get_logger().error(
                 f"[REALTIME ERROR]\n"
                 f"error_class={err_class}\n"
                 f"message={err_msg}\n"
                 f"generation_id={self.realtime_current_generation_id}"
+            )
+            self.get_logger().error(
+                f"[REALTIME RESPONSE FAILED]\n"
+                f"generation_id={self.realtime_current_generation_id}\n"
+                f"response_id=unknown\n"
+                f"error_type={err_type}\n"
+                f"error_code={err_code}\n"
+                f"error_message={err_msg}\n"
+                f"error_param={err_param}\n"
+                f"response_status=failed\n"
+                f"response_status_details={json.dumps(err, ensure_ascii=False)}"
             )
 
             # Trigger immediate fallback to Edge-TTS if there was an active turn request
@@ -2631,31 +2700,44 @@ class AstroRealtimeNode(Node):
         return res
 
     def _classify_and_store_vision_observation(self, obs: str, event_type: str):
-        """Classifies vision observation as ephemeral, important, or durable and prevents trivial memory pollution."""
+        """Classifies vision observation as ephemeral, important, or durable with repetition gating."""
         if not obs:
             return
 
         obs_clean = obs.strip()
         obs_lower = obs_clean.lower()
 
-        # Reject trivial patterns from polluting long-term memory
+        # Reject trivial / ephemeral patterns from polluting long-term durable memory
         trivial_patterns = [
             "aydınlık", "karanlık", "ışık var", "oda aydınlık", "oda karanlık",
-            "görüntü net", "bir şey yok", "boş", "normal", "net değil", "görüntü alındı"
+            "görüntü net", "bir şey yok", "boş", "normal", "net değil", "görüntü alındı",
+            "sandalye var", "koltuk görünüyor", "beyaz kapı var", "oda boş görünüyor",
+            "duvar", "zemin", "tavan", "masa var"
         ]
         is_trivial = (
-            len(obs_clean.split()) <= 3
+            len(obs_clean.split()) <= 4
             and any(tp in obs_lower for tp in trivial_patterns)
-        ) or obs_lower in ("aydınlık.", "karanlık.", "aydınlık", "karanlık")
+        ) or obs_lower in ("aydınlık.", "karanlık.", "aydınlık", "karanlık", "boş", "oda boş")
 
-        if is_trivial:
+        if is_trivial and event_type not in ("explicit_vision_query", "user_prompted_vision"):
             self.get_logger().debug(f"👁️ [Görsel Filtre (Ephemeral)]: Önemsiz/Düşük değerli gözlem ('{obs_clean}') uzun vadeli hafızaya kaydedilmedi.")
             return
 
-        # Meaningful environmental fact -> Save to Profile Memory
-        self.memory.profile.add_observation(f"Görsel Çevre ({event_type}): {obs_clean}")
-        self.get_logger().info(f"👁️🧠 [Görsel Hafıza Kaydı (Durable)]: Astro çevreyi kaydetti -> \"{obs_clean}\"")
-        self._sync_perception_to_session()
+        # Durable vision memory gating: Require repeated observations (>= 3) for passive environmental facts
+        if not hasattr(self, "_scene_observation_counts"):
+            self._scene_observation_counts = {}
+
+        norm_key = re.sub(r"[^\w\s]", "", obs_lower).strip()
+        self._scene_observation_counts[norm_key] = self._scene_observation_counts.get(norm_key, 0) + 1
+        count = self._scene_observation_counts[norm_key]
+
+        is_explicit = event_type in ("explicit_vision_query", "user_prompted_vision", "user_preference")
+        if count >= 3 or is_explicit:
+            self.memory.profile.add_observation(f"Görsel Çevre ({event_type}): {obs_clean}")
+            self.get_logger().info(f"👁️🧠 [Görsel Hafıza Kaydı (Durable)]: Astro çevreyi kaydetti (Tekrar: {count}) -> \"{obs_clean}\"")
+            self._sync_perception_to_session()
+        else:
+            self.get_logger().debug(f"👁️ [Görsel Ephemeral]: Gözlem tekrar sayısı ({count}/3) yetersiz, kalıcı hafızaya henüz yazılmadı.")
 
     def _idle_learning_loop(self):
         """Background loop for cognitive memory consolidation (0 camera calls / 0 Gemini Vision cost).
@@ -4467,7 +4549,7 @@ class AstroRealtimeNode(Node):
         old_dist = getattr(self, "_last_seen_distance", 0.0)
         if abs(new_dist - old_dist) >= 0.60:
             self._last_seen_distance = new_dist
-            threading.Thread(target=self._evaluate_vision_event, args=("person_approached",), daemon=True).start()
+            # Local perception tracking (No cloud vision triggered purely by approach)
         self._user_distance = new_dist
 
     def _on_doa(self, msg: Float32):

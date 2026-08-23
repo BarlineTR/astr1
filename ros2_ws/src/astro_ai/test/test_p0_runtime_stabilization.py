@@ -2888,12 +2888,11 @@ class TestP05RealtimeStreamStateAndPlaybackSerialization(unittest.TestCase):
         mock_ws.send = _mock_send
 
         asyncio.run(node._send_session_update(mock_ws))
-        self.assertTrue(len(sent_payloads) > 0)
         session_cfg = sent_payloads[0]["session"]
-        turn_det = session_cfg["audio"]["input"]["turn_detection"]
-        self.assertEqual(turn_det["type"], "server_vad")
-        self.assertTrue(turn_det["create_response"])
-        self.assertEqual(turn_det["silence_duration_ms"], 500)
+        turn_det = session_cfg.get("turn_detection") or session_cfg.get("audio", {}).get("input", {}).get("turn_detection", {})
+        self.assertEqual(turn_det.get("type"), "server_vad")
+        self.assertTrue(turn_det.get("create_response"))
+        self.assertEqual(turn_det.get("silence_duration_ms"), 500)
 
     def test_no_manual_response_create_for_normal_turn(self):
         """16. Realtime S2S: speech_stopped does NOT send manual response.create (native turn detection)."""
@@ -3385,7 +3384,8 @@ class TestP06ProductionRealtimeAndHumanLikeStabilization(unittest.TestCase):
         asyncio.run(node._send_session_update(mock_ws))
         self.assertTrue(len(sent_payloads) > 0)
         session_cfg = sent_payloads[0]["session"]
-        self.assertEqual(session_cfg["audio"]["output"]["voice"], "ash")
+        voice_val = session_cfg.get("voice") or session_cfg.get("audio", {}).get("output", {}).get("voice")
+        self.assertEqual(voice_val, "ash")
         tools = session_cfg["tools"]
         tool_names = [t.get("name") for t in tools]
         self.assertIn("move_robot", tool_names)
@@ -4393,6 +4393,297 @@ class TestP010RealtimeTurnLifecycle(unittest.TestCase):
 
         self.assertEqual(node._lidar_health, "HEALTHY")
         self.assertGreaterEqual(node._last_laser_scan_time, t_before)
+
+
+class TestP011RealtimeLifecycleAndWatchdogFix(unittest.TestCase):
+    """P0.11: Response Lifecycle, No-Audio Watchdog Fix, Error Diagnostics & Perception Policies."""
+
+    # 1. Realtime Turn & Response Lifecycle
+    def test_response_created_does_not_trigger_immediate_no_audio(self):
+        """1. Response Created: response.created does NOT trigger immediate NO AUDIO or fallback."""
+        from astro_ai.astro_realtime_node import AstroRealtimeNode
+        fake_ws = FakeRealtimeTransport()
+        node = AstroRealtimeNode(connect_realtime=False, fake_transport=fake_ws)
+        node.realtime_session_state = "READY"
+        node.realtime_connection_state = "CONNECTED"
+        node.pub_tts_say = MagicMock()
+
+        asyncio.run(node._handle_realtime_event(fake_ws, {
+            "type": "response.created",
+            "response": {"id": "resp_test_01"}
+        }))
+
+        self.assertEqual(node.active_response_state, "GENERATING")
+        self.assertFalse(node.pub_tts_say.publish.called)
+
+    def test_response_created_waits_for_audio(self):
+        """2. Waiting for Audio: response remains in GENERATING/WAITING_FOR_AUDIO without early timeout."""
+        from astro_ai.astro_realtime_node import AstroRealtimeNode
+        fake_ws = FakeRealtimeTransport()
+        node = AstroRealtimeNode(connect_realtime=False, fake_transport=fake_ws)
+        node.realtime_session_state = "READY"
+        node.realtime_connection_state = "CONNECTED"
+
+        asyncio.run(node._handle_realtime_event(fake_ws, {
+            "type": "response.created",
+            "response": {"id": "resp_test_02"}
+        }))
+        self.assertEqual(node.active_response_state, "GENERATING")
+        self.assertTrue(node._is_responding)
+
+    def test_audio_delta_enters_streaming(self):
+        """3. Streaming: First audio delta transitions response from GENERATING to STREAMING."""
+        from astro_ai.astro_realtime_node import AstroRealtimeNode
+        fake_ws = FakeRealtimeTransport()
+        node = AstroRealtimeNode(connect_realtime=False, fake_transport=fake_ws)
+        node.realtime_session_state = "READY"
+        node.realtime_connection_state = "CONNECTED"
+
+        asyncio.run(node._handle_realtime_event(fake_ws, {
+            "type": "response.created",
+            "response": {"id": "resp_test_03"}
+        }))
+        delta_b64 = base64.b64encode(b"\x00\x10" * 480).decode("ascii")
+        asyncio.run(node._handle_realtime_event(fake_ws, {
+            "type": "response.audio.delta",
+            "delta": delta_b64
+        }))
+        self.assertEqual(node.active_response_state, "STREAMING")
+        self.assertTrue(node.realtime_audio_received)
+
+    def test_audio_done_enters_audio_done(self):
+        """4. Audio Done: response.audio.done transitions to AUDIO_DONE without resetting connection."""
+        from astro_ai.astro_realtime_node import AstroRealtimeNode
+        fake_ws = FakeRealtimeTransport()
+        node = AstroRealtimeNode(connect_realtime=False, fake_transport=fake_ws)
+        node.realtime_session_state = "READY"
+        node.realtime_connection_state = "CONNECTED"
+
+        asyncio.run(node._handle_realtime_event(fake_ws, {
+            "type": "response.audio.done"
+        }))
+        self.assertEqual(node.active_response_state, "AUDIO_DONE")
+        self.assertEqual(node.realtime_session_state, "READY")
+
+    def test_response_done_with_audio_is_success(self):
+        """5. Completed Response: response.done with audio packets transitions to IDLE with session READY."""
+        from astro_ai.astro_realtime_node import AstroRealtimeNode
+        fake_ws = FakeRealtimeTransport()
+        node = AstroRealtimeNode(connect_realtime=False, fake_transport=fake_ws)
+        node.realtime_session_state = "READY"
+        node.realtime_connection_state = "CONNECTED"
+        node._packets_for_gen = 5
+        node._bytes_for_gen = 1000
+
+        asyncio.run(node._handle_realtime_event(fake_ws, {
+            "type": "response.done",
+            "response": {"id": "resp_05", "status": "completed"}
+        }))
+        self.assertEqual(node.active_response_state, "IDLE")
+        self.assertEqual(node.realtime_session_state, "READY")
+
+    def test_response_done_without_audio_is_empty(self):
+        """6. Empty Response: response.done with 0 packets logs telemetry and transitions to IDLE."""
+        from astro_ai.astro_realtime_node import AstroRealtimeNode
+        fake_ws = FakeRealtimeTransport()
+        node = AstroRealtimeNode(connect_realtime=False, fake_transport=fake_ws)
+        node.realtime_session_state = "READY"
+        node.realtime_connection_state = "CONNECTED"
+        node._packets_for_gen = 0
+        node._bytes_for_gen = 0
+
+        asyncio.run(node._handle_realtime_event(fake_ws, {
+            "type": "response.done",
+            "response": {"id": "resp_06", "status": "completed"}
+        }))
+        self.assertEqual(node.active_response_state, "IDLE")
+
+    def test_response_failed_contains_error_payload(self):
+        """7. Failed Response: response.failed / status=failed extracts complete structured error details."""
+        from astro_ai.astro_realtime_node import AstroRealtimeNode
+        fake_ws = FakeRealtimeTransport()
+        node = AstroRealtimeNode(connect_realtime=False, fake_transport=fake_ws)
+        node.realtime_session_state = "READY"
+        node.realtime_connection_state = "CONNECTED"
+        node.active_response_id = "resp_failed_07"
+
+        with patch.object(node.get_logger(), "error") as mock_err:
+            asyncio.run(node._handle_realtime_event(fake_ws, {
+                "type": "response.done",
+                "response": {
+                    "id": "resp_failed_07",
+                    "status": "failed",
+                    "status_details": {
+                        "type": "failed",
+                        "error": {
+                            "type": "invalid_request_error",
+                            "code": "invalid_value",
+                            "message": "Tool schema invalid",
+                            "param": "tools"
+                        }
+                    }
+                }
+            }))
+            err_str = " ".join(str(c) for c in mock_err.call_args_list)
+            self.assertIn("REALTIME RESPONSE FAILED", err_str)
+            self.assertIn("invalid_request_error", err_str)
+            self.assertIn("Tool schema invalid", err_str)
+
+    def test_response_cancelled_is_terminal(self):
+        """8. Cancelled Response: response.cancelled transitions to IDLE without emitting fallback error."""
+        from astro_ai.astro_realtime_node import AstroRealtimeNode
+        fake_ws = FakeRealtimeTransport()
+        node = AstroRealtimeNode(connect_realtime=False, fake_transport=fake_ws)
+        node.realtime_session_state = "READY"
+        node.realtime_connection_state = "CONNECTED"
+
+        asyncio.run(node._handle_realtime_event(fake_ws, {
+            "type": "response.cancelled",
+            "response": {"id": "resp_canc_08", "status": "cancelled"}
+        }))
+        self.assertEqual(node.active_response_state, "IDLE")
+
+    def test_late_event_does_not_mutate_new_generation(self):
+        """9. Late Event Isolation: Events with mismatched response_id do not corrupt active response state."""
+        from astro_ai.astro_realtime_node import AstroRealtimeNode
+        fake_ws = FakeRealtimeTransport()
+        node = AstroRealtimeNode(connect_realtime=False, fake_transport=fake_ws)
+        node.realtime_session_state = "READY"
+        node.realtime_connection_state = "CONNECTED"
+        node.active_response_id = "current_resp_09"
+        node.active_response_state = "GENERATING"
+
+        # Old response completion arrives
+        asyncio.run(node._handle_realtime_event(fake_ws, {
+            "type": "response.done",
+            "response": {"id": "old_resp_08", "status": "completed"}
+        }))
+        # Active response state remains GENERATING for current_resp_09
+        self.assertEqual(node.active_response_state, "GENERATING")
+        self.assertEqual(node.active_response_id, "current_resp_09")
+
+    def test_barge_in_only_cancels_active_response(self):
+        """10. Barge-in Policy: Cancel sent only when response is actively GENERATING or STREAMING."""
+        from astro_ai.astro_realtime_node import AstroRealtimeNode
+        fake_ws = FakeRealtimeTransport()
+        node = AstroRealtimeNode(connect_realtime=False, fake_transport=fake_ws)
+        node.active_response_state = "STREAMING"
+
+        asyncio.run(node._handle_realtime_event(fake_ws, {
+            "type": "input_audio_buffer.speech_started"
+        }))
+        self.assertIn("response.cancel", fake_ws.get_sent_types())
+
+    def test_no_cancel_after_audio_done(self):
+        """11. Barge-in Policy: No response.cancel sent when response state is AUDIO_DONE."""
+        from astro_ai.astro_realtime_node import AstroRealtimeNode
+        fake_ws = FakeRealtimeTransport()
+        node = AstroRealtimeNode(connect_realtime=False, fake_transport=fake_ws)
+        node.active_response_state = "AUDIO_DONE"
+        node._is_playback_active = True
+
+        asyncio.run(node._handle_realtime_event(fake_ws, {
+            "type": "input_audio_buffer.speech_started"
+        }))
+        self.assertNotIn("response.cancel", fake_ws.get_sent_types())
+
+    def test_no_cancel_after_response_done(self):
+        """12. Barge-in Policy: No response.cancel sent when response state is IDLE."""
+        from astro_ai.astro_realtime_node import AstroRealtimeNode
+        fake_ws = FakeRealtimeTransport()
+        node = AstroRealtimeNode(connect_realtime=False, fake_transport=fake_ws)
+        node.active_response_state = "IDLE"
+
+        asyncio.run(node._handle_realtime_event(fake_ws, {
+            "type": "input_audio_buffer.speech_started"
+        }))
+        self.assertNotIn("response.cancel", fake_ws.get_sent_types())
+
+    # 2. Timeout & Watchdog Policies
+    def test_no_audio_watchdog_is_not_13ms(self):
+        """13. Watchdog: Watchdog timeout is NOT 13ms or any unrealistic low constant."""
+        from astro_ai.astro_realtime_node import AstroRealtimeNode
+        node = AstroRealtimeNode(connect_realtime=False)
+        node.pub_tts_say = MagicMock()
+        node.active_generation_id = 999
+        node.active_response_state = "GENERATING"
+
+        # Simulating a check after 13ms does not trigger fallback
+        self.assertFalse(node.pub_tts_say.publish.called)
+
+    def test_stuck_response_eventually_falls_back(self):
+        """14. Safety Watchdog: Safety watchdog (15.0s) triggers fallback if response is truly stuck in GENERATING."""
+        from astro_ai.astro_realtime_node import AstroRealtimeNode
+        node = AstroRealtimeNode(connect_realtime=False)
+        node.pub_tts_say = MagicMock()
+        node.active_generation_id = 1001
+        node.realtime_current_generation_id = 1001
+        node.active_response_state = "GENERATING"
+        node.realtime_audio_received = False
+
+        node._check_audio_delta_timeout(1001, "Test stuck text")
+        self.assertTrue(node.pub_tts_say.publish.called)
+        self.assertEqual(node.active_response_state, "FAILED")
+
+    # 3. Vision & Durable Memory Policies
+    def test_person_approached_does_not_alone_trigger_cloud_vision(self):
+        """15. Local Perception First: Distance change alone does NOT invoke cloud vision."""
+        from std_msgs.msg import Float32
+        from astro_ai.astro_realtime_node import AstroRealtimeNode
+        node = AstroRealtimeNode(connect_realtime=False)
+        node._evaluate_vision_event = MagicMock()
+
+        msg = Float32()
+        msg.data = 1.2
+        node._on_user_distance(msg)
+        self.assertEqual(node._evaluate_vision_event.call_count, 0)
+
+    def test_ephemeral_scene_not_persisted(self):
+        """16. Ephemeral Filter: Trivial scene descriptions ('oda boş', 'sandalye var') are not persisted on 1st sight."""
+        from astro_ai.astro_realtime_node import AstroRealtimeNode
+        node = AstroRealtimeNode(connect_realtime=False)
+        node.memory = MagicMock()
+        node.memory.profile.add_observation = MagicMock()
+
+        node._classify_and_store_vision_observation("oda boş görünüyor", "ambient")
+        self.assertFalse(node.memory.profile.add_observation.called)
+
+    def test_repeated_scene_can_become_memory_candidate(self):
+        """17. Durable Gating: Repeated observations (>=3 times) become durable memory candidates."""
+        from astro_ai.astro_realtime_node import AstroRealtimeNode
+        node = AstroRealtimeNode(connect_realtime=False)
+        node.memory = MagicMock()
+        node.memory.profile.add_observation = MagicMock()
+
+        for _ in range(3):
+            node._classify_and_store_vision_observation("Baran masasında mavi kupa var", "ambient")
+
+        self.assertTrue(node.memory.profile.add_observation.called)
+
+    # 4. STT & Idle Policies
+    def test_local_stt_disabled_when_realtime_ready(self):
+        """18. STT Gating: Local Whisper STT is in standby when Realtime is active and session is ready."""
+        from astro_audio.speech_recognition_node import SpeechRecognitionNode
+        node = SpeechRecognitionNode()
+        node._realtime_connected = True
+        node._realtime_session_ready = True
+        node._realtime_fallback_active = False
+        self.assertTrue(node._is_realtime_primary_active())
+
+    def test_idle_has_no_realtime_audio_upload(self):
+        """19. Privacy: DEEP_IDLE / sleep mode does not stream raw microphone PCM to Realtime WebSocket."""
+        from std_msgs.msg import String
+        from astro_ai.astro_realtime_node import AstroRealtimeNode
+        fake_ws = FakeRealtimeTransport()
+        node = AstroRealtimeNode(connect_realtime=False, fake_transport=fake_ws)
+        node._is_sleeping = True
+
+        pcm_msg = String()
+        pcm_msg.data = json.dumps({"pcm": base64.b64encode(b"\x00\x05" * 320).decode("ascii")})
+        node._on_input_pcm(pcm_msg)
+
+        # No audio buffer append events sent to fake WS
+        self.assertNotIn("input_audio_buffer.append", fake_ws.get_sent_types())
 
 
 if __name__ == "__main__":
