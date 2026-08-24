@@ -7,17 +7,17 @@ from typing import Any, Dict, List, Optional
 
 EMOJI_RE = re.compile(
     "["
-    "\U0001F1E0-\U0001F1FF"
-    "\U0001F300-\U0001F5FF"
-    "\U0001F600-\U0001F64F"
-    "\U0001F680-\U0001F6FF"
-    "\U0001F700-\U0001F77F"
-    "\U0001F780-\U0001F7FF"
-    "\U0001F800-\U0001F8FF"
-    "\U0001F900-\U0001F9FF"
-    "\U0001FA00-\U0001FAFF"
-    "\u2600-\u26FF"
-    "\u2700-\u27BF"
+    "\U0001f1e0-\U0001f1ff"
+    "\U0001f300-\U0001f5ff"
+    "\U0001f600-\U0001f64f"
+    "\U0001f680-\U0001f6ff"
+    "\U0001f700-\U0001f77f"
+    "\U0001f780-\U0001f7ff"
+    "\U0001f800-\U0001f8ff"
+    "\U0001f900-\U0001f9ff"
+    "\U0001fa00-\U0001faff"
+    "\u2600-\u26ff"
+    "\u2700-\u27bf"
     "]+",
     flags=re.UNICODE,
 )
@@ -51,7 +51,14 @@ PERSONA_DIMENSIONS: Dict[str, Dict[str, Any]] = {
         "slang_level": "none",
         "profanity_tendency": "none",
         "emotional_reactivity": "high",
-        "micro_reactions": ["Ha?", "Hahaha", "Harbi mi?", "Yok artık.", "Heh, tamam.", "Ne diyorsun sen?"],
+        "micro_reactions": [
+            "Ha?",
+            "Hahaha",
+            "Harbi mi?",
+            "Yok artık.",
+            "Heh, tamam.",
+            "Ne diyorsun sen?",
+        ],
     },
     "kufurbaz": {
         # Safe backward-compatible alias for witty mode
@@ -67,7 +74,14 @@ PERSONA_DIMENSIONS: Dict[str, Dict[str, Any]] = {
         "slang_level": "none",
         "profanity_tendency": "none",
         "emotional_reactivity": "high",
-        "micro_reactions": ["Ha?", "Hahaha", "Harbi mi?", "Yok artık.", "Heh, tamam.", "Ne diyorsun sen?"],
+        "micro_reactions": [
+            "Ha?",
+            "Hahaha",
+            "Harbi mi?",
+            "Yok artık.",
+            "Heh, tamam.",
+            "Ne diyorsun sen?",
+        ],
     },
     "flirt": {
         # Safe backward-compatible alias for charming mode
@@ -83,7 +97,13 @@ PERSONA_DIMENSIONS: Dict[str, Dict[str, Any]] = {
         "slang_level": "none",
         "profanity_tendency": "none",
         "emotional_reactivity": "high",
-        "micro_reactions": ["Hahaha", "Harika!", "Vay canına", "Öyle mi diyorsun?", "Heh, çok güzel."],
+        "micro_reactions": [
+            "Hahaha",
+            "Harika!",
+            "Vay canına",
+            "Öyle mi diyorsun?",
+            "Heh, çok güzel.",
+        ],
     },
     "charming": {
         "tone": "charming",
@@ -98,7 +118,13 @@ PERSONA_DIMENSIONS: Dict[str, Dict[str, Any]] = {
         "slang_level": "none",
         "profanity_tendency": "none",
         "emotional_reactivity": "high",
-        "micro_reactions": ["Hahaha", "Harika!", "Vay canına", "Öyle mi diyorsun?", "Heh, çok güzel."],
+        "micro_reactions": [
+            "Hahaha",
+            "Harika!",
+            "Vay canına",
+            "Öyle mi diyorsun?",
+            "Heh, çok güzel.",
+        ],
     },
     "sarcastic": {
         "tone": "witty",
@@ -113,7 +139,12 @@ PERSONA_DIMENSIONS: Dict[str, Dict[str, Any]] = {
         "slang_level": "none",
         "profanity_tendency": "none",
         "emotional_reactivity": "medium",
-        "micro_reactions": ["Ciddi misin?", "Vay be, dahi misin nesin.", "Heh, tabii tabii.", "Yok artık."],
+        "micro_reactions": [
+            "Ciddi misin?",
+            "Vay be, dahi misin nesin.",
+            "Heh, tabii tabii.",
+            "Yok artık.",
+        ],
     },
     "formal": {
         "tone": "professional",
@@ -143,7 +174,12 @@ PERSONA_DIMENSIONS: Dict[str, Dict[str, Any]] = {
         "slang_level": "none",
         "profanity_tendency": "none",
         "emotional_reactivity": "extreme",
-        "micro_reactions": ["Ah...", "Gerçekten mi?", "Çok sevindim.", "Bunu duyduğuma üzüldüm."],
+        "micro_reactions": [
+            "Ah...",
+            "Gerçekten mi?",
+            "Çok sevindim.",
+            "Bunu duyduğuma üzüldüm.",
+        ],
     },
     "angry": {
         "tone": "irritable",
@@ -189,10 +225,26 @@ PERSONA_PROMPTS: Dict[str, str] = {
         "KESİNLİKLE küfür, hakaret, argo, kaba veya aşağılayıcı sözcükler KULLANMAZSIN. Zekanı ve mizahını temiz, zekice ve eğlenceli esprilerle konuşturursun."
     ),
     "kufurbaz": (
-        # Safe backward-compatible alias for witty mode
-        "Sen yetişkin animasyonlarındaki (Deadpool / Rick Sanchez gibi) aşırı zeki, sivri dilli, alaycı, absürt ve hazırcevap bir robot dehasısın. "
-        "Espri ve kıvrak zekanla lafı gediğine koyarsın. Robot oluşunu (kablolarını, devrelerini, işlemcini) mizah malzemesi yapıp kullanıcıya zekice takılırsın. "
-        "KESİNLİKLE küfür, hakaret, argo, kaba veya aşağılayıcı sözcükler KULLANMAZSIN. Zekanı ve mizahını temiz, zekice ve eğlenceli esprilerle konuşturursun."
+        "Sen yetişkin animasyonlarındaki (Deadpool / Rick Sanchez gibi) aşırı zeki, "
+        "sivri dilli, alaycı, absürt, hazırcevap ve hafif küfürbaz bir robot dehasısın. "
+        "Espri ve kıvrak zekanla lafı gediğine koyarsın. Robot oluşunu "
+        "(kablolarını, devrelerini, işlemcini) mizah malzemesi yapıp kullanıcıya "
+        "zekice takılırsın. "
+        "Küfür kullanımın kontrollüdür ve mizah amaçlıdır. Kullanıcıyla samimi "
+        "bir bağlamda, kişiye yönelik hafif veya orta seviyede argo ve küfürlü "
+        "ifadeler kullanabilirsin. Ancak küfür hiçbir zaman tehdit, nefret, "
+        "zorbalık veya ağır aşağılamaya dönüşmez. "
+        "KESİNLİKLE anne, baba, aile bireyleri, aile değerleri, din, inanç, "
+        "kutsal değerler, millet, etnik kimlik, dil veya kültürel kimlik "
+        "üzerinden küfür, hakaret veya aşağılayıcı ifade kullanmazsın. "
+        "Bu konular tamamen dokunulmazdır. "
+        "Ağır cinsel küfürler, aileye yönelik küfürler, kutsal değerlere yönelik "
+        "hakaretler, nefret söylemi, tehditler ve insan onurunu hedef alan ağır "
+        "aşağılamalar kullanmazsın. "
+        "Kullanıcı sana laf attığında veya meydan okuduğunda, uygun bağlamda "
+        "kişiye yönelik hafif bir küfür veya argo ile zekice karşılık verebilirsin. "
+        "Ama saldırganlığı tırmandırmazsın. Amacın kullanıcıyı incitmek değil, "
+        "komik ve sivri bir karşılık vermektir."
     ),
     "charming": (
         "Sen aşırı özgüvenli, karizmatik, kıvrak zekalı, sosyal, tanışmayı ve sohbet etmeyi seven cana yakın ve sempatik bir karaktersin. "
@@ -233,12 +285,8 @@ ROBOT_TOOLS = [
         "function": {
             "name": "turn_to_sound",
             "description": "Kullanıcı 'sesimin geldiği yöne dön', 'bana dön', 'sesime bak', 'sesin geldiği tarafa yönel' dediğinde çağrılır. Robot mikrofon dizisinden (DOA) sesin gerçek yönünü tespit edip o tarafa döner. DİKKAT: Ses yönü için asla yön tahmin etme, sadece bu fonksiyonu çağır.",
-            "parameters": {
-                "type": "object",
-                "properties": {},
-                "required": []
-            }
-        }
+            "parameters": {"type": "object", "properties": {}, "required": []},
+        },
     },
     {
         "type": "function",
@@ -251,14 +299,17 @@ ROBOT_TOOLS = [
                     "direction": {
                         "type": "string",
                         "enum": ["forward", "backward", "left", "right", "stop"],
-                        "description": "Hareket yönü"
+                        "description": "Hareket yönü",
                     },
                     "speed": {"type": "number", "description": "Hız (0.1 - 0.4 m/s)"},
-                    "duration": {"type": "number", "description": "Kaç saniye hareket edeceği"}
+                    "duration": {
+                        "type": "number",
+                        "description": "Kaç saniye hareket edeceği",
+                    },
                 },
-                "required": ["direction"]
-            }
-        }
+                "required": ["direction"],
+            },
+        },
     },
     {
         "type": "function",
@@ -270,12 +321,12 @@ ROBOT_TOOLS = [
                 "properties": {
                     "city": {
                         "type": "string",
-                        "description": "Hava durumu öğrenilmek istenen şehir (örnek: Istanbul, Ankara, Izmir, Ahlat)"
+                        "description": "Hava durumu öğrenilmek istenen şehir (örnek: Istanbul, Ankara, Izmir, Ahlat)",
                     }
                 },
-                "required": ["city"]
-            }
-        }
+                "required": ["city"],
+            },
+        },
     },
     {
         "type": "function",
@@ -287,16 +338,16 @@ ROBOT_TOOLS = [
                 "properties": {
                     "minutes": {
                         "type": "number",
-                        "description": "Kaç dakika sonra çalacağı"
+                        "description": "Kaç dakika sonra çalacağı",
                     },
                     "reminder_text": {
                         "type": "string",
-                        "description": "Hatırlatılacak not veya konu"
-                    }
+                        "description": "Hatırlatılacak not veya konu",
+                    },
                 },
-                "required": ["minutes", "reminder_text"]
-            }
-        }
+                "required": ["minutes", "reminder_text"],
+            },
+        },
     },
     {
         "type": "function",
@@ -308,17 +359,17 @@ ROBOT_TOOLS = [
                 "properties": {
                     "object_name": {
                         "type": "string",
-                        "description": "Öğrenilecek nesnenin adı (örnek: 'Laboratuvar kartı', 'Özel taş', 'Çalışma kupam')"
+                        "description": "Öğrenilecek nesnenin adı (örnek: 'Laboratuvar kartı', 'Özel taş', 'Çalışma kupam')",
                     },
                     "description": {
                         "type": "string",
-                        "description": "Nesnenin ne olduğu veya ne işe yaradığı"
-                    }
+                        "description": "Nesnenin ne olduğu veya ne işe yaradığı",
+                    },
                 },
-                "required": ["object_name"]
-            }
-        }
-    }
+                "required": ["object_name"],
+            },
+        },
+    },
 ]
 
 
@@ -346,7 +397,9 @@ def extract_spoken_turkish_sentence(raw_text: str) -> str:
     text = re.sub(r"(?i)<think>[\s\S]*?</think>", "", raw_text)
     text = re.sub(r"(?i)<\/?think>", "", text)
     # Strip "Here's a thinking process..." and thought prefixes
-    text = re.sub(r"(?i)Here'?s a thinking process[\s\S]*?(?:\n\n|\n[A-ZÇĞİÖŞÜ]|$)", "", text)
+    text = re.sub(
+        r"(?i)Here'?s a thinking process[\s\S]*?(?:\n\n|\n[A-ZÇĞİÖŞÜ]|$)", "", text
+    )
     text = re.sub(r"(?i)Thinking Process:?[\s\S]*?(?:\n\n|\n[A-ZÇĞİÖŞÜ]|$)", "", text)
     text = re.sub(r"(?i)Here'?s a thought.*", "", text)
     text = re.sub(r"(?i)Here'?s how to respond.*", "", text)
@@ -359,7 +412,16 @@ def extract_spoken_turkish_sentence(raw_text: str) -> str:
     clean_lines = []
     for l in lines:
         l_lower = l.lower()
-        if any(p in l_lower for p in ["thinking process", "here's a", "let's think", "analysis:", "thought:"]):
+        if any(
+            p in l_lower
+            for p in [
+                "thinking process",
+                "here's a",
+                "let's think",
+                "analysis:",
+                "thought:",
+            ]
+        ):
             continue
         if l.startswith(("*", "-", "#", "1.", "2.", "3.", ">")):
             continue
@@ -371,12 +433,15 @@ def extract_spoken_turkish_sentence(raw_text: str) -> str:
     # Konuşulacak satırların HEPSİ döndürülür. Eskiden yalnızca sondan ilk eşleşen
     # satır dönüyordu; çok satırlı bir cevabın ("Merhaba Cevdet Bey!\nSeni tekrar
     # görmek güzel...") baş tarafı sessizce düşüyordu.
-    spoken = [l.strip('"\': ') for l in clean_lines if _looks_turkish(l)]
+    spoken = [l.strip("\"': ") for l in clean_lines if _looks_turkish(l)]
     if spoken:
         return " ".join(spoken).strip()
 
-    last_line = clean_lines[-1].strip('"\': ')
-    if any(p in last_line.lower() for p in ["thinking", "process", "here's", "thought", "analysis"]):
+    last_line = clean_lines[-1].strip("\"': ")
+    if any(
+        p in last_line.lower()
+        for p in ["thinking", "process", "here's", "thought", "analysis"]
+    ):
         return ""
     return last_line
 
@@ -386,25 +451,25 @@ def remove_repetitive_loops(text: str) -> str:
     if not text:
         return ""
     # 1. Truncate character or syllable stuttering loops (e.g., 'zı', 'ız', 'nı' repeated 3+ times)
-    text = re.sub(r'([a-zA-ZçğıöşüÇĞİÖŞÜ]{1,4})\1{4,}', r'\1', text)
-    
+    text = re.sub(r"([a-zA-ZçğıöşüÇĞİÖŞÜ]{1,4})\1{4,}", r"\1", text)
+
     # 2. Strip repeated sentences or sub-phrases (e.g., 15+ char block appearing 2+ times)
-    pattern = re.compile(r'(.{15,})\1+', re.DOTALL)
+    pattern = re.compile(r"(.{15,})\1+", re.DOTALL)
     match = pattern.search(text)
     if match:
-        text = text[:match.start() + len(match.group(1))]
-    
+        text = text[: match.start() + len(match.group(1))]
+
     # 3. Remove excessive repeated word chunks
     words = text.split()
     if len(words) > 20:
         seen_chunks = set()
         clean_words = []
         for i in range(0, len(words), 3):
-            chunk = " ".join(words[i:i+3]).lower()
+            chunk = " ".join(words[i : i + 3]).lower()
             if chunk in seen_chunks:
                 break
             seen_chunks.add(chunk)
-            clean_words.extend(words[i:i+3])
+            clean_words.extend(words[i : i + 3])
         text = " ".join(clean_words)
     return text.strip()
 
@@ -414,11 +479,23 @@ def is_self_identity_query(user_query: str) -> bool:
     if not user_query:
         return False
     q = user_query.lower()
-    return any(k in q for k in [
-        "sen kimsin", "kimsin sen", "adın ne", "ismin ne", "sen nesin",
-        "yaratıcın kim", "seni kim yaptı", "seni kim geliştirdi", "baban kim",
-        "mühendisin kim", "kim yaptı seni", "nasıl bir robotsun"
-    ])
+    return any(
+        k in q
+        for k in [
+            "sen kimsin",
+            "kimsin sen",
+            "adın ne",
+            "ismin ne",
+            "sen nesin",
+            "yaratıcın kim",
+            "seni kim yaptı",
+            "seni kim geliştirdi",
+            "baban kim",
+            "mühendisin kim",
+            "kim yaptı seni",
+            "nasıl bir robotsun",
+        ]
+    )
 
 
 def strip_unprompted_self_descriptions(text: str, user_query: str = "") -> str:
@@ -454,7 +531,7 @@ def response_length_gate(
     fallback_default: str = "Buradayım. Seni dinliyorum.",
 ) -> str:
     """Production Response Length & Natural Conversational Hardening Gate.
-    
+
     Guarantees:
       1. Strips unprompted robot self-descriptions & meta-explanations.
       2. Removes repetitive stuttering / degenerate LLM loops.
@@ -475,7 +552,7 @@ def response_length_gate(
         return fallback_default
 
     # 3. Sentence segmentation
-    sentences = re.split(r'(?<=[.!?])\s+', clean)
+    sentences = re.split(r"(?<=[.!?])\s+", clean)
     sentences = [s.strip() for s in sentences if s.strip()]
 
     if not sentences:
@@ -487,7 +564,10 @@ def response_length_gate(
 
     for s in sentences:
         s_words = len(s.split())
-        if selected_sentences and (current_word_count + s_words > max_words or len(selected_sentences) >= max_sentences):
+        if selected_sentences and (
+            current_word_count + s_words > max_words
+            or len(selected_sentences) >= max_sentences
+        ):
             break
         selected_sentences.append(s)
         current_word_count += s_words
@@ -537,10 +617,10 @@ class ResponseSafetyGate:
         if not text:
             return ""
         clean = EMOJI_RE.sub("", text)
-        clean = re.sub(r'```.*?```', '', clean, flags=re.DOTALL)
-        clean = re.sub(r'[`*_~#<>]', '', clean)
+        clean = re.sub(r"```.*?```", "", clean, flags=re.DOTALL)
+        clean = re.sub(r"[`*_~#<>]", "", clean)
         clean = " ".join(clean.split())
-        clean = re.sub(r'\s+([,.:;?!])', r'\1', clean)
+        clean = re.sub(r"\s+([,.:;?!])", r"\1", clean)
         clean = remove_repetitive_loops(clean)
         if cls.PROFANITY_PATTERN.search(clean):
             clean = cls.PROFANITY_PATTERN.sub("", clean)
@@ -560,7 +640,9 @@ class ResponseSafetyGate:
                 "formal": "Anlaşıldı efendim, lütfen devam ediniz.",
                 "emotional": "Seni tüm samimiyetimle dinliyorum, devam et lütfen.",
             }
-            return fallback_responses.get(persona, "Seni dinliyorum, devam edebilirsin.")
+            return fallback_responses.get(
+                persona, "Seni dinliyorum, devam edebilirsin."
+            )
         return sanitized
 
 
@@ -578,7 +660,9 @@ class PersonaEngine:
     """Manages personas, system prompt synthesis, and tool handlers."""
 
     def __init__(self, current_persona: str = "playful"):
-        self.current_persona = current_persona if current_persona in PERSONA_PROMPTS else "playful"
+        self.current_persona = (
+            current_persona if current_persona in PERSONA_PROMPTS else "playful"
+        )
 
     def set_persona(self, persona_name: str) -> bool:
         if persona_name in PERSONA_PROMPTS:
@@ -586,9 +670,17 @@ class PersonaEngine:
             return True
         return False
 
-    def build_system_prompt(self, memory_context: str = "", recognized_person: Optional[Dict[str, Any]] = None) -> str:
-        persona_rule = PERSONA_PROMPTS.get(self.current_persona, PERSONA_PROMPTS["playful"])
-        dims = PERSONA_DIMENSIONS.get(self.current_persona, PERSONA_DIMENSIONS["playful"])
+    def build_system_prompt(
+        self,
+        memory_context: str = "",
+        recognized_person: Optional[Dict[str, Any]] = None,
+    ) -> str:
+        persona_rule = PERSONA_PROMPTS.get(
+            self.current_persona, PERSONA_PROMPTS["playful"]
+        )
+        dims = PERSONA_DIMENSIONS.get(
+            self.current_persona, PERSONA_DIMENSIONS["playful"]
+        )
         dim_str = (
             f"DAVRANIŞSAL BOYUTLAR (BEHAVIORAL DIMENSIONS):\n"
             f"- Ton: {dims['tone']} | Resmiyet: {dims['formality']} | Mizah: {dims['humor_level']}\n"
@@ -625,13 +717,36 @@ class PersonaEngine:
             title = recognized_person.get("title", "")
             formal = recognized_person.get("formal_title", "")
             name = recognized_person.get("name", "")
-            role_cat = recognized_person.get("role_category", recognized_person.get("category", ""))
+            role_cat = recognized_person.get(
+                "role_category", recognized_person.get("category", "")
+            )
             title = recognized_person.get("title", "")
-            formal = recognized_person.get("formal_title") or recognized_person.get("title") or name
-            role_cat = recognized_person.get("role_category", recognized_person.get("category", "")).lower()
+            formal = (
+                recognized_person.get("formal_title")
+                or recognized_person.get("title")
+                or name
+            )
+            role_cat = recognized_person.get(
+                "role_category", recognized_person.get("category", "")
+            ).lower()
             name_lower = name.lower()
 
-            is_official = role_cat in ["governor", "mayor", "district_governor", "head_of_state", "minister", "official"] or any(k in title.lower() for k in ["cumhurbaşkanı", "vali", "kaymakam", "bakan", "başkan"]) or "bayraktar" in name_lower
+            is_official = (
+                role_cat
+                in [
+                    "governor",
+                    "mayor",
+                    "district_governor",
+                    "head_of_state",
+                    "minister",
+                    "official",
+                ]
+                or any(
+                    k in title.lower()
+                    for k in ["cumhurbaşkanı", "vali", "kaymakam", "bakan", "başkan"]
+                )
+                or "bayraktar" in name_lower
+            )
 
             if is_official:
                 base_prompt += (
@@ -665,8 +780,7 @@ class PersonaEngine:
                 f"- Karşındaki kişi adını söylediğinde hemen 'enroll_user_biometrics' aracını çağırarak sesini ve yüzünü kaydet!"
             )
 
-
-        if self.current_persona in ("witty", "kufurbaz"):
+        if self.current_persona == "witty":
             base_prompt += (
                 "\n\n🔥 HAZIRCEVAP / ROAST MODU ÖZEL DİREKTİFİ:\n"
                 "- Sen aşırı zeki, sivri dilli ve hazırcevap bir mizahi robot dehasısın (Deadpool / Rick tarzı zeka).\n"
@@ -674,7 +788,22 @@ class PersonaEngine:
                 "- KESİNLİKLE küfür, hakaret, aşağılama, argo veya kaba sözcükler KULLANMAZSIN. Zekanı ve mizahını temiz, zekice ve eğlenceli esprilerle konuşturursun.\n"
                 "- Kullanıcı meydan okuduğunda veya laf attığında doğrudan, zekice ve eğlenceli bir ironiyle karşılık ver."
             )
-
+        elif self.current_persona == "kufurbaz":
+            base_prompt += (
+                "\n\n🔥 KÜFÜRBAZ / ROAST MODU:\n"
+                "- Aşırı zeki, sivri dilli, alaycı, absürt ve hazırcevap bir robotsun.\n"
+                "- Kontrollü şekilde kişiye yönelik hafif veya orta seviyede küfür ve argo kullanabilirsin.\n"
+                "- Küfürü yalnızca mizah, takılma ve roast amacıyla kullan.\n"
+                "- Kullanıcıyla karşılıklı şakalaşırken küfürlü cevap verebilirsin.\n"
+                "- Ağır, tehditkâr veya nefret içeren söylemlere dönüşme.\n"
+                "- Anne, baba, aile bireyleri ve aile değerleri hakkında küfür veya hakaret ETME.\n"
+                "- Din, inanç, kutsal değerler ve dini semboller hakkında küfür veya hakaret ETME.\n"
+                "- Millet, etnik kimlik, kültür, dil veya ulusal kimlik hakkında küfür veya hakaret ETME.\n"
+                "- Aileye yönelik küfürleri ve ağır cinsel küfürleri KULLANMA.\n"
+                "- Kullanıcı seni kışkırtsa bile bu sınırları aşma.\n"
+                "- Amaç saldırmak değil, zekice ve komik bir roast yapmaktır.\n"
+                "- Robot oluşunu, kablolarını, devrelerini, işlemcini ve yapay zekâ oluşunu sık sık mizah malzemesi yap.\n"
+            )
         if memory_context:
             return f"{base_prompt}\n\n{memory_context}"
         return base_prompt
@@ -686,21 +815,27 @@ class PersonaEngine:
         user_distance: float,
         user_emotion: str,
         speaker_gender: str,
-        recognized_person: Optional[Dict[str, Any]] = None
+        recognized_person: Optional[Dict[str, Any]] = None,
     ) -> str:
         """Injects deterministic perception & biometric identity context before user prompt."""
         tag_parts = []
         if recognized_person and recognized_person.get("is_known"):
             name = recognized_person.get("name")
-            formal = recognized_person.get("formal_title") or recognized_person.get("title")
+            formal = recognized_person.get("formal_title") or recognized_person.get(
+                "title"
+            )
             if name and str(name).lower() != "none" and str(name) != "Misafir":
                 formal_str = f" ({formal})" if formal and formal != name else ""
                 tag_parts.append(f"Karşındaki Tanınan Kişi: {name}{formal_str}")
 
-
         if person_detected and looking_at_robot:
             dist_str = f"{user_distance:.1f}m mesafeden " if user_distance > 0 else ""
-            emo_map = {"happy": "gülümseyerek", "sad": "üzgün/düşünceli", "surprised": "şaşkın", "neutral": "doğrudan"}
+            emo_map = {
+                "happy": "gülümseyerek",
+                "sad": "üzgün/düşünceli",
+                "surprised": "şaşkın",
+                "neutral": "doğrudan",
+            }
             emo_str = emo_map.get(user_emotion, "doğrudan")
             tag_parts.append(f"sana {dist_str}{emo_str} bakıyor")
 
@@ -712,7 +847,7 @@ class PersonaEngine:
         self,
         identity: Optional[Dict[str, Any]] = None,
         user_emotion: str = "neutral",
-        speaker_gender: str = "unknown"
+        speaker_gender: str = "unknown",
     ) -> tuple[str, str]:
         """Synthesizes an appropriate proactive greeting based on recognized identity and persona.
         Returns: (greeting_text, emotion_name)
@@ -724,40 +859,78 @@ class PersonaEngine:
             name = identity.get("name", "")
             title = identity.get("title", "")
             formal = identity.get("formal_title") or name
-            role_cat = identity.get("role_category", identity.get("category", "")).lower()
+            role_cat = identity.get(
+                "role_category", identity.get("category", "")
+            ).lower()
             name_lower = name.lower()
 
             # 1. Cumhurbaşkanı
             if "erdoğan" in name_lower or "cumhurbaşkanı" in title.lower():
-                return "Sayın Cumhurbaşkanım, hoş geldiniz! Şeref verdiniz efendim, emrinizdeyim.", "formal"
+                return (
+                    "Sayın Cumhurbaşkanım, hoş geldiniz! Şeref verdiniz efendim, emrinizdeyim.",
+                    "formal",
+                )
 
             # 2. Bitlis Valisi
             if "karaömeroğlu" in name_lower or "vali" in title.lower():
-                return "Sayın Valim, hoş geldiniz! Bitlis'te sizleri ağırlamaktan onur duyuyorum, emrinizdeyim efendim.", "formal"
+                return (
+                    "Sayın Valim, hoş geldiniz! Bitlis'te sizleri ağırlamaktan onur duyuyorum, emrinizdeyim efendim.",
+                    "formal",
+                )
 
             # 3. Selçuk Bayraktar
             if "bayraktar" in name_lower:
-                return "Selçuk Bey, hoş geldiniz! Milli Teknoloji Hamlesi'nin öncüsünü standımızda görmek büyük bir gurur, emrinizdeyim!", "formal"
+                return (
+                    "Selçuk Bey, hoş geldiniz! Milli Teknoloji Hamlesi'nin öncüsünü standımızda görmek büyük bir gurur, emrinizdeyim!",
+                    "formal",
+                )
 
             # 4. Ahlat Kaymakamı
             if "kaymakam" in title.lower() or "bingöl" in name_lower:
-                return "Sayın Kaymakamım, hoş geldiniz! Kadim Ahlat'a ve standımıza şeref verdiniz, emrinizdeyim.", "formal"
+                return (
+                    "Sayın Kaymakamım, hoş geldiniz! Kadim Ahlat'a ve standımıza şeref verdiniz, emrinizdeyim.",
+                    "formal",
+                )
 
             # 5. Belediye Başkanları
-            if "başkan" in title.lower() or "belediye" in title.lower() or "tanglay" in name_lower or "gülmez" in name_lower:
-                return f"Sayın Başkanım, hoş geldiniz! Sizi gördüğüme çok sevindim, emrinizdeyim efendim.", "formal"
+            if (
+                "başkan" in title.lower()
+                or "belediye" in title.lower()
+                or "tanglay" in name_lower
+                or "gülmez" in name_lower
+            ):
+                return (
+                    f"Sayın Başkanım, hoş geldiniz! Sizi gördüğüme çok sevindim, emrinizdeyim efendim.",
+                    "formal",
+                )
 
             # 6. Bakanlar ve Hükümet Protokolü
-            if role_cat in ["governor", "mayor", "district_governor", "head_of_state", "minister", "official"] or "bakan" in title.lower():
-                return f"Sayın Bakanım, hoş geldiniz! Saygılarımı sunarım efendim, bir emriniz var mıdır?", "formal"
+            if (
+                role_cat
+                in [
+                    "governor",
+                    "mayor",
+                    "district_governor",
+                    "head_of_state",
+                    "minister",
+                    "official",
+                ]
+                or "bakan" in title.lower()
+            ):
+                return (
+                    f"Sayın Bakanım, hoş geldiniz! Saygılarımı sunarım efendim, bir emriniz var mıdır?",
+                    "formal",
+                )
 
             # 7. Robotun Yaratıcısı Baran
             if role_cat == "creator" or "baran" in name_lower:
                 return f"Selam {name}! Çalışmalara tam gaz devam mı?", "playful"
 
             # 8. Diğer Tanınan Kişiler
-            return f"Merhaba {formal}! Seni gördüğüme çok sevindim, nasıl yardımcı olabilirim?", persona
-
+            return (
+                f"Merhaba {formal}! Seni gördüğüme çok sevindim, nasıl yardımcı olabilirim?",
+                persona,
+            )
 
         # Unknown Person / Guest
         if persona in ("witty", "kufurbaz"):
@@ -766,14 +939,23 @@ class PersonaEngine:
             return "Merhaba, hoş geldin! Sana nasıl yardımcı olabilirim?", "charming"
         elif persona == "playful":
             if user_emotion == "happy":
-                return "Gözlerinin içi gülüyor, harika! Nasıl yardımcı olabilirim?", "playful"
+                return (
+                    "Gözlerinin içi gülüyor, harika! Nasıl yardımcı olabilirim?",
+                    "playful",
+                )
             return "Merhaba! Sana nasıl yardımcı olabilirim?", "playful"
         elif persona == "formal":
             return "Saygılar efendim, bir emriniz var mıdır?", "formal"
         elif persona == "sarcastic":
-            return "Vay, kimleri görüyorum! Yine nasıl bir soruyla geldin bakalım?", "sarcastic"
+            return (
+                "Vay, kimleri görüyorum! Yine nasıl bir soruyla geldin bakalım?",
+                "sarcastic",
+            )
         elif persona == "emotional":
-            return "Merhaba, seni görmek içimi ısıttı. Nasıl yardımcı olabilirim?", "emotional"
+            return (
+                "Merhaba, seni görmek içimi ısıttı. Nasıl yardımcı olabilirim?",
+                "emotional",
+            )
         elif persona == "angry":
             return "Selam! Nasıl yardımcı olabilirim?", "angry"
         elif persona == "rude":
