@@ -53,6 +53,21 @@ try:
 except ImportError:
     sd = None
 
+try:
+    from astro_audio.doa_estimator import AcousticDOAEstimator, ReSpeakerGeometry
+except ImportError:
+    try:
+        from .doa_estimator import AcousticDOAEstimator, ReSpeakerGeometry
+    except ImportError:
+        try:
+            _this_dir = os.path.dirname(os.path.abspath(__file__))
+            if _this_dir not in sys.path:
+                sys.path.insert(0, _this_dir)
+            from doa_estimator import AcousticDOAEstimator, ReSpeakerGeometry
+        except ImportError:
+            AcousticDOAEstimator = None  # type: ignore
+            ReSpeakerGeometry = None  # type: ignore
+
 
 RESPEAKER_NAME_HINTS = ("respeaker", "uac1", "seeed", "arrayuac", "usb audio")
 HW_SAMPLE_RATE = 16000  # ReSpeaker native hardware rate
