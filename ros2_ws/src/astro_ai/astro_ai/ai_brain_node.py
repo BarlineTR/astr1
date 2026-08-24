@@ -277,13 +277,14 @@ class AiBrainNode(Node):
 
         # 2. OpenAI Client (Emergency High-Performance Backup Engine)
         self.openai_api_key = os.environ.get("OPENAI_API_KEY", "").strip() or os.environ.get("AI_API_KEY", "").strip()
+        self._openai_model = os.environ.get("OPENAI_CHAT_MODEL", os.environ.get("LLM_FALLBACK_MODEL", "gpt-4o-mini"))
         self._openai = None
 
         if OpenAI and self.openai_api_key and self.openai_api_key.startswith("sk-"):
             try:
                 self._openai = OpenAI(api_key=self.openai_api_key)
                 self._enabled = True
-                self.get_logger().info(f"✅ [AI Brain] OpenAI GPT-4o-mini Yedek Motoru Hazır.")
+                self.get_logger().info(f"✅ [AI Brain] OpenAI ({self._openai_model}) Yedek Motoru Hazır.")
             except Exception as e:
                 self.get_logger().error(f"❌ [AI Brain] OpenAI client başlatılamadı: {e}")
 
@@ -503,7 +504,7 @@ class AiBrainNode(Node):
             if self._openai:
                 res = self._openai.chat.completions.create(
                     messages=[{"role": "user", "content": prompt}],
-                    model="gpt-4o-mini",
+                    model=self._openai_model,
                     temperature=0.2,
                     max_tokens=50
                 )
@@ -1378,11 +1379,11 @@ class AiBrainNode(Node):
             # Step 4: Tertiary Emergency Fallback: OpenAI Client (Only if healthy & available)
             if self._provider_enabled("openai") and not full_text and self._openai and self.circuit_breaker and self.circuit_breaker.is_available("openai", sub_provider="openai_rest"):
                 provider_attempts += 1
-                self.get_logger().info(f"[LLM ROUTE] provider=openai model=gpt-4o-mini reason={self._route_reason('openai')}")
+                self.get_logger().info(f"[LLM ROUTE] provider=openai model={self._openai_model} reason={self._route_reason('openai')}")
                 try:
                     stream_resp = self._openai.chat.completions.create(
                         messages=messages,
-                        model="gpt-4o-mini",
+                        model=self._openai_model,
                         temperature=self._temperature,
                         max_tokens=min(150, self._max_tokens),
                         presence_penalty=0.5,
@@ -1398,7 +1399,7 @@ class AiBrainNode(Node):
                             self.state_machine.transition_to(RobotState.SPEAKING)
                         full_text += delta
                     if full_text:
-                        llm_provider = "openai/gpt-4o-mini"
+                        llm_provider = f"openai/{self._openai_model}"
                         fallback_chain.append("openai")
                         self.circuit_breaker.record_success("openai", sub_provider="openai_rest")
                 except Exception as oai_err:
@@ -1518,13 +1519,13 @@ class AiBrainNode(Node):
                     self.get_logger().debug(f"Groq social filter ({g_model}) failed: {ge}")
                     continue
 
-        # 2. Fallback to OpenAI gpt-4o-mini ONLY if circuit breaker allows
+        # 2. Fallback to OpenAI model ONLY if circuit breaker allows
         openai_ok = self.circuit_breaker.is_available("openai", sub_provider="openai_rest") if self.circuit_breaker else True
         if self._openai and openai_ok:
             try:
                 res = self._openai.chat.completions.create(
                     messages=[{"role": "user", "content": prompt}],
-                    model="gpt-4o-mini",
+                    model=self._openai_model,
                     temperature=0.0,
                     max_tokens=10,
                     timeout=1.5
@@ -2455,7 +2456,7 @@ class AiBrainNode(Node):
                 try:
                     res = self._openai.chat.completions.create(
                         messages=[{"role": "user", "content": prompt}],
-                        model="gpt-4o-mini",
+                        model=self._openai_model,
                         temperature=0.0,
                         max_tokens=60
                     )
