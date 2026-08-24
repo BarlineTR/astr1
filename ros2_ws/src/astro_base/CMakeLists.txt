@@ -36,8 +36,15 @@ rosidl_generate_interfaces(${PROJECT_NAME}
 
 # Install Python executables - Çalıştırılabilir scriptimizi hedefe kopyalıyoruz
 install(PROGRAMS
-  src/serial_bridge.py
+  astro_base/serial_bridge.py
   DESTINATION lib/${PROJECT_NAME}
+  RENAME serial_bridge
+)
+
+install(PROGRAMS
+  astro_base/head_tracker_node.py
+  DESTINATION lib/${PROJECT_NAME}
+  RENAME head_tracker
 )
 
 # Linting
