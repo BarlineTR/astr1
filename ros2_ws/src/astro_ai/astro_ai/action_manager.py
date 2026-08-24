@@ -44,6 +44,14 @@ except ImportError:
     class HeadCmd:  # type: ignore
         angle_deg: float = 0.0
 
+try:
+    from astro_audio.doa_estimator import AcousticDOAEstimator, ReSpeakerGeometry
+except ImportError:
+    try:
+        from doa_estimator import AcousticDOAEstimator, ReSpeakerGeometry
+    except ImportError:
+        AcousticDOAEstimator = ReSpeakerGeometry = None  # type: ignore
+
 
 @dataclass
 class SoundDirection:
@@ -101,9 +109,9 @@ class ActionResult:
         if self.generation_id is not None:
             d["generation_id"] = self.generation_id
         if self.azimuth_deg is not None:
-            d["azimuth_deg"] = self.azimuth_deg
+            d["azimuth_deg"] = round(self.azimuth_deg, 1)
         if self.confidence is not None:
-            d["confidence"] = self.confidence
+            d["confidence"] = round(self.confidence, 2)
         if self.requested_direction is not None:
             d["requested_direction"] = self.requested_direction
         if self.actual_direction is not None:
@@ -119,20 +127,16 @@ class ActionResult:
         return d
 
 
-def circular_doa_to_yaw(doa_deg: float, offset_deg: float = 0.0, invert: bool = False) -> float:
+def circular_doa_to_yaw(raw_doa_deg: float) -> float:
     """Converts 0°..359° circular ReSpeaker DOA to robot body yaw frame (-180°..+180°)."""
-    raw = (doa_deg + offset_deg) % 360.0
+    raw = float(raw_doa_deg) % 360.0
     if raw <= 180.0:
-        yaw = raw
-    else:
-        yaw = raw - 360.0
-    if invert:
-        yaw = -yaw
-    return yaw
+        return raw
+    return raw - 360.0
 
 
 class ActionManager:
-    """Physical action grounding, DOA orientation authority, and hardware coordination."""
+    """Authoritative physical execution and sound orientation coordinator."""
 
     def __init__(
         self,
@@ -147,6 +151,9 @@ class ActionManager:
         self._node = node
         self._lock = threading.RLock()
 
+        # Acoustic Estimator (GCC-PHAT)
+        self._acoustic_estimator = AcousticDOAEstimator(sample_rate=16000) if AcousticDOAEstimator else None
+
         # DOA Tracking & Consensus
         self._latest_doa: Optional[SoundDirection] = None
         self._doa_history: Deque[Tuple[float, float, float]] = collections.deque(maxlen=6)  # (timestamp, yaw, rms)
@@ -155,6 +162,11 @@ class ActionManager:
         self._ambient_rms = 120.0
         self._is_speaking = False
         self._is_playback_active = False
+
+        # Anti-Spam Logging State
+        self._last_logged_doa_time = 0.0
+        self._last_logged_valid: Optional[bool] = None
+        self._last_logged_yaw: Optional[float] = None
 
         # Action Idempotency & History
         self._executed_action_ids: Set[str] = set()
@@ -173,7 +185,13 @@ class ActionManager:
         is_speaking: bool = False,
         is_playback_active: bool = False,
     ):
-        """Updates internal acoustic perception state and evaluates DOA validity."""
+        """Updates internal acoustic perception state and evaluates DOA validity.
+        
+        Strict physical rule:
+        - 0.0° uncalibrated default / idle reading is NEVER marked valid=true.
+        - 0.0° is only valid if confirmed by active VAD and high acoustic energy.
+        - Log is event-driven and throttled to prevent spam.
+        """
         now = time.monotonic()
         with self._lock:
             self._is_speaking = is_speaking
@@ -197,19 +215,29 @@ class ActionManager:
                 vad_factor = 0.9 if vad_active else 0.5
                 conf = min(1.0, max(0.0, (energy_ratio / 3.0) * vad_factor))
 
-                # Temporal clustering / consistency check
-                recent = [y for ts, y, _ in self._doa_history if (now - ts) <= 2.0]
-                if len(recent) >= 2:
-                    # Check angular variance
-                    mean_y = sum(recent) / len(recent)
-                    is_consistent = all(abs(y - mean_y) <= 25.0 for y in recent)
-                    if is_consistent:
-                        conf = min(1.0, conf + 0.25)
-                        yaw = mean_y
+                # Strict gating for 0.0° default
+                is_zero_angle = abs(yaw) < 0.5
+                if is_zero_angle:
+                    # 0° is the uninitialized / hardware idle default.
+                    # ONLY valid if strong active speech and high energy ratio is proven.
+                    if not vad_active or cur_rms < 450.0 or energy_ratio < 2.5:
+                        conf = min(conf, 0.25)
+                        is_valid = False
                     else:
-                        conf = max(0.0, conf - 0.20)
+                        is_valid = (conf >= self._min_doa_confidence)
+                else:
+                    # Temporal clustering / consistency check for non-zero angles
+                    recent = [y for ts, y, _ in self._doa_history if (now - ts) <= 2.0]
+                    if len(recent) >= 2:
+                        mean_y = sum(recent) / len(recent)
+                        is_consistent = all(abs(y - mean_y) <= 25.0 for y in recent)
+                        if is_consistent:
+                            conf = min(1.0, conf + 0.25)
+                            yaw = mean_y
+                        else:
+                            conf = max(0.0, conf - 0.20)
 
-                is_valid = (conf >= self._min_doa_confidence) and (energy_ratio >= 1.5)
+                    is_valid = (conf >= self._min_doa_confidence) and (energy_ratio >= 1.5)
 
                 self._latest_doa = SoundDirection(
                     azimuth_deg=float(yaw),
@@ -220,14 +248,49 @@ class ActionManager:
                     rms_level=float(cur_rms),
                 )
 
-                # Format exact ROS log as mandated by specification
-                sign = "+" if yaw >= 0 else ""
-                self._logger.info(
-                    f"[DOA]\n"
-                    f"azimuth_deg={sign}{yaw:.1f}\n"
-                    f"confidence={conf:.2f}\n"
-                    f"valid={str(is_valid).lower()}"
-                )
+                # Anti-Spam Logging: Only log on state change or significant angle shift or periodic keepalive
+                should_log = False
+                if self._last_logged_valid != is_valid:
+                    should_log = True
+                elif is_valid:
+                    if self._last_logged_yaw is None or abs(yaw - self._last_logged_yaw) >= 15.0:
+                        should_log = True
+                    elif (now - self._last_logged_doa_time) >= 3.0:
+                        should_log = True
+
+                if should_log:
+                    self._last_logged_doa_time = now
+                    self._last_logged_valid = is_valid
+                    self._last_logged_yaw = yaw
+                    sign = "+" if yaw >= 0 else ""
+                    self._logger.info(
+                        f"[DOA]\n"
+                        f"azimuth_deg={sign}{yaw:.1f}\n"
+                        f"confidence={conf:.2f}\n"
+                        f"valid={str(is_valid).lower()}"
+                    )
+
+    def update_multichannel_audio(
+        self,
+        pcm_channels: Any,
+        rms_level: Optional[float] = None,
+        vad_active: bool = False,
+        is_speaking: bool = False,
+        is_playback_active: bool = False,
+    ):
+        """Processes 4-channel microphone buffer with GCC-PHAT to compute exact DOA."""
+        if is_speaking or is_playback_active or self._acoustic_estimator is None:
+            return
+        azimuth, conf, is_valid = self._acoustic_estimator.estimate_from_multichannel_pcm(pcm_channels)
+        if azimuth is not None:
+            raw_doa = azimuth if azimuth >= 0 else azimuth + 360.0
+            self.update_audio_state(
+                raw_doa_deg=raw_doa,
+                rms_level=rms_level,
+                vad_active=vad_active,
+                is_speaking=is_speaking,
+                is_playback_active=is_playback_active,
+            )
 
     def get_sound_direction(self) -> Optional[SoundDirection]:
         """Returns the current sound direction if fresh and valid, else None."""

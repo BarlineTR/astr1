@@ -2,6 +2,7 @@
 """Unit tests for ASTRO V1 — Physical Grounding, Sound Direction (DOA), Action ACK, and Persona Hotfix."""
 
 import json
+import logging
 import math
 import os
 import sys
@@ -15,6 +16,15 @@ if pkg_dir not in sys.path:
 from astro_ai.action_manager import ActionManager, SoundDirection, ActionResult, circular_doa_to_yaw
 from astro_ai.conversation_session import normalize_turkish_speech_input
 from astro_ai.persona_engine import PersonaEngine, PERSONA_PROMPTS
+
+
+class MockLogger(logging.Logger):
+    def __init__(self, name="TestMockLogger"):
+        super().__init__(name)
+        self.log_messages = []
+
+    def info(self, msg, *args, **kwargs):
+        self.log_messages.append(str(msg))
 
 
 class MockNode:
@@ -75,12 +85,12 @@ class TestSoundDirectionDOA(unittest.TestCase):
         self.assertEqual(len(mock_node.published_head_cmds), 0)
         self.assertIn("tespit edilemedi", res.message)
 
-    def test_test_b_turn_to_sound_success_with_valid_doa(self):
+    def test_test_b_turn_to_sound_success_with_valid_right_doa(self):
         """Test B: DOA has azimuth = +35°, confidence = 0.91 -> turn +35° executed with ACK."""
         mock_node = MockNode()
         action_mgr = ActionManager(node=mock_node)
 
-        # Provide strong valid DOA
+        # Provide strong valid Right DOA (+35°)
         action_mgr.update_audio_state(
             raw_doa_deg=35.0,
             rms_level=2500.0,
@@ -96,6 +106,81 @@ class TestSoundDirectionDOA(unittest.TestCase):
         self.assertGreaterEqual(res.confidence, 0.40)
         self.assertTrue(res.hardware_ack)
         self.assertGreater(len(mock_node.published_twists) + len(mock_node.published_head_cmds), 0)
+
+    def test_controlled_left_sound_direction_execution(self):
+        """Controlled Left (-45° / raw 315°) sound -> produces negative azimuth (-45°) and executes Left turn."""
+        mock_node = MockNode()
+        action_mgr = ActionManager(node=mock_node)
+
+        action_mgr.update_audio_state(
+            raw_doa_deg=315.0,  # 315° = -45° (Left)
+            rms_level=2200.0,
+            vad_active=True,
+            is_speaking=False,
+        )
+
+        res = action_mgr.execute_turn_to_sound(generation_id=1027)
+
+        self.assertTrue(res.success)
+        self.assertEqual(res.action, "turn_to_sound")
+        self.assertAlmostEqual(res.azimuth_deg, -45.0, places=1)
+        self.assertTrue(res.hardware_ack)
+
+    def test_zero_degree_uncalibrated_idle_rejected(self):
+        """0.0° default without active speech / low energy MUST produce valid=False and NO_DIRECTION."""
+        mock_node = MockNode()
+        action_mgr = ActionManager(node=mock_node)
+
+        # Send 0.0° with no VAD and low energy (uncalibrated / idle state)
+        action_mgr.update_audio_state(
+            raw_doa_deg=0.0,
+            rms_level=200.0,
+            vad_active=False,
+            is_speaking=False,
+        )
+
+        sd = action_mgr.get_sound_direction()
+        self.assertIsNone(sd)
+
+        res = action_mgr.execute_turn_to_sound(generation_id=1028)
+        self.assertFalse(res.success)
+        self.assertEqual(res.error_code, "NO_DIRECTION")
+
+    def test_zero_degree_confirmed_speech_accepted(self):
+        """0.0° with strong active speech + high energy ratio MUST produce valid=True."""
+        mock_node = MockNode()
+        action_mgr = ActionManager(node=mock_node)
+
+        # Send 0.0° with strong VAD and high energy (genuine front speaker)
+        action_mgr.update_audio_state(
+            raw_doa_deg=0.0,
+            rms_level=3000.0,
+            vad_active=True,
+            is_speaking=False,
+        )
+
+        sd = action_mgr.get_sound_direction()
+        self.assertIsNotNone(sd)
+        self.assertTrue(sd.valid)
+        self.assertAlmostEqual(sd.azimuth_deg, 0.0)
+
+    def test_log_throttling_eliminates_spam(self):
+        """10 consecutive identical 10Hz ticks should only log on initial change, eliminating spam."""
+        mock_logger = MockLogger()
+        action_mgr = ActionManager(logger=mock_logger)
+
+        # 10 identical idle ticks
+        for _ in range(10):
+            action_mgr.update_audio_state(
+                raw_doa_deg=0.0,
+                rms_level=150.0,
+                vad_active=False,
+                is_speaking=False,
+            )
+
+        # Should only have logged once for the initial state
+        doa_logs = [m for m in mock_logger.log_messages if "[DOA]" in m]
+        self.assertLessEqual(len(doa_logs), 1)
 
 
 class TestActionManagerPhysicalGrounding(unittest.TestCase):

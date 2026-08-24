@@ -166,16 +166,26 @@ class ReSpeakerHID:
 
     def __init__(self):
         self.dev = None
+        self._last_find_attempt = 0.0
+        self._find_device()
+
+    def _find_device(self):
         if not HAS_USB:
             return
+        now = time.monotonic()
+        if (now - self._last_find_attempt) < 5.0:
+            return
+        self._last_find_attempt = now
         try:
             self.dev = usb.core.find(idVendor=RESPEAKER_VID, idProduct=RESPEAKER_PID)
         except Exception:
             self.dev = None
 
-    def _read_param(self, param_id: int) -> int:
+    def _read_param(self, param_id: int) -> Optional[int]:
         if self.dev is None:
-            return 0
+            self._find_device()
+            if self.dev is None:
+                return None
         try:
             data = self.dev.ctrl_transfer(
                 usb.util.CTRL_IN | usb.util.CTRL_TYPE_VENDOR | usb.util.CTRL_RECIPIENT_DEVICE,
@@ -185,15 +195,22 @@ class ReSpeakerHID:
                 8,
                 self.TIMEOUT_MS,
             )
-            return struct.unpack_from("i", data, 0)[0]
+            if data and len(data) >= 4:
+                return struct.unpack_from("i", data, 0)[0]
+            return None
         except Exception:
-            return 0
+            self.dev = None
+            return None
 
-    def speech_detected(self) -> bool:
-        return self._read_param(PARAM_SPEECH_DETECTED) == 1
+    def speech_detected(self) -> Optional[bool]:
+        val = self._read_param(PARAM_SPEECH_DETECTED)
+        return (val == 1) if val is not None else None
 
-    def doa_angle(self) -> float:
-        return float(self._read_param(PARAM_DOA_ANGLE))
+    def doa_angle(self) -> Optional[float]:
+        val = self._read_param(PARAM_DOA_ANGLE)
+        if val is not None and 0 <= val <= 359:
+            return float(val)
+        return None
 
 
 class AudioStreamNode(Node):
@@ -287,23 +304,16 @@ class AudioStreamNode(Node):
             is_speech = self._respeaker.speech_detected()
             doa_angle = self._respeaker.doa_angle()
 
-            vad_msg = Bool()
-            vad_msg.data = bool(is_speech)
-            self.pub_vad.publish(vad_msg)
+            if is_speech is not None:
+                vad_msg = Bool()
+                vad_msg.data = bool(is_speech)
+                self.pub_vad.publish(vad_msg)
 
-            doa_msg = Float32()
-            doa_msg.data = float(doa_angle)
-            self.pub_doa.publish(doa_msg)
-
-            if is_speech:
-                yaw = doa_angle if doa_angle <= 180.0 else doa_angle - 360.0
-                sign = "+" if yaw >= 0 else ""
-                self.get_logger().info(
-                    f"[DOA]\n"
-                    f"azimuth_deg={sign}{yaw:.1f}\n"
-                    f"confidence=0.90\n"
-                    f"valid=true"
-                )
+            # Only publish genuine hardware DOA when speech is detected and angle is valid
+            if doa_angle is not None and is_speech is True:
+                doa_msg = Float32()
+                doa_msg.data = float(doa_angle)
+                self.pub_doa.publish(doa_msg)
         except Exception as exc:
             self.get_logger().debug(f"_poll_respeaker_hid error: {exc}")
 
