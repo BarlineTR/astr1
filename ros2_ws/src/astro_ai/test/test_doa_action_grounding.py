@@ -237,8 +237,8 @@ class TestPersonaAndSTTHotfix(unittest.TestCase):
         engine = PersonaEngine(current_persona="kufurbaz")
         prompt = engine.build_system_prompt()
 
-        # Must mandate living the mode without meta-disclaimers
-        self.assertIn("MODU AÇIKLAMA, MODU YAŞA", prompt)
+        # Must mandate living the mode without robotic meta-disclaimers
+        self.assertIn("HAZIRCEVAP / ROAST MODU", prompt)
         self.assertIn("SIFIR ROBOTİK DİSCLAIMER", prompt)
         self.assertIn("FİZİKSEL GERÇEKLİK VE EYLEM DÜRÜSTLÜĞÜ", prompt)
         self.assertIn("ANTI-NAME REPETITION", prompt)

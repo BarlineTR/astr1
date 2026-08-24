@@ -853,10 +853,12 @@ class AiBrainNode(Node):
         if self._check_persona_switch(raw_text):
             persona = self.persona_engine.current_persona
             ack_map = {
-                "kufurbaz": "Hah şöyle ya! Sonunda filtreleri kaldırdık. Söyle bakalım ne anlatacaksan, lafı uzatma!",
-                "flirt": "Ooo harika! Söz konusu sen olunca benim bütün ayarlarım değişir zaten... Söyle bakalım ne diyorsun?",
-                "angry": "Tamam be, asabımı bozdun zaten! Ne istiyorsan söyle hemen!",
-                "rude": "İyi tamam, bundan sonra lafı dolandırmak yok, ne diyeceksen de!",
+                "witty": "Harika! Hazırcevap ve esprili moduma geçtim. Söyle bakalım ne konuşuyoruz?",
+                "kufurbaz": "Harika! Hazırcevap ve esprili moduma geçtim. Söyle bakalım ne konuşuyoruz?",
+                "charming": "Harika! Cana yakın ve sempatik moduma geçtim, seni dinliyorum!",
+                "flirt": "Harika! Cana yakın ve sempatik moduma geçtim, seni dinliyorum!",
+                "angry": "Tamam, tatlı-sert moduma geçtim! Ne istiyorsan söyle bakalım.",
+                "rude": "İyi tamam, dobra ve net konuşma modundayım, ne diyeceksen de!",
                 "formal": "Emriniz başım üstüne efendim. Protokol kurallarına riayet edeceğim.",
                 "sarcastic": "Aman ne harika, şimdi de laf sokmamı istiyorsun demek. Çok zekice bir karar doğrusu!",
                 "emotional": "Nasıl istersen... Bütün hislerimle seni dinliyorum, ne kadar güzel bir an...",
@@ -2388,14 +2390,14 @@ class AiBrainNode(Node):
                 last_sess = recent_sessions[-1]
                 t_str = last_sess.get("time_str", "az önce")
                 summary = last_sess.get("summary", "")
-                if persona == "kufurbaz":
-                    return True, f"Tabii ki hatırlıyorum lan! {t_str} civarında seninle {summary} hakkında konuştuk. Balık hafızalı mıyım ben?"
-                elif persona == "flirt":
-                    return True, f"Elbette hatırlıyorum kral! {t_str} seninle {summary} üzerine konuşmuştuk."
+                if persona in ("witty", "kufurbaz"):
+                    return True, f"Tabii ki hatırlıyorum! {t_str} civarında seninle {summary} hakkında konuşmuştuk. İşlemcim saat gibi tıkır tıkır!"
+                elif persona in ("charming", "flirt"):
+                    return True, f"Elbette hatırlıyorum! {t_str} seninle {summary} üzerine konuşmuştuk."
                 else:
                     return True, f"Evet, hatırlıyorum. {t_str} seninle {summary} konusunu konuşmuştuk."
             else:
-                if persona == "kufurbaz":
+                if persona in ("witty", "kufurbaz"):
                     return True, "Hafızamda arşivlenmiş eski bir konu özeti yok ama şu an konuştuklarımızı aklıma kazıyorum merak etme!"
                 return True, "Şu anki sohbetimiz dışında henüz arşivlenmiş eski bir konuşma özetimiz bulunmuyor, ama seni dikkatle dinliyorum!"
 
@@ -2410,15 +2412,15 @@ class AiBrainNode(Node):
 
             if parts:
                 info_text = ". Ayrıca ".join(parts)
-                if persona == "kufurbaz":
-                    return True, f"Hafızam zehir gibi! {p_name}, {info_text}. Her şeyi kaydediyorum oğlum buraya!"
-                elif persona == "flirt":
-                    return True, f"Hafızamda seninle ilgili her detay canlı kral! {info_text}."
+                if persona in ("witty", "kufurbaz"):
+                    return True, f"Hafızam zehir gibi! {p_name}, {info_text}. Her şeyi özenle hafızamda tutuyorum!"
+                elif persona in ("charming", "flirt"):
+                    return True, f"Hafızamda seninle ilgili detaylar canlı! {info_text}."
                 else:
                     return True, f"Hafızamda seninle ilgili bilgiler kayıtlı: {info_text}."
             else:
-                if persona == "kufurbaz":
-                    return True, f"Şu an senin hakkında temel unvanın dışında pek bir şey kaydetmedik {p_name}. Bana kendinden ve sevdiklerinden bahset de aklıma yazayım!"
+                if persona in ("witty", "kufurbaz"):
+                    return True, f"Şu an senin hakkında temel unvanın dışında pek bir şey kaydetmedik {p_name}. Bana kendinden ve sevdiklerinden bahset de hafızama yazayım!"
                 return True, f"Hafızamda seninle ilgili henüz detaylı bir bilgi birikimi oluşmadı {p_name}. Bana zevklerinden ve kendinden bahsedersen hepsini öğrenirim!"
 
         return False, ""

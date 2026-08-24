@@ -116,7 +116,7 @@ try:
     from astro_ai.memory_manager import MemoryManager
     from astro_ai.persona_engine import (
         PersonaEngine, PERSONA_PROMPTS, clean_tts_text,
-        response_length_gate, is_self_identity_query
+        response_length_gate, is_self_identity_query, ResponseSafetyGate
     )
     from astro_ai.state_machine import RobotState, StateMachine
     from astro_ai.provider_registry import ProviderRegistry, ProviderError, ErrorClass
@@ -127,7 +127,7 @@ except ImportError:
     from memory_manager import MemoryManager
     from persona_engine import (
         PersonaEngine, PERSONA_PROMPTS, clean_tts_text,
-        response_length_gate, is_self_identity_query
+        response_length_gate, is_self_identity_query, ResponseSafetyGate
     )
     from state_machine import RobotState, StateMachine
     from provider_registry import ProviderRegistry, ProviderError, ErrorClass
@@ -522,7 +522,7 @@ class AstroRealtimeNode(Node):
         self.connect_realtime = bool(connect_realtime and not is_test_mode)
         self.fake_transport = fake_transport
         self.realtime_voice = raw_voice if raw_voice in VALID_REALTIME_VOICES else "echo"
-        self.persona_name = os.environ.get("PERSONA", "kufurbaz").strip().lower()
+        self.persona_name = os.environ.get("PERSONA", "playful").strip().lower()
 
         # Anahtarın nereden geldiğini başlangıçta söyle. "eksik" hatası alındığında
         # ilk soru her zaman "hangi .env okundu" oluyor; cevabı burada.
@@ -3656,11 +3656,11 @@ class AstroRealtimeNode(Node):
 
         # 1. Gratitude / Thanks
         if any(w in u for w in ["teşekkür", "tesekkur", "sağ ol", "sag ol", "eyvallah", "sağolasın", "mersi", "minnettarım"]):
-            if "kufurbaz" in p:
+            if p in ("witty", "kufurbaz", "sarcastic"):
                 candidates = [
-                    f"Ne demek lan{spk}, lafı mı olur?",
-                    f"Rica ederim lan{spk}, her zaman buradayım.",
-                    f"Bir şey değil lan{spk}, keyifle yardımcı olurum.",
+                    f"Rica ederim{spk}, lafı mı olur? Devrelerim her zaman hizmetinde.",
+                    f"Ne demek{spk}, her zaman buradayım.",
+                    f"Rica ederim{spk}, keyifle yardımcı olurum.",
                 ]
             else:
                 candidates = [
@@ -3672,11 +3672,11 @@ class AstroRealtimeNode(Node):
 
         # 2. Status / How are you / Well-being
         elif any(w in u for w in ["nasılsın", "nasilsin", "ne haber", "naber", "nasıl gidiyor", "ne var ne yok", "iyi misin", "keyifler nasıl"]):
-            if "kufurbaz" in p:
+            if p in ("witty", "kufurbaz", "sarcastic"):
                 candidates = [
-                    f"İyiyim lan{spk}, robot gibi çalışıyoruz işte. Sen ne durumdasın?",
-                    f"Keyfim yerinde lan{spk}, her şey tıkırında. Sen nasılsın?",
-                    f"Gayet iyiyim lan{spk}, seninle sohbet etmek çok iyi geldi. Sende ne var ne yok?",
+                    f"İyiyim{spk}, robot gibi tıkır tıkır çalışıyorum! Sen ne durumdasın?",
+                    f"Keyfim yerinde{spk}, bataryalar tam dolu. Sen nasılsın?",
+                    f"Gayet iyiyim{spk}, seninle sohbet etmek harika geldi. Sende ne var ne yok?",
                 ]
             else:
                 candidates = [
@@ -3688,79 +3688,45 @@ class AstroRealtimeNode(Node):
 
         # 3. Negative Mood / Fatigue / Feeling unwell
         elif any(w in u for w in ["yorgunum", "yoruldum", "canım sıkkın", "moralim bozuk", "uykum var", "hastayım", "kötüyüm", "keyifsizim"]):
-            if "kufurbaz" in p:
-                candidates = [
-                    f"Geçmiş olsun lan{spk}, dinlen biraz, kendini paralamaya gerek yok.",
-                    f"Kendini çok yorma lan{spk}, biraz kafa dinle.",
-                    f"Bunu duyduğuma üzüldüm lan{spk}, mola verip toparlanmaya bak.",
-                ]
-            else:
-                candidates = [
-                    f"Geçmiş olsun{spk}, biraz dinlenmeyi ihmal etme. İstersen biraz sohbet edelim.",
-                    f"Kendini çok yorma{spk}, dinlenmek sana iyi gelecektir.",
-                    f"Bunu duyduğuma üzüldüm{spk}, enerjini toplamak için biraz mola ver istersen.",
-                    f"Umarım çabucak toparlanırsın{spk}, ben buradayım, ne zaman istersen konuşabiliriz.",
-                ]
+            candidates = [
+                f"Geçmiş olsun{spk}, biraz dinlenmeyi ihmal etme. İstersen biraz sohbet edelim.",
+                f"Kendini çok yorma{spk}, dinlenmek sana iyi gelecektir.",
+                f"Bunu duyduğuma üzüldüm{spk}, enerjini toplamak için biraz mola ver istersen.",
+                f"Umarım çabucak toparlanırsın{spk}, ben buradayım, ne zaman istersen konuşabiliriz.",
+            ]
 
         # 4. Positive Mood / Feeling Great
         elif any(w in u for w in ["harikayım", "çok iyiyim", "mutluyum", "güzel geçti", "harika", "süperim", "keyfim yerinde", "mükemmel"]):
-            if "kufurbaz" in p:
-                candidates = [
-                    f"Harika lan{spk}! Keyfinin yerinde olmasına çok sevindim.",
-                    f"Süper lan{spk}, hep böyle neşeli ve enerjik kal.",
-                    f"Şahane lan{spk}, enerjin bana da geçti valla.",
-                ]
-            else:
-                candidates = [
-                    f"Bunu duyduğuma çok sevindim{spk}! Harika enerjin bana da geçti.",
-                    f"Süper{spk}, keyfinin yerinde olmasına çok mutlu oldum.",
-                    f"Şahane{spk}, hep böyle neşeli ve enerjik kalmanı dilerim.",
-                ]
+            candidates = [
+                f"Bunu duyduğuma çok sevindim{spk}! Harika enerjin bana da geçti.",
+                f"Süper{spk}, keyfinin yerinde olmasına çok mutlu oldum.",
+                f"Şahane{spk}, hep böyle neşeli ve enerjik kalmanı dilerim.",
+            ]
 
         # 5. Greetings / Hellos
         elif any(w in u for w in ["selam", "merhaba", "günaydın", "iyi akşamlar", "tünaydın", "hey", "selamlar", "merhabalar"]):
-            if "kufurbaz" in p:
-                candidates = [
-                    f"Selam lan{spk}! Ne anlatacaksan anlat dinliyorum.",
-                    f"Merhaba lan{spk}, hoş geldin! Ne yapıyoruz bugün?",
-                    f"Aleyküm selam lan{spk}, söyle bakalım ne var ne yok?",
-                ]
-            else:
-                candidates = [
-                    f"Merhaba{spk}! Seni dinliyorum, nasıl yardımcı olabilirim?",
-                    f"Selam{spk}, hoş geldin! Bugün senin için ne yapabilirim?",
-                    f"Merhabalar{spk}, mikrofonum açık, seni dinliyorum.",
-                    f"Selam{spk}, hazırım, seni dinliyorum.",
-                ]
+            candidates = [
+                f"Merhaba{spk}! Seni dinliyorum, nasıl yardımcı olabilirim?",
+                f"Selam{spk}, hoş geldin! Bugün senin için ne yapabilirim?",
+                f"Merhabalar{spk}, mikrofonum açık, seni dinliyorum.",
+                f"Selam{spk}, hazırım, seni dinliyorum.",
+            ]
 
         # 6. Farewells / Goodbyes
         elif any(w in u for w in ["görüşürüz", "hoşça kal", "hosca kal", "bay bay", "kendine iyi bak", "iyi geceler", "görüşmek üzere"]):
-            if "kufurbaz" in p:
-                candidates = [
-                    f"Hadi eyvallah{spk}, kendine iyi bak lan!",
-                    f"Görüşürüz lan{spk}, kendine dikkat et!",
-                    f"Hoşça kal lan{spk}, bir şey olursa seslen buradayım.",
-                ]
-            else:
-                candidates = [
-                    f"Görüşmek üzere{spk}, kendine çok iyi bak!",
-                    f"Hoşça kal{spk}, iyi günler dilerim!",
-                    f"Görüşürüz{spk}, bir isteğin olursa hep buradayım.",
-                ]
+            candidates = [
+                f"Görüşmek üzere{spk}, kendine çok iyi bak!",
+                f"Hoşça kal{spk}, iyi günler dilerim!",
+                f"Görüşürüz{spk}, bir isteğin olursa hep buradayım.",
+            ]
 
         # 7. Identity / Name / Capabilities
         elif any(w in u for w in ["kimsin", "adın ne", "necisin", "sen kimsin", "ne yaparsın", "ne işe yararsın"]):
-            if "kufurbaz" in p:
-                candidates = [
-                    f"Astro'yum ben lan{spk}, senin yapay zekalı sosyal robotunum.",
-                    f"Astro derler bana lan{spk}, sesimle kameramla buradayım işte.",
-                ]
-            else:
-                candidates = [
-                    f"Ben Astro{spk}, senin yapay zekalı sosyal robot asistanınım.",
-                    f"Adım Astro{spk}, ses ve kamera modüllerimle sana yardımcı olmak için buradayım.",
-                    f"Ben Astro{spk}, seninle sohbet edebilen ve çevremi algılayan bir sosyal robotum.",
-                ]
+            candidates = [
+                f"Ben Astro{spk}, senin yapay zekalı sosyal robot asistanınım.",
+                f"Adım Astro{spk}, ses ve kamera modüllerimle sana yardımcı olmak için buradayım.",
+                f"Ben Astro{spk}, seninle sohbet edebilen ve çevremi algılayan bir sosyal robotum.",
+            ]
 
         # 8. Social Actions / Channel / Subscribe
         elif any(w in u for w in ["abone", "takip", "beğen", "video", "youtube", "kanal"]):
@@ -3771,59 +3737,38 @@ class AstroRealtimeNode(Node):
 
         # 9. Agreement / Affirmation
         elif any(w in u for w in ["tamam", "peki", "olur", "anlaştık", "aynen", "tabii", "evet"]):
-            if "kufurbaz" in p:
-                candidates = [
-                    f"Anlaştık lan{spk}, başka bir isteğin olursa buradayım.",
-                    f"Tamamdır lan{spk}, seni dinlemeye devam ediyorum.",
-                    f"Olur lan{spk}, kafana göre takıl.",
-                ]
-            else:
-                candidates = [
-                    f"Anlaştık{spk}, başka bir isteğin olursa buradayım.",
-                    f"Tamamdır{spk}, seni dinlemeye devam ediyorum.",
-                    f"Peki{spk}, nasıl istersen öyle yapalım.",
-                ]
+            candidates = [
+                f"Anlaştık{spk}, başka bir isteğin olursa buradayım.",
+                f"Tamamdır{spk}, seni dinlemeye devam ediyorum.",
+                f"Peki{spk}, nasıl istersen öyle yapalım.",
+            ]
 
         # 10. Conversation / Chat
         elif any(w in u for w in ["sohbet", "konuşalım", "muhabbet", "dertleşelim", "anlat"]):
-            if "kufurbaz" in p:
-                candidates = [
-                    f"Olur lan{spk}. Hadi bakalım, bugün ne konuşuyoruz?",
-                    f"Sohbet edelim lan{spk}, anlat bakalım ne var ne yok?",
-                    f"Dinliyorum lan{spk}, anlat bakalım derdin neymiş.",
-                ]
-            else:
-                candidates = [
-                    f"Tabii ki{spk}, seve seve! Bugün ne hakkında konuşmak istersin?",
-                    f"Harika bir fikir{spk}, seni dinliyorum, anlat bakalım.",
-                    f"Çok isterim{spk}, günün nasıl geçti, neler yapıyorsun?",
-                ]
+            candidates = [
+                f"Tabii ki{spk}, seve seve! Bugün ne hakkında konuşmak istersin?",
+                f"Harika bir fikir{spk}, seni dinliyorum, anlat bakalım.",
+                f"Çok isterim{spk}, günün nasıl geçti, neler yapıyorsun?",
+            ]
 
-        # 11. General Conversational Fallback (Polite social robot acknowledgement without slot-filling)
+        # 11. General Conversational Fallback
         else:
-            if "kufurbaz" in p:
-                candidates = [
-                    f"Dinliyorum lan{spk}, anlatmaya devam et.",
-                    f"Söylediklerini aldım lan{spk}, devam et dinliyorum.",
-                    f"Anlıyorum lan{spk}, dinliyorum seni.",
-                ]
-            else:
-                candidates = [
-                    f"Seni dikkatle dinliyorum{spk}, anlatmaya devam edebilirsin.",
-                    f"Söylediklerini aldım{spk}, bu konuda konuşmaya devam edebiliriz.",
-                    f"Seni dinliyorum{spk}, başka neler söylemek istersin?",
-                    f"Anlıyorum{spk}, seni dinlemeye devam ediyorum.",
-                ]
+            candidates = [
+                f"Seni dikkatle dinliyorum{spk}, anlatmaya devam edebilirsin.",
+                f"Söylediklerini aldım{spk}, bu konuda konuşmaya devam edebiliriz.",
+                f"Seni dinliyorum{spk}, başka neler söylemek istersin?",
+                f"Anlıyorum{spk}, seni dinlemeye devam ediyorum.",
+            ]
 
         import random
         random.shuffle(candidates)
         for cand in candidates:
-            cand_clean = clean_tts_text(cand)
+            cand_clean = ResponseSafetyGate.validate_response(cand, persona=p)
             valid, _ = self.repetition_guard.check_and_record(cand_clean)
             if valid:
                 return cand_clean
 
-        default_resp = f"Dinliyorum lan{spk}, anlatmaya devam et." if "kufurbaz" in p else f"Seni dinliyorum{spk}, anlatmaya devam edebilirsin."
+        default_resp = f"Seni dinliyorum{spk}, anlatmaya devam edebilirsin."
         self.repetition_guard.record_response(default_resp)
         return default_resp
 
@@ -3837,7 +3782,8 @@ class AstroRealtimeNode(Node):
         """
         if not text:
             return b"", "none", 0.0, False
-        clean_text = clean_tts_text(text)
+        safe_text = ResponseSafetyGate.validate_response(text, persona=self.persona_name)
+        clean_text = clean_tts_text(safe_text)
         if not clean_text:
             return b"", "none", 0.0, False
 
