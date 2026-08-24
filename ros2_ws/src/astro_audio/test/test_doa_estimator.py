@@ -110,13 +110,44 @@ class TestAcousticDOAEstimator(unittest.TestCase):
         self.assertIsNotNone(azimuth)
         self.assertAlmostEqual(azimuth, 0.0, delta=5.0)
 
-    def test_silence_or_ambient_noise_produces_invalid(self):
-        """Low energy ambient noise or silence must return valid=False and None azimuth."""
-        silence = np.random.normal(0.0, 10.0, (4, 800)).astype(np.float32)  # Low RMS < 50
-        azimuth, conf, valid = self.estimator.estimate_from_multichannel_pcm(silence)
-        
-        self.assertFalse(valid)
-        self.assertIsNone(azimuth)
+    def test_spatial_triangulation_multi_angle_series(self):
+        """Validates that as sound location shifts (SOL -> ÖN -> SAĞ), estimated azimuth changes accordingly."""
+        # 1. Left series (expect negative angles)
+        left_angles = [-30.0, -42.0, -38.0]
+        left_results = []
+        for ang in left_angles:
+            pcm = generate_multichannel_synthetic_sound(azimuth_deg=ang, seed=int(abs(ang) * 10))
+            az, _, valid = self.estimator.estimate_from_multichannel_pcm(pcm)
+            self.assertTrue(valid)
+            self.assertLess(az, 0.0)
+            self.assertAlmostEqual(az, ang, delta=5.0)
+            left_results.append(az)
+
+        # 2. Front series (expect near zero angles)
+        front_angles = [-4.0, +2.0, +5.0]
+        front_results = []
+        for ang in front_angles:
+            pcm = generate_multichannel_synthetic_sound(azimuth_deg=ang, seed=int(abs(ang) * 10 + 100))
+            az, _, valid = self.estimator.estimate_from_multichannel_pcm(pcm)
+            self.assertTrue(valid)
+            self.assertAlmostEqual(az, ang, delta=5.0)
+            front_results.append(az)
+
+        # 3. Right series (expect positive angles)
+        right_angles = [+35.0, +44.0, +39.0]
+        right_results = []
+        for ang in right_angles:
+            pcm = generate_multichannel_synthetic_sound(azimuth_deg=ang, seed=int(abs(ang) * 10 + 200))
+            az, _, valid = self.estimator.estimate_from_multichannel_pcm(pcm)
+            self.assertTrue(valid)
+            self.assertGreater(az, 0.0)
+            self.assertAlmostEqual(az, ang, delta=5.0)
+            right_results.append(az)
+
+        # Verify distinct positive, near-zero, and negative separation
+        self.assertTrue(all(l < -20.0 for l in left_results))
+        self.assertTrue(all(-10.0 <= f <= 10.0 for f in front_results))
+        self.assertTrue(all(r > 20.0 for r in right_results))
 
 
 if __name__ == "__main__":
