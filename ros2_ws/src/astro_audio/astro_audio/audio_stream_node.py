@@ -303,14 +303,16 @@ class AudioStreamNode(Node):
         try:
             is_speech = self._respeaker.speech_detected()
             doa_angle = self._respeaker.doa_angle()
+            now = time.monotonic()
+            recent_speech = (is_speech is True) or ((now - getattr(self, "_last_mic_speech_time", 0.0)) < 1.5)
 
             if is_speech is not None:
                 vad_msg = Bool()
                 vad_msg.data = bool(is_speech)
                 self.pub_vad.publish(vad_msg)
 
-            # Only publish genuine hardware DOA when speech is detected and angle is valid
-            if doa_angle is not None and is_speech is True:
+            # Publish genuine hardware DOA when speech occurred recently and angle is valid
+            if doa_angle is not None and recent_speech:
                 doa_msg = Float32()
                 doa_msg.data = float(doa_angle)
                 self.pub_doa.publish(doa_msg)
@@ -426,6 +428,8 @@ class AudioStreamNode(Node):
             if not is_active_playback and rms < 400.0:
                 # Continuously adapt ambient background noise floor during quiet periods
                 self._ambient_rms = 0.96 * self._ambient_rms + 0.04 * rms
+            elif not is_active_playback and rms >= 400.0:
+                self._last_mic_speech_time = now
 
             # Software Echo Mute & Self-Voice Suppression (Zero Self-Hearing):
             # When Astro is playing voice or within echo cooldown, protect playback
