@@ -277,11 +277,21 @@ class AudioStreamNode(Node):
         self._last_playback_time = 0.0
         self._playback_lock = threading.Lock()
         self._stop_event = threading.Event()
+        self._total_enqueued_bytes = 0
+        self._total_played_bytes = 0
+        self._total_playback_bytes = 0
+        self._current_gen_played_bytes = 0
+        self._cancelled_gen_ids: set[int] = set()
         self._playback_burst_active = False
         self._burst_start_time = 0.0
+        self._playback_worker_alive = True
+        self._playback_worker_error = "none"
         self._last_input_callback_time = time.monotonic()
         self._last_output_chunk_time = 0.0
+        self._last_output_envelope: Optional[dict] = None
+        self._active_provenance: dict = {}
         self._input_stream = None
+        self._output_stream = None
         self._input_stream_alive = False
         self._last_cb_err_log_time = 0.0
         self._callback_exception_count = 0
@@ -296,7 +306,6 @@ class AudioStreamNode(Node):
         self._gen_packets: dict[int, int] = {}
         self._gen_stream_start: dict[int, float] = {}
         self._gen_playback_start: dict[int, float] = {}
-        self._total_playback_bytes: int = 0
 
         # Background Audio Input Stream initialization
         self._start_input_stream()
@@ -580,52 +589,55 @@ class AudioStreamNode(Node):
 
     def _on_interrupt(self, msg: Bool):
         """Zero-latency barge-in signal: instantly flush playback buffer queue and mute lingering tail."""
-        if not msg.data:
-            return
+        try:
+            if not msg.data:
+                return
 
-        # P0-7: Barge-in is only valid if playback has actually started and played bytes > 0
-        if not self._playback_burst_active or self._total_played_bytes == 0:
-            return
+            # P0-7: Barge-in is only valid if playback has actually started and played bytes > 0
+            if not self._playback_burst_active or self._total_played_bytes == 0:
+                return
 
-        discarded_bytes = 0
-        with self._playback_lock:
-            while not self._play_queue.empty():
-                try:
-                    c = self._play_queue.get_nowait()
-                    raw_len = len(c["pcm"]) if isinstance(c, dict) else len(c)
-                    discarded_bytes += raw_len
-                except queue.Empty:
-                    break
+            discarded_bytes = 0
+            with self._playback_lock:
+                while not self._play_queue.empty():
+                    try:
+                        c = self._play_queue.get_nowait()
+                        raw_len = len(c["pcm"]) if isinstance(c, dict) else len(c)
+                        discarded_bytes += raw_len
+                    except queue.Empty:
+                        break
 
-        now_mono = time.monotonic()
-        barge_in_after_ms = int((now_mono - self._burst_start_time) * 1000.0) if self._burst_start_time > 0 else 0
-        barge_in_source = "self_voice" if (self._burst_start_time > 0 and barge_in_after_ms < int(self.barge_in_protection_ms)) else "user"
-        self._is_playing = False
-        self._playback_burst_active = False
-        self._last_playback_time = 0.0
-        self._playback_drop_until = now_mono + 0.15
-        prov = getattr(self, "_active_provenance", {})
-        cancelled_gen = prov.get('generation_id', 0)
-        if not hasattr(self, "_cancelled_gen_ids"):
-            self._cancelled_gen_ids = set()
-        self._cancelled_gen_ids.add(cancelled_gen)
+            now_mono = time.monotonic()
+            barge_in_after_ms = int((now_mono - self._burst_start_time) * 1000.0) if self._burst_start_time > 0 else 0
+            barge_in_source = "self_voice" if (self._burst_start_time > 0 and barge_in_after_ms < int(self.barge_in_protection_ms)) else "user"
+            self._is_playing = False
+            self._playback_burst_active = False
+            self._last_playback_time = 0.0
+            self._playback_drop_until = now_mono + 0.15
+            prov = getattr(self, "_active_provenance", {})
+            cancelled_gen = prov.get('generation_id', 0)
+            if not hasattr(self, "_cancelled_gen_ids"):
+                self._cancelled_gen_ids = set()
+            self._cancelled_gen_ids.add(cancelled_gen)
 
-        gen_bytes = getattr(self, "_current_gen_played_bytes", self._total_played_bytes)
+            gen_bytes = getattr(self, "_current_gen_played_bytes", self._total_played_bytes)
 
-        self.get_logger().info(
-            f"⚡ [Playback Telemetry]: tts_playback_cancelled=True | "
-            f"generation_id={cancelled_gen} | "
-            f"playback_source={prov.get('playback_source', 'unknown')} | "
-            f"tts_provider={prov.get('tts_provider', 'unknown')} | "
-            f"tts_model={prov.get('tts_model', 'unknown')} | "
-            f"tts_played_bytes={gen_bytes} | "
-            f"tts_remaining_bytes={discarded_bytes} | "
-            f"total_playback_bytes={self._total_played_bytes} | "
-            f"playback_duration_ms={barge_in_after_ms} | "
-            f"barge_in_after_ms={barge_in_after_ms} | "
-            f"barge_in_source={barge_in_source} | "
-            f"reason=barge_in"
-        )
+            self.get_logger().info(
+                f"⚡ [Playback Telemetry]: tts_playback_cancelled=True | "
+                f"generation_id={cancelled_gen} | "
+                f"playback_source={prov.get('playback_source', 'unknown')} | "
+                f"tts_provider={prov.get('tts_provider', 'unknown')} | "
+                f"tts_model={prov.get('tts_model', 'unknown')} | "
+                f"tts_played_bytes={gen_bytes} | "
+                f"tts_remaining_bytes={discarded_bytes} | "
+                f"total_playback_bytes={self._total_played_bytes} | "
+                f"playback_duration_ms={barge_in_after_ms} | "
+                f"barge_in_after_ms={barge_in_after_ms} | "
+                f"barge_in_source={barge_in_source} | "
+                f"reason=barge_in"
+            )
+        except Exception as exc:
+            self.get_logger().debug(f"_on_interrupt error: {exc}")
 
     def _playback_worker(self):
         """Dedicated real-time audio playback loop sending PCM directly to hardware DAC."""
