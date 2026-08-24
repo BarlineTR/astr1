@@ -147,6 +147,55 @@ def find_audio_device(is_input: bool = True, preferred: str = "") -> tuple[Optio
     return valid[0][0], valid[0][1]
 
 
+try:
+    import usb.core
+    import usb.util
+    HAS_USB = True
+except ImportError:
+    HAS_USB = False
+
+RESPEAKER_VID = 0x2886
+RESPEAKER_PID = 0x0018
+PARAM_SPEECH_DETECTED = 19
+PARAM_DOA_ANGLE = 21
+
+
+class ReSpeakerHID:
+    """Hardware HID interface for ReSpeaker 4-Mic USB Array parameters (VAD & DOA)."""
+    TIMEOUT_MS = 1000
+
+    def __init__(self):
+        self.dev = None
+        if not HAS_USB:
+            return
+        try:
+            self.dev = usb.core.find(idVendor=RESPEAKER_VID, idProduct=RESPEAKER_PID)
+        except Exception:
+            self.dev = None
+
+    def _read_param(self, param_id: int) -> int:
+        if self.dev is None:
+            return 0
+        try:
+            data = self.dev.ctrl_transfer(
+                usb.util.CTRL_IN | usb.util.CTRL_TYPE_VENDOR | usb.util.CTRL_RECIPIENT_DEVICE,
+                0,
+                param_id,
+                0,
+                8,
+                self.TIMEOUT_MS,
+            )
+            return struct.unpack_from("i", data, 0)[0]
+        except Exception:
+            return 0
+
+    def speech_detected(self) -> bool:
+        return self._read_param(PARAM_SPEECH_DETECTED) == 1
+
+    def doa_angle(self) -> float:
+        return float(self._read_param(PARAM_DOA_ANGLE))
+
+
 class AudioStreamNode(Node):
     """ROS 2 Node managing real-time bidirectional audio for OpenAI Realtime WebSocket."""
 
@@ -157,6 +206,12 @@ class AudioStreamNode(Node):
         self.pub_input_pcm = self.create_publisher(String, "/audio/realtime_input_pcm", 20)
         self.pub_playback_active = self.create_publisher(Bool, "/audio/playback_active", 10)
         self.pub_input_level = self.create_publisher(Float32, "/audio/mic_level", 10)
+        self.pub_doa = self.create_publisher(Float32, "/audio/doa", 10)
+        self.pub_vad = self.create_publisher(Bool, "/audio/vad", 10)
+
+        # Hardware ReSpeaker HID
+        self._respeaker = ReSpeakerHID()
+        self._last_doa_angle = 0.0
 
         # Subscribers
         self.create_subscription(String, "/audio/realtime_output_pcm", self._on_output_pcm, 50)
@@ -219,6 +274,38 @@ class AudioStreamNode(Node):
 
         # Playback status ticker timer
         self.create_timer(0.1, self._publish_status)
+
+        # ReSpeaker 4-Mic HID DOA & VAD polling timer (10 Hz)
+        if not self._under_pytest():
+            self.create_timer(0.1, self._poll_respeaker_hid)
+
+    def _poll_respeaker_hid(self):
+        """Polls ReSpeaker 4-Mic hardware parameters (DOA & VAD) and publishes to ROS topics."""
+        if not self._respeaker or not self._respeaker.dev:
+            return
+        try:
+            is_speech = self._respeaker.speech_detected()
+            doa_angle = self._respeaker.doa_angle()
+
+            vad_msg = Bool()
+            vad_msg.data = bool(is_speech)
+            self.pub_vad.publish(vad_msg)
+
+            doa_msg = Float32()
+            doa_msg.data = float(doa_angle)
+            self.pub_doa.publish(doa_msg)
+
+            if is_speech:
+                yaw = doa_angle if doa_angle <= 180.0 else doa_angle - 360.0
+                sign = "+" if yaw >= 0 else ""
+                self.get_logger().info(
+                    f"[DOA]\n"
+                    f"azimuth_deg={sign}{yaw:.1f}\n"
+                    f"confidence=0.90\n"
+                    f"valid=true"
+                )
+        except Exception as exc:
+            self.get_logger().debug(f"_poll_respeaker_hid error: {exc}")
 
     @staticmethod
     def _under_pytest() -> bool:

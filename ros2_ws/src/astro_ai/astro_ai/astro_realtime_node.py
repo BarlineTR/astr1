@@ -112,7 +112,7 @@ EMOJI_RE = re.compile(
 )
 
 try:
-    from astro_ai.conversation_session import ConversationSession
+    from astro_ai.conversation_session import ConversationSession, normalize_turkish_speech_input
     from astro_ai.memory_manager import MemoryManager
     from astro_ai.persona_engine import (
         PersonaEngine, PERSONA_PROMPTS, clean_tts_text,
@@ -121,8 +121,9 @@ try:
     from astro_ai.state_machine import RobotState, StateMachine
     from astro_ai.provider_registry import ProviderRegistry, ProviderError, ErrorClass
     from astro_ai.repetition_guard import RepetitionGuard
+    from astro_ai.action_manager import ActionManager, SoundDirection, ActionResult
 except ImportError:
-    from conversation_session import ConversationSession
+    from conversation_session import ConversationSession, normalize_turkish_speech_input
     from memory_manager import MemoryManager
     from persona_engine import (
         PersonaEngine, PERSONA_PROMPTS, clean_tts_text,
@@ -131,6 +132,10 @@ except ImportError:
     from state_machine import RobotState, StateMachine
     from provider_registry import ProviderRegistry, ProviderError, ErrorClass
     from repetition_guard import RepetitionGuard
+    try:
+        from action_manager import ActionManager, SoundDirection, ActionResult
+    except ImportError:
+        ActionManager = SoundDirection = ActionResult = None  # type: ignore
 
 
 
@@ -536,6 +541,7 @@ class AstroRealtimeNode(Node):
         self.persona_engine = PersonaEngine(self.persona_name)
         self.state_machine = StateMachine(RobotState.DEEP_IDLE)
         self.session = ConversationSession(base_timeout_s=16.0)
+        self.action_manager = ActionManager(logger=self.get_logger(), node=self) if ActionManager else None
 
         # State
         self._lock = threading.RLock()
@@ -735,6 +741,7 @@ class AstroRealtimeNode(Node):
         self.pub_emotion = self.create_publisher(String, "/robot/emotion", 10)
         self.pub_gesture = self.create_publisher(String, "/robot/head_gesture", 10)
         self.pub_transcript = self.create_publisher(String, "/speech/text", 10)
+        self.pub_head_cmd = self.create_publisher(HeadCmd, "/head_cmd", 10) if 'HeadCmd' in globals() else None
 
         # ROS 2 Subscribers
         self.create_subscription(String, "/tts/realtime_request", self._on_realtime_turn_request, 10)
@@ -746,6 +753,8 @@ class AstroRealtimeNode(Node):
         self.create_subscription(Bool, "/vision/looking_at_robot", self._on_looking_at_robot, 10)
         self.create_subscription(Float32, "/vision/user_distance", self._on_user_distance, 10)
         self.create_subscription(Float32, "/audio/doa", self._on_doa, 10)
+        self.create_subscription(Float32, "/audio/mic_level", self._on_mic_level, 10)
+        self.create_subscription(Bool, "/audio/vad", self._on_vad, 10)
         # Görüntü akışları sensör QoS'u (BEST_EFFORT): kare kaybı, geciken kareler
         # için retransmission yapmaktan iyidir. BEST_EFFORT abone RELIABLE
         # yayıncıdan da veri alır, bu yüzden depthai_ros_driver ile uyumlu.
@@ -1358,8 +1367,18 @@ class AstroRealtimeNode(Node):
                     },
                     {
                         "type": "function",
+                        "name": "turn_to_sound",
+                        "description": "Kullanıcı 'sesimin geldiği yöne dön', 'bana dön', 'sesime bak', 'sesin geldiği tarafa yönel', 'sesime doğru dön' dediğinde çağrılır. Robot mikrofon dizisinden (DOA) sesin gerçek fiziksel açısını tespit edip o yöne döner. DİKKAT: Ses yönü için yön tahmin etme (sağ/sol deme), sadece bu fonksiyonu çağır.",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {},
+                            "required": []
+                        }
+                    },
+                    {
+                        "type": "function",
                         "name": "move_robot",
-                        "description": "Kullanıcı robotun hareket etmesini istediğinde çağrılır ('ileri git', 'geri gel', 'dur', 'sağa dön', 'sola dön').",
+                        "description": "Kullanıcı doğrudan belirli bir yöne gitmesini istediğinde çağrılır ('ileri git', 'geri gel', 'dur', 'sağa dön', 'sola dön'). DİKKAT: Kullanıcı 'sesime dön' dediğinde bu fonksiyon KESİNLİKLE ÇAĞRILMAZ, yön uydurulmaz; 'turn_to_sound' fonksiyonu çağrılır.",
                         "parameters": {
                             "type": "object",
                             "properties": {
@@ -1368,7 +1387,7 @@ class AstroRealtimeNode(Node):
                                     "enum": ["forward", "backward", "left", "right", "stop"],
                                     "description": "Hareket yönü"
                                 },
-                                "speed": {"type": "number", "description": "Hız (0.1 - 0.5 m/s)"},
+                                "speed": {"type": "number", "description": "Hız (0.1 - 0.4 m/s)"},
                                 "duration": {"type": "number", "description": "Kaç saniye hareket edeceği"}
                             },
                             "required": ["direction"]
@@ -1832,8 +1851,19 @@ class AstroRealtimeNode(Node):
                 res = ws.send(json.dumps(tool_output_event))
                 if asyncio.iscoroutine(res):
                     await res
-                # Trigger response generation with tool output
-                res2 = ws.send(json.dumps({"type": "response.create"}))
+                # Trigger response generation with strictly grounded physical reality instructions
+                response_create_payload = {
+                    "type": "response.create",
+                    "response": {
+                        "instructions": (
+                            "FİZİKSEL VE EYLEM CEVAP KURALI: Az önce çalıştırılan fonksiyonun (tool) çıktısını kesin ve mutlak gerçeklik kabul et. "
+                            "Eğer çıktı başarı (success=true) içeriyorsa eylemin başarıyla yapıldığını belirt. "
+                            "Eğer çıktı hata/engel (success=false veya status=blocked/error) içeriyorsa, SADECE ve SADECE çıktıda yazan 'message' veya 'reason' açıklamasını esas al; "
+                            "çıktıda yazmayan hiçbir uydurma sebep (kalp ritmi, nabız, bağlantı vb.) KESİNLİKLE ÜRETME. Asla gerçekleşmeyen bir hareketi gerçekleşmiş gibi iddia etme."
+                        )
+                    }
+                }
+                res2 = ws.send(json.dumps(response_create_payload))
                 if asyncio.iscoroutine(res2):
                     await res2
 
@@ -2039,44 +2069,61 @@ class AstroRealtimeNode(Node):
             focus = args.get("focus", "kullanıcının elindeki nesne, rengi ve çevre")
             return self._inspect_camera_view(focus)
 
+        elif name == "turn_to_sound":
+            if getattr(self, "action_manager", None):
+                res = self.action_manager.execute_turn_to_sound(
+                    generation_id=getattr(self, "realtime_current_generation_id", None)
+                )
+                return res.to_dict()
+            return {
+                "status": "error",
+                "success": False,
+                "action": "turn_to_sound",
+                "error_code": "NO_DIRECTION",
+                "message": "Ses yönü yöneticisi hazır değil veya DOA verisi yok."
+            }
+
         elif name == "move_robot":
             direction = args.get("direction", "stop").lower().strip()
             speed = float(args.get("speed", 0.2))
-            speed = max(0.05, min(speed, 0.4))
             duration = float(args.get("duration", 1.5))
-            duration = max(0.5, min(duration, 5.0))
+            if getattr(self, "action_manager", None):
+                res = self.action_manager.execute_move(
+                    direction=direction,
+                    speed=speed,
+                    duration=duration,
+                    generation_id=getattr(self, "realtime_current_generation_id", None),
+                )
+                return res.to_dict()
 
+            # Direct fallback if ActionManager is not instantiated
+            speed = max(0.05, min(speed, 0.4))
+            duration = max(0.5, min(duration, 5.0))
             if direction != "stop":
-                # 1. Heartbeat Health Gate
                 hb_ok = getattr(self, "_arduino_heartbeat_healthy", False)
                 last_ack = getattr(self, "_last_heartbeat_ack_time", 0.0)
                 if not hb_ok or (time.monotonic() - last_ack) > 2.0:
                     return {
                         "status": "blocked",
                         "reason": "heartbeat_unhealthy",
+                        "error_code": "MOTOR_CONTROLLER_UNAVAILABLE",
                         "message": "Arduino bağlantısı veya heartbeat aktif değil, güvenlik için hareket engellendi."
                     }
-
-                # 2. Obstacle Detection Gate (Immediate proximity block)
                 if direction == "forward" and getattr(self, "_obstacle_detected", False):
                     return {
                         "status": "blocked",
                         "reason": "obstacle_detected",
+                        "error_code": "OBSTACLE_DETECTED",
                         "message": "Robotun önünde engel tespit edildi, hareket güvenlik nedeniyle engellendi."
                     }
-
-                # 3. LiDAR Health & Freshness Watchdog Gate
                 last_scan_time = getattr(self, "_last_laser_scan_time", 0.0)
-                now_mono = time.monotonic()
-                is_lidar_stale = (now_mono - last_scan_time) > 2.0
-                if is_lidar_stale:
-                    self._lidar_health = "UNHEALTHY"
-                    if direction == "forward":
-                        return {
-                            "status": "blocked",
-                            "reason": "lidar_stale_or_disconnected",
-                            "message": "LiDAR tarama verisi alınamıyor veya güncel değil, güvenlik nedeniyle ileri hareket engellendi."
-                        }
+                if (time.monotonic() - last_scan_time) > 2.0 and direction == "forward":
+                    return {
+                        "status": "blocked",
+                        "reason": "lidar_stale_or_disconnected",
+                        "error_code": "LIDAR_STALE_OR_DISCONNECTED",
+                        "message": "LiDAR tarama verisi alınamıyor veya güncel değil, güvenlik nedeniyle ileri hareket engellendi."
+                    }
 
             pub = getattr(self, "pub_cmd_vel", None)
             if pub:
@@ -2095,7 +2142,6 @@ class AstroRealtimeNode(Node):
                         tw.angular.z = 0.0
 
                     pub.publish(tw)
-
                     if direction != "stop":
                         def _stop_later():
                             time.sleep(duration)
@@ -2106,10 +2152,10 @@ class AstroRealtimeNode(Node):
                                 pass
                         threading.Thread(target=_stop_later, daemon=True).start()
 
-                    return {"status": "success", "action": f"Robot {direction} yönünde {speed} m/s hızla hareket ettirildi."}
+                    return {"status": "success", "success": True, "action": f"Robot {direction} yönünde {speed} m/s hızla hareket ettirildi."}
                 except Exception as me:
-                    return {"status": "error", "message": f"Hareket komutu verilemedi: {me}"}
-            return {"status": "error", "message": "/cmd_vel yayıncısı hazır değil."}
+                    return {"status": "error", "success": False, "message": f"Hareket komutu verilemedi: {me}"}
+            return {"status": "error", "success": False, "message": "/cmd_vel yayıncısı hazır değil."}
 
         elif name == "enroll_user_biometrics":
             name_param = args.get("name", "")
@@ -3211,7 +3257,8 @@ class AstroRealtimeNode(Node):
         is_echo_cooldown: bool,
     ) -> Tuple[Optional[str], Dict[str, Any]]:
         """Multi-signal validation fusing transcript text, acoustic evidence, VAD, playback state, and self-voice score."""
-        cleaned = (transcript or "").strip()
+        raw_cleaned = (transcript or "").strip()
+        cleaned = normalize_turkish_speech_input(raw_cleaned) if 'normalize_turkish_speech_input' in globals() else raw_cleaned
         if not cleaned:
             return None, {
                 "transcript": "",
@@ -3601,7 +3648,8 @@ class AstroRealtimeNode(Node):
         Strictly avoids artificial keyword slot-filling or robotic template echoes.
         """
         p = self.persona_name.lower()
-        spk = f" {self._active_person_name}" if self._active_person_name != "Misafir" else ""
+        # Keep name usage sparse and natural across conversation turns
+        spk = ""
         u = (user_text or "").lower().strip()
 
         candidates = []
@@ -4831,6 +4879,35 @@ class AstroRealtimeNode(Node):
 
     def _on_doa(self, msg: Float32):
         self._speaker_angle = float(msg.data)
+        if getattr(self, "action_manager", None):
+            self.action_manager.update_audio_state(
+                raw_doa_deg=float(msg.data),
+                rms_level=getattr(self, "_latest_mic_rms", None),
+                vad_active=getattr(self, "_vad_active", False),
+                is_speaking=self._is_responding,
+                is_playback_active=self._is_playback_active,
+            )
+
+    def _on_mic_level(self, msg: Float32):
+        rms = float(msg.data)
+        self._latest_mic_rms = rms
+        if getattr(self, "action_manager", None):
+            self.action_manager.update_audio_state(
+                rms_level=rms,
+                vad_active=getattr(self, "_vad_active", False),
+                is_speaking=self._is_responding,
+                is_playback_active=self._is_playback_active,
+            )
+
+    def _on_vad(self, msg: Bool):
+        self._vad_active = bool(msg.data)
+        if getattr(self, "action_manager", None):
+            self.action_manager.update_audio_state(
+                vad_active=bool(msg.data),
+                rms_level=getattr(self, "_latest_mic_rms", None),
+                is_speaking=self._is_responding,
+                is_playback_active=self._is_playback_active,
+            )
 
     def _get_active_biometric_identity(self) -> Dict[str, Any]:
         now = time.monotonic()

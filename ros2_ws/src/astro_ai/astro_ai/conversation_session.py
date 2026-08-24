@@ -72,6 +72,10 @@ def normalize_turkish_speech_input(text: str) -> str:
     t = re.sub(r"(?i)\basro\b", "Astro", t)
     t = re.sub(r"(?i)\basto\b", "Astro", t)
     t = re.sub(r"(?i)\bastrom\b", "Astro", t)
+    # Fix common persona / speech phonetic mis-transcriptions
+    t = re.sub(r"(?i)\b(?:kürbat|kurbat|küfür\s*bat|küfür\s*bal|kufur\s*bat)\b", "küfürbaz", t)
+    t = re.sub(r"(?i)\b(?:kürbata|kurbata|küfür\s*bata)\b", "küfürbaza", t)
+    t = re.sub(r"(?i)\b(?:kürbatlık|kurbatlık)\b", "küfürbazlık", t)
     # Fix common location / name mis-transcriptions
     t = re.sub(r"(?i)\bahvatta\b", "Ahlat'ta", t)
     t = re.sub(r"(?i)\bahlatta\b", "Ahlat'ta", t)
