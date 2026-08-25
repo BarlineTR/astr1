@@ -36,10 +36,10 @@ static const int      PWM_MAX         = 255;
 // 1 yapilirsa Timer2/3/4/5 prescaler'i 1'e cekilir -> 31.37 kHz (sessiz).
 // NOT: BTS7960 datasheet'i ~25 kHz'e kadar veriyor; 31 kHz pratikte yaygin
 // kullaniliyor ama spec'in bir tik ustunde. Suruculer isinirsa 0 yapin.
-#define PWM_HIGH_FREQ 1
+#define PWM_HIGH_FREQ 0
 
-static const int      TEST_PWM        = 150;   // tekerlek otomatik test PWM'i
-static const uint32_t TEST_STEP_MS    = 200;  // her tekerlek adiminin suresi
+static const int TEST_PWM = 60;
+static const uint32_t TEST_STEP_MS = 1000;
 
 // Kafa 1000 rpm'lik bir motor; tam PWM'de savrulur. Tavani dusuk tutuyoruz.
 static const int      HEAD_PWM_LIMIT  = 100;   // kafa icin izin verilen maks PWM

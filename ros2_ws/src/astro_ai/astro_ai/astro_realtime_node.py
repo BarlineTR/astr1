@@ -2603,13 +2603,14 @@ class AstroRealtimeNode(Node):
                 except Exception as gem_e:
                     self.get_logger().debug(f"Gemini Vision ({g_mod}) notice: {gem_e}")
 
-        # 3. Emergency Safety Fallback: OpenAI Vision REST API (gpt-4o-mini)
+        # 3. Emergency Safety Fallback: OpenAI Vision REST API (configurable fallback model)
         # (Only used if Gemini & Groq keys are invalid/failed, so robot never goes blind)
         if not obs and self.openai_api_key:
             try:
                 import urllib.request
+                vision_fallback_model = os.environ.get("OPENAI_VISION_MODEL", os.environ.get("LLM_FALLBACK_MODEL", "gpt-4o-mini"))
                 req_data = {
-                    "model": "gpt-4o-mini",
+                    "model": vision_fallback_model,
                     "messages": [
                         {
                             "role": "user",
@@ -3030,7 +3031,7 @@ class AstroRealtimeNode(Node):
         """Background loop for cognitive memory consolidation (0 camera calls / 0 Gemini Vision cost).
 
         Idle Gemini Vision request = 0.
-        Only performs memory reflection from recent conversations when idle.
+        Only performs memory reflection from new conversation events when idle.
         """
         while (rclpy is not None and getattr(rclpy, "ok", lambda: True)()):
             time.sleep(10)
@@ -3044,16 +3045,19 @@ class AstroRealtimeNode(Node):
             if not self._is_sleeping and (now - getattr(self, "_last_interaction_time", 0.0)) < 30.0:
                 continue
 
-            if (now - self._last_idle_learning_time) > 45.0:
+            idle_interval = float(os.environ.get("IDLE_LEARNING_INTERVAL_S", "45.0"))
+            if (now - self._last_idle_learning_time) > idle_interval:
                 self._last_idle_learning_time = now
-                # Background Cognitive Memory Reflection (text-only LLM)
+                # Background Cognitive Memory Reflection (triggered ONLY if new dialogue messages exist)
                 self._idle_memory_reflection()
 
     def _idle_memory_reflection(self):
         """Extracts user preferences and facts from recent dialogue into long-term profile using FREE Groq/Gemini."""
         messages = self.memory.episodic.get_messages()
-        if len(messages) < 2:
+        # Event/state gating: Only run LLM reflection if new messages have arrived since last reflection
+        if len(messages) < 2 or len(messages) == getattr(self, "_last_reflected_msg_count", 0):
             return
+        self._last_reflected_msg_count = len(messages)
         try:
             recent_conv = messages[-6:]
             conv_str = "\n".join([f"{m['role']}: {m['content']}" for m in recent_conv])
@@ -4782,43 +4786,47 @@ class AstroRealtimeNode(Node):
             if raw_16k:
                 try:
                     speech_start_condition = (local_rms > max(380.0, self._ambient_rms * 1.40) and peak_val > 900)
-                    if speech_start_condition:
-                        self._last_speech_time = now
-                        if not self._fallback_speaking:
-                            self._fallback_speaking = True
-                            self._fallback_speech_start = now
-                            with self._lock:
+                    buf_to_proc = None
+                    with self._lock:
+                        if speech_start_condition:
+                            self._last_speech_time = now
+                            if not self._fallback_speaking:
+                                self._fallback_speaking = True
+                                self._fallback_speech_start = now
                                 pre_frames = list(self._user_speech_audio_buffer[-8:]) if len(self._user_speech_audio_buffer) >= 8 else []
-                            self._fallback_audio_buffer = list(pre_frames) + [raw_16k]
-                        else:
+                                self._fallback_audio_buffer = list(pre_frames) + [raw_16k]
+                            else:
+                                self._fallback_audio_buffer.append(raw_16k)
+                        elif self._fallback_speaking:
                             self._fallback_audio_buffer.append(raw_16k)
-                    elif self._fallback_speaking:
-                        self._fallback_audio_buffer.append(raw_16k)
-                        # Silence timeout (0.75s after speech ends)
-                        if (now - self._last_speech_time) > 0.75:
-                            self._fallback_speaking = False
-                            if len(self._fallback_audio_buffer) >= 12 and not self._is_processing_fallback:
-                                # Pre-STT Local VAD Density Filter (0-Token protection against noise/silence)
-                                raw_fb = b"".join(self._fallback_audio_buffer)
-                                arr_fb = np.frombuffer(raw_fb, dtype=np.int16)
-                                fb_rms = float(np.sqrt(np.mean(arr_fb.astype(np.float32) ** 2))) if len(arr_fb) > 0 else 0.0
-                                chunk_sz = 320  # 20ms
-                                loud_cnt = sum(
-                                    1 for i in range(0, len(arr_fb) - chunk_sz + 1, chunk_sz)
-                                    if np.sqrt(np.mean(arr_fb[i : i + chunk_sz].astype(np.float32) ** 2)) > max(280.0, self._ambient_rms * 1.25)
-                                )
-                                total_chunks = max(1, len(arr_fb) // chunk_sz)
-                                speech_ratio = loud_cnt / float(total_chunks)
-
-                                if fb_rms >= max(260.0, self._ambient_rms * 1.20) and loud_cnt >= 5 and speech_ratio >= 0.15:
+                            # Silence timeout (0.75s after speech ends)
+                            if (now - self._last_speech_time) > 0.75:
+                                self._fallback_speaking = False
+                                if len(self._fallback_audio_buffer) >= 12 and not self._is_processing_fallback:
                                     buf_to_proc = list(self._fallback_audio_buffer)
                                     self._fallback_audio_buffer.clear()
-                                    threading.Thread(target=self._process_fallback_turn, args=(buf_to_proc,), daemon=True).start()
                                 else:
-                                    self.no_speech_rejection_count += 1
                                     self._fallback_audio_buffer.clear()
+
+                    if buf_to_proc:
+                        # Pre-STT Local VAD Density Filter (0-Token protection against noise/silence)
+                        raw_fb = b"".join(buf_to_proc)
+                        arr_fb = np.frombuffer(raw_fb, dtype=np.int16)
+                        fb_rms = float(np.sqrt(np.mean(arr_fb.astype(np.float32) ** 2))) if len(arr_fb) > 0 else 0.0
+                        chunk_sz = 320  # 20ms
+                        loud_cnt = sum(
+                            1 for i in range(0, len(arr_fb) - chunk_sz + 1, chunk_sz)
+                            if np.sqrt(np.mean(arr_fb[i : i + chunk_sz].astype(np.float32) ** 2)) > max(280.0, self._ambient_rms * 1.25)
+                        )
+                        total_chunks = max(1, len(arr_fb) // chunk_sz)
+                        speech_ratio = loud_cnt / float(total_chunks)
+
+                        if fb_rms >= max(260.0, self._ambient_rms * 1.20) and loud_cnt >= 5 and speech_ratio >= 0.15:
+                            threading.Thread(target=self._process_fallback_turn, args=(buf_to_proc,), daemon=True).start()
+                        else:
+                            self.no_speech_rejection_count += 1
                 except Exception as _exc:
-                    self.get_logger().debug(f"_on_input_pcm: yok sayılan hata ({_exc})")
+                    self.get_logger().warning(f"[_on_input_pcm fallback error]: {_exc}")
             return
 
         # --- Standard OpenAI Realtime Mode ---
