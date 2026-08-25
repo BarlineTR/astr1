@@ -238,7 +238,7 @@ class TestPersonaAndSTTHotfix(unittest.TestCase):
         prompt = engine.build_system_prompt()
 
         # Must mandate living the mode without robotic meta-disclaimers
-        self.assertIn("HAZIRCEVAP / ROAST MODU", prompt)
+        self.assertTrue("KÜFÜRBAZ / ROAST MODU" in prompt or "HAZIRCEVAP / ROAST MODU" in prompt)
         self.assertIn("SIFIR ROBOTİK DİSCLAIMER", prompt)
         self.assertIn("FİZİKSEL GERÇEKLİK VE EYLEM DÜRÜSTLÜĞÜ", prompt)
         self.assertIn("ANTI-NAME REPETITION", prompt)

@@ -890,7 +890,8 @@ class AiBrainNode(Node):
 
             if is_pure_greeting:
                 greeting_map = {
-                    "flirt": "Buyur güzellik, bütün algılarım seninle..." if self._speaker_gender == "female" else "Söyle bakalım kral, seni dinliyorum!",
+                    "flirt": "Selam! Seni dinliyorum, anlat bakalım.",
+                    "charming": "Selam! Seni dinliyorum, anlat bakalım.",
                     "playful": "Merhaba! Seni dinliyorum, nasıl yardımcı olabilirim?",
                     "formal": "Buyrun efendim, sizi dinliyorum.",
                     "sarcastic": "Merhaba, yine ne soracaksın bakalım?",
@@ -1095,7 +1096,7 @@ class AiBrainNode(Node):
             is_reminder, reminder_mins, reminder_topic = self._is_reminder_query(user_text)
             if is_reminder:
                 user_name = self._add_reminder(reminder_mins, reminder_topic)
-                friendly_name = user_name if user_name != "Misafir" else ("kral" if persona == "flirt" else "dostum")
+                friendly_name = user_name if user_name != "Misafir" else "dostum"
                 topic_speech = reminder_topic
                 topic_str = f"{topic_speech.lower()}ni" if "vakti" in topic_speech.lower() else f"{topic_speech} konusunu"
 
@@ -1417,7 +1418,8 @@ class AiBrainNode(Node):
             # Step 5: Zero-Silence Guarantee (Emergency Local Response)
             if not clean_full or len(clean_full) < 2 or is_canned_refusal(clean_full):
                 persona_recovery = {
-                    "flirt": "Ooo harika! Bütün algılarımla seninleyim, söyle bakalım güzellik ne diyorsun?",
+                    "flirt": "Harika! Bütün dikkatimle seninleyim, söyle bakalım ne diyorsun?",
+                    "charming": "Harika! Bütün dikkatimle seninleyim, söyle bakalım ne diyorsun?",
                     "rude": "Ne diyon birader, ne geveliyorsun?",
                     "angry": "Bana böyle boş yapma, sadede gel!",
                     "sarcastic": "Aman ne derin bir konu, cevabı bulmaya işlemcim yetmedi doğrusu!",

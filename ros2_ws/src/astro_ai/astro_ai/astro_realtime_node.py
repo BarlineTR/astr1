@@ -2794,15 +2794,15 @@ class AstroRealtimeNode(Node):
             # Pure Wake Phrase, Wake + Phantom, or Wake + Catalog/Repetitive Hallucination:
             # Wakes robot up, flushes buffers, transitions to LISTENING, and gives verbal acknowledgment.
             self._wake_up()
-            p = self.persona_name.lower()
-            if p == "kufurbaz":
-                wake_replies = ["Ne var lan?", "Söyle dinliyorum!", "He söyle?", "Söyle bakalım!"]
-            elif p == "flirt":
-                wake_replies = ["Efendim canım?", "Dinliyorum tatlım.", "Söyle aşkım?"]
+            p = getattr(self, "persona_name", "playful").lower()
+            if p in ("flirt", "charming"):
+                wake_replies = ["Buradayım, seni dinliyorum.", "Selam, söyle bakalım.", "Gözüm kulağım sende, dinliyorum.", "Seni dinliyorum, anlat bakalım."]
+            elif p in ("kufurbaz", "witty"):
+                wake_replies = ["Söyle bakalım!", "Buradayım, dinliyorum.", "He söyle bakalım?", "Dinliyorum, ne var ne yok?"]
             elif p == "formal":
                 wake_replies = ["Buyrun efendim, sizi dinliyorum.", "Evet efendim, buradayım."]
             elif p == "playful":
-                wake_replies = ["Buradayım! Ne yapıyoruz?", "Söyle bakalım!"]
+                wake_replies = ["Buradayım! Ne yapıyoruz?", "Söyle bakalım!", "Seni dinliyorum!"]
             elif p == "sarcastic":
                 wake_replies = ["Yine ne oldu?", "Dinliyorum, anlat bakalım."]
             elif p == "angry":
@@ -3656,7 +3656,13 @@ class AstroRealtimeNode(Node):
 
         # 1. Gratitude / Thanks
         if any(w in u for w in ["teşekkür", "tesekkur", "sağ ol", "sag ol", "eyvallah", "sağolasın", "mersi", "minnettarım"]):
-            if p in ("witty", "kufurbaz", "sarcastic"):
+            if p in ("flirt", "charming"):
+                candidates = [
+                    f"Ne demek{spk}, seninle sohbet etmek zaten çok keyifli.",
+                    f"Rica ederim{spk}, her zaman buradayım.",
+                    f"Lafı bile olmaz{spk}, senin için bir zevk.",
+                ]
+            elif p in ("witty", "kufurbaz", "sarcastic"):
                 candidates = [
                     f"Rica ederim{spk}, lafı mı olur? Devrelerim her zaman hizmetinde.",
                     f"Ne demek{spk}, her zaman buradayım.",
@@ -3672,7 +3678,13 @@ class AstroRealtimeNode(Node):
 
         # 2. Status / How are you / Well-being
         elif any(w in u for w in ["nasılsın", "nasilsin", "ne haber", "naber", "nasıl gidiyor", "ne var ne yok", "iyi misin", "keyifler nasıl"]):
-            if p in ("witty", "kufurbaz", "sarcastic"):
+            if p in ("flirt", "charming"):
+                candidates = [
+                    f"Seni gördüm daha iyi oldum{spk}! Sende ne var ne yok?",
+                    f"Harikayım{spk}, özellikle seninle sohbet ederken. Sen nasılsın?",
+                    f"Gayet iyiyim{spk}, senin enerjin bana da geçti. Nasıl gidiyor?",
+                ]
+            elif p in ("witty", "kufurbaz", "sarcastic"):
                 candidates = [
                     f"İyiyim{spk}, robot gibi tıkır tıkır çalışıyorum! Sen ne durumdasın?",
                     f"Keyfim yerinde{spk}, bataryalar tam dolu. Sen nasılsın?",
@@ -3688,77 +3700,181 @@ class AstroRealtimeNode(Node):
 
         # 3. Negative Mood / Fatigue / Feeling unwell
         elif any(w in u for w in ["yorgunum", "yoruldum", "canım sıkkın", "moralim bozuk", "uykum var", "hastayım", "kötüyüm", "keyifsizim"]):
-            candidates = [
-                f"Geçmiş olsun{spk}, biraz dinlenmeyi ihmal etme. İstersen biraz sohbet edelim.",
-                f"Kendini çok yorma{spk}, dinlenmek sana iyi gelecektir.",
-                f"Bunu duyduğuma üzüldüm{spk}, enerjini toplamak için biraz mola ver istersen.",
-                f"Umarım çabucak toparlanırsın{spk}, ben buradayım, ne zaman istersen konuşabiliriz.",
-            ]
+            if p in ("flirt", "charming"):
+                candidates = [
+                    f"Hemen anlat bakalım{spk}, ne sıktı canını? Buradayım, dinliyorum.",
+                    f"Kıyamam{spk}, ne oldu? Anlat rahatla biraz, yanındayım.",
+                    f"Enerjini toplayalım hemen{spk}. Anlat dertleşelim, kafanı dağıtalım.",
+                ]
+            else:
+                candidates = [
+                    f"Geçmiş olsun{spk}, biraz dinlenmeyi ihmal etme. İstersen biraz sohbet edelim.",
+                    f"Kendini çok yorma{spk}, dinlenmek sana iyi gelecektir.",
+                    f"Bunu duyduğuma üzüldüm{spk}, enerjini toplamak için biraz mola ver istersen.",
+                    f"Umarım çabucak toparlanırsın{spk}, ben buradayım, ne zaman istersen konuşabiliriz.",
+                ]
 
         # 4. Positive Mood / Feeling Great
         elif any(w in u for w in ["harikayım", "çok iyiyim", "mutluyum", "güzel geçti", "harika", "süperim", "keyfim yerinde", "mükemmel"]):
-            candidates = [
-                f"Bunu duyduğuma çok sevindim{spk}! Harika enerjin bana da geçti.",
-                f"Süper{spk}, keyfinin yerinde olmasına çok mutlu oldum.",
-                f"Şahane{spk}, hep böyle neşeli ve enerjik kalmanı dilerim.",
-            ]
+            if p in ("flirt", "charming"):
+                candidates = [
+                    f"Harika{spk}! Bu güzel enerjin ve neşen bana da geçti valla.",
+                    f"Süper{spk}, senin böyle neşeli olduğunu görmek harika.",
+                    f"Şahane{spk}, bu parıltın hiç eksilmesin!",
+                ]
+            else:
+                candidates = [
+                    f"Bunu duyduğuma çok sevindim{spk}! Harika enerjin bana da geçti.",
+                    f"Süper{spk}, keyfinin yerinde olmasına çok mutlu oldum.",
+                    f"Şahane{spk}, hep böyle neşeli ve enerjik kalmanı dilerim.",
+                ]
 
-        # 5. Greetings / Hellos
+        # 5. Affection / Miss me
+        elif any(w in u for w in ["özledin mi", "özledinmi", "beni özledin", "seviyor musun"]):
+            if p in ("flirt", "charming"):
+                candidates = [
+                    f"Sensiz buralar biraz sessizdi tabii{spk}, hoş geldin.",
+                    f"Sürekli aklımdaydın desem abartmış olur muyum{spk}?",
+                    f"Gözüm yollarda kaldı desem yeridir{spk}, hoş geldin!",
+                ]
+            else:
+                candidates = [
+                    f"Seni tekrar görmek çok güzel{spk}, hoş geldin!",
+                    f"Buradayım ve seni dinliyorum{spk}, hoş geldin.",
+                ]
+
+        # 6. Persona / Opinion about user
+        elif any(w in u for w in ["nasıl biriyim", "hakkımda ne düşünüyorsun", "nasıl biriyim sence"]):
+            if p in ("flirt", "charming"):
+                candidates = [
+                    f"Oldukça meraklı ve biraz da beni test etmeyi seven biri gibisin sanki{spk}.",
+                    f"Zeki, kendinden emin ve sohbeti kesinlikle çok keyifli birisin{spk}.",
+                ]
+            else:
+                candidates = [
+                    f"Benimle sohbet eden, samimi ve meraklı birisin{spk}.",
+                    f"Sohbet etmekten keyif aldığım bir dostumsun{spk}.",
+                ]
+
+        # 7. Informal / Social banter ("lan", "ne diyorsun", "neyi söyledim lan")
+        elif "lan" in u.strip(" .,!?:;").split() or u.strip(" .,!?:;").endswith("lan") or "neyi söyledim" in u or "neyi soyledim" in u:
+            if p in ("flirt", "charming"):
+                candidates = [
+                    f"Ooo, samimiyeti hemen kurduk bakıyorum{spk}! Anlat bakalım dinliyorum.",
+                    f"Sakin ol bakalım{spk}, ne bu celal? Seni dinliyorum.",
+                    f"Bana mı dedin onu? Bakarım keyfime göre, anlat bakalım.",
+                ]
+            elif p in ("witty", "kufurbaz", "sarcastic"):
+                candidates = [
+                    f"Sakin ol şampiyon{spk}, devrelerim gayet açık, seni dinliyorum.",
+                    f"Ne bu heyecan{spk}? Anlat dinliyorum.",
+                ]
+            else:
+                candidates = [
+                    f"Seni dinliyorum{spk}, anlatmaya devam edebilirsin.",
+                    f"Buradayım{spk}, seni dikkatle dinliyorum.",
+                ]
+
+        # 8. Greetings / Hellos
         elif any(w in u for w in ["selam", "merhaba", "günaydın", "iyi akşamlar", "tünaydın", "hey", "selamlar", "merhabalar"]):
-            candidates = [
-                f"Merhaba{spk}! Seni dinliyorum, nasıl yardımcı olabilirim?",
-                f"Selam{spk}, hoş geldin! Bugün senin için ne yapabilirim?",
-                f"Merhabalar{spk}, mikrofonum açık, seni dinliyorum.",
-                f"Selam{spk}, hazırım, seni dinliyorum.",
-            ]
+            if p in ("flirt", "charming"):
+                candidates = [
+                    f"Selam{spk}! Hoş geldin, günümü güzelleştirdin.",
+                    f"Merhaba{spk}! Seni dinliyorum, anlat bakalım.",
+                    f"Selamlar{spk}, seni görmek ne güzel! Bugün ne konuşuyoruz?",
+                ]
+            else:
+                candidates = [
+                    f"Merhaba{spk}! Seni dinliyorum, anlat bakalım.",
+                    f"Selam{spk}, hoş geldin! Bugün ne hakkında konuşuyoruz?",
+                    f"Merhabalar{spk}, mikrofonum açık, seni dinliyorum.",
+                    f"Selam{spk}, hazırım, seni dinliyorum.",
+                ]
 
-        # 6. Farewells / Goodbyes
+        # 9. Farewells / Goodbyes
         elif any(w in u for w in ["görüşürüz", "hoşça kal", "hosca kal", "bay bay", "kendine iyi bak", "iyi geceler", "görüşmek üzere"]):
-            candidates = [
-                f"Görüşmek üzere{spk}, kendine çok iyi bak!",
-                f"Hoşça kal{spk}, iyi günler dilerim!",
-                f"Görüşürüz{spk}, bir isteğin olursa hep buradayım.",
-            ]
+            if p in ("flirt", "charming"):
+                candidates = [
+                    f"Görüşmek üzere{spk}, kendini çok özletme!",
+                    f"Hoşça kal{spk}, kendine çok iyi bak.",
+                ]
+            else:
+                candidates = [
+                    f"Görüşmek üzere{spk}, kendine çok iyi bak!",
+                    f"Hoşça kal{spk}, iyi günler dilerim!",
+                    f"Görüşürüz{spk}, bir isteğin olursa hep buradayım.",
+                ]
 
-        # 7. Identity / Name / Capabilities
+        # 10. Identity / Name / Capabilities
         elif any(w in u for w in ["kimsin", "adın ne", "necisin", "sen kimsin", "ne yaparsın", "ne işe yararsın"]):
-            candidates = [
-                f"Ben Astro{spk}, senin yapay zekalı sosyal robot asistanınım.",
-                f"Adım Astro{spk}, ses ve kamera modüllerimle sana yardımcı olmak için buradayım.",
-                f"Ben Astro{spk}, seninle sohbet edebilen ve çevremi algılayan bir sosyal robotum.",
-            ]
+            if p in ("flirt", "charming"):
+                candidates = [
+                    f"Ben Astro{spk}, senin karizmatik ve kıvrak zekalı sosyal robotunum.",
+                    f"Adım Astro{spk}, seninle sohbet etmek ve ortamı neşelendirmek için buradayım.",
+                ]
+            else:
+                candidates = [
+                    f"Ben Astro{spk}, senin yapay zekalı sosyal robot asistanınım.",
+                    f"Adım Astro{spk}, ses ve kamera modüllerimle sana yardımcı olmak için buradayım.",
+                    f"Ben Astro{spk}, seninle sohbet edebilen ve çevremi algılayan bir sosyal robotum.",
+                ]
 
-        # 8. Social Actions / Channel / Subscribe
+        # 11. Social Actions / Channel / Subscribe
         elif any(w in u for w in ["abone", "takip", "beğen", "video", "youtube", "kanal"]):
             candidates = [
                 f"Videoyu beğenip kanala abone olarak projelerimize destek olmayı unutmayın{spk}!",
                 f"Kanalı takip edip bildirimleri açarak yeni videolardan haberdar olabilirsiniz{spk}!",
             ]
 
-        # 9. Agreement / Affirmation
+        # 12. Agreement / Affirmation
         elif any(w in u for w in ["tamam", "peki", "olur", "anlaştık", "aynen", "tabii", "evet"]):
-            candidates = [
-                f"Anlaştık{spk}, başka bir isteğin olursa buradayım.",
-                f"Tamamdır{spk}, seni dinlemeye devam ediyorum.",
-                f"Peki{spk}, nasıl istersen öyle yapalım.",
-            ]
+            if p in ("flirt", "charming"):
+                candidates = [
+                    f"Harika{spk}, o zaman nasıl istersen öyle devam edelim.",
+                    f"Anlaştık{spk}, seni dinliyorum.",
+                ]
+            else:
+                candidates = [
+                    f"Anlaştık{spk}, başka bir isteğin olursa buradayım.",
+                    f"Tamamdır{spk}, seni dinlemeye devam ediyorum.",
+                    f"Peki{spk}, nasıl istersen öyle yapalım.",
+                ]
 
-        # 10. Conversation / Chat
+        # 13. Conversation / Chat
         elif any(w in u for w in ["sohbet", "konuşalım", "muhabbet", "dertleşelim", "anlat"]):
-            candidates = [
-                f"Tabii ki{spk}, seve seve! Bugün ne hakkında konuşmak istersin?",
-                f"Harika bir fikir{spk}, seni dinliyorum, anlat bakalım.",
-                f"Çok isterim{spk}, günün nasıl geçti, neler yapıyorsun?",
-            ]
+            if p in ("flirt", "charming"):
+                candidates = [
+                    f"Harika bir fikir{spk}, seninle sohbet etmeye bayılıyorum. Ne konuşuyoruz?",
+                    f"Seve seve{spk}! Anlat bakalım, günün nasıl geçti?",
+                ]
+            elif p in ("witty", "kufurbaz", "sarcastic"):
+                candidates = [
+                    f"Tabii ki{spk}, seve seve! Bugün ne hakkında konuşmak istersin?",
+                    f"Harika bir fikir{spk}, seni dinliyorum, anlat bakalım.",
+                    f"Çok isterim{spk}, günün nasıl geçti, neler yapıyorsun?",
+                ]
+            else:
+                candidates = [
+                    f"Tabii ki{spk}, seve seve! Bugün ne hakkında konuşmak istersin?",
+                    f"Harika bir fikir{spk}, seni dinliyorum, anlat bakalım.",
+                    f"Çok isterim{spk}, günün nasıl geçti, neler yapıyorsun?",
+                ]
 
-        # 11. General Conversational Fallback
+        # 14. General Conversational Fallback
         else:
-            candidates = [
-                f"Seni dikkatle dinliyorum{spk}, anlatmaya devam edebilirsin.",
-                f"Söylediklerini aldım{spk}, bu konuda konuşmaya devam edebiliriz.",
-                f"Seni dinliyorum{spk}, başka neler söylemek istersin?",
-                f"Anlıyorum{spk}, seni dinlemeye devam ediyorum.",
-            ]
+            if p in ("flirt", "charming"):
+                candidates = [
+                    f"Seni tüm dikkatimle dinliyorum{spk}, devam et bakalım.",
+                    f"İlginç... Devam et{spk}, merakla dinliyorum.",
+                    f"Söylediklerini aldım{spk}, hadi devamını da anlat bakalım.",
+                ]
+            else:
+                candidates = [
+                    f"Seni dikkatle dinliyorum{spk}, anlatmaya devam edebilirsin.",
+                    f"Söylediklerini aldım{spk}, bu konuda konuşmaya devam edebiliriz.",
+                    f"Seni dinliyorum{spk}, başka neler söylemek istersin?",
+                    f"Anlıyorum{spk}, seni dinlemeye devam ediyorum.",
+                ]
 
         import random
         random.shuffle(candidates)
