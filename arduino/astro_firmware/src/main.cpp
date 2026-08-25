@@ -39,14 +39,13 @@ static constexpr float HEAD_TICKS_PER_DEG = 14.667f;
 static constexpr float HEAD_MIN_DEG = -90.0f;
 static constexpr float HEAD_MAX_DEG =  90.0f;
 
-// Kafa motoru 12V'ta 1000 rpm; tam PWM'de savrulur.
-static constexpr int HEAD_PWM_LIMIT = 100;
-// Statik sürtünmeyi aşmak için minimum etkili PWM
-static constexpr int HEAD_PWM_MIN = 30;
+// Kafa motoru PWM limitleri ve statik sürtünme eşiği
+static constexpr int HEAD_PWM_LIMIT = 180;
+static constexpr int HEAD_PWM_MIN = 45;
 
 static constexpr float HEAD_KP = 1.8f, HEAD_KD = 0.08f;
 static constexpr int32_t HEAD_DEADBAND_TICKS = 8;  // bu kadar yakınsa motoru bırak
-static constexpr uint32_t HEAD_STALL_MS = 400;     // PWM'e rağmen tick değişmiyorsa kes
+static constexpr uint32_t HEAD_STALL_MS = 1500;    // PWM'e rağmen tick değişmiyorsa kes (1.5s güvenli süre)
 
 // ====== Diagnostik bayraklari ======
 static constexpr uint32_t FLAG_WATCHDOG_TIMEOUT = 0x01;
@@ -195,26 +194,21 @@ void headControl(uint32_t dt_ms) {
     g_head_err_prev = err;
     g_head_stall_ref = pos;
     g_head_stall_ms = millis();
-    // NOT: FLAG_HEAD_STALL burada temizlenmez. Stall sonrasi hedef mevcut
-    // konuma cekildigi icin hemen bu dala duseriz; bayragi burada silersek
-    // host stall'i hic goremez. Temizleme yalnizca yeni HEAD_CMD'de olur.
     return;
   }
 
   float de = (float)(err - g_head_err_prev) / (dt_ms / 1000.0f);
   g_head_err_prev = err;
 
-  float u = HEAD_KP * (float)err + HEAD_KD * de;
+  // PID + Statik sürtünme eşiği için feedforward tabanı
+  float ff = (err > 0) ? (float)HEAD_PWM_MIN : -(float)HEAD_PWM_MIN;
+  float u = ff + (HEAD_KP * (float)err) + (HEAD_KD * de);
   int pwm = (int)constrain(u, (float)-HEAD_PWM_LIMIT, (float)HEAD_PWM_LIMIT);
-
-  // Statik sürtünme: çok küçük PWM motoru hiç döndürmez, sadece ısıtır
-  if (pwm > 0 && pwm < HEAD_PWM_MIN) pwm = HEAD_PWM_MIN;
-  if (pwm < 0 && pwm > -HEAD_PWM_MIN) pwm = -HEAD_PWM_MIN;
 
   setHeadPWM(pwm);
 
   // Stall tespiti: PWM veriliyor ama enkoder kımıldamıyor
-  if (pos != g_head_stall_ref) {
+  if (abs(pos - g_head_stall_ref) >= 2) {
     g_head_stall_ref = pos;
     g_head_stall_ms = millis();
   } else if (millis() - g_head_stall_ms > HEAD_STALL_MS) {
@@ -323,9 +317,10 @@ void processPacket(uint8_t msg_id, const uint8_t* pl, uint8_t len) {
       else                      g_diag_flags &= ~FLAG_HEAD_LIMIT;
 
       g_head_target_ticks = (int32_t)lroundf(clamped * HEAD_TICKS_PER_DEG);
-      // Yeni hedef geldi: eski stall kilidini kaldır
-      g_diag_flags &= ~FLAG_HEAD_STALL;
+      // Yeni hedef geldi: eski stall kilidini kaldır ve anlık konumu referans al
+      g_head_stall_ref = readTicks(g_head_ticks);
       g_head_stall_ms = millis();
+      g_diag_flags &= ~FLAG_HEAD_STALL;
       g_last_heartbeat_ms = millis();
     } break;
   }

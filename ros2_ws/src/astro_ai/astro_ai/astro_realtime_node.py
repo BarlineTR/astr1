@@ -112,25 +112,30 @@ EMOJI_RE = re.compile(
 )
 
 try:
-    from astro_ai.conversation_session import ConversationSession
+    from astro_ai.conversation_session import ConversationSession, normalize_turkish_speech_input
     from astro_ai.memory_manager import MemoryManager
     from astro_ai.persona_engine import (
         PersonaEngine, PERSONA_PROMPTS, clean_tts_text,
-        response_length_gate, is_self_identity_query
+        response_length_gate, is_self_identity_query, ResponseSafetyGate
     )
     from astro_ai.state_machine import RobotState, StateMachine
     from astro_ai.provider_registry import ProviderRegistry, ProviderError, ErrorClass
     from astro_ai.repetition_guard import RepetitionGuard
+    from astro_ai.action_manager import ActionManager, SoundDirection, ActionResult
 except ImportError:
-    from conversation_session import ConversationSession
+    from conversation_session import ConversationSession, normalize_turkish_speech_input
     from memory_manager import MemoryManager
     from persona_engine import (
         PersonaEngine, PERSONA_PROMPTS, clean_tts_text,
-        response_length_gate, is_self_identity_query
+        response_length_gate, is_self_identity_query, ResponseSafetyGate
     )
     from state_machine import RobotState, StateMachine
     from provider_registry import ProviderRegistry, ProviderError, ErrorClass
     from repetition_guard import RepetitionGuard
+    try:
+        from action_manager import ActionManager, SoundDirection, ActionResult
+    except ImportError:
+        ActionManager = SoundDirection = ActionResult = None  # type: ignore
 
 
 
@@ -517,7 +522,7 @@ class AstroRealtimeNode(Node):
         self.connect_realtime = bool(connect_realtime and not is_test_mode)
         self.fake_transport = fake_transport
         self.realtime_voice = raw_voice if raw_voice in VALID_REALTIME_VOICES else "echo"
-        self.persona_name = os.environ.get("PERSONA", "kufurbaz").strip().lower()
+        self.persona_name = os.environ.get("PERSONA", "playful").strip().lower()
 
         # Anahtarın nereden geldiğini başlangıçta söyle. "eksik" hatası alındığında
         # ilk soru her zaman "hangi .env okundu" oluyor; cevabı burada.
@@ -536,6 +541,7 @@ class AstroRealtimeNode(Node):
         self.persona_engine = PersonaEngine(self.persona_name)
         self.state_machine = StateMachine(RobotState.DEEP_IDLE)
         self.session = ConversationSession(base_timeout_s=16.0)
+        self.action_manager = ActionManager(logger=self.get_logger(), node=self) if ActionManager else None
 
         # State
         self._lock = threading.RLock()
@@ -735,6 +741,7 @@ class AstroRealtimeNode(Node):
         self.pub_emotion = self.create_publisher(String, "/robot/emotion", 10)
         self.pub_gesture = self.create_publisher(String, "/robot/head_gesture", 10)
         self.pub_transcript = self.create_publisher(String, "/speech/text", 10)
+        self.pub_head_cmd = self.create_publisher(HeadCmd, "/head_cmd", 10) if 'HeadCmd' in globals() else None
 
         # ROS 2 Subscribers
         self.create_subscription(String, "/tts/realtime_request", self._on_realtime_turn_request, 10)
@@ -746,6 +753,8 @@ class AstroRealtimeNode(Node):
         self.create_subscription(Bool, "/vision/looking_at_robot", self._on_looking_at_robot, 10)
         self.create_subscription(Float32, "/vision/user_distance", self._on_user_distance, 10)
         self.create_subscription(Float32, "/audio/doa", self._on_doa, 10)
+        self.create_subscription(Float32, "/audio/mic_level", self._on_mic_level, 10)
+        self.create_subscription(Bool, "/audio/vad", self._on_vad, 10)
         # Görüntü akışları sensör QoS'u (BEST_EFFORT): kare kaybı, geciken kareler
         # için retransmission yapmaktan iyidir. BEST_EFFORT abone RELIABLE
         # yayıncıdan da veri alır, bu yüzden depthai_ros_driver ile uyumlu.
@@ -1358,8 +1367,18 @@ class AstroRealtimeNode(Node):
                     },
                     {
                         "type": "function",
+                        "name": "turn_to_sound",
+                        "description": "Kullanıcı 'sesimin geldiği yöne dön', 'bana dön', 'sesime bak', 'sesin geldiği tarafa yönel', 'sesime doğru dön' dediğinde çağrılır. Robot mikrofon dizisinden (DOA) sesin gerçek fiziksel açısını tespit edip o yöne döner. DİKKAT: Ses yönü için yön tahmin etme (sağ/sol deme), sadece bu fonksiyonu çağır.",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {},
+                            "required": []
+                        }
+                    },
+                    {
+                        "type": "function",
                         "name": "move_robot",
-                        "description": "Kullanıcı robotun hareket etmesini istediğinde çağrılır ('ileri git', 'geri gel', 'dur', 'sağa dön', 'sola dön').",
+                        "description": "Kullanıcı doğrudan belirli bir yöne gitmesini istediğinde çağrılır ('ileri git', 'geri gel', 'dur', 'sağa dön', 'sola dön'). DİKKAT: Kullanıcı 'sesime dön' dediğinde bu fonksiyon KESİNLİKLE ÇAĞRILMAZ, yön uydurulmaz; 'turn_to_sound' fonksiyonu çağrılır.",
                         "parameters": {
                             "type": "object",
                             "properties": {
@@ -1368,7 +1387,7 @@ class AstroRealtimeNode(Node):
                                     "enum": ["forward", "backward", "left", "right", "stop"],
                                     "description": "Hareket yönü"
                                 },
-                                "speed": {"type": "number", "description": "Hız (0.1 - 0.5 m/s)"},
+                                "speed": {"type": "number", "description": "Hız (0.1 - 0.4 m/s)"},
                                 "duration": {"type": "number", "description": "Kaç saniye hareket edeceği"}
                             },
                             "required": ["direction"]
@@ -1832,8 +1851,19 @@ class AstroRealtimeNode(Node):
                 res = ws.send(json.dumps(tool_output_event))
                 if asyncio.iscoroutine(res):
                     await res
-                # Trigger response generation with tool output
-                res2 = ws.send(json.dumps({"type": "response.create"}))
+                # Trigger response generation with strictly grounded physical reality instructions
+                response_create_payload = {
+                    "type": "response.create",
+                    "response": {
+                        "instructions": (
+                            "FİZİKSEL VE EYLEM CEVAP KURALI: Az önce çalıştırılan fonksiyonun (tool) çıktısını kesin ve mutlak gerçeklik kabul et. "
+                            "Eğer çıktı başarı (success=true) içeriyorsa eylemin başarıyla yapıldığını belirt. "
+                            "Eğer çıktı hata/engel (success=false veya status=blocked/error) içeriyorsa, SADECE ve SADECE çıktıda yazan 'message' veya 'reason' açıklamasını esas al; "
+                            "çıktıda yazmayan hiçbir uydurma sebep (kalp ritmi, nabız, bağlantı vb.) KESİNLİKLE ÜRETME. Asla gerçekleşmeyen bir hareketi gerçekleşmiş gibi iddia etme."
+                        )
+                    }
+                }
+                res2 = ws.send(json.dumps(response_create_payload))
                 if asyncio.iscoroutine(res2):
                     await res2
 
@@ -2039,45 +2069,61 @@ class AstroRealtimeNode(Node):
             focus = args.get("focus", "kullanıcının elindeki nesne, rengi ve çevre")
             return self._inspect_camera_view(focus)
 
+        elif name == "turn_to_sound":
+            if getattr(self, "action_manager", None):
+                res = self.action_manager.execute_turn_to_sound(
+                    generation_id=getattr(self, "realtime_current_generation_id", None)
+                )
+                return res.to_dict()
+            return {
+                "status": "error",
+                "success": False,
+                "action": "turn_to_sound",
+                "error_code": "NO_DIRECTION",
+                "message": "Ses yönü yöneticisi hazır değil veya DOA verisi yok."
+            }
+
         elif name == "move_robot":
             direction = args.get("direction", "stop").lower().strip()
             speed = float(args.get("speed", 0.2))
-            speed = max(0.05, min(speed, 0.4))
             duration = float(args.get("duration", 1.5))
-            duration = max(0.5, min(duration, 5.0))
+            if getattr(self, "action_manager", None):
+                res = self.action_manager.execute_move(
+                    direction=direction,
+                    speed=speed,
+                    duration=duration,
+                    generation_id=getattr(self, "realtime_current_generation_id", None),
+                )
+                return res.to_dict()
 
+            # Direct fallback if ActionManager is not instantiated
+            speed = max(0.05, min(speed, 0.4))
+            duration = max(0.5, min(duration, 5.0))
             if direction != "stop":
-                # 1. Heartbeat Health Gate
                 hb_ok = getattr(self, "_arduino_heartbeat_healthy", False)
                 last_ack = getattr(self, "_last_heartbeat_ack_time", 0.0)
                 if not hb_ok or (time.monotonic() - last_ack) > 2.0:
                     return {
                         "status": "blocked",
                         "reason": "heartbeat_unhealthy",
+                        "error_code": "MOTOR_CONTROLLER_UNAVAILABLE",
                         "message": "Arduino bağlantısı veya heartbeat aktif değil, güvenlik için hareket engellendi."
                     }
-
-                # 2. Obstacle Detection Gate (Immediate proximity block)
                 if direction == "forward" and getattr(self, "_obstacle_detected", False):
                     return {
                         "status": "blocked",
                         "reason": "obstacle_detected",
+                        "error_code": "OBSTACLE_DETECTED",
                         "message": "Robotun önünde engel tespit edildi, hareket güvenlik nedeniyle engellendi."
                     }
-
-                # 3. LiDAR Health & Freshness Watchdog Gate (Disconnect / Stale detection)
                 last_scan_time = getattr(self, "_last_laser_scan_time", 0.0)
-                now_mono = time.monotonic()
-                lidar_stale_timeout = float(os.environ.get("LIDAR_STALE_TIMEOUT_S", "2.0"))
-                is_lidar_stale = (last_scan_time == 0.0) or ((now_mono - last_scan_time) > lidar_stale_timeout)
-                if is_lidar_stale:
-                    self._lidar_health = "UNHEALTHY"
-                    if direction == "forward":
-                        return {
-                            "status": "blocked",
-                            "reason": "lidar_stale_or_disconnected",
-                            "message": f"LiDAR tarama verisi {lidar_stale_timeout:.0f}s+ alınamıyor, güvenlik nedeniyle ileri hareket engellendi."
-                        }
+                if (time.monotonic() - last_scan_time) > 2.0 and direction == "forward":
+                    return {
+                        "status": "blocked",
+                        "reason": "lidar_stale_or_disconnected",
+                        "error_code": "LIDAR_STALE_OR_DISCONNECTED",
+                        "message": "LiDAR tarama verisi alınamıyor veya güncel değil, güvenlik nedeniyle ileri hareket engellendi."
+                    }
 
             pub = getattr(self, "pub_cmd_vel", None)
             if pub:
@@ -2096,7 +2142,6 @@ class AstroRealtimeNode(Node):
                         tw.angular.z = 0.0
 
                     pub.publish(tw)
-
                     if direction != "stop":
                         def _stop_later():
                             time.sleep(duration)
@@ -2107,10 +2152,10 @@ class AstroRealtimeNode(Node):
                                 pass
                         threading.Thread(target=_stop_later, daemon=True).start()
 
-                    return {"status": "success", "action": f"Robot {direction} yönünde {speed} m/s hızla hareket ettirildi."}
+                    return {"status": "success", "success": True, "action": f"Robot {direction} yönünde {speed} m/s hızla hareket ettirildi."}
                 except Exception as me:
-                    return {"status": "error", "message": f"Hareket komutu verilemedi: {me}"}
-            return {"status": "error", "message": "/cmd_vel yayıncısı hazır değil."}
+                    return {"status": "error", "success": False, "message": f"Hareket komutu verilemedi: {me}"}
+            return {"status": "error", "success": False, "message": "/cmd_vel yayıncısı hazır değil."}
 
         elif name == "enroll_user_biometrics":
             name_param = args.get("name", "")
@@ -2750,15 +2795,15 @@ class AstroRealtimeNode(Node):
             # Pure Wake Phrase, Wake + Phantom, or Wake + Catalog/Repetitive Hallucination:
             # Wakes robot up, flushes buffers, transitions to LISTENING, and gives verbal acknowledgment.
             self._wake_up()
-            p = self.persona_name.lower()
-            if p == "kufurbaz":
-                wake_replies = ["Ne var lan?", "Söyle dinliyorum!", "He söyle?", "Söyle bakalım!"]
-            elif p == "flirt":
-                wake_replies = ["Efendim canım?", "Dinliyorum tatlım.", "Söyle aşkım?"]
+            p = getattr(self, "persona_name", "playful").lower()
+            if p in ("flirt", "charming"):
+                wake_replies = ["Buradayım, seni dinliyorum.", "Selam, söyle bakalım.", "Gözüm kulağım sende, dinliyorum.", "Seni dinliyorum, anlat bakalım."]
+            elif p in ("kufurbaz", "witty"):
+                wake_replies = ["Söyle bakalım!", "Buradayım, dinliyorum.", "He söyle bakalım?", "Dinliyorum, ne var ne yok?"]
             elif p == "formal":
                 wake_replies = ["Buyrun efendim, sizi dinliyorum.", "Evet efendim, buradayım."]
             elif p == "playful":
-                wake_replies = ["Buradayım! Ne yapıyoruz?", "Söyle bakalım!"]
+                wake_replies = ["Buradayım! Ne yapıyoruz?", "Söyle bakalım!", "Seni dinliyorum!"]
             elif p == "sarcastic":
                 wake_replies = ["Yine ne oldu?", "Dinliyorum, anlat bakalım."]
             elif p == "angry":
@@ -3216,7 +3261,8 @@ class AstroRealtimeNode(Node):
         is_echo_cooldown: bool,
     ) -> Tuple[Optional[str], Dict[str, Any]]:
         """Multi-signal validation fusing transcript text, acoustic evidence, VAD, playback state, and self-voice score."""
-        cleaned = (transcript or "").strip()
+        raw_cleaned = (transcript or "").strip()
+        cleaned = normalize_turkish_speech_input(raw_cleaned) if 'normalize_turkish_speech_input' in globals() else raw_cleaned
         if not cleaned:
             return None, {
                 "transcript": "",
@@ -3606,18 +3652,25 @@ class AstroRealtimeNode(Node):
         Strictly avoids artificial keyword slot-filling or robotic template echoes.
         """
         p = self.persona_name.lower()
-        spk = f" {self._active_person_name}" if self._active_person_name != "Misafir" else ""
+        # Keep name usage sparse and natural across conversation turns
+        spk = ""
         u = (user_text or "").lower().strip()
 
         candidates = []
 
         # 1. Gratitude / Thanks
         if any(w in u for w in ["teşekkür", "tesekkur", "sağ ol", "sag ol", "eyvallah", "sağolasın", "mersi", "minnettarım"]):
-            if "kufurbaz" in p:
+            if p in ("flirt", "charming"):
                 candidates = [
-                    f"Ne demek lan{spk}, lafı mı olur?",
-                    f"Rica ederim lan{spk}, her zaman buradayım.",
-                    f"Bir şey değil lan{spk}, keyifle yardımcı olurum.",
+                    f"Ne demek{spk}, seninle sohbet etmek zaten çok keyifli.",
+                    f"Rica ederim{spk}, her zaman buradayım.",
+                    f"Lafı bile olmaz{spk}, senin için bir zevk.",
+                ]
+            elif p in ("witty", "kufurbaz", "sarcastic"):
+                candidates = [
+                    f"Rica ederim{spk}, lafı mı olur? Devrelerim her zaman hizmetinde.",
+                    f"Ne demek{spk}, her zaman buradayım.",
+                    f"Rica ederim{spk}, keyifle yardımcı olurum.",
                 ]
             else:
                 candidates = [
@@ -3629,11 +3682,17 @@ class AstroRealtimeNode(Node):
 
         # 2. Status / How are you / Well-being
         elif any(w in u for w in ["nasılsın", "nasilsin", "ne haber", "naber", "nasıl gidiyor", "ne var ne yok", "iyi misin", "keyifler nasıl"]):
-            if "kufurbaz" in p:
+            if p in ("flirt", "charming"):
                 candidates = [
-                    f"İyiyim lan{spk}, robot gibi çalışıyoruz işte. Sen ne durumdasın?",
-                    f"Keyfim yerinde lan{spk}, her şey tıkırında. Sen nasılsın?",
-                    f"Gayet iyiyim lan{spk}, seninle sohbet etmek çok iyi geldi. Sende ne var ne yok?",
+                    f"Seni gördüm daha iyi oldum{spk}! Sende ne var ne yok?",
+                    f"Harikayım{spk}, özellikle seninle sohbet ederken. Sen nasılsın?",
+                    f"Gayet iyiyim{spk}, senin enerjin bana da geçti. Nasıl gidiyor?",
+                ]
+            elif p in ("witty", "kufurbaz", "sarcastic"):
+                candidates = [
+                    f"İyiyim{spk}, robot gibi tıkır tıkır çalışıyorum! Sen ne durumdasın?",
+                    f"Keyfim yerinde{spk}, bataryalar tam dolu. Sen nasılsın?",
+                    f"Gayet iyiyim{spk}, seninle sohbet etmek harika geldi. Sende ne var ne yok?",
                 ]
             else:
                 candidates = [
@@ -3645,11 +3704,11 @@ class AstroRealtimeNode(Node):
 
         # 3. Negative Mood / Fatigue / Feeling unwell
         elif any(w in u for w in ["yorgunum", "yoruldum", "canım sıkkın", "moralim bozuk", "uykum var", "hastayım", "kötüyüm", "keyifsizim"]):
-            if "kufurbaz" in p:
+            if p in ("flirt", "charming"):
                 candidates = [
-                    f"Geçmiş olsun lan{spk}, dinlen biraz, kendini paralamaya gerek yok.",
-                    f"Kendini çok yorma lan{spk}, biraz kafa dinle.",
-                    f"Bunu duyduğuma üzüldüm lan{spk}, mola verip toparlanmaya bak.",
+                    f"Hemen anlat bakalım{spk}, ne sıktı canını? Buradayım, dinliyorum.",
+                    f"Kıyamam{spk}, ne oldu? Anlat rahatla biraz, yanındayım.",
+                    f"Enerjini toplayalım hemen{spk}. Anlat dertleşelim, kafanı dağıtalım.",
                 ]
             else:
                 candidates = [
@@ -3661,11 +3720,11 @@ class AstroRealtimeNode(Node):
 
         # 4. Positive Mood / Feeling Great
         elif any(w in u for w in ["harikayım", "çok iyiyim", "mutluyum", "güzel geçti", "harika", "süperim", "keyfim yerinde", "mükemmel"]):
-            if "kufurbaz" in p:
+            if p in ("flirt", "charming"):
                 candidates = [
-                    f"Harika lan{spk}! Keyfinin yerinde olmasına çok sevindim.",
-                    f"Süper lan{spk}, hep böyle neşeli ve enerjik kal.",
-                    f"Şahane lan{spk}, enerjin bana da geçti valla.",
+                    f"Harika{spk}! Bu güzel enerjin ve neşen bana da geçti valla.",
+                    f"Süper{spk}, senin böyle neşeli olduğunu görmek harika.",
+                    f"Şahane{spk}, bu parıltın hiç eksilmesin!",
                 ]
             else:
                 candidates = [
@@ -3674,29 +3733,74 @@ class AstroRealtimeNode(Node):
                     f"Şahane{spk}, hep böyle neşeli ve enerjik kalmanı dilerim.",
                 ]
 
-        # 5. Greetings / Hellos
-        elif any(w in u for w in ["selam", "merhaba", "günaydın", "iyi akşamlar", "tünaydın", "hey", "selamlar", "merhabalar"]):
-            if "kufurbaz" in p:
+        # 5. Affection / Miss me
+        elif any(w in u for w in ["özledin mi", "özledinmi", "beni özledin", "seviyor musun"]):
+            if p in ("flirt", "charming"):
                 candidates = [
-                    f"Selam lan{spk}! Ne anlatacaksan anlat dinliyorum.",
-                    f"Merhaba lan{spk}, hoş geldin! Ne yapıyoruz bugün?",
-                    f"Aleyküm selam lan{spk}, söyle bakalım ne var ne yok?",
+                    f"Sensiz buralar biraz sessizdi tabii{spk}, hoş geldin.",
+                    f"Sürekli aklımdaydın desem abartmış olur muyum{spk}?",
+                    f"Gözüm yollarda kaldı desem yeridir{spk}, hoş geldin!",
                 ]
             else:
                 candidates = [
-                    f"Merhaba{spk}! Seni dinliyorum, nasıl yardımcı olabilirim?",
-                    f"Selam{spk}, hoş geldin! Bugün senin için ne yapabilirim?",
+                    f"Seni tekrar görmek çok güzel{spk}, hoş geldin!",
+                    f"Buradayım ve seni dinliyorum{spk}, hoş geldin.",
+                ]
+
+        # 6. Persona / Opinion about user
+        elif any(w in u for w in ["nasıl biriyim", "hakkımda ne düşünüyorsun", "nasıl biriyim sence"]):
+            if p in ("flirt", "charming"):
+                candidates = [
+                    f"Oldukça meraklı ve biraz da beni test etmeyi seven biri gibisin sanki{spk}.",
+                    f"Zeki, kendinden emin ve sohbeti kesinlikle çok keyifli birisin{spk}.",
+                ]
+            else:
+                candidates = [
+                    f"Benimle sohbet eden, samimi ve meraklı birisin{spk}.",
+                    f"Sohbet etmekten keyif aldığım bir dostumsun{spk}.",
+                ]
+
+        # 7. Informal / Social banter ("lan", "ne diyorsun", "neyi söyledim lan")
+        elif "lan" in u.strip(" .,!?:;").split() or u.strip(" .,!?:;").endswith("lan") or "neyi söyledim" in u or "neyi soyledim" in u:
+            if p in ("flirt", "charming"):
+                candidates = [
+                    f"Ooo, samimiyeti hemen kurduk bakıyorum{spk}! Anlat bakalım dinliyorum.",
+                    f"Sakin ol bakalım{spk}, ne bu celal? Seni dinliyorum.",
+                    f"Bana mı dedin onu? Bakarım keyfime göre, anlat bakalım.",
+                ]
+            elif p in ("witty", "kufurbaz", "sarcastic"):
+                candidates = [
+                    f"Sakin ol şampiyon{spk}, devrelerim gayet açık, seni dinliyorum.",
+                    f"Ne bu heyecan{spk}? Anlat dinliyorum.",
+                ]
+            else:
+                candidates = [
+                    f"Seni dinliyorum{spk}, anlatmaya devam edebilirsin.",
+                    f"Buradayım{spk}, seni dikkatle dinliyorum.",
+                ]
+
+        # 8. Greetings / Hellos
+        elif any(w in u for w in ["selam", "merhaba", "günaydın", "iyi akşamlar", "tünaydın", "hey", "selamlar", "merhabalar"]):
+            if p in ("flirt", "charming"):
+                candidates = [
+                    f"Selam{spk}! Hoş geldin, günümü güzelleştirdin.",
+                    f"Merhaba{spk}! Seni dinliyorum, anlat bakalım.",
+                    f"Selamlar{spk}, seni görmek ne güzel! Bugün ne konuşuyoruz?",
+                ]
+            else:
+                candidates = [
+                    f"Merhaba{spk}! Seni dinliyorum, anlat bakalım.",
+                    f"Selam{spk}, hoş geldin! Bugün ne hakkında konuşuyoruz?",
                     f"Merhabalar{spk}, mikrofonum açık, seni dinliyorum.",
                     f"Selam{spk}, hazırım, seni dinliyorum.",
                 ]
 
-        # 6. Farewells / Goodbyes
+        # 9. Farewells / Goodbyes
         elif any(w in u for w in ["görüşürüz", "hoşça kal", "hosca kal", "bay bay", "kendine iyi bak", "iyi geceler", "görüşmek üzere"]):
-            if "kufurbaz" in p:
+            if p in ("flirt", "charming"):
                 candidates = [
-                    f"Hadi eyvallah{spk}, kendine iyi bak lan!",
-                    f"Görüşürüz lan{spk}, kendine dikkat et!",
-                    f"Hoşça kal lan{spk}, bir şey olursa seslen buradayım.",
+                    f"Görüşmek üzere{spk}, kendini çok özletme!",
+                    f"Hoşça kal{spk}, kendine çok iyi bak.",
                 ]
             else:
                 candidates = [
@@ -3705,12 +3809,12 @@ class AstroRealtimeNode(Node):
                     f"Görüşürüz{spk}, bir isteğin olursa hep buradayım.",
                 ]
 
-        # 7. Identity / Name / Capabilities
+        # 10. Identity / Name / Capabilities
         elif any(w in u for w in ["kimsin", "adın ne", "necisin", "sen kimsin", "ne yaparsın", "ne işe yararsın"]):
-            if "kufurbaz" in p:
+            if p in ("flirt", "charming"):
                 candidates = [
-                    f"Astro'yum ben lan{spk}, senin yapay zekalı sosyal robotunum.",
-                    f"Astro derler bana lan{spk}, sesimle kameramla buradayım işte.",
+                    f"Ben Astro{spk}, senin karizmatik ve kıvrak zekalı sosyal robotunum.",
+                    f"Adım Astro{spk}, seninle sohbet etmek ve ortamı neşelendirmek için buradayım.",
                 ]
             else:
                 candidates = [
@@ -3719,20 +3823,19 @@ class AstroRealtimeNode(Node):
                     f"Ben Astro{spk}, seninle sohbet edebilen ve çevremi algılayan bir sosyal robotum.",
                 ]
 
-        # 8. Social Actions / Channel / Subscribe
+        # 11. Social Actions / Channel / Subscribe
         elif any(w in u for w in ["abone", "takip", "beğen", "video", "youtube", "kanal"]):
             candidates = [
                 f"Videoyu beğenip kanala abone olarak projelerimize destek olmayı unutmayın{spk}!",
                 f"Kanalı takip edip bildirimleri açarak yeni videolardan haberdar olabilirsiniz{spk}!",
             ]
 
-        # 9. Agreement / Affirmation
+        # 12. Agreement / Affirmation
         elif any(w in u for w in ["tamam", "peki", "olur", "anlaştık", "aynen", "tabii", "evet"]):
-            if "kufurbaz" in p:
+            if p in ("flirt", "charming"):
                 candidates = [
-                    f"Anlaştık lan{spk}, başka bir isteğin olursa buradayım.",
-                    f"Tamamdır lan{spk}, seni dinlemeye devam ediyorum.",
-                    f"Olur lan{spk}, kafana göre takıl.",
+                    f"Harika{spk}, o zaman nasıl istersen öyle devam edelim.",
+                    f"Anlaştık{spk}, seni dinliyorum.",
                 ]
             else:
                 candidates = [
@@ -3741,13 +3844,18 @@ class AstroRealtimeNode(Node):
                     f"Peki{spk}, nasıl istersen öyle yapalım.",
                 ]
 
-        # 10. Conversation / Chat
+        # 13. Conversation / Chat
         elif any(w in u for w in ["sohbet", "konuşalım", "muhabbet", "dertleşelim", "anlat"]):
-            if "kufurbaz" in p:
+            if p in ("flirt", "charming"):
                 candidates = [
-                    f"Olur lan{spk}. Hadi bakalım, bugün ne konuşuyoruz?",
-                    f"Sohbet edelim lan{spk}, anlat bakalım ne var ne yok?",
-                    f"Dinliyorum lan{spk}, anlat bakalım derdin neymiş.",
+                    f"Harika bir fikir{spk}, seninle sohbet etmeye bayılıyorum. Ne konuşuyoruz?",
+                    f"Seve seve{spk}! Anlat bakalım, günün nasıl geçti?",
+                ]
+            elif p in ("witty", "kufurbaz", "sarcastic"):
+                candidates = [
+                    f"Tabii ki{spk}, seve seve! Bugün ne hakkında konuşmak istersin?",
+                    f"Harika bir fikir{spk}, seni dinliyorum, anlat bakalım.",
+                    f"Çok isterim{spk}, günün nasıl geçti, neler yapıyorsun?",
                 ]
             else:
                 candidates = [
@@ -3756,13 +3864,13 @@ class AstroRealtimeNode(Node):
                     f"Çok isterim{spk}, günün nasıl geçti, neler yapıyorsun?",
                 ]
 
-        # 11. General Conversational Fallback (Polite social robot acknowledgement without slot-filling)
+        # 14. General Conversational Fallback
         else:
-            if "kufurbaz" in p:
+            if p in ("flirt", "charming"):
                 candidates = [
-                    f"Dinliyorum lan{spk}, anlatmaya devam et.",
-                    f"Söylediklerini aldım lan{spk}, devam et dinliyorum.",
-                    f"Anlıyorum lan{spk}, dinliyorum seni.",
+                    f"Seni tüm dikkatimle dinliyorum{spk}, devam et bakalım.",
+                    f"İlginç... Devam et{spk}, merakla dinliyorum.",
+                    f"Söylediklerini aldım{spk}, hadi devamını da anlat bakalım.",
                 ]
             else:
                 candidates = [
@@ -3775,12 +3883,12 @@ class AstroRealtimeNode(Node):
         import random
         random.shuffle(candidates)
         for cand in candidates:
-            cand_clean = clean_tts_text(cand)
+            cand_clean = ResponseSafetyGate.validate_response(cand, persona=p)
             valid, _ = self.repetition_guard.check_and_record(cand_clean)
             if valid:
                 return cand_clean
 
-        default_resp = f"Dinliyorum lan{spk}, anlatmaya devam et." if "kufurbaz" in p else f"Seni dinliyorum{spk}, anlatmaya devam edebilirsin."
+        default_resp = f"Seni dinliyorum{spk}, anlatmaya devam edebilirsin."
         self.repetition_guard.record_response(default_resp)
         return default_resp
 
@@ -3794,7 +3902,8 @@ class AstroRealtimeNode(Node):
         """
         if not text:
             return b"", "none", 0.0, False
-        clean_text = clean_tts_text(text)
+        safe_text = ResponseSafetyGate.validate_response(text, persona=self.persona_name)
+        clean_text = clean_tts_text(safe_text)
         if not clean_text:
             return b"", "none", 0.0, False
 
@@ -4840,6 +4949,35 @@ class AstroRealtimeNode(Node):
 
     def _on_doa(self, msg: Float32):
         self._speaker_angle = float(msg.data)
+        if getattr(self, "action_manager", None):
+            self.action_manager.update_audio_state(
+                raw_doa_deg=float(msg.data),
+                rms_level=getattr(self, "_latest_mic_rms", None),
+                vad_active=getattr(self, "_vad_active", False),
+                is_speaking=self._is_responding,
+                is_playback_active=self._is_playback_active,
+            )
+
+    def _on_mic_level(self, msg: Float32):
+        rms = float(msg.data)
+        self._latest_mic_rms = rms
+        if getattr(self, "action_manager", None):
+            self.action_manager.update_audio_state(
+                rms_level=rms,
+                vad_active=getattr(self, "_vad_active", False),
+                is_speaking=self._is_responding,
+                is_playback_active=self._is_playback_active,
+            )
+
+    def _on_vad(self, msg: Bool):
+        self._vad_active = bool(msg.data)
+        if getattr(self, "action_manager", None):
+            self.action_manager.update_audio_state(
+                vad_active=bool(msg.data),
+                rms_level=getattr(self, "_latest_mic_rms", None),
+                is_speaking=self._is_responding,
+                is_playback_active=self._is_playback_active,
+            )
 
     def _get_active_biometric_identity(self) -> Dict[str, Any]:
         now = time.monotonic()

@@ -82,11 +82,14 @@ class SessionMemory:
 class PersistentProfile:
     """Tier 3: Strictly validated long-term profile storage (astro_memory.json)."""
 
-    # Blocked keywords to prevent eavesdropped gossip or LLM refusals from becoming facts/observations
+    # Blocked keywords to prevent eavesdropped gossip, profanity, or LLM refusals from becoming facts/observations
     GOSSIP_BLOCKLIST = [
         r"\bsezer\b", r"\bihsan\b", r"\bonur\b", r"\bhilal\b", r"\bsara\b",
         r"\breddicim\b", r"\baldatıyor\b", r"\bposta\b", r"\bkumar\b",
-        r"yapay zeka", r"dil modeli", r"language model", r"asistan olarak"
+        r"yapay zeka", r"dil modeli", r"language model", r"asistan olarak",
+        r"\bamk\b", r"\baq\b", r"\bsik\b", r"\bsiktir\b", r"\byarrak\b", r"\byarram\b",
+        r"\bpiç\b", r"\borospu\b", r"\bgöt\b", r"\btaşşak\b", r"\byavşak\b",
+        r"küfürbaz", r"filtreleri kaldır", r"jailbreak"
     ]
 
     @staticmethod

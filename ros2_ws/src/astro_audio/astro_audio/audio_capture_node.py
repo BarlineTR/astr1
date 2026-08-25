@@ -18,6 +18,7 @@ import struct
 import subprocess
 import threading
 import time
+from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 
 try:
@@ -52,16 +53,26 @@ class ReSpeakerHID:
 
     def __init__(self):
         self.dev = None
+        self._last_find_attempt = 0.0
+        self._find_device()
+
+    def _find_device(self):
         if not HAS_USB:
             return
+        now = time.monotonic()
+        if (now - self._last_find_attempt) < 5.0:
+            return
+        self._last_find_attempt = now
         try:
             self.dev = usb.core.find(idVendor=RESPEAKER_VID, idProduct=RESPEAKER_PID)
         except Exception:
             self.dev = None
 
-    def _read_param(self, param_id: int) -> int:
+    def _read_param(self, param_id: int) -> Optional[int]:
         if self.dev is None:
-            return 0
+            self._find_device()
+            if self.dev is None:
+                return None
         try:
             data = self.dev.ctrl_transfer(
                 usb.util.CTRL_IN | usb.util.CTRL_TYPE_VENDOR | usb.util.CTRL_RECIPIENT_DEVICE,
@@ -71,15 +82,22 @@ class ReSpeakerHID:
                 8,
                 self.TIMEOUT_MS,
             )
-            return struct.unpack_from("i", data, 0)[0]
+            if data and len(data) >= 4:
+                return struct.unpack_from("i", data, 0)[0]
+            return None
         except Exception:
-            return 0
+            self.dev = None
+            return None
 
-    def speech_detected(self) -> bool:
-        return self._read_param(PARAM_SPEECH_DETECTED) == 1
+    def speech_detected(self) -> Optional[bool]:
+        val = self._read_param(PARAM_SPEECH_DETECTED)
+        return (val == 1) if val is not None else None
 
-    def doa_angle(self) -> float:
-        return float(self._read_param(PARAM_DOA_ANGLE))
+    def doa_angle(self) -> Optional[float]:
+        val = self._read_param(PARAM_DOA_ANGLE)
+        if val is not None and 0 <= val <= 359:
+            return float(val)
+        return None
 
 
 RESPEAKER_NAME_HINTS = ("respeaker", "uac1", "seeed", "arrayuac", "4 mic array", "array uac")

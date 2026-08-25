@@ -553,18 +553,18 @@ class TestContextualFallbackAndTelemetry(unittest.TestCase):
 
         # 1. "Nasılsın Astro?"
         resp_status = node._generate_contextual_persona_fallback("Nasılsın Astro?")
-        self.assertIn("lan", resp_status.lower())
-        self.assertTrue(any(w in resp_status.lower() for w in ["iyiyim", "keyfim", "çalışıyoruz", "sen ne durumdasın", "sen nasılsın"]))
+        self.assertNotIn("lan", resp_status.lower())
+        self.assertTrue(any(w in resp_status.lower() for w in ["iyiyim", "keyfim", "çalışıyorum", "sen ne durumdasın", "sen nasılsın"]))
 
         # 2. "Teşekkür ederim"
         resp_thanks = node._generate_contextual_persona_fallback("Teşekkür ederim")
-        self.assertIn("lan", resp_thanks.lower())
+        self.assertNotIn("lan", resp_thanks.lower())
         self.assertTrue(any(w in resp_thanks.lower() for w in ["ne demek", "lafı mı olur", "rica ederim", "bir şey değil"]))
 
         # 3. "Biraz sohbet edelim"
         resp_chat = node._generate_contextual_persona_fallback("Biraz sohbet edelim")
-        self.assertIn("lan", resp_chat.lower())
-        self.assertTrue(any(w in resp_chat.lower() for w in ["olur lan", "hadi bakalım", "ne konuşuyoruz", "sohbet edelim", "dinliyorum"]))
+        self.assertNotIn("lan", resp_chat.lower())
+        self.assertTrue(any(w in resp_chat.lower() for w in ["tabii ki", "harika", "dinliyorum", "seve seve", "konuşmak", "anlat", "sohbet", "isterim", "neler"]))
 
     def test_tts_hierarchy_elevenlabs_xtts_edgetts(self):
         """Test TTS hierarchy: ElevenLabs (Primary) -> Local XTTS GPU (Fallback) -> Edge-TTS (Emergency)."""

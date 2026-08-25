@@ -114,6 +114,41 @@ class ToolRegistry:
                 }
             }
         },
+        # Robot Physical Movement
+        {
+            "category": ToolCategory.ROBOT,
+            "type": "function",
+            "function": {
+                "name": "turn_to_sound",
+                "description": "Kullanıcı 'sesimin geldiği yöne dön', 'bana dön', 'sesime bak' dediğinde çağrılır. Mikrofon dizisinden (DOA) sesin gerçek yönünü tespit edip döner.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {},
+                    "required": []
+                }
+            }
+        },
+        {
+            "category": ToolCategory.ROBOT,
+            "type": "function",
+            "function": {
+                "name": "move_robot",
+                "description": "Kullanıcı doğrudan belirli bir yöne gitmesini istediğinde çağrılır ('ileri git', 'geri gel', 'dur', 'sağa dön', 'sola dön'). DİKKAT: 'sesime dön' için turn_to_sound çağrılır.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "direction": {
+                            "type": "string",
+                            "enum": ["forward", "backward", "left", "right", "stop"],
+                            "description": "Hareket yönü"
+                        },
+                        "speed": {"type": "number", "description": "Hız (0.1 - 0.4 m/s)"},
+                        "duration": {"type": "number", "description": "Kaç saniye hareket edeceği"}
+                    },
+                    "required": ["direction"]
+                }
+            }
+        },
     ]
 
     @classmethod
