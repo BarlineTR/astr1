@@ -2568,6 +2568,49 @@ class AstroRealtimeNode(Node):
         buffer_extract_ms = (t_extract_done - t_extract_start) * 1000.0
 
         if len(buffer_copy) < 25:  # Less than ~0.5s -- too short to analyze reliably
+            now = time.monotonic()
+            held_name = getattr(self, "_active_person_name", "Misafir")
+            hold_until = getattr(self, "_person_hold_until", 0.0)
+            has_active_hold = (now < hold_until) and (held_name != "Misafir")
+            total_id_ms = (now - t_id_start) * 1000.0
+
+            p50_tot, p95_tot, max_tot = self._record_voice_id_segment("total_voice_id_ms", total_id_ms)
+            p50_s1, p95_s1, max_s1 = self._record_voice_id_segment("speech_stopped_to_extract_ms", speech_stopped_to_extract_ms)
+            p50_s2, p95_s2, max_s2 = self._record_voice_id_segment("buffer_extract_ms", buffer_extract_ms)
+
+            self._latest_voice_id_profile = {
+                "path": "SHORT_BUFFER_HOLD_RETAIN" if has_active_hold else "SHORT_BUFFER_BYPASS",
+                "speech_stopped_to_extract_ms": speech_stopped_to_extract_ms,
+                "buffer_extract_ms": buffer_extract_ms,
+                "audio_prep_ms": 0.0,
+                "embedding_infer_ms": 0.0,
+                "speaker_match_ms": 0.0,
+                "vote_aggregation_ms": 0.0,
+                "identity_decision_ms": 0.0,
+                "total_id_ms": total_id_ms,
+                "windows_evaluated": 0,
+                "window_breakdowns": [],
+                "candidate_speaker_count": 0,
+                "number_of_votes": 0,
+                "selected_speaker": held_name if has_active_hold else "Misafir",
+                "confidence": 1.0 if has_active_hold else 0.0,
+                "rejection_reason": "buffer_too_short (<0.5s)",
+                "device": "cached_session_hold",
+                "sample_count": len(buffer_copy) * 320,
+                "audio_duration_ms": (len(buffer_copy) * 320 / 16000.0) * 1000.0,
+                "stats": {
+                    "total_voice_id_ms": {"p50": p50_tot, "p95": p95_tot, "max": max_tot},
+                }
+            }
+            if hasattr(self, "get_logger") and callable(self.get_logger):
+                self.get_logger().info(
+                    f"⚡ [VOICE ID FAST-PATH / CACHE HIT]\n"
+                    f"  path={'SHORT_BUFFER_HOLD_RETAIN' if has_active_hold else 'SHORT_BUFFER_BYPASS'}\n"
+                    f"  speaker={held_name if has_active_hold else 'Misafir'}\n"
+                    f"  hold_remaining_s={max(0.0, hold_until - now):.1f}s\n"
+                    f"  buffer_chunks={len(buffer_copy)} ({len(buffer_copy)*20}ms)\n"
+                    f"  total_id_ms={total_id_ms:.1f}ms"
+                )
             return
 
         total_samples = len(buffer_copy) * 320
@@ -2590,6 +2633,7 @@ class AstroRealtimeNode(Node):
             infer_times = []
             window_breakdowns = []
             early_exit = False
+            exit_path_type = "COLD_FULL_3WIN_VOTING"
             threshold = float(os.getenv("SPEAKER_MATCH_THRESHOLD", "0.40"))
 
             held_name = getattr(self, "_active_person_name", "Misafir")
@@ -2628,6 +2672,7 @@ class AstroRealtimeNode(Node):
                 # Early-exit optimization 1: High confidence match on known speaker
                 if win_idx == 0 and spk_name is not None and spk_conf >= 0.46 and spk_name.lower() != "misafir":
                     early_exit = True
+                    exit_path_type = "HIGH_CONF_EARLY_EXIT_1WIN"
                     break
 
                 # Early-exit optimization 2 (Active Conversation Fast-Path):
@@ -2635,6 +2680,7 @@ class AstroRealtimeNode(Node):
                     other_person_detected = (spk_name is not None and spk_name != held_name and spk_conf >= 0.45)
                     if not other_person_detected:
                         early_exit = True
+                        exit_path_type = "ACTIVE_HOLD_FAST_PATH_1WIN"
                         break
 
             if not window_results:
@@ -2788,6 +2834,7 @@ class AstroRealtimeNode(Node):
 
             # Record telemetry object
             self._latest_voice_id_profile = {
+                "path": exit_path_type,
                 "speech_stopped_to_extract_ms": speech_stopped_to_extract_ms,
                 "buffer_extract_ms": buffer_extract_ms,
                 "audio_prep_ms": audio_prep_ms,
@@ -2827,6 +2874,7 @@ class AstroRealtimeNode(Node):
             if hasattr(self, "get_logger") and callable(self.get_logger):
                 self.get_logger().info(
                     f"⏱️ [VOICE ID PROFILE]\n"
+                    f"  path={exit_path_type}\n"
                     f"  total_ms={total_id_ms:.1f}ms\n"
                     f"  prep_ms={audio_prep_ms:.1f}ms\n"
                     f"  windows_evaluated={len(window_results)}\n"
