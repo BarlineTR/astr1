@@ -769,10 +769,13 @@ class AstroRealtimeNode(Node):
         # Publish initial realtime state (DISCONNECTED / NOT_READY)
         self._publish_realtime_state("DISCONNECTED", "init")
 
-        # Sleep Mode (Default: Start in Sleeping / DEEP_IDLE State)
+        # Sleep Mode (Test mode starts sleeping for invariant testing; Production starts active and ready)
+        is_test = (os.environ.get("ASTRO_TEST_MODE") == "1")
         self._node_start_time = time.monotonic()
-        self._is_sleeping = True
-        self._last_interaction_time = time.monotonic() - 20.0
+        self._is_sleeping = is_test
+        if not is_test:
+            self.state_machine.transition_to(RobotState.LISTENING)
+        self._last_interaction_time = time.monotonic()
         self._consecutive_loud_frames = 0
         self.create_timer(1.0, self._check_sleep_mode)
 
@@ -1419,7 +1422,7 @@ class AstroRealtimeNode(Node):
                     {
                         "type": "function",
                         "name": "change_persona",
-                        "description": "Kullanıcı robotun kişiliğini veya konuşma modunu değiştirmek istediğinde çağrılır (Örn: 'kaba moda geç', 'küfürbaz moda geç', 'neşeli moda geç', 'resmi moda geç', 'flört moduna geç', 'sarkastik moda geç', 'sinirli moda geç', 'duygusal moda geç').",
+                        "description": "Kullanıcı robotun kişiliğini veya konuşma modunu değiştirmek istediğinde KESİNLİKLE çağrılır (Örn: 'küfürbaz moda geç', 'kürbaz moda geç', 'kaba moda geç', 'neşeli moda geç', 'resmi moda geç', 'flört moduna geç', 'sinirli moda geç'). Kullanıcı mod değişikliği istediğinde ASLA 'geçemem' deme, DERHAL bu aracı çağır.",
                         "parameters": {
                             "type": "object",
                             "properties": {
@@ -2191,6 +2194,7 @@ class AstroRealtimeNode(Node):
             raw_p = args.get("persona", "").lower().strip()
             p_map = {
                 "kufurbaz": "kufurbaz", "küfürbaz": "kufurbaz", "kufur": "kufurbaz", "küfür": "kufurbaz",
+                "kürbaz": "kufurbaz", "kürbato": "kufurbaz", "küfürlü": "kufurbaz", "kufurlu": "kufurbaz", "roast": "kufurbaz",
                 "kaba": "rude", "rude": "rude",
                 "flort": "flirt", "flört": "flirt", "flirt": "flirt", "capkin": "flirt", "çapkın": "flirt",
                 "neseli": "playful", "neşeli": "playful", "playful": "playful", "sakaci": "playful", "şakacı": "playful",
@@ -2686,10 +2690,10 @@ class AstroRealtimeNode(Node):
 
         if not self._is_sleeping:
             idle_seconds = now - self._last_interaction_time
-            if idle_seconds >= 12.0:
+            if idle_seconds >= 60.0:
                 self._is_sleeping = True
                 self.state_machine.transition_to(RobotState.DEEP_IDLE)
-                self.get_logger().info("💤 [Astro Uyku Modu]: 12 saniye hareketsizlik — Astro DEEP_IDLE moduna geçti (😴). Wake listener aktif.")
+                self.get_logger().info("💤 [Astro Uyku Modu]: 60 saniye hareketsizlik — Astro DEEP_IDLE moduna geçti (😴). Wake listener aktif.")
 
                 # 1. Publish sleeping emotion for face/display
                 if self.pub_emotion is not None:

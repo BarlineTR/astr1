@@ -479,6 +479,31 @@ class TestKufurbazPersonaAndSafetyBoundaries(unittest.TestCase):
         val = ResponseSafetyGate.validate_response(roast, persona="playful")
         self.assertNotIn("sikik", val)
 
+    def test_persona_switching_mandate_and_no_refusal(self):
+        """Prompt in standard personas explicitly mandates executing change_persona on user request."""
+        from persona_engine import PersonaEngine
+        engine = PersonaEngine(current_persona="playful")
+        prompt = engine.build_system_prompt()
+        self.assertIn("KİŞİLİK VE MOD DEĞİŞTİRME KURALI", prompt)
+        self.assertIn("change_persona", prompt)
+        self.assertNotIn("artık küfürbaz bir robotsun", prompt)
+
+    def test_dynamic_brevity_rule_enforced(self):
+        """Prompt enforces 5-12 words brevity and dynamic mirroring rule."""
+        from persona_engine import PersonaEngine
+        engine = PersonaEngine(current_persona="playful")
+        prompt = engine.build_system_prompt()
+        self.assertIn("5-12 KELİME SINIRI", prompt)
+        self.assertIn("DİNAMİK AYNA KURALI", prompt)
+
+    def test_kufurbaz_dimensions_active_roast(self):
+        """PERSONA_DIMENSIONS for kufurbaz specifies controlled_roast and high slang."""
+        from persona_engine import PERSONA_DIMENSIONS
+        dims = PERSONA_DIMENSIONS["kufurbaz"]
+        self.assertEqual(dims["profanity_tendency"], "controlled_roast")
+        self.assertEqual(dims["slang_level"], "high")
+        self.assertEqual(dims["teasing_level"], "roast_savage")
+
 
 if __name__ == '__main__':
     unittest.main()
