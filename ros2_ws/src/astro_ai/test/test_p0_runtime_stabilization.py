@@ -2963,6 +2963,141 @@ class TestP05RealtimeStreamStateAndPlaybackSerialization(unittest.TestCase):
         self.assertEqual(len(sent_events), 0)
         node._run_voice_identification.assert_not_called()
 
+    def test_acoustic_validation_protects_short_commands_with_trailing_silence(self):
+        """Phase 1 field fix: Short commands like 'Astro' (or questions) followed by 600ms trailing silence are NOT rejected."""
+        import numpy as np
+        import threading
+        from astro_ai.astro_realtime_node import AstroRealtimeNode
+        node = AstroRealtimeNode.__new__(AstroRealtimeNode)
+        node._lock = threading.Lock()
+        node._ambient_rms = 120.0
+        node.get_logger = lambda: MagicMock()
+
+        # Generate 15 frames of speech (300ms, peak=5000, rms~2500)
+        t = np.linspace(0, 0.02, 320, endpoint=False)
+        speech_frame = (5000 * np.sin(2 * np.pi * 300 * t)).astype(np.int16).tobytes()
+        speech_frames = [speech_frame] * 15
+
+        # Followed by 30 frames (600ms) of trailing silence (Server VAD timeout)
+        silence_frame = np.zeros(320, dtype=np.int16).tobytes()
+        silence_frames = [silence_frame] * 30
+
+        node._user_speech_audio_buffer = speech_frames + silence_frames
+        # Must pass acoustic validation because genuine speech was present in the turn
+        self.assertTrue(node._validate_user_speech_acoustics())
+
+    def test_acoustic_validation_rejects_ambient_click_or_pure_silence(self):
+        """Phase 1 field fix: Ambient click or silence with no vocal peak (<650) is rejected."""
+        import numpy as np
+        import threading
+        from astro_ai.astro_realtime_node import AstroRealtimeNode
+        node = AstroRealtimeNode.__new__(AstroRealtimeNode)
+        node._lock = threading.Lock()
+        node._ambient_rms = 120.0
+        node.get_logger = lambda: MagicMock()
+
+        # Faint electrical noise floor: peak=200, rms=50
+        noise_frame = (np.random.randint(-150, 150, 320, dtype=np.int16)).tobytes()
+        node._user_speech_audio_buffer = [noise_frame] * 30
+        self.assertFalse(node._validate_user_speech_acoustics())
+
+    def test_voice_identification_early_exit_on_high_confidence(self):
+        """Phase 1 field fix: When window 0 yields high confidence on known speaker, skip redundant windows (saves ~800ms)."""
+        import numpy as np
+        import threading
+        from astro_ai.astro_realtime_node import AstroRealtimeNode
+        node = AstroRealtimeNode.__new__(AstroRealtimeNode)
+        node._lock = threading.Lock()
+        node._user_speech_audio_buffer = [b"\x00\x02" * 320] * 60
+        node.get_logger = lambda: MagicMock()
+        node._sync_perception_to_session = MagicMock()
+        node.memory = MagicMock()
+
+        mock_vr = MagicMock()
+        # Window 0 returns Oktay with 0.54 confidence (> 0.46 early-exit threshold)
+        mock_vr.recognize_voice.return_value = ("Oktay", 0.54, {"title": "Oktay Bey", "formal_title": "Oktay Bey"})
+        node.voice_recognizer = mock_vr
+
+        node._run_voice_identification()
+        # Only 1 inference called thanks to early exit
+        self.assertEqual(mock_vr.recognize_voice.call_count, 1)
+        self.assertEqual(node._active_person_name, "Oktay")
+
+    def test_barge_in_40ms_human_speech_candidate_triggers_interrupt(self):
+        """Phase 1 field fix: 40ms of loud speech (peak=6784, rms=4236, self_voice=0.0) triggers barge-in and is NOT rejected as transient noise."""
+        import numpy as np
+        import threading
+        from astro_ai.astro_realtime_node import AstroRealtimeNode
+        node = AstroRealtimeNode.__new__(AstroRealtimeNode)
+        node._lock = threading.Lock()
+        node._ambient_rms = 120.0
+        node.barge_in_min_rms = 1200.0
+        node.barge_in_min_peak = 2800
+        node.barge_in_min_speech_ms = 40.0
+        node.barge_in_min_consecutive_frames = 2
+        node.barge_in_noise_mult = 3.5
+        node.barge_in_protection_ms = 350.0
+        node._playback_start_monotonic = time.monotonic() - 1.0
+        node._is_playback_active = True
+        node._is_responding = True
+        node._barge_in_consecutive_frames = 0
+        node._barge_in_latched = False
+        node._is_sleeping = False
+        node.state_machine = MagicMock()
+        node.state_machine.is_deep_idle.return_value = False
+        node._user_speech_audio_buffer = []
+        node.pub_interrupt = MagicMock()
+        node.get_logger = lambda: MagicMock()
+
+        # Mock voice recognizer with zero self-voice (external human speaking)
+        node.voice_recognizer = MagicMock()
+        node.voice_recognizer.score_self_voice.return_value = 0.0
+
+        # Frame with peak=6784, rms=4236
+        t = np.linspace(0, 0.02, 320, endpoint=False)
+        frame_pcm = (6784 * np.sin(2 * np.pi * 300 * t)).astype(np.int16).tobytes()
+
+        # Frame 1 (20ms): consecutive_frames = 1
+        node._on_input_pcm(frame_pcm)
+        self.assertFalse(node._barge_in_latched)
+
+        # Frame 2 (40ms): consecutive_frames = 2 >= 2 -> barge-in MUST trigger!
+        node._on_input_pcm(frame_pcm)
+        self.assertTrue(node._barge_in_latched)
+        self.assertFalse(node._is_playback_active)
+        node.pub_interrupt.publish.assert_called_once()
+
+    def test_tool_continuation_response_telemetry_type(self):
+        """Phase 1 field fix: Distinguishes USER_TURN_RESPONSE from TOOL_CONTINUATION_RESPONSE in telemetry."""
+        import asyncio
+        import threading
+        from astro_ai.astro_realtime_node import AstroRealtimeNode
+        node = AstroRealtimeNode.__new__(AstroRealtimeNode)
+        node._is_sleeping = False
+        node._lock = threading.Lock()
+        node._can_use_openai = MagicMock(return_value=True)
+        node.active_generation_id = 1004
+
+        logs = []
+        mock_logger = MagicMock()
+        mock_logger.info = lambda msg: logs.append(str(msg))
+        mock_logger.debug = lambda msg: logs.append(str(msg))
+        mock_logger.warn = lambda msg: logs.append(str(msg))
+        node.get_logger = lambda: mock_logger
+
+        # Simulate tool continuation event
+        node._active_tool_call_in_progress = True
+        node._last_tool_call_time = time.monotonic()
+        node._vad_end_time = time.monotonic()
+
+        asyncio.run(node._handle_realtime_event(None, {
+            "type": "response.created",
+            "response": {"id": "resp_tool_cont_01"}
+        }))
+
+        joined_logs = "\n".join(logs)
+        self.assertIn("turn_type=TOOL_CONTINUATION_RESPONSE", joined_logs)
+
     def test_motion_and_memory_tools_execution(self):
         """17. Tools: move_robot publishes Twist to /cmd_vel and search_memory queries storage."""
         from astro_ai.astro_realtime_node import AstroRealtimeNode

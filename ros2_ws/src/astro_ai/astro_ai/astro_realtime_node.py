@@ -600,6 +600,7 @@ class AstroRealtimeNode(Node):
         self.barge_in_min_peak = int(os.getenv("BARGE_IN_MIN_PEAK", "2800"))
         self.barge_in_playback_min_peak = int(os.getenv("BARGE_IN_PLAYBACK_MIN_PEAK", "9000"))
         self._barge_in_consecutive_frames = 0
+        self.barge_in_min_speech_ms = float(os.getenv("BARGE_IN_MIN_SPEECH_MS", "60.0"))
         self.barge_in_min_consecutive_frames = int(os.getenv("BARGE_IN_MIN_CONSECUTIVE_FRAMES", "3"))
         self.barge_in_playback_min_consecutive_frames = int(os.getenv("BARGE_IN_PLAYBACK_CONSECUTIVE_FRAMES", "3"))
         self._playback_start_monotonic = 0.0
@@ -1481,9 +1482,11 @@ class AstroRealtimeNode(Node):
                 self._publish_realtime_state("SESSION_CONFIG_ERROR", str(e))
                 return False
     def _validate_user_speech_acoustics(self) -> bool:
-        """Phase 1: Validates that the recorded user speech audio buffer contains genuine
-        speech energy (duration >= 140ms, peak >= 1000, RMS >= threshold).
-        Prevents ambient room clicks, chair squeaks, or breaths from triggering response.create.
+        """Phase 1 field fix: Validates presence of human acoustic energy in the buffered turn.
+        OpenAI Server VAD adds ~600ms (30 frames) trailing silence timeout before emitting speech_stopped.
+        Therefore, we scan across the entire pre-silence utterance window (up to 150 frames / 3.0s).
+        Only reject if the entire utterance is devoid of vocal energy (max_peak < 650 and loud_frames < 2).
+        Short commands like 'Astro', 'Dur', 'Hey' and conversational questions are completely protected.
         """
         lock = getattr(self, "_lock", None)
         buf = getattr(self, "_user_speech_audio_buffer", None)
@@ -1500,25 +1503,48 @@ class AstroRealtimeNode(Node):
         if not buf_copy:
             return False
 
-        # Require at least ~7 frames (140ms) of buffered user speech
-        if len(buf_copy) < 7:
+        # If buffer is tiny (< 3 frames / 60ms), likely a single hardware click
+        if len(buf_copy) < 3:
             return False
 
         try:
-            # Analyze the most recent 30 frames (up to 600ms)
-            raw = b"".join(buf_copy[-30:])
+            # Scan up to last 150 frames (3 seconds of audio before/during VAD window)
+            search_frames = buf_copy[-150:]
+            raw = b"".join(search_frames)
             arr = np.frombuffer(raw, dtype=np.int16)
             if len(arr) == 0:
                 return False
-            mean_rms = float(np.sqrt(np.mean(arr.astype(np.float32) ** 2)))
+
             peak_val = int(np.max(np.abs(arr)))
 
-            ambient = getattr(self, "_ambient_rms", 150.0)
-            min_rms = max(260.0, ambient * 1.15)
-            min_peak = 1000
+            chunk_size = 320
+            num_chunks = len(arr) // chunk_size
+            max_frame_rms = 0.0
+            loud_frame_count = 0
 
-            if mean_rms < min_rms or peak_val < min_peak:
+            ambient = getattr(self, "_ambient_rms", 150.0)
+            speech_rms_floor = max(200.0, ambient * 1.08)
+
+            for i in range(num_chunks):
+                chunk = arr[i * chunk_size : (i + 1) * chunk_size].astype(np.float32)
+                c_rms = float(np.sqrt(np.mean(chunk ** 2)))
+                if c_rms > max_frame_rms:
+                    max_frame_rms = c_rms
+                if c_rms >= speech_rms_floor:
+                    loud_frame_count += 1
+
+            # Only reject if there is NO vocal peak (< 650) AND NO sustained energy (< 2 loud frames)
+            if peak_val < 650 and loud_frame_count < 2:
+                if hasattr(self, "get_logger") and callable(self.get_logger):
+                    self.get_logger().info(
+                        f"🤫 [Acoustic Gate Reject] peak={peak_val} max_rms={max_frame_rms:.1f} loud_frames={loud_frame_count} (sessizlik/tıkırtı filtrelendi)"
+                    )
                 return False
+
+            if hasattr(self, "get_logger") and callable(self.get_logger):
+                self.get_logger().debug(
+                    f"🔊 [Acoustic Gate Pass] peak={peak_val} max_rms={max_frame_rms:.1f} loud_frames={loud_frame_count}"
+                )
             return True
         except Exception:
             return True
@@ -1785,9 +1811,14 @@ class AstroRealtimeNode(Node):
             vad_start = getattr(self, "_vad_end_time", None) or self._response_start_time
             vad_to_created_ms = (self._response_start_time - vad_start) * 1000.0 if (self._response_start_time and vad_start) else 0.0
 
+            is_tool_continuation = getattr(self, "_active_tool_call_in_progress", False) or (vad_to_created_ms == 0.0 and getattr(self, "_last_tool_call_time", 0.0) > 0 and (time.monotonic() - getattr(self, "_last_tool_call_time", 0.0) < 6.0))
+            turn_type = "TOOL_CONTINUATION_RESPONSE" if is_tool_continuation else "USER_TURN_RESPONSE"
+            self._active_tool_call_in_progress = False
+
             self.get_logger().info(
                 f"[REALTIME RESPONSE CREATED]\n"
                 f"generation_id={self.active_generation_id}\n"
+                f"turn_type={turn_type}\n"
                 f"response_id={self.active_response_id or 'unknown'}\n"
                 f"vad_to_created_ms={vad_to_created_ms:.1f}"
             )
@@ -2022,6 +2053,8 @@ class AstroRealtimeNode(Node):
                         "output": json.dumps(tool_result, ensure_ascii=False)
                     }
                 }
+                self._active_tool_call_in_progress = True
+                self._last_tool_call_time = time.monotonic()
                 res = ws.send(json.dumps(tool_output_event))
                 if asyncio.iscoroutine(res):
                     await res
@@ -2419,27 +2452,25 @@ class AstroRealtimeNode(Node):
         return {"status": "success", "message": msg}
 
     def _run_voice_identification(self):
-        """Robust multi-window voice identification with majority voting, margin control, and streak tracking.
-
-        Engineering approach (eliminates single-sample threshold fragility):
-        - Splits audio buffer into 3 independent windows
-        - Runs WeSpeaker on each window independently
-        - A person is ONLY confirmed if ALL three conditions are met:
-            1. Majority win (>=2/3 windows vote for same person)
-            2. Best window confidence >= 0.42
-            3. Margin over runner-up >= 0.07 (prevents weak ties passing through)
-        - Streak counter tracks consecutive identifications per person for debugging
-        """
-        if not self.voice_recognizer:
+        """Robust multi-window voice identification with profiling, rolling p50/p95 tracking, and early-exit optimization."""
+        t_id_start = time.monotonic()
+        if not getattr(self, "voice_recognizer", None):
             return
-        with self._lock:
-            if not self._user_speech_audio_buffer:
+        lock = getattr(self, "_lock", None)
+        if lock is not None:
+            with lock:
+                if not getattr(self, "_user_speech_audio_buffer", None):
+                    return
+                buffer_copy = list(self._user_speech_audio_buffer)
+        else:
+            if not getattr(self, "_user_speech_audio_buffer", None):
                 return
             buffer_copy = list(self._user_speech_audio_buffer)
 
-        if len(buffer_copy) < 30:  # Less than ~0.6s -- too short to analyze reliably
+        if len(buffer_copy) < 25:  # Less than ~0.5s -- too short to analyze reliably
             return
 
+        t_prep_start = time.monotonic()
         try:
             from collections import Counter
             n = len(buffer_copy)
@@ -2449,18 +2480,31 @@ class AstroRealtimeNode(Node):
                 buffer_copy[max(0, n - third * 2): n - third] if n >= third * 2 else buffer_copy[:third],
                 buffer_copy[:third],
             ]
+            t_prep_ms = (time.monotonic() - t_prep_start) * 1000.0
 
             window_results = []
-            for win in windows:
+            infer_times = []
+            early_exit = False
+            threshold = float(os.getenv("SPEAKER_MATCH_THRESHOLD", "0.40"))
+
+            for win_idx, win in enumerate(windows):
+                t_infer_start = time.monotonic()
                 raw = b"".join(win)
                 arr = np.frombuffer(raw, dtype=np.int16)
                 if len(arr) < int(16000 * 0.4):
                     continue
-                threshold = float(os.getenv("SPEAKER_MATCH_THRESHOLD", "0.40"))
                 spk_name, spk_conf, spk_meta = self.voice_recognizer.recognize_voice(
                     arr, sample_rate=16000, threshold=threshold
                 )
+                t_infer_ms = (time.monotonic() - t_infer_start) * 1000.0
+                infer_times.append(t_infer_ms)
                 window_results.append((spk_name, spk_conf, spk_meta))
+
+                # Early-exit optimization: If window 0 yields high confidence (>= 0.46) on known speaker,
+                # skip redundant 2nd and 3rd ONNX inferences to save ~800ms of latency!
+                if win_idx == 0 and spk_name is not None and spk_conf >= 0.46 and spk_name.lower() != "misafir":
+                    early_exit = True
+                    break
 
             if not window_results:
                 return
@@ -2479,8 +2523,15 @@ class AstroRealtimeNode(Node):
             now = time.monotonic()
 
             if not votes:
-                self.get_logger().info("🎙️ [Ses Tanıma]: Bilinmeyen Ses — hiçbir pencerede eşleşme bulunamadı")
-                with self._lock:
+                if hasattr(self, "get_logger") and callable(self.get_logger):
+                    self.get_logger().info("🎙️ [Ses Tanıma]: Bilinmeyen Ses — hiçbir pencerede eşleşme bulunamadı")
+                if lock is not None:
+                    with lock:
+                        self._recognized_speaker = {"name": "Misafir", "confidence": 0.0, "is_known": False, "source": "unknown_voice"}
+                        self._active_person_name = "Misafir"
+                        self._person_hold_until = 0.0
+                        self._voice_id_streak = {}
+                else:
                     self._recognized_speaker = {"name": "Misafir", "confidence": 0.0, "is_known": False, "source": "unknown_voice"}
                     self._active_person_name = "Misafir"
                     self._person_hold_until = 0.0
@@ -2502,26 +2553,37 @@ class AstroRealtimeNode(Node):
             is_confident = winner_conf >= 0.40
             is_clear_winner = (margin > 0.03) or (total_windows <= 1)
 
-            with self._lock:
+            if lock is not None:
+                with lock:
+                    streak_map = getattr(self, "_voice_id_streak", {})
+            else:
                 streak_map = getattr(self, "_voice_id_streak", {})
 
             if is_majority and is_confident and is_clear_winner:
                 streak_count = streak_map.get(winner_name, 0) + 1
                 streak_map[winner_name] = streak_count
-                self.get_logger().info(
-                    f"🎙️ [Ses Tanıma]: {winner_name} ({winner_meta.get('formal_title', '')}) "
-                    f"— Güven: %{int(winner_conf*100)}, Oy: {winner_votes}/{total_windows}, "
-                    f"Margin: {margin:.2f}, Streak: {streak_count}"
-                )
-                with self._lock:
-                    self._recognized_speaker = {
-                        "name": winner_name,
-                        "title": winner_meta.get("title", ""),
-                        "formal_title": winner_meta.get("formal_title", winner_name),
-                        "confidence": winner_conf,
-                        "is_known": True,
-                        "source": "voice"
-                    }
+                if hasattr(self, "get_logger") and callable(self.get_logger):
+                    self.get_logger().info(
+                        f"🎙️ [Ses Tanıma]: {winner_name} ({winner_meta.get('formal_title', '')}) "
+                        f"— Güven: %{int(winner_conf*100)}, Oy: {winner_votes}/{total_windows}, "
+                        f"Margin: {margin:.2f}, Streak: {streak_count}"
+                    )
+                speaker_dict = {
+                    "name": winner_name,
+                    "title": winner_meta.get("title", ""),
+                    "formal_title": winner_meta.get("formal_title", winner_name),
+                    "confidence": winner_conf,
+                    "is_known": True,
+                    "source": "voice"
+                }
+                if lock is not None:
+                    with lock:
+                        self._recognized_speaker = speaker_dict
+                        self._active_person_name = winner_name
+                        self._person_hold_until = now + 45.0
+                        self._voice_id_streak = streak_map
+                else:
+                    self._recognized_speaker = speaker_dict
                     self._active_person_name = winner_name
                     self._person_hold_until = now + 45.0
                     self._voice_id_streak = streak_map
@@ -2536,28 +2598,55 @@ class AstroRealtimeNode(Node):
                     reason.append(f"margin yetersiz ({margin:.2f})")
 
                 # Retain speaker identity if within active conversation hold (45s)
-                with self._lock:
-                    has_active_hold = (now < self._person_hold_until) and (self._active_person_name != "Misafir")
+                held_name = getattr(self, "_active_person_name", "Misafir")
+                hold_until = getattr(self, "_person_hold_until", 0.0)
+                has_active_hold = (now < hold_until) and (held_name != "Misafir")
 
                 if has_active_hold:
-                    self.get_logger().info(
-                        f"🎙️ [Ses Tanıma (Kişi Korundu)]: {self._active_person_name} konuşmaya devam ediyor "
-                        f"(Bu kısa kelimede anlık güven: {winner_conf:.2f})"
-                    )
+                    if hasattr(self, "get_logger") and callable(self.get_logger):
+                        self.get_logger().info(
+                            f"🎙️ [Ses Tanıma (Kişi Korundu)]: {held_name} konuşmaya devam ediyor "
+                            f"(Bu kısa kelimede anlık güven: {winner_conf:.2f})"
+                        )
                 else:
-                    self.get_logger().info(
-                        f"🎙️ [Ses Tanıma]: Bilinmeyen Ses / Tanınmadı "
-                        f"(En Yakın: '{winner_name}', Güven: {winner_conf:.2f}, {', '.join(reason)})"
-                    )
-                    with self._lock:
+                    if hasattr(self, "get_logger") and callable(self.get_logger):
+                        self.get_logger().info(
+                            f"🎙️ [Ses Tanıma]: Bilinmeyen Ses / Tanınmadı "
+                            f"(En Yakın: '{winner_name}', Güven: {winner_conf:.2f}, {', '.join(reason)})"
+                        )
+                    if lock is not None:
+                        with lock:
+                            self._recognized_speaker = {"name": "Misafir", "confidence": winner_conf, "is_known": False, "source": "unknown_voice"}
+                            self._active_person_name = "Misafir"
+                    else:
                         self._recognized_speaker = {"name": "Misafir", "confidence": winner_conf, "is_known": False, "source": "unknown_voice"}
                         self._active_person_name = "Misafir"
-                        self._person_hold_until = 0.0
-                        streak_map[winner_name] = 0
-                        self._voice_id_streak = streak_map
-                    self._sync_perception_to_session()
+
+            # Profiling & rolling p50/p95 latency calculation
+            total_id_ms = (time.monotonic() - t_id_start) * 1000.0
+            if not hasattr(self, "_voice_id_latencies"):
+                self._voice_id_latencies = []
+            self._voice_id_latencies.append(total_id_ms)
+            if len(self._voice_id_latencies) > 50:
+                self._voice_id_latencies.pop(0)
+
+            p50 = float(np.percentile(self._voice_id_latencies, 50)) if len(self._voice_id_latencies) > 0 else total_id_ms
+            p95 = float(np.percentile(self._voice_id_latencies, 95)) if len(self._voice_id_latencies) > 0 else total_id_ms
+
+            if hasattr(self, "get_logger") and callable(self.get_logger):
+                self.get_logger().info(
+                    f"⏱️ [VOICE ID PROFILE]\n"
+                    f"  total_ms={total_id_ms:.1f}ms\n"
+                    f"  prep_ms={t_prep_ms:.1f}ms\n"
+                    f"  windows_evaluated={len(window_results)}\n"
+                    f"  window_infer_ms={[f'{t:.1f}' for t in infer_times]}\n"
+                    f"  early_exit={'true' if early_exit else 'false'}\n"
+                    f"  p50_ms={p50:.1f}ms\n"
+                    f"  p95_ms={p95:.1f}ms"
+                )
         except Exception as e:
-            self.get_logger().debug(f"Voice id notice: {e}")
+            if hasattr(self, "get_logger") and callable(self.get_logger):
+                self.get_logger().error(f"Voice identification error: {e}")
 
 
     def _enroll_user_biometrics(self, name: str, formal_title: str = "") -> Dict[str, Any]:
@@ -4949,7 +5038,10 @@ class AstroRealtimeNode(Node):
             min_speech_ms = min(getattr(self, "barge_in_min_speech_ms", 60.0), getattr(self, "barge_in_min_consecutive_frames", 3) * 20.0)
             if speech_duration_ms < min_speech_ms:
                 if local_rms >= target_barge_in_rms and peak_val >= target_barge_in_peak:
-                    is_transient = (speech_duration_ms < 60)
+                    is_vad_active = getattr(self, "_vad_active", False)
+                    is_human_candidate = is_vad_active and (self_voice_score < 0.60)
+                    # Transient noise is an isolated impulse (<40ms) when VAD does not detect human voice
+                    is_transient = (speech_duration_ms < 40) and not is_human_candidate
                     reason = "transient_noise" if is_transient else "insufficient_speech_duration"
                     self.get_logger().info(
                         f"[BARGE-IN DECISION]\n"
