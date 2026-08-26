@@ -24,8 +24,8 @@
 #include "protocol.h"
 
 // ====== Seri ekran (Serial Monitor) mesajları ======
-#define ENABLE_TEXT_BANNER 1      // açılışta banner bas
-#define ENABLE_TEXT_STATUS 1      // host bağlı değilken periyodik durum satırı
+#define ENABLE_TEXT_BANNER 0      // açılışta banner bas (binary protokol için 0 olmalı)
+#define ENABLE_TEXT_STATUS 0      // host bağlı değilken periyodik durum satırı (binary protokol için 0 olmalı)
 #define TEXT_STATUS_PERIOD_MS 2000UL
 
 #define FW_NAME    "AstroFirmware"
@@ -363,7 +363,7 @@ void processPacket(uint8_t msg_id, const uint8_t* pl, uint8_t len) {
   switch (msg_id) {
     case Proto::HEARTBEAT: {
       g_last_heartbeat_ms = millis();
-      Proto::writePacket(Serial, Proto::HEARTBEAT_ACK, nullptr, 0);
+      Proto::writePacket(Serial, Proto::HEARTBEAT_ACK, pl, len);
       digitalWrite(STATUS_LED, !digitalRead(STATUS_LED));
     } break;
     case Proto::WHEEL_CMD: {

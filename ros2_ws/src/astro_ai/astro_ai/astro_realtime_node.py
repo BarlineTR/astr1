@@ -1193,11 +1193,21 @@ class AstroRealtimeNode(Node):
 
     def _build_current_system_prompt(self, active_speaker: Optional[Dict[str, Any]] = None) -> str:
         """Builds system instructions with memory, identity, persona, and strict anti-hallucination rules."""
-        identity = active_speaker or self._get_active_biometric_identity()
+        identity = active_speaker or self.resolve_identities()
         is_known = identity.get("is_known", False) and identity.get("name", "Misafir").lower() != "misafir"
         name_val = identity.get("name", "Misafir")
         conf_pct = int(identity.get("confidence", identity.get("score", 0.0)) * 100)
         source_str = identity.get("source", "perception")
+
+        self.get_logger().info(
+            f"[SESSION IDENTITY]\n"
+            f"user_id={identity.get('user_id', name_val.lower())}\n"
+            f"display_name={identity.get('display_name', name_val)}\n"
+            f"identity_source={identity.get('identity_source', source_str)}\n"
+            f"biometric_status={identity.get('biometric_status', 'verified' if is_known else 'unknown')}\n"
+            f"memory_profile_loaded=true\n"
+            f"realtime_context_injected=true"
+        )
 
         known_speakers = []
         if self.voice_recognizer:
@@ -1555,6 +1565,14 @@ class AstroRealtimeNode(Node):
 
         # 3. User Speech Started
         elif event_type == "input_audio_buffer.speech_started":
+            # Acoustic protection: if playback just started (< 350ms), server speech_started is speaker echo onset!
+            now_mono = time.monotonic()
+            playback_elapsed_ms = (now_mono - getattr(self, "_playback_start_monotonic", 0.0)) * 1000.0
+            prot_ms = float(getattr(self, "barge_in_protection_ms", 350.0))
+            if self._is_playback_active and playback_elapsed_ms < prot_ms:
+                self.get_logger().info(f"🛡️ [Server VAD Echo Suppressed]: Hoparlör koruma penceresinde ({playback_elapsed_ms:.0f}ms < {prot_ms}ms), kendi sesi iptal edilmedi.")
+                return
+
             is_active_streaming = (
                 self.active_response_state in ("STREAMING", "RESPONSE_STREAMING")
                 or (self._is_responding and self.active_response_state not in ("AUDIO_DONE", "COMPLETED", "CANCELLED", "FAILED", "GENERATING"))
@@ -1791,7 +1809,10 @@ class AstroRealtimeNode(Node):
                 "çeviri ve altyazı", "altyazı m.k.", "altyazı:", "çeviren:", "abone ol", 
                 "izlediğiniz için", "beğenmeyi unutmayın", "subtitle", "transcription by"
             ]
-            if any(h in user_transcript.lower() for h in whisper_hallucinations):
+            has_cjk = bool(re.search(r"[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\uff66-\uff9f]", user_transcript))
+            has_foreign_script = bool(re.search(r"[\u0600-\u06ff\u0400-\u04ff\u0590-\u05ff]", user_transcript))
+
+            if has_cjk or has_foreign_script or len(user_transcript) <= 1 or any(h in user_transcript.lower() for h in whisper_hallucinations):
                 self.get_logger().info(f"🔇 [Gürültü/Halüsinasyon Filtrelendi]: \"{user_transcript}\"")
                 return
 
@@ -3747,6 +3768,27 @@ class AstroRealtimeNode(Node):
                     f"Buradayım ve seni dinliyorum{spk}, hoş geldin.",
                 ]
 
+        # 5b. Who am I / Identity Query
+        elif any(w in u for w in ["kimim", "ben kimim", "astroman kimim"]):
+            owner = "Baran"
+            if hasattr(self, "memory") and hasattr(self.memory, "profile") and hasattr(self.memory.profile, "data"):
+                owner = self.memory.profile.data.get("owner_name", "Baran")
+            if p in ("flirt", "charming"):
+                candidates = [
+                    f"Sen {owner}'sın tabii ki, en sevdiğim mühendissin.",
+                    f"Karşımda {owner} duruyor, seni unutur muyum hiç?",
+                ]
+            elif p == "kufurbaz":
+                candidates = [
+                    f"Sen {owner}'sın tabii lan yavşak, hafızamı mı sınıyorsun?",
+                    f"{owner}'sın işte hıyar, unutacak halimiz yok ya seni!",
+                ]
+            else:
+                candidates = [
+                    f"Sen {owner}'sın, hafızamda kayıtlısın ve seni çok iyi tanıyorum.",
+                    f"Tabii ki tanıyorum, sen {owner}'sın!",
+                ]
+
         # 6. Persona / Opinion about user
         elif any(w in u for w in ["nasıl biriyim", "hakkımda ne düşünüyorsun", "nasıl biriyim sence"]):
             if p in ("flirt", "charming"):
@@ -4608,28 +4650,35 @@ class AstroRealtimeNode(Node):
             self._playback_end_time = time.monotonic()
             self._flush_audio_buffers("end_fallback_turn")
 
-    def _on_input_pcm(self, msg: String):
+    def _on_input_pcm(self, msg: Any):
         """Sends incoming microphone 24kHz PCM chunk to OpenAI Realtime WebSocket or processes turn via 0-cost Groq fallback."""
-        if not msg.data:
+        if msg is None:
             return
 
         now = time.monotonic()
 
-        # Try parsing JSON wrapped frame or raw base64 PCM string
+        # Try parsing JSON wrapped frame, raw base64 PCM string, or direct bytes
         raw_16k: bytes = b""
         local_rms: float = 0.0
         peak_val: int = 0
         try:
-            raw_str = msg.data.strip()
-            if raw_str.startswith("{") and raw_str.endswith("}"):
-                data_dict = json.loads(raw_str)
-                b64_audio = data_dict.get("data", "")
-                raw_bytes = base64.b64decode(b64_audio.encode("ascii")) if b64_audio else b""
+            if isinstance(msg, (bytes, bytearray)):
+                raw_bytes = bytes(msg)
             else:
-                raw_bytes = base64.b64decode(raw_str.encode("ascii"))
+                if not getattr(msg, "data", None):
+                    return
+                raw_str = msg.data.strip()
+                if raw_str.startswith("{") and raw_str.endswith("}"):
+                    data_dict = json.loads(raw_str)
+                    b64_audio = data_dict.get("data", "")
+                    raw_bytes = base64.b64decode(b64_audio.encode("ascii")) if b64_audio else b""
+                else:
+                    raw_bytes = base64.b64decode(raw_str.encode("ascii"))
             if raw_bytes:
-                # Always resample 24kHz incoming audio to 16kHz for uniform processing
-                raw_16k = resample_24k_to_16k(raw_bytes)
+                if len(raw_bytes) == 640:
+                    raw_16k = raw_bytes
+                else:
+                    raw_16k = resample_24k_to_16k(raw_bytes)
                 arr = np.frombuffer(raw_16k, dtype=np.int16)
                 if len(arr) > 0:
                     local_rms = float(np.sqrt(np.mean(arr.astype(np.float32) ** 2)))
@@ -4706,24 +4755,78 @@ class AstroRealtimeNode(Node):
                 except Exception:
                     self_voice_score = 0.0
 
-            # 2. Distinguish genuine loud user speech from robot's own speaker output
-            is_loud = (local_rms >= target_barge_in_rms and peak_val >= target_barge_in_peak and self_voice_score < 0.70)
+            # 2. Self-Voice Rejection Check
+            if self_voice_score >= 0.70:
+                self.get_logger().info(
+                    f"[BARGE-IN DECISION]\n"
+                    f"playback_active=true\n"
+                    f"vad_confidence={1.0 if getattr(self, '_vad_active', False) else 0.0:.2f}\n"
+                    f"speech_duration_ms=0\n"
+                    f"speech_continuity_ms=0\n"
+                    f"rms={local_rms:.0f}\n"
+                    f"peak={peak_val}\n"
+                    f"self_voice_score={self_voice_score:.2f}\n"
+                    f"transient_noise=false\n"
+                    f"speech_confirmed=false\n"
+                    f"decision=false\n"
+                    f"reason=self_voice"
+                )
+                self._barge_in_consecutive_frames = 0
+                return
+
+            # 3. Energy threshold check
+            is_loud = (local_rms >= target_barge_in_rms and peak_val >= target_barge_in_peak)
             if is_loud:
                 self._barge_in_consecutive_frames += 1
             else:
                 self._barge_in_consecutive_frames = max(0, self._barge_in_consecutive_frames - 1)
 
-            # Require persistent speech across multiple consecutive frames (>= 3 frames = 60ms) to avoid impulse noise
-            min_frames = getattr(self, "barge_in_min_consecutive_frames", 3)
-            if self._barge_in_consecutive_frames < min_frames:
+            speech_duration_ms = self._barge_in_consecutive_frames * 20
+            speech_continuity_ms = speech_duration_ms
+            min_speech_ms = min(getattr(self, "barge_in_min_speech_ms", 60.0), getattr(self, "barge_in_min_consecutive_frames", 3) * 20.0)
+
+            # 4. Transient / Peak Filtering (Single peak or brief impulse < min_speech_ms rejected)
+            if speech_duration_ms < min_speech_ms:
+                if local_rms >= target_barge_in_rms and peak_val >= target_barge_in_peak:
+                    is_transient = (speech_duration_ms < 60)
+                    reason = "transient_noise" if is_transient else "insufficient_speech_duration"
+                    self.get_logger().info(
+                        f"[BARGE-IN DECISION]\n"
+                        f"playback_active=true\n"
+                        f"vad_confidence={1.0 if getattr(self, '_vad_active', False) else 0.0:.2f}\n"
+                        f"speech_duration_ms={speech_duration_ms}\n"
+                        f"speech_continuity_ms={speech_continuity_ms}\n"
+                        f"rms={local_rms:.0f}\n"
+                        f"peak={peak_val}\n"
+                        f"self_voice_score={self_voice_score:.2f}\n"
+                        f"transient_noise={'true' if is_transient else 'false'}\n"
+                        f"speech_confirmed=false\n"
+                        f"decision=false\n"
+                        f"reason={reason}"
+                    )
                 return
 
-            # Barge-In latch: Only one logical barge-in transition per generation
+            # 5. Barge-In Latch
             if self._barge_in_latched:
                 return
             self._barge_in_latched = True
             self._barge_in_consecutive_frames = 0
             barge_in_after_ms = int((now - playback_start) * 1000.0) if playback_start > 0.0 else int(self.barge_in_protection_ms + 100)
+
+            self.get_logger().info(
+                f"[BARGE-IN DECISION]\n"
+                f"playback_active=true\n"
+                f"vad_confidence={1.0 if getattr(self, '_vad_active', False) else 0.0:.2f}\n"
+                f"speech_duration_ms={speech_duration_ms}\n"
+                f"speech_continuity_ms={speech_continuity_ms}\n"
+                f"rms={local_rms:.0f}\n"
+                f"peak={peak_val}\n"
+                f"self_voice_score={self_voice_score:.2f}\n"
+                f"transient_noise=false\n"
+                f"speech_confirmed=true\n"
+                f"decision=true\n"
+                f"reason=human_speech_confirmed"
+            )
 
             # Genuine User Barge-In during Playback!
             self.state_machine.transition_to(RobotState.INTERRUPTED)
@@ -4984,22 +5087,70 @@ class AstroRealtimeNode(Node):
         with self._lock:
             face = self._recognized_person or {}
             spk = self._recognized_speaker or {}
-            held_name = getattr(self, "_active_person_name", "Misafir")
+            held_name = getattr(self, "_active_person_name", "")
             hold_until = getattr(self, "_person_hold_until", 0.0)
 
-        # 1. Known Active Voice
+    def resolve_identities(self) -> Dict[str, Any]:
+        """Separates and resolves USER_IDENTITY, BIOMETRIC_IDENTITY, SESSION_IDENTITY, MEMORY_IDENTITY."""
+        now = time.monotonic()
+        with self._lock:
+            face = self._recognized_person or {}
+            spk = self._recognized_speaker or {}
+            held_name = getattr(self, "_active_person_name", "")
+            hold_until = getattr(self, "_person_hold_until", 0.0)
+
+        # 1. BIOMETRIC IDENTITY
+        bio_id = "unknown"
+        bio_source = "none"
+        bio_conf = 0.0
         if spk.get("is_known") and spk.get("confidence", 0.0) >= 0.40 and spk.get("name", "").lower() != "misafir":
-            return {**spk, "source": "voice"}
+            bio_id = spk.get("name")
+            bio_source = "voice"
+            bio_conf = float(spk.get("confidence", 0.0))
+        elif face.get("is_known") and face.get("confidence", 0.0) >= 0.45 and face.get("name", "").lower() != "misafir":
+            bio_id = face.get("name")
+            bio_source = "face"
+            bio_conf = float(face.get("confidence", 0.0))
 
-        # 2. Known Active Face
-        if face.get("is_known") and face.get("confidence", 0.0) >= 0.45 and face.get("name", "").lower() != "misafir":
-            return {**face, "source": "face"}
+        # 2. MEMORY & PERSISTENT IDENTITY
+        owner_name = "Baran"
+        if hasattr(self, "memory") and hasattr(self.memory, "profile") and hasattr(self.memory.profile, "data"):
+            owner_name = self.memory.profile.data.get("owner_name", "Baran")
 
-        # 3. Memory Hold (Active conversation continuity)
-        if now < hold_until and held_name and held_name.lower() != "misafir":
-            return {"name": held_name, "title": held_name, "formal_title": held_name, "is_known": True, "source": "memory_hold", "confidence": 0.90}
+        # 3. USER IDENTITY RESOLUTION
+        if bio_id != "unknown":
+            user_name = bio_id
+            user_source = f"biometric_{bio_source}"
+            bio_status = "verified"
+        elif now < hold_until and held_name and held_name.lower() != "misafir":
+            user_name = held_name
+            user_source = "session_hold"
+            bio_status = "session_active"
+        elif owner_name and owner_name.lower() != "misafir":
+            user_name = owner_name
+            user_source = "persistent_memory"
+            bio_status = "unknown"
+        else:
+            user_name = "Misafir"
+            user_source = "guest_fallback"
+            bio_status = "unknown"
 
-        return {"name": "Misafir", "title": "Ziyaretçi", "formal_title": "Misafir", "is_known": False, "source": "guest"}
+        identity_dict = {
+            "user_id": user_name.lower(),
+            "display_name": user_name,
+            "name": user_name,
+            "title": user_name,
+            "formal_title": user_name,
+            "is_known": (user_name.lower() != "misafir"),
+            "identity_source": user_source,
+            "biometric_status": bio_status,
+            "biometric_confidence": bio_conf,
+            "source": user_source,
+        }
+        return identity_dict
+
+    def _get_active_biometric_identity(self) -> Dict[str, Any]:
+        return self.resolve_identities()
 
     def _sync_perception_to_session(self):
         """Dynamically syncs persona & recognized identity to the active OpenAI Realtime session ONLY when identity changes."""

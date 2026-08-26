@@ -597,6 +597,12 @@ class AudioStreamNode(Node):
             if not self._playback_burst_active or self._total_played_bytes == 0:
                 return
 
+            now_mono = time.monotonic()
+            barge_in_after_ms = int((now_mono - self._burst_start_time) * 1000.0) if self._burst_start_time > 0 else 0
+            if self._burst_start_time > 0 and barge_in_after_ms < int(self.barge_in_protection_ms):
+                self.get_logger().debug(f"🛡️ [Acoustic Gate] Interruption rejected: {barge_in_after_ms}ms < {self.barge_in_protection_ms}ms (self-voice echo)")
+                return
+
             discarded_bytes = 0
             with self._playback_lock:
                 while not self._play_queue.empty():
@@ -607,9 +613,7 @@ class AudioStreamNode(Node):
                     except queue.Empty:
                         break
 
-            now_mono = time.monotonic()
-            barge_in_after_ms = int((now_mono - self._burst_start_time) * 1000.0) if self._burst_start_time > 0 else 0
-            barge_in_source = "self_voice" if (self._burst_start_time > 0 and barge_in_after_ms < int(self.barge_in_protection_ms)) else "user"
+            barge_in_source = "user"
             self._is_playing = False
             self._playback_burst_active = False
             self._last_playback_time = 0.0

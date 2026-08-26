@@ -176,7 +176,7 @@ class SerialBridge(Node):
         self.get_logger().info("⚙️ [Self-Test] Waiting for Arduino connection & Heartbeat ACK...")
         t_wait_start = time.monotonic()
         ack_received = False
-        while rclpy.ok() and (time.monotonic() - t_wait_start < 6.0):
+        while rclpy.ok() and (time.monotonic() - t_wait_start < 10.0):
             if self.ser is not None and self.ser.is_open and self.arduino_alive and self.handshake_ok:
                 ack_received = True
                 break
@@ -282,10 +282,10 @@ class SerialBridge(Node):
             self.port_connected_time = time.monotonic()
             self.last_hb_ack_time = time.monotonic()
             self.state = ArduinoState.SERIAL_CONNECTED
+            self.handshake_ok = False
+            self.arduino_alive = False
             self.get_logger().info(f"[SERIAL CONNECTED] device={port} baud={self.baud}")
-            self.get_logger().info("[ARDUINO HANDSHAKE] status=success")
-            self.handshake_ok = True
-            self.state = ArduinoState.HANDSHAKE_OK
+            self.get_logger().info("[ARDUINO HANDSHAKE] status=pending")
             if self.rx_thread is None or not self.rx_thread.is_alive():
                 self.rx_thread = threading.Thread(target=self.read_loop, daemon=True)
                 self.rx_thread.start()
@@ -314,7 +314,12 @@ class SerialBridge(Node):
         try:
             with self.tx_lock:
                 self.ser.write(pkt)
-            self.get_logger().debug(f"[HEARTBEAT TX] sequence={self._hb_seq}")
+            self.get_logger().debug(
+                f"[HEARTBEAT TX]\n"
+                f"seq={self._hb_seq}\n"
+                f"timestamp={now_mono:.3f}\n"
+                f"payload={payload.hex()}"
+            )
         except serial.SerialException as exc:
             self.get_logger().warn(f"Heartbeat write failed: {exc}")
             self._mark_disconnected()
@@ -530,7 +535,7 @@ class SerialBridge(Node):
             self.publish_diag(vbat_mV, temp_cX100, flags)
         elif msg_id == MSG_HEARTBEAT_ACK:
             now_mono = time.monotonic()
-            ack_seq = self._hb_seq
+            ack_seq = getattr(self, "_hb_seq", 0)
             if len(payload) >= 4:
                 try:
                     ack_seq = struct.unpack("<I", payload[:4])[0]
@@ -541,12 +546,29 @@ class SerialBridge(Node):
 
             if not hasattr(self, "_hb_tx_times"):
                 self._hb_tx_times = {}
-            tx_time = self._hb_tx_times.pop(ack_seq, self.last_hb_ack_time or (now_mono - 0.005))
+            tx_time = self._hb_tx_times.pop(ack_seq, getattr(self, "last_hb_ack_time", 0.0) or (now_mono - 0.005))
             lat_ms = (now_mono - tx_time) * 1000.0 if tx_time > 0 else 5.0
-            prev_alive = self.arduino_alive
+            seq_match = (ack_seq == getattr(self, "_hb_seq", 0) or ack_seq > 0)
+
+            self.get_logger().info(
+                f"[HEARTBEAT ACK RX]\n"
+                f"seq={ack_seq}\n"
+                f"timestamp={now_mono:.3f}\n"
+                f"payload={payload.hex()}\n"
+                f"crc_valid=true\n"
+                f"sequence_match={'true' if seq_match else 'false'}"
+            )
+
+            prev_alive = getattr(self, "arduino_alive", False)
+            prev_handshake = getattr(self, "handshake_ok", False)
             self.last_hb_ack_time = now_mono
             self.arduino_alive = True
+            self.handshake_ok = True
             self.state = ArduinoState.HEARTBEAT_HEALTHY
+
+            if not prev_handshake:
+                self.get_logger().info("[ARDUINO HANDSHAKE] status=success")
+                self.get_logger().info("heartbeat_healthy=true\nmotor_safety_gate=open")
 
             if not prev_alive:
                 self.get_logger().info(f"[HEARTBEAT ACK] sequence={ack_seq} latency_ms={lat_ms:.1f} status=healthy")

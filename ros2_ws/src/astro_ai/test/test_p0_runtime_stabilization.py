@@ -1698,6 +1698,8 @@ class TestP02RealtimeTurnPipelineAndHardwareCorrection(unittest.TestCase):
             bridge._try_connect()
             log_text = "\n".join(logs)
             self.assertIn("[SERIAL CONNECTED]", log_text)
+            bridge.handle_msg(0x13, b"\x01\x00\x00\x00")
+            log_text = "\n".join(logs)
             self.assertIn("[ARDUINO HANDSHAKE] status=success", log_text)
 
     def test_heartbeat_required_before_motor_enable(self):
@@ -2002,6 +2004,8 @@ class TestP03CriticalRuntimeRecovery(unittest.TestCase):
         with patch("serial_bridge.resolve_serial_port", return_value="/dev/astro_arduino"), \
              patch("serial.Serial", return_value=mock_ser):
             bridge._try_connect()
+            self.assertFalse(bridge.handshake_ok)
+            bridge.handle_msg(0x13, b"\x01\x00\x00\x00")
             self.assertTrue(bridge.handshake_ok)
             log_text = "\n".join(logs)
             self.assertIn("[ARDUINO HANDSHAKE] status=success", log_text)
@@ -3216,7 +3220,10 @@ class TestP06ProductionRealtimeAndHumanLikeStabilization(unittest.TestCase):
         self.assertTrue(node.arduino_alive)
 
         log_text = "\n".join(logs)
-        self.assertIn("[HEARTBEAT TX] sequence=201", log_text)
+        self.assertIn("[HEARTBEAT TX]", log_text)
+        self.assertIn("seq=201", log_text)
+        self.assertIn("[HEARTBEAT ACK RX]", log_text)
+        self.assertIn("[ARDUINO HANDSHAKE] status=success", log_text)
         self.assertIn("[HEARTBEAT ACK] sequence=201 latency_ms=", log_text)
 
     def test_p06_move_robot_blocked_when_heartbeat_unhealthy(self):

@@ -229,8 +229,10 @@ class ActionManager:
                     # Temporal clustering / consistency check for non-zero angles
                     recent = [y for ts, y, _ in self._doa_history if (now - ts) <= 2.0]
                     if len(recent) >= 2:
-                        mean_y = sum(recent) / len(recent)
-                        is_consistent = all(abs(y - mean_y) <= 25.0 for y in recent)
+                        sin_sum = sum(math.sin(math.radians(y)) for y in recent)
+                        cos_sum = sum(math.cos(math.radians(y)) for y in recent)
+                        mean_y = math.degrees(math.atan2(sin_sum, cos_sum))
+                        is_consistent = all(abs((y - mean_y + 180.0) % 360.0 - 180.0) <= 25.0 for y in recent)
                         if is_consistent:
                             conf = min(1.0, conf + 0.25)
                             yaw = mean_y

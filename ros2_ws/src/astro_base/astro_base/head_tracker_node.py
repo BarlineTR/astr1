@@ -89,6 +89,12 @@ def doa_to_robot_yaw(doa_deg: float, offset_deg: float = 0.0, invert: bool = Fal
     return yaw
 
 
+def angular_diff_deg(a: float, b: float) -> float:
+    """Calculates minimal signed angular difference between two angles in degrees (-180..+180)."""
+    diff = (a - b + 180.0) % 360.0 - 180.0
+    return diff
+
+
 class SocialGazeStateMachine:
     """Manages social gaze states: IDLE, ATTENDING, ENGAGED, RETURNING."""
     IDLE = "IDLE"
@@ -121,21 +127,29 @@ class HeadTrackerNode(Node):
         self.declare_parameter("consensus_tolerance_deg", 18.0)
 
         # Load parameters
-        self.enabled = bool(self.get_parameter("enabled").value)
-        self.doa_offset_deg = float(self.get_parameter("doa_offset_deg").value)
-        self.doa_invert = bool(self.get_parameter("doa_invert").value)
-        self.max_yaw_deg = float(self.get_parameter("max_yaw_deg").value)
-        self.min_yaw_deg = float(self.get_parameter("min_yaw_deg").value)
-        self.deadband_deg = float(self.get_parameter("deadband_deg").value)
-        self.min_dwell_time_s = float(self.get_parameter("min_dwell_time_s").value)
-        self.idle_return_timeout_s = float(self.get_parameter("idle_return_timeout_s").value)
-        self.max_speed_deg_s = float(self.get_parameter("max_speed_deg_s").value)
-        self.update_rate_hz = float(self.get_parameter("update_rate_hz").value)
-        self.min_rms_threshold = float(self.get_parameter("min_rms_threshold").value)
-        self.noise_multiplier = float(self.get_parameter("noise_multiplier").value)
-        self.consensus_window_size = int(self.get_parameter("consensus_window_size").value)
-        self.consensus_threshold = int(self.get_parameter("consensus_threshold").value)
-        self.consensus_tolerance_deg = float(self.get_parameter("consensus_tolerance_deg").value)
+        def _get_val(name, default):
+            try:
+                p = self.get_parameter(name)
+                val = getattr(p, "value", default)
+                return val if val is not None else default
+            except Exception:
+                return default
+
+        self.enabled = bool(_get_val("enabled", True))
+        self.doa_offset_deg = float(_get_val("doa_offset_deg", 0.0))
+        self.doa_invert = bool(_get_val("doa_invert", False))
+        self.max_yaw_deg = float(_get_val("max_yaw_deg", 70.0))
+        self.min_yaw_deg = float(_get_val("min_yaw_deg", -70.0))
+        self.deadband_deg = float(_get_val("deadband_deg", 12.0))
+        self.min_dwell_time_s = float(_get_val("min_dwell_time_s", 2.0))
+        self.idle_return_timeout_s = float(_get_val("idle_return_timeout_s", 8.0))
+        self.max_speed_deg_s = float(_get_val("max_speed_deg_s", 45.0))
+        self.update_rate_hz = float(_get_val("update_rate_hz", 20.0))
+        self.min_rms_threshold = float(_get_val("min_rms_threshold", 450.0))
+        self.noise_multiplier = float(_get_val("noise_multiplier", 2.2))
+        self.consensus_window_size = max(1, int(_get_val("consensus_window_size", 5)))
+        self.consensus_threshold = max(1, int(_get_val("consensus_threshold", 3)))
+        self.consensus_tolerance_deg = float(_get_val("consensus_tolerance_deg", 18.0))
 
         # Publishers
         self.pub_head_cmd = self.create_publisher(HeadCmd, "/head_cmd", 10)
@@ -203,7 +217,7 @@ class HeadTrackerNode(Node):
             self._doa_history.append((now, robot_yaw))
             self._last_speech_time = now
 
-            # 3. Temporal Consensus Clustering: Check if at least N samples in recent window agree
+            # 3. Temporal Consensus Clustering with Angular Wrap-Around Handling
             candidate_yaw = self._evaluate_consensus()
             if candidate_yaw is None:
                 return
@@ -211,13 +225,28 @@ class HeadTrackerNode(Node):
             # 4. Mechanical & Safety Clamping
             clamped_target = max(self.min_yaw_deg, min(self.max_yaw_deg, candidate_yaw))
 
+            # Confidence calculation
+            cluster_size = getattr(self, "_last_cluster_size", self.consensus_threshold)
+            total_samples = getattr(self, "_last_total_samples", len(self._doa_history))
+            energy_ratio = self._latest_rms / max(80.0, self._ambient_rms)
+            conf = min(1.0, max(0.1, (cluster_size / float(total_samples)) * min(1.0, energy_ratio / 2.0)))
+
+            self.get_logger().info(
+                f"[DOA FILTER]\n"
+                f"raw={raw_doa:.1f}\n"
+                f"confidence={conf:.2f}\n"
+                f"filtered={clamped_target:.1f}\n"
+                f"target_yaw={clamped_target:.1f}"
+            )
+
             # 5. Gaze Dwell Time & Deadband Hysteresis
             dwell_elapsed = now - self._last_gaze_switch_time
-            angle_diff = abs(clamped_target - self._current_yaw)
+            angle_diff = abs(angular_diff_deg(clamped_target, self._current_yaw))
 
             # Must exceed deadband AND satisfy dwell time to initiate a new head gaze
             if angle_diff >= self.deadband_deg and dwell_elapsed >= self.min_dwell_time_s:
                 self._target_yaw = clamped_target
+                self._filtered_target_yaw = clamped_target
                 self._last_gaze_switch_time = now
                 self._state = SocialGazeStateMachine.ATTENDING
                 self.get_logger().info(
@@ -234,13 +263,17 @@ class HeadTrackerNode(Node):
         best_cluster = []
 
         for candidate in recent_samples:
-            cluster = [y for y in recent_samples if abs(y - candidate) <= self.consensus_tolerance_deg]
+            cluster = [y for y in recent_samples if abs(angular_diff_deg(y, candidate)) <= self.consensus_tolerance_deg]
             if len(cluster) > len(best_cluster):
                 best_cluster = cluster
 
         if len(best_cluster) >= self.consensus_threshold:
-            # Return cluster average
-            return float(sum(best_cluster) / len(best_cluster))
+            sin_sum = sum(math.sin(math.radians(y)) for y in best_cluster)
+            cos_sum = sum(math.cos(math.radians(y)) for y in best_cluster)
+            avg_yaw = math.degrees(math.atan2(sin_sum, cos_sum))
+            self._last_cluster_size = len(best_cluster)
+            self._last_total_samples = len(recent_samples)
+            return float(avg_yaw)
         return None
 
     def _on_mic_level(self, msg: Float32):

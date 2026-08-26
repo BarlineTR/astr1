@@ -978,6 +978,9 @@ class TestRealtimeArchitectureInvariants(unittest.TestCase):
         node.gemini_api_key = ""
         node.openai_api_key = ""
         node.edge_tts_enabled = False
+        node.local_offline_tts = MagicMock()
+        node.local_offline_tts.is_ready.return_value = True
+        node.local_offline_tts.synthesize_sentence.return_value = b"\x00\x00" * 480
 
         # Local LLM produces answer
         fallback_ans = node._generate_contextual_persona_fallback("nasılsın")

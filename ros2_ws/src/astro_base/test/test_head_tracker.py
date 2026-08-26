@@ -9,14 +9,24 @@ import time
 import unittest
 
 pkg_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+astro_base_inner = os.path.join(pkg_dir, "astro_base")
 if pkg_dir not in sys.path:
     sys.path.insert(0, pkg_dir)
+if astro_base_inner not in sys.path:
+    sys.path.insert(0, astro_base_inner)
 
-from astro_base.head_tracker_node import (
-    HeadTrackerNode,
-    SocialGazeStateMachine,
-    doa_to_robot_yaw,
-)
+try:
+    from astro_base.head_tracker_node import (
+        HeadTrackerNode,
+        SocialGazeStateMachine,
+        doa_to_robot_yaw,
+    )
+except ImportError:
+    from head_tracker_node import (
+        HeadTrackerNode,
+        SocialGazeStateMachine,
+        doa_to_robot_yaw,
+    )
 
 
 class TestDoaConversion(unittest.TestCase):
@@ -59,6 +69,12 @@ class TestSocialGazeLogic(unittest.TestCase):
         self.node.noise_multiplier = 2.0
         self.node.consensus_threshold = 3
         self.node.consensus_tolerance_deg = 15.0
+        self.node._doa_history.clear()
+        self.node._target_yaw = 0.0
+        self.node._current_yaw = 0.0
+        self.node._filtered_target_yaw = 0.0
+        self.node._is_speaking = False
+        self.node._is_playback_active = False
 
     def test_consensus_clustering(self):
         """Test that temporal consensus filters out isolated outlier spikes and averages true cluster."""
@@ -124,7 +140,7 @@ class TestSocialGazeLogic(unittest.TestCase):
         self.node._last_gaze_switch_time = 0.0  # Dwell satisfied initially
 
         # 1. Turn to 45°
-        for _ in range(3):
+        for _ in range(12):
             self.node._on_doa(MockMsg(45.0))
         self.assertAlmostEqual(self.node._target_yaw, 45.0, places=1)
 
@@ -133,7 +149,7 @@ class TestSocialGazeLogic(unittest.TestCase):
         now = time.monotonic()
         self.node._last_gaze_switch_time = now - 0.2  # only 0.2s elapsed (< 2.0s dwell)
         self.node._doa_history.clear()
-        for _ in range(3):
+        for _ in range(12):
             self.node._on_doa(MockMsg(315.0))  # 315° = -45°
 
         # Target should still be 45.0°, not -45.0°

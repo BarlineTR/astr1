@@ -41,7 +41,9 @@ namespace Proto {
     uint8_t buf[1 + 255]; // length + data
     buf[0] = len;
     buf[1] = msg_id;
-    memcpy(&buf[2], payload, payload_len);
+    if (payload_len > 0 && payload != nullptr) {
+      memcpy(&buf[2], payload, payload_len);
+    }
     uint8_t crc = crc8(buf, 2 + payload_len);
     s.write(crc);
   }
