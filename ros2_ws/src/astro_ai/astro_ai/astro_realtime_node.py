@@ -5579,16 +5579,12 @@ class AstroRealtimeNode(Node):
                 is_playback_active=self._is_playback_active,
             )
 
-    def _get_active_biometric_identity(self) -> Dict[str, Any]:
-        now = time.monotonic()
-        with self._lock:
-            face = self._recognized_person or {}
-            spk = self._recognized_speaker or {}
-            held_name = getattr(self, "_active_person_name", "")
-            hold_until = getattr(self, "_person_hold_until", 0.0)
-
     def resolve_identities(self) -> Dict[str, Any]:
-        """Separates and resolves USER_IDENTITY, BIOMETRIC_IDENTITY, SESSION_IDENTITY, MEMORY_IDENTITY."""
+        """Separates and resolves:
+        - SESSION_IDENTITY: Default user for context, system prompt, and memory retrieval.
+        - BIOMETRIC_IDENTITY: Person genuinely verified by acoustic voice recognition / face sensor.
+        - ACTIVE_HOLD: Temporary continuation hint of previous speaker during multi-turn dialogue.
+        """
         now = time.monotonic()
         lock = getattr(self, "_lock", None)
         if lock is not None:
@@ -5603,7 +5599,7 @@ class AstroRealtimeNode(Node):
             held_name = getattr(self, "_active_person_name", "")
             hold_until = getattr(self, "_person_hold_until", 0.0)
 
-        # 1. BIOMETRIC IDENTITY
+        # 1. BIOMETRIC IDENTITY (Acoustic / Visual Ground Truth)
         bio_id = "unknown"
         bio_source = "none"
         bio_conf = 0.0
@@ -5616,17 +5612,21 @@ class AstroRealtimeNode(Node):
             bio_source = "face"
             bio_conf = float(face.get("confidence", 0.0))
 
-        # 2. MEMORY & PERSISTENT IDENTITY
+        # 2. ACTIVE HOLD (Continuation Hint)
+        has_active_hold = bool(now < hold_until and held_name and held_name.lower() != "misafir")
+        hold_remaining_s = max(0.0, hold_until - now) if has_active_hold else 0.0
+
+        # 3. MEMORY / PERSISTENT DEFAULT OWNER
         owner_name = "Baran"
         if hasattr(self, "memory") and hasattr(self.memory, "profile") and hasattr(self.memory.profile, "data"):
             owner_name = self.memory.profile.data.get("owner_name", "Baran")
 
-        # 3. USER IDENTITY RESOLUTION
+        # 4. SESSION IDENTITY RESOLUTION (Final effective user for context and memory)
         if bio_id != "unknown":
             user_name = bio_id
             user_source = f"biometric_{bio_source}"
             bio_status = "verified"
-        elif now < hold_until and held_name and held_name.lower() != "misafir":
+        elif has_active_hold:
             user_name = held_name
             user_source = "session_hold"
             bio_status = "session_active"
@@ -5640,6 +5640,8 @@ class AstroRealtimeNode(Node):
             bio_status = "unknown"
 
         identity_dict = {
+            # 1. SESSION IDENTITY (Context / System Prompt / Memory)
+            "session_identity": user_name,
             "user_id": user_name.lower(),
             "display_name": user_name,
             "name": user_name,
@@ -5647,8 +5649,19 @@ class AstroRealtimeNode(Node):
             "formal_title": user_name,
             "is_known": (user_name.lower() != "misafir"),
             "identity_source": user_source,
+
+            # 2. BIOMETRIC IDENTITY (Ground Sensor Truth)
+            "biometric_identity": bio_id,
+            "biometric_source": bio_source,
             "biometric_status": bio_status,
             "biometric_confidence": bio_conf,
+
+            # 3. ACTIVE HOLD (Multi-turn continuation hint)
+            "active_hold_speaker": held_name if has_active_hold else "",
+            "active_hold_remaining_s": round(hold_remaining_s, 1),
+            "has_active_hold": has_active_hold,
+
+            # Compatibility field
             "source": user_source,
         }
         return identity_dict
