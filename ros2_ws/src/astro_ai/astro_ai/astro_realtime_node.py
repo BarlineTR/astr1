@@ -2487,6 +2487,10 @@ class AstroRealtimeNode(Node):
             early_exit = False
             threshold = float(os.getenv("SPEAKER_MATCH_THRESHOLD", "0.40"))
 
+            held_name = getattr(self, "_active_person_name", "Misafir")
+            hold_until = getattr(self, "_person_hold_until", 0.0)
+            has_active_hold = (time.monotonic() < hold_until) and (held_name != "Misafir")
+
             for win_idx, win in enumerate(windows):
                 t_infer_start = time.monotonic()
                 raw = b"".join(win)
@@ -2500,11 +2504,20 @@ class AstroRealtimeNode(Node):
                 infer_times.append(t_infer_ms)
                 window_results.append((spk_name, spk_conf, spk_meta))
 
-                # Early-exit optimization: If window 0 yields high confidence (>= 0.46) on known speaker,
-                # skip redundant 2nd and 3rd ONNX inferences to save ~800ms of latency!
+                # Early-exit optimization 1: High confidence match on known speaker
                 if win_idx == 0 and spk_name is not None and spk_conf >= 0.46 and spk_name.lower() != "misafir":
                     early_exit = True
                     break
+
+                # Early-exit optimization 2 (Active Conversation Fast-Path):
+                # When already engaged in an active conversation with a verified speaker (e.g. Baran):
+                # If window 0 does not detect another person with high confidence (>=0.45),
+                # active hold retains the speaker anyway. Skip windows 2 & 3 to save ~800ms of latency!
+                if win_idx == 0 and has_active_hold:
+                    other_person_detected = (spk_name is not None and spk_name != held_name and spk_conf >= 0.45)
+                    if not other_person_detected:
+                        early_exit = True
+                        break
 
             if not window_results:
                 return
@@ -2912,14 +2925,13 @@ class AstroRealtimeNode(Node):
         return {"status": "error", "observation": "Görüntü analiz edilirken bir hata oluştu."}
 
     def _check_sleep_mode(self):
-        """Transitions Astro into sleep mode after 12 seconds of conversation inactivity."""
+        """Transitions Astro into sleep mode after 15 seconds of conversation inactivity."""
         now = time.monotonic()
         is_busy = (
             self._is_responding
             or self._is_playback_active
             or self.state_machine.is_speaking()
             or self.state_machine.is_thinking()
-            or getattr(self, "_vad_active", False)
             or getattr(self, "_is_processing_fallback", False)
         )
         if is_busy:
@@ -2929,7 +2941,7 @@ class AstroRealtimeNode(Node):
             return
 
         if not self._is_sleeping:
-            idle_seconds = now - self._last_interaction_time
+            idle_seconds = now - getattr(self, "_last_interaction_time", now)
             if idle_seconds >= 15.0:
                 self._is_sleeping = True
                 self.state_machine.transition_to(RobotState.DEEP_IDLE)
@@ -4982,7 +4994,7 @@ class AstroRealtimeNode(Node):
         # Playback & Echo Cooldown State Determination
         # P0-7: Barge-in is only evaluated during active audio playback
         is_active_playback = bool(self._is_playback_active)
-        if is_active_playback or (local_rms > max(450.0, self._ambient_rms * 1.35) and peak_val > 1200):
+        if is_active_playback:
             self._last_interaction_time = now
 
         # Zero Self-Hearing Protection & Multi-Signal Persistent Barge-In
@@ -5130,7 +5142,6 @@ class AstroRealtimeNode(Node):
             self._consecutive_loud_frames = max(0, self._consecutive_loud_frames - 1)
 
         if self._consecutive_loud_frames >= 5 and (now - getattr(self, "_node_start_time", 0.0)) > 4.0:
-            self._last_interaction_time = now
             if self._is_sleeping:
                 self._wake_up()
 

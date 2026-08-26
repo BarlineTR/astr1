@@ -3098,6 +3098,69 @@ class TestP05RealtimeStreamStateAndPlaybackSerialization(unittest.TestCase):
         joined_logs = "\n".join(logs)
         self.assertIn("turn_type=TOOL_CONTINUATION_RESPONSE", joined_logs)
 
+    def test_sleep_mode_transitions_after_15_seconds_inactivity(self):
+        """Field fix: Astro transitions into DEEP_IDLE sleep mode after 15 seconds of inactivity."""
+        from astro_ai.astro_realtime_node import AstroRealtimeNode
+        from astro_ai.state_machine import RobotState
+        node = AstroRealtimeNode.__new__(AstroRealtimeNode)
+        node._is_sleeping = False
+        node._is_responding = False
+        node._is_playback_active = False
+        node._is_processing_fallback = False
+        node.state_machine = MagicMock()
+        node.state_machine.is_speaking.return_value = False
+        node.state_machine.is_thinking.return_value = False
+        node.pub_emotion = MagicMock()
+        node.pub_gesture = MagicMock()
+        node.get_logger = lambda: MagicMock()
+
+        # Last interaction was 16 seconds ago
+        node._last_interaction_time = time.monotonic() - 16.0
+        node._check_sleep_mode()
+
+        self.assertTrue(node._is_sleeping)
+        node.state_machine.transition_to.assert_called_with(RobotState.DEEP_IDLE)
+
+    def test_voice_id_active_conversation_fast_path(self):
+        """Field fix: In an active conversation hold with a verified user, early-exit fires on window 0 to save ~800ms."""
+        import threading
+        from astro_ai.astro_realtime_node import AstroRealtimeNode
+        node = AstroRealtimeNode.__new__(AstroRealtimeNode)
+        node._lock = threading.Lock()
+        node._user_speech_audio_buffer = [b"\x00\x02" * 320] * 60
+        node.get_logger = lambda: MagicMock()
+        node._sync_perception_to_session = MagicMock()
+        node.memory = MagicMock()
+
+        # Active hold on Baran for the next 30 seconds
+        node._active_person_name = "Baran"
+        node._person_hold_until = time.monotonic() + 30.0
+
+        mock_vr = MagicMock()
+        # Window 0 returns Baran with moderate confidence (0.28 < 0.46) on short word
+        mock_vr.recognize_voice.return_value = ("Baran", 0.28, {"title": "Baran Bey", "formal_title": "Baran Bey"})
+        node.voice_recognizer = mock_vr
+
+        node._run_voice_identification()
+        # Fast-path early exit: exactly 1 inference executed instead of 3!
+        self.assertEqual(mock_vr.recognize_voice.call_count, 1)
+        self.assertEqual(node._active_person_name, "Baran")
+
+    def test_kufurbaz_persona_prompt_and_roast_rules(self):
+        """Field fix: Kufurbaz persona contains dynamic Turkish street roast instructions and bans template repetition."""
+        from astro_ai.persona_engine import PersonaEngine, PERSONA_PROMPTS
+        engine = PersonaEngine()
+        engine.set_persona("kufurbaz")
+        prompt = engine.build_system_prompt()
+
+        # Verify anti-repetition rule against lazy template words like 'dangalak'
+        self.assertIn("EZBER VE KALIP CÜMLELER KESİNLİKLE YASAKTIR", prompt)
+        self.assertIn("dangalak", prompt)  # Mentioned in the anti-repetition ban rule
+        self.assertIn("yavşak", prompt)
+        self.assertIn("lavuk", prompt)
+        # Verify sacred and family protection boundary is intact
+        self.assertIn("KESİNLİKLE ANNE, BABA, AİLE BİREYLERİ", prompt)
+
     def test_motion_and_memory_tools_execution(self):
         """17. Tools: move_robot publishes Twist to /cmd_vel and search_memory queries storage."""
         from astro_ai.astro_realtime_node import AstroRealtimeNode
