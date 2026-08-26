@@ -1227,11 +1227,13 @@ class AstroRealtimeNode(Node):
                 f"\n[ŞU AN SENİNLE KONUŞAN KİŞİ]:\n"
                 f"- İsim: {name_val} (Hitap: {title_val}, Doğrulama: %{conf_pct}, Kaynak: {source_str})\n"
                 f"{room_context}"
-                f"KİMLİK VE HİTAP KURALLARI (ANTI-NAME REPETITION):\n"
-                f"1. Karşındaki kişinin {name_val} olduğunu biliyorsun.\n"
-                f"2. KESİNLİKLE her cümlenin başında veya içine '{name_val}' diyerek papağan gibi isim tekrarlama! Normal bir insan gibi doğrudan konuya gir.\n"
-                f"3. KESİNLİKLE 'Seni ilk kez duyuyorum', 'Sesini tanıyamadım', 'Adın ne senin?' veya 'Kimsin sen?' gibi yabancılayıcı cümleler kurma!\n"
-                f"4. Karşındaki {name_val} iken kendisini başka biri sanma. Yakın arkadaş samimiyetini koru.\n"
+                f"KİMLİK VE HİTAP KURALLARI:\n"
+                f"1. Şu an seninle doğrudan konuşan kişi KESİNLİKLE {name_val}'dır.\n"
+                f"2. Kullanıcı 'ben kimim?', 'adımı biliyor musun?', 'beni tanıdın mı?' diye sorduğunda doğrudan 'Sen {name_val}'sın!' diyerek cevap ver!\n"
+                f"3. ASLA karşındaki kişi {name_val} iken ona 'Sen Baransın, yaratıcımsın' deme! Yaratıcın Baran'dır, ancak şu an seninle konuşan kişi {name_val}'dır!\n"
+                f"4. Sadece ve sadece karşındaki kişi Baran olarak doğrulandığında kendisine 'Sen Baransın, baş mühendissin' de.\n"
+                f"5. KESİNLİKLE her cümlenin başında veya içine '{name_val}' diyerek papağan gibi isim tekrarlama; doğrudan konuya gir.\n"
+                f"6. KESİNLİKLE 'Seni ilk kez duyuyorum', 'Sesini tanıyamadım' deme; yakın arkadaş samimiyetini koru.\n"
             )
         else:
             bio_status = (
@@ -2307,7 +2309,7 @@ class AstroRealtimeNode(Node):
                 arr = np.frombuffer(raw, dtype=np.int16)
                 if len(arr) < int(16000 * 0.4):
                     continue
-                threshold = float(os.getenv("SPEAKER_MATCH_THRESHOLD", "0.32"))
+                threshold = float(os.getenv("SPEAKER_MATCH_THRESHOLD", "0.40"))
                 spk_name, spk_conf, spk_meta = self.voice_recognizer.recognize_voice(
                     arr, sample_rate=16000, threshold=threshold
                 )
@@ -2350,7 +2352,7 @@ class AstroRealtimeNode(Node):
             majority_threshold = max(2, total_windows // 2 + 1) if total_windows >= 2 else 1
 
             is_majority = winner_votes >= majority_threshold
-            is_confident = winner_conf >= 0.32
+            is_confident = winner_conf >= 0.40
             is_clear_winner = (margin > 0.03) or (total_windows <= 1)
 
             with self._lock:
@@ -2681,7 +2683,8 @@ class AstroRealtimeNode(Node):
             or self._is_playback_active
             or self.state_machine.is_speaking()
             or self.state_machine.is_thinking()
-            or self.state_machine.is_listening()
+            or getattr(self, "_vad_active", False)
+            or getattr(self, "_is_processing_fallback", False)
         )
         if is_busy:
             self._last_interaction_time = now
@@ -3268,6 +3271,7 @@ class AstroRealtimeNode(Node):
             self._playback_start_monotonic = time.monotonic()
         elif was_active and not self._is_playback_active:
             self._playback_end_time = time.monotonic()
+            self._last_interaction_time = time.monotonic()
             if not self._is_processing_fallback:
                 self._is_responding = False
             self._flush_audio_buffers("playback_ended")
@@ -4739,11 +4743,11 @@ class AstroRealtimeNode(Node):
         # ====================================================================
         # ACTIVE MODE: Interaction timestamp & State Tracking
         # ====================================================================
-        self._last_interaction_time = now
-
         # Playback & Echo Cooldown State Determination
         # P0-7: Barge-in is only evaluated during active audio playback
         is_active_playback = bool(self._is_playback_active)
+        if is_active_playback or (local_rms > max(450.0, self._ambient_rms * 1.35) and peak_val > 1200):
+            self._last_interaction_time = now
 
         # Zero Self-Hearing Protection & Multi-Signal Persistent Barge-In
         if is_active_playback:
@@ -4794,9 +4798,8 @@ class AstroRealtimeNode(Node):
 
             speech_duration_ms = self._barge_in_consecutive_frames * 20
             speech_continuity_ms = speech_duration_ms
+            
             min_speech_ms = min(getattr(self, "barge_in_min_speech_ms", 60.0), getattr(self, "barge_in_min_consecutive_frames", 3) * 20.0)
-
-            # 4. Transient / Peak Filtering (Single peak or brief impulse < min_speech_ms rejected)
             if speech_duration_ms < min_speech_ms:
                 if local_rms >= target_barge_in_rms and peak_val >= target_barge_in_peak:
                     is_transient = (speech_duration_ms < 60)
@@ -4822,6 +4825,8 @@ class AstroRealtimeNode(Node):
                 return
             self._barge_in_latched = True
             self._barge_in_consecutive_frames = 0
+            self._is_playback_active = False
+            self._is_responding = False
             barge_in_after_ms = int((now - playback_start) * 1000.0) if playback_start > 0.0 else int(self.barge_in_protection_ms + 100)
 
             self.get_logger().info(
@@ -4839,11 +4844,7 @@ class AstroRealtimeNode(Node):
                 f"reason=human_speech_confirmed"
             )
 
-            # Genuine User Barge-In during Playback!
-            self.state_machine.transition_to(RobotState.INTERRUPTED)
-            self._is_responding = False
-            self._is_playback_active = False
-
+            # 6. Actuate Cancellation: Cancel ongoing audio and speech pipeline
             if getattr(self, "_fallback_mode", False) or not self._can_use_openai("realtime"):
                 self._fallback_speaking = True
                 self._fallback_speech_start = now
