@@ -1227,10 +1227,11 @@ class AstroRealtimeNode(Node):
                 f"\n[ŞU AN SENİNLE KONUŞAN KİŞİ]:\n"
                 f"- İsim: {name_val} (Hitap: {title_val}, Doğrulama: %{conf_pct}, Kaynak: {source_str})\n"
                 f"{room_context}"
-                f"KİMLİK DOĞRULAMA VE HİTAP KURALLARI:\n"
-                f"1. Şu an doğrudan seninle konuşan kişi: {name_val}. Kendisine samimiyetle ismiyle ({name_val}) hitap et.\n"
-                f"2. KESİNLİKLE 'Seni ilk kez duyuyorum', 'Sesini tanıyamadım', 'Adın ne senin?' veya 'Kimsin sen?' gibi yabancılayıcı cümleler kurma!\n"
-                f"3. Karşındaki {name_val} iken kendisini başka biri sanma. Yakın arkadaş samimiyetini koru.\n"
+                f"KİMLİK VE HİTAP KURALLARI (ANTI-NAME REPETITION):\n"
+                f"1. Karşındaki kişinin {name_val} olduğunu biliyorsun.\n"
+                f"2. KESİNLİKLE her cümlenin başında veya içine '{name_val}' diyerek papağan gibi isim tekrarlama! Normal bir insan gibi doğrudan konuya gir.\n"
+                f"3. KESİNLİKLE 'Seni ilk kez duyuyorum', 'Sesini tanıyamadım', 'Adın ne senin?' veya 'Kimsin sen?' gibi yabancılayıcı cümleler kurma!\n"
+                f"4. Karşındaki {name_val} iken kendisini başka biri sanma. Yakın arkadaş samimiyetini koru.\n"
             )
         else:
             bio_status = (
@@ -2690,10 +2691,10 @@ class AstroRealtimeNode(Node):
 
         if not self._is_sleeping:
             idle_seconds = now - self._last_interaction_time
-            if idle_seconds >= 60.0:
+            if idle_seconds >= 15.0:
                 self._is_sleeping = True
                 self.state_machine.transition_to(RobotState.DEEP_IDLE)
-                self.get_logger().info("💤 [Astro Uyku Modu]: 60 saniye hareketsizlik — Astro DEEP_IDLE moduna geçti (😴). Wake listener aktif.")
+                self.get_logger().info("💤 [Astro Uyku Modu]: 15 saniye hareketsizlik — Astro DEEP_IDLE moduna geçti (😴). Wake listener aktif.")
 
                 # 1. Publish sleeping emotion for face/display
                 if self.pub_emotion is not None:
@@ -4687,6 +4688,12 @@ class AstroRealtimeNode(Node):
                 if len(arr) > 0:
                     local_rms = float(np.sqrt(np.mean(arr.astype(np.float32) ** 2)))
                     peak_val = int(np.max(np.abs(arr)))
+                    # Maintain speech audio buffer for speaker recognition while robot is not speaking
+                    if not self._is_playback_active and raw_16k:
+                        with self._lock:
+                            self._user_speech_audio_buffer.append(raw_16k)
+                            if len(self._user_speech_audio_buffer) > 250:
+                                self._user_speech_audio_buffer = self._user_speech_audio_buffer[-250:]
         except Exception as _exc:
             self.get_logger().debug(f"_on_input_pcm: yok sayılan hata ({_exc})")
 
@@ -5186,24 +5193,6 @@ class AstroRealtimeNode(Node):
         try:
             asyncio.run_coroutine_threadsafe(self._ws.send(json.dumps(update_event)), self._loop)
             self.get_logger().info(f"👤 [Realtime Biyometri]: Oturum kimliği güncellendi -> {identity_name}")
-
-            # Send in-conversation event to notify current active context of identity switch
-            if identity.get("is_known"):
-                name_id = identity.get("name")
-                notice_text = f"[Sistem Bildirimi]: Karşındaki kişi %100 doğrulukla biyometrik olarak tanındı: {name_id} ({identity.get('formal_title')}). Kendisine doğrudan bu isimle ({name_id}) hitap et."
-            else:
-                prev_str = f"önceki kullanıcı ({prev_id})" if prev_id and prev_id != "Misafir" else "önceki kişi"
-                notice_text = f"[Sistem Bildirimi]: DİKKAT: Karşındaki kişinin sesi analiz edildi ve TANINMADI (Bilinmeyen Kişi / Misafir). Bu kişi {prev_str} DEĞİLDİR! Kendisine ASLA {prev_id or 'Baran'} deme. Kendisini tanımadığını ve sesini ilk defa duyduğunu belirterek adını sor."
-
-            notice_event = {
-                "type": "conversation.item.create",
-                "item": {
-                    "type": "message",
-                    "role": "user",
-                    "content": [{"type": "input_text", "text": notice_text}]
-                }
-            }
-            asyncio.run_coroutine_threadsafe(self._ws.send(json.dumps(notice_event)), self._loop)
         except Exception as _exc:
             self.get_logger().debug(f"_sync_perception_to_session: yok sayılan hata ({_exc})")
 
