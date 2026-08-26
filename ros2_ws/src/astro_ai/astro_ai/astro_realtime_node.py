@@ -613,6 +613,15 @@ class AstroRealtimeNode(Node):
         self.no_speech_rejection_count = 0
         self.stale_audio_rejection_count = 0
 
+        # Architecture Profile (Profile A: Baseline create_response=False + synchronous turn orchestration; Profile B: OpenAI-native create_response=True + async biometric side-channel)
+        self.architecture_profile = os.getenv("REALTIME_ARCHITECTURE_PROFILE", "profile_a").lower()
+        self.vad_silence_duration_ms = int(os.getenv("REALTIME_VAD_SILENCE_MS", "600" if self.architecture_profile == "profile_a" else "400"))
+        self.vad_prefix_padding_ms = int(os.getenv("REALTIME_VAD_PREFIX_MS", "300"))
+        self.vad_threshold = float(os.getenv("REALTIME_VAD_THRESHOLD", "0.72" if self.architecture_profile == "profile_a" else "0.68"))
+        self._async_identity_in_flight: bool = False
+        self._latest_async_identity_ms: float = 0.0
+        self._latest_barge_in_reaction_ms: float = 0.0
+
         # Biometric Voice & Face Engines
         self.voice_recognizer = VoiceRecognizer() if VoiceRecognizer else None
         self.face_recognizer = FaceRecognizer() if FaceRecognizer else None
@@ -1312,10 +1321,10 @@ class AstroRealtimeNode(Node):
                         },
                         "turn_detection": {
                             "type": "server_vad",
-                            "threshold": 0.72,
-                            "prefix_padding_ms": 300,
-                            "silence_duration_ms": 600,
-                            "create_response": False
+                            "threshold": getattr(self, "vad_threshold", 0.72),
+                            "prefix_padding_ms": getattr(self, "vad_prefix_padding_ms", 300),
+                            "silence_duration_ms": getattr(self, "vad_silence_duration_ms", 600),
+                            "create_response": (getattr(self, "architecture_profile", "profile_a") == "profile_b")
                         }
                     },
                     "output": {
@@ -1682,6 +1691,10 @@ class AstroRealtimeNode(Node):
                     vad_start = getattr(self, "_vad_end_time", None) or created_start
                     t_resp_send = getattr(self, "_turn_telemetry", {}).get("t_resp_send", created_start)
                     t_speech_stopped = getattr(self, "_turn_telemetry", {}).get("t_speech_stopped", vad_start)
+                    arch_prof = getattr(self, "architecture_profile", "profile_a")
+
+                    local_id_blocking_ms = (t_resp_send - t_speech_stopped) * 1000.0 if (arch_prof == "profile_a" and t_resp_send and t_speech_stopped) else 0.0
+                    async_id_ms = getattr(self, "_latest_async_identity_ms", 0.0) if (arch_prof == "profile_b") else 0.0
                     response_create_to_first_audio_ms = (self._first_audio_time - t_resp_send) * 1000.0 if (self._first_audio_time and t_resp_send) else 0.0
                     speech_stopped_to_first_audio_ms = (self._first_audio_time - t_speech_stopped) * 1000.0 if (self._first_audio_time and t_speech_stopped) else 0.0
                     created_to_first_audio_ms = (self._first_audio_time - created_start) * 1000.0 if (self._first_audio_time and created_start) else 0.0
@@ -1689,8 +1702,11 @@ class AstroRealtimeNode(Node):
                     self.get_logger().info(
                         f"[REALTIME AUDIO START]\n"
                         f"generation_id={self.active_generation_id or self.realtime_current_generation_id}\n"
+                        f"architecture_profile={arch_prof}\n"
                         f"turn_type={getattr(self, '_last_turn_type', 'USER_TURN_RESPONSE')}\n"
                         f"actual_provider=openai_realtime\n"
+                        f"local_identity_blocking_ms={local_id_blocking_ms:.1f}\n"
+                        f"async_identity_ms={async_id_ms:.1f}\n"
                         f"response_create_to_first_audio_ms={response_create_to_first_audio_ms:.1f}\n"
                         f"created_to_first_audio_ms={created_to_first_audio_ms:.1f}\n"
                         f"speech_stopped_to_first_audio_ms={speech_stopped_to_first_audio_ms:.1f}\n"
@@ -1743,6 +1759,7 @@ class AstroRealtimeNode(Node):
                 self.get_logger().info(f"🛡️ [Server VAD Echo Suppressed]: Hoparlör koruma penceresinde ({playback_elapsed_ms:.0f}ms < {prot_ms}ms), kendi sesi iptal edilmedi.")
                 return
 
+            t_intr_start = time.monotonic()
             is_active_streaming = (
                 self.active_response_state in ("STREAMING", "RESPONSE_STREAMING")
                 or (self._is_responding and self.active_response_state not in ("AUDIO_DONE", "COMPLETED", "CANCELLED", "FAILED", "GENERATING"))
@@ -1763,6 +1780,9 @@ class AstroRealtimeNode(Node):
                             await res
                     except Exception:
                         pass
+                barge_in_reaction_ms = (time.monotonic() - t_intr_start) * 1000.0
+                self._latest_barge_in_reaction_ms = barge_in_reaction_ms
+                self.get_logger().info(f"⚡ [Barge-In Cancel Complete] reaction_ms={barge_in_reaction_ms:.1f}ms")
             elif self._is_playback_active and self.active_response_state in ("AUDIO_DONE", "IDLE", "COMPLETED", "CANCELLED", "FAILED"):
                 # Playback is draining on DAC, but OpenAI response is already done on server side: ONLY cancel DAC, DO NOT send response.cancel to OpenAI!
                 self.get_logger().info("⚡ [Playback Interrupted] Kullanıcı konuştu — Kalan DAC çalması durduruluyor (Server cancel yok)...")
@@ -1772,6 +1792,8 @@ class AstroRealtimeNode(Node):
                     self.pub_interrupt.publish(intr_msg)
                 self._is_playback_active = False
                 self._is_responding = False
+                barge_in_reaction_ms = (time.monotonic() - t_intr_start) * 1000.0
+                self._latest_barge_in_reaction_ms = barge_in_reaction_ms
             else:
                 self._is_responding = False
                 self.get_logger().debug(f"🎤 [Realtime] Kullanıcı konuşmaya başladı (response_state={self.active_response_state})...")
@@ -1781,8 +1803,12 @@ class AstroRealtimeNode(Node):
             if self._is_sleeping:
                 return
             self._vad_end_time = time.monotonic()
-            self.get_logger().info("🤫 [Realtime] Cümle bitti, deterministik turn orkestrasyonu başlatılıyor...")
-            await self._orchestrate_turn_after_speech_stopped(ws)
+            if getattr(self, "architecture_profile", "profile_a") == "profile_b":
+                self.get_logger().info("🤫 [Realtime Profile B] Cümle bitti, OpenAI native response bekleniyor (Async biometric side-channel başlatılıyor)...")
+                self._run_async_biometric_side_channel(self._vad_end_time)
+            else:
+                self.get_logger().info("🤫 [Realtime Profile A] Cümle bitti, deterministik turn orkestrasyonu başlatılıyor...")
+                await self._orchestrate_turn_after_speech_stopped(ws)
 
         # 3c. Response Created
         elif event_type == "response.created":
@@ -2530,6 +2556,49 @@ class AstroRealtimeNode(Node):
         msg = f"'{name}' biyometrik kayıtları ve hafızası başarıyla silindi."
         self.get_logger().info(f"🗑️ [Biyometrik Silindi]: {msg}")
         return {"status": "success", "message": msg}
+
+    def _run_async_biometric_side_channel(self, t_speech_stopped: float):
+        """Profile B: Asynchronous biometric identification side-channel.
+        Runs concurrently in a background thread without blocking response.create or audio streaming.
+        Safely updates identity state only when multi-factor verified, and syncs perception for subsequent turns.
+        Never mutates the ongoing response stream retroactively.
+        """
+        def _bg_worker():
+            self._async_identity_in_flight = True
+            t_start = time.monotonic()
+            try:
+                self._run_voice_identification(t_speech_stopped)
+                t_end = time.monotonic()
+                async_id_ms = (t_end - t_start) * 1000.0
+                self._latest_async_identity_ms = async_id_ms
+
+                # Check resulting biometric status
+                ident = self.resolve_identities()
+                bio_status = ident.get("biometric_status", "unknown")
+                bio_name = ident.get("biometric_identity", "unknown")
+                bio_conf = ident.get("biometric_confidence", 0.0)
+
+                if bio_status == "verified" and bio_name != "unknown" and bio_conf >= 0.40:
+                    if hasattr(self, "get_logger") and callable(self.get_logger):
+                        self.get_logger().info(
+                            f"🎙️ [BIOMETRIC ASYNC VERIFIED] user={bio_name} (conf={bio_conf:.2f}, async_time={async_id_ms:.1f}ms) "
+                            f"— Session state updated for upcoming turns"
+                        )
+                else:
+                    if hasattr(self, "get_logger") and callable(self.get_logger):
+                        self.get_logger().debug(
+                            f"🎙️ [BIOMETRIC ASYNC UNVERIFIED] status={bio_status} (async_time={async_id_ms:.1f}ms) "
+                            f"— No identity promotion"
+                        )
+            except Exception as exc:
+                if hasattr(self, "get_logger") and callable(self.get_logger):
+                    self.get_logger().debug(f"_run_async_biometric_side_channel error: {exc}")
+            finally:
+                self._async_identity_in_flight = False
+
+        t = threading.Thread(target=_bg_worker, daemon=True, name="astro-async-biometric")
+        t.start()
+        return t
 
     def _record_voice_id_segment(self, segment_name: str, duration_ms: float) -> Tuple[float, float, float]:
         """Tracks rolling 50-turn p50, p95, and max for each voice identification pipeline segment."""
