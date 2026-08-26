@@ -1335,11 +1335,14 @@ class AstroRealtimeNode(Node):
                     {
                         "type": "function",
                         "name": "get_live_weather",
-                        "description": "Bitlis, Ahlat, Tatvan, İstanbul veya istenen bir şehrin canlı anlık hava durumu ve sıcaklık bilgisini getirir.",
+                        "description": "Bitlis, Ahlat, Tatvan, İstanbul gibi belirli bir şehrin canlı anlık hava durumu ve sıcaklık bilgisini getirir. DİKKAT: 'Astro' senin robot ismindir, ASLA bir şehir/konum olarak kabul edilemez. Kullanıcı 'Astro nasılsın', 'Astro selam', 'Astro naber' gibi sana hitap ettiğinde bu fonksiyon KESİNLİKLE ÇAĞRILMAZ. Sadece kullanıcı açıkça hava durumu sorduğunda çağrılır; şehir belirtilmediğinde ('hava nasıl') varsayılan şehir 'Ahlat'tır.",
                         "parameters": {
                             "type": "object",
                             "properties": {
-                                "city": {"type": "string", "description": "Hava durumu sorgulanan şehir (örn: Ahlat, Bitlis, Ankara)"}
+                                "city": {
+                                    "type": "string",
+                                    "description": "Hava durumu sorgulanan gerçek şehir (örn: Ahlat, Bitlis, Tatvan, Istanbul, Ankara). 'Astro' asla şehir olarak girilemez."
+                                }
                             },
                             "required": ["city"]
                         }
@@ -1600,15 +1603,26 @@ class AstroRealtimeNode(Node):
         # response.create costs ~1500-2000 tokens per turn and is the primary TPM burn source.
         # We send ONLY the minimal per-turn speaker identity context that changes turn-to-turn.
         identity = self.resolve_identities() if hasattr(self, "resolve_identities") else {}
-        is_known = identity.get("is_known", False) and identity.get("name", "Misafir").lower() != "misafir"
+        bio_status = identity.get("biometric_status", "unknown")
         name_val = identity.get("name", "Misafir")
+        is_known = bool(identity.get("is_known", False) and name_val.lower() != "misafir")
+
         if is_known:
-            per_turn_instructions = (
-                f"[ŞU AN KONUŞAN]: {name_val} (biyometrik doğrulandı). "
-                f"Ona {name_val} olarak hitap et."
-            )
+            if bio_status in ("verified", "session_active"):
+                per_turn_instructions = (
+                    f"[ŞU AN KONUŞAN]: {name_val} (biyometrik doğrulandı). "
+                    f"Ona {name_val} olarak hitap et."
+                )
+            else:
+                per_turn_instructions = (
+                    f"[ŞU AN KONUŞAN]: {name_val} (hafıza profili). "
+                    f"Doğal ve samimi cevap ver; her cümlenin başında yapay isim tekrarlama."
+                )
         else:
-            per_turn_instructions = "[ŞU AN KONUŞAN]: Kimliği doğrulanmamış misafir."
+            per_turn_instructions = (
+                "[ŞU AN KONUŞAN]: Kimliği doğrulanmamış misafir. "
+                "Kullanıcıya doğrudan, samimi ve doğal cevap ver; ezbere 'Baran' deme."
+            )
 
         # 5. response.create Dispatch
         t_resp_send = time.monotonic()
@@ -2431,7 +2445,10 @@ class AstroRealtimeNode(Node):
     def _execute_realtime_tool(self, name: str, args: Dict[str, Any]) -> Dict[str, Any]:
         """Executes integrated robot tools in real time."""
         if name == "get_live_weather":
-            city = args.get("city", "Ahlat")
+            city = str(args.get("city", "Ahlat")).strip()
+            # Guard against robot name or greeting artifacts interpreted as city
+            if not city or city.lower() in ("astro", "robot", "sen", "kendin", "unknown", "none", "yok", "undefined"):
+                city = "Ahlat"
             w_str = self._execute_fallback_weather(city)
             return {"status": "success", "city": city, "weather": w_str}
 
@@ -5802,28 +5819,33 @@ class AstroRealtimeNode(Node):
             user_name = bio_id
             user_source = f"biometric_{bio_source}"
             bio_status = "verified"
+            is_known = True
         elif has_active_hold:
             user_name = held_name
             user_source = "session_hold"
             bio_status = "session_active"
+            is_known = True
         elif owner_name and owner_name.lower() != "misafir":
             user_name = owner_name
             user_source = "persistent_memory"
             bio_status = "unknown"
+            is_known = True
         else:
             user_name = "Misafir"
             user_source = "guest_fallback"
             bio_status = "unknown"
+            is_known = False
 
         identity_dict = {
             # 1. SESSION IDENTITY (Context / System Prompt / Memory)
             "session_identity": user_name,
+            "owner_name": owner_name,
             "user_id": user_name.lower(),
             "display_name": user_name,
             "name": user_name,
             "title": user_name,
             "formal_title": user_name,
-            "is_known": (user_name.lower() != "misafir"),
+            "is_known": is_known,
             "identity_source": user_source,
 
             # 2. BIOMETRIC IDENTITY (Ground Sensor Truth)
