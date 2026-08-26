@@ -514,8 +514,8 @@ class AudioStreamNode(Node):
                 if not is_genuine_barge_in:
                     return
 
-            # Energy gate: do not stream dead room silence (saves bandwidth and prevents Whisper hallucination)
-            if not is_active_playback and rms < max(65.0, self._ambient_rms * 0.75):
+            # Streaming continuity: Stream audio continuously without artificial gap cuts so Server VAD receives clean speech
+            if not is_active_playback and rms < 5.0:
                 return
 
             # Publish mic level

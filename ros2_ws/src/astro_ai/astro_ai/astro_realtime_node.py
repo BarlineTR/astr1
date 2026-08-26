@@ -1317,7 +1317,7 @@ class AstroRealtimeNode(Node):
                     "input": {
                         "transcription": {
                             "model": self.realtime_transcribe_model or "gpt-live-transcribe",
-                            "language": "tr"
+                            **({"language": os.getenv("REALTIME_TRANSCRIBE_LANGUAGE", "").strip()} if os.getenv("REALTIME_TRANSCRIBE_LANGUAGE", "").strip() else {})
                         },
                         "turn_detection": {
                             "type": "server_vad",
