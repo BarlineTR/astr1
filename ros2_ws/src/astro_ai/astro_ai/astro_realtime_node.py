@@ -1595,9 +1595,20 @@ class AstroRealtimeNode(Node):
         t_id_done = time.monotonic()
         speech_stopped_to_id_ms = (t_id_done - t_speech_stopped) * 1000.0
 
-        # 4. Context & Speaker Injection
-        build_prompt = getattr(self, "_build_current_system_prompt", None)
-        current_prompt = build_prompt() if callable(build_prompt) else ""
+        # 4. Per-turn speaker context injection (minimal — NOT the full persona prompt).
+        # The full system prompt was already loaded via session.update; resending it on every
+        # response.create costs ~1500-2000 tokens per turn and is the primary TPM burn source.
+        # We send ONLY the minimal per-turn speaker identity context that changes turn-to-turn.
+        identity = self.resolve_identities() if hasattr(self, "resolve_identities") else {}
+        is_known = identity.get("is_known", False) and identity.get("name", "Misafir").lower() != "misafir"
+        name_val = identity.get("name", "Misafir")
+        if is_known:
+            per_turn_instructions = (
+                f"[ŞU AN KONUŞAN]: {name_val} (biyometrik doğrulandı). "
+                f"Ona {name_val} olarak hitap et."
+            )
+        else:
+            per_turn_instructions = "[ŞU AN KONUŞAN]: Kimliği doğrulanmamış misafir."
 
         # 5. response.create Dispatch
         t_resp_send = time.monotonic()
@@ -1626,7 +1637,7 @@ class AstroRealtimeNode(Node):
         resp_event = {
             "type": "response.create",
             "response": {
-                "instructions": current_prompt
+                "instructions": per_turn_instructions
             }
         }
         if ws is not None:
@@ -1914,16 +1925,59 @@ class AstroRealtimeNode(Node):
             error_param = error_info.get("param") or "unknown"
 
             # Check if this failure is rate limit or quota exhaustion:
-            is_rate_limit_or_quota = (
+            is_true_quota_exhausted = (
+                "insufficient_quota" in str(error_code).lower()
+                or "insufficient_quota" in str(error_msg).lower()
+                or "402" in str(error_msg)
+                or "Payment Required" in str(error_msg)
+                or ("quota_exhausted" in str(error_code).lower())
+            )
+            # TPM / RPM rate limits are *temporary* (seconds to minutes), not permanent quota exhaustion.
+            # They get a short cooldown then the Realtime WebSocket reconnects — NOT a process-lifetime lockout.
+            is_temporary_rate_limit = (
+                not is_true_quota_exhausted
+                and (
+                    "rate_limit_exceeded" in str(error_code).lower()
+                    or "rate_limit" in str(error_msg).lower()
+                    or "rate_limit_exceeded" in str(error_type).lower()
+                )
+                and ("Please try again in" in str(error_msg) or "per min" in str(error_msg) or "TPM" in str(error_msg) or "RPM" in str(error_msg))
+            )
+            is_rate_limit_or_quota = is_true_quota_exhausted or (
                 "rate_limit_exceeded" in str(error_code).lower()
                 or "rate_limit_exceeded" in str(error_type).lower()
                 or "rate_limit" in str(error_msg).lower()
-                or "insufficient_quota" in str(error_code).lower()
-                or "insufficient_quota" in str(error_msg).lower()
                 or "quota" in str(error_msg).lower()
-                or "402" in str(error_msg)
             )
-            if is_rate_limit_or_quota:
+            if is_temporary_rate_limit:
+                # Temporary TPM/RPM limit: short cooldown then resume — do NOT permanently lock out OpenAI
+                import re as _re
+                retry_s = 30.0
+                retry_match = _re.search(r"try again in (\d+\.?\d*)\s*s", str(error_msg))
+                if retry_match:
+                    retry_s = max(10.0, float(retry_match.group(1)) + 5.0)
+                self.get_logger().warn(
+                    f"⏳ [REALTIME TPM RATE LIMIT] Temporary token-per-minute limit hit. "
+                    f"Cooling down for {retry_s:.0f}s before resuming.\n"
+                    f"  reason={error_msg[:200]}"
+                )
+                self.realtime_provider_state = "COOLDOWN"
+                self._is_connected = False
+                self.active_response_state = "IDLE"
+                self._realtime_cooldown_until = time.monotonic() + retry_s
+                # Schedule reconnect after cooldown
+                def _schedule_reconnect_after_cooldown(delay_s):
+                    time.sleep(delay_s)
+                    if not getattr(self, "_openai_hard_disabled", False):
+                        self.realtime_provider_state = "AVAILABLE"
+                        self.get_logger().info(f"🔄 [REALTIME TPM COOLDOWN ENDED] Reconnecting to OpenAI Realtime...")
+                threading.Thread(
+                    target=_schedule_reconnect_after_cooldown,
+                    args=(retry_s,),
+                    daemon=True,
+                    name="astro-tpm-cooldown"
+                ).start()
+            elif is_rate_limit_or_quota:
                 self._trigger_openai_hard_lockout(error_msg, ws=ws)
 
             audio_generated = (getattr(self, "_packets_for_gen", 0) > 0 or getattr(self, "_bytes_for_gen", 0) > 0)
@@ -2219,16 +2273,55 @@ class AstroRealtimeNode(Node):
                 f"response_status_details={json.dumps(err, ensure_ascii=False)}"
             )
 
-            is_rate_limit_or_quota = (
+            is_true_quota_exhausted = (
+                "insufficient_quota" in str(err_code).lower()
+                or "insufficient_quota" in str(err_msg).lower()
+                or "402" in str(err_msg)
+                or "Payment Required" in str(err_msg)
+            )
+            is_temporary_rate_limit = (
+                not is_true_quota_exhausted
+                and (
+                    "rate_limit_exceeded" in str(err_code).lower()
+                    or "rate_limit" in str(err_msg).lower()
+                    or "rate_limit_exceeded" in str(err_type).lower()
+                )
+                and ("Please try again in" in str(err_msg) or "per min" in str(err_msg) or "TPM" in str(err_msg) or "RPM" in str(err_msg))
+            )
+            is_rate_limit_or_quota = is_true_quota_exhausted or (
                 "rate_limit_exceeded" in str(err_code).lower()
                 or "rate_limit_exceeded" in str(err_type).lower()
                 or "rate_limit" in str(err_msg).lower()
-                or "insufficient_quota" in str(err_code).lower()
-                or "insufficient_quota" in str(err_msg).lower()
                 or "quota" in str(err_msg).lower()
-                or "402" in str(err_msg)
             )
-            if is_rate_limit_or_quota:
+            if is_temporary_rate_limit:
+                import re as _re
+                retry_s = 30.0
+                retry_match = _re.search(r"try again in (\d+\.?\d*)\s*s", str(err_msg))
+                if retry_match:
+                    retry_s = max(10.0, float(retry_match.group(1)) + 5.0)
+                self.get_logger().warn(
+                    f"⏳ [REALTIME TPM RATE LIMIT] Temporary token-per-minute limit hit. "
+                    f"Cooling down for {retry_s:.0f}s before resuming.\n"
+                    f"  reason={err_msg[:200]}"
+                )
+                self.realtime_provider_state = "COOLDOWN"
+                self._is_connected = False
+                self.active_response_state = "IDLE"
+                self._realtime_cooldown_until = time.monotonic() + retry_s
+                def _schedule_reconnect_after_cooldown_b(delay_s):
+                    time.sleep(delay_s)
+                    if not getattr(self, "_openai_hard_disabled", False):
+                        self.realtime_provider_state = "AVAILABLE"
+                        self.get_logger().info(f"🔄 [REALTIME TPM COOLDOWN ENDED] Reconnecting to OpenAI Realtime...")
+                threading.Thread(
+                    target=_schedule_reconnect_after_cooldown_b,
+                    args=(retry_s,),
+                    daemon=True,
+                    name="astro-tpm-cooldown-b"
+                ).start()
+                return
+            elif is_rate_limit_or_quota:
                 self._trigger_openai_hard_lockout(err_msg, ws=ws)
                 return
 
@@ -5351,7 +5444,21 @@ class AstroRealtimeNode(Node):
             speech_duration_ms = self._barge_in_consecutive_frames * 20
             speech_continuity_ms = speech_duration_ms
             
-            min_speech_ms = min(getattr(self, "barge_in_min_speech_ms", 60.0), getattr(self, "barge_in_min_consecutive_frames", 3) * 20.0)
+            # Barge-in minimum speech duration is provider-dependent.
+            # Edge-TTS: self_voice_score=0.00 (suppressor trained only on OpenAI Realtime voice, not Edge-TTS audio),
+            # so minimum confirmation window must be wider to avoid false cuts from ambient echo.
+            # OpenAI Realtime: server manages barge-in natively; client-side can stay at base threshold.
+            try:
+                is_edge_tts_active = getattr(self, "_fallback_mode", False) or not self._can_use_openai("realtime")
+            except Exception:
+                is_edge_tts_active = False
+            base_min_speech_ms = float(getattr(self, "barge_in_min_speech_ms", float(os.getenv("BARGE_IN_MIN_SPEECH_MS", "60.0"))))
+            effective_min_speech_ms = (
+                max(120.0, base_min_speech_ms)  # Edge-TTS: require 120ms sustained speech (6 frames) before cutting
+                if is_edge_tts_active
+                else max(base_min_speech_ms, getattr(self, "barge_in_min_consecutive_frames", 3) * 20.0)
+            )
+            min_speech_ms = effective_min_speech_ms
             if speech_duration_ms < min_speech_ms:
                 if local_rms >= target_barge_in_rms and peak_val >= target_barge_in_peak:
                     is_vad_active = getattr(self, "_vad_active", False)

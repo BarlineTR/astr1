@@ -2915,6 +2915,8 @@ class TestP05RealtimeStreamStateAndPlaybackSerialization(unittest.TestCase):
     def test_deterministic_turn_orchestration_on_speech_stopped(self):
         """16. Realtime S2S: speech_stopped executes deterministic turn orchestration:
         validates speech, runs voice identification, and dispatches controlled response.create.
+        response.create now sends MINIMAL per-turn speaker context (not full system prompt)
+        to avoid resending ~1500 tokens per turn (TPM waste) that session.update already loaded.
         """
         import asyncio
         import threading
@@ -2928,6 +2930,10 @@ class TestP05RealtimeStreamStateAndPlaybackSerialization(unittest.TestCase):
         node.get_logger = lambda: MagicMock()
         node._validate_user_speech_acoustics = MagicMock(return_value=True)
         node._run_voice_identification = MagicMock()
+        # Mock resolve_identities for the new per-turn minimal context injection
+        node.resolve_identities = MagicMock(return_value={
+            "is_known": True, "name": "Oktay", "confidence": 0.85, "source": "biometric"
+        })
 
         sent_events = []
         mock_ws = MagicMock()
@@ -2938,7 +2944,10 @@ class TestP05RealtimeStreamStateAndPlaybackSerialization(unittest.TestCase):
         asyncio.run(node._handle_realtime_event(mock_ws, {"type": "input_audio_buffer.speech_stopped"}))
         self.assertEqual(len(sent_events), 1)
         self.assertEqual(sent_events[0]["type"], "response.create")
-        self.assertEqual(sent_events[0]["response"]["instructions"], "Astro Prompt for Oktay")
+        # Verify minimal per-turn instructions (NOT full system prompt — that was session.update's job)
+        instructions = sent_events[0]["response"]["instructions"]
+        self.assertIn("Oktay", instructions)
+        self.assertNotIn("Astro Prompt for Oktay", instructions)  # full prompt must NOT be re-sent
         node._run_voice_identification.assert_called_once()
 
     def test_noise_filtered_no_response_create_on_speech_stopped(self):
@@ -5822,7 +5831,10 @@ class TestP012BargeInPlaybackLifecycleStabilization(unittest.TestCase):
         self.assertEqual(node.active_response_state, "GENERATING")
 
     def test_09_fallback_playback_cancels_on_genuine_user_speech(self):
-        """9. In Fallback mode, 4+ confirmed user speech frames cancel playback cleanly."""
+        """9. In Fallback mode, 6+ confirmed user speech frames (120ms) cancel playback cleanly.
+        Edge-TTS barge-in requires 120ms minimum (vs 60ms for OpenAI Realtime) because
+        the self-voice suppressor (score=0.00 for Edge-TTS) cannot distinguish echo from human voice.
+        """
         from astro_ai.astro_realtime_node import AstroRealtimeNode
         from astro_ai.state_machine import RobotState
         fake_ws = FakeRealtimeTransport()
@@ -5834,7 +5846,7 @@ class TestP012BargeInPlaybackLifecycleStabilization(unittest.TestCase):
         node._playback_start_monotonic = time.monotonic() - 1.0
         node._barge_in_latched = False
 
-        for _ in range(4):
+        for _ in range(6):
             msg = self._create_synthetic_pcm_msg(amplitude=16000, length_samples=320)
             node._on_input_pcm(msg)
 

@@ -514,8 +514,10 @@ class AudioStreamNode(Node):
                 if not is_genuine_barge_in:
                     return
 
-            # Streaming continuity: Stream audio continuously without artificial gap cuts so Server VAD receives clean speech
-            if not is_active_playback and rms < 5.0:
+            # Energy gate: Only stream frames with meaningful speech energy.
+            # Streaming continuous silence wastes bandwidth and burns TPM quota on OpenAI Realtime.
+            # Gate threshold: above dead silence floor (10) AND either above ambient*0.5 or above hard minimum of 40.
+            if not is_active_playback and rms < max(40.0, self._ambient_rms * 0.50):
                 return
 
             # Publish mic level

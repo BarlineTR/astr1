@@ -188,8 +188,9 @@ class TestBargeInMultiSignalPipeline(unittest.TestCase):
         self.node.voice_recognizer = MagicMock()
         self.node.voice_recognizer.score_self_voice = MagicMock(return_value=0.08)
 
-        # Feed 5 consecutive 20ms frames (100ms > 80ms MIN_SPEECH_MS)
-        for _ in range(5):
+        # Feed 6 consecutive 20ms frames (120ms >= 120ms Edge-TTS MIN_SPEECH_MS)
+        # Edge-TTS path requires 120ms minimum to distinguish intentional speech from ambient echo
+        for _ in range(6):
             self.node._on_input_pcm(speech_pcm)
 
         self.assertTrue(self.node._barge_in_latched)
@@ -199,8 +200,8 @@ class TestBargeInMultiSignalPipeline(unittest.TestCase):
         log_text = '\n'.join(self.logs)
         self.assertIn('[BARGE-IN DECISION]', log_text)
         self.assertIn('playback_active=true', log_text)
-        self.assertIn('speech_duration_ms=80', log_text)
-        self.assertIn('speech_continuity_ms=80', log_text)
+        self.assertIn('speech_duration_ms=120', log_text)
+        self.assertIn('speech_continuity_ms=120', log_text)
         self.assertIn('transient_noise=false', log_text)
         self.assertIn('speech_confirmed=true', log_text)
         self.assertIn('decision=true', log_text)
