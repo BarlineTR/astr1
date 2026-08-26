@@ -578,7 +578,7 @@ class AudioStreamNode(Node):
                     "is_first": is_first,
                     "is_done": is_done,
                     "tts_provider": payload.get("tts_provider", "openai"),
-                    "tts_model": payload.get("tts_model", "gpt-4o-realtime"),
+                    "tts_model": payload.get("tts_model", "gpt-realtime-2.1-mini"),
                     "tts_source": payload.get("tts_source", "realtime_openai"),
                     "playback_source": payload.get("playback_source", payload.get("tts_source", "realtime_openai")),
                 }
@@ -700,7 +700,7 @@ class AudioStreamNode(Node):
                     gen_id = 0
                     is_done = False
                     tts_provider = "openai"
-                    tts_model = "gpt-4o-realtime"
+                    tts_model = os.getenv("REALTIME_MODEL", "gpt-realtime-2.1-mini")
                     tts_source = "realtime_openai"
                     playback_source = "realtime_openai"
 

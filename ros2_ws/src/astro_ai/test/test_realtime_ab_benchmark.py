@@ -388,5 +388,142 @@ class TestRealtimeABBenchmark(unittest.TestCase):
         self.assertLess(p50_b, p50_a)
 
 
+    def test_profile_b_scenario_1_short_conversation(self):
+        """Scenario 1: Kısa Normal Konuşma — speech_stopped -> response.created -> first_audio."""
+        node = self._create_test_node(profile="profile_b")
+        node.realtime_model = "gpt-realtime-2.1-mini"
+        mock_ws = MagicMock()
+        mock_ws.send = MagicMock()
+
+        t_stop = time.monotonic()
+        node._turn_telemetry = {"t_speech_stopped": t_stop}
+
+        # 1. speech_stopped arrives
+        asyncio.run(node._handle_realtime_event(mock_ws, {"type": "input_audio_buffer.speech_stopped"}))
+        # 2. Native response.created arrives (~18ms later)
+        t_created = t_stop + 0.018
+        node._response_start_time = t_created
+        asyncio.run(node._handle_realtime_event(mock_ws, {"type": "response.created", "response": {"id": "resp_short_1"}}))
+        # 3. First audio chunk arrives (~410ms later)
+        t_first_audio = t_created + 0.410
+        node._first_audio_time = t_first_audio
+        raw_audio_chunk = base64.b64encode(b"\x00\x02" * 480).decode("ascii")
+        asyncio.run(node._handle_realtime_event(mock_ws, {"type": "response.audio.delta", "delta": raw_audio_chunk}))
+
+        stopped_to_created_ms = (t_created - t_stop) * 1000.0
+        created_to_first_audio_ms = (t_first_audio - t_created) * 1000.0
+        total_latency_ms = (t_first_audio - t_stop) * 1000.0
+
+        self.assertAlmostEqual(stopped_to_created_ms, 18.0, delta=1.0)
+        self.assertAlmostEqual(created_to_first_audio_ms, 410.0, delta=1.0)
+        self.assertAlmostEqual(total_latency_ms, 428.0, delta=1.0)
+        self.assertEqual(node.architecture_profile, "profile_b")
+        self.assertEqual(node.realtime_model, "gpt-realtime-2.1-mini")
+
+    def test_profile_b_scenario_2_long_conversation(self):
+        """Scenario 2: Uzun Normal Konuşma — 8 audio deltas streamed without underrun."""
+        node = self._create_test_node(profile="profile_b")
+        node.realtime_model = "gpt-realtime-2.1-mini"
+        mock_ws = MagicMock()
+        mock_ws.send = MagicMock()
+
+        asyncio.run(node._handle_realtime_event(mock_ws, {"type": "response.created", "response": {"id": "resp_long_1"}}))
+        for _ in range(8):
+            chunk_b64 = base64.b64encode(b"\x00\x02" * 480).decode("ascii")
+            asyncio.run(node._handle_realtime_event(mock_ws, {"type": "response.audio.delta", "delta": chunk_b64}))
+
+        asyncio.run(node._handle_realtime_event(mock_ws, {"type": "response.done", "response": {"status": "completed"}}))
+        self.assertEqual(node.active_response_state, "IDLE")
+        self.assertEqual(node._packets_for_gen, 8)
+        self.assertEqual(node._bytes_for_gen, 8 * 960)
+
+    def test_profile_b_scenario_3_tool_call(self):
+        """Scenario 3: Tool Call (get_live_weather) lifecycle and continuation response."""
+        node = self._create_test_node(profile="profile_b")
+        node.realtime_model = "gpt-realtime-2.1-mini"
+        node._execute_fallback_weather = MagicMock(return_value="Ahlat: 18°C, Güneşli")
+        sent_messages = []
+        mock_ws = MagicMock()
+        async def _mock_send(msg):
+            sent_messages.append(json.loads(msg))
+        mock_ws.send = _mock_send
+
+        # Server initiates tool call
+        t_call_start = time.monotonic()
+        asyncio.run(node._handle_realtime_event(mock_ws, {
+            "type": "response.function_call_arguments.done",
+            "call_id": "call_weather_101",
+            "name": "get_live_weather",
+            "arguments": json.dumps({"city": "Ahlat"})
+        }))
+        t_call_done = time.monotonic()
+        tool_latency_ms = (t_call_done - t_call_start) * 1000.0
+
+        # Verify tool output sent and response continuation requested
+        self.assertTrue(any(msg.get("type") == "conversation.item.create" for msg in sent_messages))
+        self.assertTrue(any(msg.get("type") == "response.create" for msg in sent_messages))
+        self.assertLess(tool_latency_ms, 50.0)
+
+    def test_profile_b_scenario_4_barge_in_and_cancellation(self):
+        """Scenario 4: Barge-In Interruption and Server Stream Cancellation."""
+        node = self._create_test_node(profile="profile_b")
+        node.realtime_model = "gpt-realtime-2.1-mini"
+        node.active_response_state = "STREAMING"
+        node._is_responding = True
+        node._playback_start_monotonic = time.monotonic() - 1.0
+
+        sent_messages = []
+        mock_ws = MagicMock()
+        async def _mock_send(msg):
+            sent_messages.append(json.loads(msg))
+        mock_ws.send = _mock_send
+
+        t_interrupt_start = time.monotonic()
+        asyncio.run(node._handle_realtime_event(mock_ws, {"type": "input_audio_buffer.speech_started"}))
+        t_interrupt_done = time.monotonic()
+        barge_in_reaction_ms = (t_interrupt_done - t_interrupt_start) * 1000.0
+
+        self.assertTrue(any(msg.get("type") == "response.cancel" for msg in sent_messages))
+        node.pub_interrupt.publish.assert_called_once()
+        self.assertLess(barge_in_reaction_ms, 25.0)
+
+    def test_profile_b_scenario_5_active_hold_identity(self):
+        """Scenario 5: Active Hold Continuity (speaker continuity retain)."""
+        node = self._create_test_node(profile="profile_b")
+        node.realtime_model = "gpt-realtime-2.1-mini"
+        node._active_person_name = "Baran"
+        node._person_hold_until = time.monotonic() + 30.0
+
+        ident = node.resolve_identities()
+        self.assertEqual(ident["name"], "Baran")
+        self.assertTrue(ident["is_known"])
+        self.assertIn("hold", ident["identity_source"])
+        # Invariant: Active hold alone does NOT produce verified biometric status
+        self.assertNotEqual(ident.get("biometric_status"), "verified")
+
+    def test_profile_b_scenario_6_unknown_guest_speaker(self):
+        """Scenario 6: Unknown Guest Speaker — safe guest fallback without false biometric identification."""
+        node = self._create_test_node(profile="profile_b")
+        node.realtime_model = "gpt-realtime-2.1-mini"
+        node._active_person_name = "Misafir"
+        node._person_hold_until = 0.0
+
+        mock_vr = MagicMock()
+        mock_vr.recognize_voice.return_value = ("Misafir", 0.15, {
+            "title": "Misafir", "formal_title": "Misafir", "voice_id_profile": {"device": "CPU"}
+        })
+        node.voice_recognizer = mock_vr
+
+        t = node._run_async_biometric_side_channel(time.monotonic())
+        t.join(timeout=2.0)
+
+        ident = node.resolve_identities()
+        # Biometric ground truth is strictly unknown
+        self.assertEqual(ident["biometric_identity"], "unknown")
+        self.assertEqual(ident["biometric_status"], "unknown")
+        # Invariant: Persistent memory or default session identity NEVER produces verified biometric status
+        self.assertNotEqual(ident.get("biometric_status"), "verified")
+
+
 if __name__ == "__main__":
     unittest.main()

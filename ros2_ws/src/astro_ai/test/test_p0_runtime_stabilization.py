@@ -3458,7 +3458,7 @@ class TestP06ProductionRealtimeAndHumanLikeStabilization(unittest.TestCase):
                 "is_first": (i == 0),
                 "is_done": False,
                 "tts_provider": "openai",
-                "tts_model": "gpt-4o-realtime",
+                "tts_model": "gpt-realtime-2.1-mini",
                 "tts_source": "realtime_openai"
             })
             node._on_output_pcm(msg)
