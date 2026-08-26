@@ -3199,6 +3199,145 @@ class TestP05RealtimeStreamStateAndPlaybackSerialization(unittest.TestCase):
         self.assertEqual(mock_vr.recognize_voice.call_count, 1)
         self.assertEqual(node._active_person_name, "Baran")
 
+    def test_voice_id_7_segment_profiling_and_telemetry(self):
+        """P1 Profiling: Voice identification measures all 7 segments, calculates rolling p50/p95/max, and stores profile."""
+        import threading
+        from astro_ai.astro_realtime_node import AstroRealtimeNode
+        node = AstroRealtimeNode.__new__(AstroRealtimeNode)
+        node._lock = threading.Lock()
+        node._user_speech_audio_buffer = [b"\x00\x02" * 320] * 60
+        logs = []
+        mock_logger = MagicMock()
+        mock_logger.info = lambda msg: logs.append(str(msg))
+        mock_logger.debug = lambda msg: logs.append(str(msg))
+        mock_logger.error = lambda msg: logs.append(str(msg))
+        node.get_logger = lambda: mock_logger
+        node._sync_perception_to_session = MagicMock()
+        node.memory = MagicMock()
+
+        mock_vr = MagicMock()
+        mock_vr.recognize_voice.return_value = ("Baran", 0.75, {
+            "title": "Baş Mühendis",
+            "formal_title": "Baran Bey",
+            "voice_id_profile": {
+                "fbank_ms": 11.2,
+                "onnx_infer_ms": 340.5,
+                "norm_ms": 0.1,
+                "speaker_match_ms": 0.3,
+                "device": "CPUExecutionProvider",
+                "candidate_count": 6
+            }
+        })
+        node.voice_recognizer = mock_vr
+
+        t_speech_stopped = time.monotonic() - 0.05
+        node._run_voice_identification(t_speech_stopped)
+
+        joined_logs = "\n".join(logs)
+        self.assertIn("[VOICE ID PROFILE]", joined_logs)
+        self.assertIn("[VOICE ID DETAILED BREAKDOWN]", joined_logs)
+        self.assertIn("1_speech_stopped_to_extract_ms=", joined_logs)
+        self.assertIn("2_buffer_extract_ms=", joined_logs)
+        self.assertIn("3_audio_prep_ms=", joined_logs)
+        self.assertIn("4_embedding_infer_ms=", joined_logs)
+        self.assertIn("5_speaker_match_ms=", joined_logs)
+        self.assertIn("6_vote_aggregation_ms=", joined_logs)
+        self.assertIn("7_identity_decision_ms=", joined_logs)
+
+        # Check telemetry struct
+        prof = node._latest_voice_id_profile
+        self.assertIsNotNone(prof)
+        self.assertEqual(prof["selected_speaker"], "Baran")
+        self.assertEqual(prof["device"], "CPUExecutionProvider")
+        self.assertEqual(prof["candidate_speaker_count"], 6)
+        self.assertIn("p50", prof["stats"]["embedding_infer_ms"])
+        self.assertIn("p95", prof["stats"]["embedding_infer_ms"])
+        self.assertIn("max", prof["stats"]["embedding_infer_ms"])
+
+    def test_turn_orchestration_telemetry_segment_tracking(self):
+        """P1 Profiling: Turn orchestrator passes t_speech_stopped and tracks decision_to_response_create segment."""
+        import asyncio
+        import json
+        from astro_ai.astro_realtime_node import AstroRealtimeNode
+
+        node = AstroRealtimeNode.__new__(AstroRealtimeNode)
+        node._is_sleeping = False
+        node._validate_user_speech_acoustics = MagicMock(return_value=True)
+        node._active_person_name = "Baran"
+        node._build_current_system_prompt = MagicMock(return_value="system prompt test")
+
+        sent_messages = []
+        mock_ws = MagicMock()
+        async def _mock_send(msg):
+            sent_messages.append(json.loads(msg))
+        mock_ws.send = _mock_send
+
+        logs = []
+        mock_logger = MagicMock()
+        mock_logger.info = lambda msg: logs.append(str(msg))
+        mock_logger.debug = lambda msg: logs.append(str(msg))
+        mock_logger.error = lambda msg: logs.append(str(msg))
+        mock_logger.warning = lambda msg: logs.append(str(msg))
+        node.get_logger = lambda: mock_logger
+
+        received_t_speech_stopped = []
+        def _mock_voice_id(t_stop=None):
+            received_t_speech_stopped.append(t_stop)
+        node._run_voice_identification = _mock_voice_id
+
+        asyncio.run(node._orchestrate_turn_after_speech_stopped(mock_ws))
+
+        self.assertEqual(len(received_t_speech_stopped), 1)
+        self.assertIsNotNone(received_t_speech_stopped[0])
+
+        joined_logs = "\n".join(logs)
+        self.assertIn("[TURN ORCHESTRATION TELEMETRY]", joined_logs)
+        self.assertIn("speech_stopped_to_speaker_identified_ms=", joined_logs)
+        self.assertIn("speaker_identified_to_response_create_ms=", joined_logs)
+        self.assertIn("total_turn_orchestration_ms=", joined_logs)
+
+    def test_tool_continuation_acknowledgement_vs_info_instruction(self):
+        """P2 Brevity: Acknowledgement tools get 3-8 word mandate while info tools get natural instruction."""
+        import asyncio
+        import json
+        from astro_ai.astro_realtime_node import AstroRealtimeNode
+
+        node = AstroRealtimeNode.__new__(AstroRealtimeNode)
+        node._executed_tool_calls = set()
+        node._lock = threading.Lock()
+        node._can_use_openai = MagicMock(return_value=True)
+
+        sent_messages = []
+        mock_ws = MagicMock()
+        async def _mock_send(msg):
+            sent_messages.append(json.loads(msg))
+        mock_ws.send = _mock_send
+        node.get_logger = lambda: MagicMock()
+
+        # 1. Acknowledgement tool (change_persona)
+        node._execute_realtime_tool = MagicMock(return_value={"status": "success", "message": "done"})
+        asyncio.run(node._handle_realtime_event(mock_ws, {
+            "type": "response.function_call_arguments.done",
+            "call_id": "call_ack_1",
+            "name": "change_persona",
+            "arguments": '{"persona": "kufurbaz"}'
+        }))
+        ack_event = sent_messages[-1]
+        self.assertIn("TEK BİR KISA CÜMLE (maksimum 3-8 kelime)", ack_event["response"]["instructions"])
+
+        # 2. Informational tool (get_current_weather)
+        sent_messages.clear()
+        node._execute_realtime_tool = MagicMock(return_value={"status": "success", "weather": "Güneşli, 22C"})
+        asyncio.run(node._handle_realtime_event(mock_ws, {
+            "type": "response.function_call_arguments.done",
+            "call_id": "call_info_1",
+            "name": "get_current_weather",
+            "arguments": '{"city": "Bitlis"}'
+        }))
+        info_event = sent_messages[-1]
+        self.assertIn("FİZİKSEL VE BİLGİ CEVAP KURALI", info_event["response"]["instructions"])
+        self.assertNotIn("maksimum 3-8 kelime", info_event["response"]["instructions"])
+
     def test_kufurbaz_persona_prompt_and_roast_rules(self):
         """Field fix: Kufurbaz persona contains dynamic Turkish street roast instructions and bans template repetition."""
         from astro_ai.persona_engine import PersonaEngine, PERSONA_PROMPTS

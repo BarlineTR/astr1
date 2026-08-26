@@ -1579,7 +1579,7 @@ class AstroRealtimeNode(Node):
         run_voice_id = getattr(self, "_run_voice_identification", None)
         if callable(run_voice_id):
             try:
-                await asyncio.to_thread(run_voice_id)
+                await asyncio.to_thread(run_voice_id, t_speech_stopped)
             except Exception as e:
                 if hasattr(self, "get_logger") and callable(self.get_logger):
                     self.get_logger().warning(f"[Turn Orchestrator] Voice identification error: {e}")
@@ -1593,6 +1593,10 @@ class AstroRealtimeNode(Node):
         # 5. response.create Dispatch
         t_resp_send = time.monotonic()
         id_to_resp_ms = (t_resp_send - t_id_done) * 1000.0
+        turn_orch_total_ms = (t_resp_send - t_speech_stopped) * 1000.0
+
+        p50_dec, p95_dec, max_dec = self._record_voice_id_segment("decision_to_response_create_ms", id_to_resp_ms) if hasattr(self, "_record_voice_id_segment") else (id_to_resp_ms, id_to_resp_ms, id_to_resp_ms)
+        p50_orch, p95_orch, max_orch = self._record_voice_id_segment("total_turn_orchestration_ms", turn_orch_total_ms) if hasattr(self, "_record_voice_id_segment") else (turn_orch_total_ms, turn_orch_total_ms, turn_orch_total_ms)
 
         # Track turn latency telemetry timestamps
         self._turn_telemetry = {
@@ -1601,6 +1605,7 @@ class AstroRealtimeNode(Node):
             "t_resp_send": t_resp_send,
             "speech_stopped_to_speaker_identified_ms": speech_stopped_to_id_ms,
             "speaker_identified_to_response_create_ms": id_to_resp_ms,
+            "total_turn_orchestration_ms": turn_orch_total_ms,
             "speaker": getattr(self, "_active_person_name", "Bilinmiyor"),
         }
 
@@ -1624,7 +1629,8 @@ class AstroRealtimeNode(Node):
                         f"  generation_id={self.active_generation_id}\n"
                         f"  speaker={getattr(self, '_active_person_name', 'Bilinmiyor')}\n"
                         f"  speech_stopped_to_speaker_identified_ms={speech_stopped_to_id_ms:.1f}ms\n"
-                        f"  speaker_identified_to_response_create_ms={id_to_resp_ms:.1f}ms"
+                        f"  speaker_identified_to_response_create_ms={id_to_resp_ms:.1f}ms (p50: {p50_dec:.1f}ms, p95: {p95_dec:.1f}ms, max: {max_dec:.1f}ms)\n"
+                        f"  total_turn_orchestration_ms={turn_orch_total_ms:.1f}ms (p50: {p50_orch:.1f}ms, p95: {p95_orch:.1f}ms, max: {max_orch:.1f}ms)"
                     )
             except Exception as se:
                 if hasattr(self, "get_logger") and callable(self.get_logger):
@@ -2080,17 +2086,30 @@ class AstroRealtimeNode(Node):
                 t_out_send_done = time.monotonic()
                 tool_output_send_ms = (t_out_send_done - t_out_send_start) * 1000.0
 
-                # Trigger response generation with strictly grounded physical reality instructions AND strict brevity mandate
+                # Trigger response generation with strictly grounded physical reality instructions
+                is_acknowledgement_tool = func_name in (
+                    "change_persona", "enroll_user_biometrics", "delete_user_biometrics",
+                    "move_robot", "turn_to_sound", "navigate_to_location"
+                )
+                if is_acknowledgement_tool:
+                    tool_instructions = (
+                        "FİZİKSEL VE EYLEM CEVAP KURALI: Az önce çalıştırılan fonksiyonun (tool) çıktısını kesin ve mutlak gerçeklik kabul et. "
+                        "Eğer çıktı başarı (success=true) içeriyorsa eylemin yapıldığını TEK BİR KISA CÜMLE (maksimum 3-8 kelime) ile doğrula! "
+                        "KESİNLİKLE 10-15 saniyelik uzun tirat, açıklama, nutuk veya mod tarifi YAPMA! "
+                        "Eğer çıktı hata/engel (success=false veya status=blocked/error) içeriyorsa, SADECE ve SADECE çıktıda yazan 'message' veya 'reason' açıklamasını esas al; "
+                        "çıktıda yazmayan hiçbir uydurma sebep (kalp ritmi, nabız, bağlantı vb.) KESİNLİKLE ÜRETME. Asla gerçekleşmeyen bir hareketi gerçekleşmiş gibi iddia etme."
+                    )
+                else:
+                    tool_instructions = (
+                        "FİZİKSEL VE BİLGİ CEVAP KURALI: Az önce çalıştırılan fonksiyonun (tool) çıktısındaki bilgileri esas al. "
+                        "Çıktıdaki bilgiyi (örneğin hava durumu, arama sonucu vb.) kullanıcıya doğrudan, net, samimi ve doğal bir şekilde aktar. "
+                        "Uydurma bilgi veya spekülasyon ekleme."
+                    )
+
                 response_create_payload = {
                     "type": "response.create",
                     "response": {
-                        "instructions": (
-                            "FİZİKSEL VE EYLEM CEVAP KURALI: Az önce çalıştırılan fonksiyonun (tool) çıktısını kesin ve mutlak gerçeklik kabul et. "
-                            "Eğer çıktı başarı (success=true) içeriyorsa eylemin yapıldığını TEK BİR KISA CÜMLE (maksimum 3-8 kelime) ile doğrula! "
-                            "KESİNLİKLE 10-15 saniyelik uzun tirat, açıklama, nutuk veya mod tarifi YAPMA! "
-                            "Eğer çıktı hata/engel (success=false veya status=blocked/error) içeriyorsa, SADECE ve SADECE çıktıda yazan 'message' veya 'reason' açıklamasını esas al; "
-                            "çıktıda yazmayan hiçbir uydurma sebep (kalp ritmi, nabız, bağlantı vb.) KESİNLİKLE ÜRETME. Asla gerçekleşmeyen bir hareketi gerçekleşmiş gibi iddia etme."
-                        )
+                        "instructions": tool_instructions
                     }
                 }
                 t_create_send_start = time.monotonic()
@@ -2512,11 +2531,29 @@ class AstroRealtimeNode(Node):
         self.get_logger().info(f"🗑️ [Biyometrik Silindi]: {msg}")
         return {"status": "success", "message": msg}
 
-    def _run_voice_identification(self):
-        """Robust multi-window voice identification with profiling, rolling p50/p95 tracking, and early-exit optimization."""
+    def _record_voice_id_segment(self, segment_name: str, duration_ms: float) -> Tuple[float, float, float]:
+        """Tracks rolling 50-turn p50, p95, and max for each voice identification pipeline segment."""
+        if not hasattr(self, "_voice_id_segment_stats"):
+            self._voice_id_segment_stats = {}
+        hist = self._voice_id_segment_stats.setdefault(segment_name, [])
+        hist.append(float(duration_ms))
+        if len(hist) > 50:
+            hist.pop(0)
+        p50 = float(np.percentile(hist, 50)) if len(hist) > 0 else duration_ms
+        p95 = float(np.percentile(hist, 95)) if len(hist) > 0 else duration_ms
+        max_val = float(np.max(hist)) if len(hist) > 0 else duration_ms
+        return round(p50, 1), round(p95, 1), round(max_val, 1)
+
+    def _run_voice_identification(self, t_speech_stopped: Optional[float] = None):
+        """Robust multi-window voice identification with comprehensive 7-segment latency profiling and rolling p50/p95/max telemetry."""
         t_id_start = time.monotonic()
+        t_speech_stopped = t_speech_stopped or t_id_start
+        speech_stopped_to_extract_ms = (t_id_start - t_speech_stopped) * 1000.0
+
         if not getattr(self, "voice_recognizer", None):
             return
+
+        t_extract_start = time.monotonic()
         lock = getattr(self, "_lock", None)
         if lock is not None:
             with lock:
@@ -2527,9 +2564,14 @@ class AstroRealtimeNode(Node):
             if not getattr(self, "_user_speech_audio_buffer", None):
                 return
             buffer_copy = list(self._user_speech_audio_buffer)
+        t_extract_done = time.monotonic()
+        buffer_extract_ms = (t_extract_done - t_extract_start) * 1000.0
 
         if len(buffer_copy) < 25:  # Less than ~0.5s -- too short to analyze reliably
             return
+
+        total_samples = len(buffer_copy) * 320
+        total_audio_dur_ms = (total_samples / 16000.0) * 1000.0
 
         t_prep_start = time.monotonic()
         try:
@@ -2541,10 +2583,12 @@ class AstroRealtimeNode(Node):
                 buffer_copy[max(0, n - third * 2): n - third] if n >= third * 2 else buffer_copy[:third],
                 buffer_copy[:third],
             ]
-            t_prep_ms = (time.monotonic() - t_prep_start) * 1000.0
+            t_prep_done = time.monotonic()
+            audio_prep_ms = (t_prep_done - t_prep_start) * 1000.0
 
             window_results = []
             infer_times = []
+            window_breakdowns = []
             early_exit = False
             threshold = float(os.getenv("SPEAKER_MATCH_THRESHOLD", "0.40"))
 
@@ -2553,7 +2597,7 @@ class AstroRealtimeNode(Node):
             has_active_hold = (time.monotonic() < hold_until) and (held_name != "Misafir")
 
             for win_idx, win in enumerate(windows):
-                t_infer_start = time.monotonic()
+                t_win_start = time.monotonic()
                 raw = b"".join(win)
                 arr = np.frombuffer(raw, dtype=np.int16)
                 if len(arr) < int(16000 * 0.4):
@@ -2561,9 +2605,25 @@ class AstroRealtimeNode(Node):
                 spk_name, spk_conf, spk_meta = self.voice_recognizer.recognize_voice(
                     arr, sample_rate=16000, threshold=threshold
                 )
-                t_infer_ms = (time.monotonic() - t_infer_start) * 1000.0
-                infer_times.append(t_infer_ms)
+                t_win_done = time.monotonic()
+                win_total_ms = (t_win_done - t_win_start) * 1000.0
+                infer_times.append(win_total_ms)
                 window_results.append((spk_name, spk_conf, spk_meta))
+
+                # Extract sub-segment profile from voice_recognizer metadata
+                emb_prof = spk_meta.get("voice_id_profile", {}) if isinstance(spk_meta, dict) else {}
+                window_breakdowns.append({
+                    "win": win_idx,
+                    "fbank_ms": emb_prof.get("fbank_ms", 0.0),
+                    "onnx_infer_ms": emb_prof.get("onnx_infer_ms", 0.0),
+                    "norm_ms": emb_prof.get("norm_ms", 0.0),
+                    "match_ms": emb_prof.get("speaker_match_ms", 0.0),
+                    "total_ms": round(win_total_ms, 2),
+                    "spk": spk_name,
+                    "conf": round(float(spk_conf or 0.0), 3),
+                    "device": emb_prof.get("device", "CPUExecutionProvider"),
+                    "candidates": emb_prof.get("candidate_count", 0),
+                })
 
                 # Early-exit optimization 1: High confidence match on known speaker
                 if win_idx == 0 and spk_name is not None and spk_conf >= 0.46 and spk_name.lower() != "misafir":
@@ -2571,9 +2631,6 @@ class AstroRealtimeNode(Node):
                     break
 
                 # Early-exit optimization 2 (Active Conversation Fast-Path):
-                # When already engaged in an active conversation with a verified speaker (e.g. Baran):
-                # If window 0 does not detect another person with high confidence (>=0.45),
-                # active hold retains the speaker anyway. Skip windows 2 & 3 to save ~800ms of latency!
                 if win_idx == 0 and has_active_hold:
                     other_person_detected = (spk_name is not None and spk_name != held_name and spk_conf >= 0.45)
                     if not other_person_detected:
@@ -2583,6 +2640,7 @@ class AstroRealtimeNode(Node):
             if not window_results:
                 return
 
+            t_vote_start = time.monotonic()
             votes: Counter = Counter()
             best_conf: dict = {}
             best_meta: dict = {}
@@ -2594,8 +2652,12 @@ class AstroRealtimeNode(Node):
                         best_conf[spk_name] = spk_conf
                         best_meta[spk_name] = spk_meta
 
+            t_vote_done = time.monotonic()
+            vote_aggregation_ms = (t_vote_done - t_vote_start) * 1000.0
+
             now = time.monotonic()
 
+            t_decision_start = time.monotonic()
             if not votes:
                 if hasattr(self, "get_logger") and callable(self.get_logger):
                     self.get_logger().info("🎙️ [Ses Tanıma]: Bilinmeyen Ses — hiçbir pencerede eşleşme bulunamadı")
@@ -2611,6 +2673,8 @@ class AstroRealtimeNode(Node):
                     self._person_hold_until = 0.0
                     self._voice_id_streak = {}
                 self._sync_perception_to_session()
+                t_decision_done = time.monotonic()
+                identity_decision_ms = (t_decision_done - t_decision_start) * 1000.0
                 return
 
             ranked = votes.most_common()
@@ -2632,6 +2696,10 @@ class AstroRealtimeNode(Node):
                     streak_map = getattr(self, "_voice_id_streak", {})
             else:
                 streak_map = getattr(self, "_voice_id_streak", {})
+
+            selected_speaker_name = winner_name
+            selected_conf = winner_conf
+            rejection_reason_str = "none"
 
             if is_majority and is_confident and is_clear_winner:
                 streak_count = streak_map.get(winner_name, 0) + 1
@@ -2670,6 +2738,7 @@ class AstroRealtimeNode(Node):
                     reason.append(f"güven düşük ({winner_conf:.2f})")
                 if not is_clear_winner:
                     reason.append(f"margin yetersiz ({margin:.2f})")
+                rejection_reason_str = ", ".join(reason)
 
                 # Retain speaker identity if within active conversation hold (45s)
                 held_name = getattr(self, "_active_person_name", "Misafir")
@@ -2677,16 +2746,18 @@ class AstroRealtimeNode(Node):
                 has_active_hold = (now < hold_until) and (held_name != "Misafir")
 
                 if has_active_hold:
+                    selected_speaker_name = held_name
                     if hasattr(self, "get_logger") and callable(self.get_logger):
                         self.get_logger().info(
                             f"🎙️ [Ses Tanıma (Kişi Korundu)]: {held_name} konuşmaya devam ediyor "
                             f"(Bu kısa kelimede anlık güven: {winner_conf:.2f})"
                         )
                 else:
+                    selected_speaker_name = "Misafir"
                     if hasattr(self, "get_logger") and callable(self.get_logger):
                         self.get_logger().info(
                             f"🎙️ [Ses Tanıma]: Bilinmeyen Ses / Tanınmadı "
-                            f"(En Yakın: '{winner_name}', Güven: {winner_conf:.2f}, {', '.join(reason)})"
+                            f"(En Yakın: '{winner_name}', Güven: {winner_conf:.2f}, {rejection_reason_str})"
                         )
                     if lock is not None:
                         with lock:
@@ -2696,27 +2767,82 @@ class AstroRealtimeNode(Node):
                         self._recognized_speaker = {"name": "Misafir", "confidence": winner_conf, "is_known": False, "source": "unknown_voice"}
                         self._active_person_name = "Misafir"
 
-            # Profiling & rolling p50/p95 latency calculation
-            total_id_ms = (time.monotonic() - t_id_start) * 1000.0
+            t_decision_done = time.monotonic()
+            identity_decision_ms = (t_decision_done - t_decision_start) * 1000.0
+            total_id_ms = (t_decision_done - t_id_start) * 1000.0
+
+            total_embedding_infer_ms = sum(w.get("onnx_infer_ms", 0.0) + w.get("fbank_ms", 0.0) for w in window_breakdowns)
+            total_speaker_match_ms = sum(w.get("match_ms", 0.0) for w in window_breakdowns)
+            device_str = window_breakdowns[0].get("device", "CPUExecutionProvider") if window_breakdowns else "CPUExecutionProvider"
+            cand_count = window_breakdowns[0].get("candidates", 0) if window_breakdowns else 0
+
+            # Rolling stats calculation across all 7 segments
+            p50_s1, p95_s1, max_s1 = self._record_voice_id_segment("speech_stopped_to_extract_ms", speech_stopped_to_extract_ms)
+            p50_s2, p95_s2, max_s2 = self._record_voice_id_segment("buffer_extract_ms", buffer_extract_ms)
+            p50_s3, p95_s3, max_s3 = self._record_voice_id_segment("audio_prep_ms", audio_prep_ms)
+            p50_s4, p95_s4, max_s4 = self._record_voice_id_segment("embedding_infer_ms", total_embedding_infer_ms)
+            p50_s5, p95_s5, max_s5 = self._record_voice_id_segment("speaker_match_ms", total_speaker_match_ms)
+            p50_s6, p95_s6, max_s6 = self._record_voice_id_segment("vote_aggregation_ms", vote_aggregation_ms)
+            p50_s7, p95_s7, max_s7 = self._record_voice_id_segment("identity_decision_ms", identity_decision_ms)
+            p50_tot, p95_tot, max_tot = self._record_voice_id_segment("total_voice_id_ms", total_id_ms)
+
+            # Record telemetry object
+            self._latest_voice_id_profile = {
+                "speech_stopped_to_extract_ms": speech_stopped_to_extract_ms,
+                "buffer_extract_ms": buffer_extract_ms,
+                "audio_prep_ms": audio_prep_ms,
+                "embedding_infer_ms": total_embedding_infer_ms,
+                "speaker_match_ms": total_speaker_match_ms,
+                "vote_aggregation_ms": vote_aggregation_ms,
+                "identity_decision_ms": identity_decision_ms,
+                "total_id_ms": total_id_ms,
+                "windows_evaluated": len(window_results),
+                "window_breakdowns": window_breakdowns,
+                "candidate_speaker_count": cand_count,
+                "number_of_votes": winner_votes if votes else 0,
+                "selected_speaker": selected_speaker_name,
+                "confidence": selected_conf,
+                "rejection_reason": rejection_reason_str,
+                "device": device_str,
+                "sample_count": total_samples,
+                "audio_duration_ms": total_audio_dur_ms,
+                "stats": {
+                    "speech_stopped_to_extract_ms": {"p50": p50_s1, "p95": p95_s1, "max": max_s1},
+                    "buffer_extract_ms": {"p50": p50_s2, "p95": p95_s2, "max": max_s2},
+                    "audio_prep_ms": {"p50": p50_s3, "p95": p95_s3, "max": max_s3},
+                    "embedding_infer_ms": {"p50": p50_s4, "p95": p95_s4, "max": max_s4},
+                    "speaker_match_ms": {"p50": p50_s5, "p95": p95_s5, "max": max_s5},
+                    "vote_aggregation_ms": {"p50": p50_s6, "p95": p95_s6, "max": max_s6},
+                    "identity_decision_ms": {"p50": p50_s7, "p95": p95_s7, "max": max_s7},
+                    "total_voice_id_ms": {"p50": p50_tot, "p95": p95_tot, "max": max_tot},
+                }
+            }
+
             if not hasattr(self, "_voice_id_latencies"):
                 self._voice_id_latencies = []
             self._voice_id_latencies.append(total_id_ms)
             if len(self._voice_id_latencies) > 50:
                 self._voice_id_latencies.pop(0)
 
-            p50 = float(np.percentile(self._voice_id_latencies, 50)) if len(self._voice_id_latencies) > 0 else total_id_ms
-            p95 = float(np.percentile(self._voice_id_latencies, 95)) if len(self._voice_id_latencies) > 0 else total_id_ms
-
             if hasattr(self, "get_logger") and callable(self.get_logger):
                 self.get_logger().info(
                     f"⏱️ [VOICE ID PROFILE]\n"
                     f"  total_ms={total_id_ms:.1f}ms\n"
-                    f"  prep_ms={t_prep_ms:.1f}ms\n"
+                    f"  prep_ms={audio_prep_ms:.1f}ms\n"
                     f"  windows_evaluated={len(window_results)}\n"
                     f"  window_infer_ms={[f'{t:.1f}' for t in infer_times]}\n"
                     f"  early_exit={'true' if early_exit else 'false'}\n"
-                    f"  p50_ms={p50:.1f}ms\n"
-                    f"  p95_ms={p95:.1f}ms"
+                    f"  p50_ms={p50_tot:.1f}ms\n"
+                    f"  p95_ms={p95_tot:.1f}ms\n"
+                    f"⏱️ [VOICE ID DETAILED BREAKDOWN]\n"
+                    f"  1_speech_stopped_to_extract_ms={speech_stopped_to_extract_ms:.1f}ms (p50: {p50_s1:.1f}ms, p95: {p95_s1:.1f}ms, max: {max_s1:.1f}ms)\n"
+                    f"  2_buffer_extract_ms={buffer_extract_ms:.1f}ms (p50: {p50_s2:.1f}ms, p95: {p95_s2:.1f}ms, max: {max_s2:.1f}ms)\n"
+                    f"  3_audio_prep_ms={audio_prep_ms:.1f}ms (p50: {p50_s3:.1f}ms, p95: {p95_s3:.1f}ms, max: {max_s3:.1f}ms)\n"
+                    f"  4_embedding_infer_ms={total_embedding_infer_ms:.1f}ms (p50: {p50_s4:.1f}ms, p95: {p95_s4:.1f}ms, max: {max_s4:.1f}ms)\n"
+                    f"  5_speaker_match_ms={total_speaker_match_ms:.1f}ms (p50: {p50_s5:.1f}ms, p95: {p95_s5:.1f}ms, max: {max_s5:.1f}ms)\n"
+                    f"  6_vote_aggregation_ms={vote_aggregation_ms:.1f}ms (p50: {p50_s6:.1f}ms, p95: {p95_s6:.1f}ms, max: {max_s6:.1f}ms)\n"
+                    f"  7_identity_decision_ms={identity_decision_ms:.1f}ms (p50: {p50_s7:.1f}ms, p95: {p95_s7:.1f}ms, max: {max_s7:.1f}ms)\n"
+                    f"  device={device_str} | candidates={cand_count} | duration_ms={total_audio_dur_ms:.1f} | samples={total_samples} | votes={winner_votes if votes else 0}/{total_windows} | rej_reason={rejection_reason_str}"
                 )
         except Exception as e:
             if hasattr(self, "get_logger") and callable(self.get_logger):
