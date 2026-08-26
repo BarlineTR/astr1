@@ -1308,9 +1308,9 @@ class AstroRealtimeNode(Node):
                         },
                         "turn_detection": {
                             "type": "server_vad",
-                            "threshold": 0.60,
+                            "threshold": 0.72,
                             "prefix_padding_ms": 300,
-                            "silence_duration_ms": 500,
+                            "silence_duration_ms": 600,
                             "create_response": True
                         }
                     },
@@ -1820,6 +1820,25 @@ class AstroRealtimeNode(Node):
 
             if has_cjk or has_foreign_script or len(user_transcript) <= 1 or any(h in user_transcript.lower() for h in whisper_hallucinations):
                 self.get_logger().info(f"🔇 [Gürültü/Halüsinasyon Filtrelendi]: \"{user_transcript}\"")
+                # INSTANTLY CANCEL OPENAI RESPONSE IF RUNNING SO IT DOES NOT TALK TO SILENCE
+                if self.active_response_state in ("GENERATING", "STREAMING", "RESPONSE_STREAMING"):
+                    self.active_response_state = "CANCELLED"
+                    if self._ws is not None and self._can_use_openai("realtime"):
+                        try:
+                            if self._loop is not None:
+                                asyncio.run_coroutine_threadsafe(self._ws.send(json.dumps({"type": "response.cancel"})), self._loop)
+                            elif hasattr(self._ws, "send"):
+                                res = self._ws.send(json.dumps({"type": "response.cancel"}))
+                                if inspect.iscoroutine(res):
+                                    asyncio.run(res)
+                        except Exception:
+                            pass
+                if self._is_playback_active:
+                    self._is_playback_active = False
+                    int_msg = Bool()
+                    int_msg.data = True
+                    if getattr(self, "pub_interrupt", None):
+                        self.pub_interrupt.publish(int_msg)
                 return
 
             if user_transcript:
