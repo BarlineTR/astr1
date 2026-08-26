@@ -1683,10 +1683,11 @@ class AstroRealtimeNode(Node):
                     self.get_logger().info(
                         f"[REALTIME AUDIO START]\n"
                         f"generation_id={self.active_generation_id or self.realtime_current_generation_id}\n"
+                        f"turn_type={getattr(self, '_last_turn_type', 'USER_TURN_RESPONSE')}\n"
                         f"actual_provider=openai_realtime\n"
                         f"response_create_to_first_audio_ms={response_create_to_first_audio_ms:.1f}\n"
-                        f"speech_stopped_to_first_audio_ms={speech_stopped_to_first_audio_ms:.1f}\n"
                         f"created_to_first_audio_ms={created_to_first_audio_ms:.1f}\n"
+                        f"speech_stopped_to_first_audio_ms={speech_stopped_to_first_audio_ms:.1f}\n"
                         f"first_audio_ms={first_audio_ms:.1f}"
                     )
 
@@ -1813,13 +1814,27 @@ class AstroRealtimeNode(Node):
 
             is_tool_continuation = getattr(self, "_active_tool_call_in_progress", False) or (vad_to_created_ms == 0.0 and getattr(self, "_last_tool_call_time", 0.0) > 0 and (time.monotonic() - getattr(self, "_last_tool_call_time", 0.0) < 6.0))
             turn_type = "TOOL_CONTINUATION_RESPONSE" if is_tool_continuation else "USER_TURN_RESPONSE"
+            self._last_turn_type = turn_type
             self._active_tool_call_in_progress = False
+
+            tool_create_to_created_ms = 0.0
+            if is_tool_continuation:
+                t_cont_send = getattr(self, "_continuation_create_time", None)
+                if t_cont_send:
+                    tool_create_to_created_ms = (self._response_start_time - t_cont_send) * 1000.0
+
+                if not hasattr(self, "_tool_create_to_created_latencies"):
+                    self._tool_create_to_created_latencies = []
+                self._tool_create_to_created_latencies.append(tool_create_to_created_ms)
+                if len(self._tool_create_to_created_latencies) > 50:
+                    self._tool_create_to_created_latencies.pop(0)
 
             self.get_logger().info(
                 f"[REALTIME RESPONSE CREATED]\n"
                 f"generation_id={self.active_generation_id}\n"
                 f"turn_type={turn_type}\n"
                 f"response_id={self.active_response_id or 'unknown'}\n"
+                f"tool_create_to_created_ms={tool_create_to_created_ms:.1f}\n"
                 f"vad_to_created_ms={vad_to_created_ms:.1f}"
             )
 
@@ -2036,12 +2051,16 @@ class AstroRealtimeNode(Node):
             except Exception:
                 args = {}
 
+            t_tool_event_recv = time.monotonic()
             self.get_logger().info(f"🛠️ [Realtime Tool]: {func_name}({args}) çalıştırılıyor...")
+            t_exec_start = time.monotonic()
             try:
                 tool_result = await asyncio.to_thread(self._execute_realtime_tool, func_name, args)
             except Exception as te:
                 self.get_logger().error(f"❌ [Tool Hatası]: {te}")
                 tool_result = {"status": "error", "message": str(te)}
+            t_exec_done = time.monotonic()
+            tool_exec_ms = (t_exec_done - t_exec_start) * 1000.0
 
             # Send tool response back to OpenAI
             if ws and hasattr(ws, "send") and self._can_use_openai("realtime"):
@@ -2054,25 +2073,67 @@ class AstroRealtimeNode(Node):
                     }
                 }
                 self._active_tool_call_in_progress = True
-                self._last_tool_call_time = time.monotonic()
+                t_out_send_start = time.monotonic()
                 res = ws.send(json.dumps(tool_output_event))
                 if asyncio.iscoroutine(res):
                     await res
-                # Trigger response generation with strictly grounded physical reality instructions
+                t_out_send_done = time.monotonic()
+                tool_output_send_ms = (t_out_send_done - t_out_send_start) * 1000.0
+
+                # Trigger response generation with strictly grounded physical reality instructions AND strict brevity mandate
                 response_create_payload = {
                     "type": "response.create",
                     "response": {
                         "instructions": (
                             "FİZİKSEL VE EYLEM CEVAP KURALI: Az önce çalıştırılan fonksiyonun (tool) çıktısını kesin ve mutlak gerçeklik kabul et. "
-                            "Eğer çıktı başarı (success=true) içeriyorsa eylemin başarıyla yapıldığını belirt. "
+                            "Eğer çıktı başarı (success=true) içeriyorsa eylemin yapıldığını TEK BİR KISA CÜMLE (maksimum 3-8 kelime) ile doğrula! "
+                            "KESİNLİKLE 10-15 saniyelik uzun tirat, açıklama, nutuk veya mod tarifi YAPMA! "
                             "Eğer çıktı hata/engel (success=false veya status=blocked/error) içeriyorsa, SADECE ve SADECE çıktıda yazan 'message' veya 'reason' açıklamasını esas al; "
                             "çıktıda yazmayan hiçbir uydurma sebep (kalp ritmi, nabız, bağlantı vb.) KESİNLİKLE ÜRETME. Asla gerçekleşmeyen bir hareketi gerçekleşmiş gibi iddia etme."
                         )
                     }
                 }
+                t_create_send_start = time.monotonic()
                 res2 = ws.send(json.dumps(response_create_payload))
                 if asyncio.iscoroutine(res2):
                     await res2
+                t_create_send_done = time.monotonic()
+                continuation_create_send_ms = (t_create_send_done - t_create_send_start) * 1000.0
+
+                self._continuation_create_time = t_create_send_done
+                self._last_tool_call_time = t_create_send_done
+
+                # Update turn telemetry timestamps specifically for this continuation turn!
+                if not hasattr(self, "_turn_telemetry"):
+                    self._turn_telemetry = {}
+                self._turn_telemetry["t_resp_send"] = t_create_send_done
+                self._turn_telemetry["t_continuation_send"] = t_create_send_done
+                self._turn_telemetry["tool_exec_ms"] = tool_exec_ms
+                self._turn_telemetry["tool_output_send_ms"] = tool_output_send_ms
+                self._turn_telemetry["continuation_create_send_ms"] = continuation_create_send_ms
+
+                total_tool_orchestration_ms = (t_create_send_done - t_tool_event_recv) * 1000.0
+
+                # Rolling p50/p95 latency tracking for tool continuation overhead
+                if not hasattr(self, "_tool_orchestration_latencies"):
+                    self._tool_orchestration_latencies = []
+                self._tool_orchestration_latencies.append(total_tool_orchestration_ms)
+                if len(self._tool_orchestration_latencies) > 50:
+                    self._tool_orchestration_latencies.pop(0)
+
+                p50_orch = float(np.percentile(self._tool_orchestration_latencies, 50)) if len(self._tool_orchestration_latencies) > 0 else total_tool_orchestration_ms
+                p95_orch = float(np.percentile(self._tool_orchestration_latencies, 95)) if len(self._tool_orchestration_latencies) > 0 else total_tool_orchestration_ms
+
+                self.get_logger().info(
+                    f"⏱️ [TOOL CONTINUATION PROFILE]\n"
+                    f"  tool_name={func_name}\n"
+                    f"  tool_exec_ms={tool_exec_ms:.1f}ms\n"
+                    f"  tool_output_send_ms={tool_output_send_ms:.1f}ms\n"
+                    f"  continuation_create_send_ms={continuation_create_send_ms:.1f}ms\n"
+                    f"  total_tool_orchestration_ms={total_tool_orchestration_ms:.1f}ms\n"
+                    f"  p50_ms={p50_orch:.1f}ms\n"
+                    f"  p95_ms={p95_orch:.1f}ms"
+                )
 
         # 7. Error Handling
         elif event_type == "error":
@@ -2403,7 +2464,7 @@ class AstroRealtimeNode(Node):
                 return {
                     "status": "success",
                     "persona": target,
-                    "message": f"Kişilik modu başarıyla '{target}' olarak değiştirildi. Artık tamamen bu yeni kişiliğin kurallarıyla konuş."
+                    "message": f"Kişilik modu '{target}' yapıldı. Tek kısa cümleyle (maksimum 3-6 kelime) doğrudan bu yeni modun üslubuyla onay ver."
                 }
             return {"status": "error", "message": f"'{raw_p}' geçerli bir kişilik modu değil."}
 

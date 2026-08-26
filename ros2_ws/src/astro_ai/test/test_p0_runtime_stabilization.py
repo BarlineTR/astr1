@@ -3098,6 +3098,59 @@ class TestP05RealtimeStreamStateAndPlaybackSerialization(unittest.TestCase):
         joined_logs = "\n".join(logs)
         self.assertIn("turn_type=TOOL_CONTINUATION_RESPONSE", joined_logs)
 
+    def test_tool_continuation_profiling_and_telemetry_reset(self):
+        """P0 Latency fix: Tool continuation logs [TOOL CONTINUATION PROFILE] and updates t_resp_send."""
+        import asyncio
+        import json
+        from astro_ai.astro_realtime_node import AstroRealtimeNode
+
+        node = AstroRealtimeNode.__new__(AstroRealtimeNode)
+        node._executed_tool_calls = set()
+        node._lock = threading.Lock()
+        node._can_use_openai = MagicMock(return_value=True)
+        node._execute_realtime_tool = MagicMock(return_value={"status": "success", "message": "done"})
+
+        sent_messages = []
+        mock_ws = MagicMock()
+        async def _mock_send(msg):
+            sent_messages.append(json.loads(msg))
+        mock_ws.send = _mock_send
+
+        logs = []
+        mock_logger = MagicMock()
+        mock_logger.info = lambda msg: logs.append(str(msg))
+        mock_logger.debug = lambda msg: logs.append(str(msg))
+        mock_logger.error = lambda msg: logs.append(str(msg))
+        node.get_logger = lambda: mock_logger
+
+        # Set an old user turn t_resp_send from 4 seconds ago
+        old_t_resp_send = time.monotonic() - 4.0
+        node._turn_telemetry = {"t_resp_send": old_t_resp_send}
+
+        # Simulate function_call_arguments.done event
+        asyncio.run(node._handle_realtime_event(mock_ws, {
+            "type": "response.function_call_arguments.done",
+            "call_id": "call_test_1028",
+            "name": "change_persona",
+            "arguments": '{"persona": "kufurbaz"}'
+        }))
+
+        joined_logs = "\n".join(logs)
+        # Verify dedicated tool continuation profiling log
+        self.assertIn("[TOOL CONTINUATION PROFILE]", joined_logs)
+        self.assertIn("tool_name=change_persona", joined_logs)
+        self.assertIn("tool_exec_ms=", joined_logs)
+        self.assertIn("continuation_create_send_ms=", joined_logs)
+
+        # Verify that t_resp_send was refreshed to the continuation send time (NOT 4 seconds ago!)
+        self.assertGreater(node._turn_telemetry["t_resp_send"], old_t_resp_send + 3.0)
+
+        # Verify continuation response.create payload contains brevity mandate
+        create_event = next(e for e in sent_messages if e.get("type") == "response.create")
+        instructions = create_event["response"]["instructions"]
+        self.assertIn("TEK BİR KISA CÜMLE", instructions)
+        self.assertIn("KESİNLİKLE 10-15 saniyelik uzun tirat", instructions)
+
     def test_sleep_mode_transitions_after_15_seconds_inactivity(self):
         """Field fix: Astro transitions into DEEP_IDLE sleep mode after 15 seconds of inactivity."""
         from astro_ai.astro_realtime_node import AstroRealtimeNode
