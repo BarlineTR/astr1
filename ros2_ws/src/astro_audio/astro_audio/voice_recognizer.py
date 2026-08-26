@@ -207,6 +207,17 @@ class VoiceRecognizer:
         Threshold enforcement and margin-based accept/reject logic is handled by the caller
         (_run_voice_identification multi-window voter). This enables proper margin calculation.
         """
+        # Check if database was updated on disk by enroll_speaker.py and reload dynamically
+        engine = _get_engine()
+        if engine is not None and hasattr(engine, "db_path") and hasattr(engine.db_path, "exists") and engine.db_path.exists():
+            try:
+                mtime = engine.db_path.stat().st_mtime
+                if mtime > getattr(self, "_last_db_mtime", 0.0):
+                    self._last_db_mtime = mtime
+                    self.reload_voiceprints()
+            except Exception:
+                pass
+
         t0 = time.monotonic()
         emb, emb_prof = self.extract_voiceprint_with_profile(audio_arr, sample_rate)
         t_emb_done = time.monotonic()

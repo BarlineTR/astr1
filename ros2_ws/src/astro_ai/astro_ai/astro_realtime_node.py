@@ -2798,12 +2798,28 @@ class AstroRealtimeNode(Node):
         t_prep_start = time.monotonic()
         try:
             from collections import Counter
-            n = len(buffer_copy)
-            third = max(n // 3, 20)
+            # 1. Strip trailing Server VAD silence padding (last ~500-600ms) to ensure clean speech embeddings
+            ambient = getattr(self, "_ambient_rms", 150.0)
+            speech_floor = max(180.0, ambient * 1.05)
+
+            last_speech_idx = len(buffer_copy)
+            for idx in range(len(buffer_copy) - 1, -1, -1):
+                chunk_arr = np.frombuffer(buffer_copy[idx], dtype=np.int16)
+                chunk_rms = float(np.sqrt(np.mean(chunk_arr.astype(np.float32) ** 2))) if len(chunk_arr) > 0 else 0.0
+                if chunk_rms > speech_floor:
+                    last_speech_idx = min(len(buffer_copy), idx + 5)  # retain small 100ms natural tail margin
+                    break
+
+            clean_speech_buffer = buffer_copy[:last_speech_idx] if last_speech_idx >= 20 else buffer_copy
+            cn = len(clean_speech_buffer)
+
+            # 2. Window 0: Full clean speech utterance (highest information density & most accurate embedding)
+            #    Windows 1 & 2: First half and second half for multi-window validation
+            half = max(cn // 2, 20)
             windows = [
-                buffer_copy[-third:],
-                buffer_copy[max(0, n - third * 2): n - third] if n >= third * 2 else buffer_copy[:third],
-                buffer_copy[:third],
+                clean_speech_buffer,
+                clean_speech_buffer[:half] if cn >= 30 else clean_speech_buffer,
+                clean_speech_buffer[-half:] if cn >= 30 else clean_speech_buffer,
             ]
             t_prep_done = time.monotonic()
             audio_prep_ms = (t_prep_done - t_prep_start) * 1000.0
