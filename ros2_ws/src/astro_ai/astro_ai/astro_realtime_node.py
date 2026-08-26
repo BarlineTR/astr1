@@ -1213,7 +1213,7 @@ class AstroRealtimeNode(Node):
         )
 
         known_speakers = []
-        if self.voice_recognizer:
+        if getattr(self, "voice_recognizer", None):
             try:
                 known_speakers = [k for k, v in self.voice_recognizer._known_voiceprints.items() if len(v) > 0 and k.lower() != "misafir"]
             except Exception as _exc:
@@ -1252,8 +1252,11 @@ class AstroRealtimeNode(Node):
             "- Yapılmayan eylemler için yapılmış gibi iddialarda bulunma."
         )
 
+        if not getattr(self, "persona_engine", None):
+            return f"Astro Default Instructions {bio_status}"
+        mem_ctx = self.memory.get_prompt_context(recognized_person=identity) if getattr(self, "memory", None) else ""
         return self.persona_engine.build_system_prompt(
-            memory_context=self.memory.get_prompt_context(recognized_person=identity) + bio_status + memory_rule,
+            memory_context=mem_ctx + bio_status + memory_rule,
             recognized_person=identity
         )
 
@@ -1311,7 +1314,7 @@ class AstroRealtimeNode(Node):
                             "threshold": 0.72,
                             "prefix_padding_ms": 300,
                             "silence_duration_ms": 600,
-                            "create_response": True
+                            "create_response": False
                         }
                     },
                     "output": {
@@ -1477,7 +1480,129 @@ class AstroRealtimeNode(Node):
                 self._fallback_mode = True
                 self._publish_realtime_state("SESSION_CONFIG_ERROR", str(e))
                 return False
-        return True
+    def _validate_user_speech_acoustics(self) -> bool:
+        """Phase 1: Validates that the recorded user speech audio buffer contains genuine
+        speech energy (duration >= 140ms, peak >= 1000, RMS >= threshold).
+        Prevents ambient room clicks, chair squeaks, or breaths from triggering response.create.
+        """
+        lock = getattr(self, "_lock", None)
+        buf = getattr(self, "_user_speech_audio_buffer", None)
+        if buf is None:
+            # If buffer not initialized on bare mock object, do not reject
+            return True
+
+        if lock is not None:
+            with lock:
+                buf_copy = list(buf)
+        else:
+            buf_copy = list(buf)
+
+        if not buf_copy:
+            return False
+
+        # Require at least ~7 frames (140ms) of buffered user speech
+        if len(buf_copy) < 7:
+            return False
+
+        try:
+            # Analyze the most recent 30 frames (up to 600ms)
+            raw = b"".join(buf_copy[-30:])
+            arr = np.frombuffer(raw, dtype=np.int16)
+            if len(arr) == 0:
+                return False
+            mean_rms = float(np.sqrt(np.mean(arr.astype(np.float32) ** 2)))
+            peak_val = int(np.max(np.abs(arr)))
+
+            ambient = getattr(self, "_ambient_rms", 150.0)
+            min_rms = max(260.0, ambient * 1.15)
+            min_peak = 1000
+
+            if mean_rms < min_rms or peak_val < min_peak:
+                return False
+            return True
+        except Exception:
+            return True
+
+    async def _orchestrate_turn_after_speech_stopped(self, ws):
+        """Phase 1: Deterministic Turn Orchestrator with Response Authority.
+        Enforces lifecycle order:
+        speech_stopped
+        -> transcript / turn validation
+        -> speaker identification (deterministic wait: MUST finish before response.create)
+        -> speaker/context injection
+        -> response.create dispatch
+        Logs measurable telemetry targets:
+        - speech_stopped -> speaker_identified (ms)
+        - speaker_identified -> response.create (ms)
+        """
+        t_speech_stopped = time.monotonic()
+
+        # 1. Sleeping guard
+        if getattr(self, "_is_sleeping", False):
+            return
+
+        # 2. Turn Validation (Acoustic Presence & Energy Gating)
+        is_valid_speech = self._validate_user_speech_acoustics()
+        if not is_valid_speech:
+            if hasattr(self, "get_logger") and callable(self.get_logger):
+                self.get_logger().info("🤫 [Turn Orchestrator] Gürültü / Tıkırtı / Yetersiz ses enerjisi elendi -> response.create gönderilmedi (0 token).")
+            return
+
+        # 3. Speaker Identification (Deterministic Ordering: Wait for result before responding)
+        t_id_start = time.monotonic()
+        run_voice_id = getattr(self, "_run_voice_identification", None)
+        if callable(run_voice_id):
+            try:
+                await asyncio.to_thread(run_voice_id)
+            except Exception as e:
+                if hasattr(self, "get_logger") and callable(self.get_logger):
+                    self.get_logger().warning(f"[Turn Orchestrator] Voice identification error: {e}")
+        t_id_done = time.monotonic()
+        speech_stopped_to_id_ms = (t_id_done - t_speech_stopped) * 1000.0
+
+        # 4. Context & Speaker Injection
+        build_prompt = getattr(self, "_build_current_system_prompt", None)
+        current_prompt = build_prompt() if callable(build_prompt) else ""
+
+        # 5. response.create Dispatch
+        t_resp_send = time.monotonic()
+        id_to_resp_ms = (t_resp_send - t_id_done) * 1000.0
+
+        # Track turn latency telemetry timestamps
+        self._turn_telemetry = {
+            "t_speech_stopped": t_speech_stopped,
+            "t_id_done": t_id_done,
+            "t_resp_send": t_resp_send,
+            "speech_stopped_to_speaker_identified_ms": speech_stopped_to_id_ms,
+            "speaker_identified_to_response_create_ms": id_to_resp_ms,
+            "speaker": getattr(self, "_active_person_name", "Bilinmiyor"),
+        }
+
+        counter = getattr(self, "_global_generation_counter", 1000) + 1
+        self._global_generation_counter = counter
+        self.active_generation_id = counter
+        self.realtime_current_generation_id = counter
+
+        resp_event = {
+            "type": "response.create",
+            "response": {
+                "instructions": current_prompt
+            }
+        }
+        if ws is not None:
+            try:
+                await ws.send(json.dumps(resp_event))
+                if hasattr(self, "get_logger") and callable(self.get_logger):
+                    self.get_logger().info(
+                        f"⏱️ [TURN ORCHESTRATION TELEMETRY]\n"
+                        f"  generation_id={self.active_generation_id}\n"
+                        f"  speaker={getattr(self, '_active_person_name', 'Bilinmiyor')}\n"
+                        f"  speech_stopped_to_speaker_identified_ms={speech_stopped_to_id_ms:.1f}ms\n"
+                        f"  speaker_identified_to_response_create_ms={id_to_resp_ms:.1f}ms"
+                    )
+            except Exception as se:
+                if hasattr(self, "get_logger") and callable(self.get_logger):
+                    self.get_logger().error(f"[Turn Orchestrator] response.create send error: {se}")
 
     async def _handle_realtime_event(self, ws, event: Dict[str, Any]):
         """Dispatches Realtime WebSocket server events."""
@@ -1523,12 +1648,18 @@ class AstroRealtimeNode(Node):
                     self._first_audio_time = time.monotonic()
                     created_start = getattr(self, "_response_start_time", None) or self._first_audio_time
                     vad_start = getattr(self, "_vad_end_time", None) or created_start
+                    t_resp_send = getattr(self, "_turn_telemetry", {}).get("t_resp_send", created_start)
+                    t_speech_stopped = getattr(self, "_turn_telemetry", {}).get("t_speech_stopped", vad_start)
+                    response_create_to_first_audio_ms = (self._first_audio_time - t_resp_send) * 1000.0 if (self._first_audio_time and t_resp_send) else 0.0
+                    speech_stopped_to_first_audio_ms = (self._first_audio_time - t_speech_stopped) * 1000.0 if (self._first_audio_time and t_speech_stopped) else 0.0
                     created_to_first_audio_ms = (self._first_audio_time - created_start) * 1000.0 if (self._first_audio_time and created_start) else 0.0
                     first_audio_ms = (self._first_audio_time - vad_start) * 1000.0 if (self._first_audio_time and vad_start) else 0.0
                     self.get_logger().info(
                         f"[REALTIME AUDIO START]\n"
                         f"generation_id={self.active_generation_id or self.realtime_current_generation_id}\n"
                         f"actual_provider=openai_realtime\n"
+                        f"response_create_to_first_audio_ms={response_create_to_first_audio_ms:.1f}\n"
+                        f"speech_stopped_to_first_audio_ms={speech_stopped_to_first_audio_ms:.1f}\n"
                         f"created_to_first_audio_ms={created_to_first_audio_ms:.1f}\n"
                         f"first_audio_ms={first_audio_ms:.1f}"
                     )
@@ -1617,11 +1748,8 @@ class AstroRealtimeNode(Node):
             if self._is_sleeping:
                 return
             self._vad_end_time = time.monotonic()
-            self.get_logger().info("🤫 [Realtime] Cümle bitti, dinleme tamamlandı...")
-            try:
-                asyncio.create_task(asyncio.to_thread(self._run_voice_identification))
-            except Exception:
-                threading.Thread(target=self._run_voice_identification, daemon=True).start()
+            self.get_logger().info("🤫 [Realtime] Cümle bitti, deterministik turn orkestrasyonu başlatılıyor...")
+            await self._orchestrate_turn_after_speech_stopped(ws)
 
         # 3c. Response Created
         elif event_type == "response.created":
@@ -5124,9 +5252,16 @@ class AstroRealtimeNode(Node):
     def resolve_identities(self) -> Dict[str, Any]:
         """Separates and resolves USER_IDENTITY, BIOMETRIC_IDENTITY, SESSION_IDENTITY, MEMORY_IDENTITY."""
         now = time.monotonic()
-        with self._lock:
-            face = self._recognized_person or {}
-            spk = self._recognized_speaker or {}
+        lock = getattr(self, "_lock", None)
+        if lock is not None:
+            with lock:
+                face = getattr(self, "_recognized_person", None) or {}
+                spk = getattr(self, "_recognized_speaker", None) or {}
+                held_name = getattr(self, "_active_person_name", "")
+                hold_until = getattr(self, "_person_hold_until", 0.0)
+        else:
+            face = getattr(self, "_recognized_person", None) or {}
+            spk = getattr(self, "_recognized_speaker", None) or {}
             held_name = getattr(self, "_active_person_name", "")
             hold_until = getattr(self, "_person_hold_until", 0.0)
 

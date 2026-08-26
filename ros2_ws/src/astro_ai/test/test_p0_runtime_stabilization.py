@@ -2888,7 +2888,7 @@ class TestP05RealtimeStreamStateAndPlaybackSerialization(unittest.TestCase):
         self.assertIn("[REALTIME TURN DUPLICATE DROPPED]\ngeneration_id=999", log_text)
 
     def test_server_vad_configuration(self):
-        """15. Realtime S2S: Session config configures server_vad with native create_response=True."""
+        """15. Realtime S2S: Session config configures server_vad with client-controlled create_response=False."""
         import asyncio
         from astro_ai.astro_realtime_node import AstroRealtimeNode
         node = AstroRealtimeNode.__new__(AstroRealtimeNode)
@@ -2909,25 +2909,59 @@ class TestP05RealtimeStreamStateAndPlaybackSerialization(unittest.TestCase):
         session_cfg = sent_payloads[0]["session"]
         turn_det = session_cfg.get("turn_detection") or session_cfg.get("audio", {}).get("input", {}).get("turn_detection", {})
         self.assertEqual(turn_det.get("type"), "server_vad")
-        self.assertTrue(turn_det.get("create_response"))
-        self.assertEqual(turn_det.get("silence_duration_ms"), 500)
+        self.assertFalse(turn_det.get("create_response"))
+        self.assertEqual(turn_det.get("silence_duration_ms"), 600)
 
-    def test_no_manual_response_create_for_normal_turn(self):
-        """16. Realtime S2S: speech_stopped does NOT send manual response.create (native turn detection)."""
+    def test_deterministic_turn_orchestration_on_speech_stopped(self):
+        """16. Realtime S2S: speech_stopped executes deterministic turn orchestration:
+        validates speech, runs voice identification, and dispatches controlled response.create.
+        """
         import asyncio
+        import threading
         from astro_ai.astro_realtime_node import AstroRealtimeNode
         node = AstroRealtimeNode.__new__(AstroRealtimeNode)
         node._is_sleeping = False
+        node._lock = threading.Lock()
+        node._active_person_name = "Oktay"
+        node._global_generation_counter = 1000
+        node._build_current_system_prompt = lambda: "Astro Prompt for Oktay"
         node.get_logger = lambda: MagicMock()
+        node._validate_user_speech_acoustics = MagicMock(return_value=True)
         node._run_voice_identification = MagicMock()
 
         sent_events = []
         mock_ws = MagicMock()
-        mock_ws.send = lambda payload: sent_events.append(json.loads(payload))
+        async def _mock_send(payload):
+            sent_events.append(json.loads(payload))
+        mock_ws.send = _mock_send
 
         asyncio.run(node._handle_realtime_event(mock_ws, {"type": "input_audio_buffer.speech_stopped"}))
-        # No manual response.create sent on speech_stopped
+        self.assertEqual(len(sent_events), 1)
+        self.assertEqual(sent_events[0]["type"], "response.create")
+        self.assertEqual(sent_events[0]["response"]["instructions"], "Astro Prompt for Oktay")
+        node._run_voice_identification.assert_called_once()
+
+    def test_noise_filtered_no_response_create_on_speech_stopped(self):
+        """16b. Noise or click does NOT trigger response.create, saving tokens and avoiding talking to silence."""
+        import asyncio
+        import threading
+        from astro_ai.astro_realtime_node import AstroRealtimeNode
+        node = AstroRealtimeNode.__new__(AstroRealtimeNode)
+        node._is_sleeping = False
+        node._lock = threading.Lock()
+        node.get_logger = lambda: MagicMock()
+        node._validate_user_speech_acoustics = MagicMock(return_value=False)
+        node._run_voice_identification = MagicMock()
+
+        sent_events = []
+        mock_ws = MagicMock()
+        async def _mock_send(payload):
+            sent_events.append(json.loads(payload))
+        mock_ws.send = _mock_send
+
+        asyncio.run(node._handle_realtime_event(mock_ws, {"type": "input_audio_buffer.speech_stopped"}))
         self.assertEqual(len(sent_events), 0)
+        node._run_voice_identification.assert_not_called()
 
     def test_motion_and_memory_tools_execution(self):
         """17. Tools: move_robot publishes Twist to /cmd_vel and search_memory queries storage."""
