@@ -794,6 +794,7 @@ class AstroRealtimeNode(Node):
         self.create_subscription(String, "/audio/realtime_input_pcm", self._on_input_pcm, 50)
         self.create_subscription(Bool, "/audio/playback_active", self._on_playback_active, 10)
         self.create_subscription(String, "/vision/recognized_person", self._on_recognized_person, 10)
+        self.create_subscription(String, "/vision/faces", self._on_faces, 10)
         self.create_subscription(String, "/audio/speaker_id", self._on_speaker_id, 10)
         self.create_subscription(String, "/vision/user_emotion", self._on_user_emotion, 10)
         self.create_subscription(Bool, "/vision/looking_at_robot", self._on_looking_at_robot, 10)
@@ -5860,6 +5861,58 @@ class AstroRealtimeNode(Node):
             self._sync_perception_to_session()
         except Exception as _exc:
             self.get_logger().debug(f"_on_recognized_person: yok sayılan hata ({_exc})")
+
+    def _on_faces(self, msg: String):
+        """Processes multi-person detection array and runs AttentionManager focus selection."""
+        try:
+            raw = (msg.data or "").strip()
+            if not raw:
+                return
+            faces_data = json.loads(raw)
+            if not isinstance(faces_data, list) or len(faces_data) == 0:
+                return
+
+            candidates: List[Any] = []
+            for idx, f in enumerate(faces_data):
+                if not isinstance(f, dict):
+                    continue
+                name_val = f.get("recognized_name") or f.get("name") or "Misafir"
+                is_known = bool(f.get("is_known", False) or (name_val.lower() != "misafir"))
+                dist = float(f.get("distance_m", 1.5))
+                looking = bool(f.get("looking_at_robot", False))
+                yaw = float(f.get("yaw_deg", 0.0))
+                p_id = str(f.get("person_id") or f"person_{name_val.lower()}_{idx}")
+
+                if UnifiedPersonState:
+                    p_state = UnifiedPersonState(
+                        person_id=p_id,
+                        name=name_val,
+                        formal_title=f.get("recognized_title") or name_val,
+                        is_known=is_known,
+                        identity_confidence=0.85 if is_known else 0.20,
+                        familiarity_score=0.80 if is_known else 0.20,
+                        distance_m=dist,
+                        azimuth_deg=yaw,
+                        is_looking_at_robot=looking,
+                        is_present=True,
+                    )
+                    candidates.append(p_state)
+
+            if getattr(self, "social_brain", None):
+                self.social_brain.world_model.update_people(candidates)
+
+                # Focus target selection via AttentionManager
+                if hasattr(self.social_brain, "attention_manager") and candidates:
+                    chosen, score = self.social_brain.attention_manager.select_focus_target(candidates)
+                    if chosen:
+                        with self._lock:
+                            if chosen.is_known and chosen.name.lower() != "misafir":
+                                self._active_person_name = chosen.name
+                                self._person_hold_until = time.monotonic() + 30.0
+                            self._user_distance = chosen.distance_m
+                            self._looking_at_robot = chosen.is_looking_at_robot
+        except Exception as _exc:
+            self.get_logger().debug(f"_on_faces: {_exc}")
 
     def _on_speaker_id(self, msg: String):
         try:

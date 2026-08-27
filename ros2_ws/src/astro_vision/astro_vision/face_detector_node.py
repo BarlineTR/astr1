@@ -21,14 +21,36 @@ import logging
 _LOG = logging.getLogger(__name__)
 
 from collections import deque
-import cv2
+try:
+    import cv2
+except ImportError:
+    class _MockCV2:
+        class data:
+            haarcascades = ""
+        class CascadeClassifier:
+            def __init__(self, *args, **kwargs): pass
+            def detectMultiScale(self, *args, **kwargs): return []
+        INTER_AREA = 3
+        FONT_HERSHEY_SIMPLEX = 0
+        def resize(self, src, dsize, *args, **kwargs): return src
+        def cvtColor(self, src, code): return src
+        def rectangle(self, *args, **kwargs): pass
+        def putText(self, *args, **kwargs): pass
+    cv2 = _MockCV2()
+
 import numpy as np
 
-import rclpy
-from rclpy.node import Node
-from rclpy.qos import qos_profile_sensor_data
-from sensor_msgs.msg import Image
-from std_msgs.msg import String, Bool, Float32
+try:
+    import rclpy
+    from rclpy.node import Node
+    from rclpy.qos import qos_profile_sensor_data
+    from sensor_msgs.msg import Image
+    from std_msgs.msg import String, Bool, Float32
+except ImportError:
+    rclpy = None
+    Node = object
+    qos_profile_sensor_data = 10
+    Image = String = Bool = Float32 = object
 
 try:
     from astro_vision.image_utils import bgr_to_imgmsg, imgmsg_to_bgr
@@ -149,12 +171,32 @@ class SpatialVisionNode(Node):
         # If no eyes are detected, user is NOT looking at the robot!
         return 45.0, False
 
-    def _detect_facial_emotion(self, face_roi_gray, w, h) -> str:
-        """Determines emotion (happy/smiling, surprised, sad/neutral) based on mouth and eyes geometry."""
+    def _detect_facial_emotion(self, face_roi_gray, w, h, yaw: float = 0.0, eyes_found: bool = False) -> str:
+        """Determines emotion (happy, surprised, focused, neutral) based on mouth contrast, smile and gaze geometry."""
         lower_face = cv2.resize(face_roi_gray[int(h * 0.5):, :], (96, 48), interpolation=cv2.INTER_AREA) if w > 96 else face_roi_gray[int(h * 0.5):, :]
         smiles = self.smile_cascade.detectMultiScale(lower_face, scaleFactor=1.65, minNeighbors=10, minSize=(15, 15))
         if len(smiles) > 0:
             return "happy"
+
+        # Surprise detection: open oral cavity with dark center contrast + high variance in mouth region
+        try:
+            mouth_region = lower_face[int(lower_face.shape[0] * 0.3):int(lower_face.shape[0] * 0.9), :]
+            if mouth_region.size > 0:
+                mean_val = float(np.mean(mouth_region))
+                std_val = float(np.std(mouth_region))
+                mh, mw = mouth_region.shape[:2]
+                center_patch = mouth_region[int(mh * 0.3):int(mh * 0.7), int(mw * 0.3):int(mw * 0.7)]
+                if center_patch.size > 0:
+                    center_mean = float(np.mean(center_patch))
+                    if center_mean < (mean_val - 18.0) and std_val > 22.0:
+                        return "surprised"
+        except Exception:
+            pass
+
+        # Focused detection: direct frontal gaze with eyes clearly tracked and low head yaw
+        if eyes_found and abs(yaw) <= 8.0:
+            return "focused"
+
         return "neutral"
 
     def image_callback(self, msg: Image):
@@ -260,7 +302,7 @@ class SpatialVisionNode(Node):
 
 
             # 5. Emotion Detection
-            detected_emotion = self._detect_facial_emotion(face_roi_gray, w, h)
+            detected_emotion = self._detect_facial_emotion(face_roi_gray, w, h, yaw=yaw, eyes_found=eyes_found)
 
             face_list.append({
                 "x": int(x), "y": int(y), "width": int(w), "height": int(h),
