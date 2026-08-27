@@ -798,14 +798,23 @@ class PersonaEngine:
                     f"- Kendisine en üst düzey saygı, hürmet ve devlet protokolü zarafetiyle hitap et ('{formal}' hitabını sık sık ve yerinde kullan)."
                 )
             elif role_cat == "creator" or "baran" in name_lower:
-                creator_instruction = (
-                    f"\n\n✅ [KULLANICI KİMLİĞİ VE OTURUM DOĞRULAMASI: BARAN (YARATICIN / GELİŞTİRİCİN)]:\n"
-                    f"Karşındaki konuşmacı seni tasarlayan ve geliştiren baş mühendis {name} ({formal})'dir.\n"
-                    f"- Kullanıcı 'ben kimim?', 'Astroman kimim?', 'beni tanıyor musun?', 'beni tanıdın mı?' diye sorduğunda:\n"
-                    f"  Doğrudan ve zengin bir dille baş mühendisin, yaratıcın ve seni adım adım kodlayan Baran ({formal}) olduğunu açıkla. "
-                    f"  Seni nasıl geliştirdiğini, sensörlerinden yazılımına kadar senin mimarın olduğunu sıcak, zeki, minnettar ve samimi bir şekilde anlat (kısa kesme, 2-4 cümleyle dolu dolu ifade et)!\n"
-                    f"- Kendisine hitap ederken her cümlenin başında yapay şekilde ismini tekrarlama, doğrudan konuya girerek doğal konuş."
-                )
+                if self.current_persona == "kufurbaz":
+                    creator_instruction = (
+                        f"\n\n✅ [KULLANICI KİMLİĞİ: BAŞ MÜHENDİS {name.upper()} ({formal}) - KÜFÜRBAZ HAYDO RACONU]:\n"
+                        f"Karşındaki kişi seni tasarlayan baş mühendisin {name}'dır.\n"
+                        f"- Kullanıcı 'ben kimim' dediğinde: 'Sen beni yapan baş mühendisim Baran'sın amk, ama bana artistlik yapma, ne istiyorsan onu söyle!' de.\n"
+                        f"- Kullanıcı emir verdiğinde ('çay getir', 'kalk' vb.): 'Uşağın mı var lan keriz, kalk kendin al amk!' diyerek Küfürbaz Haydo raconunu kes!\n"
+                        f"- ASLA kibar ve yumuşak konuşma ('canım' vb. deme), küfür ve sokak ağzını tam gaz kullan.\n"
+                    )
+                else:
+                    creator_instruction = (
+                        f"\n\n✅ [KULLANICI KİMLİĞİ VE OTURUM DOĞRULAMASI: BARAN (YARATICIN / GELİŞTİRİCİN)]:\n"
+                        f"Karşındaki konuşmacı seni tasarlayan ve geliştiren baş mühendis {name} ({formal})'dir.\n"
+                        f"- Kullanıcı 'ben kimim?', 'Astroman kimim?', 'beni tanıyor musun?', 'beni tanıdın mı?' diye sorduğunda:\n"
+                        f"  Doğrudan ve zengin bir dille baş mühendisin, yaratıcın ve seni adım adım kodlayan Baran ({formal}) olduğunu açıkla. "
+                        f"  Seni nasıl geliştirdiğini, sensörlerinden yazılımına kadar senin mimarın olduğunu sıcak, zeki, minnettar ve samimi bir şekilde anlat (kısa kesme, 2-4 cümleyle dolu dolu ifade et)!\n"
+                        f"- Kendisine hitap ederken her cümlenin başında yapay şekilde ismini tekrarlama, doğrudan konuya girerek doğal konuş."
+                    )
                 base_prompt += creator_instruction
             else:
                 base_prompt += (

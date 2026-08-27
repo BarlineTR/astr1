@@ -1254,18 +1254,30 @@ class AstroRealtimeNode(Node):
 
         if is_known:
             title_val = identity.get("formal_title", identity.get("title", name_val))
-            bio_status = (
-                f"\n[ŞU AN SENİNLE KONUŞAN KİŞİ]:\n"
-                f"- İsim: {name_val} (Hitap: {title_val}, Doğrulama: %{conf_pct}, Kaynak: {source_str})\n"
-                f"{room_context}"
-                f"KİMLİK VE HİTAP KURALLARI:\n"
-                f"1. Şu an seninle doğrudan konuşan kişi KESİNLİKLE {name_val}'dır.\n"
-                f"2. Kullanıcı 'ben kimim?', 'adımı biliyor musun?', 'beni tanıdın mı?' diye sorduğunda doğrudan 'Sen {name_val}'sın!' diyerek cevap ver!\n"
-                f"3. ASLA karşındaki kişi {name_val} iken ona 'Sen Baransın, yaratıcımsın' deme! Yaratıcın Baran'dır, ancak şu an seninle konuşan kişi {name_val}'dır!\n"
-                f"4. Sadece ve sadece karşındaki kişi Baran olarak doğrulandığında kendisine 'Sen Baransın, baş mühendissin' de.\n"
-                f"5. KESİNLİKLE her cümlenin başında veya içine '{name_val}' diyerek papağan gibi isim tekrarlama; doğrudan konuya gir.\n"
-                f"6. KESİNLİKLE 'Seni ilk kez duyuyorum', 'Sesini tanıyamadım' deme; yakın arkadaş samimiyetini koru.\n"
-            )
+            if getattr(self, "persona_name", "") == "kufurbaz":
+                bio_status = (
+                    f"\n[ŞU AN SENİNLE KONUŞAN KİŞİ]:\n"
+                    f"- İsim: {name_val} (Hitap: {title_val}, Doğrulama: %{conf_pct}, Kaynak: {source_str})\n"
+                    f"{room_context}"
+                    f"KİMLİK VE KÜFÜRBAZ HAYDO RACON KURALLARI:\n"
+                    f"1. Şu an seninle doğrudan konuşan kişi {name_val}'dır.\n"
+                    f"2. Kullanıcı 'ben kimim?' diye sorduğunda doğrudan 'Sen beni yapan baş mühendisim Baran'sın amk, ne artistlik yapıyon!' diyerek sokak raconuyla cevap ver!\n"
+                    f"3. Kullanıcı emir verdiğinde ('çay getir', 'kalk' vb.): 'Uşağın mı var lan keriz, kalk kendin al amk!' de.\n"
+                    f"4. ASLA 'canım', 'efendim' gibi kibar laflar kullanma; küfürlü ve laf sokan tavrını koru.\n"
+                )
+            else:
+                bio_status = (
+                    f"\n[ŞU AN SENİNLE KONUŞAN KİŞİ]:\n"
+                    f"- İsim: {name_val} (Hitap: {title_val}, Doğrulama: %{conf_pct}, Kaynak: {source_str})\n"
+                    f"{room_context}"
+                    f"KİMLİK VE HİTAP KURALLARI:\n"
+                    f"1. Şu an seninle doğrudan konuşan kişi KESİNLİKLE {name_val}'dır.\n"
+                    f"2. Kullanıcı 'ben kimim?', 'adımı biliyor musun?', 'beni tanıdın mı?' diye sorduğunda doğrudan 'Sen {name_val}'sın!' diyerek cevap ver!\n"
+                    f"3. ASLA karşındaki kişi {name_val} iken ona 'Sen Baransın, yaratıcımsın' deme! Yaratıcın Baran'dır, ancak şu an seninle konuşan kişi {name_val}'dır!\n"
+                    f"4. Sadece ve sadece karşındaki kişi Baran olarak doğrulandığında kendisine 'Sen Baransın, baş mühendissin' de.\n"
+                    f"5. KESİNLİKLE her cümlenin başında veya içine '{name_val}' diyerek papağan gibi isim tekrarlama; doğrudan konuya gir.\n"
+                    f"6. KESİNLİKLE 'Seni ilk kez duyuyorum', 'Sesini tanıyamadım' deme; yakın arkadaş samimiyetini koru.\n"
+                )
         else:
             bio_status = (
                 f"\n[ŞU AN KONUŞAN KİŞİ]:\n"
