@@ -2211,8 +2211,13 @@ class AstroRealtimeNode(Node):
 
             if has_cjk or has_foreign_script or len(user_transcript) <= 1 or any(h in user_transcript.lower() for h in whisper_hallucinations):
                 self.get_logger().info(f"🔇 [Gürültü/Halüsinasyon Filtrelendi]: \"{user_transcript}\"")
-                # INSTANTLY CANCEL OPENAI RESPONSE IF RUNNING SO IT DOES NOT TALK TO SILENCE
-                if self.active_response_state in ("GENERATING", "STREAMING", "RESPONSE_STREAMING"):
+                # INSTANTLY CANCEL OPENAI RESPONSE ONLY IF TRIGGERED BY USER SPEECH, NEVER CANCEL TOOL CONTINUATION!
+                is_tool_active = (
+                    getattr(self, "_active_tool_call_in_progress", False)
+                    or getattr(self, "_last_turn_type", "") == "TOOL_CONTINUATION_RESPONSE"
+                    or (time.monotonic() - getattr(self, "_last_tool_call_time", 0.0) < 10.0)
+                )
+                if not is_tool_active and self.active_response_state in ("GENERATING", "STREAMING", "RESPONSE_STREAMING"):
                     self.active_response_state = "CANCELLED"
                     if self._ws is not None and self._can_use_openai("realtime"):
                         try:
@@ -2224,7 +2229,7 @@ class AstroRealtimeNode(Node):
                                     asyncio.run(res)
                         except Exception:
                             pass
-                if self._is_playback_active:
+                if not is_tool_active and self._is_playback_active:
                     self._is_playback_active = False
                     int_msg = Bool()
                     int_msg.data = True
@@ -2281,6 +2286,9 @@ class AstroRealtimeNode(Node):
                 args = {}
 
             t_tool_event_recv = time.monotonic()
+            self._active_tool_call_in_progress = True
+            self._active_tool_start_time = t_tool_event_recv
+            self._last_turn_type = "TOOL_CONTINUATION_RESPONSE"
             self.get_logger().info(f"🛠️ [Realtime Tool]: {func_name}({args}) çalıştırılıyor...")
             t_exec_start = time.monotonic()
             try:
@@ -2321,6 +2329,15 @@ class AstroRealtimeNode(Node):
                         "KESİNLİKLE 10-15 saniyelik uzun tirat, açıklama, nutuk veya mod tarifi YAPMA! "
                         "Eğer çıktı hata/engel (success=false veya status=blocked/error) içeriyorsa, SADECE ve SADECE çıktıda yazan 'message' veya 'reason' açıklamasını esas al; "
                         "çıktıda yazmayan hiçbir uydurma sebep (kalp ritmi, nabız, bağlantı vb.) KESİNLİKLE ÜRETME. Asla gerçekleşmeyen bir hareketi gerçekleşmiş gibi iddia etme."
+                    )
+                elif func_name == "inspect_camera_view":
+                    obs_text = tool_result.get("observation", "") if isinstance(tool_result, dict) else str(tool_result)
+                    tool_instructions = (
+                        f"KAMERA VE GÖRME CEVABI KURALI: Kamera görüntüsü başarıyla alındı ve analiz edildi! "
+                        f"Kameranın gördüğü ortam ve nesneler şunlardır: '{obs_text}'. "
+                        f"Bu gözlemi kullanıcıya doğrudan, samimi ve tek bir kısa Türkçe cümle (en fazla 15-25 kelime) ile söyle. "
+                        f"KESİNLİKLE 'kamera çağrısı hâlâ işliyor', 'biraz bekle', 'şu an göremiyorum', 'netleşirse' gibi sözler SÖYLEME! "
+                        f"Gözlemdeki nesneleri ve odayı hemen şimdi kendi gözünle görmüş gibi kullanıcıya aktar."
                     )
                 else:
                     tool_instructions = (
@@ -3355,7 +3372,8 @@ class AstroRealtimeNode(Node):
         if frame is None:
             return {"status": "no_camera_frame", "observation": "Kamera görüntüsü şu an alınamadı."}
 
-        b64_img = frame_to_base64_jpeg(frame, max_dim=512)
+        # Optimized 384px dimension for ultra-fast base64 encoding and transfer
+        b64_img = frame_to_base64_jpeg(frame, max_dim=384)
         if not b64_img:
             return {"status": "encode_error", "observation": "Görüntü işlenemedi."}
 
@@ -3364,25 +3382,91 @@ class AstroRealtimeNode(Node):
             b64_img = b64_img.split(",")[-1]
         b64_img = b64_img.replace("\n", "").replace("\r", "").strip()
 
+        # Concise prompt asking for an immediate, short conversational description (15-20 words)
         prompt_text = (
-            f"Sen Astro adlı sosyal robotun gözüsün. Bu fotoğrafta karşındaki odayı, ortamı, insanların duruşunu, "
-            f"masadaki eşyaları ve kullanıcının elinde tuttuğu nesneyi çok detaylı ve %100 doğru şekilde Türkçe açıkla. "
-            f"Odaklanılacak konu: {focus if focus else 'kullanıcının elindeki nesne, odadaki eşyalar ve çevre'}. Doğrudan kesin gözlemini kısa ve net yaz."
+            f"Sen sosyal robot Astrosun. Bu fotoğrafta kameranın gördüğü ortamı, eşyaları ve kişiyi tek bir kısa, samimi ve canlı Türkçe cümleyle (en fazla 15-20 kelime) söyle. "
+            f"Odaklanılacak konu: {focus if focus else 'odadaki eşyalar ve çevre'}. Doğrudan ne gördüğünü söyle."
         )
 
         refusal_kws = ["üzgünüm", "yardımcı olamam", "açıklayamıyorum", "cannot assist", "i am sorry", "i'm sorry", "doğrudan açıklayamıyorum"]
         obs = None
 
-        # 1. Primary: Groq Vision Models (0 Token Cost, Ultra Fast)
-        if self.groq_api_key:
+        def _try_openai_vision():
+            if not self.openai_api_key:
+                return None
+            import urllib.request
+            vision_model = os.environ.get("OPENAI_VISION_MODEL", "gpt-4o-mini")
+            req_data = {
+                "model": vision_model,
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": prompt_text},
+                            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64_img}"}}
+                        ]
+                    }
+                ],
+                "max_tokens": 60,
+                "temperature": 0.2
+            }
+            req = urllib.request.Request(
+                "https://api.openai.com/v1/chat/completions",
+                data=json.dumps(req_data, ensure_ascii=False).encode("utf-8"),
+                headers={
+                    "Content-Type": "application/json",
+                    "Authorization": f"Bearer {self.openai_api_key}",
+                    "User-Agent": "Mozilla/5.0"
+                },
+                method="POST"
+            )
+            with urllib.request.urlopen(req, timeout=3.5) as resp:
+                res_json = json.loads(resp.read().decode("utf-8"))
+                cand = res_json["choices"][0]["message"]["content"].strip()
+                if cand and not any(rk in cand.lower() for rk in refusal_kws):
+                    return cand
+            return None
+
+        def _try_gemini_vision():
+            if not self.gemini_api_key:
+                return None
+            import urllib.request
+            # Active fast vision models
+            for g_mod in ["gemini-2.0-flash", "gemini-1.5-flash"]:
+                try:
+                    url = f"https://generativelanguage.googleapis.com/v1beta/models/{g_mod}:generateContent?key={self.gemini_api_key}"
+                    payload = {
+                        "contents": [{
+                            "parts": [
+                                {"text": prompt_text},
+                                {"inline_data": {"mime_type": "image/jpeg", "data": b64_img}}
+                            ]
+                        }],
+                        "generation_config": {"temperature": 0.2, "max_output_tokens": 60}
+                    }
+                    req = urllib.request.Request(
+                        url,
+                        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+                        headers={"Content-Type": "application/json", "User-Agent": "Mozilla/5.0"}
+                    )
+                    with urllib.request.urlopen(req, timeout=3.0) as resp:
+                        res_json = json.loads(resp.read().decode("utf-8"))
+                        cand = res_json["candidates"][0]["content"]["parts"][0]["text"].strip()
+                        if cand and not any(rk in cand.lower() for rk in refusal_kws):
+                            return cand
+                except Exception as ge:
+                    self.get_logger().debug(f"Gemini Vision ({g_mod}) error: {ge}")
+            return None
+
+        def _try_groq_vision():
+            if not self.groq_api_key:
+                return None
+            import urllib.request
             active_groq = discover_groq_models(self.groq_api_key)
-            groq_v_models = [m for m in active_groq if "vision" in m]
-            if not groq_v_models:
-                groq_v_models = [m for m in ["llama-3.3-70b-versatile", "openai/gpt-oss-120b", "openai/gpt-oss-20b"] if m in active_groq]
+            # Only use models that explicitly support vision
+            groq_v_models = [m for m in active_groq if "vision" in m.lower()]
             for v_mod in groq_v_models:
                 try:
-                    import urllib.request
-                    import urllib.error
                     req_data = {
                         "model": v_mod,
                         "messages": [
@@ -3394,12 +3478,11 @@ class AstroRealtimeNode(Node):
                                 ]
                             }
                         ],
-                        "max_tokens": 150
+                        "max_tokens": 60
                     }
-                    data_bytes = json.dumps(req_data, ensure_ascii=False).encode("utf-8")
                     req = urllib.request.Request(
                         "https://api.groq.com/openai/v1/chat/completions",
-                        data=data_bytes,
+                        data=json.dumps(req_data, ensure_ascii=False).encode("utf-8"),
                         headers={
                             "Content-Type": "application/json",
                             "Authorization": f"Bearer {self.groq_api_key}",
@@ -3407,89 +3490,32 @@ class AstroRealtimeNode(Node):
                         },
                         method="POST"
                     )
-                    with urllib.request.urlopen(req, timeout=5.0) as resp:
-                        resp_json = json.loads(resp.read().decode("utf-8"))
-                        candidate_obs = resp_json["choices"][0]["message"]["content"].strip()
-                        if candidate_obs and not any(rk in candidate_obs.lower() for rk in refusal_kws):
-                            obs = candidate_obs
-                            break
-                except urllib.error.HTTPError as http_e:
-                    error_body = http_e.read().decode("utf-8", errors="ignore")
-                    self.get_logger().debug(f"Groq API ({v_mod}) notice: {http_e.code} - {error_body}")
-                except Exception as ge:
-                    self.get_logger().debug(f"Groq ({v_mod}) notice: {ge}")
-
-        # 2. Secondary: Google Gemini Flash REST (0 Token Cost, Blazing Fast)
-        if not obs and self.gemini_api_key:
-            for g_mod in ["gemini-2.5-flash", "gemini-1.5-flash", "gemini-3.6-flash", "gemini-flash-latest"]:
-                try:
-                    import urllib.request
-                    import urllib.error
-                    url = f"https://generativelanguage.googleapis.com/v1beta/models/{g_mod}:generateContent?key={self.gemini_api_key}"
-                    payload = {
-                        "contents": [{
-                            "parts": [
-                                {"text": prompt_text},
-                                {"inline_data": {"mime_type": "image/jpeg", "data": b64_img}}
-                            ]
-                        }],
-                        "generation_config": {"temperature": 0.2, "max_output_tokens": 150}
-                    }
-                    data_bytes = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-                    req = urllib.request.Request(
-                        url,
-                        data=data_bytes,
-                        headers={"Content-Type": "application/json", "User-Agent": "Mozilla/5.0"}
-                    )
-                    with urllib.request.urlopen(req, timeout=5.0) as resp:
+                    with urllib.request.urlopen(req, timeout=3.0) as resp:
                         res_json = json.loads(resp.read().decode("utf-8"))
-                        candidate_obs = res_json["candidates"][0]["content"]["parts"][0]["text"].strip()
-                        if candidate_obs and not any(rk in candidate_obs.lower() for rk in refusal_kws):
-                            obs = candidate_obs
-                            break
-                except urllib.error.HTTPError as http_e:
-                    error_body = http_e.read().decode("utf-8", errors="ignore")
-                    self.get_logger().debug(f"Gemini Vision ({g_mod}) notice: {http_e.code} - {error_body}")
-                except Exception as gem_e:
-                    self.get_logger().debug(f"Gemini Vision ({g_mod}) notice: {gem_e}")
+                        cand = res_json["choices"][0]["message"]["content"].strip()
+                        if cand and not any(rk in cand.lower() for rk in refusal_kws):
+                            return cand
+                except Exception as ge:
+                    self.get_logger().debug(f"Groq Vision ({v_mod}) error: {ge}")
+            return None
 
-        # 3. Emergency Safety Fallback: OpenAI Vision REST API (configurable fallback model)
-        # (Only used if Gemini & Groq keys are invalid/failed, so robot never goes blind)
-        if not obs and self.openai_api_key:
+        # Execute providers with cached fastest preference
+        fastest_pref = getattr(self, "_fastest_vision_provider", "openai")
+        providers = [("openai", _try_openai_vision), ("gemini", _try_gemini_vision), ("groq", _try_groq_vision)]
+        if fastest_pref == "gemini":
+            providers = [("gemini", _try_gemini_vision), ("openai", _try_openai_vision), ("groq", _try_groq_vision)]
+        elif fastest_pref == "groq":
+            providers = [("groq", _try_groq_vision), ("openai", _try_openai_vision), ("gemini", _try_gemini_vision)]
+
+        for prov_name, prov_fn in providers:
             try:
-                import urllib.request
-                vision_fallback_model = os.environ.get("OPENAI_VISION_MODEL", os.environ.get("LLM_FALLBACK_MODEL", "gpt-4o-mini"))
-                req_data = {
-                    "model": vision_fallback_model,
-                    "messages": [
-                        {
-                            "role": "user",
-                            "content": [
-                                {"type": "text", "text": prompt_text},
-                                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64_img}"}}
-                            ]
-                        }
-                    ],
-                    "max_tokens": 150
-                }
-                data_bytes = json.dumps(req_data, ensure_ascii=False).encode("utf-8")
-                req = urllib.request.Request(
-                    "https://api.openai.com/v1/chat/completions",
-                    data=data_bytes,
-                    headers={
-                        "Content-Type": "application/json",
-                        "Authorization": f"Bearer {self.openai_api_key}",
-                        "User-Agent": "Mozilla/5.0"
-                    },
-                    method="POST"
-                )
-                with urllib.request.urlopen(req, timeout=6.0) as resp:
-                    resp_json = json.loads(resp.read().decode("utf-8"))
-                    candidate_obs = resp_json["choices"][0]["message"]["content"].strip()
-                    if candidate_obs and not any(rk in candidate_obs.lower() for rk in refusal_kws):
-                        obs = candidate_obs
-            except Exception as oe:
-                self.get_logger().debug(f"OpenAI Vision emergency fallback notice: {oe}")
+                cand = prov_fn()
+                if cand:
+                    obs = cand
+                    self._fastest_vision_provider = prov_name
+                    break
+            except Exception as pe:
+                self.get_logger().debug(f"Vision provider ({prov_name}) exception: {pe}")
 
         if obs:
             self.get_logger().info(f"👁️ [Kamera Görme Sonucu]: \"{obs}\"")
@@ -5816,6 +5842,10 @@ class AstroRealtimeNode(Node):
             return
 
         # --- Standard OpenAI Realtime Mode ---
+        # Gating: While a tool is actively in progress, do NOT stream audio to OpenAI to prevent premature server VAD!
+        if getattr(self, "_active_tool_call_in_progress", False):
+            return
+
         # Gating: Microphone PCM is strictly streamed ONLY when _can_use_openai("realtime") is True
         if (
             self._can_use_openai("realtime")

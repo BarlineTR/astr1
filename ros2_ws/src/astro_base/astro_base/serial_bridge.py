@@ -24,7 +24,17 @@ try:
     from sensor_msgs.msg import Imu, JointState
     from astro_base.msg import HeadCmd, WheelCmd
 except ImportError:
-    rclpy = None
+    class _MockRclpy:
+        @staticmethod
+        def ok():
+            return True
+        @staticmethod
+        def shutdown():
+            pass
+        @staticmethod
+        def init(*args, **kwargs):
+            pass
+    rclpy = _MockRclpy()  # type: ignore
     class Node:  # type: ignore
         def __init__(self, *args, **kwargs): pass
         def get_logger(self):
