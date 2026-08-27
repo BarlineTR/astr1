@@ -21,6 +21,7 @@ setup(
         'console_scripts': [
             'serial_bridge = astro_base.serial_bridge:main',
             'head_tracker = astro_base.head_tracker_node:main',
+            'diff_drive = astro_base.diff_drive_node:main',
         ],
     },
 )

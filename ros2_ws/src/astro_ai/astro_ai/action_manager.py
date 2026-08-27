@@ -89,6 +89,8 @@ class ActionResult:
     actual_direction: Optional[str] = None
     duration_ms: Optional[int] = None
     hardware_ack: bool = False
+    verified: bool = False
+    encoder_delta: Optional[float] = None
     error_code: Optional[str] = None
     error: Optional[str] = None
     reason: Optional[str] = None
@@ -103,9 +105,12 @@ class ActionResult:
             "action": self.action,
             "action_id": self.action_id,
             "hardware_ack": self.hardware_ack,
+            "verified": self.verified,
             "message": self.message,
             "timestamp": round(self.timestamp, 3),
         }
+        if self.encoder_delta is not None:
+            d["encoder_delta"] = round(self.encoder_delta, 4)
         if self.generation_id is not None:
             d["generation_id"] = self.generation_id
         if self.azimuth_deg is not None:
@@ -170,12 +175,46 @@ class ActionManager:
 
         # Action Idempotency & History
         self._executed_action_ids: Set[str] = set()
+        self._action_id_history: Deque[str] = collections.deque(maxlen=200)
         self._recent_actions: Deque[ActionResult] = collections.deque(maxlen=50)
+
+        # Joint States / Encoder Tracking for Physical Grounding
+        self._joint_positions: Dict[str, float] = {
+            "left_wheel_joint": 0.0,
+            "right_wheel_joint": 0.0,
+            "head_yaw_joint": 0.0,
+        }
+        self._joint_velocities: Dict[str, float] = {
+            "left_wheel_joint": 0.0,
+            "right_wheel_joint": 0.0,
+            "head_yaw_joint": 0.0,
+        }
+        self._last_joint_update_ts: float = 0.0
 
         # Movement Safety Limits
         self.max_linear_speed = 0.4   # m/s
         self.max_angular_speed = 0.8  # rad/s
         self.max_duration_s = 5.0
+
+    def update_joint_states(
+        self,
+        joint_names: List[str],
+        positions: List[float],
+        velocities: Optional[List[float]] = None,
+    ):
+        """Updates internal physical joint state estimates from /joint_states."""
+        with self._lock:
+            for idx, name in enumerate(joint_names):
+                if idx < len(positions):
+                    self._joint_positions[name] = float(positions[idx])
+                if velocities and idx < len(velocities):
+                    self._joint_velocities[name] = float(velocities[idx])
+            self._last_joint_update_ts = time.monotonic()
+
+    def get_joint_positions(self) -> Dict[str, float]:
+        """Returns a snapshot of current joint positions."""
+        with self._lock:
+            return dict(self._joint_positions)
 
     def update_audio_state(
         self,
@@ -419,8 +458,9 @@ class ActionManager:
                     return res
 
             self._executed_action_ids.add(act_id)
-            if len(self._executed_action_ids) > 100:
-                self._executed_action_ids.clear()
+            self._action_id_history.append(act_id)
+
+            has_joint_feedback = (self._last_joint_update_ts > 0.0 and (time.monotonic() - self._last_joint_update_ts) < 5.0)
 
             res = ActionResult(
                 success=True,
@@ -433,6 +473,7 @@ class ActionManager:
                 actual_direction=dir_str,
                 duration_ms=int(turn_duration * 1000),
                 hardware_ack=True,
+                verified=bool(has_joint_feedback),
                 message=f"Sesin geldiği {round(azimuth, 1)}° ({dir_str}) yönüne başarıyla dönüldü.",
             )
             self._recent_actions.append(res)
@@ -453,7 +494,7 @@ class ActionManager:
 
         with self._lock:
             # Idempotency check
-            if clean_dir != "stop" and act_id in self._executed_action_ids:
+            if clean_dir != "stop" and (act_id in self._executed_action_ids or act_id in self._action_id_history):
                 return ActionResult(
                     success=True,
                     action="move_robot",
@@ -541,8 +582,9 @@ class ActionManager:
 
                 if clean_dir != "stop":
                     self._executed_action_ids.add(act_id)
-                    if len(self._executed_action_ids) > 100:
-                        self._executed_action_ids.clear()
+                    self._action_id_history.append(act_id)
+
+                has_joint_feedback = (clean_dir == "stop") or (self._last_joint_update_ts > 0.0 and (time.monotonic() - self._last_joint_update_ts) < 5.0)
 
                 res = ActionResult(
                     success=True,
@@ -553,6 +595,7 @@ class ActionManager:
                     actual_direction=clean_dir,
                     duration_ms=int(clamped_duration * 1000),
                     hardware_ack=True,
+                    verified=bool(has_joint_feedback),
                     message=f"Robot {clean_dir} yönünde {clamped_speed} m/s hızla hareket ettirildi.",
                 )
                 self._recent_actions.append(res)

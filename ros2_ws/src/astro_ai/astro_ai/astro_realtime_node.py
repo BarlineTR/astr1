@@ -33,7 +33,7 @@ try:
     import rclpy
     from rclpy.node import Node
     from rclpy.qos import qos_profile_sensor_data
-    from sensor_msgs.msg import Image, CameraInfo, LaserScan
+    from sensor_msgs.msg import Image, CameraInfo, LaserScan, JointState
     from std_msgs.msg import Bool, Float32, String
     from geometry_msgs.msg import Twist
     from diagnostic_msgs.msg import DiagnosticArray
@@ -65,7 +65,7 @@ except ImportError:
         def __init__(self):
             self.linear = Twist.Vector3()
             self.angular = Twist.Vector3()
-    Image = CameraInfo = Bool = Float32 = String = DiagnosticArray = LaserScan = _MockMsg  # type: ignore
+    Image = CameraInfo = Bool = Float32 = String = DiagnosticArray = LaserScan = JointState = _MockMsg  # type: ignore
 
 try:
     import cv2
@@ -136,6 +136,17 @@ except ImportError:
         from action_manager import ActionManager, SoundDirection, ActionResult
     except ImportError:
         ActionManager = SoundDirection = ActionResult = None  # type: ignore
+
+try:
+    from astro_ai.brain.social_brain import SocialBrain
+    from astro_ai.contracts.person_state import UnifiedPersonState
+except ImportError:
+    try:
+        from brain.social_brain import SocialBrain
+        from contracts.person_state import UnifiedPersonState
+    except ImportError:
+        SocialBrain = None
+        UnifiedPersonState = None
 
 
 
@@ -556,6 +567,18 @@ class AstroRealtimeNode(Node):
         self.session = ConversationSession(base_timeout_s=16.0)
         self.action_manager = ActionManager(logger=self.get_logger(), node=self) if ActionManager else None
 
+        # Social Cognitive Brain Subsystem (authoritative unified world model & social intelligence)
+        self.social_brain = None
+        if SocialBrain:
+            try:
+                db_dir = os.path.expanduser("~/.astro")
+                os.makedirs(db_dir, exist_ok=True)
+                cognitive_db_path = os.path.join(db_dir, "cognitive.db")
+                self.social_brain = SocialBrain(db_path=cognitive_db_path)
+                self.get_logger().info(f"🧠 [SocialBrain] Başlatıldı. Bilişsel veritabanı: {cognitive_db_path}")
+            except Exception as e:
+                self.get_logger().warn(f"⚠️ [SocialBrain] Başlatma uyarısı: {e}")
+
         # State
         self._lock = threading.RLock()
         self._recognized_person: Optional[Dict[str, Any]] = None
@@ -785,6 +808,8 @@ class AstroRealtimeNode(Node):
         self.create_subscription(CameraInfo, "/oak/rgb/camera_info", self._on_camera_info, qos_profile_sensor_data)
         self.create_subscription(DiagnosticArray, "/arduino/diagnostics", self._on_arduino_diag, 10)
         self.create_subscription(LaserScan, "/scan", self._on_laser_scan, qos_profile_sensor_data)
+        self.create_subscription(LaserScan, "/scan_filtered", self._on_laser_scan, qos_profile_sensor_data)
+        self.create_subscription(JointState, "/joint_states", self._on_joint_states, qos_profile_sensor_data)
 
         # Tool execution deduplication
         self._executed_tool_calls: set[str] = set()
@@ -1295,11 +1320,32 @@ class AstroRealtimeNode(Node):
             "- Yapılmayan eylemler için yapılmış gibi iddialarda bulunma."
         )
 
+        social_context_str = ""
+        if getattr(self, "social_brain", None) and UnifiedPersonState:
+            try:
+                person = UnifiedPersonState(
+                    person_id=str(identity.get("user_id", name_val.lower())),
+                    name=name_val,
+                    formal_title=identity.get("formal_title", name_val),
+                    is_known=is_known,
+                    identity_confidence=float(identity.get("confidence", identity.get("score", 0.0))),
+                    distance_m=float(getattr(self, "_user_distance", 1.5)),
+                    is_looking_at_robot=bool(getattr(self, "_looking_at_robot", False)),
+                    is_present=True,
+                )
+                self.social_brain.world_model.update_people([person])
+                last_txt = getattr(self, "_last_user_transcript", "merhaba") or "merhaba"
+                _, _, brain_prompt = self.social_brain.process_dialogue_turn(last_txt, person_state=person)
+                if brain_prompt:
+                    social_context_str = f"\n\n[SOSYAL ROBOT BİLİŞSEL BAĞLAMI]:\n{brain_prompt}\n"
+            except Exception as _sb_err:
+                self.get_logger().debug(f"SocialBrain dialogue turn notice: {_sb_err}")
+
         if not getattr(self, "persona_engine", None):
-            return f"Astro Default Instructions {bio_status}"
+            return f"Astro Default Instructions {bio_status}{social_context_str}"
         mem_ctx = self.memory.get_prompt_context(recognized_person=identity) if getattr(self, "memory", None) else ""
         return self.persona_engine.build_system_prompt(
-            memory_context=mem_ctx + bio_status + memory_rule,
+            memory_context=mem_ctx + bio_status + memory_rule + social_context_str,
             recognized_person=identity
         )
 
@@ -3683,8 +3729,29 @@ class AstroRealtimeNode(Node):
             forward_samples = ranges[: max(1, n // 8)] + ranges[- max(1, n // 8) :]
             valid = [r for r in forward_samples if 0.05 < r < 0.45]
             self._obstacle_detected = (len(valid) >= 3)
+            if getattr(self, "social_brain", None) and hasattr(self.social_brain, "spatial_fusion"):
+                try:
+                    self.social_brain.spatial_fusion.update_lidar_scan(ranges)
+                except Exception:
+                    pass
         except Exception as _exc:
             self.get_logger().debug(f"_on_laser_scan: {_exc}")
+
+    def _on_joint_states(self, msg: Any):
+        """Processes wheel and head encoder feedback from /joint_states for physical grounding."""
+        try:
+            names = list(getattr(msg, "name", []))
+            positions = list(getattr(msg, "position", []))
+            velocities = list(getattr(msg, "velocity", []))
+            if getattr(self, "action_manager", None) and hasattr(self.action_manager, "update_joint_states"):
+                self.action_manager.update_joint_states(names, positions, velocities)
+            if getattr(self, "social_brain", None) and hasattr(self.social_brain, "world_model"):
+                for idx, name in enumerate(names):
+                    if name == "head_yaw_joint" and idx < len(positions):
+                        head_yaw_deg = math.degrees(float(positions[idx]))
+                        self.social_brain.world_model._robot_state["head_yaw_deg"] = head_yaw_deg
+        except Exception as _exc:
+            self.get_logger().debug(f"_on_joint_states: {_exc}")
 
     def _evaluate_vision_event(self, event_type: str, focus: str = "", explicit: bool = False) -> Optional[Dict[str, Any]]:
         """Event-driven vision gating: evaluates frame difference, cooldown, budget, and semantic filters."""

@@ -10,14 +10,49 @@ import struct
 import threading
 import time
 
-import rclpy
-import serial
-from diagnostic_msgs.msg import DiagnosticArray, DiagnosticStatus, KeyValue
-from rclpy.node import Node
-from rclpy.qos import QoSProfile, ReliabilityPolicy
-from sensor_msgs.msg import Imu, JointState
+try:
+    import serial
+except ImportError:
+    serial = None
 
-from astro_base.msg import HeadCmd, WheelCmd
+try:
+    import rclpy
+    from rclpy.node import Node
+    from rclpy.qos import QoSProfile, ReliabilityPolicy
+    from diagnostic_msgs.msg import DiagnosticArray, DiagnosticStatus, KeyValue
+    from geometry_msgs.msg import Twist
+    from sensor_msgs.msg import Imu, JointState
+    from astro_base.msg import HeadCmd, WheelCmd
+except ImportError:
+    rclpy = None
+    class Node:  # type: ignore
+        def __init__(self, *args, **kwargs): pass
+        def get_logger(self):
+            import logging
+            return logging.getLogger("SerialBridge")
+        def declare_parameter(self, *args, **kwargs): pass
+        def get_parameter(self, name):
+            class _P:
+                value = 0.0
+                def get_parameter_value(self):
+                    class _PV:
+                        string_value = ""
+                        integer_value = 0
+                    return _PV()
+            return _P()
+        def create_publisher(self, *args, **kwargs): return None
+        def create_subscription(self, *args, **kwargs): return None
+        def create_timer(self, *args, **kwargs): return None
+    class QoSProfile:  # type: ignore
+        def __init__(self, *args, **kwargs): pass
+    class ReliabilityPolicy:  # type: ignore
+        BEST_EFFORT = 1
+    class HeadCmd:
+        angle_deg: float = 0.0
+    class WheelCmd:
+        left_rpm: float = 0.0
+        right_rpm: float = 0.0
+    DiagnosticArray = DiagnosticStatus = KeyValue = Twist = Imu = JointState = object
 
 SOF1 = 0xAA
 SOF2 = 0x55
@@ -114,6 +149,7 @@ class SerialBridge(Node):
         self.declare_parameter("ticks_per_rev_right", 2048.0)
         self.declare_parameter("wheel_radius_left", 0.06)
         self.declare_parameter("wheel_radius_right", 0.06)
+        self.declare_parameter("wheel_separation", 0.26)
 
         self.port_param = self.get_parameter("port").get_parameter_value().string_value
         self.baud = self.get_parameter("baud").get_parameter_value().integer_value
@@ -124,6 +160,9 @@ class SerialBridge(Node):
         )
         self.tpr_l = float(self.get_parameter("ticks_per_rev_left").value)
         self.tpr_r = float(self.get_parameter("ticks_per_rev_right").value)
+        self.wheel_radius_l = float(self.get_parameter("wheel_radius_left").value)
+        self.wheel_radius_r = float(self.get_parameter("wheel_radius_right").value)
+        self.wheel_separation = float(self.get_parameter("wheel_separation").value)
 
         qos_best_effort = QoSProfile(
             depth=10, reliability=ReliabilityPolicy.BEST_EFFORT
@@ -139,6 +178,9 @@ class SerialBridge(Node):
 
         self.sub_wheel = self.create_subscription(
             WheelCmd, "/wheel_cmds", self.on_wheel_cmd, 10
+        )
+        self.sub_cmd_vel = self.create_subscription(
+            Twist, "/cmd_vel", self.on_cmd_vel, 10
         )
         self.sub_head = self.create_subscription(
             HeadCmd, "/head_cmd", self.on_head_cmd, 10
@@ -392,8 +434,26 @@ class SerialBridge(Node):
             self.get_logger().error(f"WheelCmd write failed: {exc}")
             self._mark_disconnected()
 
+    def on_cmd_vel(self, msg: Twist):
+        """Converts standard differential drive Twist (m/s, rad/s) to WheelCmd (RPM)."""
+        v = float(msg.linear.x)
+        w = float(msg.angular.z)
+        v_left = v - (w * self.wheel_separation / 2.0)
+        v_right = v + (w * self.wheel_separation / 2.0)
+        left_rpm = (v_left / self.wheel_radius_l) * (60.0 / (2.0 * math.pi))
+        right_rpm = (v_right / self.wheel_radius_r) * (60.0 / (2.0 * math.pi))
+
+        wheel_cmd = WheelCmd()
+        wheel_cmd.left_rpm = float(left_rpm)
+        wheel_cmd.right_rpm = float(right_rpm)
+        self.on_wheel_cmd(wheel_cmd)
+
     def on_head_cmd(self, msg: HeadCmd):
-        if self.ser is None or not self.ser.is_open:
+        if self.ser is None or not self.ser.is_open or not self.arduino_alive:
+            self.get_logger().warn(
+                "[HEAD SAFETY BLOCK] reason=heartbeat_ack_missing\n"
+                "  Arduino not responding to heartbeat — head command rejected."
+            )
             return
 
         payload = struct.pack("<f", msg.angle_deg)
@@ -506,7 +566,7 @@ class SerialBridge(Node):
                         body = bytes([expected_len]) + bytes(buf)
                         c = crc8(body)
                         msg_id = buf[0] if buf else 0
-                        if c == b or msg_id == MSG_HEARTBEAT_ACK:
+                        if c == b:
                             payload = bytes(buf[1:])
                             self.handle_msg(msg_id, payload)
                             state = 0
