@@ -134,11 +134,26 @@ class CalendarService:
                     elif line.startswith("DTSTART"):
                         val = line.split(":")[-1].replace("Z", "")
                         try:
-                            dt = datetime.strptime(val[:15], "%Y%m%dT%H%M%S")
-                            cur_event["start_time"] = dt.strftime("%Y-%m-%d %H:%M")
+                            if len(val) == 8 and val.isdigit():
+                                dt = datetime.strptime(val, "%Y%m%d")
+                                cur_event["start_time"] = dt.strftime("%Y-%m-%d 09:00")
+                            else:
+                                dt = datetime.strptime(val[:15], "%Y%m%dT%H%M%S")
+                                cur_event["start_time"] = dt.strftime("%Y-%m-%d %H:%M")
                             cur_event["duration_minutes"] = 45
                             cur_event["organizer"] = "Google Takvim"
                             cur_event["id"] = f"ical_{val[:15]}_{abs(hash(cur_event.get('title', '')))}"
+                        except Exception:
+                            pass
+                    elif line.startswith("DTEND"):
+                        val = line.split(":")[-1].replace("Z", "")
+                        try:
+                            if len(val) >= 15 and "start_time" in cur_event:
+                                dt_end = datetime.strptime(val[:15], "%Y%m%dT%H%M%S")
+                                dt_start = datetime.strptime(cur_event["start_time"], "%Y-%m-%d %H:%M")
+                                dur = int((dt_end - dt_start).total_seconds() / 60.0)
+                                if dur > 0:
+                                    cur_event["duration_minutes"] = dur
                         except Exception:
                             pass
             return events
