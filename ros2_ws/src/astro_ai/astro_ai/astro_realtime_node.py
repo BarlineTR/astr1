@@ -264,6 +264,19 @@ def reset_openai_hard_disabled_for_test() -> None:
 REALTIME_WS_URL = "wss://api.openai.com/v1/realtime?model=gpt-realtime-2.1-mini"
 VALID_REALTIME_VOICES = {"alloy", "ash", "ballad", "coral", "echo", "sage", "shimmer", "verse", "fable", "onyx"}
 
+PERSONA_DEFAULT_VOICES: Dict[str, str] = {
+    "kufurbaz": "ash",      # Raspy, gritty, aggressive street tone (Küfürbaz Haydo)
+    "angry": "ash",         # Aggressive, raspy
+    "rude": "ash",          # Rough, blunt
+    "sarcastic": "ash",     # Cynical, sharp
+    "flirt": "shimmer",     # Energetic, charismatic
+    "charming": "shimmer",  # Playful, attractive
+    "playful": "ballad",    # Animated, lively
+    "witty": "verse",       # Punchy, dynamic
+    "formal": "sage",       # Professional, calm
+    "emotional": "echo",    # Soft, empathetic
+}
+
 
 def discover_realtime_models(api_key: str, preferred: str = "") -> list[str]:
     # Öncelik sırası HIZA göre. gpt-realtime-2.1-mini (6 Tem 2026) Realtime
@@ -521,8 +534,8 @@ class AstroRealtimeNode(Node):
         )
         self.connect_realtime = bool(connect_realtime and not is_test_mode)
         self.fake_transport = fake_transport
-        self.realtime_voice = raw_voice if raw_voice in VALID_REALTIME_VOICES else "echo"
         self.persona_name = os.environ.get("PERSONA", "playful").strip().lower()
+        self.realtime_voice = raw_voice if raw_voice in VALID_REALTIME_VOICES else PERSONA_DEFAULT_VOICES.get(self.persona_name, "echo")
 
         # Anahtarın nereden geldiğini başlangıçta söyle. "eksik" hatası alındığında
         # ilk soru her zaman "hangi .env okundu" oluyor; cevabı burada.
@@ -2607,6 +2620,8 @@ class AstroRealtimeNode(Node):
                 self.persona_name = target
                 self.persona_engine.set_persona(target)
                 self.memory.profile.set_persona(target)
+                raw_v = os.environ.get("OPENAI_REALTIME_VOICE", "").strip().lower()
+                self.realtime_voice = raw_v if raw_v in VALID_REALTIME_VOICES else PERSONA_DEFAULT_VOICES.get(target, "echo")
                 self._last_synced_identity = ""  # Force immediate session update
 
                 # Publish emotion for face screen
@@ -2614,7 +2629,7 @@ class AstroRealtimeNode(Node):
                 emo_msg.data = target
                 self.pub_emotion.publish(emo_msg)
 
-                self.get_logger().info(f"🎭 [Kişilik Değiştirildi]: Yeni kişilik modu -> '{target.upper()}'")
+                self.get_logger().info(f"🎭 [Kişilik Değiştirildi]: Yeni kişilik modu -> '{target.upper()}', Ses -> [{self.realtime_voice}]")
                 self._sync_perception_to_session()
                 return {
                     "status": "success",
@@ -5456,7 +5471,7 @@ class AstroRealtimeNode(Node):
 
             # 2. Self-Voice Rejection Check
             if self_voice_score >= 0.70:
-                self.get_logger().info(
+                self.get_logger().debug(
                     f"[BARGE-IN DECISION]\n"
                     f"playback_active=true\n"
                     f"vad_confidence={1.0 if getattr(self, '_vad_active', False) else 0.0:.2f}\n"
@@ -5505,7 +5520,7 @@ class AstroRealtimeNode(Node):
                     # Transient noise is an isolated impulse (<40ms) when VAD does not detect human voice
                     is_transient = (speech_duration_ms < 40) and not is_human_candidate
                     reason = "transient_noise" if is_transient else "insufficient_speech_duration"
-                    self.get_logger().info(
+                    self.get_logger().debug(
                         f"[BARGE-IN DECISION]\n"
                         f"playback_active=true\n"
                         f"vad_confidence={1.0 if getattr(self, '_vad_active', False) else 0.0:.2f}\n"
