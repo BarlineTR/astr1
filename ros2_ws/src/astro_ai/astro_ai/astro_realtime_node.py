@@ -564,7 +564,11 @@ class AstroRealtimeNode(Node):
         self.memory = MemoryManager()
         self.persona_engine = PersonaEngine(self.persona_name)
         self.state_machine = StateMachine(RobotState.DEEP_IDLE)
-        self.session = ConversationSession(base_timeout_s=16.0)
+        self._session_turns_buffer: List[Dict[str, Any]] = []
+        self.session = ConversationSession(
+            base_timeout_s=16.0,
+            on_session_end=self._on_conversation_session_ended,
+        )
         self.action_manager = ActionManager(logger=self.get_logger(), node=self) if ActionManager else None
 
         # Social Cognitive Brain Subsystem (authoritative unified world model & social intelligence)
@@ -2215,6 +2219,11 @@ class AstroRealtimeNode(Node):
                 self._last_user_transcript = user_transcript
                 self.get_logger().info(f"🗣️ [Siz]: \"{user_transcript}\"")
                 self.memory.episodic.add_message("user", user_transcript)
+                self._session_turns_buffer.append({
+                    "role": "user",
+                    "content": user_transcript,
+                    "timestamp": time.time(),
+                })
                 self.session.record_user_speech()
                 self.session.activate_session(reason="user_speech")
                 t_msg = String()
@@ -2227,7 +2236,13 @@ class AstroRealtimeNode(Node):
             if assistant_transcript:
                 self.get_logger().info(f"🤖 [Astro Realtime]: \"{assistant_transcript}\"")
                 self.memory.episodic.add_message("assistant", assistant_transcript)
+                self._session_turns_buffer.append({
+                    "role": "assistant",
+                    "content": assistant_transcript,
+                    "timestamp": time.time(),
+                })
                 self.session.record_robot_speech()
+                self._ground_speech_gesture(assistant_transcript)
 
 
         # 6. Realtime Function Calling Execution (Single Execution per call_id)
@@ -5932,6 +5947,57 @@ class AstroRealtimeNode(Node):
             self._sync_perception_to_session()
         except Exception as _exc:
             self.get_logger().debug(f"_on_speaker_id: yok sayılan hata ({_exc})")
+
+    def _on_conversation_session_ended(self):
+        """Called when a conversational session times out or user departs; consolidates episodic memory."""
+        try:
+            with self._lock:
+                turns = list(self._session_turns_buffer)
+                self._session_turns_buffer.clear()
+                active_person = self._active_person_name or "Misafir"
+                current_emotion = getattr(self, "_user_emotion", "neutral")
+
+            if not turns:
+                return
+
+            if getattr(self, "social_brain", None) and hasattr(self.social_brain, "consolidation_engine"):
+                def _run_consolidation():
+                    try:
+                        self.get_logger().info(
+                            f"💾 [Hafıza Konsolidasyonu]: {active_person} ile yapılan {len(turns)} turluk sohbet kalıcı belleğe işleniyor..."
+                        )
+                        self.social_brain.consolidation_engine.consolidate_session(
+                            person_name=active_person,
+                            dialogue_turns=turns,
+                            emotional_arc=current_emotion,
+                        )
+                    except Exception as err:
+                        self.get_logger().debug(f"Consolidation error: {err}")
+
+                threading.Thread(target=_run_consolidation, daemon=True).start()
+        except Exception as exc:
+            self.get_logger().debug(f"_on_conversation_session_ended: {exc}")
+
+    def _ground_speech_gesture(self, text: str):
+        """Triggers subtle embodied head gestures matching speech semantics and conversational tone."""
+        if not getattr(self, "action_manager", None):
+            return
+        t_low = text.lower()
+        gesture = None
+        if any(k in t_low for k in ("kesinlikle", "tabii ki", "evet", "anladım", "harika", "süper", "memnun oldum")):
+            gesture = "nod"
+        elif any(k in t_low for k in ("merak", "nasıl", "ne dersin", "acaba", "?")):
+            gesture = "tilt"
+        elif any(k in t_low for k in ("hayır", "öyle değil", "malesef", "katılmıyorum", "yanlış")):
+            gesture = "shake"
+        elif any(k in t_low for k in ("bakalım", "etrafta", "nerede", "arıyorum")):
+            gesture = "scan"
+
+        if gesture:
+            try:
+                self.action_manager.execute_gesture(gesture)
+            except Exception as _exc:
+                self.get_logger().debug(f"_ground_speech_gesture: {_exc}")
 
     def _on_user_emotion(self, msg: String):
         self._user_emotion = msg.data.lower().strip()

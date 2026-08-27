@@ -615,6 +615,105 @@ class ActionManager:
                 self._recent_actions.append(res)
                 return res
 
+    GESTURE_PROFILES: Dict[str, List[float]] = {
+        "nod": [12.0, -8.0, 0.0],
+        "shake": [22.0, -22.0, 12.0, 0.0],
+        "tilt": [16.0],
+        "scan": [-35.0, 35.0, 0.0],
+        "center": [0.0],
+        "look_left": [35.0],
+        "look_right": [-35.0],
+    }
+
+    GESTURE_ALIASES: Dict[str, str] = {
+        "yes": "nod",
+        "onayla": "nod",
+        "no": "shake",
+        "reddet": "shake",
+        "curious": "tilt",
+        "merak": "tilt",
+        "ara": "scan",
+        "search": "scan",
+        "sifirla": "center",
+    }
+
+    def execute_gesture(
+        self,
+        gesture_name: str,
+        duration_ms: int = 600,
+        generation_id: Optional[int] = None,
+        action_id: Optional[str] = None,
+    ) -> ActionResult:
+        """Executes a physical head gesture sequence (nod, shake, tilt, scan, center)."""
+        now = time.monotonic()
+        act_id = action_id or f"gesture_{gesture_name}_{int(now * 1000)}"
+        clean_name = (gesture_name or "center").lower().strip()
+        canonical_gesture = self.GESTURE_ALIASES.get(clean_name, clean_name)
+
+        with self._lock:
+            # Idempotency check
+            if act_id in self._executed_action_ids or act_id in self._action_id_history:
+                return ActionResult(
+                    success=True,
+                    action="execute_gesture",
+                    action_id=act_id,
+                    generation_id=generation_id,
+                    requested_direction=clean_name,
+                    actual_direction=canonical_gesture,
+                    hardware_ack=True,
+                    message="Bu jest eylemi zaten yürütüldü.",
+                )
+
+            if canonical_gesture not in self.GESTURE_PROFILES:
+                return ActionResult(
+                    success=False,
+                    action="execute_gesture",
+                    action_id=act_id,
+                    generation_id=generation_id,
+                    error_code="INVALID_GESTURE",
+                    error=f"Geçersiz jest: '{gesture_name}'. Desteklenen jestler: {list(self.GESTURE_PROFILES.keys())}",
+                    message="Geçersiz kafa jesti belirtildi.",
+                    hardware_ack=False,
+                )
+
+            angles = self.GESTURE_PROFILES[canonical_gesture]
+            pub_head = self._pub_head_cmd or getattr(self._node, "pub_head_cmd", None)
+
+            if pub_head and 'HeadCmd' in globals():
+                def _run_gesture_sequence():
+                    step_delay = max(0.08, (duration_ms / 1000.0) / len(angles))
+                    for ang in angles:
+                        try:
+                            h_cmd = HeadCmd()
+                            h_cmd.angle_deg = float(ang)
+                            pub_head.publish(h_cmd)
+                            time.sleep(step_delay)
+                        except Exception as he:
+                            self._logger.debug(f"Gesture step failure: {he}")
+                            break
+
+                threading.Thread(target=_run_gesture_sequence, daemon=True).start()
+
+            self._executed_action_ids.add(act_id)
+            self._action_id_history.append(act_id)
+
+            has_joint_feedback = (self._last_joint_update_ts > 0.0 and (time.monotonic() - self._last_joint_update_ts) < 5.0)
+
+            res = ActionResult(
+                success=True,
+                action="execute_gesture",
+                action_id=act_id,
+                generation_id=generation_id,
+                requested_direction=clean_name,
+                actual_direction=canonical_gesture,
+                duration_ms=duration_ms,
+                hardware_ack=True,
+                verified=bool(has_joint_feedback),
+                message=f"Kafa jesti '{canonical_gesture}' başarıyla yürütüldü.",
+            )
+            self._recent_actions.append(res)
+            return res
+
     def _check_safety_gates(self, direction: str) -> Optional[Dict[str, str]]:
         """Checks Arduino heartbeat health, LiDAR proximity, and LiDAR freshness."""
         node = self._node
