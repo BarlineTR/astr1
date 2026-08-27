@@ -37,6 +37,23 @@ class EpisodicBuffer:
         with self._lock:
             return list(self.messages)
 
+    def search(self, query: str, top_k: int = 3) -> List[str]:
+        """Searches recent dialogue messages for keywords matching query."""
+        with self._lock:
+            if not query:
+                return []
+            q_words = [w.lower() for w in query.split() if len(w) > 2]
+            scored = []
+            for msg in self.messages:
+                content = msg.get("content", "")
+                c_lower = content.lower()
+                matches = sum(1 for w in q_words if w in c_lower)
+                if matches > 0:
+                    role_str = "Kullanıcı" if msg.get("role") == "user" else "Astro"
+                    scored.append((matches, f"{role_str}: {content}"))
+            scored.sort(key=lambda x: x[0], reverse=True)
+            return [s[1] for s in scored[:top_k]]
+
     def clear(self):
         with self._lock:
             self.messages.clear()
@@ -322,6 +339,19 @@ class PersistentProfile:
         """Sets or updates a specific fact / preference for a known user."""
         self.add_person_preference(name, key, value)
         self.add_person_fact(name, f"{key}: {value}")
+
+    def get_user_facts(self, name: str) -> Dict[str, Any]:
+        """Retrieves all preferences, facts, and past conversation summaries for a given user."""
+        with self._lock:
+            person = self.get_known_person(name)
+            if not person:
+                return {}
+            facts = dict(person.get("preferences", {}))
+            for idx, fact in enumerate(person.get("learned_facts", [])):
+                facts[f"Bilgi_{idx+1}"] = fact
+            for idx, sess in enumerate(person.get("session_summaries", [])[-3:]):
+                facts[f"Geçmiş_Sohbet_{idx+1}"] = f"({sess.get('time_str')}): {sess.get('summary')}"
+            return facts
 
     def add_person_preference(self, name: str, key: str, value: str):
         """Stores a specific preference (e.g. coffee: unsweetened) for a known person."""

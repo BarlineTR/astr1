@@ -2498,6 +2498,11 @@ class AstroRealtimeNode(Node):
             identity = self._get_active_biometric_identity()
             name_p = identity.get("name", "Baran")
             self.memory.profile.set_user_fact(name_p, key, val)
+            if self._ws and self._loop and self._is_connected:
+                try:
+                    asyncio.run_coroutine_threadsafe(self._send_session_update(self._ws), self._loop)
+                except Exception as _exc:
+                    self.get_logger().debug(f"save_user_memory: session update failed ({_exc})")
             return {"status": "success", "message": f"'{key}: {val}' bilgisi hafızaya kaydedildi."}
 
         elif name == "search_memory":
@@ -2508,14 +2513,21 @@ class AstroRealtimeNode(Node):
                     search_res = self.memory.episodic.search(query, top_k=3)
                     if isinstance(search_res, list):
                         results.extend(search_res)
-                if hasattr(self.memory, "profile") and hasattr(self.memory.profile, "get_user_facts"):
+                if hasattr(self.memory, "profile"):
                     identity = self._get_active_biometric_identity()
                     name_p = identity.get("name", "Baran")
-                    facts = self.memory.profile.get_user_facts(name_p)
-                    if isinstance(facts, dict):
-                        for k, v in facts.items():
-                            if query.lower() in k.lower() or query.lower() in str(v).lower():
-                                results.append(f"{k}: {v}")
+                    if hasattr(self.memory.profile, "get_user_facts"):
+                        facts = self.memory.profile.get_user_facts(name_p)
+                        if isinstance(facts, dict):
+                            for k, v in facts.items():
+                                if query.lower() in k.lower() or query.lower() in str(v).lower():
+                                    results.append(f"{k}: {v}")
+                    for vf in self.memory.profile.data.get("verified_facts", []):
+                        if query.lower() in str(vf).lower():
+                            results.append(f"Kalıcı Bilgi: {vf}")
+                    for ob in self.memory.profile.data.get("environmental_observations", []):
+                        if query.lower() in str(ob).lower():
+                            results.append(f"Gözlem: {ob}")
             except Exception as se:
                 self.get_logger().debug(f"Memory search error: {se}")
             res_text = "\n".join(str(r) for r in results) if results else "Hafızada bu konuyla ilgili özel bir kayıt bulunamadı."
