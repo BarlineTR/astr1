@@ -12,6 +12,10 @@ Publishes to standard ROS 2 topics with ~0% Jetson CPU usage!
 """
 
 import json
+import logging
+
+_LOG = logging.getLogger(__name__)
+
 import threading
 import time
 import cv2
@@ -222,8 +226,8 @@ class OakSpatialNativeNode(Node):
                             valid = patch[patch > 150]
                             if len(valid) > 0:
                                 dist_m = float(np.median(valid)) / 1000.0
-                        except Exception:
-                            pass
+                        except Exception as _exc:
+                            self.get_logger().debug(f"_worker_loop: yok sayılan hata ({_exc})")
 
                     if dist_m <= 0.1:
                         focal_length = w * 0.8
@@ -319,8 +323,8 @@ def main(args=None):
     node = OakSpatialNativeNode()
     try:
         rclpy.spin(node)
-    except KeyboardInterrupt:
-        pass
+    except KeyboardInterrupt as _exc:
+        _LOG.debug("main: yok sayılan hata (%s)", _exc)
     finally:
         node.destroy_node()
         if rclpy.ok():

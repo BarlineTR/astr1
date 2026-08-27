@@ -8,6 +8,10 @@ Features:
 """
 
 import collections
+import logging
+
+_LOG = logging.getLogger(__name__)
+
 import re
 import threading
 import time
@@ -24,9 +28,12 @@ class LatencyTracker:
         self._total_turn_latencies: collections.deque[float] = collections.deque(maxlen=history_size)
         self._lock = threading.Lock()
 
-    def record_turn(self, stt_ms: float, llm_first_token_ms: float, total_turn_ms: float):
+    def record_turn(self, gate_ms: float, llm_first_token_ms: float, total_turn_ms: float):
+        """gate_ms: transkript geldikten sonra kapı mantığında (uyandırma sözcüğü
+        kontrolü + sosyal filtre LLM çağrısı) geçen süre. STT süresi DEĞİLDİR —
+        o speech_recognition_node içinde ölçülür."""
         with self._lock:
-            self._stt_latencies.append(stt_ms)
+            self._stt_latencies.append(gate_ms)
             self._llm_first_token_latencies.append(llm_first_token_ms)
             self._total_turn_latencies.append(total_turn_ms)
 
@@ -46,6 +53,34 @@ class LatencyTracker:
                 "p95_total_ms": round(totals[p95_idx], 1),
                 "samples": n
             }
+
+
+def normalize_turkish_speech_input(text: str) -> str:
+    """Corrects common Turkish acoustic STT phonetic mis-transcriptions for ASTRO."""
+    if not text:
+        return ""
+    t = text
+    # Fix common Astro wake phrase corruptions
+    t = re.sub(r"(?i)\b(?:heya\s+sonuç\s+ısın|heya\s+sonuç|heya\s+sonuc)\b", "Hey Astro nasılsın", t)
+    t = re.sub(r"(?i)\b(?:ey|ay|hey|he)\s+aston\b", "Hey Astro", t)
+    t = re.sub(r"(?i)\b(?:ey|ay|hey|he)\s+asto\b", "Hey Astro", t)
+    t = re.sub(r"(?i)\b(?:ey|ay|hey|he)\s+asro\b", "Hey Astro", t)
+    t = re.sub(r"(?i)\b(?:ey|ay|he)\s+astro\b", "Hey Astro", t)
+    t = re.sub(r"(?i)\baston\b", "Astro", t)
+    t = re.sub(r"(?i)\bastor\b", "Astro", t)
+    t = re.sub(r"(?i)\bastıro\b", "Astro", t)
+    t = re.sub(r"(?i)\basro\b", "Astro", t)
+    t = re.sub(r"(?i)\basto\b", "Astro", t)
+    t = re.sub(r"(?i)\bastrom\b", "Astro", t)
+    # Fix common persona / speech phonetic mis-transcriptions
+    t = re.sub(r"(?i)\b(?:kürbat|kurbat|küfür\s*bat|küfür\s*bal|kufur\s*bat)\b", "küfürbaz", t)
+    t = re.sub(r"(?i)\b(?:kürbata|kurbata|küfür\s*bata)\b", "küfürbaza", t)
+    t = re.sub(r"(?i)\b(?:kürbatlık|kurbatlık)\b", "küfürbazlık", t)
+    # Fix common location / name mis-transcriptions
+    t = re.sub(r"(?i)\bahvatta\b", "Ahlat'ta", t)
+    t = re.sub(r"(?i)\bahlatta\b", "Ahlat'ta", t)
+    t = re.sub(r"(?i)\bahlatın\b", "Ahlat'ın", t)
+    return t.strip()
 
 
 class ConversationSession:
@@ -94,8 +129,8 @@ class ConversationSession:
                 if self.on_session_start:
                     try:
                         self.on_session_start()
-                    except Exception:
-                        pass
+                    except Exception as _exc:
+                        _LOG.debug("activate_session: yok sayılan hata (%s)", _exc)
 
     def record_user_speech(self):
         with self._lock:
@@ -137,20 +172,20 @@ class ConversationSession:
                 if self.on_session_end:
                     try:
                         self.on_session_end()
-                    except Exception:
-                        pass
+                    except Exception as _exc:
+                        _LOG.debug("check_and_update_session_lifecycle: yok sayılan hata (%s)", _exc)
                 return True  # Timed out
             return False
 
     def is_wake_word(self, text: str, wake_word: str = "hey astro") -> tuple[bool, str]:
         """Detects explicit robot wake words with Turkish phonetic variations, returning (has_wake_word, clean_text)."""
-        clean_input = re.sub(r"^['\"`´“”‘’]+|['\"`´“”‘’]+$", "", text.strip())
+        clean_input = normalize_turkish_speech_input(re.sub(r"^['\"`´“”‘’]+|['\"`´“”‘’]+$", "", text.strip()))
         text_lower = clean_input.lower().strip()
 
-        # Regex pattern captures Turkish phonetic variations: astro, astıro, astor, asro, asu, astrocum, astro'cum, etc.
+        # Regex pattern captures Turkish phonetic variations: astro, astıro, astor, asro, asu, astrocum, aston, asto, etc.
         wake_pattern = re.compile(
-            r'(?:h[ea]y\s*|merhaba\s+|selam\s+|robot\s+)?'  # optional prefix
-            r'(?:ast[ıi]?ro[\'’]?\w*|astor[\'’]?\w*|asro[\'’]?\w*|asu[\'’]?\w*|asistan\w*)', # core robot name + suffixes
+            r'(?:h[ea]y\s*|merhaba\s+|selam\s+|robot\s+|ey\s+|ay\s+|heya\s+)?'  # optional prefix
+            r'(?:ast[ıi]?ro[\'’]?\w*|ast[ıi]?on[\'’]?\w*|astor[\'’]?\w*|asro[\'’]?\w*|asto[\'’]?\w*|asu[\'’]?\w*|asistan\w*)', # core robot name + suffixes
             re.IGNORECASE
         )
         has_wake = bool(wake_pattern.search(text_lower)) or wake_word.lower() in text_lower

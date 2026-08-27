@@ -1,5 +1,8 @@
 # .env file
 .env
+# .env yedekleri (API anahtarı içerir — asla depoya girmemeli)
+.env.bak.*
+.env.production
 
 # Python sanal ortamı (uv ile yeniden üretilir — bkz. requirements.txt)
 .venv/
@@ -17,3 +20,6 @@ vosk-model-small-tr-0.3/
 # Yüz tanıma: kişilerin fotoğrafları (kişisel veri — depoya girmez)
 faces/
 Persons/
+# Çalışma zamanı hafızası (kişisel veri; tohum: astro_memory.seed.json)
+ros2_ws/astro_memory.json
+ros2_ws/astro_memory.json.bak

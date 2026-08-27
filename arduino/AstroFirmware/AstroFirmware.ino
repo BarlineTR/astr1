@@ -1,0 +1,446 @@
+/*
+ * AstroFirmware - Arduino IDE sürümü
+ * ----------------------------------
+ * arduino/astro_firmware (PlatformIO) projesinin Arduino IDE kopyası.
+ * Kontrol mantığı main.cpp ile birebir aynıdır; farkı Serial Monitor'e
+ * okunabilir açılış/durum mesajı basmasıdır.
+ *
+ * Kart      : Arduino Mega 2560
+ * Seri hız  : 115200 baud (Serial Monitor da 115200 olmalı)
+ * Kütüphane : gerekmiyor (sadece Arduino core)
+ *
+ * - İki tekerlek: BTS7960 + enkoder, 50 Hz hız PID'i (RPM)
+ * - Kafa: BTS7960 + enkoderli DC motor, 50 Hz konum PID'i (derece)
+ * - Host ile ikili paket protokolü (bkz. protocol.h)
+ *
+ * IMU YOK: 20/21 (I2C) kafa enkoderine verildi, bkz. pins.h.
+ * TMC2209 YOK: kafa artık DC motor, Serial1 sağ enkodere verildi.
+ */
+
+#include <Arduino.h>
+#include <avr/wdt.h>
+
+#include "pins.h"
+#include "protocol.h"
+
+// ====== Seri ekran (Serial Monitor) mesajları ======
+#define ENABLE_TEXT_BANNER 0      // açılışta banner bas (binary protokol için 0 olmalı)
+#define ENABLE_TEXT_STATUS 0      // host bağlı değilken periyodik durum satırı (binary protokol için 0 olmalı)
+#define TEXT_STATUS_PERIOD_MS 2000UL
+
+#define FW_NAME    "AstroFirmware"
+#define FW_VERSION "2.0.0-ino"
+
+// ====== Parametreler ======
+static const uint32_t SERIAL_BAUD = 115200; // CH340/CH341 ve Linux Kernel stabil standart baud
+static const float CONTROL_HZ = 50.0f;
+static const uint32_t CONTROL_DT_MS = (uint32_t)(1000.0f / CONTROL_HZ);
+
+static const int32_t TICKS_PER_REV_L = 2048; // enkoder CPR*4 uygun biçimde ayarlayın
+static const int32_t TICKS_PER_REV_R = 2048;
+
+static const float WHEEL_R_L = 0.06f; // metre (örnek 60mm)
+static const float WHEEL_R_R = 0.06f;
+
+static const float KP = 0.6f, KI = 0.2f, KD = 0.0f; // 50 Hz PID için örnek
+static const int PWM_MAX = 255;
+static const float PID_INTEGRAL_LIMIT = 50.0f;
+
+// ====== Kafa (BTS7960 + enkoderli DC motor) ======
+// ⚠ KALİBRE EDİLMELİ: MotorTest sketch'indeki 'c <derece>' komutuyla ölçün.
+static const float HEAD_TICKS_PER_DEG = 14.667f;
+
+static const float HEAD_MIN_DEG = -90.0f;
+static const float HEAD_MAX_DEG =  90.0f;
+
+static const int HEAD_PWM_LIMIT = 180;
+static const int HEAD_PWM_MIN   = 45;
+
+static const float HEAD_KP = 1.8f, HEAD_KD = 0.08f;
+static const int32_t HEAD_DEADBAND_TICKS = 8;
+static const uint32_t HEAD_STALL_MS = 1500;
+
+// ====== Diagnostik bayrakları ======
+static const uint32_t FLAG_WATCHDOG_TIMEOUT = 0x01;
+static const uint32_t FLAG_RESERVED_IMU     = 0x02; // eski IMU_READ_FAIL
+static const uint32_t FLAG_HEAD_STALL       = 0x04;
+static const uint32_t FLAG_HEAD_LIMIT       = 0x08;
+
+// ====== Global Durum ======
+volatile int32_t g_left_ticks = 0;
+volatile int32_t g_right_ticks = 0;
+volatile int32_t g_head_ticks = 0;
+
+static int32_t g_left_last_ticks = 0;
+static int32_t g_right_last_ticks = 0;
+
+static float g_left_target_rpm = 0.0f;
+static float g_right_target_rpm = 0.0f;
+
+static float g_left_err_i = 0.0f, g_right_err_i = 0.0f;
+static float g_left_err_prev = 0.0f, g_right_err_prev = 0.0f;
+
+static int32_t g_head_target_ticks = 0;
+static int32_t g_head_err_prev = 0;
+static int g_head_pwm = 0;
+static int32_t g_head_stall_ref = 0;
+static uint32_t g_head_stall_ms = 0;
+
+static uint32_t g_last_control_ms = 0;
+static uint32_t g_last_heartbeat_ms = 0;
+static uint32_t g_last_text_ms = 0;
+static bool g_host_seen = false; // host'tan en az bir paket geldi mi?
+
+static bool g_motors_enabled = true;
+static uint32_t g_diag_flags = 0;
+
+// ====== Yardımcılar ======
+inline void setMotorPWM(int pwm_fwd_pin, int pwm_rev_pin, int val, int limit) {
+  val = constrain(val, -limit, limit);
+  if (val >= 0) {
+    analogWrite(pwm_rev_pin, 0);
+    analogWrite(pwm_fwd_pin, val);
+  } else {
+    analogWrite(pwm_fwd_pin, 0);
+    analogWrite(pwm_rev_pin, -val);
+  }
+}
+
+inline void setLeftPWM(int v)  { setMotorPWM(L_MOTOR_PWM_FWD, L_MOTOR_PWM_REV, v, PWM_MAX); }
+inline void setRightPWM(int v) { setMotorPWM(R_MOTOR_PWM_FWD, R_MOTOR_PWM_REV, v, PWM_MAX); }
+
+inline void setHeadPWM(int v) {
+  g_head_pwm = constrain(v, -HEAD_PWM_LIMIT, HEAD_PWM_LIMIT);
+  setMotorPWM(HEAD_MOTOR_PWM_FWD, HEAD_MOTOR_PWM_REV, g_head_pwm, HEAD_PWM_LIMIT);
+}
+
+inline int32_t readTicks(volatile int32_t& src) {
+  int32_t v;
+  noInterrupts();
+  v = src;
+  interrupts();
+  return v;
+}
+
+void leftEncA()  { g_left_ticks  += digitalRead(L_ENC_B)    ? -1 : +1; }
+void rightEncA() { g_right_ticks += digitalRead(R_ENC_B)    ? -1 : +1; }
+void headEncA()  { g_head_ticks  += digitalRead(HEAD_ENC_B) ? -1 : +1; }
+
+void setupIO() {
+  pinMode(STATUS_LED, OUTPUT);
+  pinMode(L_MOTOR_PWM_FWD, OUTPUT);
+  pinMode(L_MOTOR_PWM_REV, OUTPUT);
+  pinMode(R_MOTOR_PWM_FWD, OUTPUT);
+  pinMode(R_MOTOR_PWM_REV, OUTPUT);
+  pinMode(HEAD_MOTOR_PWM_FWD, OUTPUT);
+  pinMode(HEAD_MOTOR_PWM_REV, OUTPUT);
+
+  pinMode(L_ENC_A, INPUT_PULLUP);
+  pinMode(L_ENC_B, INPUT_PULLUP);
+  pinMode(R_ENC_A, INPUT_PULLUP);
+  pinMode(R_ENC_B, INPUT_PULLUP);
+  pinMode(HEAD_ENC_A, INPUT_PULLUP);
+  pinMode(HEAD_ENC_B, INPUT_PULLUP);
+
+  attachInterrupt(digitalPinToInterrupt(L_ENC_A),    leftEncA,  RISING);
+  attachInterrupt(digitalPinToInterrupt(R_ENC_A),    rightEncA, RISING);
+  attachInterrupt(digitalPinToInterrupt(HEAD_ENC_A), headEncA,  RISING);
+
+  // PWM frekansı -> 8-bit phase-correct, prescaler 1: 16MHz/(1*510) = 31.37 kHz
+  // Timer2: pin 9,10 (sağ)   Timer3: pin 5 (sol ileri)
+  // Timer4: pin 6 (sol geri) Timer5: pin 44,45 (kafa)
+  TCCR2B = (TCCR2B & 0xF8) | 0x01;
+  TCCR3B = (TCCR3B & 0xF8) | 0x01;
+  TCCR4B = (TCCR4B & 0xF8) | 0x01;
+  TCCR5B = (TCCR5B & 0xF8) | 0x01;
+}
+
+void stopMotors() {
+  setLeftPWM(0);
+  setRightPWM(0);
+  setHeadPWM(0);
+}
+
+// ====== Seri ekran metin çıktıları ======
+void printBanner() {
+#if ENABLE_TEXT_BANNER
+  Serial.println();
+  Serial.println(F("=============================================="));
+  Serial.print (F("  ")); Serial.print(F(FW_NAME));
+  Serial.print (F("  v")); Serial.println(F(FW_VERSION));
+  Serial.println(F("  Arduino Mega 2560 - Astro robot alt kontrol"));
+  Serial.println(F("=============================================="));
+  Serial.print  (F("  Derleme   : ")); Serial.print(F(__DATE__));
+  Serial.print  (F(" ")); Serial.println(F(__TIME__));
+  Serial.print  (F("  Seri hiz  : ")); Serial.print(SERIAL_BAUD); Serial.println(F(" baud"));
+  Serial.print  (F("  Kontrol   : ")); Serial.print((int)CONTROL_HZ); Serial.println(F(" Hz"));
+  Serial.println(F("----------------------------------------------"));
+  Serial.println(F("  Motor  : sol 5/6   sag 9/10   kafa 44/45"));
+  Serial.println(F("  Enkoder: sol 2/3   sag 18/19  kafa 20/21"));
+  Serial.print  (F("  Kafa   : "));
+  Serial.print(HEAD_TICKS_PER_DEG, 3); Serial.print(F(" tick/derece, limit "));
+  Serial.print((int)HEAD_MIN_DEG); Serial.print(F("/"));
+  Serial.print((int)HEAD_MAX_DEG); Serial.println(F(" derece"));
+  Serial.println(F("  IMU    : YOK (I2C pinleri kafa enkoderinde)"));
+  Serial.println(F("  TMC2209: YOK (kafa artik DC motor)"));
+  Serial.println(F("----------------------------------------------"));
+  Serial.println(F("  Kafa acilis konumu 0 derece kabul edildi."));
+  Serial.println(F("  Hazir. Host'tan HEARTBEAT bekleniyor..."));
+  Serial.println(F("=============================================="));
+  Serial.flush();
+#endif
+}
+
+void printStatusLine() {
+#if ENABLE_TEXT_STATUS
+  Serial.print(F("[STATUS] t="));
+  Serial.print(millis() / 1000UL);
+  Serial.print(F("s  motor="));
+  Serial.print(g_motors_enabled ? F("ON") : F("OFF"));
+  Serial.print(F("  encL="));
+  Serial.print(g_left_last_ticks);
+  Serial.print(F(" encR="));
+  Serial.print(g_right_last_ticks);
+  Serial.print(F(" kafa="));
+  Serial.print(readTicks(g_head_ticks) / HEAD_TICKS_PER_DEG, 1);
+  Serial.print(F("deg"));
+  Serial.print(F("  flags=0x"));
+  Serial.print(g_diag_flags, HEX);
+  if (g_diag_flags & FLAG_HEAD_STALL) Serial.print(F(" [KAFA STALL]"));
+  if (g_diag_flags & FLAG_HEAD_LIMIT) Serial.print(F(" [KAFA LIMIT]"));
+  Serial.println(F("  (host bagli degil)"));
+#endif
+}
+
+void publishEncoders(uint32_t dt_us, int32_t dl, int32_t dr) {
+  uint8_t payload[4 + 4 + 4];
+  memcpy(&payload[0], &dl, 4);
+  memcpy(&payload[4], &dr, 4);
+  memcpy(&payload[8], &dt_us, 4);
+  Proto::writePacket(Serial, Proto::ENCODER_TICKS, payload, sizeof(payload));
+}
+
+void publishDiag(uint16_t vbat_mV, int16_t temp_cX100, uint32_t flags) {
+  uint8_t payload[2 + 2 + 4];
+  memcpy(&payload[0], &vbat_mV, 2);
+  memcpy(&payload[2], &temp_cX100, 2);
+  memcpy(&payload[4], &flags, 4);
+  Proto::writePacket(Serial, Proto::DIAGNOSTICS, payload, sizeof(payload));
+}
+
+// Kafa konum PID'i. Limit switch olmadığı için stall koruması şart.
+void headControl(uint32_t dt_ms) {
+  int32_t pos = readTicks(g_head_ticks);
+  int32_t err = g_head_target_ticks - pos;
+
+  if (!g_motors_enabled) {
+    setHeadPWM(0);
+    g_head_err_prev = err;
+    g_head_stall_ref = pos;
+    g_head_stall_ms = millis();
+    return;
+  }
+
+  if (abs(err) <= HEAD_DEADBAND_TICKS) {
+    setHeadPWM(0);
+    g_head_err_prev = err;
+    g_head_stall_ref = pos;
+    g_head_stall_ms = millis();
+    // NOT: FLAG_HEAD_STALL burada temizlenmez. Stall sonrasi hedef mevcut
+    // konuma cekildigi icin hemen bu dala duseriz; bayragi burada silersek
+    // host stall'i hic goremez. Temizleme yalnizca yeni HEAD_CMD'de olur.
+    return;
+  }
+
+  float de = (float)(err - g_head_err_prev) / (dt_ms / 1000.0f);
+  g_head_err_prev = err;
+
+  // PID + Statik sürtünme eşiği için feedforward tabanı
+  float ff = (err > 0) ? (float)HEAD_PWM_MIN : -(float)HEAD_PWM_MIN;
+  float u = ff + (HEAD_KP * (float)err) + (HEAD_KD * de);
+  int pwm = (int)constrain(u, (float)-HEAD_PWM_LIMIT, (float)HEAD_PWM_LIMIT);
+
+  setHeadPWM(pwm);
+
+  // Stall tespiti: PWM veriliyor ama enkoder kımıldamıyor
+  if (abs(pos - g_head_stall_ref) >= 2) {
+    g_head_stall_ref = pos;
+    g_head_stall_ms = millis();
+  } else if (millis() - g_head_stall_ms > HEAD_STALL_MS) {
+    setHeadPWM(0);
+    g_head_target_ticks = pos; // dayanağı zorlamayı bırak
+    g_head_err_prev = 0;
+    g_diag_flags |= FLAG_HEAD_STALL;
+#if ENABLE_TEXT_BANNER
+    if (!g_host_seen) Serial.println(F("[STALL] Kafa donmuyor -> motor kesildi."));
+#endif
+  }
+}
+
+void loopControl() {
+  uint32_t now = millis();
+  if (now - g_last_control_ms < CONTROL_DT_MS) return;
+  uint32_t dt_ms = now - g_last_control_ms;
+  g_last_control_ms = now;
+
+  // Watchdog: 500 ms içinde heartbeat/komut gelmezse motorları kes
+  if (now - g_last_heartbeat_ms > 500) {
+    g_motors_enabled = false;
+    stopMotors();
+    g_diag_flags |= FLAG_WATCHDOG_TIMEOUT;
+  } else {
+    g_motors_enabled = true;
+    g_diag_flags &= ~FLAG_WATCHDOG_TIMEOUT;
+  }
+
+  // Enkoder okuma atomik (AVR'de int32_t atomik değil)
+  int32_t l_ticks = readTicks(g_left_ticks);
+  int32_t r_ticks = readTicks(g_right_ticks);
+
+  int32_t dl = l_ticks - g_left_last_ticks;
+  int32_t dr = r_ticks - g_right_last_ticks;
+  g_left_last_ticks = l_ticks;
+  g_right_last_ticks = r_ticks;
+
+  float dt_min = dt_ms / 60000.0f; // ms -> dakika
+  float l_rpm_meas = (dl / (float)TICKS_PER_REV_L) / dt_min;
+  float r_rpm_meas = (dr / (float)TICKS_PER_REV_R) / dt_min;
+
+  // PID: stiction feedforward + conditional integration anti-windup
+  auto pid_step = [&](float target_rpm, float meas_rpm, float& e_i, float& e_prev)->int {
+    if (abs(target_rpm) < 0.01f) {
+      e_i = 0.0f;
+      e_prev = 0.0f;
+      return 0;
+    }
+    float e = target_rpm - meas_rpm;
+    float de = (e - e_prev) / (dt_ms / 1000.0f);
+    e_prev = e;
+
+    // Feedforward: motor statik sürtünme (stiction) eşiğini aşmak için minimum PWM tabanı
+    float ff = (target_rpm > 0.0f) ? 25.0f : -25.0f;
+    float u = ff + (KP * 2.0f * e) + (KI * e_i) + (KD * de);
+    int pwm = (int)constrain(u, -PWM_MAX, PWM_MAX);
+
+    // Conditional integration: sadece PWM saturate olmadığında integral artır
+    if (abs(pwm) < PWM_MAX) {
+      e_i += e * (dt_ms / 1000.0f);
+      e_i = constrain(e_i, -PID_INTEGRAL_LIMIT, PID_INTEGRAL_LIMIT);
+    }
+
+    return pwm;
+  };
+
+  int l_pwm = 0, r_pwm = 0;
+  if (g_motors_enabled) {
+    l_pwm = pid_step(g_left_target_rpm, l_rpm_meas, g_left_err_i, g_left_err_prev);
+    r_pwm = pid_step(g_right_target_rpm, r_rpm_meas, g_right_err_i, g_right_err_prev);
+  }
+  setLeftPWM(l_pwm);
+  setRightPWM(r_pwm);
+
+  // Kafa konum kontrolü (aynı 50 Hz döngüde)
+  headControl(dt_ms);
+
+  // Host bağlıysa binary telemetri gönder; değilse seri ekranı kirletme
+  if (g_host_seen) {
+    publishEncoders(dt_ms * 1000u, dl, dr);
+    uint16_t vbat = 12000; // mV (örn. gelecekte ADC ile ölç)
+    int16_t temp = 2500;   // 25.00 C
+    publishDiag(vbat, temp, g_diag_flags);
+  }
+}
+
+void processPacket(uint8_t msg_id, const uint8_t* pl, uint8_t len) {
+  if (!g_host_seen) {
+    g_host_seen = true;
+#if ENABLE_TEXT_BANNER
+    Serial.println(F("[INFO] Host baglandi - binary telemetri baslatiliyor."));
+    Serial.flush();
+#endif
+  }
+
+  switch (msg_id) {
+    case Proto::HEARTBEAT: {
+      g_last_heartbeat_ms = millis();
+      Proto::writePacket(Serial, Proto::HEARTBEAT_ACK, pl, len);
+      digitalWrite(STATUS_LED, !digitalRead(STATUS_LED));
+    } break;
+    case Proto::WHEEL_CMD: {
+      if (len < 8) break;
+      memcpy(&g_left_target_rpm, &pl[0], 4);
+      memcpy(&g_right_target_rpm, &pl[4], 4);
+      g_last_heartbeat_ms = millis(); // komut da heartbeat sayılır
+    } break;
+    case Proto::HEAD_CMD: {
+      if (len < 4) break;
+      float angle_deg;
+      memcpy(&angle_deg, &pl[0], 4);
+
+      // Yazılımsal limit: limit switch yok, mekanik dayanağa gitmeyi engelle
+      float clamped = constrain(angle_deg, HEAD_MIN_DEG, HEAD_MAX_DEG);
+      if (clamped != angle_deg) g_diag_flags |= FLAG_HEAD_LIMIT;
+      else                      g_diag_flags &= ~FLAG_HEAD_LIMIT;
+
+      g_head_target_ticks = (int32_t)lroundf(clamped * HEAD_TICKS_PER_DEG);
+      g_head_stall_ref = readTicks(g_head_ticks);
+      g_head_stall_ms = millis();
+      g_diag_flags &= ~FLAG_HEAD_STALL;
+      g_last_heartbeat_ms = millis();
+    } break;
+  }
+}
+
+void setup() {
+  setupIO();
+  stopMotors();
+
+  Serial.begin(SERIAL_BAUD);
+  delay(200); // Serial Monitor'ün açılmasına küçük bir pay
+
+  printBanner();
+
+  // Kısa açılış LED işareti
+  for (uint8_t i = 0; i < 6; ++i) {
+    digitalWrite(STATUS_LED, !digitalRead(STATUS_LED));
+    delay(80);
+  }
+  digitalWrite(STATUS_LED, LOW);
+
+  // Açılıştaki kafa konumu 0° kabul edilir (limit switch / homing yok)
+  g_head_target_ticks = 0;
+  g_head_stall_ms = millis();
+
+  g_last_control_ms = millis();
+  g_last_heartbeat_ms = millis();
+  g_last_text_ms = millis();
+
+  // Donanım watchdog (2 s güvenlik marjı)
+  wdt_enable(WDTO_2S);
+}
+
+void loop() {
+  // Watchdog besle
+  wdt_reset();
+
+  // Seri parser
+  static Proto::Parser parser;
+  while (Serial.available() > 0) {
+    uint8_t b = Serial.read();
+    uint8_t id; const uint8_t* payload; uint8_t pl_len;
+    if (parser.feed(b, id, payload, pl_len)) {
+      processPacket(id, payload, pl_len);
+    }
+  }
+
+  // Kontrol döngüsü 50 Hz
+  loopControl();
+
+  // Host bağlı değilken seri ekrana okunabilir durum satırı bas
+#if ENABLE_TEXT_STATUS
+  if (!g_host_seen && (millis() - g_last_text_ms >= TEXT_STATUS_PERIOD_MS)) {
+    g_last_text_ms = millis();
+    printStatusLine();
+  }
+#endif
+}

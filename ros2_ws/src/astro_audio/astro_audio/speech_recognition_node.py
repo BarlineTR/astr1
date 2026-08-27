@@ -16,6 +16,11 @@ Features:
 """
 
 import os
+import sys
+import logging
+
+_LOG = logging.getLogger(__name__)
+
 import time
 import io
 import wave
@@ -55,6 +60,13 @@ except ImportError:
 
 
 def _load_env():
+    # Test sürecinde .env YÜKLENMEZ: aksi hâlde testler kullanıcının gerçek
+    # anahtarlarını alıp canlı API çağrıları yapıyor (astro_realtime_node
+    # websocket'i gerçekten açıyor, kota harcanıyor) ve testler ".env yok"
+    # varsayımıyla yazıldığı için sonuçlar çalıştırma ortamına göre değişiyor.
+    if "PYTEST_CURRENT_TEST" in os.environ or "pytest" in sys.modules:
+        return None
+
     candidates = [
         os.path.abspath(".env"),
         os.path.abspath(".env.production"),
@@ -62,8 +74,6 @@ def _load_env():
         os.path.abspath(os.path.join(os.getcwd(), ".env.production")),
         os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..", "..", ".env")),
         os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..", "..", ".env.production")),
-        os.path.expanduser("~/Desktop/astr1/.env"),
-        os.path.expanduser("~/Desktop/astr1/.env.production"),
         os.path.expanduser("~/.env")
     ]
     for c in candidates:
@@ -75,8 +85,8 @@ def _load_env():
         if env_path:
             load_dotenv(dotenv_path=env_path, override=True)
             return env_path
-    except Exception:
-        pass
+    except Exception as _exc:
+        _LOG.debug("_load_env: yok sayılan hata (%s)", _exc)
     return None
 
 
@@ -106,8 +116,8 @@ def estimate_pitch_and_gender(audio_arr: np.ndarray, sample_rate: int = 16000) -
                     return float(pitch_hz), "female"
                 elif pitch_hz >= 75.0:
                     return float(pitch_hz), "male"
-    except Exception:
-        pass
+    except Exception as _exc:
+        _LOG.debug("estimate_pitch_and_gender: yok sayılan hata (%s)", _exc)
     return 0.0, "unknown"
 
 
@@ -149,6 +159,18 @@ class SpeechRecognitionNode(Node):
             self.enabled = False
             return
 
+        try:
+            from astro_audio.stt_router import STTRouter
+        except ImportError:
+            from stt_router import STTRouter
+
+        self.stt_router = STTRouter(
+            groq_client=self.groq_client,
+            openai_client=self.openai_client,
+            local_whisper_model=self.fw_model,
+            logger=lambda lvl, msg: getattr(self.get_logger(), lvl)(msg),
+        )
+
         # Parameters (Ultra-fast responsive conversational turn-taking: 0.38s silence pause tolerance)
         self.declare_parameter('silence_timeout_s', 0.38)
         self.declare_parameter('sample_rate', 16000)
@@ -180,6 +202,7 @@ class SpeechRecognitionNode(Node):
         self.create_subscription(Bool, '/tts/speaking', self._tts_speaking_cb, 10)
         self.create_subscription(String, '/tts/say', self._tts_say_cb, 10)
         self.create_subscription(Bool, '/ai/session_active', self._session_active_cb, 10)
+        self.create_subscription(String, '/realtime/state', self._realtime_state_cb, 10)
 
         # Internal state
         self._lock = threading.Lock()
@@ -194,6 +217,11 @@ class SpeechRecognitionNode(Node):
         self._ambient_rms: float = 100.0
         self._recent_tts_phrases: list[tuple[str, float]] = []  # (phrase_lower, timestamp)
 
+        # Realtime primary S2S gating (STT pipeline is STANDBY when Realtime is CONNECTED and READY)
+        self._realtime_connected: bool = False
+        self._realtime_session_ready: bool = False
+        self._realtime_fallback_active: bool = False
+
         # Guards against concurrent / out-of-order transcription results
         self._transcribe_lock = threading.Lock()
         self._stt_sequence: int = 0
@@ -201,7 +229,31 @@ class SpeechRecognitionNode(Node):
         # Timer (0.05s resolution)
         self.create_timer(0.05, self._silence_tick)
 
-        self.get_logger().info("✅ [STT] Groq Whisper-large-v3 + Self-Echo Immunity + Bağlam Duyarlı Filtre Hazır.")
+        # Banner GERÇEK durumu yansıtmalı: eskiden motor ne olursa olsun sabit
+        # "Groq Whisper-large-v3 ... Hazır" basıyordu ve hata ayıklarken yanıltıyordu.
+        engines = []
+        if self.openai_client: engines.append("openai/whisper-1")
+        if self.groq_client: engines.append("groq/whisper-large-v3")
+        if self.fw_model: engines.append(f"yerel/faster-whisper({getattr(self, '_fw_model_name', '?')}/{getattr(self, '_fw_device', '?')})")
+        self.get_logger().info(
+            f"✅ [STT] Hazır | zincir: {' -> '.join(engines) if engines else 'YOK'} "
+            f"| STT_ENGINE={self.stt_engine} | Self-Echo Immunity + Bağlam Duyarlı Filtre aktif"
+        )
+
+    def _realtime_state_cb(self, msg: String):
+        try:
+            data = json.loads(msg.data)
+            conn = data.get("connection", data.get("state", ""))
+            sess = data.get("session", "")
+            self._realtime_connected = (conn == "CONNECTED")
+            self._realtime_session_ready = (sess == "READY" or data.get("state") == "SESSION_READY")
+            self._realtime_fallback_active = bool(data.get("fallback_mode", False) or data.get("provider") in ("EXHAUSTED", "COOLDOWN"))
+        except Exception:
+            pass
+
+    def _is_realtime_primary_active(self) -> bool:
+        """Returns True if OpenAI Realtime Speech-to-Speech is connected and active."""
+        return bool(self._realtime_connected and self._realtime_session_ready and not self._realtime_fallback_active)
 
     def _session_active_cb(self, msg: Bool):
         self._session_active = msg.data
@@ -242,6 +294,13 @@ class SpeechRecognitionNode(Node):
             return
 
         with self._lock:
+            # Standby Gating: If OpenAI Realtime S2S is active, do NOT accumulate STT buffers
+            if self._is_realtime_primary_active():
+                if self._buffer:
+                    self._buffer.clear()
+                self._is_speaking = False
+                return
+
             # While robot is speaking, do NOT record speaker audio into buffer!
             if self._tts_speaking:
                 return
@@ -266,6 +325,10 @@ class SpeechRecognitionNode(Node):
             return
 
         with self._lock:
+            # Standby Gating: Ignore VAD triggers while Realtime is primary
+            if self._is_realtime_primary_active():
+                return
+
             # Ignore VAD while robot is actively speaking to prevent echolalia
             if self._tts_speaking:
                 return
@@ -284,6 +347,10 @@ class SpeechRecognitionNode(Node):
 
     def _silence_tick(self):
         if not self.enabled:
+            return
+
+        # Standby Gating: Do not process silence ticks while Realtime is primary
+        if self._is_realtime_primary_active():
             return
 
         audio_data = None
@@ -318,6 +385,7 @@ class SpeechRecognitionNode(Node):
 
         name = os.getenv("STT_FW_MODEL", "large-v2")
         device = os.getenv("STT_FW_DEVICE", "cuda")
+        self._fw_model_name, self._fw_device = name, device
         compute = os.getenv("STT_FW_COMPUTE_TYPE", "float16")
         try:
             self.get_logger().info(f"Yerele yükleniyor: Faster-Whisper ({name}, {device}, {compute})...")
@@ -338,6 +406,8 @@ class SpeechRecognitionNode(Node):
             self.fw_model = None
             return False
 
+        self._fw_model_name = name
+        self._fw_device = device
         self.get_logger().info(f"✅ [STT] Faster-Whisper hazır (model: {name}, cihaz: {device})")
         return True
 
@@ -417,84 +487,61 @@ class SpeechRecognitionNode(Node):
                 self.get_logger().info(f"🎙️ [Ses Tanıma]: {spk_name} ({spk_meta.get('formal_title', '')}) (Güven: {spk_conf:.2f})")
 
             text = None
-
-            # 1. Ultra-Fast Groq Whisper Large V3 (80ms Latency - Primary Free STT)
-            if self.groq_client:
-                try:
-                    result = self.groq_client.audio.transcriptions.create(
-                        file=("speech.wav", wav_bytes),
-                        model="whisper-large-v3",
-                        language="tr",
-                        temperature=0.0,
-                        response_format="text"
-                    )
-                    text = str(result).strip()
-                except Exception as ge:
-                    self.get_logger().warn(f"⚠️ [Groq Whisper] Hatası ({ge}), yedek motorlara geçiliyor...")
-
-            # 2. OpenAI Whisper-1 Fallback
-            if not text and self.openai_client:
-                try:
-                    res = self.openai_client.audio.transcriptions.create(
-                        model="whisper-1",
-                        file=("speech.wav", wav_bytes),
-                        language="tr",
-                        temperature=0.0,
-                        response_format="text"
-                    )
-                    text = str(res).strip()
-                except Exception as oe:
-                    self.get_logger().warn(f"⚠️ [OpenAI Whisper] Hatası: {oe}")
-
-            # 3. Yerel Faster-Whisper (Yalnızca bulut motorlar başarısız olursa)
-            if not text and self.fw_model is not None:
-                try:
-                    audio_f32 = arr.astype(np.float32) / 32768.0
-                    segments, _info = self.fw_model.transcribe(
-                        audio_f32, beam_size=1, language="tr"
-                    )
-                    text = "".join(seg.text for seg in segments).strip()
-                except Exception as fe:
-                    self.get_logger().warn(f"⚠️ [Faster-Whisper] Hatası ({fe})")
-
+            # Gerçek STT süresi burada ölçülür. ai_brain_node'un "Bu Dönüş" satırı
+            # transkript GELDİKTEN sonrasını ölçer, dolayısıyla bu süreyi göremez.
+            # Unified STTRouter Transcription
+            route_res = self.stt_router.transcribe(arr, wav_bytes, self._sample_rate)
+            text = route_res.text
+            stt_engine_used = route_res.provider
+            stt_ms = route_res.duration_ms
 
             if not text:
                 return
             text_lower = text.lower().strip(" .,!?:;")
 
+            is_wake_contained = any(w in text_lower for w in ["astro", "hey astro", "astor", "aston", "asistan"])
+
             # Hallucination Filter: Ignore known Whisper silence phantom phrases
             silence_hallucinations = [
-                "iyi misin", "teşekkür ederim", "teşekkürler", "altyazı", "abone ol",
+                "altyazı m.k.", "altyazı m.k", "altyazı:", "altyazı", "altyazi", "amara.org",
+                "abone ol", "abone olmayı unutmayın", "videoyu beğenmeyi",
+                "izlediğiniz için teşekkürler", "izlediginiz icin tesekkurler",
                 "görüşmek üzere", "hoşça kalın", "hoşçakalın", "sağ olun", "kalbimde sizle geldim",
                 "merhaba, kalbimde sizle geldim", "sizle geldim", "ben ali", "merhaba, ben ali",
                 "sıfır tutu", "gizletme üzerime", "yanıldım gözlerimde"
             ]
-            if any(sh in text_lower for sh in silence_hallucinations) and (total_rms < 500.0 or voice_ratio < 0.35):
+            if not is_wake_contained and any(sh in text_lower for sh in silence_hallucinations) and (total_rms < 600.0 or voice_ratio < 0.35):
+                self.get_logger().info(f'[STT FILTER] text="{text}" rms={total_rms:.1f} decision=reject reason=whisper_hallucination')
                 return
 
             # Reject isolated 'merhaba' if voice energy is low or voice duration under 0.5s
-            if text_lower in ["merhaba", "merhabalar"] and (total_rms < 480.0 or total_voice_duration < 0.45):
+            if not is_wake_contained and text_lower in ["merhaba", "merhabalar"] and (total_rms < 480.0 or total_voice_duration < 0.45):
+                self.get_logger().info(f'[STT FILTER] text="{text}" rms={total_rms:.1f} decision=reject reason=low_energy_merhaba')
                 return
 
             # Context-aware single-word filter: Only reject when NO active conversation session
             # During active session, "evet"/"hayır"/"tamam" are legitimate user responses
             always_hallucinations = ["hı hı", "hı", "cık", "çık", "eee", "ııı", "hmm"]
             session_dependent = ["evet", "hayır", "tamam"]
-            if text_lower in always_hallucinations:
+            if not is_wake_contained and text_lower in always_hallucinations:
+                self.get_logger().info(f'[STT FILTER] text="{text}" rms={total_rms:.1f} decision=reject reason=filler_hallucination')
                 return
-            if text_lower in session_dependent and not self._session_active:
+            if not is_wake_contained and text_lower in session_dependent and not self._session_active:
+                self.get_logger().info(f'[STT FILTER] text="{text}" rms={total_rms:.1f} decision=reject reason=inactive_session_single_word')
                 return
 
-            # Filter empty / junk / phantom noise
+            # Filter empty / junk / phantom noise when acoustic evidence is weak
             junk_filters = [
-                "altyazı", "abone ol", "izlediğiniz için", "www.", ".com",
+                "altyazı", "altyazi", "abone ol", "izlediğiniz için", "www.", ".com",
                 "you", "thank you", "bye", "subtitles", "watching", "amara.org",
-                "kalbimde", "sizle geldim", "sıfır tutu", "gizletme üzerime"
+                "kalbimde", "sizle geldim", "sıfır tutu", "gizletme üzerime", "diz"
             ]
-            if any(junk in text_lower for junk in junk_filters):
+            if not is_wake_contained and any(junk in text_lower for junk in junk_filters) and (total_rms < 450.0 or voice_ratio < 0.30 or total_voice_duration < 0.30):
+                self.get_logger().info(f'[STT FILTER] text="{text}" rms={total_rms:.1f} decision=reject reason=phantom_noise')
                 return
 
-            if len(text_lower) < 3 and text_lower not in ["ne", "su", "al", "ev", "on"]:
+            if not is_wake_contained and len(text_lower) < 3 and text_lower not in ["ne", "su", "al", "ev", "on", "dur", "hey", "lan"]:
+                self.get_logger().info(f'[STT FILTER] text="{text}" rms={total_rms:.1f} decision=reject reason=too_short')
                 return
 
             # ── Self-Echo Immunity Check ──────────────────────────────────────────
@@ -504,22 +551,33 @@ class SpeechRecognitionNode(Node):
                 for past_phrase, past_time in self._recent_tts_phrases:
                     if (now - past_time) < 8.0:
                         if text_lower in past_phrase or past_phrase in text_lower:
-                            self.get_logger().info(f'🔇 [Yankı / Robot Kendi Sesini Duydu — Filtrelendi]: "{text}"')
+                            self.get_logger().info(f'[STT FILTER] text="{text}" rms={total_rms:.1f} decision=reject reason=self_echo_match')
                             return
                         # Check word overlap
                         words_heard = set(text_lower.split())
                         words_spoken = set(past_phrase.split())
                         if len(words_heard) >= 2 and len(words_heard.intersection(words_spoken)) >= len(words_heard) * 0.75:
-                            self.get_logger().info(f'🔇 [Yankı / Robot Kendi Sesini Duydu — Filtrelendi]: "{text}"')
+                            self.get_logger().info(f'[STT FILTER] text="{text}" rms={total_rms:.1f} decision=reject reason=self_echo_overlap')
                             return
 
             if text and text not in [".", "...", ",", "!", "?"]:
+                # Standby Gating: If OpenAI Realtime S2S is active, do NOT publish STT turns
+                if self._is_realtime_primary_active():
+                    self.get_logger().debug(f'[STT STANDBY] text="{text}" dropped because Realtime S2S is active')
+                    return
+
                 # Discard stale results
                 with self._transcribe_lock:
                     if seq != self._stt_sequence:
                         return
 
-                self.get_logger().info(f'🎤 [Duyulan]: "{text}"')
+                audio_s = len(arr) / float(self._sample_rate)
+                rtf = (stt_ms / 1000.0) / audio_s if audio_s > 0 else 0.0
+                self.get_logger().info(f'[STT FILTER] text="{text}" rms={total_rms:.1f} decision=accept reason=valid_speech')
+                self.get_logger().info(
+                    f'🎤 [Duyulan]: "{text}" '
+                    f'(STT: {stt_ms:.0f}ms | motor: {stt_engine_used} | ses: {audio_s:.1f}sn | RTF: {rtf:.2f})'
+                )
                 msg = String()
                 msg.data = text
                 self._text_pub.publish(msg)
@@ -533,8 +591,8 @@ def main(args=None):
     node = SpeechRecognitionNode()
     try:
         rclpy.spin(node)
-    except KeyboardInterrupt:
-        pass
+    except KeyboardInterrupt as _exc:
+        _LOG.debug("main: yok sayılan hata (%s)", _exc)
     finally:
         node.destroy_node()
         if rclpy.ok():

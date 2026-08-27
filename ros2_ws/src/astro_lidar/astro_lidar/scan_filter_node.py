@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
 import math
+import logging
+
+_LOG = logging.getLogger(__name__)
+
 
 import rclpy
 from rclpy.node import Node
@@ -71,8 +75,8 @@ def main():
     node = ScanFilterNode()
     try:
         rclpy.spin(node)
-    except KeyboardInterrupt:
-        pass
+    except KeyboardInterrupt as _exc:
+        _LOG.debug("main: yok sayılan hata (%s)", _exc)
     finally:
         node.destroy_node()
         if rclpy.ok():

@@ -144,6 +144,16 @@ fi
 VIRTUAL_ENV="$VENV" uv pip install -r "$ROOT/requirements.txt" --quiet
 ok "requirements.txt kuruldu ($(VIRTUAL_ENV="$VENV" uv pip list 2>/dev/null | tail -n +3 | wc -l) paket)"
 
+# Jetson (aarch64): NVIDIA'nın torch derlemesi NumPy 1.x'e karşı derlenmiştir.
+# requirements.in bunu bir marker ile belirtir, ancak requirements.txt x86_64 için
+# çözüldüğünden marker kilide yansımaz; burada açıkça uyguluyoruz. NumPy 2.x kalırsa
+# torch "Failed to initialize NumPy: _ARRAY_API not found" verir ve torch<->numpy
+# dönüşümleri sessizce bozulur.
+if [ "$(uname -m)" = "aarch64" ]; then
+  VIRTUAL_ENV="$VENV" uv pip install --quiet "numpy==1.26.4"
+  ok "Jetson (aarch64) algılandı — numpy 1.26.4'e sabitlendi (NVIDIA torch ABI uyumu)"
+fi
+
 # ------------------------------------------------------------------ 5. .env
 step "5/7  Yapılandırma (.env)"
 if [ -f "$ROOT/.env" ]; then

@@ -20,13 +20,17 @@ The system has been completely modularized into ROS 2 Humble packages:
 Every engine is chosen in `.env`; each has a working fallback, so a missing key or a
 dead network degrades the robot instead of stopping it.
 
-| Job | Default | Alternatives | Local? |
+| Job | Shipped default | Alternatives | Local? |
 |---|---|---|---|
-| LLM (chat) | Groq LPU | Gemini (`LLM_PROVIDER="gemini"`), OpenAI | cloud |
-| Speech → text | Faster-Whisper (`STT_ENGINE="faster-whisper"`) | Groq Whisper, OpenAI Whisper | **yes**, GPU |
-| Text → speech | XTTS (`TTS_ENGINE="xtts"`) | OpenAI TTS, edge-tts | **yes**, GPU |
+| LLM (chat) | OpenAI `gpt-4o-mini` (`LLM_PROVIDER="openai"`) | Groq LPU, Gemini | cloud |
+| Speech → text | OpenAI `whisper-1` (`STT_ENGINE="openai"`) | Groq Whisper, local Faster-Whisper | optional |
+| Text → speech | OpenAI Speech API (`TTS_ENGINE="openai"`) | ElevenLabs, XTTS, edge-tts, espeak | optional |
 | Who is this face? | SFace embeddings (OpenCV ONNX) | — | **yes**, CPU |
 | Who is speaking? | WeSpeaker ResNet34 (ONNX) | — | **yes**, CPU |
+
+The shipped `.env` runs the whole speech stack through OpenAI. Every engine still has a
+fallback chain, so a dead network degrades the robot instead of stopping it — but the
+*selection* is explicit, not implicit: see [Configuration](#-configuration).
 
 Face and speaker recognition need no extra pip package — they run on `opencv-python`
 and `onnxruntime`, which are already installed. Only the model files are downloaded:
@@ -186,15 +190,72 @@ ros2 pkg executables | grep astro          # 7 executables
 
 Or just re-run `./scripts/install.sh --skip-apt`, which performs the same checks and prints a pass/fail line per node.
 
-## 🚦 Usage
+## 🚦 Running the robot
 
-With the new ROS 2 structure, you no longer need to run separate scripts. The entire system is managed via `astro_bringup`.
+Every shell that talks to the robot needs both environments sourced — the venv (Python
+packages) and the workspace overlay (ROS packages):
 
-### Launching the Entire Robot (All Sensors + Base)
+```bash
+cd <repo-root>
+source .venv/bin/activate
+source ros2_ws/install/setup.bash      # zsh users: setup.zsh
+```
+
+### 1. Check the environment is clean
+
+**Do this first.** ROS nodes are plain background processes: a leftover `tts_node` from an
+earlier debugging session stays subscribed to `/tts/say` and speaks *every* sentence
+alongside the new one. Two stray nodes means you hear the same reply three times, overlapping.
+
+```bash
+ros2 node list                                        # must be empty
+ps -ef | grep -E "astro_(audio|ai|vision|lidar)/lib" | grep -v grep   # must be empty
+```
+
+If anything is listed:
+
+```bash
+ps -eo pid,cmd | grep -E "astro_(audio|ai|vision|lidar)/lib" | grep -v grep \
+  | awk '{print $1}' | xargs -r kill -9
+ros2 daemon stop && ros2 daemon start                 # clears stale discovery cache
+```
+
+> `ros2 node list` can keep showing nodes whose processes are already dead — that is the
+> ROS daemon's cached discovery data, not a running node. Restarting the daemon clears it.
+
+### 2. Launch
+
 ```bash
 ros2 launch astro_bringup robot.launch.py
 ```
-*(This will launch the base, lidar, camera, and audio nodes all at once.)*
+
+Starts base, LiDAR, camera, audio and the AI brain together. Missing hardware is handled
+gracefully and the corresponding warnings are **expected**, not errors:
+
+| Log line | Meaning |
+|---|---|
+| `LiDAR port '/dev/astro_lidar' not found — skipping` | No RPLIDAR; launch skips that node |
+| `Arduino port not found (expected /dev/astro_arduino)` | No Arduino; retries every 2 s |
+| `Cannot find any device with given deviceInfo` | No OAK-D camera attached |
+| `ReSpeaker donanımı bulunamadı` | Falls back to the system default microphone |
+
+### 3. Talk to it
+
+Say the wake word (`WAKE_WORD`, default `hey astro`), then your sentence. The startup
+banners tell you exactly which engines are live — they reflect real state, so trust them:
+
+```text
+✅ [STT] Hazır | zincir: openai/whisper-1 | STT_ENGINE=openai | ...
+🚀 [TTS Node] Hazır | TTS_ENGINE=openai | zincir: openai_realtime -> openai_tts(gpt-4o-mini-tts) -> edge_tts -> espeak
+```
+
+The chain is a *fallback order*, not parallel execution: the first engine that returns
+audio wins and the rest are never called.
+
+### Shutting down
+
+`Ctrl-C` in the launch terminal. Then re-run the check in step 1 — a node that fails to
+exit cleanly is exactly what causes the overlapping-voices problem next time.
 
 ### Launching Individual Subsystems
 If you want to test or launch sensors individually for debugging:
@@ -208,7 +269,7 @@ ros2 launch astro_vision camera.launch.py use_native_spatial:=true   # on-chip O
 
 All sources publish to the same topic (`/oak/rgb/image_raw`), so the vision nodes do not
 care which one is running. `source:=webcam` is what makes the stack testable on a laptop
-with no OAK-D attached. `face_detector_node` publishes `/vision/person_name` with the
+with no OAK-D attached. `face_detector_node` publishes `/vision/recognized_person` with the
 recognized person, plus `/vision/faces` (JSON with names, similarity and boxes).
 
 **LiDAR (RPLIDAR + Filter):**
@@ -221,20 +282,213 @@ ros2 launch astro_lidar lidar.launch.py
 ros2 launch astro_audio audio.launch.py
 ```
 
+## 🗺️ Simulation, mapping and navigation
+
+A Gazebo Harmonic simulation of the robot, used to develop LiDAR mapping and
+navigation without hardware. Packages: `astro_sim` (world, spawn, ros_gz bridge)
+and `astro_navigation` (slam_toolbox, Nav2).
+
+> **Full reference: [docs/simulasyon-ve-gercek-robot.md](docs/simulasyon-ve-gercek-robot.md)** —
+> every parameter with its simulation and real-robot value, the calibration
+> procedure, troubleshooting, and what is still missing before the stack can run
+> on the physical robot.
+
+### Prerequisites
+
+```bash
+sudo apt install -y ros-humble-slam-toolbox ros-humble-nav2-bringup \
+  ros-humble-nav2-common ros-humble-robot-localization \
+  ros-humble-joint-state-publisher ros-humble-twist-mux
+```
+
+Gazebo Harmonic (`gz sim`, package `ros-humble-ros-gzharmonic`) is the simulator.
+Gazebo Classic and Ignition Fortress use different plugin filenames and will not
+load this robot.
+
+### 1. Run the simulation
+
+```bash
+ros2 launch astro_sim simulation.launch.py
+ros2 launch astro_sim simulation.launch.py rviz:=false headless:=true   # no GUI
+ros2 launch astro_sim simulation.launch.py x:=0 y:=-3                   # spawn elsewhere
+```
+
+The world is an indoor plan: a corridor, three rooms behind 0.9 m doorways, and
+furniture that gives scan matching something to lock onto. The robot spawns in
+the corridor at (-4, 0).
+
+Simulation-only parts of the description live in `astro_gazebo.xacro` and are
+included only under `sim_mode:=true`, so the real robot's tf tree is unchanged.
+Sensors publish to the same topics as the hardware (`/scan`, `/imu`,
+`/oak/rgb/image_raw`), which is what lets the same nodes run in both worlds.
+
+### 2. Build a map
+
+```bash
+ros2 launch astro_navigation slam.launch.py                    # 2nd terminal
+```
+
+Drive from the **Teleop panel** in the Gazebo window — buttons and speed
+sliders, no extra terminal. `ros2 run teleop_twist_keyboard teleop_twist_keyboard`
+still works if you prefer keys.
+
+Drive through every room, and return to where you started so slam_toolbox can
+close the loop. Then save:
+
+```bash
+ros2 run nav2_map_server map_saver_cli \
+  -f ros2_ws/src/astro_navigation/maps/astro_indoor --ros-args -p use_sim_time:=true
+```
+
+### 3. Navigate on the saved map
+
+```bash
+ros2 launch astro_navigation navigation.launch.py
+```
+
+AMCL starts at the map origin, which is the simulation spawn point. On the real
+robot, or after moving the robot by hand, give it a starting estimate with
+RViz's **2D Pose Estimate** before sending a goal — an unlocalised AMCL makes
+the planner produce nonsense. Then use **Nav2 Goal**, or send one directly:
+
+```bash
+ros2 action send_goal /navigate_to_pose nav2_msgs/action/NavigateToPose \
+  "{pose: {header: {frame_id: map}, pose: {position: {x: 6.0, y: 0.0}}}}"
+```
+
+### On the real robot
+
+Both launch files take `use_sim_time:=false`. `astro_lidar`'s `scan_filter_node`
+strips NaN and out-of-range returns and republishes on `/scan_filtered`; point
+SLAM at it with `scan_topic:=/scan_filtered`. The simulated LiDAR is already
+clean, so `/scan` is the default.
+
+> **One odom publisher at a time.** In simulation the DiffDrive plugin publishes
+> `/odom` and `odom -> base_footprint`; on the real robot `serial_bridge` does.
+> Running both puts two publishers on the same transform and tf becomes
+> unusable.
+
+## 🧪 Tests & CI
+
+```bash
+source .venv/bin/activate
+source ros2_ws/install/setup.bash
+pytest                      # 292 tests
+```
+
+`pytest.ini` disables the two ROS plugins (`launch_testing`, `launch_ros`) whose old hook
+signatures crash modern pytest — without it the run dies with
+`PluginValidationError` before collecting anything.
+
+`.github/workflows/ci.yml` runs the same thing on every push inside a `ros:humble-ros-base`
+container: apt deps → uv venv → `scripts/build.sh` → `pytest` → `scripts/check_env_drift.py`.
+
+## 🎙️ Realtime mode (OpenAI speech-to-speech)
+
+A second, **alternative** pipeline sends microphone audio straight to the OpenAI Realtime
+API over a WebSocket and plays the returned audio — no local STT or TTS in the loop:
+
+```bash
+ros2 launch astro_bringup realtime_sensors.launch.py
+```
+
+It starts `audio_stream_node` (24 kHz) + `astro_realtime_node` + the camera. It is **not**
+an add-on to `robot.launch.py`: both publish `/speech/text` and both capture the
+microphone, so running them together gives you two brains fighting over one robot. Pick one.
+
+| | `robot.launch.py` | `realtime_sensors.launch.py` |
+|---|---|---|
+| Speech path | STT → LLM → TTS (separate calls) | single WebSocket, audio in / audio out |
+| Latency | higher | lowest |
+| Persona, long-term memory, reminders | `ai_brain_node` | `astro_realtime_node` (separate implementation) |
+| Base, LiDAR | yes | no |
+
 ## ⚙️ Configuration
 
-Centralized parameters are stored in `astro_bringup/config/astro_params.yaml`. You can modify:
-- Serial ports (e.g., `/dev/astro_lidar`, `/dev/astro_arduino`)
-- Camera resolution and FPS
-- VAD thresholds and Audio settings
-- RPLIDAR ranges and baud rates
+Two files, two jobs:
+
+| File | Holds | Tracked in git? |
+|---|---|---|
+| `.env` | API keys, engine selection, thresholds | **no** (`.gitignore`) |
+| `astro_bringup/config/astro_params.yaml` | ROS parameters: serial ports, camera FPS, VAD thresholds, LiDAR ranges | yes |
+
+### The one rule about `.env`
+
+**Define every key exactly once.** `python-dotenv` keeps the *last* definition of a
+duplicated key, so a setting added at the top of the file is silently overwritten by a
+template line further down. This is not hypothetical — it is why an "OpenAI everything"
+block once sat in `.env` while the robot kept using edge-tts and a local Whisper model.
+When changing a setting, **edit the existing line**; never append a second one.
+
+`.env.example` is generated from the source with an AST scan, so every key in it is
+actually read by the code, with its real default and the file that reads it. A CI check
+keeps them in sync:
+
+```bash
+python scripts/check_env_drift.py
+# ✅ Yapılandırma tutarlı — 101 anahtar, hepsi kodda okunuyor, tekrar yok.
+```
+
+It fails the build on three things: a key read by code but missing from `.env.example`,
+a key documented but never read (dead setting), and any duplicate key.
+
+### Getting started
+
+```bash
+cp .env.example .env
+```
+
+Then fill in **`OPENAI_API_KEY`** — that single key drives STT, LLM and TTS in the default
+configuration. Everything else has a working default.
+
+### Choosing engines
+
+```ini
+# LLM — built-in chain is groq -> gemini -> openai.
+# Providers BEFORE the selected one are skipped; the ones after remain as fallback.
+LLM_PROVIDER="openai"
+LLM_FALLBACK_ENABLED="true"    # "false" -> only LLM_PROVIDER is ever tried
+
+# STT — "openai" | "groq" | "faster-whisper"
+# Any value other than "faster-whisper" prevents the local model from loading at all.
+STT_ENGINE="openai"
+
+# TTS — "openai" | "elevenlabs" | "xtts"
+# Selects the primary engine. edge-tts and espeak stay as emergency fallbacks
+# so the robot never goes mute on a network failure.
+TTS_ENGINE="openai"
+OPENAI_TTS_MODEL="gpt-4o-mini-tts"   # "tts-1" is noticeably faster, slightly lower quality
+OPENAI_TTS_VOICE="echo"
+```
+
+> **Selecting a provider means emptying the others' keys is no longer required.**
+> `LLM_PROVIDER` used to be documented but never read — the order was hard-coded and the
+> only way to pick OpenAI was to blank out `GROQ_API_KEY` and `GEMINI_API_KEY`. It is now
+> honoured for real.
+
+> **`.env` overrides the process environment.** The nodes call `load_dotenv(override=True)`,
+> so `TTS_ENGINE=xtts ros2 run ...` will *not* work — change the value in `.env` instead.
+
+### Persistent memory
+
+The robot's long-term memory (known people, learned facts, reminders, conversation
+summaries) lives in `ros2_ws/astro_memory.json`. That file is **not tracked by git** — it
+changes on every run and contains personal data. On first start it is seeded from the
+tracked template `ros2_ws/astro_memory.seed.json`; point `MEMORY_FILE_PATH` elsewhere if
+you want it outside the repo.
+
+To reset the robot's memory, delete the runtime file — it will be re-seeded on next start:
+
+```bash
+rm ros2_ws/astro_memory.json
+```
 
 ### 4. Advanced STT (Ses Tanıma) Options
 
-`STT_ENGINE` in `.env` picks the engine. The node tries them in order and keeps the first
-that works, so a missing key never leaves the robot deaf.
+`STT_ENGINE` in `.env` picks the primary engine; the router falls through
+Groq → OpenAI → local Faster-Whisper, so a missing key never leaves the robot deaf.
 
-**Faster-Whisper (default, local, no internet)**
+**Faster-Whisper (local, no internet, no API key)**
 
 ```ini
 STT_ENGINE="faster-whisper"
@@ -242,7 +496,14 @@ STT_FW_MODEL="large-v2"        # "turbo", "medium", "small" on weaker GPUs
 STT_FW_DEVICE="cuda"           # falls back to CPU automatically if CUDA fails
 STT_FW_COMPUTE_TYPE="float16"  # "int8" on CPU
 STT_FW_CPU_COMPUTE_TYPE="int8"
+STT_FW_CPU_MODEL="base"        # model used after a CPU fallback
 ```
+
+> 🟩 **On Jetson (aarch64), `STT_FW_DEVICE="cuda"` silently falls back to CPU.** The
+> `ctranslate2` aarch64 wheel on PyPI is built without CUDA, so Faster-Whisper cannot
+> reach the GPU no matter how you configure it — you get the small `base` model on CPU,
+> which is slow and hallucinates on silence. Fixing it means building CTranslate2 from
+> source: see **[docs/jetson-cuda-stt.md](docs/jetson-cuda-stt.md)**.
 
 > ⚠️ **Never use `distil-*` models for Turkish.** Every Distil-Whisper checkpoint is an
 > English-only distillation — it ignores `language="tr"` and returns English text.
@@ -256,13 +517,25 @@ GROQ_API_KEY="gsk-..."
 
 Groq's `whisper-large-v3` is the fastest of the three; it needs internet and a key.
 
-**Who is speaking.** Every transcription also runs speaker recognition and publishes the
-result on `/audio/speaker_name`, alongside the plain text on `/speech/text` (kept separate
-so wake-word matching is not disturbed). Turn it off with `SPEAKER_ID_ENABLED=0`.
+**Who is speaking.** Every transcription also runs speaker recognition and publishes a
+JSON payload (name, confidence, embedding) on `/audio/speaker_id`, alongside the plain
+text on `/speech/text` — kept separate so wake-word matching is not disturbed. Thresholds
+live in `SPEAKER_MATCH_THRESHOLD`; the model and profile paths in `SPEAKER_MODEL_DIR` /
+`SPEAKER_DB_PATH`.
 
 ### 5. Advanced TTS (Ses Sentezi) Options
 
-`TTS_ENGINE` in `.env` selects the engine: `elevenlabs`, `edge-tts` (default), `xtts`, `pyttsx3`, `gtts`. The first two and `gtts` need internet; `xtts` and `pyttsx3` are fully offline.
+`TTS_ENGINE` in `.env` selects the **primary** engine — `openai` (default), `elevenlabs`
+or `xtts`. It is not a full list of engines: whatever you pick, the router keeps
+`edge-tts` and offline `espeak` at the end of the chain as emergency fallbacks, so the
+robot never goes mute. Only `xtts` and `espeak` work without internet.
+
+The chain in order: `openai_realtime` → *your engine* → `edge_tts` → `espeak` →
+pre-generated emergency WAV. The startup banner prints the live chain.
+
+> **`openai_realtime` only produces audio when `astro_realtime_node` is running**, which
+> `robot.launch.py` does not start — see [Realtime mode](#-realtime-mode-openai-speech-to-speech).
+> In the classic pipeline the realtime step is a no-op and `TTS_ENGINE` decides what you hear.
 
 **XTTS v2 — local voice cloning (offline, GPU recommended)**
 

@@ -1,0 +1,50 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-22.04
+    container:
+      image: ros:humble-ros-base
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # sounddevice/pyttsx3/edge-tts'in bağlandığı yerel kütüphaneler — pip'ten gelmez
+      - name: Sistem paketleri
+        run: |
+          apt-get update -qq
+          apt-get install -y --no-install-recommends \
+            python3-colcon-common-extensions \
+            libportaudio2 espeak-ng mpg123 alsa-utils ffmpeg curl git
+
+      - name: uv kur
+        run: |
+          curl -LsSf https://astral.sh/uv/install.sh | sh
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      # --system-site-packages ZORUNLU: rclpy/sensor_msgs/std_msgs PyPI'da yok,
+      # /opt/ros/humble altından gelir. İzole venv hiçbir düğümü import edemez.
+      - name: Python ortamı
+        run: |
+          uv venv --python 3.10 --system-site-packages .venv
+          VIRTUAL_ENV=.venv uv pip install -r requirements.txt
+
+      # Depo KÖKÜNDEN değil ros2_ws içinden ve venv Python'uyla derlenir;
+      # aksi hâlde giriş noktalarının shebang'i /usr/bin/python3 olur.
+      - name: Çalışma alanını derle
+        run: ./scripts/build.sh
+
+      - name: Testler
+        run: |
+          . /opt/ros/humble/setup.sh
+          . ros2_ws/install/setup.sh
+          .venv/bin/python -m pytest -q
+
+      - name: Yapılandırma sürüklenmesi kontrolü
+        run: .venv/bin/python scripts/check_env_drift.py

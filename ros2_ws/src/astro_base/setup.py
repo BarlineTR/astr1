@@ -17,10 +17,10 @@ setup(
     maintainer_email='baran@example.com',
     description='ASTRO V1 base hardware interface',
     license='Apache-2.0',
-    tests_require=['pytest'],
     entry_points={
         'console_scripts': [
             'serial_bridge = astro_base.serial_bridge:main',
+            'head_tracker = astro_base.head_tracker_node:main',
         ],
     },
 )

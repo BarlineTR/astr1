@@ -14,6 +14,7 @@ Kayıt ve tanıma aynı yolu kullanır (bkz. scripts/enroll_speaker.py).
 """
 import json
 import os
+import time
 from pathlib import Path
 
 import numpy as np
@@ -139,11 +140,36 @@ class SpeakerEngine:
         self.db_path = Path(os.path.expanduser(str(db_path))) if db_path else DEFAULT_DB_PATH
         self.threshold = threshold
 
-        model_path = self.model_dir / MODEL_FILE
-        if not model_path.exists():
+        model_candidates = [
+            (self.model_dir / MODEL_FILE),
+            Path(os.path.expanduser("~/.astro/models")) / MODEL_FILE,
+            Path(os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..", "..", "models"))) / MODEL_FILE,
+            Path(os.path.abspath("./models")) / MODEL_FILE,
+        ]
+        resolved_model_path = None
+        for cand in model_candidates:
+            if cand and cand.exists() and cand.stat().st_size > 1000:
+                resolved_model_path = cand
+                self.model_dir = cand.parent
+                break
+
+        if not resolved_model_path:
             raise SpeakerEngineUnavailable(
-                f"Konuşmacı modeli yok: {model_path} — ./scripts/install_face_models.sh çalıştırın"
+                f"Konuşmacı modeli yok: {self.model_dir / MODEL_FILE} — ./scripts/install_face_models.sh çalıştırın"
             )
+
+        self.model_path = resolved_model_path
+
+        db_candidates = [
+            self.db_path,
+            Path(os.path.expanduser("~/.astro/voices/speakers.json")),
+            Path(os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "data", "known_voices", "speakers.json"))),
+        ]
+        for cand in db_candidates:
+            if cand and cand.exists():
+                self.db_path = cand
+                break
+
         try:
             import onnxruntime as ort
         except ImportError as exc:
@@ -152,8 +178,12 @@ class SpeakerEngine:
         options = ort.SessionOptions()
         options.intra_op_num_threads = 1          # robotta CPU'yu tek çekirdekte tut
         try:
+            available_providers = ort.get_available_providers()
+            providers = [p for p in ["CUDAExecutionProvider", "CPUExecutionProvider"] if p in available_providers]
+            if not providers:
+                providers = ["CPUExecutionProvider"]
             self._session = ort.InferenceSession(
-                str(model_path), sess_options=options, providers=["CPUExecutionProvider"]
+                str(self.model_path), sess_options=options, providers=providers
             )
         except Exception as exc:
             raise SpeakerEngineUnavailable(f"Model yüklenemedi: {exc}") from exc
@@ -162,14 +192,46 @@ class SpeakerEngine:
         self.load()
 
     # ------------------------------------------------------------------ vektör
+    def embed_with_profile(self, audio_int16: np.ndarray, sample_rate: int = SAMPLE_RATE) -> tuple[np.ndarray | None, dict]:
+        """int16 ses dizisinden 256 boyutlu vektör ve detaylı mikro zamanlama profili döndürür."""
+        prof = {
+            "sample_count": int(audio_int16.size) if audio_int16 is not None else 0,
+            "duration_ms": (float(audio_int16.size) / sample_rate * 1000.0) if (audio_int16 is not None and sample_rate > 0) else 0.0,
+            "fbank_ms": 0.0,
+            "onnx_infer_ms": 0.0,
+            "norm_ms": 0.0,
+            "device": "CPUExecutionProvider",
+        }
+        if audio_int16 is None or audio_int16.size < MIN_SECONDS * sample_rate:
+            return None, prof
+
+        t0 = time.monotonic()
+        feats = compute_fbank(np.asarray(audio_int16, dtype=np.float32), sample_rate)
+        t1 = time.monotonic()
+        prof["fbank_ms"] = round((t1 - t0) * 1000.0, 2)
+
+        try:
+            provs = self._session.get_providers()
+            prof["device"] = provs[0] if provs else "CPUExecutionProvider"
+        except Exception:
+            prof["device"] = "CPUExecutionProvider"
+
+        t2 = time.monotonic()
+        embedding = self._session.run(None, {"feats": feats[None, :, :]})[0][0]
+        t3 = time.monotonic()
+        prof["onnx_infer_ms"] = round((t3 - t2) * 1000.0, 2)
+
+        norm = np.linalg.norm(embedding)
+        emb = (embedding / norm).astype(np.float32) if norm > 0 else None
+        t4 = time.monotonic()
+        prof["norm_ms"] = round((t4 - t3) * 1000.0, 2)
+
+        return emb, prof
+
     def embed(self, audio_int16: np.ndarray, sample_rate: int = SAMPLE_RATE) -> np.ndarray | None:
         """int16 ses dizisinden 256 boyutlu, birim uzunluklu konuşmacı vektörü."""
-        if audio_int16.size < MIN_SECONDS * sample_rate:
-            return None
-        feats = compute_fbank(np.asarray(audio_int16, dtype=np.float32), sample_rate)
-        embedding = self._session.run(None, {"feats": feats[None, :, :]})[0][0]
-        norm = np.linalg.norm(embedding)
-        return (embedding / norm).astype(np.float32) if norm > 0 else None
+        emb, _ = self.embed_with_profile(audio_int16, sample_rate)
+        return emb
 
     @staticmethod
     def similarity(a: np.ndarray, b: np.ndarray) -> float:

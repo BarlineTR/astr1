@@ -41,7 +41,9 @@ namespace Proto {
     uint8_t buf[1 + 255]; // length + data
     buf[0] = len;
     buf[1] = msg_id;
-    memcpy(&buf[2], payload, payload_len);
+    if (payload_len > 0 && payload != nullptr) {
+      memcpy(&buf[2], payload, payload_len);
+    }
     uint8_t crc = crc8(buf, 2 + payload_len);
     s.write(crc);
   }
@@ -59,6 +61,7 @@ namespace Proto {
           break;
         case WAIT_SOF2:
           if (b == SOF2) state = WAIT_LEN;
+          else if (b == SOF1) state = WAIT_SOF2;
           else state = WAIT_SOF1;
           break;
         case WAIT_LEN:
@@ -71,7 +74,6 @@ namespace Proto {
           if (idx >= len) state = WAIT_CRC;
           break;
         case WAIT_CRC: {
-          // ✅ FIX: Temiz CRC hesaplama (gereksiz satırlar kaldırıldı)
           uint8_t tmp[1 + 255];
           tmp[0] = len;
           memcpy(&tmp[1], data, len);
@@ -83,8 +85,8 @@ namespace Proto {
             state = WAIT_SOF1;
             return true;
           } else {
-            // CRC fail -> reset parser
-            state = WAIT_SOF1;
+            // CRC fail -> re-sync if current byte is SOF1
+            state = (b == SOF1) ? WAIT_SOF2 : WAIT_SOF1;
           }
         } break;
       }

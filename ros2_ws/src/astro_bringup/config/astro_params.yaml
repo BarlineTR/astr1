@@ -1,7 +1,7 @@
 serial_bridge:
   ros__parameters:
     port: "/dev/astro_arduino"
-    baud: 500000
+    baud: 115200
     connect_retry_sec: 2.0
     frame_id_imu: "imu_link"
     ticks_per_rev_left: 2048.0
@@ -11,11 +11,15 @@ serial_bridge:
 
 rplidar_node:
   ros__parameters:
+    channel_type: "serial"
     serial_port: "/dev/astro_lidar"
     serial_baudrate: 115200
     frame_id: "laser_frame"
+    inverted: false
     angle_compensate: true
     scan_mode: "Standard"
+    scan_frequency: 10.0
+    auto_standby: false
 
 scan_filter_node:
   ros__parameters:
@@ -52,7 +56,7 @@ tts_node:
       i_enable_imu: false
     i_pipeline_type: "RGBD"
     rgb:
-      i_resolution: "720P"
+      i_resolution: "1080P"
       i_fps: 30.0
       i_publish_topic: true
     stereo:
@@ -66,3 +70,17 @@ face_detector_node:
     scale_factor: 1.1
     min_neighbors: 5
     min_size: 30
+
+head_tracker_node:
+  ros__parameters:
+    enabled: true
+    doa_offset_deg: 0.0
+    doa_invert: false
+    max_yaw_deg: 70.0
+    min_yaw_deg: -70.0
+    deadband_deg: 12.0
+    min_dwell_time_s: 2.5
+    idle_return_timeout_s: 8.0
+    max_speed_deg_s: 45.0
+    min_rms_threshold: 800.0
+    noise_multiplier: 2.2

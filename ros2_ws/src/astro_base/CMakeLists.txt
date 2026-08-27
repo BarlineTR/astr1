@@ -14,6 +14,19 @@ find_package(diagnostic_msgs REQUIRED)
 find_package(std_msgs REQUIRED)
 find_package(rosidl_default_generators REQUIRED)
 
+# Ubuntu 22.04'te CMake, Debian'ın distutils şemasını kullanıp üretilen python
+# mesaj modülünü install/astro_base/LOCAL/lib/python3.10/dist-packages altına
+# koyuyordu. colcon oraya PYTHONPATH hook'u üretmediği için paket kurulu
+# görünmesine rağmen `from astro_base.msg import WheelCmd` ModuleNotFoundError
+# veriyordu — hem serial_bridge.py çalışma anında, hem de testlerinde.
+# Hedefi açıkça vererek hook'un üretilmesini garantiliyoruz.
+if(NOT DEFINED PYTHON_INSTALL_DIR)
+  find_package(Python3 REQUIRED COMPONENTS Interpreter)
+  set(PYTHON_INSTALL_DIR
+      "lib/python${Python3_VERSION_MAJOR}.${Python3_VERSION_MINOR}/site-packages"
+      CACHE STRING "Üretilen python mesaj modülünün kurulacağı yer")
+endif()
+
 # Generate custom messages (ROS 2 otomatik olarak python mesaj paketini de üretecek)
 rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/WheelCmd.msg"
@@ -23,8 +36,15 @@ rosidl_generate_interfaces(${PROJECT_NAME}
 
 # Install Python executables - Çalıştırılabilir scriptimizi hedefe kopyalıyoruz
 install(PROGRAMS
-  src/serial_bridge.py
+  astro_base/serial_bridge.py
   DESTINATION lib/${PROJECT_NAME}
+  RENAME serial_bridge
+)
+
+install(PROGRAMS
+  astro_base/head_tracker_node.py
+  DESTINATION lib/${PROJECT_NAME}
+  RENAME head_tracker
 )
 
 # Linting

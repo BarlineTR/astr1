@@ -10,6 +10,10 @@ Features:
 """
 
 import json
+import logging
+
+_LOG = logging.getLogger(__name__)
+
 import os
 import re
 import threading
@@ -54,14 +58,13 @@ def _get_engine():
 
 class FaceRecognizer:
     """Manages facial feature embeddings, known gallery indexing, and matching."""
+    EMBEDDING_DIM: int = 128  # OpenCV SFace standard embedding dimension
 
     def __init__(self, data_dir: Optional[str] = None):
         if data_dir is None:
             # Check default workspace paths
             candidates = [
                 os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "data", "known_faces")),
-                os.path.expanduser("~/Desktop/astr1/ros2_ws/src/astro_vision/data/known_faces"),
-                os.path.expanduser("~/Desktop/astr1/data/known_faces"),
                 os.path.abspath("./data/known_faces")
             ]
             self.data_dir = candidates[0]
@@ -127,8 +130,13 @@ class FaceRecognizer:
                 largest = max(faces, key=lambda f: float(f[2]) * float(f[3]))
                 feature = engine.embed(face_bgr, largest)
             else:
-                aligned = cv2.resize(face_bgr, (112, 112))
-                feature = engine.feature(aligned)
+                h, w = face_bgr.shape[:2]
+                if h <= 250 and w <= 250:
+                    aligned = cv2.resize(face_bgr, (112, 112))
+                    feature = engine.feature(aligned)
+                else:
+                    # Full frame with no face detected
+                    return None
         except Exception:
             return None
 
@@ -144,8 +152,8 @@ class FaceRecognizer:
         if engine is not None:
             try:
                 engine.load()
-            except Exception:
-                pass
+            except Exception as _exc:
+                _LOG.debug("reload_gallery: yok sayılan hata (%s)", _exc)
 
         with self._lock:
             self._known_embeddings.clear()
@@ -217,8 +225,8 @@ class FaceRecognizer:
                 os.makedirs(person_dir, exist_ok=True)
                 filename = f"face_{int(np.random.randint(1000, 9999))}.jpg"
                 cv2.imwrite(os.path.join(person_dir, filename), face_bgr)
-            except Exception:
-                pass
+            except Exception as _exc:
+                _LOG.debug("enroll_face: yok sayılan hata (%s)", _exc)
 
             # Save to FaceEngine database
             engine = _get_engine()
@@ -226,8 +234,8 @@ class FaceRecognizer:
                 try:
                     engine.add_person(name, [emb])
                     engine.save()
-                except Exception:
-                    pass
+                except Exception as _exc:
+                    _LOG.debug("enroll_face: yok sayılan hata (%s)", _exc)
             return True
 
     def recognize_face(self, face_bgr: np.ndarray, threshold: float = FACE_MATCH_THRESHOLD) -> Tuple[Optional[str], float, Dict[str, Any]]:
@@ -248,8 +256,8 @@ class FaceRecognizer:
                     return meta["name"], round(float(sim), 2), meta
                 elif sim is not None and sim > 0:
                     return None, round(float(sim), 2), {}
-            except Exception:
-                pass
+            except Exception as _exc:
+                _LOG.debug("recognize_face: yok sayılan hata (%s)", _exc)
 
         # 2. Fallback to in-memory matching
         emb = self.extract_embedding(face_bgr)
@@ -265,10 +273,11 @@ class FaceRecognizer:
 
             for person_norm, emb_list in self._known_embeddings.items():
                 for known_emb in emb_list:
-                    sim = float(np.dot(emb, known_emb))
+                    sim = float(np.dot(emb.flatten(), np.asarray(known_emb).flatten()))
                     if sim > highest_sim:
                         highest_sim = sim
                         best_match = person_norm
+
 
             if best_match is not None and highest_sim >= threshold:
                 meta = self._person_metadata.get(best_match, {

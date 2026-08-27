@@ -1,4 +1,8 @@
 import os
+import logging
+
+_LOG = logging.getLogger(__name__)
+
 
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
@@ -9,20 +13,16 @@ from launch.substitutions import LaunchConfiguration
 
 
 def generate_launch_description():
+    # .env'i CWD'den ve bu dosyanın konumundan YUKARI DOĞRU yürüyerek ara.
+    # Eski hâli yalnızca os.path.abspath(".env")'e bakıyordu; `ros2 launch` komutu
+    # repo kökü dışından (ör. ros2_ws içinden) verildiğinde hiçbir aday tutmuyor,
+    # anahtarlar çocuk süreçlere geçmiyor ve düğümler "OPENAI_API_KEY eksik"
+    # diyordu. env_utils.find_env_file() bringup.launch.py ile aynı aramayı yapar.
     try:
-        from dotenv import load_dotenv
-        for env_path in [
-            os.path.abspath(".env"),
-            os.path.abspath(".env.production"),
-            os.path.expanduser("~/Desktop/astr1/.env"),
-            os.path.expanduser("~/Desktop/astr1/.env.production"),
-            os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..", "..", ".env")),
-            os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..", "..", ".env.production")),
-        ]:
-            if os.path.exists(env_path):
-                load_dotenv(env_path, override=True)
-    except Exception:
-        pass
+        from astro_bringup.env_utils import load_astro_env
+        load_astro_env()
+    except Exception as _exc:
+        _LOG.debug("generate_launch_description: .env yüklenemedi (%s)", _exc)
 
     lidar_pkg = get_package_share_directory("astro_lidar")
     audio_pkg = get_package_share_directory("astro_audio")
@@ -34,6 +34,7 @@ def generate_launch_description():
     enable_vision = LaunchConfiguration("enable_vision")
     enable_ai = LaunchConfiguration("enable_ai")
     use_native_spatial = LaunchConfiguration("use_native_spatial")
+    camera_source = LaunchConfiguration("camera_source")
 
     return LaunchDescription(
         [
@@ -46,6 +47,11 @@ def generate_launch_description():
                 "use_native_spatial",
                 default_value="false",
                 description="Use 100% Native DepthAI on-chip VPU spatial perception pipeline",
+            ),
+            DeclareLaunchArgument(
+                "camera_source",
+                default_value="oakd",
+                description="Görüntü kaynağı: oakd | webcam | none",
             ),
             DeclareLaunchArgument(
                 "enable_lidar",
@@ -82,6 +88,7 @@ def generate_launch_description():
                 launch_arguments={
                     "use_sim_time": use_sim_time,
                     "use_native_spatial": use_native_spatial,
+                    "source": camera_source,
                 }.items(),
             ),
             IncludeLaunchDescription(

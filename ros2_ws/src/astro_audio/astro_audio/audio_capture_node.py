@@ -9,16 +9,26 @@ Matches TTS/hey_groq_assistant.py hardware capture pipeline:
 """
 
 import os
+import logging
+
+_LOG = logging.getLogger(__name__)
+
 import re
 import struct
 import subprocess
 import threading
 import time
+from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 
-import rclpy
-from rclpy.node import Node
-from std_msgs.msg import Bool, Float32, Int16MultiArray
+try:
+    import rclpy
+    from rclpy.node import Node
+    from std_msgs.msg import Bool, Float32, Int16MultiArray
+except ImportError:
+    rclpy = None
+    Node = object
+    Bool = Float32 = Int16MultiArray = None
 
 try:
     import sounddevice as sd
@@ -43,16 +53,26 @@ class ReSpeakerHID:
 
     def __init__(self):
         self.dev = None
+        self._last_find_attempt = 0.0
+        self._find_device()
+
+    def _find_device(self):
         if not HAS_USB:
             return
+        now = time.monotonic()
+        if (now - self._last_find_attempt) < 5.0:
+            return
+        self._last_find_attempt = now
         try:
             self.dev = usb.core.find(idVendor=RESPEAKER_VID, idProduct=RESPEAKER_PID)
         except Exception:
             self.dev = None
 
-    def _read_param(self, param_id: int) -> int:
+    def _read_param(self, param_id: int) -> Optional[int]:
         if self.dev is None:
-            return 0
+            self._find_device()
+            if self.dev is None:
+                return None
         try:
             data = self.dev.ctrl_transfer(
                 usb.util.CTRL_IN | usb.util.CTRL_TYPE_VENDOR | usb.util.CTRL_RECIPIENT_DEVICE,
@@ -62,18 +82,25 @@ class ReSpeakerHID:
                 8,
                 self.TIMEOUT_MS,
             )
-            return struct.unpack_from("i", data, 0)[0]
+            if data and len(data) >= 4:
+                return struct.unpack_from("i", data, 0)[0]
+            return None
         except Exception:
-            return 0
+            self.dev = None
+            return None
 
-    def speech_detected(self) -> bool:
-        return self._read_param(PARAM_SPEECH_DETECTED) == 1
+    def speech_detected(self) -> Optional[bool]:
+        val = self._read_param(PARAM_SPEECH_DETECTED)
+        return (val == 1) if val is not None else None
 
-    def doa_angle(self) -> float:
-        return float(self._read_param(PARAM_DOA_ANGLE))
+    def doa_angle(self) -> Optional[float]:
+        val = self._read_param(PARAM_DOA_ANGLE)
+        if val is not None and 0 <= val <= 359:
+            return float(val)
+        return None
 
 
-RESPEAKER_NAME_HINTS = ("respeaker", "uac1", "seeed", "arrayuac")
+RESPEAKER_NAME_HINTS = ("respeaker", "uac1", "seeed", "arrayuac", "4 mic array", "array uac")
 
 
 def list_input_devices() -> list[tuple[int, str]]:
@@ -130,8 +157,8 @@ def find_input_device(preferred: str = "") -> tuple[int | None, str, str]:
             for i, name in inputs:
                 if i == default_in:
                     return i, name, "default"
-    except Exception:
-        pass
+    except Exception as _exc:
+        _LOG.debug("find_input_device: yok sayılan hata (%s)", _exc)
 
     # 4. Varsayılan da yoksa ilk giriş cihazı
     return inputs[0][0], inputs[0][1], "first"
@@ -190,6 +217,12 @@ class AudioCaptureNode(Node):
             "none": "kullanılabilir mikrofon yok",
         }[source]
 
+        if source in ("default", "first"):
+            self.get_logger().warn(
+                f"⚠️ [AUDIO_DEVICE_FALLBACK]: ReSpeaker donanımı bulunamadı! "
+                f"Seçilen cihaz: [{dev_id}] {dev_name} ({reason})"
+            )
+
         if dev_id is None:
             self.get_logger().error(f"❌ [Mikrofon] {reason} — ses yakalama devre dışı")
             for i, name in list_input_devices():
@@ -236,8 +269,8 @@ class AudioCaptureNode(Node):
             for i, name in list_input_devices():
                 if i == default_in:
                     return i, name
-        except Exception:
-            pass
+        except Exception as _exc:
+            self.get_logger().debug(f"_default_device: yok sayılan hata ({_exc})")
         return None
 
     def _open_stream(self, dev_id: int, dev_name: str) -> bool:
@@ -310,8 +343,8 @@ class AudioCaptureNode(Node):
                 msg = Float32()
                 msg.data = angle
                 self.pub_doa.publish(msg)
-            except Exception:
-                pass
+            except Exception as _exc:
+                self.get_logger().debug(f"_publish_hid: yok sayılan hata ({_exc})")
 
     def destroy_node(self):
         if self.stream:
@@ -328,8 +361,8 @@ def main(args=None):
     node = AudioCaptureNode()
     try:
         rclpy.spin(node)
-    except KeyboardInterrupt:
-        pass
+    except KeyboardInterrupt as _exc:
+        _LOG.debug("main: yok sayılan hata (%s)", _exc)
     finally:
         node.destroy_node()
         if rclpy.ok():

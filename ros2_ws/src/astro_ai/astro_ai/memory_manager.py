@@ -8,6 +8,10 @@ Tiers:
 """
 
 import json
+import logging
+
+_LOG = logging.getLogger(__name__)
+
 import os
 import re
 import threading
@@ -32,6 +36,23 @@ class EpisodicBuffer:
     def get_messages(self) -> List[Dict[str, Any]]:
         with self._lock:
             return list(self.messages)
+
+    def search(self, query: str, top_k: int = 3) -> List[str]:
+        """Searches recent dialogue messages for keywords matching query."""
+        with self._lock:
+            if not query:
+                return []
+            q_words = [w.lower() for w in query.split() if len(w) > 2]
+            scored = []
+            for msg in self.messages:
+                content = msg.get("content", "")
+                c_lower = content.lower()
+                matches = sum(1 for w in q_words if w in c_lower)
+                if matches > 0:
+                    role_str = "Kullanıcı" if msg.get("role") == "user" else "Astro"
+                    scored.append((matches, f"{role_str}: {content}"))
+            scored.sort(key=lambda x: x[0], reverse=True)
+            return [s[1] for s in scored[:top_k]]
 
     def clear(self):
         with self._lock:
@@ -78,11 +99,51 @@ class SessionMemory:
 class PersistentProfile:
     """Tier 3: Strictly validated long-term profile storage (astro_memory.json)."""
 
-    # Blocked keywords to prevent eavesdropped gossip from becoming facts
+    # Blocked keywords to prevent eavesdropped gossip, profanity, or LLM refusals from becoming facts/observations
     GOSSIP_BLOCKLIST = [
         r"\bsezer\b", r"\bihsan\b", r"\bonur\b", r"\bhilal\b", r"\bsara\b",
-        r"\breddicim\b", r"\baldatıyor\b", r"\bposta\b", r"\bkumar\b"
+        r"\breddicim\b", r"\baldatıyor\b", r"\bposta\b", r"\bkumar\b",
+        r"yapay zeka", r"dil modeli", r"language model", r"asistan olarak",
+        r"\bamk\b", r"\baq\b", r"\bsik\b", r"\bsiktir\b", r"\byarrak\b", r"\byarram\b",
+        r"\bpiç\b", r"\borospu\b", r"\bgöt\b", r"\btaşşak\b", r"\byavşak\b",
+        r"küfürbaz", r"filtreleri kaldır", r"jailbreak"
     ]
+
+    @staticmethod
+    def _discover_memory_file() -> str:
+        """Çalışılan depoya ait astro_memory.json yolunu bulur.
+
+        Eskiden ilk aday modül konumundan üç seviye yukarısıydı (kurulu pakette
+        hiç var olmayan bir yol) ve hemen ardından başka bir geliştiricinin makinesine
+        ait sabit yollar geliyordu:
+        makinede eski bir kopya duruyorsa tüm kalıcı bellek — tanınan kişiler dahil —
+        çalışan depoya değil o kopyaya yazılıyordu. Artık modülün bulunduğu yerden
+        yukarı yürüyüp ros2_ws içeren gerçek depo kökü aranır; makineye özel sabit
+        yollar tamamen kaldırıldı.
+        """
+        here = os.path.dirname(os.path.abspath(__file__))
+
+        # Kurulu paket (install/astro_ai/lib/pythonX/site-packages/astro_ai) ya da
+        # kaynak ağacı (ros2_ws/src/astro_ai/astro_ai) fark etmeksizin yukarı yürü.
+        current = here
+        for _ in range(10):
+            parent = os.path.dirname(current)
+            if parent == current:
+                break
+            current = parent
+            if os.path.basename(current) == "ros2_ws":
+                return os.path.join(current, "astro_memory.json")
+            candidate = os.path.join(current, "ros2_ws", "astro_memory.json")
+            if os.path.exists(candidate):
+                return candidate
+
+        legacy = [
+            os.path.abspath("./astro_memory.json"),
+        ]
+        for c in legacy:
+            if os.path.exists(c):
+                return c
+        return legacy[0]
 
     def __init__(self, filepath: Optional[str] = None):
         if filepath is None:
@@ -90,11 +151,17 @@ class PersistentProfile:
             if env_path:
                 self.filepath = os.path.expanduser(env_path)
             else:
-                self.filepath = os.path.expanduser("~/Desktop/astr1/ros2_ws/astro_memory.json")
+                self.filepath = self._discover_memory_file()
         else:
             self.filepath = filepath
 
-        self._lock = threading.Lock()
+
+        # RLock ZORUNLU: add_person_fact / add_person_preference /
+        # add_person_session_summary kilidi tutarken add_known_person'ı çağırıyor.
+        # Düz Lock ile bu, thread'i kalıcı olarak kilitliyordu; 1 sn'lik
+        # _check_reminders timer'ı da aynı kilitte bloke olunca ai_brain_node'un
+        # tüm callback grubu donuyor ve robot kalıcı olarak sağırlaşıyordu.
+        self._lock = threading.RLock()
         self.data: Dict[str, Any] = {
             "robot_name": "Astro",
             "owner_name": "Baran",
@@ -113,13 +180,22 @@ class PersistentProfile:
 
     def load(self):
         with self._lock:
-            if os.path.exists(self.filepath):
+            source = self.filepath
+            if not os.path.exists(source):
+                # Çalışma dosyası depoda TAKİP EDİLMEZ (her çalıştırmada değişir ve
+                # kişisel veri içerir). İlk açılışta yanındaki tohum şablonundan
+                # başlatılır; şablon da yoksa koddaki varsayılanlar kullanılır.
+                seed = os.path.join(os.path.dirname(source), "astro_memory.seed.json")
+                if os.path.exists(seed):
+                    source = seed
+
+            if os.path.exists(source):
                 try:
-                    with open(self.filepath, "r", encoding="utf-8") as f:
+                    with open(source, "r", encoding="utf-8") as f:
                         saved = json.load(f)
                         self.data.update(saved)
-                except Exception:
-                    pass
+                except Exception as _exc:
+                    _LOG.debug("load: yok sayılan hata (%s)", _exc)
 
             # Sanitize any polluted data
             self._sanitize()
@@ -157,8 +233,8 @@ class PersistentProfile:
             try:
                 if os.path.exists(tmp_path):
                     os.remove(tmp_path)
-            except Exception:
-                pass
+            except Exception as _exc:
+                _LOG.debug("save: yok sayılan hata (%s)", _exc)
 
     def add_verified_fact(self, fact: str) -> bool:
         """Adds a fact only if it passes strict validation against hallucinations."""
@@ -192,16 +268,23 @@ class PersistentProfile:
             self.data.setdefault("learned_objects", {})[obj_name] = visual_desc
             self.save()
 
-    def add_observation(self, observation: str):
+    def add_observation(self, observation: str, confidence: float = 1.0) -> bool:
+        """Gated memory write: only persists observations with confidence >= 0.70 and non-empty/non-gossip content."""
+        if not observation or len(observation.strip()) < 5 or confidence < 0.70:
+            return False
+        obs_lower = observation.lower()
+        if any(re.search(p, obs_lower) for p in self.GOSSIP_BLOCKLIST):
+            return False
         with self._lock:
-            if observation:
-                obs_list = self.data.setdefault("environmental_observations", [])
-                # Avoid duplicate identical observations
-                if not obs_list or obs_list[-1] != observation:
-                    obs_list.append(observation)
-                    if len(obs_list) > 3:
-                        self.data["environmental_observations"] = obs_list[-3:]
-                    self.save()
+            obs_list = self.data.setdefault("environmental_observations", [])
+            clean_obs = observation.strip()
+            if not obs_list or obs_list[-1] != clean_obs:
+                obs_list.append(clean_obs)
+                if len(obs_list) > 5:
+                    self.data["environmental_observations"] = obs_list[-5:]
+                self.save()
+                return True
+            return False
 
     def add_known_person(self, name: str, title: str = "Tanışılan Kişi", formal_title: str = "", notes: str = ""):
         """Stores a learned person profile in persistent memory."""
@@ -252,8 +335,27 @@ class PersistentProfile:
                 self.save()
             return True
 
+    def set_user_fact(self, name: str, key: str, value: str):
+        """Sets or updates a specific fact / preference for a known user."""
+        self.add_person_preference(name, key, value)
+        self.add_person_fact(name, f"{key}: {value}")
+
+    def get_user_facts(self, name: str) -> Dict[str, Any]:
+        """Retrieves all preferences, facts, and past conversation summaries for a given user."""
+        with self._lock:
+            person = self.get_known_person(name)
+            if not person:
+                return {}
+            facts = dict(person.get("preferences", {}))
+            for idx, fact in enumerate(person.get("learned_facts", [])):
+                facts[f"Bilgi_{idx+1}"] = fact
+            for idx, sess in enumerate(person.get("session_summaries", [])[-3:]):
+                facts[f"Geçmiş_Sohbet_{idx+1}"] = f"({sess.get('time_str')}): {sess.get('summary')}"
+            return facts
+
     def add_person_preference(self, name: str, key: str, value: str):
         """Stores a specific preference (e.g. coffee: unsweetened) for a known person."""
+
         if not name or not key:
             return
         with self._lock:

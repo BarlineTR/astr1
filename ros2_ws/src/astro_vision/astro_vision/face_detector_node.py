@@ -16,12 +16,17 @@ Features:
 """
 
 import json
+import logging
+
+_LOG = logging.getLogger(__name__)
+
 from collections import deque
 import cv2
 import numpy as np
 
 import rclpy
 from rclpy.node import Node
+from rclpy.qos import qos_profile_sensor_data
 from sensor_msgs.msg import Image
 from std_msgs.msg import String, Bool, Float32
 
@@ -67,8 +72,8 @@ class SpatialVisionNode(Node):
             if hasattr(cv2, 'cuda') and cv2.cuda.getCudaEnabledDeviceCount() > 0:
                 self.gpu_accelerated = True
                 self.get_logger().info(f"🚀 [Spatial Vision] Jetson Orin Nano GPU / CUDA Hızlandırma Aktif!")
-        except Exception:
-            pass
+        except Exception as _exc:
+            self.get_logger().debug(f"__init__: yok sayılan hata ({_exc})")
 
         # Internal Buffers
         self._latest_depth = None
@@ -87,8 +92,11 @@ class SpatialVisionNode(Node):
         self.pub_image = self.create_publisher(Image, "/vision/face_image", 10)
 
         # Subscribers
-        self.sub_rgb = self.create_subscription(Image, input_topic, self.image_callback, 10)
-        self.sub_depth = self.create_subscription(Image, depth_topic, self.depth_callback, 10)
+        # Görüntü akışları sensör QoS'u (BEST_EFFORT) kullanır: kare kaybı, geciken
+        # kareler için retransmission yapmaktan iyidir. BEST_EFFORT abone RELIABLE
+        # yayıncıdan da veri alabilir, bu yüzden depthai_ros_driver ile uyumludur.
+        self.sub_rgb = self.create_subscription(Image, input_topic, self.image_callback, qos_profile_sensor_data)
+        self.sub_depth = self.create_subscription(Image, depth_topic, self.depth_callback, qos_profile_sensor_data)
 
         self.get_logger().info(f"👁️ [Spatial Emotion Vision] 3D Bakış, Mesafe ve Yüz Duygu Analizi Aktif! RGB: {input_topic}")
 
@@ -98,8 +106,8 @@ class SpatialVisionNode(Node):
                 self._latest_depth = np.frombuffer(msg.data, dtype=np.uint16).reshape(msg.height, msg.width)
             elif msg.encoding in ["32FC1"]:
                 self._latest_depth = (np.frombuffer(msg.data, dtype=np.float32).reshape(msg.height, msg.width) * 1000.0).astype(np.uint16)
-        except Exception:
-            pass
+        except Exception as _exc:
+            self.get_logger().debug(f"depth_callback: yok sayılan hata ({_exc})")
 
     def _estimate_distance(self, x: int, y: int, w: int, h: int, frame_w: int, frame_h: int) -> float:
         if self._latest_depth is not None:
@@ -114,8 +122,8 @@ class SpatialVisionNode(Node):
                 valid = patch[patch > 200]
                 if len(valid) > 0:
                     return float(np.median(valid)) / 1000.0
-            except Exception:
-                pass
+            except Exception as _exc:
+                self.get_logger().debug(f"_estimate_distance: yok sayılan hata ({_exc})")
 
         focal_length = frame_w * 0.8
         distance = (0.15 * focal_length) / max(1, w)
@@ -342,8 +350,8 @@ class SpatialVisionNode(Node):
         try:
             face_img_msg = bgr_to_imgmsg(frame, msg.header)
             self.pub_image.publish(face_img_msg)
-        except Exception:
-            pass
+        except Exception as _exc:
+            self.get_logger().debug(f"image_callback: yok sayılan hata ({_exc})")
 
 
 def main(args=None):
@@ -351,8 +359,8 @@ def main(args=None):
     node = SpatialVisionNode()
     try:
         rclpy.spin(node)
-    except KeyboardInterrupt:
-        pass
+    except KeyboardInterrupt as _exc:
+        _LOG.debug("main: yok sayılan hata (%s)", _exc)
     finally:
         node.destroy_node()
         if rclpy.ok():
