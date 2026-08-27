@@ -628,9 +628,9 @@ class AstroRealtimeNode(Node):
 
         # Architecture Profile (Profile A: Baseline create_response=False + synchronous turn orchestration; Profile B: OpenAI-native create_response=True + async biometric side-channel)
         self.architecture_profile = os.getenv("REALTIME_ARCHITECTURE_PROFILE", "profile_a").lower()
-        self.vad_silence_duration_ms = int(os.getenv("REALTIME_VAD_SILENCE_MS", "600" if self.architecture_profile == "profile_a" else "400"))
+        self.vad_silence_duration_ms = int(os.getenv("REALTIME_VAD_SILENCE_MS", "700" if self.architecture_profile == "profile_a" else "750"))
         self.vad_prefix_padding_ms = int(os.getenv("REALTIME_VAD_PREFIX_MS", "300"))
-        self.vad_threshold = float(os.getenv("REALTIME_VAD_THRESHOLD", "0.72" if self.architecture_profile == "profile_a" else "0.68"))
+        self.vad_threshold = float(os.getenv("REALTIME_VAD_THRESHOLD", "0.75"))
         self._async_identity_in_flight: bool = False
         self._latest_async_identity_ms: float = 0.0
         self._latest_barge_in_reaction_ms: float = 0.0
@@ -1350,7 +1350,7 @@ class AstroRealtimeNode(Node):
                     "input": {
                         "transcription": {
                             "model": self.realtime_transcribe_model or "gpt-live-transcribe",
-                            **({"language": os.getenv("REALTIME_TRANSCRIBE_LANGUAGE", "").strip()} if os.getenv("REALTIME_TRANSCRIBE_LANGUAGE", "").strip() else {})
+                            "language": os.getenv("REALTIME_TRANSCRIBE_LANGUAGE", "tr").strip() or "tr"
                         },
                         "turn_detection": {
                             "type": "server_vad",
