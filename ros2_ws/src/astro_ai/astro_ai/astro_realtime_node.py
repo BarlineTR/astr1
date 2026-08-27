@@ -5430,15 +5430,21 @@ class AstroRealtimeNode(Node):
         # Zero Self-Hearing Protection & Multi-Signal Persistent Barge-In
         if is_active_playback:
             playback_start = getattr(self, "_playback_start_monotonic", 0.0)
+            prot_ms = float(getattr(self, "barge_in_protection_ms", 350.0))
 
             # 1. Acoustic Protection Window: Strictly suppress self-voice feedback during initial burst (e.g. 350ms)
-            if playback_start > 0.0 and ((now - playback_start) * 1000.0 < self.barge_in_protection_ms):
+            if playback_start > 0.0 and ((now - playback_start) * 1000.0 < prot_ms):
                 self._barge_in_consecutive_frames = 0
                 return
 
             # Target barge-in threshold: Requires intentional voice exceeding baseline ambient
-            target_barge_in_rms = max(self.barge_in_min_rms, self._ambient_rms * self.barge_in_noise_mult)
-            target_barge_in_peak = self.barge_in_min_peak
+            barge_min_rms = float(getattr(self, "barge_in_min_rms", 1200.0))
+            barge_noise_mult = float(getattr(self, "barge_in_noise_mult", 3.5))
+            barge_min_peak = int(getattr(self, "barge_in_min_peak", 2800))
+            ambient_val = float(getattr(self, "_ambient_rms", 120.0))
+
+            target_barge_in_rms = max(barge_min_rms, ambient_val * barge_noise_mult)
+            target_barge_in_peak = barge_min_peak
 
             # Self-voice rejection score check: if voice recognizer is active, check self-voice score
             self_voice_score = 0.0
@@ -5485,9 +5491,9 @@ class AstroRealtimeNode(Node):
                 is_edge_tts_active = getattr(self, "_fallback_mode", False) or not self._can_use_openai("realtime")
             except Exception:
                 is_edge_tts_active = False
-            base_min_speech_ms = float(getattr(self, "barge_in_min_speech_ms", float(os.getenv("BARGE_IN_MIN_SPEECH_MS", "60.0"))))
+            base_min_speech_ms = float(getattr(self, "barge_in_min_speech_ms", 60.0))
             effective_min_speech_ms = (
-                max(120.0, base_min_speech_ms)  # Edge-TTS: require 120ms sustained speech (6 frames) before cutting
+                max(120.0, base_min_speech_ms)
                 if is_edge_tts_active
                 else max(base_min_speech_ms, getattr(self, "barge_in_min_consecutive_frames", 3) * 20.0)
             )
