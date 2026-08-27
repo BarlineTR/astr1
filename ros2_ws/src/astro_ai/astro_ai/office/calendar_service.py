@@ -21,7 +21,8 @@ class CalendarService:
             self.storage_path = os.path.join(astro_dir, "office_calendar.json")
 
         self.google_api_key = os.environ.get("GOOGLE_CALENDAR_API_KEY", "")
-        self.google_calendar_id = os.environ.get("GOOGLE_CALENDAR_ID", "primary")
+        self.google_calendar_id = os.environ.get("GOOGLE_CALENDAR_ID", "")
+        self.google_ical_url = os.environ.get("GOOGLE_CALENDAR_ICAL_URL", "")
         self._reminded_event_ids = set()
 
         self._ensure_storage_initialized()
@@ -69,16 +70,105 @@ class CalendarService:
         except Exception:
             return []
 
+    def _fetch_google_rest_events(self) -> List[Dict[str, Any]]:
+        """Fetches upcoming events via Google Calendar v3 REST API (if key and calendar ID provided)."""
+        if not self.google_api_key or not self.google_calendar_id:
+            return []
+        import urllib.request
+        import urllib.parse
+        now_iso = datetime.now(timezone.utc).isoformat()
+        cal_id = urllib.parse.quote(self.google_calendar_id)
+        url = (
+            f"https://www.googleapis.com/calendar/v3/calendars/{cal_id}/events"
+            f"?key={self.google_api_key}&timeMin={now_iso}&singleEvents=true&orderBy=startTime&maxResults=15"
+        )
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "AstroV1-OfficeBot"})
+            with urllib.request.urlopen(req, timeout=3.0) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+                items = data.get("items", [])
+                events = []
+                for it in items:
+                    st_val = it.get("start", {}).get("dateTime", it.get("start", {}).get("date", ""))
+                    title = it.get("summary", "Toplantı")
+                    loc = it.get("location", "Ofis")
+                    attendees = [a.get("displayName", a.get("email", "")) for a in it.get("attendees", [])]
+                    events.append({
+                        "id": it.get("id"),
+                        "title": title,
+                        "start_time": st_val,
+                        "duration_minutes": 30,
+                        "location": loc,
+                        "organizer": it.get("organizer", {}).get("displayName", "Ekip"),
+                        "attendees": attendees
+                    })
+                return events
+        except Exception:
+            return []
+
+    def _fetch_google_ical_events(self) -> List[Dict[str, Any]]:
+        """Fetches upcoming events via Google Calendar Secret iCal Feed URL (Zero API Key needed!)."""
+        if not self.google_ical_url:
+            return []
+        import urllib.request
+        try:
+            req = urllib.request.Request(self.google_ical_url, headers={"User-Agent": "AstroV1-OfficeBot"})
+            with urllib.request.urlopen(req, timeout=3.5) as resp:
+                content = resp.read().decode("utf-8", errors="ignore")
+
+            events = []
+            cur_event = None
+            for line in content.splitlines():
+                line = line.strip()
+                if line == "BEGIN:VEVENT":
+                    cur_event = {}
+                elif line == "END:VEVENT" and cur_event is not None:
+                    if "title" in cur_event and "start_time" in cur_event:
+                        events.append(cur_event)
+                    cur_event = None
+                elif cur_event is not None:
+                    if line.startswith("SUMMARY:"):
+                        cur_event["title"] = line[8:]
+                    elif line.startswith("LOCATION:"):
+                        cur_event["location"] = line[9:]
+                    elif line.startswith("DTSTART"):
+                        val = line.split(":")[-1].replace("Z", "")
+                        try:
+                            dt = datetime.strptime(val[:15], "%Y%m%dT%H%M%S")
+                            cur_event["start_time"] = dt.strftime("%Y-%m-%d %H:%M")
+                            cur_event["duration_minutes"] = 45
+                            cur_event["organizer"] = "Google Takvim"
+                            cur_event["id"] = f"ical_{val[:15]}_{abs(hash(cur_event.get('title', '')))}"
+                        except Exception:
+                            pass
+            return events
+        except Exception:
+            return []
+
     def get_upcoming_events(self, hours: float = 12.0) -> List[Dict[str, Any]]:
-        """Returns sorted upcoming events within specified hours."""
-        events = self._load_local_events()
+        """Returns sorted upcoming events merged across Google Calendar (REST or iCal) and local storage."""
+        # 1. Collect from Google Calendar (if configured)
+        google_events = self._fetch_google_ical_events() or self._fetch_google_rest_events()
+
+        # 2. Collect from local JSON storage
+        local_events = self._load_local_events()
+
+        # Merge with deduplication (by event id or title+start_time)
+        all_events = []
+        seen_keys = set()
+
+        for ev in (google_events + local_events):
+            t_key = f"{ev.get('title')}_{ev.get('start_time')}"
+            if t_key not in seen_keys:
+                seen_keys.add(t_key)
+                all_events.append(ev)
+
         now = datetime.now()
         cutoff = now + timedelta(hours=hours)
 
         upcoming = []
-        for ev in events:
+        for ev in all_events:
             try:
-                # Handle formats like "YYYY-MM-DD HH:MM" or ISO
                 st_str = ev.get("start_time", "")
                 if "T" in st_str:
                     st = datetime.fromisoformat(st_str.replace("Z", "+00:00")).astimezone().replace(tzinfo=None)
