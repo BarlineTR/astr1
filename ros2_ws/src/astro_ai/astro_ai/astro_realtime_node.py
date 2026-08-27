@@ -1346,6 +1346,7 @@ class AstroRealtimeNode(Node):
             "session": {
                 "type": "realtime",
                 "instructions": system_prompt,
+                "max_response_output_tokens": int(os.getenv("REALTIME_MAX_OUTPUT_TOKENS", "350")),
                 "audio": {
                     "input": {
                         "transcription": {
@@ -2002,7 +2003,9 @@ class AstroRealtimeNode(Node):
                 retry_s = 30.0
                 retry_match = _re.search(r"try again in (\d+\.?\d*)\s*s", str(error_msg))
                 if retry_match:
-                    retry_s = max(10.0, float(retry_match.group(1)) + 5.0)
+                    retry_s = max(20.0, float(retry_match.group(1)) + 10.0)
+                else:
+                    retry_s = 20.0
                 self.get_logger().warn(
                     f"⏳ [REALTIME TPM RATE LIMIT] Temporary token-per-minute limit hit. "
                     f"Cooling down for {retry_s:.0f}s before resuming.\n"
@@ -2048,6 +2051,20 @@ class AstroRealtimeNode(Node):
                     f"error_param={error_param}\n"
                     f"response_status={resp_status}\n"
                 )
+                gen_id = self.active_generation_id or self.realtime_current_generation_id
+                self.get_logger().warn(
+                    f"[REALTIME FAILED FALLBACK] generation_id={gen_id}\n"
+                    f"[TTS FALLBACK] from=openai_realtime to=edge_tts reason=realtime_response_failed"
+                )
+                last_txt = getattr(self, "_last_user_transcript", "")
+                if last_txt and len(last_txt.strip()) > 1 and not getattr(self, "_is_processing_fallback", False):
+                    self._last_user_transcript = ""
+                    threading.Thread(
+                        target=self._process_fallback_turn,
+                        kwargs={"direct_text": last_txt},
+                        daemon=True,
+                        name=f"astro-failed-fallback-{gen_id}"
+                    ).start()
             elif resp_status == "cancelled" or event_type == "response.cancelled":
                 self.active_response_state = "CANCELLED"
                 self.get_logger().info(
@@ -2149,6 +2166,7 @@ class AstroRealtimeNode(Node):
                 return
 
             if user_transcript:
+                self._last_user_transcript = user_transcript
                 self.get_logger().info(f"🗣️ [Siz]: \"{user_transcript}\"")
                 self.memory.episodic.add_message("user", user_transcript)
                 self.session.record_user_speech()
@@ -4794,9 +4812,9 @@ class AstroRealtimeNode(Node):
             if self.state_machine.current_state == RobotState.SPEAKING:
                 self.state_machine.transition_to(RobotState.LISTENING)
 
-    def _process_fallback_turn(self, audio_chunks: List[bytes]):
+    def _process_fallback_turn(self, audio_chunks: Optional[List[bytes]] = None, direct_text: Optional[str] = None):
         """Processes turn using capability-aware ProviderRegistry + Streaming LLM + Pipelined TTS."""
-        if self._is_processing_fallback or not audio_chunks:
+        if self._is_processing_fallback or (not audio_chunks and not direct_text):
             return
 
         self._is_processing_fallback = True
@@ -4821,104 +4839,111 @@ class AstroRealtimeNode(Node):
         attempts: List[Dict[str, Any]] = []
 
         try:
-            # 1. Combine raw 16kHz PCM chunks into valid in-memory WAV buffer
-            raw_pcm = b"".join(audio_chunks)
-            if len(raw_pcm) < 16000 * 2 * 0.20:
-                return
+            if direct_text:
+                user_text = direct_text.strip()
+                self.get_logger().info(f"🗣️ [Siz (Yedek Zeka)]: \"{user_text}\"")
+                self.memory.episodic.add_message("user", user_text)
+                raw_pcm = b""
+            else:
+                # 1. Combine raw 16kHz PCM chunks into valid in-memory WAV buffer
+                raw_pcm = b"".join(audio_chunks or [])
+                if len(raw_pcm) < 16000 * 2 * 0.20:
+                    return
 
-            # Cheap Local VAD Gate on raw_pcm before remote STT
-            t_vad_start = time.monotonic()
-            arr_pcm = np.frombuffer(raw_pcm, dtype=np.int16)
-            pcm_rms = float(np.sqrt(np.mean(arr_pcm.astype(np.float32) ** 2))) if len(arr_pcm) > 0 else 0.0
-            pcm_peak = int(np.max(np.abs(arr_pcm))) if len(arr_pcm) > 0 else 0
+            if not direct_text:
+                # Cheap Local VAD Gate on raw_pcm before remote STT
+                t_vad_start = time.monotonic()
+                arr_pcm = np.frombuffer(raw_pcm, dtype=np.int16)
+                pcm_rms = float(np.sqrt(np.mean(arr_pcm.astype(np.float32) ** 2))) if len(arr_pcm) > 0 else 0.0
+                pcm_peak = int(np.max(np.abs(arr_pcm))) if len(arr_pcm) > 0 else 0
 
-            chunk_sz = 320  # 20ms
-            speech_frames_cnt = 0
-            tot_frames_cnt = max(1, len(arr_pcm) // chunk_sz)
-            sp_thresh = max(220.0, self._ambient_rms * 1.15)
-            for i in range(0, len(arr_pcm) - chunk_sz + 1, chunk_sz):
-                if np.sqrt(np.mean(arr_pcm[i : i + chunk_sz].astype(np.float32) ** 2)) > sp_thresh:
-                    speech_frames_cnt += 1
-            local_speech_ms = int((speech_frames_cnt * chunk_sz / 16000.0) * 1000.0)
-            local_vad_conf = round(min(1.0, speech_frames_cnt / float(tot_frames_cnt)), 2)
-            t_vad_end = time.monotonic()
+                chunk_sz = 320  # 20ms
+                speech_frames_cnt = 0
+                tot_frames_cnt = max(1, len(arr_pcm) // chunk_sz)
+                sp_thresh = max(220.0, self._ambient_rms * 1.15)
+                for i in range(0, len(arr_pcm) - chunk_sz + 1, chunk_sz):
+                    if np.sqrt(np.mean(arr_pcm[i : i + chunk_sz].astype(np.float32) ** 2)) > sp_thresh:
+                        speech_frames_cnt += 1
+                local_speech_ms = int((speech_frames_cnt * chunk_sz / 16000.0) * 1000.0)
+                local_vad_conf = round(min(1.0, speech_frames_cnt / float(tot_frames_cnt)), 2)
+                t_vad_end = time.monotonic()
 
-            # Discard immediately if audio has no genuine acoustic speech evidence (0 STT calls)
-            if local_speech_ms < 90 or pcm_rms < max(200.0, self._ambient_rms * 1.15) or local_vad_conf < 0.15:
-                self.no_speech_rejection_count += 1
-                self.get_logger().debug(
-                    f"🔇 [VAD Gate Dropped Buffer (0 STT Calls)]: speech_ms={local_speech_ms} | rms={pcm_rms:.1f} | vad_conf={local_vad_conf:.2f}"
+                # Discard immediately if audio has no genuine acoustic speech evidence (0 STT calls)
+                if local_speech_ms < 90 or pcm_rms < max(200.0, self._ambient_rms * 1.15) or local_vad_conf < 0.15:
+                    self.no_speech_rejection_count += 1
+                    self.get_logger().debug(
+                        f"🔇 [VAD Gate Dropped Buffer (0 STT Calls)]: speech_ms={local_speech_ms} | rms={pcm_rms:.1f} | vad_conf={local_vad_conf:.2f}"
+                    )
+                    return
+
+                # 2. Transcribe via Groq Whisper Cloud (0-Token Cost STT ~250ms)
+                wav_buf = io.BytesIO()
+                with wave.open(wav_buf, "wb") as wf:
+                    wf.setnchannels(1)
+                    wf.setsampwidth(2)
+                    wf.setframerate(16000)
+                    wf.writeframes(raw_pcm)
+                wav_bytes = wav_buf.getvalue()
+
+                t_stt_start = time.monotonic()
+                raw_transcript = self._transcribe_wav(wav_bytes)
+                t_stt_end = time.monotonic()
+                stt_ms = (t_stt_end - t_stt_start) * 1000.0
+
+                # 3. Multi-Signal Validation Gate (Transcript + Acoustics + VAD + Playback + Self-Voice)
+                now = time.monotonic()
+                is_playback = bool(self._is_playback_active)
+                is_cooldown = bool((now - self._playback_end_time) < self.echo_mute_cooldown_s)
+
+                validated_text, stt_meta = self._validate_stt_transcript(
+                    transcript=raw_transcript or "",
+                    raw_pcm=raw_pcm,
+                    is_playback_active=is_playback,
+                    is_echo_cooldown=is_cooldown,
                 )
-                return
 
-            # 2. Transcribe via Groq Whisper Cloud (0-Token Cost STT ~250ms)
-            wav_buf = io.BytesIO()
-            with wave.open(wav_buf, "wb") as wf:
-                wf.setnchannels(1)
-                wf.setsampwidth(2)
-                wf.setframerate(16000)
-                wf.writeframes(raw_pcm)
-            wav_bytes = wav_buf.getvalue()
-
-            t_stt_start = time.monotonic()
-            raw_transcript = self._transcribe_wav(wav_bytes)
-            t_stt_end = time.monotonic()
-            stt_ms = (t_stt_end - t_stt_start) * 1000.0
-
-            # 3. Multi-Signal Validation Gate (Transcript + Acoustics + VAD + Playback + Self-Voice)
-            now = time.monotonic()
-            is_playback = bool(self._is_playback_active)
-            is_cooldown = bool((now - self._playback_end_time) < self.echo_mute_cooldown_s)
-
-            validated_text, stt_meta = self._validate_stt_transcript(
-                transcript=raw_transcript or "",
-                raw_pcm=raw_pcm,
-                is_playback_active=is_playback,
-                is_echo_cooldown=is_cooldown,
-            )
-
-            # Log Detailed STT Segment Telemetry
-            self.get_logger().info(
-                f"📊 [STT Segment Telemetry]: vad_started={t_vad_start:.2f} | vad_ended={t_vad_end:.2f} | "
-                f"stt_started={t_stt_start:.2f} | stt_finished={t_stt_end:.2f} | transcript=\"{raw_transcript}\" | "
-                f"vad_confidence={stt_meta.get('vad_confidence', 0.0):.2f} | stt_confidence={stt_meta.get('stt_confidence', 0.0):.2f} | "
-                f"rms={stt_meta.get('rms', 0.0):.1f} | peak={stt_meta.get('peak', 0)} | speech_ms={stt_meta.get('speech_ms', 0)} | "
-                f"playback_active={is_playback} | self_voice_score={stt_meta.get('self_voice_score', 0.0):.2f} | "
-                f"stt_rejected={stt_meta.get('stt_rejected', False)} | reject_reason={stt_meta.get('stt_reject_reason', 'none')}"
-            )
-
-            # If rejected, immediately abort turn without LLM, memory, or TTS invocation
-            if not validated_text:
-                return
-
-            # Check for pure wake word in active mode (e.g. "Astro.", "Hey Astro", "Selam")
-            norm_wake_check = re.sub(r"[^\w\s]", "", validated_text.lower()).strip()
-            if norm_wake_check in ("astro", "hey astro", "selam astro", "hey", "selam"):
-                self.state_machine.transition_to(RobotState.LISTENING)
+                # Log Detailed STT Segment Telemetry
                 self.get_logger().info(
-                    f"⚡ [Active Wake-Only]: \"{validated_text}\" -> Woke to LISTENING (wake_only=True, turn_created=False, 0 LLM / 0 TTS)."
+                    f"📊 [STT Segment Telemetry]: vad_started={t_vad_start:.2f} | vad_ended={t_vad_end:.2f} | "
+                    f"stt_started={t_stt_start:.2f} | stt_finished={t_stt_end:.2f} | transcript=\"{raw_transcript}\" | "
+                    f"vad_confidence={stt_meta.get('vad_confidence', 0.0):.2f} | stt_confidence={stt_meta.get('stt_confidence', 0.0):.2f} | "
+                    f"rms={stt_meta.get('rms', 0.0):.1f} | peak={stt_meta.get('peak', 0)} | speech_ms={stt_meta.get('speech_ms', 0)} | "
+                    f"playback_active={is_playback} | self_voice_score={stt_meta.get('self_voice_score', 0.0):.2f} | "
+                    f"stt_rejected={stt_meta.get('stt_rejected', False)} | reject_reason={stt_meta.get('stt_reject_reason', 'none')}"
                 )
-                return
 
-            # Check if user said "Hey Astro, <command>" or "Astro, <command>"
-            if norm_wake_check.startswith("hey astro "):
-                validated_text = validated_text[len("hey astro"):].lstrip(" ,.")
-            elif norm_wake_check.startswith("astro "):
-                validated_text = validated_text[len("astro"):].lstrip(" ,.")
-            elif norm_wake_check.startswith("selam astro "):
-                validated_text = validated_text[len("selam astro"):].lstrip(" ,.")
+                # If rejected, immediately abort turn without LLM, memory, or TTS invocation
+                if not validated_text:
+                    return
 
-            valid_cmd, cmd_reason = is_valid_user_command(validated_text)
-            if not valid_cmd:
-                self.state_machine.transition_to(RobotState.LISTENING)
-                self.get_logger().info(
-                    f"⚡ [Wake + Invalid Command Dropped]: \"{raw_transcript}\" (reason={cmd_reason}) -> Transitioned to LISTENING (0 LLM / 0 TTS)."
-                )
-                return
+                # Check for pure wake word in active mode (e.g. "Astro.", "Hey Astro", "Selam")
+                norm_wake_check = re.sub(r"[^\w\s]", "", validated_text.lower()).strip()
+                if norm_wake_check in ("astro", "hey astro", "selam astro", "hey", "selam"):
+                    self.state_machine.transition_to(RobotState.LISTENING)
+                    self.get_logger().info(
+                        f"⚡ [Active Wake-Only]: \"{validated_text}\" -> Woke to LISTENING (wake_only=True, turn_created=False, 0 LLM / 0 TTS)."
+                    )
+                    return
 
-            user_text = validated_text
-            self.get_logger().info(f"🗣️ [Siz (0-Maliyet)]: \"{user_text}\"")
-            self.memory.episodic.add_message("user", user_text)
+                # Check if user said "Hey Astro, <command>" or "Astro, <command>"
+                if norm_wake_check.startswith("hey astro "):
+                    validated_text = validated_text[len("hey astro"):].lstrip(" ,.")
+                elif norm_wake_check.startswith("astro "):
+                    validated_text = validated_text[len("astro"):].lstrip(" ,.")
+                elif norm_wake_check.startswith("selam astro "):
+                    validated_text = validated_text[len("selam astro"):].lstrip(" ,.")
+
+                valid_cmd, cmd_reason = is_valid_user_command(validated_text)
+                if not valid_cmd:
+                    self.state_machine.transition_to(RobotState.LISTENING)
+                    self.get_logger().info(
+                        f"⚡ [Wake + Invalid Command Dropped]: \"{raw_transcript}\" (reason={cmd_reason}) -> Transitioned to LISTENING (0 LLM / 0 TTS)."
+                    )
+                    return
+
+                user_text = validated_text
+                self.get_logger().info(f"🗣️ [Siz (0-Maliyet)]: \"{user_text}\"")
+                self.memory.episodic.add_message("user", user_text)
 
             # 4. Run Voiceprint Recognition (Acoustic Speaker Identification with Temporal Smoothing)
             spk_name = None
@@ -4926,7 +4951,7 @@ class AstroRealtimeNode(Node):
             spk_source = "unidentified"
             spk_known = False
 
-            if self.voice_recognizer:
+            if not direct_text and self.voice_recognizer and raw_pcm:
                 try:
                     audio_i16 = np.frombuffer(raw_pcm, dtype=np.int16)
                     identified_name, score = self.voice_recognizer.identify_speaker(audio_i16, sample_rate=16000)
