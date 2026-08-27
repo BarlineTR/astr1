@@ -992,6 +992,14 @@ class AstroRealtimeNode(Node):
         """Dispatches a single conversational turn to Realtime WebSocket."""
         if not self._can_use_openai("realtime") or not self._ws:
             return
+        # If a previous response is still active in-flight, cancel it first to prevent conversation_already_has_active_response
+        if getattr(self, "active_response_state", "") in ("RESPONSE_CREATING", "RESPONSE_STREAMING") and getattr(self, "active_response_id", None) and self._ws and self._loop:
+            try:
+                cancel_event = {"type": "response.cancel"}
+                asyncio.run_coroutine_threadsafe(self._ws.send(json.dumps(cancel_event)), self._loop)
+            except Exception:
+                pass
+
         self.realtime_current_generation_id = gen_id
         self.active_generation_id = gen_id
         self._last_sent_generation_id = gen_id
