@@ -1346,7 +1346,6 @@ class AstroRealtimeNode(Node):
             "session": {
                 "type": "realtime",
                 "instructions": system_prompt,
-                "max_response_output_tokens": int(os.getenv("REALTIME_MAX_OUTPUT_TOKENS", "350")),
                 "audio": {
                     "input": {
                         "transcription": {
