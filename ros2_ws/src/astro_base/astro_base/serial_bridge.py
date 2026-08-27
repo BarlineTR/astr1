@@ -52,7 +52,28 @@ except ImportError:
     class WheelCmd:
         left_rpm: float = 0.0
         right_rpm: float = 0.0
-    DiagnosticArray = DiagnosticStatus = KeyValue = Twist = Imu = JointState = object
+    class _MockHeader:
+        stamp = None
+        frame_id = ""
+    class DiagnosticArray:
+        def __init__(self):
+            self.header = _MockHeader()
+            self.status = []
+    class DiagnosticStatus:
+        OK = 0
+        WARN = 1
+        ERROR = 2
+        def __init__(self):
+            self.name = ""
+            self.hardware_id = ""
+            self.level = 0
+            self.message = ""
+            self.values = []
+    class KeyValue:
+        def __init__(self, key="", value=""):
+            self.key = str(key)
+            self.value = str(value)
+    Twist = Imu = JointState = object
 
 SOF1 = 0xAA
 SOF2 = 0x55
@@ -174,6 +195,9 @@ class SerialBridge(Node):
         )
         self.pub_diag = self.create_publisher(
             DiagnosticArray, "/arduino/diagnostics", 10
+        )
+        self.pub_std_diag = self.create_publisher(
+            DiagnosticArray, "/diagnostics", 10
         )
 
         self.sub_wheel = self.create_subscription(
@@ -525,6 +549,8 @@ class SerialBridge(Node):
         ]
         da.status = [st]
         self.pub_diag.publish(da)
+        if hasattr(self, "pub_std_diag") and self.pub_std_diag:
+            self.pub_std_diag.publish(da)
 
     def read_loop(self):
         state = 0

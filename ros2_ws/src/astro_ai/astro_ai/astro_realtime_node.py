@@ -36,7 +36,7 @@ try:
     from sensor_msgs.msg import Image, CameraInfo, LaserScan, JointState
     from std_msgs.msg import Bool, Float32, String
     from geometry_msgs.msg import Twist
-    from diagnostic_msgs.msg import DiagnosticArray
+    from diagnostic_msgs.msg import DiagnosticArray, DiagnosticStatus, KeyValue
 except ImportError:
     rclpy = None
     qos_profile_sensor_data = 10  # rclpy yoksa (mock/test modu) düz derinlik
@@ -65,6 +65,20 @@ except ImportError:
         def __init__(self):
             self.linear = Twist.Vector3()
             self.angular = Twist.Vector3()
+    class DiagnosticStatus:
+        OK = 0
+        WARN = 1
+        ERROR = 2
+        STALE = 3
+        def __init__(self, name="", level=0, message="", values=None):
+            self.name = name
+            self.level = level
+            self.message = message
+            self.values = values or []
+    class KeyValue:
+        def __init__(self, key="", value=""):
+            self.key = str(key)
+            self.value = str(value)
     Image = CameraInfo = Bool = Float32 = String = DiagnosticArray = LaserScan = JointState = _MockMsg  # type: ignore
 
 try:
@@ -792,6 +806,8 @@ class AstroRealtimeNode(Node):
         self.pub_gesture = self.create_publisher(String, "/robot/head_gesture", 10)
         self.pub_transcript = self.create_publisher(String, "/speech/text", 10)
         self.pub_head_cmd = self.create_publisher(HeadCmd, "/head_cmd", 10) if 'HeadCmd' in globals() else None
+        self.pub_telemetry = self.create_publisher(String, "/astro/telemetry", 10)
+        self.pub_diagnostics = self.create_publisher(DiagnosticArray, "/diagnostics", 10)
 
         # ROS 2 Subscribers
         self.create_subscription(String, "/tts/realtime_request", self._on_realtime_turn_request, 10)
@@ -839,6 +855,7 @@ class AstroRealtimeNode(Node):
         # Long-Term Episodic Session Lifecycle & Summarizer Timer
         self._last_summarized_turn_count = 0
         self.create_timer(1.0, self._check_session_lifecycle)
+        self.create_timer(1.0, self._publish_system_telemetry)
 
         # Purge any corrupted / profanity records
         self._purge_corrupted_biometrics()
@@ -6182,6 +6199,136 @@ class AstroRealtimeNode(Node):
 
 
 
+
+
+    def _publish_system_telemetry(self):
+        """Periodically aggregates system health, turn latencies, and sensor watchdogs to /astro/telemetry and /diagnostics."""
+        try:
+            now = time.monotonic()
+
+            # 1. Sensor Freshness & Watchdogs
+            last_lidar = getattr(self, "_last_laser_scan_time", 0.0)
+            lidar_age = now - last_lidar if last_lidar > 0.0 else 999.0
+            lidar_ok = (last_lidar > 0.0 and lidar_age <= 3.0)
+            lidar_level = DiagnosticStatus.OK if lidar_ok else (DiagnosticStatus.WARN if lidar_age <= 8.0 else DiagnosticStatus.ERROR)
+
+            last_cam = getattr(self, "_last_img_time", 0.0)
+            cam_age = now - last_cam if last_cam > 0.0 else 999.0
+            cam_ok = (last_cam > 0.0 and cam_age <= 5.0)
+            cam_level = DiagnosticStatus.OK if cam_ok else DiagnosticStatus.WARN
+
+            ard_hb = getattr(self, "_arduino_heartbeat_healthy", False)
+            last_hb = getattr(self, "_last_heartbeat_ack_time", 0.0)
+            ard_age = now - last_hb if last_hb > 0.0 else 999.0
+            ard_alive = ard_hb and (ard_age <= 2.5)
+            ard_level = DiagnosticStatus.OK if ard_alive else DiagnosticStatus.ERROR
+
+            ws_conn = getattr(self, "_is_connected", False)
+            ws_state = getattr(self, "_realtime_state", "DISCONNECTED")
+            ws_level = DiagnosticStatus.OK if ws_conn else (DiagnosticStatus.WARN if ws_state == "CONNECTING" else DiagnosticStatus.ERROR)
+
+            # 2. Latency Metrics
+            lat_stats = self.session.latency_tracker.get_stats() if hasattr(self.session, "latency_tracker") else {}
+            p50_ms = lat_stats.get("p50_total_ms", 0.0)
+            p95_ms = lat_stats.get("p95_total_ms", 0.0)
+            samples = lat_stats.get("samples", 0)
+
+            # 3. Social Cognitive Context
+            active_p = getattr(self, "_active_person_name", "Misafir") or "Misafir"
+            is_looking = bool(getattr(self, "_looking_at_robot", False))
+            user_dist = float(getattr(self, "_user_distance", 0.0))
+            user_emot = getattr(self, "_user_emotion", "neutral")
+
+            fam = 0.10
+            trust = 0.50
+            role_str = "new_user"
+            if getattr(self, "social_brain", None) and hasattr(self.social_brain, "relationship_manager"):
+                rel_info = self.social_brain.relationship_manager.assess_relationship(active_p)
+                fam = float(rel_info.get("familiarity", 0.10))
+                trust = float(rel_info.get("trust", 0.50))
+                r = rel_info.get("role", "new_user")
+                role_str = r.value if hasattr(r, "value") else str(r)
+
+            # 4. Publish /astro/telemetry (JSON)
+            if getattr(self, "pub_telemetry", None):
+                telem_payload = {
+                    "timestamp": time.time(),
+                    "latency": {
+                        "p50_total_ms": p50_ms,
+                        "p95_total_ms": p95_ms,
+                        "samples": samples,
+                    },
+                    "sensors": {
+                        "lidar_alive": lidar_ok,
+                        "lidar_age_s": round(lidar_age, 2),
+                        "camera_alive": cam_ok,
+                        "camera_age_s": round(cam_age, 2),
+                        "arduino_alive": ard_alive,
+                        "arduino_age_s": round(ard_age, 2),
+                    },
+                    "realtime_ws": {
+                        "connected": ws_conn,
+                        "state": ws_state,
+                    },
+                    "social_state": {
+                        "active_person": active_p,
+                        "role": role_str,
+                        "familiarity": fam,
+                        "trust": trust,
+                        "user_distance_m": round(user_dist, 2),
+                        "looking_at_robot": is_looking,
+                        "emotion": user_emot,
+                    },
+                }
+                msg_telem = String()
+                msg_telem.data = json.dumps(telem_payload)
+                self.pub_telemetry.publish(msg_telem)
+
+            # 5. Publish /diagnostics (DiagnosticArray)
+            if getattr(self, "pub_diagnostics", None) and 'DiagnosticArray' in globals():
+                diag_arr = DiagnosticArray()
+                st_ws = DiagnosticStatus(
+                    name="Astro Realtime / OpenAI WebSocket",
+                    level=ws_level,
+                    message=f"State: {ws_state}",
+                    values=[
+                        KeyValue("connected", str(ws_conn)),
+                        KeyValue("p50_ms", str(p50_ms)),
+                        KeyValue("p95_ms", str(p95_ms)),
+                    ],
+                )
+                st_ard = DiagnosticStatus(
+                    name="Astro Base / Serial Controller",
+                    level=ard_level,
+                    message="Alive" if ard_alive else f"Stale/Dead ({round(ard_age, 1)}s)",
+                    values=[
+                        KeyValue("heartbeat_healthy", str(ard_alive)),
+                        KeyValue("age_s", str(round(ard_age, 2))),
+                    ],
+                )
+                st_lidar = DiagnosticStatus(
+                    name="Astro Safety / RPLiDAR",
+                    level=lidar_level,
+                    message="Active" if lidar_ok else f"Stale ({round(lidar_age, 1)}s)",
+                    values=[
+                        KeyValue("scan_alive", str(lidar_ok)),
+                        KeyValue("age_s", str(round(lidar_age, 2))),
+                    ],
+                )
+                st_cam = DiagnosticStatus(
+                    name="Astro Perception / OAK-D Lite",
+                    level=cam_level,
+                    message="Active" if cam_ok else f"Stale ({round(cam_age, 1)}s)",
+                    values=[
+                        KeyValue("camera_alive", str(cam_ok)),
+                        KeyValue("age_s", str(round(cam_age, 2))),
+                    ],
+                )
+                diag_arr.status = [st_ws, st_ard, st_lidar, st_cam]
+                self.pub_diagnostics.publish(diag_arr)
+
+        except Exception as _exc:
+            self.get_logger().debug(f"_publish_system_telemetry: {_exc}")
 
 
 def main(args=None):
