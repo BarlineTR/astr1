@@ -5437,10 +5437,10 @@ class AstroRealtimeNode(Node):
                 self._barge_in_consecutive_frames = 0
                 return
 
-            # Target barge-in threshold: Requires intentional voice exceeding baseline ambient
-            barge_min_rms = float(getattr(self, "barge_in_min_rms", 1200.0))
+            # Target barge-in threshold: Requires intentional voice exceeding loudspeaker playback level
+            barge_min_rms = float(getattr(self, "barge_in_playback_min_rms", getattr(self, "barge_in_min_rms", 3800.0)))
             barge_noise_mult = float(getattr(self, "barge_in_noise_mult", 3.5))
-            barge_min_peak = int(getattr(self, "barge_in_min_peak", 2800))
+            barge_min_peak = int(getattr(self, "barge_in_playback_min_peak", getattr(self, "barge_in_min_peak", 8500)))
             ambient_val = float(getattr(self, "_ambient_rms", 120.0))
 
             target_barge_in_rms = max(barge_min_rms, ambient_val * barge_noise_mult)
