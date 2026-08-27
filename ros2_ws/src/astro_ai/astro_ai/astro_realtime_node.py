@@ -181,6 +181,18 @@ except ImportError:
         FaceRecognizer = None
 
 try:
+    from astro_ai.office.calendar_service import CalendarService
+    from astro_ai.office.slack_service import SlackService
+    from astro_ai.office.office_concierge import OfficeConciergeManager
+except ImportError:
+    try:
+        from office.calendar_service import CalendarService
+        from office.slack_service import SlackService
+        from office.office_concierge import OfficeConciergeManager
+    except ImportError:
+        CalendarService = SlackService = OfficeConciergeManager = None  # type: ignore
+
+try:
     from dotenv import find_dotenv, load_dotenv
 except ImportError:
     def find_dotenv(*args, **kwargs): return ""
@@ -597,6 +609,14 @@ class AstroRealtimeNode(Node):
             except Exception as e:
                 self.get_logger().warn(f"⚠️ [SocialBrain] Başlatma uyarısı: {e}")
 
+        # Office Automation & Concierge Subsystem
+        self.calendar_service = CalendarService() if CalendarService else None
+        self.slack_service = SlackService() if SlackService else None
+        self.office_concierge = (
+            OfficeConciergeManager(calendar_service=self.calendar_service, slack_service=self.slack_service)
+            if OfficeConciergeManager else None
+        )
+
         # State
         self._lock = threading.RLock()
         self._recognized_person: Optional[Dict[str, Any]] = None
@@ -831,6 +851,7 @@ class AstroRealtimeNode(Node):
         self.create_subscription(LaserScan, "/scan", self._on_laser_scan, qos_profile_sensor_data)
         self.create_subscription(LaserScan, "/scan_filtered", self._on_laser_scan, qos_profile_sensor_data)
         self.create_subscription(JointState, "/joint_states", self._on_joint_states, qos_profile_sensor_data)
+        self.create_subscription(String, "/office/slack_command", self._on_slack_command, 10)
 
         # Tool execution deduplication
         self._executed_tool_calls: set[str] = set()
@@ -1566,6 +1587,31 @@ class AstroRealtimeNode(Node):
                             },
                             "required": ["name"]
                         }
+                    },
+                    {
+                        "type": "function",
+                        "name": "check_calendar_events",
+                        "description": "Kullanıcı takvimdeki toplantıları, etkinlikleri, bugünkü programını veya yaklaşan randevularını sorduğunda ('bugün hangi toplantım var?', 'sonraki toplantı ne zaman?', 'öğleden sonra neyim var?') çağrılır.",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "query": {"type": "string", "description": "Kullanıcının sorduğu zaman veya konu filtresi (örn: 'bugün', 'öğleden sonra', 'sonraki')"}
+                            },
+                            "required": []
+                        }
+                    },
+                    {
+                        "type": "function",
+                        "name": "notify_via_slack",
+                        "description": "Ofise bir misafir geldiğinde, kullanıcı birine haber iletmek istediğinde veya çalışanlara Slack üzerinden mesaj/haber atmak istediğinde çağrılır ('Ahmet\\'e geldiğimi haber ver', 'Baran\\'a Slack\\'ten yaz').",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "recipient": {"type": "string", "description": "Haber verilecek çalışan veya kanal (örn: 'Baran', 'Ahmet', '#ofis-giris')"},
+                                "message": {"type": "string", "description": "İletilecek mesaj veya misafir bilgisi"}
+                            },
+                            "required": ["recipient", "message"]
+                        }
                     }
                 ],
                 "tool_choice": "auto"
@@ -2239,6 +2285,11 @@ class AstroRealtimeNode(Node):
 
             if user_transcript:
                 self._last_user_transcript = user_transcript
+                # Check if visitor was answering lobby concierge question
+                if getattr(self, "office_concierge", None) and getattr(self.office_concierge, "_waiting_visitor_response", False):
+                    vis_res = self.office_concierge.process_visitor_answer(user_transcript)
+                    if vis_res:
+                        self.get_logger().info(f"🛎️ [Lobi Misafir Cevabı]: {vis_res}")
                 self.get_logger().info(f"🗣️ [Siz]: \"{user_transcript}\"")
                 self.memory.episodic.add_message("user", user_transcript)
                 self._session_turns_buffer.append({
@@ -2320,7 +2371,7 @@ class AstroRealtimeNode(Node):
                 # Trigger response generation with strictly grounded physical reality instructions
                 is_acknowledgement_tool = func_name in (
                     "change_persona", "enroll_user_biometrics", "delete_user_biometrics",
-                    "move_robot", "turn_to_sound", "navigate_to_location"
+                    "move_robot", "turn_to_sound", "navigate_to_location", "notify_via_slack"
                 )
                 if is_acknowledgement_tool:
                     tool_instructions = (
@@ -2329,6 +2380,13 @@ class AstroRealtimeNode(Node):
                         "KESİNLİKLE 10-15 saniyelik uzun tirat, açıklama, nutuk veya mod tarifi YAPMA! "
                         "Eğer çıktı hata/engel (success=false veya status=blocked/error) içeriyorsa, SADECE ve SADECE çıktıda yazan 'message' veya 'reason' açıklamasını esas al; "
                         "çıktıda yazmayan hiçbir uydurma sebep (kalp ritmi, nabız, bağlantı vb.) KESİNLİKLE ÜRETME. Asla gerçekleşmeyen bir hareketi gerçekleşmiş gibi iddia etme."
+                    )
+                elif func_name == "check_calendar_events":
+                    sched_text = tool_result.get("schedule", "") if isinstance(tool_result, dict) else str(tool_result)
+                    tool_instructions = (
+                        f"OFİS TAKVİMİ CEVAP KURALI: Takvimdeki etkinlikler şunlardır: '{sched_text}'. "
+                        f"Bu etkinlikleri kullanıcıya doğrudan, samimi, net ve canlı bir Türkçe ile aktar. "
+                        f"Uydurma toplantı veya saat ekleme."
                     )
                 elif func_name == "inspect_camera_view":
                     obs_text = tool_result.get("observation", "") if isinstance(tool_result, dict) else str(tool_result)
@@ -2782,6 +2840,25 @@ class AstroRealtimeNode(Node):
                     "message": f"Kişilik modu '{target}' yapıldı. Tek kısa cümleyle (maksimum 3-6 kelime) doğrudan bu yeni modun üslubuyla onay ver."
                 }
             return {"status": "error", "message": f"'{raw_p}' geçerli bir kişilik modu değil."}
+
+        elif name == "check_calendar_events":
+            query = args.get("query", "bugün")
+            if getattr(self, "calendar_service", None):
+                summary = self.calendar_service.get_today_summary()
+                return {"status": "success", "query": query, "schedule": summary}
+            return {"status": "error", "message": "Takvim servisi aktif değil."}
+
+        elif name == "notify_via_slack":
+            recipient = str(args.get("recipient", "Baran")).strip()
+            msg = str(args.get("message", "Ofise yeni misafir geldi.")).strip()
+            if getattr(self, "slack_service", None):
+                res = self.slack_service.notify_visitor_arrival(
+                    employee_name=recipient,
+                    visitor_name=getattr(self, "_active_person_name", "Misafir"),
+                    note=msg
+                )
+                return {"status": "success", "recipient": recipient, "delivered": res.get("delivered", False), "note": msg}
+            return {"status": "error", "message": "Slack servisi aktif değil."}
 
         return {"status": "unknown_tool"}
 
@@ -3793,8 +3870,76 @@ class AstroRealtimeNode(Node):
                     self.social_brain.spatial_fusion.update_lidar_scan(ranges)
                 except Exception:
                     pass
+
+            # Office Concierge: detect person entering door (1.5 - 2.0m)
+            if getattr(self, "office_concierge", None):
+                ident = getattr(self, "_recognized_person", None)
+                welcome_act = self.office_concierge.evaluate_entrance_presence(
+                    lidar_ranges=ranges,
+                    recognized_identity=ident,
+                    is_speaking=(self._is_responding or self._is_playback_active)
+                )
+                if welcome_act:
+                    self._handle_office_welcome(welcome_act)
         except Exception as _exc:
             self.get_logger().debug(f"_on_laser_scan: {_exc}")
+
+    def _handle_office_welcome(self, welcome_act: Dict[str, Any]):
+        """Executes head nod gesture and triggers proactive welcome speech for lobby guests."""
+        gesture = welcome_act.get("gesture")
+        if gesture and getattr(self, "action_manager", None):
+            self.action_manager.execute_gesture(gesture)
+
+        speech_text = welcome_act.get("speech_text", "")
+        if speech_text and self._ws and self._loop and self._is_connected:
+            welcome_event = {
+                "type": "conversation.item.create",
+                "item": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_text",
+                            "text": f"[Sistem Olayı - Lobi Karşılama]: Kapıdan biri girdi! Tam olarak şu cümleyle sıcak ve samimi şekilde selamla: '{speech_text}'"
+                        }
+                    ]
+                }
+            }
+            try:
+                asyncio.run_coroutine_threadsafe(self._ws.send(json.dumps(welcome_event)), self._loop)
+                asyncio.run_coroutine_threadsafe(self._ws.send(json.dumps({"type": "response.create"})), self._loop)
+                self.get_logger().info(f"👋 [Lobi Karşılama Tetiklendi]: {speech_text}")
+            except Exception as _exc:
+                self.get_logger().debug(f"_handle_office_welcome: {_exc}")
+
+    def _on_slack_command(self, msg: Any):
+        """Processes incoming Slack command from /office/slack_command topic."""
+        try:
+            raw_data = str(getattr(msg, "data", "")).strip()
+            if not raw_data or not getattr(self, "slack_service", None):
+                return
+            parsed = self.slack_service.parse_incoming_command(raw_data)
+            action = parsed.get("action")
+            self.get_logger().info(f"💬 [Slack Komutu Alındı]: {parsed}")
+            if action == "navigate_to":
+                target = parsed.get("target", "baran_masa")
+                if getattr(self, "action_manager", None):
+                    self.action_manager.execute_move(direction="forward", speed=0.2, duration=2.0)
+            elif action == "announce":
+                text = parsed.get("text", "")
+                if text and self._ws and self._loop and self._is_connected:
+                    ann_event = {
+                        "type": "conversation.item.create",
+                        "item": {
+                            "type": "message",
+                            "role": "user",
+                            "content": [{"type": "input_text", "text": f"[Slack Ofis Duyurusu]: Ekibe şunu sesli duyur: '{text}'"}]
+                        }
+                    }
+                    asyncio.run_coroutine_threadsafe(self._ws.send(json.dumps(ann_event)), self._loop)
+                    asyncio.run_coroutine_threadsafe(self._ws.send(json.dumps({"type": "response.create"})), self._loop)
+        except Exception as exc:
+            self.get_logger().debug(f"_on_slack_command error: {exc}")
 
     def _on_joint_states(self, msg: Any):
         """Processes wheel and head encoder feedback from /joint_states for physical grounding."""
@@ -4048,6 +4193,36 @@ class AstroRealtimeNode(Node):
                 }
                 asyncio.run_coroutine_threadsafe(self._ws.send(json.dumps(alarm_event)), self._loop)
                 asyncio.run_coroutine_threadsafe(self._ws.send(json.dumps({"type": "response.create"})), self._loop)
+
+        # Check pre-meeting proactive reminders (10 minutes before meeting)
+        if getattr(self, "calendar_service", None):
+            due_meetings = self.calendar_service.check_meeting_reminders(lead_minutes=10)
+            for m in due_meetings:
+                m_title = m.get("title", "Toplantı")
+                m_min = m.get("minutes_left", 10)
+                m_loc = m.get("location", "Toplantı Odası")
+                self.get_logger().info(f"📅 [Toplantı Hatırlatması]: '{m_title}' için {m_min} dk kaldı!")
+                if getattr(self, "action_manager", None):
+                    self.action_manager.execute_gesture("nod")
+                if self._ws and self._loop and self._is_connected:
+                    meet_event = {
+                        "type": "conversation.item.create",
+                        "item": {
+                            "type": "message",
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "input_text",
+                                    "text": f"[Sistem Hatırlatması - Toplantı]: Kullanıcıya {m_min} dakika sonra '{m_title}' ({m_loc}) toplantısının başlayacağını nazikçe ve samimi şekilde hatırlat."
+                                }
+                            ]
+                        }
+                    }
+                    try:
+                        asyncio.run_coroutine_threadsafe(self._ws.send(json.dumps(meet_event)), self._loop)
+                        asyncio.run_coroutine_threadsafe(self._ws.send(json.dumps({"type": "response.create"})), self._loop)
+                    except Exception:
+                        pass
 
     def _check_session_lifecycle(self):
         """Periodically checks if the active session ended and summarizes it into long-term profile."""
