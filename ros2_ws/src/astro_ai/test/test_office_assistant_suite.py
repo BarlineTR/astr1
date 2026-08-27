@@ -180,6 +180,50 @@ class TestAstroRealtimeNodeOfficeTools(unittest.TestCase):
         self.assertEqual(res["recipient"], "Baran")
         self.assertTrue(res["delivered"])
 
+    def test_08_get_events_summary_7_days(self):
+        summary = self.node.calendar_service.get_events_summary(days=7, query="bu hafta")
+        self.assertIn("Önümüzdeki 7 gün", summary)
+
+    def test_09_add_and_delete_event_smart(self):
+        cal = self.node.calendar_service
+        # Add smart event
+        add_res = cal.add_event_smart(
+            title="Ahmet ile Tasarım Toplantısı",
+            date_str="yarın",
+            time_str="14:30",
+            location="Oda C"
+        )
+        self.assertEqual(add_res["status"], "success")
+        self.assertIn("Tasarım", add_res["event"]["title"])
+
+        # Check it appears in upcoming
+        events = cal.get_upcoming_events(hours=48)
+        self.assertTrue(any("Tasarım" in e.get("title", "") for e in events))
+
+        # Delete event
+        del_res = cal.delete_event("Tasarım")
+        self.assertEqual(del_res["status"], "success")
+        self.assertIn("Ahmet ile Tasarım Toplantısı", del_res["deleted_title"])
+
+    def test_10_realtime_tools_add_and_delete(self):
+        # Test tool calling add_calendar_event
+        res_add = self.node._execute_realtime_tool("add_calendar_event", {
+            "title": "Diş Randevusu",
+            "date": "önümüzdeki salı",
+            "time": "15:00",
+            "location": "Klinik"
+        })
+        self.assertEqual(res_add["status"], "success")
+        self.assertIn("Diş Randevusu", res_add["title"])
+
+        # Test tool calling delete_calendar_event
+        res_del = self.node._execute_realtime_tool("delete_calendar_event", {
+            "query": "Diş Randevusu"
+        })
+        self.assertEqual(res_del["status"], "success")
+        self.assertIn("kaldırıldı", res_del["message"])
+
 
 if __name__ == "__main__":
     unittest.main()
+

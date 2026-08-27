@@ -1591,13 +1591,42 @@ class AstroRealtimeNode(Node):
                     {
                         "type": "function",
                         "name": "check_calendar_events",
-                        "description": "Kullanıcı takvimdeki toplantıları, etkinlikleri, bugünkü programını veya yaklaşan randevularını sorduğunda ('bugün hangi toplantım var?', 'sonraki toplantı ne zaman?', 'öğleden sonra neyim var?') çağrılır.",
+                        "description": "Kullanıcı takvimdeki toplantıları, etkinlikleri, bugünkü veya haftalık programını sorduğunda ('bugün neyim var?', 'bu 1 hafta hangi etkinlikler var?', 'önümüzdeki hafta neyim var?', 'sonraki toplantı ne zaman?') çağrılır.",
                         "parameters": {
                             "type": "object",
                             "properties": {
-                                "query": {"type": "string", "description": "Kullanıcının sorduğu zaman veya konu filtresi (örn: 'bugün', 'öğleden sonra', 'sonraki')"}
+                                "query": {"type": "string", "description": "Kullanıcının sorguladığı zaman aralığı veya konu (örn: 'bugün', 'yarın', 'bu hafta', 'önümüzdeki hafta')"},
+                                "days": {"type": "number", "description": "Kaç günlük takvimin sorgulanacağı (örn: 1 gün, 7 gün, 14 gün; haftalık sorgularda 7 girilir)"}
                             },
                             "required": []
+                        }
+                    },
+                    {
+                        "type": "function",
+                        "name": "add_calendar_event",
+                        "description": "Kullanıcı konuşma esnasında takvime yeni bir etkinlik, toplantı, randevu veya iş eklemek istediğinde KESİNLİKLE çağrılır (Örn: 'önümüzdeki salı saat 14:00\\'te Ahmet ile toplantım var kaydet', 'yarın saat 3\\'te diş randevum var', 'pazartesi ekiple toplantı ayarla').",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "title": {"type": "string", "description": "Toplantı veya etkinliğin başlığı/konusu (örn: 'Ahmet ile tasarım toplantısı', 'Diş randevusu')"},
+                                "date": {"type": "string", "description": "Etkinlik günü veya tarihi (örn: 'yarın', 'salı', 'gelecek pazartesi', '2026-09-02')"},
+                                "time": {"type": "string", "description": "Saat (örn: '14:00', '15:30', '10:00')"},
+                                "duration_minutes": {"type": "number", "description": "Toplantı süresi (dakika cinsinden, varsayılan 45)"},
+                                "location": {"type": "string", "description": "Toplantı yeri veya oda (örn: 'Toplantı Odası A', 'Ofis')"}
+                            },
+                            "required": ["title"]
+                        }
+                    },
+                    {
+                        "type": "function",
+                        "name": "delete_calendar_event",
+                        "description": "Kullanıcı takvimindeki bir toplantıyı veya randevuyu iptal etmek, silmek veya takvimden kaldırmak istediğinde çağrılır (Örn: 'yarınki diş randevusunu iptal et', 'salı günkü toplantıyı sil', 'tasarım toplantısını kaldır').",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "query": {"type": "string", "description": "İptal edilmek istenen toplantının adı veya anahtar kelimesi (örn: 'diş randevusu', 'tasarım toplantısı')"}
+                            },
+                            "required": ["query"]
                         }
                     },
                     {
@@ -2371,7 +2400,8 @@ class AstroRealtimeNode(Node):
                 # Trigger response generation with strictly grounded physical reality instructions
                 is_acknowledgement_tool = func_name in (
                     "change_persona", "enroll_user_biometrics", "delete_user_biometrics",
-                    "move_robot", "turn_to_sound", "navigate_to_location", "notify_via_slack"
+                    "move_robot", "turn_to_sound", "navigate_to_location", "notify_via_slack",
+                    "add_calendar_event", "delete_calendar_event"
                 )
                 if is_acknowledgement_tool:
                     tool_instructions = (
@@ -2842,10 +2872,39 @@ class AstroRealtimeNode(Node):
             return {"status": "error", "message": f"'{raw_p}' geçerli bir kişilik modu değil."}
 
         elif name == "check_calendar_events":
-            query = args.get("query", "bugün")
+            query = str(args.get("query", "bugün")).strip()
+            days = int(args.get("days", 7 if ("hafta" in query.lower() or not query) else 1))
             if getattr(self, "calendar_service", None):
-                summary = self.calendar_service.get_today_summary()
-                return {"status": "success", "query": query, "schedule": summary}
+                summary = self.calendar_service.get_events_summary(days=days, query=query)
+                return {"status": "success", "query": query, "days": days, "schedule": summary}
+            return {"status": "error", "message": "Takvim servisi aktif değil."}
+
+        elif name == "add_calendar_event":
+            title = str(args.get("title", "")).strip()
+            date_str = str(args.get("date", "bugün")).strip()
+            time_str = str(args.get("time", "10:00")).strip()
+            duration = int(args.get("duration_minutes", 45))
+            loc = str(args.get("location", "Ofis")).strip()
+            if getattr(self, "calendar_service", None):
+                res = self.calendar_service.add_event_smart(
+                    title=title,
+                    date_str=date_str,
+                    time_str=time_str,
+                    duration_minutes=duration,
+                    location=loc
+                )
+                if res.get("status") == "success":
+                    ev = res.get("event", {})
+                    st = ev.get("start_time", f"{date_str} {time_str}")
+                    return {"status": "success", "title": title, "start_time": st, "message": f"'{title}' etkinliği {st} için takvime eklendi."}
+                return {"status": "error", "message": res.get("message", "Etkinlik eklenemedi.")}
+            return {"status": "error", "message": "Takvim servisi aktif değil."}
+
+        elif name == "delete_calendar_event":
+            query = str(args.get("query", "")).strip()
+            if getattr(self, "calendar_service", None):
+                res = self.calendar_service.delete_event(query)
+                return res
             return {"status": "error", "message": "Takvim servisi aktif değil."}
 
         elif name == "notify_via_slack":

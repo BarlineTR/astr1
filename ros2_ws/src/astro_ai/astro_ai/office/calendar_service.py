@@ -216,6 +216,58 @@ class CalendarService:
 
         return "\n".join(lines)
 
+    def get_events_summary(self, days: int = 7, query: str = "") -> str:
+        """Returns structured Turkish summary of events for specified days (e.g. 7 days / this week)."""
+        q_low = (query or "").lower().strip()
+        if "bugün" in q_low or "bugun" in q_low:
+            return self.get_today_summary()
+
+        hours = float(max(1, days) * 24)
+        events = self.get_upcoming_events(hours=hours)
+
+        if q_low and q_low not in ("bu hafta", "hafta", "önümüzdeki hafta", "onumuzdeki hafta"):
+            filtered = [
+                e for e in events
+                if q_low in e.get("title", "").lower() or q_low in e.get("location", "").lower()
+            ]
+            if filtered:
+                events = filtered
+
+        if not events:
+            return f"Önümüzdeki {days} gün için planlanmış herhangi bir etkinlik veya toplantı bulunmuyor."
+
+        tr_days = {
+            "Monday": "Pazartesi", "Tuesday": "Salı", "Wednesday": "Çarşamba",
+            "Thursday": "Perşembe", "Friday": "Cuma", "Saturday": "Cumartesi", "Sunday": "Pazar"
+        }
+        tr_months = {
+            1: "Ocak", 2: "Şubat", 3: "Mart", 4: "Nisan", 5: "Mayıs", 6: "Haziran",
+            7: "Temmuz", 8: "Ağustos", 9: "Eylül", 10: "Ekim", 11: "Kasım", 12: "Aralık"
+        }
+
+        grouped = {}
+        for ev in events:
+            dt = ev["dt_start"]
+            d_key = dt.strftime("%Y-%m-%d")
+            if d_key not in grouped:
+                day_name = tr_days.get(dt.strftime("%A"), dt.strftime("%A"))
+                m_name = tr_months.get(dt.month, "")
+                label = f"{day_name} ({dt.day} {m_name})"
+                grouped[d_key] = {"label": label, "items": []}
+            grouped[d_key]["items"].append(ev)
+
+        lines = [f"Önümüzdeki {days} gün için toplam {len(events)} etkinlik bulunuyor:"]
+        for d_key, grp in grouped.items():
+            lines.append(f"\n📅 {grp['label']}:")
+            for ev in grp["items"]:
+                t_str = ev["dt_start"].strftime("%H:%M")
+                title = ev.get("title", "Toplantı")
+                loc = ev.get("location", "")
+                loc_str = f" ({loc})" if loc else ""
+                lines.append(f"  • {t_str} - {title}{loc_str}")
+
+        return "\n".join(lines)
+
     def is_employee_in_meeting(self, employee_name: str) -> Tuple[bool, Optional[Dict[str, Any]]]:
         """Checks if employee is currently in a meeting or one is ending soon."""
         now = datetime.now()
@@ -300,3 +352,100 @@ class CalendarService:
             return {"status": "success", "event": new_event}
         except Exception as e:
             return {"status": "error", "message": str(e)}
+
+    def delete_event(self, query: str) -> Dict[str, Any]:
+        """Deletes an event matching the query title or keyword from local storage."""
+        q_low = query.lower().strip()
+        if not q_low:
+            return {"status": "error", "message": "Silinecek etkinlik adı belirtilmedi."}
+
+        events = self._load_local_events()
+        to_keep = []
+        deleted = []
+
+        for ev in events:
+            title = ev.get("title", "").lower()
+            ev_id = str(ev.get("id", "")).lower()
+            if q_low in title or q_low in ev_id or (len(q_low) > 3 and any(w in title for w in q_low.split())):
+                deleted.append(ev)
+            else:
+                to_keep.append(ev)
+
+        if not deleted:
+            return {
+                "status": "not_found",
+                "message": f"'{query}' ile eşleşen bir etkinlik bulunamadı."
+            }
+
+        try:
+            with open(self.storage_path, "w", encoding="utf-8") as f:
+                json.dump({"events": to_keep}, f, ensure_ascii=False, indent=2)
+            del_title = deleted[0].get("title", query)
+            return {
+                "status": "success",
+                "deleted_title": del_title,
+                "count": len(deleted),
+                "message": f"'{del_title}' takvimden başarıyla kaldırıldı."
+            }
+        except Exception as e:
+            return {"status": "error", "message": str(e)}
+
+    def add_event_smart(
+        self,
+        title: str,
+        date_str: str = "bugün",
+        time_str: str = "10:00",
+        duration_minutes: int = 45,
+        location: str = "Ofis",
+        organizer: str = "Baran",
+        attendees: Optional[List[str]] = None
+    ) -> Dict[str, Any]:
+        """Smart event creator that parses relative Turkish date words and saves event."""
+        now = datetime.now()
+        target_date = now
+
+        d_low = (date_str or "").lower().strip()
+        tr_weekdays = {
+            "pazartesi": 0, "salı": 1, "sali": 1, "çarşamba": 2, "carsamba": 2,
+            "perşembe": 3, "persembe": 3, "cuma": 4, "cumartesi": 5, "pazar": 6
+        }
+
+        if "yarın" in d_low or "yarin" in d_low:
+            target_date = now + timedelta(days=1)
+        elif "öbür gün" in d_low or "obur gun" in d_low:
+            target_date = now + timedelta(days=2)
+        elif any(w in d_low for w in tr_weekdays):
+            for w_name, w_idx in tr_weekdays.items():
+                if w_name in d_low:
+                    cur_w = now.weekday()
+                    days_ahead = (w_idx - cur_w) % 7
+                    if days_ahead == 0 or "gelecek" in d_low or "önümüzdeki" in d_low or "onumuzdeki" in d_low:
+                        days_ahead += 7
+                    target_date = now + timedelta(days=days_ahead)
+                    break
+        elif len(d_low) == 10 and "-" in d_low:
+            try:
+                target_date = datetime.strptime(d_low, "%Y-%m-%d")
+            except Exception:
+                pass
+
+        # Parse time string: e.g. "14:00", "15.30", "14"
+        clean_time = (time_str or "10:00").replace(".", ":").strip()
+        if ":" not in clean_time and clean_time.isdigit():
+            clean_time = f"{int(clean_time):02d}:00"
+
+        try:
+            t_parts = [int(p) for p in clean_time.split(":")[:2]]
+            full_dt = target_date.replace(hour=t_parts[0], minute=t_parts[1], second=0, microsecond=0)
+        except Exception:
+            full_dt = target_date.replace(hour=10, minute=0, second=0, microsecond=0)
+
+        start_time_str = full_dt.strftime("%Y-%m-%d %H:%M")
+        return self.add_event(
+            title=title,
+            start_time_str=start_time_str,
+            duration_minutes=duration_minutes,
+            location=location,
+            organizer=organizer,
+            attendees=attendees
+        )
