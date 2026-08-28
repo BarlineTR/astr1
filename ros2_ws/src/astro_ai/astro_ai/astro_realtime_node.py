@@ -37,9 +37,16 @@ try:
     from std_msgs.msg import Bool, Float32, String
     from geometry_msgs.msg import Twist
     from diagnostic_msgs.msg import DiagnosticArray, DiagnosticStatus, KeyValue
+    try:
+        from astro_base.msg import HeadCmd
+    except ImportError:
+        class HeadCmd:  # type: ignore
+            angle_deg: float = 0.0
 except ImportError:
     rclpy = None
     qos_profile_sensor_data = 10  # rclpy yoksa (mock/test modu) düz derinlik
+    class HeadCmd:  # type: ignore
+        angle_deg: float = 0.0
     class Node:  # type: ignore
         def __init__(self, *args, **kwargs):
             pass
@@ -825,9 +832,13 @@ class AstroRealtimeNode(Node):
         self.pub_emotion = self.create_publisher(String, "/robot/emotion", 10)
         self.pub_gesture = self.create_publisher(String, "/robot/head_gesture", 10)
         self.pub_transcript = self.create_publisher(String, "/speech/text", 10)
-        self.pub_head_cmd = self.create_publisher(HeadCmd, "/head_cmd", 10) if 'HeadCmd' in globals() else None
+        self.pub_head_cmd = self.create_publisher(HeadCmd, "/head_cmd", 10)
         self.pub_telemetry = self.create_publisher(String, "/astro/telemetry", 10)
         self.pub_diagnostics = self.create_publisher(DiagnosticArray, "/diagnostics", 10)
+
+        if self.action_manager:
+            self.action_manager._pub_head_cmd = self.pub_head_cmd
+            self.action_manager._pub_cmd_vel = self.pub_cmd_vel
 
         # ROS 2 Subscribers
         self.create_subscription(String, "/tts/realtime_request", self._on_realtime_turn_request, 10)

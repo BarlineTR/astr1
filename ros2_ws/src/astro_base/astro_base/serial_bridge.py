@@ -496,12 +496,21 @@ class SerialBridge(Node):
             with self.tx_lock:
                 self.ser.write(pkt)
                 # Dual compatibility: If Arduino runs ASCII test sketch, also send '5'/'6'/'0'
+                cmd_char = None
                 if msg.angle_deg > 5.0:
+                    cmd_char = b"5"
                     self.ser.write(b"5")
                 elif msg.angle_deg < -5.0:
+                    cmd_char = b"6"
                     self.ser.write(b"6")
                 elif abs(msg.angle_deg) <= 2.0:
+                    cmd_char = b"0"
                     self.ser.write(b"0")
+                try:
+                    self.ser.flush()
+                except Exception:
+                    pass
+                self.get_logger().info(f"🎯 [SERIAL HEAD CMD] angle_deg={msg.angle_deg:.1f} ascii_cmd={cmd_char.decode() if cmd_char else 'none'}")
         except serial.SerialException as exc:
             self.get_logger().error(f"HeadCmd write failed: {exc}")
             self._mark_disconnected()
