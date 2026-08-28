@@ -592,17 +592,26 @@ class SerialBridge(Node):
             lat_ms = (now_mono - tx_time) * 1000.0 if tx_time > 0 else 5.0
             seq_match = (ack_seq == getattr(self, "_hb_seq", 0) or ack_seq > 0)
 
-            self.get_logger().info(
-                f"[HEARTBEAT ACK RX]\n"
-                f"seq={ack_seq}\n"
-                f"timestamp={now_mono:.3f}\n"
-                f"payload={payload.hex()}\n"
-                f"crc_valid=true\n"
-                f"sequence_match={'true' if seq_match else 'false'}"
-            )
-
             prev_alive = getattr(self, "arduino_alive", False)
             prev_handshake = getattr(self, "handshake_ok", False)
+
+            # Only log multi-line ACK block on initial handshake, recovery, or periodically (every 10s)
+            last_logged_ack = getattr(self, "_last_logged_ack_time", 0.0)
+            if not prev_alive or not prev_handshake or (now_mono - last_logged_ack) >= 10.0:
+                self._last_logged_ack_time = now_mono
+                self.get_logger().info(
+                    f"[HEARTBEAT ACK RX]\n"
+                    f"seq={ack_seq}\n"
+                    f"timestamp={now_mono:.3f}\n"
+                    f"payload={payload.hex()}\n"
+                    f"crc_valid=true\n"
+                    f"sequence_match={'true' if seq_match else 'false'}"
+                )
+            else:
+                self.get_logger().debug(
+                    f"[HEARTBEAT ACK RX] seq={ack_seq} latency_ms={lat_ms:.1f}"
+                )
+
             self.last_hb_ack_time = now_mono
             self.arduino_alive = True
             self.handshake_ok = True

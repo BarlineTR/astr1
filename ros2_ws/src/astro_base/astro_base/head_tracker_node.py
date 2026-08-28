@@ -231,13 +231,18 @@ class HeadTrackerNode(Node):
             energy_ratio = self._latest_rms / max(80.0, self._ambient_rms)
             conf = min(1.0, max(0.1, (cluster_size / float(total_samples)) * min(1.0, energy_ratio / 2.0)))
 
-            self.get_logger().info(
-                f"[DOA FILTER]\n"
-                f"raw={raw_doa:.1f}\n"
-                f"confidence={conf:.2f}\n"
-                f"filtered={clamped_target:.1f}\n"
-                f"target_yaw={clamped_target:.1f}"
-            )
+            last_logged_filtered = getattr(self, "_last_logged_filtered_yaw", None)
+            last_logged_time = getattr(self, "_last_logged_doa_time", 0.0)
+            if last_logged_filtered is None or abs(clamped_target - last_logged_filtered) >= 10.0 or (now - last_logged_time) >= 3.0:
+                self._last_logged_filtered_yaw = clamped_target
+                self._last_logged_doa_time = now
+                self.get_logger().info(
+                    f"[DOA FILTER]\n"
+                    f"raw={raw_doa:.1f}\n"
+                    f"confidence={conf:.2f}\n"
+                    f"filtered={clamped_target:.1f}\n"
+                    f"target_yaw={clamped_target:.1f}"
+                )
 
             # 5. Gaze Dwell Time & Deadband Hysteresis
             dwell_elapsed = now - self._last_gaze_switch_time
