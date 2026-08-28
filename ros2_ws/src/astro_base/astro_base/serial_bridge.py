@@ -384,8 +384,14 @@ class SerialBridge(Node):
         if self.ser is None or not self.ser.is_open:
             return
 
-        self._hb_seq = (self._hb_seq + 1) & 0xFFFFFFFF
         now_mono = time.monotonic()
+        # In ASCII compatibility mode (no handshake yet), probe at low frequency (2.5s) to avoid flooding serial
+        if not getattr(self, "handshake_ok", False):
+            if (now_mono - getattr(self, "_last_probe_hb_time", 0.0)) < 2.5:
+                return
+            self._last_probe_hb_time = now_mono
+
+        self._hb_seq = (self._hb_seq + 1) & 0xFFFFFFFF
         if not hasattr(self, "_hb_tx_times"):
             self._hb_tx_times = {}
         self._hb_tx_times[self._hb_seq] = now_mono
@@ -494,23 +500,28 @@ class SerialBridge(Node):
         pkt = self.build_packet(MSG_HEAD_CMD, payload)
         try:
             with self.tx_lock:
-                self.ser.write(pkt)
-                # Dual compatibility: If Arduino runs ASCII test sketch, also send '5'/'6'/'0'
-                cmd_char = None
-                if msg.angle_deg > 5.0:
-                    cmd_char = b"5"
-                    self.ser.write(b"5")
-                elif msg.angle_deg < -5.0:
-                    cmd_char = b"6"
-                    self.ser.write(b"6")
-                elif abs(msg.angle_deg) <= 2.0:
-                    cmd_char = b"0"
-                    self.ser.write(b"0")
+                if getattr(self, "handshake_ok", False):
+                    # Full ROS2 binary packet mode
+                    self.ser.write(pkt)
+                    self.get_logger().info(f"🎯 [SERIAL HEAD CMD] binary_pkt angle_deg={msg.angle_deg:.1f}")
+                else:
+                    # Direct ASCII Compatibility mode (for test sketch with 5/6/0)
+                    cmd_char = None
+                    if msg.angle_deg > 5.0:
+                        cmd_char = b"5"
+                    elif msg.angle_deg < -5.0:
+                        cmd_char = b"6"
+                    elif abs(msg.angle_deg) <= 2.0:
+                        cmd_char = b"0"
+
+                    if cmd_char:
+                        self.ser.write(cmd_char)
+                    self.get_logger().info(f"🎯 [SERIAL HEAD CMD] angle_deg={msg.angle_deg:.1f} ascii_cmd={cmd_char.decode() if cmd_char else 'none'}")
+
                 try:
                     self.ser.flush()
                 except Exception:
                     pass
-                self.get_logger().info(f"🎯 [SERIAL HEAD CMD] angle_deg={msg.angle_deg:.1f} ascii_cmd={cmd_char.decode() if cmd_char else 'none'}")
         except serial.SerialException as exc:
             self.get_logger().error(f"HeadCmd write failed: {exc}")
             self._mark_disconnected()
