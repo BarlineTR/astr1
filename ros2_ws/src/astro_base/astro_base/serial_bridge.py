@@ -132,26 +132,28 @@ class ArduinoState:
     SAFETY_BLOCKED = "SAFETY_BLOCKED"
 
 
-def resolve_serial_port(primary: str = "/dev/astro_arduino", logger=None, baud: int = 115200) -> str:
+def resolve_serial_port(primary: str = "/dev/astro_arduino", logger=None, baud: int = 500000) -> str:
     candidates = []
-    # 1. Primary rule
-    if primary and os.path.exists(primary):
+    # 1. Primary rule (if it's not a lidar port)
+    if primary and primary not in ("/dev/astro_lidar", "/dev/rplidar") and os.path.exists(primary):
         if logger:
             logger.info(f"[ARDUINO PORT DISCOVERY]\n  candidate={primary}\n  selected={primary}\n  baud={baud}")
         return primary
     elif primary:
         candidates.append(primary)
 
-    # 2. Search patterns in priority order
+    # 2. Search patterns in priority order (CH341 USB Arduino clone first, avoid lidar)
     search_patterns = [
-        "/dev/astro_*",
         "/dev/ttyCH341USB*",
+        "/dev/astro_arduino*",
         "/dev/ttyUSB*",
         "/dev/ttyACM*",
     ]
     for pattern in search_patterns:
         matched = sorted(glob.glob(pattern))
         for p in matched:
+            if p in ("/dev/astro_lidar", "/dev/rplidar"):
+                continue
             if p not in candidates:
                 candidates.append(p)
             if os.path.exists(p):
