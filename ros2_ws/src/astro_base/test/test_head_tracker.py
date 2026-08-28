@@ -192,10 +192,37 @@ class TestSocialGazeLogic(unittest.TestCase):
 
         # Simulate 1 step of 0.1s (dt = 0.1s -> max step = 4.0 deg)
         self.node._last_update_time = time.monotonic() - 0.1
+    def test_lidar_radar_gaze_orientation(self):
+        """Test that approaching person detected on LiDAR/Radar smoothly steers head target."""
+        class MockLaserScan:
+            def __init__(self, target_angle_deg=30.0, distance_m=1.2):
+                self.angle_min = -math.pi
+                self.angle_increment = math.radians(1.0)
+                self.range_min = 0.15
+                self.range_max = 12.0
+                # 360 ranges (index 0 = -180°, index 180 = 0°, index 210 = +30°)
+                self.ranges = [10.0] * 360
+                idx = int((math.radians(target_angle_deg) - self.angle_min) / self.angle_increment)
+                if 0 <= idx < 360:
+                    self.ranges[idx] = distance_m
+
+        self.node._current_yaw = 0.0
+        self.node._target_yaw = 0.0
+        self.node._vad_active = False
+        self.node._vision_person_detected = False
+        self.node._last_gaze_switch_time = time.monotonic() - 5.0  # Dwell satisfied
+
+        scan_msg = MockLaserScan(target_angle_deg=35.0, distance_m=1.5)
+        self.node._on_laser_scan(scan_msg)
+
+        self.assertTrue(self.node._lidar_person_detected)
+        self.assertAlmostEqual(self.node._lidar_target_yaw, 35.0, places=1)
+
+        # Run control loop tick
+        self.node._last_update_time = time.monotonic() - 0.05
         self.node._control_loop()
 
-        self.assertAlmostEqual(self.node._current_yaw, 4.0, delta=0.5)
-
+        self.assertAlmostEqual(self.node._target_yaw, 35.0, places=1)
 
 
 if __name__ == "__main__":

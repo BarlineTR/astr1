@@ -6271,23 +6271,8 @@ class AstroRealtimeNode(Node):
             self.get_logger().debug(f"_on_conversation_session_ended: {exc}")
 
     def _ground_speech_gesture(self, text: str):
-        """Triggers subtle embodied head gestures matching speech semantics and conversational tone."""
-        if not getattr(self, "action_manager", None):
-            return
-        t_low = text.lower()
-        gesture = None
-        if any(k in t_low for k in ("kesinlikle", "tabii ki", "evet", "anladım", "harika", "süper", "memnun oldum")):
-            gesture = "nod"
-        elif any(k in t_low for k in ("merak", "nasıl", "ne dersin", "acaba", "?")):
-            gesture = "tilt"
-        elif any(k in t_low for k in ("hayır", "öyle değil", "malesef", "katılmıyorum", "yanlış")):
-            gesture = "shake"
-
-        if gesture:
-            try:
-                self.action_manager.execute_gesture(gesture)
-            except Exception as _exc:
-                self.get_logger().debug(f"_ground_speech_gesture: {_exc}")
+        """Speech gestures are disabled to maintain dedicated spatial tracking (Radar + Vision + Audio)."""
+        pass
 
     def _on_user_emotion(self, msg: String):
         self._user_emotion = msg.data.lower().strip()

@@ -24,6 +24,7 @@ from typing import Deque, Optional, Tuple, Any
 try:
     import rclpy
     from rclpy.node import Node
+    from sensor_msgs.msg import LaserScan
     from std_msgs.msg import Bool, Float32, String
 except ImportError:
     rclpy = None
@@ -46,6 +47,8 @@ except ImportError:
                 "consensus_tolerance_deg": 22.0,
                 "vision_fusion_enabled": True, "vision_gain": 0.6,
                 "vision_timeout_s": 2.0,
+                "lidar_fusion_enabled": True, "lidar_min_dist_m": 0.4,
+                "lidar_max_dist_m": 2.8, "lidar_timeout_s": 2.5,
             }
             return _Param(defaults.get(name, 0.0))
         def get_logger(self):
@@ -63,7 +66,7 @@ except ImportError:
             pass
     class _MockMsg:
         data: Any = None
-    Bool = Float32 = String = _MockMsg  # type: ignore
+    Bool = Float32 = String = LaserScan = _MockMsg  # type: ignore
 
 try:
     from astro_base.msg import HeadCmd
@@ -161,6 +164,11 @@ class HeadTrackerNode(Node):
         self.vision_fusion_enabled = bool(_get_val("vision_fusion_enabled", True))
         self.vision_gain = float(_get_val("vision_gain", 0.6))
         self.vision_timeout_s = float(_get_val("vision_timeout_s", 2.0))
+        # 2D LiDAR Radar tracking fusion
+        self.lidar_fusion_enabled = bool(_get_val("lidar_fusion_enabled", True))
+        self.lidar_min_dist_m = float(_get_val("lidar_min_dist_m", 0.4))
+        self.lidar_max_dist_m = float(_get_val("lidar_max_dist_m", 2.8))
+        self.lidar_timeout_s = float(_get_val("lidar_timeout_s", 2.5))
 
         # Publishers
         self.pub_head_cmd = self.create_publisher(HeadCmd, "/head_cmd", 10)
@@ -176,6 +184,9 @@ class HeadTrackerNode(Node):
         # Subscribers — vision (OAK-D Lite face_detector_node)
         self.create_subscription(Bool, "/vision/person_detected", self._on_person_detected, 10)
         self.create_subscription(Float32, "/vision/head_yaw", self._on_vision_head_yaw, 10)
+        # Subscribers — radar/LiDAR (RPLIDAR scan_filter_node)
+        self.create_subscription(LaserScan, "/scan", self._on_laser_scan, 10)
+        self.create_subscription(LaserScan, "/scan_filtered", self._on_laser_scan, 10)
 
         # State & Thread Safety
         self._lock = threading.Lock()
@@ -200,6 +211,12 @@ class HeadTrackerNode(Node):
         self._vision_head_yaw = 0.0          # Relative camera yaw: negative=left of frame, positive=right
         self._vision_last_seen_time = 0.0    # monotonic time of last person_detected=True
 
+        # 2D LiDAR radar tracking state
+        self._lidar_person_detected = False
+        self._lidar_target_yaw = 0.0
+        self._lidar_distance_m = 0.0
+        self._lidar_last_seen_time = 0.0
+
         # Circular buffer for DOA temporal consensus
         self._doa_history: Deque[Tuple[float, float]] = collections.deque(maxlen=self.consensus_window_size)
 
@@ -210,7 +227,7 @@ class HeadTrackerNode(Node):
         self.get_logger().info(
             f"🤖 [Head Tracker] Başlatıldı | Limitler: [{self.min_yaw_deg}°, {self.max_yaw_deg}°] | "
             f"Maks Hız: {self.max_speed_deg_s}°/s | Deadband: {self.deadband_deg}° | Dwell: {self.min_dwell_time_s}s | "
-            f"Vision Fusion: {'✅' if self.vision_fusion_enabled else '❌'}"
+            f"Vision: {'✅' if self.vision_fusion_enabled else '❌'} | LiDAR Radar: {'✅' if self.lidar_fusion_enabled else '❌'}"
         )
 
 
@@ -359,15 +376,47 @@ class HeadTrackerNode(Node):
                     self.get_logger().info("👁️ [Vision Fusion] Yüz tespit edildi — DOA devre dışı, kamera yönelimi aktif")
 
     def _on_vision_head_yaw(self, msg: Float32):
-        """OAK-D Lite: face_detector_node publishes relative head yaw inside camera frame.
-        Values are approximately -40° (face left of frame) to +40° (face right of frame).
-        This is the angular error between the face and the camera center.
-        We scale it by vision_gain and add to current_yaw to drive the head toward the face.
-        """
+        """OAK-D Lite: face_detector_node publishes relative head yaw inside camera frame."""
         if not self.vision_fusion_enabled:
             return
         with self._lock:
             self._vision_head_yaw = float(msg.data)
+
+    def _on_laser_scan(self, msg: Any):
+        """Processes 2D LiDAR planar scan to detect humans/objects in the front social zone."""
+        if not self.enabled or not self.lidar_fusion_enabled or self._is_sleeping:
+            return
+
+        now = time.monotonic()
+        ranges = getattr(msg, "ranges", None)
+        if not ranges:
+            return
+
+        angle_min = getattr(msg, "angle_min", -math.pi)
+        angle_increment = getattr(msg, "angle_increment", 0.01745)
+
+        points: list[tuple[float, float]] = []
+        for i, r in enumerate(ranges):
+            if math.isnan(r) or math.isinf(r) or r < self.lidar_min_dist_m or r > self.lidar_max_dist_m:
+                continue
+            ang_rad = angle_min + (i * angle_increment)
+            ang_deg = math.degrees(ang_rad)
+            # Normalize to [-180, 180]
+            ang_deg = (ang_deg + 180.0) % 360.0 - 180.0
+            if self.min_yaw_deg <= ang_deg <= self.max_yaw_deg:
+                points.append((float(r), float(ang_deg)))
+
+        if not points:
+            return
+
+        points.sort(key=lambda p: p[0])
+        closest_r, closest_angle = points[0]
+
+        with self._lock:
+            self._lidar_person_detected = True
+            self._lidar_target_yaw = closest_angle
+            self._lidar_distance_m = closest_r
+            self._lidar_last_seen_time = now
 
     def _control_loop(self):
         """Periodic 20 Hz trajectory generator with slew-rate velocity limiting."""
@@ -401,10 +450,33 @@ class HeadTrackerNode(Node):
                 elif self._vision_person_detected and (now - self._vision_last_seen_time) > self.vision_timeout_s:
                     # Face was lost — mark as not detected so DOA resumes
                     self._vision_person_detected = False
-                    self.get_logger().info("👁️ [Vision Fusion] Yüz kayboldu — DOA takibine dönülüyor")
+                    self.get_logger().info("👁️ [Vision Fusion] Yüz kayboldu — DOA / LiDAR takibine dönülüyor")
+
+                # --- LiDAR / Radar Tracking (RPLIDAR) ---
+                # When quiet (no active speech) and no active face lock, orient smoothly to approaching person
+                lidar_active = (
+                    self.lidar_fusion_enabled
+                    and getattr(self, "_lidar_person_detected", False)
+                    and (now - getattr(self, "_lidar_last_seen_time", 0.0)) <= self.lidar_timeout_s
+                    and not self._vad_active
+                    and not vision_active
+                )
+                if lidar_active and (now - self._last_gaze_switch_time) >= self.min_dwell_time_s:
+                    target_diff = abs(angular_diff_deg(self._lidar_target_yaw, self._current_yaw))
+                    if target_diff >= self.deadband_deg:
+                        self._target_yaw = max(self.min_yaw_deg, min(self.max_yaw_deg, self._lidar_target_yaw))
+                        self._last_speech_time = now
+                        self._last_gaze_switch_time = now
+                        self._state = SocialGazeStateMachine.ATTENDING
+                        self.get_logger().info(
+                            f"📡 [LiDAR Radar Gaze]: İnsan/Nesne algılandı -> Hedef Yaw={self._target_yaw:.1f}° "
+                            f"(Mesafe={self._lidar_distance_m:.2f}m)"
+                        )
+                elif getattr(self, "_lidar_person_detected", False) and (now - getattr(self, "_lidar_last_seen_time", 0.0)) > self.lidar_timeout_s:
+                    self._lidar_person_detected = False
 
                 # --- Idle Timeout ---
-                # Return head to 0° (neutral forward position) after prolonged silence / no face
+                # Return head to 0° (neutral forward position) after prolonged silence / no face / no person
                 if (now - self._last_speech_time) > self.idle_return_timeout_s:
                     if abs(self._current_yaw) > 2.0:
                         self._target_yaw = 0.0
