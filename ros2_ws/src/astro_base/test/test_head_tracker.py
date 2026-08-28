@@ -90,14 +90,14 @@ class TestSocialGazeLogic(unittest.TestCase):
         self.assertEqual(len(self.node._doa_history), 0)
         self.assertEqual(self.node._target_yaw, 0.0)
 
-    def test_180_deg_back_wall_echo_rejected(self):
-        """Test that acoustic reflection from directly behind (160°..200°) is ignored to avoid false ±70° clamps."""
+    def test_180_deg_speech_clamps_to_max_yaw(self):
+        """Test that speech from behind (>70°) safely clamps to physical neck limit (+70° or -70°)."""
         self.node._latest_rms = 3000.0
         self.node._vad_active = True
-        for raw in (170.0, 180.0, 190.0):
-            self.node._on_doa(MockMsg(raw))
-        self.assertEqual(len(self.node._doa_history), 0)
-        self.assertEqual(self.node._target_yaw, 0.0)
+        self.node._last_gaze_switch_time = 0.0
+        for _ in range(8):
+            self.node._on_doa(MockMsg(170.0))
+        self.assertEqual(self.node._target_yaw, 70.0)
 
     def test_consensus_clustering(self):
         """Test that temporal consensus filters out isolated outlier spikes and averages true cluster."""

@@ -3941,25 +3941,27 @@ class AstroRealtimeNode(Node):
                 except Exception:
                     pass
 
-            # Office Concierge: detect person entering door (1.5 - 2.0m)
+            # Office Concierge: only trigger in true idle state (not during active conversation or speaking)
             if getattr(self, "office_concierge", None):
-                ident = getattr(self, "_recognized_person", None)
-                welcome_act = self.office_concierge.evaluate_entrance_presence(
-                    lidar_ranges=ranges,
-                    recognized_identity=ident,
-                    is_speaking=(self._is_responding or self._is_playback_active)
+                is_active = (
+                    getattr(self, "_is_responding", False)
+                    or getattr(self, "_is_playback_active", False)
+                    or (getattr(self, "conversation_session", None) and self.conversation_session.is_active())
                 )
-                if welcome_act:
-                    self._handle_office_welcome(welcome_act)
+                if not is_active:
+                    ident = getattr(self, "_recognized_person", None)
+                    welcome_act = self.office_concierge.evaluate_entrance_presence(
+                        lidar_ranges=ranges,
+                        recognized_identity=ident,
+                        is_speaking=False
+                    )
+                    if welcome_act:
+                        self._handle_office_welcome(welcome_act)
         except Exception as _exc:
             self.get_logger().debug(f"_on_laser_scan: {_exc}")
 
     def _handle_office_welcome(self, welcome_act: Dict[str, Any]):
-        """Executes head nod gesture and triggers proactive welcome speech for lobby guests."""
-        gesture = welcome_act.get("gesture")
-        if gesture and getattr(self, "action_manager", None):
-            self.action_manager.execute_gesture(gesture)
-
+        """Triggers proactive welcome speech for lobby guests without disruptive gestures."""
         speech_text = welcome_act.get("speech_text", "")
         if speech_text and self._ws and self._loop and self._is_connected:
             welcome_event = {

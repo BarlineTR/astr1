@@ -24,10 +24,12 @@ from typing import Deque, Optional, Tuple, Any
 try:
     import rclpy
     from rclpy.node import Node
+    from rclpy.qos import qos_profile_sensor_data
     from sensor_msgs.msg import LaserScan
     from std_msgs.msg import Bool, Float32, String
 except ImportError:
     rclpy = None
+    qos_profile_sensor_data = 10  # type: ignore
     class Node:  # type: ignore
         def __init__(self, *args, **kwargs):
             pass
@@ -184,9 +186,9 @@ class HeadTrackerNode(Node):
         # Subscribers — vision (OAK-D Lite face_detector_node)
         self.create_subscription(Bool, "/vision/person_detected", self._on_person_detected, 10)
         self.create_subscription(Float32, "/vision/head_yaw", self._on_vision_head_yaw, 10)
-        # Subscribers — radar/LiDAR (RPLIDAR scan_filter_node)
-        self.create_subscription(LaserScan, "/scan", self._on_laser_scan, 10)
-        self.create_subscription(LaserScan, "/scan_filtered", self._on_laser_scan, 10)
+        # Subscribers — radar/LiDAR (RPLIDAR scan_filter_node with SensorData QoS)
+        self.create_subscription(LaserScan, "/scan", self._on_laser_scan, qos_profile_sensor_data)
+        self.create_subscription(LaserScan, "/scan_filtered", self._on_laser_scan, qos_profile_sensor_data)
 
         # State & Thread Safety
         self._lock = threading.Lock()
@@ -250,13 +252,7 @@ class HeadTrackerNode(Node):
             if not self._vad_active or self._latest_rms < adaptive_threshold:
                 return
 
-            # 4. 180° Acoustic Echo Rejection:
-            #    ReSpeaker 4-Mic arrays on tables/walls suffer from 180° acoustic back-wall reflections.
-            #    Sounds coming from directly behind (160° .. 200°) are discarded to prevent false ±70° clamps.
-            if 160.0 <= raw_doa <= 200.0:
-                return
-
-            # Convert to robot body frame yaw angle
+            # Convert to robot body frame yaw angle (clamped to [-70°, +70°] downstream)
             robot_yaw = doa_to_robot_yaw(raw_doa, offset_deg=self.doa_offset_deg, invert=self.doa_invert)
 
             # Record in consensus history (timestamp, yaw)
@@ -383,7 +379,7 @@ class HeadTrackerNode(Node):
             self._vision_head_yaw = float(msg.data)
 
     def _on_laser_scan(self, msg: Any):
-        """Processes 2D LiDAR planar scan to detect humans/objects in the front social zone."""
+        """Processes 2D LiDAR planar scan to detect humans/objects in the social zone around the robot."""
         if not self.enabled or not self.lidar_fusion_enabled or self._is_sleeping:
             return
 
@@ -403,18 +399,19 @@ class HeadTrackerNode(Node):
             ang_deg = math.degrees(ang_rad)
             # Normalize to [-180, 180]
             ang_deg = (ang_deg + 180.0) % 360.0 - 180.0
-            if self.min_yaw_deg <= ang_deg <= self.max_yaw_deg:
-                points.append((float(r), float(ang_deg)))
+            points.append((float(r), float(ang_deg)))
 
         if not points:
             return
 
+        # Sort by distance (closest obstacle / human)
         points.sort(key=lambda p: p[0])
-        closest_r, closest_angle = points[0]
+        closest_r, raw_closest_angle = points[0]
+        clamped_closest_angle = max(self.min_yaw_deg, min(self.max_yaw_deg, raw_closest_angle))
 
         with self._lock:
             self._lidar_person_detected = True
-            self._lidar_target_yaw = closest_angle
+            self._lidar_target_yaw = clamped_closest_angle
             self._lidar_distance_m = closest_r
             self._lidar_last_seen_time = now
 
