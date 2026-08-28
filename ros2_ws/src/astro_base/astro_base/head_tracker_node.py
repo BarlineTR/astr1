@@ -227,14 +227,7 @@ class HeadTrackerNode(Node):
             if self._is_sleeping or self._is_speaking or self._is_playback_active:
                 return
 
-            # 2. Vision Gate: If OAK-D camera has a face lock, skip DOA — vision is more accurate.
-            #    Still update _last_speech_time via VAD to prevent spurious idle return.
-            if self.vision_fusion_enabled and self._vision_person_detected:
-                if self._vad_active:
-                    self._last_speech_time = now  # keep idle timer alive
-                return
-
-            # 3. Acoustic Energy & VAD Gate: Require BOTH active VAD AND energy significantly above ambient
+            # 2. Acoustic Energy & VAD Gate: Require BOTH active VAD AND energy significantly above ambient
             #    (Prevents random room noises, chair movements, or TV spikes from moving the head)
             adaptive_threshold = max(self.min_rms_threshold, self._ambient_rms * self.noise_multiplier)
             if not self._vad_active or self._latest_rms < adaptive_threshold:
@@ -396,25 +389,15 @@ class HeadTrackerNode(Node):
                     self._state = SocialGazeStateMachine.IDLE
             else:
                 # --- Vision Fusion (OAK-D Lite) ---
-                # When a face is visible (and within timeout), drive head toward the face center
-                # using the relative angular error from the camera frame.
+                # When a face is visible, hold gaze steadily on the speaker and keep idle timer refreshed.
                 vision_active = (
                     self.vision_fusion_enabled
                     and self._vision_person_detected
                     and (now - self._vision_last_seen_time) <= self.vision_timeout_s
                 )
                 if vision_active:
-                    # _vision_head_yaw: face offset from camera center (-40° left .. +40° right)
-                    # Apply gain and add to current position to create a closed-loop correction target.
-                    correction = self._vision_head_yaw * self.vision_gain
-                    raw_vision_target = self._current_yaw + correction
-                    vision_target = max(self.min_yaw_deg, min(self.max_yaw_deg, raw_vision_target))
-                    angle_diff = abs(angular_diff_deg(vision_target, self._target_yaw))
-                    if angle_diff >= self.deadband_deg:
-                        self._target_yaw = vision_target
-                        self._last_speech_time = now  # prevent idle return while face is visible
-                        self._last_gaze_switch_time = now
-                        self._state = SocialGazeStateMachine.ATTENDING
+                    self._last_speech_time = now  # prevent idle return while face is visible
+                    self._state = SocialGazeStateMachine.ATTENDING
                 elif self._vision_person_detected and (now - self._vision_last_seen_time) > self.vision_timeout_s:
                     # Face was lost — mark as not detected so DOA resumes
                     self._vision_person_detected = False

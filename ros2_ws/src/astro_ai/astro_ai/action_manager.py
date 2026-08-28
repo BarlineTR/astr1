@@ -410,55 +410,19 @@ class ActionManager:
                 self._recent_actions.append(res)
                 return res
 
-            # 3. Execute Motor Command
-            # Calculate rotation parameters
+            # 3. Acoustic Orientation
+            # Steer head motor toward sound source (clamped to physical limits [-70°, 70°]).
+            # No wheel motors (/cmd_vel) are published to maintain pure head-tracking behavior.
             dir_str = "right" if azimuth > 0 else "left"
-            yaw_rad = math.radians(abs(azimuth))
-            turn_speed = 0.4  # rad/s
-            turn_duration = max(0.4, min(3.0, yaw_rad / turn_speed))
 
-            # Send Base Rotation to /cmd_vel
-            pub_vel = self._pub_cmd_vel or getattr(self._node, "pub_cmd_vel", None)
-            if pub_vel:
+            pub_head = self._pub_head_cmd or getattr(self._node, "pub_head_cmd", None)
+            if pub_head:
                 try:
-                    tw = Twist()
-                    tw.angular.z = turn_speed if azimuth < 0 else -turn_speed
-                    pub_vel.publish(tw)
-
-                    def _stop_later():
-                        time.sleep(turn_duration)
-                        try:
-                            stop_tw = Twist()
-                            pub_vel.publish(stop_tw)
-                        except Exception:
-                            pass
-                    threading.Thread(target=_stop_later, daemon=True).start()
-                except Exception as me:
-                    res = ActionResult(
-                        success=False,
-                        action="turn_to_sound",
-                        action_id=act_id,
-                        generation_id=generation_id,
-                        azimuth_deg=round(azimuth, 1),
-                        confidence=round(confidence, 2),
-                        error_code="VELOCITY_PUB_FAILED",
-                        reason=str(me),
-                        error=f"Tekerlek motoru komutu yayınlanamadı: {me}",
-                        message="Motor sürüşü başlatılamadı.",
-                        hardware_ack=False,
-                    )
-                    self._recent_actions.append(res)
-                    return res
-            else:
-                # Fallback: If base wheel publisher is unavailable, steer head motor directly
-                pub_head = self._pub_head_cmd or getattr(self._node, "pub_head_cmd", None)
-                if pub_head:
-                    try:
-                        head_msg = HeadCmd()
-                        head_msg.angle_deg = float(max(-70.0, min(70.0, azimuth)))
-                        pub_head.publish(head_msg)
-                    except Exception as he:
-                        self._logger.warning(f"HeadCmd yayını başarısız: {he}")
+                    head_msg = HeadCmd()
+                    head_msg.angle_deg = float(max(-70.0, min(70.0, azimuth)))
+                    pub_head.publish(head_msg)
+                except Exception as he:
+                    self._logger.debug(f"HeadCmd publication failed: {he}")
 
             self._executed_action_ids.add(act_id)
             self._action_id_history.append(act_id)
@@ -474,10 +438,9 @@ class ActionManager:
                 confidence=round(confidence, 2),
                 requested_direction=dir_str,
                 actual_direction=dir_str,
-                duration_ms=int(turn_duration * 1000),
                 hardware_ack=True,
                 verified=bool(has_joint_feedback),
-                message=f"Sesin geldiği {round(azimuth, 1)}° ({dir_str}) yönüne başarıyla dönüldü.",
+                message=f"Ses yönü ({azimuth:.1f}°) kafa takipçisine iletildi.",
             )
             self._recent_actions.append(res)
             return res

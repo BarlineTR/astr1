@@ -142,23 +142,25 @@ class TestSocialGazeLogic(unittest.TestCase):
 
     def test_deadband_hysteresis(self):
         """Test that small angle variations (<12°) do not cause head movement."""
+        self.node._doa_history.clear()
         self.node._current_yaw = 0.0
         self.node._target_yaw = 0.0
-        self.node._latest_rms = 1500.0
+        self.node._latest_rms = 2500.0
         self.node._ambient_rms = 200.0
         self.node._last_gaze_switch_time = 0.0  # Dwell time satisfied
 
-        # Feed 3 consistent 8° DOA readings (below 12° deadband)
-        for _ in range(3):
+        # Feed consistent 8° DOA readings (below 12° deadband)
+        for _ in range(8):
             self.node._on_doa(MockMsg(8.0))
 
         self.assertEqual(self.node._target_yaw, 0.0)
 
     def test_gaze_dwell_time(self):
         """Test that a new gaze direction is held for at least min_dwell_time_s."""
+        self.node._doa_history.clear()
         self.node._current_yaw = 0.0
         self.node._target_yaw = 0.0
-        self.node._latest_rms = 1500.0
+        self.node._latest_rms = 2500.0
         self.node._ambient_rms = 200.0
         self.node._last_gaze_switch_time = 0.0  # Dwell satisfied initially
 

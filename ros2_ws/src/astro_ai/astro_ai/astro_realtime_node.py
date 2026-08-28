@@ -6282,8 +6282,6 @@ class AstroRealtimeNode(Node):
             gesture = "tilt"
         elif any(k in t_low for k in ("hayır", "öyle değil", "malesef", "katılmıyorum", "yanlış")):
             gesture = "shake"
-        elif any(k in t_low for k in ("bakalım", "etrafta", "nerede", "arıyorum")):
-            gesture = "scan"
 
         if gesture:
             try:
