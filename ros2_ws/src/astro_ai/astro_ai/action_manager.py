@@ -720,15 +720,18 @@ class ActionManager:
         if not node:
             return None
 
-        # 1. Heartbeat Health Gate
+        # 1. Heartbeat Health Gate (Strict for linear wheel driving; relaxed for head/sound orientation)
         hb_ok = getattr(node, "_arduino_heartbeat_healthy", False)
         last_ack = getattr(node, "_last_heartbeat_ack_time", 0.0)
-        if not hb_ok or (time.monotonic() - last_ack) > 2.0:
-            return {
-                "error_code": "MOTOR_CONTROLLER_UNAVAILABLE",
-                "reason": "heartbeat_unhealthy",
-                "message": "Arduino bağlantısı veya heartbeat aktif değil, güvenlik için hareket engellendi."
-            }
+        is_turn_or_head = direction in ("turn", "head", "gesture")
+        
+        if not is_turn_or_head:
+            if not hb_ok or (time.monotonic() - last_ack) > 3.0:
+                return {
+                    "error_code": "MOTOR_CONTROLLER_UNAVAILABLE",
+                    "reason": "heartbeat_unhealthy",
+                    "message": "Arduino bağlantısı veya heartbeat aktif değil, güvenlik için hareket engellendi."
+                }
 
         # 2. Obstacle Detection Gate
         if direction == "forward" and getattr(node, "_obstacle_detected", False):

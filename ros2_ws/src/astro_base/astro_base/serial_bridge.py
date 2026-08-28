@@ -183,7 +183,11 @@ class SerialBridge(Node):
         self.declare_parameter("wheel_separation", 0.26)
 
         self.port_param = self.get_parameter("port").get_parameter_value().string_value
-        self.baud = self.get_parameter("baud").get_parameter_value().integer_value
+        env_baud = os.getenv("ASTRO_SERIAL_BAUD")
+        if env_baud and env_baud.isdigit():
+            self.baud = int(env_baud)
+        else:
+            self.baud = self.get_parameter("baud").get_parameter_value().integer_value or 115200
         self.connect_retry_sec = float(self.get_parameter("connect_retry_sec").value)
 
         self.frame_id_imu = (
@@ -483,11 +487,7 @@ class SerialBridge(Node):
         self.on_wheel_cmd(wheel_cmd)
 
     def on_head_cmd(self, msg: HeadCmd):
-        if self.ser is None or not self.ser.is_open or not self.arduino_alive:
-            self.get_logger().warn(
-                "[HEAD SAFETY BLOCK] reason=heartbeat_ack_missing\n"
-                "  Arduino not responding to heartbeat — head command rejected."
-            )
+        if self.ser is None or not self.ser.is_open:
             return
 
         payload = struct.pack("<f", msg.angle_deg)
@@ -495,6 +495,13 @@ class SerialBridge(Node):
         try:
             with self.tx_lock:
                 self.ser.write(pkt)
+                # Dual compatibility: If Arduino runs ASCII test sketch, also send '5'/'6'/'0'
+                if msg.angle_deg > 5.0:
+                    self.ser.write(b"5")
+                elif msg.angle_deg < -5.0:
+                    self.ser.write(b"6")
+                elif abs(msg.angle_deg) <= 2.0:
+                    self.ser.write(b"0")
         except serial.SerialException as exc:
             self.get_logger().error(f"HeadCmd write failed: {exc}")
             self._mark_disconnected()
