@@ -66,7 +66,7 @@ class ArduinoState:
     SAFETY_BLOCKED = "SAFETY_BLOCKED"
 
 
-def resolve_serial_port(primary: str = "/dev/astro_arduino", logger=None, baud: int = 500000) -> str:
+def resolve_serial_port(primary: str = "/dev/astro_arduino", logger=None, baud: int = 115200) -> str:
     candidates = []
     # 1. Primary rule (if it's not a lidar port)
     if primary and primary not in ("/dev/astro_lidar", "/dev/rplidar") and os.path.exists(primary):
@@ -109,7 +109,7 @@ class SerialBridge(Node):
     def __init__(self):
         super().__init__("serial_bridge")
         self.declare_parameter("port", "/dev/ttyCH341USB0")
-        self.declare_parameter("baud", 500000)
+        self.declare_parameter("baud", 115200)
         self.declare_parameter("connect_retry_sec", 2.0)
         self.declare_parameter("frame_id_imu", "imu_link")
         self.declare_parameter("ticks_per_rev_left", 2048.0)
@@ -122,7 +122,7 @@ class SerialBridge(Node):
         if env_baud and env_baud.isdigit():
             self.baud = int(env_baud)
         else:
-            self.baud = self.get_parameter("baud").get_parameter_value().integer_value or 500000
+            self.baud = self.get_parameter("baud").get_parameter_value().integer_value or 115200
         self.connect_retry_sec = float(self.get_parameter("connect_retry_sec").value)
 
         self.frame_id_imu = (
