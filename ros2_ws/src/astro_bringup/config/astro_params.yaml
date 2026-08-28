@@ -78,9 +78,12 @@ head_tracker_node:
     doa_invert: false
     max_yaw_deg: 70.0
     min_yaw_deg: -70.0
-    deadband_deg: 12.0
+    deadband_deg: 15.0
     min_dwell_time_s: 2.5
     idle_return_timeout_s: 8.0
-    max_speed_deg_s: 45.0
-    min_rms_threshold: 800.0
-    noise_multiplier: 2.2
+    max_speed_deg_s: 25.0
+    min_rms_threshold: 900.0
+    noise_multiplier: 2.5
+    consensus_window_size: 5
+    consensus_threshold: 4
+    consensus_tolerance_deg: 18.0
