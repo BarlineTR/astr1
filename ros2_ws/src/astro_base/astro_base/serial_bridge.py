@@ -504,10 +504,12 @@ class SerialBridge(Node):
         try:
             with self.tx_lock:
                 if getattr(self, "handshake_ok", False):
-                    # Full ROS2 binary packet mode: send on change >=0.5 deg or 1.0s heartbeat
+                    # Full ROS2 binary packet mode: send only on change >=0.5 deg.
+                    # The 1s heartbeat was removed — Arduino PID holds position internally
+                    # and does not require periodic refreshes. Removing it prevents the head
+                    # motor from being driven while the robot is in IDLE state.
                     last_sent_angle = getattr(self, "_last_sent_angle", None)
-                    last_sent_time = getattr(self, "_last_sent_angle_time", 0.0)
-                    if last_sent_angle is None or abs(msg.angle_deg - last_sent_angle) >= 0.5 or (now - last_sent_time) > 1.0:
+                    if last_sent_angle is None or abs(msg.angle_deg - last_sent_angle) >= 0.5:
                         self.ser.write(pkt)
                         self._last_sent_angle = msg.angle_deg
                         self._last_sent_angle_time = now

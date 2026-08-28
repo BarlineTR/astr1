@@ -160,12 +160,17 @@ class TestSocialGazeLogic(unittest.TestCase):
         self.node._current_yaw = 0.0
         self.node._target_yaw = 60.0
         self.node.max_speed_deg_s = 40.0  # 40 deg/sec
+        # Prevent idle timeout from resetting _target_yaw to 0° during this test
+        self.node._last_speech_time = time.monotonic()
+        # Ensure vision fusion doesn't interfere
+        self.node._vision_person_detected = False
 
         # Simulate 1 step of 0.1s (dt = 0.1s -> max step = 4.0 deg)
         self.node._last_update_time = time.monotonic() - 0.1
         self.node._control_loop()
 
         self.assertAlmostEqual(self.node._current_yaw, 4.0, delta=0.5)
+
 
 
 if __name__ == "__main__":

@@ -10,6 +10,7 @@ and multimodal perception with human-like social gaze behavior:
   - Gaze dwell time (holds attention for >= 2.5s before switching target)
   - Smooth S-curve / slew-rate velocity limiting (max 45°/s, organic motion)
   - Idle return-to-center after sustained silence
+  - OAK-D Lite vision fusion: camera-based face angle overrides DOA when a face is detected
 """
 
 import collections
@@ -42,7 +43,9 @@ except ImportError:
                 "max_speed_deg_s": 45.0, "update_rate_hz": 20.0,
                 "min_rms_threshold": 800.0, "noise_multiplier": 2.2,
                 "consensus_window_size": 5, "consensus_threshold": 3,
-                "consensus_tolerance_deg": 18.0
+                "consensus_tolerance_deg": 22.0,
+                "vision_fusion_enabled": True, "vision_gain": 0.6,
+                "vision_timeout_s": 1.5,
             }
             return _Param(defaults.get(name, 0.0))
         def get_logger(self):
@@ -124,7 +127,11 @@ class HeadTrackerNode(Node):
         self.declare_parameter("noise_multiplier", 2.5)
         self.declare_parameter("consensus_window_size", 5)
         self.declare_parameter("consensus_threshold", 4)
-        self.declare_parameter("consensus_tolerance_deg", 18.0)
+        self.declare_parameter("consensus_tolerance_deg", 22.0)  # Raised from 18° to fix 180°/0° cluster split
+        # OAK-D Lite vision fusion parameters
+        self.declare_parameter("vision_fusion_enabled", True)
+        self.declare_parameter("vision_gain", 0.6)       # Scale factor for vision head_yaw → robot yaw correction
+        self.declare_parameter("vision_timeout_s", 1.5)  # Seconds before reverting to DOA after face is lost
 
         # Load parameters
         def _get_val(name, default):
@@ -149,19 +156,26 @@ class HeadTrackerNode(Node):
         self.noise_multiplier = float(_get_val("noise_multiplier", 2.5))
         self.consensus_window_size = max(1, int(_get_val("consensus_window_size", 5)))
         self.consensus_threshold = max(1, int(_get_val("consensus_threshold", 4)))
-        self.consensus_tolerance_deg = float(_get_val("consensus_tolerance_deg", 18.0))
+        self.consensus_tolerance_deg = float(_get_val("consensus_tolerance_deg", 22.0))
+        # OAK-D Lite vision fusion
+        self.vision_fusion_enabled = bool(_get_val("vision_fusion_enabled", True))
+        self.vision_gain = float(_get_val("vision_gain", 0.6))
+        self.vision_timeout_s = float(_get_val("vision_timeout_s", 1.5))
 
         # Publishers
         self.pub_head_cmd = self.create_publisher(HeadCmd, "/head_cmd", 10)
         self.pub_head_status = self.create_publisher(String, "/head/status", 10)
 
-        # Subscribers
+        # Subscribers — acoustic
         self.create_subscription(Float32, "/audio/doa", self._on_doa, 10)
         self.create_subscription(Float32, "/audio/mic_level", self._on_mic_level, 10)
         self.create_subscription(Bool, "/audio/vad", self._on_vad, 10)
         self.create_subscription(Bool, "/tts/speaking", self._on_tts_speaking, 10)
         self.create_subscription(Bool, "/audio/playback_active", self._on_playback_active, 10)
         self.create_subscription(String, "/robot/emotion", self._on_emotion, 10)
+        # Subscribers — vision (OAK-D Lite face_detector_node)
+        self.create_subscription(Bool, "/vision/person_detected", self._on_person_detected, 10)
+        self.create_subscription(Float32, "/vision/head_yaw", self._on_vision_head_yaw, 10)
 
         # State & Thread Safety
         self._lock = threading.Lock()
@@ -180,6 +194,11 @@ class HeadTrackerNode(Node):
         self._last_gaze_switch_time = time.monotonic()
         self._last_update_time = time.monotonic()
 
+        # OAK-D Lite vision state
+        self._vision_person_detected = False
+        self._vision_head_yaw = 0.0          # Relative camera yaw: negative=left of frame, positive=right
+        self._vision_last_seen_time = 0.0    # monotonic time of last person_detected=True
+
         # Circular buffer for DOA temporal consensus
         self._doa_history: Deque[Tuple[float, float]] = collections.deque(maxlen=self.consensus_window_size)
 
@@ -189,8 +208,10 @@ class HeadTrackerNode(Node):
 
         self.get_logger().info(
             f"🤖 [Head Tracker] Başlatıldı | Limitler: [{self.min_yaw_deg}°, {self.max_yaw_deg}°] | "
-            f"Maks Hız: {self.max_speed_deg_s}°/s | Deadband: {self.deadband_deg}° | Dwell: {self.min_dwell_time_s}s"
+            f"Maks Hız: {self.max_speed_deg_s}°/s | Deadband: {self.deadband_deg}° | Dwell: {self.min_dwell_time_s}s | "
+            f"Vision Fusion: {'✅' if self.vision_fusion_enabled else '❌'}"
         )
+
 
     def _on_doa(self, msg: Float32):
         """Processes raw acoustic Direction of Arrival from ReSpeaker."""
@@ -205,10 +226,18 @@ class HeadTrackerNode(Node):
             if self._is_speaking or self._is_playback_active:
                 return
 
-            # 2. Acoustic Energy Gate: Verify sound is significantly louder than ambient noise
+            # 2. Vision Gate: If OAK-D camera has a face lock, skip DOA — vision is more accurate.
+            #    Still update _last_speech_time via VAD to prevent spurious idle return.
+            if self.vision_fusion_enabled and self._vision_person_detected:
+                if self._vad_active:
+                    self._last_speech_time = now  # keep idle timer alive
+                return
+
+            # 3. Acoustic Energy Gate: Verify sound is significantly louder than ambient noise
             adaptive_threshold = max(self.min_rms_threshold, self._ambient_rms * self.noise_multiplier)
             if self._latest_rms < adaptive_threshold and not self._vad_active:
                 return
+
 
             # Convert to robot body frame yaw angle
             robot_yaw = doa_to_robot_yaw(raw_doa, offset_deg=self.doa_offset_deg, invert=self.doa_invert)
@@ -308,6 +337,29 @@ class HeadTrackerNode(Node):
         # Placeholder for future emotional head gestures (e.g. nodding, tilt)
         pass
 
+    def _on_person_detected(self, msg: Bool):
+        """OAK-D Lite: called when face detector publishes person presence."""
+        with self._lock:
+            was_detected = self._vision_person_detected
+            self._vision_person_detected = bool(msg.data)
+            if self._vision_person_detected:
+                self._vision_last_seen_time = time.monotonic()
+                if not was_detected:
+                    # Face just appeared — clear stale DOA history to avoid conflicting targets
+                    self._doa_history.clear()
+                    self.get_logger().info("👁️ [Vision Fusion] Yüz tespit edildi — DOA devre dışı, kamera yönelimi aktif")
+
+    def _on_vision_head_yaw(self, msg: Float32):
+        """OAK-D Lite: face_detector_node publishes relative head yaw inside camera frame.
+        Values are approximately -40° (face left of frame) to +40° (face right of frame).
+        This is the angular error between the face and the camera center.
+        We scale it by vision_gain and add to current_yaw to drive the head toward the face.
+        """
+        if not self.vision_fusion_enabled:
+            return
+        with self._lock:
+            self._vision_head_yaw = float(msg.data)
+
     def _control_loop(self):
         """Periodic 20 Hz trajectory generator with slew-rate velocity limiting."""
         if not self.enabled:
@@ -318,15 +370,42 @@ class HeadTrackerNode(Node):
             dt = max(0.001, now - self._last_update_time)
             self._last_update_time = now
 
-            # Idle timeout: return head to 0° (neutral forward position) after prolonged silence
+            # --- Vision Fusion (OAK-D Lite) ---
+            # When a face is visible (and within timeout), drive head toward the face center
+            # using the relative angular error from the camera frame.
+            vision_active = (
+                self.vision_fusion_enabled
+                and self._vision_person_detected
+                and (now - self._vision_last_seen_time) <= self.vision_timeout_s
+            )
+            if vision_active:
+                # _vision_head_yaw: face offset from camera center (-40° left .. +40° right)
+                # Apply gain and add to current position to create a closed-loop correction target.
+                correction = self._vision_head_yaw * self.vision_gain
+                raw_vision_target = self._current_yaw + correction
+                vision_target = max(self.min_yaw_deg, min(self.max_yaw_deg, raw_vision_target))
+                angle_diff = abs(angular_diff_deg(vision_target, self._target_yaw))
+                if angle_diff >= self.deadband_deg:
+                    self._target_yaw = vision_target
+                    self._last_speech_time = now  # prevent idle return while face is visible
+                    self._last_gaze_switch_time = now
+                    self._state = SocialGazeStateMachine.ATTENDING
+            elif self._vision_person_detected and (now - self._vision_last_seen_time) > self.vision_timeout_s:
+                # Face was lost — mark as not detected so DOA resumes
+                self._vision_person_detected = False
+                self.get_logger().info("👁️ [Vision Fusion] Yüz kayboldu — DOA takibine dönülüyor")
+
+            # --- Idle Timeout ---
+            # Return head to 0° (neutral forward position) after prolonged silence / no face
             if (now - self._last_speech_time) > self.idle_return_timeout_s:
                 if abs(self._current_yaw) > 2.0:
                     self._target_yaw = 0.0
                     self._state = SocialGazeStateMachine.RETURNING
                 else:
+                    self._target_yaw = 0.0
                     self._state = SocialGazeStateMachine.IDLE
 
-            # Smooth Trajectory Generation: Slew-rate velocity limiting
+            # --- Smooth Trajectory Generation: Slew-rate velocity limiting ---
             max_step = self.max_speed_deg_s * dt
             err = self._target_yaw - self._current_yaw
 
@@ -339,10 +418,24 @@ class HeadTrackerNode(Node):
             target_yaw_snapshot = self._target_yaw
             state_snapshot = self._state
 
-        # Publish head command to /head_cmd (only on motion or entering resting position)
+        # --- Publish /head_cmd ---
+        # Only publish when there is meaningful motion or on the first tick that settles to 0°.
+        # CRITICAL FIX: Do NOT publish in IDLE+settled state — serial_bridge must not send
+        # the same angle repeatedly to Arduino (removed 1s heartbeat on serial_bridge side too).
         last_pub = getattr(self, "_last_published_cmd_yaw", None)
         is_idle_settled = (state_snapshot == SocialGazeStateMachine.IDLE and abs(current_yaw_to_send) < 0.1)
-        if last_pub is None or abs(current_yaw_to_send - last_pub) >= 0.5 or (not is_idle_settled) or (last_pub != 0.0 and is_idle_settled):
+
+        should_publish = False
+        if is_idle_settled:
+            # Only publish once when transitioning to settled idle (to send the final 0° command)
+            if last_pub is None or abs(last_pub) >= 0.5:
+                should_publish = True
+        else:
+            # Publish when yaw has changed enough to warrant an update
+            if last_pub is None or abs(current_yaw_to_send - last_pub) >= 0.5:
+                should_publish = True
+
+        if should_publish:
             cmd = HeadCmd()
             cmd.angle_deg = float(current_yaw_to_send)
             self.pub_head_cmd.publish(cmd)
@@ -355,10 +448,12 @@ class HeadTrackerNode(Node):
             "state": state_snapshot,
             "ambient_rms": round(self._ambient_rms, 1),
             "is_speaking": self._is_speaking,
+            "vision_active": vision_active,
         }
         status_msg = String()
         status_msg.data = json.dumps(status)
         self.pub_head_status.publish(status_msg)
+
 
 
 def main(args=None):
