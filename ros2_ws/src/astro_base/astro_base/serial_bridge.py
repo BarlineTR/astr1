@@ -498,14 +498,20 @@ class SerialBridge(Node):
         if self.ser is None or not self.ser.is_open:
             return
 
+        now = time.monotonic()
         payload = struct.pack("<f", msg.angle_deg)
         pkt = self.build_packet(MSG_HEAD_CMD, payload)
         try:
             with self.tx_lock:
                 if getattr(self, "handshake_ok", False):
-                    # Full ROS2 binary packet mode
-                    self.ser.write(pkt)
-                    self.get_logger().info(f"🎯 [SERIAL HEAD CMD] binary_pkt angle_deg={msg.angle_deg:.1f}")
+                    # Full ROS2 binary packet mode: send on change >=0.5 deg or 1.0s heartbeat
+                    last_sent_angle = getattr(self, "_last_sent_angle", None)
+                    last_sent_time = getattr(self, "_last_sent_angle_time", 0.0)
+                    if last_sent_angle is None or abs(msg.angle_deg - last_sent_angle) >= 0.5 or (now - last_sent_time) > 1.0:
+                        self.ser.write(pkt)
+                        self._last_sent_angle = msg.angle_deg
+                        self._last_sent_angle_time = now
+                        self.get_logger().info(f"🎯 [SERIAL HEAD CMD] binary_pkt angle_deg={msg.angle_deg:.1f}")
                 else:
                     # Direct ASCII Compatibility mode (for test sketch with 5/6/0)
                     cmd_char = None
@@ -516,14 +522,17 @@ class SerialBridge(Node):
                     elif abs(msg.angle_deg) <= 2.0:
                         cmd_char = b"0"
 
-                    if cmd_char:
-                        self.ser.write(cmd_char)
-                    self.get_logger().info(f"🎯 [SERIAL HEAD CMD] angle_deg={msg.angle_deg:.1f} ascii_cmd={cmd_char.decode() if cmd_char else 'none'}")
-
-                try:
-                    self.ser.flush()
-                except Exception:
-                    pass
+                    last_ascii = getattr(self, "_last_sent_ascii_cmd", None)
+                    if cmd_char is not None:
+                        # ONLY transmit across serial when command character changes!
+                        if cmd_char != last_ascii:
+                            self.ser.write(cmd_char)
+                            try:
+                                self.ser.flush()
+                            except Exception:
+                                pass
+                            self._last_sent_ascii_cmd = cmd_char
+                            self.get_logger().info(f"🎯 [SERIAL HEAD CMD] angle_deg={msg.angle_deg:.1f} ascii_cmd={cmd_char.decode()}")
         except serial.SerialException as exc:
             self.get_logger().error(f"HeadCmd write failed: {exc}")
             self._mark_disconnected()

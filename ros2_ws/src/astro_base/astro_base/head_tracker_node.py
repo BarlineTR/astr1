@@ -334,10 +334,14 @@ class HeadTrackerNode(Node):
             target_yaw_snapshot = self._target_yaw
             state_snapshot = self._state
 
-        # Publish smooth head command to /head_cmd
-        cmd = HeadCmd()
-        cmd.angle_deg = float(current_yaw_to_send)
-        self.pub_head_cmd.publish(cmd)
+        # Publish head command to /head_cmd (only on motion or entering resting position)
+        last_pub = getattr(self, "_last_published_cmd_yaw", None)
+        is_idle_settled = (state_snapshot == SocialGazeStateMachine.IDLE and abs(current_yaw_to_send) < 0.1)
+        if last_pub is None or abs(current_yaw_to_send - last_pub) >= 0.5 or (not is_idle_settled) or (last_pub != 0.0 and is_idle_settled):
+            cmd = HeadCmd()
+            cmd.angle_deg = float(current_yaw_to_send)
+            self.pub_head_cmd.publish(cmd)
+            self._last_published_cmd_yaw = current_yaw_to_send
 
         # Periodic status telemetry
         status = {
