@@ -75,6 +75,29 @@ class TestSocialGazeLogic(unittest.TestCase):
         self.node._filtered_target_yaw = 0.0
         self.node._is_speaking = False
         self.node._is_playback_active = False
+        self.node._is_sleeping = False
+        self.node._vad_active = True
+        self.node.vision_fusion_enabled = False
+        self.node._vision_person_detected = False
+
+    def test_sleep_mode_locks_head_and_rejects_doa(self):
+        """Test that when robot is in sleep mode, DOA is ignored and head target stays 0.0°."""
+        self.node._is_sleeping = True
+        self.node._latest_rms = 5000.0
+        self.node._vad_active = True
+        for _ in range(10):
+            self.node._on_doa(MockMsg(45.0))
+        self.assertEqual(len(self.node._doa_history), 0)
+        self.assertEqual(self.node._target_yaw, 0.0)
+
+    def test_180_deg_back_wall_echo_rejected(self):
+        """Test that acoustic reflection from directly behind (160°..200°) is ignored to avoid false ±70° clamps."""
+        self.node._latest_rms = 3000.0
+        self.node._vad_active = True
+        for raw in (170.0, 180.0, 190.0):
+            self.node._on_doa(MockMsg(raw))
+        self.assertEqual(len(self.node._doa_history), 0)
+        self.assertEqual(self.node._target_yaw, 0.0)
 
     def test_consensus_clustering(self):
         """Test that temporal consensus filters out isolated outlier spikes and averages true cluster."""

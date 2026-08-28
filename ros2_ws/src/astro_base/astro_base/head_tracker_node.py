@@ -39,13 +39,13 @@ except ImportError:
             defaults = {
                 "enabled": True, "doa_offset_deg": 0.0, "doa_invert": False,
                 "max_yaw_deg": 70.0, "min_yaw_deg": -70.0, "deadband_deg": 12.0,
-                "min_dwell_time_s": 2.5, "idle_return_timeout_s": 8.0,
-                "max_speed_deg_s": 45.0, "update_rate_hz": 20.0,
-                "min_rms_threshold": 800.0, "noise_multiplier": 2.2,
-                "consensus_window_size": 5, "consensus_threshold": 3,
+                "min_dwell_time_s": 3.0, "idle_return_timeout_s": 10.0,
+                "max_speed_deg_s": 25.0, "update_rate_hz": 20.0,
+                "min_rms_threshold": 1600.0, "noise_multiplier": 3.0,
+                "consensus_window_size": 7, "consensus_threshold": 5,
                 "consensus_tolerance_deg": 22.0,
                 "vision_fusion_enabled": True, "vision_gain": 0.6,
-                "vision_timeout_s": 1.5,
+                "vision_timeout_s": 2.0,
             }
             return _Param(defaults.get(name, 0.0))
         def get_logger(self):
@@ -119,19 +119,19 @@ class HeadTrackerNode(Node):
         self.declare_parameter("max_yaw_deg", 70.0)
         self.declare_parameter("min_yaw_deg", -70.0)
         self.declare_parameter("deadband_deg", 12.0)
-        self.declare_parameter("min_dwell_time_s", 2.5)
-        self.declare_parameter("idle_return_timeout_s", 8.0)
+        self.declare_parameter("min_dwell_time_s", 3.0)
+        self.declare_parameter("idle_return_timeout_s", 10.0)
         self.declare_parameter("max_speed_deg_s", 25.0)
         self.declare_parameter("update_rate_hz", 20.0)
-        self.declare_parameter("min_rms_threshold", 900.0)
-        self.declare_parameter("noise_multiplier", 2.5)
-        self.declare_parameter("consensus_window_size", 5)
-        self.declare_parameter("consensus_threshold", 4)
+        self.declare_parameter("min_rms_threshold", 1600.0)
+        self.declare_parameter("noise_multiplier", 3.0)
+        self.declare_parameter("consensus_window_size", 7)
+        self.declare_parameter("consensus_threshold", 5)
         self.declare_parameter("consensus_tolerance_deg", 22.0)  # Raised from 18° to fix 180°/0° cluster split
         # OAK-D Lite vision fusion parameters
         self.declare_parameter("vision_fusion_enabled", True)
         self.declare_parameter("vision_gain", 0.6)       # Scale factor for vision head_yaw → robot yaw correction
-        self.declare_parameter("vision_timeout_s", 1.5)  # Seconds before reverting to DOA after face is lost
+        self.declare_parameter("vision_timeout_s", 2.0)  # Seconds before reverting to DOA after face is lost
 
         # Load parameters
         def _get_val(name, default):
@@ -147,20 +147,20 @@ class HeadTrackerNode(Node):
         self.doa_invert = bool(_get_val("doa_invert", False))
         self.max_yaw_deg = float(_get_val("max_yaw_deg", 70.0))
         self.min_yaw_deg = float(_get_val("min_yaw_deg", -70.0))
-        self.deadband_deg = float(_get_val("deadband_deg", 15.0))
-        self.min_dwell_time_s = float(_get_val("min_dwell_time_s", 2.5))
-        self.idle_return_timeout_s = float(_get_val("idle_return_timeout_s", 8.0))
+        self.deadband_deg = float(_get_val("deadband_deg", 12.0))
+        self.min_dwell_time_s = float(_get_val("min_dwell_time_s", 3.0))
+        self.idle_return_timeout_s = float(_get_val("idle_return_timeout_s", 10.0))
         self.max_speed_deg_s = float(_get_val("max_speed_deg_s", 25.0))
         self.update_rate_hz = float(_get_val("update_rate_hz", 20.0))
-        self.min_rms_threshold = float(_get_val("min_rms_threshold", 900.0))
-        self.noise_multiplier = float(_get_val("noise_multiplier", 2.5))
-        self.consensus_window_size = max(1, int(_get_val("consensus_window_size", 5)))
-        self.consensus_threshold = max(1, int(_get_val("consensus_threshold", 4)))
+        self.min_rms_threshold = float(_get_val("min_rms_threshold", 1600.0))
+        self.noise_multiplier = float(_get_val("noise_multiplier", 3.0))
+        self.consensus_window_size = max(1, int(_get_val("consensus_window_size", 7)))
+        self.consensus_threshold = max(1, int(_get_val("consensus_threshold", 5)))
         self.consensus_tolerance_deg = float(_get_val("consensus_tolerance_deg", 22.0))
         # OAK-D Lite vision fusion
         self.vision_fusion_enabled = bool(_get_val("vision_fusion_enabled", True))
         self.vision_gain = float(_get_val("vision_gain", 0.6))
-        self.vision_timeout_s = float(_get_val("vision_timeout_s", 1.5))
+        self.vision_timeout_s = float(_get_val("vision_timeout_s", 2.0))
 
         # Publishers
         self.pub_head_cmd = self.create_publisher(HeadCmd, "/head_cmd", 10)
@@ -190,6 +190,7 @@ class HeadTrackerNode(Node):
         self._vad_active = False
         self._is_speaking = False
         self._is_playback_active = False
+        self._is_sleeping = False
         self._last_speech_time = 0.0
         self._last_gaze_switch_time = time.monotonic()
         self._last_update_time = time.monotonic()
@@ -222,8 +223,8 @@ class HeadTrackerNode(Node):
         raw_doa = float(msg.data)
 
         with self._lock:
-            # 1. Self-Voice Gate: Ignore DOA if robot itself is playing audio/speaking
-            if self._is_speaking or self._is_playback_active:
+            # 1. Sleep & Self-Voice Gate: Ignore DOA if robot is sleeping, speaking, or playing audio
+            if self._is_sleeping or self._is_speaking or self._is_playback_active:
                 return
 
             # 2. Vision Gate: If OAK-D camera has a face lock, skip DOA — vision is more accurate.
@@ -233,11 +234,17 @@ class HeadTrackerNode(Node):
                     self._last_speech_time = now  # keep idle timer alive
                 return
 
-            # 3. Acoustic Energy Gate: Verify sound is significantly louder than ambient noise
+            # 3. Acoustic Energy & VAD Gate: Require BOTH active VAD AND energy significantly above ambient
+            #    (Prevents random room noises, chair movements, or TV spikes from moving the head)
             adaptive_threshold = max(self.min_rms_threshold, self._ambient_rms * self.noise_multiplier)
-            if self._latest_rms < adaptive_threshold and not self._vad_active:
+            if not self._vad_active or self._latest_rms < adaptive_threshold:
                 return
 
+            # 4. 180° Acoustic Echo Rejection:
+            #    ReSpeaker 4-Mic arrays on tables/walls suffer from 180° acoustic back-wall reflections.
+            #    Sounds coming from directly behind (160° .. 200°) are discarded to prevent false ±70° clamps.
+            if 160.0 <= raw_doa <= 200.0:
+                return
 
             # Convert to robot body frame yaw angle
             robot_yaw = doa_to_robot_yaw(raw_doa, offset_deg=self.doa_offset_deg, invert=self.doa_invert)
@@ -334,8 +341,17 @@ class HeadTrackerNode(Node):
             self._is_playback_active = bool(msg.data)
 
     def _on_emotion(self, msg: String):
-        # Placeholder for future emotional head gestures (e.g. nodding, tilt)
-        pass
+        """Monitors robot emotional and sleep state to lock head during sleep/deep-idle."""
+        with self._lock:
+            emo = str(msg.data).strip().lower()
+            if emo in ("sleeping", "sleep"):
+                self._is_sleeping = True
+                self._doa_history.clear()
+                self._target_yaw = 0.0
+                self._state = SocialGazeStateMachine.IDLE
+            elif self._is_sleeping and emo not in ("sleeping", "sleep"):
+                self._is_sleeping = False
+                self._last_speech_time = time.monotonic()
 
     def _on_person_detected(self, msg: Bool):
         """OAK-D Lite: called when face detector publishes person presence."""
@@ -370,40 +386,56 @@ class HeadTrackerNode(Node):
             dt = max(0.001, now - self._last_update_time)
             self._last_update_time = now
 
-            # --- Vision Fusion (OAK-D Lite) ---
-            # When a face is visible (and within timeout), drive head toward the face center
-            # using the relative angular error from the camera frame.
-            vision_active = (
+            # --- Sleep Mode Gate ---
+            # If robot is sleeping / deep idle, strictly lock target at 0° and do not process gaze
+            if self._is_sleeping:
+                self._target_yaw = 0.0
+                if abs(self._current_yaw) > 1.0:
+                    self._state = SocialGazeStateMachine.RETURNING
+                else:
+                    self._state = SocialGazeStateMachine.IDLE
+            else:
+                # --- Vision Fusion (OAK-D Lite) ---
+                # When a face is visible (and within timeout), drive head toward the face center
+                # using the relative angular error from the camera frame.
+                vision_active = (
+                    self.vision_fusion_enabled
+                    and self._vision_person_detected
+                    and (now - self._vision_last_seen_time) <= self.vision_timeout_s
+                )
+                if vision_active:
+                    # _vision_head_yaw: face offset from camera center (-40° left .. +40° right)
+                    # Apply gain and add to current position to create a closed-loop correction target.
+                    correction = self._vision_head_yaw * self.vision_gain
+                    raw_vision_target = self._current_yaw + correction
+                    vision_target = max(self.min_yaw_deg, min(self.max_yaw_deg, raw_vision_target))
+                    angle_diff = abs(angular_diff_deg(vision_target, self._target_yaw))
+                    if angle_diff >= self.deadband_deg:
+                        self._target_yaw = vision_target
+                        self._last_speech_time = now  # prevent idle return while face is visible
+                        self._last_gaze_switch_time = now
+                        self._state = SocialGazeStateMachine.ATTENDING
+                elif self._vision_person_detected and (now - self._vision_last_seen_time) > self.vision_timeout_s:
+                    # Face was lost — mark as not detected so DOA resumes
+                    self._vision_person_detected = False
+                    self.get_logger().info("👁️ [Vision Fusion] Yüz kayboldu — DOA takibine dönülüyor")
+
+                # --- Idle Timeout ---
+                # Return head to 0° (neutral forward position) after prolonged silence / no face
+                if (now - self._last_speech_time) > self.idle_return_timeout_s:
+                    if abs(self._current_yaw) > 2.0:
+                        self._target_yaw = 0.0
+                        self._state = SocialGazeStateMachine.RETURNING
+                    else:
+                        self._target_yaw = 0.0
+                        self._state = SocialGazeStateMachine.IDLE
+
+            vision_active = bool(
                 self.vision_fusion_enabled
                 and self._vision_person_detected
                 and (now - self._vision_last_seen_time) <= self.vision_timeout_s
+                and not self._is_sleeping
             )
-            if vision_active:
-                # _vision_head_yaw: face offset from camera center (-40° left .. +40° right)
-                # Apply gain and add to current position to create a closed-loop correction target.
-                correction = self._vision_head_yaw * self.vision_gain
-                raw_vision_target = self._current_yaw + correction
-                vision_target = max(self.min_yaw_deg, min(self.max_yaw_deg, raw_vision_target))
-                angle_diff = abs(angular_diff_deg(vision_target, self._target_yaw))
-                if angle_diff >= self.deadband_deg:
-                    self._target_yaw = vision_target
-                    self._last_speech_time = now  # prevent idle return while face is visible
-                    self._last_gaze_switch_time = now
-                    self._state = SocialGazeStateMachine.ATTENDING
-            elif self._vision_person_detected and (now - self._vision_last_seen_time) > self.vision_timeout_s:
-                # Face was lost — mark as not detected so DOA resumes
-                self._vision_person_detected = False
-                self.get_logger().info("👁️ [Vision Fusion] Yüz kayboldu — DOA takibine dönülüyor")
-
-            # --- Idle Timeout ---
-            # Return head to 0° (neutral forward position) after prolonged silence / no face
-            if (now - self._last_speech_time) > self.idle_return_timeout_s:
-                if abs(self._current_yaw) > 2.0:
-                    self._target_yaw = 0.0
-                    self._state = SocialGazeStateMachine.RETURNING
-                else:
-                    self._target_yaw = 0.0
-                    self._state = SocialGazeStateMachine.IDLE
 
             # --- Smooth Trajectory Generation: Slew-rate velocity limiting ---
             max_step = self.max_speed_deg_s * dt

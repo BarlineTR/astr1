@@ -1533,7 +1533,7 @@ class AstroRealtimeNode(Node):
                     {
                         "type": "function",
                         "name": "turn_to_sound",
-                        "description": "Kullanıcı 'sesimin geldiği yöne dön', 'bana dön', 'sesime bak', 'sesin geldiği tarafa yönel', 'sesime doğru dön' dediğinde çağrılır. Robot mikrofon dizisinden (DOA) sesin gerçek fiziksel açısını tespit edip o yöne döner. DİKKAT: Ses yönü için yön tahmin etme (sağ/sol deme), sadece bu fonksiyonu çağır.",
+                        "description": "Kullanıcı robotun tüm gövdesiyle tekerlekler üzerinde ses yönüne dönmesini istediğinde ('tüm gövdenle dön', 'arkana dön') çağrılır. Robot mikrofon dizisinden (DOA) sesin fiziksel açısını tespit edip tekerleklerle o yöne döner. DİKKAT: Normal sohbette kafa zaten otonom olarak konuşmacıya bakar, gereksiz çağırma.",
                         "parameters": {
                             "type": "object",
                             "properties": {},

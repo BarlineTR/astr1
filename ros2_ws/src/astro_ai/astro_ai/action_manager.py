@@ -417,16 +417,6 @@ class ActionManager:
             turn_speed = 0.4  # rad/s
             turn_duration = max(0.4, min(3.0, yaw_rad / turn_speed))
 
-            # Send Head Command if head motor publisher exists
-            pub_head = self._pub_head_cmd or getattr(self._node, "pub_head_cmd", None)
-            if pub_head:
-                try:
-                    head_msg = HeadCmd()
-                    head_msg.angle_deg = float(max(-70.0, min(70.0, azimuth)))
-                    pub_head.publish(head_msg)
-                except Exception as he:
-                    self._logger.warning(f"HeadCmd yayını başarısız: {he}")
-
             # Send Base Rotation to /cmd_vel
             pub_vel = self._pub_cmd_vel or getattr(self._node, "pub_cmd_vel", None)
             if pub_vel:
@@ -449,13 +439,26 @@ class ActionManager:
                         action="turn_to_sound",
                         action_id=act_id,
                         generation_id=generation_id,
-                        error_code="MOTOR_COMMAND_FAILED",
-                        error=str(me),
-                        message="Motor komutu verilemedi.",
+                        azimuth_deg=round(azimuth, 1),
+                        confidence=round(confidence, 2),
+                        error_code="VELOCITY_PUB_FAILED",
+                        reason=str(me),
+                        error=f"Tekerlek motoru komutu yayınlanamadı: {me}",
+                        message="Motor sürüşü başlatılamadı.",
                         hardware_ack=False,
                     )
                     self._recent_actions.append(res)
                     return res
+            else:
+                # Fallback: If base wheel publisher is unavailable, steer head motor directly
+                pub_head = self._pub_head_cmd or getattr(self._node, "pub_head_cmd", None)
+                if pub_head:
+                    try:
+                        head_msg = HeadCmd()
+                        head_msg.angle_deg = float(max(-70.0, min(70.0, azimuth)))
+                        pub_head.publish(head_msg)
+                    except Exception as he:
+                        self._logger.warning(f"HeadCmd yayını başarısız: {he}")
 
             self._executed_action_ids.add(act_id)
             self._action_id_history.append(act_id)

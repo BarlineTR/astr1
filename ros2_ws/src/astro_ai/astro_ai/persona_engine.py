@@ -279,7 +279,7 @@ ROBOT_TOOLS = [
         "type": "function",
         "function": {
             "name": "turn_to_sound",
-            "description": "Kullanıcı 'sesimin geldiği yöne dön', 'bana dön', 'sesime bak', 'sesin geldiği tarafa yönel' dediğinde çağrılır. Robot mikrofon dizisinden (DOA) sesin gerçek yönünü tespit edip o tarafa döner. DİKKAT: Ses yönü için asla yön tahmin etme, sadece bu fonksiyonu çağır.",
+            "description": "Kullanıcı robotun tüm gövdesiyle tekerlekler üzerinde ses yönüne dönmesini istediğinde ('tüm gövdenle dön', 'arkana dön') çağrılır. Robot mikrofon dizisinden (DOA) sesin fiziksel açısını tespit edip tekerleklerle o yöne döner. DİKKAT: Normal sohbette kafa zaten otonom olarak konuşmacıya bakar, gereksiz çağırma.",
             "parameters": {"type": "object", "properties": {}, "required": []},
         },
     },

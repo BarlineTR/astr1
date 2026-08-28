@@ -79,15 +79,16 @@ head_tracker_node:
     max_yaw_deg: 70.0
     min_yaw_deg: -70.0
     deadband_deg: 12.0
-    min_dwell_time_s: 2.5
-    idle_return_timeout_s: 8.0
+    min_dwell_time_s: 3.0           # 2.5'ten artırıldı (hedef stabilitesi)
+    idle_return_timeout_s: 10.0     # 8.0'dan artırıldı (huzurlu bekleme)
     max_speed_deg_s: 25.0
-    min_rms_threshold: 900.0
-    noise_multiplier: 2.5
-    consensus_window_size: 5
-    consensus_threshold: 4
-    consensus_tolerance_deg: 22.0  # Raised: reduces 180°/0° boundary cluster split bug
+    min_rms_threshold: 1600.0       # 900.0'dan artırıldı (arka plan gürültü bağışıklığı)
+    noise_multiplier: 3.0           # 2.5'ten artırıldı (adaptif enerji koruması)
+    consensus_window_size: 7        # 5'ten artırıldı
+    consensus_threshold: 5          # 4'ten artırıldı (fantom 1-2 spike'a karşı koruma)
+    consensus_tolerance_deg: 22.0  # 180°/0° cluster bölünmesini engelleme
     # OAK-D Lite vision fusion — face tracking overrides DOA when camera sees a face
     vision_fusion_enabled: true
     vision_gain: 0.6         # Scale factor: camera relative yaw → robot yaw correction
-    vision_timeout_s: 1.5    # Fallback to DOA after face lost for this many seconds
+    vision_timeout_s: 2.0    # 1.5'ten artırıldı (yüzü odakta tutma süresi)
+
