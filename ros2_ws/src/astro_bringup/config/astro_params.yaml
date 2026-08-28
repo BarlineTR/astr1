@@ -1,6 +1,6 @@
 serial_bridge:
   ros__parameters:
-    port: "/dev/astro_arduino"
+    port: "/dev/ttyCH341USB0"
     baud: 500000
     connect_retry_sec: 2.0
     frame_id_imu: "imu_link"

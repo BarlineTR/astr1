@@ -108,7 +108,7 @@ def resolve_serial_port(primary: str = "/dev/astro_arduino", logger=None, baud: 
 class SerialBridge(Node):
     def __init__(self):
         super().__init__("serial_bridge")
-        self.declare_parameter("port", "/dev/astro_arduino")
+        self.declare_parameter("port", "/dev/ttyCH341USB0")
         self.declare_parameter("baud", 500000)
         self.declare_parameter("connect_retry_sec", 2.0)
         self.declare_parameter("frame_id_imu", "imu_link")
