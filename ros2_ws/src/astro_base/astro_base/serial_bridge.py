@@ -586,7 +586,9 @@ class SerialBridge(Node):
                 if not chunk:
                     continue
 
-                self.get_logger().debug(f"[SERIAL RX RAW] bytes={len(chunk)} hex={chunk[:16].hex()}")
+                self.get_logger().info(
+                    f"[SERIAL RX RAW] bytes={len(chunk)} hex={chunk[:64].hex()}"
+                )
 
                 for b in chunk:
                     if state == 0:
@@ -623,6 +625,11 @@ class SerialBridge(Node):
                 time.sleep(0.5)
 
     def handle_msg(self, msg_id: int, payload: bytes):
+        self.get_logger().info(
+            f"[SERIAL RX PARSED] msg_id=0x{msg_id:02X} "
+            f"payload_len={len(payload)} payload={payload.hex()}"
+        )
+
         if msg_id == MSG_IMU_DATA:
             if len(payload) != 6 * 4 + 4:
                 return
