@@ -41,14 +41,14 @@ except ImportError:
             # Map standard defaults
             defaults = {
                 "enabled": True, "doa_offset_deg": 0.0, "doa_invert": False,
-                "max_yaw_deg": 70.0, "min_yaw_deg": -70.0, "deadband_deg": 12.0,
-                "min_dwell_time_s": 3.0, "idle_return_timeout_s": 30.0,
-                "max_speed_deg_s": 25.0, "update_rate_hz": 20.0,
+                "max_yaw_deg": 70.0, "min_yaw_deg": -70.0, "deadband_deg": 16.0,
+                "min_dwell_time_s": 3.5, "idle_return_timeout_s": 30.0,
+                "max_speed_deg_s": 16.0, "update_rate_hz": 20.0,
                 "min_rms_threshold": 1600.0, "noise_multiplier": 3.0,
                 "consensus_window_size": 7, "consensus_threshold": 5,
                 "consensus_tolerance_deg": 22.0,
-                "vision_fusion_enabled": True, "vision_gain": 0.6,
-                "vision_timeout_s": 2.0,
+                "vision_fusion_enabled": True, "vision_gain": 0.35,
+                "vision_timeout_s": 3.0,
                 "lidar_fusion_enabled": True, "lidar_min_dist_m": 0.4,
                 "lidar_max_dist_m": 2.8, "lidar_timeout_s": 2.5,
             }
@@ -156,10 +156,10 @@ class HeadTrackerNode(Node):
         self.declare_parameter("doa_invert", False)
         self.declare_parameter("max_yaw_deg", 70.0)
         self.declare_parameter("min_yaw_deg", -70.0)
-        self.declare_parameter("deadband_deg", 12.0)
-        self.declare_parameter("min_dwell_time_s", 3.0)
+        self.declare_parameter("deadband_deg", 16.0)
+        self.declare_parameter("min_dwell_time_s", 3.5)
         self.declare_parameter("idle_return_timeout_s", 30.0)
-        self.declare_parameter("max_speed_deg_s", 25.0)
+        self.declare_parameter("max_speed_deg_s", 16.0)
         self.declare_parameter("update_rate_hz", 20.0)
         self.declare_parameter("min_rms_threshold", 1600.0)
         self.declare_parameter("noise_multiplier", 3.0)
@@ -168,8 +168,8 @@ class HeadTrackerNode(Node):
         self.declare_parameter("consensus_tolerance_deg", 22.0)
         # OAK-D Lite vision fusion parameters
         self.declare_parameter("vision_fusion_enabled", True)
-        self.declare_parameter("vision_gain", 0.6)
-        self.declare_parameter("vision_timeout_s", 2.0)
+        self.declare_parameter("vision_gain", 0.35)
+        self.declare_parameter("vision_timeout_s", 3.0)
         # 2D LiDAR Radar tracking fusion
         self.declare_parameter("lidar_fusion_enabled", True)
         self.declare_parameter("lidar_min_dist_m", 0.4)
@@ -190,10 +190,10 @@ class HeadTrackerNode(Node):
         self.doa_invert = bool(_get_val("doa_invert", False))
         self.max_yaw_deg = float(_get_val("max_yaw_deg", 70.0))
         self.min_yaw_deg = float(_get_val("min_yaw_deg", -70.0))
-        self.deadband_deg = float(_get_val("deadband_deg", 12.0))
-        self.min_dwell_time_s = float(_get_val("min_dwell_time_s", 3.0))
+        self.deadband_deg = float(_get_val("deadband_deg", 16.0))
+        self.min_dwell_time_s = float(_get_val("min_dwell_time_s", 3.5))
         self.idle_return_timeout_s = float(_get_val("idle_return_timeout_s", 30.0))
-        self.max_speed_deg_s = float(_get_val("max_speed_deg_s", 25.0))
+        self.max_speed_deg_s = float(_get_val("max_speed_deg_s", 16.0))
         self.update_rate_hz = float(_get_val("update_rate_hz", 20.0))
         self.min_rms_threshold = float(_get_val("min_rms_threshold", 1600.0))
         self.noise_multiplier = float(_get_val("noise_multiplier", 3.0))
@@ -733,11 +733,19 @@ class HeadTrackerNode(Node):
                 and not self._is_sleeping
             )
 
-            # --- Smooth Trajectory Generation: Central Slew-Rate Velocity Limiting ---
-            max_step = self.max_speed_deg_s * dt
+            # --- Smooth Trajectory Generation: Central Slew-Rate Limiting & Soft-Landing ---
             err = self._target_yaw - self._estimated_yaw
+            abs_err = abs(err)
 
-            if abs(err) <= max_step:
+            # Soft landing: gradually decelerate when within 15° of target for organic, non-abrupt stopping
+            if abs_err < 15.0:
+                cur_speed = max(4.0, self.max_speed_deg_s * (abs_err / 15.0))
+            else:
+                cur_speed = self.max_speed_deg_s
+
+            max_step = cur_speed * dt
+
+            if abs_err <= max_step:
                 self._estimated_yaw = self._target_yaw
             else:
                 self._estimated_yaw += math.copysign(max_step, err)
