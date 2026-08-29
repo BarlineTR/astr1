@@ -5331,6 +5331,9 @@ class AstroRealtimeNode(Node):
                 if not validated_text:
                     return
 
+                # Valid human speech confirmed — wake Astro up from DEEP_IDLE / Sleep
+                self._wake_up()
+
                 # Check for pure wake word in active mode (e.g. "Astro.", "Hey Astro", "Selam")
                 norm_wake_check = re.sub(r"[^\w\s]", "", validated_text.lower()).strip()
                 if norm_wake_check in ("astro", "hey astro", "selam astro", "hey", "selam"):

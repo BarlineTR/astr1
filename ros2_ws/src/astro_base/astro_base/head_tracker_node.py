@@ -320,7 +320,7 @@ class HeadTrackerNode(Node):
 
     def _on_gesture_cmd(self, msg: String):
         """Queues a gesture sequence in the central arbitration engine."""
-        if not self.enabled or self._is_sleeping:
+        if not self.enabled:
             return
         g_name = (msg.data or "").lower().strip()
         if not g_name:
@@ -332,6 +332,9 @@ class HeadTrackerNode(Node):
 
         now = time.monotonic()
         with self._lock:
+            if self._command_source == CommandSource.SAFETY:
+                return
+            self._is_sleeping = False
             if canonical == "center":
                 self._active_gesture = None
                 self._gesture_steps = []
@@ -356,7 +359,7 @@ class HeadTrackerNode(Node):
 
     def _on_target_yaw_cmd(self, msg: Float32):
         """Direct orientation intent from turn_to_sound tool."""
-        if not self.enabled or self._is_sleeping:
+        if not self.enabled:
             return
         now = time.monotonic()
         req_yaw = float(msg.data)
@@ -365,6 +368,7 @@ class HeadTrackerNode(Node):
             if self._command_source in (CommandSource.SAFETY, CommandSource.GESTURE):
                 self.get_logger().info(f"⏳ [Arbitration]: turn_to_sound ({clamped_yaw:.1f}°) ertelendi / öncelik: {self._command_source}")
                 return
+            self._is_sleeping = False
             self._command_source = CommandSource.TURN_TO_SOUND
             self._target_yaw = clamped_yaw
             self._filtered_target_yaw = clamped_yaw
