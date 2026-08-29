@@ -2752,7 +2752,7 @@ class AstroRealtimeNode(Node):
             "atmış": 60, "yetmiş": 70, "yetmis": 70,
         }
 
-        is_negative = bool("eksi" in t or "negatif" in t or "-" in t)
+        is_negative = bool("eksi" in t or "negatif" in t or bool(re.search(r"(?:^|\s)-\d+", t)))
         is_right = bool("sağa" in t or "saga" in t or "sağ" in t or "sag" in t)
         is_left = bool("sola" in t or "sol" in t)
 
