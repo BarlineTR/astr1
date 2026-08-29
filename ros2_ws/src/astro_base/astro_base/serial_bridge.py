@@ -387,12 +387,6 @@ class SerialBridge(Node):
             return
 
         now_mono = time.monotonic()
-        # In ASCII / startup mode (no handshake yet), probe at 400ms interval to quickly catch Arduino bootloader completion
-        if not getattr(self, "handshake_ok", False):
-            if (now_mono - getattr(self, "_last_probe_hb_time", 0.0)) < 0.4:
-                return
-            self._last_probe_hb_time = now_mono
-
         self._hb_seq = (self._hb_seq + 1) & 0xFFFFFFFF
         if not hasattr(self, "_hb_tx_times"):
             self._hb_tx_times = {}
@@ -510,26 +504,6 @@ class SerialBridge(Node):
                     self._last_sent_angle = msg.angle_deg
                     self._last_sent_angle_time = now
                     self.get_logger().info(f"🎯 [SERIAL HEAD CMD] binary_pkt angle_deg={msg.angle_deg:.1f}")
-
-                # Optional ASCII fallback for test sketches when handshake not yet established
-                if not getattr(self, "handshake_ok", False):
-                    cmd_char = None
-                    if msg.angle_deg > 5.0:
-                        cmd_char = b"5"
-                    elif msg.angle_deg < -5.0:
-                        cmd_char = b"6"
-                    elif abs(msg.angle_deg) <= 2.0:
-                        cmd_char = b"0"
-
-                    last_ascii = getattr(self, "_last_sent_ascii_cmd", None)
-                    if cmd_char is not None and cmd_char != last_ascii:
-                        self.ser.write(cmd_char)
-                        try:
-                            self.ser.flush()
-                        except Exception:
-                            pass
-                        self._last_sent_ascii_cmd = cmd_char
-                        self.get_logger().info(f"🎯 [SERIAL HEAD CMD] angle_deg={msg.angle_deg:.1f} ascii_cmd={cmd_char.decode()}")
         except serial.SerialException as exc:
             self.get_logger().error(f"HeadCmd write failed: {exc}")
             self._mark_disconnected()
