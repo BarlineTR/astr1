@@ -238,6 +238,16 @@ class SerialBridge(Node):
         self._hb_seq = 0
         self.port_connected_time = 0.0
 
+        # Forensic RX Telemetry & Packet Counters
+        self._rx_bytes_total = 0
+        self._rx_bytes_window = 0
+        self._rx_fed_window = 0
+        self._last_rx_telemetry_time = 0.0
+        self._rx_count_enc = 0
+        self._rx_count_diag = 0
+        self._rx_count_imu = 0
+        self._rx_count_ack = 0
+
         self.left_pos = 0.0
         self.right_pos = 0.0
         self.time_offset_ns = None
@@ -581,14 +591,33 @@ class SerialBridge(Node):
                 continue
 
             try:
-                in_waiting = self.ser.in_waiting or 1
+                in_waiting = getattr(self.ser, "in_waiting", 0) or 1
                 chunk = self.ser.read(in_waiting)
                 if not chunk:
                     continue
 
-                self.get_logger().info(
-                    f"[SERIAL RX RAW] bytes={len(chunk)} hex={chunk[:64].hex()}"
-                )
+                now_mono = time.monotonic()
+                chunk_len = len(chunk)
+                self._rx_bytes_total += chunk_len
+                self._rx_bytes_window += chunk_len
+                self._rx_fed_window += chunk_len
+
+                # 1 saniyede bir özet telemetri logu (Log spam yapmadan)
+                if now_mono - self._last_rx_telemetry_time >= 1.0:
+                    dt = max(0.001, now_mono - self._last_rx_telemetry_time)
+                    rate_bps = self._rx_bytes_window / dt
+                    self.get_logger().info(
+                        f"[SERIAL RX TELEMETRY 1s]\n"
+                        f"  port_open={self.ser.is_open if self.ser else False}\n"
+                        f"  in_waiting={in_waiting}\n"
+                        f"  rx_rate={rate_bps:.1f} B/s (window={self._rx_bytes_window}B in {dt:.2f}s)\n"
+                        f"  last_chunk={chunk_len}B hex_32={chunk[:32].hex()}\n"
+                        f"  bytes_fed_1s={self._rx_fed_window}\n"
+                        f"  parsed_total: enc={self._rx_count_enc} diag={self._rx_count_diag} imu={self._rx_count_imu} ack={self._rx_count_ack}"
+                    )
+                    self._last_rx_telemetry_time = now_mono
+                    self._rx_bytes_window = 0
+                    self._rx_fed_window = 0
 
                 for b in chunk:
                     if state == 0:
@@ -620,32 +649,34 @@ class SerialBridge(Node):
                         else:
                             state = 1 if b == SOF1 else 0
             except serial.SerialException as exc:
-                self.get_logger().error(f"Serial read error: {exc}")
+                self.get_logger().error(f"[SERIAL RX ERROR] SerialException: {exc}")
                 self._mark_disconnected()
+                time.sleep(0.5)
+            except Exception as exc:
+                self.get_logger().error(f"[SERIAL RX THREAD EXCEPTION] Unexpected error: {exc}", exc_info=True)
                 time.sleep(0.5)
 
     def handle_msg(self, msg_id: int, payload: bytes):
-        self.get_logger().info(
-            f"[SERIAL RX PARSED] msg_id=0x{msg_id:02X} "
-            f"payload_len={len(payload)} payload={payload.hex()}"
-        )
-
         if msg_id == MSG_IMU_DATA:
+            self._rx_count_imu += 1
             if len(payload) != 6 * 4 + 4:
                 return
             ax, ay, az, gx, gy, gz, micros_ts = struct.unpack("<ffffffI", payload)
             self.publish_imu(ax, ay, az, gx, gy, gz, micros_ts)
         elif msg_id == MSG_ENCODER_TICKS:
+            self._rx_count_enc += 1
             if len(payload) != 12:
                 return
             l, r, dt_us = struct.unpack("<iiI", payload)
             self.publish_joint_states(l, r, dt_us)
         elif msg_id == MSG_DIAGNOSTICS:
+            self._rx_count_diag += 1
             if len(payload) != 8:
                 return
             vbat_mV, temp_cX100, flags = struct.unpack("<HhI", payload)
             self.publish_diag(vbat_mV, temp_cX100, flags)
         elif msg_id == MSG_HEARTBEAT_ACK:
+            self._rx_count_ack += 1
             now_mono = time.monotonic()
             ack_seq = getattr(self, "_hb_seq", 0)
             if len(payload) >= 4:
@@ -655,6 +686,10 @@ class SerialBridge(Node):
                     pass
             elif len(payload) >= 1:
                 ack_seq = payload[0]
+
+            self.get_logger().info(
+                f"🎯 [FORENSIC ACK DETECTED] msg_id=0x13 seq={ack_seq} payload_hex={payload.hex()} len={len(payload)}"
+            )
 
             if not hasattr(self, "_hb_tx_times"):
                 self._hb_tx_times = {}
