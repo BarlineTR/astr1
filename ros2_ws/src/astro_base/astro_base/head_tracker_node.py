@@ -506,9 +506,7 @@ class HeadTrackerNode(Node):
             if self._vision_person_detected:
                 self._vision_last_seen_time = time.monotonic()
                 if not was_detected:
-                    # Face just appeared — clear stale DOA history to avoid conflicting targets
-                    self._doa_history.clear()
-                    self.get_logger().info("👁️ [Vision Fusion] Yüz tespit edildi — DOA devre dışı, kamera yönelimi aktif")
+                    self.get_logger().info("👁️ [Vision Fusion] Yüz tespit edildi — Kamera yönelimi aktif")
 
     def _on_vision_head_yaw(self, msg: Float32):
         """OAK-D Lite: face_detector_node publishes relative head yaw inside camera frame."""
@@ -626,6 +624,10 @@ class HeadTrackerNode(Node):
                 if vision_active:
                     self._last_speech_time = now  # prevent idle return while face is visible
                     self._state = SocialGazeStateMachine.ATTENDING
+                    # Smooth visual gaze centering (proportional visual servoing)
+                    if abs(self._vision_head_yaw) >= 2.0:
+                        desired_yaw = self._estimated_yaw + (self.vision_gain * self._vision_head_yaw)
+                        self._target_yaw = max(self.min_yaw_deg, min(self.max_yaw_deg, desired_yaw))
                 elif self._vision_person_detected and (now - self._vision_last_seen_time) > self.vision_timeout_s:
                     self._vision_person_detected = False
                     self.get_logger().info("👁️ [Vision Fusion] Yüz kayboldu — DOA / LiDAR takibine dönülüyor")

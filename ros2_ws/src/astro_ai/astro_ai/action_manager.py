@@ -382,8 +382,25 @@ class ActionManager:
 
             sound_dir = self.get_sound_direction()
 
-            # 1. DOA Verification Gate
-            if sound_dir is None or not sound_dir.valid or sound_dir.confidence < self._min_doa_confidence:
+            # 1. DOA / Multimodal User Direction Resolution
+            azimuth = None
+            confidence = 0.0
+            if sound_dir and sound_dir.valid and sound_dir.confidence >= self._min_doa_confidence:
+                azimuth = sound_dir.azimuth_deg
+                confidence = sound_dir.confidence
+            else:
+                # Fallback: check recent DOA history in action manager
+                recent_doa = [y for ts, y, _ in self._doa_history if (now - ts) <= 5.0 and abs(y) >= 1.0]
+                if recent_doa:
+                    azimuth = float(recent_doa[-1])
+                    confidence = 0.55
+                elif self._node and getattr(self._node, "_speaker_angle", None) is not None:
+                    spk_angle = float(self._node._speaker_angle)
+                    if abs(spk_angle) >= 1.0:
+                        azimuth = float(circular_doa_to_yaw(spk_angle)) if (spk_angle > 180 or spk_angle < -180) else spk_angle
+                        confidence = 0.50
+
+            if azimuth is None:
                 self._logger.warning("⚠️ [ActionManager] turn_to_sound reddedildi: NO_DIRECTION (DOA yok veya zayıf)")
                 res = ActionResult(
                     success=False,
@@ -398,9 +415,6 @@ class ActionManager:
                 )
                 self._recent_actions.append(res)
                 return res
-
-            azimuth = sound_dir.azimuth_deg
-            confidence = sound_dir.confidence
 
             # 2. Safety Gates (Heartbeat & LiDAR Freshness)
             blocked_reason = self._check_safety_gates(direction="turn")

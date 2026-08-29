@@ -267,16 +267,24 @@ class SpatialVisionNode(Node):
         is_looking = False
         user_distance = 0.0
         head_yaw = 0.0
+        face_camera_azimuth = 0.0
         detected_emotion = "neutral"
         top_recognized_person = {"name": "Misafir", "title": "Ziyaretçi", "formal_title": "Misafir", "confidence": 0.0, "is_known": False}
 
-        for x, y, w, h in faces:
+        for idx, (x, y, w, h) in enumerate(faces):
             face_roi_gray = gray[y:y + h, x:x + w]
             face_roi_bgr = frame[y:y + h, x:x + w]
             
             # 1. 3D Head Yaw & Eye Verification
             yaw, eyes_found = self._estimate_head_yaw(face_roi_gray, w, h)
             head_yaw = yaw
+
+            # Camera Optical Axis Azimuth Angle (HFOV ~ 72°, half = 36°)
+            face_center_x = x + (w / 2.0)
+            norm_offset = (face_center_x - (frame_w / 2.0)) / (frame_w / 2.0)
+            cam_azimuth = float(norm_offset * 36.0)
+            if idx == 0:
+                face_camera_azimuth = cam_azimuth
 
             # 2. 3D Distance
             dist_m = self._estimate_distance(x, y, w, h, frame_w, frame_h)
@@ -300,13 +308,13 @@ class SpatialVisionNode(Node):
                     "distance_m": round(dist_m, 2)
                 }
 
-
             # 5. Emotion Detection
             detected_emotion = self._detect_facial_emotion(face_roi_gray, w, h, yaw=yaw, eyes_found=eyes_found)
 
             face_list.append({
                 "x": int(x), "y": int(y), "width": int(w), "height": int(h),
                 "yaw_deg": round(yaw, 1),
+                "camera_azimuth_deg": round(cam_azimuth, 1),
                 "distance_m": round(dist_m, 2),
                 "looking_at_robot": direct_gaze,
                 "emotion": detected_emotion,
@@ -350,7 +358,7 @@ class SpatialVisionNode(Node):
         self.pub_looking.publish(looking_msg)
 
         yaw_msg = Float32()
-        yaw_msg.data = float(head_yaw)
+        yaw_msg.data = float(face_camera_azimuth)
         self.pub_yaw.publish(yaw_msg)
 
         dist_msg = Float32()
