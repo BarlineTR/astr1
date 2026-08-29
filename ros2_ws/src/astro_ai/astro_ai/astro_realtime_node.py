@@ -6844,8 +6844,10 @@ def main(args=None):
     node = AstroRealtimeNode()
     try:
         rclpy.spin(node)
-    except KeyboardInterrupt as _exc:
-        _LOG.debug("main: yok sayılan hata (%s)", _exc)
+    except KeyboardInterrupt:
+        pass
+    except Exception as exc:
+        _LOG.debug("main spin exit: %s", exc)
     finally:
         node.destroy_node()
         if rclpy.ok():

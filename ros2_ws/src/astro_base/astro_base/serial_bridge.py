@@ -526,7 +526,7 @@ class SerialBridge(Node):
         self.on_wheel_cmd(wheel_cmd)
 
     def on_head_cmd(self, msg: HeadCmd):
-        if self.ser is None or not self.ser.is_open:
+        if self.ser is None or not self.ser.is_open or not self.arduino_alive:
             return
 
         now = time.monotonic()
