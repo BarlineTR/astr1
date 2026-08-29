@@ -626,7 +626,6 @@ class SerialBridge(Node):
         state = 0
         expected_len = 0
         buf = bytearray()
-        sliding_history = bytearray()
 
         while rclpy.ok():
             if self.ser is None or not self.ser.is_open:
@@ -637,17 +636,17 @@ class SerialBridge(Node):
                 in_waiting = getattr(self.ser, "in_waiting", 0)
                 now_mono = time.monotonic()
 
-                # 1 saniyede bir özet telemetri logu (chunk boş olsa bile durum basar)
-                if now_mono - self._last_rx_telemetry_time >= 1.0:
+                # Periyodik telemetri logu (DEBUG seviyesinde, log spam yapmaz)
+                if now_mono - self._last_rx_telemetry_time >= 5.0:
                     dt = max(0.001, now_mono - self._last_rx_telemetry_time)
                     rate_bps = self._rx_bytes_window / dt
-                    self.get_logger().info(
-                        f"[SERIAL RX TELEMETRY 1s]\n"
+                    self.get_logger().debug(
+                        f"[SERIAL RX TELEMETRY 5s]\n"
                         f"  port_open={self.ser.is_open if self.ser else False}\n"
                         f"  device={self.port}\n"
                         f"  in_waiting={in_waiting}\n"
                         f"  rx_rate={rate_bps:.1f} B/s (window={self._rx_bytes_window}B in {dt:.2f}s, total={self._rx_bytes_total}B)\n"
-                        f"  bytes_fed_1s={self._rx_fed_window}\n"
+                        f"  bytes_fed_5s={self._rx_fed_window}\n"
                         f"  parser_state: state={state} exp_len={expected_len} buf_len={len(buf)}\n"
                         f"  parsed_total: enc={self._rx_count_enc} diag={self._rx_count_diag} imu={self._rx_count_imu} ack={self._rx_count_ack}"
                     )
@@ -668,21 +667,9 @@ class SerialBridge(Node):
                 self._rx_bytes_window += chunk_len
                 self._rx_fed_window += chunk_len
 
-                # [RAW SERIAL RX LOG] Veri geldiğinde parser'a vermeden ÖNCE logla
-                self.get_logger().info(
+                self.get_logger().debug(
                     f"[RAW SERIAL RX] bytes={chunk_len} in_waiting={in_waiting} hex_64={chunk[:64].hex()}"
                 )
-
-                # Ham byte seviyesinde ACK pattern tespiti (aa550513010000000f)
-                sliding_history.extend(chunk)
-                if len(sliding_history) > 64:
-                    sliding_history = sliding_history[-64:]
-
-                target_ack_pattern = bytes.fromhex("aa550513010000000f")
-                if target_ack_pattern in chunk or target_ack_pattern in sliding_history:
-                    self.get_logger().info(
-                        f"🎯 [FORENSIC ACK DETECTED] seq=1 raw=aa550513010000000f in_chunk_hex={chunk.hex()}"
-                    )
 
                 for b in chunk:
                     if state == 0:
@@ -751,10 +738,6 @@ class SerialBridge(Node):
                     pass
             elif len(payload) >= 1:
                 ack_seq = payload[0]
-
-            self.get_logger().info(
-                f"🎯 [FORENSIC ACK DETECTED] msg_id=0x13 seq={ack_seq} payload_hex={payload.hex()} len={len(payload)}"
-            )
 
             if not hasattr(self, "_hb_tx_times"):
                 self._hb_tx_times = {}
