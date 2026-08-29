@@ -358,9 +358,6 @@ class HeadTrackerNode(Node):
                 )
 
     def _on_target_yaw_cmd(self, msg: Float32):
-        """Direct orientation intent from turn_to_sound tool."""
-        if not self.enabled:
-            return
         now = time.monotonic()
         req_yaw = float(msg.data)
         clamped_yaw = max(self.min_yaw_deg, min(self.max_yaw_deg, req_yaw))
@@ -374,10 +371,12 @@ class HeadTrackerNode(Node):
             self._filtered_target_yaw = clamped_yaw
             self._turn_to_sound_active = True
             self._turn_to_sound_start_time = now
+            self._turn_to_sound_timeout_s = 15.0  # Explicit manual command stays locked for 15s
             self._last_speech_time = now
             self._last_gaze_switch_time = now
+            self._doa_history.clear()
             self._state = SocialGazeStateMachine.ATTENDING
-            self.get_logger().info(f"🎯 [Arbitration]: turn_to_sound hedefi ayarlandı -> {self._target_yaw:.1f}°")
+            self.get_logger().info(f"🎯 [Arbitration]: turn_to_sound hedefi ayarlandı -> {self._target_yaw:.1f}° (15s kilitlendi)")
 
     def _on_doa(self, msg: Float32):
         """Processes raw acoustic Direction of Arrival from ReSpeaker."""
@@ -527,6 +526,9 @@ class HeadTrackerNode(Node):
     def _on_playback_active(self, msg: Bool):
         with self._lock:
             self._is_playback_active = bool(msg.data)
+            self._doa_history.clear()
+            if not self._is_playback_active:
+                self._last_speech_time = time.monotonic()
 
     def _on_emotion(self, msg: String):
         """Monitors robot emotional and sleep state to lock head during sleep/deep-idle."""
@@ -701,7 +703,7 @@ class HeadTrackerNode(Node):
                     self._last_speech_time = now  # prevent idle return while face is visible
                     self._state = SocialGazeStateMachine.ATTENDING
                     # Smooth visual gaze centering (proportional visual servoing)
-                    if abs(self._vision_head_yaw) >= 2.0:
+                    if abs(self._vision_head_yaw) >= 4.0:
                         desired_yaw = self._estimated_yaw + (self.vision_gain * self._vision_head_yaw)
                         self._target_yaw = max(self.min_yaw_deg, min(self.max_yaw_deg, desired_yaw))
                 elif self._vision_person_detected and (now - self._vision_last_seen_time) > self.vision_timeout_s:
