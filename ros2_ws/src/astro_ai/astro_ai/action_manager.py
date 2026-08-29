@@ -140,11 +140,16 @@ class ActionResult:
 
 
 def circular_doa_to_yaw(raw_doa_deg: float) -> float:
-    """Converts 0°..359° circular ReSpeaker DOA to robot body yaw frame (-180°..+180°)."""
+    """Converts 0°..359° circular ReSpeaker DOA to robot body yaw frame (-180°..+180°).
+
+    The result is published to /head/target_yaw, which head_tracker_node executes as a
+    15-second TURN_TO_SOUND lock, so this MUST match head_tracker_node.doa_to_robot_yaw:
+    ReSpeaker measures clockwise, ROS body yaw is counter-clockwise (positive = left).
+    Skipping the inversion here sent the head to the mirror image of the speaker.
+    """
     raw = float(raw_doa_deg) % 360.0
-    if raw <= 180.0:
-        return raw
-    return raw - 360.0
+    yaw = raw if raw <= 180.0 else raw - 360.0
+    return -yaw
 
 
 class ActionManager:

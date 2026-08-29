@@ -21,6 +21,43 @@ import threading
 import time
 from typing import Deque, Optional, Tuple, Any
 
+# Single source of truth for every declared parameter.
+#
+# doa_invert: ReSpeaker reports azimuth clockwise (90 deg = right), while ROS body
+# yaw is counter-clockwise — positive = LEFT, which is the convention this node's own
+# GESTURE_PROFILES already use ("look_left": +35, "look_right": -35). Inverting is
+# therefore the correct default, not an opt-in: without it the head turns toward the
+# mirror image of the speaker and the DOA loop diverges instead of converging.
+HEAD_TRACKER_DEFAULTS: dict[str, Any] = {
+    "enabled": True,
+    "doa_offset_deg": 0.0,
+    "doa_invert": True,
+    "max_yaw_deg": 70.0,
+    "min_yaw_deg": -70.0,
+    "deadband_deg": 16.0,
+    "min_dwell_time_s": 3.5,
+    "idle_return_timeout_s": 30.0,
+    "max_speed_deg_s": 16.0,
+    "update_rate_hz": 20.0,
+    "min_rms_threshold": 1600.0,
+    "noise_multiplier": 3.0,
+    "consensus_window_size": 7,
+    "consensus_threshold": 5,
+    "consensus_tolerance_deg": 22.0,
+    # OAK-D Lite vision fusion
+    "vision_fusion_enabled": True,
+    "vision_gain": 0.35,
+    "vision_timeout_s": 3.0,
+    # 2D LiDAR radar fusion
+    "lidar_fusion_enabled": True,
+    "lidar_min_dist_m": 0.4,
+    "lidar_max_dist_m": 2.8,
+    "lidar_timeout_s": 2.5,
+    # Quiet window after the head stops moving, before acoustic tracking resumes.
+    "head_motion_settle_s": 0.5,
+}
+
+
 try:
     import rclpy
     from rclpy.node import Node
@@ -38,21 +75,7 @@ except ImportError:
         def get_parameter(self, name):
             class _Param:
                 def __init__(self, val): self.value = val
-            # Map standard defaults
-            defaults = {
-                "enabled": True, "doa_offset_deg": 0.0, "doa_invert": False,
-                "max_yaw_deg": 70.0, "min_yaw_deg": -70.0, "deadband_deg": 16.0,
-                "min_dwell_time_s": 3.5, "idle_return_timeout_s": 30.0,
-                "max_speed_deg_s": 16.0, "update_rate_hz": 20.0,
-                "min_rms_threshold": 1600.0, "noise_multiplier": 3.0,
-                "consensus_window_size": 7, "consensus_threshold": 5,
-                "consensus_tolerance_deg": 22.0,
-                "vision_fusion_enabled": True, "vision_gain": 0.35,
-                "vision_timeout_s": 3.0,
-                "lidar_fusion_enabled": True, "lidar_min_dist_m": 0.4,
-                "lidar_max_dist_m": 2.8, "lidar_timeout_s": 2.5,
-            }
-            return _Param(defaults.get(name, 0.0))
+            return _Param(HEAD_TRACKER_DEFAULTS.get(name, 0.0))
         def get_logger(self):
             import logging
             return logging.getLogger("HeadTrackerNode")
@@ -80,11 +103,16 @@ except ImportError:
 def doa_to_robot_yaw(doa_deg: float, offset_deg: float = 0.0, invert: bool = False) -> float:
     """Converts ReSpeaker circular DOA (0°..359° clockwise) to robot body yaw frame (-180°..+180°).
 
-    Standard ReSpeaker 4-Mic mounting:
-      - 0° = straight ahead (0° yaw)
-      - 90° = right (+90° yaw)
-      - 270° = left (-90° yaw)
-      - 180° = directly behind (±180° yaw)
+    Robot body yaw follows REP-103: rotation about +Z, so POSITIVE yaw is LEFT. That is
+    the convention of the URDF head_yaw_joint (axis 0 0 1) and of GESTURE_PROFILES
+    ("look_left": +35, "look_right": -35).
+
+    ReSpeaker measures clockwise, which is the opposite sense, so invert=True is the
+    correct setting for the standard mounting:
+      - DOA   0° = straight ahead    ->    0° yaw
+      - DOA  90° = right            ->  -90° yaw (invert=True)
+      - DOA 270° = left             ->  +90° yaw (invert=True)
+      - DOA 180° = directly behind  -> ±180° yaw
     """
     raw = (doa_deg + offset_deg) % 360.0
     if raw <= 180.0:
@@ -150,34 +178,13 @@ class HeadTrackerNode(Node):
     def __init__(self):
         super().__init__("head_tracker_node")
 
-        # Declare parameters with configurable defaults
-        self.declare_parameter("enabled", True)
-        self.declare_parameter("doa_offset_deg", 0.0)
-        self.declare_parameter("doa_invert", False)
-        self.declare_parameter("max_yaw_deg", 70.0)
-        self.declare_parameter("min_yaw_deg", -70.0)
-        self.declare_parameter("deadband_deg", 16.0)
-        self.declare_parameter("min_dwell_time_s", 3.5)
-        self.declare_parameter("idle_return_timeout_s", 30.0)
-        self.declare_parameter("max_speed_deg_s", 16.0)
-        self.declare_parameter("update_rate_hz", 20.0)
-        self.declare_parameter("min_rms_threshold", 1600.0)
-        self.declare_parameter("noise_multiplier", 3.0)
-        self.declare_parameter("consensus_window_size", 7)
-        self.declare_parameter("consensus_threshold", 5)
-        self.declare_parameter("consensus_tolerance_deg", 22.0)
-        # OAK-D Lite vision fusion parameters
-        self.declare_parameter("vision_fusion_enabled", True)
-        self.declare_parameter("vision_gain", 0.35)
-        self.declare_parameter("vision_timeout_s", 3.0)
-        # 2D LiDAR Radar tracking fusion
-        self.declare_parameter("lidar_fusion_enabled", True)
-        self.declare_parameter("lidar_min_dist_m", 0.4)
-        self.declare_parameter("lidar_max_dist_m", 2.8)
-        self.declare_parameter("lidar_timeout_s", 2.5)
+        # Declare parameters from the single defaults table
+        for _name, _default in HEAD_TRACKER_DEFAULTS.items():
+            self.declare_parameter(_name, _default)
 
         # Load parameters
-        def _get_val(name, default):
+        def _get_val(name, default=None):
+            default = HEAD_TRACKER_DEFAULTS[name] if default is None else default
             try:
                 p = self.get_parameter(name)
                 val = getattr(p, "value", default)
@@ -185,30 +192,31 @@ class HeadTrackerNode(Node):
             except Exception:
                 return default
 
-        self.enabled = bool(_get_val("enabled", True))
-        self.doa_offset_deg = float(_get_val("doa_offset_deg", 0.0))
-        self.doa_invert = bool(_get_val("doa_invert", False))
-        self.max_yaw_deg = float(_get_val("max_yaw_deg", 70.0))
-        self.min_yaw_deg = float(_get_val("min_yaw_deg", -70.0))
-        self.deadband_deg = float(_get_val("deadband_deg", 16.0))
-        self.min_dwell_time_s = float(_get_val("min_dwell_time_s", 3.5))
-        self.idle_return_timeout_s = float(_get_val("idle_return_timeout_s", 30.0))
-        self.max_speed_deg_s = float(_get_val("max_speed_deg_s", 16.0))
-        self.update_rate_hz = float(_get_val("update_rate_hz", 20.0))
-        self.min_rms_threshold = float(_get_val("min_rms_threshold", 1600.0))
-        self.noise_multiplier = float(_get_val("noise_multiplier", 3.0))
-        self.consensus_window_size = max(1, int(_get_val("consensus_window_size", 7)))
-        self.consensus_threshold = max(1, int(_get_val("consensus_threshold", 5)))
-        self.consensus_tolerance_deg = float(_get_val("consensus_tolerance_deg", 22.0))
+        self.enabled = bool(_get_val("enabled"))
+        self.doa_offset_deg = float(_get_val("doa_offset_deg"))
+        self.doa_invert = bool(_get_val("doa_invert"))
+        self.max_yaw_deg = float(_get_val("max_yaw_deg"))
+        self.min_yaw_deg = float(_get_val("min_yaw_deg"))
+        self.deadband_deg = float(_get_val("deadband_deg"))
+        self.min_dwell_time_s = float(_get_val("min_dwell_time_s"))
+        self.idle_return_timeout_s = float(_get_val("idle_return_timeout_s"))
+        self.max_speed_deg_s = float(_get_val("max_speed_deg_s"))
+        self.update_rate_hz = float(_get_val("update_rate_hz"))
+        self.min_rms_threshold = float(_get_val("min_rms_threshold"))
+        self.noise_multiplier = float(_get_val("noise_multiplier"))
+        self.head_motion_settle_s = float(_get_val("head_motion_settle_s"))
+        self.consensus_window_size = max(1, int(_get_val("consensus_window_size")))
+        self.consensus_threshold = max(1, int(_get_val("consensus_threshold")))
+        self.consensus_tolerance_deg = float(_get_val("consensus_tolerance_deg"))
         # OAK-D Lite vision fusion
-        self.vision_fusion_enabled = bool(_get_val("vision_fusion_enabled", True))
-        self.vision_gain = float(_get_val("vision_gain", 0.6))
-        self.vision_timeout_s = float(_get_val("vision_timeout_s", 2.0))
+        self.vision_fusion_enabled = bool(_get_val("vision_fusion_enabled"))
+        self.vision_gain = float(_get_val("vision_gain"))
+        self.vision_timeout_s = float(_get_val("vision_timeout_s"))
         # 2D LiDAR Radar tracking fusion
-        self.lidar_fusion_enabled = bool(_get_val("lidar_fusion_enabled", True))
-        self.lidar_min_dist_m = float(_get_val("lidar_min_dist_m", 0.4))
-        self.lidar_max_dist_m = float(_get_val("lidar_max_dist_m", 2.8))
-        self.lidar_timeout_s = float(_get_val("lidar_timeout_s", 2.5))
+        self.lidar_fusion_enabled = bool(_get_val("lidar_fusion_enabled"))
+        self.lidar_min_dist_m = float(_get_val("lidar_min_dist_m"))
+        self.lidar_max_dist_m = float(_get_val("lidar_max_dist_m"))
+        self.lidar_timeout_s = float(_get_val("lidar_timeout_s"))
 
         # Publishers — SINGLE AUTHORITATIVE OUTPUT OWNER FOR /head_cmd
         self.pub_head_cmd = self.create_publisher(HeadCmd, "/head_cmd", 10)
@@ -270,10 +278,12 @@ class HeadTrackerNode(Node):
         self._last_speech_time = 0.0
         self._last_gaze_switch_time = time.monotonic()
         self._last_update_time = time.monotonic()
+        self._last_motion_cmd_time = 0.0
 
         # OAK-D Lite vision state
         self._vision_person_detected = False
         self._vision_head_yaw = 0.0          # Relative camera yaw: negative=left of frame, positive=right
+        self._vision_yaw_pending = False     # True only while a fresh measurement awaits servoing
         self._vision_last_seen_time = 0.0    # monotonic time of last person_detected=True
 
         # 2D LiDAR radar tracking state
@@ -293,6 +303,18 @@ class HeadTrackerNode(Node):
             f"🤖 [Head Tracker] Central Arbiter Başlatıldı | Limitler: [{self.min_yaw_deg}°, {self.max_yaw_deg}°] | "
             f"Maks Hız: {self.max_speed_deg_s}°/s | Deadband: {self.deadband_deg}° | Dwell: {self.min_dwell_time_s}s"
         )
+
+    def _head_in_motion(self, now: float) -> bool:
+        """True for a bounded window after the neck was last commanded to move.
+
+        ROS never learns the real head angle — the firmware keeps its encoder ticks to
+        itself — so the exact moment the motor stops is unknowable here. Gating on the
+        software trajectory instead would over-block for seconds, because _estimated_yaw
+        crawls at max_speed_deg_s while the Arduino PID has long since arrived. A fixed
+        quiet window after each command is the honest approximation; streaming head ticks
+        back over the serial link would let this become exact.
+        """
+        return (now - self._last_motion_cmd_time) < self.head_motion_settle_s
 
     @property
     def _current_yaw(self) -> float:
@@ -401,6 +423,13 @@ class HeadTrackerNode(Node):
             if self.vision_fusion_enabled and self._vision_person_detected and (now - self._vision_last_seen_time) <= self.vision_timeout_s:
                 return
 
+            # 3b. Head-Motion Gate: the ReSpeaker array is mounted on the head, so the
+            #     yaw motor's structure-borne noise reaches the capsules directly and
+            #     the array reports an unusable bearing while the neck is turning.
+            if self._head_in_motion(now):
+                self._doa_history.clear()
+                return
+
             # 4. Acoustic Energy & VAD Gate: Require BOTH active VAD AND energy significantly above ambient
             #    (Prevents random room noises, chair movements, or TV spikes from moving the head)
             adaptive_threshold = max(self.min_rms_threshold, self._ambient_rms * self.noise_multiplier)
@@ -410,11 +439,9 @@ class HeadTrackerNode(Node):
             # Convert to robot body frame yaw angle (clamped to [-70°, +70°] downstream)
             robot_yaw = doa_to_robot_yaw(raw_doa, offset_deg=self.doa_offset_deg, invert=self.doa_invert)
 
-            # Clamp to physical neck reach [-70°, +70°]
-            if abs(robot_yaw) > self.max_yaw_deg:
-                robot_yaw = math.copysign(self.max_yaw_deg, robot_yaw)
-
-            # Record in consensus history (timestamp, yaw)
+            # Record the UNCLAMPED bearing: clamping before the consensus step splits a
+            # single source behind the robot into alternating +max/-max samples.
+            # Mechanical clamping happens once, after consensus (step 7).
             self._doa_history.append((now, robot_yaw))
             self._last_speech_time = now
 
@@ -563,6 +590,7 @@ class HeadTrackerNode(Node):
             return
         with self._lock:
             self._vision_head_yaw = float(msg.data)
+            self._vision_yaw_pending = True
 
     def _on_vision_faces(self, msg: String):
         """Maintains local spatial map of detected people in robot coordinate frame."""
@@ -703,7 +731,8 @@ class HeadTrackerNode(Node):
                     self._last_speech_time = now  # prevent idle return while face is visible
                     self._state = SocialGazeStateMachine.ATTENDING
                     # Smooth visual gaze centering (proportional visual servoing)
-                    if abs(self._vision_head_yaw) >= 4.0:
+                    if self._vision_yaw_pending and abs(self._vision_head_yaw) >= 4.0:
+                        self._vision_yaw_pending = False
                         desired_yaw = self._estimated_yaw + (self.vision_gain * self._vision_head_yaw)
                         self._target_yaw = max(self.min_yaw_deg, min(self.max_yaw_deg, desired_yaw))
                 elif self._vision_person_detected and (now - self._vision_last_seen_time) > self.vision_timeout_s:
@@ -790,6 +819,7 @@ class HeadTrackerNode(Node):
             cmd.angle_deg = float(target_yaw_snapshot)
             self.pub_head_cmd.publish(cmd)
             self._last_published_cmd_yaw = target_yaw_snapshot
+            self._last_motion_cmd_time = now
 
         # Periodic status telemetry
         status = {

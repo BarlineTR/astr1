@@ -51,7 +51,7 @@ class TestRealtimeRateLimitsAndOptimization(unittest.TestCase):
         res = self.action_manager.execute_turn_to_sound(generation_id=101)
         self.assertTrue(res.success)
         self.assertEqual(len(self.mock_pub_target_yaw.published), 1)
-        self.assertEqual(self.mock_pub_target_yaw.published[0].data, 45.0)
+        self.assertEqual(self.mock_pub_target_yaw.published[0].data, -45.0)
 
     def test_02_tool_turn_to_sound_debounce(self):
         """2. Rapid repeated turn_to_sound with same azimuth is debounced without redundant publishing."""

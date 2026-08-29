@@ -69,6 +69,7 @@ class TestHeadYawCentralArbitration(unittest.TestCase):
         self.node.update_rate_hz = 20.0
         self.node.min_rms_threshold = 1600.0
         self.node.noise_multiplier = 3.0
+        self.node.head_motion_settle_s = 0.0  # motor-noise gate disabled for arbitration tests
         self.node.consensus_window_size = 7
         self.node.consensus_threshold = 5
         self.node.consensus_tolerance_deg = 22.0
@@ -84,6 +85,8 @@ class TestHeadYawCentralArbitration(unittest.TestCase):
         self.node._target_yaw = 0.0
         self.node._estimated_yaw = 0.0
         self.node._filtered_target_yaw = 0.0
+        self.node._last_motion_cmd_time = 0.0
+        self.node._vision_yaw_pending = False
         self.node._state = SocialGazeStateMachine.IDLE
         self.node._command_source = CommandSource.IDLE
 

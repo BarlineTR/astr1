@@ -85,6 +85,7 @@ head_tracker_node:
     max_speed_deg_s: 16.0           # 16°/s (yumuşak, yavaş ve doğal insansı dönüş)
     min_rms_threshold: 1600.0       # 1600 (arka plan gürültü bağışıklığı)
     noise_multiplier: 3.0           # 3.0 (adaptif gürültü eşiği)
+    head_motion_settle_s: 0.5       # 0.5s (kafa durduktan sonra motor gürültüsünün dinmesini bekle)
     consensus_window_size: 7
     consensus_threshold: 5
     consensus_tolerance_deg: 22.0  # 180°/0° cluster bölünmesini engelleme
