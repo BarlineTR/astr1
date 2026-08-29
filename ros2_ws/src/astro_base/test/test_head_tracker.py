@@ -69,6 +69,9 @@ class TestSocialGazeLogic(unittest.TestCase):
         self.node.noise_multiplier = 2.0
         self.node.consensus_threshold = 3
         self.node.consensus_tolerance_deg = 15.0
+        self.node.doa_offset_deg = 0.0
+        self.node.doa_invert = False
+        self.node.lidar_fusion_enabled = True
         self.node._doa_history.clear()
         self.node._target_yaw = 0.0
         self.node._current_yaw = 0.0
@@ -92,6 +95,11 @@ class TestSocialGazeLogic(unittest.TestCase):
 
     def test_180_deg_speech_clamps_to_max_yaw(self):
         """Test that speech from behind (>70°) safely clamps to physical neck limit (+70° or -70°)."""
+        self.node._doa_history.clear()
+        self.node._current_yaw = 0.0
+        self.node._target_yaw = 0.0
+        self.node.doa_offset_deg = 0.0
+        self.node.doa_invert = False
         self.node._latest_rms = 3000.0
         self.node._vad_active = True
         self.node._last_gaze_switch_time = 0.0
@@ -192,20 +200,28 @@ class TestSocialGazeLogic(unittest.TestCase):
 
         # Simulate 1 step of 0.1s (dt = 0.1s -> max step = 4.0 deg)
         self.node._last_update_time = time.monotonic() - 0.1
+        self.node._control_loop()
+        self.assertAlmostEqual(self.node._current_yaw, 4.0, places=1)
+
     def test_lidar_radar_gaze_orientation(self):
         """Test that approaching person detected on LiDAR/Radar smoothly steers head target."""
         class MockLaserScan:
-            def __init__(self, target_angle_deg=30.0, distance_m=1.2):
+            def __init__(self, target_angle_deg=35.0, distance_m=1.5):
                 self.angle_min = -math.pi
                 self.angle_increment = math.radians(1.0)
                 self.range_min = 0.15
                 self.range_max = 12.0
-                # 360 ranges (index 0 = -180°, index 180 = 0°, index 210 = +30°)
+                # 360 ranges (index 0 = -180°, index 180 = 0°, index 215 = +35°)
                 self.ranges = [10.0] * 360
                 idx = int((math.radians(target_angle_deg) - self.angle_min) / self.angle_increment)
                 if 0 <= idx < 360:
                     self.ranges[idx] = distance_m
 
+        self.node.enabled = True
+        self.node.lidar_fusion_enabled = True
+        self.node.lidar_min_dist_m = 0.4
+        self.node.lidar_max_dist_m = 2.8
+        self.node._is_sleeping = False
         self.node._current_yaw = 0.0
         self.node._target_yaw = 0.0
         self.node._vad_active = False

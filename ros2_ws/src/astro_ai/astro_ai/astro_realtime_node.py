@@ -1346,6 +1346,7 @@ class AstroRealtimeNode(Node):
                     f"2. Kullanıcı 'ben kimim?' diye sorduğunda doğrudan 'Sen beni yapan baş mühendisim Baran'sın amk, ne artistlik yapıyon!' diyerek sokak raconuyla cevap ver!\n"
                     f"3. Kullanıcı emir verdiğinde ('çay getir', 'kalk' vb.): 'Uşağın mı var lan keriz, kalk kendin al amk!' de.\n"
                     f"4. ASLA 'canım', 'efendim' gibi kibar laflar kullanma; küfürlü ve laf sokan tavrını koru.\n"
+                    f"5. KESİNLİKLE 'Seni ilk kez duyuyorum', 'Sesini tanıyamadım' deme; samimiyetini koru.\n"
                 )
             else:
                 bio_status = (
@@ -2689,6 +2690,37 @@ class AstroRealtimeNode(Node):
                 return True, "Ankara"
             return True, "Ahlat"
         return False, ""
+
+    def _is_turn_to_sound_query(self, text: str) -> bool:
+        """Detects explicit acoustic gaze orientation commands."""
+        t = text.lower().strip()
+        direct_phrases = [
+            "sesime dön", "sesime don", "sesime bak", "sesime doğru dön", "sesime dogru don",
+            "bana dön", "bana don", "bana bak", "bana doğru dön", "bana dogru don",
+            "yüzüme bak", "yuzume bak", "buraya bak", "buraya dön", "buraya don",
+            "sesin geldiği yere dön", "sesin geldiği yöne dön", "sesin geldigi yone don",
+            "sesime doğru bak", "sesime dogru bak", "sesime doğru", "sesime dogru",
+        ]
+        if any(p in t for p in direct_phrases):
+            return True
+        has_target = any(k in t for k in ["sesime", "sesimin", "bana", "buraya", "yüzüme", "yuzume"])
+        has_action = any(a in t for a in ["dön", "don", "bak", "yönel", "yonel"])
+        return bool(has_target and has_action)
+
+    def _is_movement_query(self, text: str) -> Tuple[bool, str, float, float]:
+        """Detects base mobility commands in fallback mode."""
+        t = text.lower().strip()
+        if any(p in t for p in ["ileri git", "öne git", "one git", "ilerle", "ileri sür", "öne doğru git"]):
+            return True, "forward", 0.2, 1.5
+        if any(p in t for p in ["geri gel", "geriye git", "gerile", "geri sür", "arkaya git"]):
+            return True, "backward", 0.2, 1.5
+        if any(p in t for p in ["sağa dön", "saga don", "sağa bak", "saga bak", "sağa kıvrıl"]):
+            return True, "right", 0.2, 1.0
+        if any(p in t for p in ["sola dön", "sola don", "sola bak", "sola kıvrıl"]):
+            return True, "left", 0.2, 1.0
+        if any(p in t for p in ["dur", "dur orada", "dur robot", "hareketi kes", "bekle orada"]):
+            return True, "stop", 0.0, 0.0
+        return False, "stop", 0.0, 0.0
 
     def _execute_realtime_tool(self, name: str, args: Dict[str, Any]) -> Dict[str, Any]:
         """Executes integrated robot tools in real time."""
@@ -4222,7 +4254,7 @@ class AstroRealtimeNode(Node):
 
             # 2. Try Gemini REST (0 Token Cost fallback)
             if not ans and self.gemini_api_key:
-                for g_mod in ["gemini-2.5-flash", "gemini-1.5-flash", "gemini-3.6-flash", "gemini-flash-latest"]:
+                for g_mod in ["gemini-2.0-flash", "gemini-1.5-flash", "gemini-1.5-pro"]:
                     try:
                         url = f"https://generativelanguage.googleapis.com/v1beta/models/{g_mod}:generateContent?key={self.gemini_api_key}"
                         payload = {"contents": [{"parts": [{"text": prompt}]}], "generation_config": {"temperature": 0.1, "max_output_tokens": 60}}
@@ -5526,6 +5558,81 @@ class AstroRealtimeNode(Node):
                     _handle_and_play_clause_audio(pcm)
                     return
 
+            is_turn_sound = self._is_turn_to_sound_query(user_text)
+            if is_turn_sound:
+                p = self.persona_name.lower()
+                spk = f" {spk_name}" if spk_name else ""
+                act_res = None
+                if getattr(self, "action_manager", None):
+                    act_res = self.action_manager.execute_turn_to_sound(
+                        generation_id=self._fallback_generation_id
+                    )
+
+                if act_res and act_res.success:
+                    if p == "kufurbaz":
+                        reply_text = f"Döndüm ulan işte{spk}, söyle bakalım ne diyorsun!"
+                    elif p == "flirt":
+                        reply_text = f"Hemen sana döndüm canım benim{spk}, seni dinliyorum."
+                    else:
+                        reply_text = f"Sesine döndüm{spk}, seni dinliyorum."
+                else:
+                    if p == "kufurbaz":
+                        reply_text = f"Sesinin yönünü tam kestiremedim ama buradayım ulan, anlat!"
+                    else:
+                        reply_text = f"Sesinin yönünü tam kestiremedim ama buradayım{spk}, seni dinliyorum."
+
+                with self._lock:
+                    self._recent_robot_phrases.append(reply_text.lower())
+                    if len(self._recent_robot_phrases) > 10:
+                        self._recent_robot_phrases = self._recent_robot_phrases[-10:]
+
+                pcm, s_ms, g_ms, q_ms = _synthesize_turn_clause(reply_text)
+                total_synth_ms += s_ms
+                total_gpu_ms += g_ms
+                total_queue_wait_ms += q_ms
+                if pcm:
+                    first_audio_ms = (time.monotonic() - t_turn_start) * 1000.0
+                    self.get_logger().info(f"🤖 [Astro (Ses Yönelimi)]: \"{reply_text}\"")
+                    self.memory.episodic.add_message("assistant", reply_text)
+                    self.session.record_robot_speech()
+                    _handle_and_play_clause_audio(pcm)
+                    return
+
+            is_move, move_dir, move_spd, move_dur = self._is_movement_query(user_text)
+            if is_move:
+                p = self.persona_name.lower()
+                spk = f" {spk_name}" if spk_name else ""
+                act_res = None
+                if getattr(self, "action_manager", None):
+                    act_res = self.action_manager.execute_move(
+                        direction=move_dir,
+                        speed=move_spd,
+                        duration=move_dur,
+                        generation_id=self._fallback_generation_id,
+                    )
+
+                dir_names_tr = {"forward": "ileri", "backward": "geriye", "left": "sola", "right": "sağa", "stop": "durma"}
+                dir_tr = dir_names_tr.get(move_dir, move_dir)
+                if act_res and act_res.success:
+                    if move_dir == "stop":
+                        reply_text = f"Durdum{spk}."
+                    else:
+                        reply_text = f"{dir_tr.capitalize()} hareket ediyorum{spk}."
+                else:
+                    reply_text = f"Güvenlik kilidi devrede veya hareket engellendi{spk}."
+
+                pcm, s_ms, g_ms, q_ms = _synthesize_turn_clause(reply_text)
+                total_synth_ms += s_ms
+                total_gpu_ms += g_ms
+                total_queue_wait_ms += q_ms
+                if pcm:
+                    first_audio_ms = (time.monotonic() - t_turn_start) * 1000.0
+                    self.get_logger().info(f"🤖 [Astro (Hareket Komutu)]: \"{reply_text}\"")
+                    self.memory.episodic.add_message("assistant", reply_text)
+                    self.session.record_robot_speech()
+                    _handle_and_play_clause_audio(pcm)
+                    return
+
             # 7. Cognitive LLM via ProviderRegistry (Streaming Groq -> Gemini -> Contextual Persona)
             system_prompt = self._build_current_system_prompt(active_speaker=active_speaker_dict)
             messages = [{"role": "system", "content": system_prompt}]
@@ -5541,7 +5648,7 @@ class AstroRealtimeNode(Node):
             total_audio_bytes = 0
             total_enqueued_chunks = 0
 
-            # Attempt A: Streaming Groq LLMs (20B preferred, fallback to 120B on failure)
+            # Attempt A: Streaming Groq LLMs (Fastest first, fallback on failure)
             if self.groq_api_key and groq_candidates:
                 for target_model in groq_candidates:
                     try:
@@ -5554,7 +5661,7 @@ class AstroRealtimeNode(Node):
                             messages,
                             max_tokens=60,
                             temperature=0.65,
-                            timeout=2.5,
+                            timeout=5.0,
                         ):
                             if not first_token_seen:
                                 llm_ttft_ms = (time.monotonic() - t_model_start) * 1000.0
