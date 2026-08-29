@@ -76,6 +76,11 @@ static uint32_t g_head_stall_ms = 0;
 
 static uint32_t g_last_control_ms = 0;
 static uint32_t g_last_heartbeat_ms = 0;
+static uint32_t g_last_diag_serial2_ms = 0;
+
+// ====== Forensic Diagnostik Sayaçları ======
+static volatile uint32_t g_hb_rx_count = 0;
+static volatile uint32_t g_hb_ack_tx_count = 0;
 
 static bool g_motors_enabled = true;
 static uint32_t g_diag_flags = 0;
@@ -291,20 +296,64 @@ void loopControl() {
   uint16_t vbat = 12000; // mV (örn. gelecekte ADC ile ölç)
   int16_t temp = 2500;   // 25.00 C
   publishDiag(vbat, temp, g_diag_flags);
+
+  // 1 saniyelik Serial2 durum telemetrisi (UART0 binary akışına asla dokunmaz)
+  if (now - g_last_diag_serial2_ms >= 1000) {
+    g_last_diag_serial2_ms = now;
+    Serial2.print(F("[MCU STATUS 1s] hb_rx="));
+    Serial2.print(g_hb_rx_count);
+    Serial2.print(F(" hb_ack="));
+    Serial2.print(g_hb_ack_tx_count);
+    Serial2.print(F(" mot_en="));
+    Serial2.print(g_motors_enabled ? 1 : 0);
+    Serial2.print(F(" head_ticks="));
+    Serial2.print(readTicks(g_head_ticks));
+    Serial2.print(F(" tx_avail="));
+    Serial2.println(Serial.availableForWrite());
+  }
 }
 
 void processPacket(uint8_t msg_id, const uint8_t* pl, uint8_t len) {
   switch (msg_id) {
     case Proto::HEARTBEAT: {
+      g_hb_rx_count++;
       g_last_heartbeat_ms = millis();
-      Proto::writePacket(Serial, Proto::HEARTBEAT_ACK, pl, len);
       digitalWrite(STATUS_LED, !digitalRead(STATUS_LED));
+
+      uint32_t seq = 0;
+      if (len >= 4 && pl != nullptr) {
+        memcpy(&seq, pl, 4);
+      }
+
+      int buf_before = Serial.availableForWrite();
+      Serial2.print(F("[HB RX] id=0x01 len="));
+      Serial2.print(len);
+      Serial2.print(F(" seq="));
+      Serial2.print(seq);
+      Serial2.print(F(" tx_buf_before="));
+      Serial2.println(buf_before);
+
+      Serial2.print(F("[HB ACK TX BEGIN] seq="));
+      Serial2.println(seq);
+
+      Proto::writePacket(Serial, Proto::HEARTBEAT_ACK, pl, len);
+      g_hb_ack_tx_count++;
+
+      int buf_after = Serial.availableForWrite();
+      Serial2.print(F("[HB ACK TX END] count="));
+      Serial2.print(g_hb_ack_tx_count);
+      Serial2.print(F(" tx_buf_after="));
+      Serial2.println(buf_after);
     } break;
     case Proto::WHEEL_CMD: {
       if (len < 8) break;
       memcpy(&g_left_target_rpm, &pl[0], 4);
       memcpy(&g_right_target_rpm, &pl[4], 4);
       g_last_heartbeat_ms = millis(); // komut da heartbeat sayılır
+      Serial2.print(F("[WHEEL CMD] L="));
+      Serial2.print(g_left_target_rpm);
+      Serial2.print(F(" R="));
+      Serial2.println(g_right_target_rpm);
     } break;
     case Proto::HEAD_CMD: {
       if (len < 4) break;
@@ -322,6 +371,8 @@ void processPacket(uint8_t msg_id, const uint8_t* pl, uint8_t len) {
       g_head_stall_ms = millis();
       g_diag_flags &= ~FLAG_HEAD_STALL;
       g_last_heartbeat_ms = millis();
+      Serial2.print(F("[HEAD CMD] angle="));
+      Serial2.println(angle_deg);
     } break;
   }
 }
@@ -331,12 +382,17 @@ void setup() {
   stopMotors();
   Serial.begin(SERIAL_BAUD);
 
+  // İkincil debug portu (Mega Pin 16 TX2, Pin 17 RX2)
+  Serial2.begin(115200);
+  Serial2.println(F("[ASTRO MCU BOOT] Protocol=v2.0 Baud=115200 Serial2=DebugReady"));
+
   // Açılıştaki kafa konumu 0° kabul edilir (limit switch / homing yok)
   g_head_target_ticks = 0;
   g_head_stall_ms = millis();
 
   g_last_control_ms = millis();
   g_last_heartbeat_ms = millis();
+  g_last_diag_serial2_ms = millis();
 
   // ✅ FIX: Watchdog timeout 2s'ye çıkarıldı (güvenlik marjı)
   wdt_enable(WDTO_2S);
