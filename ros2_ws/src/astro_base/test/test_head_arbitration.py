@@ -233,6 +233,39 @@ class TestHeadYawCentralArbitration(unittest.TestCase):
         self.node._on_target_yaw_cmd(MockMsg(data=-150.0))
         self.assertEqual(self.node._target_yaw, -70.0)
 
+    def test_09_multi_speaker_spatial_mapping_and_turn_taking(self):
+        """9. Multi-Speaker Spatial Mapping & Turn Taking: Maps visual faces and tracks active speaker."""
+        # 1. Simulate vision seeing two people: Baran at -25° and Misafir at +35°
+        faces_json = json.dumps([
+            {"camera_azimuth_deg": -25.0, "recognized_name": "Baran", "is_known": True, "distance_m": 1.2},
+            {"camera_azimuth_deg": 35.0, "recognized_name": "Misafir", "is_known": False, "distance_m": 1.5},
+        ])
+        self.node._estimated_yaw = 0.0
+        self.node._on_vision_faces(MockMsg(data=faces_json))
+        self.assertEqual(len(self.node._spatial_people_map), 2)
+        self.assertEqual(self.node._spatial_people_map[0]["world_yaw"], -25.0)
+        self.assertEqual(self.node._spatial_people_map[1]["world_yaw"], 35.0)
+
+        # 2. Simulate acoustic speech from Baran (-25°)
+        self.node.min_rms_threshold = 300.0
+        self.node.consensus_threshold = 3
+        self.node._vad_active = True
+        self.node._latest_rms = 800.0
+        self.node._ambient_rms = 100.0
+        self.node._last_gaze_switch_time = 0.0
+        for _ in range(3):
+            self.node._on_doa(MockMsg(data=335.0)) # 335° in 360° frame = -25° in signed frame
+
+        self.assertEqual(self.node._target_yaw, -25.0)
+
+        # 3. Simulate speech turning to Misafir (+35°)
+        self.node._doa_history.clear()
+        self.node._last_gaze_switch_time = 0.0
+        for _ in range(3):
+            self.node._on_doa(MockMsg(data=35.0)) # 35° in 360° frame = +35° in signed frame
+
+        self.assertEqual(self.node._target_yaw, 35.0)
+
 
 if __name__ == '__main__':
     unittest.main()

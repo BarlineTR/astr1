@@ -229,6 +229,7 @@ class HeadTrackerNode(Node):
         # Subscribers — vision (OAK-D Lite face_detector_node)
         self.create_subscription(Bool, "/vision/person_detected", self._on_person_detected, 10)
         self.create_subscription(Float32, "/vision/head_yaw", self._on_vision_head_yaw, 10)
+        self.create_subscription(String, "/vision/faces", self._on_vision_faces, 10)
         # Subscribers — radar/LiDAR (RPLIDAR scan_filter_node with SensorData QoS)
         self.create_subscription(LaserScan, "/scan", self._on_laser_scan, qos_profile_sensor_data)
         self.create_subscription(LaserScan, "/scan_filtered", self._on_laser_scan, qos_profile_sensor_data)
@@ -244,6 +245,8 @@ class HeadTrackerNode(Node):
         self._filtered_target_yaw = 0.0
         self._state = SocialGazeStateMachine.IDLE
         self._command_source = CommandSource.IDLE
+        self._spatial_people_map: list[dict] = []
+        self._last_speaker_switch_time: float = 0.0
 
         # Gesture sequencing state
         self._active_gesture: Optional[str] = None
@@ -403,6 +406,15 @@ class HeadTrackerNode(Node):
             if candidate_yaw is None:
                 return
 
+            # Multi-Speaker Spatial Face Association (Snap acoustic DOA to visual face if in vicinity)
+            matched_person_name = None
+            for person in getattr(self, "_spatial_people_map", []):
+                if (now - person.get("timestamp", 0.0)) <= 4.0:
+                    if abs(angular_diff_deg(candidate_yaw, person["world_yaw"])) <= 25.0:
+                        candidate_yaw = person["world_yaw"]
+                        matched_person_name = person["name"]
+                        break
+
             # 4. Mechanical & Safety Clamping
             clamped_target = max(self.min_yaw_deg, min(self.max_yaw_deg, candidate_yaw))
 
@@ -425,18 +437,20 @@ class HeadTrackerNode(Node):
                     f"target_yaw={clamped_target:.1f}"
                 )
 
-            # 5. Gaze Dwell Time & Deadband Hysteresis
+            # 5. Gaze Dwell Time & Deadband Hysteresis (with Multi-Speaker Turn-Taking Responsiveness)
             dwell_elapsed = now - self._last_gaze_switch_time
             angle_diff = abs(angular_diff_deg(clamped_target, self._current_yaw))
 
-            # Must exceed deadband AND satisfy dwell time to initiate a new head gaze
-            if angle_diff >= self.deadband_deg and dwell_elapsed >= self.min_dwell_time_s:
+            # Allow speaker switch if dwell time elapsed OR if a distinct multi-speaker turn is detected (>20° after min 0.8s)
+            min_dwell = 0.8 if (matched_person_name and angle_diff >= 20.0) else self.min_dwell_time_s
+            if angle_diff >= self.deadband_deg and dwell_elapsed >= min_dwell:
                 self._target_yaw = clamped_target
                 self._filtered_target_yaw = clamped_target
                 self._last_gaze_switch_time = now
                 self._state = SocialGazeStateMachine.ATTENDING
+                spk_tag = f" ({matched_person_name})" if matched_person_name else ""
                 self.get_logger().info(
-                    f"🎯 [Head Tracker Gaze]: DOA={raw_doa:.1f}° -> Hedef Yaw={clamped_target:.1f}° "
+                    f"🎯 [Head Tracker Gaze]: DOA={raw_doa:.1f}° -> Hedef Yaw={clamped_target:.1f}°{spk_tag} "
                     f"(Fark={angle_diff:.1f}°, RMS={self._latest_rms:.0f})"
                 )
 
@@ -514,6 +528,33 @@ class HeadTrackerNode(Node):
             return
         with self._lock:
             self._vision_head_yaw = float(msg.data)
+
+    def _on_vision_faces(self, msg: String):
+        """Maintains local spatial map of detected people in robot coordinate frame."""
+        if not self.vision_fusion_enabled:
+            return
+        try:
+            faces = json.loads(msg.data)
+            if not isinstance(faces, list):
+                return
+            now = time.monotonic()
+            with self._lock:
+                updated_map = []
+                for f in faces:
+                    cam_azimuth = float(f.get("camera_azimuth_deg", 0.0))
+                    world_yaw = max(self.min_yaw_deg, min(self.max_yaw_deg, self._estimated_yaw + cam_azimuth))
+                    updated_map.append({
+                        "name": f.get("recognized_name") or "Misafir",
+                        "is_known": bool(f.get("is_known", False)),
+                        "cam_azimuth": cam_azimuth,
+                        "world_yaw": world_yaw,
+                        "distance_m": float(f.get("distance_m", 1.0)),
+                        "timestamp": now,
+                    })
+                if updated_map:
+                    self._spatial_people_map = updated_map
+        except Exception as _exc:
+            self.get_logger().debug(f"_on_vision_faces json error: {_exc}")
 
     def _on_laser_scan(self, msg: Any):
         """Processes 2D LiDAR planar scan to detect humans/objects in the social zone around the robot."""

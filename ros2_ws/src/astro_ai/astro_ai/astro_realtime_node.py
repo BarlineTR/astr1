@@ -309,16 +309,16 @@ REALTIME_WS_URL = "wss://api.openai.com/v1/realtime?model=gpt-realtime-2.1-mini"
 VALID_REALTIME_VOICES = {"alloy", "ash", "ballad", "coral", "echo", "sage", "shimmer", "verse", "fable", "onyx"}
 
 PERSONA_DEFAULT_VOICES: Dict[str, str] = {
-    "kufurbaz": "ash",      # Raspy, gritty, aggressive street tone (Küfürbaz Haydo)
-    "angry": "ash",         # Aggressive, raspy
-    "rude": "ash",          # Rough, blunt
-    "sarcastic": "ash",     # Cynical, sharp
-    "flirt": "shimmer",     # Energetic, charismatic
-    "charming": "shimmer",  # Playful, attractive
-    "playful": "ballad",    # Animated, lively
-    "witty": "verse",       # Punchy, dynamic
-    "formal": "sage",       # Professional, calm
-    "emotional": "echo",    # Soft, empathetic
+    "kufurbaz": "echo",     # Echo - Deep, expressive natural voice
+    "angry": "echo",        # Echo
+    "rude": "echo",         # Echo
+    "sarcastic": "echo",    # Echo
+    "flirt": "echo",        # Echo
+    "charming": "echo",     # Echo
+    "playful": "echo",      # Echo
+    "witty": "echo",        # Echo
+    "formal": "echo",       # Echo
+    "emotional": "echo",    # Echo
 }
 
 
@@ -565,7 +565,7 @@ class AstroRealtimeNode(Node):
         self.realtime_model = os.environ.get("REALTIME_MODEL", "gpt-realtime-2.1-mini").strip()
         self.realtime_transcribe_model = os.environ.get(
             "REALTIME_TRANSCRIBE_MODEL", "gpt-live-transcribe").strip() or "gpt-live-transcribe"
-        raw_voice = os.environ.get("REALTIME_VOICE", os.environ.get("TTS_VOICE", "echo")).strip().lower()
+        raw_voice = os.environ.get("REALTIME_VOICE", os.environ.get("OPENAI_TTS_VOICE", os.environ.get("TTS_VOICE", "echo"))).strip().lower()
 
         # Test mode isolation guard
         is_test_mode = (
