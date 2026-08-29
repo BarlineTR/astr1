@@ -438,6 +438,17 @@ class HeadTrackerNode(Node):
                         matched_person_name = person["name"]
                         break
 
+            # 2D LiDAR (Radar) Fusion Association: Snap coarse acoustic angle to precise physical human/obstacle detected in zone
+            if not matched_person_name and self.lidar_fusion_enabled and getattr(self, "_lidar_person_detected", False):
+                if (now - getattr(self, "_lidar_last_seen_time", 0.0)) <= self.lidar_timeout_s:
+                    lidar_target = getattr(self, "_lidar_target_yaw", 0.0)
+                    lidar_dist = getattr(self, "_lidar_distance_m", 0.0)
+                    if abs(angular_diff_deg(candidate_yaw, lidar_target)) <= 35.0:
+                        self.get_logger().info(
+                            f"📡 [Radar Fusion] Akustik DOA ({candidate_yaw:.1f}°) LiDAR radar hedefiyle ({lidar_target:.1f}°, {lidar_dist:.2f}m) kilitlendi."
+                        )
+                        candidate_yaw = lidar_target
+
             # 7. Mechanical & Safety Clamping
             clamped_target = max(self.min_yaw_deg, min(self.max_yaw_deg, candidate_yaw))
 

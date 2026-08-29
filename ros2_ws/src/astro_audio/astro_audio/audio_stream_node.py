@@ -502,8 +502,9 @@ class AudioStreamNode(Node):
             elif not is_active_playback and rms >= 400.0:
                 self._last_mic_speech_time = now
 
-            # Multi-Channel GCC-PHAT DOA Spatial Estimation on Raw Separate Channels
-            if multi_ch is not None and self._doa_estimator and not is_active_playback and rms >= 400.0:
+            # Multi-Channel GCC-PHAT DOA Spatial Estimation (Fallback only when hardware ReSpeaker HID is absent)
+            has_hw_hid = bool(self._respeaker and getattr(self._respeaker, "dev", None) is not None)
+            if not has_hw_hid and multi_ch is not None and self._doa_estimator and not is_active_playback and rms >= 400.0:
                 azimuth_deg, conf, valid = self._doa_estimator.estimate_from_multichannel_pcm(multi_ch[:4])
                 if valid and azimuth_deg is not None:
                     raw_doa = azimuth_deg if azimuth_deg >= 0.0 else azimuth_deg + 360.0

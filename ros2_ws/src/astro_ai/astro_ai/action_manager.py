@@ -389,14 +389,16 @@ class ActionManager:
                 azimuth = sound_dir.azimuth_deg
                 confidence = sound_dir.confidence
             else:
-                # Fallback: check recent DOA history in action manager
-                recent_doa = [y for ts, y, _ in self._doa_history if (now - ts) <= 5.0 and abs(y) >= 1.0]
+                # Fallback: check recent DOA history in action manager using robust circular mean
+                recent_doa = [y for ts, y, _ in self._doa_history if (now - ts) <= 5.0 and abs(y) >= 2.0]
                 if recent_doa:
-                    azimuth = float(recent_doa[-1])
-                    confidence = 0.55
+                    sin_s = sum(math.sin(math.radians(y)) for y in recent_doa)
+                    cos_s = sum(math.cos(math.radians(y)) for y in recent_doa)
+                    azimuth = float(math.degrees(math.atan2(sin_s, cos_s)))
+                    confidence = 0.60
                 elif self._node and getattr(self._node, "_speaker_angle", None) is not None:
                     spk_angle = float(self._node._speaker_angle)
-                    if abs(spk_angle) >= 1.0:
+                    if abs(spk_angle) >= 2.0:
                         azimuth = float(circular_doa_to_yaw(spk_angle)) if (spk_angle > 180 or spk_angle < -180) else spk_angle
                         confidence = 0.50
 
