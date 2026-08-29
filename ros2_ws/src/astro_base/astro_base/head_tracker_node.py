@@ -42,7 +42,7 @@ except ImportError:
             defaults = {
                 "enabled": True, "doa_offset_deg": 0.0, "doa_invert": False,
                 "max_yaw_deg": 70.0, "min_yaw_deg": -70.0, "deadband_deg": 12.0,
-                "min_dwell_time_s": 3.0, "idle_return_timeout_s": 10.0,
+                "min_dwell_time_s": 3.0, "idle_return_timeout_s": 30.0,
                 "max_speed_deg_s": 25.0, "update_rate_hz": 20.0,
                 "min_rms_threshold": 1600.0, "noise_multiplier": 3.0,
                 "consensus_window_size": 7, "consensus_threshold": 5,
@@ -158,7 +158,7 @@ class HeadTrackerNode(Node):
         self.declare_parameter("min_yaw_deg", -70.0)
         self.declare_parameter("deadband_deg", 12.0)
         self.declare_parameter("min_dwell_time_s", 3.0)
-        self.declare_parameter("idle_return_timeout_s", 10.0)
+        self.declare_parameter("idle_return_timeout_s", 30.0)
         self.declare_parameter("max_speed_deg_s", 25.0)
         self.declare_parameter("update_rate_hz", 20.0)
         self.declare_parameter("min_rms_threshold", 1600.0)
@@ -192,7 +192,7 @@ class HeadTrackerNode(Node):
         self.min_yaw_deg = float(_get_val("min_yaw_deg", -70.0))
         self.deadband_deg = float(_get_val("deadband_deg", 12.0))
         self.min_dwell_time_s = float(_get_val("min_dwell_time_s", 3.0))
-        self.idle_return_timeout_s = float(_get_val("idle_return_timeout_s", 10.0))
+        self.idle_return_timeout_s = float(_get_val("idle_return_timeout_s", 30.0))
         self.max_speed_deg_s = float(_get_val("max_speed_deg_s", 25.0))
         self.update_rate_hz = float(_get_val("update_rate_hz", 20.0))
         self.min_rms_threshold = float(_get_val("min_rms_threshold", 1600.0))
@@ -367,13 +367,13 @@ class HeadTrackerNode(Node):
                 return
             self._command_source = CommandSource.TURN_TO_SOUND
             self._target_yaw = clamped_yaw
+            self._filtered_target_yaw = clamped_yaw
             self._turn_to_sound_active = True
             self._turn_to_sound_start_time = now
             self._last_speech_time = now
             self._last_gaze_switch_time = now
             self._state = SocialGazeStateMachine.ATTENDING
             self.get_logger().info(f"🎯 [Arbitration]: turn_to_sound hedefi ayarlandı -> {self._target_yaw:.1f}°")
-
 
     def _on_doa(self, msg: Float32):
         """Processes raw acoustic Direction of Arrival from ReSpeaker."""
@@ -388,7 +388,17 @@ class HeadTrackerNode(Node):
             if self._is_sleeping or self._is_speaking or self._is_playback_active:
                 return
 
-            # 2. Acoustic Energy & VAD Gate: Require BOTH active VAD AND energy significantly above ambient
+            # 2. Priority check: If gesture, safety, or active turn_to_sound is running, do NOT override
+            if self._command_source in (CommandSource.SAFETY, CommandSource.GESTURE):
+                return
+            if self._command_source == CommandSource.TURN_TO_SOUND and self._turn_to_sound_active:
+                return
+
+            # 3. Vision Priority: If camera actively sees a person/face, do NOT override with acoustic DOA
+            if self.vision_fusion_enabled and self._vision_person_detected and (now - self._vision_last_seen_time) <= self.vision_timeout_s:
+                return
+
+            # 4. Acoustic Energy & VAD Gate: Require BOTH active VAD AND energy significantly above ambient
             #    (Prevents random room noises, chair movements, or TV spikes from moving the head)
             adaptive_threshold = max(self.min_rms_threshold, self._ambient_rms * self.noise_multiplier)
             if not self._vad_active or self._latest_rms < adaptive_threshold:
@@ -397,11 +407,20 @@ class HeadTrackerNode(Node):
             # Convert to robot body frame yaw angle (clamped to [-70°, +70°] downstream)
             robot_yaw = doa_to_robot_yaw(raw_doa, offset_deg=self.doa_offset_deg, invert=self.doa_invert)
 
+            # 5. Anti-Flipping / 180° Back-Sound Hysteresis:
+            # Sounds from directly behind (|raw_doa - 180°| <= 25°) cannot be faced directly with a ±70° neck.
+            # Preserve the current hemisphere to prevent rapid +70° <-> -70° oscillation:
+            if abs(raw_doa - 180.0) <= 25.0 or abs(robot_yaw) >= 110.0:
+                if self._estimated_yaw >= 0.0:
+                    robot_yaw = 70.0
+                else:
+                    robot_yaw = -70.0
+
             # Record in consensus history (timestamp, yaw)
             self._doa_history.append((now, robot_yaw))
             self._last_speech_time = now
 
-            # 3. Temporal Consensus Clustering with Angular Wrap-Around Handling
+            # 6. Temporal Consensus Clustering with Angular Wrap-Around Handling
             candidate_yaw = self._evaluate_consensus()
             if candidate_yaw is None:
                 return
@@ -415,7 +434,7 @@ class HeadTrackerNode(Node):
                         matched_person_name = person["name"]
                         break
 
-            # 4. Mechanical & Safety Clamping
+            # 7. Mechanical & Safety Clamping
             clamped_target = max(self.min_yaw_deg, min(self.max_yaw_deg, candidate_yaw))
 
             # Confidence calculation
@@ -437,7 +456,7 @@ class HeadTrackerNode(Node):
                     f"target_yaw={clamped_target:.1f}"
                 )
 
-            # 5. Gaze Dwell Time & Deadband Hysteresis (with Multi-Speaker Turn-Taking Responsiveness)
+            # 8. Gaze Dwell Time & Deadband Hysteresis (with Multi-Speaker Turn-Taking Responsiveness)
             dwell_elapsed = now - self._last_gaze_switch_time
             angle_diff = abs(angular_diff_deg(clamped_target, self._current_yaw))
 
@@ -642,8 +661,11 @@ class HeadTrackerNode(Node):
                 if elapsed_tts >= self._turn_to_sound_timeout_s or tts_settled:
                     self._turn_to_sound_active = False
                     self._command_source = CommandSource.TRACKING
+                    self._state = SocialGazeStateMachine.ENGAGED
                     self._last_speech_time = now
-                self._state = SocialGazeStateMachine.ATTENDING
+                    self._last_gaze_switch_time = now
+                else:
+                    self._state = SocialGazeStateMachine.ATTENDING
 
             # 4. BEHAVIORAL CENTER (Commanded neutral return)
             elif self._command_source == CommandSource.CENTER:
