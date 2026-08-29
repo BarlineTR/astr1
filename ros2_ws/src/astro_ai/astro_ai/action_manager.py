@@ -39,6 +39,13 @@ except ImportError:
             self.angular = _Vec()
 
 try:
+    from std_msgs.msg import Bool, Float32, String
+except ImportError:
+    class _MockMsg:
+        data: Any = None
+    Bool = Float32 = String = _MockMsg  # type: ignore
+
+try:
     from astro_base.msg import HeadCmd
 except ImportError:
     class HeadCmd:  # type: ignore
@@ -148,11 +155,15 @@ class ActionManager:
         logger: Optional[logging.Logger] = None,
         pub_cmd_vel: Any = None,
         pub_head_cmd: Any = None,
+        pub_head_gesture: Any = None,
+        pub_head_target_yaw: Any = None,
         node: Any = None,
     ):
         self._logger = logger or logging.getLogger("ActionManager")
         self._pub_cmd_vel = pub_cmd_vel
-        self._pub_head_cmd = pub_head_cmd
+        self._pub_head_cmd = pub_head_cmd  # Kept for backward compatibility in mock tests
+        self._pub_head_gesture = pub_head_gesture
+        self._pub_head_target_yaw = pub_head_target_yaw
         self._node = node
         self._lock = threading.RLock()
 
@@ -411,18 +422,28 @@ class ActionManager:
                 return res
 
             # 3. Acoustic Orientation
-            # Steer head motor toward sound source (clamped to physical limits [-70°, 70°]).
-            # No wheel motors (/cmd_vel) are published to maintain pure head-tracking behavior.
+            # Steer head motor toward sound source via central arbitration in head_tracker_node
             dir_str = "right" if azimuth > 0 else "left"
+            target_clamped = float(max(-70.0, min(70.0, azimuth)))
 
-            pub_head = self._pub_head_cmd or getattr(self._node, "pub_head_cmd", None)
-            if pub_head:
+            pub_target_yaw = self._pub_head_target_yaw or getattr(self._node, "pub_head_target_yaw", None)
+            if pub_target_yaw:
                 try:
-                    head_msg = HeadCmd()
-                    head_msg.angle_deg = float(max(-70.0, min(70.0, azimuth)))
-                    pub_head.publish(head_msg)
+                    msg = Float32()
+                    msg.data = target_clamped
+                    pub_target_yaw.publish(msg)
                 except Exception as he:
-                    self._logger.debug(f"HeadCmd publication failed: {he}")
+                    self._logger.debug(f"Float32 target_yaw publication failed: {he}")
+            else:
+                # Fallback for unit tests mocking pub_head_cmd directly
+                pub_head = self._pub_head_cmd or getattr(self._node, "pub_head_cmd", None)
+                if pub_head:
+                    try:
+                        head_msg = HeadCmd()
+                        head_msg.angle_deg = target_clamped
+                        pub_head.publish(head_msg)
+                    except Exception as he:
+                        self._logger.debug(f"HeadCmd publication fallback failed: {he}")
 
             self._executed_action_ids.add(act_id)
             self._action_id_history.append(act_id)
@@ -643,22 +664,26 @@ class ActionManager:
                 )
 
             angles = self.GESTURE_PROFILES[canonical_gesture]
-            pub_head = self._pub_head_cmd or getattr(self._node, "pub_head_cmd", None)
 
-            if pub_head and 'HeadCmd' in globals():
-                def _run_gesture_sequence():
-                    step_delay = max(0.08, (duration_ms / 1000.0) / len(angles))
-                    for ang in angles:
-                        try:
-                            h_cmd = HeadCmd()
-                            h_cmd.angle_deg = float(ang)
-                            pub_head.publish(h_cmd)
-                            time.sleep(step_delay)
-                        except Exception as he:
-                            self._logger.debug(f"Gesture step failure: {he}")
-                            break
-
-                threading.Thread(target=_run_gesture_sequence, daemon=True).start()
+            # Route gesture command to central HeadTrackerNode arbitration engine
+            pub_gesture = self._pub_head_gesture or getattr(self._node, "pub_head_gesture", None)
+            if pub_gesture:
+                try:
+                    g_msg = String()
+                    g_msg.data = canonical_gesture
+                    pub_gesture.publish(g_msg)
+                except Exception as ge:
+                    self._logger.debug(f"Gesture publication to /head/gesture failed: {ge}")
+            else:
+                # Fallback for unit tests mocking legacy pub_head_cmd
+                pub_head = self._pub_head_cmd or getattr(self._node, "pub_head_cmd", None)
+                if pub_head and 'HeadCmd' in globals():
+                    try:
+                        h_cmd = HeadCmd()
+                        h_cmd.angle_deg = float(angles[0]) if angles else 0.0
+                        pub_head.publish(h_cmd)
+                    except Exception as he:
+                        self._logger.debug(f"Legacy gesture publication fallback failed: {he}")
 
             self._executed_action_ids.add(act_id)
             self._action_id_history.append(act_id)

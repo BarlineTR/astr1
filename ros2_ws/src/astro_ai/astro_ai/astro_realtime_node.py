@@ -831,13 +831,16 @@ class AstroRealtimeNode(Node):
         self.pub_interrupt = self.create_publisher(Bool, "/tts/interrupt", 10)
         self.pub_emotion = self.create_publisher(String, "/robot/emotion", 10)
         self.pub_gesture = self.create_publisher(String, "/robot/head_gesture", 10)
+        self.pub_head_gesture = self.create_publisher(String, "/head/gesture", 10)
+        self.pub_head_target_yaw = self.create_publisher(Float32, "/head/target_yaw", 10)
         self.pub_transcript = self.create_publisher(String, "/speech/text", 10)
-        self.pub_head_cmd = self.create_publisher(HeadCmd, "/head_cmd", 10)
+        # Single output owner for /head_cmd is HeadTrackerNode
         self.pub_telemetry = self.create_publisher(String, "/astro/telemetry", 10)
         self.pub_diagnostics = self.create_publisher(DiagnosticArray, "/diagnostics", 10)
 
         if self.action_manager:
-            self.action_manager._pub_head_cmd = self.pub_head_cmd
+            self.action_manager._pub_head_gesture = self.pub_head_gesture
+            self.action_manager._pub_head_target_yaw = self.pub_head_target_yaw
             self.action_manager._pub_cmd_vel = self.pub_cmd_vel
 
         # ROS 2 Subscribers

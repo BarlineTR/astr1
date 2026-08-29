@@ -111,8 +111,41 @@ class SocialGazeStateMachine:
     RETURNING = "RETURNING"
 
 
+class CommandSource:
+    """Arbitration priority sources for head movement."""
+    SAFETY = "SAFETY"
+    GESTURE = "GESTURE"
+    TURN_TO_SOUND = "TURN_TO_SOUND"
+    CENTER = "CENTER"
+    TRACKING = "TRACKING"
+    IDLE = "IDLE"
+
+
 class HeadTrackerNode(Node):
-    """ROS 2 Node for intelligent sound-driven head orientation."""
+    """ROS 2 Node for central head yaw arbitration and multimodal sound-localization."""
+
+    GESTURE_PROFILES: dict[str, list[float]] = {
+        "nod": [12.0, -8.0, 0.0],
+        "shake": [22.0, -22.0, 12.0, 0.0],
+        "tilt": [16.0, 0.0],
+        "scan": [-35.0, 35.0, 0.0],
+        "center": [0.0],
+        "look_left": [35.0],
+        "look_right": [-35.0],
+    }
+
+    GESTURE_ALIASES: dict[str, str] = {
+        "yes": "nod",
+        "onayla": "nod",
+        "no": "shake",
+        "reddet": "shake",
+        "merak": "tilt",
+        "curious": "tilt",
+        "ara": "scan",
+        "search": "scan",
+        "sifirla": "center",
+        "reset": "center",
+    }
 
     def __init__(self):
         super().__init__("head_tracker_node")
@@ -132,11 +165,16 @@ class HeadTrackerNode(Node):
         self.declare_parameter("noise_multiplier", 3.0)
         self.declare_parameter("consensus_window_size", 7)
         self.declare_parameter("consensus_threshold", 5)
-        self.declare_parameter("consensus_tolerance_deg", 22.0)  # Raised from 18° to fix 180°/0° cluster split
+        self.declare_parameter("consensus_tolerance_deg", 22.0)
         # OAK-D Lite vision fusion parameters
         self.declare_parameter("vision_fusion_enabled", True)
-        self.declare_parameter("vision_gain", 0.6)       # Scale factor for vision head_yaw → robot yaw correction
-        self.declare_parameter("vision_timeout_s", 2.0)  # Seconds before reverting to DOA after face is lost
+        self.declare_parameter("vision_gain", 0.6)
+        self.declare_parameter("vision_timeout_s", 2.0)
+        # 2D LiDAR Radar tracking fusion
+        self.declare_parameter("lidar_fusion_enabled", True)
+        self.declare_parameter("lidar_min_dist_m", 0.4)
+        self.declare_parameter("lidar_max_dist_m", 2.8)
+        self.declare_parameter("lidar_timeout_s", 2.5)
 
         # Load parameters
         def _get_val(name, default):
@@ -172,9 +210,14 @@ class HeadTrackerNode(Node):
         self.lidar_max_dist_m = float(_get_val("lidar_max_dist_m", 2.8))
         self.lidar_timeout_s = float(_get_val("lidar_timeout_s", 2.5))
 
-        # Publishers
+        # Publishers — SINGLE AUTHORITATIVE OUTPUT OWNER FOR /head_cmd
         self.pub_head_cmd = self.create_publisher(HeadCmd, "/head_cmd", 10)
         self.pub_head_status = self.create_publisher(String, "/head/status", 10)
+
+        # External Intent / Action Subscriptions (Central Arbitration)
+        self.create_subscription(String, "/head/gesture", self._on_gesture_cmd, 10)
+        self.create_subscription(Float32, "/head/target_yaw", self._on_target_yaw_cmd, 10)
+        self.create_subscription(Bool, "/head/safety", self._on_safety_cmd, 10)
 
         # Subscribers — acoustic
         self.create_subscription(Float32, "/audio/doa", self._on_doa, 10)
@@ -192,10 +235,27 @@ class HeadTrackerNode(Node):
 
         # State & Thread Safety
         self._lock = threading.Lock()
-        self._current_yaw = 0.0
+        # Semantics:
+        # - _target_yaw: arbitrated goal angle [-70°, +70°]
+        # - _estimated_yaw: software trajectory angle simulated with slew limiter
+        # - commanded_yaw: the actual value sent over /head_cmd
         self._target_yaw = 0.0
+        self._estimated_yaw = 0.0
         self._filtered_target_yaw = 0.0
         self._state = SocialGazeStateMachine.IDLE
+        self._command_source = CommandSource.IDLE
+
+        # Gesture sequencing state
+        self._active_gesture: Optional[str] = None
+        self._gesture_steps: list[float] = []
+        self._gesture_step_index: int = 0
+        self._gesture_step_start_time: float = 0.0
+        self._gesture_step_duration_s: float = 0.35
+
+        # Turn to sound state
+        self._turn_to_sound_active: bool = False
+        self._turn_to_sound_start_time: float = 0.0
+        self._turn_to_sound_timeout_s: float = 3.0
 
         # Acoustic & Noise Tracking
         self._ambient_rms = 120.0
@@ -227,10 +287,89 @@ class HeadTrackerNode(Node):
         self._control_timer = self.create_timer(timer_period, self._control_loop)
 
         self.get_logger().info(
-            f"🤖 [Head Tracker] Başlatıldı | Limitler: [{self.min_yaw_deg}°, {self.max_yaw_deg}°] | "
-            f"Maks Hız: {self.max_speed_deg_s}°/s | Deadband: {self.deadband_deg}° | Dwell: {self.min_dwell_time_s}s | "
-            f"Vision: {'✅' if self.vision_fusion_enabled else '❌'} | LiDAR Radar: {'✅' if self.lidar_fusion_enabled else '❌'}"
+            f"🤖 [Head Tracker] Central Arbiter Başlatıldı | Limitler: [{self.min_yaw_deg}°, {self.max_yaw_deg}°] | "
+            f"Maks Hız: {self.max_speed_deg_s}°/s | Deadband: {self.deadband_deg}° | Dwell: {self.min_dwell_time_s}s"
         )
+
+    @property
+    def _current_yaw(self) -> float:
+        """Backward-compatible property returning software estimated trajectory yaw."""
+        return self._estimated_yaw
+
+    @_current_yaw.setter
+    def _current_yaw(self, val: float):
+        self._estimated_yaw = float(val)
+
+    def _on_safety_cmd(self, msg: Bool):
+        """Emergency safety lock: immediately overrides all commands and locks head at center."""
+        with self._lock:
+            if msg.data:
+                self._is_sleeping = True
+                self._command_source = CommandSource.SAFETY
+                self._active_gesture = None
+                self._gesture_steps = []
+                self._target_yaw = 0.0
+                self.get_logger().info("🛑 [Safety Arbiter]: Acil güvenlik kilidi devrede -> Hedef 0°")
+            else:
+                self._is_sleeping = False
+                self._command_source = CommandSource.IDLE
+                self.get_logger().info("🟢 [Safety Arbiter]: Güvenlik kilidi kaldırıldı.")
+
+    def _on_gesture_cmd(self, msg: String):
+        """Queues a gesture sequence in the central arbitration engine."""
+        if not self.enabled or self._is_sleeping:
+            return
+        g_name = (msg.data or "").lower().strip()
+        if not g_name:
+            return
+        canonical = self.GESTURE_ALIASES.get(g_name, g_name)
+        if canonical not in self.GESTURE_PROFILES:
+            self.get_logger().warning(f"Unknown gesture: '{g_name}'")
+            return
+
+        now = time.monotonic()
+        with self._lock:
+            if canonical == "center":
+                self._active_gesture = None
+                self._gesture_steps = []
+                self._command_source = CommandSource.CENTER
+                self._target_yaw = 0.0
+                self._last_speech_time = now
+                self.get_logger().info("🎯 [Gesture Arbiter]: Merkeze yönelme (CENTER) komutu alındı.")
+            else:
+                self._active_gesture = canonical
+                self._gesture_steps = list(self.GESTURE_PROFILES[canonical])
+                self._gesture_step_index = 0
+                self._gesture_step_start_time = now
+                self._gesture_step_duration_s = 0.35
+                self._command_source = CommandSource.GESTURE
+                self._target_yaw = max(self.min_yaw_deg, min(self.max_yaw_deg, self._gesture_steps[0]))
+                self._last_speech_time = now
+                self._state = SocialGazeStateMachine.ATTENDING
+                self.get_logger().info(
+                    f"🎭 [Gesture Arbiter]: Jest başlatıldı -> '{canonical}' "
+                    f"(Adım 1/{len(self._gesture_steps)}: {self._target_yaw:.1f}°)"
+                )
+
+    def _on_target_yaw_cmd(self, msg: Float32):
+        """Direct orientation intent from turn_to_sound tool."""
+        if not self.enabled or self._is_sleeping:
+            return
+        now = time.monotonic()
+        req_yaw = float(msg.data)
+        clamped_yaw = max(self.min_yaw_deg, min(self.max_yaw_deg, req_yaw))
+        with self._lock:
+            if self._command_source in (CommandSource.SAFETY, CommandSource.GESTURE):
+                self.get_logger().info(f"⏳ [Arbitration]: turn_to_sound ({clamped_yaw:.1f}°) ertelendi / öncelik: {self._command_source}")
+                return
+            self._command_source = CommandSource.TURN_TO_SOUND
+            self._target_yaw = clamped_yaw
+            self._turn_to_sound_active = True
+            self._turn_to_sound_start_time = now
+            self._last_speech_time = now
+            self._last_gaze_switch_time = now
+            self._state = SocialGazeStateMachine.ATTENDING
+            self.get_logger().info(f"🎯 [Arbitration]: turn_to_sound hedefi ayarlandı -> {self._target_yaw:.1f}°")
 
 
     def _on_doa(self, msg: Float32):
@@ -416,7 +555,7 @@ class HeadTrackerNode(Node):
             self._lidar_last_seen_time = now
 
     def _control_loop(self):
-        """Periodic 20 Hz trajectory generator with slew-rate velocity limiting."""
+        """Periodic 20 Hz trajectory generator with central arbitration and slew-rate limiting."""
         if not self.enabled:
             return
 
@@ -425,17 +564,60 @@ class HeadTrackerNode(Node):
             dt = max(0.001, now - self._last_update_time)
             self._last_update_time = now
 
-            # --- Sleep Mode Gate ---
-            # If robot is sleeping / deep idle, strictly lock target at 0° and do not process gaze
-            if self._is_sleeping:
+            # =========================================================
+            # CENTRAL ARBITRATION PRIORITY
+            # Priority: SAFETY > GESTURE > TURN_TO_SOUND > CENTER > TRACKING
+            # =========================================================
+
+            # 1. SAFETY / SLEEP (Highest Priority)
+            if self._is_sleeping or self._command_source == CommandSource.SAFETY:
                 self._target_yaw = 0.0
-                if abs(self._current_yaw) > 1.0:
+                if abs(self._estimated_yaw) > 1.0:
                     self._state = SocialGazeStateMachine.RETURNING
                 else:
                     self._state = SocialGazeStateMachine.IDLE
+
+            # 2. GESTURE SEQUENCE (High Priority — cannot be clobbered by tracking)
+            elif self._command_source == CommandSource.GESTURE and self._gesture_steps:
+                elapsed_step = now - self._gesture_step_start_time
+                step_settled = abs(self._estimated_yaw - self._target_yaw) <= 1.5
+                if elapsed_step >= self._gesture_step_duration_s or step_settled:
+                    self._gesture_step_index += 1
+                    if self._gesture_step_index < len(self._gesture_steps):
+                        self._target_yaw = max(self.min_yaw_deg, min(self.max_yaw_deg, self._gesture_steps[self._gesture_step_index]))
+                        self._gesture_step_start_time = now
+                    else:
+                        # Gesture sequence fully completed! Transition smoothly back to tracking
+                        self.get_logger().info(f"✅ [Gesture Arbiter]: Tamamlandı -> '{self._active_gesture}', Tracking'e dönülüyor.")
+                        self._active_gesture = None
+                        self._gesture_steps = []
+                        self._command_source = CommandSource.TRACKING
+                        self._last_speech_time = now
+                        self._last_gaze_switch_time = now
+                self._state = SocialGazeStateMachine.ATTENDING
+
+            # 3. TURN_TO_SOUND (Explicit sound orientation from LLM tool)
+            elif self._command_source == CommandSource.TURN_TO_SOUND and self._turn_to_sound_active:
+                elapsed_tts = now - self._turn_to_sound_start_time
+                tts_settled = abs(self._estimated_yaw - self._target_yaw) <= 1.5
+                if elapsed_tts >= self._turn_to_sound_timeout_s or tts_settled:
+                    self._turn_to_sound_active = False
+                    self._command_source = CommandSource.TRACKING
+                    self._last_speech_time = now
+                self._state = SocialGazeStateMachine.ATTENDING
+
+            # 4. BEHAVIORAL CENTER (Commanded neutral return)
+            elif self._command_source == CommandSource.CENTER:
+                self._target_yaw = 0.0
+                if abs(self._estimated_yaw) <= 1.0:
+                    self._command_source = CommandSource.IDLE
+                    self._state = SocialGazeStateMachine.IDLE
+                else:
+                    self._state = SocialGazeStateMachine.RETURNING
+
+            # 5. MULTIMODAL TRACKING (Vision, Radar/LiDAR, Acoustic DOA)
             else:
                 # --- Vision Fusion (OAK-D Lite) ---
-                # When a face is visible, hold gaze steadily on the speaker and keep idle timer refreshed.
                 vision_active = (
                     self.vision_fusion_enabled
                     and self._vision_person_detected
@@ -445,12 +627,10 @@ class HeadTrackerNode(Node):
                     self._last_speech_time = now  # prevent idle return while face is visible
                     self._state = SocialGazeStateMachine.ATTENDING
                 elif self._vision_person_detected and (now - self._vision_last_seen_time) > self.vision_timeout_s:
-                    # Face was lost — mark as not detected so DOA resumes
                     self._vision_person_detected = False
                     self.get_logger().info("👁️ [Vision Fusion] Yüz kayboldu — DOA / LiDAR takibine dönülüyor")
 
                 # --- LiDAR / Radar Tracking (RPLIDAR) ---
-                # When quiet (no active speech) and no active face lock, orient smoothly to approaching person
                 lidar_active = (
                     self.lidar_fusion_enabled
                     and getattr(self, "_lidar_person_detected", False)
@@ -459,7 +639,7 @@ class HeadTrackerNode(Node):
                     and not vision_active
                 )
                 if lidar_active and (now - self._last_gaze_switch_time) >= self.min_dwell_time_s:
-                    target_diff = abs(angular_diff_deg(self._lidar_target_yaw, self._current_yaw))
+                    target_diff = abs(angular_diff_deg(self._lidar_target_yaw, self._estimated_yaw))
                     if target_diff >= self.deadband_deg:
                         self._target_yaw = max(self.min_yaw_deg, min(self.max_yaw_deg, self._lidar_target_yaw))
                         self._last_speech_time = now
@@ -473,66 +653,63 @@ class HeadTrackerNode(Node):
                     self._lidar_person_detected = False
 
                 # --- Idle Timeout ---
-                # Return head to 0° (neutral forward position) after prolonged silence / no face / no person
                 if (now - self._last_speech_time) > self.idle_return_timeout_s:
-                    if abs(self._current_yaw) > 2.0:
+                    if abs(self._estimated_yaw) > 2.0:
                         self._target_yaw = 0.0
                         self._state = SocialGazeStateMachine.RETURNING
                     else:
                         self._target_yaw = 0.0
                         self._state = SocialGazeStateMachine.IDLE
 
-            vision_active = bool(
+            vision_active_flag = bool(
                 self.vision_fusion_enabled
                 and self._vision_person_detected
                 and (now - self._vision_last_seen_time) <= self.vision_timeout_s
                 and not self._is_sleeping
             )
 
-            # --- Smooth Trajectory Generation: Slew-rate velocity limiting ---
+            # --- Smooth Trajectory Generation: Central Slew-Rate Velocity Limiting ---
             max_step = self.max_speed_deg_s * dt
-            err = self._target_yaw - self._current_yaw
+            err = self._target_yaw - self._estimated_yaw
 
             if abs(err) <= max_step:
-                self._current_yaw = self._target_yaw
+                self._estimated_yaw = self._target_yaw
             else:
-                self._current_yaw += math.copysign(max_step, err)
+                self._estimated_yaw += math.copysign(max_step, err)
 
-            current_yaw_to_send = self._current_yaw
+            commanded_yaw_to_send = self._estimated_yaw
             target_yaw_snapshot = self._target_yaw
             state_snapshot = self._state
 
-        # --- Publish /head_cmd ---
-        # Only publish when there is meaningful motion or on the first tick that settles to 0°.
-        # CRITICAL FIX: Do NOT publish in IDLE+settled state — serial_bridge must not send
-        # the same angle repeatedly to Arduino (removed 1s heartbeat on serial_bridge side too).
+        # --- Publish /head_cmd (SINGLE OUTPUT OWNER) ---
         last_pub = getattr(self, "_last_published_cmd_yaw", None)
-        is_idle_settled = (state_snapshot == SocialGazeStateMachine.IDLE and abs(current_yaw_to_send) < 0.1)
+        is_idle_settled = (state_snapshot == SocialGazeStateMachine.IDLE and abs(commanded_yaw_to_send) < 0.1)
 
         should_publish = False
         if is_idle_settled:
-            # Only publish once when transitioning to settled idle (to send the final 0° command)
+            # Send final settling 0° command once when returning to idle
             if last_pub is None or abs(last_pub) >= 0.5:
                 should_publish = True
         else:
-            # Publish when yaw has changed enough to warrant an update
-            if last_pub is None or abs(current_yaw_to_send - last_pub) >= 0.5:
+            # Deduplication: Publish only when yaw changed >= 0.5°
+            if last_pub is None or abs(commanded_yaw_to_send - last_pub) >= 0.5:
                 should_publish = True
 
         if should_publish:
             cmd = HeadCmd()
-            cmd.angle_deg = float(current_yaw_to_send)
+            cmd.angle_deg = float(commanded_yaw_to_send)
             self.pub_head_cmd.publish(cmd)
-            self._last_published_cmd_yaw = current_yaw_to_send
+            self._last_published_cmd_yaw = commanded_yaw_to_send
 
         # Periodic status telemetry
         status = {
-            "current_yaw_deg": round(current_yaw_to_send, 1),
+            "current_yaw_deg": round(commanded_yaw_to_send, 1),
             "target_yaw_deg": round(target_yaw_snapshot, 1),
             "state": state_snapshot,
+            "source": getattr(self, "_command_source", CommandSource.IDLE),
             "ambient_rms": round(self._ambient_rms, 1),
             "is_speaking": self._is_speaking,
-            "vision_active": vision_active,
+            "vision_active": vision_active_flag,
         }
         status_msg = String()
         status_msg.data = json.dumps(status)
