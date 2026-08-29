@@ -518,60 +518,75 @@ class SerialBridge(Node):
             self.get_logger().error(f"HeadCmd write failed: {exc}")
             self._mark_disconnected()
 
-    def publish_imu(self, ax, ay, az, gx, gy, gz, micros_ts: int):
-        m = Imu()
+    def publish_imu(self, ax, ay, az, gx, gy, gz, micros_ts):
+        now = self.get_clock().now()
+        imu = Imu()
+        imu.header.stamp = now.to_msg()
+        imu.header.frame_id = self.frame_id_imu
 
-        if self.first_imu_sync:
-            self.time_offset_ns = self.get_clock().now().nanoseconds - (
-                micros_ts * 1000
-            )
-            self.first_imu_sync = False
+        imu.linear_acceleration.x = float(ax)
+        imu.linear_acceleration.y = float(ay)
+        imu.linear_acceleration.z = float(az)
 
-        stamp_ros_ns = (micros_ts * 1000) + self.time_offset_ns
-        m.header.stamp = rclpy.time.Time(nanoseconds=stamp_ros_ns).to_msg()
-        m.header.frame_id = self.frame_id_imu
-        m.linear_acceleration.x = ax
-        m.linear_acceleration.y = ay
-        m.linear_acceleration.z = az
-        m.angular_velocity.x = gx
-        m.angular_velocity.y = gy
-        m.angular_velocity.z = gz
-        m.linear_acceleration_covariance[0] = -1.0
-        m.angular_velocity_covariance[0] = -1.0
-        self.pub_imu.publish(m)
+        imu.angular_velocity.x = float(gx)
+        imu.angular_velocity.y = float(gy)
+        imu.angular_velocity.z = float(gz)
 
-    def publish_joint_states(self, dl: int, dr: int, dt_us: int):
-        del dt_us
-        dtheta_l = (dl / self.tpr_l) * 2.0 * math.pi
-        dtheta_r = (dr / self.tpr_r) * 2.0 * math.pi
-        self.left_pos = math.fsum([self.left_pos, dtheta_l])
-        self.right_pos = math.fsum([self.right_pos, dtheta_r])
+        imu.orientation.w = 1.0
+        imu.orientation.x = 0.0
+        imu.orientation.y = 0.0
+        imu.orientation.z = 0.0
+
+        imu.orientation_covariance[0] = -1.0
+        imu.linear_acceleration_covariance[0] = 0.01
+        imu.angular_velocity_covariance[0] = 0.001
+
+        self.pub_imu.publish(imu)
+
+    def publish_joint_states(self, left_ticks, right_ticks, dt_us):
+        now = self.get_clock().now()
+        dt_s = dt_us / 1e6
+
+        d_left = (left_ticks / self.tpr_l) * 2.0 * math.pi
+        d_right = (right_ticks / self.tpr_r) * 2.0 * math.pi
+
+        self.left_pos += d_left
+        self.right_pos += d_right
+
+        left_vel = d_left / dt_s if dt_s > 0 else 0.0
+        right_vel = d_right / dt_s if dt_s > 0 else 0.0
 
         js = JointState()
-        js.header.stamp = self.get_clock().now().to_msg()
-        js.name = ["left_wheel_joint", "right_wheel_joint", "head_yaw_joint"]
-        js.position = [self.left_pos, self.right_pos, float("nan")]
+        js.header.stamp = now.to_msg()
+        js.name = ["left_wheel_joint", "right_wheel_joint"]
+        js.position = [self.left_pos, self.right_pos]
+        js.velocity = [left_vel, right_vel]
+        js.effort = [0.0, 0.0]
+
         self.pub_js.publish(js)
 
-    def publish_diag(self, vbat_mV: int, temp_cX100: int, flags: int):
+    def publish_diag(self, vbat_mV, temp_cX100, flags):
+        now = self.get_clock().now()
         da = DiagnosticArray()
-        da.header.stamp = self.get_clock().now().to_msg()
+        da.header.stamp = now.to_msg()
+
         st = DiagnosticStatus()
-        st.name = "arduino"
-        st.hardware_id = "astro_arduino_mega"
-        st.level = DiagnosticStatus.OK
-        st.message = "OK"
+        st.name = "Arduino Base Controller"
+        st.hardware_id = "arduino_mega2560"
 
         if flags & 0x01:
-            st.level = DiagnosticStatus.WARN
-            st.message = "MOTORS_DISABLED_WATCHDOG"
-        if flags & 0x02:
             st.level = DiagnosticStatus.ERROR
-            st.message = "IMU_READ_FAIL"
+            st.message = "Watchdog timeout - motors halted"
+        elif flags & 0x02:
+            st.level = DiagnosticStatus.WARN
+            st.message = "IMU read failure"
+        else:
+            st.level = DiagnosticStatus.OK
+            st.message = "OK"
 
         st.values = [
-            KeyValue(key="vbat_mV", value=str(vbat_mV)),
-            KeyValue(key="mcu_temp_c", value=str(temp_cX100 / 100.0)),
+            KeyValue(key="vbat_V", value=f"{vbat_mV / 1000.0:.2f}"),
+            KeyValue(key="temp_C", value=f"{temp_cX100 / 100.0:.2f}"),
             KeyValue(key="flags", value=hex(flags)),
             KeyValue(key="arduino_alive", value=str(self.arduino_alive)),
             KeyValue(key="port", value=str(self.port or "disconnected")),
@@ -585,39 +600,56 @@ class SerialBridge(Node):
         state = 0
         expected_len = 0
         buf = bytearray()
+        sliding_history = bytearray()
+        self.get_logger().info("🚀 [SERIAL RX THREAD STARTED] read_loop is now actively polling serial port.")
+
         while rclpy.ok():
             if self.ser is None or not self.ser.is_open:
                 time.sleep(0.1)
                 continue
 
             try:
-                in_waiting = getattr(self.ser, "in_waiting", 0) or 1
-                chunk = self.ser.read(in_waiting)
-                if not chunk:
-                    continue
-
+                in_waiting = getattr(self.ser, "in_waiting", 0)
                 now_mono = time.monotonic()
-                chunk_len = len(chunk)
-                self._rx_bytes_total += chunk_len
-                self._rx_bytes_window += chunk_len
-                self._rx_fed_window += chunk_len
 
-                # 1 saniyede bir özet telemetri logu (Log spam yapmadan)
+                # 1 saniyede bir özet telemetri logu (chunk boş olsa bile durum basar)
                 if now_mono - self._last_rx_telemetry_time >= 1.0:
                     dt = max(0.001, now_mono - self._last_rx_telemetry_time)
                     rate_bps = self._rx_bytes_window / dt
                     self.get_logger().info(
                         f"[SERIAL RX TELEMETRY 1s]\n"
                         f"  port_open={self.ser.is_open if self.ser else False}\n"
+                        f"  device={self.port}\n"
                         f"  in_waiting={in_waiting}\n"
-                        f"  rx_rate={rate_bps:.1f} B/s (window={self._rx_bytes_window}B in {dt:.2f}s)\n"
-                        f"  last_chunk={chunk_len}B hex_32={chunk[:32].hex()}\n"
+                        f"  rx_rate={rate_bps:.1f} B/s (window={self._rx_bytes_window}B in {dt:.2f}s, total={self._rx_bytes_total}B)\n"
                         f"  bytes_fed_1s={self._rx_fed_window}\n"
+                        f"  parser_state: state={state} exp_len={expected_len} buf_len={len(buf)}\n"
                         f"  parsed_total: enc={self._rx_count_enc} diag={self._rx_count_diag} imu={self._rx_count_imu} ack={self._rx_count_ack}"
                     )
                     self._last_rx_telemetry_time = now_mono
                     self._rx_bytes_window = 0
                     self._rx_fed_window = 0
+
+                read_size = in_waiting or 1
+                chunk = self.ser.read(read_size)
+                if not chunk:
+                    continue
+
+                chunk_len = len(chunk)
+                self._rx_bytes_total += chunk_len
+                self._rx_bytes_window += chunk_len
+                self._rx_fed_window += chunk_len
+
+                # Ham byte seviyesinde ACK pattern tespiti (aa550513010000000f)
+                sliding_history.extend(chunk)
+                if len(sliding_history) > 64:
+                    sliding_history = sliding_history[-64:]
+
+                target_ack_pattern = bytes.fromhex("aa550513010000000f")
+                if target_ack_pattern in chunk or target_ack_pattern in sliding_history:
+                    self.get_logger().info(
+                        f"🎯 [FORENSIC ACK DETECTED] seq=1 raw=aa550513010000000f in_chunk_hex={chunk.hex()}"
+                    )
 
                 for b in chunk:
                     if state == 0:
