@@ -774,24 +774,26 @@ class HeadTrackerNode(Node):
             state_snapshot = self._state
 
         # --- Publish /head_cmd (SINGLE OUTPUT OWNER) ---
+        # Microcontroller (Arduino) executes its own 50 Hz PID position controller.
+        # Publish target yaw setpoint directly on target change (>= 1.0°) or state change.
         last_pub = getattr(self, "_last_published_cmd_yaw", None)
-        is_idle_settled = (state_snapshot == SocialGazeStateMachine.IDLE and abs(commanded_yaw_to_send) < 0.1)
+        is_idle_settled = (state_snapshot == SocialGazeStateMachine.IDLE and abs(target_yaw_snapshot) < 0.1)
 
         should_publish = False
         if is_idle_settled:
-            # Send final settling 0° command once when returning to idle
+            # Send settling 0° command once when returning to idle
             if last_pub is None or abs(last_pub) >= 0.5:
                 should_publish = True
         else:
-            # Deduplication: Publish only when yaw changed >= 0.5°
-            if last_pub is None or abs(commanded_yaw_to_send - last_pub) >= 0.5:
+            # Publish on target change >= 1.0°
+            if last_pub is None or abs(target_yaw_snapshot - last_pub) >= 1.0:
                 should_publish = True
 
         if should_publish:
             cmd = HeadCmd()
-            cmd.angle_deg = float(commanded_yaw_to_send)
+            cmd.angle_deg = float(target_yaw_snapshot)
             self.pub_head_cmd.publish(cmd)
-            self._last_published_cmd_yaw = commanded_yaw_to_send
+            self._last_published_cmd_yaw = target_yaw_snapshot
 
         # Periodic status telemetry
         status = {
