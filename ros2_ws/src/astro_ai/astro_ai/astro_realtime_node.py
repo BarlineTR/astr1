@@ -1554,6 +1554,21 @@ class AstroRealtimeNode(Node):
                     },
                     {
                         "type": "function",
+                        "name": "set_head_angle",
+                        "description": "Kullanıcı kafanın belirli bir dereceye dönmesini istediğinde çağrılır ('0 dereceye dön', '-30'a dön', '30 derece sağa bak', 'sola 45 derece bak', 'merkeze dön'). Açı -70 ile +70 derece arasındadır (0 = ileri, negatif = sağ, pozitif = sol).",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "angle_deg": {
+                                    "type": "number",
+                                    "description": "Hedef kafa açısı (-70.0 ile +70.0 derece arası)"
+                                }
+                            },
+                            "required": ["angle_deg"]
+                        }
+                    },
+                    {
+                        "type": "function",
                         "name": "move_robot",
                         "description": "Kullanıcı doğrudan belirli bir yöne gitmesini istediğinde çağrılır ('ileri git', 'geri gel', 'dur', 'sağa dön', 'sola dön'). DİKKAT: Kullanıcı 'sesime dön' dediğinde bu fonksiyon KESİNLİKLE ÇAĞRILMAZ, yön uydurulmaz; 'turn_to_sound' fonksiyonu çağrılır.",
                         "parameters": {
@@ -2715,6 +2730,71 @@ class AstroRealtimeNode(Node):
         has_action = any(a in t for a in ["dön", "don", "bak", "yönel", "yonel"])
         return bool(has_target and has_action)
 
+    def _is_head_angle_query(self, text: str) -> Tuple[bool, float, str]:
+        """Detects explicit head angular positioning commands (e.g. '0 dereceye dön', '-30'a dön', '30 derece sağa bak')."""
+        t = text.lower().strip()
+
+        # 1. Direct Center words
+        center_words = [
+            "merkeze dön", "merkeze don", "merkeze bak", "merkez", "düz bak", "duz bak",
+            "öne bak", "one bak", "düz dur", "duz dur", "karşıya bak", "karsiya bak",
+            "karşıya dön", "karsiya don", "ortaya bak", "ortaya dön", "ortaya don",
+        ]
+        if any(p in t for p in center_words):
+            return True, 0.0, "0°"
+
+        # 2. Number parsing with directional keywords (sağa/sola)
+        tr_words = {
+            "sıfır": 0, "sifir": 0, "on": 10, "on beş": 15, "onbes": 15,
+            "yirmi": 20, "yirmi beş": 25, "yirmibes": 25, "otuz": 30,
+            "otuz beş": 35, "otuzbes": 35, "kırk": 40, "kirk": 40,
+            "kırk beş": 45, "kirkbes": 45, "elli": 50, "altmış": 60,
+            "atmış": 60, "yetmiş": 70, "yetmis": 70,
+        }
+
+        is_negative = bool("eksi" in t or "negatif" in t or "-" in t)
+        is_right = bool("sağa" in t or "saga" in t or "sağ" in t or "sag" in t)
+        is_left = bool("sola" in t or "sol" in t)
+
+        target_angle = None
+
+        # Regex for digits (e.g. -30, +30, 0, 45, -60.5)
+        match = re.search(r"([+-]?\d+(?:\.\d+)?)", t)
+        if match:
+            try:
+                val = float(match.group(1))
+                if is_negative and val > 0:
+                    val = -val
+                target_angle = val
+            except Exception:
+                pass
+
+        if target_angle is None:
+            for w_name, w_val in tr_words.items():
+                if w_name in t:
+                    target_angle = float(-w_val if is_negative else w_val)
+                    break
+
+        if target_angle is not None:
+            # In ROS body frame: Right is negative, Left is positive
+            if is_right and target_angle > 0:
+                target_angle = -target_angle
+            elif is_left and target_angle < 0:
+                target_angle = abs(target_angle)
+
+            if any(k in t for k in ["dön", "don", "bak", "çevir", "cevir", "derece", "açı", "aci", "'a", "'e", "'ye", "'ya", "dur"]):
+                clamped = max(-70.0, min(70.0, target_angle))
+                sign_str = f"{clamped:+.0f}°" if clamped != 0 else "0°"
+                return True, clamped, sign_str
+
+        # 3. Simple relative left/right commands without number
+        if "sağa bak" in t or "sağa dön" in t or "saga bak" in t or "saga don" in t:
+            return True, -35.0, "sağ 35°"
+        if "sola bak" in t or "sola dön" in t or "sola bak" in t or "sola don" in t:
+            return True, 35.0, "sol 35°"
+
+        return False, 0.0, ""
+
     def _is_movement_query(self, text: str) -> Tuple[bool, str, float, float]:
         """Detects base mobility commands in fallback mode."""
         t = text.lower().strip()
@@ -2805,6 +2885,12 @@ class AstroRealtimeNode(Node):
                 "error_code": "NO_DIRECTION",
                 "message": "Ses yönü yöneticisi hazır değil veya DOA verisi yok."
             }
+
+        elif name == "set_head_angle":
+            angle = float(args.get("angle_deg", 0.0))
+            clamped = max(-70.0, min(70.0, angle))
+            self.pub_head_target_yaw.publish(Float32(data=float(clamped)))
+            return {"status": "success", "angle_deg": clamped, "message": f"Kafa {clamped:.1f} dereceye ayarlandı."}
 
         elif name == "move_robot":
             direction = args.get("direction", "stop").lower().strip()
@@ -5564,6 +5650,47 @@ class AstroRealtimeNode(Node):
                 if pcm:
                     first_audio_ms = (time.monotonic() - t_turn_start) * 1000.0
                     self.get_logger().info(f"🤖 [Astro (Canlı Hava Durumu)]: \"{reply_text}\"")
+                    self.memory.episodic.add_message("assistant", reply_text)
+                    self.session.record_robot_speech()
+                    _handle_and_play_clause_audio(pcm)
+                    return
+
+            # Explicit Head Angle Command (e.g. '0 dereceye dön', '-30'a dön', '30 derece sağa bak')
+            is_angle, target_angle, angle_label = self._is_head_angle_query(user_text)
+            if is_angle:
+                p = self.persona_name.lower()
+                spk = f" {spk_name}" if spk_name else ""
+                self.pub_head_target_yaw.publish(Float32(data=float(target_angle)))
+                self.get_logger().info(f"🎯 [Head Manual Command]: Kafa açısı komutla ayarlandı -> {target_angle:.1f}° ({angle_label})")
+
+                if p == "kufurbaz":
+                    if abs(target_angle) < 0.1:
+                        reply_text = f"Kafayı tam ortaya sıfırladım{spk}, düz bakıyorum işte!"
+                    else:
+                        reply_text = f"Kafayı {int(target_angle)} dereceye çevirdim{spk}, rahatladın mı!"
+                elif p == "flirt":
+                    if abs(target_angle) < 0.1:
+                        reply_text = f"Hemen tam karşına bakıyorum canım benim{spk}."
+                    else:
+                        reply_text = f"Senin için {int(target_angle)} dereceye döndüm tatlım{spk}."
+                else:
+                    if abs(target_angle) < 0.1:
+                        reply_text = f"Kafa konumu 0 derece merkeze hizalandı{spk}."
+                    else:
+                        reply_text = f"Kafa konumu {int(target_angle)} dereceye ayarlandı{spk}."
+
+                with self._lock:
+                    self._recent_robot_phrases.append(reply_text.lower())
+                    if len(self._recent_robot_phrases) > 10:
+                        self._recent_robot_phrases = self._recent_robot_phrases[-10:]
+
+                pcm, s_ms, g_ms, q_ms = _synthesize_turn_clause(reply_text)
+                total_synth_ms += s_ms
+                total_gpu_ms += g_ms
+                total_queue_wait_ms += q_ms
+                if pcm:
+                    first_audio_ms = (time.monotonic() - t_turn_start) * 1000.0
+                    self.get_logger().info(f"🤖 [Astro (Açı Komutu)]: \"{reply_text}\"")
                     self.memory.episodic.add_message("assistant", reply_text)
                     self.session.record_robot_speech()
                     _handle_and_play_clause_audio(pcm)
