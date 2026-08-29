@@ -773,6 +773,18 @@ class SerialBridge(Node):
             if not prev_handshake:
                 self.get_logger().info("[ARDUINO HANDSHAKE] status=success")
                 self.get_logger().info("heartbeat_healthy=true\nmotor_safety_gate=open")
+                # Başlangıçta kafa açısını 0.0° (Home/Merkez) ve tekerlekleri 0 RPM'e kesin olarak hizala
+                try:
+                    head_zero_pkt = self.build_packet(MSG_HEAD_CMD, struct.pack("<f", 0.0))
+                    wheel_zero_pkt = self.build_packet(MSG_WHEEL_CMD, struct.pack("<ff", 0.0, 0.0))
+                    with self.tx_lock:
+                        if self.ser and self.ser.is_open:
+                            self.ser.write(head_zero_pkt)
+                            self.ser.write(wheel_zero_pkt)
+                    self._last_sent_angle = 0.0
+                    self.get_logger().info("🎯 [HEAD HOMING] Başlangıç kafa konumu 0.0° (Center) olarak hizalandı.")
+                except Exception as exc:
+                    self.get_logger().debug(f"Initial zero homing command error: {exc}")
 
             if not prev_alive:
                 self.get_logger().info(f"[HEARTBEAT ACK] sequence={ack_seq} latency_ms={lat_ms:.1f} status=healthy")
