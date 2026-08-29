@@ -266,7 +266,7 @@ class HeadTrackerNode(Node):
         self._vad_active = False
         self._is_speaking = False
         self._is_playback_active = False
-        self._is_sleeping = False
+        self._is_sleeping = True
         self._last_speech_time = 0.0
         self._last_gaze_switch_time = time.monotonic()
         self._last_update_time = time.monotonic()
@@ -522,12 +522,16 @@ class HeadTrackerNode(Node):
         """Monitors robot emotional and sleep state to lock head during sleep/deep-idle."""
         with self._lock:
             emo = str(msg.data).strip().lower()
-            if emo in ("sleeping", "sleep"):
+            if emo in ("sleeping", "sleep", "deep_idle"):
+                if not self._is_sleeping:
+                    self.get_logger().info(f"💤 [Head Tracker]: Uyku modu aktif ({emo}) — Kafa 0.0° merkezde kilitlendi.")
                 self._is_sleeping = True
                 self._doa_history.clear()
                 self._target_yaw = 0.0
                 self._state = SocialGazeStateMachine.IDLE
-            elif self._is_sleeping and emo not in ("sleeping", "sleep"):
+            else:
+                if self._is_sleeping:
+                    self.get_logger().info(f"⏰ [Head Tracker]: Uyanma algılandı ({emo}) — Ses ve bakış takibi devrede.")
                 self._is_sleeping = False
                 self._last_speech_time = time.monotonic()
 

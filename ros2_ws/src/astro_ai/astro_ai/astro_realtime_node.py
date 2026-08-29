@@ -843,6 +843,14 @@ class AstroRealtimeNode(Node):
             self.action_manager._pub_head_target_yaw = self.pub_head_target_yaw
             self.action_manager._pub_cmd_vel = self.pub_cmd_vel
 
+        # Publish initial sleeping / deep-idle state so head tracker stays parked at 0.0° until wake
+        try:
+            emo_init = String()
+            emo_init.data = "sleeping"
+            self.pub_emotion.publish(emo_init)
+        except Exception:
+            pass
+
         # ROS 2 Subscribers
         self.create_subscription(String, "/tts/realtime_request", self._on_realtime_turn_request, 10)
         self.create_subscription(String, "/audio/realtime_input_pcm", self._on_input_pcm, 50)
