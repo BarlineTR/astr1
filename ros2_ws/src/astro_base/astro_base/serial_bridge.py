@@ -183,6 +183,7 @@ class SerialBridge(Node):
         self.declare_parameter("wheel_radius_left", 0.06)
         self.declare_parameter("wheel_radius_right", 0.06)
         self.declare_parameter("wheel_separation", 0.26)
+        self.declare_parameter("head_angle_scale", 0.17647)
 
         self.port_param = self.get_parameter("port").get_parameter_value().string_value
         env_baud = os.getenv("ASTRO_SERIAL_BAUD")
@@ -200,6 +201,7 @@ class SerialBridge(Node):
         self.wheel_radius_l = float(self.get_parameter("wheel_radius_left").value)
         self.wheel_radius_r = float(self.get_parameter("wheel_radius_right").value)
         self.wheel_separation = float(self.get_parameter("wheel_separation").value)
+        self.head_angle_scale = float(self.get_parameter("head_angle_scale").value)
 
         qos_best_effort = QoSProfile(
             depth=10, reliability=ReliabilityPolicy.BEST_EFFORT
@@ -528,7 +530,8 @@ class SerialBridge(Node):
             return
 
         now = time.monotonic()
-        payload = struct.pack("<f", msg.angle_deg)
+        scaled_angle = msg.angle_deg * getattr(self, "head_angle_scale", 1.0)
+        payload = struct.pack("<f", scaled_angle)
         pkt = self.build_packet(MSG_HEAD_CMD, payload)
         try:
             with self.tx_lock:
@@ -538,7 +541,7 @@ class SerialBridge(Node):
                     self.ser.write(pkt)
                     self._last_sent_angle = msg.angle_deg
                     self._last_sent_angle_time = now
-                    self.get_logger().info(f"🎯 [SERIAL HEAD CMD] binary_pkt angle_deg={msg.angle_deg:.1f}")
+                    self.get_logger().info(f"🎯 [SERIAL HEAD CMD] binary_pkt angle_deg={msg.angle_deg:.1f} (scaled={scaled_angle:.2f}°)")
         except serial.SerialException as exc:
             self.get_logger().error(f"HeadCmd write failed: {exc}")
             self._mark_disconnected()

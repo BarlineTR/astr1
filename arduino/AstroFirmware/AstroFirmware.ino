@@ -39,19 +39,19 @@ static constexpr int PWM_MAX = 255;
 static constexpr float PID_INTEGRAL_LIMIT = 50.0f; // ✅ FIX: Daha dar anti-windup limit
 
 // ====== Kafa (BTS7960 + enkoderli DC motor) ======
-// ⚠ KALİBRE EDİLMELİ: MotorTest sketch'indeki 'c <derece>' komutuyla ölçün.
-static constexpr float HEAD_TICKS_PER_DEG = 14.667f;
+// Kalibre Edildi: 440 tick / 170 derece = 2.588 tick/derece (14.667 * 0.17647)
+static constexpr float HEAD_TICKS_PER_DEG = 2.588f;
 
 // Yazılımsal açı limitleri (limit switch yok; açılıştaki konum 0° kabul edilir)
 static constexpr float HEAD_MIN_DEG = -90.0f;
 static constexpr float HEAD_MAX_DEG =  90.0f;
 
 // Kafa motoru PWM limitleri ve statik sürtünme eşiği
-static constexpr int HEAD_PWM_LIMIT = 180;
-static constexpr int HEAD_PWM_MIN = 45;
+static constexpr int HEAD_PWM_LIMIT = 150;
+static constexpr int HEAD_PWM_MIN = 35;
 
-static constexpr float HEAD_KP = 1.8f, HEAD_KD = 0.08f;
-static constexpr int32_t HEAD_DEADBAND_TICKS = 8;  // bu kadar yakınsa motoru bırak
+static constexpr float HEAD_KP = 2.0f, HEAD_KD = 0.05f;
+static constexpr int32_t HEAD_DEADBAND_TICKS = 2;  // 2 tick ~= 0.77 derece
 static constexpr uint32_t HEAD_STALL_MS = 1500;    // PWM'e rağmen tick değişmiyorsa kes (1.5s güvenli süre)
 
 // ====== Diagnostik bayraklari ======
