@@ -329,16 +329,15 @@ class AudioStreamNode(Node):
         try:
             is_speech = self._respeaker.speech_detected()
             doa_angle = self._respeaker.doa_angle()
-            now = time.monotonic()
-            recent_speech = (is_speech is True) or ((now - getattr(self, "_last_mic_speech_time", 0.0)) < 1.5)
 
             if is_speech is not None:
                 vad_msg = Bool()
                 vad_msg.data = bool(is_speech)
                 self.pub_vad.publish(vad_msg)
 
-            # Publish genuine hardware DOA when speech occurred recently and angle is valid
-            if doa_angle is not None and recent_speech:
+            # Publish genuine hardware DOA ONLY when speech is actively detected and playback is not active
+            is_active_playback = self._is_playing or (self._output_stream and self._output_stream.active)
+            if is_speech is True and doa_angle is not None and not is_active_playback:
                 doa_msg = Float32()
                 doa_msg.data = float(doa_angle)
                 self.pub_doa.publish(doa_msg)
