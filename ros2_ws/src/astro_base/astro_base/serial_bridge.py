@@ -365,11 +365,27 @@ class SerialBridge(Node):
                 rtscts=False,
                 dsrdtr=False,
             )
-            try:
-                self.ser.reset_input_buffer()
-                self.ser.reset_output_buffer()
-            except Exception:
-                pass
+            # [FORENSIC DEBUG] Port parametrelerini doğrula
+            self.get_logger().info(
+                f"🔌 [SERIAL PORT PARAMS]\n"
+                f"  is_open={self.ser.is_open}\n"
+                f"  port={self.ser.port}\n"
+                f"  baudrate={self.ser.baudrate}\n"
+                f"  timeout={self.ser.timeout}\n"
+                f"  write_timeout={self.ser.write_timeout}\n"
+                f"  rtscts={self.ser.rtscts}\n"
+                f"  dsrdtr={self.ser.dsrdtr}"
+            )
+
+            # GEÇİCİ FORENSIC TEST: reset_input_buffer / reset_output_buffer çağrıları,
+            # Arduino DTR reset sonrası gelen ilk baytları temizleyip RX senkronizasyonunu
+            # etkileyip etkilemediğini test etmek için geçici olarak yoruma alındı.
+            # try:
+            #     self.ser.reset_input_buffer()
+            #     self.ser.reset_output_buffer()
+            # except Exception:
+            #     pass
+
             self.port = port
             self.port_connected_time = time.monotonic()
             self.last_hb_ack_time = time.monotonic()
@@ -381,6 +397,7 @@ class SerialBridge(Node):
             if self.rx_thread is None or not self.rx_thread.is_alive():
                 self.rx_thread = threading.Thread(target=self.read_loop, daemon=True)
                 self.rx_thread.start()
+                self.get_logger().info(f"[RX THREAD LAUNCHED] thread_name={self.rx_thread.name} alive={self.rx_thread.is_alive()}")
         except serial.SerialException as exc:
             self.get_logger().warn(f"Could not open {port}: {exc}. Retrying...")
             self.ser = None
@@ -630,8 +647,11 @@ class SerialBridge(Node):
                     self._rx_bytes_window = 0
                     self._rx_fed_window = 0
 
-                read_size = in_waiting or 1
-                chunk = self.ser.read(read_size)
+                if in_waiting > 0:
+                    chunk = self.ser.read(in_waiting)
+                else:
+                    chunk = self.ser.read(1)
+
                 if not chunk:
                     continue
 
@@ -639,6 +659,11 @@ class SerialBridge(Node):
                 self._rx_bytes_total += chunk_len
                 self._rx_bytes_window += chunk_len
                 self._rx_fed_window += chunk_len
+
+                # [RAW SERIAL RX LOG] Veri geldiğinde parser'a vermeden ÖNCE logla
+                self.get_logger().info(
+                    f"[RAW SERIAL RX] bytes={chunk_len} in_waiting={in_waiting} hex_64={chunk[:64].hex()}"
+                )
 
                 # Ham byte seviyesinde ACK pattern tespiti (aa550513010000000f)
                 sliding_history.extend(chunk)
