@@ -124,7 +124,7 @@ void rightEncA() {
 }
 void headEncA() {
   bool b = digitalRead(HEAD_ENC_B);
-  g_head_ticks += b ? -1 : +1;
+  g_head_ticks += b ? +1 : -1;
 }
 
 void setupIO() {

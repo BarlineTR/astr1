@@ -122,7 +122,10 @@ inline int32_t readTicks(volatile int32_t& src) {
 
 void leftEncA()  { g_left_ticks  += digitalRead(L_ENC_B)    ? -1 : +1; }
 void rightEncA() { g_right_ticks += digitalRead(R_ENC_B)    ? -1 : +1; }
-void headEncA()  { g_head_ticks  += digitalRead(HEAD_ENC_B) ? -1 : +1; }
+void headEncA() {
+  bool b = digitalRead(HEAD_ENC_B);
+  g_head_ticks += b ? +1 : -1;
+}
 
 void setupIO() {
   pinMode(STATUS_LED, OUTPUT);
