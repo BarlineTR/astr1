@@ -597,11 +597,11 @@ class SerialBridge(Node):
             self.pub_std_diag.publish(da)
 
     def read_loop(self):
+        self.get_logger().info("🚀 [SERIAL RX THREAD STARTED]")
         state = 0
         expected_len = 0
         buf = bytearray()
         sliding_history = bytearray()
-        self.get_logger().info("🚀 [SERIAL RX THREAD STARTED] read_loop is now actively polling serial port.")
 
         while rclpy.ok():
             if self.ser is None or not self.ser.is_open:
