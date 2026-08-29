@@ -280,9 +280,10 @@ class SpatialVisionNode(Node):
             head_yaw = yaw
 
             # Camera Optical Axis Azimuth Angle (HFOV ~ 72°, half = 36°)
+            # In ROS body frame: Image Right (+X) is Robot Right (-Yaw), Image Left (-X) is Robot Left (+Yaw)
             face_center_x = x + (w / 2.0)
             norm_offset = (face_center_x - (frame_w / 2.0)) / (frame_w / 2.0)
-            cam_azimuth = float(norm_offset * 36.0)
+            cam_azimuth = float(-norm_offset * 36.0)
             if idx == 0:
                 face_camera_azimuth = cam_azimuth
 

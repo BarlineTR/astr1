@@ -411,14 +411,9 @@ class HeadTrackerNode(Node):
             # Convert to robot body frame yaw angle (clamped to [-70°, +70°] downstream)
             robot_yaw = doa_to_robot_yaw(raw_doa, offset_deg=self.doa_offset_deg, invert=self.doa_invert)
 
-            # 5. Anti-Flipping / 180° Back-Sound Hysteresis:
-            # Sounds from directly behind (|raw_doa - 180°| <= 25°) cannot be faced directly with a ±70° neck.
-            # Preserve the current hemisphere to prevent rapid +70° <-> -70° oscillation:
-            if abs(raw_doa - 180.0) <= 25.0 or abs(robot_yaw) >= 110.0:
-                if self._estimated_yaw >= 0.0:
-                    robot_yaw = 70.0
-                else:
-                    robot_yaw = -70.0
+            # Clamp to physical neck reach [-70°, +70°]
+            if abs(robot_yaw) > self.max_yaw_deg:
+                robot_yaw = math.copysign(self.max_yaw_deg, robot_yaw)
 
             # Record in consensus history (timestamp, yaw)
             self._doa_history.append((now, robot_yaw))
@@ -673,11 +668,10 @@ class HeadTrackerNode(Node):
                         self._last_gaze_switch_time = now
                 self._state = SocialGazeStateMachine.ATTENDING
 
-            # 3. TURN_TO_SOUND (Explicit sound orientation from LLM tool)
+            # 3. TURN_TO_SOUND (Explicit sound orientation & manual angle commands)
             elif self._command_source == CommandSource.TURN_TO_SOUND and self._turn_to_sound_active:
                 elapsed_tts = now - self._turn_to_sound_start_time
-                tts_settled = abs(self._estimated_yaw - self._target_yaw) <= 1.5
-                if elapsed_tts >= self._turn_to_sound_timeout_s or tts_settled:
+                if elapsed_tts >= self._turn_to_sound_timeout_s:
                     self._turn_to_sound_active = False
                     self._command_source = CommandSource.TRACKING
                     self._state = SocialGazeStateMachine.ENGAGED
