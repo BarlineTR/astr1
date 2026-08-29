@@ -414,6 +414,14 @@ class SerialBridge(Node):
             return
 
         now_mono = time.monotonic()
+        time_since_connect = now_mono - getattr(self, "port_connected_time", 0.0)
+
+        # Bootloader Quiet Window:
+        # ATmega2560 DTR reset sonrasi ~1.8 saniye STK500 bootloader calistirir.
+        # Bu sure zarfinda UART TX yapilirsa STK500 sync loop'a girip user sketch'e gecemez.
+        if time_since_connect < 1.8:
+            return
+
         self._hb_seq = (self._hb_seq + 1) & 0xFFFFFFFF
         if not hasattr(self, "_hb_tx_times"):
             self._hb_tx_times = {}
