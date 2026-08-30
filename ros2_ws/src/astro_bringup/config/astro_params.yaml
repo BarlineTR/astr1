@@ -8,7 +8,7 @@ serial_bridge:
     ticks_per_rev_right: 2048.0
     wheel_radius_left: 0.06
     wheel_radius_right: 0.06
-    head_angle_scale: 1.0  # Arduino firmware 2.588 tick/deg olarak yüklendiği için 1:1 iletim
+    head_angle_scale: -1.0  # ROS REP-103 (+Left / -Right) -> Arduino motor polaritesi eşlemesi (-1.0)
 
 rplidar_node:
   ros__parameters:

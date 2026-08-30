@@ -404,7 +404,7 @@ class ActionManager:
                 elif self._node and getattr(self._node, "_speaker_angle", None) is not None:
                     spk_angle = float(self._node._speaker_angle)
                     if abs(spk_angle) >= 2.0:
-                        azimuth = float(circular_doa_to_yaw(spk_angle)) if (spk_angle > 180 or spk_angle < -180) else spk_angle
+                        azimuth = float(circular_doa_to_yaw(spk_angle))
                         confidence = 0.50
 
             if azimuth is None:
