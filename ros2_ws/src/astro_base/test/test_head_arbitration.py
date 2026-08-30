@@ -34,6 +34,7 @@ try:
         angular_diff_deg,
         doa_to_robot_yaw,
     )
+    from astro_base.speech_energy_map import SpeechEnergyMap, SpeechFrameGate
 except ImportError:
     from head_tracker_node import (
         CommandSource,
@@ -42,9 +43,42 @@ except ImportError:
         angular_diff_deg,
         doa_to_robot_yaw,
     )
+    from speech_energy_map import SpeechEnergyMap, SpeechFrameGate
 
 
 bool_msg_class = type("MockMsg", (), {"data": None})
+
+class _FakeClock:
+    """Speech only counts once it has lasted a while, so tests must let time pass.
+    Real sleeps would make the suite crawl, so the module's clock is swapped out."""
+
+    def __init__(self, start=None):
+        # Start from the real clock: fixtures build state out of time.monotonic() (dwell
+        # timers, last-seen stamps), and a clock that starts somewhere else would make
+        # those look like they happened in the future.
+        self.t = time.monotonic() if start is None else start
+
+    def monotonic(self):
+        return self.t
+
+    def advance(self, seconds):
+        self.t += seconds
+
+
+def feed_speech(node, doa_deg, frames=14, dt=0.05):
+    """Speak steadily from one direction for `frames` frames at 20 Hz."""
+    module = sys.modules[HeadTrackerNode.__module__]
+    clock = _FakeClock()
+    real_time = module.time
+    module.time = clock
+    try:
+        node._last_update_time = clock.monotonic()
+        for _ in range(frames):
+            node._on_doa(MockMsg(data=doa_deg))
+            clock.advance(dt)
+    finally:
+        module.time = real_time
+
 
 def MockMsg(data=None):
     m = bool_msg_class()
@@ -72,9 +106,12 @@ class TestHeadYawCentralArbitration(unittest.TestCase):
         self.node.min_rms_threshold = 1600.0
         self.node.noise_multiplier = 3.0
         self.node.head_motion_settle_s = 0.0  # motor-noise gate disabled for arbitration tests
-        self.node.consensus_window_size = 7
-        self.node.consensus_threshold = 5
-        self.node.consensus_tolerance_deg = 22.0
+        self.node._speech_gate = SpeechFrameGate()
+        self.node._speech_map = SpeechEnergyMap()
+        self.node.doa_calibration_enabled = False
+        self.node._calib_sin = self.node._calib_cos = 0.0
+        self.node._calib_n = 0
+        self.node._calib_last_log_t = 0.0
         self.node.vision_fusion_enabled = True
         self.node.vision_gain = 0.6
         self.node.vision_timeout_s = 2.0
@@ -126,7 +163,7 @@ class TestHeadYawCentralArbitration(unittest.TestCase):
         self.node._lidar_distance_m = 0.0
         self.node._lidar_last_seen_time = 0.0
 
-        self.node._doa_history = collections.deque(maxlen=7)
+        self.node._doa_history = collections.deque(maxlen=16)
         self.published_head_cmds = []
         self.published_status = []
 
@@ -137,10 +174,9 @@ class TestHeadYawCentralArbitration(unittest.TestCase):
         self.node.get_logger = lambda: MagicMock()
 
     def test_01_tracking_only_behavior(self):
-        """1. Tracking Only: DOA consensus sets target and slew limiter smoothly moves head."""
-        for _ in range(5):
-            self.node._on_doa(MockMsg(data=45.0))
-        self.assertEqual(self.node._target_yaw, 45.0)
+        """1. Tracking Only: sustained speech sets the target and the slew limiter moves the head."""
+        feed_speech(self.node, 45.0)
+        self.assertAlmostEqual(self.node._target_yaw, 45.0, delta=6.0)
 
         for _ in range(10):
             self.node._last_update_time -= 0.05
@@ -257,21 +293,19 @@ class TestHeadYawCentralArbitration(unittest.TestCase):
 
         # 2. Simulate acoustic speech from Baran (-25°)
         self.node.min_rms_threshold = 300.0
-        self.node.consensus_threshold = 3
         self.node._vad_active = True
         self.node._latest_rms = 800.0
         self.node._ambient_rms = 100.0
         self.node._last_gaze_switch_time = 0.0
-        for _ in range(3):
-            self.node._on_doa(MockMsg(data=335.0)) # 335° in 360° frame = -25° in signed frame
+        feed_speech(self.node, 335.0)  # 335° in 360° frame = -25° in signed frame
 
         self.assertEqual(self.node._target_yaw, -25.0)
 
         # 3. Simulate speech turning to Misafir (+35°)
         self.node._doa_history.clear()
+        self.node._speech_map.clear()
         self.node._last_gaze_switch_time = 0.0
-        for _ in range(3):
-            self.node._on_doa(MockMsg(data=35.0)) # 35° in 360° frame = +35° in signed frame
+        feed_speech(self.node, 35.0)  # 35° in 360° frame = +35° in signed frame
 
         self.assertEqual(self.node._target_yaw, 35.0)
 

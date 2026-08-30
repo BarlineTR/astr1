@@ -132,28 +132,44 @@ class TestYawSignConvention(unittest.TestCase):
         )
 
 
-class TestConsensusAgainstBackSector(unittest.TestCase):
-    def test_sound_from_behind_does_not_flip_between_neck_limits(self):
-        """A source behind the robot straddles +-180 and must not split the cluster."""
-        node = make_node()
-        node.doa_invert = False
-        node.consensus_tolerance_deg = 22.0
-        # Hold the gaze dwell so no target is committed mid-run; this test is about what
-        # lands in the consensus buffer, not about when the head decides to move.
-        node._last_gaze_switch_time = time.monotonic()
+class TestRearSourceIsNotSplit(unittest.TestCase):
+    """A talker directly behind straddles the +-180 seam and must stay one source."""
 
-        # Same physical source, +-5 deg of measurement noise around straight back.
-        for doa in (175.0, 185.0, 175.0, 185.0, 175.0, 185.0):
-            node._on_doa(MockMsg(doa))
+    def test_sound_from_behind_lands_behind_and_does_not_flip(self):
+        import astro_base.head_tracker_node as H
 
-        yaws = [y for _, y in node._doa_history]
-        self.assertTrue(yaws, "DOA gecmisi bos")
-        spread = max(abs(angular_diff_deg(y, yaws[0])) for y in yaws)
+        clock = FakeClock()
+        real_time = H.time
+        H.time = clock
+        try:
+            node = make_node()
+            node.doa_invert = False
+            node.head_motion_settle_s = 0.0
+            node._last_update_time = clock.monotonic()
+
+            # Same physical source, +-5 deg of measurement noise around straight back.
+            for i in range(20):
+                node._on_doa(MockMsg(175.0 if i % 2 else 185.0))
+                clock.advance(0.05)
+
+            target = node._target_yaw
+            bearings = [y for _, y in node._doa_history]
+        finally:
+            H.time = real_time
+
+        self.assertTrue(bearings, "DOA gecmisi bos: konusma kapisi hicbir kareyi gecirmedi")
+        spread = max(abs(angular_diff_deg(y, bearings[0])) for y in bearings)
         self.assertLessEqual(
             spread,
-            node.consensus_tolerance_deg,
-            f"Arkadaki tek kaynak {spread:.0f} derecelik saciliyor: konsensus "
-            f"gecmisine kirpilmis degerler yaziliyor. Ornekler: {yaws}",
+            20.0,
+            f"Arkadaki tek kaynak {spread:.0f} derecelik saciliyor; kirpilmis degerler "
+            f"yaziliyor olabilir. Ornekler: {bearings}",
+        )
+        self.assertLessEqual(
+            min(abs(angular_diff_deg(target, 180.0)), abs(angular_diff_deg(target, -180.0))),
+            15.0,
+            f"Hedef {target:.1f} derece; arkadaki kaynak icin +-180 civari olmali, "
+            "iki boyun limiti arasinda gidip gelmemeli.",
         )
 
 

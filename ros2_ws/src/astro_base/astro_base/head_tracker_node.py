@@ -5,7 +5,8 @@ Controls robot head yaw orientation using ReSpeaker 4-Mic DOA (Direction of Arri
 and multimodal perception with human-like social gaze behavior:
   - Acoustic energy & VAD gating (resists ambient background noise)
   - Self-voice suppression (zero tracking while robot is speaking)
-  - Temporal consensus filtering (rejects momentary noise spikes & reverberation)
+  - Spatial speech-energy mapping (the head goes where sustained speech accumulates,
+    not where any single bearing points -- the array is mounted at an angle)
   - Deadband hysteresis (prevents micro-jitter and neck twitching)
   - Gaze dwell time (holds attention for >= 2.5s before switching target)
   - Smooth S-curve / slew-rate velocity limiting (max 45°/s, organic motion)
@@ -20,6 +21,9 @@ import os
 import threading
 import time
 from typing import Deque, Optional, Tuple, Any
+
+# Recent accepted bearings kept for logging and tests. Nothing decides on this buffer.
+DOA_HISTORY_SIZE = 16
 
 # Single source of truth for every declared parameter.
 #
@@ -46,9 +50,20 @@ HEAD_TRACKER_DEFAULTS: dict[str, Any] = {
     "update_rate_hz": 20.0,
     "min_rms_threshold": 1600.0,
     "noise_multiplier": 3.0,
-    "consensus_window_size": 7,
-    "consensus_threshold": 5,
-    "consensus_tolerance_deg": 22.0,
+    # Spatial speech-energy map. The array is mounted at an angle on the dome, so no
+    # single bearing is trustworthy; the head goes to whichever direction sustained
+    # speech energy accumulates in. See speech_energy_map.py.
+    "speech_map_bin_width_deg": 30.0,
+    "speech_map_half_life_s": 4.0,
+    "speech_map_peak_dominance": 1.6,
+    "speech_map_min_energy": 4000.0,
+    # A burst has to run this long, without collapsing like an impulse, to count as
+    # speech at all. This is what keeps a door slam out of the map.
+    "speech_gate_min_duration_s": 0.15,
+    "speech_gate_collapse_ratio": 8.0,
+    # Prints the raw DOA the array reports while someone speaks to a centred head, so the
+    # mounting offset can be read off and pasted into doa_offset_deg. Off in normal use.
+    "doa_calibration_enabled": False,
     # OAK-D Lite vision fusion
     "vision_fusion_enabled": True,
     "vision_gain": 0.85,
@@ -106,6 +121,12 @@ try:
 except ImportError:
     class HeadCmd:  # type: ignore
         angle_deg: float = 0.0
+
+
+try:
+    from astro_base.speech_energy_map import SpeechEnergyMap, SpeechFrameGate
+except ImportError:  # running straight from the source tree, without the package installed
+    from speech_energy_map import SpeechEnergyMap, SpeechFrameGate
 
 
 def doa_to_robot_yaw(doa_deg: float, offset_deg: float = 0.0, invert: bool = False) -> float:
@@ -220,9 +241,18 @@ class HeadTrackerNode(Node):
         self.min_rms_threshold = float(_get_val("min_rms_threshold"))
         self.noise_multiplier = float(_get_val("noise_multiplier"))
         self.head_motion_settle_s = float(_get_val("head_motion_settle_s"))
-        self.consensus_window_size = max(1, int(_get_val("consensus_window_size")))
-        self.consensus_threshold = max(1, int(_get_val("consensus_threshold")))
-        self.consensus_tolerance_deg = float(_get_val("consensus_tolerance_deg"))
+        self.doa_calibration_enabled = bool(_get_val("doa_calibration_enabled"))
+
+        self._speech_gate = SpeechFrameGate(
+            min_duration_s=float(_get_val("speech_gate_min_duration_s")),
+            collapse_ratio=float(_get_val("speech_gate_collapse_ratio")),
+        )
+        self._speech_map = SpeechEnergyMap(
+            bin_width_deg=float(_get_val("speech_map_bin_width_deg")),
+            decay_half_life_s=float(_get_val("speech_map_half_life_s")),
+            peak_dominance=float(_get_val("speech_map_peak_dominance")),
+            min_peak_energy=float(_get_val("speech_map_min_energy")),
+        )
         # OAK-D Lite vision fusion
         self.vision_fusion_enabled = bool(_get_val("vision_fusion_enabled"))
         self.vision_gain = float(_get_val("vision_gain"))
@@ -300,6 +330,10 @@ class HeadTrackerNode(Node):
         self._vision_person_detected = False
         self._vision_head_yaw = 0.0          # Relative camera yaw: negative=left of frame, positive=right
         self._vision_ref_yaw = 0.0           # Head angle the pending measurement was taken from
+        self._calib_sin = 0.0                # Circular accumulator for the mounting-offset log
+        self._calib_cos = 0.0
+        self._calib_n = 0
+        self._calib_last_log_t = 0.0
         self._vision_anchor_yaw = 0.0        # Head angle this servo "budget" started from
         self._vision_last_applied_yaw = None # Bearing that produced the last correction
         self._vision_yaw_pending = False     # True only while a fresh measurement awaits servoing
@@ -311,8 +345,9 @@ class HeadTrackerNode(Node):
         self._lidar_distance_m = 0.0
         self._lidar_last_seen_time = 0.0
 
-        # Circular buffer for DOA temporal consensus
-        self._doa_history: Deque[Tuple[float, float]] = collections.deque(maxlen=self.consensus_window_size)
+        # Recent accepted bearings, kept purely as a diagnostic trail: the decision is
+        # the speech-energy map's, not this buffer's.
+        self._doa_history: Deque[Tuple[float, float]] = collections.deque(maxlen=DOA_HISTORY_SIZE)
 
         # Periodic control loop timer (20 Hz)
         timer_period = 1.0 / max(1.0, self.update_rate_hz)
@@ -350,6 +385,42 @@ class HeadTrackerNode(Node):
         """
         last = getattr(self, "_last_published_cmd_yaw", None)
         return float(last) if last is not None else float(self._estimated_yaw)
+
+    def _note_calibration_sample(self, now: float, raw_doa: float) -> None:
+        """Reports the mounting offset of the array, when asked to.
+
+        The array sits at an angle on the dome, so the raw DOA of someone standing in
+        front of a centred head is not 0 -- it is whatever that mounting rotation happens
+        to be. Rather than measure it with a protractor, stand in front of the robot with
+        the head centred, talk, and read the suggested doa_offset_deg off this log.
+
+        Only samples taken with the head genuinely centred mean anything, so the rest are
+        skipped. Nothing is written to disk: the value goes into astro_params.yaml by
+        hand, deliberately.
+        """
+        if not self.doa_calibration_enabled:
+            return
+        if abs(self._commanded_head_yaw()) > 5.0:
+            return
+
+        rad = math.radians(raw_doa % 360.0)
+        self._calib_sin += math.sin(rad)
+        self._calib_cos += math.cos(rad)
+        self._calib_n += 1
+
+        if self._calib_n < 20 or (now - self._calib_last_log_t) < 5.0:
+            return
+        self._calib_last_log_t = now
+
+        mean_deg = math.degrees(math.atan2(self._calib_sin, self._calib_cos)) % 360.0
+        strength = math.hypot(self._calib_sin, self._calib_cos) / self._calib_n
+        self.get_logger().info(
+            f"[DOA KALIBRASYON]\n"
+            f"ortalama_ham_doa={mean_deg:.1f}\n"
+            f"onerilen_doa_offset_deg={-mean_deg:.1f}\n"
+            f"ornek_sayisi={self._calib_n}\n"
+            f"tutarlilik={strength:.2f} (1.00 = mukemmel, <0.5 ise tekrar deneyin)"
+        )
 
     def _shortest_reachable_arc(self, target_yaw: float, current_yaw: float) -> float:
         """Signed rotation to get from current_yaw to target_yaw the short way.
@@ -523,22 +594,33 @@ class HeadTrackerNode(Node):
             if not self._vad_active or self._latest_rms < adaptive_threshold:
                 return
 
+            # 5. Speech Shape Gate: a door slam is louder than a voice but lasts a moment
+            #    and collapses. Only a burst that runs on without collapsing is speech.
+            if not self._speech_gate.accept(now, self._latest_rms):
+                return
+
+            self._last_speech_time = now
+            self._note_calibration_sample(now, raw_doa)
+
             # Bearing of the talker as seen FROM THE HEAD, in REP-103 sense.
             relative_yaw = doa_to_robot_yaw(raw_doa, offset_deg=self.doa_offset_deg, invert=self.doa_invert)
 
-            # ...then expressed in the robot body frame. Storing the body-frame angle is
-            # also what makes the consensus window meaningful: samples taken while the
-            # neck was at different angles are only comparable once they share a frame.
+            # ...then expressed in the robot body frame. Samples taken while the neck was
+            # at different angles only become comparable once they share a frame, and the
+            # map integrates across exactly such samples.
             body_yaw = self._acoustic_bearing_to_body_yaw(relative_yaw)
 
-            # Record the UNCLAMPED bearing: clamping before the consensus step splits a
-            # single source behind the robot into alternating +max/-max samples.
-            # Mechanical clamping happens once, after consensus (step 7).
+            # Record the UNCLAMPED bearing: clamping here would split a single source
+            # behind the robot into alternating +max/-max samples. Mechanical clamping
+            # happens once, after the map has spoken (step 7).
             self._doa_history.append((now, body_yaw))
-            self._last_speech_time = now
 
-            # 6. Temporal Consensus Clustering with Angular Wrap-Around Handling
-            candidate_yaw = self._evaluate_consensus()
+            # 6. Spatial Speech-Energy Map. The array is tilted on top of the dome, so
+            #    individual bearings scatter wildly -- the field logs show -88, -161, -3
+            #    and -135 arriving inside 300 ms. Energy poured into directions over
+            #    seconds survives that scatter where any single sample cannot.
+            self._speech_map.add(now, body_yaw, self._latest_rms)
+            candidate_yaw = self._speech_map.peak(now)
             if candidate_yaw is None:
                 return
 
@@ -565,11 +647,10 @@ class HeadTrackerNode(Node):
             # 7. Mechanical & Safety Clamping
             clamped_target = max(self.min_yaw_deg, min(self.max_yaw_deg, candidate_yaw))
 
-            # Confidence calculation
-            cluster_size = getattr(self, "_last_cluster_size", self.consensus_threshold)
-            total_samples = getattr(self, "_last_total_samples", len(self._doa_history))
+            # Confidence: how much louder than the room this is, and how cleanly the map
+            # separates the winning direction from the rest.
             energy_ratio = self._latest_rms / max(80.0, self._ambient_rms)
-            conf = min(1.0, max(0.1, (cluster_size / float(total_samples)) * min(1.0, energy_ratio / 2.0)))
+            conf = min(1.0, max(0.1, min(1.0, energy_ratio / 2.0)))
 
             last_logged_filtered = getattr(self, "_last_logged_filtered_yaw", None)
             last_logged_time = getattr(self, "_last_logged_doa_time", 0.0)
@@ -600,28 +681,6 @@ class HeadTrackerNode(Node):
                     f"🎯 [Head Tracker Gaze]: DOA={raw_doa:.1f}° -> Hedef Yaw={clamped_target:.1f}°{spk_tag} "
                     f"(Fark={angle_diff:.1f}°, RMS={self._latest_rms:.0f})"
                 )
-
-    def _evaluate_consensus(self) -> Optional[float]:
-        """Finds cluster consensus in recent DOA history to filter reverberation & outlier spikes."""
-        if len(self._doa_history) < self.consensus_threshold:
-            return None
-
-        recent_samples = [yaw for ts, yaw in self._doa_history]
-        best_cluster = []
-
-        for candidate in recent_samples:
-            cluster = [y for y in recent_samples if abs(angular_diff_deg(y, candidate)) <= self.consensus_tolerance_deg]
-            if len(cluster) > len(best_cluster):
-                best_cluster = cluster
-
-        if len(best_cluster) >= self.consensus_threshold:
-            sin_sum = sum(math.sin(math.radians(y)) for y in best_cluster)
-            cos_sum = sum(math.cos(math.radians(y)) for y in best_cluster)
-            avg_yaw = math.degrees(math.atan2(sin_sum, cos_sum))
-            self._last_cluster_size = len(best_cluster)
-            self._last_total_samples = len(recent_samples)
-            return float(avg_yaw)
-        return None
 
     def _on_mic_level(self, msg: Float32):
         """Tracks RMS audio input energy and background ambient noise floor."""

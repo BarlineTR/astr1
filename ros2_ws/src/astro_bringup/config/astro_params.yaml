@@ -86,9 +86,17 @@ head_tracker_node:
     min_rms_threshold: 1600.0       # 1600 (arka plan gürültü bağışıklığı)
     noise_multiplier: 3.0           # 3.0 (adaptif gürültü eşiği)
     head_motion_settle_s: 0.5       # 0.5s (kafa durduktan sonra motor gürültüsünün dinmesini bekle)
-    consensus_window_size: 7
-    consensus_threshold: 5
-    consensus_tolerance_deg: 22.0  # 180°/0° cluster bölünmesini engelleme
+    # Konusma enerjisi haritasi: dizi kubbenin tepesinde ACILI durdugu icin tek bir
+    # kerteriz guvenilir degil; kafa, surekli konusma enerjisinin biriktigi yone doner.
+    speech_map_bin_width_deg: 30.0   # yon kovasi genisligi (cikis cozunurlugu degil)
+    speech_map_half_life_s: 4.0      # eski konusmacinin sonme yari omru
+    speech_map_peak_dominance: 1.6   # tepe, rakibini bu kat gecmezse karar verilmez
+    speech_map_min_energy: 4000.0    # bu esigin altinda harita kafayi oynatmaz
+    speech_gate_min_duration_s: 0.15 # kapi carpmasini eleyen sure esigi
+    speech_gate_collapse_ratio: 8.0  # zirveden bu kat asagi cokerse darbe sayilir
+    # Montaj kaymasini olcmek icin: kafa merkezdeyken onune gecip konusun, log'un
+    # onerdigi degeri yukaridaki doa_offset_deg'e yazin. Normal kullanimda kapali.
+    doa_calibration_enabled: false
     # OAK-D Lite vision fusion — face tracking overrides DOA when camera sees a face
     vision_fusion_enabled: true
     vision_gain: 0.85               # 0.85 (daha seri takip)

@@ -103,7 +103,14 @@ sys.path.insert(0, astro_base_dir)
 from persona_engine import PersonaEngine
 from memory_manager import MemoryManager
 from action_manager import ActionManager, SoundDirection, circular_doa_to_yaw
-from head_tracker_node import doa_to_robot_yaw, angular_diff_deg, HeadTrackerNode
+from head_tracker_node import (
+    doa_to_robot_yaw,
+    angular_diff_deg,
+    HeadTrackerNode,
+    CommandSource,
+    SocialGazeStateMachine,
+)
+from speech_energy_map import SpeechEnergyMap, SpeechFrameGate
 from serial_bridge import SerialBridge, MSG_HEARTBEAT, MSG_HEARTBEAT_ACK, MSG_WHEEL_CMD, ArduinoState
 
 
@@ -348,9 +355,18 @@ class TestDOAJitterFiltering(unittest.TestCase):
             tracker.min_dwell_time_s = 2.5
             tracker.min_rms_threshold = 500.0
             tracker.noise_multiplier = 2.0
-            tracker.consensus_window_size = 5
-            tracker.consensus_threshold = 3
-            tracker.consensus_tolerance_deg = 18.0
+            tracker._speech_gate = SpeechFrameGate()
+            tracker._speech_map = SpeechEnergyMap()
+            tracker.doa_calibration_enabled = False
+            tracker._command_source = CommandSource.TRACKING
+            tracker._turn_to_sound_active = False
+            tracker._state = SocialGazeStateMachine.IDLE
+            tracker.head_motion_settle_s = 0.0
+            tracker._last_motion_cmd_time = 0.0
+            tracker._last_published_cmd_yaw = 0.0
+            tracker._estimated_yaw = 0.0
+            tracker.lidar_fusion_enabled = False
+            tracker._spatial_people_map = []
             # Vision fusion attributes (added in OAK-D integration)
             tracker.vision_fusion_enabled = False  # Disable for DOA-only test
             tracker._vision_person_detected = False
@@ -382,10 +398,26 @@ class TestDOAJitterFiltering(unittest.TestCase):
             class Msg:
                 data = 90.0
 
-            # Feed 3 consistent frames around 90° (clamped to 70°)
-            tracker._on_doa(Msg())
-            tracker._on_doa(Msg())
-            tracker._on_doa(Msg())
+            # Speech only counts once the burst has lasted long enough not to be a bang,
+            # so the clock has to advance between frames.
+            import head_tracker_node as _H
+
+            class _Clock:
+                def __init__(self):
+                    self.t = time.monotonic()
+
+                def monotonic(self):
+                    return self.t
+
+            clock = _Clock()
+            real_time = _H.time
+            _H.time = clock
+            try:
+                for _ in range(14):
+                    tracker._on_doa(Msg())
+                    clock.t += 0.05
+            finally:
+                _H.time = real_time
 
             log_text = '\n'.join(logs)
             self.assertIn('[DOA FILTER]', log_text)

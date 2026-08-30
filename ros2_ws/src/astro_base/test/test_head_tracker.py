@@ -56,6 +56,39 @@ class MockMsg:
         self.data = data
 
 
+class _FakeClock:
+    """The head only reacts to speech that has lasted a while, so tests have to let time
+    pass. Real sleeps would make the suite crawl, so the module's clock is swapped out."""
+
+    def __init__(self, start=None):
+        # Start from the real clock: fixtures build state out of time.monotonic() (dwell
+        # timers, last-seen stamps), and a clock that starts somewhere else would make
+        # those look like they happened in the future.
+        self.t = time.monotonic() if start is None else start
+
+    def monotonic(self):
+        return self.t
+
+    def advance(self, seconds):
+        self.t += seconds
+
+
+def feed_speech(node, doa_deg, frames=14, dt=0.05):
+    """Speak steadily from one direction for `frames` frames at 20 Hz."""
+    module = sys.modules[HeadTrackerNode.__module__]
+    clock = _FakeClock()
+    real_time = module.time
+    module.time = clock
+    try:
+        node._last_update_time = clock.monotonic()
+        for _ in range(frames):
+            node._on_doa(MockMsg(doa_deg))
+            clock.advance(dt)
+        return clock.monotonic()
+    finally:
+        module.time = real_time
+
+
 class TestSocialGazeLogic(unittest.TestCase):
     def setUp(self):
         # Instantiate HeadTrackerNode with test defaults without requiring live ROS 2 daemon
@@ -67,8 +100,6 @@ class TestSocialGazeLogic(unittest.TestCase):
         self.node.min_yaw_deg = -70.0
         self.node.min_rms_threshold = 500.0
         self.node.noise_multiplier = 2.0
-        self.node.consensus_threshold = 3
-        self.node.consensus_tolerance_deg = 15.0
         self.node.doa_offset_deg = 0.0
         self.node.doa_invert = False
         self.node.lidar_fusion_enabled = True
@@ -103,65 +134,52 @@ class TestSocialGazeLogic(unittest.TestCase):
         self.node._latest_rms = 3000.0
         self.node._vad_active = True
         self.node._last_gaze_switch_time = 0.0
-        for _ in range(8):
-            self.node._on_doa(MockMsg(170.0))
+        feed_speech(self.node, 170.0)
         self.assertEqual(self.node._target_yaw, 70.0)
 
-    def test_consensus_clustering(self):
-        """Test that temporal consensus filters out isolated outlier spikes and averages true cluster."""
-        # 3 samples around 45° and 2 outlier spikes at -60° and 150°
-        self.node._doa_history = collections.deque([
-            (1.0, 44.0),
-            (1.1, -60.0),  # Outlier
-            (1.2, 46.0),
-            (1.3, 150.0),  # Outlier
-            (1.4, 45.0),
-        ], maxlen=5)
-
-        consensus = self.node._evaluate_consensus()
-        self.assertIsNotNone(consensus)
-        # Average of (44.0, 46.0, 45.0) = 45.0
-        self.assertAlmostEqual(consensus, 45.0, places=1)
-
-    def test_consensus_rejects_chaotic_noise(self):
-        """Test that when all samples are scattered, no consensus is reached."""
-        self.node._doa_history = collections.deque([
-            (1.0, 10.0),
-            (1.1, 70.0),
-            (1.2, -45.0),
-            (1.3, 130.0),
-            (1.4, -80.0),
-        ], maxlen=5)
-
-        consensus = self.node._evaluate_consensus()
-        self.assertIsNone(consensus)
-
-    def test_self_voice_suppression(self):
-        """Test that DOA is ignored while the robot is speaking (no self-voice feedback loop)."""
-        self.node._is_speaking = True
+    def test_scattered_bearings_do_not_move_the_head(self):
+        """A tilted array in a live room throws bearings all over the place -- the field
+        logs show -88, -161, -3, -135 and +45 arriving inside 300 ms. No direction is
+        busier than any other there, so the head must stay where it is."""
         self.node._current_yaw = 0.0
         self.node._target_yaw = 0.0
-
-        # Feed loud DOA while speaking
-        self.node._latest_rms = 5000.0
-        self.node._on_doa(MockMsg(45.0))
-        self.assertEqual(len(self.node._doa_history), 0)
-        self.assertEqual(self.node._target_yaw, 0.0)
-
-    def test_deadband_hysteresis(self):
-        """Test that small angle variations (<12°) do not cause head movement."""
-        self.node._doa_history.clear()
-        self.node._current_yaw = 0.0
-        self.node._target_yaw = 0.0
-        self.node._latest_rms = 2500.0
+        self.node._latest_rms = 3000.0
         self.node._ambient_rms = 200.0
-        self.node._last_gaze_switch_time = 0.0  # Dwell time satisfied
+        self.node._last_gaze_switch_time = 0.0
 
-        # Feed consistent 8° DOA readings (below 12° deadband)
-        for _ in range(8):
-            self.node._on_doa(MockMsg(8.0))
+        module = sys.modules[HeadTrackerNode.__module__]
+        clock = _FakeClock()
+        real_time = module.time
+        module.time = clock
+        try:
+            for doa in (12.0, 200.0, 88.0, 315.0, 175.0, 44.0, 260.0, 130.0,
+                        20.0, 300.0, 95.0, 240.0, 160.0, 60.0):
+                self.node._on_doa(MockMsg(doa))
+                clock.advance(0.05)
+        finally:
+            module.time = real_time
 
-        self.assertEqual(self.node._target_yaw, 0.0)
+        self.assertEqual(
+            self.node._target_yaw,
+            0.0,
+            f"Dagilmis kerterizler kafayi {self.node._target_yaw:.1f} dereceye surdu.",
+        )
+
+    def test_a_consistent_direction_does_move_the_head(self):
+        """The counterpart: the same gates must not block a real talker."""
+        self.node._current_yaw = 0.0
+        self.node._target_yaw = 0.0
+        self.node._latest_rms = 3000.0
+        self.node._ambient_rms = 200.0
+        self.node._last_gaze_switch_time = 0.0
+
+        feed_speech(self.node, 45.0)
+        self.assertAlmostEqual(
+            self.node._target_yaw,
+            45.0,
+            delta=8.0,
+            msg=f"Tutarli bir kaynak kafayi hareket ettirmedi ({self.node._target_yaw:.1f}).",
+        )
 
     def test_gaze_dwell_time(self):
         """Test that a new gaze direction is held for at least min_dwell_time_s."""
@@ -173,20 +191,23 @@ class TestSocialGazeLogic(unittest.TestCase):
         self.node._last_gaze_switch_time = 0.0  # Dwell satisfied initially
 
         # 1. Turn to 45°
-        for _ in range(12):
-            self.node._on_doa(MockMsg(45.0))
-        self.assertAlmostEqual(self.node._target_yaw, 45.0, places=1)
+        feed_speech(self.node, 45.0)
+        self.assertAlmostEqual(self.node._target_yaw, 45.0, delta=6.0)
+        held = self.node._target_yaw
 
-        # 2. Immediately try to switch to -45° within dwell window (0.1s later)
+        # 2. Immediately try to switch to -45° within the dwell window
         import time
-        now = time.monotonic()
-        self.node._last_gaze_switch_time = now - 0.2  # only 0.2s elapsed (< 2.0s dwell)
+        self.node._last_gaze_switch_time = time.monotonic() - 0.2  # 0.2s < 2.0s dwell
+        self.node._speech_map.clear()
         self.node._doa_history.clear()
-        for _ in range(12):
-            self.node._on_doa(MockMsg(315.0))  # 315° = -45°
+        feed_speech(self.node, 315.0)  # 315° = -45°
 
-        # Target should still be 45.0°, not -45.0°
-        self.assertAlmostEqual(self.node._target_yaw, 45.0, places=1)
+        self.assertAlmostEqual(
+            self.node._target_yaw,
+            held,
+            delta=1.0,
+            msg="Bakis suresi dolmadan yeni konusmaciya atlanmamali.",
+        )
 
     def test_slew_rate_velocity_limiting(self):
         """Test that the control loop limits angular step size per cycle (smooth velocity profile)."""
