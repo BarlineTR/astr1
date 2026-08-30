@@ -444,8 +444,9 @@ class ActionManager:
 
             # 3. Acoustic Orientation
             # Steer head motor toward sound source via central arbitration in head_tracker_node
-            dir_str = "right" if azimuth > 0 else "left"
-            target_clamped = float(max(-70.0, min(70.0, azimuth)))
+            dir_str = "left" if azimuth > 0 else "right"
+            # Coarse acoustic sweep capped at +/-50° (ensures 72° HFOV camera encompasses speaker without overshooting)
+            target_clamped = float(max(-50.0, min(50.0, azimuth)))
 
             pub_target_yaw = self._pub_head_target_yaw or getattr(self._node, "pub_head_target_yaw", None)
             if pub_target_yaw:

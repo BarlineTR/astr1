@@ -393,12 +393,12 @@ class HeadTrackerNode(Node):
             self._filtered_target_yaw = clamped_yaw
             self._turn_to_sound_active = True
             self._turn_to_sound_start_time = now
-            self._turn_to_sound_timeout_s = 15.0  # Explicit manual command stays locked for 15s
+            self._turn_to_sound_timeout_s = 2.5  # Initial acoustic orientation lock (2.5s), then hands over to vision
             self._last_speech_time = now
             self._last_gaze_switch_time = now
             self._doa_history.clear()
             self._state = SocialGazeStateMachine.ATTENDING
-            self.get_logger().info(f"🎯 [Arbitration]: turn_to_sound hedefi ayarlandı -> {self._target_yaw:.1f}° (15s kilitlendi)")
+            self.get_logger().info(f"🎯 [Arbitration]: turn_to_sound hedefi ayarlandı -> {self._target_yaw:.1f}° (2.5s kilitlendi)")
 
     def _on_doa(self, msg: Float32):
         """Processes raw acoustic Direction of Arrival from ReSpeaker."""
@@ -701,10 +701,18 @@ class HeadTrackerNode(Node):
             # 3. TURN_TO_SOUND (Explicit sound orientation & manual angle commands)
             elif self._command_source == CommandSource.TURN_TO_SOUND and self._turn_to_sound_active:
                 elapsed_tts = now - self._turn_to_sound_start_time
-                if elapsed_tts >= self._turn_to_sound_timeout_s:
+                vision_acquired = (
+                    self.vision_fusion_enabled
+                    and self._vision_person_detected
+                    and (now - self._vision_last_seen_time) <= self.vision_timeout_s
+                    and elapsed_tts >= 0.6  # Give at least 0.6s for head to slew toward initial acoustic heading
+                )
+                if elapsed_tts >= self._turn_to_sound_timeout_s or vision_acquired:
+                    if vision_acquired:
+                        self.get_logger().info("👁️ [Vision Fusion] turn_to_sound sırasında yüz yakalandı -> Kamera kilitlendi.")
                     self._turn_to_sound_active = False
                     self._command_source = CommandSource.TRACKING
-                    self._state = SocialGazeStateMachine.ENGAGED
+                    self._state = SocialGazeStateMachine.ATTENDING
                     self._last_speech_time = now
                     self._last_gaze_switch_time = now
                 else:
