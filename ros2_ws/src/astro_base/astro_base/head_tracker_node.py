@@ -53,6 +53,9 @@ HEAD_TRACKER_DEFAULTS: dict[str, Any] = {
     "vision_fusion_enabled": True,
     "vision_gain": 0.85,
     "vision_timeout_s": 2.0,
+    # Camera half field of view: the furthest a face can honestly be from where the lens
+    # was pointing, and therefore the cap on what one visual acquisition may command.
+    "vision_max_correction_deg": 36.0,
     # 2D LiDAR radar fusion
     "lidar_fusion_enabled": True,
     "lidar_min_dist_m": 0.4,
@@ -223,6 +226,7 @@ class HeadTrackerNode(Node):
         # OAK-D Lite vision fusion
         self.vision_fusion_enabled = bool(_get_val("vision_fusion_enabled"))
         self.vision_gain = float(_get_val("vision_gain"))
+        self.vision_max_correction_deg = float(_get_val("vision_max_correction_deg"))
         self.vision_timeout_s = float(_get_val("vision_timeout_s"))
         # 2D LiDAR Radar tracking fusion
         self.lidar_fusion_enabled = bool(_get_val("lidar_fusion_enabled"))
@@ -295,6 +299,9 @@ class HeadTrackerNode(Node):
         # OAK-D Lite vision state
         self._vision_person_detected = False
         self._vision_head_yaw = 0.0          # Relative camera yaw: negative=left of frame, positive=right
+        self._vision_ref_yaw = 0.0           # Head angle the pending measurement was taken from
+        self._vision_anchor_yaw = 0.0        # Head angle this servo "budget" started from
+        self._vision_last_applied_yaw = None # Bearing that produced the last correction
         self._vision_yaw_pending = False     # True only while a fresh measurement awaits servoing
         self._vision_last_seen_time = 0.0    # monotonic time of last person_detected=True
 
@@ -667,6 +674,8 @@ class HeadTrackerNode(Node):
             if self._vision_person_detected:
                 self._vision_last_seen_time = time.monotonic()
                 if not was_detected:
+                    self._vision_anchor_yaw = self._commanded_head_yaw()
+                    self._vision_last_applied_yaw = None
                     self.get_logger().info("👁️ [Vision Fusion] Yüz tespit edildi — Kamera yönelimi aktif")
 
     def _on_vision_head_yaw(self, msg: Float32):
@@ -675,6 +684,11 @@ class HeadTrackerNode(Node):
             return
         with self._lock:
             self._vision_head_yaw = float(msg.data)
+            # Where the neck was pointing when this bearing was measured. The correction
+            # is anchored here rather than on the running target, so replaying a stale
+            # measurement keeps describing the same spot in the room instead of walking
+            # the head another step every time -- see _control_loop's vision branch.
+            self._vision_ref_yaw = self._commanded_head_yaw()
             self._vision_yaw_pending = True
 
     def _on_vision_faces(self, msg: String):
@@ -827,11 +841,40 @@ class HeadTrackerNode(Node):
                     if self._vision_yaw_pending and abs(self._vision_head_yaw) >= 1.5:
                         self._vision_yaw_pending = False
                         
-                        # Saccadic tracking: Only update the target if the head has physically settled from the last command.
-                        # This prevents integral windup (adding error to a moving baseline) without needing encoder feedback.
+                        # Saccadic tracking: only act once the head has settled from the
+                        # last command, so the bearing being applied is not one measured
+                        # mid-flight.
                         if (now - self._last_motion_cmd_time) > self.head_motion_settle_s:
-                            desired_yaw = self._target_yaw + (self.vision_gain * self._vision_head_yaw)
-                            self._target_yaw = max(self.min_yaw_deg, min(self.max_yaw_deg, desired_yaw))
+                            # Anchored on the pose the bearing was measured from, not on
+                            # the running target. Adding to the target integrates instead
+                            # of correcting: the face detector replays its last bounding
+                            # box for several frames after a dropout, and each replay used
+                            # to push the neck another gain*bearing further, walking it to
+                            # the travel limit on a single acquisition. Anchored, the same
+                            # measurement always resolves to the same place in the room.
+                            bearing = self._vision_head_yaw
+                            last = self._vision_last_applied_yaw
+
+                            # The error falling means the corrections are landing, so the
+                            # servo has earned a fresh budget from where it now points.
+                            if last is None or abs(bearing) < abs(last) - 2.0:
+                                self._vision_anchor_yaw = self._vision_ref_yaw
+
+                            desired_yaw = self._vision_ref_yaw + (self.vision_gain * bearing)
+
+                            # A face is only ever seen inside the lens, so it cannot lie
+                            # further than half the field of view from where the camera was
+                            # looking. Corrections that never shrink the error are not
+                            # landing -- a replayed bounding box, a frozen stream, a false
+                            # positive -- and without this bound they compound into the
+                            # steady 120 deg sweep to the travel limit seen in the field.
+                            budget = self.vision_max_correction_deg
+                            overshoot = angular_diff_deg(desired_yaw, self._vision_anchor_yaw)
+                            if abs(overshoot) > budget:
+                                desired_yaw = self._vision_anchor_yaw + math.copysign(budget, overshoot)
+
+                            self._vision_last_applied_yaw = bearing
+                            self._target_yaw = max(self.min_yaw_deg, min(self.max_yaw_deg, wrap_deg(desired_yaw)))
                 elif self._vision_person_detected and (now - self._vision_last_seen_time) > self.vision_timeout_s:
                     self._vision_person_detected = False
                     self.get_logger().info("👁️ [Vision Fusion] Yüz kayboldu — DOA / LiDAR takibine dönülüyor")

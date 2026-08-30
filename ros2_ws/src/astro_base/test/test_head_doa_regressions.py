@@ -336,6 +336,76 @@ class TestHeadPoseReference(unittest.TestCase):
         )
 
 
+class TestVisualServoingIsBounded(unittest.TestCase):
+    """A face inside a 72 deg field of view can never justify walking the neck 120 deg."""
+
+    CAMERA_HALF_FOV_DEG = 36.0
+
+    def _run_with_stale_face(self, camera_azimuth_deg: float, seconds: float = 8.0):
+        """The detector replays its last bounding box for a few frames when it drops a
+        face (face_detector_node._last_known_face), so the same camera azimuth arrives
+        over and over. Re-applying it must not walk the head any further each time."""
+        import astro_base.head_tracker_node as H
+
+        clock = FakeClock()
+        real_time = H.time
+        H.time = clock
+        try:
+            node = make_node()
+            node.vision_fusion_enabled = True
+            node._vision_person_detected = True
+            node._vision_last_seen_time = clock.monotonic()
+            node.head_motion_settle_s = 0.0
+            node._vad_active = False  # vision alone drives the head here
+            node._last_update_time = clock.monotonic()
+            node._last_speech_time = clock.monotonic()
+
+            targets = []
+            for _ in range(int(seconds * 20)):
+                node._vision_last_seen_time = clock.monotonic()
+                node._last_speech_time = clock.monotonic()
+                node._on_vision_head_yaw(MockMsg(camera_azimuth_deg))
+                node._control_loop()
+                clock.advance(0.05)
+                targets.append(node._target_yaw)
+
+            return node, targets
+        finally:
+            H.time = real_time
+
+    def test_one_face_bearing_cannot_walk_the_neck_past_the_field_of_view(self):
+        """Measured as distance travelled, not as final angle: with the head free to turn
+        a full circle a runaway can wrap right back past its starting point and look
+        innocent at the last sample -- which is exactly what the operator saw."""
+        _, targets = self._run_with_stale_face(15.8)
+        travelled = sum(
+            abs(angular_diff_deg(b, a)) for a, b in zip(targets, targets[1:])
+        )
+        self.assertLessEqual(
+            travelled,
+            self.CAMERA_HALF_FOV_DEG + 1.0,
+            f"Tek bir yuz tespitinden kafa {travelled:.0f} derece yol katetti. Kamera "
+            "sadece +-36 deg goruyor, yani yuz en fazla 36 deg otede olabilir; bunun "
+            "otesi duzeltmelerin ust uste toplanmasidir (windup), gercek bir hata degil.",
+        )
+
+    def test_an_error_that_never_shrinks_stops_driving_the_head(self):
+        """A working proportional servo sees its error fall as the head turns. When the
+        bearing keeps coming back unchanged the corrections are not landing, so they must
+        stop rather than accumulate."""
+        _, targets = self._run_with_stale_face(15.8, seconds=12.0)
+        tail = targets[-100:]  # last 5 seconds of identical measurements
+        drift = max(tail) - min(tail)
+
+        self.assertLessEqual(
+            drift,
+            0.5,
+            f"Son 5 saniyede hedef hala {drift:.1f} derece yurudu (kuyruk: "
+            f"{tail[0]:.1f} -> {tail[-1]:.1f}). Ayni hata tekrar tekrar gelirken kafayi "
+            "surmeye devam etmek, loglardaki sabit adimli 120 derecelik suzulmenin ta kendisi.",
+        )
+
+
 class TestShortestPathRotation(unittest.TestCase):
     """The neck can turn all the way round, so it must never take the long arc."""
 

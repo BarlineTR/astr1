@@ -89,6 +89,10 @@ class TestHeadYawCentralArbitration(unittest.TestCase):
         self.node._filtered_target_yaw = 0.0
         self.node._last_motion_cmd_time = 0.0
         self.node._vision_yaw_pending = False
+        self.node._vision_ref_yaw = 0.0
+        self.node._vision_anchor_yaw = 0.0
+        self.node._vision_last_applied_yaw = None
+        self.node.vision_max_correction_deg = 36.0
         self.node._state = SocialGazeStateMachine.IDLE
         self.node._command_source = CommandSource.IDLE
 
