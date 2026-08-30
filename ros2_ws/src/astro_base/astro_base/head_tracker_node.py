@@ -741,8 +741,12 @@ class HeadTrackerNode(Node):
                     # Confident visual gaze centering (proportional visual servoing)
                     if self._vision_yaw_pending and abs(self._vision_head_yaw) >= 1.5:
                         self._vision_yaw_pending = False
-                        desired_yaw = self._estimated_yaw + (self.vision_gain * self._vision_head_yaw)
-                        self._target_yaw = max(self.min_yaw_deg, min(self.max_yaw_deg, desired_yaw))
+                        
+                        # Saccadic tracking: Only update the target if the head has physically settled from the last command.
+                        # This prevents integral windup (adding error to a moving baseline) without needing encoder feedback.
+                        if (now - self._last_motion_cmd_time) > self.head_motion_settle_s:
+                            desired_yaw = self._target_yaw + (self.vision_gain * self._vision_head_yaw)
+                            self._target_yaw = max(self.min_yaw_deg, min(self.max_yaw_deg, desired_yaw))
                 elif self._vision_person_detected and (now - self._vision_last_seen_time) > self.vision_timeout_s:
                     self._vision_person_detected = False
                     self.get_logger().info("👁️ [Vision Fusion] Yüz kayboldu — DOA / LiDAR takibine dönülüyor")
@@ -808,23 +812,25 @@ class HeadTrackerNode(Node):
 
         # --- Publish /head_cmd (SINGLE OUTPUT OWNER) ---
         # Microcontroller (Arduino) executes its own 50 Hz PID position controller.
-        # Publish the software-smoothed estimated trajectory directly to Arduino.
-        # This tightly couples the physical head to the software simulation,
-        # preventing visual servoing integral windup and eliminating aggressive PID "ticks".
+        # Publish target yaw setpoint directly on target change (>= 1.0°) or state change.
         last_pub = getattr(self, "_last_published_cmd_yaw", None)
-        
+        is_idle_settled = (state_snapshot == SocialGazeStateMachine.IDLE and abs(target_yaw_snapshot) < 0.1)
+
         should_publish = False
-        if last_pub is None or abs(commanded_yaw_to_send - last_pub) >= 0.5:
-            should_publish = True
-            # Force publish exactly 0.0 when settled to ensure perfect homing
-            if self._state == SocialGazeStateMachine.IDLE and abs(self._target_yaw) < 0.1 and abs(commanded_yaw_to_send) < 0.5:
-                commanded_yaw_to_send = 0.0
+        if is_idle_settled:
+            # Send settling 0° command once when returning to idle
+            if last_pub is None or abs(last_pub) >= 0.5:
+                should_publish = True
+        else:
+            # Publish on target change >= 1.0°
+            if last_pub is None or abs(target_yaw_snapshot - last_pub) >= 1.0:
+                should_publish = True
 
         if should_publish:
             cmd = HeadCmd()
-            cmd.angle_deg = float(commanded_yaw_to_send)
+            cmd.angle_deg = float(target_yaw_snapshot)
             self.pub_head_cmd.publish(cmd)
-            self._last_published_cmd_yaw = commanded_yaw_to_send
+            self._last_published_cmd_yaw = target_yaw_snapshot
             self._last_motion_cmd_time = now
 
         # Periodic status telemetry
