@@ -4710,8 +4710,7 @@ class AstroRealtimeNode(Node):
         """multipart/form-data ile /audio/transcriptions çağırır. OpenAI ve Groq aynı şemayı kullanır."""
         boundary = "----AstroBoundary" + os.urandom(16).hex()
         body = bytearray()
-        for field, value in (("model", model), ("language", "tr"),
-                             ("prompt", "Astro Türkçe konuşma, diyalog, robot asistan.")):
+        for field, value in (("model", model), ("language", "tr")):
             body.extend(f"--{boundary}\r\n".encode())
             body.extend(f'Content-Disposition: form-data; name="{field}"\r\n\r\n'.encode())
             body.extend(value.encode("utf-8"))
@@ -4815,10 +4814,6 @@ class AstroRealtimeNode(Node):
             body.extend(f"--{boundary}\r\n".encode())
             body.extend(b'Content-Disposition: form-data; name="language"\r\n\r\n')
             body.extend(b'tr\r\n')
-            body.extend(f"--{boundary}\r\n".encode())
-            body.extend(b'Content-Disposition: form-data; name="prompt"\r\n\r\n')
-            body.extend("Astro Türkçe konuşma, diyalog, robot asistan.".encode("utf-8"))
-            body.extend(b'\r\n')
             body.extend(f"--{boundary}--\r\n".encode())
 
             req = urllib.request.Request(
