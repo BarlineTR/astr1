@@ -86,6 +86,7 @@ head_tracker_node:
     min_rms_threshold: 1600.0       # 1600 (arka plan gürültü bağışıklığı)
     noise_multiplier: 3.0           # 3.0 (adaptif gürültü eşiği)
     head_motion_settle_s: 0.5       # 0.5s (kafa durduktan sonra motor gürültüsünün dinmesini bekle)
+    vision_gain: 0.85               # 0.85 (kamera hedefi merkezleme hızı/oranı)
     consensus_window_size: 7
     consensus_threshold: 5
     consensus_tolerance_deg: 22.0  # 180°/0° cluster bölünmesini engelleme

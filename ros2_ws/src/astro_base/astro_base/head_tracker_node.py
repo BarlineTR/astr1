@@ -46,8 +46,8 @@ HEAD_TRACKER_DEFAULTS: dict[str, Any] = {
     "consensus_tolerance_deg": 22.0,
     # OAK-D Lite vision fusion
     "vision_fusion_enabled": True,
-    "vision_gain": 0.35,
-    "vision_timeout_s": 3.0,
+    "vision_gain": 0.85,
+    "vision_timeout_s": 2.0,
     # 2D LiDAR radar fusion
     "lidar_fusion_enabled": True,
     "lidar_min_dist_m": 0.4,
@@ -738,8 +738,8 @@ class HeadTrackerNode(Node):
                 if vision_active:
                     self._last_speech_time = now  # prevent idle return while face is visible
                     self._state = SocialGazeStateMachine.ATTENDING
-                    # Smooth visual gaze centering (proportional visual servoing)
-                    if self._vision_yaw_pending and abs(self._vision_head_yaw) >= 4.0:
+                    # Confident visual gaze centering (proportional visual servoing)
+                    if self._vision_yaw_pending and abs(self._vision_head_yaw) >= 1.5:
                         self._vision_yaw_pending = False
                         desired_yaw = self._estimated_yaw + (self.vision_gain * self._vision_head_yaw)
                         self._target_yaw = max(self.min_yaw_deg, min(self.max_yaw_deg, desired_yaw))
