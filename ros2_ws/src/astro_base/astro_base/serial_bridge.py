@@ -183,7 +183,7 @@ class SerialBridge(Node):
         self.declare_parameter("wheel_radius_left", 0.06)
         self.declare_parameter("wheel_radius_right", 0.06)
         self.declare_parameter("wheel_separation", 0.26)
-        self.declare_parameter("head_angle_scale", -1.0)
+        self.declare_parameter("head_angle_scale", 1.0)
 
         self.port_param = self.get_parameter("port").get_parameter_value().string_value
         env_baud = os.getenv("ASTRO_SERIAL_BAUD")

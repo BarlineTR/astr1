@@ -8,7 +8,7 @@
     ticks_per_rev_right: 2048.0
     wheel_radius_left: 0.06
     wheel_radius_right: 0.06
-    head_angle_scale: -1.0  # ROS REP-103 (+Left / -Right) -> Arduino motor polaritesi eşlemesi (-1.0)
+    head_angle_scale: 1.0  # Polarity fixed: ROS (+Left) -> Arduino (+Left)
 
 rplidar_node:
   ros__parameters:
