@@ -42,6 +42,9 @@ except ImportError:
 LAUNCH_FILE = os.path.join(
     repo_root, "ros2_ws", "src", "astro_bringup", "launch", "base.launch.py"
 )
+FIRMWARE_FILE = os.path.join(
+    repo_root, "arduino", "astro_firmware", "src", "main.cpp"
+)
 PARAMS_FILE = os.path.join(
     repo_root, "ros2_ws", "src", "astro_bringup", "config", "astro_params.yaml"
 )
@@ -191,6 +194,213 @@ class TestVisionServoing(unittest.TestCase):
             5.0,
             f"Bayat gorsel olcum hedefi {node._target_yaw:.1f} dereceye tasidi; "
             f"tek olcum her dongude yeniden uygulaniyor.",
+        )
+
+
+class FakeClock:
+    """Deterministic monotonic clock so a whole tracking session runs in microseconds."""
+
+    def __init__(self, start: float = 1000.0):
+        self.t = start
+
+    def monotonic(self) -> float:
+        return self.t
+
+    def advance(self, seconds: float) -> None:
+        self.t += seconds
+
+
+def run_tracking_session(speaker_body_deg: float, seconds: float = 25.0):
+    """Simulate a person standing still at a fixed BODY angle while the head tracks them.
+
+    The mic array is bolted to head_link (URDF mic_joint), so what /doa reports is the
+    bearing RELATIVE TO THE HEAD, not to the robot body. This helper reproduces that
+    geometry honestly: every tick it recomputes the bearing from wherever the head
+    currently points.
+    """
+    import astro_base.head_tracker_node as H  # already imported; grab the module object
+
+    clock = FakeClock()
+    real_time = H.time
+    H.time = clock
+    try:
+        node = make_node()
+        node.head_motion_settle_s = 0.0  # isolate the frame question from the noise gate
+        node._last_update_time = clock.monotonic()
+        node._last_speech_time = clock.monotonic()
+        node._last_gaze_switch_time = 0.0
+
+        trajectory = []
+        for _ in range(int(seconds * 20)):
+            # The Arduino runs its own position PID on whatever setpoint /head_cmd last
+            # carried, so that value -- not the software slew trajectory -- is where the
+            # neck actually is.
+            head = getattr(node, "_last_published_cmd_yaw", None) or 0.0
+            relative = angular_diff_deg(speaker_body_deg, head)
+            raw_doa = (-relative) % 360.0  # ReSpeaker counts clockwise; doa_invert undoes it
+            node._on_doa(MockMsg(raw_doa))
+            node._control_loop()
+            clock.advance(0.05)
+            node._last_speech_time = clock.monotonic()
+            trajectory.append(getattr(node, "_last_published_cmd_yaw", None) or 0.0)
+
+        return node, trajectory
+    finally:
+        H.time = real_time
+
+
+def worst_settled_error(speaker_body_deg: float, trajectory, tail_seconds: float = 6.0):
+    """Largest pointing error over the tail of the run.
+
+    Checking only the final sample would let an oscillating head pass whenever the run
+    happens to end on a favourable tick, so measure the whole settled window instead.
+    """
+    tail = trajectory[-int(tail_seconds * 20):]
+    return max(abs(angular_diff_deg(speaker_body_deg, yaw)) for yaw in tail)
+
+
+class TestHeadActuallyFacesTheSpeaker(unittest.TestCase):
+    """The mic rides on the head, so DOA is head-relative and must be composed, not assigned."""
+
+    def test_head_settles_facing_a_stationary_speaker(self):
+        speaker = 60.0
+        node, traj = run_tracking_session(speaker)
+        residual = worst_settled_error(speaker, traj)
+        self.assertLessEqual(
+            residual,
+            node.deadband_deg,
+            f"Kafa konusmaciya yerlesmedi: son 6 saniyede en kotu hata {residual:.1f} deg "
+            f"(konusmaci={speaker:.1f} deg). "
+            "Mikrofon head_link'e bagli oldugu icin DOA basa GORE olcum; mutlak "
+            "govde acisi gibi atanirsa dongu yakinsamaz.",
+        )
+
+    def test_head_does_not_oscillate_once_it_has_found_the_speaker(self):
+        """Assigning a head-relative bearing as an absolute target makes the head swing
+        back to 0 the moment it arrives, then out again, forever."""
+        speaker = -40.0
+        node, traj = run_tracking_session(speaker, seconds=30.0)
+        tail = traj[-120:]
+        swing = max(tail) - min(tail)
+        self.assertLessEqual(
+            swing,
+            node.deadband_deg,
+            f"Kafa yerlestikten sonra hala {swing:.1f} deg genlikte gidip geliyor. "
+            "Hedefe varinca DOA 0 okuyor, 0 mutlak hedef sanilip kafa one donuyor, "
+            "sonra ses yine yandan geliyor -> sonsuz salinim.",
+        )
+
+    def test_speaker_behind_the_robot_is_reachable(self):
+        speaker = 150.0
+        node, traj = run_tracking_session(speaker, seconds=30.0)
+        residual = worst_settled_error(speaker, traj)
+        self.assertLessEqual(
+            residual,
+            node.deadband_deg,
+            f"Arkadaki kaynak icin {residual:.1f} deg hata kaldi; boyun hareket "
+            "sinirlari kafanin arkaya donmesine izin vermiyor.",
+        )
+
+    def test_turn_to_sound_bearing_is_relative_to_where_the_head_points(self):
+        """/head/target_yaw carries a DOA-derived bearing, which is head-relative too."""
+        node = make_node()
+        node._estimated_yaw = 30.0
+        node._target_yaw = 30.0
+        node._on_target_yaw_cmd(MockMsg(20.0))  # "ses 20 deg solumda" (basa gore)
+        self.assertAlmostEqual(
+            node._target_yaw,
+            50.0,
+            delta=1.0,
+            msg="Kafa 30 deg'de iken basa gore +20 deg gelen ses, govdede +50 deg'dedir. "
+            "Dogrudan 20 deg'e gitmek kafayi kaynagin gerisinde birakir.",
+        )
+
+
+class TestHeadPoseReference(unittest.TestCase):
+    """Composing a relative bearing needs the pose the FIRMWARE holds, not the software one."""
+
+    def test_bearing_is_composed_onto_the_angle_the_arduino_was_given(self):
+        node = make_node()
+        # /head_cmd carries the full setpoint, so the Arduino PID is already driving to
+        # 60 deg while the node's own slew trajectory is still crawling through 10 deg.
+        node._last_published_cmd_yaw = 60.0
+        node._estimated_yaw = 10.0
+
+        self.assertAlmostEqual(
+            node._acoustic_bearing_to_body_yaw(20.0),
+            80.0,
+            delta=0.5,
+            msg="Kafa 60 deg'e surulurken basa gore +20 deg gelen ses govdede +80 deg'dedir. "
+            "Yazilim yorungesi (_estimated_yaw) firmware'in gerisinde kaldigi icin ona "
+            "eklemek gecici olarak yanlis hedef uretir.",
+        )
+
+
+class TestShortestPathRotation(unittest.TestCase):
+    """The neck can turn all the way round, so it must never take the long arc."""
+
+    def test_slew_crosses_the_180_seam_by_the_short_arc(self):
+        import astro_base.head_tracker_node as H
+
+        clock = FakeClock()
+        real_time = H.time
+        H.time = clock
+        try:
+            node = make_node()
+            node._estimated_yaw = 170.0
+            node._target_yaw = -170.0  # 20 deg the short way, 340 deg the long way
+            node._last_update_time = clock.monotonic()
+            node._last_speech_time = clock.monotonic()
+
+            path = [node._estimated_yaw]
+            for _ in range(80):
+                node._control_loop()
+                clock.advance(0.05)
+                node._last_speech_time = clock.monotonic()
+                path.append(node._estimated_yaw)
+
+            travelled = sum(
+                abs(angular_diff_deg(b, a)) for a, b in zip(path, path[1:])
+            )
+        finally:
+            H.time = real_time
+
+        self.assertLessEqual(
+            travelled,
+            40.0,
+            f"Kafa 170 deg -> -170 deg icin {travelled:.0f} deg yol katetti; kisa yol 20 deg. "
+            "err = target - estimated cikarmasi sarmali degil, bu yuzden uzun yoldan gidiyor.",
+        )
+
+    def test_ros_travel_limit_never_exceeds_the_firmware_limit(self):
+        """If ROS commands past the firmware clamp, the firmware silently truncates and
+        the node's dead-reckoned head angle drifts away from reality for good."""
+        fw = open(FIRMWARE_FILE, encoding="utf-8").read()
+        m = re.search(r"HEAD_MAX_DEG\s*=\s*([0-9.]+)f", fw)
+        self.assertIsNotNone(m, "main.cpp icinde HEAD_MAX_DEG bulunamadi")
+        firmware_max = float(m.group(1))
+
+        params_src = open(PARAMS_FILE, encoding="utf-8").read()
+        m2 = re.search(r"^\s+max_yaw_deg:\s*([0-9.]+)", params_src, re.M)
+        self.assertIsNotNone(m2, "astro_params.yaml icinde max_yaw_deg yok")
+        ros_max = float(m2.group(1))
+
+        self.assertLessEqual(
+            ros_max,
+            firmware_max,
+            f"ROS {ros_max} deg'e kadar komut veriyor ama firmware {firmware_max} deg'de "
+            "kirpiyor; aradaki fark kalici acisal kayma olarak birikir.",
+        )
+
+    def test_full_circle_is_available_so_a_rear_source_needs_no_front_sweep(self):
+        params_src = open(PARAMS_FILE, encoding="utf-8").read()
+        m = re.search(r"^\s+max_yaw_deg:\s*([0-9.]+)", params_src, re.M)
+        self.assertIsNotNone(m)
+        self.assertGreaterEqual(
+            float(m.group(1)),
+            180.0,
+            "Boyun +-180 deg donemezse arkadaki kaynaga ancak onden 140 deg suzulerek "
+            "yaklasilir; kullanicinin gordugu 'uzun yoldan gecme' davranisi budur.",
         )
 
 

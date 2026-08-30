@@ -34,9 +34,24 @@ static constexpr float PID_INTEGRAL_LIMIT = 50.0f; // ✅ FIX: Daha dar anti-win
 // Kalibre Edildi: 440 tick / 170 derece = 2.588 tick/derece (14.667 * 0.17647)
 static constexpr float HEAD_TICKS_PER_DEG = 2.588f;
 
-// Yazılımsal açı limitleri (limit switch yok; açılıştaki konum 0° kabul edilir)
-static constexpr float HEAD_MIN_DEG = -90.0f;
-static constexpr float HEAD_MAX_DEG =  90.0f;
+// Yazılımsal açı limitleri (limit switch yok; açılıştaki konum 0° kabul edilir).
+//
+// Boyun mekanik olarak tam tur dönebildiği için ±180° serbest bırakıldı: arkadaki bir
+// ses kaynağına kısa yaydan ulaşılabilmesi tüm çemberin erişilebilir olmasını gerektirir.
+// ±180 burada bir mekanik dayanak değil, sadece açının yazılış biçimindeki dikiştir; bu
+// yüzden HEAD_CONTINUOUS_ROTATION açıkken konum hatası bir tam tur modunda sarılır ve
+// ROS +179° -> -179° setpoint gönderdiğinde motor 358° geri sarmak yerine 2° kısa
+// yaydan gider.
+//
+// ROS tarafı aynı sınırları kullanır (astro_params.yaml: max_yaw_deg / min_yaw_deg).
+// İkisi ayrışırsa firmware sessizce kırpar ve ROS'un ölü-hesap açısı kalıcı olarak kayar.
+// Kablo demeti tam turu kaldırmıyorsa değiştirilecek TEK yer burasıdır: sınırları daralt
+// ve HEAD_CONTINUOUS_ROTATION'ı false yap — YAML'daki eşleniğiyle birlikte.
+static constexpr float HEAD_MIN_DEG = -180.0f;
+static constexpr float HEAD_MAX_DEG =  180.0f;
+static constexpr bool  HEAD_CONTINUOUS_ROTATION = true;
+static constexpr int32_t HEAD_TICKS_PER_REV =
+    (int32_t)(360.0f * HEAD_TICKS_PER_DEG + 0.5f);
 
 // Kafa motoru PWM limitleri ve statik sürtünme eşiği
 static constexpr int HEAD_PWM_LIMIT = 150;
@@ -184,6 +199,12 @@ void publishDiag(uint16_t vbat_mV, int16_t temp_cX100, uint32_t flags) {
 void headControl(uint32_t dt_ms) {
   int32_t pos = readTicks(g_head_ticks);
   int32_t err = g_head_target_ticks - pos;
+
+  // Kisa yay: hata yarim turu asiyorsa diger yonden gitmek daha kisadir.
+  if (HEAD_CONTINUOUS_ROTATION) {
+    while (err >  HEAD_TICKS_PER_REV / 2) err -= HEAD_TICKS_PER_REV;
+    while (err < -HEAD_TICKS_PER_REV / 2) err += HEAD_TICKS_PER_REV;
+  }
 
   if (!g_motors_enabled) {
     setHeadPWM(0);

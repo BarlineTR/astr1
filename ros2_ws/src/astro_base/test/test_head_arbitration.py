@@ -62,6 +62,8 @@ class TestHeadYawCentralArbitration(unittest.TestCase):
         self.node.doa_invert = False
         self.node.max_yaw_deg = 70.0
         self.node.min_yaw_deg = -70.0
+        # This fixture pins a narrow neck range, so the seam-crossing shortcut is off.
+        self.node._full_circle_travel = False
         self.node.deadband_deg = 12.0
         self.node.min_dwell_time_s = 3.0
         self.node.idle_return_timeout_s = 10.0

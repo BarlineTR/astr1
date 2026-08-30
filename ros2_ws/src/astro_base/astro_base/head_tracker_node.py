@@ -32,9 +32,14 @@ HEAD_TRACKER_DEFAULTS: dict[str, Any] = {
     "enabled": True,
     "doa_offset_deg": 0.0,
     "doa_invert": True,
-    "max_yaw_deg": 70.0,
-    "min_yaw_deg": -70.0,
-    "deadband_deg": 16.0,
+    # Full circle: the neck turns freely, and clipping the range is what forced a rear
+    # source to be approached by a 140 deg sweep across the front (the "long way round").
+    # Must stay <= the firmware's HEAD_MIN_DEG/HEAD_MAX_DEG in arduino/astro_firmware.
+    "max_yaw_deg": 180.0,
+    "min_yaw_deg": -180.0,
+    # Small enough that the head actually ends up facing the talker rather than parked
+    # up to 16 deg off them; large enough to sit still under ReSpeaker's coarse DOA.
+    "deadband_deg": 8.0,
     "min_dwell_time_s": 3.5,
     "idle_return_timeout_s": 30.0,
     "max_speed_deg_s": 45.0,
@@ -131,6 +136,11 @@ def angular_diff_deg(a: float, b: float) -> float:
     return diff
 
 
+def wrap_deg(angle: float) -> float:
+    """Folds any angle into (-180, +180], the range every head target lives in."""
+    return (angle + 180.0) % 360.0 - 180.0
+
+
 class SocialGazeStateMachine:
     """Manages social gaze states: IDLE, ATTENDING, ENGAGED, RETURNING."""
     IDLE = "IDLE"
@@ -197,6 +207,8 @@ class HeadTrackerNode(Node):
         self.doa_invert = bool(_get_val("doa_invert"))
         self.max_yaw_deg = float(_get_val("max_yaw_deg"))
         self.min_yaw_deg = float(_get_val("min_yaw_deg"))
+        # A band covering the whole circle means there is no mechanical stop to respect.
+        self._full_circle_travel = (self.max_yaw_deg - self.min_yaw_deg) >= 359.9
         self.deadband_deg = float(_get_val("deadband_deg"))
         self.min_dwell_time_s = float(_get_val("min_dwell_time_s"))
         self.idle_return_timeout_s = float(_get_val("idle_return_timeout_s"))
@@ -304,6 +316,67 @@ class HeadTrackerNode(Node):
             f"Maks Hız: {self.max_speed_deg_s}°/s | Deadband: {self.deadband_deg}° | Dwell: {self.min_dwell_time_s}s"
         )
 
+    def _acoustic_bearing_to_body_yaw(self, relative_deg: float) -> float:
+        """Turns a head-relative acoustic bearing into an absolute body-frame yaw target.
+
+        The mic array is rigidly attached to head_link (URDF mic_joint), so it turns with
+        the head and reports where the talker is relative to the FACE, not to the body.
+        Assigning that number straight to _target_yaw makes the loop chase its own tail:
+        the head swings out to the bearing, the array then reads ~0 because it is pointing
+        at the talker, 0 is taken as "face forward", the head returns to centre, and the
+        cycle repeats. Adding the bearing to where the head already points gives a fixed
+        point at the talker's true body angle, which is what actually converges.
+
+        The base is the angle last written to /head_cmd, because that is the setpoint the
+        Arduino's own position PID is driving to. _estimated_yaw is only the node's slew
+        trajectory towards it and lags the real neck by seconds on a large move, so
+        composing onto it produces a wrong target for the whole flight.
+        """
+        return wrap_deg(self._commanded_head_yaw() + relative_deg)
+
+    def _commanded_head_yaw(self) -> float:
+        """Best available statement of where the neck is: the last setpoint sent out.
+
+        There is no encoder feedback -- the firmware prints its head ticks only to its
+        Serial2 debug port -- so the commanded angle is as close to ground truth as this
+        node can get. Streaming those ticks back would make it exact.
+        """
+        last = getattr(self, "_last_published_cmd_yaw", None)
+        return float(last) if last is not None else float(self._estimated_yaw)
+
+    def _shortest_reachable_arc(self, target_yaw: float, current_yaw: float) -> float:
+        """Signed rotation to get from current_yaw to target_yaw the short way.
+
+        A plain subtraction sends the neck 340 deg around the houses whenever the two
+        angles sit either side of the +-180 seam, which is the "goes the long way" the
+        operator sees. The wrapped difference is the short arc; it is only unusable when
+        it would run past a mechanical limit, and then the long arc is the one that fits.
+        On a range-limited neck the result therefore always stays inside
+        [min_yaw_deg, max_yaw_deg], so the angle handed to the firmware never jumps and
+        its dead-reckoned zero keeps its meaning.
+        """
+        short = angular_diff_deg(target_yaw, current_yaw)
+
+        if self._full_circle_travel:
+            # +-180 is a seam in how the angle is written down, not a mechanical stop.
+            # With the whole circle reachable the short arc is always the right one, and
+            # _estimated_yaw is re-wrapped after the step so it stays in (-180, +180].
+            # This only holds because the firmware wraps its position error too
+            # (HEAD_CONTINUOUS_ROTATION in arduino/astro_firmware/src/main.cpp); without
+            # that, a +179 -> -179 setpoint would be executed as 358 deg the wrong way.
+            return short
+
+        if self.min_yaw_deg <= current_yaw + short <= self.max_yaw_deg:
+            return short
+
+        long_way = short - math.copysign(360.0, short) if short != 0.0 else 0.0
+        if self.min_yaw_deg <= current_yaw + long_way <= self.max_yaw_deg:
+            return long_way
+
+        # Neither arc lands inside the band: aim at the closer limit.
+        clamped = max(self.min_yaw_deg, min(self.max_yaw_deg, current_yaw + short))
+        return clamped - current_yaw
+
     def _head_in_motion(self, now: float) -> bool:
         """True for a bounded window after the neck was last commanded to move.
 
@@ -380,10 +453,17 @@ class HeadTrackerNode(Node):
                 )
 
     def _on_target_yaw_cmd(self, msg: Float32):
+        """Handles /head/target_yaw, the explicit "turn to that sound" command.
+
+        Its only publisher is action_manager, which derives the angle from the same
+        ReSpeaker DOA, so the number is a bearing RELATIVE TO THE HEAD and has to be
+        composed onto where the head already points — see _acoustic_bearing_to_body_yaw.
+        """
         now = time.monotonic()
         req_yaw = float(msg.data)
-        clamped_yaw = max(self.min_yaw_deg, min(self.max_yaw_deg, req_yaw))
         with self._lock:
+            body_yaw = self._acoustic_bearing_to_body_yaw(req_yaw)
+            clamped_yaw = max(self.min_yaw_deg, min(self.max_yaw_deg, body_yaw))
             if self._command_source in (CommandSource.SAFETY, CommandSource.GESTURE):
                 self.get_logger().info(f"⏳ [Arbitration]: turn_to_sound ({clamped_yaw:.1f}°) ertelendi / öncelik: {self._command_source}")
                 return
@@ -436,13 +516,18 @@ class HeadTrackerNode(Node):
             if not self._vad_active or self._latest_rms < adaptive_threshold:
                 return
 
-            # Convert to robot body frame yaw angle (clamped to [-70°, +70°] downstream)
-            robot_yaw = doa_to_robot_yaw(raw_doa, offset_deg=self.doa_offset_deg, invert=self.doa_invert)
+            # Bearing of the talker as seen FROM THE HEAD, in REP-103 sense.
+            relative_yaw = doa_to_robot_yaw(raw_doa, offset_deg=self.doa_offset_deg, invert=self.doa_invert)
+
+            # ...then expressed in the robot body frame. Storing the body-frame angle is
+            # also what makes the consensus window meaningful: samples taken while the
+            # neck was at different angles are only comparable once they share a frame.
+            body_yaw = self._acoustic_bearing_to_body_yaw(relative_yaw)
 
             # Record the UNCLAMPED bearing: clamping before the consensus step splits a
             # single source behind the robot into alternating +max/-max samples.
             # Mechanical clamping happens once, after consensus (step 7).
-            self._doa_history.append((now, robot_yaw))
+            self._doa_history.append((now, body_yaw))
             self._last_speech_time = now
 
             # 6. Temporal Consensus Clustering with Angular Wrap-Around Handling
@@ -790,7 +875,7 @@ class HeadTrackerNode(Node):
             )
 
             # --- Smooth Trajectory Generation: Central Slew-Rate Limiting & Soft-Landing ---
-            err = self._target_yaw - self._estimated_yaw
+            err = self._shortest_reachable_arc(self._target_yaw, self._estimated_yaw)
             abs_err = abs(err)
 
             # Soft landing: gradually decelerate when within 15° of target for organic, non-abrupt stopping
@@ -805,6 +890,9 @@ class HeadTrackerNode(Node):
                 self._estimated_yaw = self._target_yaw
             else:
                 self._estimated_yaw += math.copysign(max_step, err)
+
+            if self._full_circle_travel:
+                self._estimated_yaw = wrap_deg(self._estimated_yaw)
 
             commanded_yaw_to_send = self._estimated_yaw
             target_yaw_snapshot = self._target_yaw
