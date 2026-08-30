@@ -37,7 +37,7 @@ HEAD_TRACKER_DEFAULTS: dict[str, Any] = {
     "deadband_deg": 16.0,
     "min_dwell_time_s": 3.5,
     "idle_return_timeout_s": 30.0,
-    "max_speed_deg_s": 16.0,
+    "max_speed_deg_s": 45.0,
     "update_rate_hz": 20.0,
     "min_rms_threshold": 1600.0,
     "noise_multiplier": 3.0,
@@ -808,25 +808,23 @@ class HeadTrackerNode(Node):
 
         # --- Publish /head_cmd (SINGLE OUTPUT OWNER) ---
         # Microcontroller (Arduino) executes its own 50 Hz PID position controller.
-        # Publish target yaw setpoint directly on target change (>= 1.0°) or state change.
+        # Publish the software-smoothed estimated trajectory directly to Arduino.
+        # This tightly couples the physical head to the software simulation,
+        # preventing visual servoing integral windup and eliminating aggressive PID "ticks".
         last_pub = getattr(self, "_last_published_cmd_yaw", None)
-        is_idle_settled = (state_snapshot == SocialGazeStateMachine.IDLE and abs(target_yaw_snapshot) < 0.1)
-
+        
         should_publish = False
-        if is_idle_settled:
-            # Send settling 0° command once when returning to idle
-            if last_pub is None or abs(last_pub) >= 0.5:
-                should_publish = True
-        else:
-            # Publish on target change >= 1.0°
-            if last_pub is None or abs(target_yaw_snapshot - last_pub) >= 1.0:
-                should_publish = True
+        if last_pub is None or abs(commanded_yaw_to_send - last_pub) >= 0.5:
+            should_publish = True
+            # Force publish exactly 0.0 when settled to ensure perfect homing
+            if self._state == SocialGazeStateMachine.IDLE and abs(self._target_yaw) < 0.1 and abs(commanded_yaw_to_send) < 0.5:
+                commanded_yaw_to_send = 0.0
 
         if should_publish:
             cmd = HeadCmd()
-            cmd.angle_deg = float(target_yaw_snapshot)
+            cmd.angle_deg = float(commanded_yaw_to_send)
             self.pub_head_cmd.publish(cmd)
-            self._last_published_cmd_yaw = target_yaw_snapshot
+            self._last_published_cmd_yaw = commanded_yaw_to_send
             self._last_motion_cmd_time = now
 
         # Periodic status telemetry
