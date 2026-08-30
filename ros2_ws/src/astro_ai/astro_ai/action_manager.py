@@ -280,9 +280,16 @@ class ActionManager:
                         is_valid = False
                     else:
                         is_valid = (conf >= self._min_doa_confidence)
+                elif abs(yaw) > 135.0:
+                    # Rear wall reflection / acoustic bounce: only valid if proven with high acoustic energy and active VAD
+                    if not vad_active or cur_rms < 600.0 or energy_ratio < 3.0:
+                        conf = min(conf, 0.30)
+                        is_valid = False
+                    else:
+                        is_valid = (conf >= self._min_doa_confidence)
                 else:
-                    # Temporal clustering / consistency check for non-zero angles
-                    recent = [y for ts, y, _ in self._doa_history if (now - ts) <= 2.0]
+                    # Temporal clustering / consistency check for frontal / lateral angles
+                    recent = [y for ts, y, _ in self._doa_history if (now - ts) <= 2.0 and abs(y) <= 135.0]
                     if len(recent) >= 2:
                         sin_sum = sum(math.sin(math.radians(y)) for y in recent)
                         cos_sum = sum(math.cos(math.radians(y)) for y in recent)
@@ -390,11 +397,19 @@ class ActionManager:
             # 1. DOA / Multimodal User Direction Resolution
             azimuth = None
             confidence = 0.0
-            if sound_dir and sound_dir.valid and sound_dir.confidence >= self._min_doa_confidence:
+
+            # Prefer recent speech consensus (within 4.0s) that is not a rear wall bounce
+            speech_doa = [y for ts, y, cur_rms in self._doa_history if (now - ts) <= 4.0 and 2.0 <= abs(y) <= 135.0 and cur_rms >= 300.0]
+            if speech_doa:
+                sin_s = sum(math.sin(math.radians(y)) for y in speech_doa)
+                cos_s = sum(math.cos(math.radians(y)) for y in speech_doa)
+                azimuth = float(math.degrees(math.atan2(sin_s, cos_s)))
+                confidence = 0.85
+            elif sound_dir and sound_dir.valid and sound_dir.confidence >= self._min_doa_confidence and abs(sound_dir.azimuth_deg) <= 135.0:
                 azimuth = sound_dir.azimuth_deg
                 confidence = sound_dir.confidence
             else:
-                # Fallback: check recent DOA history in action manager using robust circular mean
+                # Secondary fallback: any non-zero history within 5s
                 recent_doa = [y for ts, y, _ in self._doa_history if (now - ts) <= 5.0 and abs(y) >= 2.0]
                 if recent_doa:
                     sin_s = sum(math.sin(math.radians(y)) for y in recent_doa)
