@@ -172,15 +172,22 @@ class HeadCalibrator:
 
 
     def run_multi_point_manual_calibration(self):
-        """Measures raw encoder ticks across multiple physical reference angles and performs linear regression."""
+        """Measures raw encoder ticks across multiple physical reference angles with live interactive tracking."""
         print("\n========================================================")
         print("   MULTI-POINT LARGE-ANGLE ENCODER IDENTIFICATION")
+        print("   (Motor is completely DISABLED. Move head by HAND)")
         print("========================================================")
         print("Instructions:")
         print("1. Set the physical head at TRUE MECHANICAL 0.0° (Center).")
+        
+        # Flush buffer and read live
+        if self.ser: self.ser.reset_input_buffer()
+        time.sleep(0.1)
+        self.read_telemetry()
+        
         input("Press [ENTER] when head is mechanically at 0.0° Center...")
-        self.send_heartbeat()
-        time.sleep(0.2)
+        if self.ser: self.ser.reset_input_buffer()
+        time.sleep(0.1)
         self.read_telemetry()
         zero_ticks = self.raw_head_ticks
         print(f"  -> Baseline 0.0° Reference Ticks = {zero_ticks}\n")
@@ -188,21 +195,29 @@ class HeadCalibrator:
         test_points = [15.0, 30.0, 45.0, 90.0, -15.0, -30.0, -45.0, -90.0]
         recorded_data = [(0.0, 0)]  # (physical_angle, delta_ticks)
 
-        print("For each target angle, manually align the head, then press Enter.")
-        print("(If ±90° is mechanically unsafe for your wiring, you can type 'skip')\n")
+        print("For each target angle, manually rotate the head to the reference angle,")
+        print("verify the ticks on screen, then press [ENTER] to record that point.")
+        print("(Type 's' to skip any angle that is mechanically unreachable)\n")
 
         for angle in test_points:
-            user_in = input(f"Align head to physical {angle:+.1f}° (or 's' to skip) -> press ENTER: ").strip().lower()
+            prompt = f"Align head to physical {angle:+.1f}° -> Press ENTER (or 's' to skip): "
+            sys.stdout.write(prompt)
+            sys.stdout.flush()
+            
+            user_in = input().strip().lower()
             if user_in == 's' or user_in == 'skip':
                 continue
 
-            self.send_heartbeat()
-            time.sleep(0.2)
-            self.read_telemetry()
+            # Flush OS serial buffer to get the absolute freshest packet
+            if self.ser: self.ser.reset_input_buffer()
+            time.sleep(0.08)
+            self.read_telemetry(timeout_s=0.3)
+            
             current_ticks = self.raw_head_ticks
             delta = current_ticks - zero_ticks
             recorded_data.append((angle, delta))
-            print(f"  Recorded: Angle = {angle:+.1f}°, Raw Ticks = {current_ticks}, Delta Ticks = {delta:+d}\n")
+            print(f"  >>> RECORDED: Physical={angle:+.1f}° | Raw={current_ticks:d} | Delta={delta:+d} ticks <<<\n")
+
 
         if len(recorded_data) < 3:
             print("Not enough points recorded for regression.")
@@ -276,25 +291,45 @@ class HeadCalibrator:
         print("========================================================")
         test_angles = [0.0, 2.0, 0.0, -2.0, 0.0, 5.0, 0.0, -5.0, 0.0, 10.0, 0.0, -10.0, 0.0]
 
-        print("\n| ROS cmd | Packet Bytes (Hex) | Arduino Target (Calc) | Encoder Ticks (Read) | Reported Angle | Physical Head Angle (Notes) |")
-        print("|--------:|:------------------:|----------------------:|---------------------:|---------------:|:----------------------------|")
+        print("\n| ROS cmd | Target Ticks | Encoder Before | Encoder After | Encoder Delta | Reported Angle | Status |")
+        print("|--------:|-------------:|---------------:|--------------:|--------------:|---------------:|:-------|")
 
         for angle in test_angles:
-            payload = struct.pack("<f", float(angle))
-            pkt = build_packet(MSG_HEAD_CMD, payload)
+            if self.ser: self.ser.reset_input_buffer()
+            time.sleep(0.05)
+            self.read_telemetry(timeout_s=0.2)
+            enc_before = self.raw_head_ticks
+
+            # Send command
             self.command_angle(angle)
-
-            time.sleep(1.0)
-            self.read_telemetry(timeout_s=0.5)
-
-            ticks = self.raw_head_ticks
-            reported_angle = ticks / 2.5882  # Current configured scale
-            pkt_hex = " ".join(f"{b:02X}" for b in pkt)
             calc_ticks = round(angle * 2.5882)
 
-            print(f"| {angle:+6.1f}° | `{pkt_hex}` | {calc_ticks:21d} | {ticks:20d} | {reported_angle:+13.2f}° |                             |")
+            # Wait for physical settling (poll for 1.5 seconds)
+            settled = False
+            last_val = enc_before
+            stable_count = 0
+            for _ in range(30):
+                time.sleep(0.05)
+                self.read_telemetry(timeout_s=0.1)
+                curr_val = self.raw_head_ticks
+                if curr_val == last_val:
+                    stable_count += 1
+                    if stable_count >= 3:
+                        settled = True
+                        break
+                else:
+                    stable_count = 0
+                    last_val = curr_val
+
+            enc_after = self.raw_head_ticks
+            delta = enc_after - enc_before
+            reported_angle = enc_after / 2.5882
+            status = "SETTLED" if settled else "MOVING/TIMEOUT"
+
+            print(f"| {angle:+6.1f}° | {calc_ticks:12d} | {enc_before:14d} | {enc_after:13d} | {delta:+13d} | {reported_angle:+13.2f}° | {status} |")
 
         print("\nVerification complete.")
+
 
 
 def main():
