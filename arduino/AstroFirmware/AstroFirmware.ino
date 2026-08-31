@@ -38,13 +38,14 @@ static constexpr float KP = 0.6f, KI = 0.2f, KD = 0.0f; // 50 Hz PID için örne
 static constexpr int PWM_MAX = 255;
 static constexpr float PID_INTEGRAL_LIMIT = 50.0f; // ✅ FIX: Daha dar anti-windup limit
 
-// ====== Kafa (BTS7960 + enkoderli DC motor) ======
-// Kalibre Edildi: 440 tick / 170 derece = 2.588 tick/derece (14.667 * 0.17647)
-static constexpr float HEAD_TICKS_PER_DEG = 2.588f;
+// Kalibre Edildi: 366 tick / 270 derece = 1.3556 tick/derece (488 tick / 360 derece)
+static constexpr float HEAD_TICKS_PER_DEG = 1.3556f;
+
 
 // Yazılımsal açı limitleri (limit switch yok; açılıştaki konum 0° kabul edilir)
-static constexpr float HEAD_MIN_DEG = -90.0f;
-static constexpr float HEAD_MAX_DEG =  90.0f;
+static constexpr float HEAD_MIN_DEG = -180.0f;
+static constexpr float HEAD_MAX_DEG =  180.0f;
+
 
 // Kafa motoru PWM limitleri ve statik sürtünme eşiği
 static constexpr int HEAD_PWM_LIMIT = 150;
@@ -124,7 +125,8 @@ inline int32_t readTicks(volatile int32_t& src) {
 
 void leftEncA()  { g_left_ticks  += digitalRead(L_ENC_B)    ? -1 : +1; }
 void rightEncA() { g_right_ticks += digitalRead(R_ENC_B)    ? -1 : +1; }
-void headEncA()  { g_head_ticks  += digitalRead(HEAD_ENC_B) ? -1 : +1; }
+void headEncA()  { bool b = digitalRead(HEAD_ENC_B); g_head_ticks += b ? +1 : -1; }
+
 
 
 void setupIO() {

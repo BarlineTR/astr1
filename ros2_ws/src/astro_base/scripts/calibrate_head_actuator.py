@@ -302,7 +302,7 @@ class HeadCalibrator:
 
             # Send command
             self.command_angle(angle)
-            calc_ticks = round(angle * 2.5882)
+            calc_ticks = round(angle * 1.3556)
 
             # Wait for physical settling (poll for 1.5 seconds)
             settled = False
@@ -323,7 +323,8 @@ class HeadCalibrator:
 
             enc_after = self.raw_head_ticks
             delta = enc_after - enc_before
-            reported_angle = enc_after / 2.5882
+            reported_angle = enc_after / 1.3556
+
             status = "SETTLED" if settled else "MOVING/TIMEOUT"
 
             print(f"| {angle:+6.1f}° | {calc_ticks:12d} | {enc_before:14d} | {enc_after:13d} | {delta:+13d} | {reported_angle:+13.2f}° | {status} |")
