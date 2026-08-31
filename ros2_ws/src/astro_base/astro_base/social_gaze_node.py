@@ -161,20 +161,16 @@ class SocialGazeNode(Node):
         # Actuator command topic
         self.pub_head_cmd_pos = self.create_publisher(Float32, "/head/cmd_pos", 10)
 
-        # Typed Gaze and Head State publishers
+        # Typed Gaze Status publisher
         if GazeStatus is not None:
             self.pub_gaze_state = self.create_publisher(GazeStatus, "/gaze/state", 10)
         else:
             self.pub_gaze_state = None
 
-        if HeadState is not None:
-            self.pub_head_state = self.create_publisher(HeadState, "/head/state", 10)
-        else:
-            self.pub_head_state = None
-
         # Diagnostics & Visualization topics
         self.pub_gaze_debug = self.create_publisher(String, "/gaze/debug", 10)
         self.pub_active_target = self.create_publisher(String, "/gaze/active_target", 10)
+
 
         # Subscriptions
         if HeadState is not None:
@@ -376,24 +372,9 @@ class SocialGazeNode(Node):
             status_msg.active_target_id = str(gaze_cmd.active_target_id or "")
             self.pub_gaze_state.publish(status_msg)
 
-        # 7. Publish Typed HeadState Feedback Message
-        if self.pub_head_state is not None:
-            head_state_msg = HeadState()
-            head_state_msg.header.stamp = self.get_clock().now().to_msg()
-            head_state_msg.header.frame_id = "head_link"
-            head_state_msg.position_deg = float(self.actual_head_yaw_deg)
-            head_state_msg.velocity_deg_s = float(self.actual_head_vel_deg_s)
-            head_state_msg.target_position_deg = float(traj_point.position_deg)
-            head_state_msg.moving = bool(abs(self.actual_head_vel_deg_s) > 1.0)
-            head_state_msg.at_target = bool(self.fsm.at_target)
-            head_state_msg.enabled = True
-            head_state_msg.watchdog_healthy = True
-            head_state_msg.encoder_valid = (not math.isnan(self.actual_head_yaw_deg))
-            head_state_msg.fault_code = 0
-            self.pub_head_state.publish(head_state_msg)
-
-        # 8. Publish JSON Debug Telemetry
+        # 7. Publish JSON Debug Telemetry
         state_diag = {
+
             "timestamp": t,
             "fsm_state": gaze_cmd.gaze_state.value,
             "priority": gaze_cmd.priority_source.value,

@@ -94,6 +94,59 @@ class TestMotionPlannerKinematics(unittest.TestCase):
 
         self.assertAlmostEqual(self.planner.current_pos, -45.0, delta=0.25)
 
+    def test_stationary_target_does_not_oscillate_or_limit_cycle(self):
+        """CRITICAL REGRESSION: 0° -> -35° saccade must monotonically converge to -35° without -10° limit-cycle oscillation."""
+        cmd = GazeCommand(target_yaw_deg=-35.0, timestamp=1.0)
+        self.planner.reset(initial_pos_deg=0.0)
+
+        t = 1.0
+        dt = 0.02
+        trajectory = []
+        
+        # Simulate physical motor lagging at 0° initially then slowly following
+        simulated_actual = 0.0
+
+        for step in range(120):
+            # Actuator follows commanded position with realistic first-order mechanical lag
+            simulated_actual += 0.20 * (self.planner.current_pos - simulated_actual)
+
+            pt = self.planner.plan_step(cmd, actual_pos_deg=simulated_actual, timestamp=t)
+            trajectory.append(pt.position_deg)
+
+            # Monotonicity check during acceleration and cruise (until settling)
+            if step > 0 and pt.position_deg > trajectory[step - 1] and pt.position_deg > -34.5:
+                self.fail(
+                    f"BUG DETECTED: Non-monotonic regression or reversal at step {step}: "
+                    f"pos={pt.position_deg:.2f}° prev={trajectory[step-1]:.2f}° (Oscillation trapped around -10°!)"
+                )
+
+            if pt.is_settled:
+                break
+            t += dt
+
+        # Verify convergence to -35.0°
+        self.assertAlmostEqual(trajectory[-1], -35.0, delta=0.25)
+        self.assertAlmostEqual(self.planner.current_vel, 0.0, delta=0.5)
+
+    def test_plant_lag_closed_loop_convergence(self):
+        """Tests that full closed-loop HIL simulation converges seamlessly to any target."""
+        for target in [-35.0, +35.0, +60.0, -60.0]:
+            planner = MotionPlannerCore(max_velocity_deg_s=75.0, max_acceleration_deg_s2=180.0)
+            planner.reset(initial_pos_deg=0.0)
+            cmd = GazeCommand(target_yaw_deg=target, timestamp=1.0)
+
+            t = 1.0
+            actual = 0.0
+            for _ in range(150):
+                actual += 0.25 * (planner.current_pos - actual)
+                pt = planner.plan_step(cmd, actual_pos_deg=actual, timestamp=t)
+                t += 0.02
+                if pt.is_settled:
+                    break
+
+            self.assertAlmostEqual(planner.current_pos, target, delta=0.25)
+
 
 if __name__ == "__main__":
     unittest.main()
+

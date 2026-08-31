@@ -84,15 +84,12 @@ class MotionPlannerCore:
         dt = max(0.001, min(0.10, timestamp - self.last_update_time))
         self.last_update_time = timestamp
 
-        # Closed-loop tracking alignment: if actual position deviates significantly, soft-realign
-        if actual_pos_deg is not None and abs(actual_pos_deg - self.current_pos) > 10.0:
-            self.current_pos = 0.8 * self.current_pos + 0.2 * actual_pos_deg
-
         self.target_pos = clamp_deg(gaze_cmd.target_yaw_deg, self.min_limit, self.max_limit)
 
         # 1. Shortest reachable rotation arc respecting limits
         err_deg = shortest_reachable_arc(self.target_pos, self.current_pos, self.min_limit, self.max_limit)
         abs_err = abs(err_deg)
+
 
         # Settling check: settled only if both position error and velocity are minimal
         if abs_err < 0.25 and abs(self.current_vel) < 2.0:
