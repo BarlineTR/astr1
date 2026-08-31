@@ -57,7 +57,9 @@ class HeadCalibrator:
         self.baud = baud
         self.ser = None
         self.raw_head_ticks = 0
+        self.received_packet_len = 0
         self.running = True
+        self._heartbeat_active = False
 
     def connect(self):
         print(f"\n[1/3] Connecting to Arduino on {self.port_name} at {self.baud} baud...")
@@ -65,13 +67,39 @@ class HeadCalibrator:
             self.ser = serial.Serial(self.port_name, self.baud, timeout=0.1)
             time.sleep(1.5)  # Allow Arduino reset
             print("  -> Connected successfully!")
+            self._start_heartbeat_thread()
+            # Check packet format
+            time.sleep(0.5)
+            self.read_telemetry(timeout_s=1.0)
+            if self.received_packet_len == 12:
+                print("\n" + "="*70)
+                print("⚠️  UYARI: Arduino'da ESKİ firmware (12-byte paket) yüklü!")
+                print("   Kafa enkoder telemetrisini okumak için Arduino'yu güncelleyin:")
+                print("   cd ~/Desktop/astr1/arduino/astro_firmware && pio run -t upload")
+                print("="*70 + "\n")
+            elif self.received_packet_len == 16:
+                print("  -> Firmware doğrulandı: 16-byte canlı kafa enkoder akışı AKTİF.")
         except Exception as e:
             print(f"  -> ERROR: Failed to open serial port {self.port_name}: {e}")
             sys.exit(1)
 
+    def _start_heartbeat_thread(self):
+        import threading
+        self._heartbeat_active = True
+        def hb_loop():
+            while self._heartbeat_active and self.ser and self.ser.is_open:
+                try:
+                    self.send_heartbeat()
+                    time.sleep(0.10)
+                except Exception:
+                    break
+        t = threading.Thread(target=hb_loop, daemon=True)
+        t.start()
+
     def send_heartbeat(self):
-        pkt = build_packet(MSG_HEARTBEAT, struct.pack("<I", 1))
-        self.ser.write(pkt)
+        if self.ser and self.ser.is_open:
+            pkt = build_packet(MSG_HEARTBEAT, struct.pack("<I", 1))
+            self.ser.write(pkt)
 
     def read_telemetry(self, timeout_s: float = 1.0) -> bool:
         """Reads latest encoder ticks from Arduino stream."""
@@ -103,10 +131,14 @@ class HeadCalibrator:
                         if c == b and len(buf) > 0:
                             msg_id = buf[0]
                             payload = bytes(buf[1:])
-                            if msg_id == MSG_ENCODER_TICKS and len(payload) >= 12:
+                            if msg_id == MSG_ENCODER_TICKS:
+                                self.received_packet_len = len(payload)
                                 if len(payload) == 16:
                                     dl, dr, head_ticks, dt_us = struct.unpack("<iiiI", payload)
                                     self.raw_head_ticks = head_ticks
+                                    return True
+                                elif len(payload) == 12:
+                                    dl, dr, dt_us = struct.unpack("<iiI", payload)
                                     return True
                         state = 1 if b == SOF1 else 0
             time.sleep(0.01)
@@ -117,8 +149,27 @@ class HeadCalibrator:
         self.send_heartbeat()
         payload = struct.pack("<f", float(angle_deg))
         pkt = build_packet(MSG_HEAD_CMD, payload)
-        self.ser.write(pkt)
-        self.ser.flush()
+        if self.ser and self.ser.is_open:
+            self.ser.write(pkt)
+            self.ser.flush()
+
+    def run_live_monitor(self):
+        """Displays real-time encoder stream."""
+
+        print("\n========================================================")
+        print("   CANLI ENKODER VE TELEMETRİ İZLEME")
+        print("   (Çıkmak için Ctrl+C'ye basın)")
+        print("========================================================")
+        try:
+            while True:
+                self.read_telemetry(timeout_s=0.1)
+                pkt_info = f"{self.received_packet_len} bytes"
+                sys.stdout.write(f"\r[CANLI] Kafa Enkoder Ticki: {self.raw_head_ticks:8d} | Paket Boyutu: {pkt_info}   ")
+                sys.stdout.flush()
+                time.sleep(0.05)
+        except KeyboardInterrupt:
+            print("\nCanlı izleme sonlandırıldı.")
+
 
     def run_multi_point_manual_calibration(self):
         """Measures raw encoder ticks across multiple physical reference angles and performs linear regression."""
@@ -257,7 +308,8 @@ def main():
     print("  [1] Multi-Point Large-Angle Identification (0°, ±15°, ±30°, ±45°, ±90° with linear fit)")
     print("  [2] Safe Step Response Table Test (±2°, ±5°, ±10° command sequence)")
     print("  [3] Single Direct Angle Test (Safe range: -10° to +10°)")
-    choice = input("\nEnter choice [1, 2, or 3]: ").strip()
+    print("  [4] Canlı Enkoder & Telemetri İzleme (Live Stream)")
+    choice = input("\nEnter choice [1, 2, 3, or 4]: ").strip()
 
     if choice == "1":
         calib.run_multi_point_manual_calibration()
@@ -274,6 +326,9 @@ def main():
             print(f"Final Encoder Ticks: {calib.raw_head_ticks}")
         except ValueError:
             print("Invalid input.")
+    elif choice == "4":
+        calib.run_live_monitor()
+
 
 
 if __name__ == "__main__":
