@@ -24,6 +24,11 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy
 from std_msgs.msg import Bool, Float32, Header, Int32, String
 from sensor_msgs.msg import JointState
 
+try:
+    from astro_base.msg import GazeStatus, HeadState
+except ImportError:
+    GazeStatus = HeadState = None
+
 from astro_base.gaze.audio_filter import AudioFilterCore
 from astro_base.gaze.audio_perception import AudioPerceptionCore
 from astro_base.gaze.coordinate_frames import CalibrationConfig, CoordinateTransformer
@@ -156,15 +161,29 @@ class SocialGazeNode(Node):
         # Actuator command topic
         self.pub_head_cmd_pos = self.create_publisher(Float32, "/head/cmd_pos", 10)
 
+        # Typed Gaze and Head State publishers
+        if GazeStatus is not None:
+            self.pub_gaze_state = self.create_publisher(GazeStatus, "/gaze/state", 10)
+        else:
+            self.pub_gaze_state = None
+
+        if HeadState is not None:
+            self.pub_head_state = self.create_publisher(HeadState, "/head/state", 10)
+        else:
+            self.pub_head_state = None
+
         # Diagnostics & Visualization topics
-        self.pub_gaze_state = self.create_publisher(String, "/gaze/state", 10)
+        self.pub_gaze_debug = self.create_publisher(String, "/gaze/debug", 10)
         self.pub_active_target = self.create_publisher(String, "/gaze/active_target", 10)
 
         # Subscriptions
-        self.create_subscription(Int32, "/audio/doa_raw", self._on_doa_raw, 10)
-        self.create_subscription(Float32, "/audio/doa_deg", self._on_doa_deg, 10)
-        self.create_subscription(String, "/vision/detections_json", self._on_vision_json, 10)
+        if HeadState is not None:
+            self.create_subscription(HeadState, "/head/state", self._on_head_state, 10)
         self.create_subscription(JointState, "/joint_states", self._on_joint_states, qos_best_effort)
+        self.create_subscription(Float32, "/audio/doa", self._on_doa_deg, 10)
+        self.create_subscription(Float32, "/audio/doa_deg", self._on_doa_deg, 10)
+        self.create_subscription(Int32, "/audio/doa_raw", self._on_doa_raw, 10)
+        self.create_subscription(String, "/vision/detections_json", self._on_vision_json, 10)
         self.create_subscription(String, "/behavior/gesture", self._on_gesture, 10)
         self.create_subscription(Float32, "/behavior/gaze_intent", self._on_gaze_intent, 10)
         self.create_subscription(Bool, "/robot/is_speaking", self._on_speaking_status, 10)
@@ -176,11 +195,30 @@ class SocialGazeNode(Node):
         timer_period_s = 1.0 / max(1.0, rate_hz)
         self.timer = self.create_timer(timer_period_s, self._control_cycle)
 
-        self.get_logger().info(f"SocialGazeNode initialized at {rate_hz:.1f} Hz")
+        self.get_logger().info(f"SocialGazeNode initialized at {rate_hz:.1f} Hz (Typed GazeStatus & HeadState enabled)")
 
     # =========================================================================
     # Callbacks
     # =========================================================================
+
+    def _on_head_state(self, msg) -> None:
+        """Reads real encoder position and velocity from HeadState message."""
+        if hasattr(msg, "position_deg") and not math.isnan(msg.position_deg):
+            self.actual_head_yaw_deg = float(msg.position_deg)
+        if hasattr(msg, "velocity_deg_s") and not math.isnan(msg.velocity_deg_s):
+            self.actual_head_vel_deg_s = float(msg.velocity_deg_s)
+
+    def _on_joint_states(self, msg: JointState) -> None:
+        """Fallback reader for head_yaw_joint actual position and velocity."""
+        if "head_yaw_joint" in msg.name:
+            idx = msg.name.index("head_yaw_joint")
+            pos_val = msg.position[idx]
+            if not math.isnan(pos_val):
+                self.actual_head_yaw_deg = math.degrees(pos_val)
+            if len(msg.velocity) > idx:
+                vel_val = msg.velocity[idx]
+                if not math.isnan(vel_val):
+                    self.actual_head_vel_deg_s = math.degrees(vel_val)
 
     def _on_doa_raw(self, msg: Int32) -> None:
         """Processes raw integer DOA from ReSpeaker firmware."""
@@ -242,14 +280,6 @@ class SocialGazeNode(Node):
         except Exception as exc:
             self.get_logger().error(f"Error parsing vision JSON: {exc}")
 
-    def _on_joint_states(self, msg: JointState) -> None:
-        """Reads head_yaw_joint actual position and velocity."""
-        if "head_yaw_joint" in msg.name:
-            idx = msg.name.index("head_yaw_joint")
-            self.actual_head_yaw_deg = math.degrees(msg.position[idx])
-            if len(msg.velocity) > idx:
-                self.actual_head_vel_deg_s = math.degrees(msg.velocity[idx])
-
     def _on_gesture(self, msg: String) -> None:
         t = time.monotonic()
         ok = self.fsm.trigger_gesture(msg.data, timestamp=t)
@@ -289,11 +319,12 @@ class SocialGazeNode(Node):
             timestamp=t,
         )
 
-        # 3. Behavioral Social Gaze FSM & Priority Arbitration
+        # 3. Behavioral Social Gaze FSM & Priority Arbitration with True Velocity Feedback
         gaze_cmd = self.fsm.update(
             target_state=target_state,
             actual_head_yaw_deg=self.actual_head_yaw_deg,
             timestamp=t,
+            actual_head_vel_deg_s=self.actual_head_vel_deg_s,
         )
 
         # 4. Kinematic Motion Planning & Trajectory Generation
@@ -308,22 +339,77 @@ class SocialGazeNode(Node):
         cmd_msg.data = float(traj_point.position_deg)
         self.pub_head_cmd_pos.publish(cmd_msg)
 
-        # 6. Publish Diagnostics & State Telemetry
+        # 6. Publish Typed GazeStatus Message
+        if self.pub_gaze_state is not None:
+            status_msg = GazeStatus()
+            status_msg.header.stamp = self.get_clock().now().to_msg()
+            status_msg.header.frame_id = "base_link"
+
+            state_enum_map = {
+                GazeStateEnum.IDLE: 0,
+                GazeStateEnum.SEARCHING: 1,
+                GazeStateEnum.AUDIO_ACQUIRE: 2,
+                GazeStateEnum.ORIENTING: 3,
+                GazeStateEnum.VISUAL_ACQUIRE: 4,
+                GazeStateEnum.TRACKING: 5,
+                GazeStateEnum.HOLD: 6,
+                GazeStateEnum.TARGET_LOST: 7,
+                GazeStateEnum.RETURNING: 8,
+            }
+            priority_enum_map = {
+                PrioritySource.IDLE: 0,
+                PrioritySource.VISUAL_PERSON: 1,
+                PrioritySource.ACTIVE_SPEAKER: 2,
+                PrioritySource.DIALOGUE: 3,
+                PrioritySource.GESTURE: 4,
+                PrioritySource.SAFETY: 5,
+            }
+            status_msg.state = state_enum_map.get(gaze_cmd.gaze_state, 0)
+            status_msg.priority = priority_enum_map.get(gaze_cmd.priority_source, 0)
+            status_msg.desired_yaw_deg = float(gaze_cmd.target_yaw_deg)
+            status_msg.planned_yaw_deg = float(traj_point.position_deg)
+            status_msg.actual_yaw_deg = float(self.actual_head_yaw_deg)
+            status_msg.target_confidence = float(gaze_cmd.confidence)
+            status_msg.target_valid = bool(gaze_cmd.confidence > 0.10)
+            status_msg.motion_active = bool(abs(traj_point.velocity_deg_s) > 1.0 or abs(self.actual_head_vel_deg_s) > 1.0)
+            status_msg.at_target = bool(self.fsm.at_target and traj_point.is_settled)
+            status_msg.active_target_id = str(gaze_cmd.active_target_id or "")
+            self.pub_gaze_state.publish(status_msg)
+
+        # 7. Publish Typed HeadState Feedback Message
+        if self.pub_head_state is not None:
+            head_state_msg = HeadState()
+            head_state_msg.header.stamp = self.get_clock().now().to_msg()
+            head_state_msg.header.frame_id = "head_link"
+            head_state_msg.position_deg = float(self.actual_head_yaw_deg)
+            head_state_msg.velocity_deg_s = float(self.actual_head_vel_deg_s)
+            head_state_msg.target_position_deg = float(traj_point.position_deg)
+            head_state_msg.moving = bool(abs(self.actual_head_vel_deg_s) > 1.0)
+            head_state_msg.at_target = bool(self.fsm.at_target)
+            head_state_msg.enabled = True
+            head_state_msg.watchdog_healthy = True
+            head_state_msg.encoder_valid = (not math.isnan(self.actual_head_yaw_deg))
+            head_state_msg.fault_code = 0
+            self.pub_head_state.publish(head_state_msg)
+
+        # 8. Publish JSON Debug Telemetry
         state_diag = {
             "timestamp": t,
             "fsm_state": gaze_cmd.gaze_state.value,
             "priority": gaze_cmd.priority_source.value,
-            "target_yaw_deg": gaze_cmd.target_yaw_deg,
+            "desired_yaw_deg": gaze_cmd.target_yaw_deg,
             "planned_pos_deg": traj_point.position_deg,
             "planned_vel_deg_s": traj_point.velocity_deg_s,
             "actual_pos_deg": self.actual_head_yaw_deg,
+            "actual_vel_deg_s": self.actual_head_vel_deg_s,
+            "at_target": self.fsm.at_target,
             "active_target_id": gaze_cmd.active_target_id,
             "is_speaking": self.is_robot_speaking,
             "is_settled": traj_point.is_settled,
         }
         msg_str = String()
         msg_str.data = json.dumps(state_diag)
-        self.pub_gaze_state.publish(msg_str)
+        self.pub_gaze_debug.publish(msg_str)
 
 
 def main(args=None):
@@ -340,3 +426,4 @@ def main(args=None):
 
 if __name__ == "__main__":
     main()
+

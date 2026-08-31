@@ -31,8 +31,11 @@ endif()
 rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/WheelCmd.msg"
   "msg/HeadCmd.msg"
+  "msg/HeadState.msg"
+  "msg/GazeStatus.msg"
   DEPENDENCIES std_msgs
 )
+
 
 # Install Python modules
 install(DIRECTORY

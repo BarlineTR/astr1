@@ -58,6 +58,9 @@ class SocialGazeFSM:
         idle_saccade_interval_s: float = 8.0,
         min_limit_deg: float = -90.0,
         max_limit_deg: float = 90.0,
+        position_tolerance_deg: float = 2.5,
+        velocity_tolerance_deg_s: float = 3.0,
+        settling_persistence_required: int = 3,
     ):
         self.deadband_deg = deadband_deg
         self.idle_return_timeout_s = idle_return_timeout_s
@@ -67,6 +70,9 @@ class SocialGazeFSM:
         self.idle_saccade_interval_s = idle_saccade_interval_s
         self.min_limit_deg = min_limit_deg
         self.max_limit_deg = max_limit_deg
+        self.position_tolerance_deg = position_tolerance_deg
+        self.velocity_tolerance_deg_s = velocity_tolerance_deg_s
+        self.settling_persistence_required = settling_persistence_required
 
         # Internal FSM state
         self.state = GazeStateEnum.IDLE
@@ -74,6 +80,8 @@ class SocialGazeFSM:
         self.target_pitch_deg: float = 0.0
         self.active_priority: PrioritySource = PrioritySource.IDLE
         self.active_target_id: Optional[str] = None
+        self.at_target: bool = True
+        self._settling_persistence_count: int = 0
 
         # Safety & sleep locks
         self.is_sleeping: bool = False
@@ -146,15 +154,29 @@ class SocialGazeFSM:
         if self.state != new_state:
             self.state = new_state
             self._state_entry_time = timestamp
+            self._settling_persistence_count = 0
 
     def update(
         self,
         target_state: TargetState,
         actual_head_yaw_deg: float,
         timestamp: float,
+        actual_head_vel_deg_s: float = 0.0,
     ) -> GazeCommand:
         """Evaluates sensory inputs, priority arbitration, and FSM state transitions."""
         active_target = target_state.active_target
+
+        # Physical settling detection at commanded target_yaw_deg
+        pos_err = abs(angular_diff_deg(actual_head_yaw_deg, self.target_yaw_deg))
+        pos_ok = (pos_err <= self.position_tolerance_deg)
+        vel_ok = (abs(actual_head_vel_deg_s) <= self.velocity_tolerance_deg_s)
+
+        if pos_ok and vel_ok:
+            self._settling_persistence_count += 1
+        else:
+            self._settling_persistence_count = 0
+
+        self.at_target = (self._settling_persistence_count >= self.settling_persistence_required)
 
         # =========================================================================
         # 1. PRIORITY ARBITRATION: SAFETY > GESTURE > DIALOGUE
@@ -182,7 +204,8 @@ class SocialGazeFSM:
             self.active_priority = PrioritySource.GESTURE
             elapsed_step = timestamp - self._gesture_step_start_time
             step_target = self._gesture_steps[self._gesture_step_idx]
-            head_settled = abs(actual_head_yaw_deg - step_target) <= 2.0
+            head_settled = (abs(angular_diff_deg(actual_head_yaw_deg, step_target)) <= 2.0 and
+                            abs(actual_head_vel_deg_s) <= self.velocity_tolerance_deg_s)
 
             if elapsed_step >= self._gesture_step_duration_s or head_settled:
                 self._gesture_step_idx += 1
@@ -192,7 +215,6 @@ class SocialGazeFSM:
                     )
                     self._gesture_step_start_time = timestamp
                 else:
-                    # Gesture sequence completed!
                     self._active_gesture = None
                     self._gesture_steps = []
                     self._last_speech_time = timestamp
@@ -231,7 +253,7 @@ class SocialGazeFSM:
             self._last_target_observed_time = timestamp
             self.active_target_id = active_target.target_id
             target_yaw = clamp_deg(active_target.body_azimuth_deg, self.min_limit_deg, self.max_limit_deg)
-            err_deg = circular_distance_deg(target_yaw, actual_head_yaw_deg)
+            err_deg = abs(angular_diff_deg(target_yaw, actual_head_yaw_deg))
 
             if active_target.is_speaking:
                 self._last_speech_time = timestamp
@@ -239,37 +261,56 @@ class SocialGazeFSM:
             else:
                 self.active_priority = PrioritySource.VISUAL_PERSON
 
-            # State transition logic based on modality and angular error
-            if active_target.modality == Modality.AUDIO:
-                # Audio-only coarse cue
+            if self.state == GazeStateEnum.ORIENTING:
+                # Saccade in progress: update target if shifted by more than deadband
+                if abs(angular_diff_deg(target_yaw, self.target_yaw_deg)) >= self.deadband_deg:
+                    self.target_yaw_deg = target_yaw
+
+                # Complete orientation ONLY when physically arrived and settled
+                if self.at_target or (timestamp - self._state_entry_time) >= 3.0:
+                    if active_target.modality in (Modality.FUSED, Modality.VISION):
+                        self._transition_to(GazeStateEnum.TRACKING, timestamp)
+                    else:
+                        self._transition_to(GazeStateEnum.VISUAL_ACQUIRE, timestamp)
+            else:
+                # Initiate orienting saccade if outside narrow tracking window (>15°)
                 if err_deg > 15.0:
+                    self.target_yaw_deg = target_yaw
+                    self._settling_persistence_count = 0
+                    self.at_target = False
                     self._transition_to(GazeStateEnum.ORIENTING, timestamp)
                 else:
-                    self._transition_to(GazeStateEnum.VISUAL_ACQUIRE, timestamp)
+                    if abs(angular_diff_deg(target_yaw, self.target_yaw_deg)) >= self.deadband_deg:
+                        self.target_yaw_deg = target_yaw
 
-            elif active_target.modality in (Modality.FUSED, Modality.VISION):
-                if err_deg > 15.0:
-                    self._transition_to(GazeStateEnum.ORIENTING, timestamp)
-                else:
-                    self._transition_to(GazeStateEnum.TRACKING, timestamp)
-
-            # Apply Gaze Deadband: do not generate tiny jitter corrections (< deadband_deg)
-            if abs(angular_diff_deg(target_yaw, self.target_yaw_deg)) >= self.deadband_deg:
-                self.target_yaw_deg = target_yaw
+                    if active_target.modality in (Modality.FUSED, Modality.VISION):
+                        self._transition_to(GazeStateEnum.TRACKING, timestamp)
+                    else:
+                        self._transition_to(GazeStateEnum.VISUAL_ACQUIRE, timestamp)
 
         else:
-            # Active target is absent (no speaker / no face)
+            # Active target is absent (no speech / no face)
             self.active_target_id = None
             self.active_priority = PrioritySource.IDLE
-            time_since_target = timestamp - self._last_target_observed_time
 
-            if self.state in (GazeStateEnum.TRACKING, GazeStateEnum.ORIENTING, GazeStateEnum.VISUAL_ACQUIRE):
+            if self.state == GazeStateEnum.ORIENTING:
+                # Do NOT abort orientation mid-flight! Wait for head to arrive and settle
+                if self.at_target or (timestamp - self._state_entry_time) >= 3.0:
+                    self._transition_to(GazeStateEnum.VISUAL_ACQUIRE, timestamp)
+
+            elif self.state == GazeStateEnum.VISUAL_ACQUIRE:
+                scan_elapsed = timestamp - self._state_entry_time
+                if scan_elapsed >= 0.80:
+                    self._transition_to(GazeStateEnum.HOLD, timestamp)
+
+            elif self.state == GazeStateEnum.TRACKING:
                 self._transition_to(GazeStateEnum.HOLD, timestamp)
 
             elif self.state == GazeStateEnum.HOLD:
                 dwell_elapsed = timestamp - self._state_entry_time
                 if dwell_elapsed >= self.min_attention_dwell_s:
                     self._transition_to(GazeStateEnum.TARGET_LOST, timestamp)
+
 
             elif self.state == GazeStateEnum.TARGET_LOST:
                 time_lost = timestamp - self._state_entry_time
@@ -278,13 +319,12 @@ class SocialGazeFSM:
 
             elif self.state == GazeStateEnum.RETURNING:
                 self.target_yaw_deg = 0.0
-                if abs(actual_head_yaw_deg) <= 1.5:
+                if abs(actual_head_yaw_deg) <= 1.5 and abs(actual_head_vel_deg_s) <= self.velocity_tolerance_deg_s:
                     self._transition_to(GazeStateEnum.IDLE, timestamp)
 
             elif self.state == GazeStateEnum.IDLE:
                 self.target_yaw_deg = 0.0
 
-                # Optional idle social breathing micro-saccades
                 if self.idle_saccades_enabled:
                     time_since_saccade = timestamp - self._last_idle_saccade_time
                     if time_since_saccade >= self.idle_saccade_interval_s:
@@ -301,3 +341,4 @@ class SocialGazeFSM:
             confidence=round(active_target.confidence if active_target else 0.0, 2),
             timestamp=timestamp,
         )
+

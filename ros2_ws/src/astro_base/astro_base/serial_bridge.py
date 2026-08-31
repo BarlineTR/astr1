@@ -22,7 +22,13 @@ try:
     from diagnostic_msgs.msg import DiagnosticArray, DiagnosticStatus, KeyValue
     from geometry_msgs.msg import Twist
     from sensor_msgs.msg import Imu, JointState
+    from std_msgs.msg import Float32
     from astro_base.msg import HeadCmd, WheelCmd
+    try:
+        from astro_base.msg import HeadState
+    except ImportError:
+        HeadState = None
+
 except ImportError:
     class _MockRclpy:
         @staticmethod
@@ -217,6 +223,12 @@ class SerialBridge(Node):
         self.pub_std_diag = self.create_publisher(
             DiagnosticArray, "/diagnostics", 10
         )
+        if HeadState is not None:
+            self.pub_head_state = self.create_publisher(
+                HeadState, "/head/state", 10
+            )
+        else:
+            self.pub_head_state = None
 
         self.sub_wheel = self.create_subscription(
             WheelCmd, "/wheel_cmds", self.on_wheel_cmd, 10
@@ -227,6 +239,10 @@ class SerialBridge(Node):
         self.sub_head = self.create_subscription(
             HeadCmd, "/head_cmd", self.on_head_cmd, 10
         )
+        self.sub_head_pos = self.create_subscription(
+            Float32, "/head/cmd_pos", self.on_head_pos_cmd, 10
+        )
+
 
         self.state = ArduinoState.DISCONNECTED
         self.ser = None
@@ -525,6 +541,12 @@ class SerialBridge(Node):
         wheel_cmd.right_rpm = float(right_rpm)
         self.on_wheel_cmd(wheel_cmd)
 
+    def on_head_pos_cmd(self, msg: Float32):
+        """Converts Float32 cmd_pos to HeadCmd for serial transmission."""
+        cmd = HeadCmd()
+        cmd.angle_deg = float(msg.data)
+        self.on_head_cmd(cmd)
+
     def on_head_cmd(self, msg: HeadCmd):
         if self.ser is None or not self.ser.is_open or not self.arduino_alive:
             return
@@ -571,7 +593,7 @@ class SerialBridge(Node):
 
         self.pub_imu.publish(imu)
 
-    def publish_joint_states(self, left_ticks, right_ticks, dt_us):
+    def publish_joint_states(self, left_ticks, right_ticks, dt_us, head_ticks=None):
         now = self.get_clock().now()
         dt_s = dt_us / 1e6
 
@@ -584,14 +606,53 @@ class SerialBridge(Node):
         left_vel = d_left / dt_s if dt_s > 0 else 0.0
         right_vel = d_right / dt_s if dt_s > 0 else 0.0
 
+        if head_ticks is not None:
+            self.head_pos = float(head_ticks) / 2.5882
+            self.head_encoder_valid = True
+        else:
+            self.head_pos = float(getattr(self, "_last_sent_angle", 0.0))
+            self.head_encoder_valid = False
+
+        if not hasattr(self, "_last_head_pos_time"):
+            self._last_head_pos_time = time.monotonic()
+            self._last_head_pos = self.head_pos
+            self.head_vel = 0.0
+        else:
+            now_mono = time.monotonic()
+            dt_head = now_mono - self._last_head_pos_time
+            if dt_head > 0.005:
+                raw_vel = (self.head_pos - self._last_head_pos) / dt_head
+                self.head_vel = 0.8 * self.head_vel + 0.2 * raw_vel
+                self._last_head_pos_time = now_mono
+                self._last_head_pos = self.head_pos
+
+        target_pos = float(getattr(self, "_last_sent_angle", 0.0))
+        is_moving = abs(self.head_vel) > 1.0
+        at_target = abs(self.head_pos - target_pos) <= 2.0 and not is_moving
+
         js = JointState()
         js.header.stamp = now.to_msg()
-        js.name = ["left_wheel_joint", "right_wheel_joint"]
-        js.position = [self.left_pos, self.right_pos]
-        js.velocity = [left_vel, right_vel]
-        js.effort = [0.0, 0.0]
-
+        js.name = ["left_wheel_joint", "right_wheel_joint", "head_yaw_joint"]
+        js.position = [self.left_pos, self.right_pos, math.radians(self.head_pos)]
+        js.velocity = [left_vel, right_vel, math.radians(self.head_vel)]
+        js.effort = [0.0, 0.0, 0.0]
         self.pub_js.publish(js)
+
+        if self.pub_head_state is not None:
+            hs = HeadState()
+            hs.header.stamp = now.to_msg()
+            hs.header.frame_id = "head_link"
+            hs.position_deg = float(self.head_pos)
+            hs.velocity_deg_s = float(self.head_vel)
+            hs.target_position_deg = target_pos
+            hs.moving = is_moving
+            hs.at_target = at_target
+            hs.enabled = bool(getattr(self, "arduino_alive", False))
+            hs.watchdog_healthy = bool(getattr(self, "arduino_alive", False))
+            hs.encoder_valid = bool(self.head_encoder_valid)
+            hs.fault_code = 0
+            self.pub_head_state.publish(hs)
+
 
     def publish_diag(self, vbat_mV, temp_cX100, flags):
         now = self.get_clock().now()
@@ -720,10 +781,13 @@ class SerialBridge(Node):
             self.publish_imu(ax, ay, az, gx, gy, gz, micros_ts)
         elif msg_id == MSG_ENCODER_TICKS:
             self._rx_count_enc += 1
-            if len(payload) != 12:
-                return
-            l, r, dt_us = struct.unpack("<iiI", payload)
-            self.publish_joint_states(l, r, dt_us)
+            if len(payload) == 16:
+                l, r, head_ticks, dt_us = struct.unpack("<iiiI", payload)
+                self.publish_joint_states(l, r, dt_us, head_ticks=head_ticks)
+            elif len(payload) == 12:
+                l, r, dt_us = struct.unpack("<iiI", payload)
+                self.publish_joint_states(l, r, dt_us, head_ticks=None)
+
         elif msg_id == MSG_DIAGNOSTICS:
             self._rx_count_diag += 1
             if len(payload) != 8:

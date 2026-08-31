@@ -45,11 +45,18 @@ class TestGazeStateMachine(unittest.TestCase):
         self.assertEqual(cmd1.target_yaw_deg, 45.0)
         self.assertEqual(cmd1.priority_source, PrioritySource.ACTIVE_SPEAKER)
 
-        # 2. Head has rotated to 42° (error = 3° <= 15°) -> VISUAL_ACQUIRE
-        t += 0.5
-        cmd2 = self.fsm.update(TargetState(active_target=aud_target), actual_head_yaw_deg=42.0, timestamp=t)
+        # 2. Head has rotated to 44.5° and settled -> VISUAL_ACQUIRE
+        for _ in range(3):
+            t += 0.02
+            cmd2 = self.fsm.update(
+                TargetState(active_target=aud_target),
+                actual_head_yaw_deg=44.5,
+                timestamp=t,
+                actual_head_vel_deg_s=0.1,
+            )
         self.assertEqual(cmd2.gaze_state, GazeStateEnum.VISUAL_ACQUIRE)
         self.assertEqual(cmd2.target_yaw_deg, 45.0)
+
 
     def test_visual_target_triggers_tracking(self):
         """Visual target when aligned enters TRACKING state."""
@@ -114,6 +121,104 @@ class TestGazeStateMachine(unittest.TestCase):
         self.assertEqual(cmd1.priority_source, PrioritySource.GESTURE)
         self.assertEqual(cmd1.target_yaw_deg, 12.0)
 
+    def test_fsm_does_not_hold_before_actual_head_reaches_target(self):
+        """CRITICAL REGRESSION: FSM must NEVER transition to HOLD or VISUAL_ACQUIRE while head is en route."""
+        t = 1.0
+        target = FusedTarget(
+            target_id="spk_neg35", modality=Modality.AUDIO, body_azimuth_deg=-35.0,
+            body_elevation_deg=0.0, distance_m=2.0, confidence=0.85,
+            is_speaking=True, eye_contact=False, person_name=None, is_known=False,
+            timestamp=t, tracking_state=TrackingState.TRACKING
+        )
+
+        # 1. Cue at -35.0° triggers ORIENTING from initial 0.0°
+        cmd1 = self.fsm.update(TargetState(active_target=target), actual_head_yaw_deg=0.0, timestamp=t)
+        self.assertEqual(cmd1.gaze_state, GazeStateEnum.ORIENTING)
+        self.assertEqual(cmd1.target_yaw_deg, -35.0)
+
+        # 2. Audio cue vanishes (like a single ros2 topic pub --once message)
+        # Head is moving and currently at actual_head_yaw_deg = -9.97°, vel = -45°/s
+        # FSM MUST REMAIN IN ORIENTING! It must NOT enter HOLD!
+        t += 0.02
+        cmd2 = self.fsm.update(
+            TargetState(active_target=None),
+            actual_head_yaw_deg=-9.97,
+            timestamp=t,
+            actual_head_vel_deg_s=-45.0,
+        )
+        self.assertEqual(cmd2.gaze_state, GazeStateEnum.ORIENTING,
+                         "BUG DETECTED: FSM prematurely transitioned out of ORIENTING before head arrived!")
+        self.assertEqual(cmd2.target_yaw_deg, -35.0)
+
+        # 3. Head is at -25.0° (still en route) -> MUST STAY in ORIENTING
+        t += 0.10
+        cmd3 = self.fsm.update(
+            TargetState(active_target=None),
+            actual_head_yaw_deg=-25.0,
+            timestamp=t,
+            actual_head_vel_deg_s=-30.0,
+        )
+        self.assertEqual(cmd3.gaze_state, GazeStateEnum.ORIENTING)
+
+        # 4. Head arrives at -34.8° with low velocity, but first cycle of settling -> Still ORIENTING
+        t += 0.10
+        cmd4 = self.fsm.update(
+            TargetState(active_target=None),
+            actual_head_yaw_deg=-34.8,
+            timestamp=t,
+            actual_head_vel_deg_s=-1.2,
+        )
+        # 1st cycle of settling
+        self.assertEqual(cmd4.gaze_state, GazeStateEnum.ORIENTING)
+
+        # 5. Head stays settled at -34.9° for 2 more cycles -> NOW transitions to VISUAL_ACQUIRE
+        t += 0.02
+        self.fsm.update(TargetState(active_target=None), actual_head_yaw_deg=-34.9, timestamp=t, actual_head_vel_deg_s=0.1)
+        t += 0.02
+        cmd5 = self.fsm.update(TargetState(active_target=None), actual_head_yaw_deg=-35.0, timestamp=t, actual_head_vel_deg_s=0.0)
+        self.assertEqual(cmd5.gaze_state, GazeStateEnum.VISUAL_ACQUIRE)
+        self.assertEqual(cmd5.target_yaw_deg, -35.0)
+
+    def test_all_motion_phases_with_closed_loop_feedback(self):
+        """Tests closed-loop trajectory settling across all canonical motion phases."""
+        test_cases = [
+            (0.0, -35.0),
+            (0.0, 35.0),
+            (0.0, 60.0),
+            (60.0, -60.0),
+            (-60.0, 60.0),
+        ]
+
+        for start_pos, target_pos in test_cases:
+            fsm = SocialGazeFSM()
+            t = 10.0
+
+            target = FusedTarget(
+                target_id="tgt", modality=Modality.AUDIO, body_azimuth_deg=target_pos,
+                body_elevation_deg=0.0, distance_m=2.0, confidence=0.85,
+                is_speaking=True, eye_contact=False, person_name=None, is_known=False,
+                timestamp=t, tracking_state=TrackingState.TRACKING
+            )
+
+            # Start saccade
+            cmd = fsm.update(TargetState(active_target=target), actual_head_yaw_deg=start_pos, timestamp=t)
+            self.assertEqual(cmd.gaze_state, GazeStateEnum.ORIENTING)
+
+            # Midway check (50% progress) -> MUST stay in ORIENTING
+            mid_pos = (start_pos + target_pos) / 2.0
+            t += 0.1
+            cmd_mid = fsm.update(TargetState(active_target=None), actual_head_yaw_deg=mid_pos, timestamp=t, actual_head_vel_deg_s=25.0)
+            self.assertEqual(cmd_mid.gaze_state, GazeStateEnum.ORIENTING)
+
+            # Complete motion and settle
+            for _ in range(4):
+                t += 0.02
+                cmd_settled = fsm.update(TargetState(active_target=None), actual_head_yaw_deg=target_pos, timestamp=t, actual_head_vel_deg_s=0.0)
+
+            self.assertEqual(cmd_settled.gaze_state, GazeStateEnum.VISUAL_ACQUIRE)
+            self.assertEqual(cmd_settled.target_yaw_deg, target_pos)
+
 
 if __name__ == "__main__":
     unittest.main()
+

@@ -179,12 +179,15 @@ void stopMotors() {
 }
 
 void publishEncoders(uint32_t dt_us, int32_t dl, int32_t dr) {
-  uint8_t payload[4 + 4 + 4];
+  int32_t head_ticks = readTicks(g_head_ticks);
+  uint8_t payload[4 + 4 + 4 + 4];
   memcpy(&payload[0], &dl, 4);
   memcpy(&payload[4], &dr, 4);
-  memcpy(&payload[8], &dt_us, 4);
+  memcpy(&payload[8], &head_ticks, 4);
+  memcpy(&payload[12], &dt_us, 4);
   Proto::writePacket(Serial, Proto::ENCODER_TICKS, payload, sizeof(payload));
 }
+
 
 void publishDiag(uint16_t vbat_mV, int16_t temp_cX100, uint32_t flags) {
   uint8_t payload[2 + 2 + 4];
