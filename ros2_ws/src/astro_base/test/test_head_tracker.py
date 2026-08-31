@@ -227,16 +227,21 @@ class TestSocialGazeLogic(unittest.TestCase):
     def test_lidar_radar_gaze_orientation(self):
         """Test that approaching person detected on LiDAR/Radar smoothly steers head target."""
         class MockLaserScan:
-            def __init__(self, target_angle_deg=35.0, distance_m=1.5):
+            def __init__(self, target_angle_deg=35.0, distance_m=1.5, width_m=0.5):
                 self.angle_min = -math.pi
                 self.angle_increment = math.radians(1.0)
                 self.range_min = 0.15
                 self.range_max = 12.0
-                # 360 ranges (index 0 = -180°, index 180 = 0°, index 215 = +35°)
+                # 360 ranges (index 0 = -180°, index 180 = 0°, index 215 = +35°).
+                # A person is not one stray return: at 1.5 m a 0.5 m torso covers about
+                # 19 beams. Filling only one beam is what noise looks like, and treating
+                # that as a person is how the head used to end up facing furniture.
                 self.ranges = [10.0] * 360
-                idx = int((math.radians(target_angle_deg) - self.angle_min) / self.angle_increment)
-                if 0 <= idx < 360:
-                    self.ranges[idx] = distance_m
+                half = math.degrees(math.atan2(width_m / 2.0, distance_m))
+                for i in range(360):
+                    bearing = -180.0 + i
+                    if abs((bearing - target_angle_deg + 180.0) % 360.0 - 180.0) <= half:
+                        self.ranges[i] = distance_m
 
         self.node.enabled = True
         self.node.lidar_fusion_enabled = True

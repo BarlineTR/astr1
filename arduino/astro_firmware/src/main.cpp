@@ -53,9 +53,24 @@ static constexpr bool  HEAD_CONTINUOUS_ROTATION = true;
 static constexpr int32_t HEAD_TICKS_PER_REV =
     (int32_t)(360.0f * HEAD_TICKS_PER_DEG + 0.5f);
 
-// Kafa motoru PWM limitleri ve statik sürtünme eşiği
+// Kafa motoru PWM limitleri ve statik sürtünme eşiği.
+//
+// Duran bir motoru kırmak için gereken tork, zaten döneni sürdürmekten büyüktür.
+// HEAD_PWM_MIN dönerken doğru taban, ama kalkışta yetmiyor: küçük bir hedef için
+// KP*err katkısı da küçük kaldığından toplam PWM statik sürtünmeyi aşamıyor ve kafa
+// elle itilene kadar yerinde duruyor. Büyük hedeflerde sorun görünmez, çünkü KP*err
+// eşiği tek başına aşar -- arıza tam da deadband'in hemen üstündeki düzeltmelerde çıkar.
+//
+// Çözüm, kalkışa özel yüksek taban: enkoder henüz kımıldamadıysa HEAD_PWM_BREAKAWAY ile
+// it, ilk tick gelir gelmez normal tabana dön. Süreyi ayrıca sınırlamaya gerek yok,
+// stall koruması (HEAD_STALL_MS) zaten 1.5 s sonra gücü kesiyor.
+// Kafa hâlâ kalkmıyorsa artırılacak tek değer HEAD_PWM_BREAKAWAY'dir.
 static constexpr int HEAD_PWM_LIMIT = 150;
 static constexpr int HEAD_PWM_MIN = 35;
+static constexpr int HEAD_PWM_BREAKAWAY = 90;
+// Deadband'e çok yakın düzeltmelere darbe uygulanmaz: 1 derecelik bir hareketi 90 PWM
+// ile itmek aşmaya ve salınıma yol açar.
+static constexpr int32_t HEAD_BREAKAWAY_MIN_ERR_TICKS = 5;
 
 static constexpr float HEAD_KP = 2.0f, HEAD_KD = 0.05f;
 static constexpr int32_t HEAD_DEADBAND_TICKS = 2;  // 2 tick ~= 0.77 derece
@@ -225,8 +240,13 @@ void headControl(uint32_t dt_ms) {
   float de = (float)(err - g_head_err_prev) / (dt_ms / 1000.0f);
   g_head_err_prev = err;
 
-  // PID + Statik sürtünme eşiği için feedforward tabanı
-  float ff = (err > 0) ? (float)HEAD_PWM_MIN : -(float)HEAD_PWM_MIN;
+  // PID + statik sürtünme eşiği için feedforward tabanı.
+  // Enkoder kımıldamıyorken kalkış tabanı, kımıldar kımıldamaz normal taban.
+  const bool stationary = (abs(pos - g_head_stall_ref) < 2);
+  const int ff_base =
+      (stationary && abs(err) >= HEAD_BREAKAWAY_MIN_ERR_TICKS) ? HEAD_PWM_BREAKAWAY
+                                                               : HEAD_PWM_MIN;
+  float ff = (err > 0) ? (float)ff_base : -(float)ff_base;
   float u = ff + (HEAD_KP * (float)err) + (HEAD_KD * de);
   int pwm = (int)constrain(u, (float)-HEAD_PWM_LIMIT, (float)HEAD_PWM_LIMIT);
 

@@ -76,6 +76,15 @@ HEAD_TRACKER_DEFAULTS: dict[str, Any] = {
     "lidar_min_dist_m": 0.4,
     "lidar_max_dist_m": 2.8,
     "lidar_timeout_s": 2.5,
+    # A horizontal slice through a standing person: narrower is furniture trim, wider is
+    # a wall or a sofa. The LiDAR cannot see a face, so this is only ever used to confirm
+    # a direction the microphones already chose.
+    "lidar_min_width_m": 0.12,
+    "lidar_max_width_m": 0.75,
+    # Two-stage gaze: the sound says roughly where, the camera says exactly who.
+    "speaker_id_timeout_s": 4.0,   # how long /audio/speaker_id stays relevant
+    "people_memory_s": 20.0,       # how long someone stays placed after leaving the frame
+    "speaker_snap_deg": 40.0,      # how far a confirmation may pull the acoustic target
     # Quiet window after the head stops moving, before acoustic tracking resumes.
     "head_motion_settle_s": 0.5,
 }
@@ -125,8 +134,10 @@ except ImportError:
 
 try:
     from astro_base.speech_energy_map import SpeechEnergyMap, SpeechFrameGate
+    from astro_base.lidar_person_finder import confirm_direction, find_person_like_clusters
 except ImportError:  # running straight from the source tree, without the package installed
     from speech_energy_map import SpeechEnergyMap, SpeechFrameGate
+    from lidar_person_finder import confirm_direction, find_person_like_clusters
 
 
 def doa_to_robot_yaw(doa_deg: float, offset_deg: float = 0.0, invert: bool = False) -> float:
@@ -263,6 +274,11 @@ class HeadTrackerNode(Node):
         self.lidar_min_dist_m = float(_get_val("lidar_min_dist_m"))
         self.lidar_max_dist_m = float(_get_val("lidar_max_dist_m"))
         self.lidar_timeout_s = float(_get_val("lidar_timeout_s"))
+        self.lidar_min_width_m = float(_get_val("lidar_min_width_m"))
+        self.lidar_max_width_m = float(_get_val("lidar_max_width_m"))
+        self.speaker_id_timeout_s = float(_get_val("speaker_id_timeout_s"))
+        self.people_memory_s = float(_get_val("people_memory_s"))
+        self.speaker_snap_deg = float(_get_val("speaker_snap_deg"))
 
         # Publishers — SINGLE AUTHORITATIVE OUTPUT OWNER FOR /head_cmd
         self.pub_head_cmd = self.create_publisher(HeadCmd, "/head_cmd", 10)
@@ -284,6 +300,7 @@ class HeadTrackerNode(Node):
         self.create_subscription(Bool, "/vision/person_detected", self._on_person_detected, 10)
         self.create_subscription(Float32, "/vision/head_yaw", self._on_vision_head_yaw, 10)
         self.create_subscription(String, "/vision/faces", self._on_vision_faces, 10)
+        self.create_subscription(String, "/audio/speaker_id", self._on_speaker_id, 10)
         # Subscribers — radar/LiDAR (RPLIDAR scan_filter_node with SensorData QoS)
         self.create_subscription(LaserScan, "/scan", self._on_laser_scan, qos_profile_sensor_data)
         self.create_subscription(LaserScan, "/scan_filtered", self._on_laser_scan, qos_profile_sensor_data)
@@ -344,6 +361,18 @@ class HeadTrackerNode(Node):
         self._lidar_target_yaw = 0.0
         self._lidar_distance_m = 0.0
         self._lidar_last_seen_time = 0.0
+        # Latest scan as (range_m, bearing_deg), kept so a direction can be confirmed
+        # against it once the microphones have chosen one.
+        self._lidar_points: list[Tuple[float, float]] = []
+        self._lidar_points_time = 0.0
+
+        # Where people are, remembered past the camera's narrow field of view. Turning to
+        # a sound means looking somewhere the camera is not looking yet, so someone who
+        # leaves the frame has to stay placed rather than vanish.
+        self._people_memory: list[dict] = []
+        self._active_speaker_name: Optional[str] = None
+        self._active_speaker_known = False
+        self._active_speaker_time = 0.0
 
         # Recent accepted bearings, kept purely as a diagnostic trail: the decision is
         # the speech-energy map's, not this buffer's.
@@ -385,6 +414,106 @@ class HeadTrackerNode(Node):
         """
         last = getattr(self, "_last_published_cmd_yaw", None)
         return float(last) if last is not None else float(self._estimated_yaw)
+
+    def _merge_into_people_memory(self, seen: list, now: float) -> None:
+        """Folds this frame's sightings into the remembered map.
+
+        Matching is by name for people the recogniser knows, and by position otherwise:
+        two guests both called "Misafir" are two different people, and keying the memory
+        on the name alone would silently merge them into one.
+        """
+        self._forget_stale_people(now)
+        for person in seen:
+            match = None
+            if person["is_known"]:
+                match = next(
+                    (p for p in self._people_memory if p["name"] == person["name"]), None
+                )
+            if match is None:
+                nearby = [
+                    p
+                    for p in self._people_memory
+                    if not p["is_known"]
+                    and abs(angular_diff_deg(p["world_yaw"], person["world_yaw"])) <= 15.0
+                ]
+                if nearby:
+                    match = min(
+                        nearby,
+                        key=lambda p: abs(angular_diff_deg(p["world_yaw"], person["world_yaw"])),
+                    )
+            if match is None:
+                self._people_memory.append(dict(person))
+            else:
+                match.update(person)
+
+    def _on_speaker_id(self, msg: String):
+        """Who the voice recogniser thinks is talking (/audio/speaker_id, JSON).
+
+        This is the link between hearing and seeing: the acoustic map says a direction,
+        the camera says which faces are there, and this says which of them is speaking.
+        Note the two recognisers keep separate databases, so a name only matches if the
+        same person is enrolled under the same string in both -- _select_speaker_face
+        says so out loud when it cannot match, rather than failing silently.
+        """
+        try:
+            info = json.loads(msg.data)
+        except Exception:
+            return
+        if not isinstance(info, dict):
+            return
+        with self._lock:
+            self._active_speaker_name = info.get("name") or None
+            self._active_speaker_known = bool(info.get("is_known", False))
+            self._active_speaker_time = time.monotonic()
+
+    def _forget_stale_people(self, now: float) -> list:
+        """Drops anyone nobody has seen for people_memory_s."""
+        self._people_memory = [
+            p for p in self._people_memory if (now - p["timestamp"]) <= self.people_memory_s
+        ]
+        return self._people_memory
+
+    def _recall_person(self, name: str, now: float) -> Optional[dict]:
+        """The freshest remembered sighting of a named person, if it has not expired."""
+        with_name = [p for p in self._forget_stale_people(now) if p["name"] == name]
+        if not with_name:
+            return None
+        return max(with_name, key=lambda p: p["timestamp"])
+
+    def _select_speaker_face(self, now: float, acoustic_bearing: float) -> Optional[dict]:
+        """Which of the people we know about is the one talking.
+
+        Preference order, decided with the operator: the face whose name matches the
+        voice, otherwise the face nearest the direction the sound came from. Looking at
+        a person who turns out not to be the speaker is better than looking at nobody,
+        and unrecognised guests have to work too.
+        """
+        candidates = self._forget_stale_people(now)
+        if not candidates:
+            return None
+
+        speaker_fresh = (
+            self._active_speaker_name
+            and self._active_speaker_known
+            and (now - self._active_speaker_time) <= self.speaker_id_timeout_s
+        )
+        if speaker_fresh:
+            named = self._recall_person(self._active_speaker_name, now)
+            if named is not None:
+                return named
+            last_warned = getattr(self, "_last_name_miss_log", 0.0)
+            if (now - last_warned) >= 10.0:
+                self._last_name_miss_log = now
+                self.get_logger().info(
+                    f"🔎 [Füzyon] Ses '{self._active_speaker_name}' diyor ama o isimde bir "
+                    "yüz kaydı yok — ses ve yüz veritabanları aynı ismi kullanıyor mu? "
+                    "Sese en yakın yüze dönülüyor."
+                )
+
+        return min(
+            candidates,
+            key=lambda p: abs(angular_diff_deg(p["world_yaw"], acoustic_bearing)),
+        )
 
     def _note_calibration_sample(self, now: float, raw_doa: float) -> None:
         """Reports the mounting offset of the array, when asked to.
@@ -624,25 +753,40 @@ class HeadTrackerNode(Node):
             if candidate_yaw is None:
                 return
 
-            # Multi-Speaker Spatial Face Association (Snap acoustic DOA to visual face if in vicinity)
+            # 6b. Confirmation. The acoustic direction is coarse -- the array is tilted --
+            #     so a second opinion sharpens it. Each source may be absent; none of
+            #     them being available is a normal state, not an error, and the head
+            #     simply goes to the acoustic direction on its own.
             matched_person_name = None
-            for person in getattr(self, "_spatial_people_map", []):
-                if (now - person.get("timestamp", 0.0)) <= 4.0:
-                    if abs(angular_diff_deg(candidate_yaw, person["world_yaw"])) <= 25.0:
-                        candidate_yaw = person["world_yaw"]
-                        matched_person_name = person["name"]
-                        break
+            if self.vision_fusion_enabled:
+                person = self._select_speaker_face(now, candidate_yaw)
+                if person is not None and abs(
+                    angular_diff_deg(candidate_yaw, person["world_yaw"])
+                ) <= self.speaker_snap_deg:
+                    candidate_yaw = person["world_yaw"]
+                    matched_person_name = person["name"]
 
-            # 2D LiDAR (Radar) Fusion Association: Snap coarse acoustic angle to precise physical human/obstacle detected in zone
-            if not matched_person_name and self.lidar_fusion_enabled and getattr(self, "_lidar_person_detected", False):
-                if (now - getattr(self, "_lidar_last_seen_time", 0.0)) <= self.lidar_timeout_s:
-                    lidar_target = getattr(self, "_lidar_target_yaw", 0.0)
-                    lidar_dist = getattr(self, "_lidar_distance_m", 0.0)
-                    if abs(angular_diff_deg(candidate_yaw, lidar_target)) <= 35.0:
+            # No face to lock onto -- camera off, or nobody recognised in that direction.
+            # The LiDAR cannot see a face, but it can say whether something person-sized
+            # is standing where the sound came from.
+            if matched_person_name is None and self.lidar_fusion_enabled:
+                if (now - self._lidar_points_time) <= self.lidar_timeout_s:
+                    figure = confirm_direction(
+                        self._lidar_points,
+                        candidate_yaw,
+                        tolerance_deg=self.speaker_snap_deg,
+                        min_width_m=self.lidar_min_width_m,
+                        max_width_m=self.lidar_max_width_m,
+                        min_dist_m=self.lidar_min_dist_m,
+                        max_dist_m=self.lidar_max_dist_m,
+                    )
+                    if figure is not None:
                         self.get_logger().info(
-                            f"📡 [Radar Fusion] Akustik DOA ({candidate_yaw:.1f}°) LiDAR radar hedefiyle ({lidar_target:.1f}°, {lidar_dist:.2f}m) kilitlendi."
+                            f"📡 [LiDAR Doğrulama] Akustik yön ({candidate_yaw:.1f}°) "
+                            f"{figure['bearing_deg']:.1f}°'deki insan boyutlu figürle "
+                            f"({figure['distance_m']:.2f}m, {figure['width_m']:.2f}m) doğrulandı."
                         )
-                        candidate_yaw = lidar_target
+                        candidate_yaw = figure["bearing_deg"]
 
             # 7. Mechanical & Safety Clamping
             clamped_target = max(self.min_yaw_deg, min(self.max_yaw_deg, candidate_yaw))
@@ -760,11 +904,14 @@ class HeadTrackerNode(Node):
                 return
             now = time.monotonic()
             with self._lock:
-                updated_map = []
+                seen = []
                 for f in faces:
                     cam_azimuth = float(f.get("camera_azimuth_deg", 0.0))
-                    world_yaw = max(self.min_yaw_deg, min(self.max_yaw_deg, self._estimated_yaw + cam_azimuth))
-                    updated_map.append({
+                    # The camera rides on the head, so a face bearing only becomes a place
+                    # in the room once it is added to the angle the FIRMWARE was given.
+                    # _estimated_yaw is the software slew trajectory and lags it.
+                    world_yaw = wrap_deg(self._commanded_head_yaw() + cam_azimuth)
+                    seen.append({
                         "name": f.get("recognized_name") or "Misafir",
                         "is_known": bool(f.get("is_known", False)),
                         "cam_azimuth": cam_azimuth,
@@ -772,8 +919,10 @@ class HeadTrackerNode(Node):
                         "distance_m": float(f.get("distance_m", 1.0)),
                         "timestamp": now,
                     })
-                if updated_map:
-                    self._spatial_people_map = updated_map
+
+                self._merge_into_people_memory(seen, now)
+                # Currently visible people, in the order the detector reported them.
+                self._spatial_people_map = seen
         except Exception as _exc:
             self.get_logger().debug(f"_on_vision_faces json error: {_exc}")
 
@@ -803,15 +952,33 @@ class HeadTrackerNode(Node):
         if not points:
             return
 
-        # Sort by distance (closest obstacle / human)
-        points.sort(key=lambda p: p[0])
-        closest_r, raw_closest_angle = points[0]
-        clamped_closest_angle = max(self.min_yaw_deg, min(self.max_yaw_deg, raw_closest_angle))
+        # Person-shaped clusters, not simply the nearest return. Taking the closest point
+        # in range called every wall and chair leg a person, and answered the wrong
+        # question besides: the nearest object is not the one that spoke.
+        people = find_person_like_clusters(
+            points,
+            min_width_m=self.lidar_min_width_m,
+            max_width_m=self.lidar_max_width_m,
+            min_dist_m=self.lidar_min_dist_m,
+            max_dist_m=self.lidar_max_dist_m,
+        )
 
         with self._lock:
+            # The raw scan is kept so a direction can be confirmed against it later, once
+            # the microphones have said which direction is worth confirming.
+            self._lidar_points = points
+            self._lidar_points_time = now
+
+            if not people:
+                self._lidar_person_detected = False
+                return
+
+            nearest = min(people, key=lambda c: c["distance_m"])
             self._lidar_person_detected = True
-            self._lidar_target_yaw = clamped_closest_angle
-            self._lidar_distance_m = closest_r
+            self._lidar_target_yaw = max(
+                self.min_yaw_deg, min(self.max_yaw_deg, nearest["bearing_deg"])
+            )
+            self._lidar_distance_m = nearest["distance_m"]
             self._lidar_last_seen_time = now
 
     def _control_loop(self):
@@ -897,6 +1064,22 @@ class HeadTrackerNode(Node):
                     self._last_speech_time = now  # prevent idle return while face is visible
                     self._state = SocialGazeStateMachine.ATTENDING
                     # Confident visual gaze centering (proportional visual servoing)
+                    # /vision/head_yaw carries only faces[0], the largest face in frame,
+                    # so following it centres whoever is nearest the camera rather than
+                    # whoever is speaking. /vision/faces has every face with its name, so
+                    # prefer the one the voice recogniser points at.
+                    speaker_face = self._select_speaker_face(now, self._target_yaw)
+                    if speaker_face is not None and (
+                        now - speaker_face["timestamp"]
+                    ) <= self.vision_timeout_s:
+                        self._vision_head_yaw = float(speaker_face["cam_azimuth"])
+                        # Anchor on the head angle this sighting was taken from, which the
+                        # record already implies: world_yaw = head_yaw + cam_azimuth.
+                        self._vision_ref_yaw = wrap_deg(
+                            speaker_face["world_yaw"] - speaker_face["cam_azimuth"]
+                        )
+                        self._vision_yaw_pending = True
+
                     if self._vision_yaw_pending and abs(self._vision_head_yaw) >= 1.5:
                         self._vision_yaw_pending = False
                         

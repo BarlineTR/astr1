@@ -108,6 +108,18 @@ class TestHeadYawCentralArbitration(unittest.TestCase):
         self.node.head_motion_settle_s = 0.0  # motor-noise gate disabled for arbitration tests
         self.node._speech_gate = SpeechFrameGate()
         self.node._speech_map = SpeechEnergyMap()
+        self.node._people_memory = []
+        self.node._spatial_people_map = []
+        self.node._lidar_points = []
+        self.node._lidar_points_time = 0.0
+        self.node._active_speaker_name = None
+        self.node._active_speaker_known = False
+        self.node._active_speaker_time = 0.0
+        self.node.speaker_id_timeout_s = 4.0
+        self.node.people_memory_s = 20.0
+        self.node.speaker_snap_deg = 40.0
+        self.node.lidar_min_width_m = 0.12
+        self.node.lidar_max_width_m = 0.75
         self.node.doa_calibration_enabled = False
         self.node._calib_sin = self.node._calib_cos = 0.0
         self.node._calib_n = 0
