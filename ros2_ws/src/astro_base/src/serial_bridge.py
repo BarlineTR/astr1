@@ -375,6 +375,14 @@ class SerialBridge(Node):
             return
 
         try:
+            # Linux'ta port acildiginda DTR reset darbesini ve Arduino resetlenmesini engelle
+            try:
+                if os.name != 'nt' and os.path.exists(port):
+                    import subprocess
+                    subprocess.run(["stty", "-F", port, "-hupcl"], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            except Exception:
+                pass
+
             self.ser = serial.Serial(
                 port,
                 self.baud,
@@ -383,6 +391,7 @@ class SerialBridge(Node):
                 rtscts=False,
                 dsrdtr=False,
             )
+
             # [FORENSIC DEBUG] Port parametrelerini doğrula
             self.get_logger().info(
                 f"🔌 [SERIAL PORT PARAMS]\n"

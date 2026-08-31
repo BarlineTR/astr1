@@ -144,8 +144,30 @@ void headEncA() {
 
 
 
+// Erken donanımsal pin kilidi: MCU açıldığı mikrosaniyede (C runtime ve main'den önce)
+// tüm motor PWM pinlerini kesin olarak OUTPUT ve LOW yaparak BTS7960 açılış savrulmasını sıfırlar.
+void init_early_pwm(void) __attribute__((naked)) __attribute__((section(".init3")));
+void init_early_pwm(void) {
+  // Pin 44 (PL5) & Pin 45 (PL4) - Kafa Motoru
+  PORTL &= ~((1 << 5) | (1 << 4));
+  DDRL  |=  ((1 << 5) | (1 << 4));
+
+  // Pin 5 (PE3) & Pin 6 (PH3) - Sol Tekerlek
+  PORTE &= ~(1 << 3);
+  DDRE  |=  (1 << 3);
+  PORTH &= ~(1 << 3);
+  DDRH  |=  (1 << 3);
+
+  // Pin 9 (PH6) & Pin 10 (PB4) - Sağ Tekerlek
+  PORTH &= ~(1 << 6);
+  DDRH  |=  (1 << 6);
+  PORTB &= ~(1 << 4);
+  DDRB  |=  (1 << 4);
+}
+
 void setupIO() {
   // Önce pinleri LOW'a çek, sonra OUTPUT yap (BTS7960 açılış anlık darbe koruması)
+
   digitalWrite(L_MOTOR_PWM_FWD, LOW);
   digitalWrite(L_MOTOR_PWM_REV, LOW);
   digitalWrite(R_MOTOR_PWM_FWD, LOW);
