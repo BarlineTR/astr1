@@ -27,8 +27,13 @@ static constexpr float WHEEL_R_L = 0.06f; // metre (örnek 60mm)
 static constexpr float WHEEL_R_R = 0.06f;
 
 static constexpr float KP = 0.6f, KI = 0.2f, KD = 0.0f; // 50 Hz PID için örnek
+static constexpr int PWM_MAX = 255;
+static constexpr float PID_INTEGRAL_LIMIT = 50.0f; // ✅ FIX: Daha dar anti-windup limit
+
+// ====== Kafa (BTS7960 + enkoderli DC motor) ======
 // Kalibre Edildi: 366 tick / 270 derece = 1.3556 tick/derece (488 tick / 360 derece)
 static constexpr float HEAD_TICKS_PER_DEG = 1.3556f;
+
 
 
 // Yazılımsal açı limitleri (limit switch yok; açılıştaki konum 0° kabul edilir).
