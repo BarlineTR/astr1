@@ -89,6 +89,11 @@ class CalibrationConfig:
             data = yaml.safe_load(f) or {}
         return cls.from_dict(data)
 
+    @classmethod
+    def from_yaml_file(cls, yaml_path: str) -> "CalibrationConfig":
+        return cls.load_yaml(yaml_path)
+
+
     def to_dict(self) -> dict:
         return {
             "head": {
