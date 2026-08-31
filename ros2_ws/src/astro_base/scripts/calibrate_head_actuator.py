@@ -354,26 +354,27 @@ def main():
         ang_str = input("Enter test angle [-45.0 to +45.0 deg]: ").strip()
         try:
             ang = max(-45.0, min(45.0, float(ang_str)))
-            if self.ser: self.ser.reset_input_buffer()
+            if calib.ser: calib.ser.reset_input_buffer()
             time.sleep(0.05)
-            self.read_telemetry(timeout_s=0.2)
-            enc_start = self.raw_head_ticks
+            calib.read_telemetry(timeout_s=0.2)
+            enc_start = calib.raw_head_ticks
 
             print(f"\nSending command: {ang:+.2f}°...")
-            self.command_angle(ang)
+            calib.command_angle(ang)
             
             # Wait for settling
             for _ in range(30):
                 time.sleep(0.08)
-                self.read_telemetry(timeout_s=0.1)
+                calib.read_telemetry(timeout_s=0.1)
 
-            enc_end = self.raw_head_ticks
+            enc_end = calib.raw_head_ticks
             delta = enc_end - enc_start
             print("\n---------------- STEP RESULT ----------------")
             print(f"Commanded Angle      : {ang:+.2f}°")
             print(f"Encoder Ticks Start  : {enc_start}")
             print(f"Encoder Ticks End    : {enc_end}")
             print(f"Encoder Delta Ticks  : {delta:+d} ticks")
+
             
             phys_str = input("\nPhysically measure: Approximately how many DEGREES did the head turn? (e.g. 5, 10, 15, 20): ").strip()
             try:
