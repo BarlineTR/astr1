@@ -472,6 +472,8 @@ class HeadTrackerNode(Node):
             body_yaw = self._acoustic_bearing_to_body_yaw(req_yaw)
             clamped_yaw = max(self.min_yaw_deg, min(self.max_yaw_deg, body_yaw))
             if self._command_source in (CommandSource.SAFETY, CommandSource.GESTURE):
+
+
                 self.get_logger().info(f"⏳ [Arbitration]: turn_to_sound ({clamped_yaw:.1f}°) ertelendi / öncelik: {self._command_source}")
                 return
             self._is_sleeping = False
@@ -530,6 +532,8 @@ class HeadTrackerNode(Node):
             # also what makes the consensus window meaningful: samples taken while the
             # neck was at different angles are only comparable once they share a frame.
             body_yaw = self._acoustic_bearing_to_body_yaw(relative_yaw)
+
+
 
 
 
@@ -875,8 +879,9 @@ class HeadTrackerNode(Node):
                                 desired_yaw = self._vision_anchor_yaw + math.copysign(budget, overshoot)
 
                             self._vision_last_applied_yaw = bearing
-                            self._target_yaw = max(self.min_yaw_deg, min(self.max_yaw_deg, wrap_deg(desired_yaw)))
+                            self._target_yaw = max(max(self.min_yaw_deg, -85.0), min(min(self.max_yaw_deg, 85.0), wrap_deg(desired_yaw)))
                 elif self._vision_person_detected and (now - self._vision_last_seen_time) > self.vision_timeout_s:
+
                     self._vision_person_detected = False
                     self.get_logger().info("👁️ [Vision Fusion] Yüz kayboldu — DOA / LiDAR takibine dönülüyor")
 
