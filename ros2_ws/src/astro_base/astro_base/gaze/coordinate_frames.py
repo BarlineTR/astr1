@@ -51,9 +51,15 @@ class CalibrationConfig:
 
     @classmethod
     def from_dict(cls, data: dict) -> "CalibrationConfig":
+        if "ros__parameters" in data:
+            data = data["ros__parameters"]
+        elif "/**" in data and isinstance(data["/**"], dict) and "ros__parameters" in data["/**"]:
+            data = data["/**"]["ros__parameters"]
+
         cfg = cls()
         if "head" in data:
             h = data["head"]
+
             cfg.head = HeadCalibration(
                 zero_offset_deg=float(h.get("zero_offset_deg", 0.0)),
                 min_angle_deg=float(h.get("min_angle_deg", -90.0)),
