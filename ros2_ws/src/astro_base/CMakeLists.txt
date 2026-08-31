@@ -8,6 +8,7 @@ endif()
 
 # Find dependencies
 find_package(ament_cmake REQUIRED)
+find_package(ament_cmake_python REQUIRED)
 find_package(rclpy REQUIRED)
 find_package(sensor_msgs REQUIRED)
 find_package(diagnostic_msgs REQUIRED)
@@ -34,6 +35,9 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   DEPENDENCIES std_msgs
 )
 
+# Install Python modules
+ament_python_install_package(${PROJECT_NAME})
+
 # Install Python executables - Çalıştırılabilir scriptimizi hedefe kopyalıyoruz
 install(PROGRAMS
   astro_base/serial_bridge.py
@@ -42,9 +46,22 @@ install(PROGRAMS
 )
 
 install(PROGRAMS
+  astro_base/social_gaze_node.py
+  DESTINATION lib/${PROJECT_NAME}
+  RENAME social_gaze
+)
+
+install(PROGRAMS
   astro_base/head_tracker_node.py
   DESTINATION lib/${PROJECT_NAME}
   RENAME head_tracker
+)
+
+# Install launch and config directories
+install(DIRECTORY
+  launch
+  config
+  DESTINATION share/${PROJECT_NAME}
 )
 
 # Linting
@@ -54,3 +71,4 @@ if(BUILD_TESTING)
 endif()
 
 ament_package()
+
