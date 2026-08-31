@@ -1,4 +1,6 @@
+#!/usr/bin/env python3
 """Social Gaze ROS 2 Node for ASTRO Robot Head.
+
 
 Integrates:
   1. Audio Perception & GCC-PHAT Filtering

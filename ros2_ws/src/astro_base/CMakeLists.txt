@@ -8,7 +8,6 @@ endif()
 
 # Find dependencies
 find_package(ament_cmake REQUIRED)
-find_package(ament_cmake_python REQUIRED)
 find_package(rclpy REQUIRED)
 find_package(sensor_msgs REQUIRED)
 find_package(diagnostic_msgs REQUIRED)
@@ -36,7 +35,10 @@ rosidl_generate_interfaces(${PROJECT_NAME}
 )
 
 # Install Python modules
-ament_python_install_package(${PROJECT_NAME})
+install(DIRECTORY
+  astro_base
+  DESTINATION "${PYTHON_INSTALL_DIR}"
+)
 
 # Install Python executables - Çalıştırılabilir scriptimizi hedefe kopyalıyoruz
 install(PROGRAMS
@@ -71,4 +73,5 @@ if(BUILD_TESTING)
 endif()
 
 ament_package()
+
 
