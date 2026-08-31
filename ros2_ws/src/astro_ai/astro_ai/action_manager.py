@@ -398,19 +398,19 @@ class ActionManager:
             azimuth = None
             confidence = 0.0
 
-            # Prefer recent speech consensus (within 4.0s) that is not a rear wall bounce
-            speech_doa = [y for ts, y, cur_rms in self._doa_history if (now - ts) <= 4.0 and 2.0 <= abs(y) <= 135.0 and cur_rms >= 300.0]
+            # Prefer recent speech consensus (within 3.0s) that is not a rear wall bounce (>130°)
+            speech_doa = [y for ts, y, cur_rms in self._doa_history if (now - ts) <= 3.0 and 2.0 <= abs(y) <= 130.0 and cur_rms >= 400.0]
             if speech_doa:
                 sin_s = sum(math.sin(math.radians(y)) for y in speech_doa)
                 cos_s = sum(math.cos(math.radians(y)) for y in speech_doa)
                 azimuth = float(math.degrees(math.atan2(sin_s, cos_s)))
                 confidence = 0.85
-            elif sound_dir and sound_dir.valid and sound_dir.confidence >= self._min_doa_confidence and abs(sound_dir.azimuth_deg) <= 135.0:
+            elif sound_dir and sound_dir.valid and sound_dir.confidence >= self._min_doa_confidence and abs(sound_dir.azimuth_deg) <= 130.0:
                 azimuth = sound_dir.azimuth_deg
                 confidence = sound_dir.confidence
             else:
-                # Secondary fallback: any non-zero history within 5s
-                recent_doa = [y for ts, y, _ in self._doa_history if (now - ts) <= 5.0 and abs(y) >= 2.0]
+                # Secondary fallback: only recent high-confidence lateral speech within 3.5s
+                recent_doa = [y for ts, y, cur_rms in self._doa_history if (now - ts) <= 3.5 and 2.0 <= abs(y) <= 130.0]
                 if recent_doa:
                     sin_s = sum(math.sin(math.radians(y)) for y in recent_doa)
                     cos_s = sum(math.cos(math.radians(y)) for y in recent_doa)
@@ -418,9 +418,10 @@ class ActionManager:
                     confidence = 0.60
                 elif self._node and getattr(self._node, "_speaker_angle", None) is not None:
                     spk_angle = float(self._node._speaker_angle)
-                    if abs(spk_angle) >= 2.0:
+                    if 2.0 <= abs(spk_angle) <= 130.0:
                         azimuth = float(circular_doa_to_yaw(spk_angle))
                         confidence = 0.50
+
 
             if azimuth is None:
                 self._logger.warning("⚠️ [ActionManager] turn_to_sound reddedildi: NO_DIRECTION (DOA yok veya zayıf)")

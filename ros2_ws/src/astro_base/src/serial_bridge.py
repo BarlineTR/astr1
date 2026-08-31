@@ -89,7 +89,8 @@ except ImportError:
         def __init__(self, key="", value=""):
             self.key = str(key)
             self.value = str(value)
-    Twist = Imu = JointState = object
+    Twist = Imu = JointState = Float32 = object
+
 
 SOF1 = 0xAA
 SOF2 = 0x55
