@@ -315,7 +315,7 @@ class HeadCalibrator:
 
             # Send command
             self.command_angle(angle)
-            calc_ticks = round(angle * 1.5111)
+            calc_ticks = round(angle * 1.5000)
 
             # Wait for physical settling (poll for 1.5 seconds)
             settled = False
@@ -336,7 +336,8 @@ class HeadCalibrator:
 
             enc_after = self.raw_head_ticks
             delta = enc_after - enc_before
-            reported_angle = enc_after / 1.5111
+            reported_angle = enc_after / 1.5000
+
 
 
 

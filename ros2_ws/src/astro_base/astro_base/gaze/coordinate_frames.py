@@ -22,7 +22,9 @@ class HeadCalibration:
     zero_offset_deg: float = 0.0
     min_angle_deg: float = -180.0
     max_angle_deg: float = 180.0
-    ticks_per_deg: float = 1.5111
+    ticks_per_deg: float = 1.5000
+
+
 
 
 

@@ -7,7 +7,9 @@
       zero_offset_deg: 0.0          # Software calibration zero offset
       min_angle_deg: -180.0         # Mechanical safety soft lower limit (degrees)
       max_angle_deg: 180.0          # Mechanical safety soft upper limit (degrees)
-      ticks_per_deg: 1.5111         # Measured via multi-point calibration: 136 ticks / 90.0 degrees (544 ticks/rev)
+      ticks_per_deg: 1.5000         # Empirically verified on physical robot: 45 ticks / 30.0 deg (540 ticks/rev)
+
+
 
 
 
