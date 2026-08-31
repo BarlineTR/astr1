@@ -30,8 +30,10 @@ static constexpr float KP = 0.6f, KI = 0.2f, KD = 0.0f; // 50 Hz PID için örne
 static constexpr int PWM_MAX = 255;
 static constexpr float PID_INTEGRAL_LIMIT = 50.0f; // ✅ FIX: Daha dar anti-windup limit
 
-// Kalibre Edildi: 344 tick / 270 derece = 1.2741 tick/derece (458.7 tick / 360 derece)
-static constexpr float HEAD_TICKS_PER_DEG = 1.2741f;
+// Kalibre Edildi: 136 tick / 90 derece = 1.5111 tick/derece (544 tick / 360 derece)
+static constexpr float HEAD_TICKS_PER_DEG = 1.5111f;
+
+
 
 
 
