@@ -45,19 +45,44 @@ class RobotLED:
         """Attempts to discover and initialize ReSpeaker USB Pixel Ring."""
         try:
             from pixel_ring import pixel_ring
-            self._pixel_ring = pixel_ring
+            if pixel_ring is not None:
+                self._pixel_ring = pixel_ring
+        except Exception:
+            pass
+
+        if not self._pixel_ring:
             try:
-                if hasattr(pixel_ring, "change_pattern"):
-                    pixel_ring.change_pattern('echo')
-                if hasattr(pixel_ring, "set_brightness"):
-                    pixel_ring.set_brightness(20)
-                if hasattr(pixel_ring, "off"):
-                    pixel_ring.off()
+                import usb.core
+                from pixel_ring.usb_pixel_ring_v2 import PixelRing as UsbPixelRingV2
+                dev = usb.core.find(idVendor=0x2886, idProduct=0x0018)
+                if not dev:
+                    dev = usb.core.find(idVendor=0x2886)
+                if dev is not None:
+                    self._pixel_ring = UsbPixelRingV2(dev)
+                    self._dev = dev
+            except Exception as e:
+                self._logger.debug(f"[RobotLED] UsbPixelRingV2 init notice: {e}")
+
+        if not self._pixel_ring:
+            try:
+                import usb.core
+                dev = usb.core.find(idVendor=0x2886)
+                if dev is not None:
+                    self._dev = dev
+            except Exception:
+                pass
+
+        if self._pixel_ring or self._dev:
+            try:
+                if self._pixel_ring and hasattr(self._pixel_ring, "set_brightness"):
+                    self._pixel_ring.set_brightness(25)
+                if self._pixel_ring and hasattr(self._pixel_ring, "change_pattern"):
+                    self._pixel_ring.change_pattern('echo')
             except Exception:
                 pass
             self._logger.info("✨ [RobotLED] ReSpeaker 12 LED Ring (pixel_ring) donanımı bağlandı.")
-        except Exception as exc:
-            self._logger.debug(f"[RobotLED] pixel_ring import/init notice: {exc}")
+        else:
+            self._logger.debug("[RobotLED] ReSpeaker LED donanımı henüz bulunamadı (otomatik denenecek).")
 
     def _worker_loop(self):
         """Worker loop processing LED commands asynchronously."""
@@ -69,60 +94,69 @@ class RobotLED:
                 self._apply_state(state_cmd)
                 self._state_queue.task_done()
             except queue.Empty:
+                if not self._pixel_ring and not self._dev:
+                    self._init_hardware()
                 continue
             except Exception as exc:
                 self._logger.debug(f"[RobotLED] Worker error: {exc}")
 
     def _apply_state(self, state: str):
         """Applies state to hardware with safety guard."""
-        if not self._pixel_ring:
-            return
+        if not self._pixel_ring and not self._dev:
+            self._init_hardware()
+            if not self._pixel_ring and not self._dev:
+                return
+
         try:
             with self._lock:
-                if state == "idle":
-                    if hasattr(self._pixel_ring, "wakeup"):
-                        self._pixel_ring.wakeup()
-                    elif hasattr(self._pixel_ring, "off"):
-                        self._pixel_ring.off()
-                elif state == "listening":
-                    if hasattr(self._pixel_ring, "listen"):
-                        self._pixel_ring.listen()
-                    elif hasattr(self._pixel_ring, "mono"):
-                        self._pixel_ring.mono(0, 180, 255)
-                    elif hasattr(self._pixel_ring, "set_color"):
-                        self._pixel_ring.set_color(r=0, g=180, b=255)
-                elif state == "thinking":
-                    if hasattr(self._pixel_ring, "think"):
-                        self._pixel_ring.think()
-                    elif hasattr(self._pixel_ring, "wait"):
-                        self._pixel_ring.wait()
-                    elif hasattr(self._pixel_ring, "spin"):
-                        self._pixel_ring.spin()
-                    elif hasattr(self._pixel_ring, "mono"):
-                        self._pixel_ring.mono(255, 180, 0)
-                    elif hasattr(self._pixel_ring, "set_color"):
-                        self._pixel_ring.set_color(r=255, g=180, b=0)
-                elif state == "speaking":
-                    if hasattr(self._pixel_ring, "speak"):
-                        self._pixel_ring.speak()
-                    elif hasattr(self._pixel_ring, "trace"):
-                        self._pixel_ring.trace()
-                    elif hasattr(self._pixel_ring, "mono"):
-                        self._pixel_ring.mono(0, 255, 120)
-                    elif hasattr(self._pixel_ring, "set_color"):
-                        self._pixel_ring.set_color(r=0, g=255, b=120)
-                elif state == "error":
-                    if hasattr(self._pixel_ring, "mono"):
-                        self._pixel_ring.mono(255, 0, 0)
-                    elif hasattr(self._pixel_ring, "set_color"):
-                        self._pixel_ring.set_color(r=255, g=0, b=0)
-                    elif hasattr(self._pixel_ring, "off"):
-                        self._pixel_ring.off()
-                elif state == "off":
-                    if hasattr(self._pixel_ring, "off"):
-                        self._pixel_ring.off()
+                if self._pixel_ring:
+                    if state == "idle":
+                        if hasattr(self._pixel_ring, "wakeup"):
+                            self._pixel_ring.wakeup()
+                        elif hasattr(self._pixel_ring, "off"):
+                            self._pixel_ring.off()
+                    elif state == "listening":
+                        if hasattr(self._pixel_ring, "listen"):
+                            self._pixel_ring.listen()
+                        elif hasattr(self._pixel_ring, "mono"):
+                            self._pixel_ring.mono(0, 180, 255)
+                        elif hasattr(self._pixel_ring, "set_color"):
+                            self._pixel_ring.set_color(r=0, g=180, b=255)
+                    elif state == "thinking":
+                        if hasattr(self._pixel_ring, "think"):
+                            self._pixel_ring.think()
+                        elif hasattr(self._pixel_ring, "wait"):
+                            self._pixel_ring.wait()
+                        elif hasattr(self._pixel_ring, "spin"):
+                            self._pixel_ring.spin()
+                        elif hasattr(self._pixel_ring, "mono"):
+                            self._pixel_ring.mono(255, 180, 0)
+                        elif hasattr(self._pixel_ring, "set_color"):
+                            self._pixel_ring.set_color(r=255, g=180, b=0)
+                    elif state == "speaking":
+                        if hasattr(self._pixel_ring, "speak"):
+                            self._pixel_ring.speak()
+                        elif hasattr(self._pixel_ring, "trace"):
+                            self._pixel_ring.trace()
+                        elif hasattr(self._pixel_ring, "mono"):
+                            self._pixel_ring.mono(0, 255, 120)
+                        elif hasattr(self._pixel_ring, "set_color"):
+                            self._pixel_ring.set_color(r=0, g=255, b=120)
+                    elif state == "error":
+                        if hasattr(self._pixel_ring, "mono"):
+                            self._pixel_ring.mono(255, 0, 0)
+                        elif hasattr(self._pixel_ring, "set_color"):
+                            self._pixel_ring.set_color(r=255, g=0, b=0)
+                        elif hasattr(self._pixel_ring, "off"):
+                            self._pixel_ring.off()
+                    elif state == "off":
+                        if hasattr(self._pixel_ring, "off"):
+                            self._pixel_ring.off()
+
+                self._logger.info(f"✨ [RobotLED] LED Durumu: {state.upper()}")
         except Exception as exc:
             self._logger.debug(f"[RobotLED] Hardware apply error ({state}): {exc}")
+
 
 
     def set_state(self, state: str):
