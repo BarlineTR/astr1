@@ -335,12 +335,14 @@ class AudioStreamNode(Node):
                 vad_msg.data = bool(is_speech)
                 self.pub_vad.publish(vad_msg)
 
-            # Publish genuine hardware DOA ONLY when speech is actively detected and playback is not active
+            # Publish genuine hardware DOA when speech is actively detected or during speech energy window
             is_active_playback = self._is_playing or (self._output_stream and self._output_stream.active)
-            if is_speech is True and doa_angle is not None and not is_active_playback:
+            is_recent_speech = (time.monotonic() - getattr(self, "_last_mic_speech_time", 0.0)) < 2.5
+            if (is_speech is True or is_recent_speech) and doa_angle is not None and not is_active_playback:
                 doa_msg = Float32()
                 doa_msg.data = float(doa_angle)
                 self.pub_doa.publish(doa_msg)
+
         except Exception as exc:
             self.get_logger().debug(f"_poll_respeaker_hid error: {exc}")
 
