@@ -72,6 +72,13 @@ static constexpr int HEAD_PWM_BREAKAWAY = 90;
 // ile itmek aşmaya ve salınıma yol açar.
 static constexpr int32_t HEAD_BREAKAWAY_MIN_ERR_TICKS = 5;
 
+// Kalkış tabanı PWM limitini aşarsa sessizce kırpılır ve ayar yapıldığı sanılır;
+// normal tabanın altına düşerse kalkış hareketten zayıf olur ki anlamsızdır.
+static_assert(HEAD_PWM_BREAKAWAY <= HEAD_PWM_LIMIT,
+              "HEAD_PWM_BREAKAWAY, HEAD_PWM_LIMIT'i asamaz: fazlasi kirpilir.");
+static_assert(HEAD_PWM_MIN <= HEAD_PWM_BREAKAWAY,
+              "Kalkis tabani, donerkenki tabandan kucuk olamaz.");
+
 static constexpr float HEAD_KP = 2.0f, HEAD_KD = 0.05f;
 static constexpr int32_t HEAD_DEADBAND_TICKS = 2;  // 2 tick ~= 0.77 derece
 static constexpr uint32_t HEAD_STALL_MS = 1500;    // PWM'e rağmen tick değişmiyorsa kes (1.5s güvenli süre)
