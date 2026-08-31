@@ -150,6 +150,14 @@ void headEncA() {
 
 
 void setupIO() {
+  // Önce pinleri LOW'a çek, sonra OUTPUT yap (BTS7960 açılış anlık darbe koruması)
+  digitalWrite(L_MOTOR_PWM_FWD, LOW);
+  digitalWrite(L_MOTOR_PWM_REV, LOW);
+  digitalWrite(R_MOTOR_PWM_FWD, LOW);
+  digitalWrite(R_MOTOR_PWM_REV, LOW);
+  digitalWrite(HEAD_MOTOR_PWM_FWD, LOW);
+  digitalWrite(HEAD_MOTOR_PWM_REV, LOW);
+
   pinMode(STATUS_LED, OUTPUT);
   pinMode(L_MOTOR_PWM_FWD, OUTPUT);
   pinMode(L_MOTOR_PWM_REV, OUTPUT);
@@ -157,6 +165,7 @@ void setupIO() {
   pinMode(R_MOTOR_PWM_REV, OUTPUT);
   pinMode(HEAD_MOTOR_PWM_FWD, OUTPUT);
   pinMode(HEAD_MOTOR_PWM_REV, OUTPUT);
+
 
   pinMode(L_ENC_A, INPUT_PULLUP);
   pinMode(L_ENC_B, INPUT_PULLUP);
