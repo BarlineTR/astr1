@@ -68,19 +68,14 @@ class HeadCalibrator:
     def connect(self):
         print(f"\n[1/3] Connecting to Arduino on {self.port_name} at {self.baud} baud...")
         try:
-            self.ser = serial.Serial()
-            self.ser.port = self.port_name
-            self.ser.baudrate = self.baud
-            self.ser.timeout = 0.1
-            self.ser.dtr = False  # Prevent hardware reset
-            self.ser.rts = False
-            self.ser.open()
-            time.sleep(0.3)
-            print("  -> Connected successfully without reset glitch!")
+            self.ser = serial.Serial(self.port_name, self.baud, timeout=0.1)
+            time.sleep(1.5)  # Clean Arduino boot
+            print("  -> Connected successfully!")
             self._start_heartbeat_thread()
             # Check packet format
-            time.sleep(0.3)
+            time.sleep(0.5)
             self.read_telemetry(timeout_s=1.0)
+
 
             if self.received_packet_len == 12:
                 print("\n" + "="*70)
