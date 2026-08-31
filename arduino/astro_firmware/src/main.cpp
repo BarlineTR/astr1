@@ -146,9 +146,16 @@ void rightEncA() {
   g_right_ticks += b ? -1 : +1;
 }
 void headEncA() {
-  bool b = digitalRead(HEAD_ENC_B);
-  g_head_ticks += b ? -1 : +1;
+  if (g_head_pwm > 0) {
+    g_head_ticks++;
+  } else if (g_head_pwm < 0) {
+    g_head_ticks--;
+  } else {
+    bool b = digitalRead(HEAD_ENC_B);
+    g_head_ticks += b ? -1 : +1;
+  }
 }
+
 
 
 
