@@ -58,12 +58,13 @@ static constexpr int32_t HEAD_TICKS_PER_REV =
     (int32_t)(360.0f * HEAD_TICKS_PER_DEG + 0.5f);
 
 // Kafa motoru PWM limitleri ve statik sürtünme eşiği
-static constexpr int HEAD_PWM_LIMIT = 150;
-static constexpr int HEAD_PWM_MIN = 35;
+static constexpr int HEAD_PWM_LIMIT = 160;
+static constexpr int HEAD_PWM_MIN = 70;
 
-static constexpr float HEAD_KP = 2.0f, HEAD_KD = 0.05f;
-static constexpr int32_t HEAD_DEADBAND_TICKS = 2;  // 2 tick ~= 0.77 derece
+static constexpr float HEAD_KP = 4.0f, HEAD_KD = 0.05f;
+static constexpr int32_t HEAD_DEADBAND_TICKS = 1;  // 1 tick ~= 0.78 derece
 static constexpr uint32_t HEAD_STALL_MS = 1500;    // PWM'e rağmen tick değişmiyorsa kes (1.5s güvenli süre)
+
 
 // ====== Diagnostik bayraklari ======
 static constexpr uint32_t FLAG_WATCHDOG_TIMEOUT = 0x01;
