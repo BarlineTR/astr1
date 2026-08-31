@@ -47,10 +47,11 @@ static constexpr float HEAD_TICKS_PER_DEG = 2.588f;
 // İkisi ayrışırsa firmware sessizce kırpar ve ROS'un ölü-hesap açısı kalıcı olarak kayar.
 // Kablo demeti tam turu kaldırmıyorsa değiştirilecek TEK yer burasıdır: sınırları daralt
 // ve HEAD_CONTINUOUS_ROTATION'ı false yap — YAML'daki eşleniğiyle birlikte.
-static constexpr float HEAD_MIN_DEG = -180.0f;
-static constexpr float HEAD_MAX_DEG =  180.0f;
-static constexpr bool  HEAD_CONTINUOUS_ROTATION = true;
+static constexpr float HEAD_MIN_DEG = -90.0f;
+static constexpr float HEAD_MAX_DEG =  90.0f;
+static constexpr bool  HEAD_CONTINUOUS_ROTATION = false;
 static constexpr int32_t HEAD_TICKS_PER_REV =
+
     (int32_t)(360.0f * HEAD_TICKS_PER_DEG + 0.5f);
 
 // Kafa motoru PWM limitleri ve statik sürtünme eşiği
@@ -97,6 +98,7 @@ static volatile uint32_t g_hb_rx_count = 0;
 static volatile uint32_t g_hb_ack_tx_count = 0;
 
 static bool g_motors_enabled = true;
+static bool g_head_active = false;
 static uint32_t g_diag_flags = 0;
 
 // ====== Yardımcılar ======
@@ -139,8 +141,9 @@ void rightEncA() {
 }
 void headEncA() {
   bool b = digitalRead(HEAD_ENC_B);
-  g_head_ticks += b ? +1 : -1;
+  g_head_ticks += b ? -1 : +1;
 }
+
 
 void setupIO() {
   pinMode(STATUS_LED, OUTPUT);
@@ -209,13 +212,14 @@ void headControl(uint32_t dt_ms) {
     while (err < -HEAD_TICKS_PER_REV / 2) err += HEAD_TICKS_PER_REV;
   }
 
-  if (!g_motors_enabled) {
+  if (!g_motors_enabled || !g_head_active) {
     setHeadPWM(0);
     g_head_err_prev = err;
     g_head_stall_ref = pos;
     g_head_stall_ms = millis();
     return;
   }
+
 
   if (abs(err) <= HEAD_DEADBAND_TICKS) {
     setHeadPWM(0);
@@ -389,7 +393,9 @@ void processPacket(uint8_t msg_id, const uint8_t* pl, uint8_t len) {
       else                      g_diag_flags &= ~FLAG_HEAD_LIMIT;
 
       g_head_target_ticks = (int32_t)lroundf(clamped * HEAD_TICKS_PER_DEG);
+      g_head_active = true;
       // Yeni hedef geldi: eski stall kilidini kaldır ve anlık konumu referans al
+
       g_head_stall_ref = readTicks(g_head_ticks);
       g_head_stall_ms = millis();
       g_diag_flags &= ~FLAG_HEAD_STALL;
