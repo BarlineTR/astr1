@@ -13,12 +13,15 @@ import serial
 import glob
 import os
 
+import threading
+
 SOF1 = 0xAA
 SOF2 = 0x55
 MSG_HEAD_CMD = 0x03
 MSG_ENCODER_TICKS = 0x11
 MSG_HEARTBEAT = 0x01
 MSG_HEARTBEAT_ACK = 0x13
+
 
 
 def crc8(data: bytes) -> int:
@@ -56,6 +59,7 @@ class HeadCalibrator:
         self.port_name = port or find_serial_port()
         self.baud = baud
         self.ser = None
+        self.ser_lock = threading.Lock()
         self.raw_head_ticks = 0
         self.received_packet_len = 0
         self.running = True
@@ -91,7 +95,6 @@ class HeadCalibrator:
             sys.exit(1)
 
     def _start_heartbeat_thread(self):
-        import threading
         self._heartbeat_active = True
         def hb_loop():
             while self._heartbeat_active and self.ser and self.ser.is_open:
@@ -104,9 +107,11 @@ class HeadCalibrator:
         t.start()
 
     def send_heartbeat(self):
-        if self.ser and self.ser.is_open:
-            pkt = build_packet(MSG_HEARTBEAT, struct.pack("<I", 1))
-            self.ser.write(pkt)
+        with self.ser_lock:
+            if self.ser and self.ser.is_open:
+                pkt = build_packet(MSG_HEARTBEAT, struct.pack("<I", 1))
+                self.ser.write(pkt)
+                self.ser.flush()
 
     def read_telemetry(self, timeout_s: float = 1.0) -> bool:
         """Reads latest encoder ticks from Arduino stream."""
@@ -117,7 +122,8 @@ class HeadCalibrator:
 
         while time.time() - start < timeout_s:
             if self.ser.in_waiting > 0:
-                chunk = self.ser.read(self.ser.in_waiting)
+                with self.ser_lock:
+                    chunk = self.ser.read(self.ser.in_waiting)
                 for b in chunk:
                     if state == 0:
                         if b == SOF1: state = 1
@@ -153,12 +159,17 @@ class HeadCalibrator:
 
     def command_angle(self, angle_deg: float):
         """Sends binary head angle command."""
-        self.send_heartbeat()
         payload = struct.pack("<f", float(angle_deg))
         pkt = build_packet(MSG_HEAD_CMD, payload)
-        if self.ser and self.ser.is_open:
-            self.ser.write(pkt)
-            self.ser.flush()
+        pkt_hex = " ".join(f"{b:02X}" for b in pkt)
+        print(f"  -> Sending UART packet: {pkt_hex} (Target: {angle_deg:+.2f}°)")
+        with self.ser_lock:
+            if self.ser and self.ser.is_open:
+                for _ in range(3):
+                    self.ser.write(pkt)
+                    self.ser.flush()
+                    time.sleep(0.01)
+
 
     def run_live_monitor(self):
         """Displays real-time encoder stream."""
