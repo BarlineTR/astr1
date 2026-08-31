@@ -351,21 +351,49 @@ def main():
     elif choice == "2":
         calib.run_step_table_verification()
     elif choice == "3":
-        ang_str = input("Enter test angle [-10.0 to +10.0 deg]: ").strip()
+        ang_str = input("Enter test angle [-45.0 to +45.0 deg]: ").strip()
         try:
-            ang = max(-10.0, min(10.0, float(ang_str)))
-            print(f"Sending safe command: {ang:+.2f}°...")
-            calib.command_angle(ang)
-            time.sleep(1.0)
-            calib.read_telemetry()
-            print(f"Final Encoder Ticks: {calib.raw_head_ticks}")
+            ang = max(-45.0, min(45.0, float(ang_str)))
+            if self.ser: self.ser.reset_input_buffer()
+            time.sleep(0.05)
+            self.read_telemetry(timeout_s=0.2)
+            enc_start = self.raw_head_ticks
+
+            print(f"\nSending command: {ang:+.2f}°...")
+            self.command_angle(ang)
+            
+            # Wait for settling
+            for _ in range(30):
+                time.sleep(0.08)
+                self.read_telemetry(timeout_s=0.1)
+
+            enc_end = self.raw_head_ticks
+            delta = enc_end - enc_start
+            print("\n---------------- STEP RESULT ----------------")
+            print(f"Commanded Angle      : {ang:+.2f}°")
+            print(f"Encoder Ticks Start  : {enc_start}")
+            print(f"Encoder Ticks End    : {enc_end}")
+            print(f"Encoder Delta Ticks  : {delta:+d} ticks")
+            
+            phys_str = input("\nPhysically measure: Approximately how many DEGREES did the head turn? (e.g. 5, 10, 15, 20): ").strip()
+            try:
+                phys_deg = float(phys_str)
+                if abs(phys_deg) > 0.1:
+                    real_scale = abs(delta) / abs(phys_deg)
+                    print(f"\n🎯 >>> CALCULATED TICKS PER DEGREE: {real_scale:.4f} ticks/deg <<<")
+                    print(f"   (360° full revolution = {real_scale * 360.0:.1f} ticks)")
+                    print(f"\nRecommended action:")
+                    print(f"1. In calibration_params.yaml : ticks_per_deg: {real_scale:.4f}")
+                    print(f"2. In AstroFirmware.ino       : static constexpr float HEAD_TICKS_PER_DEG = {real_scale:.4f}f;")
+            except ValueError:
+                pass
         except ValueError:
             print("Invalid input.")
     elif choice == "4":
         calib.run_live_monitor()
 
 
-
 if __name__ == "__main__":
     main()
+
 
