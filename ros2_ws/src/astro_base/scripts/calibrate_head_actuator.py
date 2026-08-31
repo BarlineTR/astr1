@@ -120,98 +120,147 @@ class HeadCalibrator:
         self.ser.write(pkt)
         self.ser.flush()
 
-    def run_manual_encoder_calibration(self):
-        """Measures raw encoder resolution by manual physical rotation."""
+    def run_multi_point_manual_calibration(self):
+        """Measures raw encoder ticks across multiple physical reference angles and performs linear regression."""
         print("\n========================================================")
-        print("   MANUAL ENCODER RESOLUTION CALIBRATION")
+        print("   MULTI-POINT LARGE-ANGLE ENCODER IDENTIFICATION")
         print("========================================================")
         print("Instructions:")
-        print("1. Turn the head manually to 0.0° (Center position).")
-        input("Press [ENTER] when head is at 0.0° Center...")
+        print("1. Set the physical head at TRUE MECHANICAL 0.0° (Center).")
+        input("Press [ENTER] when head is mechanically at 0.0° Center...")
         self.send_heartbeat()
         time.sleep(0.2)
         self.read_telemetry()
-        start_ticks = self.raw_head_ticks
-        print(f"  -> Baseline 0.0° Encoder Ticks = {start_ticks}")
+        zero_ticks = self.raw_head_ticks
+        print(f"  -> Baseline 0.0° Reference Ticks = {zero_ticks}\n")
 
-        print("\n2. Now manually rotate the physical head by a KNOWN angle.")
-        print("   (e.g., exactly +45° Left or +90° Left, or -45° Right)")
-        measured_angle_str = input("Enter the physical angle you turned (in degrees, e.g. 45 or 90): ")
-        try:
-            measured_angle = float(measured_angle_str)
-        except ValueError:
-            print("Invalid number!")
+        test_points = [15.0, 30.0, 45.0, 90.0, -15.0, -30.0, -45.0, -90.0]
+        recorded_data = [(0.0, 0)]  # (physical_angle, delta_ticks)
+
+        print("For each target angle, manually align the head, then press Enter.")
+        print("(If ±90° is mechanically unsafe for your wiring, you can type 'skip')\n")
+
+        for angle in test_points:
+            user_in = input(f"Align head to physical {angle:+.1f}° (or 's' to skip) -> press ENTER: ").strip().lower()
+            if user_in == 's' or user_in == 'skip':
+                continue
+
+            self.send_heartbeat()
+            time.sleep(0.2)
+            self.read_telemetry()
+            current_ticks = self.raw_head_ticks
+            delta = current_ticks - zero_ticks
+            recorded_data.append((angle, delta))
+            print(f"  Recorded: Angle = {angle:+.1f}°, Raw Ticks = {current_ticks}, Delta Ticks = {delta:+d}\n")
+
+        if len(recorded_data) < 3:
+            print("Not enough points recorded for regression.")
             return
 
-        self.send_heartbeat()
-        time.sleep(0.2)
-        self.read_telemetry()
-        end_ticks = self.raw_head_ticks
-        delta_ticks = end_ticks - start_ticks
+        # Linear regression: ticks = a * angle + b
+        n = len(recorded_data)
+        sum_x = sum(pt[0] for pt in recorded_data)
+        sum_y = sum(pt[1] for pt in recorded_data)
+        sum_xx = sum(pt[0]**2 for pt in recorded_data)
+        sum_xy = sum(pt[0]*pt[1] for pt in recorded_data)
+        sum_yy = sum(pt[1]**2 for pt in recorded_data)
 
-        print("\n---------------- RESULTS ----------------")
-        print(f"Physical Head Angle     : {measured_angle:+.2f}°")
-        print(f"Start Encoder Ticks     : {start_ticks}")
-        print(f"End Encoder Ticks       : {end_ticks}")
-        print(f"Delta Encoder Ticks     : {delta_ticks}")
+        denom = (n * sum_xx - sum_x**2)
+        if abs(denom) < 1e-6:
+            print("Regression calculation error: zero denominator.")
+            return
 
-        if abs(measured_angle) > 0.1:
-            ticks_per_deg = float(delta_ticks) / float(measured_angle)
-            deg_per_tick = 1.0 / ticks_per_deg if ticks_per_deg != 0 else 0.0
-            ticks_per_rev = ticks_per_deg * 360.0
-            print(f"\n>>> CALCULATED RESOLUTION: {ticks_per_deg:.4f} ticks / degree <<<")
-            print(f"    (1 tick = {deg_per_tick:.4f} degrees, {ticks_per_rev:.1f} ticks / 360° turn)")
-            print("\nRecommended actions:")
-            print(f"1. In calibration_params.yaml : ticks_per_deg: {abs(ticks_per_deg):.4f}")
-            print(f"2. In AstroFirmware.ino       : static constexpr float HEAD_TICKS_PER_DEG = {abs(ticks_per_deg):.4f}f;")
+        a = (n * sum_xy - sum_x * sum_y) / denom
+        b = (sum_y * sum_xx - sum_x * sum_xy) / denom
+
+        # Calculate R^2 and residuals
+        residuals = []
+        for x, y in recorded_data:
+            predicted = a * x + b
+            residuals.append(y - predicted)
+
+        ss_res = sum(r**2 for r in residuals)
+        ss_tot = sum_yy - (sum_y**2 / n)
+        r_squared = 1.0 - (ss_res / ss_tot) if ss_tot > 1e-6 else 1.0
+        rmse = math.sqrt(ss_res / n)
+        max_res = max(abs(r) for r in residuals)
+
+        print("\n========================================================")
+        print("   SYSTEM IDENTIFICATION RESULTS & STATISTICAL FIT")
+        print("========================================================")
+        print(f"Number of Points Recorded : {n}")
+        print(f"Linear Fit Equation       : encoder_ticks = ({a:.4f}) * angle_deg + ({b:.2f})")
+        print(f"Slope (ticks_per_degree)  : {abs(a):.4f} ticks / degree")
+        print(f"Zero Offset Residual      : {b:+.2f} ticks")
+        print(f"Correlation (R²)          : {r_squared:.6f}")
+        print(f"RMSE                      : {rmse:.3f} ticks")
+        print(f"Max Residual Error        : {max_res:.3f} ticks")
+
+        # Sign verification
+        sign_polarity = "POSITIVE (+)" if a > 0 else "NEGATIVE (-)"
+        print(f"Actuator Direction Sign   : {sign_polarity} (Left/CCW generates positive ticks)")
+
+        print("\n---------------- FINAL VERIFICATION TABLE ----------------")
+        print("| Physical Head Angle | Raw Encoder Ticks | Model Predicted Ticks | Residual Error (Ticks) |")
+        print("|--------------------:|------------------:|----------------------:|-----------------------:|")
+        for x, y in recorded_data:
+            pred = a * x + b
+            err = y - pred
+            print(f"| {x:+19.1f}° | {y:+17d} | {pred:+21.1f} | {err:+22.2f} |")
+
+        print("\n---------------- UPDATED CONFIGURATION BLOCK ----------------")
+        print("# Paste this directly into config/calibration_params.yaml:")
+        print("head:")
+        print(f"  ticks_per_deg: {abs(a):.4f}         # Measured via linear regression (R²={r_squared:.4f})")
+        print(f"  zero_offset_deg: {(-b / a if abs(a) > 0 else 0.0):.2f}")
+        print("  min_angle_deg: -90.0")
+        print("  max_angle_deg: 90.0")
+        print("\n// Paste this into AstroFirmware.ino & main.cpp:")
+        print(f"static constexpr float HEAD_TICKS_PER_DEG = {abs(a):.4f}f;")
 
     def run_step_table_verification(self):
-        """Runs micro-step commands (±2°, ±5°, ±10°) and builds verification table."""
+        """Runs safe micro-step commands (±2°, ±5°, ±10°) and builds verification table."""
         print("\n========================================================")
         print("   ISOLATED STEP COMMAND VERIFICATION TABLE")
         print("========================================================")
-        test_angles = [0.0, 2.0, -2.0, 5.0, -5.0, 10.0, -10.0, 0.0]
+        test_angles = [0.0, 2.0, 0.0, -2.0, 0.0, 5.0, 0.0, -5.0, 0.0, 10.0, 0.0, -10.0, 0.0]
 
-        print("\n| ROS cmd | Packet Bytes (Hex) | Target Ticks (Calc) | Encoder Ticks (Read) | Reported Angle | Physical Obs (Notes) |")
-        print("|--------:|:------------------:|--------------------:|---------------------:|---------------:|:---------------------|")
+        print("\n| ROS cmd | Packet Bytes (Hex) | Arduino Target (Calc) | Encoder Ticks (Read) | Reported Angle | Physical Head Angle (Notes) |")
+        print("|--------:|:------------------:|----------------------:|---------------------:|---------------:|:----------------------------|")
 
         for angle in test_angles:
-            # Send command
             payload = struct.pack("<f", float(angle))
             pkt = build_packet(MSG_HEAD_CMD, payload)
             self.command_angle(angle)
 
-            # Wait 1.0s for motor to settle
             time.sleep(1.0)
             self.read_telemetry(timeout_s=0.5)
 
-            # Read back encoder
             ticks = self.raw_head_ticks
             reported_angle = ticks / 2.5882  # Current configured scale
-
             pkt_hex = " ".join(f"{b:02X}" for b in pkt)
             calc_ticks = round(angle * 2.5882)
 
-            print(f"| {angle:+6.1f}° | `{pkt_hex}` | {calc_ticks:19d} | {ticks:20d} | {reported_angle:+13.2f}° |                      |")
+            print(f"| {angle:+6.1f}° | `{pkt_hex}` | {calc_ticks:21d} | {ticks:20d} | {reported_angle:+13.2f}° |                             |")
 
-        print("\nTable completed. Verify physical head angles match the commanded angles.")
+        print("\nVerification complete.")
 
 
 def main():
     print("========================================================")
-    print("   ASTRO ROBOT - HEAD ACTUATOR CALIBRATOR")
+    print("   ASTRO ROBOT - ISOLATED ACTUATOR IDENTIFICATION")
     print("========================================================")
     calib = HeadCalibrator()
     calib.connect()
 
     print("\nSelect Mode:")
-    print("  [1] Manual Encoder Calibration (Rotate head by hand & measure exact ticks/deg)")
-    print("  [2] Step Response Verification Table (±2°, ±5°, ±10° command test)")
-    print("  [3] Send Single Test Angle (Safety limited to ±10°)")
+    print("  [1] Multi-Point Large-Angle Identification (0°, ±15°, ±30°, ±45°, ±90° with linear fit)")
+    print("  [2] Safe Step Response Table Test (±2°, ±5°, ±10° command sequence)")
+    print("  [3] Single Direct Angle Test (Safe range: -10° to +10°)")
     choice = input("\nEnter choice [1, 2, or 3]: ").strip()
 
     if choice == "1":
-        calib.run_manual_encoder_calibration()
+        calib.run_multi_point_manual_calibration()
     elif choice == "2":
         calib.run_step_table_verification()
     elif choice == "3":
@@ -229,3 +278,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
