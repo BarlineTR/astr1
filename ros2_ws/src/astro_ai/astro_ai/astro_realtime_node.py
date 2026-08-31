@@ -143,6 +143,7 @@ try:
     from astro_ai.provider_registry import ProviderRegistry, ProviderError, ErrorClass
     from astro_ai.repetition_guard import RepetitionGuard
     from astro_ai.action_manager import ActionManager, SoundDirection, ActionResult
+    from astro_ai.robot_led import RobotLED
 except ImportError:
     from conversation_session import ConversationSession, normalize_turkish_speech_input
     from memory_manager import MemoryManager
@@ -157,6 +158,11 @@ except ImportError:
         from action_manager import ActionManager, SoundDirection, ActionResult
     except ImportError:
         ActionManager = SoundDirection = ActionResult = None  # type: ignore
+    try:
+        from robot_led import RobotLED
+    except ImportError:
+        RobotLED = None  # type: ignore
+
 
 try:
     from astro_ai.brain.social_brain import SocialBrain
@@ -619,13 +625,14 @@ class AstroRealtimeNode(Node):
         # Office Automation & Concierge Subsystem
         self.calendar_service = CalendarService() if CalendarService else None
         self.slack_service = SlackService() if SlackService else None
-        self.office_concierge = (
-            OfficeConciergeManager(calendar_service=self.calendar_service, slack_service=self.slack_service)
-            if OfficeConciergeManager else None
-        )
+        # ReSpeaker 12 LED Ring Controller Subsystem
+        self.robot_led = RobotLED(logger=self.get_logger()) if RobotLED else None
+        if self.robot_led:
+            self.state_machine.add_listener(self._on_robot_state_change)
 
         # State
         self._lock = threading.RLock()
+
         self._recognized_person: Optional[Dict[str, Any]] = None
         self._recognized_speaker: Optional[Dict[str, Any]] = None
         self._user_emotion = "neutral"
@@ -882,11 +889,16 @@ class AstroRealtimeNode(Node):
         self._publish_realtime_state("DISCONNECTED", "init")
 
         # Sleep Mode (Test mode starts sleeping for invariant testing; Production starts active and ready)
-        is_test = (os.environ.get("ASTRO_TEST_MODE") == "1")
+        is_test = (
+            os.environ.get("ASTRO_TEST_MODE") == "1"
+            or "pytest" in sys.modules
+            or "unittest" in sys.modules
+        )
         self._node_start_time = time.monotonic()
         self._is_sleeping = is_test
         if not is_test:
             self.state_machine.transition_to(RobotState.LISTENING)
+
         self._last_interaction_time = time.monotonic()
         self._consecutive_loud_frames = 0
         self.create_timer(1.0, self._check_sleep_mode)
@@ -4801,6 +4813,7 @@ class AstroRealtimeNode(Node):
         if not self.groq_api_key:
             return None
         try:
+            prompt_text = "Astro, hey Astro, sesime dön, bana bak, bana dön, yüzüme bak, dur, durdum, merkez, Baran, Oktay, robot."
             boundary = "----WebKitFormBoundary" + os.urandom(16).hex()
             body = bytearray()
             body.extend(f"--{boundary}\r\n".encode())
@@ -4814,6 +4827,10 @@ class AstroRealtimeNode(Node):
             body.extend(f"--{boundary}\r\n".encode())
             body.extend(b'Content-Disposition: form-data; name="language"\r\n\r\n')
             body.extend(b'tr\r\n')
+            body.extend(f"--{boundary}\r\n".encode())
+            body.extend(b'Content-Disposition: form-data; name="prompt"\r\n\r\n')
+            body.extend(prompt_text.encode("utf-8"))
+            body.extend(b'\r\n')
             body.extend(f"--{boundary}--\r\n".encode())
 
             req = urllib.request.Request(
@@ -4842,18 +4859,18 @@ class AstroRealtimeNode(Node):
             return b""
 
         p = self.persona_name.lower()
-        if p in ("flirt", "emotional"):
-            voice = "tr-TR-EmelNeural"
-            rate = "+12%"
-        else:
-            voice = "tr-TR-AhmetNeural"
-            rate = "+20%" if p in ("kufurbaz", "playful", "angry", "rude") else "+8%"
+        default_voice = "tr-TR-EmelNeural" if p in ("flirt", "emotional") else "tr-TR-AhmetNeural"
+        voice = os.getenv("EDGE_TTS_VOICE", default_voice).strip() or default_voice
+        default_rate = "+10%" if p in ("kufurbaz", "playful", "angry", "rude") else "+4%"
+        rate = os.getenv("EDGE_TTS_RATE", default_rate).strip() or default_rate
+        pitch = os.getenv("EDGE_TTS_PITCH", "+0Hz").strip() or "+0Hz"
+        volume = os.getenv("EDGE_TTS_VOLUME", "+0%").strip() or "+0%"
 
         try:
             import edge_tts
             loop = asyncio.new_event_loop()
             async def _get_mp3():
-                communicate = edge_tts.Communicate(clean_text, voice, rate=rate)
+                communicate = edge_tts.Communicate(clean_text, voice, rate=rate, pitch=pitch, volume=volume)
                 buf = bytearray()
                 async for chunk in communicate.stream():
                     if chunk["type"] == "audio":
@@ -4861,6 +4878,7 @@ class AstroRealtimeNode(Node):
                 return bytes(buf)
             mp3_data = loop.run_until_complete(_get_mp3())
             loop.close()
+
 
             if mp3_data:
                 try:
@@ -5826,6 +5844,9 @@ class AstroRealtimeNode(Node):
                         })
                         self.get_logger().warn(f"⚠️ [Groq Model Fallback] {target_model} failed ({pe.error_class.value}): {pe.message[:80]}")
                         full_reply_parts = []
+                        if pe.error_class in (ErrorClass.QUOTA_EXHAUSTED, ErrorClass.RATE_LIMITED, ErrorClass.AUTHENTICATION_ERROR):
+                            # Quota/rate-limit is provider-wide; do not loop through other models on this provider
+                            break
                         continue
 
             # Attempt B: Google Gemini REST Fallback (if Groq produced no tokens)
@@ -5869,7 +5890,11 @@ class AstroRealtimeNode(Node):
                             "error": pe.message[:80]
                         })
                         self.get_logger().warn(f"⚠️ [Gemini Model Fallback] {g_mod} failed ({pe.error_class.value}): {pe.message[:80]}")
+                        if pe.error_class in (ErrorClass.QUOTA_EXHAUSTED, ErrorClass.RATE_LIMITED, ErrorClass.AUTHENTICATION_ERROR):
+                            # Quota/rate-limit is provider-wide; do not loop through other models on this provider
+                            break
                         continue
+
 
             full_reply_str = clean_tts_text("".join(full_reply_parts))
 
@@ -6833,8 +6858,34 @@ class AstroRealtimeNode(Node):
         except Exception as _exc:
             self.get_logger().debug(f"_publish_system_telemetry: {_exc}")
 
+    def _on_robot_state_change(self, old_state: RobotState, new_state: RobotState):
+        """Maps state machine transitions directly to non-blocking ReSpeaker 12 LED animations."""
+        if not getattr(self, "robot_led", None):
+            return
+        try:
+            if new_state in (RobotState.DEEP_IDLE, RobotState.IDLE):
+                self.robot_led.idle()
+            elif new_state in (RobotState.WAKE, RobotState.LISTENING, RobotState.INTERRUPTED):
+                self.robot_led.listening()
+            elif new_state in (RobotState.THINKING, RobotState.THINKING_ACK):
+                self.robot_led.thinking()
+            elif new_state == RobotState.SPEAKING:
+                self.robot_led.speaking()
+        except Exception as exc:
+            self.get_logger().debug(f"LED state transition notice: {exc}")
+
+    def destroy_node(self):
+        """Clean shutdown turning off hardware LEDs and stopping worker threads."""
+        try:
+            if getattr(self, "robot_led", None):
+                self.robot_led.shutdown()
+        except Exception:
+            pass
+        return super().destroy_node()
+
 
 def main(args=None):
+
     rclpy.init(args=args)
     node = AstroRealtimeNode()
     try:
