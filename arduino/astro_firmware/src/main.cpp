@@ -146,16 +146,21 @@ void rightEncA() {
   bool b = digitalRead(R_ENC_B);
   g_right_ticks += b ? -1 : +1;
 }
+volatile int8_t g_head_last_dir = 1;
+
 void headEncA() {
   if (g_head_pwm > 0) {
+    g_head_last_dir = 1;
     g_head_ticks++;
   } else if (g_head_pwm < 0) {
+    g_head_last_dir = -1;
     g_head_ticks--;
   } else {
-    bool b = digitalRead(HEAD_ENC_B);
-    g_head_ticks += b ? -1 : +1;
+    // Frenleme/atalet aninda son hareket yonunde sayarak faz terslenmesi ve kaymayi onle
+    g_head_ticks += g_head_last_dir;
   }
 }
+
 
 
 

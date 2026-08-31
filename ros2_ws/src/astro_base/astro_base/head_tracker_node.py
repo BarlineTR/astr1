@@ -531,6 +531,8 @@ class HeadTrackerNode(Node):
             # neck was at different angles are only comparable once they share a frame.
             body_yaw = self._acoustic_bearing_to_body_yaw(relative_yaw)
 
+
+
             # Record the UNCLAMPED bearing: clamping before the consensus step splits a
             # single source behind the robot into alternating +max/-max samples.
             # Mechanical clamping happens once, after consensus (step 7).
@@ -841,10 +843,9 @@ class HeadTrackerNode(Node):
                     if self._vision_yaw_pending and abs(self._vision_head_yaw) >= 1.5:
                         self._vision_yaw_pending = False
                         
-                        # Saccadic tracking: only act once the head has settled from the
-                        # last command, so the bearing being applied is not one measured
-                        # mid-flight.
-                        if (now - self._last_motion_cmd_time) > self.head_motion_settle_s:
+                        # Akıcı ve organik yüz takibi: Görsel servo gecikmesini 80ms'ye indirerek pürüzsüz takip sağla
+                        if (now - self._last_motion_cmd_time) > 0.08:
+
                             # Anchored on the pose the bearing was measured from, not on
                             # the running target. Adding to the target integrates instead
                             # of correcting: the face detector replays its last bounding
