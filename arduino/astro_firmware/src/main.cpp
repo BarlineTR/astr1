@@ -30,22 +30,44 @@ static constexpr float KP = 0.6f, KI = 0.2f, KD = 0.0f; // 50 Hz PID için örne
 static constexpr int PWM_MAX = 255;
 static constexpr float PID_INTEGRAL_LIMIT = 50.0f; // ✅ FIX: Daha dar anti-windup limit
 
-// ====== Kafa (BTS7960 + enkoderli DC motor) ======
-// ⚠ KALİBRE EDİLMELİ: MotorTest sketch'indeki 'c <derece>' komutuyla ölçün.
-//   Motorun ürün sayfası enkoder CPR'ını vermiyor, bu değer tahmindir.
-static constexpr float HEAD_TICKS_PER_DEG = 14.667f;
+// Kalibre Edildi: 45 tick / 30 derece = 1.5000 tick/derece (540 tick / 360 derece)
+static constexpr float HEAD_TICKS_PER_DEG = 1.5000f;
 
-// Yazılımsal açı limitleri (limit switch yok; açılıştaki konum 0° kabul edilir)
-static constexpr float HEAD_MIN_DEG = -90.0f;
-static constexpr float HEAD_MAX_DEG =  90.0f;
+
+
+
+
+
+
+// Yazılımsal açı limitleri (limit switch yok; açılıştaki konum 0° kabul edilir).
+//
+// Boyun mekanik olarak tam tur dönebildiği için ±180° serbest bırakıldı: arkadaki bir
+// ses kaynağına kısa yaydan ulaşılabilmesi tüm çemberin erişilebilir olmasını gerektirir.
+// ±180 burada bir mekanik dayanak değil, sadece açının yazılış biçimindeki dikiştir; bu
+// yüzden HEAD_CONTINUOUS_ROTATION açıkken konum hatası bir tam tur modunda sarılır ve
+// ROS +179° -> -179° setpoint gönderdiğinde motor 358° geri sarmak yerine 2° kısa
+// yaydan gider.
+//
+// ROS tarafı aynı sınırları kullanır (astro_params.yaml: max_yaw_deg / min_yaw_deg).
+// İkisi ayrışırsa firmware sessizce kırpar ve ROS'un ölü-hesap açısı kalıcı olarak kayar.
+// Kablo demeti tam turu kaldırmıyorsa değiştirilecek TEK yer burasıdır: sınırları daralt
+// ve HEAD_CONTINUOUS_ROTATION'ı false yap — YAML'daki eşleniğiyle birlikte.
+static constexpr float HEAD_MIN_DEG = -180.0f;
+static constexpr float HEAD_MAX_DEG =  180.0f;
+static constexpr bool  HEAD_CONTINUOUS_ROTATION = false;
+
+static constexpr int32_t HEAD_TICKS_PER_REV =
+
+    (int32_t)(360.0f * HEAD_TICKS_PER_DEG + 0.5f);
 
 // Kafa motoru PWM limitleri ve statik sürtünme eşiği
-static constexpr int HEAD_PWM_LIMIT = 180;
-static constexpr int HEAD_PWM_MIN = 45;
+static constexpr int HEAD_PWM_LIMIT = 160;
+static constexpr int HEAD_PWM_MIN = 70;
 
-static constexpr float HEAD_KP = 1.8f, HEAD_KD = 0.08f;
-static constexpr int32_t HEAD_DEADBAND_TICKS = 8;  // bu kadar yakınsa motoru bırak
+static constexpr float HEAD_KP = 4.0f, HEAD_KD = 0.05f;
+static constexpr int32_t HEAD_DEADBAND_TICKS = 1;  // 1 tick ~= 0.78 derece
 static constexpr uint32_t HEAD_STALL_MS = 1500;    // PWM'e rağmen tick değişmiyorsa kes (1.5s güvenli süre)
+
 
 // ====== Diagnostik bayraklari ======
 static constexpr uint32_t FLAG_WATCHDOG_TIMEOUT = 0x01;
@@ -76,8 +98,14 @@ static uint32_t g_head_stall_ms = 0;
 
 static uint32_t g_last_control_ms = 0;
 static uint32_t g_last_heartbeat_ms = 0;
+static uint32_t g_last_diag_serial2_ms = 0;
+
+// ====== Forensic Diagnostik Sayaçları ======
+static volatile uint32_t g_hb_rx_count = 0;
+static volatile uint32_t g_hb_ack_tx_count = 0;
 
 static bool g_motors_enabled = true;
+static bool g_head_active = false;
 static uint32_t g_diag_flags = 0;
 
 // ====== Yardımcılar ======
@@ -118,12 +146,57 @@ void rightEncA() {
   bool b = digitalRead(R_ENC_B);
   g_right_ticks += b ? -1 : +1;
 }
+volatile int8_t g_head_last_dir = 1;
+
 void headEncA() {
-  bool b = digitalRead(HEAD_ENC_B);
-  g_head_ticks += b ? -1 : +1;
+  if (g_head_pwm > 0) {
+    g_head_last_dir = 1;
+    g_head_ticks++;
+  } else if (g_head_pwm < 0) {
+    g_head_last_dir = -1;
+    g_head_ticks--;
+  } else {
+    // Frenleme/atalet aninda son hareket yonunde sayarak faz terslenmesi ve kaymayi onle
+    g_head_ticks += g_head_last_dir;
+  }
+}
+
+
+
+
+
+
+// Erken donanımsal pin kilidi: MCU açıldığı mikrosaniyede (C runtime ve main'den önce)
+// tüm motor PWM pinlerini kesin olarak OUTPUT ve LOW yaparak BTS7960 açılış savrulmasını sıfırlar.
+void init_early_pwm(void) __attribute__((naked)) __attribute__((section(".init3")));
+void init_early_pwm(void) {
+  // Pin 44 (PL5) & Pin 45 (PL4) - Kafa Motoru
+  PORTL &= ~((1 << 5) | (1 << 4));
+  DDRL  |=  ((1 << 5) | (1 << 4));
+
+  // Pin 5 (PE3) & Pin 6 (PH3) - Sol Tekerlek
+  PORTE &= ~(1 << 3);
+  DDRE  |=  (1 << 3);
+  PORTH &= ~(1 << 3);
+  DDRH  |=  (1 << 3);
+
+  // Pin 9 (PH6) & Pin 10 (PB4) - Sağ Tekerlek
+  PORTH &= ~(1 << 6);
+  DDRH  |=  (1 << 6);
+  PORTB &= ~(1 << 4);
+  DDRB  |=  (1 << 4);
 }
 
 void setupIO() {
+  // Önce pinleri LOW'a çek, sonra OUTPUT yap (BTS7960 açılış anlık darbe koruması)
+
+  digitalWrite(L_MOTOR_PWM_FWD, LOW);
+  digitalWrite(L_MOTOR_PWM_REV, LOW);
+  digitalWrite(R_MOTOR_PWM_FWD, LOW);
+  digitalWrite(R_MOTOR_PWM_REV, LOW);
+  digitalWrite(HEAD_MOTOR_PWM_FWD, LOW);
+  digitalWrite(HEAD_MOTOR_PWM_REV, LOW);
+
   pinMode(STATUS_LED, OUTPUT);
   pinMode(L_MOTOR_PWM_FWD, OUTPUT);
   pinMode(L_MOTOR_PWM_REV, OUTPUT);
@@ -131,6 +204,7 @@ void setupIO() {
   pinMode(R_MOTOR_PWM_REV, OUTPUT);
   pinMode(HEAD_MOTOR_PWM_FWD, OUTPUT);
   pinMode(HEAD_MOTOR_PWM_REV, OUTPUT);
+
 
   pinMode(L_ENC_A, INPUT_PULLUP);
   pinMode(L_ENC_B, INPUT_PULLUP);
@@ -160,12 +234,15 @@ void stopMotors() {
 }
 
 void publishEncoders(uint32_t dt_us, int32_t dl, int32_t dr) {
-  uint8_t payload[4 + 4 + 4];
+  int32_t head_ticks = readTicks(g_head_ticks);
+  uint8_t payload[4 + 4 + 4 + 4];
   memcpy(&payload[0], &dl, 4);
   memcpy(&payload[4], &dr, 4);
-  memcpy(&payload[8], &dt_us, 4);
+  memcpy(&payload[8], &head_ticks, 4);
+  memcpy(&payload[12], &dt_us, 4);
   Proto::writePacket(Serial, Proto::ENCODER_TICKS, payload, sizeof(payload));
 }
+
 
 void publishDiag(uint16_t vbat_mV, int16_t temp_cX100, uint32_t flags) {
   uint8_t payload[2 + 2 + 4];
@@ -181,13 +258,20 @@ void headControl(uint32_t dt_ms) {
   int32_t pos = readTicks(g_head_ticks);
   int32_t err = g_head_target_ticks - pos;
 
-  if (!g_motors_enabled) {
+  // Kisa yay: hata yarim turu asiyorsa diger yonden gitmek daha kisadir.
+  if (HEAD_CONTINUOUS_ROTATION) {
+    while (err >  HEAD_TICKS_PER_REV / 2) err -= HEAD_TICKS_PER_REV;
+    while (err < -HEAD_TICKS_PER_REV / 2) err += HEAD_TICKS_PER_REV;
+  }
+
+  if (!g_motors_enabled || !g_head_active) {
     setHeadPWM(0);
     g_head_err_prev = err;
     g_head_stall_ref = pos;
     g_head_stall_ms = millis();
     return;
   }
+
 
   if (abs(err) <= HEAD_DEADBAND_TICKS) {
     setHeadPWM(0);
@@ -291,20 +375,64 @@ void loopControl() {
   uint16_t vbat = 12000; // mV (örn. gelecekte ADC ile ölç)
   int16_t temp = 2500;   // 25.00 C
   publishDiag(vbat, temp, g_diag_flags);
+
+  // 1 saniyelik Serial2 durum telemetrisi (UART0 binary akışına asla dokunmaz)
+  if (now - g_last_diag_serial2_ms >= 1000) {
+    g_last_diag_serial2_ms = now;
+    Serial2.print(F("[MCU STATUS 1s] hb_rx="));
+    Serial2.print(g_hb_rx_count);
+    Serial2.print(F(" hb_ack="));
+    Serial2.print(g_hb_ack_tx_count);
+    Serial2.print(F(" mot_en="));
+    Serial2.print(g_motors_enabled ? 1 : 0);
+    Serial2.print(F(" head_ticks="));
+    Serial2.print(readTicks(g_head_ticks));
+    Serial2.print(F(" tx_avail="));
+    Serial2.println(Serial.availableForWrite());
+  }
 }
 
 void processPacket(uint8_t msg_id, const uint8_t* pl, uint8_t len) {
   switch (msg_id) {
     case Proto::HEARTBEAT: {
+      g_hb_rx_count++;
       g_last_heartbeat_ms = millis();
-      Proto::writePacket(Serial, Proto::HEARTBEAT_ACK, pl, len);
       digitalWrite(STATUS_LED, !digitalRead(STATUS_LED));
+
+      uint32_t seq = 0;
+      if (len >= 4 && pl != nullptr) {
+        memcpy(&seq, pl, 4);
+      }
+
+      int buf_before = Serial.availableForWrite();
+      Serial2.print(F("[HB RX] id=0x01 len="));
+      Serial2.print(len);
+      Serial2.print(F(" seq="));
+      Serial2.print(seq);
+      Serial2.print(F(" tx_buf_before="));
+      Serial2.println(buf_before);
+
+      Serial2.print(F("[HB ACK TX BEGIN] seq="));
+      Serial2.println(seq);
+
+      Proto::writePacket(Serial, Proto::HEARTBEAT_ACK, pl, len);
+      g_hb_ack_tx_count++;
+
+      int buf_after = Serial.availableForWrite();
+      Serial2.print(F("[HB ACK TX END] count="));
+      Serial2.print(g_hb_ack_tx_count);
+      Serial2.print(F(" tx_buf_after="));
+      Serial2.println(buf_after);
     } break;
     case Proto::WHEEL_CMD: {
       if (len < 8) break;
       memcpy(&g_left_target_rpm, &pl[0], 4);
       memcpy(&g_right_target_rpm, &pl[4], 4);
       g_last_heartbeat_ms = millis(); // komut da heartbeat sayılır
+      Serial2.print(F("[WHEEL CMD] L="));
+      Serial2.print(g_left_target_rpm);
+      Serial2.print(F(" R="));
+      Serial2.println(g_right_target_rpm);
     } break;
     case Proto::HEAD_CMD: {
       if (len < 4) break;
@@ -317,11 +445,15 @@ void processPacket(uint8_t msg_id, const uint8_t* pl, uint8_t len) {
       else                      g_diag_flags &= ~FLAG_HEAD_LIMIT;
 
       g_head_target_ticks = (int32_t)lroundf(clamped * HEAD_TICKS_PER_DEG);
+      g_head_active = true;
       // Yeni hedef geldi: eski stall kilidini kaldır ve anlık konumu referans al
+
       g_head_stall_ref = readTicks(g_head_ticks);
       g_head_stall_ms = millis();
       g_diag_flags &= ~FLAG_HEAD_STALL;
       g_last_heartbeat_ms = millis();
+      Serial2.print(F("[HEAD CMD] angle="));
+      Serial2.println(angle_deg);
     } break;
   }
 }
@@ -331,12 +463,17 @@ void setup() {
   stopMotors();
   Serial.begin(SERIAL_BAUD);
 
+  // İkincil debug portu (Mega Pin 16 TX2, Pin 17 RX2)
+  Serial2.begin(115200);
+  Serial2.println(F("[ASTRO MCU BOOT] Protocol=v2.0 Baud=115200 Serial2=DebugReady"));
+
   // Açılıştaki kafa konumu 0° kabul edilir (limit switch / homing yok)
   g_head_target_ticks = 0;
   g_head_stall_ms = millis();
 
   g_last_control_ms = millis();
   g_last_heartbeat_ms = millis();
+  g_last_diag_serial2_ms = millis();
 
   // ✅ FIX: Watchdog timeout 2s'ye çıkarıldı (güvenlik marjı)
   wdt_enable(WDTO_2S);

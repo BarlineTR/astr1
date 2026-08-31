@@ -36,7 +36,7 @@ def generate_launch_description():
             Node(
                 package="astro_base",
                 executable="head_tracker",
-                name="head_tracker",
+                name="head_tracker_node",
                 output="screen",
                 condition=IfCondition(enable_head_tracker),
                 parameters=[params_file, {"use_sim_time": use_sim_time}],

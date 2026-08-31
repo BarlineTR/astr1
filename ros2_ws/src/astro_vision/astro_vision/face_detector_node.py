@@ -21,14 +21,36 @@ import logging
 _LOG = logging.getLogger(__name__)
 
 from collections import deque
-import cv2
+try:
+    import cv2
+except ImportError:
+    class _MockCV2:
+        class data:
+            haarcascades = ""
+        class CascadeClassifier:
+            def __init__(self, *args, **kwargs): pass
+            def detectMultiScale(self, *args, **kwargs): return []
+        INTER_AREA = 3
+        FONT_HERSHEY_SIMPLEX = 0
+        def resize(self, src, dsize, *args, **kwargs): return src
+        def cvtColor(self, src, code): return src
+        def rectangle(self, *args, **kwargs): pass
+        def putText(self, *args, **kwargs): pass
+    cv2 = _MockCV2()
+
 import numpy as np
 
-import rclpy
-from rclpy.node import Node
-from rclpy.qos import qos_profile_sensor_data
-from sensor_msgs.msg import Image
-from std_msgs.msg import String, Bool, Float32
+try:
+    import rclpy
+    from rclpy.node import Node
+    from rclpy.qos import qos_profile_sensor_data
+    from sensor_msgs.msg import Image
+    from std_msgs.msg import String, Bool, Float32
+except ImportError:
+    rclpy = None
+    Node = object
+    qos_profile_sensor_data = 10
+    Image = String = Bool = Float32 = object
 
 try:
     from astro_vision.image_utils import bgr_to_imgmsg, imgmsg_to_bgr
@@ -149,12 +171,32 @@ class SpatialVisionNode(Node):
         # If no eyes are detected, user is NOT looking at the robot!
         return 45.0, False
 
-    def _detect_facial_emotion(self, face_roi_gray, w, h) -> str:
-        """Determines emotion (happy/smiling, surprised, sad/neutral) based on mouth and eyes geometry."""
+    def _detect_facial_emotion(self, face_roi_gray, w, h, yaw: float = 0.0, eyes_found: bool = False) -> str:
+        """Determines emotion (happy, surprised, focused, neutral) based on mouth contrast, smile and gaze geometry."""
         lower_face = cv2.resize(face_roi_gray[int(h * 0.5):, :], (96, 48), interpolation=cv2.INTER_AREA) if w > 96 else face_roi_gray[int(h * 0.5):, :]
         smiles = self.smile_cascade.detectMultiScale(lower_face, scaleFactor=1.65, minNeighbors=10, minSize=(15, 15))
         if len(smiles) > 0:
             return "happy"
+
+        # Surprise detection: open oral cavity with dark center contrast + high variance in mouth region
+        try:
+            mouth_region = lower_face[int(lower_face.shape[0] * 0.3):int(lower_face.shape[0] * 0.9), :]
+            if mouth_region.size > 0:
+                mean_val = float(np.mean(mouth_region))
+                std_val = float(np.std(mouth_region))
+                mh, mw = mouth_region.shape[:2]
+                center_patch = mouth_region[int(mh * 0.3):int(mh * 0.7), int(mw * 0.3):int(mw * 0.7)]
+                if center_patch.size > 0:
+                    center_mean = float(np.mean(center_patch))
+                    if center_mean < (mean_val - 18.0) and std_val > 22.0:
+                        return "surprised"
+        except Exception:
+            pass
+
+        # Focused detection: direct frontal gaze with eyes clearly tracked and low head yaw
+        if eyes_found and abs(yaw) <= 8.0:
+            return "focused"
+
         return "neutral"
 
     def image_callback(self, msg: Image):
@@ -225,16 +267,25 @@ class SpatialVisionNode(Node):
         is_looking = False
         user_distance = 0.0
         head_yaw = 0.0
+        face_camera_azimuth = 0.0
         detected_emotion = "neutral"
         top_recognized_person = {"name": "Misafir", "title": "Ziyaretçi", "formal_title": "Misafir", "confidence": 0.0, "is_known": False}
 
-        for x, y, w, h in faces:
+        for idx, (x, y, w, h) in enumerate(faces):
             face_roi_gray = gray[y:y + h, x:x + w]
             face_roi_bgr = frame[y:y + h, x:x + w]
             
             # 1. 3D Head Yaw & Eye Verification
             yaw, eyes_found = self._estimate_head_yaw(face_roi_gray, w, h)
             head_yaw = yaw
+
+            # Camera Optical Axis Azimuth Angle (HFOV ~ 72°, half = 36°)
+            # In ROS body frame: Image Right (+X) is Robot Right (-Yaw), Image Left (-X) is Robot Left (+Yaw)
+            face_center_x = x + (w / 2.0)
+            norm_offset = (face_center_x - (frame_w / 2.0)) / (frame_w / 2.0)
+            cam_azimuth = float(-norm_offset * 36.0)
+            if idx == 0:
+                face_camera_azimuth = cam_azimuth
 
             # 2. 3D Distance
             dist_m = self._estimate_distance(x, y, w, h, frame_w, frame_h)
@@ -258,13 +309,13 @@ class SpatialVisionNode(Node):
                     "distance_m": round(dist_m, 2)
                 }
 
-
             # 5. Emotion Detection
-            detected_emotion = self._detect_facial_emotion(face_roi_gray, w, h)
+            detected_emotion = self._detect_facial_emotion(face_roi_gray, w, h, yaw=yaw, eyes_found=eyes_found)
 
             face_list.append({
                 "x": int(x), "y": int(y), "width": int(w), "height": int(h),
                 "yaw_deg": round(yaw, 1),
+                "camera_azimuth_deg": round(cam_azimuth, 1),
                 "distance_m": round(dist_m, 2),
                 "looking_at_robot": direct_gaze,
                 "emotion": detected_emotion,
@@ -308,7 +359,7 @@ class SpatialVisionNode(Node):
         self.pub_looking.publish(looking_msg)
 
         yaw_msg = Float32()
-        yaw_msg.data = float(head_yaw)
+        yaw_msg.data = float(face_camera_azimuth)
         self.pub_yaw.publish(yaw_msg)
 
         dist_msg = Float32()

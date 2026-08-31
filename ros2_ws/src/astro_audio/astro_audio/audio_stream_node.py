@@ -233,6 +233,7 @@ class AudioStreamNode(Node):
 
     def __init__(self):
         super().__init__("audio_stream_node")
+        self.declare_parameter("input_channels", 0)
 
         # Publishers
         self.pub_input_pcm = self.create_publisher(String, "/audio/realtime_input_pcm", 20)
@@ -328,19 +329,20 @@ class AudioStreamNode(Node):
         try:
             is_speech = self._respeaker.speech_detected()
             doa_angle = self._respeaker.doa_angle()
-            now = time.monotonic()
-            recent_speech = (is_speech is True) or ((now - getattr(self, "_last_mic_speech_time", 0.0)) < 1.5)
 
             if is_speech is not None:
                 vad_msg = Bool()
                 vad_msg.data = bool(is_speech)
                 self.pub_vad.publish(vad_msg)
 
-            # Publish genuine hardware DOA when speech occurred recently and angle is valid
-            if doa_angle is not None and recent_speech:
+            # Publish genuine hardware DOA when speech is actively detected or during speech energy window
+            is_active_playback = self._is_playing or (self._output_stream and self._output_stream.active)
+            is_recent_speech = (time.monotonic() - getattr(self, "_last_mic_speech_time", 0.0)) < 2.5
+            if (is_speech is True or is_recent_speech) and doa_angle is not None and not is_active_playback:
                 doa_msg = Float32()
                 doa_msg.data = float(doa_angle)
                 self.pub_doa.publish(doa_msg)
+
         except Exception as exc:
             self.get_logger().debug(f"_poll_respeaker_hid error: {exc}")
 
@@ -381,7 +383,18 @@ class AudioStreamNode(Node):
             except Exception:
                 max_in_ch = 1
 
-            if max_in_ch >= 4 and any(h in self._in_device_name.lower() for h in RESPEAKER_NAME_HINTS):
+            param_val = 0
+            try:
+                if hasattr(self, "has_parameter") and self.has_parameter("input_channels"):
+                    param_val = int(self.get_parameter("input_channels").value)
+            except Exception:
+                param_val = 0
+            env_val = int(os.getenv("AUDIO_INPUT_CHANNELS", "0"))
+            pref_ch = param_val or env_val
+
+            if pref_ch in (1, 2, 4, 6, 8):
+                self._capture_channels = pref_ch
+            elif max_in_ch >= 4:
                 self._capture_channels = 4
             else:
                 self._capture_channels = 1
@@ -490,8 +503,9 @@ class AudioStreamNode(Node):
             elif not is_active_playback and rms >= 400.0:
                 self._last_mic_speech_time = now
 
-            # Multi-Channel GCC-PHAT DOA Spatial Estimation on Raw Separate Channels
-            if multi_ch is not None and self._doa_estimator and not is_active_playback and rms >= 400.0:
+            # Multi-Channel GCC-PHAT DOA Spatial Estimation (Fallback only when hardware ReSpeaker HID is absent)
+            has_hw_hid = bool(self._respeaker and getattr(self._respeaker, "dev", None) is not None)
+            if not has_hw_hid and multi_ch is not None and self._doa_estimator and not is_active_playback and rms >= 400.0:
                 azimuth_deg, conf, valid = self._doa_estimator.estimate_from_multichannel_pcm(multi_ch[:4])
                 if valid and azimuth_deg is not None:
                     raw_doa = azimuth_deg if azimuth_deg >= 0.0 else azimuth_deg + 360.0

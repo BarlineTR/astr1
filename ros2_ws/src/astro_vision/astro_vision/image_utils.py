@@ -1,6 +1,10 @@
 """Image conversion without cv_bridge (avoids NumPy 2.x ABI issues on Jetson)."""
 import numpy as np
-from sensor_msgs.msg import Image
+try:
+    from sensor_msgs.msg import Image
+except ImportError:
+    class Image:
+        pass
 
 
 def imgmsg_to_bgr(msg: Image) -> np.ndarray:
