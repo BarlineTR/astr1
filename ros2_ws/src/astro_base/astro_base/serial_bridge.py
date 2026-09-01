@@ -791,7 +791,7 @@ class SerialBridge(Node):
                 self._mark_disconnected()
                 time.sleep(0.5)
             except Exception as exc:
-                self.get_logger().error(f"[SERIAL RX THREAD EXCEPTION] Unexpected error: {exc}", exc_info=True)
+                self.get_logger().error(f"[SERIAL RX THREAD EXCEPTION] Unexpected error: {exc}")
                 time.sleep(0.5)
 
     def handle_msg(self, msg_id: int, payload: bytes):
