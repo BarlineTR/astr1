@@ -344,14 +344,18 @@ class SocialGazeFSM:
                 if abs(angular_diff_deg(target_yaw, self.target_yaw_deg)) >= self.deadband_deg:
                     self.target_yaw_deg = target_yaw
 
-                # Only leave HOLDING_ATTENTION if target ID switched or large step jump (> 15.0°)
+                # Only leave HOLDING_ATTENTION if target ID switched with significant spatial jump (> 12.0°) or large step jump (> 15.0°)
                 target_id_changed = (
                     target_state.active_target is not None
                     and self.active_target_id is not None
                     and target_state.active_target.target_id != self.active_target_id
                 )
                 if target_id_changed:
-                    self._transition_to(GazeStateEnum.ORIENTING, timestamp, reason=f"TARGET_SWITCH_{target_state.active_target.target_id}")
+                    if err_deg > 12.0:
+                        self._transition_to(GazeStateEnum.ORIENTING, timestamp, reason=f"TARGET_SWITCH_{target_state.active_target.target_id}")
+                    else:
+                        # Nearby target re-identification: seamlessly maintain attention
+                        self.active_target_id = target_state.active_target.target_id
                 elif err_deg > 15.0:
                     self._transition_to(GazeStateEnum.TRACKING, timestamp, reason="LARGE_TARGET_STEP_PURSUIT")
 

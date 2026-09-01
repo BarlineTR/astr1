@@ -499,8 +499,8 @@ class ActionManager:
                 return res
 
             # 3. Canonical Attention Arbiter Preemption
-            dir_str = "left" if azimuth > 0 else "right"
-            target_clamped = float(max(-75.0, min(75.0, azimuth)))
+            dir_str = "left" if (azimuth or 0.0) > 0 else "right"
+            target_clamped = float(max(-75.0, min(75.0, azimuth))) if azimuth is not None else None
 
             pub_explicit = self._pub_explicit_gaze or getattr(self._node, "pub_explicit_gaze", None)
             if pub_explicit:
@@ -508,18 +508,21 @@ class ActionManager:
                     explicit_msg = String()
                     payload = {
                         "selector": "CURRENT_SPEAKER",
-                        "target_yaw_deg": target_clamped,
-                        "confidence": float(confidence),
+                        "confidence": float(confidence if confidence > 0 else 1.0),
                         "reason": "action_manager_turn_to_sound",
                     }
+                    # Only include explicit target_yaw_deg if azimuth is fresh (<0.8s) and high-confidence
+                    # Otherwise, let AttentionArbiter resolve directly via EpistemicSpatialMemory!
+                    if target_clamped is not None and confidence >= 0.85 and sound_dir is not None and (now - sound_dir.timestamp) <= 0.8:
+                        payload["target_yaw_deg"] = target_clamped
                     explicit_msg.data = json.dumps(payload)
                     pub_explicit.publish(explicit_msg)
-                    self._logger.info(f"🎯 [ActionManager -> AttentionArbiter] EXPLICIT_USER_GAZE target={target_clamped:.1f}°")
+                    self._logger.info(f"🎯 [ActionManager -> AttentionArbiter] EXPLICIT_USER_GAZE (target={payload.get('target_yaw_deg', 'SPATIAL_MEMORY')})")
                 except Exception as ex:
                     self._logger.debug(f"Explicit gaze publication failed: {ex}")
 
             pub_target_yaw = self._pub_head_target_yaw or getattr(self._node, "pub_head_target_yaw", None)
-            if pub_target_yaw:
+            if pub_target_yaw and target_clamped is not None:
                 try:
                     msg = Float32()
                     msg.data = target_clamped

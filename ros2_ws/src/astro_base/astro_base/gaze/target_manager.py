@@ -142,8 +142,9 @@ class TargetManagerCore:
                     # Track candidate speaker persistence
                     if self._new_speaker_candidate_id == candidate_speaker.target_id:
                         sustained_time = timestamp - self._new_speaker_first_heard_time
-                        # Expedited turn-taking switch if sustained > 0.8s OR if minimum dwell elapsed
-                        if (sustained_time >= self.turn_taking_min_dwell_s and dwell_elapsed >= self.turn_taking_min_dwell_s) or (dwell_elapsed >= self.min_attention_dwell_s):
+                        # Turn-taking switch requires the new candidate to speak continuously for at least turn_taking_min_dwell_s (0.8s)
+                        # AND the current target to have been attended for at least turn_taking_min_dwell_s
+                        if sustained_time >= self.turn_taking_min_dwell_s and dwell_elapsed >= self.turn_taking_min_dwell_s:
                             # Switch active target to new speaker!
                             self.active_target = candidate_speaker
                             self._active_target_start_time = timestamp
