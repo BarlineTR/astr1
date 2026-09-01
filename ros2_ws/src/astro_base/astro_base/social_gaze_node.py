@@ -18,16 +18,47 @@ import os
 import time
 from typing import Dict, List, Optional
 
-import rclpy
-from rclpy.node import Node
-from rclpy.qos import QoSProfile, ReliabilityPolicy
-from std_msgs.msg import Bool, Float32, Header, Int32, String
-from sensor_msgs.msg import JointState
-
 try:
-    from astro_base.msg import GazeStatus, HeadState
+    import rclpy
+    from rclpy.node import Node
+    from rclpy.qos import QoSProfile, ReliabilityPolicy
+    from std_msgs.msg import Bool, Float32, Header, Int32, String
+    from sensor_msgs.msg import JointState
+    try:
+        from astro_base.msg import GazeStatus, HeadCmd, HeadState
+    except ImportError:
+        GazeStatus = HeadCmd = HeadState = None
 except ImportError:
-    GazeStatus = HeadState = None
+    class _MockRclpy:
+        @staticmethod
+        def ok(): return True
+        @staticmethod
+        def shutdown(): pass
+        @staticmethod
+        def init(*args, **kwargs): pass
+    rclpy = _MockRclpy()
+    class Node:
+        def __init__(self, *args, **kwargs): pass
+        def create_publisher(self, *args, **kwargs): return None
+        def create_subscription(self, *args, **kwargs): return None
+        def create_timer(self, *args, **kwargs): return None
+        def get_logger(self):
+            import logging
+            return logging.getLogger("SocialGazeNode")
+        def declare_parameter(self, *args, **kwargs): pass
+        def get_parameter(self, name):
+            class _MockParam:
+                def __init__(self, val=""): self.value = val
+                def get_parameter_value(self):
+                    class _Val:
+                        def __init__(self, v):
+                            self.string_value = str(v)
+                            self.integer_value = int(v) if isinstance(v, (int, float)) else 0
+                    return _Val(0)
+            return _MockParam()
+    QoSProfile = ReliabilityPolicy = object
+    Bool = Float32 = Header = Int32 = String = JointState = object
+    GazeStatus = HeadCmd = HeadState = None
 
 from astro_base.gaze.audio_filter import AudioFilterCore
 from astro_base.gaze.audio_perception import AudioPerceptionCore
@@ -158,7 +189,12 @@ class SocialGazeNode(Node):
         # -------------------------------------------------------------------------
         qos_best_effort = QoSProfile(depth=10, reliability=ReliabilityPolicy.BEST_EFFORT)
 
-        # Actuator command topic
+        # Canonical Actuator Command Publisher (/head/command -> HeadCmd)
+        if HeadCmd is not None:
+            self.pub_head_command = self.create_publisher(HeadCmd, "/head/command", 10)
+        else:
+            self.pub_head_command = None
+        # Compatibility topic (/head/cmd_pos -> Float32)
         self.pub_head_cmd_pos = self.create_publisher(Float32, "/head/cmd_pos", 10)
 
         # Typed Gaze Status publisher
@@ -341,7 +377,12 @@ class SocialGazeNode(Node):
             timestamp=t,
         )
 
-        # 5. Actuator Command Publishing
+        # 5. Actuator Command Publishing (Single Canonical Authority)
+        if self.pub_head_command is not None:
+            hcmd = HeadCmd()
+            hcmd.angle_deg = float(traj_point.position_deg)
+            self.pub_head_command.publish(hcmd)
+
         cmd_msg = Float32()
         cmd_msg.data = float(traj_point.position_deg)
         self.pub_head_cmd_pos.publish(cmd_msg)

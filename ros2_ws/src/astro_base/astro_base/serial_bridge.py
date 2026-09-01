@@ -237,6 +237,11 @@ class SerialBridge(Node):
         self.sub_cmd_vel = self.create_subscription(
             Twist, "/cmd_vel", self.on_cmd_vel, 10
         )
+        # Canonical Actuator Command Subscription (/head/command -> HeadCmd)
+        self.sub_head_command = self.create_subscription(
+            HeadCmd, "/head/command", self.on_head_cmd, 10
+        )
+        # Legacy compatibility subscriptions
         self.sub_head = self.create_subscription(
             HeadCmd, "/head_cmd", self.on_head_cmd, 10
         )
