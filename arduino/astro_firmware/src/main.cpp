@@ -60,9 +60,9 @@ static constexpr int32_t HEAD_TICKS_PER_REV =
 
     (int32_t)(360.0f * HEAD_TICKS_PER_DEG + 0.5f);
 
-// Kafa motoru PWM limitleri ve statik sürtünme eşiği (ölçülen breakaway eşiği ~95-100 PWM)
-static constexpr int HEAD_PWM_LIMIT = 160;
-static constexpr int HEAD_PWM_MIN = 100;
+// Kafa motoru PWM limitleri ve statik sürtünme eşiği (ölçülen breakaway eşiği ~100-105 PWM, limit 200 PWM)
+static constexpr int HEAD_PWM_LIMIT = 200;
+static constexpr int HEAD_PWM_MIN = 105;
 
 static constexpr float HEAD_KP = 5.0f, HEAD_KD = 0.05f;
 static constexpr int32_t HEAD_DEADBAND_TICKS = 1;  // 1 tick ~= 0.386 derece
