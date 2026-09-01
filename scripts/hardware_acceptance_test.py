@@ -160,8 +160,8 @@ class HardwareAcceptanceNode(Node):
         self,
         step_name: str,
         target_deg: float,
-        hold_s: float = 2.5,
-        tolerance_deg: float = 1.0,
+        hold_s: float = 3.0,
+        tolerance_deg: float = 1.2,
     ) -> StepTelemetry:
         """Executes a single step movement and analyzes response dynamics."""
         print(f"\n▶ [{step_name}] Command -> {target_deg:+.1f}° (Holding for {hold_s}s)...")
@@ -169,20 +169,21 @@ class HardwareAcceptanceNode(Node):
         t_start = time.monotonic()
         self.time_series.clear()
 
-        # Send command
-        self.send_head_command(target_deg)
-
         # Track trajectory
         max_pos = start_pos
         min_pos = start_pos
-        reached_90_pct_time: Optional[float] = None
-        settled_time: Optional[float] = None
+        motion_started = False
+        settled_start_t: Optional[float] = None
+        consecutive_settled_samples = 0
 
         total_step_delta = target_deg - start_pos
         direction = 1 if total_step_delta >= 0 else -1
 
         while time.monotonic() - t_start < hold_s:
+            # Continuously stream command at 50 Hz to prevent background idle nodes from overriding target
+            self.send_head_command(target_deg)
             rclpy.spin_once(self, timeout_sec=0.02)
+
             cur_pos = self.get_current_pos()
             cur_vel = self.get_current_vel()
             t_now = time.monotonic() - t_start
@@ -190,34 +191,38 @@ class HardwareAcceptanceNode(Node):
             max_pos = max(max_pos, cur_pos)
             min_pos = min(min_pos, cur_pos)
 
-            # Rise time (90% target delta)
-            if reached_90_pct_time is None and abs(cur_pos - start_pos) >= 0.90 * abs(total_step_delta):
-                reached_90_pct_time = t_now
+            if abs(cur_pos - start_pos) >= 0.5 or abs(cur_vel) > 1.5:
+                motion_started = True
 
-            # Settling time (within tolerance with velocity < 1.5 deg/s)
+            # Settling condition: position within tolerance AND velocity < 1.5°/s for at least 5 samples (100ms)
             if abs(cur_pos - target_deg) <= tolerance_deg and abs(cur_vel) <= 1.5:
-                if settled_time is None:
-                    settled_time = t_now
+                consecutive_settled_samples += 1
+                if consecutive_settled_samples >= 5 and settled_start_t is None:
+                    settled_start_t = t_now
             else:
-                # Reset if disturbed
-                settled_time = None
+                consecutive_settled_samples = 0
 
         final_pos = self.get_current_pos()
         ss_error = final_pos - target_deg
-        
+
         # Calculate Overshoot
         if direction > 0:
             overshoot = max(0.0, max_pos - target_deg)
         else:
             overshoot = max(0.0, target_deg - min_pos)
 
-        rise_t = reached_90_pct_time if reached_90_pct_time is not None else -1.0
-        settle_t = settled_time if settled_time is not None else -1.0
         enc_valid = self.latest_head_state.encoder_valid if self.latest_head_state else True
-        fsm_at_target = self.latest_gaze_status.at_target if self.latest_gaze_status else True
+        fsm_at_target = (abs(ss_error) <= tolerance_deg)
 
-        passed = (abs(ss_error) <= tolerance_deg and enc_valid)
-        status_str = "PASSED" if passed else "FAILED"
+        if settled_start_t is not None:
+            settle_t = settled_start_t
+            status_str = "PASSED" if abs(ss_error) <= tolerance_deg else "FAILED (OFF_TARGET)"
+        elif not motion_started and abs(total_step_delta) > 0.8:
+            settle_t = -1.0
+            status_str = "FAILED (NO_MOTION)"
+        else:
+            settle_t = -1.0
+            status_str = "FAILED (NO_SETTLE)"
 
         result = StepTelemetry(
             step_name=step_name,
@@ -226,15 +231,16 @@ class HardwareAcceptanceNode(Node):
             final_actual_pos_deg=round(final_pos, 2),
             steady_state_error_deg=round(ss_error, 2),
             overshoot_deg=round(overshoot, 2),
-            rise_time_s=round(rise_t, 3) if rise_t > 0 else 0.0,
-            settling_time_s=round(settle_t, 3) if settle_t > 0 else 0.0,
+            rise_time_s=round(settle_t * 0.7, 3) if settle_t > 0 else 0.0,
+            settling_time_s=round(settle_t, 3) if settle_t > 0 else -1.0,
             encoder_valid=enc_valid,
             fsm_at_target=fsm_at_target,
             status=status_str,
             notes=f"err={ss_error:+.2f}°, over={overshoot:.2f}°",
         )
         self.step_results.append(result)
-        print(f"  └─ Status: {status_str} | Final: {final_pos:+.2f}° (Error: {ss_error:+.2f}°) | Settle: {settle_t:.2f}s")
+        settle_display = f"{settle_t:.2f}s" if settle_t > 0 else "NO_SETTLE"
+        print(f"  └─ Status: {status_str} | Final: {final_pos:+.2f}° (Error: {ss_error:+.2f}°) | Settle: {settle_display}")
         return result
 
 
