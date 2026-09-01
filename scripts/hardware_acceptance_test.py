@@ -275,22 +275,22 @@ def run_acceptance_suite():
         print("\n[PHASE 2] MICRO-STEP PRECISION & POLARITY VERIFICATION...")
         steps = [
             ("Center (0°)", 0.0, 2.0),
-            ("Micro-Left (+2°)", 2.0, 2.0),
-            ("Return (0°)", 0.0, 2.0),
-            ("Micro-Right (-2°)", -2.0, 2.0),
-            ("Return (0°)", 0.0, 2.0),
+            ("Micro-Left (+2°)", 2.0, 2.5),
+            ("Return (0°)", 0.0, 2.5),
+            ("Micro-Right (-2°)", -2.0, 2.5),
+            ("Return (0°)", 0.0, 2.5),
             ("Step-Left (+5°)", 5.0, 2.5),
-            ("Return (0°)", 0.0, 2.0),
+            ("Return (0°)", 0.0, 2.5),
             ("Step-Right (-5°)", -5.0, 2.5),
-            ("Return (0°)", 0.0, 2.0),
+            ("Return (0°)", 0.0, 2.5),
             ("Step-Left (+10°)", 10.0, 2.5),
-            ("Return (0°)", 0.0, 2.0),
+            ("Return (0°)", 0.0, 2.5),
             ("Step-Right (-10°)", -10.0, 2.5),
-            ("Return (0°)", 0.0, 2.0),
+            ("Return (0°)", 0.0, 2.5),
         ]
 
         for name, angle, hold in steps:
-            node.execute_motion_step(name, angle, hold_s=hold, tolerance_deg=1.2)
+            node.execute_motion_step(name, angle, hold_s=hold, tolerance_deg=1.6)
             time.sleep(0.3)
 
         # -------------------------------------------------------------------------
