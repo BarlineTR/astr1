@@ -377,6 +377,10 @@ class SocialGazeNode(Node):
             timestamp=t,
         )
 
+        # Auto-wake social gaze from sleep mode when a person is detected or speaking
+        if target_state.active_target is not None and self.fsm.is_sleeping and not self.fsm.safety_lock:
+            self.fsm.set_sleep_mode(False)
+
         # 3. Behavioral Social Gaze FSM & Priority Arbitration with True Velocity Feedback
         gaze_cmd = self.fsm.update(
             target_state=target_state,
