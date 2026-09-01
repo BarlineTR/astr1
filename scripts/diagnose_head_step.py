@@ -143,7 +143,7 @@ def run_diagnostic(target_deg: float, duration_s: float = 4.0, raw_control_debug
             # Estimate MCU PID & PWM
             dt = max(0.001, t_now - (last_t - t0))
             de = (cur_pos - last_pos) * 2.5882 / dt
-            ff = 70.0 if err_ticks > 0 else (-70.0 if err_ticks < 0 else 0.0)
+            ff = 95.0 if err_ticks > 0 else (-95.0 if err_ticks < 0 else 0.0)
             u = ff + (4.0 * err_ticks) - (0.05 * de)
             est_pwm = int(max(-160, min(160, u))) if abs(err_ticks) > 1 else 0
 
