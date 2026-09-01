@@ -1,4 +1,4 @@
-﻿serial_bridge:
+serial_bridge:
   ros__parameters:
     port: "/dev/ttyCH341USB0"
     baud: 115200
@@ -77,22 +77,30 @@ head_tracker_node:
     enabled: true
     doa_offset_deg: 0.0
     doa_invert: true                # true (ReSpeaker Clockwise -> ROS Body CCW ters çevirme)
-    max_yaw_deg: 180.0              # tam tur serbest; firmware HEAD_MAX_DEG ile ayni olmali
-    min_yaw_deg: -180.0             # tam tur serbest; firmware HEAD_MIN_DEG ile ayni olmali
-    deadband_deg: 8.0               # 8° (kafanin tam karsiya gelebilmesi icin daraltildi)
-    min_dwell_time_s: 3.5           # 3.5s (odak ve bakış kilitleme süresi)
-    idle_return_timeout_s: 30.0     # 30.0s (kullanıcıyı terk etmeden sakin bekleme)
-    max_speed_deg_s: 45.0           # 45.0 (hizlandirildi)
-    min_rms_threshold: 1600.0       # 1600 (arka plan gürültü bağışıklığı)
-    noise_multiplier: 3.0           # 3.0 (adaptif gürültü eşiği)
-    head_motion_settle_s: 0.5       # 0.5s (kafa durduktan sonra motor gürültüsünün dinmesini bekle)
-    consensus_window_size: 7
-    consensus_threshold: 5
-    consensus_tolerance_deg: 22.0  # 180°/0° cluster bölünmesini engelleme
-    # OAK-D Lite vision fusion — face tracking overrides DOA when camera sees a face
+    max_yaw_deg: 75.0               # Bounded ±75° joint envelope
+    min_yaw_deg: -75.0              # Bounded ±75° joint envelope
+    deadband_deg: 3.0
+    min_dwell_time_s: 2.5
+    idle_return_timeout_s: 25.0
+    max_speed_deg_s: 75.0
+    min_rms_threshold: 400.0
+    head_motion_settle_s: 0.4
     vision_fusion_enabled: true
-    vision_gain: 0.85               # 0.85 (daha seri takip)
-    vision_max_correction_deg: 36.0 # kamera yari-FOV: tek bir yuz tespitinin surebilecegi azami aci
-    vision_timeout_s: 3.0           # 3.0s (yüzü odakta tutma süresi)
+    vision_gain: 0.85
+    vision_timeout_s: 1.5
+
+social_gaze_node:
+  ros__parameters:
+    control_rate_hz: 50.0
+    max_velocity_deg_s: 75.0
+    max_acceleration_deg_s2: 180.0
+    max_jerk_deg_s3: 360.0
+    gaze_deadband_deg: 3.0
+    min_attention_dwell_s: 2.50
+    turn_taking_min_dwell_s: 0.80
+    spatial_gate_deg: 25.0
+    idle_saccades_enabled: true
+    self_speech_suppression: true
+
 
 

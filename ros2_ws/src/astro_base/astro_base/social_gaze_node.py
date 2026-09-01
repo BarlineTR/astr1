@@ -180,9 +180,13 @@ class SocialGazeNode(Node):
         self.create_subscription(Float32, "/audio/doa_deg", self._on_doa_deg, 10)
         self.create_subscription(Int32, "/audio/doa_raw", self._on_doa_raw, 10)
         self.create_subscription(String, "/vision/detections_json", self._on_vision_json, 10)
+        self.create_subscription(String, "/vision/faces", self._on_vision_json, 10)
         self.create_subscription(String, "/behavior/gesture", self._on_gesture, 10)
         self.create_subscription(Float32, "/behavior/gaze_intent", self._on_gaze_intent, 10)
+        self.create_subscription(Float32, "/head/target_yaw", self._on_gaze_intent, 10)
         self.create_subscription(Bool, "/robot/is_speaking", self._on_speaking_status, 10)
+        self.create_subscription(Bool, "/audio/playback_active", self._on_speaking_status, 10)
+        self.create_subscription(String, "/robot/emotion", self._on_emotion, 10)
         self.create_subscription(Bool, "/safety/emergency_stop", self._on_emergency_stop, 10)
         self.create_subscription(Bool, "/system/sleep", self._on_sleep_mode, 10)
 
@@ -294,6 +298,13 @@ class SocialGazeNode(Node):
 
     def _on_sleep_mode(self, msg: Bool) -> None:
         self.fsm.set_sleep_mode(msg.data)
+
+    def _on_emotion(self, msg: String) -> None:
+        emo = str(msg.data).strip().lower()
+        if emo in ("sleeping", "sleep", "deep_idle"):
+            self.fsm.set_sleep_mode(True)
+        else:
+            self.fsm.set_sleep_mode(False)
 
     # =========================================================================
     # 50 Hz Synchronous Control Cycle

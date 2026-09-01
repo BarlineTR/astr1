@@ -248,20 +248,9 @@ class SpatialVisionNode(Node):
         else:
             faces = list(detected_faces)
 
-        # Temporal smoothing for face detection dropouts
-        if len(faces) == 0 and hasattr(self, '_last_known_face') and self._last_known_face is not None:
-            if self._face_lost_frames < 6:
-                faces = [self._last_known_face]
-                self._face_lost_frames += 1
-            else:
-                self._last_known_face = None
-        elif len(faces) > 0:
+        # Sort detected faces by bounding box area (largest face first)
+        if len(faces) > 0:
             faces = sorted(faces, key=lambda f: f[2]*f[3], reverse=True)
-            self._last_known_face = faces[0]
-            self._face_lost_frames = 0
-        else:
-            self._face_lost_frames = 0
-            self._last_known_face = None
 
         face_list = []
         is_looking = False

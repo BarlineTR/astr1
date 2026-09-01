@@ -177,9 +177,9 @@ class ActionManager:
 
         # DOA Tracking & Consensus
         self._latest_doa: Optional[SoundDirection] = None
-        self._doa_history: Deque[Tuple[float, float, float]] = collections.deque(maxlen=6)  # (timestamp, yaw, rms)
+        self._doa_history: Deque[Tuple[float, float, float]] = collections.deque(maxlen=60)  # (timestamp, yaw, rms)
         self._min_doa_confidence = 0.40
-        self._doa_freshness_timeout_s = 3.5
+        self._doa_freshness_timeout_s = 5.0
         self._ambient_rms = 120.0
         self._is_speaking = False
         self._is_playback_active = False
@@ -399,7 +399,7 @@ class ActionManager:
             confidence = 0.0
 
             # Prefer recent speech consensus (within 4.0s) that is not a rear wall bounce (>130°)
-            speech_doa = [y for ts, y, cur_rms in self._doa_history if (now - ts) <= 4.0 and abs(y) <= 130.0 and cur_rms >= 220.0]
+            speech_doa = [y for ts, y, cur_rms in self._doa_history if (now - ts) <= 4.0 and abs(y) <= 130.0 and cur_rms >= 400.0]
             if speech_doa:
                 sin_s = sum(math.sin(math.radians(y)) for y in speech_doa)
                 cos_s = sum(math.cos(math.radians(y)) for y in speech_doa)
@@ -410,7 +410,7 @@ class ActionManager:
                 confidence = sound_dir.confidence
             else:
                 # Secondary fallback: only recent speech within 4.5s
-                recent_doa = [y for ts, y, cur_rms in self._doa_history if (now - ts) <= 4.5 and abs(y) <= 130.0]
+                recent_doa = [y for ts, y, cur_rms in self._doa_history if (now - ts) <= 4.5 and abs(y) <= 130.0 and cur_rms >= 400.0]
                 if recent_doa:
                     sin_s = sum(math.sin(math.radians(y)) for y in recent_doa)
                     cos_s = sum(math.cos(math.radians(y)) for y in recent_doa)
@@ -453,20 +453,29 @@ class ActionManager:
                 return res
 
             if azimuth is None:
-                self._logger.warning("⚠️ [ActionManager] turn_to_sound reddedildi: NO_DIRECTION (DOA yok veya zayıf)")
-                res = ActionResult(
-                    success=False,
-                    action="turn_to_sound",
-                    action_id=act_id,
-                    generation_id=generation_id,
-                    error_code="NO_DIRECTION",
-                    error="Sesin yönü belirlenemedi (DOA unavailable veya sinyal zayıf).",
-                    reason="no_sound_direction",
-                    message="Sesin hangi yönden geldiği tespit edilemediği için robot hareket ettirilmedi.",
-                    hardware_ack=False,
-                )
-                self._recent_actions.append(res)
-                return res
+                # 3. Broader temporal history fallback (up to 8.0s with verified acoustic speech energy)
+                broader_doa = [y for ts, y, cur_rms in self._doa_history if (now - ts) <= 8.0 and abs(y) <= 130.0 and cur_rms >= 400.0]
+                if broader_doa:
+                    sin_s = sum(math.sin(math.radians(y)) for y in broader_doa)
+                    cos_s = sum(math.cos(math.radians(y)) for y in broader_doa)
+                    azimuth = float(math.degrees(math.atan2(sin_s, cos_s)))
+                    confidence = 0.45
+                    self._logger.info(f"👂 [ActionManager] Genişletilmiş zaman tamponundan ses yönü kurtarıldı -> {azimuth:.1f}°")
+                else:
+                    self._logger.warning("⚠️ [ActionManager] turn_to_sound reddedildi: NO_DIRECTION (DOA yok veya zayıf)")
+                    res = ActionResult(
+                        success=False,
+                        action="turn_to_sound",
+                        action_id=act_id,
+                        generation_id=generation_id,
+                        error_code="NO_DIRECTION",
+                        error="Sesin yönü belirlenemedi (DOA unavailable veya sinyal zayıf).",
+                        reason="no_sound_direction",
+                        message="Sesin hangi yönden geldiği tespit edilemediği için robot hareket ettirilmedi.",
+                        hardware_ack=False,
+                    )
+                    self._recent_actions.append(res)
+                    return res
 
 
             # 2. Safety Gates (Heartbeat & LiDAR Freshness)

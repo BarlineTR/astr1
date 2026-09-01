@@ -6205,12 +6205,17 @@ class AstroRealtimeNode(Node):
                 is_edge_tts_active = getattr(self, "_fallback_mode", False) or not self._can_use_openai("realtime")
             except Exception:
                 is_edge_tts_active = False
-            base_min_speech_ms = float(getattr(self, "barge_in_min_speech_ms", 60.0))
-            effective_min_speech_ms = (
-                max(120.0, base_min_speech_ms)
-                if is_edge_tts_active
-                else max(base_min_speech_ms, getattr(self, "barge_in_min_consecutive_frames", 3) * 20.0)
-            )
+
+            if is_edge_tts_active:
+                # In Edge-TTS mode without hardware AEC subtraction, require substantial human speech
+                # (>=400ms continuity and elevated energy) to avoid microphone loudspeaker feedback false cuts.
+                effective_min_speech_ms = 400.0
+                target_barge_in_rms = max(target_barge_in_rms * 1.5, 3000.0)
+                target_barge_in_peak = max(target_barge_in_peak, 8000)
+            else:
+                base_min_speech_ms = float(getattr(self, "barge_in_min_speech_ms", 60.0))
+                effective_min_speech_ms = max(base_min_speech_ms, getattr(self, "barge_in_min_consecutive_frames", 3) * 20.0)
+
             min_speech_ms = effective_min_speech_ms
             if speech_duration_ms < min_speech_ms:
                 if local_rms >= target_barge_in_rms and peak_val >= target_barge_in_peak:

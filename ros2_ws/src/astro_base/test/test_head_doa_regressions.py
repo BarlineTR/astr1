@@ -83,9 +83,9 @@ class TestShippedConfigurationIsApplied(unittest.TestCase):
         params_src = open(PARAMS_FILE, encoding="utf-8").read()
 
         m = re.search(
-            r'executable="head_tracker"[^)]*?name="([^"]+)"', launch_src, re.S
+            r'executable="(?:head_tracker|social_gaze)"[^)]*?name="([^"]+)"', launch_src, re.S
         )
-        self.assertIsNotNone(m, "head_tracker Node blogu base.launch.py'da bulunamadi")
+        self.assertIsNotNone(m, "social_gaze veya head_tracker Node blogu base.launch.py'da bulunamadi")
         launched_name = m.group(1)
 
         top_level_keys = set(re.findall(r"^([A-Za-z_/][\w/]*):", params_src, re.M))
@@ -407,40 +407,7 @@ class TestVisualServoingIsBounded(unittest.TestCase):
 
 
 class TestShortestPathRotation(unittest.TestCase):
-    """The neck can turn all the way round, so it must never take the long arc."""
-
-    def test_slew_crosses_the_180_seam_by_the_short_arc(self):
-        import astro_base.head_tracker_node as H
-
-        clock = FakeClock()
-        real_time = H.time
-        H.time = clock
-        try:
-            node = make_node()
-            node._estimated_yaw = 170.0
-            node._target_yaw = -170.0  # 20 deg the short way, 340 deg the long way
-            node._last_update_time = clock.monotonic()
-            node._last_speech_time = clock.monotonic()
-
-            path = [node._estimated_yaw]
-            for _ in range(80):
-                node._control_loop()
-                clock.advance(0.05)
-                node._last_speech_time = clock.monotonic()
-                path.append(node._estimated_yaw)
-
-            travelled = sum(
-                abs(angular_diff_deg(b, a)) for a, b in zip(path, path[1:])
-            )
-        finally:
-            H.time = real_time
-
-        self.assertLessEqual(
-            travelled,
-            40.0,
-            f"Kafa 170 deg -> -170 deg icin {travelled:.0f} deg yol katetti; kisa yol 20 deg. "
-            "err = target - estimated cikarmasi sarmali degil, bu yuzden uzun yoldan gidiyor.",
-        )
+    """The neck is a bounded physical joint (safety envelope +-70 to +-85 deg)."""
 
     def test_ros_travel_limit_never_exceeds_the_firmware_limit(self):
         """If ROS commands past the firmware clamp, the firmware silently truncates and
@@ -462,15 +429,14 @@ class TestShortestPathRotation(unittest.TestCase):
             "kirpiyor; aradaki fark kalici acisal kayma olarak birikir.",
         )
 
-    def test_full_circle_is_available_so_a_rear_source_needs_no_front_sweep(self):
+    def test_bounded_physical_joint_safety_envelope(self):
         params_src = open(PARAMS_FILE, encoding="utf-8").read()
         m = re.search(r"^\s+max_yaw_deg:\s*([0-9.]+)", params_src, re.M)
         self.assertIsNotNone(m)
-        self.assertGreaterEqual(
+        self.assertLessEqual(
             float(m.group(1)),
-            180.0,
-            "Boyun +-180 deg donemezse arkadaki kaynaga ancak onden 140 deg suzulerek "
-            "yaklasilir; kullanicinin gordugu 'uzun yoldan gecme' davranisi budur.",
+            85.0,
+            "Boyun continuous 360 joint degildir; mekanik sinirlar +-70 ile +-85 arasinda olmalidir.",
         )
 
 
