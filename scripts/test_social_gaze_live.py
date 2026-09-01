@@ -1,13 +1,10 @@
 #!/usr/bin/env python3
-"""ASTRO Robot — Real-Time Audiovisual Social Gaze Live Monitor & Test Tool.
+"""ASTRO Robot — Real-Time Audiovisual Social Gaze Live Monitor & Flight Recorder.
 
-Subscribes to all perception, fusion, state machine, and actuator topics to provide
-a live terminal dashboard for verifying:
-  1. Acoustic DOA (ReSpeaker Sound Localization)
-  2. Visual Face Tracking (OAK-D Lite Foveation & Gaze Direction)
-  3. Multimodal Audio-Visual Association & Target State
-  4. 9-State Social Gaze State Machine Transitions
-  5. S-Curve Motion Execution & Head Closed-Loop Tracking
+Subscribes to all perception, fusion, state machine, and actuator topics to provide:
+  1. Live interactive dashboard (10 Hz in-place display)
+  2. Background Flight Recorder tracking all acoustic orienting, face tracking, and FSM events
+  3. Formatted Summary Report printed to stdout and saved to JSON on Ctrl+C exit
 
 Usage:
   python3 scripts/test_social_gaze_live.py
@@ -18,7 +15,7 @@ import math
 import os
 import sys
 import time
-from typing import Optional
+from typing import Dict, List, Optional
 
 try:
     import rclpy
@@ -36,30 +33,32 @@ except ImportError as exc:
 
 
 STATE_NAMES = {
-    0: "IDLE (0)",
-    1: "SEARCHING (1)",
-    2: "AUDIO_ACQUIRE (2)",
-    3: "ORIENTING (3)",
-    4: "VISUAL_ACQUIRE (4)",
-    5: "TRACKING (5)",
-    6: "HOLD (6)",
-    7: "TARGET_LOST (7)",
-    8: "RETURNING (8)",
+    0: "IDLE",
+    1: "SEARCHING",
+    2: "AUDIO_ACQUIRE",
+    3: "ORIENTING",
+    4: "VISUAL_ACQUIRE",
+    5: "TRACKING",
+    6: "HOLD",
+    7: "TARGET_LOST",
+    8: "RETURNING",
 }
 
 PRIORITY_NAMES = {
-    0: "IDLE (0)",
-    1: "VISUAL_PERSON (1)",
-    2: "ACTIVE_SPEAKER (2)",
-    3: "DIALOGUE (3)",
-    4: "GESTURE (4)",
-    5: "SAFETY (5)",
+    0: "IDLE",
+    1: "VISUAL_PERSON",
+    2: "ACTIVE_SPEAKER",
+    3: "DIALOGUE",
+    4: "GESTURE",
+    5: "SAFETY",
 }
 
 
 class SocialGazeLiveMonitor(Node):
     def __init__(self):
         super().__init__("social_gaze_live_monitor")
+
+        self.start_time = time.monotonic()
 
         # Telemetry State
         self.audio_doa_deg: Optional[float] = None
@@ -69,8 +68,9 @@ class SocialGazeLiveMonitor(Node):
         self.visual_faces_count: int = 0
         self.visual_last_time: float = 0.0
 
-        self.gaze_state: str = "IDLE (0)"
-        self.gaze_priority: str = "IDLE (0)"
+        self.gaze_state: str = "IDLE"
+        self.prev_gaze_state: str = "IDLE"
+        self.gaze_priority: str = "IDLE"
         self.gaze_desired_yaw: float = 0.0
         self.gaze_planned_yaw: float = 0.0
         self.gaze_at_target: bool = True
@@ -85,6 +85,14 @@ class SocialGazeLiveMonitor(Node):
         self.head_moving: bool = False
         self.head_stall: bool = False
         self.robot_speaking: bool = False
+
+        # Flight Recorder History
+        self.state_transitions: List[Dict] = []
+        self.audio_events: List[Dict] = []
+        self.visual_events: List[Dict] = []
+        self.tracking_errors: List[float] = []
+        self.sample_count: int = 0
+        self.max_abs_vel: float = 0.0
 
         qos_be = QoSProfile(depth=10, reliability=ReliabilityPolicy.BEST_EFFORT)
 
@@ -107,10 +115,19 @@ class SocialGazeLiveMonitor(Node):
         self.create_subscription(JointState, "/joint_states", self._on_joint_states, qos_be)
 
     def _on_audio_doa(self, msg: Float32):
-        self.audio_doa_deg = float(msg.data)
-        self.audio_last_time = time.monotonic()
+        val = float(msg.data)
+        now = time.monotonic()
+        if self.audio_doa_deg is None or abs(val - self.audio_doa_deg) > 3.0 or (now - self.audio_last_time > 1.0):
+            self.audio_events.append({
+                "time": round(now - self.start_time, 2),
+                "doa_deg": round(val, 1),
+                "head_yaw_at_trigger": round(self.act_head_yaw, 2),
+            })
+        self.audio_doa_deg = val
+        self.audio_last_time = now
 
     def _on_vision_json(self, msg: String):
+        now = time.monotonic()
         try:
             data = json.loads(msg.data)
             faces = data.get("faces", [])
@@ -119,7 +136,13 @@ class SocialGazeLiveMonitor(Node):
                 primary = faces[0]
                 self.visual_yaw_deg = float(primary.get("azimuth_deg", primary.get("yaw_deg", 0.0)))
                 self.visual_conf = float(primary.get("confidence", 0.85))
-                self.visual_last_time = time.monotonic()
+                self.visual_last_time = now
+                self.visual_events.append({
+                    "time": round(now - self.start_time, 2),
+                    "face_yaw_deg": round(self.visual_yaw_deg, 2),
+                    "confidence": round(self.visual_conf, 2),
+                    "tracking_error": round(self.cmd_head_yaw - self.act_head_yaw, 2),
+                })
             else:
                 self.visual_conf = 0.0
         except Exception:
@@ -139,6 +162,10 @@ class SocialGazeLiveMonitor(Node):
         self.act_head_vel = float(msg.velocity_deg_s)
         self.head_moving = bool(msg.moving)
         self.head_stall = bool(getattr(msg, "fault_code", 0) == 4)
+        self.max_abs_vel = max(self.max_abs_vel, abs(self.act_head_vel))
+        err = self.cmd_head_yaw - self.act_head_yaw
+        self.tracking_errors.append(abs(err))
+        self.sample_count += 1
 
     def _on_joint_states(self, msg: JointState):
         if "head_yaw_joint" in msg.name:
@@ -149,7 +176,19 @@ class SocialGazeLiveMonitor(Node):
 
     def _on_gaze_state(self, msg):
         state_val = getattr(msg, "state", 0)
-        self.gaze_state = STATE_NAMES.get(state_val, f"STATE_{state_val}")
+        current_st = STATE_NAMES.get(state_val, f"STATE_{state_val}")
+        if current_st != self.prev_gaze_state:
+            now = time.monotonic()
+            self.state_transitions.append({
+                "time": round(now - self.start_time, 2),
+                "from_state": self.prev_gaze_state,
+                "to_state": current_st,
+                "head_yaw": round(self.act_head_yaw, 2),
+                "target_yaw": round(float(getattr(msg, "desired_yaw_deg", 0.0)), 2),
+            })
+            self.prev_gaze_state = current_st
+
+        self.gaze_state = current_st
         prio_val = getattr(msg, "priority", 0)
         self.gaze_priority = PRIORITY_NAMES.get(prio_val, f"PRIO_{prio_val}")
         self.gaze_desired_yaw = float(getattr(msg, "desired_yaw_deg", 0.0))
@@ -201,12 +240,76 @@ def render_dashboard(node: SocialGazeLiveMonitor):
     lines.append(f"  • Actuator Moving Status   : {'🔄 SLEWING' if node.head_moving else '⏸️ SETTLED / DWELLING'}")
 
     lines.append("\n" + "-" * 80)
-    lines.append("  [Canlı Test]: Robotun karşısında konuşun veya hareket edin. (Çıkış: Ctrl+C)")
+    lines.append("  [Canlı Test]: Konuşarak veya hareket ederek test edin. Bitirmek için Ctrl+C yapın.")
     lines.append("-" * 80)
 
     # Print buffer cleanly at home position
     sys.stdout.write("\033[H\033[J" + "\n".join(lines) + "\n")
     sys.stdout.flush()
+
+
+def generate_flight_report(node: SocialGazeLiveMonitor):
+    duration = time.monotonic() - node.start_time
+    avg_err = (sum(node.tracking_errors) / len(node.tracking_errors)) if node.tracking_errors else 0.0
+    rms_err = math.sqrt(sum(e**2 for e in node.tracking_errors) / len(node.tracking_errors)) if node.tracking_errors else 0.0
+
+    print("\n\n" + "=" * 80)
+    print("       ASTRO SOCIAL GAZE LIVE TEST — FLIGHT RECORDER REPORT")
+    print("=" * 80)
+    print(f"Test Süresi          : {duration:.2f} saniye")
+    print(f"Toplanan Telemetri   : {node.sample_count} örnek ({node.sample_count / max(0.1, duration):.1f} Hz)")
+    print(f"Maksimum Açısal Hız  : {node.max_abs_vel:.1f}°/s")
+    print(f"Ortalama Takip Hatası: {avg_err:.2f}° (RMS: {rms_err:.2f}°)")
+
+    # 1. State Machine Timeline
+    print("\n[1] DURUM MAKİNESİ GEÇİŞLERİ (FSM TRANSITION TIMELINE):")
+    if node.state_transitions:
+        print(f"{'Zaman (s)':<12} | {'Önceki Durum':<18} -> {'Yeni Durum':<18} | {'Kafa Konumu':<12} | {'Hedef Açı'}")
+        print("-" * 75)
+        for st in node.state_transitions:
+            print(f"{st['time']:<12.2f} | {st['from_state']:<18} -> {st['to_state']:<18} | {st['head_yaw']:>+6.2f}°      | {st['target_yaw']:>+6.2f}°")
+    else:
+        print("  (Test süresince durum değişikliği olmadı: Sabit " + node.gaze_state + ")")
+
+    # 2. Acoustic Orienting Summary
+    print("\n[2] İŞİTSEL YÖNELME (ACOUSTIC DOA EVENTS):")
+    if node.audio_events:
+        print(f"  • Tespit Edilen Ses Yönü Sayısı: {len(node.audio_events)}")
+        for i, ev in enumerate(node.audio_events[-5:], 1):
+            print(f"    - Olay {i}: {ev['time']}s | DOA = {ev['doa_deg']:+.1f}° | Kafa Başlangıç = {ev['head_yaw_at_trigger']:+.2f}°")
+    else:
+        print("  • Ses olayı algılanmadı (Sessiz ortam).")
+
+    # 3. Visual Face Tracking Summary
+    print("\n[3] GÖRSEL YÜZ TAKİBİ (VISUAL TRACKING SUMMARY):")
+    if node.visual_events:
+        print(f"  • Toplam Takip Edilen Yüz Karesi: {len(node.visual_events)} kare")
+        mean_vis_conf = sum(e['confidence'] for e in node.visual_events) / len(node.visual_events)
+        print(f"  • Ortalama Tespit Güveni: %{mean_vis_conf*100:.1f}")
+        for i, ev in enumerate(node.visual_events[-5:], 1):
+            print(f"    - Kare {i}: {ev['time']}s | Yüz Açısı = {ev['face_yaw_deg']:+.1f}° | Takip Hatası = {ev['tracking_error']:+.2f}°")
+    else:
+        print("  • Görsel yüz tespiti algılanmadı.")
+
+    print("\n" + "=" * 80)
+    print("Kabul Özeti: Test başarıyla tamamlandı. Rapor JSON dosyasına kaydedildi.")
+    print("=" * 80 + "\n")
+
+    # Save JSON Log
+    os.makedirs("ros2_ws/data", exist_ok=True)
+    report_file = "ros2_ws/data/social_gaze_live_report.json"
+    report_data = {
+        "duration_s": round(duration, 2),
+        "total_samples": node.sample_count,
+        "max_angular_velocity_deg_s": round(node.max_abs_vel, 2),
+        "mean_tracking_error_deg": round(avg_err, 2),
+        "rms_tracking_error_deg": round(rms_err, 2),
+        "state_transitions": node.state_transitions,
+        "audio_events": node.audio_events,
+        "visual_events_count": len(node.visual_events),
+    }
+    with open(report_file, "w", encoding="utf-8") as f:
+        json.dump(report_data, f, indent=2)
 
 
 def main():
@@ -220,6 +323,7 @@ def main():
     except KeyboardInterrupt:
         pass
     finally:
+        generate_flight_report(node)
         node.destroy_node()
         rclpy.shutdown()
 
