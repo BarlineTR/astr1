@@ -252,11 +252,35 @@ void publishDiag(uint16_t vbat_mV, int16_t temp_cX100, uint32_t flags) {
   Proto::writePacket(Serial, Proto::DIAGNOSTICS, payload, sizeof(payload));
 }
 
+// Kafa motoru maksimum hız limiti: 35.0 derece/saniye (sakin, insansı dönüş hızı)
+static constexpr float HEAD_MAX_VEL_DEG_S = 35.0f;
+static constexpr float HEAD_MAX_TICKS_PER_SEC = HEAD_MAX_VEL_DEG_S * HEAD_TICKS_PER_DEG; // ~90.6 ticks/s
+
+static float g_head_profile_pos = 0.0f;
+static bool g_head_profile_inited = false;
+
 // Kafa konum PID'i. Limit switch olmadigi icin stall korumasi sart:
 // mekanik dayanaga dayanirsa motor akim ceker ve isinir.
 void headControl(uint32_t dt_ms) {
   int32_t pos = readTicks(g_head_ticks);
-  int32_t err = g_head_target_ticks - pos;
+
+  if (!g_head_profile_inited) {
+    g_head_profile_pos = (float)pos;
+    g_head_profile_inited = true;
+  }
+
+  // Yumuşak hız sınırlayıcı: 50 Hz (20ms) döngüsünde hedefi 35 deg/s hızla rampala
+  float dt_s = (float)dt_ms / 1000.0f;
+  float max_step = HEAD_MAX_TICKS_PER_SEC * dt_s;
+  float diff = (float)g_head_target_ticks - g_head_profile_pos;
+  if (abs(diff) <= max_step) {
+    g_head_profile_pos = (float)g_head_target_ticks;
+  } else {
+    g_head_profile_pos += (diff > 0.0f ? max_step : -max_step);
+  }
+
+  int32_t profile_target_tick = (int32_t)lroundf(g_head_profile_pos);
+  int32_t err = profile_target_tick - pos;
 
   // Kisa yay: hata yarim turu asiyorsa diger yonden gitmek daha kisadir.
   if (HEAD_CONTINUOUS_ROTATION) {

@@ -267,11 +267,16 @@ class SocialGazeFSM:
                     self.target_yaw_deg = target_yaw
 
                 # Complete orientation ONLY when physically arrived and settled
-                if self.at_target or (timestamp - self._state_entry_time) >= 3.0:
+                if self.at_target or (timestamp - self._state_entry_time) >= 2.5:
                     if active_target.modality in (Modality.FUSED, Modality.VISION):
                         self._transition_to(GazeStateEnum.TRACKING, timestamp)
                     else:
                         self._transition_to(GazeStateEnum.VISUAL_ACQUIRE, timestamp)
+            elif self.state in (GazeStateEnum.TRACKING, GazeStateEnum.HOLD) and active_target.modality == Modality.VISION:
+                # Smooth Visual Pursuit: Human face in view -> smoothly update setpoint without abrupt orienting saccades
+                if abs(angular_diff_deg(target_yaw, self.target_yaw_deg)) >= self.deadband_deg:
+                    self.target_yaw_deg = target_yaw
+                self._transition_to(GazeStateEnum.TRACKING, timestamp)
             else:
                 # Initiate orienting saccade if outside narrow tracking window (>15°)
                 if err_deg > 15.0:
