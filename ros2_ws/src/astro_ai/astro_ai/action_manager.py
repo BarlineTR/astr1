@@ -400,8 +400,8 @@ class ActionManager:
             azimuth = None
             confidence = 0.0
 
-            # Prefer recent speech consensus (within 4.0s) that is not a rear wall bounce (>130°)
-            speech_doa = [y for ts, y, cur_rms in self._doa_history if (now - ts) <= 4.0 and abs(y) <= 130.0 and cur_rms >= 400.0]
+            # Prefer recent speech consensus (within 6.0s) that is not a rear wall bounce (>130°)
+            speech_doa = [y for ts, y, cur_rms in self._doa_history if (now - ts) <= 6.0 and abs(y) <= 130.0 and cur_rms >= 150.0]
             if speech_doa:
                 sin_s = sum(math.sin(math.radians(y)) for y in speech_doa)
                 cos_s = sum(math.cos(math.radians(y)) for y in speech_doa)
@@ -411,8 +411,8 @@ class ActionManager:
                 azimuth = sound_dir.azimuth_deg
                 confidence = sound_dir.confidence
             else:
-                # Secondary fallback: only recent speech within 4.5s
-                recent_doa = [y for ts, y, cur_rms in self._doa_history if (now - ts) <= 4.5 and abs(y) <= 130.0 and cur_rms >= 400.0]
+                # Secondary fallback: speech within 10.0s
+                recent_doa = [y for ts, y, cur_rms in self._doa_history if (now - ts) <= 10.0 and abs(y) <= 130.0 and cur_rms >= 120.0]
                 if recent_doa:
                     sin_s = sum(math.sin(math.radians(y)) for y in recent_doa)
                     cos_s = sum(math.cos(math.radians(y)) for y in recent_doa)
@@ -455,8 +455,8 @@ class ActionManager:
                 return res
 
             if azimuth is None:
-                # 3. Broader temporal history fallback (up to 8.0s with verified acoustic speech energy)
-                broader_doa = [y for ts, y, cur_rms in self._doa_history if (now - ts) <= 8.0 and abs(y) <= 130.0 and cur_rms >= 400.0]
+                # 3. Broader temporal history fallback (up to 15.0s with verified acoustic speech energy)
+                broader_doa = [y for ts, y, cur_rms in self._doa_history if (now - ts) <= 15.0 and abs(y) <= 130.0 and cur_rms >= 120.0]
                 if broader_doa:
                     sin_s = sum(math.sin(math.radians(y)) for y in broader_doa)
                     cos_s = sum(math.cos(math.radians(y)) for y in broader_doa)

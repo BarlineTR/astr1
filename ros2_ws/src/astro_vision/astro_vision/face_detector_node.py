@@ -303,6 +303,7 @@ class SpatialVisionNode(Node):
 
             face_list.append({
                 "x": int(x), "y": int(y), "width": int(w), "height": int(h),
+                "frame_width": int(frame_w), "frame_height": int(frame_h),
                 "yaw_deg": round(yaw, 1),
                 "camera_azimuth_deg": round(cam_azimuth, 1),
                 "distance_m": round(dist_m, 2),

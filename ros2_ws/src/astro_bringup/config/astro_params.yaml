@@ -99,7 +99,7 @@ social_gaze_node:
     min_attention_dwell_s: 2.50
     turn_taking_min_dwell_s: 0.80
     spatial_gate_deg: 25.0
-    idle_saccades_enabled: true
+    idle_saccades_enabled: false
     self_speech_suppression: true
 
 

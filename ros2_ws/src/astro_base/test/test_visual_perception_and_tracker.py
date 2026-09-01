@@ -127,6 +127,40 @@ class TestVisualTracker(unittest.TestCase):
         tids = {tr.target_id for tr in tracks}
         self.assertEqual(len(tids), 2)
 
+    def test_direct_cam_azimuth_bearing_projection(self):
+        """Verify direct cam_azimuth_deg overrides pixel normalization and yields correct body yaw."""
+        core = VisualPerceptionCore()
+        # Head at +17.0°, person in camera view at -14.0° (to the right of optical axis)
+        obs = core.process_detection(
+            x=320, y=240, w=60, h=60, depth_m=1.5,
+            timestamp=1.0, actual_head_yaw_deg=17.0,
+            confidence=0.85, cam_azimuth_deg=-14.0,
+        )
+        self.assertAlmostEqual(obs.camera_azimuth_deg, -14.0, delta=0.5)
+        self.assertAlmostEqual(obs.body_azimuth_deg, 3.0, delta=0.5)
+
+    def test_smooth_walking_person_tracking(self):
+        """Verify walking person continuously maintains track identity and smooth body azimuth."""
+        t = 1.0
+        core = VisualPerceptionCore()
+        # Person walking from -20° to +20° in body frame across 10 steps
+        prev_tid = None
+        for step in range(10):
+            # Head stationary at 0°
+            angle = -20.0 + step * 4.0
+            obs = core.process_detection(
+                x=320, y=240, w=60, h=60, depth_m=1.5,
+                timestamp=t, actual_head_yaw_deg=0.0,
+                confidence=0.85, cam_azimuth_deg=angle,
+            )
+            tracks = self.tracker.update([obs], timestamp=t)
+            self.assertEqual(len(tracks), 1)
+            if prev_tid is None:
+                prev_tid = tracks[0].target_id
+            else:
+                self.assertEqual(tracks[0].target_id, prev_tid, "Track ID must persist during continuous walk")
+            t += 0.05
+
 
 if __name__ == "__main__":
     unittest.main()

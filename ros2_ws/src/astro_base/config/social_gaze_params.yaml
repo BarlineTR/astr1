@@ -11,7 +11,7 @@
     min_attention_dwell_s: 2.50
     turn_taking_min_dwell_s: 0.80
     spatial_gate_deg: 25.0
-    idle_saccades_enabled: true
+    idle_saccades_enabled: false
     self_speech_suppression: true
 
     audio:
@@ -48,7 +48,7 @@
     target_manager:
       acquisition_threshold: 0.75   # Confidence required to acquire and lock a new target
       hold_threshold: 0.40          # Confidence threshold below which target drops to coasting
-      target_lost_timeout_s: 1.0    # Duration in coasting before removing target
+      target_lost_timeout_s: 2.5    # Duration in coasting before removing target
       min_attention_dwell_s: 2.50   # Minimum gaze dwell time before switching targets
       turn_taking_min_dwell_s: 0.80 # Accelerated dwell time when a new distinct speaker takes floor
       turn_taking_min_angle_deg: 20.0 # Angular separation to qualify for turn-taking switch
@@ -57,7 +57,7 @@
     gaze_manager:
       deadband_deg: 3.0             # Angular error deadband (no motor command below this)
       idle_return_timeout_s: 25.0   # Silence/inactivity timeout before returning head to 0.0° center
-      idle_saccades_enabled: true   # Enable natural gentle social micro-saccades during idle
+      idle_saccades_enabled: false  # Enable natural gentle social micro-saccades during idle
       idle_saccade_interval_s: 8.0  # Interval between idle subtle breathing saccades
       idle_saccade_max_deg: 4.5     # Amplitude of idle subtle saccades
 

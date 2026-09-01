@@ -111,7 +111,7 @@ class SocialGazeNode(Node):
         self.declare_parameter("min_attention_dwell_s", 2.50)
         self.declare_parameter("turn_taking_min_dwell_s", 0.80)
         self.declare_parameter("spatial_gate_deg", 25.0)
-        self.declare_parameter("idle_saccades_enabled", True)
+        self.declare_parameter("idle_saccades_enabled", False)
         self.declare_parameter("self_speech_suppression", True)
 
         # Load Calibration
@@ -155,7 +155,7 @@ class SocialGazeNode(Node):
         self.target_manager = TargetManagerCore(
             acquisition_threshold=0.75,
             hold_threshold=0.40,
-            target_lost_timeout_s=1.0,
+            target_lost_timeout_s=2.5,
             min_attention_dwell_s=float(self.get_parameter("min_attention_dwell_s").value),
             turn_taking_min_dwell_s=float(self.get_parameter("turn_taking_min_dwell_s").value),
         )
@@ -317,6 +317,7 @@ class SocialGazeNode(Node):
             timestamp=t,
             actual_head_yaw_deg=self.actual_head_yaw_deg,
             confidence=0.85,
+            cam_azimuth_deg=cam_azimuth,
         )
         self.latest_visual_tracks = self.visual_tracker.update(
             observations=[obs],
@@ -345,6 +346,11 @@ class SocialGazeNode(Node):
                 is_known_val = bool(d.get("is_known", recog_name is not None))
                 head_yaw_val = float(d.get("yaw_deg", d.get("head_yaw_deg", 0.0)))
                 eyes_vis = bool(d.get("eyes_visible", d.get("looking_at_robot", True)))
+                cam_az_val = d.get("camera_azimuth_deg", d.get("cam_azimuth_deg"))
+                if cam_az_val is not None:
+                    cam_az_val = float(cam_az_val)
+                frame_w_val = int(d.get("frame_width", d.get("frame_w", 640)))
+                frame_h_val = int(d.get("frame_height", d.get("frame_h", 480)))
 
                 obs = self.visual_perception.process_detection(
                     x=int(d.get("x", 0)),
@@ -354,12 +360,15 @@ class SocialGazeNode(Node):
                     depth_m=depth_val,
                     timestamp=t,
                     actual_head_yaw_deg=self.actual_head_yaw_deg,
+                    frame_width=frame_w_val,
+                    frame_height=frame_h_val,
                     confidence=float(d.get("confidence", 0.85)),
                     eyes_visible=eyes_vis,
                     head_yaw_deg=head_yaw_val,
                     emotion=str(d.get("emotion", "neutral")),
                     person_name=recog_name,
                     is_known=is_known_val,
+                    cam_azimuth_deg=cam_az_val,
                 )
                 obs_list.append(obs)
 
