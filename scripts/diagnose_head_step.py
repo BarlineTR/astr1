@@ -107,11 +107,10 @@ def run_diagnostic(target_deg: float, duration_s: float = 4.0, raw_control_debug
         start_pos = node.get_pos()
         start_vel = node.get_vel()
         start_ticks = int(round(start_pos * 2.5882))
-        target_ticks_mcu = int(round(target_deg * 1.5000))
-        target_ticks_bridge = int(round(target_deg * 2.5882))
+        target_ticks_mcu = int(round(target_deg * 2.5882))
 
         print(f"Pre-command State: pos={start_pos:+.2f}°, vel={start_vel:+.2f}°/s | raw_start_ticks={start_ticks}")
-        print(f"Target Ticks: MCU (1.5000 tick/deg) = {target_ticks_mcu} | Bridge (2.5882 tick/deg) = {target_ticks_bridge}\n")
+        print(f"Authoritative Target Ticks (2.5882 tick/deg) = {target_ticks_mcu} ticks\n")
 
         if raw_control_debug:
             print(f"{'Time (s)':<8} | {'Tgt Ticks':<9} | {'Act Ticks':<9} | {'Err Ticks':<9} | {'Est PWM':<7} | {'Mot En':<6} | {'Stall':<5} | {'Limit':<5} | {'WDog':<5} | {'Enc Delta':<9} | {'Notes'}")
