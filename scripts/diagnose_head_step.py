@@ -138,11 +138,11 @@ def run_diagnostic(target_deg: float, duration_s: float = 4.0, raw_control_debug
             cur_vel = node.get_vel()
             cur_ticks = int(round(cur_pos * 2.5882))
             enc_delta = cur_ticks - start_ticks
-            err_ticks = target_ticks_mcu - int(round(cur_pos * 1.5000))
+            err_ticks = target_ticks_mcu - cur_ticks
 
             # Estimate MCU PID & PWM
             dt = max(0.001, t_now - (last_t - t0))
-            de = (cur_pos - last_pos) * 1.5000 / dt
+            de = (cur_pos - last_pos) * 2.5882 / dt
             ff = 70.0 if err_ticks > 0 else (-70.0 if err_ticks < 0 else 0.0)
             u = ff + (4.0 * err_ticks) - (0.05 * de)
             est_pwm = int(max(-160, min(160, u))) if abs(err_ticks) > 1 else 0
