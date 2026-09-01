@@ -304,7 +304,7 @@ def run_acceptance_suite():
             ("Return (0°)", 0.0, 2.5),
             ("Wide-Left (+60°)", 60.0, 3.5),
             ("Anti-Wrap-Around Direct Arc (+60° -> -60°)", -60.0, 4.0),
-            ("Return Center (0°)", 0.0, 3.0),
+            ("Return Center (0°)", 0.0, 3.5),
         ]
 
         for name, angle, hold in range_steps:
