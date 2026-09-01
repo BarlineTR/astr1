@@ -84,6 +84,10 @@ class MotionPlannerCore:
         dt = max(0.001, min(0.10, timestamp - self.last_update_time))
         self.last_update_time = timestamp
 
+        # Closed-loop tracking synchronization: resync planner state if drift exceeds 5.0°
+        if actual_pos_deg is not None and abs(self.current_pos - actual_pos_deg) > 5.0:
+            self.current_pos = actual_pos_deg
+
         self.target_pos = clamp_deg(gaze_cmd.target_yaw_deg, self.min_limit, self.max_limit)
 
         # 1. Shortest reachable rotation arc respecting limits
