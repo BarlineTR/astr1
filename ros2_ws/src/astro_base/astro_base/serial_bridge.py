@@ -642,9 +642,9 @@ class SerialBridge(Node):
         else:
             now_mono = time.monotonic()
             dt_head = now_mono - self._last_head_pos_time
-            if dt_head > 0.005:
+            if dt_head >= 0.020:
                 raw_vel = (self.head_pos - self._last_head_pos) / dt_head
-                self.head_vel = 0.8 * self.head_vel + 0.2 * raw_vel
+                self.head_vel = 0.85 * self.head_vel + 0.15 * raw_vel
                 self._last_head_pos_time = now_mono
                 self._last_head_pos = self.head_pos
 

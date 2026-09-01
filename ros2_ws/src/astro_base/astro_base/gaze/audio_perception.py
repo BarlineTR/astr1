@@ -15,7 +15,7 @@ import numpy as np
 
 from astro_base.gaze.angle_math import wrap_deg
 from astro_base.gaze.coordinate_frames import CoordinateTransformer
-from astro_base.gaze.types import AudioObservation
+from astro_base.gaze.types import AudioEventCounters, AudioObservation
 
 
 class ReSpeaker4MicGeometry:
@@ -87,15 +87,18 @@ class AudioPerceptionCore:
         vad_threshold: float = 450.0,
         min_confidence: float = 0.40,
         self_speech_suppression_factor: float = 0.15,
+        max_acoustic_envelope_deg: float = 75.0,
     ):
         self.transformer = transformer or CoordinateTransformer()
         self.min_rms_energy = min_rms_energy
         self.vad_threshold = vad_threshold
         self.min_confidence = min_confidence
         self.self_speech_suppression_factor = self_speech_suppression_factor
+        self.max_acoustic_envelope_deg = max_acoustic_envelope_deg
 
         self.noise_floor_rms = 120.0
         self.max_tau = ReSpeaker4MicGeometry.MAX_TAU_S
+        self.counters = AudioEventCounters()
 
     def process_frame(
         self,
@@ -195,20 +198,26 @@ class AudioPerceptionCore:
         confidence = float(min(1.0, max(0.0, 0.65 * avg_quality + 0.35 * energy_factor)))
 
         # 6. Self-Speech Suppression
+        self.counters.raw_audio_events += 1
         if is_robot_speaking or is_playback_active:
+            self.counters.stale_audio_events += 1
             confidence *= self.self_speech_suppression_factor
-
-        is_valid = (confidence >= self.min_confidence) and (not is_robot_speaking)
 
         # 7. Coordinate transformations
         rel_bearing = self.transformer.raw_audio_doa_to_head_bearing(raw_azimuth_0_360)
         body_yaw = self.transformer.audio_head_bearing_to_body_yaw(rel_bearing, actual_head_yaw_deg)
 
-        # Strict conversational acoustic envelope gate (±85° relative to head)
-        in_acoustic_fov = abs(rel_bearing) <= 85.0
-        is_valid = (confidence >= self.min_confidence) and (not is_robot_speaking) and in_acoustic_fov
+        # Strict conversational acoustic envelope gate (±75° relative to head)
+        in_acoustic_fov = abs(rel_bearing) <= self.max_acoustic_envelope_deg
         if not in_acoustic_fov:
+            self.counters.invalid_angle_events += 1
             confidence = 0.0
+
+        is_valid = (confidence >= self.min_confidence) and (not is_robot_speaking) and (not is_playback_active) and in_acoustic_fov
+        if is_valid:
+            self.counters.accepted_audio_events += 1
+        else:
+            self.counters.rejected_audio_events += 1
 
         return AudioObservation(
             timestamp=timestamp,
@@ -233,18 +242,26 @@ class AudioPerceptionCore:
         is_robot_speaking: bool = False,
     ) -> AudioObservation:
         """Processes a pre-calculated raw DOA angle (e.g. from ReSpeaker onboard DSP)."""
+        self.counters.raw_audio_events += 1
         rel_bearing = self.transformer.raw_audio_doa_to_head_bearing(raw_doa_deg)
         body_yaw = self.transformer.audio_head_bearing_to_body_yaw(rel_bearing, actual_head_yaw_deg)
 
         eff_conf = confidence
         if is_robot_speaking:
+            self.counters.stale_audio_events += 1
             eff_conf *= self.self_speech_suppression_factor
 
-        # Reject rear acoustic blindspot reflections (> 85° relative to head) so neck never slams to mechanical limits
-        in_acoustic_fov = abs(rel_bearing) <= 85.0
-        is_valid = (eff_conf >= self.min_confidence) and (not is_robot_speaking) and in_acoustic_fov
+        # Reject rear acoustic blindspot reflections (> 75° relative to head) so neck never slams to mechanical limits
+        in_acoustic_fov = abs(rel_bearing) <= self.max_acoustic_envelope_deg
         if not in_acoustic_fov:
+            self.counters.invalid_angle_events += 1
             eff_conf = 0.0
+
+        is_valid = (eff_conf >= self.min_confidence) and (not is_robot_speaking) and in_acoustic_fov
+        if is_valid:
+            self.counters.accepted_audio_events += 1
+        else:
+            self.counters.rejected_audio_events += 1
 
         return AudioObservation(
             timestamp=timestamp,

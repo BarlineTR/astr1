@@ -274,22 +274,23 @@ class SocialGazeFSM:
 
         self.at_target = (self._settling_persistence_count >= self.settling_persistence_required)
 
-        # 5. Gaze Policy Lifecycle
+        # 5. Gaze Policy Lifecycle & Invariant Transitions
         if decision.owner == PrioritySource.EMERGENCY_STOP:
             self.target_yaw_deg = 0.0
             if abs(actual_head_yaw_deg) > 1.5:
                 self._transition_to(GazeStateEnum.RECOVERING, timestamp, reason="EMERGENCY_STOP_RECOVERY")
             else:
+                self.active_target_id = None
                 self._transition_to(GazeStateEnum.IDLE, timestamp, reason="EMERGENCY_STOP_IDLE")
 
         elif decision.is_preemption:
             # Explicit user command immediately preempts active attention without turn-taking dwell
             self.target_yaw_deg = decision.target_yaw_deg
             err_to_target = abs(angular_diff_deg(self.target_yaw_deg, actual_head_yaw_deg))
-            if err_to_target > 12.0 and not self.at_target:
-                self._transition_to(GazeStateEnum.ORIENTING, timestamp, reason="EXPLICIT_COMMAND_SACCADE")
+            if err_to_target > 8.0 and not self.at_target:
+                self._transition_to(GazeStateEnum.ORIENTING, timestamp, reason=f"PREEMPTION_SACCADE_{decision.reason}")
             else:
-                self._transition_to(GazeStateEnum.HOLDING_ATTENTION, timestamp, reason="EXPLICIT_COMMAND_HOLD")
+                self._transition_to(GazeStateEnum.HOLDING_ATTENTION, timestamp, reason=f"PREEMPTION_HOLD_{decision.reason}")
 
         elif decision.owner in (PrioritySource.ACTIVE_SPEAKER, PrioritySource.VISUAL_TRACKING):
             target_yaw = decision.target_yaw_deg
@@ -314,15 +315,35 @@ class SocialGazeFSM:
                     else:
                         self._transition_to(GazeStateEnum.ACQUIRING, timestamp, reason="ORIENTING_COMPLETE_ACQUIRING")
 
-            elif self.state == GazeStateEnum.HOLDING_ATTENTION:
-                # Stable Social Attention Commitment:
-                # Update target setpoint smoothly if target has drifted by more than deadband
+            elif self.state == GazeStateEnum.ACQUIRING:
+                # Active target updated while acquiring (e.g. vision lock or speaker switch)
                 if abs(angular_diff_deg(target_yaw, self.target_yaw_deg)) >= self.deadband_deg:
                     self.target_yaw_deg = target_yaw
 
-                # Leave HOLDING_ATTENTION to TRACKING only if the target exhibits significant motion (> 8.0°)
-                if err_deg > 8.0:
-                    self._transition_to(GazeStateEnum.TRACKING, timestamp, reason="TARGET_MOTION_PURSUIT")
+                if has_vision or decision.owner == PrioritySource.VISUAL_TRACKING:
+                    if self.at_target or err_deg <= self.position_tolerance_deg:
+                        self._transition_to(GazeStateEnum.HOLDING_ATTENTION, timestamp, reason="ACQUIRE_VISION_HOLD")
+                    else:
+                        self._transition_to(GazeStateEnum.TRACKING, timestamp, reason="ACQUIRE_VISION_TRACK")
+                elif err_deg > 8.0:
+                    self._transition_to(GazeStateEnum.ORIENTING, timestamp, reason="ACQUIRE_AUDIO_STEP_SACCADE")
+
+            elif self.state == GazeStateEnum.HOLDING_ATTENTION:
+                # Stable Social Attention Commitment (Failure 9 & 10):
+                # Continuously follow target setpoint smoothly if moved by more than deadband
+                if abs(angular_diff_deg(target_yaw, self.target_yaw_deg)) >= self.deadband_deg:
+                    self.target_yaw_deg = target_yaw
+
+                # Only leave HOLDING_ATTENTION if target ID switched or large step jump (> 15.0°)
+                target_id_changed = (
+                    target_state.active_target is not None
+                    and self.active_target_id is not None
+                    and target_state.active_target.target_id != self.active_target_id
+                )
+                if target_id_changed:
+                    self._transition_to(GazeStateEnum.ORIENTING, timestamp, reason=f"TARGET_SWITCH_{target_state.active_target.target_id}")
+                elif err_deg > 15.0:
+                    self._transition_to(GazeStateEnum.TRACKING, timestamp, reason="LARGE_TARGET_STEP_PURSUIT")
 
             elif self.state == GazeStateEnum.TRACKING:
                 # Smooth Visual Pursuit
@@ -335,21 +356,51 @@ class SocialGazeFSM:
                 elif err_deg > 25.0:
                     self._transition_to(GazeStateEnum.ORIENTING, timestamp, reason="LARGE_TARGET_STEP")
 
-            else:
-                # Initiating from IDLE or RECOVERING
-                self.target_yaw_deg = target_yaw
-                if err_deg > 12.0:
-                    self._settling_persistence_count = 0
-                    self.at_target = False
-                    self._transition_to(GazeStateEnum.ORIENTING, timestamp, reason="INITIATE_SACCADE")
-                else:
-                    if has_vision or decision.owner == PrioritySource.VISUAL_TRACKING:
-                        if self.at_target:
-                            self._transition_to(GazeStateEnum.HOLDING_ATTENTION, timestamp, reason="DIRECT_ALIGNED_HOLD")
+            elif self.state == GazeStateEnum.TARGET_LOST:
+                # Explicit Reacquisition Semantics (Failure 3):
+                # Debounce window (150ms) to reject single-frame glitch oscillations
+                time_in_lost = timestamp - self._state_entry_time
+                if time_in_lost >= 0.15:
+                    if (
+                        target_state.active_target is not None
+                        and target_state.active_target.confidence >= 0.75
+                        and (timestamp - target_state.active_target.timestamp) <= 0.25
+                    ):
+                        reacq_reason = (
+                            f"REACQUIRED_SAME_{target_state.active_target.target_id}"
+                            if target_state.active_target.target_id == self.active_target_id
+                            else f"REACQUIRED_NEW_{target_state.active_target.target_id}"
+                        )
+                        self.target_yaw_deg = target_state.active_target.body_azimuth_deg
+                        if has_vision:
+                            self._transition_to(GazeStateEnum.TRACKING, timestamp, reason=reacq_reason)
                         else:
-                            self._transition_to(GazeStateEnum.TRACKING, timestamp, reason="DIRECT_ALIGNED_TRACK")
+                            self._transition_to(GazeStateEnum.ACQUIRING, timestamp, reason=reacq_reason)
+                    elif time_in_lost >= self.target_lost_timeout_s:
+                        self._transition_to(GazeStateEnum.RECOVERING, timestamp, reason="TARGET_LOST_TIMEOUT_RECOVER")
+
+            elif self.state == GazeStateEnum.IDLE:
+                # Strict IDLE Entry Guards (Failure 1):
+                # IDLE can NEVER jump directly to HOLDING_ATTENTION!
+                if target_state.active_target is not None and target_state.active_target.confidence >= 0.75:
+                    self.target_yaw_deg = target_yaw
+                    if err_deg > 6.0:
+                        self._settling_persistence_count = 0
+                        self.at_target = False
+                        self._transition_to(GazeStateEnum.ORIENTING, timestamp, reason=f"IDLE_TARGET_ACQUIRED_SACCADE_{target_state.active_target.target_id}")
+                    elif has_vision:
+                        self._transition_to(GazeStateEnum.TRACKING, timestamp, reason=f"IDLE_TARGET_ACQUIRED_TRACK_{target_state.active_target.target_id}")
                     else:
-                        self._transition_to(GazeStateEnum.ACQUIRING, timestamp, reason="DIRECT_AUDIO_ACQUIRE")
+                        self._transition_to(GazeStateEnum.ACQUIRING, timestamp, reason=f"IDLE_AUDIO_ACQUIRE_{target_state.active_target.target_id}")
+
+            elif self.state == GazeStateEnum.RECOVERING:
+                # Target detected during return to center
+                if target_state.active_target is not None and target_state.active_target.confidence >= 0.75:
+                    self.target_yaw_deg = target_yaw
+                    if err_deg > 8.0:
+                        self._transition_to(GazeStateEnum.ORIENTING, timestamp, reason="RECOVERY_PREEMPTED_SACCADE")
+                    else:
+                        self._transition_to(GazeStateEnum.TRACKING, timestamp, reason="RECOVERY_PREEMPTED_TRACK")
 
         elif decision.owner in (PrioritySource.DIRECT_DIALOGUE_INTENT, PrioritySource.GESTURE_INTENT):
             self.target_yaw_deg = decision.target_yaw_deg
@@ -368,11 +419,9 @@ class SocialGazeFSM:
             elif self.state == GazeStateEnum.ACQUIRING:
                 scan_elapsed = timestamp - self._state_entry_time
                 if scan_elapsed >= 0.80:
-                    # Timeout with no target: go to TARGET_LOST -> RECOVERING, NEVER HOLDING_ATTENTION
                     self._transition_to(GazeStateEnum.TARGET_LOST, timestamp, reason="ACQUISITION_TIMEOUT_NO_TARGET")
 
             elif self.state == GazeStateEnum.TRACKING:
-                # Target dropped during tracking -> coast in HOLDING_ATTENTION for dwell
                 self._transition_to(GazeStateEnum.HOLDING_ATTENTION, timestamp, reason="TRACKING_DROPOUT_COAST")
 
             elif self.state == GazeStateEnum.HOLDING_ATTENTION:
@@ -388,11 +437,14 @@ class SocialGazeFSM:
             elif self.state == GazeStateEnum.RECOVERING:
                 self.target_yaw_deg = 0.0
                 if abs(actual_head_yaw_deg) <= 1.5 and abs(actual_head_vel_deg_s) <= self.velocity_tolerance_deg_s:
+                    self.active_target_id = None
+                    self.active_priority = PrioritySource.IDLE
                     self._transition_to(GazeStateEnum.IDLE, timestamp, reason="RECOVERY_SETTLED_IDLE")
 
             elif self.state == GazeStateEnum.IDLE:
-                # In empty room: NO random motion, hold 0.0° center
                 self.target_yaw_deg = 0.0
+                self.active_target_id = None
+                self.active_priority = PrioritySource.IDLE
                 if self.idle_saccades_enabled:
                     time_since_saccade = timestamp - self._last_idle_saccade_time
                     if time_since_saccade >= self.idle_saccade_interval_s:

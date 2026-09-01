@@ -253,9 +253,16 @@ class SafetyGazeIntent:
     reason: str = "SAFETY_LOCK"
 
 
-# =============================================================================
-# 4. ATTENTION & GAZE COMMANDS
-# =============================================================================
+@dataclass
+class AudioEventCounters:
+    """Telemetry counters for raw vs valid audio event auditing."""
+    raw_audio_events: int = 0
+    accepted_audio_events: int = 0
+    rejected_audio_events: int = 0
+    invalid_angle_events: int = 0
+    stale_audio_events: int = 0
+    audio_target_births: int = 0
+
 
 @dataclass
 class AttentionDecision:
@@ -267,6 +274,7 @@ class AttentionDecision:
     reason: str
     timestamp: float
     is_preemption: bool = False
+    preempted_target_id: Optional[str] = None
 
 
 @dataclass

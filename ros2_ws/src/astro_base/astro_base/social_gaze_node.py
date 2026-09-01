@@ -484,7 +484,25 @@ class SocialGazeNode(Node):
         cmd_msg.data = target_goal_deg
         self.pub_head_cmd_pos.publish(cmd_msg)
 
-        # 6. Separate Error Metrics Calculation
+        # 6. Lifecycle Purging on IDLE (Failure 4)
+        if self.fsm.state == GazeStateEnum.IDLE and not self.latest_visual_tracks and not (self.latest_audio_state and self.latest_audio_state.valid):
+            self.target_manager.reset_lifecycle()
+
+        # 7. TARGET_BIRTH Telemetry Dispatch (Failure 2 & 10)
+        if self.target_manager.last_target_birth is not None:
+            tb = self.target_manager.last_target_birth
+            if tb.get("source") == "AUDIO":
+                self.audio_perception.counters.audio_target_births += 1
+            tb_msg = String()
+            tb_msg.data = json.dumps(tb)
+            self.pub_active_target.publish(tb_msg)
+            self.get_logger().info(
+                f"🎯 [TARGET_BIRTH] id={tb['target_id']} source={tb['source']} "
+                f"bearing={tb['bearing']:+.1f}° conf={tb['confidence']:.2f} reason={tb['reason']}"
+            )
+            self.target_manager.last_target_birth = None
+
+        # 8. Separate Error Metrics Calculation (Failure 7)
         face_bearing_deg = self.latest_visual_tracks[0].body_azimuth_deg if self.latest_visual_tracks else None
         face_to_desired_error_deg = round(float(face_bearing_deg - gaze_cmd.target_yaw_deg), 2) if face_bearing_deg is not None else 0.0
         desired_to_actual_error_deg = round(float(gaze_cmd.target_yaw_deg - self.actual_head_yaw_deg), 2)
@@ -493,7 +511,10 @@ class SocialGazeNode(Node):
         audio_age_s = round(float(t - self.latest_audio_state.timestamp), 2) if self.latest_audio_state else 999.0
         visual_age_s = round(float(t - self.latest_visual_tracks[0].last_seen_time), 2) if self.latest_visual_tracks else 999.0
 
-        # 7. Publish Typed GazeStatus Message
+        target_identity_correctness = bool(gaze_cmd.active_target_id is not None and target_state.active_target is not None and gaze_cmd.active_target_id == target_state.active_target.target_id)
+        attention_owner_correctness = bool(gaze_cmd.priority_source != PrioritySource.IDLE or target_state.active_target is None)
+
+        # 9. Publish Typed GazeStatus Message
         if self.pub_gaze_state is not None:
             status_msg = GazeStatus()
             status_msg.header.stamp = self.get_clock().now().to_msg()
@@ -530,7 +551,7 @@ class SocialGazeNode(Node):
             status_msg.active_target_id = str(gaze_cmd.active_target_id or "")
             self.pub_gaze_state.publish(status_msg)
 
-        # 8. Publish JSON Debug Telemetry
+        # 10. Publish JSON Debug Telemetry
         state_diag = {
             "timestamp": round(t, 3),
             "gaze_state": gaze_cmd.gaze_state.value,
@@ -545,10 +566,20 @@ class SocialGazeNode(Node):
             "actual_yaw_deg": round(self.actual_head_yaw_deg, 2),
             "face_to_desired_error_deg": face_to_desired_error_deg,
             "desired_to_actual_error_deg": desired_to_actual_error_deg,
+            "target_identity_correctness": target_identity_correctness,
+            "attention_owner_correctness": attention_owner_correctness,
             "audio_valid": bool(self.latest_audio_state.valid) if self.latest_audio_state else False,
             "audio_age_s": audio_age_s,
             "visual_valid": bool(self.latest_visual_tracks[0].confidence > 0.4) if self.latest_visual_tracks else False,
             "visual_age_s": visual_age_s,
+            "audio_counters": {
+                "raw": self.audio_perception.counters.raw_audio_events,
+                "accepted": self.audio_perception.counters.accepted_audio_events,
+                "rejected": self.audio_perception.counters.rejected_audio_events,
+                "invalid_angle": self.audio_perception.counters.invalid_angle_events,
+                "stale": self.audio_perception.counters.stale_audio_events,
+                "births": self.audio_perception.counters.audio_target_births,
+            },
             "at_target": self.fsm.at_target,
             "is_speaking": self.is_robot_speaking,
             "hold_enter_reason": getattr(self.fsm, "hold_enter_reason", "NONE"),

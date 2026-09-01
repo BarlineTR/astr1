@@ -83,6 +83,7 @@ class AttentionArbiterCore:
             if explicit_intent.expiry_time == 0.0 or timestamp <= explicit_intent.expiry_time:
                 chosen_target_id: Optional[str] = None
                 chosen_yaw: float = actual_head_yaw_deg
+                preempted_tid: Optional[str] = target_state.active_target.target_id if target_state.active_target else None
                 decision_reason: str = explicit_intent.reason
 
                 if explicit_intent.selector == TargetSelectorType.CURRENT_SPEAKER:
@@ -128,6 +129,7 @@ class AttentionArbiterCore:
                     reason=decision_reason,
                     timestamp=timestamp,
                     is_preemption=True,
+                    preempted_target_id=preempted_tid,
                 )
                 self.last_decision = decision
                 return decision

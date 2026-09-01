@@ -43,6 +43,7 @@ class TargetManagerCore:
         self._last_healthy_observed_time: float = 0.0
         self._new_speaker_candidate_id: Optional[str] = None
         self._new_speaker_first_heard_time: float = 0.0
+        self.last_target_birth: Optional[dict] = None
 
     def reset(self) -> None:
         self.active_target = None
@@ -52,6 +53,11 @@ class TargetManagerCore:
         self._last_healthy_observed_time = 0.0
         self._new_speaker_candidate_id = None
         self._new_speaker_first_heard_time = 0.0
+        self.last_target_birth = None
+
+    def reset_lifecycle(self) -> None:
+        """Completely purges all active and candidate targets on transition to IDLE."""
+        self.reset()
 
     def update(
         self,
@@ -101,6 +107,17 @@ class TargetManagerCore:
                 self._last_healthy_observed_time = timestamp
                 self._new_speaker_candidate_id = None
 
+                # Log structured TARGET_BIRTH telemetry
+                self.last_target_birth = {
+                    "timestamp": round(timestamp, 3),
+                    "target_id": best_candidate.target_id,
+                    "source": best_candidate.modality.value if hasattr(best_candidate.modality, "value") else str(best_candidate.modality),
+                    "bearing": round(best_candidate.body_azimuth_deg, 1),
+                    "confidence": round(best_candidate.confidence, 2),
+                    "freshness": round(max(0.0, 1.0 - (timestamp - best_candidate.timestamp)), 2),
+                    "reason": f"TARGET_BIRTH_{best_candidate.target_id}",
+                }
+
         else:
             # Active target exists: Check if a new speaker warrants turn-taking switch
             dwell_elapsed = timestamp - self._active_target_start_time
@@ -132,6 +149,15 @@ class TargetManagerCore:
                             self._active_target_start_time = timestamp
                             self._last_active_observed_time = timestamp
                             self._new_speaker_candidate_id = None
+                            self.last_target_birth = {
+                                "timestamp": round(timestamp, 3),
+                                "target_id": candidate_speaker.target_id,
+                                "source": candidate_speaker.modality.value if hasattr(candidate_speaker.modality, "value") else str(candidate_speaker.modality),
+                                "bearing": round(candidate_speaker.body_azimuth_deg, 1),
+                                "confidence": round(candidate_speaker.confidence, 2),
+                                "freshness": round(max(0.0, 1.0 - (timestamp - candidate_speaker.timestamp)), 2),
+                                "reason": f"TURN_TAKING_SWITCH_{candidate_speaker.target_id}",
+                            }
                     else:
                         self._new_speaker_candidate_id = candidate_speaker.target_id
                         self._new_speaker_first_heard_time = timestamp
