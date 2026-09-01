@@ -104,8 +104,10 @@ except ImportError:
 try:
     from astro_base.msg import HeadCmd
 except ImportError:
-    class HeadCmd:  # type: ignore
-        angle_deg: float = 0.0
+    try:
+        from astro_base.msg._head_cmd import HeadCmd
+    except ImportError:
+        HeadCmd = None
 
 
 def doa_to_robot_yaw(doa_deg: float, offset_deg: float = 0.0, invert: bool = False) -> float:
@@ -235,7 +237,10 @@ class HeadTrackerNode(Node):
         self.lidar_timeout_s = float(_get_val("lidar_timeout_s"))
 
         # Publishers — SINGLE AUTHORITATIVE OUTPUT OWNER FOR /head_cmd
-        self.pub_head_cmd = self.create_publisher(HeadCmd, "/head_cmd", 10)
+        if HeadCmd is not None and hasattr(HeadCmd, "_TYPE_SUPPORT"):
+            self.pub_head_cmd = self.create_publisher(HeadCmd, "/head_cmd", 10)
+        else:
+            self.pub_head_cmd = None
         self.pub_head_status = self.create_publisher(String, "/head/status", 10)
 
         # External Intent / Action Subscriptions (Central Arbitration)
@@ -963,7 +968,7 @@ class HeadTrackerNode(Node):
             if last_pub is None or abs(target_yaw_snapshot - last_pub) >= 1.0:
                 should_publish = True
 
-        if should_publish:
+        if should_publish and self.pub_head_cmd is not None and HeadCmd is not None:
             cmd = HeadCmd()
             cmd.angle_deg = float(target_yaw_snapshot)
             self.pub_head_cmd.publish(cmd)
