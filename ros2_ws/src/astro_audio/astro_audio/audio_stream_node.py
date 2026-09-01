@@ -335,9 +335,10 @@ class AudioStreamNode(Node):
                 vad_msg.data = bool(is_speech)
                 self.pub_vad.publish(vad_msg)
 
-            # Publish genuine hardware DOA only when speech is actively detected by the ReSpeaker VAD
+            # Publish genuine hardware DOA as fallback only when multi-channel GCC-PHAT is inactive
             is_active_playback = self._is_playing or (self._output_stream and self._output_stream.active)
-            if is_speech is True and doa_angle is not None and not is_active_playback:
+            time_since_gcc = time.monotonic() - getattr(self, "_last_gcc_doa_time", 0.0)
+            if time_since_gcc > 0.5 and is_speech is True and doa_angle is not None and not is_active_playback:
                 doa_msg = Float32()
                 doa_msg.data = float(doa_angle)
                 self.pub_doa.publish(doa_msg)
@@ -502,9 +503,8 @@ class AudioStreamNode(Node):
             elif not is_active_playback and rms >= 400.0:
                 self._last_mic_speech_time = now
 
-            # Multi-Channel GCC-PHAT DOA Spatial Estimation (Fallback only when hardware ReSpeaker HID is absent)
-            has_hw_hid = bool(self._respeaker and getattr(self._respeaker, "dev", None) is not None)
-            if not has_hw_hid and multi_ch is not None and self._doa_estimator and not is_active_playback and rms >= 400.0:
+            # Multi-Channel GCC-PHAT DOA Spatial Estimation (Primary high-precision acoustic tracking)
+            if multi_ch is not None and self._doa_estimator and not is_active_playback and rms >= 300.0:
                 azimuth_deg, conf, valid = self._doa_estimator.estimate_from_multichannel_pcm(multi_ch[:4])
                 if valid and azimuth_deg is not None:
                     raw_doa = azimuth_deg if azimuth_deg >= 0.0 else azimuth_deg + 360.0
@@ -512,6 +512,7 @@ class AudioStreamNode(Node):
                     doa_msg.data = float(raw_doa)
                     self.pub_doa.publish(doa_msg)
                     self.pub_vad.publish(Bool(data=True))
+                    self._last_gcc_doa_time = now
 
             # Software Echo Mute & Self-Voice Suppression (Zero Self-Hearing):
             if is_active_playback:
