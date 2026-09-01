@@ -5461,8 +5461,10 @@ class AstroRealtimeNode(Node):
                 user_text = validated_text
                 self.get_logger().info(f"🗣️ [Siz (0-Maliyet)]: \"{user_text}\"")
                 self.memory.episodic.add_message("user", user_text)
+                self.state_machine.transition_to(RobotState.THINKING)
 
             # 4. Run Voiceprint Recognition (Acoustic Speaker Identification with Temporal Smoothing)
+
             spk_name = None
             spk_score = 0.0
             spk_source = "unidentified"

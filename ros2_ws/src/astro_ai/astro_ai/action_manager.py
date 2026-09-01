@@ -426,8 +426,15 @@ class ActionManager:
                     azimuth = float(getattr(self._node, "_vision_head_yaw", 0.0) or 0.0)
                     confidence = 0.70
 
+            # Filter out rear acoustic echo / wall bounce in conversational interaction
+            if azimuth is not None and abs(azimuth) > 110.0:
+                self._logger.info(f"🛡️ [ActionManager] Arkadan yansıyan akustik yankı ({azimuth:.1f}°) filtrelendi, karşıya odaklanılıyor.")
+                azimuth = 0.0
+                confidence = 0.80
+
             # If robot is already facing the user within deadband (0° - 4°), acknowledge orientation
             if azimuth is not None and abs(azimuth) <= 4.0:
+
                 azimuth = 0.0
                 if self._pub_head_gesture:
                     msg = String()
