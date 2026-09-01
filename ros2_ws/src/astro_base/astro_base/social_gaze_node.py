@@ -396,14 +396,15 @@ class SocialGazeNode(Node):
             timestamp=t,
         )
 
-        # 5. Actuator Command Publishing (Single Canonical Authority)
+        # 5. Actuator Command Publishing (Direct Authoritative Goal Setpoint to Arduino PID)
+        target_goal_deg = float(gaze_cmd.target_yaw_deg)
         if self.pub_head_command is not None:
             hcmd = HeadCmd()
-            hcmd.angle_deg = float(traj_point.position_deg)
+            hcmd.angle_deg = target_goal_deg
             self.pub_head_command.publish(hcmd)
 
         cmd_msg = Float32()
-        cmd_msg.data = float(traj_point.position_deg)
+        cmd_msg.data = target_goal_deg
         self.pub_head_cmd_pos.publish(cmd_msg)
 
         # 6. Publish Typed GazeStatus Message
