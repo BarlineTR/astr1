@@ -17,6 +17,7 @@ from astro_base.gaze.angle_math import (
     wrap_deg,
 )
 from astro_base.gaze.attention_arbiter import AttentionArbiterCore
+from astro_base.gaze.spatial_memory import EpistemicSpatialMemory
 from astro_base.gaze.types import (
     AttentionDecision,
     DialogueGazeIntent,
@@ -44,30 +45,33 @@ class SocialGazeFSM:
         "center": [0.0],
         "look_left": [35.0],
         "look_right": [-35.0],
+        "glance_left": [18.0, 0.0],
+        "glance_right": [-18.0, 0.0],
     }
 
     GESTURE_ALIASES: Dict[str, str] = {
-        "yes": "nod", "onayla": "nod",
-        "no": "shake", "reddet": "shake",
-        "merak": "tilt", "curious": "tilt",
-        "ara": "scan", "search": "scan",
-        "sifirla": "center", "reset": "center",
+        "head_nod": "nod",
+        "head_shake": "shake",
+        "head_tilt": "tilt",
+        "head_center": "center",
+        "reset": "center",
     }
 
     def __init__(
         self,
-        deadband_deg: float = 2.5,
-        idle_return_timeout_s: float = 25.0,
+        deadband_deg: float = 2.50,
+        idle_return_timeout_s: float = 8.0,
         min_attention_dwell_s: float = 2.50,
         target_lost_timeout_s: float = 1.0,
         idle_saccades_enabled: bool = False,
-        idle_saccade_interval_s: float = 8.0,
+        idle_saccade_interval_s: float = 4.0,
         min_limit_deg: float = -75.0,
         max_limit_deg: float = 75.0,
         position_tolerance_deg: float = 2.0,
         velocity_tolerance_deg_s: float = 3.0,
         settling_persistence_required: int = 3,
         arbiter: Optional[AttentionArbiterCore] = None,
+        spatial_memory: Optional[EpistemicSpatialMemory] = None,
     ):
         self.deadband_deg = deadband_deg
         self.idle_return_timeout_s = idle_return_timeout_s
@@ -81,11 +85,17 @@ class SocialGazeFSM:
         self.velocity_tolerance_deg_s = velocity_tolerance_deg_s
         self.settling_persistence_required = settling_persistence_required
 
+        # Spatial Memory for situational awareness and negative evidence
+        self.spatial_memory = spatial_memory or EpistemicSpatialMemory()
+
         # Attention Arbiter authority
         self.arbiter = arbiter or AttentionArbiterCore(
             min_limit_deg=min_limit_deg,
             max_limit_deg=max_limit_deg,
+            spatial_memory=self.spatial_memory,
         )
+        if self.arbiter.spatial_memory is None:
+            self.arbiter.spatial_memory = self.spatial_memory
 
         # Internal FSM state
         self.state = GazeStateEnum.IDLE
@@ -419,7 +429,20 @@ class SocialGazeFSM:
             elif self.state == GazeStateEnum.ACQUIRING:
                 scan_elapsed = timestamp - self._state_entry_time
                 if scan_elapsed >= 0.80:
-                    self._transition_to(GazeStateEnum.TARGET_LOST, timestamp, reason="ACQUISITION_TIMEOUT_NO_TARGET")
+                    # Register Negative Evidence: This head yaw has no face -> mark as Reverb Zone!
+                    if self.spatial_memory is not None:
+                        self.spatial_memory.register_negative_acoustic_evidence(
+                            bearing_deg=actual_head_yaw_deg,
+                            timestamp=timestamp,
+                            reason="NO_FACE_IN_ACQUIRE"
+                        )
+                    # Conscious check: Do we know where a real human is in the room?
+                    known_person_yaw = self.spatial_memory.get_most_likely_person_location(timestamp, max_age_s=15.0) if self.spatial_memory else None
+                    if known_person_yaw is not None and abs(angular_diff_deg(known_person_yaw, actual_head_yaw_deg)) > 15.0:
+                        self.target_yaw_deg = known_person_yaw
+                        self._transition_to(GazeStateEnum.ORIENTING, timestamp, reason="REORIENT_TO_KNOWN_HUMAN")
+                    else:
+                        self._transition_to(GazeStateEnum.TARGET_LOST, timestamp, reason="ACQUISITION_TIMEOUT_NO_TARGET")
 
             elif self.state == GazeStateEnum.TRACKING:
                 self._transition_to(GazeStateEnum.HOLDING_ATTENTION, timestamp, reason="TRACKING_DROPOUT_COAST")
@@ -432,7 +455,12 @@ class SocialGazeFSM:
             elif self.state == GazeStateEnum.TARGET_LOST:
                 time_lost = timestamp - self._state_entry_time
                 if time_lost >= self.target_lost_timeout_s:
-                    self._transition_to(GazeStateEnum.RECOVERING, timestamp, reason="TARGET_LOST_TIMEOUT_RECOVER")
+                    known_person_yaw = self.spatial_memory.get_most_likely_person_location(timestamp, max_age_s=15.0) if self.spatial_memory else None
+                    if known_person_yaw is not None and abs(angular_diff_deg(known_person_yaw, actual_head_yaw_deg)) > 15.0:
+                        self.target_yaw_deg = known_person_yaw
+                        self._transition_to(GazeStateEnum.ORIENTING, timestamp, reason="LOST_REORIENT_TO_KNOWN_HUMAN")
+                    else:
+                        self._transition_to(GazeStateEnum.RECOVERING, timestamp, reason="TARGET_LOST_TIMEOUT_RECOVER")
 
             elif self.state == GazeStateEnum.RECOVERING:
                 self.target_yaw_deg = 0.0

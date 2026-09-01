@@ -67,6 +67,7 @@ from astro_base.gaze.gaze_state_machine import SocialGazeFSM
 from astro_base.gaze.head_controller import HeadControllerCore
 from astro_base.gaze.motion_planner import MotionPlannerCore
 from astro_base.gaze.sensor_fusion import AudioVisualFusionCore
+from astro_base.gaze.spatial_memory import EpistemicSpatialMemory
 from astro_base.gaze.target_manager import TargetManagerCore
 from astro_base.gaze.types import (
     ActuatorStateEnum,
@@ -124,6 +125,9 @@ class SocialGazeNode(Node):
 
         self.transformer = CoordinateTransformer(self.calib)
 
+        # Epistemic Situational Spatial Memory
+        self.spatial_memory = EpistemicSpatialMemory()
+
         # -------------------------------------------------------------------------
         # 2. Pipeline Core Modules Initialization
         # -------------------------------------------------------------------------
@@ -151,6 +155,7 @@ class SocialGazeNode(Node):
             spatial_gate_deg=float(self.get_parameter("spatial_gate_deg").value),
             audio_freshness_half_life_s=0.80,
             vision_freshness_half_life_s=1.20,
+            spatial_memory=self.spatial_memory,
         )
         self.target_manager = TargetManagerCore(
             acquisition_threshold=0.75,
@@ -166,6 +171,7 @@ class SocialGazeNode(Node):
             idle_saccades_enabled=bool(self.get_parameter("idle_saccades_enabled").value),
             min_limit_deg=self.calib.head.min_angle_deg,
             max_limit_deg=self.calib.head.max_angle_deg,
+            spatial_memory=self.spatial_memory,
         )
         self.planner = MotionPlannerCore(
             max_velocity_deg_s=float(self.get_parameter("max_velocity_deg_s").value),

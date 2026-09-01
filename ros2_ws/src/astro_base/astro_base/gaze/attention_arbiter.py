@@ -16,6 +16,7 @@ import math
 from typing import List, Optional
 
 from astro_base.gaze.angle_math import clamp_deg, wrap_deg
+from astro_base.gaze.spatial_memory import EpistemicSpatialMemory
 from astro_base.gaze.types import (
     AttentionDecision,
     DialogueGazeIntent,
@@ -40,12 +41,14 @@ class AttentionArbiterCore:
         min_speaker_confidence: float = 0.50,
         min_visual_confidence: float = 0.40,
         visual_primacy_enabled: bool = True,
+        spatial_memory: Optional[EpistemicSpatialMemory] = None,
     ):
         self.min_limit_deg = min_limit_deg
         self.max_limit_deg = max_limit_deg
         self.min_speaker_confidence = min_speaker_confidence
         self.min_visual_confidence = min_visual_confidence
         self.visual_primacy_enabled = visual_primacy_enabled
+        self.spatial_memory = spatial_memory
 
         self.last_decision: Optional[AttentionDecision] = None
 
@@ -105,6 +108,9 @@ class AttentionArbiterCore:
                         chosen_target_id = best_vis.target_id
                         chosen_yaw = best_vis.body_azimuth_deg
                         decision_reason = f"EXPLICIT_FALLBACK_VISUAL_{best_vis.target_id}"
+                    elif self.spatial_memory is not None and self.spatial_memory.get_most_likely_person_location(timestamp) is not None:
+                        chosen_yaw = self.spatial_memory.get_most_likely_person_location(timestamp)
+                        decision_reason = "EXPLICIT_SPATIAL_MEMORY_PERSON"
                     else:
                         chosen_yaw = actual_head_yaw_deg
                         decision_reason = "UNRESOLVED_CURRENT_SPEAKER_POSITION"
