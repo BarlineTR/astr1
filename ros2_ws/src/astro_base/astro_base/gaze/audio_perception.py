@@ -223,13 +223,16 @@ class AudioPerceptionCore:
         is_robot_speaking: bool = False,
     ) -> AudioObservation:
         """Processes a pre-calculated raw DOA angle (e.g. from ReSpeaker onboard DSP)."""
+        rel_bearing = self.transformer.raw_audio_doa_to_head_bearing(raw_doa_deg)
+        body_yaw = self.transformer.audio_head_bearing_to_body_yaw(rel_bearing, actual_head_yaw_deg)
+
         eff_conf = confidence
         if is_robot_speaking:
             eff_conf *= self.self_speech_suppression_factor
 
-        is_valid = (eff_conf >= self.min_confidence) and (not is_robot_speaking)
-        rel_bearing = self.transformer.raw_audio_doa_to_head_bearing(raw_doa_deg)
-        body_yaw = self.transformer.audio_head_bearing_to_body_yaw(rel_bearing, actual_head_yaw_deg)
+        # Reject rear acoustic blindspot reflections (> 85° relative to head) so neck never slams to mechanical limits
+        in_acoustic_fov = abs(rel_bearing) <= 85.0
+        is_valid = (eff_conf >= self.min_confidence) and (not is_robot_speaking) and in_acoustic_fov
 
         return AudioObservation(
             timestamp=timestamp,
