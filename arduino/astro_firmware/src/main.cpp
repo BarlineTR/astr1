@@ -30,8 +30,8 @@ static constexpr float KP = 0.6f, KI = 0.2f, KD = 0.0f; // 50 Hz PID için örne
 static constexpr int PWM_MAX = 255;
 static constexpr float PID_INTEGRAL_LIMIT = 50.0f; // ✅ FIX: Daha dar anti-windup limit
 
-// Kalibre Edildi: 45 tick / 30 derece = 1.5000 tick/derece (540 tick / 360 derece)
-static constexpr float HEAD_TICKS_PER_DEG = 1.5000f;
+// Canonical Head Encoder Resolution: 440 ticks / 170.0 deg = 2.5882 ticks/deg (0.3864 deg/tick)
+static constexpr float HEAD_TICKS_PER_DEG = 2.5882f;
 
 
 
@@ -295,11 +295,12 @@ void headControl(uint32_t dt_ms) {
   if (abs(pos - g_head_stall_ref) >= 2) {
     g_head_stall_ref = pos;
     g_head_stall_ms = millis();
+    g_diag_flags &= ~FLAG_HEAD_STALL;
   } else if (millis() - g_head_stall_ms > HEAD_STALL_MS) {
     setHeadPWM(0);
-    // Hedefi bulunduğu yere çek: aksi halde motor dayanağa dayanmaya devam eder
-    g_head_target_ticks = pos;
-    g_head_err_prev = 0;
+    // Stall koruması: Motoru kes ve bayrağı kaldır.
+    // DİKKAT: Hedefi anlık konuma çekmiyoruz (g_head_target_ticks korunur),
+    // böylece teşhis telemetrisi gerçek hedefi ve hatayı raporlamaya devam eder.
     g_diag_flags |= FLAG_HEAD_STALL;
   }
 }
@@ -444,13 +445,17 @@ void processPacket(uint8_t msg_id, const uint8_t* pl, uint8_t len) {
       if (clamped != angle_deg) g_diag_flags |= FLAG_HEAD_LIMIT;
       else                      g_diag_flags &= ~FLAG_HEAD_LIMIT;
 
-      g_head_target_ticks = (int32_t)lroundf(clamped * HEAD_TICKS_PER_DEG);
-      g_head_active = true;
-      // Yeni hedef geldi: eski stall kilidini kaldır ve anlık konumu referans al
+      int32_t new_target_ticks = (int32_t)lroundf(clamped * HEAD_TICKS_PER_DEG);
 
-      g_head_stall_ref = readTicks(g_head_ticks);
-      g_head_stall_ms = millis();
-      g_diag_flags &= ~FLAG_HEAD_STALL;
+      // İdempotent Hedef Güncellemesi: Yalnızca hedef gerçekte değiştiğinde stall sayacını sıfırla
+      if (abs(new_target_ticks - g_head_target_ticks) > HEAD_DEADBAND_TICKS) {
+        g_head_target_ticks = new_target_ticks;
+        g_head_stall_ref = readTicks(g_head_ticks);
+        g_head_stall_ms = millis();
+        g_diag_flags &= ~FLAG_HEAD_STALL;
+      }
+
+      g_head_active = true;
       g_last_heartbeat_ms = millis();
       Serial2.print(F("[HEAD CMD] angle="));
       Serial2.println(angle_deg);

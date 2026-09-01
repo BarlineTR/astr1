@@ -191,6 +191,9 @@ class SerialBridge(Node):
         self.declare_parameter("wheel_radius_right", 0.06)
         self.declare_parameter("wheel_separation", 0.26)
         self.declare_parameter("head_angle_scale", 1.0)
+        self.declare_parameter("head_ticks_per_deg", 2.5882)
+        self.declare_parameter("head_zero_offset_ticks", 0.0)
+        self.declare_parameter("head_sign", 1.0)
 
         self.port_param = self.get_parameter("port").get_parameter_value().string_value
         env_baud = os.getenv("ASTRO_SERIAL_BAUD")
@@ -209,6 +212,9 @@ class SerialBridge(Node):
         self.wheel_radius_r = float(self.get_parameter("wheel_radius_right").value)
         self.wheel_separation = float(self.get_parameter("wheel_separation").value)
         self.head_angle_scale = float(self.get_parameter("head_angle_scale").value)
+        self.head_ticks_per_deg = float(self.get_parameter("head_ticks_per_deg").value or 2.5882)
+        self.head_zero_offset_ticks = float(self.get_parameter("head_zero_offset_ticks").value or 0.0)
+        self.head_sign = float(self.get_parameter("head_sign").value or 1.0)
 
         qos_best_effort = QoSProfile(
             depth=10, reliability=ReliabilityPolicy.BEST_EFFORT
@@ -617,7 +623,8 @@ class SerialBridge(Node):
         right_vel = d_right / dt_s if dt_s > 0 else 0.0
 
         if head_ticks is not None:
-            self.head_pos = float(head_ticks) / 2.5882
+            # Canonical formula: position_deg = (sign * (head_ticks - zero_offset_ticks)) / ticks_per_head_degree
+            self.head_pos = (self.head_sign * (float(head_ticks) - self.head_zero_offset_ticks)) / self.head_ticks_per_deg
             self.head_encoder_valid = True
         else:
             self.head_pos = float(getattr(self, "_last_sent_angle", 0.0))
