@@ -35,6 +35,28 @@ except ImportError as exc:
     sys.exit(1)
 
 
+STATE_NAMES = {
+    0: "IDLE (0)",
+    1: "SEARCHING (1)",
+    2: "AUDIO_ACQUIRE (2)",
+    3: "ORIENTING (3)",
+    4: "VISUAL_ACQUIRE (4)",
+    5: "TRACKING (5)",
+    6: "HOLD (6)",
+    7: "TARGET_LOST (7)",
+    8: "RETURNING (8)",
+}
+
+PRIORITY_NAMES = {
+    0: "IDLE (0)",
+    1: "VISUAL_PERSON (1)",
+    2: "ACTIVE_SPEAKER (2)",
+    3: "DIALOGUE (3)",
+    4: "GESTURE (4)",
+    5: "SAFETY (5)",
+}
+
+
 class SocialGazeLiveMonitor(Node):
     def __init__(self):
         super().__init__("social_gaze_live_monitor")
@@ -47,10 +69,14 @@ class SocialGazeLiveMonitor(Node):
         self.visual_faces_count: int = 0
         self.visual_last_time: float = 0.0
 
-        self.gaze_state: str = "IDLE_NEUTRAL"
-        self.gaze_target_yaw: float = 0.0
+        self.gaze_state: str = "IDLE (0)"
+        self.gaze_priority: str = "IDLE (0)"
+        self.gaze_desired_yaw: float = 0.0
+        self.gaze_planned_yaw: float = 0.0
         self.gaze_at_target: bool = True
-        self.gaze_dwell_time: float = 0.0
+        self.gaze_target_valid: bool = False
+        self.gaze_target_conf: float = 0.0
+        self.gaze_target_id: str = "None"
         self.active_target_json: str = "{}"
 
         self.cmd_head_yaw: float = 0.0
@@ -122,10 +148,16 @@ class SocialGazeLiveMonitor(Node):
                 self.act_head_vel = math.degrees(msg.velocity[idx])
 
     def _on_gaze_state(self, msg):
-        self.gaze_state = str(msg.current_state)
-        self.gaze_target_yaw = float(msg.target_yaw_deg)
-        self.gaze_at_target = bool(msg.at_target)
-        self.gaze_dwell_time = float(msg.dwell_time_s)
+        state_val = getattr(msg, "state", 0)
+        self.gaze_state = STATE_NAMES.get(state_val, f"STATE_{state_val}")
+        prio_val = getattr(msg, "priority", 0)
+        self.gaze_priority = PRIORITY_NAMES.get(prio_val, f"PRIO_{prio_val}")
+        self.gaze_desired_yaw = float(getattr(msg, "desired_yaw_deg", 0.0))
+        self.gaze_planned_yaw = float(getattr(msg, "planned_yaw_deg", 0.0))
+        self.gaze_at_target = bool(getattr(msg, "at_target", False))
+        self.gaze_target_valid = bool(getattr(msg, "target_valid", False))
+        self.gaze_target_conf = float(getattr(msg, "target_confidence", 0.0))
+        self.gaze_target_id = str(getattr(msg, "active_target_id", "None"))
 
     def _on_speaking(self, msg: Bool):
         self.robot_speaking = bool(msg.data)
@@ -154,8 +186,9 @@ def render_dashboard(node: SocialGazeLiveMonitor):
     # 2. Gaze Policy & State Machine Layer
     print("\n[2] SOCIAL GAZE POLICY & FSM:")
     print(f"  • Active Gaze State        : \033[1;36m{node.gaze_state}\033[0m")
-    print(f"  • Target Gaze Yaw          : {node.gaze_target_yaw:+.2f}°")
-    print(f"  • State Dwell Duration     : {node.gaze_dwell_time:.2f} s")
+    print(f"  • Priority Source          : {node.gaze_priority}")
+    print(f"  • Desired Gaze Target      : {node.gaze_desired_yaw:+.2f}° (Conf: {node.gaze_target_conf:.2f}, Valid: {node.gaze_target_valid})")
+    print(f"  • Motion Planned Trajectory: {node.gaze_planned_yaw:+.2f}°")
     print(f"  • Target Acquired / Fixed  : {'✅ YES (FOVEATED)' if node.gaze_at_target else '⏳ SLEWING / CONVERGING'}")
 
     # 3. Motion Planning & Actuator Loop
