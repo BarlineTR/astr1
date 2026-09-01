@@ -168,46 +168,45 @@ def render_dashboard(node: SocialGazeLiveMonitor):
     audio_fresh = (now - node.audio_last_time < 1.5) and (node.audio_doa_deg is not None)
     vision_fresh = (now - node.visual_last_time < 1.5) and (node.visual_yaw_deg is not None)
 
-    # ANSI Clear Screen and Home
-    print("\033[2J\033[H", end="")
-    print("=" * 80)
-    print("       ASTRO SOCIAL ROBOT — REAL-TIME MULTIMODAL SOCIAL GAZE DASHBOARD")
-    print("=" * 80)
+    # ANSI Clear Screen and Home (Single Buffer)
+    lines = []
+    lines.append("=" * 80)
+    lines.append("       ASTRO SOCIAL ROBOT — REAL-TIME MULTIMODAL SOCIAL GAZE DASHBOARD")
+    lines.append("=" * 80)
 
     # 1. Perception Layer
-    print("\n[1] PERCEPTION INPUTS:")
+    lines.append("\n[1] PERCEPTION INPUTS:")
     audio_str = f"{node.audio_doa_deg:+.1f}° (ACTIVE)" if audio_fresh else "SILENT / NO SIGNAL"
-    print(f"  • Acoustic DOA (ReSpeaker) : {audio_str}")
+    lines.append(f"  • Acoustic DOA (ReSpeaker) : {audio_str}")
     
     vis_str = f"{node.visual_yaw_deg:+.1f}° (Conf: {node.visual_conf:.2f}, Faces: {node.visual_faces_count})" if vision_fresh else "NO FACE DETECTED"
-    print(f"  • Visual Face (OAK-D Lite) : {vis_str}")
-    print(f"  • Robot Self-Speech Gate   : {'🔴 SPEAKING (ECHO SUPPRESSION ACTIVE)' if node.robot_speaking else '🟢 LISTENING / ATTENTIVE'}")
+    lines.append(f"  • Visual Face (OAK-D Lite) : {vis_str}")
+    lines.append(f"  • Robot Self-Speech Gate   : {'🔴 SPEAKING (ECHO SUPPRESSION ACTIVE)' if node.robot_speaking else '🟢 LISTENING / ATTENTIVE'}")
 
     # 2. Gaze Policy & State Machine Layer
-    print("\n[2] SOCIAL GAZE POLICY & FSM:")
-    print(f"  • Active Gaze State        : \033[1;36m{node.gaze_state}\033[0m")
-    print(f"  • Priority Source          : {node.gaze_priority}")
-    print(f"  • Desired Gaze Target      : {node.gaze_desired_yaw:+.2f}° (Conf: {node.gaze_target_conf:.2f}, Valid: {node.gaze_target_valid})")
-    print(f"  • Motion Planned Trajectory: {node.gaze_planned_yaw:+.2f}°")
-    print(f"  • Target Acquired / Fixed  : {'✅ YES (FOVEATED)' if node.gaze_at_target else '⏳ SLEWING / CONVERGING'}")
+    lines.append("\n[2] SOCIAL GAZE POLICY & FSM:")
+    lines.append(f"  • Active Gaze State        : \033[1;36m{node.gaze_state}\033[0m")
+    lines.append(f"  • Priority Source          : {node.gaze_priority}")
+    lines.append(f"  • Desired Gaze Target      : {node.gaze_desired_yaw:+.2f}° (Conf: {node.gaze_target_conf:.2f}, Valid: {node.gaze_target_valid})")
+    lines.append(f"  • Motion Planned Trajectory: {node.gaze_planned_yaw:+.2f}°")
+    lines.append(f"  • Target Acquired / Fixed  : {'✅ YES (FOVEATED)' if node.gaze_at_target else '⏳ SLEWING / CONVERGING'}")
 
     # 3. Motion Planning & Actuator Loop
     err = node.cmd_head_yaw - node.act_head_yaw
-    print("\n[3] ACTUATOR CLOSED-LOOP EXECUTION:")
-    print(f"  • Commanded Trajectory     : {node.cmd_head_yaw:+.2f}°")
-    print(f"  • Physical Head Position   : \033[1;32m{node.act_head_yaw:+.2f}°\033[0m")
-    print(f"  • Joint Angular Velocity   : {node.act_head_vel:+.1f}°/s")
-    print(f"  • Steady-State Error       : {err:+.2f}° ({'★ ON TARGET' if abs(err) <= 1.2 else 'TRACKING'})")
-    print(f"  • Actuator Moving Status   : {'🔄 SLEWING' if node.head_moving else '⏸️ SETTLED / DWELLING'}")
+    lines.append("\n[3] ACTUATOR CLOSED-LOOP EXECUTION:")
+    lines.append(f"  • Commanded Trajectory     : {node.cmd_head_yaw:+.2f}°")
+    lines.append(f"  • Physical Head Position   : \033[1;32m{node.act_head_yaw:+.2f}°\033[0m")
+    lines.append(f"  • Joint Angular Velocity   : {node.act_head_vel:+.1f}°/s")
+    lines.append(f"  • Steady-State Error       : {err:+.2f}° ({'★ ON TARGET' if abs(err) <= 1.2 else 'TRACKING'})")
+    lines.append(f"  • Actuator Moving Status   : {'🔄 SLEWING' if node.head_moving else '⏸️ SETTLED / DWELLING'}")
 
-    # 4. Interactive Guidance
-    print("\n" + "-" * 80)
-    print("  [LIVE TEST ACTIONS]:")
-    print("  1. Speak to the robot from Left/Right  -> Observe acoustic orienting saccade.")
-    print("  2. Stand in front of OAK-D Lite camera -> Observe visual engagement & foveation.")
-    print("  3. Move side to side                   -> Observe smooth continuous closed-loop pursuit.")
-    print("  4. Press Ctrl+C to stop monitor.")
-    print("-" * 80)
+    lines.append("\n" + "-" * 80)
+    lines.append("  [Canlı Test]: Robotun karşısında konuşun veya hareket edin. (Çıkış: Ctrl+C)")
+    lines.append("-" * 80)
+
+    # Print buffer cleanly at home position
+    sys.stdout.write("\033[H\033[J" + "\n".join(lines) + "\n")
+    sys.stdout.flush()
 
 
 def main():
