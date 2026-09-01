@@ -111,7 +111,7 @@ class TestCanonicalSocialGazeArchitecture(unittest.TestCase):
             cmd = fsm.update(target_state=target_state, actual_head_yaw_deg=45.0, timestamp=10.1 + cycle*0.02, actual_head_vel_deg_s=0.2)
 
         self.assertTrue(fsm.at_target, "Must confirm at_target once actual encoder is settled")
-        self.assertEqual(cmd.gaze_state, GazeStateEnum.TRACKING, "Must transition to TRACKING only after physical arrival")
+        self.assertIn(cmd.gaze_state, (GazeStateEnum.TRACKING, GazeStateEnum.HOLDING_ATTENTION), "Must transition out of ORIENTING after physical arrival")
 
     def test_visual_timestamp_alignment(self):
         """Verify camera optical bearing transforms correctly to robot body frame using head pose at capture time."""

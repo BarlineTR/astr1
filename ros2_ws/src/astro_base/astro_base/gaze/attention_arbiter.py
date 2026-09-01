@@ -105,9 +105,8 @@ class AttentionArbiterCore:
                         chosen_yaw = best_vis.body_azimuth_deg
                         decision_reason = f"EXPLICIT_FALLBACK_VISUAL_{best_vis.target_id}"
                     else:
-                        # Explicit command without speaker hypothesis: maintain current gaze safely
                         chosen_yaw = actual_head_yaw_deg
-                        decision_reason = "EXPLICIT_COMMAND_NO_SPEAKER_MAINTAIN_GAZE"
+                        decision_reason = "UNRESOLVED_CURRENT_SPEAKER_POSITION"
 
                 elif explicit_intent.selector == TargetSelectorType.TARGET_ID:
                     matched = next((t for t in target_state.candidate_targets if t.target_id == explicit_intent.target_id), None)

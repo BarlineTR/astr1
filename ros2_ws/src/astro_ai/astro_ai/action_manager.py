@@ -162,6 +162,7 @@ class ActionManager:
         pub_head_cmd: Any = None,
         pub_head_gesture: Any = None,
         pub_head_target_yaw: Any = None,
+        pub_explicit_gaze: Any = None,
         node: Any = None,
     ):
         self._logger = logger or logging.getLogger("ActionManager")
@@ -169,6 +170,7 @@ class ActionManager:
         self._pub_head_cmd = pub_head_cmd  # Kept for backward compatibility in mock tests
         self._pub_head_gesture = pub_head_gesture
         self._pub_head_target_yaw = pub_head_target_yaw
+        self._pub_explicit_gaze = pub_explicit_gaze
         self._node = node
         self._lock = threading.RLock()
 
@@ -462,21 +464,20 @@ class ActionManager:
                     confidence = 0.45
                     self._logger.info(f"👂 [ActionManager] Genişletilmiş zaman tamponundan ses yönü kurtarıldı -> {azimuth:.1f}°")
                 else:
-                    self._logger.warning("⚠️ [ActionManager] turn_to_sound reddedildi: NO_DIRECTION (DOA yok veya zayıf)")
+                    self._logger.warning("⚠️ [ActionManager] turn_to_sound: UNRESOLVED_CURRENT_SPEAKER_POSITION (DOA yok veya zayıf)")
                     res = ActionResult(
                         success=False,
                         action="turn_to_sound",
                         action_id=act_id,
                         generation_id=generation_id,
-                        error_code="NO_DIRECTION",
-                        error="Sesin yönü belirlenemedi (DOA unavailable veya sinyal zayıf).",
-                        reason="no_sound_direction",
+                        error_code="UNRESOLVED_CURRENT_SPEAKER_POSITION",
+                        error="Sesin yönü belirlenemedi (UNRESOLVED_CURRENT_SPEAKER_POSITION).",
+                        reason="UNRESOLVED_CURRENT_SPEAKER_POSITION",
                         message="Sesin hangi yönden geldiği tespit edilemediği için robot hareket ettirilmedi.",
                         hardware_ack=False,
                     )
                     self._recent_actions.append(res)
                     return res
-
 
             # 2. Safety Gates (Heartbeat & LiDAR Freshness)
             blocked_reason = self._check_safety_gates(direction="turn")
@@ -497,11 +498,25 @@ class ActionManager:
                 self._recent_actions.append(res)
                 return res
 
-            # 3. Acoustic Orientation
-            # Steer head motor toward sound source via central arbitration in head_tracker_node
+            # 3. Canonical Attention Arbiter Preemption
             dir_str = "left" if azimuth > 0 else "right"
-            # Coarse acoustic sweep capped at +/-50° (ensures 72° HFOV camera encompasses speaker without overshooting)
-            target_clamped = float(max(-50.0, min(50.0, azimuth)))
+            target_clamped = float(max(-75.0, min(75.0, azimuth)))
+
+            pub_explicit = self._pub_explicit_gaze or getattr(self._node, "pub_explicit_gaze", None)
+            if pub_explicit:
+                try:
+                    explicit_msg = String()
+                    payload = {
+                        "selector": "CURRENT_SPEAKER",
+                        "target_yaw_deg": target_clamped,
+                        "confidence": float(confidence),
+                        "reason": "action_manager_turn_to_sound",
+                    }
+                    explicit_msg.data = json.dumps(payload)
+                    pub_explicit.publish(explicit_msg)
+                    self._logger.info(f"🎯 [ActionManager -> AttentionArbiter] EXPLICIT_USER_GAZE target={target_clamped:.1f}°")
+                except Exception as ex:
+                    self._logger.debug(f"Explicit gaze publication failed: {ex}")
 
             pub_target_yaw = self._pub_head_target_yaw or getattr(self._node, "pub_head_target_yaw", None)
             if pub_target_yaw:
@@ -512,7 +527,6 @@ class ActionManager:
                 except Exception as he:
                     self._logger.debug(f"Float32 target_yaw publication failed: {he}")
             else:
-                # Fallback for unit tests mocking pub_head_cmd directly
                 pub_head = self._pub_head_cmd or getattr(self._node, "pub_head_cmd", None)
                 if pub_head:
                     try:

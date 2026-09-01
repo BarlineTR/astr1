@@ -280,12 +280,25 @@ class SocialGazeNode(Node):
     def _on_doa_deg(self, msg: Float32) -> None:
         """Processes float DOA angle in degrees."""
         t = time.monotonic()
+        raw_val = float(msg.data)
         obs = self.audio_perception.process_raw_doa(
-            raw_doa_deg=float(msg.data),
+            raw_doa_deg=raw_val,
             timestamp=t,
             actual_head_yaw_deg=self.actual_head_yaw_deg,
             is_robot_speaking=self.is_robot_speaking,
         )
+        if not obs.valid:
+            self.get_logger().info(
+                f"[AUDIO REJECT] raw_angle={raw_val:+.1f}° rel_bearing={obs.relative_azimuth_deg:+.1f}° "
+                f"confidence={obs.confidence:.2f} reason=OUT_OF_CONVERSATIONAL_FOV target_created=False "
+                f"attention_owner={self.fsm.active_priority.value}"
+            )
+        else:
+            self.get_logger().debug(
+                f"[AUDIO ACCEPT] raw_angle={raw_val:+.1f}° rel_bearing={obs.relative_azimuth_deg:+.1f}° "
+                f"confidence={obs.confidence:.2f} body_yaw={obs.body_azimuth_deg:+.1f}°"
+            )
+
         self.latest_audio_state = self.audio_filter.filter_observation(
             obs=obs,
             head_velocity_deg_s=self.actual_head_vel_deg_s,
@@ -510,24 +523,29 @@ class SocialGazeNode(Node):
 
         # 8. Publish JSON Debug Telemetry
         state_diag = {
-            "timestamp": t,
+            "timestamp": round(t, 3),
             "gaze_state": gaze_cmd.gaze_state.value,
             "actuator_state": actuator_state_val,
             "attention_owner": gaze_cmd.priority_source.value,
+            "attention_priority": gaze_cmd.priority_source.value,
             "attention_reason": self.fsm.last_decision.reason if self.fsm.last_decision else "NONE",
             "active_target_id": gaze_cmd.active_target_id,
-            "desired_yaw_deg": gaze_cmd.target_yaw_deg,
-            "actual_yaw_deg": self.actual_head_yaw_deg,
+            "target_confidence": round(gaze_cmd.confidence, 2),
+            "desired_yaw_deg": round(gaze_cmd.target_yaw_deg, 2),
+            "planned_yaw_deg": round(traj_point.position_deg, 2),
+            "actual_yaw_deg": round(self.actual_head_yaw_deg, 2),
             "face_to_desired_error_deg": face_to_desired_error_deg,
             "desired_to_actual_error_deg": desired_to_actual_error_deg,
-            "audio_measurement_age_s": audio_age_s,
-            "visual_measurement_age_s": visual_age_s,
+            "audio_valid": bool(self.latest_audio_state.valid) if self.latest_audio_state else False,
+            "audio_age_s": audio_age_s,
+            "visual_valid": bool(self.latest_visual_tracks[0].confidence > 0.4) if self.latest_visual_tracks else False,
+            "visual_age_s": visual_age_s,
             "at_target": self.fsm.at_target,
             "is_speaking": self.is_robot_speaking,
+            "hold_enter_reason": getattr(self.fsm, "hold_enter_reason", "NONE"),
+            "hold_exit_reason": getattr(self.fsm, "hold_exit_reason", "NONE"),
+            "last_transition_reason": getattr(self.fsm, "last_transition_reason", "NONE"),
         }
-        msg_str = String()
-        msg_str.data = json.dumps(state_diag)
-        self.pub_gaze_debug.publish(msg_str)
         msg_str = String()
         msg_str.data = json.dumps(state_diag)
         self.pub_gaze_debug.publish(msg_str)

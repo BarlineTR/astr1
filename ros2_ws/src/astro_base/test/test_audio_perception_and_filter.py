@@ -46,10 +46,10 @@ class TestAudioPerception(unittest.TestCase):
     def test_audio_perception_core_speech_suppression(self):
         core = AudioPerceptionCore(self_speech_suppression_factor=0.10)
         np.random.seed(42)
-        # Correlated loud speech source signal across 4 channels
+        # Correlated loud speech source signal across 4 channels (frontal azimuth 0.0°)
         t = np.linspace(0, 960 / 16000, 960)
         source = (np.sin(2 * np.pi * 500 * t) * 3000.0).astype(np.int16)
-        pcm = np.array([source, np.roll(source, 1), source, np.roll(source, -1)], dtype=np.int16)
+        pcm = np.array([source, source, source, source], dtype=np.int16)
 
         # 1. Normal speech
         obs_normal = core.process_frame(pcm, timestamp=1.0, is_robot_speaking=False)

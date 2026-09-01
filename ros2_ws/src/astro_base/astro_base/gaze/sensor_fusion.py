@@ -33,7 +33,7 @@ class AudioVisualFusionCore:
         audio_freshness_half_life_s: float = 0.40,
         vision_freshness_half_life_s: float = 1.20,
         audio_weight_base: float = 0.40,
-        vision_weight_base: float = 0.85,
+        vision_weight_base: float = 1.0,
         fallback_enabled: bool = True,
     ):
         self.spatial_gate_deg = spatial_gate_deg

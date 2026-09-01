@@ -840,14 +840,16 @@ class AstroRealtimeNode(Node):
         self.pub_gesture = self.create_publisher(String, "/robot/head_gesture", 10)
         self.pub_head_gesture = self.create_publisher(String, "/head/gesture", 10)
         self.pub_head_target_yaw = self.create_publisher(Float32, "/head/target_yaw", 10)
+        self.pub_explicit_gaze = self.create_publisher(String, "/behavior/explicit_gaze", 10)
         self.pub_transcript = self.create_publisher(String, "/speech/text", 10)
-        # Single output owner for /head_cmd is HeadTrackerNode
+        # Single output owner for /head_command is social_gaze_node
         self.pub_telemetry = self.create_publisher(String, "/astro/telemetry", 10)
         self.pub_diagnostics = self.create_publisher(DiagnosticArray, "/diagnostics", 10)
 
         if self.action_manager:
             self.action_manager._pub_head_gesture = self.pub_head_gesture
             self.action_manager._pub_head_target_yaw = self.pub_head_target_yaw
+            self.action_manager._pub_explicit_gaze = self.pub_explicit_gaze
             self.action_manager._pub_cmd_vel = self.pub_cmd_vel
 
         # Publish initial sleeping / deep-idle state so head tracker stays parked at 0.0° until wake
@@ -5713,6 +5715,19 @@ class AstroRealtimeNode(Node):
 
             is_turn_sound = self._is_turn_to_sound_query(user_text)
             if is_turn_sound:
+                if hasattr(self, "pub_explicit_gaze") and self.pub_explicit_gaze:
+                    try:
+                        explicit_msg = String()
+                        payload = {
+                            "selector": "CURRENT_SPEAKER",
+                            "confidence": 1.0,
+                            "reason": "explicit_speech_command",
+                        }
+                        explicit_msg.data = json.dumps(payload)
+                        self.pub_explicit_gaze.publish(explicit_msg)
+                    except Exception:
+                        pass
+
                 p = self.persona_name.lower()
                 spk = f" {spk_name}" if spk_name else ""
                 act_res = None

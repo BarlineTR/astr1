@@ -180,6 +180,10 @@ class AudioPerceptionCore:
         # delta_y > 0 when sound is in front (+Y in robot plane)
         delta_x = -tau_lr * ReSpeaker4MicGeometry.SPEED_OF_SOUND_MPS
         delta_y = -tau_fb * ReSpeaker4MicGeometry.SPEED_OF_SOUND_MPS
+        if abs(delta_x) < 1e-7:
+            delta_x = 0.0
+        if abs(delta_y) < 1e-7:
+            delta_y = 0.0
 
         # Azimuth angle in ReSpeaker circular frame [0..359°]
         raw_azimuth = math.degrees(math.atan2(delta_x, delta_y))
@@ -200,10 +204,16 @@ class AudioPerceptionCore:
         rel_bearing = self.transformer.raw_audio_doa_to_head_bearing(raw_azimuth_0_360)
         body_yaw = self.transformer.audio_head_bearing_to_body_yaw(rel_bearing, actual_head_yaw_deg)
 
+        # Strict conversational acoustic envelope gate (±85° relative to head)
+        in_acoustic_fov = abs(rel_bearing) <= 85.0
+        is_valid = (confidence >= self.min_confidence) and (not is_robot_speaking) and in_acoustic_fov
+        if not in_acoustic_fov:
+            confidence = 0.0
+
         return AudioObservation(
             timestamp=timestamp,
             valid=is_valid,
-            vad=vad_active,
+            vad=vad_active and in_acoustic_fov,
             raw_azimuth_deg=round(raw_azimuth_0_360, 1),
             relative_azimuth_deg=round(rel_bearing, 1),
             body_azimuth_deg=round(body_yaw, 1),
@@ -233,6 +243,8 @@ class AudioPerceptionCore:
         # Reject rear acoustic blindspot reflections (> 85° relative to head) so neck never slams to mechanical limits
         in_acoustic_fov = abs(rel_bearing) <= 85.0
         is_valid = (eff_conf >= self.min_confidence) and (not is_robot_speaking) and in_acoustic_fov
+        if not in_acoustic_fov:
+            eff_conf = 0.0
 
         return AudioObservation(
             timestamp=timestamp,
