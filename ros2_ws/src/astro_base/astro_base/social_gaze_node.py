@@ -288,23 +288,38 @@ class SocialGazeNode(Node):
         """Processes JSON array of detected faces from OAK-D Lite vision pipeline."""
         t = time.monotonic()
         try:
-            detections = json.loads(msg.data)
+            raw_data = json.loads(msg.data)
+            if isinstance(raw_data, dict):
+                detections = raw_data.get("faces", [])
+            elif isinstance(raw_data, list):
+                detections = raw_data
+            else:
+                detections = []
+
             obs_list: List[VisualObservation] = []
             for d in detections:
+                w_val = int(d.get("w", d.get("width", 50)))
+                h_val = int(d.get("h", d.get("height", 50)))
+                depth_val = float(d.get("depth_m", d.get("distance_m", 1.5)))
+                recog_name = d.get("name", d.get("recognized_name"))
+                is_known_val = bool(d.get("is_known", recog_name is not None))
+                head_yaw_val = float(d.get("yaw_deg", d.get("head_yaw_deg", 0.0)))
+                eyes_vis = bool(d.get("eyes_visible", d.get("looking_at_robot", True)))
+
                 obs = self.visual_perception.process_detection(
                     x=int(d.get("x", 0)),
                     y=int(d.get("y", 0)),
-                    w=int(d.get("w", 50)),
-                    h=int(d.get("h", 50)),
-                    depth_m=float(d.get("depth_m", 1.5)),
+                    w=w_val,
+                    h=h_val,
+                    depth_m=depth_val,
                     timestamp=t,
                     actual_head_yaw_deg=self.actual_head_yaw_deg,
-                    confidence=float(d.get("confidence", 0.8)),
-                    eyes_visible=bool(d.get("eyes_visible", True)),
-                    head_yaw_deg=float(d.get("head_yaw_deg", 0.0)),
+                    confidence=float(d.get("confidence", 0.85)),
+                    eyes_visible=eyes_vis,
+                    head_yaw_deg=head_yaw_val,
                     emotion=str(d.get("emotion", "neutral")),
-                    person_name=d.get("name"),
-                    is_known=bool(d.get("is_known", False)),
+                    person_name=recog_name,
+                    is_known=is_known_val,
                 )
                 obs_list.append(obs)
 

@@ -101,6 +101,8 @@ class SocialGazeLiveMonitor(Node):
         self.create_subscription(Float32, "/audio/doa_deg", self._on_audio_doa, 10)
         self.create_subscription(String, "/vision/detections_json", self._on_vision_json, 10)
         self.create_subscription(String, "/vision/faces", self._on_vision_json, 10)
+        self.create_subscription(Float32, "/vision/head_yaw", self._on_vision_head_yaw, 10)
+        self.create_subscription(Bool, "/vision/person_detected", self._on_person_detected, 10)
         self.create_subscription(String, "/gaze/active_target", self._on_active_target, 10)
         self.create_subscription(Float32, "/head/cmd_pos", self._on_cmd_pos, 10)
         self.create_subscription(Bool, "/robot/is_speaking", self._on_speaking, 10)
@@ -126,15 +128,39 @@ class SocialGazeLiveMonitor(Node):
         self.audio_doa_deg = val
         self.audio_last_time = now
 
+    def _on_vision_head_yaw(self, msg: Float32):
+        now = time.monotonic()
+        if self.visual_yaw_deg is None or (now - self.visual_last_time > 0.3):
+            self.visual_yaw_deg = float(msg.data)
+            self.visual_conf = 0.85
+            self.visual_faces_count = max(1, self.visual_faces_count)
+            self.visual_last_time = now
+            self.visual_events.append({
+                "time": round(now - self.start_time, 2),
+                "face_yaw_deg": round(self.visual_yaw_deg, 2),
+                "confidence": round(self.visual_conf, 2),
+                "tracking_error": round(self.cmd_head_yaw - self.act_head_yaw, 2),
+            })
+
+    def _on_person_detected(self, msg: Bool):
+        if not msg.data and (time.monotonic() - self.visual_last_time > 0.5):
+            self.visual_faces_count = 0
+            self.visual_conf = 0.0
+
     def _on_vision_json(self, msg: String):
         now = time.monotonic()
         try:
-            data = json.loads(msg.data)
-            faces = data.get("faces", [])
+            raw_data = json.loads(msg.data)
+            if isinstance(raw_data, dict):
+                faces = raw_data.get("faces", [])
+            elif isinstance(raw_data, list):
+                faces = raw_data
+            else:
+                faces = []
             self.visual_faces_count = len(faces)
             if faces:
                 primary = faces[0]
-                self.visual_yaw_deg = float(primary.get("azimuth_deg", primary.get("yaw_deg", 0.0)))
+                self.visual_yaw_deg = float(primary.get("camera_azimuth_deg", primary.get("azimuth_deg", primary.get("yaw_deg", 0.0))))
                 self.visual_conf = float(primary.get("confidence", 0.85))
                 self.visual_last_time = now
                 self.visual_events.append({
