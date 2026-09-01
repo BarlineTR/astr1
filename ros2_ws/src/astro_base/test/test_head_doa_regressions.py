@@ -50,6 +50,24 @@ PARAMS_FILE = os.path.join(
 )
 
 
+def setUpModule():
+    try:
+        import rclpy
+        if not rclpy.ok():
+            rclpy.init()
+    except Exception:
+        pass
+
+
+def tearDownModule():
+    try:
+        import rclpy
+        if rclpy.ok():
+            rclpy.shutdown()
+    except Exception:
+        pass
+
+
 class MockMsg:
     def __init__(self, data):
         self.data = data
@@ -57,6 +75,12 @@ class MockMsg:
 
 def make_node() -> HeadTrackerNode:
     """A head tracker parked at 0 deg, awake, hearing a loud steady voice."""
+    try:
+        import rclpy
+        if not rclpy.ok():
+            rclpy.init()
+    except Exception:
+        pass
     node = HeadTrackerNode()
     node.enabled = True
     node._is_sleeping = False
