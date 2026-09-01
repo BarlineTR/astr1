@@ -35,22 +35,22 @@ except ImportError as exc:
 STATE_NAMES = {
     0: "IDLE",
     1: "SEARCHING",
-    2: "AUDIO_ACQUIRE",
+    2: "ACQUIRING",
     3: "ORIENTING",
-    4: "VISUAL_ACQUIRE",
-    5: "TRACKING",
-    6: "HOLD",
-    7: "TARGET_LOST",
-    8: "RETURNING",
+    4: "TRACKING",
+    5: "HOLDING_ATTENTION",
+    6: "TARGET_LOST",
+    7: "RECOVERING",
 }
 
 PRIORITY_NAMES = {
     0: "IDLE",
-    1: "VISUAL_PERSON",
+    1: "VISUAL_TRACKING",
     2: "ACTIVE_SPEAKER",
-    3: "DIALOGUE",
-    4: "GESTURE",
-    5: "SAFETY",
+    3: "GESTURE_INTENT",
+    4: "DIRECT_DIALOGUE_INTENT",
+    5: "EXPLICIT_USER_GAZE",
+    6: "EMERGENCY_STOP",
 }
 
 

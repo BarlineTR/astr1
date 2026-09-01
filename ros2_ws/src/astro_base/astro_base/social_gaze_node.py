@@ -69,7 +69,10 @@ from astro_base.gaze.motion_planner import MotionPlannerCore
 from astro_base.gaze.sensor_fusion import AudioVisualFusionCore
 from astro_base.gaze.target_manager import TargetManagerCore
 from astro_base.gaze.types import (
+    ActuatorStateEnum,
+    AudioMeasurement,
     AudioObservation,
+    ExplicitGazeIntent,
     FilteredAudioState,
     FusedTarget,
     GazeCommand,
@@ -77,8 +80,10 @@ from astro_base.gaze.types import (
     HeadFeedback,
     Modality,
     PrioritySource,
+    TargetSelectorType,
     TargetState,
     TrajectoryPoint,
+    VisualMeasurement,
     VisualObservation,
     VisualTargetTrack,
 )
@@ -217,9 +222,11 @@ class SocialGazeNode(Node):
         self.create_subscription(Int32, "/audio/doa_raw", self._on_doa_raw, 10)
         self.create_subscription(String, "/vision/detections_json", self._on_vision_json, 10)
         self.create_subscription(String, "/vision/faces", self._on_vision_json, 10)
+        self.create_subscription(Float32, "/vision/head_yaw", self._on_vision_head_yaw, 10)
         self.create_subscription(String, "/behavior/gesture", self._on_gesture, 10)
         self.create_subscription(Float32, "/behavior/gaze_intent", self._on_gaze_intent, 10)
         self.create_subscription(Float32, "/head/target_yaw", self._on_gaze_intent, 10)
+        self.create_subscription(String, "/behavior/explicit_gaze", self._on_explicit_gaze, 10)
         self.create_subscription(Bool, "/robot/is_speaking", self._on_speaking_status, 10)
         self.create_subscription(Bool, "/audio/playback_active", self._on_speaking_status, 10)
         self.create_subscription(String, "/robot/emotion", self._on_emotion, 10)
@@ -231,7 +238,7 @@ class SocialGazeNode(Node):
         timer_period_s = 1.0 / max(1.0, rate_hz)
         self.timer = self.create_timer(timer_period_s, self._control_cycle)
 
-        self.get_logger().info(f"SocialGazeNode initialized at {rate_hz:.1f} Hz (Typed GazeStatus & HeadState enabled)")
+        self.get_logger().info(f"SocialGazeNode initialized at {rate_hz:.1f} Hz (AttentionArbiter enabled)")
 
     # =========================================================================
     # Callbacks
@@ -282,6 +289,26 @@ class SocialGazeNode(Node):
         self.latest_audio_state = self.audio_filter.filter_observation(
             obs=obs,
             head_velocity_deg_s=self.actual_head_vel_deg_s,
+        )
+
+    def _on_vision_head_yaw(self, msg: Float32) -> None:
+        """Processes 1D estimated head yaw as a fallback visual measurement."""
+        t = time.monotonic()
+        cam_azimuth = float(msg.data)
+        obs = self.visual_perception.process_detection(
+            x=320,
+            y=240,
+            w=60,
+            h=60,
+            depth_m=1.5,
+            timestamp=t,
+            actual_head_yaw_deg=self.actual_head_yaw_deg,
+            confidence=0.85,
+        )
+        self.latest_visual_tracks = self.visual_tracker.update(
+            observations=[obs],
+            timestamp=t,
+            actual_head_yaw_deg=self.actual_head_yaw_deg,
         )
 
     def _on_vision_json(self, msg: String) -> None:
@@ -341,6 +368,34 @@ class SocialGazeNode(Node):
         t = time.monotonic()
         self.fsm.set_dialogue_target(yaw_deg=msg.data, duration_s=3.0, timestamp=t)
 
+    def _on_explicit_gaze(self, msg: String) -> None:
+        """Handles explicit user gaze command (e.g. 'Astro bana dön')."""
+        t = time.monotonic()
+        text = str(msg.data).strip().lower()
+        selector = TargetSelectorType.CURRENT_SPEAKER
+        target_yaw: Optional[float] = None
+
+        try:
+            data = json.loads(text)
+            if isinstance(data, dict):
+                sel_str = data.get("selector", "CURRENT_SPEAKER")
+                selector = TargetSelectorType(sel_str)
+                target_yaw = data.get("target_yaw_deg")
+        except Exception:
+            pass
+
+        intent = ExplicitGazeIntent(
+            selector=selector,
+            target_yaw_deg=target_yaw,
+            confidence=1.0,
+            timestamp=t,
+            expiry_time=t + 4.0,
+            valid=True,
+            reason=f"EXPLICIT_COMMAND_{text}",
+        )
+        self.fsm.set_explicit_gaze_intent(intent)
+        self.get_logger().info(f"Explicit gaze intent received: selector={selector.value}, reason={intent.reason}")
+
     def _on_speaking_status(self, msg: Bool) -> None:
         self.is_robot_speaking = msg.data
 
@@ -364,14 +419,14 @@ class SocialGazeNode(Node):
     def _control_cycle(self) -> None:
         t = time.monotonic()
 
-        # 1. Multimodal Sensor Fusion
+        # 1. Multimodal Sensor Fusion (Passive Measurements -> Fused Targets)
         fused_targets = self.fusion.fuse(
             audio_state=self.latest_audio_state,
             visual_tracks=self.latest_visual_tracks,
             timestamp=t,
         )
 
-        # 2. Target Management & Turn-Taking Arbitration
+        # 2. Target Management (Candidate Targets, Track Continuity, Hysteresis)
         target_state = self.target_manager.update(
             fused_targets=fused_targets,
             timestamp=t,
@@ -381,7 +436,7 @@ class SocialGazeNode(Node):
         if target_state.active_target is not None and self.fsm.is_sleeping and not self.fsm.safety_lock:
             self.fsm.set_sleep_mode(False)
 
-        # 3. Behavioral Social Gaze FSM & Priority Arbitration with True Velocity Feedback
+        # 3. Social Gaze FSM & Attention Arbitration
         gaze_cmd = self.fsm.update(
             target_state=target_state,
             actual_head_yaw_deg=self.actual_head_yaw_deg,
@@ -407,7 +462,16 @@ class SocialGazeNode(Node):
         cmd_msg.data = target_goal_deg
         self.pub_head_cmd_pos.publish(cmd_msg)
 
-        # 6. Publish Typed GazeStatus Message
+        # 6. Separate Error Metrics Calculation
+        face_bearing_deg = self.latest_visual_tracks[0].body_azimuth_deg if self.latest_visual_tracks else None
+        face_to_desired_error_deg = round(float(face_bearing_deg - gaze_cmd.target_yaw_deg), 2) if face_bearing_deg is not None else 0.0
+        desired_to_actual_error_deg = round(float(gaze_cmd.target_yaw_deg - self.actual_head_yaw_deg), 2)
+        actuator_state_val = "MOVING" if (abs(self.actual_head_vel_deg_s) > 2.0 or abs(desired_to_actual_error_deg) > 2.0) else "SETTLED"
+
+        audio_age_s = round(float(t - self.latest_audio_state.timestamp), 2) if self.latest_audio_state else 999.0
+        visual_age_s = round(float(t - self.latest_visual_tracks[0].last_seen_time), 2) if self.latest_visual_tracks else 999.0
+
+        # 7. Publish Typed GazeStatus Message
         if self.pub_gaze_state is not None:
             status_msg = GazeStatus()
             status_msg.header.stamp = self.get_clock().now().to_msg()
@@ -416,21 +480,21 @@ class SocialGazeNode(Node):
             state_enum_map = {
                 GazeStateEnum.IDLE: 0,
                 GazeStateEnum.SEARCHING: 1,
-                GazeStateEnum.AUDIO_ACQUIRE: 2,
+                GazeStateEnum.ACQUIRING: 2,
                 GazeStateEnum.ORIENTING: 3,
-                GazeStateEnum.VISUAL_ACQUIRE: 4,
-                GazeStateEnum.TRACKING: 5,
-                GazeStateEnum.HOLD: 6,
-                GazeStateEnum.TARGET_LOST: 7,
-                GazeStateEnum.RETURNING: 8,
+                GazeStateEnum.TRACKING: 4,
+                GazeStateEnum.HOLDING_ATTENTION: 5,
+                GazeStateEnum.TARGET_LOST: 6,
+                GazeStateEnum.RECOVERING: 7,
             }
             priority_enum_map = {
                 PrioritySource.IDLE: 0,
-                PrioritySource.VISUAL_PERSON: 1,
+                PrioritySource.VISUAL_TRACKING: 1,
                 PrioritySource.ACTIVE_SPEAKER: 2,
-                PrioritySource.DIALOGUE: 3,
-                PrioritySource.GESTURE: 4,
-                PrioritySource.SAFETY: 5,
+                PrioritySource.GESTURE_INTENT: 3,
+                PrioritySource.DIRECT_DIALOGUE_INTENT: 4,
+                PrioritySource.EXPLICIT_USER_GAZE: 5,
+                PrioritySource.EMERGENCY_STOP: 6,
             }
             status_msg.state = state_enum_map.get(gaze_cmd.gaze_state, 0)
             status_msg.priority = priority_enum_map.get(gaze_cmd.priority_source, 0)
@@ -439,27 +503,31 @@ class SocialGazeNode(Node):
             status_msg.actual_yaw_deg = float(self.actual_head_yaw_deg)
             status_msg.target_confidence = float(gaze_cmd.confidence)
             status_msg.target_valid = bool(gaze_cmd.confidence > 0.10)
-            status_msg.motion_active = bool(abs(traj_point.velocity_deg_s) > 1.0 or abs(self.actual_head_vel_deg_s) > 1.0)
+            status_msg.motion_active = bool(actuator_state_val == "MOVING")
             status_msg.at_target = bool(self.fsm.at_target and traj_point.is_settled)
             status_msg.active_target_id = str(gaze_cmd.active_target_id or "")
             self.pub_gaze_state.publish(status_msg)
 
-        # 7. Publish JSON Debug Telemetry
+        # 8. Publish JSON Debug Telemetry
         state_diag = {
-
             "timestamp": t,
-            "fsm_state": gaze_cmd.gaze_state.value,
-            "priority": gaze_cmd.priority_source.value,
-            "desired_yaw_deg": gaze_cmd.target_yaw_deg,
-            "planned_pos_deg": traj_point.position_deg,
-            "planned_vel_deg_s": traj_point.velocity_deg_s,
-            "actual_pos_deg": self.actual_head_yaw_deg,
-            "actual_vel_deg_s": self.actual_head_vel_deg_s,
-            "at_target": self.fsm.at_target,
+            "gaze_state": gaze_cmd.gaze_state.value,
+            "actuator_state": actuator_state_val,
+            "attention_owner": gaze_cmd.priority_source.value,
+            "attention_reason": self.fsm.last_decision.reason if self.fsm.last_decision else "NONE",
             "active_target_id": gaze_cmd.active_target_id,
+            "desired_yaw_deg": gaze_cmd.target_yaw_deg,
+            "actual_yaw_deg": self.actual_head_yaw_deg,
+            "face_to_desired_error_deg": face_to_desired_error_deg,
+            "desired_to_actual_error_deg": desired_to_actual_error_deg,
+            "audio_measurement_age_s": audio_age_s,
+            "visual_measurement_age_s": visual_age_s,
+            "at_target": self.fsm.at_target,
             "is_speaking": self.is_robot_speaking,
-            "is_settled": traj_point.is_settled,
         }
+        msg_str = String()
+        msg_str.data = json.dumps(state_diag)
+        self.pub_gaze_debug.publish(msg_str)
         msg_str = String()
         msg_str.data = json.dumps(state_diag)
         self.pub_gaze_debug.publish(msg_str)

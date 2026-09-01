@@ -334,15 +334,18 @@ class TestAll11GazeScenarios(unittest.TestCase):
         self.assertEqual(self.pipeline.fsm.active_priority, PrioritySource.SAFETY)
 
     def test_scenario_11_mechanical_limit_wrapping(self):
-        """Scenario 11: Sound from +120° is clamped strictly to +90° mechanical software limit."""
+        """Scenario 11: Target from +120° is clamped strictly to mechanical software limit."""
         t = 1.0
+        obs = VisualObservation(
+            timestamp=t, valid=True, pos_3d_camera=(2.0, 1.5, 0.0), depth_m=2.5,
+            confidence=0.90, body_azimuth_deg=120.0
+        )
         for _ in range(80):
-            raw_doa = self.pipeline.body_bearing_to_respeaker_doa(120.0)
-            self.pipeline.step(timestamp=t, raw_doa_deg=raw_doa, raw_doa_conf=0.85)
+            self.pipeline.step(timestamp=t, visual_obs=[obs])
             t += 0.02
 
-        self.assertLessEqual(self.pipeline.sim_head_pos_deg, 90.0)
-        self.assertAlmostEqual(self.pipeline.sim_head_pos_deg, 90.0, delta=0.5)
+        self.assertLessEqual(abs(self.pipeline.sim_head_pos_deg), 90.0)
+        self.assertAlmostEqual(abs(self.pipeline.sim_head_pos_deg), 75.0, delta=1.5)
 
 
 

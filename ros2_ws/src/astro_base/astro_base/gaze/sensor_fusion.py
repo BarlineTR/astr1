@@ -30,7 +30,7 @@ class AudioVisualFusionCore:
     def __init__(
         self,
         spatial_gate_deg: float = 25.0,
-        audio_freshness_half_life_s: float = 0.80,
+        audio_freshness_half_life_s: float = 0.40,
         vision_freshness_half_life_s: float = 1.20,
         audio_weight_base: float = 0.40,
         vision_weight_base: float = 0.85,
@@ -79,6 +79,8 @@ class AudioVisualFusionCore:
             elapsed_aud = max(0.0, timestamp - audio_state.timestamp)
             audio_freshness = self.compute_freshness(elapsed_aud, self.audio_half_life)
             audio_eff_conf = audio_state.confidence * audio_freshness
+            if audio_eff_conf < 0.35 or audio_freshness < 0.35:
+                has_valid_audio = False
 
         # 1. Process all visual tracks and associate matching sound
         for vt in visual_tracks:

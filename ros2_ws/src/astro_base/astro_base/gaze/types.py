@@ -32,31 +32,66 @@ class TrackingState(str, Enum):
 
 
 class GazeStateEnum(str, Enum):
-    """9-State Social Gaze Finite State Machine (FSM)."""
+    """Social Gaze Finite State Machine (FSM) semantic states."""
     IDLE = "IDLE"                        # Resting neutral pose with gentle social breathing
-    SEARCHING = "SEARCHING"              # Evaluating candidate audio/radar cues
-    AUDIO_ACQUIRE = "AUDIO_ACQUIRE"      # Audio target confirmed above acquisition threshold
+    SEARCHING = "SEARCHING"              # Deliberate, bounded search behavior with reason
+    ACQUIRING = "ACQUIRING"              # Candidate target confirmation before saccade
     ORIENTING = "ORIENTING"              # Fast orienting saccade towards target bearing
-    VISUAL_ACQUIRE = "VISUAL_ACQUIRE"    # Camera looking for face in expected bearing window
-    TRACKING = "TRACKING"                # Face locked in camera FOV; smooth visual tracking
-    HOLD = "HOLD"                        # Target paused or speech ceased; maintaining dwell gaze
+    TRACKING = "TRACKING"                # Face locked in camera FOV; smooth visual pursuit
+    HOLDING_ATTENTION = "HOLDING_ATTENTION"  # Intentionally maintaining social attention on target
     TARGET_LOST = "TARGET_LOST"          # Target absent; coasting last known state before timeout
-    RETURNING = "RETURNING"              # Smoothly returning to neutral 0° center
+    RECOVERING = "RECOVERING"            # Smoothly returning to neutral 0° center
+
+    # Backward compatibility aliases
+    HOLD = "HOLDING_ATTENTION"
+    AUDIO_ACQUIRE = "ACQUIRING"
+    VISUAL_ACQUIRE = "ACQUIRING"
+    RETURNING = "RECOVERING"
+
+
+class ActuatorStateEnum(str, Enum):
+    """Physical actuator execution state (separate from cognitive social gaze state)."""
+    MOVING = "MOVING"      # Joint actively executing trajectory
+    SETTLED = "SETTLED"    # Joint settled within deadband and low velocity
+    FAULT = "FAULT"        # Actuator stall, mechanical limit, or watchdog fault
+
+
+# Alias for backward compatibility
+ActuatorState = ActuatorStateEnum
 
 
 class PrioritySource(str, Enum):
-    """Priority arbitration source for head gaze authority."""
-    SAFETY = "SAFETY"                    # Emergency stop or sleep lock (Highest priority)
-    GESTURE = "GESTURE"                  # Scripted social gesture sequence (nod, shake, scan)
-    DIALOGUE = "DIALOGUE"                # Direct dialogue gaze intent from cognitive brain
-    ACTIVE_SPEAKER = "ACTIVE_SPEAKER"    # Multimodal active speaker tracking
-    VISUAL_PERSON = "VISUAL_PERSON"      # Visual-only human presence in social zone
-    IDLE = "IDLE"                        # Ambient baseline / idle return (Lowest priority)
+    """Priority hierarchy for social attention arbitration."""
+    EMERGENCY_STOP = "EMERGENCY_STOP"            # Priority 1: Hardware E-Stop / Safety lock
+    EXPLICIT_USER_GAZE = "EXPLICIT_USER_GAZE"    # Priority 2: Direct user command ("Astro bana dön")
+    DIRECT_DIALOGUE_INTENT = "DIRECT_DIALOGUE_INTENT"  # Priority 3: AI Cognitive dialogue gaze intent
+    GESTURE_INTENT = "GESTURE_INTENT"            # Priority 4: Scripted social gesture sequence
+    ACTIVE_SPEAKER = "ACTIVE_SPEAKER"            # Priority 5: Multimodal active speaker tracking
+    VISUAL_TRACKING = "VISUAL_TRACKING"          # Priority 6: Visual human face tracking (Visual Primacy)
+    IDLE = "IDLE"                                # Priority 7: Neutral ambient baseline
 
+    # Backward compatibility aliases
+    SAFETY = "EMERGENCY_STOP"
+    DIALOGUE = "DIRECT_DIALOGUE_INTENT"
+    GESTURE = "GESTURE_INTENT"
+    VISUAL_PERSON = "VISUAL_TRACKING"
+
+
+class TargetSelectorType(str, Enum):
+    """Selector method for explicit gaze intents."""
+    CURRENT_SPEAKER = "CURRENT_SPEAKER"        # Direct attention to currently/recently speaking user
+    TARGET_ID = "TARGET_ID"                    # Direct attention to specific tracked target ID
+    ABSOLUTE_YAW = "ABSOLUTE_YAW"              # Direct attention to specific angle in robot frame
+    RELATIVE_DIRECTION = "RELATIVE_DIRECTION"  # Direct attention relative to head (LEFT, RIGHT, CENTER)
+
+
+# =============================================================================
+# 1. MEASUREMENTS (Passive Observations - Never Directly Move Motors)
+# =============================================================================
 
 @dataclass
-class AudioObservation:
-    """Raw acoustic directional observation from microphone array perception."""
+class AudioMeasurement:
+    """Raw acoustic directional measurement from microphone array perception."""
     timestamp: float
     valid: bool
     vad: bool
@@ -68,6 +103,11 @@ class AudioObservation:
     rms: float = 0.0                      # Frame acoustic energy RMS
     peak: float = 0.0                     # Peak amplitude
     snr_db: float = 0.0                   # Signal-to-noise ratio estimate
+    frame_id: str = "mic_link"
+
+
+# Backward compatibility alias
+AudioObservation = AudioMeasurement
 
 
 @dataclass
@@ -84,7 +124,7 @@ class FilteredAudioState:
 
 
 @dataclass
-class VisualObservation:
+class VisualMeasurement:
     """Single-frame visual detection from camera (OAK-D Lite)."""
     timestamp: float
     valid: bool
@@ -104,6 +144,11 @@ class VisualObservation:
     emotion: str = "neutral"              # Facial emotion
     person_name: Optional[str] = None     # Recognized name
     is_known: bool = False
+    frame_id: str = "oak_rgb_camera_optical_frame"
+
+
+# Backward compatibility alias
+VisualObservation = VisualMeasurement
 
 
 @dataclass
@@ -125,6 +170,10 @@ class VisualTargetTrack:
     is_known: bool = False
     eye_contact: bool = False
 
+
+# =============================================================================
+# 2. TARGET STATE (Candidate & Active Multimodal Tracking State)
+# =============================================================================
 
 @dataclass
 class FusedTarget:
@@ -151,6 +200,86 @@ class TargetState:
     active_target: Optional[FusedTarget]
     candidate_targets: List[FusedTarget] = field(default_factory=list)
     timestamp: float = 0.0
+
+
+# =============================================================================
+# 3. BEHAVIOR INTENTS (Explicit Cognitive Desires)
+# =============================================================================
+
+@dataclass
+class ExplicitGazeIntent:
+    """Explicit user-commanded gaze intent (e.g. 'Astro bana dön')."""
+    selector: TargetSelectorType = TargetSelectorType.CURRENT_SPEAKER
+    target_id: Optional[str] = None
+    target_yaw_deg: Optional[float] = None
+    confidence: float = 1.0
+    timestamp: float = 0.0
+    expiry_time: float = 0.0
+    valid: bool = True
+    reason: str = "EXPLICIT_USER_COMMAND"
+
+
+@dataclass
+class DialogueGazeIntent:
+    """Dialogue gaze intent generated by AI brain conversational system."""
+    target_yaw_deg: float
+    confidence: float = 0.90
+    timestamp: float = 0.0
+    expiry_time: float = 0.0
+    valid: bool = True
+    reason: str = "AI_DIALOGUE_INTERACTION"
+
+
+@dataclass
+class GestureGazeIntent:
+    """Social head gesture sequence intent (nod, shake, scan)."""
+    gesture_name: str
+    target_yaw_deg: float
+    confidence: float = 1.0
+    timestamp: float = 0.0
+    valid: bool = True
+    reason: str = "SOCIAL_GESTURE"
+
+
+@dataclass
+class SafetyGazeIntent:
+    """Emergency stop or hardware lock safety intent."""
+    is_locked: bool = False
+    is_sleeping: bool = False
+    target_yaw_deg: float = 0.0
+    confidence: float = 1.0
+    timestamp: float = 0.0
+    valid: bool = True
+    reason: str = "SAFETY_LOCK"
+
+
+# =============================================================================
+# 4. ATTENTION & GAZE COMMANDS
+# =============================================================================
+
+@dataclass
+class AttentionDecision:
+    """Typed decision output from AttentionArbiterCore."""
+    owner: PrioritySource
+    target_id: Optional[str]
+    target_yaw_deg: float
+    confidence: float
+    reason: str
+    timestamp: float
+    is_preemption: bool = False
+
+
+@dataclass
+class GazeTarget:
+    """High-level behavioral gaze target produced by Gaze Policy."""
+    target_yaw_deg: float
+    target_pitch_deg: float = 0.0
+    confidence: float = 1.0
+    target_id: Optional[str] = None
+    owner: PrioritySource = PrioritySource.IDLE
+    gaze_state: GazeStateEnum = GazeStateEnum.IDLE
+    timestamp: float = 0.0
+    reason: str = "DEFAULT"
 
 
 @dataclass

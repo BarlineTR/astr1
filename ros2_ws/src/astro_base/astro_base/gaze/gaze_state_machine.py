@@ -1,10 +1,10 @@
-"""Social Gaze Finite State Machine (FSM) and Priority Arbitration Engine.
+"""Social Gaze Finite State Machine (FSM) and Gaze Policy Engine.
 
-Implements the 9-State Social Gaze Machine:
-  IDLE | SEARCHING | AUDIO_ACQUIRE | ORIENTING | VISUAL_ACQUIRE | TRACKING | HOLD | TARGET_LOST | RETURNING
+Semantic Social Gaze States:
+  IDLE | SEARCHING | ACQUIRING | ORIENTING | TRACKING | HOLDING_ATTENTION | TARGET_LOST | RECOVERING
 
-Priority Arbitration Hierarchy:
-  SAFETY > GESTURE > DIALOGUE > ACTIVE_SPEAKER > VISUAL_PERSON > IDLE
+Attention Arbitration:
+  Delegated to AttentionArbiterCore (EMERGENCY_STOP > EXPLICIT_USER_GAZE > DIALOGUE > GESTURE > ACTIVE_SPEAKER > VISUAL_TRACKING > IDLE).
 """
 
 import math
@@ -16,19 +16,25 @@ from astro_base.gaze.angle_math import (
     clamp_deg,
     wrap_deg,
 )
+from astro_base.gaze.attention_arbiter import AttentionArbiterCore
 from astro_base.gaze.types import (
+    AttentionDecision,
+    DialogueGazeIntent,
+    ExplicitGazeIntent,
     FusedTarget,
     GazeCommand,
     GazeStateEnum,
+    GestureGazeIntent,
     Modality,
     PrioritySource,
+    SafetyGazeIntent,
     TargetState,
     TrackingState,
 )
 
 
 class SocialGazeFSM:
-    """Central authoritative behavioral Gaze Manager."""
+    """Central authoritative behavioral Gaze Policy Manager."""
 
     GESTURE_PROFILES: Dict[str, List[float]] = {
         "nod": [12.0, -8.0, 0.0],
@@ -50,17 +56,18 @@ class SocialGazeFSM:
 
     def __init__(
         self,
-        deadband_deg: float = 3.0,
+        deadband_deg: float = 2.5,
         idle_return_timeout_s: float = 25.0,
         min_attention_dwell_s: float = 2.50,
         target_lost_timeout_s: float = 1.0,
-        idle_saccades_enabled: bool = True,
+        idle_saccades_enabled: bool = False,
         idle_saccade_interval_s: float = 8.0,
-        min_limit_deg: float = -90.0,
-        max_limit_deg: float = 90.0,
-        position_tolerance_deg: float = 2.5,
+        min_limit_deg: float = -75.0,
+        max_limit_deg: float = 75.0,
+        position_tolerance_deg: float = 2.0,
         velocity_tolerance_deg_s: float = 3.0,
         settling_persistence_required: int = 3,
+        arbiter: Optional[AttentionArbiterCore] = None,
     ):
         self.deadband_deg = deadband_deg
         self.idle_return_timeout_s = idle_return_timeout_s
@@ -74,6 +81,12 @@ class SocialGazeFSM:
         self.velocity_tolerance_deg_s = velocity_tolerance_deg_s
         self.settling_persistence_required = settling_persistence_required
 
+        # Attention Arbiter authority
+        self.arbiter = arbiter or AttentionArbiterCore(
+            min_limit_deg=min_limit_deg,
+            max_limit_deg=max_limit_deg,
+        )
+
         # Internal FSM state
         self.state = GazeStateEnum.IDLE
         self.target_yaw_deg: float = 0.0
@@ -82,10 +95,13 @@ class SocialGazeFSM:
         self.active_target_id: Optional[str] = None
         self.at_target: bool = True
         self._settling_persistence_count: int = 0
+        self.last_decision: Optional[AttentionDecision] = None
 
-        # Safety & sleep locks
-        self.is_sleeping: bool = False
-        self.safety_lock: bool = False
+        # Intents state storage
+        self._safety_intent: SafetyGazeIntent = SafetyGazeIntent()
+        self._explicit_intent: Optional[ExplicitGazeIntent] = None
+        self._dialogue_intent: Optional[DialogueGazeIntent] = None
+        self._gesture_intent: Optional[GestureGazeIntent] = None
 
         # Gesture execution state
         self._active_gesture: Optional[str] = None
@@ -94,10 +110,6 @@ class SocialGazeFSM:
         self._gesture_step_start_time: float = 0.0
         self._gesture_step_duration_s: float = 0.35
 
-        # Explicit intent overrides
-        self._dialogue_target_yaw: Optional[float] = None
-        self._dialogue_expiry_time: float = 0.0
-
         # Timing tracking
         self._state_entry_time: float = 0.0
         self._last_speech_time: float = 0.0
@@ -105,25 +117,50 @@ class SocialGazeFSM:
         self._last_idle_saccade_time: float = 0.0
         self._saccade_direction: int = 1
 
+    @property
+    def safety_lock(self) -> bool:
+        return self._safety_intent.is_locked
+
+    @property
+    def is_sleeping(self) -> bool:
+        return self._safety_intent.is_sleeping
+
     def set_safety_lock(self, locked: bool) -> None:
         """Emergency stop or hardware safety lock."""
-        self.safety_lock = locked
+        self._safety_intent.is_locked = locked
         if locked:
             self._active_gesture = None
             self._gesture_steps = []
             self.state = GazeStateEnum.IDLE
             self.target_yaw_deg = 0.0
-            self.active_priority = PrioritySource.SAFETY
+            self.active_priority = PrioritySource.EMERGENCY_STOP
 
     def set_sleep_mode(self, sleeping: bool) -> None:
         """Sets robot sleep state; locks head at center during deep sleep."""
-        self.is_sleeping = sleeping
+        self._safety_intent.is_sleeping = sleeping
         if sleeping:
             self._active_gesture = None
             self._gesture_steps = []
             self.state = GazeStateEnum.IDLE
             self.target_yaw_deg = 0.0
-            self.active_priority = PrioritySource.SAFETY
+            self.active_priority = PrioritySource.EMERGENCY_STOP
+
+    def set_explicit_gaze_intent(self, intent: Optional[ExplicitGazeIntent]) -> None:
+        """Sets an explicit user gaze command (e.g. 'Astro bana dön')."""
+        self._explicit_intent = intent
+
+    def set_dialogue_target(self, yaw_deg: float, duration_s: float, timestamp: float) -> None:
+        """Sets explicit cognitive dialogue gaze intent (e.g. looking at interlocutor)."""
+        if self.safety_lock or self.is_sleeping:
+            return
+        self._dialogue_intent = DialogueGazeIntent(
+            target_yaw_deg=clamp_deg(yaw_deg, self.min_limit_deg, self.max_limit_deg),
+            confidence=0.90,
+            timestamp=timestamp,
+            expiry_time=timestamp + max(0.5, duration_s),
+            valid=True,
+            reason="AI_DIALOGUE_INTERACTION",
+        )
 
     def trigger_gesture(self, gesture_name: str, timestamp: float) -> bool:
         """Queues a social head gesture sequence."""
@@ -138,16 +175,14 @@ class SocialGazeFSM:
         self._gesture_steps = list(self.GESTURE_PROFILES[canonical])
         self._gesture_step_idx = 0
         self._gesture_step_start_time = timestamp
-        self.active_priority = PrioritySource.GESTURE
-        self.target_yaw_deg = clamp_deg(self._gesture_steps[0], self.min_limit_deg, self.max_limit_deg)
+        self._gesture_intent = GestureGazeIntent(
+            gesture_name=canonical,
+            target_yaw_deg=clamp_deg(self._gesture_steps[0], self.min_limit_deg, self.max_limit_deg),
+            confidence=1.0,
+            timestamp=timestamp,
+            valid=True,
+        )
         return True
-
-    def set_dialogue_target(self, yaw_deg: float, duration_s: float, timestamp: float) -> None:
-        """Sets explicit cognitive dialogue gaze intent (e.g. looking at interlocutor)."""
-        if self.safety_lock or self.is_sleeping:
-            return
-        self._dialogue_target_yaw = clamp_deg(yaw_deg, self.min_limit_deg, self.max_limit_deg)
-        self._dialogue_expiry_time = timestamp + max(0.5, duration_s)
 
     def _transition_to(self, new_state: GazeStateEnum, timestamp: float) -> None:
         """Executes FSM state transition."""
@@ -162,11 +197,63 @@ class SocialGazeFSM:
         actual_head_yaw_deg: float,
         timestamp: float,
         actual_head_vel_deg_s: float = 0.0,
+        explicit_intent: Optional[ExplicitGazeIntent] = None,
+        dialogue_intent: Optional[DialogueGazeIntent] = None,
+        gesture_intent: Optional[GestureGazeIntent] = None,
+        safety_intent: Optional[SafetyGazeIntent] = None,
     ) -> GazeCommand:
-        """Evaluates sensory inputs, priority arbitration, and FSM state transitions."""
-        active_target = target_state.active_target
+        """Evaluates sensory inputs, invokes AttentionArbiter, and executes social gaze policy."""
+        # 1. Update active intent stores if passed explicitly
+        if explicit_intent is not None:
+            self._explicit_intent = explicit_intent
+        if dialogue_intent is not None:
+            self._dialogue_intent = dialogue_intent
+        if gesture_intent is not None:
+            self._gesture_intent = gesture_intent
+        if safety_intent is not None:
+            self._safety_intent = safety_intent
 
-        # Physical settling detection at commanded target_yaw_deg
+        # 2. Advance active gesture sequence if in progress
+        if self._active_gesture and self._gesture_steps:
+            elapsed_step = timestamp - self._gesture_step_start_time
+            step_target = self._gesture_steps[self._gesture_step_idx]
+            head_settled = (
+                abs(angular_diff_deg(actual_head_yaw_deg, step_target)) <= 2.0
+                and abs(actual_head_vel_deg_s) <= self.velocity_tolerance_deg_s
+            )
+
+            if elapsed_step >= self._gesture_step_duration_s or head_settled:
+                self._gesture_step_idx += 1
+                if self._gesture_step_idx < len(self._gesture_steps):
+                    next_step = self._gesture_steps[self._gesture_step_idx]
+                    self._gesture_step_start_time = timestamp
+                    self._gesture_intent = GestureGazeIntent(
+                        gesture_name=self._active_gesture,
+                        target_yaw_deg=clamp_deg(next_step, self.min_limit_deg, self.max_limit_deg),
+                        confidence=1.0,
+                        timestamp=timestamp,
+                        valid=True,
+                    )
+                else:
+                    self._active_gesture = None
+                    self._gesture_steps = []
+                    self._gesture_intent = None
+
+        # 3. Arbitrate Attention Ownership
+        decision = self.arbiter.arbitrate(
+            target_state=target_state,
+            explicit_intent=self._explicit_intent,
+            dialogue_intent=self._dialogue_intent,
+            gesture_intent=self._gesture_intent,
+            safety_intent=self._safety_intent,
+            actual_head_yaw_deg=actual_head_yaw_deg,
+            timestamp=timestamp,
+        )
+        self.last_decision = decision
+        self.active_priority = decision.owner
+        self.active_target_id = decision.target_id
+
+        # 4. Check physical settling detection
         pos_err = abs(angular_diff_deg(actual_head_yaw_deg, self.target_yaw_deg))
         pos_ok = (pos_err <= self.position_tolerance_deg)
         vel_ok = (abs(actual_head_vel_deg_s) <= self.velocity_tolerance_deg_s)
@@ -178,107 +265,57 @@ class SocialGazeFSM:
 
         self.at_target = (self._settling_persistence_count >= self.settling_persistence_required)
 
-        # =========================================================================
-        # 1. PRIORITY ARBITRATION: SAFETY > GESTURE > DIALOGUE
-        # =========================================================================
-
-        # Priority 1: SAFETY / SLEEP
-        if self.safety_lock or self.is_sleeping:
-            self.active_priority = PrioritySource.SAFETY
+        # 5. Gaze Policy Lifecycle
+        if decision.owner == PrioritySource.EMERGENCY_STOP:
             self.target_yaw_deg = 0.0
-            self.active_target_id = None
             if abs(actual_head_yaw_deg) > 1.5:
-                self._transition_to(GazeStateEnum.RETURNING, timestamp)
+                self._transition_to(GazeStateEnum.RECOVERING, timestamp)
             else:
                 self._transition_to(GazeStateEnum.IDLE, timestamp)
-            return GazeCommand(
-                target_yaw_deg=0.0,
-                priority_source=PrioritySource.SAFETY,
-                gaze_state=self.state,
-                confidence=1.0,
-                timestamp=timestamp,
-            )
 
-        # Priority 2: GESTURE SEQUENCE
-        if self._active_gesture and self._gesture_steps:
-            self.active_priority = PrioritySource.GESTURE
-            elapsed_step = timestamp - self._gesture_step_start_time
-            step_target = self._gesture_steps[self._gesture_step_idx]
-            head_settled = (abs(angular_diff_deg(actual_head_yaw_deg, step_target)) <= 2.0 and
-                            abs(actual_head_vel_deg_s) <= self.velocity_tolerance_deg_s)
-
-            if elapsed_step >= self._gesture_step_duration_s or head_settled:
-                self._gesture_step_idx += 1
-                if self._gesture_step_idx < len(self._gesture_steps):
-                    self.target_yaw_deg = clamp_deg(
-                        self._gesture_steps[self._gesture_step_idx], self.min_limit_deg, self.max_limit_deg
-                    )
-                    self._gesture_step_start_time = timestamp
-                else:
-                    self._active_gesture = None
-                    self._gesture_steps = []
-                    self._last_speech_time = timestamp
-                    self._transition_to(GazeStateEnum.IDLE, timestamp)
-
-            return GazeCommand(
-                target_yaw_deg=self.target_yaw_deg,
-                priority_source=PrioritySource.GESTURE,
-                gaze_state=self.state,
-                confidence=1.0,
-                timestamp=timestamp,
-            )
-
-        # Priority 3: COGNITIVE DIALOGUE INTENT
-        if self._dialogue_target_yaw is not None:
-            if timestamp < self._dialogue_expiry_time:
-                self.active_priority = PrioritySource.DIALOGUE
-                self.target_yaw_deg = self._dialogue_target_yaw
-                self._transition_to(GazeStateEnum.HOLD, timestamp)
-                self._last_speech_time = timestamp
-                return GazeCommand(
-                    target_yaw_deg=self.target_yaw_deg,
-                    priority_source=PrioritySource.DIALOGUE,
-                    gaze_state=self.state,
-                    confidence=0.90,
-                    timestamp=timestamp,
-                )
+        elif decision.is_preemption:
+            # Explicit user command immediately preempts active attention without turn-taking dwell
+            self.target_yaw_deg = decision.target_yaw_deg
+            err_to_target = abs(angular_diff_deg(self.target_yaw_deg, actual_head_yaw_deg))
+            if err_to_target > 15.0:
+                self._transition_to(GazeStateEnum.ORIENTING, timestamp)
             else:
-                self._dialogue_target_yaw = None
+                self._transition_to(GazeStateEnum.HOLDING_ATTENTION, timestamp)
 
-        # =========================================================================
-        # 2. MULTIMODAL TARGET FSM (ACTIVE_SPEAKER & VISUAL_PERSON)
-        # =========================================================================
-
-        if active_target is not None:
-            self._last_target_observed_time = timestamp
-            self.active_target_id = active_target.target_id
-            target_yaw = clamp_deg(active_target.body_azimuth_deg, self.min_limit_deg, self.max_limit_deg)
+        elif decision.owner in (PrioritySource.ACTIVE_SPEAKER, PrioritySource.VISUAL_TRACKING):
+            target_yaw = decision.target_yaw_deg
             err_deg = abs(angular_diff_deg(target_yaw, actual_head_yaw_deg))
-
-            if active_target.is_speaking:
-                self._last_speech_time = timestamp
-                self.active_priority = PrioritySource.ACTIVE_SPEAKER
-            else:
-                self.active_priority = PrioritySource.VISUAL_PERSON
+            has_vision = (
+                target_state.active_target is not None
+                and target_state.active_target.modality in (Modality.FUSED, Modality.VISION)
+            )
 
             if self.state == GazeStateEnum.ORIENTING:
                 # Saccade in progress: update target if shifted by more than deadband
                 if abs(angular_diff_deg(target_yaw, self.target_yaw_deg)) >= self.deadband_deg:
                     self.target_yaw_deg = target_yaw
 
-                # Complete orientation ONLY when physically arrived and settled
+                # Complete orientation when arrived or timeout
                 if self.at_target or (timestamp - self._state_entry_time) >= 2.5:
-                    if active_target.modality in (Modality.FUSED, Modality.VISION):
+                    if has_vision or decision.owner == PrioritySource.VISUAL_TRACKING:
                         self._transition_to(GazeStateEnum.TRACKING, timestamp)
                     else:
-                        self._transition_to(GazeStateEnum.VISUAL_ACQUIRE, timestamp)
-            elif self.state in (GazeStateEnum.TRACKING, GazeStateEnum.HOLD) and active_target.modality == Modality.VISION:
-                # Smooth Visual Pursuit: Human face in view -> smoothly update setpoint without abrupt orienting saccades
+                        self._transition_to(GazeStateEnum.ACQUIRING, timestamp)
+
+            elif self.state in (GazeStateEnum.TRACKING, GazeStateEnum.HOLDING_ATTENTION):
+                # Visual Primacy: Human face in view -> smooth visual pursuit without orienting resets
                 if abs(angular_diff_deg(target_yaw, self.target_yaw_deg)) >= self.deadband_deg:
                     self.target_yaw_deg = target_yaw
-                self._transition_to(GazeStateEnum.TRACKING, timestamp)
+
+                if has_vision or decision.owner == PrioritySource.VISUAL_TRACKING:
+                    self._transition_to(GazeStateEnum.TRACKING, timestamp)
+                else:
+                    if err_deg > 15.0:
+                        self.target_yaw_deg = target_yaw
+                        self._transition_to(GazeStateEnum.ORIENTING, timestamp)
+
             else:
-                # Initiate orienting saccade if outside narrow tracking window (>15°)
+                # Initiating from IDLE or RECOVERING
                 if err_deg > 15.0:
                     self.target_yaw_deg = target_yaw
                     self._settling_persistence_count = 0
@@ -288,48 +325,51 @@ class SocialGazeFSM:
                     if abs(angular_diff_deg(target_yaw, self.target_yaw_deg)) >= self.deadband_deg:
                         self.target_yaw_deg = target_yaw
 
-                    if active_target.modality in (Modality.FUSED, Modality.VISION):
+                    if has_vision or decision.owner == PrioritySource.VISUAL_TRACKING:
                         self._transition_to(GazeStateEnum.TRACKING, timestamp)
                     else:
-                        self._transition_to(GazeStateEnum.VISUAL_ACQUIRE, timestamp)
+                        self._transition_to(GazeStateEnum.ACQUIRING, timestamp)
+
+        elif decision.owner in (PrioritySource.DIRECT_DIALOGUE_INTENT, PrioritySource.GESTURE_INTENT):
+            self.target_yaw_deg = decision.target_yaw_deg
+            err_deg = abs(angular_diff_deg(self.target_yaw_deg, actual_head_yaw_deg))
+            if err_deg > 15.0 and not self.at_target:
+                self._transition_to(GazeStateEnum.ORIENTING, timestamp)
+            else:
+                self._transition_to(GazeStateEnum.HOLDING_ATTENTION, timestamp)
 
         else:
-            # Active target is absent (no speech / no face)
-            self.active_target_id = None
-            self.active_priority = PrioritySource.IDLE
-
+            # PrioritySource.IDLE: No active targets or intents
             if self.state == GazeStateEnum.ORIENTING:
-                # Do NOT abort orientation mid-flight! Wait for head to arrive and settle
-                if self.at_target or (timestamp - self._state_entry_time) >= 3.0:
-                    self._transition_to(GazeStateEnum.VISUAL_ACQUIRE, timestamp)
+                if self.at_target or (timestamp - self._state_entry_time) >= 2.5:
+                    self._transition_to(GazeStateEnum.ACQUIRING, timestamp)
 
-            elif self.state == GazeStateEnum.VISUAL_ACQUIRE:
+            elif self.state == GazeStateEnum.ACQUIRING:
                 scan_elapsed = timestamp - self._state_entry_time
                 if scan_elapsed >= 0.80:
-                    self._transition_to(GazeStateEnum.HOLD, timestamp)
+                    self._transition_to(GazeStateEnum.HOLDING_ATTENTION, timestamp)
 
             elif self.state == GazeStateEnum.TRACKING:
-                self._transition_to(GazeStateEnum.HOLD, timestamp)
+                self._transition_to(GazeStateEnum.HOLDING_ATTENTION, timestamp)
 
-            elif self.state == GazeStateEnum.HOLD:
+            elif self.state == GazeStateEnum.HOLDING_ATTENTION:
                 dwell_elapsed = timestamp - self._state_entry_time
                 if dwell_elapsed >= self.min_attention_dwell_s:
                     self._transition_to(GazeStateEnum.TARGET_LOST, timestamp)
 
-
             elif self.state == GazeStateEnum.TARGET_LOST:
                 time_lost = timestamp - self._state_entry_time
                 if time_lost >= self.target_lost_timeout_s:
-                    self._transition_to(GazeStateEnum.RETURNING, timestamp)
+                    self._transition_to(GazeStateEnum.RECOVERING, timestamp)
 
-            elif self.state == GazeStateEnum.RETURNING:
+            elif self.state == GazeStateEnum.RECOVERING:
                 self.target_yaw_deg = 0.0
                 if abs(actual_head_yaw_deg) <= 1.5 and abs(actual_head_vel_deg_s) <= self.velocity_tolerance_deg_s:
                     self._transition_to(GazeStateEnum.IDLE, timestamp)
 
             elif self.state == GazeStateEnum.IDLE:
+                # In empty room: NO random motion, hold 0.0° center
                 self.target_yaw_deg = 0.0
-
                 if self.idle_saccades_enabled:
                     time_since_saccade = timestamp - self._last_idle_saccade_time
                     if time_since_saccade >= self.idle_saccade_interval_s:
@@ -343,7 +383,7 @@ class SocialGazeFSM:
             priority_source=self.active_priority,
             gaze_state=self.state,
             active_target_id=self.active_target_id,
-            confidence=round(active_target.confidence if active_target else 0.0, 2),
+            confidence=round(decision.confidence, 2),
             timestamp=timestamp,
         )
 
