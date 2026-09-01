@@ -42,6 +42,14 @@ except ImportError:
             return None
         def create_timer(self, *args, **kwargs):
             return None
+        def declare_parameter(self, *args, **kwargs):
+            return None
+        def has_parameter(self, *args, **kwargs):
+            return False
+        def get_parameter(self, *args, **kwargs):
+            class _Param:
+                value = None
+            return _Param()
         def destroy_node(self):
             pass
     class _MockMsg:
@@ -233,7 +241,11 @@ class AudioStreamNode(Node):
 
     def __init__(self):
         super().__init__("audio_stream_node")
-        self.declare_parameter("input_channels", 0)
+        if hasattr(self, "declare_parameter"):
+            try:
+                self.declare_parameter("input_channels", 0)
+            except Exception:
+                pass
 
         # Publishers
         self.pub_input_pcm = self.create_publisher(String, "/audio/realtime_input_pcm", 20)

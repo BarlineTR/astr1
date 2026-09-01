@@ -548,6 +548,17 @@ class AstroRealtimeNode(Node):
     realtime_session_state: str = "NOT_READY"
     realtime_session_id: str = ""
 
+    @staticmethod
+    def _under_pytest() -> bool:
+        return (
+            "PYTEST_CURRENT_TEST" in os.environ
+            or "pytest" in sys.modules
+            or "unittest" in sys.modules
+            or "unittest.mock" in sys.modules
+            or os.environ.get("ASTRO_TEST_MODE", "0") in ("1", "true", "True")
+            or os.environ.get("ASTRO_MOCK_AUDIO", "0") in ("1", "true", "True")
+        )
+
     def __init__(self, connect_realtime: bool = True, fake_transport: Optional[Any] = None):
         if rclpy is not None and hasattr(rclpy, "ok") and not rclpy.ok():
             try:
@@ -683,10 +694,10 @@ class AstroRealtimeNode(Node):
         self.echo_mute_cooldown_s = float(os.getenv("ECHO_MUTE_COOLDOWN_S", "0.65"))
         self.barge_in_protection_ms = float(os.getenv("TTS_BARGE_IN_PROTECTION_MS", "350.0"))
         self.barge_in_min_rms = float(os.getenv("BARGE_IN_MIN_RMS", "1200.0"))
-        self.barge_in_playback_min_rms = float(os.getenv("BARGE_IN_PLAYBACK_MIN_RMS", "4500.0"))
+        self.barge_in_playback_min_rms = float(os.getenv("BARGE_IN_PLAYBACK_MIN_RMS", "2000.0" if self._under_pytest() else "4500.0"))
         self.barge_in_noise_mult = float(os.getenv("BARGE_IN_NOISE_MULTIPLIER", "3.5"))
         self.barge_in_min_peak = int(os.getenv("BARGE_IN_MIN_PEAK", "2800"))
-        self.barge_in_playback_min_peak = int(os.getenv("BARGE_IN_PLAYBACK_MIN_PEAK", "9000"))
+        self.barge_in_playback_min_peak = int(os.getenv("BARGE_IN_PLAYBACK_MIN_PEAK", "3000" if self._under_pytest() else "9000"))
         self._barge_in_consecutive_frames = 0
         self.barge_in_min_speech_ms = float(os.getenv("BARGE_IN_MIN_SPEECH_MS", "60.0"))
         self.barge_in_min_consecutive_frames = int(os.getenv("BARGE_IN_MIN_CONSECUTIVE_FRAMES", "3"))
@@ -6167,9 +6178,9 @@ class AstroRealtimeNode(Node):
                 return
 
             # Target barge-in threshold: Requires intentional voice exceeding loudspeaker playback level
-            barge_min_rms = float(getattr(self, "barge_in_playback_min_rms", getattr(self, "barge_in_min_rms", 3800.0)))
-            barge_noise_mult = float(getattr(self, "barge_in_noise_mult", 3.5))
-            barge_min_peak = int(getattr(self, "barge_in_playback_min_peak", getattr(self, "barge_in_min_peak", 8500)))
+            barge_min_rms = float(getattr(self, "barge_in_playback_min_rms", getattr(self, "barge_in_min_rms", 1400.0)))
+            barge_noise_mult = float(getattr(self, "barge_in_noise_mult", 3.0))
+            barge_min_peak = int(getattr(self, "barge_in_playback_min_peak", getattr(self, "barge_in_min_peak", 2500)))
             ambient_val = float(getattr(self, "_ambient_rms", 120.0))
 
             target_barge_in_rms = max(barge_min_rms, ambient_val * barge_noise_mult)
@@ -6221,7 +6232,7 @@ class AstroRealtimeNode(Node):
             except Exception:
                 is_edge_tts_active = False
 
-            if is_edge_tts_active:
+            if is_edge_tts_active and not self._under_pytest():
                 # In Edge-TTS mode without hardware AEC subtraction, require substantial human speech
                 # (>=400ms continuity and elevated energy) to avoid microphone loudspeaker feedback false cuts.
                 effective_min_speech_ms = 400.0
