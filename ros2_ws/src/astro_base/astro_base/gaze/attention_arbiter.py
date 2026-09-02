@@ -102,12 +102,16 @@ class AttentionArbiterCore:
                     elif explicit_intent.target_yaw_deg is not None:
                         chosen_yaw = explicit_intent.target_yaw_deg
                         decision_reason = "EXPLICIT_EXACT_ANGLE"
+                    elif target_state.active_target is not None:
+                        chosen_target_id = target_state.active_target.target_id
+                        chosen_yaw = target_state.active_target.body_azimuth_deg
+                        decision_reason = f"EXPLICIT_ACTIVE_TARGET_{target_state.active_target.target_id}"
                     elif target_state.candidate_targets:
-                        # Fallback: Best visual candidate
+                        # Fallback: Best candidate
                         best_vis = target_state.candidate_targets[0]
                         chosen_target_id = best_vis.target_id
                         chosen_yaw = best_vis.body_azimuth_deg
-                        decision_reason = f"EXPLICIT_FALLBACK_VISUAL_{best_vis.target_id}"
+                        decision_reason = f"EXPLICIT_FALLBACK_CANDIDATE_{best_vis.target_id}"
                     elif self.spatial_memory is not None and self.spatial_memory.get_most_likely_person_location(timestamp) is not None:
                         chosen_yaw = self.spatial_memory.get_most_likely_person_location(timestamp)
                         decision_reason = "EXPLICIT_SPATIAL_MEMORY_PERSON"

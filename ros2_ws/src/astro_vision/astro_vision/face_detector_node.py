@@ -96,7 +96,7 @@ class SpatialVisionNode(Node):
         self.face_engine: Optional[FaceEngine] = None
         if FaceEngine is not None:
             try:
-                self.face_engine = FaceEngine(detect_threshold=0.6)
+                self.face_engine = FaceEngine(detect_threshold=0.45)
                 self.get_logger().info("🚀 [Spatial Vision] YuNet Deep Learning (3.9ms) + SFace motoru aktif!")
             except Exception as exc:
                 self.get_logger().warn(f"⚠️ [Spatial Vision] YuNet modeli yüklenemedi ({exc}), Haar kaskadı yedeği kullanılacak.")
@@ -280,41 +280,26 @@ class SpatialVisionNode(Node):
 
         detected_faces = []
 
-        # Downscale for ultra-fast deep learning inference (YuNet optimal input: 480-640 px)
-        scale_ratio = 480.0 / float(frame_w) if frame_w > 480 else 1.0
-        if scale_ratio < 1.0:
-            target_w = 480
-            target_h = int(frame_h * scale_ratio)
-            detect_frame = cv2.resize(frame, (target_w, target_h), interpolation=cv2.INTER_LINEAR)
-        else:
-            detect_frame = frame
-            target_w, target_h = frame_w, frame_h
-
         # =====================================================================
-        # 1. PRIMARY: YuNet ONNX Deep Learning Face Detection (~3.5 ms)
+        # 1. PRIMARY: YuNet ONNX Deep Learning Face Detection (FaceEngine)
         # =====================================================================
         if self.face_engine is not None:
             try:
-                self.face_engine.setInputSize((target_w, target_h))
-                raw_faces = self.face_engine.detect(detect_frame)
+                raw_faces = self.face_engine.detect(frame)
                 if raw_faces is not None and len(raw_faces) > 0:
-                    inv_scale = 1.0 / scale_ratio
                     for f in raw_faces:
                         if len(f) >= 15:
-                            fx = int(f[0] * inv_scale)
-                            fy = int(f[1] * inv_scale)
-                            fw = int(f[2] * inv_scale)
-                            fh = int(f[3] * inv_scale)
-                            # Clamp within original frame bounds
+                            fx, fy, fw, fh = int(f[0]), int(f[1]), int(f[2]), int(f[3])
+                            # Clamp within frame bounds
                             fx = max(0, min(frame_w - 1, fx))
                             fy = max(0, min(frame_h - 1, fy))
                             fw = max(1, min(frame_w - fx, fw))
                             fh = max(1, min(frame_h - fy, fh))
                             conf = float(f[14])
-                            landmarks = (f[4:14] * inv_scale) if f[4:14] is not None else None
+                            landmarks = f[4:14] if len(f) >= 14 else None
                             detected_faces.append((fx, fy, fw, fh, conf, landmarks))
             except Exception as _exc:
-                self.get_logger().debug(f"YuNet detect exception ({_exc})")
+                self.get_logger().warn(f"YuNet detect error: {_exc}")
 
         # =====================================================================
         # 2. FALLBACK: Haar Cascade MultiScale

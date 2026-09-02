@@ -354,12 +354,12 @@ class SocialGazeNode(Node):
         """Processes float DOA angle in degrees."""
         t = time.monotonic()
         raw_val = float(msg.data)
+        conf = self._latest_doa_confidence if self._latest_doa_confidence > 0.1 else 0.85
         obs = self.audio_perception.process_raw_doa(
             raw_doa_deg=raw_val,
             timestamp=t,
             actual_head_yaw_deg=self.actual_head_yaw_deg,
-            # Bug #4 fix: use the latched GCC-PHAT confidence instead of 0.85
-            confidence=self._latest_doa_confidence,
+            confidence=conf,
             is_robot_speaking=self.is_robot_speaking,
         )
         if not obs.valid:
