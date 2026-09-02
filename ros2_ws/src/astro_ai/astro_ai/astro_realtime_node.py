@@ -783,15 +783,27 @@ class AstroRealtimeNode(Node):
                 except Exception as e:
                     self.get_logger().warn(f"⚠️ [ElevenLabs TTS] Başlatma uyarısı: {e}")
 
-        # XTTS is DORMANT / DISABLED by production policy (0 spawn, 0 RAM overhead)
+        # XTTS Fine-Tuned GPU Voice Engine (Activated if checkpoint is configured)
         self.local_xtts: Optional[LocalXttsEngine] = None
-        self._safe_log(
-            "info",
-            "ℹ️ [XTTS] Runtime disabled by production policy\n"
-            "  model_retained=True\n"
-            "  worker_spawn=False\n"
-            "  reason=production_runtime_disabled"
-        )
+        xtts_ckpt = os.getenv("TTS_XTTS_CHECKPOINT", "")
+        if xtts_ckpt and os.path.exists(xtts_ckpt) and LocalXttsEngine:
+            try:
+                self.local_xtts = LocalXttsEngine(
+                    checkpoint_path=xtts_ckpt,
+                    config_path=os.getenv("TTS_XTTS_CONFIG", ""),
+                    vocab_path=os.getenv("TTS_XTTS_VOCAB", ""),
+                    speaker_wav=os.getenv("TTS_XTTS_SPEAKER_WAV", ""),
+                    logger=self._safe_log,
+                )
+                self.get_logger().info(f"🎙️ [Local XTTS GPU Engine]: Fine-tuned ses modeli bağlandı -> {xtts_ckpt}")
+            except Exception as e:
+                self.local_xtts = None
+                self.get_logger().warn(f"⚠️ [Local XTTS Engine]: Başlatılamadı ({e})")
+        else:
+            self._safe_log(
+                "info",
+                "ℹ️ [XTTS] Checkpoint bulunamadı veya belirtilmedi, standart TTS zinciri devrede."
+            )
 
         # Local Offline Backup TTS Engine (Zero internet local resilience fallback)
         self.local_offline_tts: Optional[LocalOfflineTTSEngine] = None
@@ -5570,8 +5582,14 @@ class AstroRealtimeNode(Node):
             speaker_display = spk_name if spk_name else "null"
             self.get_logger().info(f"👤 [Speaker Context] speaker={speaker_display} confidence={spk_score:.2f} source={spk_source}")
 
-            # 5. Select Atomic TTS Owner for this turn (Realtime Fallback -> Edge-TTS -> Local Offline)
-            if getattr(self, "edge_tts_enabled", True):
+            # 5. Select Atomic TTS Owner for this turn (XTTS Fine-Tuned GPU -> Edge-TTS -> Local Offline)
+            if self.local_xtts and self.local_xtts.is_ready():
+                turn_tts_engine = "xtts_gpu"
+                tts_ready_flag = True
+                tts_mode_str = "local_gpu"
+                tts_source_name = "xtts_worker"
+                tts_model_name = "xtts_finetuned"
+            elif getattr(self, "edge_tts_enabled", True):
                 turn_tts_engine = "edge_tts"
                 tts_ready_flag = True
                 tts_mode_str = "network_cloud"
