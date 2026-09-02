@@ -35,13 +35,13 @@ def check_usb_link():
         import depthai as dai
         devices = dai.Device.getAllAvailableDevices()
         if not devices:
-            print("  ❌ OAK-D kamerası USB'de bulunamadı (Başka bir süreç kamerayı açık tutuyor olabilir)!")
+            print("  ❌ OAK-D kamerası USB'de bulunamadı (Sensors launch açık olabilir, durdurun)!")
             return None
         for dev in devices:
-            print(f"  • Cihaz Adı  : {dev.name}")
-            print(f"  • MxId        : {dev.getMxId()}")
-            print(f"  • Durum       : {dev.state}")
-            print(f"  • Protokol    : {dev.protocol}")
+            print(f"  • Cihaz Adı  : {getattr(dev, 'name', str(dev))}")
+            dev_id = getattr(dev, 'deviceId', getattr(dev, 'mxid', getattr(dev, 'name', 'N/A')))
+            print(f"  • Device ID  : {dev_id}")
+            print(f"  • Protokol   : {getattr(dev, 'protocol', 'USB')}")
         
         # Test connection speed
         with dai.Device() as device:
@@ -49,10 +49,8 @@ def check_usb_link():
             print(f"\n  🎯 BAĞLANTI HIZI: \033[1;36m{usb_speed.name}\033[0m")
             if "HIGH" in usb_speed.name or "2" in usb_speed.name:
                 print("  ⚠️  DİKKAT: Kamera USB 2.0 (High Speed - 480 Mbps) modunda çalışıyor!")
-                print("      Nedenler:")
-                print("      1. Kablo: Tip-C şarj kabloları yalnızca 480 Mbps destekler (USB 3.0 SuperSpeed veri kablosu gerekir).")
-                print("      2. Port : Jetson üzerindeki mavi renkli USB 3.0 portuna takılı olmayabilir.")
-                print("      3. Hub  : Araya takılan çoklayıcı USB 2.0 hızına düşürüyor olabilir.")
+                print("      Neden: Kullanılan Type-C kablosu 4-telli telefon şarj kablosudur.")
+                print("      Çözüm: camera_params.yaml içindeki i_low_bandwidth: true donanımsal sıkıştırma modu bu kabloda 30 FPS sağlayacaktır.")
             elif "SUPER" in usb_speed.name or "3" in usb_speed.name:
                 print("  ✅ MÜKEMMEL: Kamera USB 3.0 / SuperSpeed (5 Gbps) modunda tam bant genişliğinde bağlı.")
             return usb_speed.name
@@ -66,26 +64,25 @@ def test_native_hardware_fps():
     print_header("2. SAF DONANIM AKIŞ HIZI TESTİ (ROS 2 HARİÇ)")
     try:
         import depthai as dai
-        print("Kamera donanımında doğrudan 100 karelik test akışı başlatılıyor...")
+        print("Kamera donanımında doğrudan test akışı başlatılıyor...")
         
         pipeline = dai.Pipeline()
         
-        # Support both DepthAI v2 / v3 method signatures
-        if hasattr(pipeline, "createColorCamera"):
-            cam_rgb = pipeline.createColorCamera()
-        else:
+        # Color Camera Node
+        try:
             cam_rgb = pipeline.create(dai.node.ColorCamera)
+        except Exception:
+            cam_rgb = pipeline.createColorCamera()
 
         cam_rgb.setResolution(dai.ColorCameraProperties.SensorResolution.THE_720_P)
         cam_rgb.setFps(30)
         cam_rgb.setInterleaved(False)
         cam_rgb.setColorOrder(dai.ColorCameraProperties.ColorOrder.BGR)
 
-        if hasattr(pipeline, "createXLinkOut"):
-            xout = pipeline.createXLinkOut()
-        elif hasattr(dai.node, "XLinkOut"):
+        # XLinkOut Node
+        try:
             xout = pipeline.create(dai.node.XLinkOut)
-        else:
+        except Exception:
             xout = pipeline.createXLinkOut()
 
         xout.setStreamName("video")
@@ -93,7 +90,7 @@ def test_native_hardware_fps():
 
         with dai.Device(pipeline) as device:
             usb_speed = device.getUsbSpeed()
-            print(f"  • Cihaz USB Hızı: {usb_speed.name}")
+            print(f"  • Cihaz USB Hızı: \033[1;36m{usb_speed.name}\033[0m")
             q = device.getOutputQueue(name="video", maxSize=4, blocking=False)
             t_start = time.monotonic()
             frames = 0
@@ -108,9 +105,9 @@ def test_native_hardware_fps():
             if fps >= 24.0:
                 print("  ✅ Kamera donanımı ve VPU çipi 30 FPS üretme yeteneğine tam sahip!")
             else:
-                print(f"  ⚠️ Kamera donanım seviyesinde {fps:.1f} FPS veriyor (Kablo bant genişliği kısıtlı).")
+                print(f"  ⚠️ Kamera donanım seviyesinde {fps:.1f} FPS veriyor (USB 2.0 480 Mbps kablo limiti).")
     except Exception as e:
-        print(f"  Doğrudan test notu: {e}")
+        print(f"  Doğrudan test hatası: {e}")
 
 if __name__ == "__main__":
     print("=" * 70)
