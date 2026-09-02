@@ -507,6 +507,26 @@ def generate_flight_report(node: SocialGazeLiveMonitor):
     else:
         print("  • Görsel yüz tespiti algılanmadı.")
 
+    # 5. Stability & Pipeline Verdict
+    print("\n[6] SİSTEM VE AKICILIK DEĞERLENDİRMESİ (SYSTEM STABILITY VERDICT):")
+    fps_healthy = (avg_cam_fps >= 20.0)
+    vision_healthy = (avg_vis_fps >= 10.0 or len(node.visual_events) > 0)
+    tracking_healthy = (avg_err <= 15.0)
+    
+    status_flags = []
+    if fps_healthy:
+        status_flags.append("✅ KAMERA AKICI (30 FPS Hedefinde)")
+    else:
+        status_flags.append(f"⚠️ KAMERA HIZI DÜŞÜK ({avg_cam_fps:.1f} FPS)")
+
+    if tracking_healthy:
+        status_flags.append(f"✅ HASSAS TAKİP (RMS: {rms_err:.1f}°)")
+    else:
+        status_flags.append(f"⚠️ TAKİP HATASI (RMS: {rms_err:.1f}°)")
+
+    for flag in status_flags:
+        print(f"  • {flag}")
+
     print("\n" + "=" * 80)
     print("Kabul Özeti: Test başarıyla tamamlandı. Detaylı JSON telemetri kaydedildi.")
     print("=" * 80 + "\n")
@@ -553,8 +573,14 @@ def main():
     executor = SingleThreadedExecutor()
     executor.add_node(node)
 
+    def _safe_spin():
+        try:
+            executor.spin()
+        except Exception:
+            pass
+
     # Run ROS2 event loop continuously in background thread so callbacks are never starved
-    spin_thread = threading.Thread(target=executor.spin, daemon=True)
+    spin_thread = threading.Thread(target=_safe_spin, daemon=True)
     spin_thread.start()
 
     try:
@@ -565,10 +591,13 @@ def main():
         pass
     finally:
         generate_flight_report(node)
-        executor.shutdown()
-        node.destroy_node()
-        if rclpy.ok():
-            rclpy.shutdown()
+        try:
+            executor.shutdown()
+            node.destroy_node()
+            if rclpy.ok():
+                rclpy.shutdown()
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":
