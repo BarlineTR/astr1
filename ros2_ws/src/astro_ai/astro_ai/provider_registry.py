@@ -97,9 +97,14 @@ class ModelCapability:
 
 
 # Approved Production Chat & Vision LLM Models (Strict Whitelist)
+# Approved Production Chat & Vision LLM Models (Strict Whitelist)
 GROQ_PRODUCTION_MODELS: Set[str] = {
     "llama-3.3-70b-versatile",
     "llama-3.1-8b-instant",
+    "llama3-70b-8192",
+    "llama3-8b-8192",
+    "gemma2-9b-it",
+    "mixtral-8x7b-32768",
     "openai/gpt-oss-20b",
     "openai/gpt-oss-120b",
     "llama-3.2-11b-vision-preview",
@@ -108,7 +113,11 @@ GROQ_PRODUCTION_MODELS: Set[str] = {
 
 GROQ_PREFERENCE_ORDER: List[str] = [
     "llama-3.3-70b-versatile",
+    "llama3-70b-8192",
     "llama-3.1-8b-instant",
+    "llama3-8b-8192",
+    "gemma2-9b-it",
+    "mixtral-8x7b-32768",
     "openai/gpt-oss-20b",
     "openai/gpt-oss-120b",
 ]

@@ -789,10 +789,12 @@ class AstroRealtimeNode(Node):
         if xtts_ckpt and os.path.exists(xtts_ckpt) and LocalXttsEngine:
             try:
                 self.local_xtts = LocalXttsEngine(
-                    checkpoint_path=xtts_ckpt,
-                    config_path=os.getenv("TTS_XTTS_CONFIG", ""),
-                    vocab_path=os.getenv("TTS_XTTS_VOCAB", ""),
+                    checkpoint=xtts_ckpt,
+                    config=os.getenv("TTS_XTTS_CONFIG", ""),
+                    vocab=os.getenv("TTS_XTTS_VOCAB", ""),
+                    speakers=os.getenv("TTS_XTTS_SPEAKERS", ""),
                     speaker_wav=os.getenv("TTS_XTTS_SPEAKER_WAV", ""),
+                    model_dir=os.getenv("TTS_XTTS_MODEL_DIR", ""),
                     logger=self._safe_log,
                 )
                 self.get_logger().info(f"🎙️ [Local XTTS GPU Engine]: Fine-tuned ses modeli bağlandı -> {xtts_ckpt}")

@@ -468,7 +468,7 @@ class SocialGazeFSM:
 
             elif self.state == GazeStateEnum.RECOVERING:
                 self.target_yaw_deg = 0.0
-                if abs(actual_head_yaw_deg) <= 1.5 and abs(actual_head_vel_deg_s) <= self.velocity_tolerance_deg_s:
+                if (abs(actual_head_yaw_deg) <= 3.0 and abs(actual_head_vel_deg_s) <= self.velocity_tolerance_deg_s) or (timestamp - self._state_entry_time) >= 2.5:
                     self.active_target_id = None
                     self.active_priority = PrioritySource.IDLE
                     self._transition_to(GazeStateEnum.IDLE, timestamp, reason="RECOVERY_SETTLED_IDLE")
