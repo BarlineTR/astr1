@@ -3,15 +3,24 @@
     camera:
       i_nn_type: "none"
       i_enable_imu: false
-    i_pipeline_type: "RGBD"
+      i_pipeline_type: "RGBD"
+      i_publish_synced_rect_pair: false
     rgb:
       i_resolution: "720P"
       i_fps: 30.0
       i_publish_topic: true
+    left:
+      i_resolution: "400P"
+      i_fps: 30.0
+    right:
+      i_resolution: "400P"
+      i_fps: 30.0
     stereo:
       i_enabled: true
-      i_depth_filter_size: 5
-      i_lr_check: true
+      i_align_depth: true
+      i_subpixel: false
+      i_lr_check: false
+      i_depth_filter_size: 0
 
 webcam_publisher_node:
   ros__parameters:
@@ -20,18 +29,15 @@ webcam_publisher_node:
     output_topic: "/oak/rgb/image_raw"
     width: 640
     height: 480
-    fps: 15.0
+    fps: 30.0
 
 face_detector_node:
   ros__parameters:
     input_topic: "/oak/rgb/image_raw"
-    # Her kareyi tanımaya gerek yok; 3 = her 3. kare (30 FPS'te ~10 Hz)
+    depth_topic: "/oak/stereo/image_raw"
     process_every_n: 3
-    # SFace kosinüs eşiği: yükseltmek yanlış tanımayı azaltır, tanımayı zorlaştırır
-    match_threshold: 0.363
-    # İsim yayınlanmadan önce üst üste kaç karede aynı çıkmalı (titremeyi önler)
+    match_threshold: 0.45
     stable_frames: 3
-    # Aşağıdakiler yalnızca yüz modelleri yoksa (Haar yedeği) kullanılır
     scale_factor: 1.1
     min_neighbors: 5
     min_size: 30
