@@ -148,6 +148,7 @@ class SocialGazeLiveMonitor(Node):
         # =====================================================================
         # Camera Stream
         self.create_subscription(Image, "/oak/rgb/image_raw", self._on_camera_image, qos_profile_sensor_data)
+        self.create_subscription(Image, "/camera/color/image_raw", self._on_camera_image, qos_profile_sensor_data)
         self.create_subscription(Image, "/vision/face_image", self._on_debug_face_image, qos_profile_sensor_data)
 
         # Vision Pipeline
@@ -545,15 +546,26 @@ def generate_flight_report(node: SocialGazeLiveMonitor):
 def main():
     rclpy.init()
     node = SocialGazeLiveMonitor()
+    
+    from rclpy.executors import SingleThreadedExecutor
+    import threading
+
+    executor = SingleThreadedExecutor()
+    executor.add_node(node)
+
+    # Run ROS2 event loop continuously in background thread so callbacks are never starved
+    spin_thread = threading.Thread(target=executor.spin, daemon=True)
+    spin_thread.start()
 
     try:
         while rclpy.ok():
-            rclpy.spin_once(node, timeout_sec=0.1)
+            time.sleep(0.1)  # 10 Hz dashboard refresh rate
             render_dashboard(node)
     except KeyboardInterrupt:
         pass
     finally:
         generate_flight_report(node)
+        executor.shutdown()
         node.destroy_node()
         if rclpy.ok():
             rclpy.shutdown()
