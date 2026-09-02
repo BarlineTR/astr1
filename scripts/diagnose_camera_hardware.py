@@ -77,17 +77,19 @@ def test_native_hardware_fps():
             cam_rgb.setFps(30)
 
         # Discover XLinkOut class
-        xlink_cls = getattr(dai.node, "XLinkOut", getattr(dai, "XLinkOut", None))
-        if xlink_cls is None:
-            for name in dir(dai.node):
-                if "xlink" in name.lower() and "out" in name.lower():
-                    xlink_cls = getattr(dai.node, name)
+        xlink_cls = None
+        for mod in (dai.node, dai):
+            for name in dir(mod):
+                val = getattr(mod, name, None)
+                if isinstance(val, type) and "xlink" in name.lower() and "out" in name.lower():
+                    xlink_cls = val
                     break
+            if xlink_cls is not None:
+                break
+
         if xlink_cls is None:
-            for name in dir(dai):
-                if "xlink" in name.lower() and "out" in name.lower():
-                    xlink_cls = getattr(dai, name)
-                    break
+            print("  ⚠️ XLinkOut sınıfı bulunamadı.")
+            return
 
         xout = pipeline.create(xlink_cls)
         xout.setStreamName("video")
