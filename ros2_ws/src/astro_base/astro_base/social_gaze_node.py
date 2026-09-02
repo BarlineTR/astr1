@@ -37,27 +37,62 @@ except ImportError:
         @staticmethod
         def init(*args, **kwargs): pass
     rclpy = _MockRclpy()
+
+    class _MockParam:
+        def __init__(self, val): self.value = val
+        def get_parameter_value(self):
+            class _Val:
+                def __init__(self, v):
+                    self.string_value = str(v) if v is not None else ""
+                    self.double_value = float(v) if isinstance(v, (int, float)) else 0.0
+                    self.integer_value = int(v) if isinstance(v, (int, float)) else 0
+                    self.bool_value = bool(v)
+            return _Val(self.value)
+
+    class _MockPublisher:
+        """Captures published messages so headless tests can assert on node output."""
+        def __init__(self, topic): self.topic = topic; self.last_msg = None; self.count = 0
+        def publish(self, msg): self.last_msg = msg; self.count += 1
+
+    class _MockClock:
+        def now(self):
+            class _Time:
+                def to_msg(self): return None
+            return _Time()
+
     class Node:
-        def __init__(self, *args, **kwargs): pass
-        def create_publisher(self, *args, **kwargs): return None
+        def __init__(self, *args, **kwargs):
+            self._params = {}
+        def create_publisher(self, msg_type, topic, *args, **kwargs):
+            return _MockPublisher(topic)
         def create_subscription(self, *args, **kwargs): return None
         def create_timer(self, *args, **kwargs): return None
+        def get_clock(self): return _MockClock()
         def get_logger(self):
             import logging
             return logging.getLogger("SocialGazeNode")
-        def declare_parameter(self, *args, **kwargs): pass
+        def declare_parameter(self, name, value=None, *args, **kwargs):
+            # Remembering the declared default is what lets the headless harness
+            # exercise the node's real thresholds instead of empty-string stubs.
+            self._params[name] = value
+            return _MockParam(value)
         def get_parameter(self, name):
-            class _MockParam:
-                def __init__(self, val=""): self.value = val
-                def get_parameter_value(self):
-                    class _Val:
-                        def __init__(self, v):
-                            self.string_value = str(v)
-                            self.integer_value = int(v) if isinstance(v, (int, float)) else 0
-                    return _Val(0)
-            return _MockParam()
-    QoSProfile = ReliabilityPolicy = object
-    Bool = Float32 = Header = Int32 = String = JointState = object
+            return _MockParam(self._params.get(name))
+    class QoSProfile:
+        def __init__(self, *args, **kwargs): pass
+
+    class ReliabilityPolicy:
+        BEST_EFFORT = 0
+        RELIABLE = 1
+
+    class _MockMsg:
+        """Assignable stand-in for std_msgs/sensor_msgs types."""
+        def __init__(self, data=None, **kwargs):
+            self.data = data
+            for key, val in kwargs.items():
+                setattr(self, key, val)
+
+    Bool = Float32 = Header = Int32 = String = JointState = _MockMsg
     GazeStatus = HeadCmd = HeadState = None
 
 from astro_base.gaze.audio_filter import AudioFilterCore
@@ -90,6 +125,15 @@ from astro_base.gaze.types import (
 )
 from astro_base.gaze.visual_perception import VisualPerceptionCore
 from astro_base.gaze.visual_tracker import VisualTrackerCore
+
+
+# Credited to a detection whose publisher reports no confidence of its own.
+# It has to clear the target manager's 0.40 hold threshold — an unscored person is
+# still a person, and dropping them would be worse than the bug — while staying
+# under the 0.75 acquisition threshold, so a lone unscored frame cannot seize the
+# head. Corroboration (a detector score, or speech from the same bearing) is what
+# lifts such a candidate to active target.
+UNSCORED_DETECTION_CONFIDENCE = 0.65
 
 
 class SocialGazeNode(Node):
@@ -194,6 +238,8 @@ class SocialGazeNode(Node):
         self.actual_head_yaw_deg: float = 0.0
         self.actual_head_vel_deg_s: float = 0.0
         self.is_robot_speaking: bool = False
+        # Last head POSE yaw reported on /vision/head_yaw (see _on_vision_head_yaw).
+        self.latest_person_head_yaw_deg: float = 0.0
 
         # -------------------------------------------------------------------------
         # 4. ROS 2 Publishers & Subscriptions
@@ -311,25 +357,19 @@ class SocialGazeNode(Node):
         )
 
     def _on_vision_head_yaw(self, msg: Float32) -> None:
-        """Processes 1D estimated head yaw as a fallback visual measurement."""
-        t = time.monotonic()
-        cam_azimuth = float(msg.data)
-        obs = self.visual_perception.process_detection(
-            x=320,
-            y=240,
-            w=60,
-            h=60,
-            depth_m=1.5,
-            timestamp=t,
-            actual_head_yaw_deg=self.actual_head_yaw_deg,
-            confidence=0.85,
-            cam_azimuth_deg=cam_azimuth,
-        )
-        self.latest_visual_tracks = self.visual_tracker.update(
-            observations=[obs],
-            timestamp=t,
-            actual_head_yaw_deg=self.actual_head_yaw_deg,
-        )
+        """Records the observed person's head POSE yaw — not a bearing to them.
+
+        Every astro_vision publisher fills this topic from `_estimate_head_yaw()`,
+        which measures how far the eye midpoint sits from the centre of the face
+        ROI: it answers "which way is this person facing", never "where are they".
+        Feeding it to the tracker as a camera azimuth fabricated a target out of
+        thin air — and since the detectors emit a literal 45.0 whenever they fail
+        to find eyes, a lost blink threw the head 45 degrees off to the side.
+
+        Bearings come from /vision/faces alone. This value is kept only as the
+        eye-contact cue for detections that carry no per-face yaw of their own.
+        """
+        self.latest_person_head_yaw_deg = float(msg.data)
 
     def _on_vision_json(self, msg: String) -> None:
         """Processes JSON array of detected faces from OAK-D Lite vision pipeline."""
@@ -350,7 +390,7 @@ class SocialGazeNode(Node):
                 depth_val = float(d.get("depth_m", d.get("distance_m", 1.5)))
                 recog_name = d.get("name", d.get("recognized_name"))
                 is_known_val = bool(d.get("is_known", recog_name is not None))
-                head_yaw_val = float(d.get("yaw_deg", d.get("head_yaw_deg", 0.0)))
+                head_yaw_val = float(d.get("yaw_deg", d.get("head_yaw_deg", self.latest_person_head_yaw_deg)))
                 eyes_vis = bool(d.get("eyes_visible", d.get("looking_at_robot", True)))
                 cam_az_val = d.get("camera_azimuth_deg", d.get("cam_azimuth_deg"))
                 if cam_az_val is not None:
@@ -368,7 +408,7 @@ class SocialGazeNode(Node):
                     actual_head_yaw_deg=self.actual_head_yaw_deg,
                     frame_width=frame_w_val,
                     frame_height=frame_h_val,
-                    confidence=float(d.get("confidence", 0.85)),
+                    confidence=float(d.get("confidence", UNSCORED_DETECTION_CONFIDENCE)),
                     eyes_visible=eyes_vis,
                     head_yaw_deg=head_yaw_val,
                     emotion=str(d.get("emotion", "neutral")),
