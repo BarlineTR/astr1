@@ -6,10 +6,13 @@
       i_pipeline_type: "RGB"
       i_publish_synced_rect_pair: false
       i_publish_points: false
+      i_low_bandwidth: true
     rgb:
       i_resolution: "720P"
       i_fps: 30.0
       i_publish_topic: true
+      i_low_bandwidth: true
+      i_low_bandwidth_quality: 80
 
 /oak:
   ros__parameters:
@@ -19,10 +22,13 @@
       i_pipeline_type: "RGB"
       i_publish_synced_rect_pair: false
       i_publish_points: false
+      i_low_bandwidth: true
     rgb:
       i_resolution: "720P"
       i_fps: 30.0
       i_publish_topic: true
+      i_low_bandwidth: true
+      i_low_bandwidth_quality: 80
 
 webcam_publisher_node:
   ros__parameters:
