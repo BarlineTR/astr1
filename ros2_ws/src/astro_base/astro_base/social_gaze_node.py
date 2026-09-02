@@ -364,14 +364,15 @@ class SocialGazeNode(Node):
         )
         if not obs.valid:
             self.get_logger().info(
-                f"[AUDIO REJECT] raw_angle={raw_val:+.1f}° rel_bearing={obs.relative_azimuth_deg:+.1f}° "
-                f"confidence={obs.confidence:.2f} reason=OUT_OF_CONVERSATIONAL_FOV target_created=False "
-                f"attention_owner={self.fsm.active_priority.value}"
+                f"🔇 [AUDIO REJECT] raw_doa={raw_val:+.1f}° rel_bearing={obs.relative_azimuth_deg:+.1f}° "
+                f"head_yaw={self.actual_head_yaw_deg:+.1f}° conf={obs.confidence:.2f} "
+                f"reason=OUT_OF_CONVERSATIONAL_FOV attention_owner={self.fsm.active_priority.value}"
             )
         else:
-            self.get_logger().debug(
-                f"[AUDIO ACCEPT] raw_angle={raw_val:+.1f}° rel_bearing={obs.relative_azimuth_deg:+.1f}° "
-                f"confidence={obs.confidence:.2f} body_yaw={obs.body_azimuth_deg:+.1f}°"
+            self.get_logger().info(
+                f"🔊 [AUDIO ACCEPT] raw_doa={raw_val:+.1f}° rel_bearing={obs.relative_azimuth_deg:+.1f}° "
+                f"head_yaw={self.actual_head_yaw_deg:+.1f}° -> target_body_yaw={obs.body_azimuth_deg:+.1f}° "
+                f"conf={obs.confidence:.2f} attention_owner={self.fsm.active_priority.value}"
             )
 
         self.latest_audio_state = self.audio_filter.filter_observation(

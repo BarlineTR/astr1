@@ -5,7 +5,7 @@ Subscribes to all perception, fusion, state machine, actuator, and camera stream
   1. Live interactive dashboard (10 Hz in-place ANSI display)
   2. Camera Fluidity & Stream Telemetry (FPS, Frame Jitter, Resolution, Latency)
   3. Background Flight Recorder tracking all acoustic orienting, face tracking, and FSM events
-  4. Formatted Summary Report printed to stdout and saved to JSON on Ctrl+C exit
+  4. Formatted Summary Report with Detailed Acoustic Saccade Audit Table printed to stdout and saved to JSON on Ctrl+C exit
 
 Usage:
   python3 scripts/test_social_gaze_live.py
@@ -56,6 +56,10 @@ PRIORITY_NAMES = {
 }
 
 
+def wrap_deg(deg: float) -> float:
+    return ((deg + 180.0) % 360.0) - 180.0
+
+
 class SocialGazeLiveMonitor(Node):
     def __init__(self):
         super().__init__("social_gaze_live_monitor")
@@ -90,7 +94,7 @@ class SocialGazeLiveMonitor(Node):
         self.visual_looking_at_robot: bool = False
 
         # =====================================================================
-        # 3. Acoustic DOA Telemetry
+        # 3. Acoustic DOA & Speech Telemetry
         # =====================================================================
         self.audio_doa_deg: Optional[float] = None
         self.audio_doa_conf: float = 0.0
@@ -98,6 +102,8 @@ class SocialGazeLiveMonitor(Node):
         self.audio_total_events: int = 0
         self.audio_accepted_events: int = 0
         self.audio_rejected_events: int = 0
+        self.latest_stt_transcript: str = ""
+        self.latest_stt_time: float = 0.0
 
         # =====================================================================
         # 4. Gaze FSM & Trajectory Telemetry
@@ -161,10 +167,14 @@ class SocialGazeLiveMonitor(Node):
         self.create_subscription(Bool, "/vision/looking_at_robot", self._on_looking_at_robot, 10)
         self.create_subscription(Bool, "/vision/person_detected", self._on_person_detected, 10)
 
-        # Audio DOA
+        # Audio DOA & STT
         self.create_subscription(Float32, "/audio/doa", self._on_audio_doa, 10)
         self.create_subscription(Float32, "/audio/doa_deg", self._on_audio_doa, 10)
         self.create_subscription(Float32, "/audio/doa_confidence", self._on_doa_confidence, 10)
+        self.create_subscription(String, "/stt/transcript", self._on_stt_text, 10)
+        self.create_subscription(String, "/speech/text", self._on_stt_text, 10)
+        self.create_subscription(String, "/voice/text", self._on_stt_text, 10)
+        self.create_subscription(String, "/stt_text", self._on_stt_text, 10)
 
         # Speech & Gaze State
         self.create_subscription(String, "/gaze/active_target", self._on_active_target, 10)
@@ -211,7 +221,6 @@ class SocialGazeLiveMonitor(Node):
                 self.camera_latencies_ms.append(latency_ms)
 
     def _on_debug_face_image(self, msg: Image):
-        # Fallback if raw camera topic is remapped
         if self.camera_frame_count == 0:
             self._on_camera_image(msg)
 
@@ -223,7 +232,6 @@ class SocialGazeLiveMonitor(Node):
         self.vision_msg_count += 1
         self.vision_timestamps.append(now)
 
-        # Rolling Vision Detection FPS
         if len(self.vision_timestamps) >= 2:
             dt = self.vision_timestamps[-1] - self.vision_timestamps[0]
             if dt > 0.01:
@@ -238,13 +246,21 @@ class SocialGazeLiveMonitor(Node):
                 self.visual_yaw_deg = float(primary.get("camera_azimuth_deg", primary.get("azimuth_deg", primary.get("yaw_deg", 0.0))))
                 self.visual_conf = float(primary.get("confidence", 0.85))
                 self.visual_last_time = now
+                dist_val = float(primary.get("distance_m", self.visual_user_distance))
                 self.visual_events.append({
                     "time": round(now - self.start_time, 2),
                     "face_yaw_deg": round(self.visual_yaw_deg, 2),
                     "confidence": round(self.visual_conf, 2),
-                    "distance_m": round(float(primary.get("distance_m", self.visual_user_distance)), 2),
+                    "distance_m": round(dist_val, 2),
                     "tracking_error": round(self.cmd_head_yaw - self.act_head_yaw, 2),
                 })
+                # Check if this face detection confirms any recent acoustic orientation
+                for ev in reversed(self.audio_events[-5:]):
+                    if (now - (ev["time"] + self.start_time)) <= 2.5:
+                        face_body_yaw = wrap_deg(self.act_head_yaw + self.visual_yaw_deg)
+                        if abs(wrap_deg(face_body_yaw - ev["target_body_yaw"])) <= 18.0:
+                            ev["face_seen"] = True
+                            ev["face_distance_m"] = round(dist_val, 2)
             else:
                 self.visual_conf = 0.0
         except Exception:
@@ -276,26 +292,59 @@ class SocialGazeLiveMonitor(Node):
             self.visual_conf = 0.0
 
     # -------------------------------------------------------------------------
-    # Audio Callbacks
+    # Audio & STT Callbacks
     # -------------------------------------------------------------------------
+    def _on_stt_text(self, msg: String):
+        clean_text = str(msg.data).strip()
+        if clean_text:
+            self.latest_stt_transcript = clean_text
+            self.latest_stt_time = time.monotonic()
+
     def _on_audio_doa(self, msg: Float32):
         val = float(msg.data)
         now = time.monotonic()
         self.audio_total_events += 1
 
-        # Check conversational FOV (±75°)
-        rel_bearing = val  # Approximate relative bearing
-        if abs(rel_bearing) <= 75.0:
+        # ReSpeaker DOA (0..359° clockwise) -> Relative bearing (positive=left)
+        raw = val % 360.0
+        rel_bearing = -(raw if raw <= 180.0 else raw - 360.0)
+        target_body_yaw = wrap_deg(self.act_head_yaw + rel_bearing)
+
+        # Conversational FOV (±75°), robot speaking gate, and confidence evaluation
+        is_in_fov = abs(rel_bearing) <= 75.0
+        is_speaking = bool(self.robot_speaking)
+        conf = max(0.0, min(1.0, float(self.audio_doa_conf)))
+
+        if is_in_fov and not is_speaking and conf >= 0.35:
             self.audio_accepted_events += 1
+            status = "KABUL (Yöneldi)"
+        elif is_speaking:
+            self.audio_rejected_events += 1
+            status = "RED (Eko Bastırıldı)"
+        elif not is_in_fov:
+            self.audio_rejected_events += 1
+            status = "RED (Açı Dışı > 75°)"
         else:
             self.audio_rejected_events += 1
+            status = "RED (Düşük Güven)"
 
-        if self.audio_doa_deg is None or abs(val - self.audio_doa_deg) > 3.0 or (now - self.audio_last_time > 1.0):
+        recent_stt = self.latest_stt_transcript if (now - self.latest_stt_time < 3.5) else ""
+
+        if self.audio_doa_deg is None or abs(val - self.audio_doa_deg) > 4.0 or (now - self.audio_last_time > 0.8):
             self.audio_events.append({
                 "time": round(now - self.start_time, 2),
                 "doa_deg": round(val, 1),
-                "confidence": round(self.audio_doa_conf, 2),
-                "head_yaw_at_trigger": round(self.act_head_yaw, 2),
+                "rel_bearing_deg": round(rel_bearing, 1),
+                "head_yaw_start": round(self.act_head_yaw, 2),
+                "target_body_yaw": round(target_body_yaw, 2),
+                "confidence": round(conf, 2),
+                "status": status,
+                "is_speaking": is_speaking,
+                "speech_text": recent_stt,
+                "final_head_yaw": round(self.act_head_yaw, 2),
+                "tracking_error": round(abs(self.act_head_yaw - target_body_yaw), 2),
+                "face_seen": False,
+                "face_distance_m": 0.0,
             })
         self.audio_doa_deg = val
         self.audio_last_time = now
@@ -316,6 +365,7 @@ class SocialGazeLiveMonitor(Node):
         self.cmd_head_yaw = float(msg.angle_deg)
 
     def _on_head_state(self, msg):
+        now = time.monotonic()
         self.act_head_yaw = float(msg.position_deg)
         self.act_head_vel = float(msg.velocity_deg_s)
         self.head_moving = bool(msg.moving)
@@ -324,6 +374,12 @@ class SocialGazeLiveMonitor(Node):
         err = self.cmd_head_yaw - self.act_head_yaw
         self.tracking_errors.append(abs(err))
         self.sample_count += 1
+
+        # Update settle telemetry for recent acoustic events
+        for ev in reversed(self.audio_events[-3:]):
+            if (now - (ev["time"] + self.start_time)) <= 1.5:
+                ev["final_head_yaw"] = round(self.act_head_yaw, 2)
+                ev["tracking_error"] = round(abs(self.act_head_yaw - ev["target_body_yaw"]), 2)
 
     def _on_joint_states(self, msg: JointState):
         if "head_yaw_joint" in msg.name:
@@ -410,6 +466,8 @@ def render_dashboard(node: SocialGazeLiveMonitor):
     lines.append(f"  • Direction of Arrival (DOA) : {audio_str}")
     lines.append(f"  • Acoustic Statistics        : {node.audio_total_events} events (Kabul: {node.audio_accepted_events}, Red: {node.audio_rejected_events})")
     lines.append(f"  • Robot Self-Speech Gate     : {'🔴 KONUŞUYOR (EKO BASTIRMA AKTİF)' if node.robot_speaking else '🟢 DİNLİYOR (DİKKAT AÇIK)'}")
+    if node.latest_stt_transcript and (now - node.latest_stt_time < 5.0):
+        lines.append(f"  • Son Algılanan Söz          : \033[1;32m\"{node.latest_stt_transcript}\"\033[0m")
 
     # 4. Gaze State Machine & Trajectory
     lines.append("\n[4] SOCIAL GAZE POLICY & FSM:")
@@ -430,7 +488,6 @@ def render_dashboard(node: SocialGazeLiveMonitor):
     lines.append("  [Canlı Test]: Kameranın karşısında yürüyün ve konuşun. Raporu görmek için Ctrl+C yapın.")
     lines.append("-" * 80)
 
-    # Print buffer cleanly at home position
     sys.stdout.write("\033[H\033[J" + "\n".join(lines) + "\n")
     sys.stdout.flush()
 
@@ -449,9 +506,9 @@ def generate_flight_report(node: SocialGazeLiveMonitor):
     avg_cam_fps = (node.camera_frame_count / max(0.1, duration)) if node.camera_frame_count > 0 else 0.0
     avg_vis_fps = (node.vision_msg_count / max(0.1, duration)) if node.vision_msg_count > 0 else 0.0
 
-    print("\n\n" + "=" * 80)
+    print("\n\n" + "=" * 100)
     print("       ASTRO SOCIAL GAZE LIVE TEST — FLIGHT RECORDER & FLUIDITY REPORT")
-    print("=" * 80)
+    print("=" * 100)
     print(f"Test Süresi                  : {duration:.2f} saniye")
     print(f"Toplanan Telemetri Örnekleri : {node.sample_count} örnek ({node.sample_count / max(0.1, duration):.1f} Hz)")
     print(f"Maksimum Açısal Hız          : {node.max_abs_vel:.1f}°/s")
@@ -478,21 +535,27 @@ def generate_flight_report(node: SocialGazeLiveMonitor):
 
     print("\n[3] DURUM GEÇİŞ ZAMAN ÇİZELGESİ (TRANSITION TIMELINE):")
     if node.state_transitions:
-        print(f"{'Zaman (s)':<12} | {'Önceki Durum':<18} -> {'Yeni Durum':<18} | {'Kafa Konumu':<12} | {'Hedef Açı'}")
-        print("-" * 75)
-        for st in node.state_transitions[-20:]:  # Print last 20 transitions
-            print(f"{st['time']:<12.2f} | {st['from_state']:<18} -> {st['to_state']:<18} | {st['head_yaw']:>+6.2f}°      | {st['target_yaw']:>+6.2f}°")
+        print(f"{'Zaman (s)':<10} | {'Önceki Durum':<18} -> {'Yeni Durum':<18} | {'Kafa Konumu':<12} | {'Hedef Açı'}")
+        print("-" * 80)
+        for st in node.state_transitions[-20:]:
+            print(f"{st['time']:<10.2f} | {st['from_state']:<18} -> {st['to_state']:<18} | {st['head_yaw']:>+6.2f}°      | {st['target_yaw']:>+6.2f}°")
         if len(node.state_transitions) > 20:
             print(f"  ... ({len(node.state_transitions) - 20} önceki durum geçişi rapordan kısaltıldı)")
     else:
         print("  (Test süresince durum değişikliği olmadı: Sabit " + node.gaze_state + ")")
 
-    # 3. Acoustic Orienting Summary
-    print("\n[4] İŞİTSEL YÖNELME (ACOUSTIC DOA EVENTS):")
+    # 3. Acoustic Orienting & Saccade Audit Table
+    print("\n[4] İŞİTSEL YÖNELME VE SES TAKİP DENETİMİ (ACOUSTIC ORIENTING & SACCADE AUDIT):")
     print(f"  • Toplam Algılanan Ses Olayı : {node.audio_total_events} (Kabul: {node.audio_accepted_events}, Red: {node.audio_rejected_events})")
     if node.audio_events:
-        for i, ev in enumerate(node.audio_events[-5:], 1):
-            print(f"    - Olay {i}: {ev['time']}s | DOA = {ev['doa_deg']:+.1f}° (Conf: {ev.get('confidence', 0.0)*100:.0f}%) | Kafa Başlangıç = {ev['head_yaw_at_trigger']:+.2f}°")
+        print(f"{'Zaman (s)':<9} | {'Ses Açısı':<10} | {'Kafa Başlangıç':<14} | {'Hedef Açı':<10} | {'Karar / Eylem':<20} | {'Son Kafa':<10} | {'Hata':<7} | {'Yüz Görüldü?':<12} | {'Söylenen Söz'}")
+        print("-" * 120)
+        for ev in node.audio_events[-15:]:
+            face_str = f"✅ EVET ({ev.get('face_distance_m', 0):.2f}m)" if ev.get("face_seen", False) else "❌ YOK"
+            spk_str = f'"{ev["speech_text"]}"' if ev.get("speech_text") else "-"
+            print(f"{ev['time']:<9.2f} | {ev['doa_deg']:>+6.1f}°     | {ev['head_yaw_start']:>+6.2f}°        | {ev['target_body_yaw']:>+6.2f}°   | {ev['status']:<20} | {ev['final_head_yaw']:>+6.2f}°   | {ev['tracking_error']:>5.2f}° | {face_str:<12} | {spk_str}")
+        if len(node.audio_events) > 15:
+            print(f"  ... ({len(node.audio_events) - 15} önceki ses olayı rapordan kısaltıldı)")
     else:
         print("  • Ses olayı algılanmadı (Sessiz ortam).")
 
@@ -510,7 +573,6 @@ def generate_flight_report(node: SocialGazeLiveMonitor):
     # 5. Stability & Pipeline Verdict
     print("\n[6] SİSTEM VE AKICILIK DEĞERLENDİRMESİ (SYSTEM STABILITY VERDICT):")
     fps_healthy = (avg_cam_fps >= 20.0)
-    vision_healthy = (avg_vis_fps >= 10.0 or len(node.visual_events) > 0)
     tracking_healthy = (avg_err <= 15.0)
     
     status_flags = []
@@ -527,9 +589,9 @@ def generate_flight_report(node: SocialGazeLiveMonitor):
     for flag in status_flags:
         print(f"  • {flag}")
 
-    print("\n" + "=" * 80)
+    print("\n" + "=" * 100)
     print("Kabul Özeti: Test başarıyla tamamlandı. Detaylı JSON telemetri kaydedildi.")
-    print("=" * 80 + "\n")
+    print("=" * 100 + "\n")
 
     # Save JSON Log
     os.makedirs("ros2_ws/data", exist_ok=True)
@@ -579,13 +641,12 @@ def main():
         except Exception:
             pass
 
-    # Run ROS2 event loop continuously in background thread so callbacks are never starved
     spin_thread = threading.Thread(target=_safe_spin, daemon=True)
     spin_thread.start()
 
     try:
         while rclpy.ok():
-            time.sleep(0.1)  # 10 Hz dashboard refresh rate
+            time.sleep(0.1)
             render_dashboard(node)
     except KeyboardInterrupt:
         pass
