@@ -573,11 +573,23 @@ class SocialGazeNode(Node):
         )
 
         # 4. Kinematic Motion Planning & Trajectory Generation
+        # Encoder susuyorsa planlayıcıya sahte bir konum verme: plan_step 25 dereceden
+        # büyük farkta kendini o konuma snap ediyor, uydurma 0 ile modellenen kafayı
+        # her çevrimde merkeze geri sürüklüyordu.
+        measured_pos = None if self.head_feedback_missing() else self.actual_head_yaw_deg
         traj_point = self.planner.plan_step(
             gaze_cmd=gaze_cmd,
-            actual_pos_deg=self.actual_head_yaw_deg,
+            actual_pos_deg=measured_pos,
             timestamp=t,
         )
+
+        if self.head_feedback_missing():
+            # Ölçüm yoksa kafanın söylediğimiz yere gittiğini varsayıyoruz. Planlayıcı
+            # hız ve ivme limitli integrasyon yaptığı için bu, komutun kendisini
+            # kopyalamaktan daha dürüst: kafa gerçekten varana kadar at_target olmuyor.
+            # 0 varsaymak ise her kerterizi merkeze çökertip takibi durduruyordu.
+            self.actual_head_yaw_deg = float(traj_point.position_deg)
+            self.actual_head_vel_deg_s = float(traj_point.velocity_deg_s)
 
         # 5. Actuator Command Publishing (Direct Authoritative Goal Setpoint to Arduino PID)
         target_goal_deg = float(gaze_cmd.target_yaw_deg)

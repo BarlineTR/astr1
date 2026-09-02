@@ -17,6 +17,7 @@ anything was wrong; the node simply used its default.
 """
 
 import os
+import time
 import unittest
 
 import yaml
@@ -99,6 +100,55 @@ class TestMissingHeadFeedbackIsReported(unittest.TestCase):
 
         self.assertEqual(len(warnings), 1)
         self.assertIn("geri besleme", warnings[0].lower())
+
+
+class TestOpenLoopHeadEstimate(unittest.TestCase):
+    """With no encoder, assume the head went where it was told — not that it is at 0.
+
+    Assuming 0 makes every bearing collapse: the head turns 20 degrees, the person
+    lands centred in the frame, and `0 + 0` puts them back at 0, so the command
+    returns to centre and parks. The motion planner already integrates a rate- and
+    acceleration-limited position toward each command, which is exactly a model of
+    where the head should be, so that is what stands in for the missing encoder.
+    """
+
+    def _drive(self, node, yaw, cycles=4000):
+        """plan_step clamps dt to a 1 ms floor, so the modelled head advances at least
+        that much per cycle; 4000 of them is four seconds of travel."""
+        node.fsm.set_dialogue_target(yaw_deg=yaw, duration_s=600.0, timestamp=time.monotonic())
+        for _ in range(cycles):
+            node._control_cycle()
+
+    def test_the_estimate_follows_the_command_instead_of_sitting_at_zero(self):
+        node = SocialGazeNode()
+
+        self._drive(node, 40.0)
+
+        self.assertGreater(node.actual_head_yaw_deg, 20.0)
+
+    def test_a_real_encoder_reading_still_wins(self):
+        node = SocialGazeNode()
+        node._on_head_state(type("S", (), {"position_deg": 5.0, "velocity_deg_s": 0.0})())
+
+        self._drive(node, 40.0)
+
+        self.assertEqual(node.actual_head_yaw_deg, 5.0, "the encoder is the authority")
+
+    def test_the_estimate_respects_the_head_limits(self):
+        node = SocialGazeNode()
+
+        self._drive(node, 400.0)
+
+        self.assertLessEqual(node.actual_head_yaw_deg, node.calib.head.max_angle_deg)
+
+    def test_the_planner_is_not_resynced_against_a_position_nobody_measured(self):
+        """plan_step snaps its state to actual_pos_deg past 25 degrees of error; fed a
+        fabricated 0 it dragged the modelled head back to centre every cycle."""
+        node = SocialGazeNode()
+
+        self._drive(node, 60.0)
+
+        self.assertGreater(node.planner.current_pos, 25.0)
 
 
 if __name__ == "__main__":
