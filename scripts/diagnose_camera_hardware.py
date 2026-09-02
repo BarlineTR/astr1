@@ -50,9 +50,22 @@ def main():
         print("  ❌ OAK-D kamerası bulunamadı! Lütfen kabloyu kontrol edin.")
         return
 
-    print(f"  • Bulunan Cihaz Sayısı: {len(devices)}")
-    for d in devices:
-        print(f"  • Cihaz Tanımı        : {getattr(d, 'name', str(d))}")
+    # Check for background processes locking DepthAI
+    try:
+        res = subprocess.run(["ps", "-eo", "pid,user,args"], capture_output=True, text=True)
+        locking = []
+        for line in res.stdout.split("\n"):
+            lower = line.lower()
+            if any(k in lower for k in ["depthai", "camera.launch", "sensors.launch", "face_detector_node"]) and "diagnose" not in lower and "grep" not in lower:
+                locking.append(line.strip())
+        if locking:
+            print("\n  ⚠️  DİKKAT: Kamerayı meşgul eden arka plan süreçleri tespit edildi:")
+            for p in locking:
+                print(f"      • {p}")
+            print("\n      Kamerayı serbest bırakmak için şu komutu çalıştırabilirsiniz:")
+            print("      \033[1;33mpkill -9 -f 'depthai|camera.launch|sensors.launch'\033[0m\n")
+    except Exception:
+        pass
 
     # Build Pipeline
     pipeline = dai.Pipeline()
