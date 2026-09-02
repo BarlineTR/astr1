@@ -88,7 +88,9 @@ def test_native_hardware_fps():
                 break
 
         if xlink_cls is None:
-            print("  ⚠️ XLinkOut sınıfı bulunamadı.")
+            nodes = [k for k in dir(dai.node) if not k.startswith('_')]
+            print(f"  • DepthAI Sürümü: {getattr(dai, '__version__', 'bilinmiyor')}")
+            print(f"  • Mevcut Düğümler: {nodes[:10]}...")
             return
 
         xout = pipeline.create(xlink_cls)
