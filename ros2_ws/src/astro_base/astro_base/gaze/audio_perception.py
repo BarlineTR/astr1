@@ -87,7 +87,7 @@ class AudioPerceptionCore:
         vad_threshold: float = 450.0,
         min_confidence: float = 0.40,
         self_speech_suppression_factor: float = 0.15,
-        max_acoustic_envelope_deg: float = 75.0,
+        max_acoustic_envelope_deg: float = 85.0,
     ):
         self.transformer = transformer or CoordinateTransformer()
         self.min_rms_energy = min_rms_energy

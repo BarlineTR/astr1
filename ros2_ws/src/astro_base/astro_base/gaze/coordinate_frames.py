@@ -20,8 +20,8 @@ from astro_base.gaze.angle_math import wrap_deg
 class HeadCalibration:
     """Head mechanical joint calibration parameters."""
     zero_offset_deg: float = 0.0
-    min_angle_deg: float = -75.0
-    max_angle_deg: float = 75.0
+    min_angle_deg: float = -85.0
+    max_angle_deg: float = 85.0
     ticks_per_deg: float = 1.5000
 
 

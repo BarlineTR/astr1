@@ -92,6 +92,12 @@ class EpistemicSpatialMemory:
                 observations_count=1,
             )
 
+        # Prune older anonymous tracks when a fresh visual track is actively confirmed
+        if not person_name:
+            for pid, old_rec in list(self._people_memory.items()):
+                if pid != person_id and not old_rec.person_name and (timestamp - old_rec.last_seen_time) > 1.0:
+                    del self._people_memory[pid]
+
         # Seeing a real person at this angle removes any conflicting reverb suppression
         self.clear_reverb_near(bearing, tolerance_deg=15.0)
 
@@ -102,7 +108,8 @@ class EpistemicSpatialMemory:
             age = timestamp - rec.last_seen_time
             if age <= self.person_memory_ttl_s:
                 active.append(rec)
-        active.sort(key=lambda r: (r.confidence, - (timestamp - r.last_seen_time)), reverse=True)
+        # Sort primarily by most recent observation (freshness), secondary by confidence
+        active.sort(key=lambda r: (r.last_seen_time, r.confidence), reverse=True)
         return active
 
     def get_most_likely_person_location(self, timestamp: float, max_age_s: Optional[float] = None) -> Optional[float]:
