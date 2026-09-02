@@ -47,10 +47,13 @@ try:
     from sensor_msgs.msg import Image
     from std_msgs.msg import String, Bool, Float32
 except ImportError:
-    rclpy = None
-    Node = object
+    try:
+        from astro_vision.ros_compat import MockMsg, MockNode as Node, MockRclpy
+    except ImportError:
+        from ros_compat import MockMsg, MockNode as Node, MockRclpy
+    rclpy = MockRclpy()
     qos_profile_sensor_data = 10
-    Image = String = Bool = Float32 = object
+    Image = String = Bool = Float32 = MockMsg
 
 try:
     from astro_vision.image_utils import bgr_to_imgmsg, imgmsg_to_bgr
@@ -72,12 +75,25 @@ class SpatialVisionNode(Node):
         self.declare_parameter("scale_factor", 1.1)
         self.declare_parameter("min_neighbors", 4)
         self.declare_parameter("min_size", 45)
+        self.declare_parameter("show_debug", False)
+        # Process every frame. The old hardcoded `% 2` skip sat on top of a publisher
+        # already halved to 15 Hz, leaving 7.5 Hz of bearings — one update per 133 ms —
+        # while a loaded frame costs ~13.5 ms and the CPU idled through the rest.
+        self.declare_parameter("process_every_n", 1)
+        # The alt2 cascade only runs when the primary found nothing, which is most
+        # frames, and it is the most expensive thing here: 19.0 ms primary + 13.6 ms
+        # fallback against 6.8 ms when a face is present. Retry it periodically rather
+        # than paying for it on every empty frame.
+        self.declare_parameter("fallback_every_n", 4)
 
         input_topic = self.get_parameter("input_topic").value
         depth_topic = self.get_parameter("depth_topic").value
         self.scale_factor = float(self.get_parameter("scale_factor").value)
         self.min_neighbors = int(self.get_parameter("min_neighbors").value)
         self.min_size = int(self.get_parameter("min_size").value)
+        self.show_debug = bool(self.get_parameter("show_debug").value)
+        self.process_every_n = max(1, int(self.get_parameter("process_every_n").value))
+        self.fallback_every_n = max(1, int(self.get_parameter("fallback_every_n").value))
 
         # Load Cascades (Default + Alt2 for maximum detection rate)
         frontal_path = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
@@ -119,8 +135,15 @@ class SpatialVisionNode(Node):
         # Görüntü akışları sensör QoS'u (BEST_EFFORT) kullanır: kare kaybı, geciken
         # kareler için retransmission yapmaktan iyidir. BEST_EFFORT abone RELIABLE
         # yayıncıdan da veri alabilir, bu yüzden depthai_ros_driver ile uyumludur.
-        self.sub_rgb = self.create_subscription(Image, input_topic, self.image_callback, qos_profile_sensor_data)
-        self.sub_depth = self.create_subscription(Image, depth_topic, self.depth_callback, qos_profile_sensor_data)
+        # Queue derinliği 1: yalnızca en son kare işlenir, eski kareler atılır → gecikme sıfıra yakın.
+        from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSHistoryPolicy
+        latest_frame_qos = QoSProfile(
+            reliability=QoSReliabilityPolicy.BEST_EFFORT,
+            history=QoSHistoryPolicy.KEEP_LAST,
+            depth=1
+        )
+        self.sub_rgb = self.create_subscription(Image, input_topic, self.image_callback, latest_frame_qos)
+        self.sub_depth = self.create_subscription(Image, depth_topic, self.depth_callback, latest_frame_qos)
 
         self.get_logger().info(f"👁️ [Spatial Emotion Vision] 3D Bakış, Mesafe ve Yüz Duygu Analizi Aktif! RGB: {input_topic}")
 
@@ -201,6 +224,32 @@ class SpatialVisionNode(Node):
 
         return "neutral"
 
+    def _draw_hud(self, frame):
+        """Son tespit sonuçlarını kareye çizer (her karede çağrılır)."""
+        if not hasattr(self, '_cached_hud'):
+            return
+        for hud in self._cached_hud:
+            x, y, w, h = hud["x"], hud["y"], hud["w"], hud["h"]
+            cv2.rectangle(frame, (x, y), (x + w, y + h), hud["color"], 2)
+            cv2.putText(frame, hud["text"], (x, max(22, y - 10)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, hud["color"], 2)
+
+    def _should_process(self, frame_count: int) -> bool:
+        """True on the frames the heavy detection pipeline is allowed to run."""
+        return (frame_count % self.process_every_n) == 0
+
+    def _should_try_fallback_cascade(self, frame_count: int) -> bool:
+        """True on the empty frames where the alt2 recovery pass is worth its 13.6 ms."""
+        return (frame_count % self.fallback_every_n) == 0
+
+    def _face_detect_kwargs(self) -> dict:
+        """Cascade tuning, from the declared parameters rather than hardcoded literals."""
+        return {
+            "scaleFactor": self.scale_factor,
+            "minNeighbors": self.min_neighbors,
+            "minSize": (self.min_size, self.min_size),
+        }
+
     def image_callback(self, msg: Image):
         try:
             frame = imgmsg_to_bgr(msg)
@@ -214,8 +263,15 @@ class SpatialVisionNode(Node):
             self._frame_count = 0
         self._frame_count += 1
 
-        # Process every 2nd frame (~15 FPS for responsive tracking)
-        if self._frame_count % 2 != 0:
+        # Canlı pencere — her karede göster (son tespit sonuçlarıyla)
+        if self.show_debug:
+            display = frame.copy()
+            self._draw_hud(display)
+            cv2.imshow("ASTRO Vision Debug", display)
+            cv2.waitKey(1)
+
+        # Ağır işleme yalnızca process_every_n karede bir (varsayılan: her kare)
+        if not self._should_process(self._frame_count):
             return
 
         frame_h, frame_w = frame.shape[:2]
@@ -229,21 +285,16 @@ class SpatialVisionNode(Node):
         else:
             small_gray = gray
 
-        detected_faces = detect_faces_with_confidence(
-            self.face_cascade,
-            small_gray,
-            scaleFactor=1.12,
-            minNeighbors=5,
-            minSize=(36, 36),
-        )
+        detect_kwargs = self._face_detect_kwargs()
+        detected_faces = detect_faces_with_confidence(self.face_cascade, small_gray, **detect_kwargs)
 
-        if len(detected_faces) == 0 and hasattr(self, 'face_alt_cascade'):
+        if (
+            len(detected_faces) == 0
+            and hasattr(self, 'face_alt_cascade')
+            and self._should_try_fallback_cascade(self._frame_count)
+        ):
             detected_faces = detect_faces_with_confidence(
-                self.face_alt_cascade,
-                small_gray,
-                scaleFactor=1.12,
-                minNeighbors=5,
-                minSize=(36, 36),
+                self.face_alt_cascade, small_gray, **detect_kwargs
             )
 
         # Map bounding boxes back to original resolution (the confidence is scale-free)
@@ -263,6 +314,7 @@ class SpatialVisionNode(Node):
         face_camera_azimuth = 0.0
         detected_emotion = "neutral"
         top_recognized_person = {"name": "Misafir", "title": "Ziyaretçi", "formal_title": "Misafir", "confidence": 0.0, "is_known": False}
+        hud_cache = []
 
         for idx, (x, y, w, h, detection_conf) in enumerate(faces):
             face_roi_gray = gray[y:y + h, x:x + w]
@@ -318,7 +370,7 @@ class SpatialVisionNode(Node):
                 "recognized_title": recog_meta.get("formal_title") if is_known else None
             })
 
-            # Draw HUD
+            # Build HUD overlay data
             color_map = {
                 "happy": (0, 255, 0),
                 "surprised": (255, 255, 0),
@@ -332,6 +384,12 @@ class SpatialVisionNode(Node):
             gaze_txt = "BANA BAKIYOR" if direct_gaze else (f"YANA ({yaw:.0f}°)" if eyes_found else "BAKMIYOR (GÖZ YOK)")
             hud_text = f"{tag_name} | {gaze_txt} | {dist_m:.2f}m"
             cv2.putText(frame, hud_text, (x, max(22, y - 10)), cv2.FONT_HERSHEY_SIMPLEX, 0.55, box_color, 2)
+
+            # Cache for non-processed frames
+            hud_cache.append({"x": x, "y": y, "w": w, "h": h, "color": box_color, "text": hud_text})
+
+        # Son tespit sonuçlarını cache'le (aradaki karelerde çizilecek)
+        self._cached_hud = hud_cache
 
         self._gaze_history.append(is_looking)
         smoothed_looking = (self._gaze_history.count(True) >= 2)
@@ -408,6 +466,8 @@ def main(args=None):
     except KeyboardInterrupt as _exc:
         _LOG.debug("main: yok sayılan hata (%s)", _exc)
     finally:
+        if node.show_debug:
+            cv2.destroyAllWindows()
         node.destroy_node()
         if rclpy.ok():
             rclpy.shutdown()
