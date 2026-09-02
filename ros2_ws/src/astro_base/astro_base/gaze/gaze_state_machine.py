@@ -397,7 +397,11 @@ class SocialGazeFSM:
                         else:
                             self._transition_to(GazeStateEnum.ACQUIRING, timestamp, reason=reacq_reason)
                     elif time_in_lost >= self.target_lost_timeout_s:
-                        self._transition_to(GazeStateEnum.RECOVERING, timestamp, reason="TARGET_LOST_TIMEOUT_RECOVER")
+                        known_person_yaw = self.spatial_memory.get_most_likely_person_location(timestamp, max_age_s=30.0) if self.spatial_memory else None
+                        if known_person_yaw is not None and abs(angular_diff_deg(known_person_yaw, actual_head_yaw_deg)) <= 12.0:
+                            self._transition_to(GazeStateEnum.HOLDING_ATTENTION, timestamp, reason="LOST_MAINTAIN_FACING_HUMAN")
+                        else:
+                            self._transition_to(GazeStateEnum.RECOVERING, timestamp, reason="TARGET_LOST_TIMEOUT_RECOVER")
 
             elif self.state == GazeStateEnum.IDLE:
                 # Strict IDLE Entry Guards (Failure 1):
@@ -459,7 +463,9 @@ class SocialGazeFSM:
 
             elif self.state == GazeStateEnum.HOLDING_ATTENTION:
                 dwell_elapsed = timestamp - self._state_entry_time
-                if dwell_elapsed >= self.min_attention_dwell_s:
+                known_person_yaw = self.spatial_memory.get_most_likely_person_location(timestamp, max_age_s=30.0) if self.spatial_memory else None
+                # Only leave HOLDING_ATTENTION after full idle timeout (25s) when no human has been seen
+                if known_person_yaw is None and dwell_elapsed >= self.idle_return_timeout_s:
                     self._transition_to(GazeStateEnum.TARGET_LOST, timestamp, reason="ATTENTION_DWELL_EXPIRED")
 
             elif self.state == GazeStateEnum.TARGET_LOST:
