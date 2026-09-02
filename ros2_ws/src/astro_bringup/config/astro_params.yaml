@@ -7,8 +7,8 @@ serial_bridge:
     ticks_per_rev_left: 2048.0
     ticks_per_rev_right: 2048.0
     wheel_radius_left: 0.06
-    head_angle_scale: -1.0  # Physical motor polarity: ROS (+Left) -> Motor CW/CCW
-    head_sign: -1.0         # Physical encoder polarity: Motor -> ROS (+Left)
+    head_angle_scale: 1.0  # Physical motor polarity: ROS (+Left) -> Motor CW/CCW
+    head_sign: 1.0         # Physical encoder polarity: Motor -> ROS (+Left)
 
 rplidar_node:
   ros__parameters:
