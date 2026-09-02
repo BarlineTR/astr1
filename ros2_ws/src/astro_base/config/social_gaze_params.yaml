@@ -8,7 +8,7 @@
     max_acceleration_deg_s2: 180.0
     max_jerk_deg_s3: 360.0
     gaze_deadband_deg: 3.0
-    min_attention_dwell_s: 2.50
+    min_attention_dwell_s: 6.00
     turn_taking_min_dwell_s: 0.80
     spatial_gate_deg: 25.0
     idle_saccades_enabled: false
@@ -28,19 +28,20 @@
       self_speech_suppression_factor: 0.15 # Multiplier applied to audio confidence when robot is speaking
       motion_max_sens_velocity_deg_s: 40.0 # Velocity at which audio confidence decays towards zero
       motion_settle_time_s: 0.45    # Quiet settling window after head movement before full audio sensitivity
+      max_acoustic_envelope_deg: 85.0 # Acoustic field-of-view envelope
 
     vision:
-      min_confidence: 0.50          # Face/person detection minimum confidence
-      track_coasting_timeout_s: 0.70 # Time to coast missing visual track before marking LOST
-      hungarian_gating_distance_m: 0.85 # Maximum 3D metric distance to associate detection to track
-      direct_gaze_max_yaw_deg: 22.0 # Maximum user head yaw to be considered direct eye contact
-      social_zone_min_dist_m: 0.35  # Minimum interaction distance (meters)
-      social_zone_max_dist_m: 3.50  # Maximum interaction distance (meters)
+      fov_h_deg: 72.0               # Horizontal camera field of view
+      fov_v_deg: 54.0               # Vertical camera field of view
+      detection_confidence_min: 0.35 # Minimum confidence to process visual face measurement
+      max_track_association_dist_deg: 22.0 # Gating threshold for nearest-neighbor visual track update
+      track_ttl_s: 3.5              # Time before coasting visual track is deleted
+      eye_contact_yaw_limit_deg: 22.0 # Maximum user head yaw for direct gaze confirmation
+      velocity_decay_factor: 0.85   # Damping factor applied to coasting velocity
 
     fusion:
-      spatial_association_gate_deg: 25.0 # Maximum angular difference to fuse audio & visual target
-      audio_freshness_half_life_s: 0.80  # Freshness decay half-life for sound
-      vision_freshness_half_life_s: 1.20 # Freshness decay half-life for visual tracks
+      spatial_gate_deg: 25.0        # Maximum angular separation between audio and vision for fusion
+      temporal_gate_s: 0.80         # Maximum time separation between modalities
       audio_weight_base: 0.40       # Weight factor for audio modality
       vision_weight_base: 0.85      # Weight factor for vision modality
       fallback_enabled: true        # Support automatic fallback to Audio-Only or Vision-Only
@@ -49,7 +50,7 @@
       acquisition_threshold: 0.75   # Confidence required to acquire and lock a new target
       hold_threshold: 0.40          # Confidence threshold below which target drops to coasting
       target_lost_timeout_s: 2.5    # Duration in coasting before removing target
-      min_attention_dwell_s: 2.50   # Minimum gaze dwell time before switching targets
+      min_attention_dwell_s: 6.00   # Minimum gaze dwell time before switching targets
       turn_taking_min_dwell_s: 0.80 # Accelerated dwell time when a new distinct speaker takes floor
       turn_taking_min_angle_deg: 20.0 # Angular separation to qualify for turn-taking switch
       max_tracked_candidates: 6     # Maximum simultaneous candidate tracks maintained

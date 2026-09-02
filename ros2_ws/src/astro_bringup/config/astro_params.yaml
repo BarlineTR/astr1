@@ -93,11 +93,11 @@ head_tracker_node:
 social_gaze_node:
   ros__parameters:
     control_rate_hz: 50.0
-    max_velocity_deg_s: 45.0
-    max_acceleration_deg_s2: 90.0
-    max_jerk_deg_s3: 180.0
+    max_velocity_deg_s: 75.0
+    max_acceleration_deg_s2: 180.0
+    max_jerk_deg_s3: 360.0
     gaze_deadband_deg: 2.5
-    min_attention_dwell_s: 2.50
+    min_attention_dwell_s: 6.00
     turn_taking_min_dwell_s: 0.80
     spatial_gate_deg: 25.0
     idle_saccades_enabled: false
