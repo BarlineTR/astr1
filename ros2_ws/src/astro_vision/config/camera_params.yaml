@@ -6,10 +6,13 @@
       i_pipeline_type: "RGBD"
       i_publish_synced_rect_pair: false
       i_publish_points: false
+      i_low_bandwidth: true
     rgb:
       i_resolution: "720P"
       i_fps: 30.0
       i_publish_topic: true
+      i_low_bandwidth: true
+      i_low_bandwidth_quality: 50
     left:
       i_resolution: "400P"
       i_fps: 30.0
@@ -34,10 +37,13 @@
       i_pipeline_type: "RGBD"
       i_publish_synced_rect_pair: false
       i_publish_points: false
+      i_low_bandwidth: true
     rgb:
       i_resolution: "720P"
       i_fps: 30.0
       i_publish_topic: true
+      i_low_bandwidth: true
+      i_low_bandwidth_quality: 50
     left:
       i_resolution: "400P"
       i_fps: 30.0
