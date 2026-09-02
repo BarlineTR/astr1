@@ -94,14 +94,11 @@ def main():
     time.sleep(0.5)
 
     try:
-        try:
-            device = dai.Device()
-            if hasattr(device, "startPipeline"):
-                device.startPipeline(pipeline)
-            elif hasattr(device, "start"):
-                device.start(pipeline)
-        except Exception:
-            device = dai.Device(pipeline)
+        device = dai.Device()
+        if hasattr(device, "startPipeline"):
+            device.startPipeline(pipeline)
+        elif hasattr(device, "start"):
+            device.start(pipeline)
 
         with device:
             usb_speed = device.getUsbSpeed()
