@@ -237,6 +237,12 @@ class SocialGazeNode(Node):
         self.latest_visual_tracks: List[VisualTargetTrack] = []
         self.actual_head_yaw_deg: float = 0.0
         self.actual_head_vel_deg_s: float = 0.0
+        # Her kerteriz `body_azimuth = actual_head_yaw + kamera_acisi` ile hesaplanir.
+        # Encoder hic konusmazsa bu deger 0'da kalir, kafa fiziksel olarak donse bile:
+        # 20 derece donup kisiyi tam ortaya alan kafa, kisiyi 0 derecede sanip komutu
+        # merkeze geri cekiyor ve orada bekliyor. Sessizce olmasin diye izliyoruz.
+        self._head_feedback_seen: bool = False
+        self._warned_no_head_feedback: bool = False
         self.is_robot_speaking: bool = False
         self.is_playback_active: bool = False
         # The person's own head-pose yaw (from _estimate_head_yaw), carried separately
@@ -310,6 +316,7 @@ class SocialGazeNode(Node):
         """Reads real encoder position and velocity from HeadState message."""
         if hasattr(msg, "position_deg") and not math.isnan(msg.position_deg):
             self.actual_head_yaw_deg = float(msg.position_deg)
+            self._head_feedback_seen = True
         if hasattr(msg, "velocity_deg_s") and not math.isnan(msg.velocity_deg_s):
             self.actual_head_vel_deg_s = float(msg.velocity_deg_s)
 
@@ -320,6 +327,7 @@ class SocialGazeNode(Node):
             pos_val = msg.position[idx]
             if not math.isnan(pos_val):
                 self.actual_head_yaw_deg = math.degrees(pos_val)
+                self._head_feedback_seen = True
             if len(msg.velocity) > idx:
                 vel_val = msg.velocity[idx]
                 if not math.isnan(vel_val):
@@ -519,8 +527,25 @@ class SocialGazeNode(Node):
     # 50 Hz Synchronous Control Cycle
     # =========================================================================
 
+    def head_feedback_missing(self) -> bool:
+        """Encoderdan hic konum gelmediyse True.
+
+        Bu durumda tum kerterizler kafa 0 derecedeymis gibi hesaplanir ve hedef
+        merkeze cokerek takip sessizce olur.
+        """
+        return not self._head_feedback_seen
+
     def _control_cycle(self) -> None:
         t = time.monotonic()
+
+        if self.head_feedback_missing() and not self._warned_no_head_feedback:
+            self._warned_no_head_feedback = True
+            self.get_logger().warning(
+                "Kafa geri beslemesi yok: /head/state veya /joint_states'ten hic konum "
+                "gelmedi. Butun kerterizler kafa 0 derecedeymis gibi hesaplanacak, yani "
+                "kafa donunce hedef merkeze cokup takip duracak. serial_bridge calisiyor "
+                "ve MCU head encoder tick gonderiyor mu kontrol edin."
+            )
 
         # 1. Multimodal Sensor Fusion (Passive Measurements -> Fused Targets)
         fused_targets = self.fusion.fuse(
