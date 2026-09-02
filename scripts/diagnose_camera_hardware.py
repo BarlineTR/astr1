@@ -36,8 +36,23 @@ def main():
     except Exception as e:
         print(f"  lsusb çalıştırılamadı: {e}")
 
-    # 2. Unified DepthAI Hardware Benchmark
-    print_header("2. OAK-D DONANIM BAĞLANTISI VE SAF FPS ÖLÇÜMÜ")
+    # Deep Process & Service Inspection
+    print_header("2. KAMERAYI KULLANAN SÜREÇLERİN TESPİTİ (PROCESS SCAN)")
+    try:
+        ps_res = subprocess.run(["ps", "-eo", "pid,user,command"], capture_output=True, text=True)
+        found_proc = False
+        for line in ps_res.stdout.split("\n"):
+            lower = line.lower()
+            if any(k in lower for k in ["depthai", "oak", "camera", "ros2", "astro"]) and "diagnose" not in lower:
+                print(f"  • [Çalışan Süreç]: {line.strip()}")
+                found_proc = True
+        if not found_proc:
+            print("  ✓ Standart ROS2 veya DepthAI süreci bulunamadı.")
+    except Exception as e:
+        print(f"  Süreç tarama hatası: {e}")
+
+    # 3. Unified DepthAI Hardware Benchmark
+    print_header("3. OAK-D DONANIM BAĞLANTISI VE SAF FPS ÖLÇÜMÜ")
     try:
         import depthai as dai
     except ImportError:
