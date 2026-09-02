@@ -142,9 +142,15 @@ class SpatialVisionNode(Node):
         self.pub_recognized_person = self.create_publisher(String, "/vision/recognized_person", 10)
         self.pub_image = self.create_publisher(Image, "/vision/face_image", 10)
 
-        # Subscribers
-        self.sub_rgb = self.create_subscription(Image, input_topic, self.image_callback, qos_profile_sensor_data)
-        self.sub_depth = self.create_subscription(Image, depth_topic, self.depth_callback, qos_profile_sensor_data)
+        # Subscribers (depth=1 ensures zero queue buffer bloat: always process the newest frame)
+        from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSHistoryPolicy
+        qos_latest_frame = QoSProfile(
+            reliability=QoSReliabilityPolicy.BEST_EFFORT,
+            history=QoSHistoryPolicy.KEEP_LAST,
+            depth=1,
+        )
+        self.sub_rgb = self.create_subscription(Image, input_topic, self.image_callback, qos_latest_frame)
+        self.sub_depth = self.create_subscription(Image, depth_topic, self.depth_callback, qos_latest_frame)
 
         self.get_logger().info(f"👁️ [Spatial Emotion Vision] 3D Bakış, Mesafe ve Yüz Duygu Analizi Aktif! RGB: {input_topic}")
 
