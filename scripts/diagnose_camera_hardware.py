@@ -68,21 +68,36 @@ def test_native_hardware_fps():
         
         pipeline = dai.Pipeline()
         
-        # Color Camera Node
-        cam_rgb = pipeline.create(dai.node.ColorCamera)
-        cam_rgb.setResolution(dai.ColorCameraProperties.SensorResolution.THE_720_P)
-        cam_rgb.setFps(30)
-        cam_rgb.setInterleaved(False)
-        cam_rgb.setColorOrder(dai.ColorCameraProperties.ColorOrder.BGR)
+        # Discover Camera class
+        cam_cls = getattr(dai.node, "ColorCamera", getattr(dai.node, "Camera", getattr(dai, "ColorCamera", None)))
+        cam_rgb = pipeline.create(cam_cls)
+        if hasattr(cam_rgb, "setResolution") and hasattr(dai, "ColorCameraProperties"):
+            cam_rgb.setResolution(dai.ColorCameraProperties.SensorResolution.THE_720_P)
+        if hasattr(cam_rgb, "setFps"):
+            cam_rgb.setFps(30)
 
-        # XLinkOut Node
-        xout = pipeline.create(dai.node.XLinkOut)
+        # Discover XLinkOut class
+        xlink_cls = getattr(dai.node, "XLinkOut", getattr(dai, "XLinkOut", None))
+        if xlink_cls is None:
+            for name in dir(dai.node):
+                if "xlink" in name.lower() and "out" in name.lower():
+                    xlink_cls = getattr(dai.node, name)
+                    break
+        if xlink_cls is None:
+            for name in dir(dai):
+                if "xlink" in name.lower() and "out" in name.lower():
+                    xlink_cls = getattr(dai, name)
+                    break
+
+        xout = pipeline.create(xlink_cls)
         xout.setStreamName("video")
         
         if hasattr(cam_rgb, "video"):
             cam_rgb.video.link(xout.input)
-        else:
+        elif hasattr(cam_rgb, "isp"):
             cam_rgb.isp.link(xout.input)
+        elif hasattr(cam_rgb, "preview"):
+            cam_rgb.preview.link(xout.input)
 
         with dai.Device(pipeline) as device:
             usb_speed = device.getUsbSpeed()
