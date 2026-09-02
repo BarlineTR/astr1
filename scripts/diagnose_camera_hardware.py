@@ -69,24 +69,20 @@ def test_native_hardware_fps():
         pipeline = dai.Pipeline()
         
         # Color Camera Node
-        try:
-            cam_rgb = pipeline.create(dai.node.ColorCamera)
-        except Exception:
-            cam_rgb = pipeline.createColorCamera()
-
+        cam_rgb = pipeline.create(dai.node.ColorCamera)
         cam_rgb.setResolution(dai.ColorCameraProperties.SensorResolution.THE_720_P)
         cam_rgb.setFps(30)
         cam_rgb.setInterleaved(False)
         cam_rgb.setColorOrder(dai.ColorCameraProperties.ColorOrder.BGR)
 
         # XLinkOut Node
-        try:
-            xout = pipeline.create(dai.node.XLinkOut)
-        except Exception:
-            xout = pipeline.createXLinkOut()
-
+        xout = pipeline.create(dai.node.XLinkOut)
         xout.setStreamName("video")
-        cam_rgb.video.link(xout.input)
+        
+        if hasattr(cam_rgb, "video"):
+            cam_rgb.video.link(xout.input)
+        else:
+            cam_rgb.isp.link(xout.input)
 
         with dai.Device(pipeline) as device:
             usb_speed = device.getUsbSpeed()
