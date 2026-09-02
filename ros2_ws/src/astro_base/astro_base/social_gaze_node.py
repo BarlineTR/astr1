@@ -193,7 +193,7 @@ class SocialGazeNode(Node):
         self.visual_tracker = VisualTrackerCore(
             transformer=self.transformer,
             gating_distance_m=0.85,
-            coasting_timeout_s=0.70,
+            coasting_timeout_s=3.0,
         )
         self.fusion = AudioVisualFusionCore(
             spatial_gate_deg=float(self.get_parameter("spatial_gate_deg").value),

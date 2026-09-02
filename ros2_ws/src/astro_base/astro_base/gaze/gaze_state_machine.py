@@ -465,10 +465,14 @@ class SocialGazeFSM:
             elif self.state == GazeStateEnum.TARGET_LOST:
                 time_lost = timestamp - self._state_entry_time
                 if time_lost >= self.target_lost_timeout_s:
-                    known_person_yaw = self.spatial_memory.get_most_likely_person_location(timestamp, max_age_s=15.0) if self.spatial_memory else None
-                    if known_person_yaw is not None and abs(angular_diff_deg(known_person_yaw, actual_head_yaw_deg)) > 15.0:
-                        self.target_yaw_deg = known_person_yaw
-                        self._transition_to(GazeStateEnum.ORIENTING, timestamp, reason="LOST_REORIENT_TO_KNOWN_HUMAN")
+                    known_person_yaw = self.spatial_memory.get_most_likely_person_location(timestamp, max_age_s=30.0) if self.spatial_memory else None
+                    if known_person_yaw is not None:
+                        if abs(angular_diff_deg(known_person_yaw, actual_head_yaw_deg)) > 8.0:
+                            self.target_yaw_deg = known_person_yaw
+                            self._transition_to(GazeStateEnum.ORIENTING, timestamp, reason="LOST_REORIENT_TO_KNOWN_HUMAN")
+                        else:
+                            # Already facing the known human position: hold attention patiently
+                            self._transition_to(GazeStateEnum.HOLDING_ATTENTION, timestamp, reason="LOST_MAINTAIN_FACING_HUMAN")
                     else:
                         self._transition_to(GazeStateEnum.RECOVERING, timestamp, reason="TARGET_LOST_TIMEOUT_RECOVER")
 
