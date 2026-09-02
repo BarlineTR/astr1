@@ -1,15 +1,17 @@
 #!/usr/bin/env python3
 """ASTRO Robot — Real-Time Audiovisual Social Gaze Live Monitor & Flight Recorder.
 
-Subscribes to all perception, fusion, state machine, and actuator topics to provide:
-  1. Live interactive dashboard (10 Hz in-place display)
-  2. Background Flight Recorder tracking all acoustic orienting, face tracking, and FSM events
-  3. Formatted Summary Report printed to stdout and saved to JSON on Ctrl+C exit
+Subscribes to all perception, fusion, state machine, actuator, and camera stream topics to provide:
+  1. Live interactive dashboard (10 Hz in-place ANSI display)
+  2. Camera Fluidity & Stream Telemetry (FPS, Frame Jitter, Resolution, Latency)
+  3. Background Flight Recorder tracking all acoustic orienting, face tracking, and FSM events
+  4. Formatted Summary Report printed to stdout and saved to JSON on Ctrl+C exit
 
 Usage:
   python3 scripts/test_social_gaze_live.py
 """
 
+from collections import deque
 import json
 import math
 import os
@@ -20,9 +22,9 @@ from typing import Dict, List, Optional
 try:
     import rclpy
     from rclpy.node import Node
-    from rclpy.qos import QoSProfile, ReliabilityPolicy
+    from rclpy.qos import QoSHistoryPolicy, QoSProfile, QoSReliabilityPolicy, qos_profile_sensor_data
+    from sensor_msgs.msg import Image, JointState
     from std_msgs.msg import Bool, Float32, Int32, String
-    from sensor_msgs.msg import JointState
     try:
         from astro_base.msg import GazeStatus, HeadCmd, HeadState
     except ImportError:
@@ -60,14 +62,46 @@ class SocialGazeLiveMonitor(Node):
 
         self.start_time = time.monotonic()
 
-        # Telemetry State
-        self.audio_doa_deg: Optional[float] = None
-        self.audio_last_time: float = 0.0
+        # =====================================================================
+        # 1. Camera Stream Fluidity & Latency Telemetry
+        # =====================================================================
+        self.camera_frame_count: int = 0
+        self.camera_resolution: str = "Unknown"
+        self.camera_encoding: str = "Unknown"
+        self.camera_last_frame_time: float = 0.0
+        self.camera_frame_deltas: deque = deque(maxlen=60)
+        self.camera_timestamps: deque = deque(maxlen=60)
+        self.camera_latencies_ms: deque = deque(maxlen=60)
+        self.camera_fps_rolling: float = 0.0
+
+        # =====================================================================
+        # 2. Vision & Face Detection Telemetry
+        # =====================================================================
+        self.vision_msg_count: int = 0
+        self.vision_timestamps: deque = deque(maxlen=60)
+        self.vision_fps_rolling: float = 0.0
         self.visual_yaw_deg: Optional[float] = None
         self.visual_conf: float = 0.0
         self.visual_faces_count: int = 0
         self.visual_last_time: float = 0.0
+        self.visual_user_distance: float = 0.0
+        self.visual_user_emotion: str = "neutral"
+        self.visual_recognized_name: str = "None"
+        self.visual_looking_at_robot: bool = False
 
+        # =====================================================================
+        # 3. Acoustic DOA Telemetry
+        # =====================================================================
+        self.audio_doa_deg: Optional[float] = None
+        self.audio_doa_conf: float = 0.0
+        self.audio_last_time: float = 0.0
+        self.audio_total_events: int = 0
+        self.audio_accepted_events: int = 0
+        self.audio_rejected_events: int = 0
+
+        # =====================================================================
+        # 4. Gaze FSM & Trajectory Telemetry
+        # =====================================================================
         self.gaze_state: str = "IDLE"
         self.prev_gaze_state: str = "IDLE"
         self.gaze_priority: str = "IDLE"
@@ -79,6 +113,13 @@ class SocialGazeLiveMonitor(Node):
         self.gaze_target_id: str = "None"
         self.active_target_json: str = "{}"
 
+        # FSM State Dwell Time Accumulator
+        self.state_dwell_times: Dict[str, float] = {name: 0.0 for name in STATE_NAMES.values()}
+        self._last_fsm_dwell_stamp: float = time.monotonic()
+
+        # =====================================================================
+        # 5. Actuator Closed-Loop Feedback
+        # =====================================================================
         self.cmd_head_yaw: float = 0.0
         self.act_head_yaw: float = 0.0
         self.act_head_vel: float = 0.0
@@ -86,7 +127,9 @@ class SocialGazeLiveMonitor(Node):
         self.head_stall: bool = False
         self.robot_speaking: bool = False
 
-        # Flight Recorder History
+        # =====================================================================
+        # 6. Flight Recorder Event History
+        # =====================================================================
         self.state_transitions: List[Dict] = []
         self.audio_events: List[Dict] = []
         self.visual_events: List[Dict] = []
@@ -94,15 +137,35 @@ class SocialGazeLiveMonitor(Node):
         self.sample_count: int = 0
         self.max_abs_vel: float = 0.0
 
-        qos_be = QoSProfile(depth=10, reliability=ReliabilityPolicy.BEST_EFFORT)
+        qos_be = QoSProfile(
+            reliability=QoSReliabilityPolicy.BEST_EFFORT,
+            history=QoSHistoryPolicy.KEEP_LAST,
+            depth=10,
+        )
 
-        # Subscriptions
+        # =====================================================================
+        # Topic Subscriptions
+        # =====================================================================
+        # Camera Stream
+        self.create_subscription(Image, "/oak/rgb/image_raw", self._on_camera_image, qos_profile_sensor_data)
+        self.create_subscription(Image, "/vision/face_image", self._on_debug_face_image, qos_profile_sensor_data)
+
+        # Vision Pipeline
+        self.create_subscription(String, "/vision/faces", self._on_vision_json, 10)
+        self.create_subscription(String, "/vision/detections_json", self._on_vision_json, 10)
+        self.create_subscription(Float32, "/vision/head_yaw", self._on_vision_head_yaw, 10)
+        self.create_subscription(Float32, "/vision/user_distance", self._on_user_distance, 10)
+        self.create_subscription(String, "/vision/user_emotion", self._on_user_emotion, 10)
+        self.create_subscription(String, "/vision/recognized_person", self._on_recognized_person, 10)
+        self.create_subscription(Bool, "/vision/looking_at_robot", self._on_looking_at_robot, 10)
+        self.create_subscription(Bool, "/vision/person_detected", self._on_person_detected, 10)
+
+        # Audio DOA
         self.create_subscription(Float32, "/audio/doa", self._on_audio_doa, 10)
         self.create_subscription(Float32, "/audio/doa_deg", self._on_audio_doa, 10)
-        self.create_subscription(String, "/vision/detections_json", self._on_vision_json, 10)
-        self.create_subscription(String, "/vision/faces", self._on_vision_json, 10)
-        self.create_subscription(Float32, "/vision/head_yaw", self._on_vision_head_yaw, 10)
-        self.create_subscription(Bool, "/vision/person_detected", self._on_person_detected, 10)
+        self.create_subscription(Float32, "/audio/doa_confidence", self._on_doa_confidence, 10)
+
+        # Speech & Gaze State
         self.create_subscription(String, "/gaze/active_target", self._on_active_target, 10)
         self.create_subscription(Float32, "/head/cmd_pos", self._on_cmd_pos, 10)
         self.create_subscription(Bool, "/robot/is_speaking", self._on_speaking, 10)
@@ -116,47 +179,58 @@ class SocialGazeLiveMonitor(Node):
             self.create_subscription(GazeStatus, "/gaze/state", self._on_gaze_state, 10)
         self.create_subscription(JointState, "/joint_states", self._on_joint_states, qos_be)
 
-    def _on_audio_doa(self, msg: Float32):
-        val = float(msg.data)
+    # -------------------------------------------------------------------------
+    # Camera Stream Callback
+    # -------------------------------------------------------------------------
+    def _on_camera_image(self, msg: Image):
         now = time.monotonic()
-        if self.audio_doa_deg is None or abs(val - self.audio_doa_deg) > 3.0 or (now - self.audio_last_time > 1.0):
-            self.audio_events.append({
-                "time": round(now - self.start_time, 2),
-                "doa_deg": round(val, 1),
-                "head_yaw_at_trigger": round(self.act_head_yaw, 2),
-            })
-        self.audio_doa_deg = val
-        self.audio_last_time = now
+        self.camera_frame_count += 1
+        self.camera_resolution = f"{msg.width}x{msg.height}"
+        self.camera_encoding = msg.encoding
 
-    def _on_vision_head_yaw(self, msg: Float32):
-        now = time.monotonic()
-        if self.visual_yaw_deg is None or (now - self.visual_last_time > 0.3):
-            self.visual_yaw_deg = float(msg.data)
-            self.visual_conf = 0.85
-            self.visual_faces_count = max(1, self.visual_faces_count)
-            self.visual_last_time = now
-            self.visual_events.append({
-                "time": round(now - self.start_time, 2),
-                "face_yaw_deg": round(self.visual_yaw_deg, 2),
-                "confidence": round(self.visual_conf, 2),
-                "tracking_error": round(self.cmd_head_yaw - self.act_head_yaw, 2),
-            })
+        if self.camera_last_frame_time > 0.0:
+            delta = (now - self.camera_last_frame_time) * 1000.0  # ms
+            self.camera_frame_deltas.append(delta)
 
-    def _on_person_detected(self, msg: Bool):
-        if not msg.data and (time.monotonic() - self.visual_last_time > 0.5):
-            self.visual_faces_count = 0
-            self.visual_conf = 0.0
+        self.camera_last_frame_time = now
+        self.camera_timestamps.append(now)
 
+        # Calculate Rolling Camera FPS
+        if len(self.camera_timestamps) >= 2:
+            dt = self.camera_timestamps[-1] - self.camera_timestamps[0]
+            if dt > 0.01:
+                self.camera_fps_rolling = (len(self.camera_timestamps) - 1) / dt
+
+        # Measure transport latency if stamp is populated
+        if msg.header.stamp.sec > 0:
+            now_ns = self.get_clock().now().nanoseconds
+            msg_ns = msg.header.stamp.sec * 1_000_000_000 + msg.header.stamp.nanosec
+            latency_ms = (now_ns - msg_ns) / 1_000_000.0
+            if 0.0 <= latency_ms < 5000.0:
+                self.camera_latencies_ms.append(latency_ms)
+
+    def _on_debug_face_image(self, msg: Image):
+        # Fallback if raw camera topic is remapped
+        if self.camera_frame_count == 0:
+            self._on_camera_image(msg)
+
+    # -------------------------------------------------------------------------
+    # Vision Callbacks
+    # -------------------------------------------------------------------------
     def _on_vision_json(self, msg: String):
         now = time.monotonic()
+        self.vision_msg_count += 1
+        self.vision_timestamps.append(now)
+
+        # Rolling Vision Detection FPS
+        if len(self.vision_timestamps) >= 2:
+            dt = self.vision_timestamps[-1] - self.vision_timestamps[0]
+            if dt > 0.01:
+                self.vision_fps_rolling = (len(self.vision_timestamps) - 1) / dt
+
         try:
             raw_data = json.loads(msg.data)
-            if isinstance(raw_data, dict):
-                faces = raw_data.get("faces", [])
-            elif isinstance(raw_data, list):
-                faces = raw_data
-            else:
-                faces = []
+            faces = raw_data.get("faces", []) if isinstance(raw_data, dict) else (raw_data if isinstance(raw_data, list) else [])
             self.visual_faces_count = len(faces)
             if faces:
                 primary = faces[0]
@@ -167,6 +241,7 @@ class SocialGazeLiveMonitor(Node):
                     "time": round(now - self.start_time, 2),
                     "face_yaw_deg": round(self.visual_yaw_deg, 2),
                     "confidence": round(self.visual_conf, 2),
+                    "distance_m": round(float(primary.get("distance_m", self.visual_user_distance)), 2),
                     "tracking_error": round(self.cmd_head_yaw - self.act_head_yaw, 2),
                 })
             else:
@@ -174,6 +249,62 @@ class SocialGazeLiveMonitor(Node):
         except Exception:
             pass
 
+    def _on_vision_head_yaw(self, msg: Float32):
+        self.visual_yaw_deg = float(msg.data)
+
+    def _on_user_distance(self, msg: Float32):
+        self.visual_user_distance = float(msg.data)
+
+    def _on_user_emotion(self, msg: String):
+        self.visual_user_emotion = str(msg.data)
+
+    def _on_recognized_person(self, msg: String):
+        try:
+            data = json.loads(msg.data)
+            if isinstance(data, dict) and data.get("is_known", False):
+                self.visual_recognized_name = f"{data.get('name', 'Bilinmeyen')} ({data.get('confidence', 0.0):.2f})"
+        except Exception:
+            self.visual_recognized_name = str(msg.data)
+
+    def _on_looking_at_robot(self, msg: Bool):
+        self.visual_looking_at_robot = bool(msg.data)
+
+    def _on_person_detected(self, msg: Bool):
+        if not msg.data and (time.monotonic() - self.visual_last_time > 0.5):
+            self.visual_faces_count = 0
+            self.visual_conf = 0.0
+
+    # -------------------------------------------------------------------------
+    # Audio Callbacks
+    # -------------------------------------------------------------------------
+    def _on_audio_doa(self, msg: Float32):
+        val = float(msg.data)
+        now = time.monotonic()
+        self.audio_total_events += 1
+
+        # Check conversational FOV (±75°)
+        rel_bearing = val  # Approximate relative bearing
+        if abs(rel_bearing) <= 75.0:
+            self.audio_accepted_events += 1
+        else:
+            self.audio_rejected_events += 1
+
+        if self.audio_doa_deg is None or abs(val - self.audio_doa_deg) > 3.0 or (now - self.audio_last_time > 1.0):
+            self.audio_events.append({
+                "time": round(now - self.start_time, 2),
+                "doa_deg": round(val, 1),
+                "confidence": round(self.audio_doa_conf, 2),
+                "head_yaw_at_trigger": round(self.act_head_yaw, 2),
+            })
+        self.audio_doa_deg = val
+        self.audio_last_time = now
+
+    def _on_doa_confidence(self, msg: Float32):
+        self.audio_doa_conf = max(0.0, min(1.0, float(msg.data)))
+
+    # -------------------------------------------------------------------------
+    # Actuator & State Callbacks
+    # -------------------------------------------------------------------------
     def _on_active_target(self, msg: String):
         self.active_target_json = msg.data
 
@@ -201,10 +332,15 @@ class SocialGazeLiveMonitor(Node):
                 self.act_head_vel = math.degrees(msg.velocity[idx])
 
     def _on_gaze_state(self, msg):
+        now = time.monotonic()
+        dt_dwell = now - self._last_fsm_dwell_stamp
+        if self.gaze_state in self.state_dwell_times:
+            self.state_dwell_times[self.gaze_state] += dt_dwell
+        self._last_fsm_dwell_stamp = now
+
         state_val = getattr(msg, "state", 0)
         current_st = STATE_NAMES.get(state_val, f"STATE_{state_val}")
         if current_st != self.prev_gaze_state:
-            now = time.monotonic()
             self.state_transitions.append({
                 "time": round(now - self.start_time, 2),
                 "from_state": self.prev_gaze_state,
@@ -233,40 +369,64 @@ def render_dashboard(node: SocialGazeLiveMonitor):
     audio_fresh = (now - node.audio_last_time < 1.5) and (node.audio_doa_deg is not None)
     vision_fresh = (now - node.visual_last_time < 1.5) and (node.visual_yaw_deg is not None)
 
-    # ANSI Clear Screen and Home (Single Buffer)
+    # Frame delta statistics
+    deltas = list(node.camera_frame_deltas)
+    avg_delta_ms = (sum(deltas) / len(deltas)) if deltas else 0.0
+    min_delta_ms = min(deltas) if deltas else 0.0
+    max_delta_ms = max(deltas) if deltas else 0.0
+    jitter_ms = (math.sqrt(sum((d - avg_delta_ms)**2 for d in deltas) / len(deltas))) if len(deltas) > 1 else 0.0
+
+    # Color helpers
+    cam_color = "\033[1;32m" if node.camera_fps_rolling >= 24.0 else ("\033[1;33m" if node.camera_fps_rolling >= 12.0 else "\033[1;31m")
+    vis_color = "\033[1;32m" if node.vision_fps_rolling >= 20.0 else ("\033[1;33m" if node.vision_fps_rolling >= 10.0 else "\033[1;31m")
+
     lines = []
     lines.append("=" * 80)
-    lines.append("       ASTRO SOCIAL ROBOT — REAL-TIME MULTIMODAL SOCIAL GAZE DASHBOARD")
+    lines.append("       ASTRO SOCIAL ROBOT — REAL-TIME SOCIAL GAZE & VISION FLUIDITY MONITOR")
     lines.append("=" * 80)
 
-    # 1. Perception Layer
-    lines.append("\n[1] PERCEPTION INPUTS:")
-    audio_str = f"{node.audio_doa_deg:+.1f}° (ACTIVE)" if audio_fresh else "SILENT / NO SIGNAL"
-    lines.append(f"  • Acoustic DOA (ReSpeaker) : {audio_str}")
-    
-    vis_str = f"{node.visual_yaw_deg:+.1f}° (Conf: {node.visual_conf:.2f}, Faces: {node.visual_faces_count})" if vision_fresh else "NO FACE DETECTED"
-    lines.append(f"  • Visual Face (OAK-D Lite) : {vis_str}")
-    lines.append(f"  • Robot Self-Speech Gate   : {'🔴 SPEAKING (ECHO SUPPRESSION ACTIVE)' if node.robot_speaking else '🟢 LISTENING / ATTENTIVE'}")
+    # 1. Camera Stream Fluidity & Hardware Telemetry
+    lines.append("\n[1] CAMERA HARDWARE STREAM & FLUIDITY (OAK-D LITE):")
+    lines.append(f"  • Stream Resolution / Format : {node.camera_resolution} ({node.camera_encoding})")
+    lines.append(f"  • Live Camera Frame Rate     : {cam_color}{node.camera_fps_rolling:.1f} FPS\033[0m (Total: {node.camera_frame_count} frames)")
+    lines.append(f"  • Frame Interval (Jitter)    : {avg_delta_ms:.1f} ms (Min: {min_delta_ms:.1f}ms, Max: {max_delta_ms:.1f}ms, Jitter: ±{jitter_ms:.1f}ms)")
+    if node.camera_latencies_ms:
+        avg_lat = sum(node.camera_latencies_ms) / len(node.camera_latencies_ms)
+        lines.append(f"  • Pipeline Transport Latency : {avg_lat:.1f} ms")
 
-    # 2. Gaze Policy & State Machine Layer
-    lines.append("\n[2] SOCIAL GAZE POLICY & FSM:")
-    lines.append(f"  • Active Gaze State        : \033[1;36m{node.gaze_state}\033[0m")
-    lines.append(f"  • Priority Source          : {node.gaze_priority}")
-    lines.append(f"  • Desired Gaze Target      : {node.gaze_desired_yaw:+.2f}° (Conf: {node.gaze_target_conf:.2f}, Valid: {node.gaze_target_valid})")
-    lines.append(f"  • Motion Planned Trajectory: {node.gaze_planned_yaw:+.2f}°")
-    lines.append(f"  • Target Acquired / Fixed  : {'✅ YES (FOVEATED)' if node.gaze_at_target else '⏳ SLEWING / CONVERGING'}")
+    # 2. Vision Perception & Biometrics
+    lines.append("\n[2] SPATIAL VISION & BIOMETRIC RECOGNITION:")
+    vis_hz_str = f"{vis_color}{node.vision_fps_rolling:.1f} Hz\033[0m" if node.vision_fps_rolling > 0 else "0.0 Hz"
+    lines.append(f"  • Face Detector Rate         : {vis_hz_str} (Processed: {node.vision_msg_count} cycles)")
+    vis_str = f"{node.visual_yaw_deg:+.1f}° (Conf: {node.visual_conf*100:.0f}%, Faces: {node.visual_faces_count})" if vision_fresh else "NO FACE DETECTED"
+    lines.append(f"  • Visual Face Azimuth        : {vis_str}")
+    lines.append(f"  • Distance & Emotion         : {node.visual_user_distance:.2f} m | Duygu: \033[1;33m{node.visual_user_emotion.upper()}\033[0m | Göz Teması: {'✅ EVET' if node.visual_looking_at_robot else '❌ YOK'}")
+    lines.append(f"  • Recognized Person          : \033[1;36m{node.visual_recognized_name}\033[0m")
 
-    # 3. Motion Planning & Actuator Loop
+    # 3. Acoustic Perception
+    lines.append("\n[3] ACOUSTIC DOA PERCEPTION (RESPEAKER):")
+    audio_str = f"{node.audio_doa_deg:+.1f}° (Conf: {node.audio_doa_conf*100:.0f}%)" if audio_fresh else "SILENT / NO ACTIVE SPEECH"
+    lines.append(f"  • Direction of Arrival (DOA) : {audio_str}")
+    lines.append(f"  • Acoustic Statistics        : {node.audio_total_events} events (Kabul: {node.audio_accepted_events}, Red: {node.audio_rejected_events})")
+    lines.append(f"  • Robot Self-Speech Gate     : {'🔴 KONUŞUYOR (EKO BASTIRMA AKTİF)' if node.robot_speaking else '🟢 DİNLİYOR (DİKKAT AÇIK)'}")
+
+    # 4. Gaze State Machine & Trajectory
+    lines.append("\n[4] SOCIAL GAZE POLICY & FSM:")
+    lines.append(f"  • Active Gaze State          : \033[1;36m{node.gaze_state}\033[0m (Öncelik: {node.gaze_priority})")
+    lines.append(f"  • Desired Target Yaw         : {node.gaze_desired_yaw:+.2f}° (Conf: {node.gaze_target_conf:.2f}, Valid: {node.gaze_target_valid})")
+    lines.append(f"  • Motion Planned S-Curve     : {node.gaze_planned_yaw:+.2f}°")
+    lines.append(f"  • Foveated / On Target       : {'✅ KİLİTLENDİ' if node.gaze_at_target else '⏳ HEDEFE YÖNELİYOR'}")
+
+    # 5. Actuator Execution
     err = node.cmd_head_yaw - node.act_head_yaw
-    lines.append("\n[3] ACTUATOR CLOSED-LOOP EXECUTION:")
-    lines.append(f"  • Commanded Trajectory     : {node.cmd_head_yaw:+.2f}°")
-    lines.append(f"  • Physical Head Position   : \033[1;32m{node.act_head_yaw:+.2f}°\033[0m")
-    lines.append(f"  • Joint Angular Velocity   : {node.act_head_vel:+.1f}°/s")
-    lines.append(f"  • Steady-State Error       : {err:+.2f}° ({'★ ON TARGET' if abs(err) <= 1.2 else 'TRACKING'})")
-    lines.append(f"  • Actuator Moving Status   : {'🔄 SLEWING' if node.head_moving else '⏸️ SETTLED / DWELLING'}")
+    lines.append("\n[5] CLOSED-LOOP HEAD MOTOR (50 Hz PID):")
+    lines.append(f"  • Commanded vs Physical Yaw  : Cmd: {node.cmd_head_yaw:+.2f}° | Act: \033[1;32m{node.act_head_yaw:+.2f}°\033[0m")
+    lines.append(f"  • Angular Velocity           : {node.act_head_vel:+.1f}°/s (Max: {node.max_abs_vel:.1f}°/s)")
+    lines.append(f"  • Steady-State Error         : {err:+.2f}° ({'★ MÜKEMMEL' if abs(err) <= 1.2 else 'TAKİP EDİYOR'})")
+    lines.append(f"  • Motor Durumu               : {'🔄 DÖNÜYOR' if node.head_moving else '⏸️ SABİT / DWELLING'}")
 
     lines.append("\n" + "-" * 80)
-    lines.append("  [Canlı Test]: Konuşarak veya hareket ederek test edin. Bitirmek için Ctrl+C yapın.")
+    lines.append("  [Canlı Test]: Kameranın karşısında yürüyün ve konuşun. Raporu görmek için Ctrl+C yapın.")
     lines.append("-" * 80)
 
     # Print buffer cleanly at home position
@@ -279,46 +439,75 @@ def generate_flight_report(node: SocialGazeLiveMonitor):
     avg_err = (sum(node.tracking_errors) / len(node.tracking_errors)) if node.tracking_errors else 0.0
     rms_err = math.sqrt(sum(e**2 for e in node.tracking_errors) / len(node.tracking_errors)) if node.tracking_errors else 0.0
 
-    print("\n\n" + "=" * 80)
-    print("       ASTRO SOCIAL GAZE LIVE TEST — FLIGHT RECORDER REPORT")
-    print("=" * 80)
-    print(f"Test Süresi          : {duration:.2f} saniye")
-    print(f"Toplanan Telemetri   : {node.sample_count} örnek ({node.sample_count / max(0.1, duration):.1f} Hz)")
-    print(f"Maksimum Açısal Hız  : {node.max_abs_vel:.1f}°/s")
-    print(f"Ortalama Takip Hatası: {avg_err:.2f}° (RMS: {rms_err:.2f}°)")
+    # Camera deltas
+    deltas = list(node.camera_frame_deltas)
+    avg_delta_ms = (sum(deltas) / len(deltas)) if deltas else 0.0
+    min_delta_ms = min(deltas) if deltas else 0.0
+    max_delta_ms = max(deltas) if deltas else 0.0
+    jitter_ms = (math.sqrt(sum((d - avg_delta_ms)**2 for d in deltas) / len(deltas))) if len(deltas) > 1 else 0.0
+    avg_cam_fps = (node.camera_frame_count / max(0.1, duration)) if node.camera_frame_count > 0 else 0.0
+    avg_vis_fps = (node.vision_msg_count / max(0.1, duration)) if node.vision_msg_count > 0 else 0.0
 
-    # 1. State Machine Timeline
-    print("\n[1] DURUM MAKİNESİ GEÇİŞLERİ (FSM TRANSITION TIMELINE):")
+    print("\n\n" + "=" * 80)
+    print("       ASTRO SOCIAL GAZE LIVE TEST — FLIGHT RECORDER & FLUIDITY REPORT")
+    print("=" * 80)
+    print(f"Test Süresi                  : {duration:.2f} saniye")
+    print(f"Toplanan Telemetri Örnekleri : {node.sample_count} örnek ({node.sample_count / max(0.1, duration):.1f} Hz)")
+    print(f"Maksimum Açısal Hız          : {node.max_abs_vel:.1f}°/s")
+    print(f"Ortalama Takip Hatası        : {avg_err:.2f}° (RMS: {rms_err:.2f}°)")
+
+    # 1. Camera Fluidity & Hardware Stream Report
+    print("\n[1] KAMERA VE GÖRÜNTÜ İŞLEME AKICILIĞI (CAMERA FLUIDITY):")
+    print(f"  • Kamera Çözünürlüğü / Format: {node.camera_resolution} ({node.camera_encoding})")
+    print(f"  • Ortalama Kamera Akış Hızı  : {avg_cam_fps:.1f} FPS (Toplam: {node.camera_frame_count} kare)")
+    print(f"  • Yüz Algılama Düğüm Hızı    : {avg_vis_fps:.1f} Hz (Toplam: {node.vision_msg_count} kare)")
+    print(f"  • Kareler Arası Gecikme (dt) : {avg_delta_ms:.1f} ms (Min: {min_delta_ms:.1f}ms, Max: {max_delta_ms:.1f}ms, Jitter: ±{jitter_ms:.1f}ms)")
+    if node.camera_latencies_ms:
+        mean_lat = sum(node.camera_latencies_ms) / len(node.camera_latencies_ms)
+        print(f"  • Donanım → Düğüm İletim Gecikmesi: {mean_lat:.1f} ms")
+
+    # 2. State Machine Timeline & Dwell Breakdown
+    print("\n[2] DURUM MAKİNESİ GEÇİŞLERİ VE KALMA SÜRELERİ (FSM DWELL BREAKDOWN):")
+    total_dwell = sum(node.state_dwell_times.values())
+    if total_dwell > 0:
+        for st_name, dw_t in sorted(node.state_dwell_times.items(), key=lambda x: x[1], reverse=True):
+            pct = (dw_t / total_dwell) * 100.0
+            if pct > 0.5:
+                print(f"  • {st_name:<20}: {dw_t:6.2f}s (%{pct:5.1f})")
+
+    print("\n[3] DURUM GEÇİŞ ZAMAN ÇİZELGESİ (TRANSITION TIMELINE):")
     if node.state_transitions:
         print(f"{'Zaman (s)':<12} | {'Önceki Durum':<18} -> {'Yeni Durum':<18} | {'Kafa Konumu':<12} | {'Hedef Açı'}")
         print("-" * 75)
-        for st in node.state_transitions:
+        for st in node.state_transitions[-20:]:  # Print last 20 transitions
             print(f"{st['time']:<12.2f} | {st['from_state']:<18} -> {st['to_state']:<18} | {st['head_yaw']:>+6.2f}°      | {st['target_yaw']:>+6.2f}°")
+        if len(node.state_transitions) > 20:
+            print(f"  ... ({len(node.state_transitions) - 20} önceki durum geçişi rapordan kısaltıldı)")
     else:
         print("  (Test süresince durum değişikliği olmadı: Sabit " + node.gaze_state + ")")
 
-    # 2. Acoustic Orienting Summary
-    print("\n[2] İŞİTSEL YÖNELME (ACOUSTIC DOA EVENTS):")
+    # 3. Acoustic Orienting Summary
+    print("\n[4] İŞİTSEL YÖNELME (ACOUSTIC DOA EVENTS):")
+    print(f"  • Toplam Algılanan Ses Olayı : {node.audio_total_events} (Kabul: {node.audio_accepted_events}, Red: {node.audio_rejected_events})")
     if node.audio_events:
-        print(f"  • Tespit Edilen Ses Yönü Sayısı: {len(node.audio_events)}")
         for i, ev in enumerate(node.audio_events[-5:], 1):
-            print(f"    - Olay {i}: {ev['time']}s | DOA = {ev['doa_deg']:+.1f}° | Kafa Başlangıç = {ev['head_yaw_at_trigger']:+.2f}°")
+            print(f"    - Olay {i}: {ev['time']}s | DOA = {ev['doa_deg']:+.1f}° (Conf: {ev.get('confidence', 0.0)*100:.0f}%) | Kafa Başlangıç = {ev['head_yaw_at_trigger']:+.2f}°")
     else:
         print("  • Ses olayı algılanmadı (Sessiz ortam).")
 
-    # 3. Visual Face Tracking Summary
-    print("\n[3] GÖRSEL YÜZ TAKİBİ (VISUAL TRACKING SUMMARY):")
+    # 4. Visual Face Tracking Summary
+    print("\n[5] GÖRSEL YÜZ TAKİBİ (VISUAL TRACKING SUMMARY):")
     if node.visual_events:
-        print(f"  • Toplam Takip Edilen Yüz Karesi: {len(node.visual_events)} kare")
+        print(f"  • Toplam Takip Edilen Yüz Karesi : {len(node.visual_events)} kare")
         mean_vis_conf = sum(e['confidence'] for e in node.visual_events) / len(node.visual_events)
-        print(f"  • Ortalama Tespit Güveni: %{mean_vis_conf*100:.1f}")
+        print(f"  • Ortalama Tespit Güveni         : %{mean_vis_conf*100:.1f}")
         for i, ev in enumerate(node.visual_events[-5:], 1):
-            print(f"    - Kare {i}: {ev['time']}s | Yüz Açısı = {ev['face_yaw_deg']:+.1f}° | Takip Hatası = {ev['tracking_error']:+.2f}°")
+            print(f"    - Kare {i}: {ev['time']}s | Yüz Açısı = {ev['face_yaw_deg']:+.1f}° | Mesafe = {ev.get('distance_m', 0.0):.2f}m | Hata = {ev['tracking_error']:+.2f}°")
     else:
         print("  • Görsel yüz tespiti algılanmadı.")
 
     print("\n" + "=" * 80)
-    print("Kabul Özeti: Test başarıyla tamamlandı. Rapor JSON dosyasına kaydedildi.")
+    print("Kabul Özeti: Test başarıyla tamamlandı. Detaylı JSON telemetri kaydedildi.")
     print("=" * 80 + "\n")
 
     # Save JSON Log
@@ -327,12 +516,27 @@ def generate_flight_report(node: SocialGazeLiveMonitor):
     report_data = {
         "duration_s": round(duration, 2),
         "total_samples": node.sample_count,
+        "camera_metrics": {
+            "resolution": node.camera_resolution,
+            "encoding": node.camera_encoding,
+            "total_frames": node.camera_frame_count,
+            "average_fps": round(avg_cam_fps, 2),
+            "frame_delta_avg_ms": round(avg_delta_ms, 2),
+            "frame_delta_min_ms": round(min_delta_ms, 2),
+            "frame_delta_max_ms": round(max_delta_ms, 2),
+            "frame_jitter_ms": round(jitter_ms, 2),
+        },
+        "vision_metrics": {
+            "total_messages": node.vision_msg_count,
+            "detection_fps": round(avg_vis_fps, 2),
+            "visual_events_count": len(node.visual_events),
+        },
         "max_angular_velocity_deg_s": round(node.max_abs_vel, 2),
         "mean_tracking_error_deg": round(avg_err, 2),
         "rms_tracking_error_deg": round(rms_err, 2),
+        "fsm_dwell_times_s": {k: round(v, 2) for k, v in node.state_dwell_times.items()},
         "state_transitions": node.state_transitions,
         "audio_events": node.audio_events,
-        "visual_events_count": len(node.visual_events),
     }
     with open(report_file, "w", encoding="utf-8") as f:
         json.dump(report_data, f, indent=2)
@@ -351,7 +555,8 @@ def main():
     finally:
         generate_flight_report(node)
         node.destroy_node()
-        rclpy.shutdown()
+        if rclpy.ok():
+            rclpy.shutdown()
 
 
 if __name__ == "__main__":
