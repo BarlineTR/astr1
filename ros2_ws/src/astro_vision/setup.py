@@ -30,6 +30,7 @@ setup(
             "webcam_publisher_node = astro_vision.webcam_publisher_node:main",
             "oak_perception_node = astro_vision.oak_perception_node:main",
             "oak_spatial_native_node = astro_vision.oak_spatial_native_node:main",
+            "session_recorder = astro_vision.session_recorder:main",
         ],
     },
 )
