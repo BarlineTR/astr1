@@ -98,35 +98,29 @@ class ModelCapability:
 
 # Approved Production Chat & Vision LLM Models (Strict Whitelist)
 GROQ_PRODUCTION_MODELS: Set[str] = {
-    "openai/gpt-oss-20b",
-    "openai/gpt-oss-120b",
     "llama-3.3-70b-versatile",
     "llama-3.1-8b-instant",
+    "openai/gpt-oss-20b",
+    "openai/gpt-oss-120b",
     "llama-3.2-11b-vision-preview",
     "llama-3.2-90b-vision-preview",
 }
 
 GROQ_PREFERENCE_ORDER: List[str] = [
-    "openai/gpt-oss-20b",
-    "openai/gpt-oss-120b",
     "llama-3.3-70b-versatile",
     "llama-3.1-8b-instant",
+    "openai/gpt-oss-20b",
+    "openai/gpt-oss-120b",
 ]
 
 GEMINI_PRODUCTION_MODELS: Set[str] = {
-    "gemini-2.5-flash",
-    "gemini-2.5-flash-lite",
-    "gemini-2.5-pro",
     "gemini-2.0-flash",
     "gemini-1.5-flash",
-    "gemini-1.5-pro",
     "gemini-2.0-flash-lite",
+    "gemini-1.5-pro",
 }
 
 GEMINI_PREFERENCE_ORDER: List[str] = [
-    "gemini-2.5-flash",
-    "gemini-2.5-flash-lite",
-    "gemini-2.5-pro",
     "gemini-2.0-flash",
     "gemini-1.5-flash",
     "gemini-2.0-flash-lite",

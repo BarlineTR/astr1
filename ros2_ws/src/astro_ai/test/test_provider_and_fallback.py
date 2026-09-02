@@ -109,19 +109,19 @@ class TestProviderRegistry(unittest.TestCase):
         self.assertEqual(stats["rejected"], 5)
 
         # Priority order verification
-        self.assertEqual(discovered[0], "openai/gpt-oss-20b")
-        self.assertEqual(discovered[1], "openai/gpt-oss-120b")
-        self.assertEqual(discovered[2], "llama-3.3-70b-versatile")
-        self.assertEqual(discovered[3], "llama-3.1-8b-instant")
+        self.assertEqual(discovered[0], "llama-3.3-70b-versatile")
+        self.assertEqual(discovered[1], "llama-3.1-8b-instant")
+        self.assertEqual(discovered[2], "openai/gpt-oss-20b")
+        self.assertEqual(discovered[3], "openai/gpt-oss-120b")
 
     def test_gemini_discovery_and_filtering(self):
         mock_response_json = {
             "models": [
-                {"name": "models/gemini-2.5-flash", "supportedGenerationMethods": ["generateContent"]},
-                {"name": "models/gemini-2.5-flash-lite", "supportedGenerationMethods": ["generateContent"]},
-                {"name": "models/gemini-2.5-pro", "supportedGenerationMethods": ["generateContent"]},
-                {"name": "models/gemini-2.5-flash-image", "supportedGenerationMethods": ["generateContent"]},
+                {"name": "models/gemini-2.0-flash", "supportedGenerationMethods": ["generateContent"]},
                 {"name": "models/gemini-1.5-flash", "supportedGenerationMethods": ["generateContent"]},
+                {"name": "models/gemini-1.5-pro", "supportedGenerationMethods": ["generateContent"]},
+                {"name": "models/gemini-2.0-flash-image", "supportedGenerationMethods": ["generateContent"]},
+                {"name": "models/gemini-old-model", "supportedGenerationMethods": ["generateContent"]},
                 {"name": "models/text-embedding-004", "supportedGenerationMethods": ["embedContent"]},
                 {"name": "models/aqa", "supportedGenerationMethods": ["generateAnswer"]},
             ]
@@ -136,14 +136,14 @@ class TestProviderRegistry(unittest.TestCase):
 
         self.assertEqual(self.registry.get_provider_health("gemini"), ProviderHealth.HEALTHY)
         # Exactly 3 production LLM models are routeable
-        self.assertIn("gemini-2.5-flash", discovered)
-        self.assertIn("gemini-2.5-flash-lite", discovered)
-        self.assertIn("gemini-2.5-pro", discovered)
+        self.assertIn("gemini-2.0-flash", discovered)
+        self.assertIn("gemini-1.5-flash", discovered)
+        self.assertIn("gemini-1.5-pro", discovered)
         self.assertEqual(len(discovered), 3, "Gemini routeable pool must contain exactly 3 production LLM models")
 
         # Image generation and legacy models are rejected
-        self.assertNotIn("gemini-2.5-flash-image", discovered)
-        self.assertNotIn("gemini-1.5-flash", discovered)
+        self.assertNotIn("gemini-2.0-flash-image", discovered)
+        self.assertNotIn("gemini-old-model", discovered)
         self.assertNotIn("text-embedding-004", discovered)
         self.assertNotIn("aqa", discovered)
 
@@ -382,7 +382,7 @@ class TestProductionEdgeScenarios(unittest.TestCase):
         mock_resp_json = {
             "models": [
                 {"name": "models/gemini-old-broken", "supportedGenerationMethods": ["generateContent"]},
-                {"name": "models/gemini-2.5-flash", "supportedGenerationMethods": ["generateContent"]},
+                {"name": "models/gemini-2.0-flash", "supportedGenerationMethods": ["generateContent"]},
             ]
         }
         mock_resp = MagicMock()
@@ -407,7 +407,7 @@ class TestProductionEdgeScenarios(unittest.TestCase):
 
         candidates = self.registry.get_available_models("gemini")
         self.assertNotIn("gemini-old-broken", candidates)
-        self.assertIn("gemini-2.5-flash", candidates)
+        self.assertIn("gemini-2.0-flash", candidates)
 
     def test_scenario_quota_exhausted_failover(self):
         """Scenario B: Realtime / Provider 429 Quota exhausted classified correctly."""
@@ -499,9 +499,9 @@ class TestContextualFallbackAndTelemetry(unittest.TestCase):
         }
         mock_gemini_json = {
             "models": [
-                {"name": "models/gemini-2.5-flash", "supportedGenerationMethods": ["generateContent"]},
-                {"name": "models/gemini-2.5-flash-lite", "supportedGenerationMethods": ["generateContent"]},
-                {"name": "models/gemini-2.5-pro", "supportedGenerationMethods": ["generateContent"]},
+                {"name": "models/gemini-2.0-flash", "supportedGenerationMethods": ["generateContent"]},
+                {"name": "models/gemini-1.5-flash", "supportedGenerationMethods": ["generateContent"]},
+                {"name": "models/gemini-1.5-pro", "supportedGenerationMethods": ["generateContent"]},
             ]
         }
 
@@ -520,8 +520,8 @@ class TestContextualFallbackAndTelemetry(unittest.TestCase):
             gemini_models = self.registry.discover_models("gemini", "key_gemini")
 
         # Verify exact preferred ordering
-        self.assertEqual(groq_models, ["openai/gpt-oss-20b", "openai/gpt-oss-120b", "llama-3.3-70b-versatile", "llama-3.1-8b-instant"])
-        self.assertEqual(gemini_models, ["gemini-2.5-flash", "gemini-2.5-flash-lite", "gemini-2.5-pro"])
+        self.assertEqual(groq_models, ["llama-3.3-70b-versatile", "llama-3.1-8b-instant", "openai/gpt-oss-20b", "openai/gpt-oss-120b"])
+        self.assertEqual(gemini_models, ["gemini-2.0-flash", "gemini-1.5-flash", "gemini-1.5-pro"])
 
     def test_acceptance_criteria_g_repetition_guard_5_turns_diversity(self):
         """Test G: Asking the same question 5 times produces varied responses without repetition or template lock."""
