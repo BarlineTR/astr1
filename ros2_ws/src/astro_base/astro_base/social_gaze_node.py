@@ -535,8 +535,10 @@ class SocialGazeNode(Node):
             timestamp=t,
         )
 
-        # Auto-wake social gaze from sleep mode when a person is detected or speaking
-        if target_state.active_target is not None and self.fsm.is_sleeping and not self.fsm.safety_lock:
+        # Auto-wake social gaze from sleep mode when a person is detected, or speaking, or visual tracks exist
+        has_visual_tracks = bool(self.latest_visual_tracks and len(self.latest_visual_tracks) > 0)
+        has_audio_doa = bool(self.latest_audio_state and self.latest_audio_state.valid and self.latest_audio_state.confidence >= 0.50)
+        if (has_visual_tracks or has_audio_doa or target_state.active_target is not None) and self.fsm.is_sleeping and not self.fsm.safety_lock:
             self.fsm.set_sleep_mode(False)
 
         # 3. Social Gaze FSM & Attention Arbitration

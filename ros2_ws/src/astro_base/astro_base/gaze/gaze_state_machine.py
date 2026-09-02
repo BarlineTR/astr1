@@ -147,6 +147,9 @@ class SocialGazeFSM:
             self.state = GazeStateEnum.IDLE
             self.target_yaw_deg = 0.0
             self.active_priority = PrioritySource.EMERGENCY_STOP
+        else:
+            if self.active_priority == PrioritySource.EMERGENCY_STOP and not self._safety_intent.is_sleeping:
+                self.active_priority = PrioritySource.IDLE
 
     def set_sleep_mode(self, sleeping: bool) -> None:
         """Sets robot sleep state; locks head at center during deep sleep."""
@@ -157,6 +160,9 @@ class SocialGazeFSM:
             self.state = GazeStateEnum.IDLE
             self.target_yaw_deg = 0.0
             self.active_priority = PrioritySource.EMERGENCY_STOP
+        else:
+            if self.active_priority == PrioritySource.EMERGENCY_STOP and not self._safety_intent.is_locked:
+                self.active_priority = PrioritySource.IDLE
 
     def set_explicit_gaze_intent(self, intent: Optional[ExplicitGazeIntent]) -> None:
         """Sets an explicit user gaze command (e.g. 'Astro bana dön')."""

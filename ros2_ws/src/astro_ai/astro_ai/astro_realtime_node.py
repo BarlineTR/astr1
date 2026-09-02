@@ -880,10 +880,10 @@ class AstroRealtimeNode(Node):
             self.action_manager._pub_explicit_gaze = self.pub_explicit_gaze
             self.action_manager._pub_cmd_vel = self.pub_cmd_vel
 
-        # Publish initial sleeping / deep-idle state so head tracker stays parked at 0.0° until wake
+        # Publish initial neutral emotion state so face screen and gaze tracker initialize awake
         try:
             emo_init = String()
-            emo_init.data = "sleeping"
+            emo_init.data = "neutral"
             self.pub_emotion.publish(emo_init)
         except Exception:
             pass
