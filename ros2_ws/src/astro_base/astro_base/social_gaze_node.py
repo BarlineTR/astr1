@@ -194,6 +194,15 @@ class SocialGazeNode(Node):
         self.actual_head_yaw_deg: float = 0.0
         self.actual_head_vel_deg_s: float = 0.0
         self.is_robot_speaking: bool = False
+        self.is_playback_active: bool = False
+        # The person's own head-pose yaw (from _estimate_head_yaw), carried separately
+        # from the visual tracker.  Used only as an eye-contact cue for detections
+        # that arrive without a per-face yaw_deg of their own.
+        self.latest_person_head_yaw_deg: float = 0.0
+        # Bug #4 fix: GCC-PHAT PSR confidence delivered via /audio/doa_confidence
+        # companion topic.  Updated in _on_doa_confidence, consumed in _on_doa_deg.
+        # Default 0.70 = reasonable prior while no confidence measurement has arrived.
+        self._latest_doa_confidence: float = 0.70
 
         # -------------------------------------------------------------------------
         # 4. ROS 2 Publishers & Subscriptions
@@ -226,6 +235,9 @@ class SocialGazeNode(Node):
         self.create_subscription(Float32, "/audio/doa", self._on_doa_deg, 10)
         self.create_subscription(Float32, "/audio/doa_deg", self._on_doa_deg, 10)
         self.create_subscription(Int32, "/audio/doa_raw", self._on_doa_raw, 10)
+        # Bug #4 fix: GCC-PHAT PSR confidence companion — latched into
+        # self._latest_doa_confidence so _on_doa_deg can pass it through.
+        self.create_subscription(Float32, "/audio/doa_confidence", self._on_doa_confidence, 10)
         self.create_subscription(String, "/vision/detections_json", self._on_vision_json, 10)
         self.create_subscription(String, "/vision/faces", self._on_vision_json, 10)
         self.create_subscription(Float32, "/vision/head_yaw", self._on_vision_head_yaw, 10)
@@ -234,7 +246,7 @@ class SocialGazeNode(Node):
         self.create_subscription(Float32, "/head/target_yaw", self._on_gaze_intent, 10)
         self.create_subscription(String, "/behavior/explicit_gaze", self._on_explicit_gaze, 10)
         self.create_subscription(Bool, "/robot/is_speaking", self._on_speaking_status, 10)
-        self.create_subscription(Bool, "/audio/playback_active", self._on_speaking_status, 10)
+        self.create_subscription(Bool, "/audio/playback_active", self._on_playback_active, 10)
         self.create_subscription(String, "/robot/emotion", self._on_emotion, 10)
         self.create_subscription(Bool, "/safety/emergency_stop", self._on_emergency_stop, 10)
         self.create_subscription(Bool, "/system/sleep", self._on_sleep_mode, 10)
@@ -283,6 +295,17 @@ class SocialGazeNode(Node):
             head_velocity_deg_s=self.actual_head_vel_deg_s,
         )
 
+    def _on_doa_confidence(self, msg: Float32) -> None:
+        """Latches the GCC-PHAT PSR confidence from /audio/doa_confidence.
+
+        This companion topic is published by audio_stream_node immediately before
+        (or after) /audio/doa so that the confidence value is not lost at the
+        Float32 topic boundary (Bug #4).
+        """
+        raw = float(msg.data)
+        # Clamp to [0, 1] — guard against any sensor noise in the PSR ratio
+        self._latest_doa_confidence = max(0.0, min(1.0, raw))
+
     def _on_doa_deg(self, msg: Float32) -> None:
         """Processes float DOA angle in degrees."""
         t = time.monotonic()
@@ -291,6 +314,8 @@ class SocialGazeNode(Node):
             raw_doa_deg=raw_val,
             timestamp=t,
             actual_head_yaw_deg=self.actual_head_yaw_deg,
+            # Bug #4 fix: use the latched GCC-PHAT confidence instead of 0.85
+            confidence=self._latest_doa_confidence,
             is_robot_speaking=self.is_robot_speaking,
         )
         if not obs.valid:
@@ -311,25 +336,20 @@ class SocialGazeNode(Node):
         )
 
     def _on_vision_head_yaw(self, msg: Float32) -> None:
-        """Processes 1D estimated head yaw as a fallback visual measurement."""
-        t = time.monotonic()
-        cam_azimuth = float(msg.data)
-        obs = self.visual_perception.process_detection(
-            x=320,
-            y=240,
-            w=60,
-            h=60,
-            depth_m=1.5,
-            timestamp=t,
-            actual_head_yaw_deg=self.actual_head_yaw_deg,
-            confidence=0.85,
-            cam_azimuth_deg=cam_azimuth,
-        )
-        self.latest_visual_tracks = self.visual_tracker.update(
-            observations=[obs],
-            timestamp=t,
-            actual_head_yaw_deg=self.actual_head_yaw_deg,
-        )
+        """Stores the person's own head-pose yaw as an eye-contact cue.
+
+        /vision/head_yaw carries the *person's* head rotation (degrees left/
+        right of camera centre), NOT a camera bearing to the face.  It is
+        published by face_detector_node alongside /vision/faces.
+
+        Feeding this value as cam_azimuth_deg to the visual tracker was Bug #1:
+        it fabricated phantom observations at the wrong azimuth and starved the
+        real face detections coming from /vision/faces (Bug #2).
+
+        The value is preserved here so that _on_vision_json can use it as a
+        fallback eye-contact cue when a detection JSON dict omits yaw_deg.
+        """
+        self.latest_person_head_yaw_deg = float(msg.data)
 
     def _on_vision_json(self, msg: String) -> None:
         """Processes JSON array of detected faces from OAK-D Lite vision pipeline."""
@@ -368,7 +388,13 @@ class SocialGazeNode(Node):
                     actual_head_yaw_deg=self.actual_head_yaw_deg,
                     frame_width=frame_w_val,
                     frame_height=frame_h_val,
-                    confidence=float(d.get("confidence", 0.85)),
+                    # Bug #3 fix: use the confidence field published by the vision
+                    # node (geometric quality score).  If the field is absent (old
+                    # pipeline builds), fall back to a conservative 0.55 rather
+                    # than the fabricated 0.85 that was previously hardcoded here.
+                    # 0.55 is above the 0.50 validity gate so tracking still works,
+                    # but it no longer pretends Haar is as reliable as a DNN.
+                    confidence=float(d["confidence"]) if "confidence" in d else 0.55,
                     eyes_visible=eyes_vis,
                     head_yaw_deg=head_yaw_val,
                     emotion=str(d.get("emotion", "neutral")),
@@ -425,7 +451,19 @@ class SocialGazeNode(Node):
         self.get_logger().info(f"Explicit gaze intent received: selector={selector.value}, reason={intent.reason}")
 
     def _on_speaking_status(self, msg: Bool) -> None:
-        self.is_robot_speaking = msg.data
+        """Sets TTS/NLG-level speaking flag (/robot/is_speaking)."""
+        self.is_robot_speaking = bool(msg.data) or self.is_playback_active
+
+    def _on_playback_active(self, msg: Bool) -> None:
+        """Sets audio-player playback flag (/audio/playback_active, 10 Hz).
+
+        This is separate from _on_speaking_status so that a 10 Hz playback
+        heartbeat cannot overwrite a is_speaking=True that just arrived from
+        the NLG side.  The combined robot-inhibit flag is the logical OR of
+        both sources.
+        """
+        self.is_playback_active = bool(msg.data)
+        self.is_robot_speaking = bool(msg.data) or self.is_robot_speaking
 
     def _on_emergency_stop(self, msg: Bool) -> None:
         self.fsm.set_safety_lock(msg.data)

@@ -298,7 +298,19 @@ class SpatialVisionNode(Node):
                     "distance_m": round(dist_m, 2)
                 }
 
-            # 5. Emotion Detection
+            # 5. Emission confidence — geometric quality signal so that
+            # social_gaze_node does not need to fabricate a hardcoded 0.85.
+            # Formula: eyes_found contributes the base tier; a large, close
+            # bbox adds up to +0.20 bonus (capped at 0.95).
+            # No scored cascade is available for Haar, so this is the best
+            # honest proxy for detection reliability from monocular video.
+            _base_conf = 0.72 if eyes_found else 0.55
+            _bbox_area_norm = min(1.0, (w * h) / (frame_w * frame_h * 0.25))
+            _conf = min(0.95, _base_conf + 0.20 * _bbox_area_norm)
+            if not in_social_zone:
+                _conf *= 0.70  # spatial sanity penalty
+
+            # 6. Emotion Detection
             detected_emotion = self._detect_facial_emotion(face_roi_gray, w, h, yaw=yaw, eyes_found=eyes_found)
 
             face_list.append({
@@ -308,6 +320,7 @@ class SpatialVisionNode(Node):
                 "camera_azimuth_deg": round(cam_azimuth, 1),
                 "distance_m": round(dist_m, 2),
                 "looking_at_robot": direct_gaze,
+                "confidence": round(_conf, 2),
                 "emotion": detected_emotion,
                 "recognized_name": recog_name if is_known else None,
                 "recognized_title": recog_meta.get("formal_title") if is_known else None

@@ -252,6 +252,9 @@ class AudioStreamNode(Node):
         self.pub_playback_active = self.create_publisher(Bool, "/audio/playback_active", 10)
         self.pub_input_level = self.create_publisher(Float32, "/audio/mic_level", 10)
         self.pub_doa = self.create_publisher(Float32, "/audio/doa", 10)
+        # Bug #4 fix: companion confidence topic so social_gaze_node doesn't
+        # need to hardcode 0.85 — GCC-PHAT PSR confidence is preserved here.
+        self.pub_doa_confidence = self.create_publisher(Float32, "/audio/doa_confidence", 10)
         self.pub_vad = self.create_publisher(Bool, "/audio/vad", 10)
 
         # Hardware ReSpeaker HID & Acoustic DOA Estimator
@@ -354,6 +357,10 @@ class AudioStreamNode(Node):
                 doa_msg = Float32()
                 doa_msg.data = float(doa_angle)
                 self.pub_doa.publish(doa_msg)
+                # HID DOA has ±45° coarse resolution — publish conservative confidence
+                hid_conf_msg = Float32()
+                hid_conf_msg.data = 0.60
+                self.pub_doa_confidence.publish(hid_conf_msg)
 
         except Exception as exc:
             self.get_logger().debug(f"_poll_respeaker_hid error: {exc}")
@@ -523,6 +530,10 @@ class AudioStreamNode(Node):
                     doa_msg = Float32()
                     doa_msg.data = float(raw_doa)
                     self.pub_doa.publish(doa_msg)
+                    # Bug #4 fix: preserve GCC-PHAT PSR confidence at topic boundary
+                    conf_msg = Float32()
+                    conf_msg.data = float(conf)
+                    self.pub_doa_confidence.publish(conf_msg)
                     self.pub_vad.publish(Bool(data=True))
                     self._last_gcc_doa_time = now
 
