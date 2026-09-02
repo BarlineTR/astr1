@@ -68,45 +68,31 @@ def test_native_hardware_fps():
         
         pipeline = dai.Pipeline()
         
-        # Discover Camera class
-        cam_cls = getattr(dai.node, "ColorCamera", getattr(dai.node, "Camera", getattr(dai, "ColorCamera", None)))
-        cam_rgb = pipeline.create(cam_cls)
-        if hasattr(cam_rgb, "setResolution") and hasattr(dai, "ColorCameraProperties"):
-            cam_rgb.setResolution(dai.ColorCameraProperties.SensorResolution.THE_720_P)
-        if hasattr(cam_rgb, "setFps"):
-            cam_rgb.setFps(30)
-
-        # Discover XLinkOut class
-        xlink_cls = None
-        for mod in (dai.node, dai):
-            for name in dir(mod):
-                val = getattr(mod, name, None)
-                if isinstance(val, type) and "xlink" in name.lower() and "out" in name.lower():
-                    xlink_cls = val
-                    break
-            if xlink_cls is not None:
-                break
-
-        if xlink_cls is None:
-            nodes = [k for k in dir(dai.node) if not k.startswith('_')]
-            print(f"  • DepthAI Sürümü: {getattr(dai, '__version__', 'bilinmiyor')}")
-            print(f"  • Mevcut Düğümler: {nodes[:10]}...")
-            return
-
-        xout = pipeline.create(xlink_cls)
-        xout.setStreamName("video")
-        
-        if hasattr(cam_rgb, "video"):
-            cam_rgb.video.link(xout.input)
-        elif hasattr(cam_rgb, "isp"):
-            cam_rgb.isp.link(xout.input)
-        elif hasattr(cam_rgb, "preview"):
-            cam_rgb.preview.link(xout.input)
+        # DepthAI 3.x Native Camera API
+        pipeline = dai.Pipeline()
+        cam = pipeline.create(dai.node.Camera)
+        if hasattr(cam, "setSize"):
+            cam.setSize(1280, 720)
+        if hasattr(cam, "setFps"):
+            cam.setFps(30)
 
         with dai.Device(pipeline) as device:
             usb_speed = device.getUsbSpeed()
             print(f"  • Cihaz USB Hızı: \033[1;36m{usb_speed.name}\033[0m")
-            q = device.getOutputQueue(name="video", maxSize=4, blocking=False)
+            
+            # DepthAI 3 queue discovery
+            queue_name = None
+            if hasattr(device, "getOutputQueueNames"):
+                q_names = device.getOutputQueueNames()
+                queue_name = q_names[0] if q_names else None
+            if not queue_name:
+                queue_name = "camera"
+
+            try:
+                q = device.getOutputQueue(name=queue_name, maxSize=4, blocking=False)
+            except Exception:
+                q = device.getOutputQueue(name=device.getOutputQueueNames()[0], maxSize=4, blocking=False)
+
             t_start = time.monotonic()
             frames = 0
             while frames < 90 and (time.monotonic() - t_start < 4.0):
