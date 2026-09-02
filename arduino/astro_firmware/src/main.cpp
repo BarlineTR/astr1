@@ -322,10 +322,13 @@ void headControl(uint32_t dt_ms) {
     g_diag_flags &= ~FLAG_HEAD_STALL;
   } else if (millis() - g_head_stall_ms > HEAD_STALL_MS) {
     setHeadPWM(0);
-    // Stall koruması: Motoru kes ve bayrağı kaldır.
-    // DİKKAT: Hedefi anlık konuma çekmiyoruz (g_head_target_ticks korunur),
-    // böylece teşhis telemetrisi gerçek hedefi ve hatayı raporlamaya devam eder.
     g_diag_flags |= FLAG_HEAD_STALL;
+    // Otomatik kurtarma: 800ms motor dinlendikten sonra tekrar dene (kalıcı kilitlenmeyi önle)
+    if (millis() - g_head_stall_ms > HEAD_STALL_MS + 800) {
+      g_head_stall_ref = pos;
+      g_head_stall_ms = millis();
+      g_diag_flags &= ~FLAG_HEAD_STALL;
+    }
   }
 }
 

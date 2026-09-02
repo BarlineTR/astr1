@@ -370,9 +370,12 @@ class SocialGazeFSM:
                 if abs(angular_diff_deg(target_yaw, self.target_yaw_deg)) >= self.deadband_deg:
                     self.target_yaw_deg = target_yaw
 
-                # Settle into committed HOLDING_ATTENTION once arrived and velocity settled
+                # Settle into committed HOLDING_ATTENTION once arrived and velocity settled, or on dwell timeout
+                time_in_tracking = timestamp - self._state_entry_time
                 if self.at_target or (err_deg <= self.position_tolerance_deg and abs(actual_head_vel_deg_s) <= self.velocity_tolerance_deg_s):
                     self._transition_to(GazeStateEnum.HOLDING_ATTENTION, timestamp, reason="PURSUIT_ARRIVED_HOLD")
+                elif time_in_tracking >= 1.5 and abs(actual_head_vel_deg_s) <= self.velocity_tolerance_deg_s:
+                    self._transition_to(GazeStateEnum.HOLDING_ATTENTION, timestamp, reason="PURSUIT_TIMEOUT_HOLD")
                 elif err_deg > 25.0:
                     self._transition_to(GazeStateEnum.ORIENTING, timestamp, reason="LARGE_TARGET_STEP")
 

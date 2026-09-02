@@ -578,13 +578,22 @@ class SerialBridge(Node):
         pkt = self.build_packet(MSG_HEAD_CMD, payload)
         try:
             with self.tx_lock:
-                # Transmit binary MSG_HEAD_CMD packet on change >=0.5 deg (full resolution across -70° to +70°)
                 last_sent_angle = getattr(self, "_last_sent_angle", None)
-                if last_sent_angle is None or abs(msg.angle_deg - last_sent_angle) >= 0.5:
+                last_sent_time = getattr(self, "_last_sent_angle_time", 0.0)
+                pos_err = abs(self.head_pos - msg.angle_deg)
+                
+                # Transmit binary MSG_HEAD_CMD packet on change >=0.5 deg, or periodically every 0.6s if error persists
+                should_send = (
+                    last_sent_angle is None
+                    or abs(msg.angle_deg - last_sent_angle) >= 0.5
+                    or (now - last_sent_time >= 0.60 and pos_err >= 1.5)
+                )
+                if should_send:
                     self.ser.write(pkt)
                     self._last_sent_angle = msg.angle_deg
                     self._last_sent_angle_time = now
-                    self.get_logger().info(f"🎯 [SERIAL HEAD CMD] binary_pkt angle_deg={msg.angle_deg:.1f} (scaled={scaled_angle:.2f}°)")
+                    if last_sent_angle is None or abs(msg.angle_deg - last_sent_angle) >= 0.5:
+                        self.get_logger().info(f"🎯 [SERIAL HEAD CMD] binary_pkt angle_deg={msg.angle_deg:.1f} (scaled={scaled_angle:.2f}°)")
         except serial.SerialException as exc:
             self.get_logger().error(f"HeadCmd write failed: {exc}")
             self._mark_disconnected()
@@ -688,6 +697,10 @@ class SerialBridge(Node):
         if flags & 0x01:
             st.level = DiagnosticStatus.ERROR
             st.message = "Watchdog timeout - motors halted"
+        elif flags & 0x04:
+            st.level = DiagnosticStatus.WARN
+            st.message = "Head motor stall - auto-recovering"
+            self._last_sent_angle = None
         elif flags & 0x02:
             st.level = DiagnosticStatus.WARN
             st.message = "IMU read failure"
