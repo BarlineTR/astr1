@@ -11,6 +11,7 @@ plumbing rather than the detector's speed.
 import json
 import os
 import unittest
+from pathlib import Path
 
 import cv2
 import numpy as np
@@ -102,19 +103,44 @@ class TestFaceDetectorCadence(unittest.TestCase):
         )
 
 
-class TestFallbackCascadeIsNotRunOnEveryEmptyFrame(unittest.TestCase):
-    """The alt2 pass runs only when the first cascade finds nothing — which is most
-    frames — and it is the single most expensive thing in the pipeline: 19.0 ms for
-    the primary plus 13.6 ms for the fallback, against 6.8 ms when a face is present.
+class TestDetectionIsStableFrameToFrame(unittest.TestCase):
+    """Intermittent detection came from pose, not from frame rate.
+
+    Measured over 240-frame scenes built from an enrolled photo, the Haar cascade
+    held a face perfectly while it faced the camera and collapsed the moment it did
+    not: 90.0% at 22 degrees of roll (worst gap 462 ms) and 85.8% turning to profile
+    (worst gap 792 ms). YuNet held 100% and 90.4% on the same scenes at half the
+    cost, and a three-frame bridge closes what it still drops.
     """
 
-    def test_the_fallback_is_rate_limited_rather_than_run_every_empty_frame(self):
+    def test_detection_runs_on_the_pose_robust_model_when_it_is_installed(self):
+        """The cascade holds a face only while it faces the camera: 90.0% at 22
+        degrees of roll with a 462 ms gap, 85.8% turning to profile with a 792 ms gap.
+        YuNet holds 100% and 90.4% on those scenes at roughly half the cost, and its
+        model already ships for the SFace recogniser.
+        """
+        from astro_vision.detection_quality import YuNetFaceDetector
+
+        if not (Path.home() / ".astro" / "models" / "yunet.onnx").exists():
+            self.skipTest("yunet.onnx not installed; run scripts/install_face_models.sh")
         node = SpatialVisionNode()
 
-        attempts = [n for n in range(1, 13) if node._should_try_fallback_cascade(n)]
+        self.assertIsInstance(node.face_detector, YuNetFaceDetector)
 
-        self.assertLess(len(attempts), 12, "the fallback must not run on every empty frame")
-        self.assertGreater(len(attempts), 0, "the fallback must still get a chance to recover")
+    def test_short_misses_are_bridged(self):
+        """Three frames took YuNet from 90.4% to 98.8% while a face turned to profile."""
+        node = SpatialVisionNode()
+
+        self.assertGreaterEqual(node.detection_hold.hold_frames, 3)
+
+    def test_the_dropped_fallback_cascade_is_really_gone(self):
+        """alt2 recovered 1 frame in 600 across two scenes while costing 13.6 ms per
+        run, and with YuNet leading it has nothing left to recover.
+        """
+        node = SpatialVisionNode()
+
+        self.assertFalse(hasattr(node, "face_alt_cascade"))
+        self.assertNotIn("fallback_every_n", node._declared_parameters)
 
 
 class TestAFrameFlowsThroughTheNode(unittest.TestCase):

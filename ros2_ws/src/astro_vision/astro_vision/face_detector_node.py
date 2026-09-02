@@ -17,6 +17,7 @@ Features:
 
 import json
 import logging
+import os
 
 _LOG = logging.getLogger(__name__)
 
@@ -58,10 +59,10 @@ except ImportError:
 try:
     from astro_vision.image_utils import bgr_to_imgmsg, imgmsg_to_bgr
     from astro_vision.face_recognizer import FaceRecognizer
-    from astro_vision.detection_quality import detect_faces_with_confidence
+    from astro_vision.detection_quality import DetectionHold, create_face_detector
 except ImportError:
     from image_utils import bgr_to_imgmsg, imgmsg_to_bgr
-    from detection_quality import detect_faces_with_confidence
+    from detection_quality import DetectionHold, create_face_detector
     class FaceRecognizer:
         def identify(self, frame, x, y, w, h):
             return {"name": "Misafir", "title": "Ziyaretçi", "confidence": 0.0, "is_known": False}
@@ -72,6 +73,8 @@ class SpatialVisionNode(Node):
         super().__init__("face_detector_node")
         self.declare_parameter("input_topic", "/oak/rgb/image_raw")
         self.declare_parameter("depth_topic", "/oak/stereo/image_raw")
+        # Cascade pyramid tuning. Only reaches the Haar fallback: when yunet.onnx is
+        # installed these have no effect, because YuNet does its own scale search.
         self.declare_parameter("scale_factor", 1.1)
         self.declare_parameter("min_neighbors", 4)
         self.declare_parameter("min_size", 45)
@@ -80,11 +83,11 @@ class SpatialVisionNode(Node):
         # already halved to 15 Hz, leaving 7.5 Hz of bearings — one update per 133 ms —
         # while a loaded frame costs ~13.5 ms and the CPU idled through the rest.
         self.declare_parameter("process_every_n", 1)
-        # The alt2 cascade only runs when the primary found nothing, which is most
-        # frames, and it is the most expensive thing here: 19.0 ms primary + 13.6 ms
-        # fallback against 6.8 ms when a face is present. Retry it periodically rather
-        # than paying for it on every empty frame.
-        self.declare_parameter("fallback_every_n", 4)
+        # Frames of budget for carrying the previous detection over a miss. Three
+        # takes YuNet from 90.4% to 98.8% while a face turns to profile, and drops the
+        # worst gap from 165 ms to 66 ms; the carried detection decays in confidence
+        # so it can hold an existing lock but never acquire a new target.
+        self.declare_parameter("detection_hold_frames", 3)
 
         input_topic = self.get_parameter("input_topic").value
         depth_topic = self.get_parameter("depth_topic").value
@@ -93,16 +96,29 @@ class SpatialVisionNode(Node):
         self.min_size = int(self.get_parameter("min_size").value)
         self.show_debug = bool(self.get_parameter("show_debug").value)
         self.process_every_n = max(1, int(self.get_parameter("process_every_n").value))
-        self.fallback_every_n = max(1, int(self.get_parameter("fallback_every_n").value))
+        self.detection_hold = DetectionHold(
+            hold_frames=int(self.get_parameter("detection_hold_frames").value)
+        )
 
         # Load Cascades (Default + Alt2 for maximum detection rate)
         frontal_path = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
-        alt2_path = cv2.data.haarcascades + "haarcascade_frontalface_alt2.xml"
         smile_path = cv2.data.haarcascades + "haarcascade_smile.xml"
         eye_path = cv2.data.haarcascades + "haarcascade_eye.xml"
 
         self.face_cascade = cv2.CascadeClassifier(frontal_path)
-        self.face_alt_cascade = cv2.CascadeClassifier(alt2_path)
+        # YuNet is what scripts/install_face_models.sh already fetches for SFace, and
+        # it beats the cascade on both counts: half the cost (3.6-4.4 ms against
+        # 7-8.4 ms) and steady through head pose, where the cascade collapses — 100%
+        # against 90.0% at 22 degrees of roll, and a worst gap of 165 ms against
+        # 792 ms turning to profile. Detection was running on the weaker of two
+        # detectors that were both already installed.
+        model_dir = os.path.expanduser(os.getenv("FACE_MODEL_DIR", "~/.astro/models"))
+        self.face_detector = create_face_detector(
+            model_dir, self.face_cascade, **self._face_detect_kwargs()
+        )
+        self.get_logger().info(
+            f"🔍 [Yüz algılama] {type(self.face_detector).__name__}"
+        )
         self.smile_cascade = cv2.CascadeClassifier(smile_path)
         self.eye_cascade = cv2.CascadeClassifier(eye_path)
 
@@ -238,10 +254,6 @@ class SpatialVisionNode(Node):
         """True on the frames the heavy detection pipeline is allowed to run."""
         return (frame_count % self.process_every_n) == 0
 
-    def _should_try_fallback_cascade(self, frame_count: int) -> bool:
-        """True on the empty frames where the alt2 recovery pass is worth its 13.6 ms."""
-        return (frame_count % self.fallback_every_n) == 0
-
     def _face_detect_kwargs(self) -> dict:
         """Cascade tuning, from the declared parameters rather than hardcoded literals."""
         return {
@@ -280,22 +292,18 @@ class SpatialVisionNode(Node):
         # Scale to 640px for high detection accuracy on Jetson (preserving facial landmarks)
         scale_ratio = 640.0 / float(frame_w) if frame_w > 640 else 1.0
         
+        # YuNet is trained on colour, so detection runs on the resized BGR frame; the
+        # cascade fallback converts to grey itself.
         if scale_ratio < 1.0:
-            small_gray = cv2.resize(gray, (0, 0), fx=scale_ratio, fy=scale_ratio, interpolation=cv2.INTER_AREA)
+            small_frame = cv2.resize(frame, (0, 0), fx=scale_ratio, fy=scale_ratio, interpolation=cv2.INTER_AREA)
         else:
-            small_gray = gray
+            small_frame = frame
 
-        detect_kwargs = self._face_detect_kwargs()
-        detected_faces = detect_faces_with_confidence(self.face_cascade, small_gray, **detect_kwargs)
-
-        if (
-            len(detected_faces) == 0
-            and hasattr(self, 'face_alt_cascade')
-            and self._should_try_fallback_cascade(self._frame_count)
-        ):
-            detected_faces = detect_faces_with_confidence(
-                self.face_alt_cascade, small_gray, **detect_kwargs
-            )
+        detected_faces = self.face_detector.detect(small_frame)
+        # Carry the previous detection over the one- and two-frame misses the cascade
+        # makes on a face that has not moved; without this the stream flickered on
+        # 18% of frames even with the finer pyramid.
+        detected_faces = self.detection_hold.update(detected_faces)
 
         # Map bounding boxes back to original resolution (the confidence is scale-free)
         if len(detected_faces) > 0 and scale_ratio < 1.0:
