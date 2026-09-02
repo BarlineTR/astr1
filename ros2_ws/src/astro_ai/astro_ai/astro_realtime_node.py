@@ -4683,21 +4683,21 @@ class AstroRealtimeNode(Node):
             rejected = True
             reject_reason = "self_voice" if (is_playback_active or is_echo_cooldown or self_voice_score >= 0.20) else "no_speech"
 
-        # 5. Short utterances (e.g. "Hey", "Lan", "Dur", "Tamam", "Ne?")
+        # 5. Short utterances (e.g. "Hey", "Lan", "Dur", "Tamam", "Ne?", "Sıra")
         elif len(words) == 1:
-            if is_short_utterance and speech_ms >= 70 and total_rms >= 280.0 and not is_playback_active:
+            if is_short_utterance and speech_ms >= 50 and total_rms >= 180.0 and not is_playback_active:
                 rejected = False
-            elif not is_short_utterance and (speech_ms < 140 or total_rms < 380.0 or vad_confidence < 0.30):
+            elif not is_short_utterance and (speech_ms < 80 or total_rms < 200.0 or vad_confidence < 0.20):
                 rejected = True
                 reject_reason = "low_confidence"
 
-        # 6. Low quality speech / Repetitive Whisper hallucination gate (e.g. 'Türen, türen...', 'Hahaha')
-        elif vad_confidence < 0.35 and speech_ms < 220 and total_rms < 380.0:
+        # 6. Low quality speech / Repetitive Whisper hallucination gate
+        elif vad_confidence < 0.25 and speech_ms < 140 and total_rms < 240.0:
             rejected = True
             reject_reason = "low_confidence"
 
         # 7. General sentence threshold
-        elif speech_ms < 120 or total_rms < 240.0:
+        elif speech_ms < 80 or total_rms < 180.0:
             rejected = True
             reject_reason = "low_confidence"
 
