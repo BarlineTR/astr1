@@ -1,10 +1,11 @@
-/oak:
+/**:
   ros__parameters:
     camera:
       i_nn_type: "none"
       i_enable_imu: false
       i_pipeline_type: "RGBD"
       i_publish_synced_rect_pair: false
+      i_publish_points: false
     rgb:
       i_resolution: "720P"
       i_fps: 30.0
@@ -12,19 +13,49 @@
     left:
       i_resolution: "400P"
       i_fps: 30.0
+      i_publish_topic: false
     right:
       i_resolution: "400P"
       i_fps: 30.0
+      i_publish_topic: false
     stereo:
       i_enabled: true
       i_align_depth: true
       i_subpixel: false
       i_lr_check: false
       i_depth_filter_size: 0
+      i_publish_topic: true
+
+/oak:
+  ros__parameters:
+    camera:
+      i_nn_type: "none"
+      i_enable_imu: false
+      i_pipeline_type: "RGBD"
+      i_publish_synced_rect_pair: false
+      i_publish_points: false
+    rgb:
+      i_resolution: "720P"
+      i_fps: 30.0
+      i_publish_topic: true
+    left:
+      i_resolution: "400P"
+      i_fps: 30.0
+      i_publish_topic: false
+    right:
+      i_resolution: "400P"
+      i_fps: 30.0
+      i_publish_topic: false
+    stereo:
+      i_enabled: true
+      i_align_depth: true
+      i_subpixel: false
+      i_lr_check: false
+      i_depth_filter_size: 0
+      i_publish_topic: true
 
 webcam_publisher_node:
   ros__parameters:
-    # OAK-D yokken USB kamerayı aynı konuya yayınlar (source:=webcam)
     device: 0
     output_topic: "/oak/rgb/image_raw"
     width: 640

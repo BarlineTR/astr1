@@ -48,6 +48,7 @@ def _depthai_camera(params_file, use_sim_time):
                     os.path.join(depthai_pkg, "launch", "camera.launch.py")
                 ),
                 launch_arguments={
+                    "name": "oak",
                     "params_file": params_file,
                     "use_sim_time": use_sim_time,
                 }.items(),
