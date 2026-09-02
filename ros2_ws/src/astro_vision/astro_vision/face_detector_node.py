@@ -55,8 +55,10 @@ except ImportError:
 try:
     from astro_vision.image_utils import bgr_to_imgmsg, imgmsg_to_bgr
     from astro_vision.face_recognizer import FaceRecognizer
+    from astro_vision.detection_quality import detect_faces_with_confidence
 except ImportError:
     from image_utils import bgr_to_imgmsg, imgmsg_to_bgr
+    from detection_quality import detect_faces_with_confidence
     class FaceRecognizer:
         def identify(self, frame, x, y, w, h):
             return {"name": "Misafir", "title": "Ziyaretçi", "confidence": 0.0, "is_known": False}
@@ -227,7 +229,8 @@ class SpatialVisionNode(Node):
         else:
             small_gray = gray
 
-        detected_faces = self.face_cascade.detectMultiScale(
+        detected_faces = detect_faces_with_confidence(
+            self.face_cascade,
             small_gray,
             scaleFactor=1.12,
             minNeighbors=5,
@@ -235,18 +238,19 @@ class SpatialVisionNode(Node):
         )
 
         if len(detected_faces) == 0 and hasattr(self, 'face_alt_cascade'):
-            detected_faces = self.face_alt_cascade.detectMultiScale(
+            detected_faces = detect_faces_with_confidence(
+                self.face_alt_cascade,
                 small_gray,
                 scaleFactor=1.12,
                 minNeighbors=5,
                 minSize=(36, 36),
             )
 
-        # Map bounding boxes back to original resolution
+        # Map bounding boxes back to original resolution (the confidence is scale-free)
         if len(detected_faces) > 0 and scale_ratio < 1.0:
-            faces = [[int(x / scale_ratio), int(y / scale_ratio), int(w / scale_ratio), int(h / scale_ratio)] for (x, y, w, h) in detected_faces]
+            faces = [[int(x / scale_ratio), int(y / scale_ratio), int(w / scale_ratio), int(h / scale_ratio), conf] for (x, y, w, h, conf) in detected_faces]
         else:
-            faces = list(detected_faces)
+            faces = [list(f) for f in detected_faces]
 
         # Sort detected faces by bounding box area (largest face first)
         if len(faces) > 0:
@@ -260,7 +264,7 @@ class SpatialVisionNode(Node):
         detected_emotion = "neutral"
         top_recognized_person = {"name": "Misafir", "title": "Ziyaretçi", "formal_title": "Misafir", "confidence": 0.0, "is_known": False}
 
-        for idx, (x, y, w, h) in enumerate(faces):
+        for idx, (x, y, w, h, detection_conf) in enumerate(faces):
             face_roi_gray = gray[y:y + h, x:x + w]
             face_roi_bgr = frame[y:y + h, x:x + w]
             
@@ -298,29 +302,17 @@ class SpatialVisionNode(Node):
                     "distance_m": round(dist_m, 2)
                 }
 
-            # 5. Emission confidence — geometric quality signal so that
-            # social_gaze_node does not need to fabricate a hardcoded 0.85.
-            # Formula: eyes_found contributes the base tier; a large, close
-            # bbox adds up to +0.20 bonus (capped at 0.95).
-            # No scored cascade is available for Haar, so this is the best
-            # honest proxy for detection reliability from monocular video.
-            _base_conf = 0.72 if eyes_found else 0.55
-            _bbox_area_norm = min(1.0, (w * h) / (frame_w * frame_h * 0.25))
-            _conf = min(0.95, _base_conf + 0.20 * _bbox_area_norm)
-            if not in_social_zone:
-                _conf *= 0.70  # spatial sanity penalty
-
-            # 6. Emotion Detection
+            # 5. Emotion Detection
             detected_emotion = self._detect_facial_emotion(face_roi_gray, w, h, yaw=yaw, eyes_found=eyes_found)
 
             face_list.append({
                 "x": int(x), "y": int(y), "width": int(w), "height": int(h),
+                "confidence": round(float(detection_conf), 2),
                 "frame_width": int(frame_w), "frame_height": int(frame_h),
                 "yaw_deg": round(yaw, 1),
                 "camera_azimuth_deg": round(cam_azimuth, 1),
                 "distance_m": round(dist_m, 2),
                 "looking_at_robot": direct_gaze,
-                "confidence": round(_conf, 2),
                 "emotion": detected_emotion,
                 "recognized_name": recog_name if is_known else None,
                 "recognized_title": recog_meta.get("formal_title") if is_known else None
