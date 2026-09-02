@@ -240,12 +240,15 @@ class FaceRecognizer:
 
     def recognize_face(self, face_bgr: np.ndarray, threshold: float = FACE_MATCH_THRESHOLD) -> Tuple[Optional[str], float, Dict[str, Any]]:
         """Matches a face ROI against the known gallery. Returns (name, confidence, metadata)."""
-        # 1. First try FaceEngine directly (loads ~/.astro/faces/faces.json)
+        emb = self.extract_embedding(face_bgr)
+        if emb is None:
+            return None, 0.0, {}
+
+        # 1. First try FaceEngine directly with pre-extracted embedding (in-memory)
         engine = _get_engine()
         if engine is not None:
             try:
-                engine.load()
-                matched_name, sim = engine.identify(face_bgr)
+                matched_name, sim = engine.identify(emb)
                 if matched_name is not None and sim >= threshold:
                     norm = self._normalize_name(matched_name)
                     meta = self._person_metadata.get(norm, {
@@ -257,12 +260,9 @@ class FaceRecognizer:
                 elif sim is not None and sim > 0:
                     return None, round(float(sim), 2), {}
             except Exception as _exc:
-                _LOG.debug("recognize_face: yok sayılan hata (%s)", _exc)
+                _LOG.debug("recognize_face: FaceEngine identify error (%s)", _exc)
 
         # 2. Fallback to in-memory matching
-        emb = self.extract_embedding(face_bgr)
-        if emb is None:
-            return None, 0.0, {}
 
         with self._lock:
             if not self._known_embeddings:

@@ -468,7 +468,10 @@ def is_known_phantom_pattern(text: str) -> bool:
         "izlediğiniz için teşekkür ederiz", "izlediginiz icin tesekkur ederiz",
         "diz", "dizi", "hahaha", "hahahaha", "hehehe", "hihihi",
         "türen türen türen", "türen", "turen", "turen turen turen",
-        "evet evet evet", "nokta", "virgül", "şşş", "sss", "hı hı", "cık", "çık"
+        "evet evet evet", "nokta", "virgül", "şşş", "sss", "hı hı", "cık", "çık",
+        "astro sesime dön yüzüme bak durdum merkez baran oktay robot",
+        "astro hey astro sesime dön bana bak bana dön yüzüme bak dur durdum merkez baran oktay robot",
+        "sesime dön yüzüme bak durdum merkez baran oktay robot"
     }
     if t in phantom_exacts:
         return True
@@ -4826,7 +4829,9 @@ class AstroRealtimeNode(Node):
         if not self.groq_api_key:
             return None
         try:
-            prompt_text = "Astro, hey Astro, sesime dön, bana bak, bana dön, yüzüme bak, dur, durdum, merkez, Baran, Oktay, robot."
+            # Natural conversational Turkish context prompt (never a list of commands,
+            # to prevent Whisper prompt-echo / regurgitation hallucinations in quiet audio).
+            prompt_text = "Astro robot asistanı ile Türkçe sesli iletişim ve sohbet."
             boundary = "----WebKitFormBoundary" + os.urandom(16).hex()
             body = bytearray()
             body.extend(f"--{boundary}\r\n".encode())

@@ -214,20 +214,20 @@ class SpatialVisionNode(Node):
             self._frame_count = 0
         self._frame_count += 1
 
-        # Process every 2nd frame (~15 FPS for responsive tracking)
-        if self._frame_count % 2 != 0:
-            return
-
         frame_h, frame_w = frame.shape[:2]
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         
-        # Scale to 640px for high detection accuracy on Jetson (preserving facial landmarks)
+        # Scale to 640px for high detection accuracy and low latency on Jetson CPU
         scale_ratio = 640.0 / float(frame_w) if frame_w > 640 else 1.0
         
         if scale_ratio < 1.0:
-            small_gray = cv2.resize(gray, (0, 0), fx=scale_ratio, fy=scale_ratio, interpolation=cv2.INTER_AREA)
+            target_w = 640
+            target_h = int(frame_h * scale_ratio)
+            small_bgr = cv2.resize(frame, (target_w, target_h), interpolation=cv2.INTER_LINEAR)
+            small_gray = cv2.cvtColor(small_bgr, cv2.COLOR_BGR2GRAY)
+            gray = None
         else:
-            small_gray = gray
+            small_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            gray = small_gray
 
         detected_faces = detect_faces_with_confidence(
             self.face_cascade,
@@ -265,8 +265,11 @@ class SpatialVisionNode(Node):
         top_recognized_person = {"name": "Misafir", "title": "Ziyaretçi", "formal_title": "Misafir", "confidence": 0.0, "is_known": False}
 
         for idx, (x, y, w, h, detection_conf) in enumerate(faces):
-            face_roi_gray = gray[y:y + h, x:x + w]
             face_roi_bgr = frame[y:y + h, x:x + w]
+            if gray is not None:
+                face_roi_gray = gray[y:y + h, x:x + w]
+            else:
+                face_roi_gray = cv2.cvtColor(face_roi_bgr, cv2.COLOR_BGR2GRAY) if face_roi_bgr.size > 0 else np.empty((0, 0), dtype=np.uint8)
             
             # 1. 3D Head Yaw & Eye Verification
             yaw, eyes_found = self._estimate_head_yaw(face_roi_gray, w, h)
