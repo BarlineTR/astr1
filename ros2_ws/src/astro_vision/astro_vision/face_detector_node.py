@@ -278,6 +278,8 @@ class SpatialVisionNode(Node):
         self._frame_count += 1
         frame_h, frame_w = frame.shape[:2]
 
+        detected_faces = []
+
         # Downscale for ultra-fast deep learning inference (YuNet optimal input: 480-640 px)
         scale_ratio = 480.0 / float(frame_w) if frame_w > 480 else 1.0
         if scale_ratio < 1.0:
