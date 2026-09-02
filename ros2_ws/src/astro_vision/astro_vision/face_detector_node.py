@@ -131,6 +131,8 @@ class SpatialVisionNode(Node):
             "confidence": 0.0, "is_known": False, "distance_m": 0.0
         }
         self._frame_count = 0
+        self._recog_busy = False
+        self._recog_last_time = 0.0
 
         # Publishers
         self.pub_faces = self.create_publisher(String, "/vision/faces", 10)
@@ -153,6 +155,24 @@ class SpatialVisionNode(Node):
         self.sub_depth = self.create_subscription(Image, depth_topic, self.depth_callback, qos_latest_frame)
 
         self.get_logger().info(f"👁️ [Spatial Emotion Vision] 3D Bakış, Mesafe ve Yüz Duygu Analizi Aktif! RGB: {input_topic}")
+
+    def _async_recognize(self, face_bgr_crop: np.ndarray, dist_m: float):
+        """Runs biometric recognition asynchronously in a background thread without blocking the 30 FPS camera loop."""
+        try:
+            name, conf, meta = self.face_recognizer.recognize_face(face_bgr_crop)
+            if name is not None and conf >= 0.45:
+                self._cached_top_person = {
+                    "name": name,
+                    "title": meta.get("title", "Tanınan Kişi"),
+                    "formal_title": meta.get("formal_title", name),
+                    "confidence": conf,
+                    "is_known": True,
+                    "distance_m": round(dist_m, 2)
+                }
+        except Exception as _exc:
+            self.get_logger().debug(f"_async_recognize error: {_exc}")
+        finally:
+            self._recog_busy = False
 
     def depth_callback(self, msg: Image):
         try:
@@ -356,23 +376,13 @@ class SpatialVisionNode(Node):
             if direct_gaze:
                 is_looking = True
 
-            # 4. Face Recognition (SFace Embedding)
-            # Run recognition every `process_every_n` frames or when no one is known yet
-            run_recog = (self._frame_count % self.process_every_n == 0) or (idx == 0 and not top_recognized_person.get("is_known", False))
-            recog_name, recog_conf, recog_meta = None, 0.0, {}
-            if run_recog and face_roi_bgr.size > 0:
-                recog_name, recog_conf, recog_meta = self.face_recognizer.recognize_face(face_roi_bgr)
-                is_known = (recog_name is not None and recog_conf >= 0.45)
-                if is_known and recog_conf > top_recognized_person["confidence"]:
-                    top_recognized_person = {
-                        "name": recog_name,
-                        "title": recog_meta.get("title", "Tanınan Kişi"),
-                        "formal_title": recog_meta.get("formal_title", recog_name),
-                        "confidence": recog_conf,
-                        "is_known": True,
-                        "distance_m": round(dist_m, 2)
-                    }
-                    self._cached_top_person = top_recognized_person
+            # 4. Asynchronous Face Recognition (Non-blocking background worker)
+            now_sec = time.monotonic()
+            if (now_sec - self._recog_last_time >= 1.0) and not self._recog_busy and face_roi_bgr.size > 0:
+                self._recog_busy = True
+                self._recog_last_time = now_sec
+                import threading
+                threading.Thread(target=self._async_recognize, args=(face_roi_bgr.copy(), dist_m), daemon=True).start()
 
             is_known = (top_recognized_person.get("is_known", False) and idx == 0)
 
