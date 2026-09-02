@@ -3844,11 +3844,16 @@ class AstroRealtimeNode(Node):
             return
 
         if not self._is_sleeping:
+            # Prevent sleep when user is maintaining eye contact or actively looking at robot
+            if getattr(self, "_looking_at_robot", False):
+                self._last_interaction_time = now
+                return
+
             idle_seconds = now - getattr(self, "_last_interaction_time", now)
-            if idle_seconds >= 15.0:
+            if idle_seconds >= 45.0:
                 self._is_sleeping = True
                 self.state_machine.transition_to(RobotState.DEEP_IDLE)
-                self.get_logger().info("💤 [Astro Uyku Modu]: 15 saniye hareketsizlik — Astro DEEP_IDLE moduna geçti (😴). Wake listener aktif.")
+                self.get_logger().info("💤 [Astro Uyku Modu]: 45 saniye hareketsizlik — Astro DEEP_IDLE moduna geçti (😴). Wake listener aktif.")
 
                 # 1. Publish sleeping emotion for face/display
                 if self.pub_emotion is not None:
