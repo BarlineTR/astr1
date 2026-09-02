@@ -59,22 +59,28 @@ def main():
         print("  ❌ depthai Python kütüphanesi bulunamadı.")
         return
 
-    # Build Pipeline
-    pipeline = dai.Pipeline()
-
-    # DepthAI 3.x Native Camera API
-    cam = pipeline.create(dai.node.Camera)
-    if hasattr(cam, "setSize"):
-        cam.setSize(1280, 720)
-    if hasattr(cam, "setFps"):
-        cam.setFps(30)
-
-    print("\n  [Kamera Donanımı Başlatılıyor...]")
-    time.sleep(0.5)
-
     device = None
     try:
-        device = dai.Device()
+        # Boot with explicit USB speed capability matching the 480M connection
+        try:
+            device = dai.Device(dai.UsbSpeed.HIGH)
+        except Exception:
+            try:
+                device = dai.Device()
+            except Exception as exc:
+                print(f"  ❌ Cihaz başlatma hatası: {exc}")
+                return
+
+        # Build Pipeline
+        pipeline = dai.Pipeline()
+
+        # DepthAI 3.x Native Camera API
+        cam = pipeline.create(dai.node.Camera)
+        if hasattr(cam, "setSize"):
+            cam.setSize(1280, 720)
+        if hasattr(cam, "setFps"):
+            cam.setFps(30)
+
         if hasattr(device, "startPipeline"):
             device.startPipeline(pipeline)
         elif hasattr(device, "start"):
