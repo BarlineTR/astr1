@@ -113,6 +113,8 @@ class SocialGazeLiveMonitor(Node):
         self.gaze_target_valid: bool = False
         self.gaze_target_conf: float = 0.0
         self.gaze_target_id: str = "None"
+        self.seen_target_ids: set = set()
+        self.target_churn_count: int = 0
 
         # =====================================================================
         # 5. Motor & Closed-Loop Head Telemetry
@@ -362,7 +364,12 @@ class SocialGazeLiveMonitor(Node):
         self.gaze_at_target = bool(getattr(msg, "at_target", False))
         self.gaze_target_valid = bool(getattr(msg, "target_valid", False))
         self.gaze_target_conf = float(getattr(msg, "target_confidence", 0.0))
-        self.gaze_target_id = str(getattr(msg, "active_target_id", "None"))
+        tid = str(getattr(msg, "active_target_id", "None"))
+        if tid not in ("None", "", "none"):
+            self.seen_target_ids.add(tid)
+            if self.gaze_target_id not in ("None", "", "none") and tid != self.gaze_target_id:
+                self.target_churn_count += 1
+        self.gaze_target_id = tid
 
     def _on_speaking(self, msg: Bool):
         self.robot_speaking = bool(msg.data)
@@ -511,6 +518,9 @@ def generate_flight_report(node: SocialGazeLiveMonitor):
         print(f"  • Toplam Takip Edilen Yüz Karesi : {len(node.visual_events)} kare")
         mean_vis_conf = sum(e['confidence'] for e in node.visual_events) / len(node.visual_events)
         print(f"  • Ortalama Tespit Güveni         : %{mean_vis_conf*100:.1f}")
+        print(f"  • Son Aktif Hedef (Active Target): {node.gaze_target_id}")
+        print(f"  • Görülen Hedefler (Target IDs)  : {', '.join(sorted(node.seen_target_ids)) if node.seen_target_ids else 'Yok'}")
+        print(f"  • Hedef Kimlik Değişimi (Churn)  : {node.target_churn_count}")
         for i, ev in enumerate(node.visual_events[-5:], 1):
             print(f"    - Kare {i}: {ev['time']}s | Yüz Açısı = {ev['face_yaw_deg']:+.1f}° | Mesafe = {ev.get('distance_m', 0.0):.2f}m | Hata = {ev['tracking_error']:+.2f}°")
     else:

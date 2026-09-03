@@ -72,7 +72,7 @@ class SocialGazeFSM:
         settling_persistence_required: int = 3,
         arbiter: Optional[AttentionArbiterCore] = None,
         spatial_memory: Optional[EpistemicSpatialMemory] = None,
-        acquisition_threshold: float = 0.75,
+        acquisition_threshold: float = 0.50,
     ):
         self.deadband_deg = deadband_deg
         self.idle_return_timeout_s = idle_return_timeout_s

@@ -46,7 +46,7 @@
       fallback_enabled: true        # Support automatic fallback to Audio-Only or Vision-Only
 
     target_manager:
-      acquisition_threshold: 0.75   # Confidence required to acquire and lock a new target
+      acquisition_threshold: 0.50   # Confidence required to acquire and lock a new target
       hold_threshold: 0.40          # Confidence threshold below which target drops to coasting
       target_lost_timeout_s: 2.5    # Duration in coasting before removing target
       min_attention_dwell_s: 2.50   # Minimum gaze dwell time before switching targets

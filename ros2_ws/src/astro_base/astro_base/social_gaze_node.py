@@ -130,10 +130,10 @@ from astro_base.gaze.visual_tracker import VisualTrackerCore
 # Credited to a detection whose publisher reports no confidence of its own.
 # It has to clear the target manager's 0.40 hold threshold — an unscored person is
 # still a person, and dropping them would be worse than the bug — while staying
-# under the 0.75 acquisition threshold, so a lone unscored frame cannot seize the
+# under the 0.50 acquisition threshold, so a lone unscored frame cannot seize the
 # head. Corroboration (a detector score, or speech from the same bearing) is what
 # lifts such a candidate to active target.
-UNSCORED_DETECTION_CONFIDENCE = 0.65
+UNSCORED_DETECTION_CONFIDENCE = 0.45
 
 
 class SocialGazeNode(Node):
@@ -205,8 +205,8 @@ class SocialGazeNode(Node):
             spatial_memory=self.spatial_memory,
         )
         self.target_manager = TargetManagerCore(
-            acquisition_threshold=0.75,
-            hold_threshold=0.38,
+            acquisition_threshold=0.50,
+            hold_threshold=0.40,
             target_lost_timeout_s=2.5,
             min_attention_dwell_s=float(self.get_parameter("min_attention_dwell_s").value),
             turn_taking_min_dwell_s=float(self.get_parameter("turn_taking_min_dwell_s").value),
@@ -219,7 +219,7 @@ class SocialGazeNode(Node):
             min_limit_deg=self.calib.head.min_angle_deg,
             max_limit_deg=self.calib.head.max_angle_deg,
             spatial_memory=self.spatial_memory,
-            acquisition_threshold=0.75,
+            acquisition_threshold=0.50,
         )
         self.planner = MotionPlannerCore(
             max_velocity_deg_s=float(self.get_parameter("max_velocity_deg_s").value),

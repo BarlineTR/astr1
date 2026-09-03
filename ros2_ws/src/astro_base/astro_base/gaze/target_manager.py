@@ -19,7 +19,7 @@ class TargetManagerCore:
 
     def __init__(
         self,
-        acquisition_threshold: float = 0.75,
+        acquisition_threshold: float = 0.50,
         hold_threshold: float = 0.40,
         target_lost_timeout_s: float = 1.0,
         min_attention_dwell_s: float = 2.50,
@@ -107,7 +107,7 @@ class TargetManagerCore:
 
         # 2. Candidate Selection & Turn-Taking Arbitration
         if self.active_target is None:
-            # No active target: Select best candidate meeting acquisition threshold (≥0.75)
+            # No active target: Select best candidate meeting acquisition threshold (≥0.50)
             best_candidate = next((t for t in self.candidate_targets if t.confidence >= self.acquisition_threshold), None)
             if best_candidate is not None:
                 is_reacq = best_candidate.target_id in self._seen_target_ids
