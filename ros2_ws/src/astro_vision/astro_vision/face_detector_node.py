@@ -233,18 +233,18 @@ class SpatialVisionNode(Node):
         detected_faces = detect_faces_with_confidence(
             self.face_cascade,
             small_gray,
-            scaleFactor=1.12,
-            minNeighbors=5,
-            minSize=(36, 36),
+            scaleFactor=1.10,
+            minNeighbors=3,
+            minSize=(24, 24),
         )
 
         if len(detected_faces) == 0 and hasattr(self, 'face_alt_cascade'):
             detected_faces = detect_faces_with_confidence(
                 self.face_alt_cascade,
                 small_gray,
-                scaleFactor=1.12,
-                minNeighbors=5,
-                minSize=(36, 36),
+                scaleFactor=1.10,
+                minNeighbors=3,
+                minSize=(24, 24),
             )
 
         # Map bounding boxes back to original resolution (the confidence is scale-free)

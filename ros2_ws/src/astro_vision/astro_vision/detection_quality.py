@@ -15,7 +15,7 @@ from typing import Any, List, Optional, Tuple
 # provisional — it was set from synthetic frames, and wants re-measuring against
 # real camera footage of the robot's actual working distances.
 HAAR_WEIGHT_FLOOR = 0.0
-HAAR_WEIGHT_CEILING = 6.0
+HAAR_WEIGHT_CEILING = 4.8
 
 # The floor sits under VisualPerceptionCore's 0.50 validity gate on purpose, so a
 # barely-accepted detection is discarded rather than tracked. The ceiling stays

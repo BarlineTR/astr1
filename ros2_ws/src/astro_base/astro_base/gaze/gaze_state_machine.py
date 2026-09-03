@@ -72,6 +72,7 @@ class SocialGazeFSM:
         settling_persistence_required: int = 3,
         arbiter: Optional[AttentionArbiterCore] = None,
         spatial_memory: Optional[EpistemicSpatialMemory] = None,
+        acquisition_threshold: float = 0.75,
     ):
         self.deadband_deg = deadband_deg
         self.idle_return_timeout_s = idle_return_timeout_s
@@ -84,6 +85,7 @@ class SocialGazeFSM:
         self.position_tolerance_deg = position_tolerance_deg
         self.velocity_tolerance_deg_s = velocity_tolerance_deg_s
         self.settling_persistence_required = settling_persistence_required
+        self.acquisition_threshold = acquisition_threshold
 
         # Spatial Memory for situational awareness and negative evidence
         self.spatial_memory = spatial_memory or EpistemicSpatialMemory()
@@ -377,7 +379,7 @@ class SocialGazeFSM:
                 if time_in_lost >= 0.15:
                     if (
                         target_state.active_target is not None
-                        and target_state.active_target.confidence >= 0.75
+                        and target_state.active_target.confidence >= self.acquisition_threshold
                         and (timestamp - target_state.active_target.timestamp) <= 0.25
                     ):
                         reacq_reason = (
@@ -396,7 +398,7 @@ class SocialGazeFSM:
             elif self.state == GazeStateEnum.IDLE:
                 # Strict IDLE Entry Guards (Failure 1):
                 # IDLE can NEVER jump directly to HOLDING_ATTENTION!
-                if target_state.active_target is not None and target_state.active_target.confidence >= 0.75:
+                if target_state.active_target is not None and target_state.active_target.confidence >= self.acquisition_threshold:
                     self.target_yaw_deg = target_yaw
                     if err_deg > 6.0:
                         self._settling_persistence_count = 0
@@ -409,7 +411,7 @@ class SocialGazeFSM:
 
             elif self.state == GazeStateEnum.RECOVERING:
                 # Target detected during return to center
-                if target_state.active_target is not None and target_state.active_target.confidence >= 0.75:
+                if target_state.active_target is not None and target_state.active_target.confidence >= self.acquisition_threshold:
                     self.target_yaw_deg = target_yaw
                     if err_deg > 8.0:
                         self._transition_to(GazeStateEnum.ORIENTING, timestamp, reason="RECOVERY_PREEMPTED_SACCADE")

@@ -181,20 +181,22 @@ class SocialGazeNode(Node):
             max_acoustic_envelope_deg=95.0,
         )
         self.audio_filter = AudioFilterCore(
-            max_jump_deg=35.0,
-            outlier_persistence_count=3,
+            max_jump_deg=85.0,
+            outlier_persistence_count=2,
+            median_window_size=3,
             kalman_q=0.08,
             kalman_r=0.45,
         )
         self.visual_perception = VisualPerceptionCore(
             transformer=self.transformer,
-            min_confidence=0.50,
-            direct_gaze_max_yaw_deg=22.0,
+            min_confidence=0.40,
+            direct_gaze_max_yaw_deg=25.0,
+            social_zone_max_dist_m=8.0,
         )
         self.visual_tracker = VisualTrackerCore(
             transformer=self.transformer,
             gating_distance_m=0.85,
-            coasting_timeout_s=0.70,
+            coasting_timeout_s=1.80,
         )
         self.fusion = AudioVisualFusionCore(
             spatial_gate_deg=float(self.get_parameter("spatial_gate_deg").value),
@@ -204,7 +206,7 @@ class SocialGazeNode(Node):
         )
         self.target_manager = TargetManagerCore(
             acquisition_threshold=0.75,
-            hold_threshold=0.40,
+            hold_threshold=0.38,
             target_lost_timeout_s=2.5,
             min_attention_dwell_s=float(self.get_parameter("min_attention_dwell_s").value),
             turn_taking_min_dwell_s=float(self.get_parameter("turn_taking_min_dwell_s").value),
@@ -217,6 +219,7 @@ class SocialGazeNode(Node):
             min_limit_deg=self.calib.head.min_angle_deg,
             max_limit_deg=self.calib.head.max_angle_deg,
             spatial_memory=self.spatial_memory,
+            acquisition_threshold=0.75,
         )
         self.planner = MotionPlannerCore(
             max_velocity_deg_s=float(self.get_parameter("max_velocity_deg_s").value),
