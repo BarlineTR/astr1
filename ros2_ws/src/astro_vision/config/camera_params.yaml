@@ -6,7 +6,7 @@
       i_usb_speed: "HIGH"
     i_pipeline_type: "RGB"
     rgb:
-      i_resolution: "720P"
+      i_resolution: "1080P"
       i_fps: 15.0
       i_publish_topic: true
       i_low_bandwidth: true

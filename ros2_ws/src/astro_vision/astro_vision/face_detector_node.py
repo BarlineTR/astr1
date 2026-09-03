@@ -93,6 +93,13 @@ class SpatialVisionNode(Node):
         self.smile_cascade = cv2.CascadeClassifier(smile_path)
         self.eye_cascade = cv2.CascadeClassifier(eye_path)
 
+        # Constrain OpenCV thread pool to 1 thread to eliminate multi-core CPU saturation
+        try:
+            cv2.setNumThreads(1)
+            self.get_logger().info("🧵 [Spatial Vision] OpenCV iş parçacığı 1 olarak sınırlandı (CPU koruması)")
+        except Exception as _exc:
+            self.get_logger().debug(f"setNumThreads: yok sayılan hata ({_exc})")
+
         # Check GPU / CUDA Acceleration on Jetson
         self.gpu_accelerated = False
         try:
