@@ -176,9 +176,13 @@ class VisualTrackerCore:
 
         self.tracks: Dict[str, KalmanTrack3D] = {}
         self._next_track_idx = 1
+        self._dormant_tracks: Dict[str, Tuple[float, float]] = {}
+        self.dormant_retention_s: float = 5.0
+        self.dormant_bearing_tolerance_deg: float = 25.0
 
     def reset(self) -> None:
         self.tracks.clear()
+        self._dormant_tracks.clear()
         self._next_track_idx = 1
 
     def update(
@@ -254,11 +258,43 @@ class VisualTrackerCore:
             if tid not in matched_tracks:
                 track.mark_missed(timestamp, self.coasting_timeout_s)
 
-        # 4. Unmatched observations -> Initialize new candidate tracks
+        # 4. Save LOST tracks to dormant cache before purging
+        active_tids = []
+        for tid, t in self.tracks.items():
+            if t.state != TrackingState.LOST:
+                active_tids.append(tid)
+            else:
+                last_bearing = getattr(t, "body_azimuth_deg", 0.0)
+                self._dormant_tracks[tid] = (timestamp, last_bearing)
+
+        self.tracks = {tid: self.tracks[tid] for tid in active_tids}
+
+        # Purge stale dormant records (> 5s)
+        self._dormant_tracks = {
+            tid: (t_lost, b)
+            for tid, (t_lost, b) in self._dormant_tracks.items()
+            if (timestamp - t_lost) <= self.dormant_retention_s
+        }
+
+        # 5. Unmatched observations -> Reuse dormant ID if bearing is consistent, else new
         for j, (ox, oy, oz) in enumerate(obs_base_coords):
             if j not in matched_obs:
-                new_id = f"person_{self._next_track_idx}"
-                self._next_track_idx += 1
+                obs_bearing = valid_obs[j].body_azimuth_deg
+                reused_id = None
+                best_diff = float("inf")
+                for tid, (t_lost, d_bearing) in list(self._dormant_tracks.items()):
+                    diff = abs((obs_bearing - d_bearing + 180.0) % 360.0 - 180.0)
+                    if diff <= self.dormant_bearing_tolerance_deg and diff < best_diff:
+                        best_diff = diff
+                        reused_id = tid
+
+                if reused_id is not None:
+                    new_id = reused_id
+                    del self._dormant_tracks[reused_id]
+                else:
+                    new_id = f"person_{self._next_track_idx}"
+                    self._next_track_idx += 1
+
                 new_track = KalmanTrack3D(
                     track_id=new_id,
                     initial_pos_3d=(ox, oy, oz),
@@ -266,10 +302,6 @@ class VisualTrackerCore:
                     obs=valid_obs[j],
                 )
                 self.tracks[new_id] = new_track
-
-        # 5. Purge expired LOST tracks
-        active_tids = [tid for tid, t in self.tracks.items() if t.state != TrackingState.LOST]
-        self.tracks = {tid: self.tracks[tid] for tid in active_tids}
 
         # 6. Generate track summaries sorted by confidence / proximity
         summaries = [t.get_track_summary() for t in self.tracks.values()]

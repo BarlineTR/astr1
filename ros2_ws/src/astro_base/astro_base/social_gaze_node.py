@@ -373,7 +373,7 @@ class SocialGazeNode(Node):
                     f"LOW_CONFIDENCE_{obs.confidence:.2f}"
                 )
             )
-            self.get_logger().info(
+            self.get_logger().debug(
                 f"[AUDIO REJECT] raw_angle={raw_val:+.1f}° rel_bearing={obs.relative_azimuth_deg:+.1f}° "
                 f"confidence={obs.confidence:.2f} reason={reason} target_created=False "
                 f"attention_owner={self.fsm.active_priority.value}"
@@ -560,14 +560,25 @@ class SocialGazeNode(Node):
 
         # 5. Actuator Command Publishing (Direct Authoritative Goal Setpoint to Arduino PID)
         target_goal_deg = float(gaze_cmd.target_yaw_deg)
-        if self.pub_head_command is not None:
-            hcmd = HeadCmd()
-            hcmd.angle_deg = target_goal_deg
-            self.pub_head_command.publish(hcmd)
+        angle_diff = abs(target_goal_deg - getattr(self, "_last_published_goal_deg", -999.0))
+        time_since_pub = t - getattr(self, "_last_published_goal_time", 0.0)
 
-        cmd_msg = Float32()
-        cmd_msg.data = target_goal_deg
-        self.pub_head_cmd_pos.publish(cmd_msg)
+        # Publish command if angle changed by >= 0.5° or at 10 Hz keep-alive
+        if angle_diff >= 0.5 or time_since_pub >= 0.10:
+            self._last_published_goal_deg = target_goal_deg
+            self._last_published_goal_time = t
+            if not hasattr(self, "_head_cmd_count"):
+                self._head_cmd_count = 0
+            self._head_cmd_count += 1
+
+            if self.pub_head_command is not None:
+                hcmd = HeadCmd()
+                hcmd.angle_deg = target_goal_deg
+                self.pub_head_command.publish(hcmd)
+
+            cmd_msg = Float32()
+            cmd_msg.data = target_goal_deg
+            self.pub_head_cmd_pos.publish(cmd_msg)
 
         # 6. Lifecycle Purging on IDLE (Failure 4)
         if self.fsm.state == GazeStateEnum.IDLE and not self.latest_visual_tracks and not (self.latest_audio_state and self.latest_audio_state.valid):
@@ -586,6 +597,24 @@ class SocialGazeNode(Node):
                 f"bearing={tb['bearing']:+.1f}° conf={tb['confidence']:.2f} reason={tb['reason']}"
             )
             self.target_manager.last_target_birth = None
+
+        # Periodic Gaze Performance Telemetry (Every 5 seconds)
+        if not hasattr(self, "_last_gaze_perf_time"):
+            self._last_gaze_perf_time = t
+            self._last_gaze_cmd_count = 0
+
+        dt_gaze = t - self._last_gaze_perf_time
+        if dt_gaze >= 5.0:
+            cmd_count = getattr(self, "_head_cmd_count", 0)
+            cmd_rate = (cmd_count - self._last_gaze_cmd_count) / dt_gaze
+            self._last_gaze_perf_time = t
+            self._last_gaze_cmd_count = cmd_count
+
+            active_tid = self.target_manager.active_target.target_id if self.target_manager.active_target else "None"
+            self.get_logger().info(
+                f"[GAZE PERF] tracker_fps={len(self.latest_visual_tracks):d} active_target={active_tid} "
+                f"head_cmd_rate={cmd_rate:.1f}Hz state={self.fsm.state.value}"
+            )
 
         # 8. Separate Error Metrics Calculation (Failure 7)
         face_bearing_deg = self.latest_visual_tracks[0].body_azimuth_deg if self.latest_visual_tracks else None

@@ -17,6 +17,7 @@ Features:
 
 import json
 import logging
+import threading
 import time
 
 _LOG = logging.getLogger(__name__)
@@ -44,12 +45,13 @@ import numpy as np
 try:
     import rclpy
     from rclpy.node import Node
-    from rclpy.qos import qos_profile_sensor_data
+    from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSHistoryPolicy, qos_profile_sensor_data
     from sensor_msgs.msg import Image
     from std_msgs.msg import String, Bool, Float32
 except ImportError:
     rclpy = None
     Node = object
+    QoSProfile = QoSReliabilityPolicy = QoSHistoryPolicy = object
     qos_profile_sensor_data = 10
     Image = String = Bool = Float32 = object
 
@@ -106,6 +108,26 @@ class SpatialVisionNode(Node):
         self._emotion_history = deque(maxlen=8)
         self.face_recognizer = FaceRecognizer()
 
+        # Latest-Frame-Wins Worker State & Telemetry
+        self._slot_lock = threading.Lock()
+        self._pending_image = None
+        self._pending_arrival_mono = 0.0
+        self._frame_available_event = threading.Event()
+        self._stop_worker = False
+
+        self._camera_input_count = 0
+        self._detector_processed_count = 0
+        self._dropped_frames = 0
+        self._frame_ages_ms = deque(maxlen=100)
+
+        self._last_perf_log_time = time.monotonic()
+        self._last_perf_camera_count = 0
+        self._last_perf_det_count = 0
+
+        # Start dedicated low-latency vision worker thread
+        self._worker_thread = threading.Thread(target=self._worker_loop, daemon=True)
+        self._worker_thread.start()
+
         # Publishers
         self.pub_faces = self.create_publisher(String, "/vision/faces", 10)
         self.pub_person = self.create_publisher(Bool, "/vision/person_detected", 10)
@@ -117,13 +139,17 @@ class SpatialVisionNode(Node):
         self.pub_image = self.create_publisher(Image, "/vision/face_image", 10)
 
         # Subscribers
-        # Görüntü akışları sensör QoS'u (BEST_EFFORT) kullanır: kare kaybı, geciken
-        # kareler için retransmission yapmaktan iyidir. BEST_EFFORT abone RELIABLE
-        # yayıncıdan da veri alabilir, bu yüzden depthai_ros_driver ile uyumludur.
-        self.sub_rgb = self.create_subscription(Image, input_topic, self.image_callback, qos_profile_sensor_data)
+        # Görüntü akışları en güncel tek kare (KEEP_LAST depth=1, BEST_EFFORT) kullanır:
+        # Kuyruk birikmesini (backpressure) engeller.
+        qos_profile_latest = QoSProfile(
+            reliability=QoSReliabilityPolicy.BEST_EFFORT,
+            history=QoSHistoryPolicy.KEEP_LAST,
+            depth=1,
+        )
+        self.sub_rgb = self.create_subscription(Image, input_topic, self.image_callback, qos_profile_latest)
         self.sub_depth = self.create_subscription(Image, depth_topic, self.depth_callback, qos_profile_sensor_data)
 
-        self.get_logger().info(f"👁️ [Spatial Emotion Vision] 3D Bakış, Mesafe ve Yüz Duygu Analizi Aktif! RGB: {input_topic}")
+        self.get_logger().info(f"👁️ [Spatial Emotion Vision] 3D Bakış ve Hızlı Yüz Tespiti Aktif! RGB: {input_topic}")
 
     def depth_callback(self, msg: Image):
         try:
@@ -203,6 +229,47 @@ class SpatialVisionNode(Node):
         return "neutral"
 
     def image_callback(self, msg: Image):
+        """Non-blocking subscriber callback. Holds only the latest frame (depth=1)."""
+        self._camera_input_count += 1
+        with self._slot_lock:
+            if self._pending_image is not None:
+                self._dropped_frames += 1
+            self._pending_image = msg
+            self._pending_arrival_mono = time.monotonic()
+            self._frame_available_event.set()
+
+    def _worker_loop(self):
+        """Dedicated low-latency vision worker thread. Always consumes newest frame."""
+        while rclpy.ok() and not self._stop_worker:
+            if not self._frame_available_event.wait(timeout=0.1):
+                continue
+            with self._slot_lock:
+                msg = self._pending_image
+                arrival_mono = self._pending_arrival_mono
+                self._pending_image = None
+                self._frame_available_event.clear()
+
+            if msg is None:
+                continue
+
+            try:
+                self._process_frame(msg, arrival_mono)
+            except Exception as e:
+                self.get_logger().error(f"Error in face processing: {e}")
+
+    def _process_frame(self, msg: Image, arrival_mono: float):
+        # 1. Measure timestamp age (source_image_timestamp vs processing time)
+        now_mono = time.monotonic()
+        if msg.header.stamp.sec > 0:
+            now_ros_s = self.get_clock().now().nanoseconds * 1e-9
+            msg_stamp_s = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
+            frame_age_ms = max(0.0, (now_ros_s - msg_stamp_s) * 1000.0)
+        else:
+            frame_age_ms = max(0.0, (now_mono - arrival_mono) * 1000.0)
+
+        self._frame_ages_ms.append(frame_age_ms)
+        self._detector_processed_count += 1
+
         try:
             frame = imgmsg_to_bgr(msg)
             if frame is None:
@@ -211,25 +278,19 @@ class SpatialVisionNode(Node):
             self.get_logger().warn(f"Image conversion failed: {e}")
             return
 
-        if not hasattr(self, '_frame_count'):
-            self._frame_count = 0
-        self._frame_count += 1
-
         frame_h, frame_w = frame.shape[:2]
-        
-        # Scale to 640px for high detection accuracy and low latency on Jetson CPU
+
+        # 2. Scale to 640px for low latency on Jetson CPU
         scale_ratio = 640.0 / float(frame_w) if frame_w > 640 else 1.0
-        
         if scale_ratio < 1.0:
             target_w = 640
             target_h = int(frame_h * scale_ratio)
             small_bgr = cv2.resize(frame, (target_w, target_h), interpolation=cv2.INTER_LINEAR)
             small_gray = cv2.cvtColor(small_bgr, cv2.COLOR_BGR2GRAY)
-            gray = None
         else:
             small_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            gray = small_gray
 
+        # 3. Detect faces (Haar Cascade)
         detected_faces = detect_faces_with_confidence(
             self.face_cascade,
             small_gray,
@@ -247,112 +308,49 @@ class SpatialVisionNode(Node):
                 minSize=(24, 24),
             )
 
-        # Map bounding boxes back to original resolution (the confidence is scale-free)
+        # Map bounding boxes back to original resolution
         if len(detected_faces) > 0 and scale_ratio < 1.0:
             faces = [[int(x / scale_ratio), int(y / scale_ratio), int(w / scale_ratio), int(h / scale_ratio), conf] for (x, y, w, h, conf) in detected_faces]
         else:
             faces = [list(f) for f in detected_faces]
 
-        # Sort detected faces by bounding box area (largest face first)
         if len(faces) > 0:
             faces = sorted(faces, key=lambda f: f[2]*f[3], reverse=True)
 
+        # 4. Extract Face Bounding Box, Center X, and Bearing (LIGHTWEIGHT: No eye/smile cascades)
         face_list = []
-        is_looking = False
-        user_distance = 0.0
-        head_yaw = 0.0
         face_camera_azimuth = 0.0
-        detected_emotion = "neutral"
-        top_recognized_person = {"name": "Misafir", "title": "Ziyaretçi", "formal_title": "Misafir", "confidence": 0.0, "is_known": False}
+        user_distance = 0.0
 
         for idx, (x, y, w, h, detection_conf) in enumerate(faces):
-            face_roi_bgr = frame[y:y + h, x:x + w]
-            if gray is not None:
-                face_roi_gray = gray[y:y + h, x:x + w]
-            else:
-                face_roi_gray = cv2.cvtColor(face_roi_bgr, cv2.COLOR_BGR2GRAY) if face_roi_bgr.size > 0 else np.empty((0, 0), dtype=np.uint8)
-            
-            # 1. 3D Head Yaw & Eye Verification
-            yaw, eyes_found = self._estimate_head_yaw(face_roi_gray, w, h)
-            head_yaw = yaw
-
             # Camera Optical Axis Azimuth Angle (HFOV ~ 72°, half = 36°)
-            # In ROS body frame: Image Right (+X) is Robot Right (-Yaw), Image Left (-X) is Robot Left (+Yaw)
+            # Image Right (+X) -> Robot Right (-Yaw), Image Left (-X) -> Robot Left (+Yaw)
             face_center_x = x + (w / 2.0)
             norm_offset = (face_center_x - (frame_w / 2.0)) / (frame_w / 2.0)
             cam_azimuth = float(-norm_offset * 36.0)
             if idx == 0:
                 face_camera_azimuth = cam_azimuth
 
-            # 2. 3D Distance
-            dist_m = self._estimate_distance(x, y, w, h, frame_w, frame_h)
-            user_distance = dist_m
-
-            # 3. Direct Gaze: Eyes MUST be visible AND yaw <= 22 degrees AND strictly in Social Zone (0.40m - 2.20m)
-            direct_gaze = eyes_found and (abs(yaw) <= 22.0) and (0.40 <= dist_m <= 2.20)
-            if direct_gaze:
-                is_looking = True
-
-            # 4. Face Recognition Matching (Rate-limited to 1.0s to avoid CPU starvation during real-time tracking)
-            now_mono = time.monotonic() if hasattr(time, 'monotonic') else 0.0
-            last_recog_call = getattr(self, "_last_recog_time", 0.0)
-            if (now_mono - last_recog_call) > 1.2 and face_roi_bgr.size > 0:
-                self._last_recog_time = now_mono
-                recog_name, recog_conf, recog_meta = self.face_recognizer.recognize_face(face_roi_bgr)
-                self._last_recog_result = (recog_name, recog_conf, recog_meta)
-            else:
-                recog_name, recog_conf, recog_meta = getattr(self, "_last_recog_result", (None, 0.0, {}))
-
-            is_known = (recog_name is not None and recog_conf >= 0.45)
-            if is_known and recog_conf > top_recognized_person["confidence"]:
-                top_recognized_person = {
-                    "name": recog_name,
-                    "title": recog_meta.get("title", "Tanınan Kişi"),
-                    "formal_title": recog_meta.get("formal_title", recog_name),
-                    "confidence": recog_conf,
-                    "is_known": True,
-                    "distance_m": round(dist_m, 2)
-                }
-
-            # 5. Emotion Detection
-            detected_emotion = self._detect_facial_emotion(face_roi_gray, w, h, yaw=yaw, eyes_found=eyes_found)
+            # Geometric pinhole distance (instant, zero overhead)
+            focal_length = frame_w * 0.8
+            dist_m = float(np.clip((0.15 * focal_length) / max(1, w), 0.3, 8.0))
+            if idx == 0:
+                user_distance = dist_m
 
             face_list.append({
                 "x": int(x), "y": int(y), "width": int(w), "height": int(h),
                 "confidence": round(float(detection_conf), 2),
                 "frame_width": int(frame_w), "frame_height": int(frame_h),
-                "yaw_deg": round(yaw, 1),
+                "yaw_deg": 0.0,
                 "camera_azimuth_deg": round(cam_azimuth, 1),
                 "distance_m": round(dist_m, 2),
-                "looking_at_robot": direct_gaze,
-                "emotion": detected_emotion,
-                "recognized_name": recog_name if is_known else None,
-                "recognized_title": recog_meta.get("formal_title") if is_known else None
+                "looking_at_robot": True,
+                "emotion": "neutral",
+                "recognized_name": None,
+                "recognized_title": None,
             })
 
-            # Draw HUD
-            color_map = {
-                "happy": (0, 255, 0),
-                "surprised": (255, 255, 0),
-                "neutral": (0, 200, 255),
-                "sad": (0, 0, 255)
-            }
-            box_color = (0, 215, 255) if is_known else color_map.get(detected_emotion, (0, 255, 0))
-            cv2.rectangle(frame, (x, y), (x + w, y + h), box_color, 2)
-            
-            tag_name = f"★ {recog_name} ({recog_meta.get('formal_title', '')})" if is_known else detected_emotion.upper()
-            gaze_txt = "BANA BAKIYOR" if direct_gaze else (f"YANA ({yaw:.0f}°)" if eyes_found else "BAKMIYOR (GÖZ YOK)")
-            hud_text = f"{tag_name} | {gaze_txt} | {dist_m:.2f}m"
-            cv2.putText(frame, hud_text, (x, max(22, y - 10)), cv2.FONT_HERSHEY_SIMPLEX, 0.55, box_color, 2)
-
-        self._gaze_history.append(is_looking)
-        smoothed_looking = (self._gaze_history.count(True) >= 2)
-
-        self._emotion_history.append(detected_emotion)
-        # Dominant emotion
-        smoothed_emotion = max(set(self._emotion_history), key=self._emotion_history.count)
-
-        # Publishers
+        # 5. Publish to downstream gaze topics
         faces_msg = String()
         faces_msg.data = json.dumps(face_list)
         self.pub_faces.publish(faces_msg)
@@ -362,7 +360,7 @@ class SpatialVisionNode(Node):
         self.pub_person.publish(person_msg)
 
         looking_msg = Bool()
-        looking_msg.data = smoothed_looking
+        looking_msg.data = len(faces) > 0
         self.pub_looking.publish(looking_msg)
 
         yaw_msg = Float32()
@@ -373,43 +371,33 @@ class SpatialVisionNode(Node):
         dist_msg.data = float(user_distance)
         self.pub_distance.publish(dist_msg)
 
-        emotion_msg = String()
-        emotion_msg.data = smoothed_emotion
-        self.pub_emotion.publish(emotion_msg)
+        # 6. Periodic Performance Telemetry (Every 5 seconds)
+        dt_perf = now_mono - self._last_perf_log_time
+        if dt_perf >= 5.0:
+            cam_fps = (self._camera_input_count - self._last_perf_camera_count) / dt_perf
+            det_fps = (self._detector_processed_count - self._last_perf_det_count) / dt_perf
+            self._last_perf_log_time = now_mono
+            self._last_perf_camera_count = self._camera_input_count
+            self._last_perf_det_count = self._detector_processed_count
 
-        recog_msg = String()
-        recog_msg.data = json.dumps(top_recognized_person)
-        self.pub_recognized_person.publish(recog_msg)
+            ages = list(self._frame_ages_ms)
+            if ages:
+                p50 = float(np.percentile(ages, 50))
+                p95 = float(np.percentile(ages, 95))
+                max_age = float(np.max(ages))
+            else:
+                p50 = p95 = max_age = 0.0
 
-        # Diagnostic logger on recognized person
-        if not hasattr(self, '_last_recog_logged_name'):
-            self._last_recog_logged_name = None
-            self._last_recog_logged_time = 0.0
+            self.get_logger().info(
+                f"[VISION PERF] camera_fps={cam_fps:.1f} detector_fps={det_fps:.1f} "
+                f"frame_age_p50={p50:.1f}ms frame_age_p95={p95:.1f}ms max_frame_age={max_age:.1f}ms "
+                f"dropped_frames={self._dropped_frames}"
+            )
 
-        now_t = self.get_clock().now().nanoseconds / 1e9
-        if top_recognized_person["is_known"]:
-            recog_p_name = top_recognized_person["name"]
-            if (recog_p_name != self._last_recog_logged_name) or (now_t - self._last_recog_logged_time > 10.0):
-                self._last_recog_logged_name = recog_p_name
-                self._last_recog_logged_time = now_t
-                self.get_logger().info(f"👤 [Yüz Tanındı]: {recog_p_name} ({top_recognized_person['formal_title']}) — Güven: %{int(top_recognized_person['confidence']*100)}, Mesafe: {user_distance:.2f}m")
-
-        # Diagnostic logger on gaze state change
-        if not hasattr(self, '_prev_looking_log'):
-            self._prev_looking_log = False
-        if is_looking != self._prev_looking_log:
-            self._prev_looking_log = is_looking
-            if is_looking and (0.35 <= user_distance <= 2.50):
-                known_tag = f" — [{top_recognized_person['formal_title']}]" if top_recognized_person["is_known"] else ""
-                self.get_logger().info(f"👀 [Göz Teması]: Kullanıcı algılandı! (Mesafe: {user_distance:.2f}m, Açı: {head_yaw:.1f}°){known_tag}")
-
-
-        # Publish Images
-        try:
-            face_img_msg = bgr_to_imgmsg(frame, msg.header)
-            self.pub_image.publish(face_img_msg)
-        except Exception as _exc:
-            self.get_logger().debug(f"image_callback: yok sayılan hata ({_exc})")
+    def destroy_node(self):
+        self._stop_worker = True
+        self._frame_available_event.set()
+        super().destroy_node()
 
 
 def main(args=None):

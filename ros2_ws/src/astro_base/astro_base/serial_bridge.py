@@ -584,7 +584,7 @@ class SerialBridge(Node):
                     self.ser.write(pkt)
                     self._last_sent_angle = msg.angle_deg
                     self._last_sent_angle_time = now
-                    self.get_logger().info(f"🎯 [SERIAL HEAD CMD] binary_pkt angle_deg={msg.angle_deg:.1f} (scaled={scaled_angle:.2f}°)")
+                    self.get_logger().debug(f"🎯 [SERIAL HEAD CMD] binary_pkt angle_deg={msg.angle_deg:.1f} (scaled={scaled_angle:.2f}°)")
         except serial.SerialException as exc:
             self.get_logger().error(f"HeadCmd write failed: {exc}")
             self._mark_disconnected()

@@ -3,19 +3,16 @@
     camera:
       i_nn_type: "none"
       i_enable_imu: false
-      i_usb_speed: "SUPER_PLUS"
-    i_pipeline_type: "RGBD"
+      i_usb_speed: "HIGH"
+    i_pipeline_type: "RGB"
     rgb:
-      i_resolution: "1080P"
-      i_fps: 30.0
+      i_resolution: "720P"
+      i_fps: 15.0
       i_publish_topic: true
       i_low_bandwidth: true
-      i_low_bandwidth_quality: 70
+      i_low_bandwidth_quality: 50
     stereo:
-      i_enabled: true
-      i_depth_filter_size: 5
-      i_lr_check: true
-      i_low_bandwidth: true
+      i_enabled: false
 
 webcam_publisher_node:
   ros__parameters:
