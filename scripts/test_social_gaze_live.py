@@ -71,7 +71,7 @@ class SocialGazeLiveMonitor(Node):
         self.camera_last_frame_time: float = 0.0
         self.camera_frame_deltas: deque = deque(maxlen=60)
         self.camera_timestamps: deque = deque(maxlen=60)
-        self.camera_latencies_ms: deque = deque(maxlen=60)
+        self.monitor_queue_ages_ms: deque = deque(maxlen=60)
         self.camera_fps_rolling: float = 0.0
 
         # =====================================================================
@@ -83,42 +83,39 @@ class SocialGazeLiveMonitor(Node):
         self.visual_yaw_deg: Optional[float] = None
         self.visual_conf: float = 0.0
         self.visual_faces_count: int = 0
-        self.visual_last_time: float = 0.0
         self.visual_user_distance: float = 0.0
         self.visual_user_emotion: str = "neutral"
-        self.visual_recognized_name: str = "None"
+        self.visual_recognized_name: str = "Misafir"
         self.visual_looking_at_robot: bool = False
+        self.visual_last_time: float = 0.0
 
         # =====================================================================
-        # 3. Acoustic DOA Telemetry
+        # 3. Audio & Acoustic DOA Telemetry
         # =====================================================================
-        self.audio_doa_deg: Optional[float] = None
-        self.audio_doa_conf: float = 0.0
-        self.audio_last_time: float = 0.0
         self.audio_total_events: int = 0
         self.audio_accepted_events: int = 0
         self.audio_rejected_events: int = 0
+        self.audio_doa_deg: Optional[float] = None
+        self.audio_doa_conf: float = 0.0
+        self.audio_last_time: float = 0.0
 
         # =====================================================================
-        # 4. Gaze FSM & Trajectory Telemetry
+        # 4. Gaze State & Trajectory Telemetry
         # =====================================================================
         self.gaze_state: str = "IDLE"
         self.prev_gaze_state: str = "IDLE"
+        self.state_dwell_times: Dict[str, float] = {k: 0.0 for k in STATE_NAMES.values()}
+        self._last_fsm_dwell_stamp: float = time.monotonic()
         self.gaze_priority: str = "IDLE"
         self.gaze_desired_yaw: float = 0.0
         self.gaze_planned_yaw: float = 0.0
-        self.gaze_at_target: bool = True
+        self.gaze_at_target: bool = False
         self.gaze_target_valid: bool = False
         self.gaze_target_conf: float = 0.0
         self.gaze_target_id: str = "None"
-        self.active_target_json: str = "{}"
-
-        # FSM State Dwell Time Accumulator
-        self.state_dwell_times: Dict[str, float] = {name: 0.0 for name in STATE_NAMES.values()}
-        self._last_fsm_dwell_stamp: float = time.monotonic()
 
         # =====================================================================
-        # 5. Actuator Closed-Loop Feedback
+        # 5. Motor & Closed-Loop Head Telemetry
         # =====================================================================
         self.cmd_head_yaw: float = 0.0
         self.act_head_yaw: float = 0.0
@@ -133,7 +130,8 @@ class SocialGazeLiveMonitor(Node):
         self.state_transitions: List[Dict] = []
         self.audio_events: List[Dict] = []
         self.visual_events: List[Dict] = []
-        self.tracking_errors: List[float] = []
+        self.motor_servo_errors: List[float] = []
+        self.visual_tracking_errors: List[float] = []
         self.sample_count: int = 0
         self.max_abs_vel: float = 0.0
 
@@ -142,13 +140,18 @@ class SocialGazeLiveMonitor(Node):
             history=QoSHistoryPolicy.KEEP_LAST,
             depth=10,
         )
+        qos_cam = QoSProfile(
+            reliability=QoSReliabilityPolicy.BEST_EFFORT,
+            history=QoSHistoryPolicy.KEEP_LAST,
+            depth=1,
+        )
 
         # =====================================================================
         # Topic Subscriptions
         # =====================================================================
-        # Camera Stream
-        self.create_subscription(Image, "/oak/rgb/image_raw", self._on_camera_image, qos_profile_sensor_data)
-        self.create_subscription(Image, "/vision/face_image", self._on_debug_face_image, qos_profile_sensor_data)
+        # Camera Stream (depth=1 so test monitor does not buffer stale frames)
+        self.create_subscription(Image, "/oak/rgb/image_raw", self._on_camera_image, qos_cam)
+        self.create_subscription(Image, "/vision/face_image", self._on_debug_face_image, qos_cam)
 
         # Vision Pipeline
         self.create_subscription(String, "/vision/faces", self._on_vision_json, 10)
@@ -201,13 +204,12 @@ class SocialGazeLiveMonitor(Node):
             if dt > 0.01:
                 self.camera_fps_rolling = (len(self.camera_timestamps) - 1) / dt
 
-        # Measure transport latency if stamp is populated
+        # Measure monitor callback age (queue delivery delay relative to image stamp)
         if msg.header.stamp.sec > 0:
             now_ns = self.get_clock().now().nanoseconds
             msg_ns = msg.header.stamp.sec * 1_000_000_000 + msg.header.stamp.nanosec
             latency_ms = (now_ns - msg_ns) / 1_000_000.0
-            if 0.0 <= latency_ms < 5000.0:
-                self.camera_latencies_ms.append(latency_ms)
+            self.monitor_queue_ages_ms.append(latency_ms)
 
     def _on_debug_face_image(self, msg: Image):
         # Fallback if raw camera topic is remapped
@@ -242,8 +244,10 @@ class SocialGazeLiveMonitor(Node):
                     "face_yaw_deg": round(self.visual_yaw_deg, 2),
                     "confidence": round(self.visual_conf, 2),
                     "distance_m": round(float(primary.get("distance_m", self.visual_user_distance)), 2),
-                    "tracking_error": round(self.cmd_head_yaw - self.act_head_yaw, 2),
+                    "visual_error_deg": round(self.visual_yaw_deg, 2),
+                    "motor_error_deg": round(self.cmd_head_yaw - self.act_head_yaw, 2),
                 })
+                self.visual_tracking_errors.append(abs(self.visual_yaw_deg))
             else:
                 self.visual_conf = 0.0
         except Exception:
@@ -321,7 +325,7 @@ class SocialGazeLiveMonitor(Node):
         self.head_stall = bool(getattr(msg, "fault_code", 0) == 4)
         self.max_abs_vel = max(self.max_abs_vel, abs(self.act_head_vel))
         err = self.cmd_head_yaw - self.act_head_yaw
-        self.tracking_errors.append(abs(err))
+        self.motor_servo_errors.append(abs(err))
         self.sample_count += 1
 
     def _on_joint_states(self, msg: JointState):
@@ -390,9 +394,9 @@ def render_dashboard(node: SocialGazeLiveMonitor):
     lines.append(f"  • Stream Resolution / Format : {node.camera_resolution} ({node.camera_encoding})")
     lines.append(f"  • Live Camera Frame Rate     : {cam_color}{node.camera_fps_rolling:.1f} FPS\033[0m (Total: {node.camera_frame_count} frames)")
     lines.append(f"  • Frame Interval (Jitter)    : {avg_delta_ms:.1f} ms (Min: {min_delta_ms:.1f}ms, Max: {max_delta_ms:.1f}ms, Jitter: ±{jitter_ms:.1f}ms)")
-    if node.camera_latencies_ms:
-        avg_lat = sum(node.camera_latencies_ms) / len(node.camera_latencies_ms)
-        lines.append(f"  • Pipeline Transport Latency : {avg_lat:.1f} ms")
+    if node.monitor_queue_ages_ms:
+        avg_lat = sum(node.monitor_queue_ages_ms) / len(node.monitor_queue_ages_ms)
+        lines.append(f"  • Monitör Kuyruk Yaşı (Queue Age) : {avg_lat:.1f} ms (DDS / callback teslim gecikmesi)")
 
     # 2. Vision Perception & Biometrics
     lines.append("\n[2] SPATIAL VISION & BIOMETRIC RECOGNITION:")
@@ -418,11 +422,13 @@ def render_dashboard(node: SocialGazeLiveMonitor):
     lines.append(f"  • Foveated / On Target       : {'✅ KİLİTLENDİ' if node.gaze_at_target else '⏳ HEDEFE YÖNELİYOR'}")
 
     # 5. Actuator Execution
-    err = node.cmd_head_yaw - node.act_head_yaw
-    lines.append("\n[5] CLOSED-LOOP HEAD MOTOR (50 Hz PID):")
+    motor_err = node.cmd_head_yaw - node.act_head_yaw
+    vis_err = node.visual_yaw_deg if (vision_fresh and node.visual_yaw_deg is not None) else 0.0
+    lines.append("\n[5] CLOSED-LOOP HEAD MOTOR & TRACKING ERRORS:")
     lines.append(f"  • Commanded vs Physical Yaw  : Cmd: {node.cmd_head_yaw:+.2f}° | Act: \033[1;32m{node.act_head_yaw:+.2f}°\033[0m")
     lines.append(f"  • Angular Velocity           : {node.act_head_vel:+.1f}°/s (Max: {node.max_abs_vel:.1f}°/s)")
-    lines.append(f"  • Steady-State Error         : {err:+.2f}° ({'★ MÜKEMMEL' if abs(err) <= 1.2 else 'TAKİP EDİYOR'})")
+    lines.append(f"  • Görsel Bakış Hatası        : {vis_err:+.2f}° ({'★ MERKEZDE' if abs(vis_err) <= 3.0 else 'YANA BAKIYOR'})")
+    lines.append(f"  • Motor Servo Hatası (PID)   : {motor_err:+.2f}° ({'★ MÜKEMMEL' if abs(motor_err) <= 1.2 else 'SEYİR HALİNDE'})")
     lines.append(f"  • Motor Durumu               : {'🔄 DÖNÜYOR' if node.head_moving else '⏸️ SABİT / DWELLING'}")
 
     lines.append("\n" + "-" * 80)
@@ -436,8 +442,11 @@ def render_dashboard(node: SocialGazeLiveMonitor):
 
 def generate_flight_report(node: SocialGazeLiveMonitor):
     duration = time.monotonic() - node.start_time
-    avg_err = (sum(node.tracking_errors) / len(node.tracking_errors)) if node.tracking_errors else 0.0
-    rms_err = math.sqrt(sum(e**2 for e in node.tracking_errors) / len(node.tracking_errors)) if node.tracking_errors else 0.0
+    avg_motor_err = (sum(node.motor_servo_errors) / len(node.motor_servo_errors)) if node.motor_servo_errors else 0.0
+    rms_motor_err = math.sqrt(sum(e**2 for e in node.motor_servo_errors) / len(node.motor_servo_errors)) if node.motor_servo_errors else 0.0
+
+    avg_vis_err = (sum(node.visual_tracking_errors) / len(node.visual_tracking_errors)) if node.visual_tracking_errors else 0.0
+    rms_vis_err = math.sqrt(sum(e**2 for e in node.visual_tracking_errors) / len(node.visual_tracking_errors)) if node.visual_tracking_errors else 0.0
 
     # Camera deltas
     deltas = list(node.camera_frame_deltas)
@@ -454,7 +463,8 @@ def generate_flight_report(node: SocialGazeLiveMonitor):
     print(f"Test Süresi                  : {duration:.2f} saniye")
     print(f"Toplanan Telemetri Örnekleri : {node.sample_count} örnek ({node.sample_count / max(0.1, duration):.1f} Hz)")
     print(f"Maksimum Açısal Hız          : {node.max_abs_vel:.1f}°/s")
-    print(f"Ortalama Takip Hatası        : {avg_err:.2f}° (RMS: {rms_err:.2f}°)")
+    print(f"Görsel Bakış Hatası          : {avg_vis_err:.2f}° (RMS: {rms_vis_err:.2f}°) [0° = optik merkez]")
+    print(f"Motor Servo Takip Hatası     : {avg_motor_err:.2f}° (RMS: {rms_motor_err:.2f}°) [Cmd - Act]")
 
     # 1. Camera Fluidity & Hardware Stream Report
     print("\n[1] KAMERA VE GÖRÜNTÜ İŞLEME AKICILIĞI (CAMERA FLUIDITY):")
@@ -462,9 +472,9 @@ def generate_flight_report(node: SocialGazeLiveMonitor):
     print(f"  • Ortalama Kamera Akış Hızı  : {avg_cam_fps:.1f} FPS (Toplam: {node.camera_frame_count} kare)")
     print(f"  • Yüz Algılama Düğüm Hızı    : {avg_vis_fps:.1f} Hz (Toplam: {node.vision_msg_count} kare)")
     print(f"  • Kareler Arası Gecikme (dt) : {avg_delta_ms:.1f} ms (Min: {min_delta_ms:.1f}ms, Max: {max_delta_ms:.1f}ms, Jitter: ±{jitter_ms:.1f}ms)")
-    if node.camera_latencies_ms:
-        mean_lat = sum(node.camera_latencies_ms) / len(node.camera_latencies_ms)
-        print(f"  • Donanım → Düğüm İletim Gecikmesi: {mean_lat:.1f} ms")
+    if node.monitor_queue_ages_ms:
+        mean_lat = sum(node.monitor_queue_ages_ms) / len(node.monitor_queue_ages_ms)
+        print(f"  • Monitör Kuyruk Teslim Yaşı : {mean_lat:.1f} ms (DDS/Monitör gecikmesi; donanım iletim gecikmesi DEĞİLDİR)")
 
     # 2. State Machine Timeline & Dwell Breakdown
     print("\n[2] DURUM MAKİNESİ GEÇİŞLERİ VE KALMA SÜRELERİ (FSM DWELL BREAKDOWN):")
@@ -532,8 +542,14 @@ def generate_flight_report(node: SocialGazeLiveMonitor):
             "visual_events_count": len(node.visual_events),
         },
         "max_angular_velocity_deg_s": round(node.max_abs_vel, 2),
-        "mean_tracking_error_deg": round(avg_err, 2),
-        "rms_tracking_error_deg": round(rms_err, 2),
+        "visual_error_deg": {
+            "mean": round(avg_vis_err, 2),
+            "rms": round(rms_vis_err, 2),
+        },
+        "motor_servo_error_deg": {
+            "mean": round(avg_motor_err, 2),
+            "rms": round(rms_motor_err, 2),
+        },
         "fsm_dwell_times_s": {k: round(v, 2) for k, v in node.state_dwell_times.items()},
         "state_transitions": node.state_transitions,
         "audio_events": node.audio_events,
