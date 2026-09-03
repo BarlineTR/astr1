@@ -306,10 +306,10 @@ class SpatialVisionNode(Node):
 
         frame_h, frame_w = frame.shape[:2]
 
-        # 2. Scale to 640px for low latency on Jetson CPU
-        scale_ratio = 640.0 / float(frame_w) if frame_w > 640 else 1.0
+        # 2. Scale to 320px (320x180) for low latency (~50ms) on Jetson CPU
+        scale_ratio = 320.0 / float(frame_w) if frame_w > 320 else 1.0
         if scale_ratio < 1.0:
-            target_w = 640
+            target_w = 320
             target_h = int(frame_h * scale_ratio)
             small_bgr = cv2.resize(frame, (target_w, target_h), interpolation=cv2.INTER_LINEAR)
             small_gray = cv2.cvtColor(small_bgr, cv2.COLOR_BGR2GRAY)
