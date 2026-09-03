@@ -240,6 +240,7 @@ class SocialGazeNode(Node):
         self.actual_head_vel_deg_s: float = 0.0
         self.is_robot_speaking: bool = False
         self.is_playback_active: bool = False
+        self._is_nlg_speaking: bool = False
         # The person's own head-pose yaw (from _estimate_head_yaw), carried separately
         # from the visual tracker.  Used only as an eye-contact cue for detections
         # that arrive without a per-face yaw_deg of their own.
@@ -364,9 +365,14 @@ class SocialGazeNode(Node):
             is_robot_speaking=self.is_robot_speaking,
         )
         if not obs.valid:
+            reason = "ROBOT_SPEAKING" if self.is_robot_speaking else (
+                "OUT_OF_ACOUSTIC_ENVELOPE" if abs(obs.relative_azimuth_deg) > self.audio_perception.max_acoustic_envelope_deg else (
+                    f"LOW_CONFIDENCE_{obs.confidence:.2f}"
+                )
+            )
             self.get_logger().info(
                 f"[AUDIO REJECT] raw_angle={raw_val:+.1f}° rel_bearing={obs.relative_azimuth_deg:+.1f}° "
-                f"confidence={obs.confidence:.2f} reason=OUT_OF_CONVERSATIONAL_FOV target_created=False "
+                f"confidence={obs.confidence:.2f} reason={reason} target_created=False "
                 f"attention_owner={self.fsm.active_priority.value}"
             )
         else:
@@ -490,18 +496,13 @@ class SocialGazeNode(Node):
 
     def _on_speaking_status(self, msg: Bool) -> None:
         """Sets TTS/NLG-level speaking flag (/robot/is_speaking)."""
-        self.is_robot_speaking = bool(msg.data) or self.is_playback_active
+        self._is_nlg_speaking = bool(msg.data)
+        self.is_robot_speaking = self._is_nlg_speaking or self.is_playback_active
 
     def _on_playback_active(self, msg: Bool) -> None:
-        """Sets audio-player playback flag (/audio/playback_active, 10 Hz).
-
-        This is separate from _on_speaking_status so that a 10 Hz playback
-        heartbeat cannot overwrite a is_speaking=True that just arrived from
-        the NLG side.  The combined robot-inhibit flag is the logical OR of
-        both sources.
-        """
+        """Sets audio-player playback flag (/audio/playback_active, 10 Hz)."""
         self.is_playback_active = bool(msg.data)
-        self.is_robot_speaking = bool(msg.data) or self.is_robot_speaking
+        self.is_robot_speaking = self._is_nlg_speaking or self.is_playback_active
 
     def _on_emergency_stop(self, msg: Bool) -> None:
         self.fsm.set_safety_lock(msg.data)
@@ -681,7 +682,8 @@ def main(args=None):
         pass
     finally:
         node.destroy_node()
-        rclpy.shutdown()
+        if rclpy.ok():
+            rclpy.shutdown()
 
 
 if __name__ == "__main__":

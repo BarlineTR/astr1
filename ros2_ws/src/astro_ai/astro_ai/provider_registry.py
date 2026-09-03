@@ -124,13 +124,13 @@ GEMINI_PRODUCTION_MODELS: Set[str] = {
 }
 
 GEMINI_PREFERENCE_ORDER: List[str] = [
-    "gemini-2.5-flash",
-    "gemini-2.5-flash-lite",
-    "gemini-2.5-pro",
     "gemini-2.0-flash",
     "gemini-1.5-flash",
     "gemini-2.0-flash-lite",
     "gemini-1.5-pro",
+    "gemini-2.5-flash",
+    "gemini-2.5-flash-lite",
+    "gemini-2.5-pro",
 ]
 
 
