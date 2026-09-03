@@ -141,6 +141,11 @@ class SpatialVisionNode(Node):
         self._alt_calls = 0
         self._alt_hits = 0
 
+        # Face Recall & Telemetry Tracking
+        self._total_face_frames = 0
+        self._recent_confs = deque(maxlen=100)
+        self._recent_areas_pct = deque(maxlen=100)
+
         self._last_perf_log_time = time.monotonic()
         self._last_perf_camera_count = 0
         self._last_perf_det_count = 0
@@ -311,42 +316,52 @@ class SpatialVisionNode(Node):
         if scale_ratio < 1.0:
             target_w = 320
             target_h = int(frame_h * scale_ratio)
-            small_bgr = cv2.resize(frame, (target_w, target_h), interpolation=cv2.INTER_LINEAR)
+            # Use INTER_AREA: OpenCV's recommended resampler for shrinking, avoids pixel-skipping aliasing
+            small_bgr = cv2.resize(frame, (target_w, target_h), interpolation=cv2.INTER_AREA)
             small_gray = cv2.cvtColor(small_bgr, cv2.COLOR_BGR2GRAY)
         else:
             small_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
+        # Equalize histogram: critical for Haar cascades to normalize indoor lighting, shadows, and contrast
+        small_gray = cv2.equalizeHist(small_gray)
         t2 = time.perf_counter()
         self._lat_gray_ms.append((t2 - t1) * 1000.0)
 
         # 3. Detect faces (Haar Cascade)
         self._pri_calls += 1
         t3_start = time.perf_counter()
-        detected_faces = detect_faces_with_confidence(
+        pri_detected = detect_faces_with_confidence(
             self.face_cascade,
             small_gray,
-            scaleFactor=1.10,
+            scaleFactor=1.08,
             minNeighbors=3,
-            minSize=(24, 24),
+            minSize=(20, 20),
         )
         t3_end = time.perf_counter()
         self._lat_pri_haar_ms.append((t3_end - t3_start) * 1000.0)
 
-        if len(detected_faces) > 0:
+        pri_hit = len(pri_detected) > 0
+        alt_hit = False
+        detected_faces = pri_detected
+
+        if pri_hit:
             self._pri_hits += 1
         elif hasattr(self, 'face_alt_cascade'):
             self._alt_calls += 1
             t4_start = time.perf_counter()
-            detected_faces = detect_faces_with_confidence(
+            alt_detected = detect_faces_with_confidence(
                 self.face_alt_cascade,
                 small_gray,
-                scaleFactor=1.10,
+                scaleFactor=1.08,
                 minNeighbors=3,
-                minSize=(24, 24),
+                minSize=(20, 20),
             )
             t4_end = time.perf_counter()
             self._lat_alt_haar_ms.append((t4_end - t4_start) * 1000.0)
-            if len(detected_faces) > 0:
+            if len(alt_detected) > 0:
                 self._alt_hits += 1
+                alt_hit = True
+                detected_faces = alt_detected
 
         # Map bounding boxes back to original resolution
         if len(detected_faces) > 0 and scale_ratio < 1.0:
@@ -356,6 +371,23 @@ class SpatialVisionNode(Node):
 
         if len(faces) > 0:
             faces = sorted(faces, key=lambda f: f[2]*f[3], reverse=True)
+            self._total_face_frames += 1
+            primary_f = faces[0]
+            conf_val = float(primary_f[4])
+            self._recent_confs.append(conf_val)
+
+            # Measure bbox area % in 320x180
+            w_320 = int(primary_f[2] * scale_ratio)
+            h_320 = int(primary_f[3] * scale_ratio)
+            area_pct = round((w_320 * h_320) / (320.0 * 180.0) * 100.0, 1)
+            self._recent_areas_pct.append(area_pct)
+
+            src_str = "PRI" if pri_hit else "ALT2"
+            self.get_logger().info(
+                f"🎯 [FACE DET] src={src_str} conf={conf_val:.2f} "
+                f"bbox_320=({w_320}x{h_320}) bbox_orig=({primary_f[2]}x{primary_f[3]}) "
+                f"area={area_pct:.1f}% discarded=NO pub_count={len(faces)}"
+            )
 
         # 4. Extract Face Bounding Box, Center X, and Bearing (LIGHTWEIGHT: No eye/smile cascades)
         face_list = []
@@ -438,11 +470,18 @@ class SpatialVisionNode(Node):
 
             alt_pct = (self._alt_calls / max(1, self._pri_calls)) * 100.0
 
+            confs = list(self._recent_confs)
+            avg_c = float(np.mean(confs)) if confs else 0.0
+            max_c = float(np.max(confs)) if confs else 0.0
+            min_c = float(np.min(confs)) if confs else 0.0
+            recall_rate = (self._total_face_frames / max(1, self._detector_processed_count)) * 100.0
+
             self.get_logger().info(
                 f"[VISION PERF] cam_fps={cam_fps:.1f} det_fps={det_fps:.1f} | "
                 f"proc(p50={tot_p50:.1f}ms, p95={tot_p95:.1f}ms) | "
-                f"pri={pri_p50:.1f}ms alt2={alt_p50:.1f}ms bgr={bgr_p50:.1f}ms post={post_p50:.1f}ms | "
-                f"alt2_rate={alt_pct:.1f}% (calls:{self._alt_calls}/{self._pri_calls}, hits:{self._alt_hits}) | "
+                f"pri={pri_p50:.1f}ms alt2={alt_p50:.1f}ms bgr={bgr_p50:.1f}ms | "
+                f"recall={recall_rate:.1f}% (pri_hits={self._pri_hits}, alt_hits={self._alt_hits}) | "
+                f"conf(avg={avg_c:.2f}, max={max_c:.2f}) | "
                 f"age_p50={p50:.1f}ms age_p95={p95:.1f}ms max_age={max_age:.1f}ms drop={self._dropped_frames}"
             )
 
