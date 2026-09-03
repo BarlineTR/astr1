@@ -127,6 +127,20 @@ class SpatialVisionNode(Node):
         self._dropped_frames = 0
         self._frame_ages_ms = deque(maxlen=100)
 
+        # Stage latency tracking (Phase 2A Forensic Profiling)
+        self._lat_total_ms = deque(maxlen=100)
+        self._lat_bgr_ms = deque(maxlen=100)
+        self._lat_gray_ms = deque(maxlen=100)
+        self._lat_pri_haar_ms = deque(maxlen=100)
+        self._lat_alt_haar_ms = deque(maxlen=100)
+        self._lat_post_ms = deque(maxlen=100)
+
+        # Haar invocation & hit counters
+        self._pri_calls = 0
+        self._pri_hits = 0
+        self._alt_calls = 0
+        self._alt_hits = 0
+
         self._last_perf_log_time = time.monotonic()
         self._last_perf_camera_count = 0
         self._last_perf_det_count = 0
@@ -265,6 +279,8 @@ class SpatialVisionNode(Node):
                 self.get_logger().error(f"Error in face processing: {e}")
 
     def _process_frame(self, msg: Image, arrival_mono: float):
+        t_start = time.perf_counter()
+
         # 1. Measure timestamp age (source_image_timestamp vs processing time)
         now_mono = time.monotonic()
         if msg.header.stamp.sec > 0:
@@ -277,6 +293,7 @@ class SpatialVisionNode(Node):
         self._frame_ages_ms.append(frame_age_ms)
         self._detector_processed_count += 1
 
+        t0 = time.perf_counter()
         try:
             frame = imgmsg_to_bgr(msg)
             if frame is None:
@@ -284,6 +301,8 @@ class SpatialVisionNode(Node):
         except Exception as e:
             self.get_logger().warn(f"Image conversion failed: {e}")
             return
+        t1 = time.perf_counter()
+        self._lat_bgr_ms.append((t1 - t0) * 1000.0)
 
         frame_h, frame_w = frame.shape[:2]
 
@@ -296,8 +315,12 @@ class SpatialVisionNode(Node):
             small_gray = cv2.cvtColor(small_bgr, cv2.COLOR_BGR2GRAY)
         else:
             small_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        t2 = time.perf_counter()
+        self._lat_gray_ms.append((t2 - t1) * 1000.0)
 
         # 3. Detect faces (Haar Cascade)
+        self._pri_calls += 1
+        t3_start = time.perf_counter()
         detected_faces = detect_faces_with_confidence(
             self.face_cascade,
             small_gray,
@@ -305,8 +328,14 @@ class SpatialVisionNode(Node):
             minNeighbors=3,
             minSize=(24, 24),
         )
+        t3_end = time.perf_counter()
+        self._lat_pri_haar_ms.append((t3_end - t3_start) * 1000.0)
 
-        if len(detected_faces) == 0 and hasattr(self, 'face_alt_cascade'):
+        if len(detected_faces) > 0:
+            self._pri_hits += 1
+        elif hasattr(self, 'face_alt_cascade'):
+            self._alt_calls += 1
+            t4_start = time.perf_counter()
             detected_faces = detect_faces_with_confidence(
                 self.face_alt_cascade,
                 small_gray,
@@ -314,6 +343,10 @@ class SpatialVisionNode(Node):
                 minNeighbors=3,
                 minSize=(24, 24),
             )
+            t4_end = time.perf_counter()
+            self._lat_alt_haar_ms.append((t4_end - t4_start) * 1000.0)
+            if len(detected_faces) > 0:
+                self._alt_hits += 1
 
         # Map bounding boxes back to original resolution
         if len(detected_faces) > 0 and scale_ratio < 1.0:
@@ -378,6 +411,10 @@ class SpatialVisionNode(Node):
         dist_msg.data = float(user_distance)
         self.pub_distance.publish(dist_msg)
 
+        t_end = time.perf_counter()
+        self._lat_total_ms.append((t_end - t_start) * 1000.0)
+        self._lat_post_ms.append((t_end - t3_end) * 1000.0)
+
         # 6. Periodic Performance Telemetry (Every 5 seconds)
         dt_perf = now_mono - self._last_perf_log_time
         if dt_perf >= 5.0:
@@ -388,17 +425,25 @@ class SpatialVisionNode(Node):
             self._last_perf_det_count = self._detector_processed_count
 
             ages = list(self._frame_ages_ms)
-            if ages:
-                p50 = float(np.percentile(ages, 50))
-                p95 = float(np.percentile(ages, 95))
-                max_age = float(np.max(ages))
-            else:
-                p50 = p95 = max_age = 0.0
+            p50 = float(np.percentile(ages, 50)) if ages else 0.0
+            p95 = float(np.percentile(ages, 95)) if ages else 0.0
+            max_age = float(np.max(ages)) if ages else 0.0
+
+            tot_p50 = float(np.percentile(self._lat_total_ms, 50)) if self._lat_total_ms else 0.0
+            tot_p95 = float(np.percentile(self._lat_total_ms, 95)) if self._lat_total_ms else 0.0
+            pri_p50 = float(np.percentile(self._lat_pri_haar_ms, 50)) if self._lat_pri_haar_ms else 0.0
+            alt_p50 = float(np.percentile(self._lat_alt_haar_ms, 50)) if self._lat_alt_haar_ms else 0.0
+            bgr_p50 = float(np.percentile(self._lat_bgr_ms, 50)) if self._lat_bgr_ms else 0.0
+            post_p50 = float(np.percentile(self._lat_post_ms, 50)) if self._lat_post_ms else 0.0
+
+            alt_pct = (self._alt_calls / max(1, self._pri_calls)) * 100.0
 
             self.get_logger().info(
-                f"[VISION PERF] camera_fps={cam_fps:.1f} detector_fps={det_fps:.1f} "
-                f"frame_age_p50={p50:.1f}ms frame_age_p95={p95:.1f}ms max_frame_age={max_age:.1f}ms "
-                f"dropped_frames={self._dropped_frames}"
+                f"[VISION PERF] cam_fps={cam_fps:.1f} det_fps={det_fps:.1f} | "
+                f"proc(p50={tot_p50:.1f}ms, p95={tot_p95:.1f}ms) | "
+                f"pri={pri_p50:.1f}ms alt2={alt_p50:.1f}ms bgr={bgr_p50:.1f}ms post={post_p50:.1f}ms | "
+                f"alt2_rate={alt_pct:.1f}% (calls:{self._alt_calls}/{self._pri_calls}, hits:{self._alt_hits}) | "
+                f"age_p50={p50:.1f}ms age_p95={p95:.1f}ms max_age={max_age:.1f}ms drop={self._dropped_frames}"
             )
 
     def destroy_node(self):

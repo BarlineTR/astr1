@@ -235,9 +235,133 @@ def run_live_camera_analysis(duration_sec: float = 60.0):
     rclpy.shutdown()
 
 
+def run_live_resolution_benchmark(num_iterations: int = 50):
+    """Captures a real camera frame from /oak/rgb/image_raw and benchmarks 640x360 vs 320x180."""
+    print("=" * 80)
+    print("   ASTRO GERÇEK KAMERA KARESI ÜZERİNDE 640x360 vs 320x180 BENCHMARK")
+    print("=" * 80)
+
+    # Initialize Haar cascades
+    haar_dir = cv2.data.haarcascades
+    face_cascade_path = os.path.join(haar_dir, "haarcascade_frontalface_default.xml")
+    face_alt_path = os.path.join(haar_dir, "haarcascade_frontalface_alt2.xml")
+
+    face_cascade = cv2.CascadeClassifier(face_cascade_path)
+    face_alt_cascade = cv2.CascadeClassifier(face_alt_path)
+
+    # Attempt to capture real frame from /oak/rgb/image_raw
+    captured_frame = None
+    try:
+        import rclpy
+        from rclpy.node import Node
+        from rclpy.qos import QoSHistoryPolicy, QoSProfile, QoSReliabilityPolicy
+        from sensor_msgs.msg import Image
+
+        rclpy.init()
+        node = Node("astro_frame_capture_profiler")
+
+        def _cb(msg: Image):
+            nonlocal captured_frame
+            if captured_frame is None:
+                channels = 3
+                if msg.encoding in ("bgr8", "rgb8"):
+                    arr = np.frombuffer(msg.data, dtype=np.uint8).reshape(msg.height, msg.width, channels)
+                    captured_frame = arr if msg.encoding == "bgr8" else cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
+
+        qos = QoSProfile(reliability=QoSReliabilityPolicy.BEST_EFFORT, history=QoSHistoryPolicy.KEEP_LAST, depth=1)
+        sub = node.create_subscription(Image, "/oak/rgb/image_raw", _cb, qos)
+
+        print("📡 /oak/rgb/image_raw konusundan gerçek oda/kamera karesi bekleniyor (en fazla 5 saniye)...")
+        start_wait = time.time()
+        while captured_frame is None and (time.time() - start_wait) < 5.0 and rclpy.ok():
+            rclpy.spin_once(node, timeout_sec=0.1)
+
+        node.destroy_node()
+        rclpy.shutdown()
+    except Exception as e:
+        print(f"⚠️  ROS capture atlandı: {e}")
+
+    if captured_frame is not None:
+        print(f"✅ Gerçek kamera karesi alındı! Çözünürlük: {captured_frame.shape[1]}x{captured_frame.shape[0]}")
+    else:
+        print("⚠️  Kamera yayını bulunamadı. Zengin dokulu (textured real-world simulation) kare oluşturuluyor...")
+        # High-frequency realistic textured frame to accurately benchmark Haar stages on real environments
+        rng = np.random.RandomState(42)
+        captured_frame = rng.randint(50, 200, (360, 640, 3), dtype=np.uint8)
+        cv2.putText(captured_frame, "ASTRO REAL SCENE", (50, 50), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2)
+        # Add realistic face gradient
+        cv2.circle(captured_frame, (320, 180), 60, (210, 190, 170), -1)
+        cv2.circle(captured_frame, (300, 160), 10, (30, 30, 30), -1)
+        cv2.circle(captured_frame, (340, 160), 10, (30, 30, 30), -1)
+        cv2.ellipse(captured_frame, (320, 210), (25, 12), 0, 0, 180, (40, 40, 40), 2)
+
+    # Lock threads to 1 (production setting)
+    cv2.setNumThreads(1)
+    print(f"🧵 Aktif İş Parçacığı: {cv2.getNumThreads()} (cv2.setNumThreads(1))")
+
+    # Benchmark function
+    def _bench_res(target_w: int, target_h: int):
+        t_resize_list = []
+        t_pri_list = []
+        t_alt_list = []
+        t_tot_list = []
+
+        for _ in range(num_iterations):
+            t0 = time.perf_counter()
+            resized = cv2.resize(captured_frame, (target_w, target_h), interpolation=cv2.INTER_LINEAR)
+            gray = cv2.cvtColor(resized, cv2.COLOR_BGR2GRAY)
+            t1 = time.perf_counter()
+            t_resize_list.append((t1 - t0) * 1000.0)
+
+            # Primary Haar
+            rects, _, _ = face_cascade.detectMultiScale3(
+                gray, scaleFactor=1.10, minNeighbors=3, minSize=(24, 24), outputRejectLevels=True
+            )
+            t2 = time.perf_counter()
+            t_pri_list.append((t2 - t1) * 1000.0)
+
+            # Fallback Haar
+            _ = face_alt_cascade.detectMultiScale3(
+                gray, scaleFactor=1.10, minNeighbors=3, minSize=(24, 24), outputRejectLevels=True
+            )
+            t3 = time.perf_counter()
+            t_alt_list.append((t3 - t2) * 1000.0)
+            t_tot_list.append((t3 - t0) * 1000.0)
+
+        return {
+            "res": f"{target_w}x{target_h}",
+            "pri_p50": np.percentile(t_pri_list, 50),
+            "pri_p95": np.percentile(t_pri_list, 95),
+            "alt_p50": np.percentile(t_alt_list, 50),
+            "alt_p95": np.percentile(t_alt_list, 95),
+            "tot_p50": np.percentile(t_tot_list, 50),
+            "tot_p95": np.percentile(t_tot_list, 95),
+            "pri_mean": np.mean(t_pri_list),
+            "tot_mean": np.mean(t_tot_list),
+        }
+
+    res_640 = _bench_res(640, 360)
+    res_320 = _bench_res(320, 180)
+
+    print("\n" + "=" * 80)
+    print("           ÇÖZÜNÜRLÜK KARŞILAŞTIRMA TABLOSU (cv2.threads = 1)")
+    print("=" * 80)
+    print(f"{'Metrik':<30} | {'640x360':<22} | {'320x180':<22} | {'Hızlanma Katı':<12}")
+    print("-" * 80)
+    speedup_pri = res_640["pri_mean"] / max(0.01, res_320["pri_mean"])
+    speedup_tot = res_640["tot_mean"] / max(0.01, res_320["tot_mean"])
+    print(f"{'Primary Haar (p50 / p95)':<30} | {res_640['pri_p50']:5.2f}ms / {res_640['pri_p95']:5.2f}ms | {res_320['pri_p50']:5.2f}ms / {res_320['pri_p95']:5.2f}ms | {speedup_pri:.1f}x HIZLI")
+    print(f"{'Fallback Alt2 (p50 / p95)':<30} | {res_640['alt_p50']:5.2f}ms / {res_640['alt_p95']:5.2f}ms | {res_320['alt_p50']:5.2f}ms / {res_320['alt_p95']:5.2f}ms | {(res_640['alt_p50'] / max(0.01, res_320['alt_p50'])):.1f}x HIZLI")
+    print(f"{'Toplam İşlem Süresi (p50/p95)':<30} | {res_640['tot_p50']:5.2f}ms / {res_640['tot_p95']:5.2f}ms | {res_320['tot_p50']:5.2f}ms / {res_320['tot_p95']:5.2f}ms | {speedup_tot:.1f}x HIZLI")
+    fps_640 = 1000.0 / max(1.0, res_640["tot_p50"])
+    fps_320 = 1000.0 / max(1.0, res_320["tot_p50"])
+    print(f"{'Maksimum Teorik FPS':<30} | {fps_640:5.1f} Hz                | {fps_320:5.1f} Hz                | {(fps_320/max(1.0, fps_640)):.1f}x FPS")
+    print("=" * 80)
+
+
 def main():
     parser = argparse.ArgumentParser(description="ASTRO Vision Profiler")
-    parser.add_argument("--mode", choices=["benchmark", "camera"], default="benchmark")
+    parser.add_argument("--mode", choices=["benchmark", "camera", "compare"], default="benchmark")
     parser.add_argument("--duration", type=float, default=60.0)
     args = parser.parse_args()
 
@@ -245,6 +369,8 @@ def main():
         run_synthetic_benchmark()
     elif args.mode == "camera":
         run_live_camera_analysis(args.duration)
+    elif args.mode == "compare":
+        run_live_resolution_benchmark()
 
 
 if __name__ == "__main__":
