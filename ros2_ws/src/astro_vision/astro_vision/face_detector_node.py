@@ -72,15 +72,12 @@ class SpatialVisionNode(Node):
         self.declare_parameter("scale_factor", 1.1)
         self.declare_parameter("min_neighbors", 4)
         self.declare_parameter("min_size", 45)
-        self.declare_parameter("process_every_n", 3)
 
         input_topic = self.get_parameter("input_topic").value
         depth_topic = self.get_parameter("depth_topic").value
         self.scale_factor = float(self.get_parameter("scale_factor").value)
         self.min_neighbors = int(self.get_parameter("min_neighbors").value)
         self.min_size = int(self.get_parameter("min_size").value)
-        self.process_every_n = max(1, int(self.get_parameter("process_every_n").value))
-        self._frame_count = 0
 
         # Load Cascades (Default + Alt2 for maximum detection rate)
         frontal_path = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
@@ -125,10 +122,7 @@ class SpatialVisionNode(Node):
         self.sub_rgb = self.create_subscription(Image, input_topic, self.image_callback, qos_profile_sensor_data)
         self.sub_depth = self.create_subscription(Image, depth_topic, self.depth_callback, qos_profile_sensor_data)
 
-        self.get_logger().info(
-            f"👁️ [Spatial Emotion Vision] 3D Bakış, Mesafe ve Yüz Duygu Analizi Aktif! "
-            f"RGB: {input_topic} | process_every_n={self.process_every_n} (detection ~{30.0/self.process_every_n:.0f} Hz)"
-        )
+        self.get_logger().info(f"👁️ [Spatial Emotion Vision] 3D Bakış, Mesafe ve Yüz Duygu Analizi Aktif! RGB: {input_topic}")
 
     def depth_callback(self, msg: Image):
         try:
@@ -216,20 +210,9 @@ class SpatialVisionNode(Node):
             self.get_logger().warn(f"Image conversion failed: {e}")
             return
 
+        if not hasattr(self, '_frame_count'):
+            self._frame_count = 0
         self._frame_count += 1
-
-        # ── Frame Skip: Only run heavy CV detection every Nth frame ──
-        # At 30 FPS with process_every_n=3, detection runs at ~10 Hz.
-        # Skipped frames still publish the raw image for other consumers.
-        if self._frame_count % self.process_every_n != 0:
-            # Publish the raw camera frame even on skipped frames
-            # so downstream nodes (e.g. recording, display) stay fluid.
-            try:
-                face_img_msg = bgr_to_imgmsg(frame, msg.header)
-                self.pub_image.publish(face_img_msg)
-            except Exception:
-                pass
-            return
 
         frame_h, frame_w = frame.shape[:2]
         
