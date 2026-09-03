@@ -251,8 +251,10 @@ class SocialGazeNode(Node):
         self.latest_person_head_yaw_deg: float = 0.0
         # Bug #4 fix: GCC-PHAT PSR confidence delivered via /audio/doa_confidence
         # companion topic.  Updated in _on_doa_confidence, consumed in _on_doa_deg.
-        # Default 0.70 = reasonable prior while no confidence measurement has arrived.
-        self._latest_doa_confidence: float = 0.70
+        # Default 0.85 = reasonable prior while no confidence measurement has arrived.
+        # The ReSpeaker firmware DOA carries no confidence of its own; the prior must
+        # be high enough to pass the 0.40 min_confidence gate.
+        self._latest_doa_confidence: float = 0.85
 
         # -------------------------------------------------------------------------
         # 4. ROS 2 Publishers & Subscriptions

@@ -194,7 +194,15 @@ class SpatialVisionNode(Node):
 
     def _estimate_head_yaw(self, face_roi_gray, w, h) -> tuple[float, bool]:
         """Calculates yaw angle and strictly verifies eye visibility to reject side/back-of-head false detections."""
-        roi = cv2.resize(face_roi_gray[:int(h * 0.6), :], (96, 54), interpolation=cv2.INTER_AREA) if w > 96 else face_roi_gray[:int(h * 0.6), :]
+        upper_h = int(h * 0.6)
+        if upper_h <= 0 or w <= 0 or face_roi_gray.size == 0:
+            return 45.0, False
+        upper_roi = face_roi_gray[:upper_h, :]
+        if upper_roi.size == 0:
+            return 45.0, False
+        roi = cv2.resize(upper_roi, (96, 54), interpolation=cv2.INTER_AREA) if w > 96 else upper_roi
+        if roi.size == 0:
+            return 45.0, False
         rw = roi.shape[1]
         eyes = self.eye_cascade.detectMultiScale(roi, scaleFactor=1.12, minNeighbors=3, minSize=(10, 10))
         if len(eyes) >= 2:
@@ -214,7 +222,13 @@ class SpatialVisionNode(Node):
 
     def _detect_facial_emotion(self, face_roi_gray, w, h, yaw: float = 0.0, eyes_found: bool = False) -> str:
         """Determines emotion (happy, surprised, focused, neutral) based on mouth contrast, smile and gaze geometry."""
-        lower_face = cv2.resize(face_roi_gray[int(h * 0.5):, :], (96, 48), interpolation=cv2.INTER_AREA) if w > 96 else face_roi_gray[int(h * 0.5):, :]
+        lower_h_start = int(h * 0.5)
+        if lower_h_start >= h or w <= 0 or face_roi_gray.size == 0:
+            return "neutral"
+        lower_slice = face_roi_gray[lower_h_start:, :]
+        if lower_slice.size == 0:
+            return "neutral"
+        lower_face = cv2.resize(lower_slice, (96, 48), interpolation=cv2.INTER_AREA) if w > 96 else lower_slice
         smiles = self.smile_cascade.detectMultiScale(lower_face, scaleFactor=1.65, minNeighbors=10, minSize=(15, 15))
         if len(smiles) > 0:
             return "happy"
@@ -325,8 +339,15 @@ class SpatialVisionNode(Node):
         hud_cache = []
 
         for idx, (x, y, w, h, detection_conf) in enumerate(faces):
+            # Clamp bounding box to frame boundaries to prevent empty ROI slices
+            x = max(0, min(x, frame_w - 1))
+            y = max(0, min(y, frame_h - 1))
+            w = max(1, min(w, frame_w - x))
+            h = max(1, min(h, frame_h - y))
             face_roi_gray = gray[y:y + h, x:x + w]
             face_roi_bgr = frame[y:y + h, x:x + w]
+            if face_roi_gray.size == 0 or face_roi_bgr.size == 0:
+                continue
             
             # 1. 3D Head Yaw & Eye Verification
             yaw, eyes_found = self._estimate_head_yaw(face_roi_gray, w, h)

@@ -164,7 +164,57 @@ class TestTargetManager(unittest.TestCase):
         st_final = self.tm.update([spk_a, spk_b], timestamp=t)
         self.assertEqual(st_final.active_target.target_id, "spk_b")
 
+    def test_fallback_to_other_visible_face(self):
+        """When active target face leaves the frame, system quickly falls back to another visible face."""
+        t = 1.0
+        face_a = FusedTarget(
+            target_id="person_a", modality=Modality.VISION, body_azimuth_deg=0.0,
+            body_elevation_deg=0.0, distance_m=1.5, confidence=0.85,
+            is_speaking=False, eye_contact=True, person_name=None, is_known=False,
+            timestamp=t, tracking_state=TrackingState.TRACKING
+        )
+        face_b = FusedTarget(
+            target_id="person_b", modality=Modality.VISION, body_azimuth_deg=30.0,
+            body_elevation_deg=0.0, distance_m=1.5, confidence=0.80,
+            is_speaking=False, eye_contact=False, person_name=None, is_known=False,
+            timestamp=t, tracking_state=TrackingState.TRACKING
+        )
+        # Acquire face_a
+        self.tm.update([face_a, face_b], timestamp=t)
+        self.assertEqual(self.tm.active_target.target_id, "person_a")
+
+        # Now face_a leaves frame (only face_b remains)
+        t += 0.6  # > 0.5s missing timeout
+        st_after = self.tm.update([face_b], timestamp=t)
+        self.assertEqual(st_after.active_target.target_id, "person_b")
+
+    def test_fast_turn_taking_when_silent(self):
+        """When active target is not speaking, system switches faster (0.4s) to a new speaker."""
+        t = 1.0
+        face_a = FusedTarget(
+            target_id="person_a", modality=Modality.VISION, body_azimuth_deg=0.0,
+            body_elevation_deg=0.0, distance_m=1.5, confidence=0.85,
+            is_speaking=False, eye_contact=True, person_name=None, is_known=False,
+            timestamp=t, tracking_state=TrackingState.TRACKING
+        )
+        self.tm.update([face_a], timestamp=t)
+        self.assertEqual(self.tm.active_target.target_id, "person_a")
+
+        # New speaker B starts speaking at 30°
+        spk_b = FusedTarget(
+            target_id="person_b", modality=Modality.FUSED, body_azimuth_deg=30.0,
+            body_elevation_deg=0.0, distance_m=1.5, confidence=0.85,
+            is_speaking=True, eye_contact=True, person_name=None, is_known=False,
+            timestamp=t, tracking_state=TrackingState.TRACKING
+        )
+        # First tick registers candidate
+        self.tm.update([face_a, spk_b], timestamp=t)
+        # After 0.45s (which is > 0.4s effective dwell when silent) -> switches to speaker B!
+        t += 0.45
+        st_sw = self.tm.update([face_a, spk_b], timestamp=t)
+        self.assertEqual(st_sw.active_target.target_id, "person_b")
 
 
 if __name__ == "__main__":
     unittest.main()
+

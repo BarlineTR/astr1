@@ -93,13 +93,23 @@ class TargetManagerCore:
             else:
                 # Active target missing in this frame -> check timeout
                 time_missing = timestamp - self._last_active_observed_time
-                if time_missing > self.target_lost_timeout_s:
+                # If another candidate face is present with sufficient acquisition confidence,
+                # use a shorter missing timeout (0.5s) so the head turns to the other face
+                # instead of holding onto the missing face for 2.5s.
+                has_other_candidate = any(
+                    t.confidence >= self.acquisition_threshold
+                    for t in self.candidate_targets
+                    if t.target_id != self.active_target.target_id
+                )
+                effective_timeout = 0.5 if has_other_candidate else self.target_lost_timeout_s
+                if time_missing > effective_timeout:
                     self.active_target = None
 
         # 2. Candidate Selection & Turn-Taking Arbitration
         if self.active_target is None:
             # No active target: Select best candidate meeting acquisition threshold (≥0.75)
             best_candidate = next((t for t in self.candidate_targets if t.confidence >= self.acquisition_threshold), None)
+
             if best_candidate is not None:
                 self.active_target = best_candidate
                 self._active_target_start_time = timestamp
@@ -144,7 +154,12 @@ class TargetManagerCore:
                         sustained_time = timestamp - self._new_speaker_first_heard_time
                         # Turn-taking switch requires the new candidate to speak continuously for at least turn_taking_min_dwell_s (0.8s)
                         # AND the current target to have been attended for at least turn_taking_min_dwell_s
-                        if sustained_time >= self.turn_taking_min_dwell_s and dwell_elapsed >= self.turn_taking_min_dwell_s:
+                        # When the current target is NOT speaking, use a shorter dwell
+                        # requirement (half) so the robot responds faster to a new voice.
+                        effective_dwell = self.turn_taking_min_dwell_s
+                        if not self.active_target.is_speaking:
+                            effective_dwell = self.turn_taking_min_dwell_s * 0.5
+                        if sustained_time >= effective_dwell and dwell_elapsed >= effective_dwell:
                             # Switch active target to new speaker!
                             self.active_target = candidate_speaker
                             self._active_target_start_time = timestamp
