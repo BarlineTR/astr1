@@ -66,6 +66,7 @@ static constexpr int HEAD_PWM_MIN = 105;
 
 static constexpr float HEAD_KP = 5.0f, HEAD_KD = 0.05f;
 static constexpr int32_t HEAD_DEADBAND_TICKS = 1;  // 1 tick ~= 0.386 derece
+static constexpr int32_t HEAD_DEADBAND_TICKS = 2;  // 2 ticks ~= 0.772 derece (dişli boşluğu 0.85°, sağ-sol salınımı keser)
 static constexpr uint32_t HEAD_STALL_MS = 1500;    // PWM'e rağmen tick değişmiyorsa kes (1.5s güvenli süre)
 
 
@@ -255,6 +256,9 @@ void publishDiag(uint16_t vbat_mV, int16_t temp_cX100, uint32_t flags) {
 // Kafa motoru maksimum hız limiti: 35.0 derece/saniye (sakin, insansı dönüş hızı)
 static constexpr float HEAD_MAX_VEL_DEG_S = 35.0f;
 static constexpr float HEAD_MAX_TICKS_PER_SEC = HEAD_MAX_VEL_DEG_S * HEAD_TICKS_PER_DEG; // ~90.6 ticks/s
+// Kafa motoru maksimum hız limiti: 20.0 derece/saniye (sakin, pürüzsüz takip, yüz kaçırmayı önler)
+static constexpr float HEAD_MAX_VEL_DEG_S = 20.0f;
+static constexpr float HEAD_MAX_TICKS_PER_SEC = HEAD_MAX_VEL_DEG_S * HEAD_TICKS_PER_DEG; // ~51.8 ticks/s
 
 static float g_head_profile_pos = 0.0f;
 static bool g_head_profile_inited = false;

@@ -40,6 +40,8 @@ static constexpr float PID_INTEGRAL_LIMIT = 50.0f; // ✅ FIX: Daha dar anti-win
 
 // Kalibre Edildi: 45 tick / 30 derece = 1.5000 tick/derece (540 tick / 360 derece)
 static constexpr float HEAD_TICKS_PER_DEG = 1.5000f;
+// Canonical Head Encoder Resolution: 440 ticks / 170.0 deg = 2.5882 ticks/deg (0.3864 deg/tick)
+static constexpr float HEAD_TICKS_PER_DEG = 2.5882f;
 
 
 
@@ -48,14 +50,22 @@ static constexpr float HEAD_TICKS_PER_DEG = 1.5000f;
 // Yazılımsal açı limitleri (limit switch yok; açılıştaki konum 0° kabul edilir)
 static constexpr float HEAD_MIN_DEG = -180.0f;
 static constexpr float HEAD_MAX_DEG =  180.0f;
+static constexpr bool  HEAD_CONTINUOUS_ROTATION = false;
 
+static constexpr int32_t HEAD_TICKS_PER_REV =
+    (int32_t)(360.0f * HEAD_TICKS_PER_DEG + 0.5f);
 
 // Kafa motoru PWM limitleri ve statik sürtünme eşiği
 static constexpr int HEAD_PWM_LIMIT = 160;
 static constexpr int HEAD_PWM_MIN = 70;
+// Kafa motoru PWM limitleri ve statik sürtünme eşiği (ölçülen breakaway eşiği ~100-105 PWM, limit 200 PWM)
+static constexpr int HEAD_PWM_LIMIT = 200;
+static constexpr int HEAD_PWM_MIN = 105;
 
 static constexpr float HEAD_KP = 4.0f, HEAD_KD = 0.05f;
 static constexpr int32_t HEAD_DEADBAND_TICKS = 1;  // 1 tick ~= 0.78 derece
+static constexpr float HEAD_KP = 5.0f, HEAD_KD = 0.05f;
+static constexpr int32_t HEAD_DEADBAND_TICKS = 2;  // 2 ticks ~= 0.772 derece (dişli boşluğu 0.85°, sağ-sol salınımı keser)
 static constexpr uint32_t HEAD_STALL_MS = 1500;    // PWM'e rağmen tick değişmiyorsa kes (1.5s güvenli süre)
 
 
@@ -234,11 +244,42 @@ void publishDiag(uint16_t vbat_mV, int16_t temp_cX100, uint32_t flags) {
   Proto::writePacket(Serial, Proto::DIAGNOSTICS, payload, sizeof(payload));
 }
 
+// Kafa motoru maksimum hız limiti: 20.0 derece/saniye (sakin, pürüzsüz takip, yüz kaçırmayı önler)
+static constexpr float HEAD_MAX_VEL_DEG_S = 20.0f;
+static constexpr float HEAD_MAX_TICKS_PER_SEC = HEAD_MAX_VEL_DEG_S * HEAD_TICKS_PER_DEG; // ~51.8 ticks/s
+
+static float g_head_profile_pos = 0.0f;
+static bool g_head_profile_inited = false;
+
 // Kafa konum PID'i. Limit switch olmadigi icin stall korumasi sart:
 // mekanik dayanaga dayanirsa motor akim ceker ve isinir.
 void headControl(uint32_t dt_ms) {
   int32_t pos = readTicks(g_head_ticks);
   int32_t err = g_head_target_ticks - pos;
+
+  if (!g_head_profile_inited) {
+    g_head_profile_pos = (float)pos;
+    g_head_profile_inited = true;
+  }
+
+  // Yumuşak hız sınırlayıcı: 50 Hz (20ms) döngüsünde hedefi 20 deg/s hızla rampala
+  float dt_s = (float)dt_ms / 1000.0f;
+  float max_step = HEAD_MAX_TICKS_PER_SEC * dt_s;
+  float diff = (float)g_head_target_ticks - g_head_profile_pos;
+  if (abs(diff) <= max_step) {
+    g_head_profile_pos = (float)g_head_target_ticks;
+  } else {
+    g_head_profile_pos += (diff > 0.0f ? max_step : -max_step);
+  }
+
+  int32_t profile_target_tick = (int32_t)lroundf(g_head_profile_pos);
+  int32_t err = profile_target_tick - pos;
+
+  // Kisa yay: hata yarim turu asiyorsa diger yonden gitmek daha kisadir.
+  if (HEAD_CONTINUOUS_ROTATION) {
+    while (err >  HEAD_TICKS_PER_REV / 2) err -= HEAD_TICKS_PER_REV;
+    while (err < -HEAD_TICKS_PER_REV / 2) err += HEAD_TICKS_PER_REV;
+  }
 
   if (!g_motors_enabled || !g_head_active) {
     setHeadPWM(0);
