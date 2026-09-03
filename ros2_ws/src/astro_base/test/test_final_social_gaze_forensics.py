@@ -39,7 +39,7 @@ class FinalSocialGazeTestPipeline:
 
     def __init__(self):
         self.transformer = CoordinateTransformer()
-        self.audio_perception = AudioPerceptionCore(transformer=self.transformer, max_acoustic_envelope_deg=75.0)
+        self.audio_perception = AudioPerceptionCore(transformer=self.transformer, max_acoustic_envelope_deg=95.0)
         self.audio_filter = AudioFilterCore()
         self.visual_perception = VisualPerceptionCore(transformer=self.transformer)
         self.visual_tracker = VisualTrackerCore(transformer=self.transformer)

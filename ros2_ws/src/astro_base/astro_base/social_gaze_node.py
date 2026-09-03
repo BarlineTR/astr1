@@ -178,6 +178,7 @@ class SocialGazeNode(Node):
         self.audio_perception = AudioPerceptionCore(
             transformer=self.transformer,
             self_speech_suppression_factor=0.15,
+            max_acoustic_envelope_deg=95.0,
         )
         self.audio_filter = AudioFilterCore(
             max_jump_deg=35.0,
@@ -509,11 +510,9 @@ class SocialGazeNode(Node):
         self.fsm.set_sleep_mode(msg.data)
 
     def _on_emotion(self, msg: String) -> None:
-        emo = str(msg.data).strip().lower()
-        if emo in ("sleeping", "sleep", "deep_idle"):
-            self.fsm.set_sleep_mode(True)
-        else:
-            self.fsm.set_sleep_mode(False)
+        # Passive emotion tracking for display/behavioral context;
+        # Does NOT freeze or lock mechanical neck gaze into EMERGENCY_STOP.
+        pass
 
     # =========================================================================
     # 50 Hz Synchronous Control Cycle
@@ -535,8 +534,9 @@ class SocialGazeNode(Node):
             timestamp=t,
         )
 
-        # Auto-wake social gaze from sleep mode when a person is detected or speaking
-        if target_state.active_target is not None and self.fsm.is_sleeping and not self.fsm.safety_lock:
+        # Auto-wake social gaze from sleep mode when a person is detected or sound is heard
+        has_sound = bool(self.latest_audio_state and self.latest_audio_state.valid and self.latest_audio_state.confidence >= 0.40)
+        if (target_state.active_target is not None or has_sound) and self.fsm.is_sleeping and not self.fsm.safety_lock:
             self.fsm.set_sleep_mode(False)
 
         # 3. Social Gaze FSM & Attention Arbitration

@@ -793,22 +793,14 @@ class AstroRealtimeNode(Node):
             "  reason=production_runtime_disabled"
         )
 
-        # Local Offline Backup TTS Engine (Zero internet local resilience fallback)
+        # Local Offline Backup TTS Engine (Robotic eSpeak removed per user request)
         self.local_offline_tts: Optional[LocalOfflineTTSEngine] = None
-        if LocalOfflineTTSEngine:
-            try:
-                self.local_offline_tts = LocalOfflineTTSEngine(
-                    language=os.getenv("TTS_LANGUAGE", "tr"),
-                    logger=self._safe_log,
-                )
-            except Exception as e:
-                self.get_logger().debug(f"LocalOfflineTTSEngine notice: {e}")
 
         # Generation-level Barge-In Debounce State
         self._barge_in_latched = False
         self.edge_tts_enabled = os.getenv("EDGE_TTS_ENABLED", "true").lower() in ("1", "true", "yes")
 
-        # Single Unified TTSRouter
+        # Single Unified TTSRouter (Neural Edge-TTS only, no robotic eSpeak)
         try:
             from astro_audio.tts_router import TTSRouter
         except ImportError:
@@ -816,7 +808,7 @@ class AstroRealtimeNode(Node):
 
         self.tts_router = TTSRouter(
             local_xtts=self.local_xtts,
-            local_offline_tts=self.local_offline_tts,
+            local_offline_tts=None,
             edge_tts_synth_func=self._synthesize_edge_tts_pcm24k,
             edge_tts_enabled=self.edge_tts_enabled,
             logger=self._safe_log,
@@ -5448,12 +5440,11 @@ class AstroRealtimeNode(Node):
                 if not validated_text:
                     return
 
-                # Valid human speech confirmed — wake Astro up from DEEP_IDLE / Sleep
-                self._wake_up()
-
                 # Check for pure wake word in active mode (e.g. "Astro.", "Hey Astro", "Selam")
                 norm_wake_check = re.sub(r"[^\w\s]", "", validated_text.lower()).strip()
                 if norm_wake_check in ("astro", "hey astro", "selam astro", "hey", "selam"):
+                    self._wake_up()
+                    self.session.activate_session(reason="wake_word")
                     self.state_machine.transition_to(RobotState.LISTENING)
                     self.get_logger().info(
                         f"⚡ [Active Wake-Only]: \"{validated_text}\" -> Woke to LISTENING (wake_only=True, turn_created=False, 0 LLM / 0 TTS)."
@@ -5461,21 +5452,34 @@ class AstroRealtimeNode(Node):
                     return
 
                 # Check if user said "Hey Astro, <command>" or "Astro, <command>"
+                has_wake_word = False
                 if norm_wake_check.startswith("hey astro "):
                     validated_text = validated_text[len("hey astro"):].lstrip(" ,.")
+                    has_wake_word = True
                 elif norm_wake_check.startswith("astro "):
                     validated_text = validated_text[len("astro"):].lstrip(" ,.")
+                    has_wake_word = True
                 elif norm_wake_check.startswith("selam astro "):
                     validated_text = validated_text[len("selam astro"):].lstrip(" ,.")
+                    has_wake_word = True
 
-                valid_cmd, cmd_reason = is_valid_user_command(validated_text)
-                if not valid_cmd:
-                    self.state_machine.transition_to(RobotState.LISTENING)
+                # Ambient Speech Suppression: If not an active session AND no explicit wake word, drop speech!
+                is_session_active = getattr(self.session, "is_active", lambda: False)()
+                if not has_wake_word and not is_session_active:
                     self.get_logger().info(
-                        f"⚡ [Wake + Invalid Command Dropped]: \"{raw_transcript}\" (reason={cmd_reason}) -> Transitioned to LISTENING (0 LLM / 0 TTS)."
+                        f"🔇 [Ortam Konuşması Yoksayıldı]: \"{raw_transcript}\" (Aktif oturum yok, uyandırma kelimesi eksik) -> 0 LLM / 0 TTS."
                     )
                     return
 
+                valid_cmd, cmd_reason = is_valid_user_command(validated_text)
+                if not valid_cmd:
+                    self.get_logger().info(
+                        f"⚡ [Geçersiz Komut / Hayalet Ses Yoksayıldı]: \"{raw_transcript}\" (reason={cmd_reason}) -> İşlem yapılmadı."
+                    )
+                    return
+
+                self._wake_up()
+                self.session.activate_session(reason="wake_word" if has_wake_word else "speech")
                 user_text = validated_text
                 self.get_logger().info(f"🗣️ [Siz (0-Maliyet)]: \"{user_text}\"")
                 self.memory.episodic.add_message("user", user_text)
@@ -5565,19 +5569,14 @@ class AstroRealtimeNode(Node):
             speaker_display = spk_name if spk_name else "null"
             self.get_logger().info(f"👤 [Speaker Context] speaker={speaker_display} confidence={spk_score:.2f} source={spk_source}")
 
-            # 5. Select Atomic TTS Owner for this turn (Realtime Fallback -> Edge-TTS -> Local Offline)
+            # 5. Select Atomic TTS Owner for this turn (Realtime Fallback -> Edge-TTS)
+            # Robotic local offline TTS (piper/espeak) permanently removed per user request
             if getattr(self, "edge_tts_enabled", True):
                 turn_tts_engine = "edge_tts"
                 tts_ready_flag = True
                 tts_mode_str = "network_cloud"
                 tts_source_name = "edge_tts_cloud"
                 tts_model_name = "tr_tr_ahmet"
-            elif self.local_offline_tts and self.local_offline_tts.is_ready():
-                turn_tts_engine = "local_offline_tts"
-                tts_ready_flag = True
-                tts_mode_str = "local_offline"
-                tts_source_name = "local_offline_synth"
-                tts_model_name = "piper_espeak"
             else:
                 turn_tts_engine = "none"
                 tts_ready_flag = False
@@ -6424,27 +6423,8 @@ class AstroRealtimeNode(Node):
 
     def _trigger_proactive_greeting(self, name: str, formal_title: str):
         """Sends proactive greeting message to Realtime session."""
-        if not self._ws or not self._loop or not self._is_connected:
-            return
-
-        greeting_event = {
-            "type": "conversation.item.create",
-            "item": {
-                "type": "message",
-                "role": "user",
-                "content": [
-                    {
-                        "type": "input_text",
-                        "text": f"[Sistem Olayı]: Karşında {name} ({formal_title}) duruyor! Kendisini seçili kişiliğinle coşkuyla ve uygun hitapla selamla, neşeyle hatırını sor."
-                    }
-                ]
-            }
-        }
-        try:
-            asyncio.run_coroutine_threadsafe(self._ws.send(json.dumps(greeting_event)), self._loop)
-            asyncio.run_coroutine_threadsafe(self._ws.send(json.dumps({"type": "response.create"})), self._loop)
-        except Exception as _exc:
-            self.get_logger().debug(f"_trigger_proactive_greeting: yok sayılan hata ({_exc})")
+        # PERMANENTLY DISABLED: User explicitly requested no spontaneous self-talk or proactive speech
+        return
 
     def _on_recognized_person(self, msg: String):
         try:
@@ -6461,17 +6441,13 @@ class AstroRealtimeNode(Node):
                     self._active_person_name = name
                     self._person_hold_until = now + 45.0  # Hold identity for 45 seconds
 
-                    # Event-driven vision trigger for new person
+                    # Event-driven vision trigger for new person (memory reflection only, no speech)
                     if getattr(self, "_last_seen_person", "") != name:
                         self._last_seen_person = name
                         threading.Thread(target=self._evaluate_vision_event, args=("new_person",), daemon=True).start()
 
-                    # Proactive greeting check: greet once every 2 minutes per person
-                    last_greet = self._greeted_people.get(name, 0.0)
-                    if (now - last_greet) > 120.0 and not self._is_responding and not self._is_playback_active:
-                        self._greeted_people[name] = now
-                        self.get_logger().info(f"👋 [Proaktif Selamlama]: {name} ({formal_title}) algılandı — Selamlama başlatılıyor!")
-                        self._trigger_proactive_greeting(name, formal_title)
+                    # Proactive greeting check: DISABLED per user requirement (no spontaneous speech during tracking)
+                    # Proactive speech is suppressed to keep tracking silent and focused
 
             self._sync_perception_to_session()
         except Exception as _exc:
