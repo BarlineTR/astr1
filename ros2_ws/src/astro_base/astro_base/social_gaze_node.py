@@ -611,9 +611,13 @@ class SocialGazeNode(Node):
             self._last_gaze_cmd_count = cmd_count
 
             active_tid = self.target_manager.active_target.target_id if self.target_manager.active_target else "None"
+            tm = self.target_manager
             self.get_logger().info(
-                f"[GAZE PERF] tracker_fps={len(self.latest_visual_tracks):d} active_target={active_tid} "
-                f"head_cmd_rate={cmd_rate:.1f}Hz state={self.fsm.state.value}"
+                f"[GAZE PERF] tracks={len(self.latest_visual_tracks):d} active_target={active_tid} "
+                f"head_cmd_rate={cmd_rate:.1f}Hz state={self.fsm.state.value} | "
+                f"acq_conf={tm.acquisition_threshold:.2f} hold_conf={tm.hold_threshold:.2f} "
+                f"births={tm.target_birth_count} lost={tm.target_lost_count} "
+                f"reacq_ok={tm.accepted_reacquisition_count} reacq_rej={tm.rejected_reacquisition_count}"
             )
 
         # 8. Separate Error Metrics Calculation (Failure 7)

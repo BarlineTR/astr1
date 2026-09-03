@@ -45,6 +45,13 @@ class TargetManagerCore:
         self._new_speaker_first_heard_time: float = 0.0
         self.last_target_birth: Optional[dict] = None
 
+        # Reacquisition Telemetry Counters
+        self.accepted_reacquisition_count: int = 0
+        self.rejected_reacquisition_count: int = 0
+        self.target_birth_count: int = 0
+        self.target_lost_count: int = 0
+        self._seen_target_ids: set = set()
+
     def reset(self) -> None:
         self.active_target = None
         self.candidate_targets.clear()
@@ -90,24 +97,34 @@ class TargetManagerCore:
                     if time_unhealthy > self.target_lost_timeout_s:
                         # Target lost due to sustained low confidence
                         self.active_target = None
+                        self.target_lost_count += 1
             else:
                 # Active target missing in this frame -> check timeout
                 time_missing = timestamp - self._last_active_observed_time
                 if time_missing > self.target_lost_timeout_s:
                     self.active_target = None
+                    self.target_lost_count += 1
 
         # 2. Candidate Selection & Turn-Taking Arbitration
         if self.active_target is None:
             # No active target: Select best candidate meeting acquisition threshold (≥0.75)
             best_candidate = next((t for t in self.candidate_targets if t.confidence >= self.acquisition_threshold), None)
             if best_candidate is not None:
+                is_reacq = best_candidate.target_id in self._seen_target_ids
+                self._seen_target_ids.add(best_candidate.target_id)
+                if is_reacq:
+                    self.accepted_reacquisition_count += 1
+                else:
+                    self.target_birth_count += 1
+
                 self.active_target = best_candidate
                 self._active_target_start_time = timestamp
                 self._last_active_observed_time = timestamp
                 self._last_healthy_observed_time = timestamp
                 self._new_speaker_candidate_id = None
 
-                # Log structured TARGET_BIRTH telemetry
+                # Log structured TARGET_BIRTH / REACQUIRED telemetry
+                reason_str = f"TARGET_REACQUIRED_{best_candidate.target_id}" if is_reacq else f"TARGET_BIRTH_{best_candidate.target_id}"
                 self.last_target_birth = {
                     "timestamp": round(timestamp, 3),
                     "target_id": best_candidate.target_id,
@@ -115,8 +132,11 @@ class TargetManagerCore:
                     "bearing": round(best_candidate.body_azimuth_deg, 1),
                     "confidence": round(best_candidate.confidence, 2),
                     "freshness": round(max(0.0, 1.0 - (timestamp - best_candidate.timestamp)), 2),
-                    "reason": f"TARGET_BIRTH_{best_candidate.target_id}",
+                    "reason": reason_str,
                 }
+            elif self.candidate_targets:
+                # Candidates present but none met acquisition threshold (0.75)
+                self.rejected_reacquisition_count += 1
 
         else:
             # Active target exists: Check if a new speaker warrants turn-taking switch

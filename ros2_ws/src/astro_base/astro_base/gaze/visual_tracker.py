@@ -53,6 +53,12 @@ class KalmanTrack3D:
         self.is_known = obs.is_known
         self.eye_contact = obs.eye_contact
 
+    @property
+    def body_azimuth_deg(self) -> float:
+        """Robot base body yaw azimuth angle in degrees [-180..+180]."""
+        x, y = float(self.x[0]), float(self.x[1])
+        return float(round(wrap_deg(math.degrees(math.atan2(y, x))), 1))
+
     def predict(self, dt: float) -> Tuple[float, float, float]:
         """Kalman Prediction Step."""
         dt = max(0.001, min(0.5, dt))
@@ -264,7 +270,7 @@ class VisualTrackerCore:
             if t.state != TrackingState.LOST:
                 active_tids.append(tid)
             else:
-                last_bearing = getattr(t, "body_azimuth_deg", 0.0)
+                last_bearing = t.body_azimuth_deg
                 self._dormant_tracks[tid] = (timestamp, last_bearing)
 
         self.tracks = {tid: self.tracks[tid] for tid in active_tids}
@@ -282,9 +288,13 @@ class VisualTrackerCore:
                 obs_bearing = valid_obs[j].body_azimuth_deg
                 reused_id = None
                 best_diff = float("inf")
+
+                # Single-person room scenario: If only 1 person was dormant and no one active, allow wider angular drift
+                effective_tol = 45.0 if (len(self._dormant_tracks) == 1 and not self.tracks) else self.dormant_bearing_tolerance_deg
+
                 for tid, (t_lost, d_bearing) in list(self._dormant_tracks.items()):
                     diff = abs((obs_bearing - d_bearing + 180.0) % 360.0 - 180.0)
-                    if diff <= self.dormant_bearing_tolerance_deg and diff < best_diff:
+                    if diff <= effective_tol and diff < best_diff:
                         best_diff = diff
                         reused_id = tid
 
