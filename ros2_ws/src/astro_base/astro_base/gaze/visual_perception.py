@@ -19,10 +19,10 @@ class VisualPerceptionCore:
     def __init__(
         self,
         transformer: Optional[CoordinateTransformer] = None,
-        min_confidence: float = 0.50,
-        direct_gaze_max_yaw_deg: float = 22.0,
+        min_confidence: float = 0.40,
+        direct_gaze_max_yaw_deg: float = 25.0,
         social_zone_min_dist_m: float = 0.35,
-        social_zone_max_dist_m: float = 3.50,
+        social_zone_max_dist_m: float = 8.0,
     ):
         self.transformer = transformer or CoordinateTransformer()
         self.min_confidence = min_confidence

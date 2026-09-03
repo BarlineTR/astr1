@@ -143,9 +143,9 @@ class AudioFilterCore:
 
     def __init__(
         self,
-        max_jump_deg: float = 35.0,
-        outlier_persistence_count: int = 3,
-        median_window_size: int = 5,
+        max_jump_deg: float = 85.0,
+        outlier_persistence_count: int = 2,
+        median_window_size: int = 3,
         kalman_q: float = 0.08,
         kalman_r: float = 0.45,
         motion_compensator: Optional[HeadMotionCompensator] = None,
@@ -195,13 +195,22 @@ class AudioFilterCore:
 
         # 2. Outlier Gating
         is_outlier = False
+        last_time = getattr(self, "_last_accepted_time", 0.0)
+        time_since_last_accepted = obs.timestamp - last_time
+
+        # If more than 1.0 second of silence has passed, accept new speaker direction immediately!
+        if time_since_last_accepted > 1.0:
+            self._last_accepted_angle = None
+            self._outlier_streak = 0
+            self._outlier_candidate_angle = None
+
         if self._last_accepted_angle is not None:
             jump = circular_distance_deg(raw_body_yaw, self._last_accepted_angle)
             if jump > self.max_jump_deg:
                 # Check persistence streak for genuine speaker switches
                 if (
                     self._outlier_candidate_angle is not None
-                    and circular_distance_deg(raw_body_yaw, self._outlier_candidate_angle) <= 15.0
+                    and circular_distance_deg(raw_body_yaw, self._outlier_candidate_angle) <= 25.0
                 ):
                     self._outlier_streak += 1
                 else:
@@ -214,16 +223,19 @@ class AudioFilterCore:
                 else:
                     # Sustained movement confirmed: accept new heading & reset sliding buffers
                     self._last_accepted_angle = raw_body_yaw
+                    self._last_accepted_time = obs.timestamp
                     self._outlier_candidate_angle = None
                     self._outlier_streak = 0
                     self.median_filter.reset()
                     self.kalman.reset(initial_angle_deg=raw_body_yaw)
             else:
                 self._last_accepted_angle = raw_body_yaw
+                self._last_accepted_time = obs.timestamp
                 self._outlier_candidate_angle = None
                 self._outlier_streak = 0
         else:
             self._last_accepted_angle = raw_body_yaw
+            self._last_accepted_time = obs.timestamp
 
         if is_outlier:
             return FilteredAudioState(

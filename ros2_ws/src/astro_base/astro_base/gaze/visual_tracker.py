@@ -168,7 +168,7 @@ class VisualTrackerCore:
         self,
         transformer: Optional[CoordinateTransformer] = None,
         gating_distance_m: float = 0.85,
-        coasting_timeout_s: float = 0.70,
+        coasting_timeout_s: float = 1.80,
     ):
         self.transformer = transformer or CoordinateTransformer()
         self.gating_distance_m = gating_distance_m

@@ -17,6 +17,7 @@ Features:
 
 import json
 import logging
+import time
 
 _LOG = logging.getLogger(__name__)
 
@@ -68,7 +69,7 @@ class SpatialVisionNode(Node):
     def __init__(self):
         super().__init__("face_detector_node")
         self.declare_parameter("input_topic", "/oak/rgb/image_raw")
-        self.declare_parameter("depth_topic", "/oak/stereo/image_raw")
+        self.declare_parameter("depth_topic", "/oak/depth/image_raw")
         self.declare_parameter("scale_factor", 1.1)
         self.declare_parameter("min_neighbors", 4)
         self.declare_parameter("min_size", 45)
@@ -151,7 +152,7 @@ class SpatialVisionNode(Node):
 
         focal_length = frame_w * 0.8
         distance = (0.15 * focal_length) / max(1, w)
-        return float(np.clip(distance, 0.3, 4.0))
+        return float(np.clip(distance, 0.3, 8.0))
 
     def _estimate_head_yaw(self, face_roi_gray, w, h) -> tuple[float, bool]:
         """Calculates yaw angle and strictly verifies eye visibility to reject side/back-of-head false detections."""
@@ -292,8 +293,16 @@ class SpatialVisionNode(Node):
             if direct_gaze:
                 is_looking = True
 
-            # 4. Face Recognition Matching
-            recog_name, recog_conf, recog_meta = self.face_recognizer.recognize_face(face_roi_bgr)
+            # 4. Face Recognition Matching (Rate-limited to 1.0s to avoid CPU starvation during real-time tracking)
+            now_mono = time.monotonic() if hasattr(time, 'monotonic') else 0.0
+            last_recog_call = getattr(self, "_last_recog_time", 0.0)
+            if (now_mono - last_recog_call) > 1.2 and face_roi_bgr.size > 0:
+                self._last_recog_time = now_mono
+                recog_name, recog_conf, recog_meta = self.face_recognizer.recognize_face(face_roi_bgr)
+                self._last_recog_result = (recog_name, recog_conf, recog_meta)
+            else:
+                recog_name, recog_conf, recog_meta = getattr(self, "_last_recog_result", (None, 0.0, {}))
+
             is_known = (recog_name is not None and recog_conf >= 0.45)
             if is_known and recog_conf > top_recognized_person["confidence"]:
                 top_recognized_person = {
