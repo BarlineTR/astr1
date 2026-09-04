@@ -317,6 +317,69 @@ class EchoAndBargeInTests(unittest.TestCase):
 
         self.assertEqual(len(closed), 1)
 
+    def test_barge_in_bir_kez_tetiklenir_sonrasinda_konusma_transkribe_edilir(self):
+        """Bulgu 1: kilitsiz barge-in her 0.3 sn'de bir kendini yeniden tetikler
+        (barge_in_s < echo_cooldown_s), soguma hic bitmez ve tetikleyen konusma
+        hicbir zaman transkribe edilmez. Kilitliyken tetik bir kez olmali ve
+        soguma bitince ayni konusma sozceye akmali."""
+        output = _FakeOutput()
+        loop = self._loop(output=output)
+        loop.note_playback(True, timestamp=10.0)
+
+        closed = []
+        t = 10.0
+        for _ in range(40):                      # ~2.56 sn kesintisiz konusma
+            out = loop.on_block(True, _block(), timestamp=t)
+            if out is not None:
+                closed.append(out)
+            t += BLOCK_S
+        for _ in range(20):                      # sessizlik: sozce kapanmali
+            out = loop.on_block(False, _block(), timestamp=t)
+            if out is not None:
+                closed.append(out)
+            t += BLOCK_S
+
+        self.assertEqual(output.interrupts, 1, "barge-in defalarca tetiklendi (kilit yok)")
+        self.assertEqual(len(closed), 1, "tetikleyen konusma hic transkribe edilmedi")
+
+    def test_output_playing_bayragi_note_playback_olmadan_da_yankiyi_bastirir(self):
+        """Bulgu 2: `note_playback` cagrilmazsa `is_speaking_at` yalnizca ic
+        aynaya bakiyordu ve yanki bastirma sessizce kapaniyordu. Kacirilan
+        bildirim asiri bastirmaya dusmeli, hic bastirmamaya degil."""
+        output = _FakeOutput()
+        output.is_playing = True
+        loop = self._loop(output=output)
+
+        self.assertTrue(loop.is_speaking_at(123.0), "output.is_playing yoksayildi")
+
+    def test_robot_konusmaya_baslayinca_yarim_sozce_atilir(self):
+        """Bulgu 3: robotun turu baslamadan once yarim kalmis sozce, tur bitince
+        yeni cumleyle birlesmemeli. Aradaki 5 saniyelik bosluk UtteranceTracker'a
+        gorunmuyor (blok akisi kesilmiyor, sadece beslenmiyor), o yuzden robot
+        konusmaya baslarken tampon atilmali."""
+        loop = self._loop()
+
+        t = 0.0
+        loop.on_block(True, _block(value=0.9), timestamp=t)
+        t += BLOCK_S
+        loop.on_block(True, _block(value=0.9), timestamp=t)
+        t += BLOCK_S
+
+        loop.note_playback(True, timestamp=10.0)
+        loop.note_playback(False, timestamp=15.0)          # 5 sn sonra
+
+        closed = []
+        t = 15.0 + loop.echo_cooldown_s + 0.01
+        for is_speech in [True] * 10 + [False] * 16:
+            out = loop.on_block(is_speech, _block(value=0.2), timestamp=t)
+            if out is not None:
+                closed.append(out)
+            t += BLOCK_S
+
+        self.assertEqual(len(closed), 1)
+        self.assertTrue(bool(np.all(closed[0] == 0.2)),
+                        "robot konusmadan onceki blok yeni sozceye sizdi")
+
 
 if __name__ == "__main__":
     unittest.main()

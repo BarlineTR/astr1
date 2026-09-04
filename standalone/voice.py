@@ -105,6 +105,18 @@ class UtteranceTracker:
         self._silence_started_at = None
         return utterance
 
+    def reset(self) -> None:
+        """Birikmiş sözceyi sessizce atar (sonucu döndürmez).
+
+        Robotun kendi turu başlarken çağrılır: o ana kadar yarım kalan sözce,
+        robot konuşmaya başladığı andan itibaren artık kişinin söylediği cümle
+        değil — arada geçen boşluk bloklar hiç beslenmediği için görünmez
+        kalıyor, o yüzden sızdırmak yerine atılması doğru olan.
+        """
+        self._chunks = []
+        self._samples = 0
+        self._silence_started_at = None
+
 
 def resample_to(mono: np.ndarray, from_rate: int, to_rate: int) -> np.ndarray:
     """Doğrusal ara değerle yeniden örnekler.
@@ -169,6 +181,11 @@ class VoiceLoop:
         self._playing = False
         self._playback_ended_at: Optional[float] = None
         self._barge_in_since: Optional[float] = None
+        # Bir çalma turu için barge-in tek seferlik: kilitsiz haliyle her
+        # barge_in_s'de (0.3 sn) bir yeniden tetikleniyordu çünkü barge_in_s <
+        # echo_cooldown_s (0.65 sn) — soğuma hiç bitmiyor ve tetikleyen konuşma
+        # hiç transkribe edilmiyordu. `note_playback(True, ...)` yeni turda açar.
+        self._barge_in_latched = False
         # Sözce takipçisi **yakalama** hızıyla kurulur, STT hızıyla değil. Bloklar
         # tampondan yakalama hızında geliyor (dizi modunda 16 kHz, stereo modda
         # aygıtın kendi hızı — laptopta 44.1 kHz); STT hızını varsaymak sözce üst
@@ -186,13 +203,27 @@ class VoiceLoop:
 
     def note_playback(self, is_playing: bool, timestamp: float) -> None:
         """`AudioOutputManager`'ın çalma durumu değişince çağrılır."""
-        if not is_playing and self._playing:
+        if is_playing:
+            # Yeni tur: önceki turun barge-in kilidi artık geçmişte kalır, ve o
+            # ana kadar yarım kalan sözce robotun konuşmaya başlamasıyla farklı
+            # bir cümleye dönüşür — sızdırmak yerine atılır.
+            self._barge_in_latched = False
+            self._utterance.reset()
+        elif self._playing:
             self._playback_ended_at = float(timestamp)
         self._playing = bool(is_playing)
 
     def is_speaking_at(self, timestamp: float) -> bool:
-        """Robot şu anda konuşuyor mu — yankı soğuması dahil."""
+        """Robot şu anda konuşuyor mu — yankı soğuması dahil.
+
+        `output.is_playing` da ayrıca sorulur: yalnızca iç aynaya (`_playing`)
+        bakılsaydı, `note_playback` çağrılmadan başlayan bir çalma sessizce
+        bastırmasız kalırdı. Kaçırılan bildirim aşırı bastırmaya düşmeli, hiç
+        bastırmamaya değil.
+        """
         if self._playing:
+            return True
+        if self.output is not None and getattr(self.output, "is_playing", False):
             return True
         if self._playback_ended_at is None:
             return False
@@ -214,6 +245,11 @@ class VoiceLoop:
         return self._utterance.feed(is_speech, block, timestamp)
 
     def _check_barge_in(self, is_speech: bool, timestamp: float) -> None:
+        if self._barge_in_latched:
+            # Bu tur için zaten tetiklendi. Kilitlemeden her barge_in_s'de bir
+            # yeniden tetiklenip _playback_ended_at'i tazeler, ve barge_in_s
+            # echo_cooldown_s'den kısa olduğundan soğuma hiç bitmezdi.
+            return
         if not is_speech:
             self._barge_in_since = None
             return
@@ -226,6 +262,7 @@ class VoiceLoop:
             self._playing = False
             self._playback_ended_at = timestamp
             self._barge_in_since = None
+            self._barge_in_latched = True
 
     def handle_utterance(self, utterance: np.ndarray, sample_rate: int) -> Optional[str]:
         """Bir sözceyi tura çevirir. Söylenen cevabı, yoksa None döndürür."""
