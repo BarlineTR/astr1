@@ -7,6 +7,8 @@ duraklamasi ~0.5 sn), sozce sonu kapatmali.
 """
 
 import sys
+import threading
+import time
 import unittest
 from pathlib import Path
 
@@ -501,6 +503,297 @@ class LlmErrorReportingTests(unittest.TestCase):
         self.assertEqual(printed, [])
 
     UTTERANCE = np.full(16000, 0.2, dtype=np.float32)
+
+
+class _FakeTtsResult:
+    """`TTSRouteResult`'in testte ihtiyaç duyulan tek alanı: `pcm` boş/None
+    olunca `_speak` bunu bir sentez hatası sayar, `fallback_reason`'ı basar."""
+
+    def __init__(self, pcm=None, fallback_reason="quota_exceeded"):
+        self.pcm = pcm
+        self.fallback_reason = fallback_reason
+
+
+class _FakeTtsRouter:
+    """Gercek `TTSRouter` gibi bir `TTSRouteResult` dondurur (`_FakeTts` gibi
+    None degil) -- boylece `_speak`'in sonucu inceleyip incelemedigi test
+    edilebilir."""
+
+    def __init__(self, result):
+        self._result = result
+        self.calls = []
+
+    def synthesize_and_play(self, text, generation_id, output_manager=None,
+                            language="tr", realtime_fallback_reason=None):
+        self.calls.append(text)
+        return self._result
+
+
+class TtsErrorReportingTests(unittest.TestCase):
+    """`_speak` `TTSRouteResult`'i hic incelemiyordu: TTS kota/ag/anahtar
+    seviyesinde basarisiz olunca (istisna degil, bos `pcm`) robot "konustu"
+    sayiliyor ama hoparlorden hicbir sey cikmiyordu -- eksik parca gorunmuyordu.
+    LLM hatalari icin kurulan "ayni sebep bir kez" disiplini burada da gecerli."""
+
+    UTTERANCE = np.full(16000, 0.2, dtype=np.float32)
+
+    def test_bos_pcm_basarisizligi_bir_kez_basilir(self):
+        tts = _FakeTtsRouter(_FakeTtsResult(pcm=None, fallback_reason="quota_exceeded"))
+        printed = []
+        loop = _voice(stt=_FakeStt("hey astro selam"), tts=tts)
+        loop._report = lambda msg: printed.append(msg)
+
+        loop.handle_utterance(self.UTTERANCE, sample_rate=16000)
+        loop.stt = _FakeStt("hey astro tekrar")
+        loop.handle_utterance(self.UTTERANCE, sample_rate=16000)
+
+        quota_prints = [p for p in printed if "quota_exceeded" in p]
+        self.assertEqual(len(quota_prints), 1,
+                         "ayni TTS sebebi birden fazla kez basildi")
+
+    def test_farkli_tts_sebebi_yeniden_basilir(self):
+        tts = _FakeTtsRouter(_FakeTtsResult(pcm=None, fallback_reason="quota_exceeded"))
+        printed = []
+        loop = _voice(stt=_FakeStt("hey astro selam"), tts=tts)
+        loop._report = lambda msg: printed.append(msg)
+
+        loop.handle_utterance(self.UTTERANCE, sample_rate=16000)
+        tts._result = _FakeTtsResult(pcm=None, fallback_reason="network_unavailable")
+        loop.stt = _FakeStt("hey astro tekrar")
+        loop.handle_utterance(self.UTTERANCE, sample_rate=16000)
+
+        self.assertEqual(len(printed), 2, f"ikinci farkli sebep basilmadi: {printed}")
+        self.assertIn("quota_exceeded", printed[0])
+        self.assertIn("network_unavailable", printed[1])
+
+    def test_basarili_sentezde_hicbir_sey_basilmaz(self):
+        tts = _FakeTtsRouter(_FakeTtsResult(pcm=b"\x00\x00" * 480))
+        printed = []
+        loop = _voice(stt=_FakeStt("hey astro selam"), tts=tts)
+        loop._report = lambda msg: printed.append(msg)
+
+        loop.handle_utterance(self.UTTERANCE, sample_rate=16000)
+
+        self.assertEqual(printed, [])
+
+    def test_llm_ve_tts_hatalari_ayri_kategoride_tutulur(self):
+        """`_report_once` kategori bazlidir: llm hatasi tts hatasini ezmemeli."""
+        tts = _FakeTtsRouter(_FakeTtsResult(pcm=None, fallback_reason="quota_exceeded"))
+        printed = []
+        loop = _voice(stt=_FakeStt("hey astro selam"),
+                     llm=_FakeLlmWithError("quota_exceeded"), tts=tts)
+        loop._report = lambda msg: printed.append(msg)
+
+        # LLM hatasi: cevap uretilemez, _speak hic cagrilmaz.
+        loop.handle_utterance(self.UTTERANCE, sample_rate=16000)
+        self.assertEqual(printed, ["quota_exceeded"])
+
+        # Ayni metin ("quota_exceeded") simdi TTS tarafindan da basarisiz --
+        # farkli kategoride oldugu icin yine de basilmali.
+        loop.llm = _FakeLlm(answer="Iyiyim.")
+        loop.stt = _FakeStt("hey astro tekrar")
+        loop.handle_utterance(self.UTTERANCE, sample_rate=16000)
+
+        self.assertEqual(len(printed), 2,
+                         "tts kategorisi llm kategorisinin sebebiyle karistirildi")
+
+
+def _make_logger_smoke_test_source():
+    import voice
+    import inspect
+    return inspect.getsource(voice.build_default_loop)
+
+
+class ProviderVisibilityTests(unittest.TestCase):
+    """Bulgu 1: `AudioOutputManager`/`STTRouter`/`TTSRouter` `logger=` almadan
+    kurulunca kendi `self._log`'lari no-op'a duser -- "ne sounddevice ne aplay
+    var" gibi kurulum hatalari sessizce yutulur ve track.py "Sesli yanit acik"
+    basip sonra hic konusmaz. `build_default_loop` gercek donanimla calistigi
+    icin (AudioOutputManager gercek ALSA/sounddevice yoklamasi yapar) burada
+    onu calistirmiyoruz -- her ucu de `logger=` ile kurdugunu kaynaktan
+    dogruluyoruz, `on_playback_state_change`/`note_playback` baglantisini
+    kontrol eden mevcut `test_calma_bildirimi_donguye_baglanir` ile ayni
+    yontem."""
+
+    def test_uc_bileşen_de_logger_ile_kuruluyor(self):
+        source = _make_logger_smoke_test_source()
+
+        self.assertIn("logger=_make_logger(\"cikis\")", source,
+                      "AudioOutputManager logger olmadan kuruluyor")
+        self.assertIn("logger=_make_logger(\"tts_router\")", source,
+                      "TTSRouter logger olmadan kuruluyor")
+        self.assertIn("logger=_make_logger(\"stt\")", source,
+                      "STTRouter logger olmadan kuruluyor")
+
+    def test_logger_hata_ve_uyariyi_bilgiyi_degil_iletir(self):
+        """`_make_logger` yalnizca error/warn seviyesini iletmeli -- yoksa
+        rutin bilgi satirlari da durum log'unu bogar."""
+        import voice
+
+        printed = []
+        cell = {}
+
+        def _make_logger(category):
+            def _log(level, message):
+                if level not in ("error", "warn"):
+                    return
+                loop = cell.get("loop")
+                if loop is not None:
+                    loop._report_once(category, message)
+                else:
+                    printed.append(message)
+            return _log
+
+        log = _make_logger("cikis")
+        log("info", "rutin bilgi -- basilmamali")
+        log("error", "ne sounddevice ne aplay var")
+
+        self.assertEqual(printed, ["ne sounddevice ne aplay var"])
+
+    def test_kurulum_sonrasi_calisma_zamani_hatasi_donguden_gecer(self):
+        """Kurulum bittikten sonra (cell['loop'] doluyken) bir bilesenin
+        error logu `loop._report_once` uzerinden, kategori basina bir kez
+        basilmali."""
+        loop = _voice()
+        printed = []
+        loop._report = lambda msg: printed.append(msg)
+        cell = {"loop": loop}
+
+        def _make_logger(category):
+            def _log(level, message):
+                if level not in ("error", "warn"):
+                    return
+                cell["loop"]._report_once(category, message)
+            return _log
+
+        log = _make_logger("stt")
+        log("error", "STT gecici olarak kullanilamiyor")
+        log("error", "STT gecici olarak kullanilamiyor")
+        log("error", "STT anahtari gecersiz")
+
+        self.assertEqual(printed, ["STT gecici olarak kullanilamiyor",
+                                   "STT anahtari gecersiz"])
+
+
+class _FakeAudioSource:
+    """`pump()`'in ihtiyac duydugu kadari: sample_rate, read_since, latest_speech.
+
+    Gercek `AudioSource` yerine gecer -- donanim yok, sadece cagrilari sayar.
+    """
+
+    def __init__(self, sample_rate=16000):
+        self.sample_rate = sample_rate
+        self.read_calls = 0
+        self._cursor_seen = []
+
+    def read_since(self, cursor):
+        self.read_calls += 1
+        self._cursor_seen.append(cursor)
+        return _block(), cursor + BLOCK
+
+    def latest_speech(self, now):
+        return None
+
+
+class _SlowLlm:
+    """LLM sahtesi: `reply()` bir `release` Event'i set edilene (ya da suresi
+    dolana) kadar bloke olur -- bir LLM turunun saniyeler surebildigini simule
+    eder."""
+
+    def __init__(self, answer="Iyiyim.", started=None, release=None, block_s=None):
+        self.answer = answer
+        self.prompts = []
+        self.last_error = None
+        self._started = started
+        self._release = release
+        self._block_s = block_s
+
+    def reply(self, user_text):
+        self.prompts.append(user_text)
+        if self._started is not None:
+            self._started.set()
+        if self._release is not None:
+            self._release.wait(timeout=self._block_s)
+        elif self._block_s is not None:
+            time.sleep(self._block_s)
+        return self.answer
+
+
+class PumpConcurrencyTests(unittest.TestCase):
+    """Bulgu 2: kafa 30 Hz'te akiyor (~33 ms cerceve butcesi), bir LLM turu
+    saniyeler surebiliyor. `pump()` turu bir arka plan thread'ine atmazsa ya
+    da `_turn_running` kontrolu bozulursa takip sessizce donar. Buradaki
+    testler gercek donanim/ag kullanmadan bu garantiyi kilitler."""
+
+    def _armed_loop(self):
+        started = threading.Event()
+        release = threading.Event()
+        llm = _SlowLlm(started=started, release=release)
+        loop = _voice(stt=_FakeStt("hey astro selam"), llm=llm)
+        loop.audio = _FakeAudioSource()
+        loop.on_block = lambda is_speech, block, timestamp: self.UTTERANCE
+        return loop, started, release
+
+    UTTERANCE = np.full(16000, 0.2, dtype=np.float32)
+
+    def test_pump_uzun_turu_arka_plana_atar_ve_hemen_doner(self):
+        loop, started, release = self._armed_loop()
+
+        t0 = time.monotonic()
+        loop.pump(0.0)
+        elapsed = time.monotonic() - t0
+
+        self.assertLess(elapsed, 0.2,
+                        f"pump() turu blokladi ({elapsed:.3f}s) -- 30 Hz gaze donuk kalir")
+        self.assertTrue(started.wait(timeout=1.0), "arka plan thread hic baslamadi")
+        self.assertTrue(loop._turn_running, "tur hala surerken _turn_running False")
+
+        release.set()
+        loop.stop()
+
+        self.assertFalse(loop._turn_running, "tur bitince _turn_running True kaldi")
+
+    def test_tur_calisirken_ikinci_pump_yeni_tur_baslatmaz(self):
+        loop, started, release = self._armed_loop()
+
+        loop.pump(0.0)
+        self.assertTrue(started.wait(timeout=1.0))
+        first_thread = loop._thread
+        reads_before = loop.audio.read_calls
+        cursor_before = loop._cursor
+
+        loop.pump(1.0)  # tur hala calisirken
+
+        self.assertIs(loop._thread, first_thread,
+                      "tur calisirken pump ikinci bir thread basladi")
+        self.assertEqual(loop.audio.read_calls, reads_before,
+                         "tur calisirken audio yine de okundu -- imlec ilerledi")
+        self.assertEqual(loop._cursor, cursor_before,
+                         "tur calisirken imlec okunmamis sesin otesine ilerledi")
+
+        release.set()
+        loop.stop()
+
+    def test_stop_tur_bitmeden_zaman_asimiyla_doner(self):
+        """`stop()` `thread.join(timeout=2.0)` kullanir. Bunu gercekten
+        sinamak icin LLM'in bu suredEn UZUN bloke olmasi gerekiyor -- bu
+        yuzden bu test kasitli olarak ~2 sn suruyor (gercek zaman asimini
+        tetiklemenin tek yolu gercekten beklemek)."""
+        release = threading.Event()  # hic set edilmeyecek
+        llm = _SlowLlm(release=release, block_s=5.0)
+        loop = _voice(stt=_FakeStt("hey astro selam"), llm=llm)
+        loop.audio = _FakeAudioSource()
+        loop.on_block = lambda is_speech, block, timestamp: self.UTTERANCE
+
+        loop.pump(0.0)
+        self.assertTrue(loop._turn_running)
+
+        t0 = time.monotonic()
+        loop.stop()
+        elapsed = time.monotonic() - t0
+
+        self.assertLess(elapsed, 3.0,
+                        f"stop() 2 sn'lik join timeout'unu asip surece kadar bekledi ({elapsed:.2f}s)")
 
 
 if __name__ == "__main__":

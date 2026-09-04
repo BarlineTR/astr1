@@ -197,12 +197,14 @@ class VoiceLoop:
         capture_rate = int(getattr(audio, "sample_rate", 0) or STT_SAMPLE_RATE)
         self._utterance = UtteranceTracker(sample_rate=capture_rate,
                                            silence_s=self.silence_s)
-        # `LlmClient.last_error` sessizce hicbir yerde okunmuyordu: gercek bir
-        # programlama hatasi (yanlis kwarg gibi) yutulup robotta yalnizca "hic
-        # cevap vermiyor" olarak goruluyordu. Ayni sebep her turda basilmaz --
-        # tekrarlayan bir saglayici kesintisi, kafa takibi teshislerinin aktigi
-        # durum log'unu bogmamali.
-        self._last_llm_error: Optional[str] = None
+        # `LlmClient.last_error` sessizce hicbir yerde okunmuyordu (gercek bir
+        # programlama hatasi robotta yalnizca "hic cevap vermiyor" olarak
+        # goruluyordu), ve TTS'in basarisiz sentezi de ayni sekilde yutuluyordu.
+        # Ikisi de ayni disiplinle raporlanir: kategori basina son basilan
+        # mesaj tutulur, ayni sebep tekrar basilmaz -- tekrarlayan bir
+        # saglayici kesintisi kafa takibi teshislerinin aktigi durum log'unu
+        # bogmamali. Farkli bir sebep (ya da farkli bir kategori) her zaman basilir.
+        self._last_reported: dict = {}
         self._turn_running = False
         self._thread = None
         # Halka tampon imleci: her örnek tam bir kez teslim edilsin.
@@ -346,32 +348,42 @@ class VoiceLoop:
         if not answer:
             error = getattr(self.llm, "last_error", None) if self.llm is not None else None
             if error:
-                self._report_llm_error(str(error))
+                self._report_once("llm", str(error))
             return None
 
         self._speak(answer)
         return answer
 
-    def _report_llm_error(self, message: str) -> None:
-        """`llm.reply()` cevap uretemeyip bir sebep birakinca bunu bir kez basar.
+    def _report_once(self, category: str, message: str) -> None:
+        """Bir kategoride ayni sebebi ikinci kez basmaz.
 
-        Tekrarlayan bir saglayici kesintisi (ayni sebep) ikinci kez basilmaz --
-        yoksa kafa takibi teshislerinin aktigi durum log'u bogulur.
+        `category` sebeplerin birbirini ezmesini engeller (llm ve tts ayri
+        ayri kendi son mesajini hatirlar); "farkli bir sebep" her zaman
+        basilir, "ayni sebep" bir daha basilmaz -- tekrarlayan bir saglayici
+        kesintisi kafa takibi teshislerinin aktigi durum log'unu bogmamali.
         """
-        if message == self._last_llm_error:
+        if self._last_reported.get(category) == message:
             return
-        self._last_llm_error = message
+        self._last_reported[category] = message
         self._report(message)
 
     def _report(self, message: str) -> None:
-        print(f"🗣️  LLM cevap veremedi: {message}")
+        print(f"🗣️  {message}")
 
     def _speak(self, text: str) -> None:
         if self.tts is None:
             return
         generation_id = self.output.new_generation() if self.output is not None else 0
-        self.tts.synthesize_and_play(text, generation_id=generation_id,
-                                     output_manager=self.output, language="tr")
+        result = self.tts.synthesize_and_play(text, generation_id=generation_id,
+                                              output_manager=self.output, language="tr")
+        # `synthesize_and_play` hatayi istisna olarak degil `TTSRouteResult.pcm`
+        # bos/`None` olarak bildirir (kota, ag, gecersiz anahtar TTS
+        # katmaninda). Kontrol edilmezse robot "konustu" sayilir ama hoparlorden
+        # hicbir sey cikmaz -- "eksik parca gorunur kalir" ilkesi TTS icin de
+        # gecerli, yalnizca LLM icin degil.
+        if result is not None and not getattr(result, "pcm", None):
+            reason = getattr(result, "fallback_reason", None) or "bilinmeyen sebep"
+            self._report_once("tts", f"TTS ses üretemedi: {reason}")
         self.session.record_robot_speech()
 
 
@@ -414,16 +426,38 @@ def build_default_loop(audio, api_key: Optional[str] = None, **kwargs):
         if loop is not None:
             loop.note_playback(bool(is_playing), time.monotonic())
 
+    # Bileşenlerin kendi `logger`'ı verilmezse `self._log = lambda *a: None`'a
+    # düşer: "ne sounddevice ne aplay var" gibi kurulum hataları sessizce
+    # yutulur ve `track.py` "Sesli yanıt açık" basıp sonra hiç konuşmaz. Bu üç
+    # geri çağrı, döngü henüz kurulmadıysa (kurulum sırasında) doğrudan basar,
+    # kurulduktan sonra (çalışma zamanı hataları) `loop._report_once` üzerinden
+    # kategori başına tekrar etmeyecek şekilde basar. Mesaj metni bileşenin
+    # kendi etiketini taşıdığı için ("[AudioOutputManager]", "[STTRouter]",
+    # "[TTS ROUTER]"/"[OpenAI-TTS ...]") hangi katmanın sustuğu satırdan belli
+    # olur — "anahtar yok" ve "paket eksik" satırlarından ayrı okunur.
+    def _make_logger(category: str):
+        def _log(level: str, message: str) -> None:
+            if level not in ("error", "warn"):
+                return
+            loop = cell.get("loop")
+            if loop is not None:
+                loop._report_once(category, message)
+            else:
+                print(f"🗣️  {message}")
+        return _log
+
     try:
         client = OpenAI(api_key=api_key)
-        output = AudioOutputManager(on_playback_state_change=_on_playback)
+        output = AudioOutputManager(on_playback_state_change=_on_playback,
+                                    logger=_make_logger("cikis"))
         # `OpenAITTSEngine` bir `client` kwarg'ı almıyor — yalnızca `api_key`
         # (bkz. astro_audio/openai_tts_engine.py); brief'teki `client=client`
         # her çağrıda TypeError üretip sağlayıcı kurulumunu sessizce
         # düşürüyordu (üstteki `except Exception` bunu yutuyordu).
         tts = TTSRouter(openai_tts_engine=OpenAITTSEngine(api_key=api_key),
-                        edge_tts_enabled=False, output_manager=output)
-        stt = STTRouter(openai_client=client)
+                        edge_tts_enabled=False, output_manager=output,
+                        logger=_make_logger("tts_router"))
+        stt = STTRouter(openai_client=client, logger=_make_logger("stt"))
     except Exception as exc:
         LAST_SETUP_ERROR = f"sağlayıcılar kurulamadı: {exc}"
         return None
