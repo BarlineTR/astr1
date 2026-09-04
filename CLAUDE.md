@@ -46,6 +46,8 @@ kamera 30 Hz → face_detector_node ──/vision/faces──→ social_gaze_nod
 | `acquisition 0.75 / hold 0.40` | `gaze/target_manager.py` | Hedef edinmek için 0.75, kilidi korumak için 0.40. Köprülenen (bayat) tespitler kasten 0.75'in altına düşer. |
 | `min_confidence 0.50` | `gaze/visual_perception.py` | Altındaki gözlem hiç geçerli sayılmaz. |
 | `process_every_n: 1` | `astro_vision/config/camera_params.yaml` | Yüklü kare ~13 ms, 30 Hz bütçesi 33 ms. Büyütmek doğrudan takip gecikmesi demek. |
+| Kafa hızı / deadband | `arduino/astro_firmware/src/main.cpp` | Hız limiti **firmware'de**; `social_gaze_node` Arduino'ya ham hedefi yolluyor, planlayıcı çıktısını değil. YAML'daki `max_velocity_deg_s` kafaya ulaşmaz. Deadband 3 tick (1.16°) çünkü dişli boşluğu 0.85°. |
+| Akustik zarf 75° / 121° | `gaze/audio_perception.py` | 75° sohbet konisi anında geçer. 75–121° arası ısrar ister (yankıyı insandan ayırmak için). 121° = kafa limiti 85 + kamera yarı-FOV 36; ötesi kadraja giremez, gövde dönüşü ister (yok). |
 | DDS SHM profili | `astro_vision/config/fastdds_shm.xml` | 900 KB'lık görüntü topic'i, Linux'un 208 KB UDP tamponuna sığmıyor. Profil olmadan %70 kare kaybı. `camera.launch.py` bunu set eder. |
 
 ## Bu kod tabanında tekrar eden tuzaklar
@@ -62,6 +64,12 @@ kamera 30 Hz → face_detector_node ──/vision/faces──→ social_gaze_nod
 - **Kafa geri beslemesi yoksa takip sessizce ölür.** Bütün kerterizler
   `actual_head_yaw + kamera_açısı`; encoder susarsa hedef merkeze çöker. Node artık
   bir kez uyarıyor.
+- **İki firmware kopyası var, biri bayat.** Kanonik: `astro_firmware/src/main.cpp`
+  (PlatformIO, robota yüklenen). `AstroFirmware/AstroFirmware.ino` ondan kopmuş —
+  tick ölçeği yanlış (1.5 vs 2.5882) ve hız rampası yok. Yüklemeyin.
+- **Ses nereye değil, kim'e karar verir.** Yüz görünürken kerteriz yalnızca
+  görüntüden gelir; füzyon ikisini ortalarsa DOA gürültüsü hedefi deadband'in
+  ötesine itip kafayı boşuna oynatıyordu (ölçüldü: 5.1° çekme).
 - **Headless test**: node'lar rclpy import edilemediğinde `ros_compat.py`'deki mock
   Node'a düşer; `test/conftest.py` rclpy'yi bilerek bloklar. Node seviyesinde test
   yazmak bu sayede mümkün.
