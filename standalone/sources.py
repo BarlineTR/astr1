@@ -27,7 +27,16 @@ from tracker import Detection  # noqa: E402
 SAMPLE_RATE = 16000
 BLOCK_SAMPLES = 1024
 # Below this the block is background noise and GCC-PHAT would localise the room.
-MIN_RMS = 300.0
+#
+# In float32 units. The stream is opened with dtype="float32", so sounddevice hands
+# over samples normalised to [-1.0, +1.0] — this threshold has to live on that scale.
+# It was 300.0, a number from the int16 scale (+-32768), which no float32 block can
+# ever reach: a clipped full-scale signal has an RMS of 1.0. The gate therefore
+# rejected every block including shouting, the estimator was never called, and no
+# bearing was ever produced. The head could not turn toward a voice because it was
+# never told there was one — while the status band still read `ses:V`, which only
+# means the microphone opened.
+MIN_RMS = 0.01
 
 
 def to_detections(found) -> List[Detection]:
