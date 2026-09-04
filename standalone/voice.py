@@ -55,22 +55,22 @@ class UtteranceTracker:
             self._chunks.append(samples)
             self._samples += len(samples)
             self._silence_started_at = None
-            if self._samples >= int(self.max_s * self.sample_rate):
-                return self._close()
-            return None
+        elif self._chunks:
+            # Sözce açıkken gelen sessizlik saklanır — cümle içi duraklama sözcenin
+            # parçasıdır ve atılırsa kelimeler birbirine yapışır.
+            self._chunks.append(samples)
+            self._samples += len(samples)
 
-        if not self._chunks:
+            if self._silence_started_at is None:
+                self._silence_started_at = timestamp
+            elif (timestamp - self._silence_started_at) >= self.silence_s:
+                return self._close()
+        else:
             # Sözce başlamadı: sessizlik biriktirilmez.
             return None
 
-        # Sözce açıkken gelen sessizlik saklanır — cümle içi duraklama sözcenin
-        # parçasıdır ve atılırsa kelimeler birbirine yapışır.
-        self._chunks.append(samples)
-        self._samples += len(samples)
-
-        if self._silence_started_at is None:
-            self._silence_started_at = timestamp
-        elif (timestamp - self._silence_started_at) >= self.silence_s:
+        # Azami süre sınırı, konuşma veya sessizlik bloğu eklendikten sonra uygulanır.
+        if self._samples >= int(self.max_s * self.sample_rate):
             return self._close()
         return None
 

@@ -88,6 +88,22 @@ class UtteranceBoundaryTests(unittest.TestCase):
         self.assertEqual(len(second[0]), len(first[0]),
                          "ikinci sozce birincinin sesini tasiyor")
 
+    def test_tam_ornek_sayisi_kapanista(self):
+        """Sessizlik esiginin tam blok sayisini doğrulamak.
+
+        Konusma + sessizlik duzeninde örnek sayisi hesaplanir:
+        silence_s=0.8, BLOCK_S=0.064 ile kapanis koşulu:
+        - 1 blok konusma (blok 0, t=0)
+        - Blok 1'de sessizlik baslar (t=0.064), silence_started_at=0.064
+        - Kapanis esigi: (t - 0.064) >= 0.8 → t >= 0.864
+        - 0.864 / 0.064 = 13.5, yani blok 14 ilk kapanisi tetikler
+        - Blok 14 (t=0.896): (0.896 - 0.064) = 0.832 >= 0.8 ✓
+        - Dahil bloklar: 0-14 = 15 blok = 15360 örnek
+        """
+        closed = self._feed([True] * 1 + [False] * 16)
+        self.assertEqual(len(closed), 1)
+        self.assertEqual(len(closed[0]), 15 * BLOCK)
+
 
 if __name__ == "__main__":
     unittest.main()
