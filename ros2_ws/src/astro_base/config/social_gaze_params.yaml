@@ -6,7 +6,7 @@
     control_rate_hz: 50.0
     max_velocity_deg_s: 75.0
     max_acceleration_deg_s2: 180.0
-    max_jerk_deg_s3: 360.0
+    max_jerk_deg_s3: 5400.0
     gaze_deadband_deg: 3.0
     min_attention_dwell_s: 2.50
     turn_taking_min_dwell_s: 0.80
@@ -65,7 +65,7 @@
       profile_type: "s_curve"       # "s_curve" (jerk-limited) or "trapezoidal"
       max_velocity_deg_s: 75.0      # Maximum head pan velocity (°/s)
       max_acceleration_deg_s2: 180.0 # Maximum head pan acceleration (°/s²)
-      max_jerk_deg_s3: 360.0        # Maximum head pan jerk (°/s³)
+      max_jerk_deg_s3: 5400.0        # Maximum head pan jerk (°/s³)
       soft_landing_zone_deg: 12.0   # Deceleration zone near target for smooth arrival
       control_loop_hz: 50.0         # Trajectory generator interpolation frequency
 
