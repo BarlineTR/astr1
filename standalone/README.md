@@ -1,0 +1,69 @@
+# ROS'suz takip
+
+Kamerayı, mikrofonu ve Arduino'yu doğrudan açan tek process'lik bir takip programı.
+ROS yok: DDS yok, topic yok, launch yok, tek log, çalışan debugger.
+
+```bash
+./.venv/bin/python standalone/track.py                      # kamera + ses
+./.venv/bin/python standalone/track.py --serial /dev/ttyACM0   # + kafa
+./.venv/bin/python standalone/track.py --no-window --seconds 30
+```
+
+Çıkmak için pencerede `q` ya da `Esc`.
+
+## Neden var
+
+Bu yığındaki hataların çoğu algoritmada değil taşımadaydı: DDS 900 KB'lık görüntü
+topic'inin %70'ini düşürüyordu, YAML anahtarları sessizce yutuluyordu, bir `bytes`
+ataması kare başına 45 ms yiyordu. Bunların hiçbiri burada yok.
+
+Bu yüzden program bir soruyu doğrudan cevaplıyor:
+
+> Burada takip temizse → sorun **boru hattında**.
+> Burada da aynıysa → sorun **algoritmada ya da ayarda**.
+
+## Beyin paylaşılıyor, kopyalanmıyor
+
+Karar veren her şey — `VisualPerceptionCore`, `VisualTrackerCore`,
+`AudioVisualFusionCore`, `TargetManagerCore`, `SocialGazeFSM`, `MotionPlannerCore` —
+ROS düğümünün kullandığı nesnelerin **aynısıdır**, `astro_base.gaze` içinden import
+edilir. Burada yerel olan tek şey aralarındaki kırk satırlık kablolama.
+
+İkinci bir kopya yazılmamasının sebebi somut: bu depoda iki firmware kopyası
+535 satırın 147'sinde ayrıştı ve bayat olan yüklenirse her açıyı 1.73 kat büyük
+uyguluyordu. Elle bakılan ikinci bir kopya kaçınılmaz olarak kayar — ve kaydığında
+bu programın cevapladığı soru anlamsızlaşır, çünkü artık aynı beyni ölçmüyor olur.
+
+## Ekrandaki şerit
+
+```
+HOLDING_ATTENTION  owner=VISUAL_TRACKING  hedef=person_1  conf=0.92
+istenen +6.5  ->  gercek +0.0   [29 fps  ses:V  kafa:X]
+```
+
+Hangi katmanın sustuğunu tahmin etmeden okumak için:
+
+| gördüğün | sorun nerede |
+|---|---|
+| kutu hiç yok | algılama |
+| kutu var ama `owner=IDLE` | arbitrasyon — gaze hedefi kabul etmiyor |
+| `istenen` değişiyor, `gercek` sabit | aktüatör ya da seri hat |
+| `kafa:X` | encoder konuşmuyor, açı komuttan tahmin ediliyor |
+
+## Donanım zorunlu değil
+
+Kamera dışında hiçbiri şart. ReSpeaker yoksa yalnız görüntüyle takip eder; Arduino
+yoksa açık çevrim çalışır ve kafa açısını komuttan tahmin eder (bunu da çıkışta
+söyler). Masaüstünde, robot olmadan çalışması bilinçli: yalnızca bitmiş robotta
+çalışan bir teşhis aracının teşhis değeri az olur.
+
+## Testler
+
+```bash
+./.venv/bin/python -m pytest standalone/test -q
+```
+
+35 test; hiçbiri donanım istemez. Seri protokol (çerçeveleme, CRC, encoder
+telemetrisi, heartbeat), kaynakların donanımsız davranışı ve takipçinin
+ROS tarafıyla aynı garantileri koruduğu kapsanıyor — kafa açısına göre kerteriz,
+encoder susunca merkeze çökmeme, ve sesin nişanı çekmemesi.
