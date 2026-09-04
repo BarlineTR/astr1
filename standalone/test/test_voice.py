@@ -105,5 +105,135 @@ class UtteranceBoundaryTests(unittest.TestCase):
         self.assertEqual(len(closed[0]), 15 * BLOCK)
 
 
+class _FakeStt:
+    def __init__(self, text="hey astro nasilsin"):
+        self.text = text
+        self.calls = []
+
+    def transcribe(self, audio_arr, wav_bytes, sample_rate=16000):
+        self.calls.append((len(audio_arr), sample_rate))
+
+        class _Result:
+            pass
+
+        result = _Result()
+        result.text = self.text
+        result.provider = "fake"
+        return result
+
+
+class _FakeLlm:
+    def __init__(self, answer="Iyiyim."):
+        self.answer = answer
+        self.prompts = []
+        self.available = True
+
+    def reply(self, user_text):
+        self.prompts.append(user_text)
+        return self.answer
+
+
+class _FakeTts:
+    def __init__(self):
+        self.spoken = []
+
+    def synthesize_and_play(self, text, generation_id, output_manager=None,
+                            language="tr", realtime_fallback_reason=None):
+        self.spoken.append(text)
+        return None
+
+
+class _FakeOutput:
+    def __init__(self):
+        self._gen = 0
+        self.is_playing = False
+        self.interrupts = 0
+
+    def new_generation(self):
+        self._gen += 1
+        return self._gen
+
+    def interrupt(self, new_generation_id=None):
+        self.interrupts += 1
+        self._gen += 1
+        return self._gen
+
+
+def _voice(stt=None, llm=None, tts=None, output=None, **kwargs):
+    from voice import VoiceLoop
+
+    return VoiceLoop(audio=None, stt=stt or _FakeStt(), llm=llm or _FakeLlm(),
+                     tts=tts or _FakeTts(), output=output or _FakeOutput(), **kwargs)
+
+
+class TurnTests(unittest.TestCase):
+    UTTERANCE = np.full(16000, 0.2, dtype=np.float32)
+
+    def test_wake_word_ile_oturum_acilir_ve_cevap_seslendirilir(self):
+        tts = _FakeTts()
+        loop = _voice(stt=_FakeStt("hey astro nasilsin"), tts=tts)
+
+        said = loop.handle_utterance(self.UTTERANCE, sample_rate=16000)
+
+        self.assertEqual(said, "Iyiyim.")
+        self.assertEqual(tts.spoken, ["Iyiyim."])
+
+    def test_oturum_kapaliyken_wake_wordsuz_tur_dusurulur(self):
+        tts = _FakeTts()
+        loop = _voice(stt=_FakeStt("bugun hava nasil"), tts=tts)
+
+        said = loop.handle_utterance(self.UTTERANCE, sample_rate=16000)
+
+        self.assertIsNone(said)
+        self.assertEqual(tts.spoken, [], "oturum kapaliyken konustu")
+
+    def test_oturum_acikken_wake_word_gerekmez(self):
+        tts = _FakeTts()
+        loop = _voice(stt=_FakeStt("hey astro merhaba"), tts=tts)
+        loop.handle_utterance(self.UTTERANCE, sample_rate=16000)
+
+        loop.stt = _FakeStt("bugun hava nasil")
+        said = loop.handle_utterance(self.UTTERANCE, sample_rate=16000)
+
+        self.assertIsNotNone(said)
+        self.assertEqual(len(tts.spoken), 2)
+
+    def test_wake_word_metinden_temizlenip_llme_gider(self):
+        llm = _FakeLlm()
+        loop = _voice(stt=_FakeStt("hey astro bugun hava nasil"), llm=llm)
+
+        loop.handle_utterance(self.UTTERANCE, sample_rate=16000)
+
+        self.assertNotIn("astro", llm.prompts[0].lower(),
+                         f"wake word temizlenmemis: {llm.prompts[0]!r}")
+
+    def test_bos_transkript_tur_acmaz(self):
+        tts = _FakeTts()
+        loop = _voice(stt=_FakeStt(""), tts=tts)
+
+        self.assertIsNone(loop.handle_utterance(self.UTTERANCE, sample_rate=16000))
+        self.assertEqual(tts.spoken, [])
+
+    def test_llm_cevap_veremezse_sessiz_kalinir(self):
+        tts = _FakeTts()
+        loop = _voice(stt=_FakeStt("hey astro selam"), llm=_FakeLlm(answer=None), tts=tts)
+
+        self.assertIsNone(loop.handle_utterance(self.UTTERANCE, sample_rate=16000))
+        self.assertEqual(tts.spoken, [], "LLM sussa da TTS konustu")
+
+    def test_stt_16_khze_donusturulmus_ses_gorur(self):
+        """Tampon 44.1 kHz olabilir; STT 16 kHz bekler. Donusum tek noktada."""
+        stt = _FakeStt("hey astro selam")
+        loop = _voice(stt=stt)
+        utterance = np.full(44100, 0.2, dtype=np.float32)     # 1 sn @44.1 kHz
+
+        loop.handle_utterance(utterance, sample_rate=44100)
+
+        length, rate = stt.calls[0]
+        self.assertEqual(rate, 16000)
+        self.assertAlmostEqual(length, 16000, delta=100,
+                               msg="ses STT'ye yakalama hizinda verilmis")
+
+
 if __name__ == "__main__":
     unittest.main()
