@@ -15,6 +15,7 @@ clean here and ragged under ROS, the fault is the plumbing.
 """
 
 from dataclasses import dataclass
+from pathlib import Path
 from typing import List, Optional, Sequence, Tuple
 
 import core_path  # noqa: F401
@@ -61,12 +62,35 @@ class GazeResult:
 # seize the head. Mirrors the ROS node.
 UNSCORED_CONFIDENCE = 0.65
 
+# The calibration the ROS side reads. This program used the dataclass defaults and
+# never opened it, which quietly broke the promise the folder is built on: the same
+# brain, the same settings. It matters most for the microphone array's mounting
+# offset — `audio.yaw_offset_deg` is where a measured rotation gets written, and it
+# could not reach here at all.
+DEFAULT_CALIBRATION_PATH = (Path(__file__).resolve().parent.parent
+                            / "ros2_ws" / "src" / "astro_base" / "config"
+                            / "calibration_params.yaml")
+
+
+def _load_calibration(path=None) -> CalibrationConfig:
+    """Reads the shared calibration, falling back to defaults if it is not there.
+
+    A missing file degrades rather than stops: this program has to stay runnable at
+    a desk, and a diagnostic tool that refuses to start is not a diagnostic tool.
+    """
+    candidate = Path(path) if path is not None else DEFAULT_CALIBRATION_PATH
+    try:
+        return CalibrationConfig.load_yaml(str(candidate))
+    except (OSError, ValueError):
+        return CalibrationConfig()
+
 
 class GazeTracker:
     """Holds the shared gaze objects and steps them once per frame."""
 
-    def __init__(self, calibration: Optional[CalibrationConfig] = None):
-        self.calib = calibration or CalibrationConfig()
+    def __init__(self, calibration: Optional[CalibrationConfig] = None,
+                 calibration_path=None):
+        self.calib = calibration or _load_calibration(calibration_path)
         self.transformer = CoordinateTransformer(self.calib)
         self.spatial_memory = EpistemicSpatialMemory()
 
@@ -99,14 +123,24 @@ class GazeTracker:
         doa_deg: Optional[float],
         measured_head_deg: Optional[float],
         timestamp: float,
+        speech=None,
     ) -> GazeResult:
-        """Runs one cycle: perception, fusion, arbitration, motion."""
+        """Runs one cycle: perception, fusion, arbitration, motion.
+
+        `speech` is the SpeechDetector's verdict for the window the bearing came
+        from. Only a bearing carried by human speech is allowed to steer: a passing
+        car and a steady buzz are both loud and both persistent, so neither energy
+        nor bearing stability separates them from a talker — but harmonic structure
+        and syllable-rate modulation do. Without a verdict the bearing is ignored
+        rather than trusted, because trusting it is the measured failure: in a
+        130 s run the head swung between the limits for 90 s chasing noise.
+        """
         if measured_head_deg is not None:
             self.head_angle_deg = float(measured_head_deg)
             self.head_feedback_missing = False
 
-        if doa_deg is not None:
-            self._ingest_audio(doa_deg, timestamp)
+        if doa_deg is not None and speech is not None and speech.is_speech:
+            self._ingest_audio(doa_deg, timestamp, float(speech.confidence))
 
         self._ingest_vision(faces, frame_size, timestamp)
 
@@ -144,11 +178,21 @@ class GazeTracker:
             face_bearings_deg=tuple(t.body_azimuth_deg for t in self._latest_tracks),
         )
 
-    def _ingest_audio(self, doa_deg: float, timestamp: float) -> None:
+    def _ingest_audio(self, doa_deg: float, timestamp: float, confidence: float) -> None:
+        """Feeds one bearing in, carrying the speech verdict's confidence.
+
+        `process_raw_doa` defaults to 0.85, which is what the ROS node hands it when
+        the ReSpeaker's own DSP reports an angle. Here the number was standing in for
+        a measurement nobody made: the estimator's own confidence term was tried and
+        found useless — across four acoustic conditions it stayed between 0.40 and
+        0.46, so it ranks loudness, not direction quality. The speech score does
+        discriminate, so it is what travels.
+        """
         observation = self.audio_perception.process_raw_doa(
             raw_doa_deg=float(doa_deg),
             timestamp=timestamp,
             actual_head_yaw_deg=self.head_angle_deg,
+            confidence=confidence,
         )
         self._latest_audio = self.audio_filter.filter_observation(
             obs=observation, head_velocity_deg_s=self.head_velocity_deg_s

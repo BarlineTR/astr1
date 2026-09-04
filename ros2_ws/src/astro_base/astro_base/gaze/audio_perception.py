@@ -60,9 +60,15 @@ def gcc_phat(
     # Shift zero lag to center
     cc_windowed = np.concatenate((cc[-max_shift:], cc[: max_shift + 1]))
 
-    # Find peak index
+    # Find peak index.
+    #
+    # İşaret: R = SIG·conj(REFSIG) ters dönüştürülünce, refsig sig'den D kadar
+    # gecikmişse tepe -D'de çıkar. Docstring +D vaat ediyor ve aşağıdaki
+    # `delta_x = -tau·c` satırları o vaade göre yazılmış; ikisi ayrışınca açı 180°
+    # sabit hatayla, yani konuşanın tam tersine çıkıyordu. Aynı hatanın ikinci
+    # kopyası astro_audio/doa_estimator.py içinde — ikisi birlikte düzeltildi.
     peak_idx = int(np.argmax(np.abs(cc_windowed)))
-    shift = peak_idx - max_shift
+    shift = max_shift - peak_idx
     tau = shift / float(interp * fs)
 
     # Calculate Peak-to-Sidelobe Ratio (PSR)

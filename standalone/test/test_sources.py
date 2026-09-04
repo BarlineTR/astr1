@@ -26,6 +26,7 @@ from sources import (  # noqa: E402
     CameraSource,
     to_detections,
 )
+from astro_audio.speech_detector import SpeechVerdict  # noqa: E402
 from astro_audio.doa_estimator import (  # noqa: E402
     AcousticDOAEstimator,
     ReSpeakerGeometry,
@@ -145,6 +146,25 @@ class _FakeEstimator:
         return 30.0, 0.9, True
 
 
+class _FakeSpeechDetector:
+    """Konusma siniflandiricisinin yerine gecer ve ne kadar ses gorduğunu kaydeder.
+
+    Siniflandirmanin dogrulugu burada test edilmiyor -- o astro_audio'nun isi
+    (test_speech_detector.py). Burada test edilen kablolama: pencere birikiyor mu,
+    siniflandirici yeterince uzun bir pencereyle mi cagriliyor, verdi disari
+    veriliyor mu.
+    """
+
+    def __init__(self, is_speech=True):
+        self.is_speech = is_speech
+        self.lengths = []
+
+    def classify(self, mono):
+        self.lengths.append(len(mono))
+        return SpeechVerdict(is_speech=self.is_speech, confidence=0.8 if self.is_speech else 0.0,
+                             harmonicity=0.6, modulation=0.8, rms=0.2)
+
+
 def _block(amplitude, channels=4, samples=BLOCK_SAMPLES):
     """A block on the float32 scale the stream actually delivers: [-1.0, +1.0]."""
     rng = np.random.default_rng(1)
@@ -160,6 +180,11 @@ def _detached_source():
     src._stamp = 0.0
     src.max_age_s = 0.5
     src._estimator = _FakeEstimator()
+    src._speech = _FakeSpeechDetector()
+    src._window = None
+    src._verdict = None
+    src._verdict_stamp = 0.0
+    src.sample_rate = SAMPLE_RATE
     src._array_dead = False
     src._duplicate_blocks = 0
     src._mic_channels = None
@@ -378,14 +403,24 @@ class TestWhichChannelsAreMicrophones(unittest.TestCase):
 
         self.assertEqual(source._mic_channels, (4, 3, 2, 1))
 
+    TRUTHS = (-60.0, -30.0, 30.0, 60.0)
+
     def _arc(self, channels):
-        """-60°'den +60°'ye tarayıp okunan kerteriz yayını döndürür."""
+        """-60°'den +60°'ye tarayıp okunan kerteriz yayını döndürür.
+
+        Kerteriz -180..+180 aralığına getirilerek döndürülür. `latest_doa_deg`
+        0..360 yayınlıyor, ve o çerçevede iki uç arasındaki çıkarma sarmayı
+        görmüyor: sol uçtaki -60, 300 olarak okunuyor ve 60-300 = -240 çıkıyor.
+        Ölçülen yay yine 120°, sadece çıkarma yanlış çerçevede yapılıyordu.
+        """
         bearings = []
-        for truth in (-60.0, -30.0, 30.0, 60.0):
+        for truth in self.TRUTHS:
             source = _real_estimator_source()
             source._mic_channels = channels
             source.process_block(_six_channel_block(truth), timestamp=1.0)
-            bearings.append(source.latest_doa_deg(1.0))
+            bearing = source.latest_doa_deg(1.0)
+            bearings.append(None if bearing is None
+                            else (bearing - 360.0 if bearing > 180.0 else bearing))
         return bearings
 
     def test_the_bearing_spans_the_arc_the_source_did(self):
@@ -393,6 +428,21 @@ class TestWhichChannelsAreMicrophones(unittest.TestCase):
 
         self.assertNotIn(None, bearings, "ham mikrofonlardan kerteriz cikmadi")
         self.assertAlmostEqual(bearings[-1] - bearings[0], 120.0, delta=15.0)
+
+    def test_the_bearing_follows_the_source_instead_of_mirroring_it(self):
+        """Yayı taramak yetmez: kerteriz kaynağın olduğu TARAFI göstermeli.
+
+        Yay testi aynalanmış bir kestiriciyi yakalamıyor — soldan sağa tarayan bir
+        kaynak, ters işaretli bir kestiricide de 120°'lik bir yay çizer, sadece
+        ters yöne. Sahada bunun karşılığı kafanın konuşana değil tam tersine
+        dönmesiydi. Burada her nokta ayrı ayrı karşılaştırılıyor.
+        """
+        bearings = self._arc(RESPEAKER_MIC_CHANNELS)
+
+        for truth, measured in zip(self.TRUTHS, bearings):
+            self.assertAlmostEqual(
+                measured, truth, delta=15.0,
+                msg=f"kaynak {truth:+.0f} derecede, kerteriz {measured:+.1f} dedi")
 
     def test_reading_the_beam_as_a_microphone_collapses_the_arc(self):
         """Asıl arıza buydu: açı üretiliyor ama kaynağı izlemiyor.
@@ -404,6 +454,59 @@ class TestWhichChannelsAreMicrophones(unittest.TestCase):
 
         self.assertNotIn(None, bearings)
         self.assertLess(bearings[-1] - bearings[0], 90.0)
+
+
+class TestSpeechWindow(unittest.TestCase):
+    """Yon bloktan, konusma penceresinden okunur.
+
+    Ikisi ayni surede olculemez. Yon 64 ms'lik bir bloktan cikar -- konusmaci
+    hareket ederken daha uzun pencere kerterizi bulandirir. Hece modulasyonu ise
+    tanimi geregi en az bir hece suresi ister; 4 Hz'lik bir dongu 250 ms. 64 ms'e
+    bakip "modulasyon yok" demek olcum degil, pencerenin kisaligidir.
+
+    Bu yuzden kaynak iki farkli zaman olceginde calisir: her blok bir kerteriz,
+    biriken pencere bir konusma verdisi.
+    """
+
+    WINDOW_BLOCKS = 5   # 5 x 1024 ornek @16 kHz = 320 ms > MIN_BLOCK_S (300 ms)
+
+    def _feed(self, src, blocks, t0=1.0):
+        for i in range(blocks):
+            src.process_block(_plane_wave_array(25.0), timestamp=t0 + i * 0.064)
+
+    def test_tek_blok_konusma_hakkinda_karar_vermeye_yetmez(self):
+        src = _detached_source()
+
+        src.process_block(_plane_wave_array(25.0), timestamp=1.0)
+
+        self.assertIsNone(src.latest_speech(1.0),
+                          "64 ms'lik tek blokla konusma karari verildi")
+
+    def test_pencere_dolunca_siniflandirici_calisir_ve_verdi_disari_verilir(self):
+        src = _detached_source()
+
+        self._feed(src, self.WINDOW_BLOCKS)
+
+        verdict = src.latest_speech(1.0 + self.WINDOW_BLOCKS * 0.064)
+        self.assertIsNotNone(verdict, "pencere doldu ama verdi yok")
+        self.assertTrue(verdict.is_speech)
+
+    def test_siniflandirici_hece_olcebilecek_uzunlukta_pencere_gorur(self):
+        """Siniflandiriciya blok degil pencere gitmeli; yoksa 'modulasyon yok' der."""
+        src = _detached_source()
+
+        self._feed(src, self.WINDOW_BLOCKS)
+
+        self.assertTrue(src._speech.lengths, "siniflandirici hic cagrilmadi")
+        self.assertGreaterEqual(max(src._speech.lengths), int(0.30 * SAMPLE_RATE))
+
+    def test_bayat_verdi_saklanmaz(self):
+        """Bir saniye onceki konusma, simdi konusuldugunu soylemez."""
+        src = _detached_source()
+
+        self._feed(src, self.WINDOW_BLOCKS)
+
+        self.assertIsNone(src.latest_speech(1.0 + self.WINDOW_BLOCKS * 0.064 + 5.0))
 
 
 if __name__ == "__main__":

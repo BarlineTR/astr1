@@ -111,5 +111,43 @@ class StatusLogTests(unittest.TestCase):
         self.assertIn("2 durum", summary)
 
 
+
+
+class SpeechInTheStatusLineTests(unittest.TestCase):
+    """Kafanin neden donmedigi satirdan okunabilmeli.
+
+    Kafayi artik yalnizca konusma cevirebiliyor. Bu, ekransiz kosuda yeni bir
+    sessiz basarisizlik yolu aciyor: kerteriz uretiliyor, kafa donmuyor, ve
+    sebebi hicbir yerde yazmiyor. README'deki teshis tablosunun mantigi burada
+    da gecerli -- hangi katmanin sustugu tahmin edilmemeli, okunmali.
+    """
+
+    def setUp(self):
+        self.out = []
+        self.log = StatusLog(interval_s=1.0, printer=self.out.append)
+
+    def test_konusma_reddedildiginde_sebep_satirda_gorunur(self):
+        class _Verdict:
+            is_speech = False
+            confidence = 0.0
+            reason = "harmonik ama hece modulasyonu yok"
+
+        self.log.update(0.0, _Result(), doa_deg=90.0, speech=_Verdict())
+
+        self.assertIn("hece", self.out[0],
+                      f"kerteriz elendi ama sebebi satirda yok: {self.out[0]}")
+
+    def test_konusma_kabul_edildiginde_satir_bunu_soyler(self):
+        class _Verdict:
+            is_speech = True
+            confidence = 0.76
+            reason = ""
+
+        self.log.update(0.0, _Result(), doa_deg=90.0, speech=_Verdict())
+
+        self.assertIn("konusma", self.out[0].lower(),
+                      f"kabul edilen konusma satirda gorunmuyor: {self.out[0]}")
+
+
 if __name__ == "__main__":
     unittest.main()

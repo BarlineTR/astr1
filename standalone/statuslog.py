@@ -53,6 +53,7 @@ class StatusLog:
         detections: int = 0,
         doa_deg: Optional[float] = None,
         head_feedback: bool = False,
+        speech=None,
     ) -> Optional[str]:
         """Gerekiyorsa bir satır basar ve bastığı satırı döndürür."""
         key = (
@@ -70,7 +71,7 @@ class StatusLog:
             return None
 
         line = self._format(key, elapsed_s, result, fps, detections, doa_deg,
-                            head_feedback, changed)
+                            head_feedback, changed, speech)
         self._last_key = key
         if due or changed:
             self._last_beat = elapsed_s
@@ -79,8 +80,25 @@ class StatusLog:
         self._lines += 1
         return line
 
+    @staticmethod
+    def _speech_note(doa_deg, speech) -> str:
+        """Kerterizin neden kabul ya da reddedildiğini tek kelimeyle söyler.
+
+        Kafayı yalnızca konuşma çevirebiliyor. Bu, ekransız koşuda yeni bir sessiz
+        arıza yolu açıyor: kerteriz var, kafa dönmüyor, sebep hiçbir yerde yazmıyor.
+        README'nin teşhis tablosu hangi katmanın sustuğunu okumaya dayanıyor; bu
+        sütun o tablonun ses tarafındaki karşılığı.
+        """
+        if doa_deg is None:
+            return ""
+        if speech is None:
+            return "  [pencere yok]"
+        if speech.is_speech:
+            return f"  [konusma {speech.confidence:.2f}]"
+        return f"  [elendi: {speech.reason}]"
+
     def _format(self, key, elapsed_s, result, fps, detections, doa_deg,
-                head_feedback, changed) -> str:
+                head_feedback, changed, speech=None) -> str:
         state, owner, target = key
 
         wanted = float(result.target_yaw_deg)
@@ -102,6 +120,7 @@ class StatusLog:
             f"yuz={detections}  "
             f"{fps:4.1f}fps  "
             f"kafa:{'V' if head_feedback else 'X'}"
+            f"{self._speech_note(doa_deg, speech)}"
         )
 
     def summary(self, elapsed_s: float, frames: int, bearings: Sequence[float] = ()) -> str:

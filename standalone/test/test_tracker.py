@@ -142,5 +142,121 @@ class TestAudioSaysWhoNotWhere(unittest.TestCase):
         self.assertEqual(len(aims), 1, f"audio moved the aim: {aims}")
 
 
+class TestOnlySpeechEarnsTheHead(unittest.TestCase):
+    """Yalnizca insan sesi kafayi cevirebilir.
+
+    Sahadaki 130 saniyelik bir kosuda kafa, yuz kaybolduktan sonra 90 saniye
+    boyunca +-75 arasinda salindi: kerteriz ureten her yuksek ses hedefi ele
+    geciriyordu ve guven sabit 0.85 verildigi icin 0.45'lik ses edinme esigini
+    her seferinde asiyordu. Pencereden gelen bir araba da, bir ugultu da yuksek
+    ve israrcidir; onlari enerji de yon kararliligi da elemez.
+
+    Bu iki test ciftin iki yarisi: gurultu kafayi kapamamali, ama konusma hala
+    kapabilmeli. Ikincisi olmadan birincisi "sesle takibi kapatmak" olurdu.
+    """
+
+    NOISE_BEARING = 60.0
+
+    def _run(self, speech, cycles=60):
+        tracker = GazeTracker()
+        result = None
+        for i in range(cycles):
+            result = tracker.step(
+                faces=[], frame_size=FRAME, doa_deg=self.NOISE_BEARING,
+                speech=speech, measured_head_deg=0.0, timestamp=200.0 + i * 0.02,
+            )
+        return result
+
+    def test_araba_gurultusu_kafayi_kapamaz(self):
+        from astro_audio.speech_detector import SpeechVerdict
+
+        not_speech = SpeechVerdict(is_speech=False, confidence=0.0, harmonicity=0.32,
+                                   modulation=0.03, rms=0.2,
+                                   reason="ne harmonik ne modulasyonlu")
+
+        result = self._run(not_speech)
+
+        self.assertEqual(result.owner, PrioritySource.IDLE,
+                         "konusma olmayan bir ses hedefi ele gecirdi")
+        self.assertIsNone(result.target_id)
+
+    def test_konusma_hala_kafayi_kapabilir(self):
+        """Gurultuyu elerken sesle takibi de elememis olmaliyiz."""
+        from astro_audio.speech_detector import SpeechVerdict
+
+        speech = SpeechVerdict(is_speech=True, confidence=0.76, harmonicity=0.59,
+                               modulation=0.83, rms=0.2)
+
+        result = self._run(speech)
+
+        self.assertEqual(result.owner, PrioritySource.ACTIVE_SPEAKER,
+                         "konusma kafayi cevirmedi -- gurultu filtresi ozelligi de kapatmis")
+
+    def test_guven_konusma_olcusunden_gelir_sabit_085_ten_degil(self):
+        """Sabit 0.85, kestiricinin kendi guveni olcumde ayirt etmedigi icin konmustu
+        (dort akustik kosulda 0.40-0.46). Yerine konusma olcusunun guveni geciyor."""
+        from astro_audio.speech_detector import SpeechVerdict
+
+        weak = SpeechVerdict(is_speech=True, confidence=0.52, harmonicity=0.47,
+                             modulation=0.22, rms=0.2)
+        strong = SpeechVerdict(is_speech=True, confidence=0.95, harmonicity=0.90,
+                               modulation=0.90, rms=0.2)
+
+        self.assertLess(self._run(weak, cycles=6).confidence,
+                        self._run(strong, cycles=6).confidence,
+                        "guven konusma olcusunu izlemiyor -- hala sabit")
+
+
+class TestCalibrationIsRead(unittest.TestCase):
+    """Kalibrasyon dosyasi standalone tarafina da ulasmali.
+
+    `GazeTracker` cıplak `CalibrationConfig()` kuruyordu, yani
+    astro_base/config/calibration_params.yaml hic okunmuyordu. Onemi su: dizinin
+    fiziksel montaj kaymasi olculdugunde yazilacagi yer `audio.yaw_offset_deg` ve
+    o deger standalone'a hic ulasmiyordu -- ROS tarafi ayari alir, bu program
+    almazdi, ve ikisi ayni beyni calistirdigi iddiasi orada sessizce bozulurdu.
+    """
+
+    def _config(self, tmpdir, yaw_offset):
+        path = Path(tmpdir) / "calibration_params.yaml"
+        path.write_text(
+            "/**:\n"
+            "  ros__parameters:\n"
+            "    audio:\n"
+            f"      yaw_offset_deg: {yaw_offset}\n"
+            "      invert: true\n",
+            encoding="utf-8")
+        return path
+
+    def test_dosyadaki_ses_kaymasi_kerterize_uygulanir(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tracker = GazeTracker(calibration_path=self._config(tmp, 25.0))
+
+        self.assertAlmostEqual(tracker.calib.audio.yaw_offset_deg, 25.0)
+        self.assertAlmostEqual(
+            tracker.transformer.raw_audio_doa_to_head_bearing(0.0), -25.0, places=3,
+            msg="kayma okundu ama kerterize uygulanmiyor")
+
+    def test_acikca_verilen_kalibrasyon_dosyayi_ezer(self):
+        """Testler ve deneyler icin dosyaya dokunmadan ayar verebilmek gerekiyor."""
+        from astro_base.gaze.coordinate_frames import AudioCalibration, CalibrationConfig
+
+        explicit = CalibrationConfig()
+        explicit.audio = AudioCalibration(yaw_offset_deg=7.0, invert=True)
+
+        tracker = GazeTracker(calibration=explicit)
+
+        self.assertAlmostEqual(tracker.calib.audio.yaw_offset_deg, 7.0)
+
+    def test_dosya_yoksa_program_varsayilanlarla_calisir(self):
+        """Masaustunde depo duzeni farkli olabilir; eksik dosya durdurmamali."""
+        tracker = GazeTracker(calibration_path=Path("/yok/boyle/bir/dosya.yaml"))
+
+        self.assertIsNotNone(tracker.calib)
+        self.assertAlmostEqual(tracker.calib.head.max_angle_deg, 85.0)
+
+
 if __name__ == "__main__":
     unittest.main()

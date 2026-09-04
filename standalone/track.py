@@ -147,11 +147,13 @@ def main(argv=None) -> int:
                 audio_was_available = False
 
             doa_deg = audio.latest_doa_deg(now) if audio.available else None
+            speech = audio.latest_speech(now) if audio.available else None
 
             result = tracker.step(
                 faces=detections,
                 frame_size=(frame.shape[1], frame.shape[0]),
                 doa_deg=doa_deg,
+                speech=speech,
                 measured_head_deg=head.measured_angle_deg if head.has_feedback else None,
                 timestamp=now,
             )
@@ -171,6 +173,7 @@ def main(argv=None) -> int:
                 detections=len(detections),
                 doa_deg=doa_deg,
                 head_feedback=head.has_feedback,
+                speech=speech,
             )
 
             # Bindirme bir kez çizilir: pencere ve kayıt aynı kareyi paylaşır.

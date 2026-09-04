@@ -20,6 +20,7 @@ import numpy as np
 
 import core_path  # noqa: F401
 from astro_audio.doa_estimator import AcousticDOAEstimator  # noqa: E402
+from astro_audio.speech_detector import MIN_BLOCK_S, SpeechDetector  # noqa: E402
 from stereo_doa import DEFAULT_MIC_SPACING_M, StereoDOA  # noqa: E402
 from astro_vision.detection_quality import create_face_detector  # noqa: E402
 
@@ -27,6 +28,16 @@ from tracker import Detection  # noqa: E402
 
 SAMPLE_RATE = 16000
 BLOCK_SAMPLES = 1024
+
+# Konuşma penceresi. Yön ile konuşma aynı sürede ölçülemez: yön 64 ms'lik bir
+# bloktan çıkar (uzun pencere, konuşmacı hareket ederken kerterizi bulandırır),
+# hece modülasyonu ise en az bir hece süresi ister — 4 Hz'lik bir döngü 250 ms.
+# 0.6 s iki-üç hece tutar; daha uzunu, susan birinin verdisini gereksiz uzatır.
+SPEECH_WINDOW_S = 0.6
+
+# Verdi de kerteriz gibi bayatlar. Bir saniye önce konuşulmuş olması şu an
+# konuşulduğunu söylemez, ve kafayı çeviren yetki bayat bir kanıta dayanmamalı.
+SPEECH_MAX_AGE_S = 0.5
 # Below this the block is background noise and GCC-PHAT would localise the room.
 #
 # In float32 units. The stream is opened with dtype="float32", so sounddevice hands
@@ -227,6 +238,10 @@ class AudioSource:
         self.max_age_s = max_age_s
         self._stream_factory = stream_factory
         self._estimator = AcousticDOAEstimator(sample_rate=SAMPLE_RATE)
+        self._speech = SpeechDetector(sample_rate=SAMPLE_RATE)
+        self._window: Optional[np.ndarray] = None
+        self._verdict = None
+        self._verdict_stamp: float = 0.0
         self._lock = threading.Lock()
         self._doa: Optional[float] = None
         self._stamp: float = 0.0
@@ -371,6 +386,9 @@ class AudioSource:
         channels = block.T if block.shape[0] > block.shape[1] else block
         if channels.shape[0] < 2:
             return
+
+        self._observe_speech(channels.mean(axis=0), timestamp)
+
         if float(np.sqrt(np.mean(np.square(channels)))) < MIN_RMS:
             return
 
@@ -390,6 +408,8 @@ class AudioSource:
         # Yalnızca mikrofonlar. İşlenmiş ve geri besleme kanalları hem geometriyi
         # bozar hem de enerji ölçüsünü yanıltır.
         mics = channels[list(wanted)]
+
+        self._observe_speech(mics.mean(axis=0), timestamp)
 
         if float(np.sqrt(np.mean(np.square(mics)))) < MIN_RMS:
             return
@@ -430,6 +450,34 @@ class AudioSource:
 
         self._duplicate_blocks = 0
         return True
+
+    def _observe_speech(self, mono: np.ndarray, timestamp: float) -> None:
+        """Bloğu kayan pencereye ekler ve pencere yeterince uzunsa sınıflandırır.
+
+        Pencere **her** blokla beslenir, enerji kapısına bakılmadan. Sebebi ölçünün
+        kendisi: konuşmayı ayıran şey hecelerin arasındaki susmalar, yani zarfın
+        4-8 Hz'te açılıp kapanması. Yalnızca yüksek blokları biriktirmek tam da o
+        susmaları siler ve geriye kesintisiz bir uğultu bırakır — sınıflandırıcıya
+        gerçek konuşmayı "modülasyonsuz" diye gösterirdi.
+        """
+        capacity = int(SPEECH_WINDOW_S * self.sample_rate)
+        block = np.asarray(mono, dtype=np.float32).ravel()
+        self._window = (block if self._window is None
+                        else np.concatenate((self._window, block)))[-capacity:]
+
+        if len(self._window) < int(MIN_BLOCK_S * self.sample_rate):
+            return
+
+        verdict = self._speech.classify(self._window)
+        with self._lock:
+            self._verdict, self._verdict_stamp = verdict, float(timestamp)
+
+    def latest_speech(self, now: float):
+        """En son konuşma verdisi, hâlâ tazeyse. Yoksa None."""
+        with self._lock:
+            if self._verdict is None or (now - self._verdict_stamp) > SPEECH_MAX_AGE_S:
+                return None
+            return self._verdict
 
     def _publish(self, doa_deg: float, timestamp: float) -> None:
         with self._lock:

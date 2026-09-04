@@ -69,8 +69,18 @@ def gcc_phat(
     # Shift zero lag to center
     cc_windowed = np.concatenate((cc[-max_shift:], cc[: max_shift + 1]))
     
-    # Peak index
-    shift = np.argmax(np.abs(cc_windowed)) - max_shift
+    # Peak index.
+    #
+    # İşaret: R = SIG·conj(REFSIG) alınıp ters dönüştürülünce, refsig sig'den D
+    # kadar gecikmişse tepe -D'de çıkar (y[n]=x[n-D] için Y=X·e^{-j2πfD}, dolayısıyla
+    # X·conj(Y)=|X|²·e^{+j2πfD} ve bunun ters dönüşümü δ(t+D)). Docstring ise +D
+    # vaat ediyor ve aşağıdaki `delta_x = -tau·c` satırları o vaade göre yazılmış.
+    # Eksi burada, sözleşmeyi uygulamaya değil uygulamayı sözleşmeye getiriyor.
+    #
+    # Ölçüldü: refsig sig'den 3 örnek geride iken bu satır düzeltilmeden tau -3.00
+    # dönüyordu ve tam sağdaki bir kaynak -90° (sol) olarak raporlanıyordu — kafayı
+    # konuşanın tersine çeviren 180°'lik sabit hata buradan geliyordu.
+    shift = max_shift - int(np.argmax(np.abs(cc_windowed)))
     tau = shift / float(interp * fs)
 
     # Calculate Peak-to-Sidelobe Ratio / normalized peak quality

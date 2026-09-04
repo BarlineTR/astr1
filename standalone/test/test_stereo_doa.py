@@ -17,6 +17,7 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import core_path  # noqa: F401
+from astro_audio.speech_detector import SpeechVerdict  # noqa: E402
 from astro_base.gaze.types import PrioritySource  # noqa: E402
 from sources import AudioSource  # noqa: E402
 from tracker import Detection, GazeTracker  # noqa: E402
@@ -114,10 +115,23 @@ class BearingReachesTheHeadUnturnedTests(unittest.TestCase):
     FRAME = (640, 480)
 
     def _command_for(self, faces, doa_deg, steps=12):
+        """Bir kerteriz verildiginde konusma verdisi de verilir.
+
+        Kafayi yalnizca insan sesi cevirebiliyor: kerteriz uretmek yetmiyor, o
+        kerterizin geldigi pencerenin konusma olarak siniflanmasi da gerekiyor
+        (bkz. astro_audio.speech_detector). Buradaki iddia isaret sozlesmesi
+        hakkinda, siniflandirma hakkinda degil -- o yuzden sahne konusmayla
+        besleniyor. Verdi verilmezse ses hic islenmez ve `by_ear` sifirda kalir;
+        soldaki es test tam bu yuzden bir sure yanlis sebeple geciyordu:
+        copysign(1.0, 0.0) yuz tarafinin isaretiyle rastlantisal olarak esitti.
+        """
+        speech = SpeechVerdict(is_speech=True, confidence=0.80, harmonicity=0.60,
+                               modulation=0.80, rms=0.2) if doa_deg is not None else None
         tracker = GazeTracker()
         result = None
         for i in range(steps):
             result = tracker.step(faces=faces, frame_size=self.FRAME, doa_deg=doa_deg,
+                                  speech=speech,
                                   measured_head_deg=0.0, timestamp=1.0 + i * 0.1)
         return result
 
