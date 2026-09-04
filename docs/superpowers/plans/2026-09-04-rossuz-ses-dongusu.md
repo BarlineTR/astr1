@@ -1347,6 +1347,22 @@ class DegradationTests(unittest.TestCase):
         self.assertIsNone(loop)
         self.assertIn("anahtar", voice.LAST_SETUP_ERROR.lower())
 
+    def test_calma_bildirimi_donguye_baglanir(self):
+        """Baglanmazsa yanki bastirma ve barge-in uretimde sessizce olu kalir.
+
+        `is_speaking_at` yalnizca `note_playback` ile hareket eder; cikis
+        yoneticisi geri cagriyi cagirmazsa robot kendi sesini transkribe eder.
+        """
+        import inspect
+        import voice
+
+        source = inspect.getsource(voice.build_default_loop)
+
+        self.assertIn("on_playback_state_change", source,
+                      "AudioOutputManager calma durumu geri cagrisiyla kurulmuyor")
+        self.assertIn("note_playback", source,
+                      "geri cagri VoiceLoop.note_playback'e baglanmiyor")
+
     def test_llm_yoksa_tur_sessizce_atlanir(self):
         loop = _voice(llm=None)
 
@@ -1409,9 +1425,20 @@ def build_default_loop(audio, api_key: Optional[str] = None, **kwargs):
         LAST_SETUP_ERROR = f"paket eksik ({exc}) — `./.venv/bin/pip install openai python-dotenv`"
         return None
 
+    # `note_playback` bağlanmazsa yankı bastırma ve barge-in üretimde sessizce ölü
+    # kalır: `is_speaking_at` yalnızca bu bildirimle hareket eder. Çıkış yöneticisi
+    # döngüden önce kurulmak zorunda olduğu için geri çağrı, döngüyü sonradan
+    # dolduran bir hücreden okur.
+    cell = {}
+
+    def _on_playback(is_playing: bool) -> None:
+        loop = cell.get("loop")
+        if loop is not None:
+            loop.note_playback(bool(is_playing), time.monotonic())
+
     try:
         client = OpenAI(api_key=api_key)
-        output = AudioOutputManager()
+        output = AudioOutputManager(on_playback_state_change=_on_playback)
         tts = TTSRouter(openai_tts_engine=OpenAITTSEngine(client=client),
                         edge_tts_enabled=False, output_manager=output)
         stt = STTRouter(openai_client=client)
@@ -1420,9 +1447,13 @@ def build_default_loop(audio, api_key: Optional[str] = None, **kwargs):
         return None
 
     LAST_SETUP_ERROR = ""
-    return VoiceLoop(audio=audio, stt=stt, llm=LlmClient(client=client),
+    loop = VoiceLoop(audio=audio, stt=stt, llm=LlmClient(client=client),
                      tts=tts, output=output, **kwargs)
+    cell["loop"] = loop
+    return loop
 ```
+
+Ve `standalone/voice.py` import bloğuna `import time` ekle (yoksa).
 
 `standalone/voice.py` import bloğuna ekle:
 
