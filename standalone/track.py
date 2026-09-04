@@ -78,8 +78,13 @@ def main(argv=None) -> int:
     camera = CameraSource(device=opts.camera)
     if not camera.available:
         print(f"❌ Kamera {opts.camera} açılamadı.")
+        if camera.error:
+            print(f"   OAK-D: {camera.error}")
         return 1
-    print(f"📷 Kamera {opts.camera} | yüz algılama: {camera.detector_name}")
+    if camera.backend == "webcam":
+        print(f"📷 Webcam {opts.camera} (OAK-D yok) | yüz algılama: {camera.detector_name}")
+    else:
+        print(f"📷 {camera.backend} | yüz algılama: {camera.detector_name}")
 
     audio = AudioSource(device=opts.audio_device)
     audio.start()

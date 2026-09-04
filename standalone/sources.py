@@ -39,7 +39,13 @@ def to_detections(found) -> List[Detection]:
 
 
 class CameraSource:
-    """OAK-D Lite camera plus the shared face detector."""
+    """OAK-D Lite when one is attached, otherwise a plain webcam.
+
+    The OAK-D is what the robot carries, so it is tried first. But this program has to
+    stay runnable at a desk with no robot — a diagnostic tool that only starts on the
+    finished machine cannot be used to diagnose the machine. So a missing OAK-D falls
+    back to V4L2 rather than refusing to start, and `backend` says which one answered.
+    """
 
     def __init__(
         self,
@@ -54,10 +60,12 @@ class CameraSource:
         self.capture = capture
         self.available = False
         self.error = None
+        self.backend = "none"
 
         if capture is not None:
             # Preserve the hardware-free/test injection path.
             self.available = bool(capture.isOpened())
+            self.backend = "injected"
         else:
             try:
                 self.pipeline = dai.Pipeline()
@@ -79,13 +87,28 @@ class CameraSource:
                 self.pipeline.start()
                 self.device = self.pipeline.getDefaultDevice()
                 self.available = True
+                self.backend = "OAK-D"
 
             except Exception as exc:
+                # No OAK-D attached, or the pipeline would not build. Keep the reason —
+                # it is the difference between "no camera plugged in" and "the OAK-D is
+                # there but the pipeline is wrong", which are not the same problem.
                 self.error = str(exc)
                 self.available = False
                 self.queue = None
                 self.pipeline = None
                 self.device = None
+
+                fallback = cv2.VideoCapture(device)
+                if fallback.isOpened():
+                    fallback.set(cv2.CAP_PROP_FRAME_WIDTH, width)
+                    fallback.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+                    fallback.set(cv2.CAP_PROP_FPS, 30.0)
+                    self.capture = fallback
+                    self.available = True
+                    self.backend = "webcam"
+                else:
+                    fallback.release()
 
         model_dir = os.path.expanduser(
             os.getenv("FACE_MODEL_DIR", "~/.astro/models")
