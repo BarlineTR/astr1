@@ -154,12 +154,17 @@ class TestFinalSocialGazeForensics(unittest.TestCase):
         cmd = self.pipeline.step(timestamp=t)
         self.assertNotEqual(cmd.gaze_state, GazeStateEnum.HOLDING_ATTENTION)
 
-    def test_invalid_audio_cannot_birth_target(self):
-        """Invariant: Audio DOA outside +-75 deg conversational envelope produces no target birth."""
+    def test_scattered_out_of_cone_audio_cannot_birth_target(self):
+        """Invariant: reverberation outside the conversation cone births no target.
+
+        This is what closed the rear envelope in the first place — single reflections
+        off a wall used to drive the neck into its mechanical limit. What identifies a
+        reflection is that it arrives from somewhere new each time, so the guarantee is
+        stated that way rather than as a flat angle cutoff.
+        """
         t = 1.0
-        # Feed out-of-envelope acoustic DOA (119.7 deg)
-        for _ in range(20):
-            cmd = self.pipeline.step(timestamp=t, raw_doa_deg=119.7, raw_doa_conf=0.90)
+        for bearing in (80.0, 115.0, 85.0, 120.0, 90.0, 118.0, 82.0, 116.0):
+            cmd = self.pipeline.step(timestamp=t, raw_doa_deg=bearing, raw_doa_conf=0.90)
             self.assertEqual(cmd.gaze_state, GazeStateEnum.IDLE)
             self.assertEqual(cmd.priority_source, PrioritySource.IDLE)
             self.assertEqual(self.pipeline.sim_head_pos_deg, 0.0)
@@ -167,6 +172,29 @@ class TestFinalSocialGazeForensics(unittest.TestCase):
 
         self.assertGreater(self.pipeline.audio_perception.counters.invalid_angle_events, 0)
         self.assertEqual(self.pipeline.audio_perception.counters.audio_target_births, 0)
+
+    def test_audio_beyond_what_the_neck_can_reach_cannot_birth_target(self):
+        """Invariant: past 121 deg, turning the head shows the robot nothing, so a
+        target there would only make it turn, see no one, and swing back."""
+        t = 1.0
+        for _ in range(20):
+            cmd = self.pipeline.step(timestamp=t, raw_doa_deg=180.0, raw_doa_conf=0.90)
+            self.assertEqual(cmd.priority_source, PrioritySource.IDLE)
+            t += 0.02
+
+        self.assertEqual(cmd.gaze_state, GazeStateEnum.IDLE)
+
+    def test_someone_calling_persistently_from_behind_does_birth_a_target(self):
+        """A person who keeps calling from one direction is not a reflection."""
+        t = 1.0
+        owners = []
+        for _ in range(20):
+            owners.append(self.pipeline.step(timestamp=t, raw_doa_deg=119.7, raw_doa_conf=0.90).priority_source)
+            t += 0.02
+
+        self.assertIn(PrioritySource.ACTIVE_SPEAKER, owners)
+        # ...and the head actually set off towards them (the source sits to the right).
+        self.assertLess(self.pipeline.sim_head_pos_deg, 0.0)
 
     def test_target_loss_requires_temporal_evidence(self):
         """Invariant: Single-frame drop out coasts and does not immediately lose active target."""

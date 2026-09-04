@@ -65,8 +65,12 @@ static constexpr int HEAD_PWM_LIMIT = 200;
 static constexpr int HEAD_PWM_MIN = 105;
 
 static constexpr float HEAD_KP = 5.0f, HEAD_KD = 0.05f;
-static constexpr int32_t HEAD_DEADBAND_TICKS = 1;  // 1 tick ~= 0.386 derece
-static constexpr int32_t HEAD_DEADBAND_TICKS = 2;  // 2 ticks ~= 0.772 derece (dişli boşluğu 0.85°, sağ-sol salınımı keser)
+// Dişli boşluğu 0.85 derece olarak ölçüldü (docs/final_validation_report.md) ve bir
+// tick 0.386 derece. Deadband boşluktan küçük olursa kontrolcü, mekanizmanın
+// kapatamayacağı bir hatayı kovalar: motor döner, çıkış takip etmez, hata durur,
+// tekrar döner — kafanın yüzü tutmaya çalışırken yaptığı sağ-sol salınım buydu.
+// 3 tick = 1.159 derece, boşluğu aşan ilk değer; sosyal mesafede görünmez.
+static constexpr int32_t HEAD_DEADBAND_TICKS = 3;  // 3 tick ~= 1.159 derece (boşluk 0.85)
 static constexpr uint32_t HEAD_STALL_MS = 1500;    // PWM'e rağmen tick değişmiyorsa kes (1.5s güvenli süre)
 
 
@@ -253,12 +257,12 @@ void publishDiag(uint16_t vbat_mV, int16_t temp_cX100, uint32_t flags) {
   Proto::writePacket(Serial, Proto::DIAGNOSTICS, payload, sizeof(payload));
 }
 
-// Kafa motoru maksimum hız limiti: 35.0 derece/saniye (sakin, insansı dönüş hızı)
-static constexpr float HEAD_MAX_VEL_DEG_S = 35.0f;
-static constexpr float HEAD_MAX_TICKS_PER_SEC = HEAD_MAX_VEL_DEG_S * HEAD_TICKS_PER_DEG; // ~90.6 ticks/s
-// Kafa motoru maksimum hız limiti: 20.0 derece/saniye (sakin, pürüzsüz takip, yüz kaçırmayı önler)
+// Kafa motoru maksimum hız limiti: 20.0 derece/saniye (sakin, pürüzsüz takip).
+// Hız sınırlaması burada yapılır; ROS tarafındaki planlayıcının çıktısı Arduino'ya
+// gönderilmiyor (bkz. social_gaze_node), yani YAML'daki max_velocity_deg_s kafaya
+// ulaşmaz. Kafa hızını değiştirmek isteyen bu satırı değiştirmeli.
 static constexpr float HEAD_MAX_VEL_DEG_S = 20.0f;
-static constexpr float HEAD_MAX_TICKS_PER_SEC = HEAD_MAX_VEL_DEG_S * HEAD_TICKS_PER_DEG; // ~51.8 ticks/s
+static constexpr float HEAD_MAX_TICKS_PER_SEC = HEAD_MAX_VEL_DEG_S * HEAD_TICKS_PER_DEG; // ~90.6 ticks/s
 
 static float g_head_profile_pos = 0.0f;
 static bool g_head_profile_inited = false;

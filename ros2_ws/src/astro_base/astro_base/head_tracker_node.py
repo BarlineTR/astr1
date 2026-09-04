@@ -40,11 +40,9 @@ HEAD_TRACKER_DEFAULTS: dict[str, Any] = {
     # Small enough that the head actually ends up facing the talker rather than parked
     # up to 16 deg off them; large enough to sit still under ReSpeaker's coarse DOA.
     "deadband_deg": 8.0,
-    "deadband_deg": 4.0,
     "min_dwell_time_s": 3.5,
     "idle_return_timeout_s": 30.0,
     "max_speed_deg_s": 45.0,
-    "max_speed_deg_s": 20.0,
     "update_rate_hz": 20.0,
     "min_rms_threshold": 1600.0,
     "noise_multiplier": 3.0,
@@ -54,7 +52,6 @@ HEAD_TRACKER_DEFAULTS: dict[str, Any] = {
     # OAK-D Lite vision fusion
     "vision_fusion_enabled": True,
     "vision_gain": 0.85,
-    "vision_gain": 0.40,
     "vision_timeout_s": 2.0,
     # Camera half field of view: the furthest a face can honestly be from where the lens
     # was pointing, and therefore the cap on what one visual acquisition may command.
@@ -858,13 +855,10 @@ class HeadTrackerNode(Node):
                     self._state = SocialGazeStateMachine.ATTENDING
                     # Confident visual gaze centering (proportional visual servoing)
                     if self._vision_yaw_pending and abs(self._vision_head_yaw) >= 1.5:
-                    if self._vision_yaw_pending and abs(self._vision_head_yaw) >= 3.0:
                         self._vision_yaw_pending = False
                         
                         # Akıcı ve organik yüz takibi: Görsel servo gecikmesini 80ms'ye indirerek pürüzsüz takip sağla
                         if (now - self._last_motion_cmd_time) > 0.08:
-                        # Sakin ve stabil yüz takibi: 150ms gecikme ve optimize kazanç ile sağ-sol salınımı önle
-                        if (now - self._last_motion_cmd_time) > 0.15:
 
                             # Anchored on the pose the bearing was measured from, not on
                             # the running target. Adding to the target integrates instead

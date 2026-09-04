@@ -43,7 +43,6 @@ class TestHeadlessHarness(unittest.TestCase):
 
         self.assertEqual(node.fusion.spatial_gate_deg, 25.0)
         self.assertEqual(node.planner.max_velocity, 75.0)
-        self.assertEqual(node.planner.max_velocity, 20.0)
         self.assertEqual(node.target_manager.min_attention_dwell_s, 2.50)
 
     def test_control_cycle_runs_and_publishes_a_head_command(self):

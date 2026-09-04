@@ -115,13 +115,15 @@ class AudioVisualFusionCore:
                     matched_audio = True
 
             if is_associated:
-                # FUSED target: Face + Active Voice
-                # Weighted trigonometric mean of angles (Vision is given higher spatial precision)
-                fused_yaw = circular_mean_deg(
-                    [vt.body_azimuth_deg, audio_state.azimuth_deg],
-                    weights=[vis_eff_conf * 1.5, audio_eff_conf * 0.5]
-                )
-                fused_yaw_val = fused_yaw if fused_yaw is not None else vt.body_azimuth_deg
+                # FUSED target: Face + Active Voice.
+                # Vision owns the angle; audio only says that this face is the one
+                # talking. Averaging the two used to drag the aim off a motionless
+                # face — a DOA at +45 pulled a face held at +20 out to +25.1, past
+                # the 3 degree gaze deadband, so acoustic noise alone kept commanding
+                # head motion. This project's own validation puts visual bearing
+                # error at 0.40 degrees against 3.23 for filtered DOA, so blending
+                # the coarse source in could only ever degrade the precise one.
+                fused_yaw_val = vt.body_azimuth_deg
 
                 # Combined confidence
                 combined_conf = min(1.0, vis_eff_conf + 0.30 * audio_eff_conf)
