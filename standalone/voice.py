@@ -9,6 +9,9 @@ geliyor (`STTRouter`, `TTSRouter`, `AudioOutputManager`, `ConversationSession`).
 """
 
 import io
+import os
+import threading
+import time
 import wave
 from typing import Any, Optional
 
@@ -17,6 +20,7 @@ import numpy as np
 import core_path  # noqa: F401
 from astro_ai.conversation_session import ConversationSession  # noqa: E402
 from astro_audio.speech_detector import SpeechDetector  # noqa: E402
+from llm import LlmClient  # noqa: E402
 
 # Sözce sonu eşiği. Cümle içi duraklamayı sözce sonundan ayırmalı: hece arası
 # ≤0.25 s, virgül duraklaması ~0.5 s, cümle sonu daha uzun. 0.8 s ikisinin
@@ -193,6 +197,16 @@ class VoiceLoop:
         capture_rate = int(getattr(audio, "sample_rate", 0) or STT_SAMPLE_RATE)
         self._utterance = UtteranceTracker(sample_rate=capture_rate,
                                            silence_s=self.silence_s)
+        # `LlmClient.last_error` sessizce hicbir yerde okunmuyordu: gercek bir
+        # programlama hatasi (yanlis kwarg gibi) yutulup robotta yalnizca "hic
+        # cevap vermiyor" olarak goruluyordu. Ayni sebep her turda basilmaz --
+        # tekrarlayan bir saglayici kesintisi, kafa takibi teshislerinin aktigi
+        # durum log'unu bogmamali.
+        self._last_llm_error: Optional[str] = None
+        self._turn_running = False
+        self._thread = None
+        # Halka tampon imleci: her örnek tam bir kez teslim edilsin.
+        self._cursor = 0
 
     @property
     def is_speaking(self) -> bool:
@@ -264,6 +278,46 @@ class VoiceLoop:
             self._barge_in_since = None
             self._barge_in_latched = True
 
+    def pump(self, timestamp: float) -> None:
+        """Ana döngüden her karede çağrılır; iş varsa arka plana atar.
+
+        Kafa 30 Hz'te akıyor ve bir LLM turu saniyeler sürüyor — tur bu thread'de
+        koşarsa takip donar. O yüzden burada yalnızca sözce toplanır; tur kapanınca
+        işi bir arka plan thread'i alır.
+        """
+        if self.audio is None or self._turn_running:
+            return
+
+        block, self._cursor = self.audio.read_since(self._cursor)
+        if len(block) == 0:
+            return
+
+        verdict = self.audio.latest_speech(timestamp)
+        is_speech = bool(verdict is not None and verdict.is_speech)
+        utterance = self.on_block(is_speech, block, timestamp)
+        if utterance is None:
+            return
+
+        self._turn_running = True
+        thread = threading.Thread(
+            target=self._run_turn,
+            args=(utterance, int(self.audio.sample_rate)),
+            daemon=True,
+        )
+        thread.start()
+        self._thread = thread
+
+    def _run_turn(self, utterance, sample_rate: int) -> None:
+        try:
+            self.handle_utterance(utterance, sample_rate)
+        finally:
+            self._turn_running = False
+
+    def stop(self) -> None:
+        thread = self._thread
+        if thread is not None:
+            thread.join(timeout=2.0)
+
     def handle_utterance(self, utterance: np.ndarray, sample_rate: int) -> Optional[str]:
         """Bir sözceyi tura çevirir. Söylenen cevabı, yoksa None döndürür."""
         if self.stt is None or utterance is None or len(utterance) == 0:
@@ -290,10 +344,27 @@ class VoiceLoop:
         prompt = clean.strip() or text
         answer = self.llm.reply(prompt) if self.llm is not None else None
         if not answer:
+            error = getattr(self.llm, "last_error", None) if self.llm is not None else None
+            if error:
+                self._report_llm_error(str(error))
             return None
 
         self._speak(answer)
         return answer
+
+    def _report_llm_error(self, message: str) -> None:
+        """`llm.reply()` cevap uretemeyip bir sebep birakinca bunu bir kez basar.
+
+        Tekrarlayan bir saglayici kesintisi (ayni sebep) ikinci kez basilmaz --
+        yoksa kafa takibi teshislerinin aktigi durum log'u bogulur.
+        """
+        if message == self._last_llm_error:
+            return
+        self._last_llm_error = message
+        self._report(message)
+
+    def _report(self, message: str) -> None:
+        print(f"🗣️  LLM cevap veremedi: {message}")
 
     def _speak(self, text: str) -> None:
         if self.tts is None:
@@ -302,3 +373,63 @@ class VoiceLoop:
         self.tts.synthesize_and_play(text, generation_id=generation_id,
                                      output_manager=self.output, language="tr")
         self.session.record_robot_speech()
+
+
+LAST_SETUP_ERROR = ""
+
+
+def build_default_loop(audio, api_key: Optional[str] = None, **kwargs):
+    """Bulut sağlayıcılarla bir döngü kurar; kuramazsa None döner ve sebebi yazar.
+
+    Anahtarı olmayan bir masaüstünde `track.py` çalışmaya devam etmeli — takip
+    sesli yanıta bağımlı değil. Bu yüzden burada istisna fırlatılmıyor.
+    """
+    global LAST_SETUP_ERROR
+
+    if api_key is None:
+        api_key = os.getenv("OPENAI_API_KEY", "")
+    if not api_key:
+        LAST_SETUP_ERROR = "OPENAI_API_KEY anahtarı yok — sesli yanıt kapalı, takip çalışmaya devam ediyor"
+        return None
+
+    try:
+        from openai import OpenAI
+
+        from astro_audio.audio_output_manager import AudioOutputManager
+        from astro_audio.openai_tts_engine import OpenAITTSEngine
+        from astro_audio.stt_router import STTRouter
+        from astro_audio.tts_router import TTSRouter
+    except ImportError as exc:
+        LAST_SETUP_ERROR = f"paket eksik ({exc}) — `./.venv/bin/pip install openai python-dotenv`"
+        return None
+
+    # `note_playback` bağlanmazsa yankı bastırma ve barge-in üretimde sessizce ölü
+    # kalır: `is_speaking_at` yalnızca bu bildirimle hareket eder. Çıkış yöneticisi
+    # döngüden önce kurulmak zorunda olduğu için geri çağrı, döngüyü sonradan
+    # dolduran bir hücreden okur.
+    cell = {}
+
+    def _on_playback(is_playing: bool) -> None:
+        loop = cell.get("loop")
+        if loop is not None:
+            loop.note_playback(bool(is_playing), time.monotonic())
+
+    try:
+        client = OpenAI(api_key=api_key)
+        output = AudioOutputManager(on_playback_state_change=_on_playback)
+        # `OpenAITTSEngine` bir `client` kwarg'ı almıyor — yalnızca `api_key`
+        # (bkz. astro_audio/openai_tts_engine.py); brief'teki `client=client`
+        # her çağrıda TypeError üretip sağlayıcı kurulumunu sessizce
+        # düşürüyordu (üstteki `except Exception` bunu yutuyordu).
+        tts = TTSRouter(openai_tts_engine=OpenAITTSEngine(api_key=api_key),
+                        edge_tts_enabled=False, output_manager=output)
+        stt = STTRouter(openai_client=client)
+    except Exception as exc:
+        LAST_SETUP_ERROR = f"sağlayıcılar kurulamadı: {exc}"
+        return None
+
+    LAST_SETUP_ERROR = ""
+    loop = VoiceLoop(audio=audio, stt=stt, llm=LlmClient(client=client),
+                     tts=tts, output=output, **kwargs)
+    cell["loop"] = loop
+    return loop

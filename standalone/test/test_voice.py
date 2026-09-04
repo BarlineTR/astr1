@@ -159,11 +159,27 @@ class _FakeOutput:
         return self._gen
 
 
-def _voice(stt=None, llm=None, tts=None, output=None, **kwargs):
+_UNSET = object()
+
+
+def _voice(stt=_UNSET, llm=_UNSET, tts=_UNSET, output=_UNSET, **kwargs):
+    """Sahte saglayicilarla bir VoiceLoop kurar.
+
+    Bir sentinel kullanir, `None` degil: bazi testler bilerek `llm=None` ya
+    da `tts=None` gecirip o parcanin gercekten eksik oldugu durumu sinar --
+    `x or _FakeX()` bunu sessizce varsayilana cevirip testi anlamsizlastirirdi.
+    """
     from voice import VoiceLoop
 
-    return VoiceLoop(audio=None, stt=stt or _FakeStt(), llm=llm or _FakeLlm(),
-                     tts=tts or _FakeTts(), output=output or _FakeOutput(), **kwargs)
+    if stt is _UNSET:
+        stt = _FakeStt()
+    if llm is _UNSET:
+        llm = _FakeLlm()
+    if tts is _UNSET:
+        tts = _FakeTts()
+    if output is _UNSET:
+        output = _FakeOutput()
+    return VoiceLoop(audio=None, stt=stt, llm=llm, tts=tts, output=output, **kwargs)
 
 
 class TurnTests(unittest.TestCase):
@@ -379,6 +395,112 @@ class EchoAndBargeInTests(unittest.TestCase):
         self.assertEqual(len(closed), 1)
         self.assertTrue(bool(np.all(closed[0] == 0.2)),
                         "robot konusmadan onceki blok yeni sozceye sizdi")
+
+
+class DegradationTests(unittest.TestCase):
+    """Eksik parca programi durdurmaz, gorunur kilar."""
+
+    def test_openai_anahtari_yoksa_dongu_kurulmaz_ama_sebep_soylenir(self):
+        import voice
+
+        loop = voice.build_default_loop(audio=None, api_key="")
+
+        self.assertIsNone(loop)
+        self.assertIn("anahtar", voice.LAST_SETUP_ERROR.lower())
+
+    def test_calma_bildirimi_donguye_baglanir(self):
+        """Baglanmazsa yanki bastirma ve barge-in uretimde sessizce olu kalir.
+
+        `is_speaking_at` yalnizca `note_playback` ile hareket eder; cikis
+        yoneticisi geri cagriyi cagirmazsa robot kendi sesini transkribe eder.
+        """
+        import inspect
+        import voice
+
+        source = inspect.getsource(voice.build_default_loop)
+
+        self.assertIn("on_playback_state_change", source,
+                      "AudioOutputManager calma durumu geri cagrisiyla kurulmuyor")
+        self.assertIn("note_playback", source,
+                      "geri cagri VoiceLoop.note_playback'e baglanmiyor")
+
+    def test_llm_yoksa_tur_sessizce_atlanir(self):
+        loop = _voice(llm=None)
+
+        said = loop.handle_utterance(np.full(16000, 0.2, np.float32), sample_rate=16000)
+
+        self.assertIsNone(said)
+
+    def test_hoparlor_yoksa_stt_ve_llm_yine_calisir(self):
+        """Cikis olmadan da tur islenmeli; yalniz seslendirme dusmeli."""
+        llm = _FakeLlm()
+        loop = _voice(stt=_FakeStt("hey astro selam"), llm=llm, tts=None)
+
+        said = loop.handle_utterance(np.full(16000, 0.2, np.float32), sample_rate=16000)
+
+        self.assertEqual(said, "Iyiyim.")
+        self.assertEqual(len(llm.prompts), 1)
+
+
+class _FakeLlmWithError:
+    """LLM sahtesi: cevap uretemez ve sebebini last_error'a yazar."""
+
+    def __init__(self, error="beklenmeyen cevap bicimi: boom"):
+        self.prompts = []
+        self.last_error = None
+        self._error = error
+
+    def reply(self, user_text):
+        self.prompts.append(user_text)
+        self.last_error = self._error
+        return None
+
+
+class LlmErrorReportingTests(unittest.TestCase):
+    """`LlmClient.last_error` hic okunmuyordu: gercek bir programlama hatasi
+    (yanlis yazilmis bir kwarg gibi) yutuluyor ve robotta yalnizca "hic cevap
+    vermiyor, nedeni belirsiz" olarak goruluyordu. VoiceLoop artik bu sebebi
+    bir kez basiyor -- her turda degil, cunku tekrarlayan bir saglayici kesintisi
+    durum log'unu bogmamali."""
+
+    def test_llm_hata_verince_sebep_bir_kez_basilir(self):
+        llm = _FakeLlmWithError("kota asildi")
+        printed = []
+        loop = _voice(stt=_FakeStt("hey astro selam"), llm=llm)
+        loop._report = lambda msg: printed.append(msg)
+
+        loop.handle_utterance(self.UTTERANCE, sample_rate=16000)
+        loop.stt = _FakeStt("hey astro tekrar")
+        loop.handle_utterance(self.UTTERANCE, sample_rate=16000)
+
+        self.assertEqual(printed.count("kota asildi"), 1,
+                         "ayni sebep birden fazla kez basildi")
+
+    def test_farkli_hata_yeniden_basilir(self):
+        llm = _FakeLlmWithError("kota asildi")
+        printed = []
+        loop = _voice(stt=_FakeStt("hey astro selam"), llm=llm)
+        loop._report = lambda msg: printed.append(msg)
+
+        loop.handle_utterance(self.UTTERANCE, sample_rate=16000)
+        llm._error = "ag hatasi"
+        loop.stt = _FakeStt("hey astro tekrar")
+        loop.handle_utterance(self.UTTERANCE, sample_rate=16000)
+
+        self.assertEqual(printed, ["kota asildi", "ag hatasi"],
+                         "farkli sebep basilmadi")
+
+    def test_last_error_yoksa_hic_basilmaz(self):
+        llm = _FakeLlm(answer=None)
+        printed = []
+        loop = _voice(stt=_FakeStt("hey astro selam"), llm=llm)
+        loop._report = lambda msg: printed.append(msg)
+
+        loop.handle_utterance(self.UTTERANCE, sample_rate=16000)
+
+        self.assertEqual(printed, [])
+
+    UTTERANCE = np.full(16000, 0.2, dtype=np.float32)
 
 
 if __name__ == "__main__":

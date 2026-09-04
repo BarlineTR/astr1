@@ -7,6 +7,7 @@ ROS yok: DDS yok, topic yok, launch yok, tek log, çalışan debugger.
 ./.venv/bin/python standalone/track.py                      # kamera + ses
 ./.venv/bin/python standalone/track.py --serial /dev/ttyACM0   # + kafa
 ./.venv/bin/python standalone/track.py --no-window --seconds 30
+./.venv/bin/python standalone/track.py --no-voice          # yalnizca takip
 ```
 
 Çıkmak için pencerede `q` ya da `Esc`.
@@ -56,6 +57,9 @@ Kamera dışında hiçbiri şart. ReSpeaker yoksa yalnız görüntüyle takip ed
 yoksa açık çevrim çalışır ve kafa açısını komuttan tahmin eder (bunu da çıkışta
 söyler). Masaüstünde, robot olmadan çalışması bilinçli: yalnızca bitmiş robotta
 çalışan bir teşhis aracının teşhis değeri az olur.
+
+Sesli yanıt `OPENAI_API_KEY` ister. Anahtar yoksa program tek satır uyarı basar
+ve yalnızca takip yapar — konuşma, görmenin önkoşulu değil.
 
 ## Testler
 

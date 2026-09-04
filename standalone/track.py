@@ -75,6 +75,8 @@ def main(argv=None) -> int:
                              "ölçeğini belirler; işaret ve sıralama bundan bağımsız "
                              f"doğrudur. Varsayılan {DEFAULT_MIC_SPACING_M} m.")
     parser.add_argument("--no-window", action="store_true", help="Pencere açma")
+    parser.add_argument("--no-voice", action="store_true",
+                        help="Sesli yanıtı kapat (yalnızca takip)")
     parser.add_argument("--seconds", type=float, default=None, help="Süre sınırı")
     parser.add_argument("--log-interval", type=float, default=1.0, metavar="SN",
                         help="Terminale durum satiri basma araligi (0 = yalnizca "
@@ -116,6 +118,16 @@ def main(argv=None) -> int:
               f"tek eksende yön (sağ/sol), ön/arka ayrımı yok")
     audio_was_available = audio.available
 
+    import voice as voice_module
+
+    voice_loop = None
+    if not opts.no_voice and audio.available:
+        voice_loop = voice_module.build_default_loop(audio)
+        if voice_loop is None:
+            print(f"🗣️  {voice_module.LAST_SETUP_ERROR}")
+        else:
+            print(f"🗣️  Sesli yanıt açık — uyandırma sözcüğü: '{voice_loop.wake_word}'")
+
     recorder = None
     if opts.record is not None:
         recorder = OverlayRecorder(opts.record or default_path())
@@ -149,6 +161,9 @@ def main(argv=None) -> int:
             doa_deg = audio.latest_doa_deg(now) if audio.available else None
             speech = audio.latest_speech(now) if audio.available else None
 
+            if voice_loop is not None:
+                voice_loop.pump(now)
+
             result = tracker.step(
                 faces=detections,
                 frame_size=(frame.shape[1], frame.shape[0]),
@@ -156,6 +171,7 @@ def main(argv=None) -> int:
                 speech=speech,
                 measured_head_deg=head.measured_angle_deg if head.has_feedback else None,
                 timestamp=now,
+                is_robot_speaking=voice_loop.is_speaking_at(now) if voice_loop else False,
             )
 
             head.send_angle(result.target_yaw_deg)
@@ -197,6 +213,8 @@ def main(argv=None) -> int:
                   "Gerçek açı sapabilir; --serial ile bağlayıp doğrulayın.")
         if recorder is not None:
             print(recorder.close())
+        if voice_loop is not None:
+            voice_loop.stop()
         camera.close()
         audio.close()
         head.close()
