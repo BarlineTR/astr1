@@ -20,6 +20,14 @@ class TargetManagerCore:
     def __init__(
         self,
         acquisition_threshold: float = 0.75,
+        # A bearing from sound is coarse: it says roughly where a voice came from, not
+        # who or where they are. Held to the visual bar it is never acquired at all —
+        # an audio-only target's confidence is DOA confidence times a freshness that
+        # halves every 0.4 s, so 0.75 is reached rarely and briefly, and the head sits
+        # still through a voice it can plainly hear. A lower bar is only reachable when
+        # nothing visual qualified, so sound never outranks a face; it just stops the
+        # robot ignoring someone speaking from outside the frame.
+        audio_acquisition_threshold: float = 0.45,
         hold_threshold: float = 0.40,
         target_lost_timeout_s: float = 1.0,
         min_attention_dwell_s: float = 2.50,
@@ -28,6 +36,7 @@ class TargetManagerCore:
         max_tracked_candidates: int = 6,
     ):
         self.acquisition_threshold = acquisition_threshold
+        self.audio_acquisition_threshold = audio_acquisition_threshold
         self.hold_threshold = hold_threshold
         self.target_lost_timeout_s = target_lost_timeout_s
         self.min_attention_dwell_s = min_attention_dwell_s
@@ -100,6 +109,21 @@ class TargetManagerCore:
         if self.active_target is None:
             # No active target: Select best candidate meeting acquisition threshold (≥0.75)
             best_candidate = next((t for t in self.candidate_targets if t.confidence >= self.acquisition_threshold), None)
+
+            # Nothing seen clearly enough. Fall back to sound rather than staying put:
+            # candidate_targets is already ordered Fused > Vision > Audio, so this only
+            # runs when no face cleared the visual bar, and it cannot promote sound over
+            # a face that did.
+            if best_candidate is None:
+                best_candidate = next(
+                    (
+                        t for t in self.candidate_targets
+                        if t.modality == Modality.AUDIO
+                        and t.confidence >= self.audio_acquisition_threshold
+                    ),
+                    None,
+                )
+
             if best_candidate is not None:
                 self.active_target = best_candidate
                 self._active_target_start_time = timestamp
