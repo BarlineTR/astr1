@@ -30,6 +30,7 @@ import core_path  # noqa: F401,E402
 from head_link import HeadLink, open_port  # noqa: E402
 from recorder import OverlayRecorder, default_path  # noqa: E402
 from sources import AudioSource, CameraSource  # noqa: E402
+from stereo_doa import DEFAULT_MIC_SPACING_M  # noqa: E402
 from statuslog import StatusLog  # noqa: E402
 from tracker import GazeTracker  # noqa: E402
 
@@ -64,6 +65,11 @@ def main(argv=None) -> int:
     parser.add_argument("--camera", type=int, default=0, help="Kamera indeksi")
     parser.add_argument("--serial", default=None, help="Arduino portu, örn. /dev/ttyACM0")
     parser.add_argument("--audio-device", type=int, default=None, help="Mikrofon indeksi")
+    parser.add_argument("--mic-spacing", type=float, default=DEFAULT_MIC_SPACING_M,
+                        metavar="M",
+                        help="Stereo modda iki mikrofon arası mesafe (metre). Açının "
+                             "ölçeğini belirler; işaret ve sıralama bundan bağımsız "
+                             f"doğrudur. Varsayılan {DEFAULT_MIC_SPACING_M} m.")
     parser.add_argument("--no-window", action="store_true", help="Pencere açma")
     parser.add_argument("--seconds", type=float, default=None, help="Süre sınırı")
     parser.add_argument("--log-interval", type=float, default=1.0, metavar="SN",
@@ -90,10 +96,15 @@ def main(argv=None) -> int:
     else:
         print(f"📷 {camera.backend} | yüz algılama: {camera.detector_name}")
 
-    audio = AudioSource(device=opts.audio_device)
+    audio = AudioSource(device=opts.audio_device, mic_spacing_m=opts.mic_spacing)
     audio.start()
-    print("🎤 Ses akışı açıldı (dizi ilk bloklarda doğrulanacak)" if audio.available
-          else f"🎤 Ses yok ({audio.error}) — yalnızca görüntüyle takip")
+    if not audio.available:
+        print(f"🎤 Ses yok ({audio.error}) — yalnızca görüntüyle takip")
+    elif audio.mode == "array":
+        print(f"🎤 4'lü mikrofon dizisi: {audio.device_name} (dizi ilk bloklarda doğrulanacak)")
+    else:
+        print(f"🎤 Stereo çift: {audio.device_name} @{audio.sample_rate} Hz — "
+              f"tek eksende yön (sağ/sol), ön/arka ayrımı yok")
     audio_was_available = audio.available
 
     recorder = None

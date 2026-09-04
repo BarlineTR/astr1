@@ -20,6 +20,7 @@ import numpy as np
 
 import core_path  # noqa: F401
 from astro_audio.doa_estimator import AcousticDOAEstimator  # noqa: E402
+from stereo_doa import DEFAULT_MIC_SPACING_M, StereoDOA  # noqa: E402
 from astro_vision.detection_quality import create_face_detector  # noqa: E402
 
 from tracker import Detection  # noqa: E402
@@ -52,6 +53,19 @@ INT16_SCALE = 32768.0
 # and preamp noise keeps even co-located ones well below it.
 DUPLICATE_CORRELATION = 0.9999
 DUPLICATE_BLOCKS_TO_LATCH = 3
+
+# ALSA her eklentisini bir aygıt gibi listeler. Bunlar mikrofon değil; 4 kanal istendiğinde
+# kabul edip laptopun stereo çiftini kopyalayarak "başarılı" olan da bunlar.
+VIRTUAL_DEVICE_NAMES = frozenset({
+    "default", "sysdefault", "pulse", "pipewire", "samplerate", "speexrate",
+    "upmix", "vdownmix", "dmix", "null", "jack", "oss", "spdif", "hdmi",
+})
+# Gerçek bir ses kartı bu kadar giriş kanalı sunmaz; eklentiler 32-128 ilan ediyor.
+MAX_REAL_INPUT_CHANNELS = 16
+
+# 44.1 kHz'de 4096 örnek ~93 ms: bir hecenin doğrudan yolunu tutacak kadar uzun,
+# konuşmacı hareket ederken kerterizi bulandırmayacak kadar kısa.
+STEREO_BLOCK_SAMPLES = 4096
 
 
 def _is_duplicate(a: np.ndarray, b: np.ndarray) -> bool:
@@ -198,6 +212,7 @@ class AudioSource:
         device: Optional[int] = None,
         max_age_s: float = 0.5,
         stream_factory: Optional[Callable] = None,
+        mic_spacing_m: float = DEFAULT_MIC_SPACING_M,
     ):
         self.device = device
         self.max_age_s = max_age_s
@@ -211,6 +226,11 @@ class AudioSource:
         self.error: Optional[str] = None
         self._array_dead = False
         self._duplicate_blocks = 0
+        self.mode: Optional[str] = None
+        self.device_name: Optional[str] = None
+        self.sample_rate = SAMPLE_RATE
+        self._stereo = None
+        self._mic_spacing_m = mic_spacing_m
 
     def start(self) -> None:
         try:
@@ -219,9 +239,23 @@ class AudioSource:
                 import sounddevice
 
                 factory = sounddevice.InputStream
+
+            device, channels, rate = self._choose_device()
+            if device is None:
+                self.error = "kullanilabilir mikrofon bulunamadi"
+                self.available = False
+                return
+
+            self.mode = "array" if channels >= 4 else "stereo"
+            self.sample_rate = rate
+            if self.mode == "stereo":
+                self._stereo = StereoDOA(sample_rate=rate,
+                                         mic_spacing_m=self._mic_spacing_m)
+
             self._stream = factory(
-                device=self.device, channels=4, samplerate=SAMPLE_RATE,
-                blocksize=BLOCK_SAMPLES, dtype="float32", callback=self._on_block,
+                device=device, channels=channels, samplerate=rate,
+                blocksize=BLOCK_SAMPLES if self.mode == "array" else STEREO_BLOCK_SAMPLES,
+                dtype="float32", callback=self._on_block,
             )
             self._stream.start()
             self.available = True
@@ -229,10 +263,83 @@ class AudioSource:
             self.error = str(exc)
             self.available = False
 
+    def _choose_device(self):
+        """Picks a real sound card, and the best mode it can support.
+
+        Asking the `default` device for four channels is what hid the missing array:
+        ALSA's plugin layer accepts the request and fills it by duplicating the
+        laptop's stereo pair. So the device is chosen before the channel count is,
+        and only from hardware.
+
+        A genuine four-channel card gives the full circle. Two channels give one
+        axis — front/back ambiguous, but enough to decide which way to turn, and the
+        built-in pair is genuinely separated: measured -3.99 samples from the left
+        speaker against +4.19 from the right, at 44.1 kHz on the raw device.
+        """
+        if self.device is not None:
+            info = self._device_info(self.device)
+            channels = 4 if info["max_input_channels"] >= 4 else 2
+            return self.device, channels, int(info["default_samplerate"])
+
+        best_stereo = None
+        for index, info in self._hardware_inputs():
+            if info["max_input_channels"] >= 4:
+                self.device_name = info["name"]
+                return index, 4, SAMPLE_RATE
+            if best_stereo is None and info["max_input_channels"] >= 2:
+                best_stereo = (index, info)
+
+        if best_stereo is None:
+            return None, 0, SAMPLE_RATE
+
+        index, info = best_stereo
+        self.device_name = info["name"]
+        return index, 2, int(info["default_samplerate"])
+
+    @staticmethod
+    def _device_info(index):
+        import sounddevice
+
+        return sounddevice.query_devices(index)
+
+    @staticmethod
+    def _hardware_inputs():
+        """Real capture devices, with ALSA's plugin aliases filtered out."""
+        import sounddevice
+
+        found = []
+        for index, info in enumerate(sounddevice.query_devices()):
+            inputs = info["max_input_channels"]
+            if inputs < 1 or inputs > MAX_REAL_INPUT_CHANNELS:
+                continue
+            if info["name"].split(":")[0].strip().lower() in VIRTUAL_DEVICE_NAMES:
+                continue
+            found.append((index, info))
+        return found
+
     def _on_block(self, indata, _frames, time_info, _status):
         import time as _time
 
-        self.process_block(np.array(indata, copy=True), timestamp=_time.monotonic())
+        block = np.array(indata, copy=True)
+        now = _time.monotonic()
+        if self.mode == "stereo":
+            self.process_stereo_block(block, timestamp=now)
+        else:
+            self.process_block(block, timestamp=now)
+
+    def process_stereo_block(self, block: np.ndarray, timestamp: float) -> None:
+        """Localises one block from a two-microphone pair."""
+        if self._stereo is None or block.ndim != 2:
+            return
+        channels = block.T if block.shape[0] > block.shape[1] else block
+        if channels.shape[0] < 2:
+            return
+        if float(np.sqrt(np.mean(np.square(channels)))) < MIN_RMS:
+            return
+
+        azimuth, _sharpness = self._stereo.estimate(channels[0], channels[1])
+        if azimuth is not None:
+            self._publish(azimuth if azimuth >= 0.0 else azimuth + 360.0, timestamp)
 
     def process_block(self, block: np.ndarray, timestamp: float) -> None:
         """Localises one block, if it has the channels and the energy to justify it."""
