@@ -22,6 +22,7 @@ from sources import (  # noqa: E402
     DUPLICATE_BLOCKS_TO_LATCH,
     MIN_RMS,
     SAMPLE_RATE,
+    UTTERANCE_BUFFER_S,
     AudioSource,
     CameraSource,
     to_detections,
@@ -185,6 +186,8 @@ def _detached_source():
     src._verdict = None
     src._verdict_stamp = 0.0
     src.sample_rate = SAMPLE_RATE
+    src._utterance = None
+    src._written = 0
     src._array_dead = False
     src._duplicate_blocks = 0
     src._mic_channels = None
@@ -507,6 +510,95 @@ class TestSpeechWindow(unittest.TestCase):
         self._feed(src, self.WINDOW_BLOCKS)
 
         self.assertIsNone(src.latest_speech(1.0 + self.WINDOW_BLOCKS * 0.064 + 5.0))
+
+
+class TestUtteranceBuffer(unittest.TestCase):
+    """Sozce tamponu konusma penceresinden ayri ve daha uzun.
+
+    Konusma verdisi 0.6 s'lik pencereye bakiyor; sozce ise bittikten SONRA
+    bastan sona geri okunmali. Ayni tamponu paylasirlarsa sozcenin basi silinir.
+    """
+
+    def test_yazilan_ses_geri_okunabiliyor(self):
+        src = _detached_source()
+        block = _plane_wave_array(20.0)
+
+        src.process_block(block, timestamp=1.0)
+
+        window = src.read_window(seconds=1.0)
+        self.assertIsNotNone(window)
+        self.assertEqual(window.ndim, 1, "sozce tamponu mono olmali")
+        self.assertEqual(len(window), BLOCK_SAMPLES)
+
+    def test_istenen_sureden_fazlasi_verilmez(self):
+        src = _detached_source()
+        for i in range(20):
+            src.process_block(_plane_wave_array(20.0), timestamp=1.0 + i * 0.064)
+
+        window = src.read_window(seconds=0.2)
+
+        self.assertLessEqual(len(window), int(0.2 * SAMPLE_RATE) + BLOCK_SAMPLES)
+
+    def test_tampon_konusma_penceresinden_uzun(self):
+        """0.6 s'lik konusma penceresi bir sozceyi tutamaz."""
+        src = _detached_source()
+        for i in range(60):                       # 60 x 64 ms = 3.8 s
+            src.process_block(_plane_wave_array(20.0), timestamp=1.0 + i * 0.064)
+
+        window = src.read_window(seconds=3.0)
+
+        self.assertGreater(len(window), int(2.0 * SAMPLE_RATE),
+                           "tampon 0.6 s'lik konusma penceresi kadar kisa kalmis")
+
+    def test_hic_ses_gelmemisse_none(self):
+        self.assertIsNone(_detached_source().read_window(seconds=1.0))
+
+
+class TestUtteranceCursor(unittest.TestCase):
+    """Imlec her ornegi tam bir kez teslim eder.
+
+    Ses dongusu ana dongudén 30 Hz'te (33 ms) pompalaniyor, bloklar ise 64 ms.
+    "Son 64 ms"i okumak ardisik cagrilarda ortusur ve sozceye ayni sesi iki
+    kez yazar; kelimeler kekeleyerek transkribe edilir.
+    """
+
+    def test_ayni_ses_iki_kez_teslim_edilmez(self):
+        src = _detached_source()
+        src.process_block(_plane_wave_array(20.0), timestamp=1.0)
+
+        first, cursor = src.read_since(0)
+        second, cursor2 = src.read_since(cursor)
+
+        self.assertEqual(len(first), BLOCK_SAMPLES)
+        self.assertEqual(len(second), 0, "ayni ses ikinci kez teslim edildi")
+        self.assertEqual(cursor2, cursor)
+
+    def test_yeni_ses_bir_sonraki_okumada_gelir(self):
+        src = _detached_source()
+        src.process_block(_plane_wave_array(20.0), timestamp=1.0)
+        _, cursor = src.read_since(0)
+
+        src.process_block(_plane_wave_array(20.0), timestamp=1.064)
+        new, _ = src.read_since(cursor)
+
+        self.assertEqual(len(new), BLOCK_SAMPLES)
+
+    def test_hic_ses_yokken_bos_dizi_ve_ayni_imlec(self):
+        empty, cursor = _detached_source().read_since(0)
+
+        self.assertEqual(len(empty), 0)
+        self.assertEqual(cursor, 0)
+
+    def test_pompa_gecikirse_tamponun_tuttugu_kadari_verilir(self):
+        """Imlec tamponun gerisinde kalirsa program durmaz, en eskisi dusurulur."""
+        src = _detached_source()
+        for i in range(200):                       # 12.8 sn > 10 sn tampon
+            src.process_block(_plane_wave_array(20.0), timestamp=1.0 + i * 0.064)
+
+        recovered, cursor = src.read_since(0)
+
+        self.assertLessEqual(len(recovered), int(UTTERANCE_BUFFER_S * SAMPLE_RATE))
+        self.assertEqual(cursor, 200 * BLOCK_SAMPLES)
 
 
 if __name__ == "__main__":

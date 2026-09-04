@@ -38,6 +38,11 @@ SPEECH_WINDOW_S = 0.6
 # Verdi de kerteriz gibi bayatlar. Bir saniye önce konuşulmuş olması şu an
 # konuşulduğunu söylemez, ve kafayı çeviren yetki bayat bir kanıta dayanmamalı.
 SPEECH_MAX_AGE_S = 0.5
+
+# Sözce tamponu. Konuşma verdisi 0.6 s'lik pencereye bakar; sözcenin kendisi
+# bittikten sonra baştan sona geri okunur, o yüzden ayrı ve uzun tutulur.
+# 10 s, bir turda söylenebilecek en uzun cümleyi rahatça alır.
+UTTERANCE_BUFFER_S = 10.0
 # Below this the block is background noise and GCC-PHAT would localise the room.
 #
 # In float32 units. The stream is opened with dtype="float32", so sounddevice hands
@@ -240,6 +245,8 @@ class AudioSource:
         self._estimator = AcousticDOAEstimator(sample_rate=SAMPLE_RATE)
         self._speech = SpeechDetector(sample_rate=SAMPLE_RATE)
         self._window: Optional[np.ndarray] = None
+        self._utterance: Optional[np.ndarray] = None
+        self._written: int = 0        # tampona şimdiye kadar yazılan toplam örnek
         self._verdict = None
         self._verdict_stamp: float = 0.0
         self._lock = threading.Lock()
@@ -460,6 +467,8 @@ class AudioSource:
         susmaları siler ve geriye kesintisiz bir uğultu bırakır — sınıflandırıcıya
         gerçek konuşmayı "modülasyonsuz" diye gösterirdi.
         """
+        self._append_utterance(mono)
+
         capacity = int(SPEECH_WINDOW_S * self.sample_rate)
         block = np.asarray(mono, dtype=np.float32).ravel()
         self._window = (block if self._window is None
@@ -471,6 +480,48 @@ class AudioSource:
         verdict = self._speech.classify(self._window)
         with self._lock:
             self._verdict, self._verdict_stamp = verdict, float(timestamp)
+
+    def _append_utterance(self, mono: np.ndarray) -> None:
+        """Sözce tamponunu besler. Konuşma penceresinden ayrı tutulur."""
+        capacity = int(UTTERANCE_BUFFER_S * self.sample_rate)
+        block = np.asarray(mono, dtype=np.float32).ravel()
+        with self._lock:
+            self._utterance = (block if self._utterance is None
+                               else np.concatenate((self._utterance, block)))[-capacity:]
+            self._written += len(block)
+
+    def read_since(self, cursor: int):
+        """`cursor`'dan sonra yazılan yeni örnekler ve yeni imleç.
+
+        Ses döngüsü ana döngüden 30 Hz'te (33 ms) pompalanıyor, bloklar ise 64 ms.
+        "Son N saniye" okumak ardışık çağrılarda örtüşür ve sözceye aynı sesi iki
+        kez yazar. İmleç her örneği tam bir kez teslim eder.
+
+        İmleç tamponun gerisinde kalırsa (pompa geciktiyse) elde ne varsa verilir:
+        eksik ses, duran bir program'dan iyidir.
+        """
+        with self._lock:
+            if self._utterance is None:
+                return np.zeros(0, dtype=np.float32), cursor
+            held = len(self._utterance)
+            oldest = self._written - held
+            start = max(0, int(cursor) - oldest)
+            if start >= held:
+                return np.zeros(0, dtype=np.float32), self._written
+            return np.array(self._utterance[start:], copy=True), self._written
+
+    def read_window(self, seconds: float) -> Optional[np.ndarray]:
+        """Son `seconds` saniyelik mono ses. Hız `self.sample_rate`.
+
+        16 kHz garanti edilmez: dizi modunda 16 kHz açılıyor ama stereo modda
+        aygıtın kendi hızı kullanılıyor (laptopta 44.1 kHz). Dönüştürme burada
+        değil, STT'ye verilmeden hemen önce tek noktada yapılır.
+        """
+        with self._lock:
+            if self._utterance is None or len(self._utterance) == 0:
+                return None
+            wanted = max(1, int(seconds * self.sample_rate))
+            return np.array(self._utterance[-wanted:], copy=True)
 
     def latest_speech(self, now: float):
         """En son konuşma verdisi, hâlâ tazeyse. Yoksa None."""
