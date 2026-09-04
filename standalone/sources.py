@@ -86,12 +86,33 @@ def _is_duplicate(a: np.ndarray, b: np.ndarray) -> bool:
     return abs(float(np.dot(a, b)) / denom) >= DUPLICATE_CORRELATION
 
 
-def to_detections(found) -> List[Detection]:
-    """Turns the detector's (x, y, w, h, confidence) tuples into Detections."""
-    return [
-        Detection(x=int(x), y=int(y), w=int(w), h=int(h), confidence=float(conf))
-        for (x, y, w, h, conf) in found
-    ]
+def to_detections(found, frame_size: Optional[Tuple[int, int]] = None) -> List[Detection]:
+    """Turns the detector's (x, y, w, h, confidence) tuples into Detections with geometry.
+
+    Computes camera optical axis azimuth and pinhole distance directly, matching
+    the exact calculations in feat/gaze-from-11ca516 face_detector_node.py.
+    """
+    out = []
+    frame_w = frame_size[0] if frame_size else 640
+    for item in found:
+        x, y, w, h, conf = item[:5]
+        face_center_x = x + (w / 2.0)
+        norm_offset = (face_center_x - (frame_w / 2.0)) / (frame_w / 2.0)
+        cam_azimuth = float(-norm_offset * 36.0)
+        focal_length = frame_w * 0.8
+        dist_m = float(np.clip((0.15 * focal_length) / max(1, w), 0.3, 8.0))
+        out.append(
+            Detection(
+                x=int(x),
+                y=int(y),
+                w=int(w),
+                h=int(h),
+                confidence=float(conf),
+                cam_azimuth_deg=round(cam_azimuth, 1),
+                dist_m=round(dist_m, 2),
+            )
+        )
+    return out
 
 
 class CameraSource:
@@ -166,17 +187,30 @@ class CameraSource:
                 else:
                     fallback.release()
 
-        model_dir = os.path.expanduser(
-            os.getenv("FACE_MODEL_DIR", "~/.astro/models")
+        # Constrain OpenCV thread pool to 1 thread for embedded/robot CPU protection
+        try:
+            cv2.setNumThreads(1)
+        except Exception:
+            pass
+
+        # Load cascades: Primary frontal face + Alt2 fallback, exactly matching
+        # face_detector_node.py in feat/gaze-from-11ca516. YuNet is NOT used.
+        from astro_vision.detection_quality import DetectionHold, HaarFaceDetector
+
+        frontal_path = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+        alt2_path = cv2.data.haarcascades + "haarcascade_frontalface_alt2.xml"
+        cascade = cv2.CascadeClassifier(frontal_path)
+        alt_cascade = cv2.CascadeClassifier(alt2_path)
+        self.detector = HaarFaceDetector(
+            cascade=cascade,
+            alt_cascade=alt_cascade,
+            hold=DetectionHold(hold_frames=2, decay=0.80),
         )
-        cascade = cv2.CascadeClassifier(
-            cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
-        )
-        self.detector = create_face_detector(model_dir, cascade)
 
     @property
     def detector_name(self) -> str:
         return type(self.detector).__name__
+
 
     def read(self) -> Tuple[bool, Optional[np.ndarray]]:
         if not self.available:
@@ -192,7 +226,11 @@ class CameraSource:
             return False, None
 
     def detect(self, frame) -> List[Detection]:
-        return to_detections(self.detector.detect(frame))
+        if frame is None or not self.available:
+            return []
+        h, w = frame.shape[:2]
+        return to_detections(self.detector.detect(frame), frame_size=(w, h))
+
 
     def close(self) -> None:
         try:
@@ -297,6 +335,13 @@ class AudioSource:
             return (self.device, self._plan_channels(info),
                     int(info["default_samplerate"]))
 
+        # Prefer genuine ReSpeaker array if present among hardware inputs
+        for index, info in self._hardware_inputs():
+            name_l = info["name"].lower()
+            if "respeaker" in name_l and info["max_input_channels"] >= 4:
+                self.device_name = info["name"]
+                return index, self._plan_channels(info), SAMPLE_RATE
+
         best_stereo = None
         for index, info in self._hardware_inputs():
             if info["max_input_channels"] >= 4:
@@ -304,6 +349,7 @@ class AudioSource:
                 return index, self._plan_channels(info), SAMPLE_RATE
             if best_stereo is None and info["max_input_channels"] >= 2:
                 best_stereo = (index, info)
+
 
         if best_stereo is None:
             return None, 0, SAMPLE_RATE

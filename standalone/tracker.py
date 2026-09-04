@@ -42,6 +42,9 @@ class Detection:
     w: int
     h: int
     confidence: float
+    cam_azimuth_deg: Optional[float] = None
+    dist_m: Optional[float] = None
+
 
 
 @dataclass
@@ -114,8 +117,11 @@ class GazeTracker:
 
         if doa_deg is not None:
             self._ingest_audio(doa_deg, timestamp)
+        else:
+            self._latest_audio = None
 
         self._ingest_vision(faces, frame_size, timestamp)
+
 
         fused = self.fusion.fuse(self._latest_audio, self._latest_tracks, timestamp)
         target_state = self.target_manager.update(fused, timestamp)
@@ -167,14 +173,25 @@ class GazeTracker:
         width, height = frame_size
         observations = []
         for face in faces:
+            dist = (
+                face.dist_m
+                if face.dist_m is not None
+                else self._estimate_distance(face.w, width)
+            )
+            cam_az = face.cam_azimuth_deg
             observations.append(
                 self.visual_perception.process_detection(
-                    x=face.x, y=face.y, w=face.w, h=face.h,
-                    depth_m=self._estimate_distance(face.w, width),
+                    x=face.x,
+                    y=face.y,
+                    w=face.w,
+                    h=face.h,
+                    depth_m=dist,
                     timestamp=timestamp,
                     actual_head_yaw_deg=self.head_angle_deg,
-                    frame_width=width, frame_height=height,
+                    frame_width=width,
+                    frame_height=height,
                     confidence=face.confidence if face.confidence else UNSCORED_CONFIDENCE,
+                    cam_azimuth_deg=cam_az,
                 )
             )
         self._latest_tracks = self.visual_tracker.update(
@@ -182,6 +199,7 @@ class GazeTracker:
             timestamp=timestamp,
             actual_head_yaw_deg=self.head_angle_deg,
         )
+
 
     @staticmethod
     def _estimate_distance(box_width_px: int, frame_width_px: int) -> float:
