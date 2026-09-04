@@ -64,7 +64,25 @@ static constexpr int32_t HEAD_TICKS_PER_REV =
 static constexpr int HEAD_PWM_LIMIT = 200;
 static constexpr int HEAD_PWM_MIN = 105;
 
-static constexpr float HEAD_KP = 5.0f, HEAD_KD = 0.05f;
+// Kafa konum PID'i.
+//
+// HEAD_KD 0.05 iken sonmleme yok sayilirdi: 20 deg/s (~52 tick/s) hizda D terimi
+// 2.6 PWM ediyordu, yani 200'luk olcekte gorunmez. Sonumsuz bir PID, asagidaki
+// surtunme ileri beslemesiyle birlesince limit cevrimi uretir.
+//
+// Ama enkoder turevi kuantize: iki cevrim arasindaki tek bir tick 50 Hz'de zaten
+// 50 tick/s okunur. Ham turevi buyuk bir kazancla carpmak, sonumleme yerine gurultu
+// enjekte eder. Bu yuzden turev once suzuluyor (HEAD_D_FILTER), sonra kazanca giriyor.
+static constexpr float HEAD_KP = 5.0f, HEAD_KD = 0.60f;
+
+// Turev alcak geciren katsayisi (0..1). Kucuk = daha puruzsuz, daha gecikmeli.
+static constexpr float HEAD_D_FILTER = 0.25f;
+
+// PWM egim siniri: cikisin bir kontrol cevriminde degisebilecegi en buyuk miktar.
+// Olu bant kenarinda ileri besleme 0'dan 105'e basamak yapiyordu; 200'luk olcekte
+// bu, yarim skalalik bir darbe. 25 ile 105'e dort cevrimde (80 ms) ulasilir: darbe
+// yerine rampa, ama motor yine de kopma esigini gecmekte gecikmez.
+static constexpr int HEAD_PWM_SLEW = 25;
 // Dişli boşluğu 0.85 derece olarak ölçüldü (docs/final_validation_report.md) ve bir
 // tick 0.386 derece. Deadband boşluktan küçük olursa kontrolcü, mekanizmanın
 // kapatamayacağı bir hatayı kovalar: motor döner, çıkış takip etmez, hata durur,
@@ -98,6 +116,7 @@ static float g_left_err_prev = 0.0f, g_right_err_prev = 0.0f;
 static int32_t g_head_target_ticks = 0;
 static int32_t g_head_err_prev = 0;
 static int g_head_pwm = 0;
+static float g_head_de_filt = 0.0f;   // suzulmus hata turevi (tick/s)
 static int32_t g_head_stall_ref = 0;
 static uint32_t g_head_stall_ms = 0;
 
@@ -277,7 +296,10 @@ void headControl(uint32_t dt_ms) {
     g_head_profile_inited = true;
   }
 
-  // Yumuşak hız sınırlayıcı: 50 Hz (20ms) döngüsünde hedefi 35 deg/s hızla rampala
+  // Yumuşak hız sınırlayıcı: 50 Hz (20ms) döngüsünde hedefi HEAD_MAX_VEL_DEG_S ile
+  // rampala. Bu yalnizca SETPOINT'i sinirlar, gercek hareketi degil: kafa olu bantta
+  // beklerken rampa ilerler, arada hata birikir, kafa kurtulunca PWM doyar ve gercek
+  // hiz rampayi asar. Kayittan olculen tepe 161 deg/s idi, rampa 20.
   float dt_s = (float)dt_ms / 1000.0f;
   float max_step = HEAD_MAX_TICKS_PER_SEC * dt_s;
   float diff = (float)g_head_target_ticks - g_head_profile_pos;
@@ -299,6 +321,7 @@ void headControl(uint32_t dt_ms) {
   if (!g_motors_enabled || !g_head_active) {
     setHeadPWM(0);
     g_head_err_prev = err;
+    g_head_de_filt = 0.0f;
     g_head_stall_ref = pos;
     g_head_stall_ms = millis();
     return;
@@ -308,18 +331,32 @@ void headControl(uint32_t dt_ms) {
   if (abs(err) <= HEAD_DEADBAND_TICKS) {
     setHeadPWM(0);
     g_head_err_prev = err;
+    g_head_de_filt = 0.0f;
     g_head_stall_ref = pos;
     g_head_stall_ms = millis();
     return;
   }
 
-  float de = (float)(err - g_head_err_prev) / (dt_ms / 1000.0f);
+  float de_raw = (float)(err - g_head_err_prev) / (dt_ms / 1000.0f);
   g_head_err_prev = err;
 
-  // PID + Statik sürtünme eşiği için feedforward tabanı
+  // Enkoder turevi kuantize: tek bir tick farki 50 Hz'de 50 tick/s okunur. Ham haliyle
+  // buyuk bir Kd ile carpmak sonumleme degil gurultu uretir, o yuzden once suzuyoruz.
+  g_head_de_filt += HEAD_D_FILTER * (de_raw - g_head_de_filt);
+
+  // PID + statik surtunme icin ileri besleme tabani.
   float ff = (err > 0) ? (float)HEAD_PWM_MIN : -(float)HEAD_PWM_MIN;
-  float u = ff + (HEAD_KP * (float)err) + (HEAD_KD * de);
+  float u = ff + (HEAD_KP * (float)err) + (HEAD_KD * g_head_de_filt);
   int pwm = (int)constrain(u, (float)-HEAD_PWM_LIMIT, (float)HEAD_PWM_LIMIT);
+
+  // Cikisi egimle sinirla. Olu bandi gecen an ileri besleme 0'dan 105'e basamak
+  // yapiyordu; motoru kopma esiginin cok otesine bir anda itmek, asimi ve ardindan
+  // ters yonde ayni darbeyi getiriyor — olculen 0.53 Hz'lik limit cevrimi buydu.
+  // Durdurma egime tabi degil: hedefe varinca ya da guvenlik kesince surus derhal
+  // kalkmali, motorun bosta donmesi sakincasiz.
+  int delta = pwm - g_head_pwm;
+  if (delta >  HEAD_PWM_SLEW) pwm = g_head_pwm + HEAD_PWM_SLEW;
+  if (delta < -HEAD_PWM_SLEW) pwm = g_head_pwm - HEAD_PWM_SLEW;
 
   setHeadPWM(pwm);
 
