@@ -250,5 +250,73 @@ class TurnTests(unittest.TestCase):
                                msg="ses STT'ye yakalama hizinda verilmis")
 
 
+class EchoAndBargeInTests(unittest.TestCase):
+    """Robot kendini duymamali, ama kullanici araya girince susmali."""
+
+    def _loop(self, output=None):
+        return _voice(output=output or _FakeOutput(), echo_cooldown_s=0.65)
+
+    def test_hoparlor_sustuktan_sonra_sogumada_hala_konusuyor_sayilir(self):
+        """Bayrak aninda duserse mikrofona yolda olan kendi sesi transkribe edilir."""
+        loop = self._loop()
+
+        loop.note_playback(True, timestamp=10.0)
+        loop.note_playback(False, timestamp=11.0)
+
+        self.assertTrue(loop.is_speaking_at(11.3), "soguma penceresi yok")
+        self.assertFalse(loop.is_speaking_at(11.8), "soguma hic bitmiyor")
+
+    def test_robot_konusurken_gelen_konusma_transkribe_edilmez(self):
+        loop = self._loop()
+        loop.note_playback(True, timestamp=10.0)
+
+        closed = []
+        t = 10.0
+        for is_speech in [True] * 10 + [False] * 16:
+            out = loop.on_block(is_speech, _block(), timestamp=t)
+            if out is not None:
+                closed.append(out)
+            t += BLOCK_S
+
+        self.assertEqual(closed, [], "robot konusurken sozce transkripsiyona gitti")
+
+    def test_robot_konusurken_gercek_konusma_calmayi_keser(self):
+        output = _FakeOutput()
+        loop = self._loop(output=output)
+        loop.note_playback(True, timestamp=10.0)
+
+        t = 10.0
+        for _ in range(6):                       # 0.38 sn kesintisiz konusma
+            loop.on_block(True, _block(), timestamp=t)
+            t += BLOCK_S
+
+        self.assertGreaterEqual(output.interrupts, 1, "barge-in calismadi")
+
+    def test_robot_konusurken_gurultu_calmayi_kesmez(self):
+        output = _FakeOutput()
+        loop = self._loop(output=output)
+        loop.note_playback(True, timestamp=10.0)
+
+        t = 10.0
+        for _ in range(30):
+            loop.on_block(False, _block(), timestamp=t)
+            t += BLOCK_S
+
+        self.assertEqual(output.interrupts, 0, "gurultu calmayi kesti")
+
+    def test_robot_susarken_sozce_normal_kapanir(self):
+        loop = self._loop()
+
+        closed = []
+        t = 0.0
+        for is_speech in [True] * 10 + [False] * 16:
+            out = loop.on_block(is_speech, _block(), timestamp=t)
+            if out is not None:
+                closed.append(out)
+            t += BLOCK_S
+
+        self.assertEqual(len(closed), 1)
+
+
 if __name__ == "__main__":
     unittest.main()

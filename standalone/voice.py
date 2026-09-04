@@ -36,6 +36,15 @@ STT_SAMPLE_RATE = 16000
 
 WAKE_WORD = "hey astro"
 
+# Hoparlör sustuktan sonra mikrofonun kendi sesini duymayı bırakması zaman alır.
+# .env'deki ECHO_MUTE_COOLDOWN_S ile aynı sayı; bayrak anında düşerse yolda olan
+# kendi ses transkribe edilir ve robot kendine cevap verir.
+DEFAULT_ECHO_COOLDOWN_S = 0.65
+
+# Robot konuşurken araya girmeyi ciddiye almadan önce görülmesi gereken kesintisiz
+# konuşma. Tek blok (64 ms) hoparlör sızıntısıyla da olabilir; 0.3 s bir hecedir.
+DEFAULT_BARGE_IN_S = 0.3
+
 
 class UtteranceTracker:
     """Blok blok gelen konuşma kararlarından sözce sınırı çıkarır.
@@ -143,6 +152,8 @@ class VoiceLoop:
         speech: Optional[SpeechDetector] = None,
         wake_word: str = WAKE_WORD,
         silence_s: float = DEFAULT_SILENCE_S,
+        echo_cooldown_s: float = DEFAULT_ECHO_COOLDOWN_S,
+        barge_in_s: float = DEFAULT_BARGE_IN_S,
     ):
         self.audio = audio
         self.stt = stt
@@ -153,10 +164,68 @@ class VoiceLoop:
         self.speech = speech or SpeechDetector(sample_rate=STT_SAMPLE_RATE)
         self.wake_word = wake_word
         self.silence_s = float(silence_s)
+        self.echo_cooldown_s = float(echo_cooldown_s)
+        self.barge_in_s = float(barge_in_s)
+        self._playing = False
+        self._playback_ended_at: Optional[float] = None
+        self._barge_in_since: Optional[float] = None
+        # Sözce takipçisi **yakalama** hızıyla kurulur, STT hızıyla değil. Bloklar
+        # tampondan yakalama hızında geliyor (dizi modunda 16 kHz, stereo modda
+        # aygıtın kendi hızı — laptopta 44.1 kHz); STT hızını varsaymak sözce üst
+        # sınırını 2.75 kat yanlış hesaplardı. Dönüşüm yalnızca STT'ye girerken.
+        capture_rate = int(getattr(audio, "sample_rate", 0) or STT_SAMPLE_RATE)
+        self._utterance = UtteranceTracker(sample_rate=capture_rate,
+                                           silence_s=self.silence_s)
 
     @property
     def is_speaking(self) -> bool:
-        return bool(self.output is not None and getattr(self.output, "is_playing", False))
+        """Anlık durum. Zamana bağlı karar için `is_speaking_at` kullanılır."""
+        if self.output is not None and getattr(self.output, "is_playing", False):
+            return True
+        return self._playing
+
+    def note_playback(self, is_playing: bool, timestamp: float) -> None:
+        """`AudioOutputManager`'ın çalma durumu değişince çağrılır."""
+        if not is_playing and self._playing:
+            self._playback_ended_at = float(timestamp)
+        self._playing = bool(is_playing)
+
+    def is_speaking_at(self, timestamp: float) -> bool:
+        """Robot şu anda konuşuyor mu — yankı soğuması dahil."""
+        if self._playing:
+            return True
+        if self._playback_ended_at is None:
+            return False
+        return (timestamp - self._playback_ended_at) < self.echo_cooldown_s
+
+    def on_block(self, is_speech: bool, block: np.ndarray,
+                 timestamp: float) -> Optional[np.ndarray]:
+        """Bir ses bloğunu işler. Sözce kapandıysa tamamını döndürür.
+
+        Robot konuşurken sözce biriktirilmez — biriktirilse robotun kendi sesi
+        transkribe edilirdi. Blok yine de okunur, çünkü araya girmeyi ancak
+        dinleyerek fark edebiliriz.
+        """
+        if self.is_speaking_at(timestamp):
+            self._check_barge_in(is_speech, timestamp)
+            return None
+
+        self._barge_in_since = None
+        return self._utterance.feed(is_speech, block, timestamp)
+
+    def _check_barge_in(self, is_speech: bool, timestamp: float) -> None:
+        if not is_speech:
+            self._barge_in_since = None
+            return
+        if self._barge_in_since is None:
+            self._barge_in_since = timestamp
+            return
+        if (timestamp - self._barge_in_since) >= self.barge_in_s:
+            if self.output is not None:
+                self.output.interrupt()
+            self._playing = False
+            self._playback_ended_at = timestamp
+            self._barge_in_since = None
 
     def handle_utterance(self, utterance: np.ndarray, sample_rate: int) -> Optional[str]:
         """Bir sözceyi tura çevirir. Söylenen cevabı, yoksa None döndürür."""
