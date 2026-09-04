@@ -176,8 +176,9 @@ class VoiceLoop:
         elif not self.session.is_active():
             # Oturum kapalı ve çağrılmadık: bu konuşma bize değil.
             return None
-        else:
-            clean = text
+        # else: yapacak bir şey yok — is_wake_word() uyandırma sözcüğü bulamasa
+        # bile normalize edilmiş metni döndürür, devam turu zaten `clean`'de
+        # ihtiyacı olanı buluyor.
 
         self.session.record_user_speech()
         prompt = clean.strip() or text

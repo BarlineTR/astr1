@@ -198,6 +198,21 @@ class TurnTests(unittest.TestCase):
         self.assertIsNotNone(said)
         self.assertEqual(len(tts.spoken), 2)
 
+    def test_devam_turunde_de_turkce_normallestirme_uygulanir(self):
+        """is_wake_word() uyandirma sozcugu yokken de normallestirilmis metni
+        dondurur (orn. 'ahlatta' -> "Ahlat'ta"); devam turu bunu ham STT
+        ciktisiyla ezmemeli, yoksa fonetik duzeltme yalnizca oturumu acan
+        soylemde calisir."""
+        llm = _FakeLlm()
+        loop = _voice(stt=_FakeStt("hey astro merhaba"), llm=llm)
+        loop.handle_utterance(self.UTTERANCE, sample_rate=16000)
+
+        loop.stt = _FakeStt("ahlatta oturuyorum")
+        loop.handle_utterance(self.UTTERANCE, sample_rate=16000)
+
+        self.assertEqual(llm.prompts[1], "Ahlat'ta oturuyorum",
+                         f"devam turu normallestirilmemis ham metinle gitti: {llm.prompts[1]!r}")
+
     def test_wake_word_metinden_temizlenip_llme_gider(self):
         llm = _FakeLlm()
         loop = _voice(stt=_FakeStt("hey astro bugun hava nasil"), llm=llm)
