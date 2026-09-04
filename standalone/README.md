@@ -67,7 +67,19 @@ ve yalnızca takip yapar — konuşma, görmenin önkoşulu değil.
 ./.venv/bin/python -m pytest standalone/test -q
 ```
 
-35 test; hiçbiri donanım istemez. Seri protokol (çerçeveleme, CRC, encoder
+162 test; hiçbiri donanım istemez. Seri protokol (çerçeveleme, CRC, encoder
 telemetrisi, heartbeat), kaynakların donanımsız davranışı ve takipçinin
 ROS tarafıyla aynı garantileri koruduğu kapsanıyor — kafa açısına göre kerteriz,
 encoder susunca merkeze çökmeme, ve sesin nişanı çekmemesi.
+
+## Teşhis şeridindeki ses sütunu
+
+`--log-interval` satırının sonunda, kerteriz varsa bir sütun daha basılır --
+kafayı yalnızca konuşma çevirebildiği için "kerteriz var ama kafa dönmüyor"
+sorusunun sesle ilgili yarısını buradan okumak, tahmin etmekten iyidir:
+
+| gördüğün | anlamı |
+|---|---|
+| `[konusma 0.82]` | pencere konuşma sayıldı, doluluk (confidence) yanında |
+| `[elendi: <sebep>]` | pencere konuşma sayılmadı, `speech.reason` sebebi |
+| `[pencere yok]` | kerteriz var ama konuşma penceresi henüz dolmadı |

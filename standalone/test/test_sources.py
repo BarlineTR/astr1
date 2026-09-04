@@ -136,6 +136,55 @@ class TestAudioSource(unittest.TestCase):
         self.assertIsNone(audio.latest_doa_deg(now=10.0))
 
 
+class _FakeStream:
+    """Stands in for `sounddevice.InputStream`: records how it was opened."""
+
+    def __init__(self, **kwargs):
+        self.kwargs = kwargs
+
+    def start(self):
+        pass
+
+    def stop(self):
+        pass
+
+    def close(self):
+        pass
+
+
+class TestSampleRateIsNotAssumed(unittest.TestCase):
+    """C1: the detector and estimator were built in `__init__` at a hardcoded
+    16 kHz, before `start()` ever learns the device's real rate. In stereo mode
+    that rate is the device's own — 44.1 kHz on this laptop, the mode this
+    machine actually runs. Measured consequence (repo's own synthetic speech
+    generator): analysed at the wrong rate, a 5 Hz syllable modulation aliases
+    to 1.8 Hz (below the 4-8 Hz band actually used) and the 80-300 Hz pitch
+    search actually scans 220-830 Hz -- speech is classified as not-speech, so
+    the head can never turn toward a voice.
+    """
+
+    def test_stereo_mode_builds_detector_and_estimator_at_the_devices_rate(self):
+        audio = AudioSource(stream_factory=lambda **kwargs: _FakeStream(**kwargs))
+        # Gercek donanima dokunmadan stereo/44.1 kHz kosulunu kuruyor: tek bir
+        # stereo (2 kanal) aygit, kendi varsayilan hizi 44100.
+        audio._hardware_inputs = lambda: [
+            (0, {"name": "Built-in Audio Analog Stereo",
+                 "max_input_channels": 2, "default_samplerate": 44100.0})
+        ]
+
+        audio.start()
+
+        self.assertTrue(audio.available, audio.error)
+        self.assertEqual(audio.mode, "stereo")
+        self.assertEqual(audio.sample_rate, 44100)
+        self.assertEqual(
+            audio._estimator.sample_rate, audio.sample_rate,
+            "kestirici 44.1 kHz yakalamaya karsi 16 kHz'de kuruldu")
+        self.assertEqual(
+            audio._speech.sample_rate, audio.sample_rate,
+            "konusma siniflandiricisi 44.1 kHz yakalamaya karsi 16 kHz'de kuruldu")
+
+
 class _FakeEstimator:
     """Stands in for the GCC-PHAT estimator and records whether it was reached."""
 
@@ -537,7 +586,7 @@ class TestUtteranceBuffer(unittest.TestCase):
 
         window = src.read_window(seconds=0.2)
 
-        self.assertLessEqual(len(window), int(0.2 * SAMPLE_RATE) + BLOCK_SAMPLES)
+        self.assertEqual(len(window), int(0.2 * SAMPLE_RATE))
 
     def test_tampon_konusma_penceresinden_uzun(self):
         """0.6 s'lik konusma penceresi bir sozceyi tutamaz."""

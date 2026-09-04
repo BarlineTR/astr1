@@ -43,6 +43,7 @@ SPEECH_MAX_AGE_S = 0.5
 # bittikten sonra baştan sona geri okunur, o yüzden ayrı ve uzun tutulur.
 # 10 s, bir turda söylenebilecek en uzun cümleyi rahatça alır.
 UTTERANCE_BUFFER_S = 10.0
+
 # Below this the block is background noise and GCC-PHAT would localise the room.
 #
 # In float32 units. The stream is opened with dtype="float32", so sounddevice hands
@@ -282,6 +283,17 @@ class AudioSource:
 
             self.mode = "array" if channels >= 4 else "stereo"
             self.sample_rate = rate
+            # Hız `start()`'a kadar belli olmaz: dizi modunda 16 kHz sabit ama
+            # stereo modda aygıtın kendi hızı kullanılıyor (laptopta 44.1 kHz).
+            # `__init__`'te SAMPLE_RATE'e (16000) sabitlemek ikisini de yanlış
+            # ölçekte kuruyordu — 44.1 kHz'lik 5 Hz'lik hece modülasyonu 1.8 Hz'e
+            # (4-8 Hz bandının altına) düşüyor, 80-300 Hz'lik perde araması ise
+            # aslında 220-830 Hz'i tarıyordu; konuşma "konuşma değil" sayılıyor ve
+            # kafa hiçbir zaman bir sese dönemiyordu (ölçüldü, bkz. review C1).
+            # `__init__`'teki varsayılan (16 kHz) donanımsız testler için duruyor;
+            # burada gerçek hızla yeniden kuruluyor.
+            self._estimator = AcousticDOAEstimator(sample_rate=rate)
+            self._speech = SpeechDetector(sample_rate=rate)
             if self.mode == "stereo":
                 self._stereo = StereoDOA(sample_rate=rate,
                                          mic_spacing_m=self._mic_spacing_m)
@@ -490,7 +502,7 @@ class AudioSource:
                                else np.concatenate((self._utterance, block)))[-capacity:]
             self._written += len(block)
 
-    def read_since(self, cursor: int):
+    def read_since(self, cursor: int) -> Tuple[np.ndarray, int]:
         """`cursor`'dan sonra yazılan yeni örnekler ve yeni imleç.
 
         Ses döngüsü ana döngüden 30 Hz'te (33 ms) pompalanıyor, bloklar ise 64 ms.

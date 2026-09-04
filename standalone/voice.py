@@ -13,13 +13,14 @@ import os
 import threading
 import time
 import wave
+from math import gcd
 from typing import Any, Optional
 
 import numpy as np
+from scipy.signal import resample_poly
 
 import core_path  # noqa: F401
 from astro_ai.conversation_session import ConversationSession  # noqa: E402
-from astro_audio.speech_detector import SpeechDetector  # noqa: E402
 from llm import LlmClient  # noqa: E402
 
 # Sözce sonu eşiği. Cümle içi duraklamayı sözce sonundan ayırmalı: hece arası
@@ -48,6 +49,23 @@ DEFAULT_ECHO_COOLDOWN_S = 0.65
 # Robot konuşurken araya girmeyi ciddiye almadan önce görülmesi gereken kesintisiz
 # konuşma. Tek blok (64 ms) hoparlör sızıntısıyla da olabilir; 0.3 s bir hecedir.
 DEFAULT_BARGE_IN_S = 0.3
+
+# Barge-in VARSAYILAN OLARAK KAPALI (bkz. review C2). `_check_barge_in`'e giden
+# `is_speech`, `pump`'ın `audio.latest_speech()`'ten okuduğu VERDİNİN TA
+# KENDİSİ — ve o verdi robotun kendi hoparlör çıkışını da içeren bir mikrofon
+# penceresinden çıkıyor. `SpeechDetector` TTS'i insan konuşmasından ayıramaz:
+# TTS zaten konuşmanın kendisi. Bu boru hattında yankı iptali yok, referans
+# çıkarma yok, çalınanla mikrofonun seviye karşılaştırması yok — robotun kendi
+# sesini insan sesinden ayıracak hiçbir kanıt yok. Sonuç: barge-in her cevabın
+# ~0.3 sn'sinde kendi sesine tetikleniyor; `AudioOutputManager.interrupt()`
+# sounddevice'ı `stream.write` ortasında gerçekten durdurmadığı için cümle
+# çalmaya devam ediyor; 0.65 sn sonra soğuma bitiyor ve hâlâ çalan cevap STT'ye
+# gidip yeni bir tur açıyor — robot kendiyle konuşuyor, her turda API kredisi
+# harcıyor. Yarı çalışan barge-in, hiç barge-in olmamasından kötü: en azından
+# yankı bastırma (echo_cooldown) tek başına robotun kendini duymasını zaten
+# durduruyor. Açmak için gereken: gerçek yankı iptali (AEC) ya da çalınan sesin
+# bilinen zarfına karşı bir seviye karşılaştırması — ikisi de bugün yok.
+DEFAULT_BARGE_IN_ENABLED = False
 
 
 class UtteranceTracker:
@@ -123,18 +141,23 @@ class UtteranceTracker:
 
 
 def resample_to(mono: np.ndarray, from_rate: int, to_rate: int) -> np.ndarray:
-    """Doğrusal ara değerle yeniden örnekler.
+    """Polyphase (anti-alias süzgeçli) yeniden örnekler.
 
-    Konuşma tanıma için yeterli: STT modelleri kendi ön işlemesinde zaten
-    bant sınırlıyor, ve buradaki tek amaç hızı sözleşmeye getirmek.
+    Önceden çıplak `np.interp` ile ondalıklıyordu. STT modellerinin kendi ön
+    işlemesinde bant sınırladığı doğru ama alakasız: 44.1 kHz -> 16 kHz'te yeni
+    Nyquist 8 kHz'in üzerindeki içerik (sislemeler, fan uğultusu) STT hiç
+    görmeden ÖNCE konuşma bandına katlanıyordu (aliasing), ve bir kez yanlış
+    banda katlanan enerji sonradan ayrılamıyor — STT'nin kendi filtresi bunu
+    telafi etmiyor. `scipy.signal.resample_poly` oranı `from_rate`/`to_rate`'in
+    ortak böleniyle sadeleştirip alçak geçirgen süzülmüş bir polifaz yeniden
+    örnekleme uyguluyor, bu yüzden bant dışı içerik gerçekten atılıyor.
     """
     if from_rate == to_rate or len(mono) == 0:
         return np.asarray(mono, dtype=np.float32)
-    count = int(round(len(mono) * (to_rate / float(from_rate))))
-    if count <= 0:
-        return np.zeros(0, dtype=np.float32)
-    source = np.linspace(0.0, len(mono) - 1, num=count)
-    return np.interp(source, np.arange(len(mono)), mono).astype(np.float32)
+    mono = np.asarray(mono, dtype=np.float32)
+    divisor = gcd(int(from_rate), int(to_rate))
+    up, down = int(to_rate) // divisor, int(from_rate) // divisor
+    return resample_poly(mono, up, down).astype(np.float32)
 
 
 def to_wav_bytes(mono: np.ndarray, sample_rate: int) -> bytes:
@@ -165,11 +188,11 @@ class VoiceLoop:
         tts: Any = None,
         output: Any = None,
         session: Optional[ConversationSession] = None,
-        speech: Optional[SpeechDetector] = None,
         wake_word: str = WAKE_WORD,
         silence_s: float = DEFAULT_SILENCE_S,
         echo_cooldown_s: float = DEFAULT_ECHO_COOLDOWN_S,
         barge_in_s: float = DEFAULT_BARGE_IN_S,
+        barge_in_enabled: bool = DEFAULT_BARGE_IN_ENABLED,
     ):
         self.audio = audio
         self.stt = stt
@@ -177,11 +200,11 @@ class VoiceLoop:
         self.tts = tts
         self.output = output
         self.session = session or ConversationSession()
-        self.speech = speech or SpeechDetector(sample_rate=STT_SAMPLE_RATE)
         self.wake_word = wake_word
         self.silence_s = float(silence_s)
         self.echo_cooldown_s = float(echo_cooldown_s)
         self.barge_in_s = float(barge_in_s)
+        self.barge_in_enabled = bool(barge_in_enabled)
         self._playing = False
         self._playback_ended_at: Optional[float] = None
         self._barge_in_since: Optional[float] = None
@@ -261,6 +284,11 @@ class VoiceLoop:
         return self._utterance.feed(is_speech, block, timestamp)
 
     def _check_barge_in(self, is_speech: bool, timestamp: float) -> None:
+        if not self.barge_in_enabled:
+            # Varsayılan olarak kapalı — bkz. DEFAULT_BARGE_IN_ENABLED'in
+            # yanındaki not. Robotun kendi sesini insan sesinden ayıracak hiçbir
+            # kanıt yokken tetiklemek, robotun kendiyle konuşmasına yol açıyordu.
+            return
         if self._barge_in_latched:
             # Bu tur için zaten tetiklendi. Kilitlemeden her barge_in_s'de bir
             # yeniden tetiklenip _playback_ended_at'i tazeler, ve barge_in_s
@@ -286,7 +314,17 @@ class VoiceLoop:
         Kafa 30 Hz'te akıyor ve bir LLM turu saniyeler sürüyor — tur bu thread'de
         koşarsa takip donar. O yüzden burada yalnızca sözce toplanır; tur kapanınca
         işi bir arka plan thread'i alır.
+
+        Oturum ömrü de buradan sürülür (bkz. review I1): `activate_session` bir
+        uyandırma sözcüğüyle çağrılıyordu ama `check_and_update_session_lifecycle`
+        hiçbir yerden çağrılmıyordu — `ConversationSession._is_active` yalnızca o
+        metodun içinden temizleniyor, o yüzden tek bir "hey astro" süreç ömrü
+        boyunca oturumu açık bırakıyordu. `is_speaking_at` burada geçiriliyor ki
+        uzun bir cevap ortasında oturum sessizlik sanılıp süresi dolmasın.
         """
+        self.session.check_and_update_session_lifecycle(
+            is_robot_speaking=self.is_speaking_at(timestamp))
+
         if self.audio is None or self._turn_running:
             return
 
@@ -314,6 +352,30 @@ class VoiceLoop:
             self.handle_utterance(utterance, sample_rate)
         finally:
             self._turn_running = False
+            self._discard_turn_backlog()
+
+    def _discard_turn_backlog(self) -> None:
+        """Tur boyunca biriken ses, bir sonraki sözcenin parçası değil (bkz.
+        review I2).
+
+        `_turn_running` iken imleç bilerek ilerletilmiyor (`pump` bir tur
+        sürerken hiç okumuyor) — ama mikrofon dinlemeye devam ediyor, o yüzden
+        turdan sonraki ilk okuma STT+LLM+TTS boyunca geçen bütün sesi TEK blok,
+        TEK `is_speech` verdisiyle `UtteranceTracker`'a verirdi. Bunun iki
+        sonucu vardı: `UtteranceTracker.max_s` (10.0) `UTTERANCE_BUFFER_S`
+        (10.0) ile tam eşit olduğundan 10 sn'yi aşan bir tur ilk blokta sahte
+        bir sözce kapatıyordu; ve tur hiç çalmadıysa (boş transkript, uyandırma
+        sözcüğü yok, sağlayıcı hatası) `note_playback(True, ...)` hiç
+        tetiklenmediği için `_utterance.reset()` de hiç çalışmıyor, birikinti
+        bir sonraki cümleye ekleniyordu.
+
+        İkisi de burada kapatılıyor: imleç şimdiye ilerletilip birikinti
+        atılıyor, ve `_utterance` koşulsuz sıfırlanıyor (yalnızca `note_playback`
+        çalma başlarken yaptığı gibi değil — çalma hiç olmasa da).
+        """
+        if self.audio is not None:
+            _, self._cursor = self.audio.read_since(self._cursor)
+        self._utterance.reset()
 
     def stop(self) -> None:
         thread = self._thread

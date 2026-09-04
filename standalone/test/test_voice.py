@@ -17,7 +17,7 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import core_path  # noqa: F401,E402
-from voice import UtteranceTracker  # noqa: E402
+from voice import UtteranceTracker, resample_to  # noqa: E402
 
 SAMPLE_RATE = 16000
 BLOCK = 1024
@@ -105,6 +105,43 @@ class UtteranceBoundaryTests(unittest.TestCase):
         closed = self._feed([True] * 1 + [False] * 16)
         self.assertEqual(len(closed), 1)
         self.assertEqual(len(closed[0]), 15 * BLOCK)
+
+
+class ResampleAliasingTests(unittest.TestCase):
+    """I4: `resample_to` 44.1kHz -> 16kHz'i çıplak `np.interp` ile ondalıklıyordu,
+    anti-alias süzgeci olmadan. Docstring "STT modelleri kendi ön işlemesinde
+    zaten bant sınırlıyor" diyordu ama bu alakasız -- katlanma (aliasing) burada,
+    STT hiç görmeden önce oluyor ve geri alınamıyor."""
+
+    def test_yeni_nyquistin_ustundeki_icerik_banda_katlanmiyor(self):
+        """44.1 kHz'de 12 kHz'lik bir ton, 16 kHz'e (Nyquist 8 kHz) indirgenince
+        tamamen bant dışında kalmalı. Duzgun suzulmus bir yeniden ornekleme
+        onu neredeyse sessizlige indirir; anti-alias suzgeci olmayan dogrusal
+        ara deger ise enerjiyi bandin icine katlayip tasir."""
+        fs = 44100
+        t = np.arange(fs) / fs  # 1 sn
+        tone = np.sin(2.0 * np.pi * 12000.0 * t).astype(np.float32)  # > 8 kHz
+
+        out = resample_to(tone, fs, 16000)
+
+        input_rms = float(np.sqrt(np.mean(tone ** 2)))
+        output_rms = float(np.sqrt(np.mean(out ** 2)))
+        self.assertLess(
+            output_rms, 0.1 * input_rms,
+            f"bant disi icerik katlanarak tasindi (girdi rms={input_rms:.3f}, "
+            f"cikti rms={output_rms:.3f}) -- anti-alias suzgeci yok")
+
+    def test_hiz_esitse_veri_degismeden_doner(self):
+        mono = np.array([0.1, -0.2, 0.3], dtype=np.float32)
+
+        out = resample_to(mono, 16000, 16000)
+
+        np.testing.assert_array_equal(out, mono)
+
+    def test_bos_girdi_bos_cikti_verir(self):
+        out = resample_to(np.zeros(0, dtype=np.float32), 44100, 16000)
+
+        self.assertEqual(len(out), 0)
 
 
 class _FakeStt:
@@ -271,8 +308,9 @@ class TurnTests(unittest.TestCase):
 class EchoAndBargeInTests(unittest.TestCase):
     """Robot kendini duymamali, ama kullanici araya girince susmali."""
 
-    def _loop(self, output=None):
-        return _voice(output=output or _FakeOutput(), echo_cooldown_s=0.65)
+    def _loop(self, output=None, barge_in_enabled=False):
+        return _voice(output=output or _FakeOutput(), echo_cooldown_s=0.65,
+                      barge_in_enabled=barge_in_enabled)
 
     def test_hoparlor_sustuktan_sonra_sogumada_hala_konusuyor_sayilir(self):
         """Bayrak aninda duserse mikrofona yolda olan kendi sesi transkribe edilir."""
@@ -299,8 +337,10 @@ class EchoAndBargeInTests(unittest.TestCase):
         self.assertEqual(closed, [], "robot konusurken sozce transkripsiyona gitti")
 
     def test_robot_konusurken_gercek_konusma_calmayi_keser(self):
+        """Barge-in varsayılan olarak kapalı (bkz. C2); burada bilerek açılıyor
+        çünkü test edilen şey tetikleme mantığının kendisi, varsayılan değil."""
         output = _FakeOutput()
-        loop = self._loop(output=output)
+        loop = self._loop(output=output, barge_in_enabled=True)
         loop.note_playback(True, timestamp=10.0)
 
         t = 10.0
@@ -312,7 +352,7 @@ class EchoAndBargeInTests(unittest.TestCase):
 
     def test_robot_konusurken_gurultu_calmayi_kesmez(self):
         output = _FakeOutput()
-        loop = self._loop(output=output)
+        loop = self._loop(output=output, barge_in_enabled=True)
         loop.note_playback(True, timestamp=10.0)
 
         t = 10.0
@@ -339,9 +379,10 @@ class EchoAndBargeInTests(unittest.TestCase):
         """Bulgu 1: kilitsiz barge-in her 0.3 sn'de bir kendini yeniden tetikler
         (barge_in_s < echo_cooldown_s), soguma hic bitmez ve tetikleyen konusma
         hicbir zaman transkribe edilmez. Kilitliyken tetik bir kez olmali ve
-        soguma bitince ayni konusma sozceye akmali."""
+        soguma bitince ayni konusma sozceye akmali. Barge-in varsayilan olarak
+        kapali (bkz. C2); kilit mantigini sinamak icin burada aciliyor."""
         output = _FakeOutput()
-        loop = self._loop(output=output)
+        loop = self._loop(output=output, barge_in_enabled=True)
         loop.note_playback(True, timestamp=10.0)
 
         closed = []
@@ -359,6 +400,26 @@ class EchoAndBargeInTests(unittest.TestCase):
 
         self.assertEqual(output.interrupts, 1, "barge-in defalarca tetiklendi (kilit yok)")
         self.assertEqual(len(closed), 1, "tetikleyen konusma hic transkribe edilmedi")
+
+    def test_varsayilan_ayarlarla_barge_in_hic_tetiklenmez(self):
+        """C2: bu boru hattinda robotun kendi sesini insan sesinden ayiracak
+        hicbir kanit yok (yanki iptali yok, referans cikarma yok, seviye
+        karsilastirmasi yok) -- SpeechDetector TTS'i konusma sayar, ve yarim
+        calisan barge-in robotun kendiyle konusmasina yol aciyordu (cevabin
+        ~0.3 sn'sinde kendi sesine tetiklenip, interrupt() sesi gercekten
+        kesmeyince ayni cevap 0.65 sn sonra STT'ye gidiyordu). Bu yuzden
+        varsayilan kapali: burada `barge_in_enabled` hic verilmiyor."""
+        output = _FakeOutput()
+        loop = self._loop(output=output)
+        loop.note_playback(True, timestamp=10.0)
+
+        t = 10.0
+        for _ in range(40):                      # ~2.56 sn kesintisiz "konusma"
+            loop.on_block(True, _block(), timestamp=t)
+            t += BLOCK_S
+
+        self.assertEqual(output.interrupts, 0,
+                         "barge-in varsayilan ayarlarla yine de calmayi kesti")
 
     def test_output_playing_bayragi_note_playback_olmadan_da_yankiyi_bastirir(self):
         """Bulgu 2: `note_playback` cagrilmazsa `is_speaking_at` yalnizca ic
@@ -415,16 +476,58 @@ class DegradationTests(unittest.TestCase):
 
         `is_speaking_at` yalnizca `note_playback` ile hareket eder; cikis
         yoneticisi geri cagriyi cagirmazsa robot kendi sesini transkribe eder.
-        """
-        import inspect
+
+        Kaynagi metin olarak taramak yerine (eskiden `inspect.getsource` +
+        alt dize kontrolu -- adini degistirip cagirmayi unutan bir refactor'u
+        yakalamazdi) sahte bir cikis yoneticisiyle gercekten kurup geri
+        cagriyi tetikliyor ve dongunun durumunun degistigini dogruluyor."""
+        import sys
+        import types
+        from unittest import mock
+
         import voice
 
-        source = inspect.getsource(voice.build_default_loop)
+        captured: dict = {}
 
-        self.assertIn("on_playback_state_change", source,
+        class _StubOutput:
+            def __init__(self, on_playback_state_change=None, logger=None):
+                captured["on_playback_state_change"] = on_playback_state_change
+                self.is_playing = False
+
+        class _StubProvider:
+            def __init__(self, **kwargs):
+                pass
+
+        fake_openai = types.ModuleType("openai")
+        fake_openai.OpenAI = lambda api_key=None: object()
+        fake_output_mod = types.ModuleType("astro_audio.audio_output_manager")
+        fake_output_mod.AudioOutputManager = _StubOutput
+        fake_tts_engine_mod = types.ModuleType("astro_audio.openai_tts_engine")
+        fake_tts_engine_mod.OpenAITTSEngine = _StubProvider
+        fake_stt_router_mod = types.ModuleType("astro_audio.stt_router")
+        fake_stt_router_mod.STTRouter = _StubProvider
+        fake_tts_router_mod = types.ModuleType("astro_audio.tts_router")
+        fake_tts_router_mod.TTSRouter = _StubProvider
+
+        with mock.patch.dict(sys.modules, {
+            "openai": fake_openai,
+            "astro_audio.audio_output_manager": fake_output_mod,
+            "astro_audio.openai_tts_engine": fake_tts_engine_mod,
+            "astro_audio.stt_router": fake_stt_router_mod,
+            "astro_audio.tts_router": fake_tts_router_mod,
+        }):
+            loop = voice.build_default_loop(audio=None, api_key="fake-key")
+
+        self.assertIsNotNone(loop, voice.LAST_SETUP_ERROR)
+        self.assertIn("on_playback_state_change", captured,
                       "AudioOutputManager calma durumu geri cagrisiyla kurulmuyor")
-        self.assertIn("note_playback", source,
-                      "geri cagri VoiceLoop.note_playback'e baglanmiyor")
+
+        self.assertFalse(loop.is_speaking_at(0.0))
+        captured["on_playback_state_change"](True)
+
+        self.assertTrue(
+            loop.is_speaking_at(0.0),
+            "AudioOutputManager'in calma geri cagrisi VoiceLoop.note_playback'e baglanmadi")
 
     def test_llm_yoksa_tur_sessizce_atlanir(self):
         loop = _voice(llm=None)
@@ -794,6 +897,127 @@ class PumpConcurrencyTests(unittest.TestCase):
 
         self.assertLess(elapsed, 3.0,
                         f"stop() 2 sn'lik join timeout'unu asip surece kadar bekledi ({elapsed:.2f}s)")
+
+
+class SessionLifecycleTests(unittest.TestCase):
+    """I1: `VoiceLoop` `session.activate_session()` cagiriyordu ama
+    `session.check_and_update_session_lifecycle()`'i hic cagirmiyordu. ROS
+    tarafi bunu bir zamanlayicidan surer (ai_brain_node, astro_realtime_node);
+    burada suren yoktu, o yuzden `_is_active` hicbir zaman temizlenmiyordu.
+    Tek bir "hey astro" tum surec omru boyunca odadaki her konusma-siniflandirilmis
+    sesi STT+LLM+TTS'e yolluyordu -- ne uyandirma sozcugu ne zaman asimi, sinirsiz
+    harcama. `session.base_timeout_s` (16 sn) tanimliydi ama hicbir zaman
+    calismiyordu."""
+
+    UTTERANCE = np.full(16000, 0.2, dtype=np.float32)
+
+    def test_pump_oturum_omrunu_surer_ve_suresi_dolan_oturum_sozceyi_dusurur(self):
+        from astro_ai.conversation_session import ConversationSession
+
+        session = ConversationSession(base_timeout_s=0.02, gaze_extension_s=0.0)
+        loop = _voice(stt=_FakeStt("hey astro selam"), session=session)
+
+        loop.handle_utterance(self.UTTERANCE, sample_rate=16000)
+        self.assertTrue(session.is_active(), "oturum wake word ile acilmadi")
+
+        time.sleep(0.05)
+        loop.pump(0.0)  # audio yok -- yalnizca oturum omru kontrolu calismali
+
+        self.assertFalse(
+            session.is_active(),
+            "pump() oturum omrunu hic surmedi -- tek bir uyandirma sozcugu "
+            "surecin tamami boyunca oturumu acik birakiyordu")
+
+        loop.stt = _FakeStt("bugun hava nasil")  # uyandirma sozcugu yok
+        said = loop.handle_utterance(self.UTTERANCE, sample_rate=16000)
+
+        self.assertIsNone(
+            said, "suresi dolmus bir oturumdan sonra uyandirma sozcuksuz sozce "
+            "yine de cevaplandi")
+
+    def test_robot_konusurken_oturum_suresi_dolmaz(self):
+        """Uzun bir cevap ortasinda oturum kapanmamali -- `pump` `is_robot_speaking`
+        bayragini gecirmezse `check_and_update_session_lifecycle` robotun kendi
+        cevabini "sessizlik" sanip zaman asimini isletir."""
+        from astro_ai.conversation_session import ConversationSession
+
+        session = ConversationSession(base_timeout_s=0.02, gaze_extension_s=0.0)
+        loop = _voice(stt=_FakeStt("hey astro selam"), session=session)
+        loop.handle_utterance(self.UTTERANCE, sample_rate=16000)
+
+        output = _FakeOutput()
+        output.is_playing = True
+        loop.output = output
+
+        time.sleep(0.05)
+        loop.pump(0.0)
+
+        self.assertTrue(session.is_active(),
+                        "robot konusurken oturum suresi doldu")
+
+
+class TurnBacklogTests(unittest.TestCase):
+    """I2: `_turn_running` True iken imlec bilerek ilerletilmiyor (bkz. `pump`).
+    Bir tur (STT+LLM+TTS) saniyeler surebiliyor; turdan sonraki ilk `pump` o
+    araligi TEK blok, TEK `is_speech` verdisiyle `UtteranceTracker`'a veriyordu.
+    Iki sonuc: `UtteranceTracker.max_s` (10.0) `UTTERANCE_BUFFER_S` (10.0) ile
+    tam esit oldugundan 10 sn'yi asan bir tur ilk blokta sahte bir sozce
+    kapatiyordu; ve tur hic calmadiysa (bos transkript, wake word yok,
+    saglayici hatasi) `note_playback(True, ...)` hic tetiklenmedigi icin
+    `_utterance.reset()` de hic calismiyor, birikinti bir sonraki cumleye
+    ekleniyordu. Fix: tur biter bitmez birikinti atiliyor (imlec ilerletiliyor)
+    ve `_utterance` da kosulsuz sifirlaniyor."""
+
+    class _WriteTrackingAudio:
+        """Gercek halka tampon degil: yalnizca `_written` ilerler, `read_since`
+        cursor'dan sonraki HER SEYI teslim eder -- turun arkasinda biriken
+        sesin buyuklugunu dogrudan gozlemlemek icin yeterli."""
+
+        def __init__(self, sample_rate=16000):
+            self.sample_rate = sample_rate
+            self._written = 0
+
+        def push(self, n_samples: int) -> None:
+            self._written += n_samples
+
+        def read_since(self, cursor: int):
+            n_new = max(0, self._written - cursor)
+            return np.zeros(n_new, dtype=np.float32), self._written
+
+        def latest_speech(self, now):
+            return None
+
+    def test_tur_bitince_cursor_birikintiyi_atlar(self):
+        loop = _voice(stt=_FakeStt("hey astro selam"))
+        audio = self._WriteTrackingAudio()
+        loop.audio = audio
+        loop._cursor = 0
+        audio.push(9 * 16000)  # tur surerken 9 sn ses birikti (imlec ilerlemedi)
+
+        loop._run_turn(np.zeros(1600, dtype=np.float32), 16000)
+
+        self.assertEqual(loop._cursor, audio._written,
+                         "tur sonrasi birikinti bir sonraki pompaya akiyor")
+        leftover, _ = audio.read_since(loop._cursor)
+        self.assertEqual(len(leftover), 0, "birikinti hala okunabilir durumda")
+
+    def test_calmasiz_tur_sonunda_da_sozce_takipcisi_sifirlanir(self):
+        """LLM yok -> bu turda hicbir zaman cevap/calma olmuyor, dolayisiyla
+        `note_playback(True, ...)` hic tetiklenmiyor."""
+        loop = _voice(llm=None)
+        loop.audio = _FakeAudioSource()
+
+        # Turdan once yarim kalmis bir sozce biriktir.
+        loop.on_block(True, _block(value=0.9), timestamp=0.0)
+        loop.on_block(True, _block(value=0.9), timestamp=BLOCK_S)
+        self.assertTrue(loop._utterance.active, "on kosul kurulmadi: sozce hic acilmadi")
+
+        loop._run_turn(np.zeros(1600, dtype=np.float32), 16000)
+
+        self.assertFalse(
+            loop._utterance.active,
+            "calmasiz tur bitince eski yarim sozce hala biriktirilmis durumda "
+            "-- bir sonraki cumleyle birlesecekti")
 
 
 if __name__ == "__main__":
