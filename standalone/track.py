@@ -66,6 +66,10 @@ def main(argv=None) -> int:
     parser.add_argument("--seconds", type=float, default=None, help="Süre sınırı")
     opts = parser.parse_args(argv)
 
+    head = HeadLink(port=open_port(opts.serial) if opts.serial else None)
+    print("🔌 Arduino bağlı" if head.connected
+          else "🔌 Arduino yok — açık çevrim, kafa açısı tahmin edilecek")
+
     camera = CameraSource(device=opts.camera)
     if not camera.available:
         print(f"❌ Kamera {opts.camera} açılamadı.")
@@ -76,10 +80,6 @@ def main(argv=None) -> int:
     audio.start()
     print("🎤 Mikrofon dizisi hazır" if audio.available
           else f"🎤 Ses yok ({audio.error}) — yalnızca görüntüyle takip")
-
-    head = HeadLink(port=open_port(opts.serial) if opts.serial else None)
-    print("🔌 Arduino bağlı" if head.connected
-          else "🔌 Arduino yok — açık çevrim, kafa açısı tahmin edilecek")
 
     tracker = GazeTracker()
     started = time.monotonic()

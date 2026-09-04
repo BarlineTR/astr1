@@ -15,6 +15,7 @@ import threading
 from typing import Callable, List, Optional, Tuple
 
 import cv2
+import depthai as dai
 import numpy as np
 
 import core_path  # noqa: F401
@@ -38,17 +39,57 @@ def to_detections(found) -> List[Detection]:
 
 
 class CameraSource:
-    """A webcam plus the shared face detector."""
+    """OAK-D Lite camera plus the shared face detector."""
 
-    def __init__(self, device: int = 0, width: int = 640, height: int = 480, capture=None):
-        self.capture = capture if capture is not None else cv2.VideoCapture(device)
-        self.available = bool(self.capture.isOpened())
-        if self.available:
-            self.capture.set(cv2.CAP_PROP_FRAME_WIDTH, width)
-            self.capture.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
-            self.capture.set(cv2.CAP_PROP_FPS, 30.0)
+    def __init__(
+        self,
+        device: int = 0,
+        width: int = 640,
+        height: int = 480,
+        capture=None,
+    ):
+        self.pipeline = None
+        self.queue = None
+        self.device = None
+        self.capture = capture
+        self.available = False
+        self.error = None
 
-        model_dir = os.path.expanduser(os.getenv("FACE_MODEL_DIR", "~/.astro/models"))
+        if capture is not None:
+            # Preserve the hardware-free/test injection path.
+            self.available = bool(capture.isOpened())
+        else:
+            try:
+                self.pipeline = dai.Pipeline()
+
+                cam = self.pipeline.create(dai.node.Camera).build()
+
+                output = cam.requestOutput(
+                    (width, height),
+                    dai.ImgFrame.Type.BGR888p,
+                    dai.ImgResizeMode.CROP,
+                    30.0,
+                )
+
+                self.queue = output.createOutputQueue(
+                    maxSize=2,
+                    blocking=True,
+                )
+
+                self.pipeline.start()
+                self.device = self.pipeline.getDefaultDevice()
+                self.available = True
+
+            except Exception as exc:
+                self.error = str(exc)
+                self.available = False
+                self.queue = None
+                self.pipeline = None
+                self.device = None
+
+        model_dir = os.path.expanduser(
+            os.getenv("FACE_MODEL_DIR", "~/.astro/models")
+        )
         cascade = cv2.CascadeClassifier(
             cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
         )
@@ -61,18 +102,31 @@ class CameraSource:
     def read(self) -> Tuple[bool, Optional[np.ndarray]]:
         if not self.available:
             return False, None
-        return self.capture.read()
+
+        if self.capture is not None:
+            return self.capture.read()
+
+        try:
+            frame = self.queue.get().getCvFrame()
+            return True, frame
+        except Exception:
+            return False, None
 
     def detect(self, frame) -> List[Detection]:
         return to_detections(self.detector.detect(frame))
 
     def close(self) -> None:
         try:
-            self.capture.release()
+            if self.capture is not None:
+                self.capture.release()
         except Exception:
             pass
 
-
+        try:
+            if self.pipeline is not None:
+                self.pipeline.stop()
+        except Exception:
+            pass
 class AudioSource:
     """A 4-channel microphone array reduced to one bearing at a time.
 
