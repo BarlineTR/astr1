@@ -124,6 +124,7 @@ class GazeTracker:
         measured_head_deg: Optional[float],
         timestamp: float,
         speech=None,
+        is_robot_speaking: bool = False,
     ) -> GazeResult:
         """Runs one cycle: perception, fusion, arbitration, motion.
 
@@ -134,13 +135,19 @@ class GazeTracker:
         and syllable-rate modulation do. Without a verdict the bearing is ignored
         rather than trusted, because trusting it is the measured failure: in a
         130 s run the head swung between the limits for 90 s chasing noise.
+
+        `is_robot_speaking` hoparlör çalarken True olur. Hoparlör mikrofonun
+        yanında; robot konuştuğu anda güçlü ve harmonik bir kerteriz üretilir ve
+        o kerteriz her zaman hoparlörü gösterir. Konuşma filtresi bunu elemez —
+        robotun sesi de konuşmadır.
         """
         if measured_head_deg is not None:
             self.head_angle_deg = float(measured_head_deg)
             self.head_feedback_missing = False
 
         if doa_deg is not None and speech is not None and speech.is_speech:
-            self._ingest_audio(doa_deg, timestamp, float(speech.confidence))
+            self._ingest_audio(doa_deg, timestamp, float(speech.confidence),
+                               is_robot_speaking)
 
         self._ingest_vision(faces, frame_size, timestamp)
 
@@ -178,7 +185,8 @@ class GazeTracker:
             face_bearings_deg=tuple(t.body_azimuth_deg for t in self._latest_tracks),
         )
 
-    def _ingest_audio(self, doa_deg: float, timestamp: float, confidence: float) -> None:
+    def _ingest_audio(self, doa_deg: float, timestamp: float, confidence: float,
+                      is_robot_speaking: bool = False) -> None:
         """Feeds one bearing in, carrying the speech verdict's confidence.
 
         `process_raw_doa` defaults to 0.85, which is what the ROS node hands it when
@@ -193,6 +201,7 @@ class GazeTracker:
             timestamp=timestamp,
             actual_head_yaw_deg=self.head_angle_deg,
             confidence=confidence,
+            is_robot_speaking=is_robot_speaking,
         )
         self._latest_audio = self.audio_filter.filter_observation(
             obs=observation, head_velocity_deg_s=self.head_velocity_deg_s

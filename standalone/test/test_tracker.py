@@ -258,5 +258,42 @@ class TestCalibrationIsRead(unittest.TestCase):
         self.assertAlmostEqual(tracker.calib.head.max_angle_deg, 85.0)
 
 
+class TestRobotDoesNotChaseItsOwnVoice(unittest.TestCase):
+    """Robot konusurken kendi sesi kafayi cevirmemeli.
+
+    `process_raw_doa` `is_robot_speaking` parametresini zaten kabul ediyor ve
+    guveni 0.15 ile carpiyor; standalone bu parametreyi hic gecirmiyordu.
+    Hoparlor mikrofonun yaninda oldugu icin robot konustugu anda gucla bir
+    kerteriz uretilir ve o kerteriz her zaman hoparlorun yonunu gosterir.
+    """
+
+    def _run(self, is_robot_speaking):
+        from astro_audio.speech_detector import SpeechVerdict
+
+        speech = SpeechVerdict(is_speech=True, confidence=0.85, harmonicity=0.60,
+                               modulation=0.85, rms=0.2)
+        tracker = GazeTracker()
+        result = None
+        for i in range(60):
+            result = tracker.step(
+                faces=[], frame_size=FRAME, doa_deg=55.0, speech=speech,
+                is_robot_speaking=is_robot_speaking,
+                measured_head_deg=0.0, timestamp=300.0 + i * 0.02,
+            )
+        return result
+
+    def test_robot_konusurken_ses_hedefi_ele_geciremez(self):
+        result = self._run(is_robot_speaking=True)
+
+        self.assertEqual(result.owner, PrioritySource.IDLE,
+                         "robot kendi sesine dondu")
+
+    def test_robot_susarken_ayni_ses_hedefi_ele_gecirir(self):
+        """Bastirma calisiyor diye ozelligi kapatmis olmayalim."""
+        result = self._run(is_robot_speaking=False)
+
+        self.assertEqual(result.owner, PrioritySource.ACTIVE_SPEAKER)
+
+
 if __name__ == "__main__":
     unittest.main()
