@@ -272,8 +272,8 @@ class AudioSource:
             if self._duplicate_blocks >= DUPLICATE_BLOCKS_TO_LATCH:
                 self._array_dead = True
                 self.available = False
-                self.error = ("4 kanal acildi ama iki kanalin kopyasi — mikrofon "
-                              "dizisi bagli degil, yon bulma kapatildi")
+                self.error = ("4 kanal açıldı ama iki kanalın kopyası — mikrofon "
+                              "dizisi bağlı değil, yön bulma kapatıldı")
             return False
 
         self._duplicate_blocks = 0
