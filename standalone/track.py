@@ -28,6 +28,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import core_path  # noqa: F401,E402
 from head_link import HeadLink, open_port  # noqa: E402
+from recorder import OverlayRecorder, default_path  # noqa: E402
 from sources import AudioSource, CameraSource  # noqa: E402
 from tracker import GazeTracker  # noqa: E402
 
@@ -64,6 +65,10 @@ def main(argv=None) -> int:
     parser.add_argument("--audio-device", type=int, default=None, help="Mikrofon indeksi")
     parser.add_argument("--no-window", action="store_true", help="Pencere açma")
     parser.add_argument("--seconds", type=float, default=None, help="Süre sınırı")
+    parser.add_argument("--record", nargs="?", const="", default=None, metavar="DOSYA",
+                        help="Bindirilmiş görüntüyü videoya kaydet. Yol verilmezse "
+                             "astro_<tarih>.mp4 kullanılır. Ekransız çalışırken "
+                             "(--no-window) neyin takip edildiğini sonradan izlemek için.")
     opts = parser.parse_args(argv)
 
     head = HeadLink(port=open_port(opts.serial) if opts.serial else None)
@@ -80,6 +85,11 @@ def main(argv=None) -> int:
     audio.start()
     print("🎤 Mikrofon dizisi hazır" if audio.available
           else f"🎤 Ses yok ({audio.error}) — yalnızca görüntüyle takip")
+
+    recorder = None
+    if opts.record is not None:
+        recorder = OverlayRecorder(opts.record or default_path())
+        print(f"🎬 Kayıt: {recorder.path}")
 
     tracker = GazeTracker()
     started = time.monotonic()
@@ -115,12 +125,17 @@ def main(argv=None) -> int:
                 fps = (frames - last_fps_frames) / (now - last_fps_at)
                 last_fps_at, last_fps_frames = now, frames
 
-            if not opts.no_window:
-                cv2.imshow("ASTRO — ROS'suz takip",
-                           draw_overlay(frame, detections, result, fps,
-                                        audio.available, head.has_feedback))
-                if cv2.waitKey(1) & 0xFF in (ord("q"), 27):
-                    break
+            # Bindirme bir kez çizilir: pencere ve kayıt aynı kareyi paylaşır.
+            # İki kez çizmek, zaten takılan makinede kare başına maliyeti ikiye katlar.
+            if recorder is not None or not opts.no_window:
+                overlaid = draw_overlay(frame, detections, result, fps,
+                                        audio.available, head.has_feedback)
+                if recorder is not None:
+                    recorder.add(overlaid, now)
+                if not opts.no_window:
+                    cv2.imshow("ASTRO — ROS'suz takip", overlaid)
+                    if cv2.waitKey(1) & 0xFF in (ord("q"), 27):
+                        break
     except KeyboardInterrupt:
         pass
     finally:
@@ -129,6 +144,8 @@ def main(argv=None) -> int:
         if tracker.head_feedback_missing:
             print("⚠️  Encoder hiç konuşmadı: kafa açısı komuttan tahmin edildi. "
                   "Gerçek açı sapabilir; --serial ile bağlayıp doğrulayın.")
+        if recorder is not None:
+            print(recorder.close())
         camera.close()
         audio.close()
         head.close()
