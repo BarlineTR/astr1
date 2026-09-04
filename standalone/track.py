@@ -30,6 +30,7 @@ import core_path  # noqa: F401,E402
 from head_link import HeadLink, open_port  # noqa: E402
 from recorder import OverlayRecorder, default_path  # noqa: E402
 from sources import AudioSource, CameraSource  # noqa: E402
+from statuslog import StatusLog  # noqa: E402
 from tracker import GazeTracker  # noqa: E402
 
 BOX_COLOUR = (0, 215, 255)
@@ -65,6 +66,9 @@ def main(argv=None) -> int:
     parser.add_argument("--audio-device", type=int, default=None, help="Mikrofon indeksi")
     parser.add_argument("--no-window", action="store_true", help="Pencere açma")
     parser.add_argument("--seconds", type=float, default=None, help="Süre sınırı")
+    parser.add_argument("--log-interval", type=float, default=1.0, metavar="SN",
+                        help="Terminale durum satiri basma araligi (0 = yalnizca "
+                             "durum/hedef degisimlerinde bas)")
     parser.add_argument("--record", nargs="?", const="", default=None, metavar="DOSYA",
                         help="Bindirilmiş görüntüyü videoya kaydet. Yol verilmezse "
                              "astro_<tarih>.mp4 kullanılır. Ekransız çalışırken "
@@ -96,6 +100,7 @@ def main(argv=None) -> int:
         recorder = OverlayRecorder(opts.record or default_path())
         print(f"🎬 Kayıt: {recorder.path}")
 
+    status = StatusLog(interval_s=opts.log_interval)
     tracker = GazeTracker()
     started = time.monotonic()
     frames, fps, last_fps_at, last_fps_frames = 0, 0.0, started, 0
@@ -114,10 +119,12 @@ def main(argv=None) -> int:
             detections = camera.detect(frame)
             head.poll()
 
+            doa_deg = audio.latest_doa_deg(now) if audio.available else None
+
             result = tracker.step(
                 faces=detections,
                 frame_size=(frame.shape[1], frame.shape[0]),
-                doa_deg=audio.latest_doa_deg(now) if audio.available else None,
+                doa_deg=doa_deg,
                 measured_head_deg=head.measured_angle_deg if head.has_feedback else None,
                 timestamp=now,
             )
@@ -129,6 +136,15 @@ def main(argv=None) -> int:
             if now - last_fps_at >= 1.0:
                 fps = (frames - last_fps_frames) / (now - last_fps_at)
                 last_fps_at, last_fps_frames = now, frames
+
+            status.update(
+                elapsed_s=now - started,
+                result=result,
+                fps=fps,
+                detections=len(detections),
+                doa_deg=doa_deg,
+                head_feedback=head.has_feedback,
+            )
 
             # Bindirme bir kez çizilir: pencere ve kayıt aynı kareyi paylaşır.
             # İki kez çizmek, zaten takılan makinede kare başına maliyeti ikiye katlar.
@@ -145,7 +161,7 @@ def main(argv=None) -> int:
         pass
     finally:
         elapsed = max(time.monotonic() - started, 1e-6)
-        print(f"\n📊 {frames} kare / {elapsed:.1f} sn = {frames / elapsed:.1f} Hz")
+        print("\n" + status.summary(elapsed, frames))
         if tracker.head_feedback_missing:
             print("⚠️  Encoder hiç konuşmadı: kafa açısı komuttan tahmin edildi. "
                   "Gerçek açı sapabilir; --serial ile bağlayıp doğrulayın.")
