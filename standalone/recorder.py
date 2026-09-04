@@ -28,8 +28,12 @@ _CODECS = {
 }
 _DEFAULT_CODEC = "mp4v"
 
-# Hız ölçümü için tamponlanan süre. Bir saniye, kamera ısınmasını dışarıda bırakacak
-# kadar uzun, kaçırılan kareler rahatsız edecek kadar uzun değil.
+# Ölçüm penceresi. Ama pencereyi ilk kareden başlatmak yanlış: ilk yarım saniye
+# kameranın ısınması ve algılayıcı modelinin yüklenmesiyle geçiyor ve döngünün en
+# yavaş olduğu andır. Ölçülen 28 Hz'lik bir koşu böyle 15.8 fps yazıldı ve video
+# gerçeğin 1.8 katı yavaş oynadı — kaydın söylemesi gereken şeyin tam tersi.
+# Isınma kareleri kayda giriyor, yalnızca hız hesabından dışlanıyor.
+_WARMUP_SECONDS = 0.6
 _MEASURE_SECONDS = 1.0
 
 # Ölçüm saçmalarsa (kamera takıldı, tek kare geldi) kullanılacak sınırlar.
@@ -56,6 +60,7 @@ class OverlayRecorder:
         self,
         path: str,
         measure_seconds: float = _MEASURE_SECONDS,
+        warmup_seconds: float = _WARMUP_SECONDS,
         writer_factory=None,
     ):
         self.path = str(path)
@@ -64,6 +69,7 @@ class OverlayRecorder:
         self.fps: Optional[float] = None
 
         self._measure_seconds = max(0.0, float(measure_seconds))
+        self._warmup_seconds = max(0.0, float(warmup_seconds))
         self._writer_factory = writer_factory or cv2.VideoWriter
         self._writer = None
         self._closed = False
@@ -71,6 +77,8 @@ class OverlayRecorder:
         self._buffer: List = []
         self._first_ts: Optional[float] = None
         self._last_ts: Optional[float] = None
+        self._measure_from_ts: Optional[float] = None
+        self._measure_from_index: int = 0
 
     @property
     def active(self) -> bool:
@@ -97,7 +105,14 @@ class OverlayRecorder:
         self._buffer.append(frame)
         self._last_ts = now
 
-        if (now - self._first_ts) >= self._measure_seconds and len(self._buffer) >= 2:
+        # Warm-up frames are kept but do not count toward the rate.
+        if self._measure_from_ts is None:
+            if (now - self._first_ts) >= self._warmup_seconds:
+                self._measure_from_ts = now
+                self._measure_from_index = len(self._buffer) - 1
+            return
+
+        if (now - self._measure_from_ts) >= self._measure_seconds:
             self._open(self._measured_fps())
 
     def close(self) -> str:
@@ -121,17 +136,27 @@ class OverlayRecorder:
     # -- iç işler ---------------------------------------------------------
 
     def _measured_fps(self) -> float:
-        """Tamponlanan karelerden gerçekleşen hız."""
-        if self._first_ts is None or self._last_ts is None or len(self._buffer) < 2:
+        """Isınma sonrası karelerden gerçekleşen hız."""
+        start_ts = self._measure_from_ts if self._measure_from_ts is not None else self._first_ts
+        start_i = self._measure_from_index
+
+        if start_ts is None or self._last_ts is None:
             return _FALLBACK_FPS
 
-        span = self._last_ts - self._first_ts
-        if span <= 0:
-            return _FALLBACK_FPS
+        counted = len(self._buffer) - start_i
+        span = self._last_ts - start_ts
+        if counted < 2 or span <= 0:
+            # Isınmayı geçemeden çıkıldı; elde ne varsa ondan kestir.
+            if self._first_ts is None or len(self._buffer) < 2:
+                return _FALLBACK_FPS
+            span = self._last_ts - self._first_ts
+            if span <= 0:
+                return _FALLBACK_FPS
+            return float(min(_MAX_FPS, max(_MIN_FPS, (len(self._buffer) - 1) / span)))
 
         # n kare arasında n-1 aralık var; n/span kullanmak hızı sistematik olarak
         # yüksek gösterir ve kısa tamponlarda fark belirgindir.
-        fps = (len(self._buffer) - 1) / span
+        fps = (counted - 1) / span
         return float(min(_MAX_FPS, max(_MIN_FPS, fps)))
 
     def _open(self, fps: float) -> None:

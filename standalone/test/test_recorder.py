@@ -63,7 +63,7 @@ class _Factory:
 class RecorderTests(unittest.TestCase):
     def test_writes_the_frames_it_was_given(self):
         factory = _Factory()
-        rec = OverlayRecorder("out.mp4", measure_seconds=0.1, writer_factory=factory)
+        rec = OverlayRecorder("out.mp4", warmup_seconds=0.0, measure_seconds=0.1, writer_factory=factory)
 
         for i in range(5):
             rec.add(_frame(), timestamp=i * 0.1)
@@ -76,7 +76,7 @@ class RecorderTests(unittest.TestCase):
     def test_buffered_frames_survive_the_measurement_window(self):
         """Ölçüm sırasında gelen kareler atılmaz, dosya açılınca yazılır."""
         factory = _Factory()
-        rec = OverlayRecorder("out.mp4", measure_seconds=1.0, writer_factory=factory)
+        rec = OverlayRecorder("out.mp4", warmup_seconds=0.0, measure_seconds=1.0, writer_factory=factory)
 
         # Ölçüm penceresi dolmadan üç kare: yazıcı henüz yok.
         for i in range(3):
@@ -95,7 +95,7 @@ class RecorderTests(unittest.TestCase):
         takılma, hızlı oynatmada kaybolur.
         """
         factory = _Factory()
-        rec = OverlayRecorder("out.mp4", measure_seconds=0.5, writer_factory=factory)
+        rec = OverlayRecorder("out.mp4", warmup_seconds=0.0, measure_seconds=0.5, writer_factory=factory)
 
         for i in range(7):  # 0.0 .. 0.6 sn arası, 0.1 sn aralıklarla
             rec.add(_frame(), timestamp=i * 0.1)
@@ -106,7 +106,7 @@ class RecorderTests(unittest.TestCase):
     def test_slow_loop_is_recorded_as_slow(self):
         """3 Hz'lik takılan bir döngü 3 fps olarak kaydedilir."""
         factory = _Factory()
-        rec = OverlayRecorder("out.mp4", measure_seconds=0.9, writer_factory=factory)
+        rec = OverlayRecorder("out.mp4", warmup_seconds=0.0, measure_seconds=0.9, writer_factory=factory)
 
         for i in range(4):
             rec.add(_frame(), timestamp=i / 3.0)
@@ -117,7 +117,7 @@ class RecorderTests(unittest.TestCase):
     def test_unopenable_writer_disables_recording_without_raising(self):
         """Codec yoksa program çökmez; kaydedici kendini kapatır ve sebebini söyler."""
         factory = _Factory(opened=False)
-        rec = OverlayRecorder("out.mp4", measure_seconds=0.1, writer_factory=factory)
+        rec = OverlayRecorder("out.mp4", warmup_seconds=0.0, measure_seconds=0.1, writer_factory=factory)
 
         rec.add(_frame(), timestamp=0.0)
         rec.add(_frame(), timestamp=0.2)
@@ -129,7 +129,7 @@ class RecorderTests(unittest.TestCase):
     def test_writer_exception_is_contained(self):
         """Yazıcı kurucusu patlarsa da takip devam edebilmeli."""
         factory = _Factory(raises=RuntimeError("codec yok"))
-        rec = OverlayRecorder("out.mp4", measure_seconds=0.1, writer_factory=factory)
+        rec = OverlayRecorder("out.mp4", warmup_seconds=0.0, measure_seconds=0.1, writer_factory=factory)
 
         rec.add(_frame(), timestamp=0.0)
         rec.add(_frame(), timestamp=0.2)
@@ -139,7 +139,7 @@ class RecorderTests(unittest.TestCase):
 
     def test_frames_after_failure_are_ignored(self):
         factory = _Factory(opened=False)
-        rec = OverlayRecorder("out.mp4", measure_seconds=0.1, writer_factory=factory)
+        rec = OverlayRecorder("out.mp4", warmup_seconds=0.0, measure_seconds=0.1, writer_factory=factory)
 
         rec.add(_frame(), timestamp=0.0)
         rec.add(_frame(), timestamp=0.2)
@@ -150,7 +150,7 @@ class RecorderTests(unittest.TestCase):
     def test_early_exit_still_writes_what_was_buffered(self):
         """Ölçüm penceresi dolmadan çıkılsa bile kareler kaybolmaz."""
         factory = _Factory()
-        rec = OverlayRecorder("out.mp4", measure_seconds=10.0, writer_factory=factory)
+        rec = OverlayRecorder("out.mp4", warmup_seconds=0.0, measure_seconds=10.0, writer_factory=factory)
 
         rec.add(_frame(), timestamp=0.0)
         rec.add(_frame(), timestamp=0.1)
@@ -161,7 +161,7 @@ class RecorderTests(unittest.TestCase):
 
     def test_frame_size_comes_from_the_first_frame(self):
         factory = _Factory()
-        rec = OverlayRecorder("out.mp4", measure_seconds=0.1, writer_factory=factory)
+        rec = OverlayRecorder("out.mp4", warmup_seconds=0.0, measure_seconds=0.1, writer_factory=factory)
 
         rec.add(_frame(width=320, height=240), timestamp=0.0)
         rec.add(_frame(width=320, height=240), timestamp=0.2)
@@ -170,10 +170,10 @@ class RecorderTests(unittest.TestCase):
 
     def test_extension_picks_the_codec(self):
         avi = _Factory()
-        OverlayRecorder("out.avi", measure_seconds=0.0, writer_factory=avi).add(
+        OverlayRecorder("out.avi", warmup_seconds=0.0, measure_seconds=0.0, writer_factory=avi).add(
             _frame(), timestamp=0.0)
         # measure_seconds=0 ile ikinci kare açılışı tetikler
-        rec = OverlayRecorder("out.avi", measure_seconds=0.0, writer_factory=avi)
+        rec = OverlayRecorder("out.avi", warmup_seconds=0.0, measure_seconds=0.0, writer_factory=avi)
         rec.add(_frame(), timestamp=0.0)
         rec.add(_frame(), timestamp=0.1)
 
@@ -181,13 +181,55 @@ class RecorderTests(unittest.TestCase):
         self.assertEqual(avi.made.fourcc, cv2.VideoWriter_fourcc(*"XVID"))
 
     def test_no_frames_at_all_is_reported_not_crashed(self):
-        rec = OverlayRecorder("out.mp4", writer_factory=_Factory())
+        rec = OverlayRecorder("out.mp4", warmup_seconds=0.0, writer_factory=_Factory())
         self.assertIn("boş", rec.close())
 
     def test_default_path_is_timestamped_mp4(self):
         path = default_path("/tmp")
         self.assertTrue(path.startswith("/tmp/astro_"))
         self.assertTrue(path.endswith(".mp4"))
+
+    def test_warmup_frames_are_kept_but_do_not_set_the_rate(self):
+        """The first half second is the slowest and must not decide the file's rate.
+
+        Regression for a real one: a run that averaged 28 Hz was written at 15.8 fps
+        because the measurement window started on the very first frame, while the camera
+        was still warming up and the detector model was still loading. The recording
+        then played back 1.8x slow — the opposite of what it exists to show, and just as
+        misleading as playing back fast.
+        """
+        factory = _Factory()
+        rec = OverlayRecorder("out.mp4", warmup_seconds=0.5, measure_seconds=0.5,
+                              writer_factory=factory)
+
+        # Half a second of slow warm-up (5 Hz), then a second at 25 Hz.
+        t = 0.0
+        for _ in range(3):
+            rec.add(_frame(), timestamp=t)
+            t += 0.2
+        while t <= 1.6:
+            rec.add(_frame(), timestamp=t)
+            t += 0.04
+        rec.close()
+
+        self.assertAlmostEqual(rec.fps, 25.0, delta=3.0)
+        # Nothing captured is thrown away, warm-up included.
+        self.assertEqual(rec.frames_written, len(factory.made.frames))
+        self.assertGreaterEqual(rec.frames_written, 3)
+
+    def test_exit_during_warmup_still_produces_a_file(self):
+        """A run shorter than the warm-up must not silently record nothing."""
+        factory = _Factory()
+        rec = OverlayRecorder("out.mp4", warmup_seconds=5.0, measure_seconds=1.0,
+                              writer_factory=factory)
+
+        rec.add(_frame(), timestamp=0.0)
+        rec.add(_frame(), timestamp=0.1)
+        rec.add(_frame(), timestamp=0.2)
+        rec.close()
+
+        self.assertEqual(rec.frames_written, 3)
+        self.assertIsNotNone(rec.fps)
 
 
 if __name__ == "__main__":
