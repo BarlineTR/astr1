@@ -16,6 +16,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import core_path  # noqa: F401
 from sources import (  # noqa: E402
+    ARRAY_MIC_CHANNELS,
+    RESPEAKER_MIC_CHANNELS,
     BLOCK_SAMPLES,
     DUPLICATE_BLOCKS_TO_LATCH,
     MIN_RMS,
@@ -160,6 +162,8 @@ def _detached_source():
     src._estimator = _FakeEstimator()
     src._array_dead = False
     src._duplicate_blocks = 0
+    src._mic_channels = None
+    src._requested_mic_channels = None
     src.available = True
     src.error = None
     return src
@@ -188,6 +192,21 @@ def _plane_wave_array(azimuth_deg, amplitude=0.15, samples=BLOCK_SAMPLES):
         for p in positions
     ]
     return np.stack(channels, axis=1)   # (samples, channels), as the stream delivers
+
+
+def _six_channel_block(azimuth_deg):
+    """Bir USB dizinin gerçekte verdiği blok: mikrofonlar ortada.
+
+    Kanal 0 hüzme çıkışı (mikrofonların karışımı), 1-4 ham mikrofonlar, 5 geri
+    besleme. Kanal 0'ın mikrofonlarla ilişkili ama gecikmesi anlamsız olması testin
+    can alıcı noktası: bağımsız gürültü olsaydı kestirici zaten reddederdi, oysa
+    gerçek arıza tam da bunun *inandırıcı* görünmesi.
+    """
+    mics = _plane_wave_array(azimuth_deg)
+    beam = mics.sum(axis=1, keepdims=True) / 4.0
+    rng = np.random.default_rng(7)
+    playback = (rng.standard_normal((mics.shape[0], 1)) * 0.05).astype(np.float32)
+    return np.concatenate([beam, mics, playback], axis=1)
 
 
 def _real_estimator_source():
@@ -325,6 +344,66 @@ class TestDuplicatedChannels(unittest.TestCase):
 
         self.assertTrue(src.available)
         self.assertIsNotNone(src.latest_doa_deg(1.0 + 0.01 * (DUPLICATE_BLOCKS_TO_LATCH + 1)))
+
+
+class TestWhichChannelsAreMicrophones(unittest.TestCase):
+    """İlan edilen kanal sayısı, kaç mikrofon olduğu anlamına gelmiyor.
+
+    ReSpeaker USB Mic Array 6 kanal sunar: 0 işlenmiş hüzme, 1-4 ham mikrofonlar,
+    5 geri besleme. İlk dördünü almak, kestiriciye "ön mikrofon" diye hüzme çıkışını
+    verip dördüncü mikrofonu hiç okumamak demek — ve bu sessizce başarısız olur,
+    çünkü hüzme kanalı mikrofonlarla ilişkilidir, gürültü değildir. Açı üretilmeye
+    devam eder, sadece yanlıştır.
+    """
+
+    def _planned(self, available):
+        source = AudioSource()
+        opened = source._plan_channels({"max_input_channels": available})
+        return source._mic_channels, opened
+
+    def test_a_six_channel_array_reads_the_raw_microphones(self):
+        wanted, opened = self._planned(6)
+
+        self.assertEqual(wanted, RESPEAKER_MIC_CHANNELS)
+        self.assertGreater(opened, max(wanted), "istenen kanal acilmiyor")
+
+    def test_a_four_channel_array_reads_all_four(self):
+        wanted, _ = self._planned(4)
+        self.assertEqual(wanted, ARRAY_MIC_CHANNELS)
+
+    def test_an_explicit_list_is_obeyed(self):
+        """Dizi elde ölçülmüşse sıralamayı kullanıcı bilir, tahmin değil."""
+        source = AudioSource(mic_channels=(4, 3, 2, 1))
+        source._plan_channels({"max_input_channels": 6})
+
+        self.assertEqual(source._mic_channels, (4, 3, 2, 1))
+
+    def _arc(self, channels):
+        """-60°'den +60°'ye tarayıp okunan kerteriz yayını döndürür."""
+        bearings = []
+        for truth in (-60.0, -30.0, 30.0, 60.0):
+            source = _real_estimator_source()
+            source._mic_channels = channels
+            source.process_block(_six_channel_block(truth), timestamp=1.0)
+            bearings.append(source.latest_doa_deg(1.0))
+        return bearings
+
+    def test_the_bearing_spans_the_arc_the_source_did(self):
+        bearings = self._arc(RESPEAKER_MIC_CHANNELS)
+
+        self.assertNotIn(None, bearings, "ham mikrofonlardan kerteriz cikmadi")
+        self.assertAlmostEqual(bearings[-1] - bearings[0], 120.0, delta=15.0)
+
+    def test_reading_the_beam_as_a_microphone_collapses_the_arc(self):
+        """Asıl arıza buydu: açı üretiliyor ama kaynağı izlemiyor.
+
+        120°'lik gerçek bir tarama, hüzme kanalı mikrofon sanıldığında 70°'nin altına
+        sıkışıyor — ve sahada bu, açının rastgele sıçraması olarak görünüyor.
+        """
+        bearings = self._arc(ARRAY_MIC_CHANNELS)
+
+        self.assertNotIn(None, bearings)
+        self.assertLess(bearings[-1] - bearings[0], 90.0)
 
 
 if __name__ == "__main__":

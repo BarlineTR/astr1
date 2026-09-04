@@ -12,7 +12,7 @@ or the plumbing?" is worth little if it only runs on the finished robot.
 
 import os
 import threading
-from typing import Callable, List, Optional, Tuple
+from typing import Callable, List, Optional, Sequence, Tuple
 
 import cv2
 import depthai as dai
@@ -66,6 +66,14 @@ MAX_REAL_INPUT_CHANNELS = 16
 # 44.1 kHz'de 4096 örnek ~93 ms: bir hecenin doğrudan yolunu tutacak kadar uzun,
 # konuşmacı hareket ederken kerterizi bulandırmayacak kadar kısa.
 STEREO_BLOCK_SAMPLES = 4096
+
+# Bir USB mikrofon dizisinin ilan ettiği kanalların hepsi mikrofon değil. ReSpeaker
+# USB Mic Array 6 kanal sunar: 0 işlenmiş/hüzmelenmiş ses, 1-4 ham mikrofonlar,
+# 5 geri besleme. İlk dördünü almak, kestiriciye "ön mikrofon" diye hüzme çıkışını
+# verip dördüncü mikrofonu hiç okumamak demek. Geometri baştan bozulur ve açı
+# `atan2`'nin doygunluk değerlerine (0, ±90, 180) çakılır.
+ARRAY_MIC_CHANNELS = (0, 1, 2, 3)
+RESPEAKER_MIC_CHANNELS = (1, 2, 3, 4)
 
 
 def _is_duplicate(a: np.ndarray, b: np.ndarray) -> bool:
@@ -213,6 +221,7 @@ class AudioSource:
         max_age_s: float = 0.5,
         stream_factory: Optional[Callable] = None,
         mic_spacing_m: float = DEFAULT_MIC_SPACING_M,
+        mic_channels: Optional[Sequence[int]] = None,
     ):
         self.device = device
         self.max_age_s = max_age_s
@@ -231,6 +240,9 @@ class AudioSource:
         self.sample_rate = SAMPLE_RATE
         self._stereo = None
         self._mic_spacing_m = mic_spacing_m
+        self._requested_mic_channels = (
+            tuple(int(c) for c in mic_channels) if mic_channels else None)
+        self._mic_channels: Optional[tuple] = None
 
     def start(self) -> None:
         try:
@@ -275,17 +287,21 @@ class AudioSource:
         axis — front/back ambiguous, but enough to decide which way to turn, and the
         built-in pair is genuinely separated: measured -3.99 samples from the left
         speaker against +4.19 from the right, at 44.1 kHz on the raw device.
+
+        Every channel the card offers is opened, because which of them are microphones
+        is a separate question from how many there are.
         """
         if self.device is not None:
             info = self._device_info(self.device)
-            channels = 4 if info["max_input_channels"] >= 4 else 2
-            return self.device, channels, int(info["default_samplerate"])
+            self.device_name = info["name"]
+            return (self.device, self._plan_channels(info),
+                    int(info["default_samplerate"]))
 
         best_stereo = None
         for index, info in self._hardware_inputs():
             if info["max_input_channels"] >= 4:
                 self.device_name = info["name"]
-                return index, 4, SAMPLE_RATE
+                return index, self._plan_channels(info), SAMPLE_RATE
             if best_stereo is None and info["max_input_channels"] >= 2:
                 best_stereo = (index, info)
 
@@ -294,7 +310,28 @@ class AudioSource:
 
         index, info = best_stereo
         self.device_name = info["name"]
-        return index, 2, int(info["default_samplerate"])
+        return index, self._plan_channels(info), int(info["default_samplerate"])
+
+    def _plan_channels(self, info) -> int:
+        """Kaç kanal açılacağını ve bunların hangilerinin mikrofon olduğunu belirler."""
+        available = int(info["max_input_channels"])
+        if available < 4:
+            self._mic_channels = None
+            return 2
+
+        # Açıkça verilmişse tartışma yok: kullanıcı diziyi elinde ölçmüştür.
+        if self._requested_mic_channels is not None:
+            self._mic_channels = tuple(self._requested_mic_channels)
+            return max(self._mic_channels) + 1
+
+        if available >= 6:
+            # 6 kanallı USB dizilerin yerleşimi: baştaki işlenmiş, sondaki geri
+            # besleme. Ham mikrofonlar aradadır.
+            self._mic_channels = RESPEAKER_MIC_CHANNELS
+            return max(RESPEAKER_MIC_CHANNELS) + 1
+
+        self._mic_channels = ARRAY_MIC_CHANNELS
+        return 4
 
     @staticmethod
     def _device_info(index):
@@ -346,14 +383,22 @@ class AudioSource:
         if block.ndim != 2 or min(block.shape) < 4:
             return
         channels = block.T if block.shape[0] > block.shape[1] else block
-        if float(np.sqrt(np.mean(np.square(channels)))) < MIN_RMS:
+
+        wanted = self._mic_channels or ARRAY_MIC_CHANNELS
+        if channels.shape[0] <= max(wanted):
+            return
+        # Yalnızca mikrofonlar. İşlenmiş ve geri besleme kanalları hem geometriyi
+        # bozar hem de enerji ölçüsünü yanıltır.
+        mics = channels[list(wanted)]
+
+        if float(np.sqrt(np.mean(np.square(mics)))) < MIN_RMS:
             return
 
-        if not self._array_is_real(channels[:4]):
+        if not self._array_is_real(mics):
             return
 
         azimuth, _confidence, valid = self._estimator.estimate_from_multichannel_pcm(
-            channels[:4] * INT16_SCALE
+            mics * INT16_SCALE
         )
         if valid and azimuth is not None:
             self._publish(azimuth if azimuth >= 0.0 else azimuth + 360.0, timestamp)

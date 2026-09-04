@@ -65,6 +65,10 @@ def main(argv=None) -> int:
     parser.add_argument("--camera", type=int, default=0, help="Kamera indeksi")
     parser.add_argument("--serial", default=None, help="Arduino portu, örn. /dev/ttyACM0")
     parser.add_argument("--audio-device", type=int, default=None, help="Mikrofon indeksi")
+    parser.add_argument("--mic-channels", type=str, default=None, metavar="A,B,C,D",
+                        help="Dizide hangi kanalların (ön,sağ,arka,sol) mikrofon "
+                             "olduğu. 6 kanallı USB diziler için varsayılan 1,2,3,4; "
+                             "doğru sırayı audio_check.py ölçer.")
     parser.add_argument("--mic-spacing", type=float, default=DEFAULT_MIC_SPACING_M,
                         metavar="M",
                         help="Stereo modda iki mikrofon arası mesafe (metre). Açının "
@@ -96,12 +100,17 @@ def main(argv=None) -> int:
     else:
         print(f"📷 {camera.backend} | yüz algılama: {camera.detector_name}")
 
-    audio = AudioSource(device=opts.audio_device, mic_spacing_m=opts.mic_spacing)
+    mic_channels = ([int(c) for c in opts.mic_channels.split(",")]
+                    if opts.mic_channels else None)
+    audio = AudioSource(device=opts.audio_device, mic_spacing_m=opts.mic_spacing,
+                        mic_channels=mic_channels)
     audio.start()
     if not audio.available:
         print(f"🎤 Ses yok ({audio.error}) — yalnızca görüntüyle takip")
     elif audio.mode == "array":
-        print(f"🎤 4'lü mikrofon dizisi: {audio.device_name} (dizi ilk bloklarda doğrulanacak)")
+        used = ",".join(str(c) for c in (audio._mic_channels or ()))
+        print(f"🎤 4'lü mikrofon dizisi: {audio.device_name} — kanal {used} "
+              f"(sıralama şüpheliyse: python standalone/audio_check.py)")
     else:
         print(f"🎤 Stereo çift: {audio.device_name} @{audio.sample_rate} Hz — "
               f"tek eksende yön (sağ/sol), ön/arka ayrımı yok")
