@@ -12,7 +12,6 @@ from typing import List, Optional, Tuple
 
 from astro_base.gaze.angle_math import (
     circular_distance_deg,
-    circular_mean_deg,
     wrap_deg,
 )
 from astro_base.gaze.spatial_memory import EpistemicSpatialMemory
@@ -115,22 +114,18 @@ class AudioVisualFusionCore:
                     matched_audio = True
 
             if is_associated:
-                # FUSED target: Face + Active Voice
-                # Weighted trigonometric mean of angles (Vision is given higher spatial precision)
-                fused_yaw = circular_mean_deg(
-                    [vt.body_azimuth_deg, audio_state.azimuth_deg],
-                    weights=[vis_eff_conf * 1.5, audio_eff_conf * 0.5]
-                )
-                fused_yaw_val = fused_yaw if fused_yaw is not None else vt.body_azimuth_deg
-
-                # Combined confidence
-                combined_conf = min(1.0, vis_eff_conf + 0.30 * audio_eff_conf)
+                # FUSED target: Face confirmed as active speaker.
+                # Spatial bearing comes ONLY from the visual track — the camera has
+                # sub-degree precision here, while acoustic DOA on this hardware is
+                # unreliable (saturates at 0/90/180/270° regardless of source direction).
+                # Audio's role is: confirm speaking + small confidence boost only.
+                combined_conf = min(1.0, vis_eff_conf + 0.15 * audio_eff_conf)
 
                 fused_targets.append(
                     FusedTarget(
                         target_id=vt.target_id,
                         modality=Modality.FUSED,
-                        body_azimuth_deg=round(fused_yaw_val, 1),
+                        body_azimuth_deg=round(vt.body_azimuth_deg, 1),  # visual only, not DOA blend
                         body_elevation_deg=vt.body_elevation_deg,
                         distance_m=vt.distance_m,
                         confidence=round(combined_conf, 2),
@@ -144,6 +139,7 @@ class AudioVisualFusionCore:
                         visual_confidence=round(vt.confidence, 2),
                     )
                 )
+
             else:
                 # VISION-Only target: Face detected, but not currently speaking
                 fused_targets.append(
