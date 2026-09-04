@@ -38,6 +38,31 @@ BLOCK_SAMPLES = 1024
 # means the microphone opened.
 MIN_RMS = 0.01
 
+# The estimator is shared with the ROS audio stack, which feeds it int16 PCM: both its
+# energy gate (300.0) and its confidence term (rms / 1500.0) are calibrated for that
+# scale. This stream is float32, so samples arrive in [-1.0, +1.0] and both terms land
+# near zero. The confidence term does so structurally — no float32 block can reach
+# rms 1500 — which held confidence under the 0.40 validity bar even for a
+# geometrically perfect array, so `valid` was never returned no matter the hardware.
+# Scaling here fixes it without touching the estimator's other caller.
+INT16_SCALE = 32768.0
+
+# Correlation above this between two channels means one is a copy of the other rather
+# than a second microphone. Real capsules never agree this closely; independent sensor
+# and preamp noise keeps even co-located ones well below it.
+DUPLICATE_CORRELATION = 0.9999
+DUPLICATE_BLOCKS_TO_LATCH = 3
+
+
+def _is_duplicate(a: np.ndarray, b: np.ndarray) -> bool:
+    """True when two channels carry the same signal."""
+    a = a - a.mean()
+    b = b - b.mean()
+    denom = float(np.linalg.norm(a) * np.linalg.norm(b))
+    if denom <= 0.0:
+        return False
+    return abs(float(np.dot(a, b)) / denom) >= DUPLICATE_CORRELATION
+
 
 def to_detections(found) -> List[Detection]:
     """Turns the detector's (x, y, w, h, confidence) tuples into Detections."""
@@ -184,6 +209,8 @@ class AudioSource:
         self._stream = None
         self.available = False
         self.error: Optional[str] = None
+        self._array_dead = False
+        self._duplicate_blocks = 0
 
     def start(self) -> None:
         try:
@@ -215,11 +242,42 @@ class AudioSource:
         if float(np.sqrt(np.mean(np.square(channels)))) < MIN_RMS:
             return
 
+        if not self._array_is_real(channels[:4]):
+            return
+
         azimuth, _confidence, valid = self._estimator.estimate_from_multichannel_pcm(
-            channels[:4]
+            channels[:4] * INT16_SCALE
         )
         if valid and azimuth is not None:
             self._publish(azimuth if azimuth >= 0.0 else azimuth + 360.0, timestamp)
+
+    def _array_is_real(self, channels: np.ndarray) -> bool:
+        """Latches false when the four channels are two channels duplicated.
+
+        Opening a 4-channel stream is not proof of a 4-microphone array. With no
+        ReSpeaker attached the request still succeeds against PulseAudio's virtual
+        `default` device, which satisfies it by duplicating the laptop's built-in
+        stereo pair: channel 2 becomes a copy of channel 0 and channel 3 of channel 1.
+        GCC-PHAT then measures a delay of exactly zero on both axes and returns a
+        confident bearing straight down one of them — a direction no sound came from,
+        held steady enough to look real. Refusing here makes the missing hardware
+        visible instead of aiming the head at it.
+        """
+        if self._array_dead:
+            return False
+
+        if (_is_duplicate(channels[0], channels[2])
+                or _is_duplicate(channels[1], channels[3])):
+            self._duplicate_blocks += 1
+            if self._duplicate_blocks >= DUPLICATE_BLOCKS_TO_LATCH:
+                self._array_dead = True
+                self.available = False
+                self.error = ("4 kanal acildi ama iki kanalin kopyasi — mikrofon "
+                              "dizisi bagli degil, yon bulma kapatildi")
+            return False
+
+        self._duplicate_blocks = 0
+        return True
 
     def _publish(self, doa_deg: float, timestamp: float) -> None:
         with self._lock:

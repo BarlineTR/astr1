@@ -92,8 +92,9 @@ def main(argv=None) -> int:
 
     audio = AudioSource(device=opts.audio_device)
     audio.start()
-    print("🎤 Mikrofon dizisi hazır" if audio.available
+    print("🎤 Ses akışı açıldı (dizi ilk bloklarda doğrulanacak)" if audio.available
           else f"🎤 Ses yok ({audio.error}) — yalnızca görüntüyle takip")
+    audio_was_available = audio.available
 
     recorder = None
     if opts.record is not None:
@@ -118,6 +119,12 @@ def main(argv=None) -> int:
 
             detections = camera.detect(frame)
             head.poll()
+
+            if audio_was_available and not audio.available:
+                # The array check runs on the audio thread and can only fail once the
+                # first blocks arrive, after the startup line was already printed.
+                print(f"🎤 {audio.error} — yalnızca görüntüyle takip")
+                audio_was_available = False
 
             doa_deg = audio.latest_doa_deg(now) if audio.available else None
 
