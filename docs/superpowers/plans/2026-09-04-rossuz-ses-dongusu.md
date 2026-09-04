@@ -803,6 +803,7 @@ Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
 
 **Files:**
 - Modify: `standalone/voice.py`
+- Modify: `standalone/core_path.py` (astro_ai yola eklenir — ön uçuş bulgusu)
 - Test: `standalone/test/test_voice.py`
 
 **Interfaces:**
@@ -951,7 +952,23 @@ Expected: FAIL — `ImportError: cannot import name 'VoiceLoop' from 'voice'`
 
 - [ ] **Step 3: Write minimal implementation**
 
-`standalone/voice.py` başındaki import bloğunu değiştir:
+**Önce `standalone/core_path.py`'yi düzelt.** Bugün yalnızca `astro_base`,
+`astro_vision` ve `astro_audio`'yu yola ekliyor; `astro_ai` yok, ve aşağıdaki
+import onsuz `ModuleNotFoundError` ile düşer (ön uçuş taramasında doğrulandı).
+`_PACKAGES` demetine ekle:
+
+```python
+    os.path.join(REPO, "ros2_ws", "src", "astro_ai"),
+```
+
+`core_path.py`'nin docstring'inin son paragrafını da güncelle:
+
+```
+So astro_base/gaze, the astro_vision helpers and the astro_ai conversation
+pieces are imported from where they live.
+```
+
+Sonra `standalone/voice.py` başındaki import bloğunu değiştir:
 
 ```python
 import io
