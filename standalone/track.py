@@ -118,10 +118,15 @@ def main(argv=None) -> int:
               f"tek eksende yön (sağ/sol), ön/arka ayrımı yok")
     audio_was_available = audio.available
 
-    import voice as voice_module
-
     voice_loop = None
     if not opts.no_voice and audio.available:
+        # İçeride ve şart arkasında: `voice` `scipy`'yi (opsiyonel, bkz.
+        # voice.py review R2) ve `astro_ai`'yi içe aktarıyor -- `--no-voice`
+        # ile ya da ses donanımı yokken bunlar hiç gerekmemeli. Modül
+        # seviyesinde koşulsuz import, README'nin vaat ettiği görüntü-yalnız
+        # yolu (ses hiç kurulu olmasa da) bir bağımlılık eksikse çökertirdi.
+        import voice as voice_module
+
         voice_loop = voice_module.build_default_loop(audio)
         if voice_loop is None:
             print(f"🗣️  {voice_module.LAST_SETUP_ERROR}")

@@ -17,7 +17,6 @@ from math import gcd
 from typing import Any, Optional
 
 import numpy as np
-from scipy.signal import resample_poly
 
 import core_path  # noqa: F401
 from astro_ai.conversation_session import ConversationSession  # noqa: E402
@@ -151,10 +150,26 @@ def resample_to(mono: np.ndarray, from_rate: int, to_rate: int) -> np.ndarray:
     telafi etmiyor. `scipy.signal.resample_poly` oranı `from_rate`/`to_rate`'in
     ortak böleniyle sadeleştirip alçak geçirgen süzülmüş bir polifaz yeniden
     örnekleme uyguluyor, bu yüzden bant dışı içerik gerçekten atılıyor.
+
+    `scipy` burada pip bağımlılığı değil (bkz. review R2) -- bu makinede
+    yalnızca `--system-site-packages` üzerinden geliyor, temiz bir kurulumda
+    yok olabilir. `astro_audio/speaker_db.py`'deki `to_16k_mono` aynı ödünle
+    kurulmuştu: import içeride ve tembel, yoksa `np.interp`'e düşülüyor.
     """
     if from_rate == to_rate or len(mono) == 0:
         return np.asarray(mono, dtype=np.float32)
     mono = np.asarray(mono, dtype=np.float32)
+    try:
+        from scipy.signal import resample_poly
+    except ImportError:
+        # scipy yoksa çıplak np.interp'e düşülüyor: bu katlanma (aliasing)
+        # yaratır (yeni Nyquist üzerindeki içerik konuşma bandına bulaşır) --
+        # ama STT yine de az bozulmuş sesle çalışır, oysa burada çökmek
+        # track.py'nin ses gerektirmeyen görüntü-yalnız yolunu da beraberinde
+        # götürürdü (bkz. README: "konuşma, görmenin önkoşulu değil").
+        indices = np.linspace(0, mono.size - 1,
+                               int(mono.size * to_rate / from_rate))
+        return np.interp(indices, np.arange(mono.size), mono).astype(np.float32)
     divisor = gcd(int(from_rate), int(to_rate))
     up, down = int(to_rate) // divisor, int(from_rate) // divisor
     return resample_poly(mono, up, down).astype(np.float32)
@@ -230,8 +245,12 @@ class VoiceLoop:
         self._last_reported: dict = {}
         self._turn_running = False
         self._thread = None
-        # Halka tampon imleci: her örnek tam bir kez teslim edilsin.
+        # Halka tampon imleci: her örnek tam bir kez teslim edilsin. İki yazarı
+        # var -- `pump` (ana thread) ve `_discard_turn_backlog` (tur thread'i) --
+        # o yüzden kendi kilidini taşır (bkz. review R1). `AudioSource._lock`
+        # kasıtlı olarak kullanılmıyor: o ses kaynağının kilidi, bunun değil.
         self._cursor = 0
+        self._cursor_lock = threading.Lock()
 
     @property
     def is_speaking(self) -> bool:
@@ -328,7 +347,7 @@ class VoiceLoop:
         if self.audio is None or self._turn_running:
             return
 
-        block, self._cursor = self.audio.read_since(self._cursor)
+        block = self._read_since_cursor()
         if len(block) == 0:
             return
 
@@ -351,8 +370,30 @@ class VoiceLoop:
         try:
             self.handle_utterance(utterance, sample_rate)
         finally:
-            self._turn_running = False
+            # Sıra kasıtlı: `_turn_running` ATILMADAN ÖNCE değil, birikinti
+            # atıldıktan SONRA düşürülüyor (bkz. review R1). Tersi -- eski
+            # kod -- `_turn_running`'i önce False yapıyordu; `pump` 30 Hz ana
+            # thread'de çalışıyor ve bayrağı False görür görmez kendi
+            # `read_since` çağrısını yapabiliyordu. `_discard_turn_backlog`
+            # hemen `AudioSource._lock`'a takılıyor (yakalama callback'i
+            # periyodik olarak tutuyor), o yüzden iki thread'in burada
+            # gerçekten kuyruğa girdiği ölçüldü -- pencere teorik değil.
+            # Araya giren `pump` birikmiş çok-saniyelik sesi TEK blok, TEK
+            # verdiyle `UtteranceTracker`'a yutturuyordu -- discard'ın
+            # önlemesi gereken hatanın ta kendisi.
             self._discard_turn_backlog()
+            self._turn_running = False
+
+    def _read_since_cursor(self) -> np.ndarray:
+        """`self._cursor`'ı okuyup ilerletir -- tek kilit altında (bkz. R1).
+
+        İki yazar var: `pump` (ana thread) ve `_discard_turn_backlog` (tur
+        thread'i). `AudioSource._lock` burada kullanılmıyor; o ses kaynağının
+        kendi kilidi, bu nesnenin imlecini korumuyor.
+        """
+        with self._cursor_lock:
+            block, self._cursor = self.audio.read_since(self._cursor)
+        return block
 
     def _discard_turn_backlog(self) -> None:
         """Tur boyunca biriken ses, bir sonraki sözcenin parçası değil (bkz.
@@ -374,7 +415,7 @@ class VoiceLoop:
         çalma başlarken yaptığı gibi değil — çalma hiç olmasa da).
         """
         if self.audio is not None:
-            _, self._cursor = self.audio.read_since(self._cursor)
+            self._read_since_cursor()
         self._utterance.reset()
 
     def stop(self) -> None:

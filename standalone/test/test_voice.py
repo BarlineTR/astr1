@@ -144,6 +144,47 @@ class ResampleAliasingTests(unittest.TestCase):
         self.assertEqual(len(out), 0)
 
 
+class ResampleWithoutScipyTests(unittest.TestCase):
+    """R2: `voice.py` modul seviyesinde `from scipy.signal import resample_poly`
+    yapiyordu. `scipy` bu depoda pip bagimliligi degil -- yalnizca bu
+    makinede `--system-site-packages` uzerinden geliyor (`requirements.in`da
+    yoktu). Temiz bir kurulumda yoksa modul importu patlar, ve `track.py`
+    `import voice`'u `--no-voice` kontrolunden ONCE calistirdigi icin
+    goruntu-yalniz takip yolu da (README'nin ozellikle vaat ettigi) beraberinde
+    cokerdi. Duzeltme `astro_audio/speaker_db.py::to_16k_mono`'daki desenin
+    aynisi: import fonksiyon icinde ve tembel, `ImportError`'da `np.interp`'e
+    dusuluyor. Bu test scipy'yi GERCEKTEN kaldirmiyor -- sys.modules'ta
+    gorunmez kilip ayni etkiyi taklit ediyor."""
+
+    def test_scipy_yokken_voice_ice_aktarilir_ve_resample_dogru_calisir(self):
+        import importlib
+        import sys as _sys
+        from unittest import mock
+
+        saved = {}
+        for name in list(_sys.modules):
+            if name == "voice" or name == "scipy" or name.startswith("scipy."):
+                saved[name] = _sys.modules.pop(name)
+
+        try:
+            with mock.patch.dict(_sys.modules, {"scipy": None, "scipy.signal": None}):
+                voice_mod = importlib.import_module("voice")  # patlamamali
+
+                mono = np.full(44100, 0.5, dtype=np.float32)  # sabit genlik
+                out = voice_mod.resample_to(mono, 44100, 16000)
+
+                self.assertGreater(len(out), 0,
+                                   "scipy yokken resample_to bos cikti dondurdu")
+                self.assertAlmostEqual(
+                    float(np.mean(out)), 0.5, places=2,
+                    msg="scipy yokken np.interp yedegi genligi bozdu")
+        finally:
+            for name in list(_sys.modules):
+                if name == "voice" or name == "scipy" or name.startswith("scipy."):
+                    del _sys.modules[name]
+            _sys.modules.update(saved)
+
+
 class _FakeStt:
     def __init__(self, text="hey astro nasilsin"):
         self.text = text
@@ -1018,6 +1059,42 @@ class TurnBacklogTests(unittest.TestCase):
             loop._utterance.active,
             "calmasiz tur bitince eski yarim sozce hala biriktirilmis durumda "
             "-- bir sonraki cumleyle birlesecekti")
+
+
+class BacklogDiscardOrderingTests(unittest.TestCase):
+    """R1: `_run_turn` `_turn_running`'i False yapip SONRA birikintiyi
+    atiyordu. `pump` ana thread'de (30 Hz) kosuyor ve `_turn_running` iken
+    erken donuyor -- ama iki satir arasindaki pencerede bayragi zaten False
+    gorup kendi `read_since` cagrisini yapabilir, turun bastan sona biriken
+    sesini TEK blok TEK verdiyle `UtteranceTracker`'a yutturur. Bu, discard'in
+    var olma sebebinin ta kendisi (bkz. TurnBacklogTests / I2). Duzeltme iki
+    satiri yer degistiriyor: bayrak, birikinti GERCEKTEN atildiktan sonra
+    dusuyor. Gercek thread donusumunu belirlenimli yakalamak yerine
+    `_discard_turn_backlog`'u gozlemlenebilir kiliyoruz: calistigi anda
+    `_turn_running`'in hala True olup olmadigini kaydediyoruz."""
+
+    def test_discard_calisirken_turn_running_hala_true(self):
+        loop = _voice(stt=_FakeStt("hey astro selam"))
+        loop.audio = _FakeAudioSource()
+
+        observed_turn_running_at_discard = []
+        original_discard = loop._discard_turn_backlog
+
+        def _spy_discard():
+            observed_turn_running_at_discard.append(loop._turn_running)
+            original_discard()
+
+        loop._discard_turn_backlog = _spy_discard
+        loop._turn_running = True  # pump() bir tur baslattigini boyle isaretler
+
+        loop._run_turn(np.zeros(1600, dtype=np.float32), 16000)
+
+        self.assertEqual(
+            observed_turn_running_at_discard, [True],
+            "_discard_turn_backlog calisirken _turn_running zaten False'tu -- "
+            "pump() araya girip henuz atilmamis birikintiyi okuyabilirdi")
+        self.assertFalse(loop._turn_running,
+                         "tur bitince _turn_running True kaldi")
 
 
 if __name__ == "__main__":
