@@ -1623,3 +1623,55 @@ Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
 C1 bittiğinde çalışan şey: uyandırma sözcüğüyle açılan, sesli cevap veren, kafası bu sırada takibe devam eden, kendi sesine dönmeyen ve araya girilince susan bir döngü.
 
 Sırada C2 (persona, hafıza, oturum özeti, streaming) var; `LlmClient.system_prompt` ve `VoiceLoop.session` şimdiden onun bağlanacağı yerler.
+
+---
+
+## Yürütme sonrası — açık kalanlar
+
+C1 uygulandı (7 görev, 164 standalone testi yeşil). Aşağıdakiler bilinçli olarak
+açık bırakıldı; sıradaki oturumun başlangıç listesi budur.
+
+### Doğrulanmamış (ortam engeli)
+
+- **Gerçek sağlayıcılarla hiçbir uçtan uca tur koşulmadı.** OpenAI hesabı
+  `429 credit_balance_exhausted` döndü. Gerçek STT doğruluğu/gecikmesi, gerçek TTS
+  çalması, gerçek turda fps etkisi ve gerçek donanımda `note_playback` zamanlaması
+  hiç ölçülmedi. Kredi geldiğinde ilk iş bu.
+- **ReSpeaker takılı değil.** Kanal sırası açık: ROS `multi_ch[:4]` (kanal 0-3),
+  standalone `(1,2,3,4)`. İkisi birden doğru olamaz; `standalone/audio_check.py`
+  ölçecek.
+- **Sessizlik eşiği uzlaştırılmadı.** ROS yığını 0.38 s kullanıyor
+  (`speech_recognition_node`), `UtteranceTracker` 0.8 s. 0.38 sahada çalışan bir
+  değer, 0.8 akıl yürütme. Gerçek kayıtla karara bağlanmalı.
+- **`SpeechDetector` eşikleri yalnızca sentetik sesle doğrulandı.** Gerçek konuşma,
+  gerçek trafik ve gerçek uğultu kaydıyla yeniden ayarlanmalı.
+
+### Bilinçli kapatılanlar
+
+- **Barge-in varsayılan olarak kapalı** (`barge_in_enabled=False`). Boru hattında
+  robotun kendi sesini insandan ayıracak hiçbir kanıt yok — yankı iptali yok,
+  referans çıkarma yok, seviye karşılaştırması yok — ve TTS de konuşmadır. Açık
+  bırakıldığında robot her cevabın ~0.3 sn'sinde kendini kesip kendine cevap
+  veriyordu. Açılabilmesi için yankı iptali ya da çalma zarfına göre seviye
+  ayrımı gerekiyor.
+
+### Kalan küçük borçlar
+
+- `LlmClient` testleri `model`/`temperature`/`timeout` iletimini doğrulamıyor.
+- `UtteranceTracker.max_s` kapağı sessizlik dalından hiçbir testle sürülmüyor.
+- `UtteranceTracker.active` ve `VoiceLoop.is_speaking` kullanılmıyor ve test
+  edilmiyor — silinmeli ya da test edilmeli.
+- Yalnız uyandırma sözcüğünden ibaret sözce ("hey astro") ham metni LLM'e prompt
+  olarak gönderiyor; savunulabilir ama test edilmemiş.
+- `build_default_loop`, sonraki bir kurucu hata verirse `AudioOutputManager`'ın
+  worker thread'ini durdurmuyor (yetim daemon thread).
+- `_speak`, TTS ses üretemediğinde de `session.record_robot_speech()` çağırıyor.
+- Uzun bir tur (STT+LLM+TTS > 16 s) henüz çalma başlamamışsa oturumu tur ortasında
+  düşürebiliyor: cevap yine çalınır ama takip sözcesi düşer.
+- `pump()`, `thread.start()` hata verirse `_turn_running`'i True'da bırakır ve ses
+  döngüsü süreç ömrü boyunca ölür.
+
+### Sıradaki aşamalar
+
+C2 (persona, hafıza, oturum özeti, streaming) → C3 (araçlar, ofis) → C4 (Realtime
+S2S). `LlmClient.system_prompt` ve `VoiceLoop.session` C2'nin bağlanacağı yerler.
