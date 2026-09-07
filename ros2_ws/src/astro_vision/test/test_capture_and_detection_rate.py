@@ -127,11 +127,13 @@ class TestDetectionIsStableFrameToFrame(unittest.TestCase):
 
         self.assertIsInstance(node.face_detector, YuNetFaceDetector)
 
-    def test_short_misses_are_bridged(self):
-        """Three frames took YuNet from 90.4% to 98.8% while a face turned to profile."""
+    def test_detection_hold_is_removed_for_standalone_semantics(self):
+        """DetectionHold is removed so that dropouts publish empty detections,
+        preventing synthetic bounding box re-projection and positive feedback runaway."""
         node = SpatialVisionNode()
 
-        self.assertGreaterEqual(node.detection_hold.hold_frames, 3)
+        self.assertFalse(hasattr(node, "detection_hold"))
+        self.assertEqual(node.synthetic_hold_detections_count, 0)
 
     def test_the_dropped_fallback_cascade_is_really_gone(self):
         """alt2 recovered 1 frame in 600 across two scenes while costing 13.6 ms per

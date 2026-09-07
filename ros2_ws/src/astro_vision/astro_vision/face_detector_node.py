@@ -60,10 +60,10 @@ except ImportError:
 try:
     from astro_vision.image_utils import bgr_to_imgmsg, imgmsg_to_bgr
     from astro_vision.face_recognizer import FaceRecognizer
-    from astro_vision.detection_quality import DetectionHold, create_face_detector
+    from astro_vision.detection_quality import create_face_detector
 except ImportError:
     from image_utils import bgr_to_imgmsg, imgmsg_to_bgr
-    from detection_quality import DetectionHold, create_face_detector
+    from detection_quality import create_face_detector
     class FaceRecognizer:
         def identify(self, frame, x, y, w, h):
             return {"name": "Misafir", "title": "Ziyaretçi", "confidence": 0.0, "is_known": False}
@@ -84,11 +84,6 @@ class SpatialVisionNode(Node):
         # already halved to 15 Hz, leaving 7.5 Hz of bearings — one update per 133 ms —
         # while a loaded frame costs ~13.5 ms and the CPU idled through the rest.
         self.declare_parameter("process_every_n", 1)
-        # Frames of budget for carrying the previous detection over a miss. Three
-        # takes YuNet from 90.4% to 98.8% while a face turns to profile, and drops the
-        # worst gap from 165 ms to 66 ms; the carried detection decays in confidence
-        # so it can hold an existing lock but never acquire a new target.
-        self.declare_parameter("detection_hold_frames", 3)
 
         input_topic = self.get_parameter("input_topic").value
         depth_topic = self.get_parameter("depth_topic").value
@@ -97,9 +92,6 @@ class SpatialVisionNode(Node):
         self.min_size = int(self.get_parameter("min_size").value)
         self.show_debug = bool(self.get_parameter("show_debug").value)
         self.process_every_n = max(1, int(self.get_parameter("process_every_n").value))
-        self.detection_hold = DetectionHold(
-            hold_frames=int(self.get_parameter("detection_hold_frames").value)
-        )
 
         # Load Cascades (Default + Alt2 for maximum detection rate)
         frontal_path = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
@@ -143,6 +135,8 @@ class SpatialVisionNode(Node):
         self.clipped_bbox_count: int = 0
         self.head_yaw_fallback_count: int = 0
         self.detector_exception_count: int = 0
+        self.real_detections_count: int = 0
+        self.synthetic_hold_detections_count: int = 0
         self._last_perf_log_time: float = time.time()
 
         # Publishers
@@ -160,12 +154,15 @@ class SpatialVisionNode(Node):
         # kareler için retransmission yapmaktan iyidir. BEST_EFFORT abone RELIABLE
         # yayıncıdan da veri alabilir, bu yüzden depthai_ros_driver ile uyumludur.
         # Queue derinliği 1: yalnızca en son kare işlenir, eski kareler atılır → gecikme sıfıra yakın.
-        from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSHistoryPolicy
-        latest_frame_qos = QoSProfile(
-            reliability=QoSReliabilityPolicy.BEST_EFFORT,
-            history=QoSHistoryPolicy.KEEP_LAST,
-            depth=1
-        )
+        try:
+            from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSHistoryPolicy
+            latest_frame_qos = QoSProfile(
+                reliability=QoSReliabilityPolicy.BEST_EFFORT,
+                history=QoSHistoryPolicy.KEEP_LAST,
+                depth=1
+            )
+        except ImportError:
+            latest_frame_qos = 10
         self.sub_rgb = self.create_subscription(Image, input_topic, self.image_callback, latest_frame_qos)
         self.sub_depth = self.create_subscription(Image, depth_topic, self.depth_callback, latest_frame_qos)
 
@@ -340,10 +337,7 @@ class SpatialVisionNode(Node):
             small_frame = frame
 
         detected_faces = self.face_detector.detect(small_frame)
-        # Carry the previous detection over the one- and two-frame misses the cascade
-        # makes on a face that has not moved; without this the stream flickered on
-        # 18% of frames even with the finer pyramid.
-        detected_faces = self.detection_hold.update(detected_faces)
+        self.real_detections_count += len(detected_faces)
 
         # Map bounding boxes back to original resolution (the confidence is scale-free)
         if len(detected_faces) > 0 and scale_ratio < 1.0:
@@ -371,7 +365,9 @@ class SpatialVisionNode(Node):
                 f"[VISION PERF] invalid_roi={self.invalid_roi_count}, "
                 f"clipped_bbox={self.clipped_bbox_count}, "
                 f"yaw_fallback={self.head_yaw_fallback_count}, "
-                f"exceptions={self.detector_exception_count}"
+                f"exceptions={self.detector_exception_count}, "
+                f"real_detections={self.real_detections_count}, "
+                f"synthetic_hold_detections={self.synthetic_hold_detections_count}"
             )
             self._last_perf_log_time = now
 

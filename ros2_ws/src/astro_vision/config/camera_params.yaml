@@ -31,10 +31,6 @@ face_detector_node:
     # 1 = her kare. Yüklü bir kare ~13.5 ms sürüyor, 30 FPS'in bütçesi 33 ms —
     # atlamaya gerek yok. Bunu büyütmek doğrudan takip gecikmesine dönüşür.
     process_every_n: 1
-    # Iskalanan kareyi öncekiyle köprüler. 3 kare, kişi profile dönerken YuNet'i
-    # %90.4'ten %98.8'e çıkarıyor, en uzun boşluk 165 ms -> 66 ms. Köprülenen
-    # tespitin güveni düştüğü için mevcut kilidi korur ama yeni hedef edinemez.
-    detection_hold_frames: 3
     # Cascade ayarı — yalnızca yunet.onnx kurulu DEĞİLKEN (Haar yedeği) etkili.
     # YuNet kendi ölçek aramasını yapar.
     scale_factor: 1.1
