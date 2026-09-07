@@ -226,3 +226,115 @@ class TestStandaloneAudioIntegration:
         engine = EdgeTTSEngine()
         assert hasattr(engine, "is_ready")
         assert hasattr(engine, "synthesize_sentence")
+
+    def test_ros_audio_topic_subscription_bridge(self):
+        """StandaloneGazeRosNode in 'topics' mode ingests /audio/doa, /audio/doa_confidence, /audio/vad."""
+        from astro_base.standalone_gaze_ros_node import Float32, Bool
+        node = StandaloneGazeRosNode(
+            use_camera_source=False,
+            enable_audio=True,
+            audio_source_mode="topics",
+        )
+
+        assert node.audio_source_mode == "topics"
+        assert node.audio is None  # Does NOT open hardware ReSpeaker
+
+        # Feed ROS topic messages
+        node._on_audio_doa(Float32(data=45.0))
+        node._on_audio_doa_conf(Float32(data=0.92))
+        node._on_audio_vad(Bool(data=True))
+        node._on_playback_active(Bool(data=False))
+
+        now = time.monotonic()
+        doa, speech, is_speaking = node._sample_acoustic_state(now)
+
+        assert doa == pytest.approx(45.0, abs=1e-3)
+        assert speech is not None
+        assert speech.is_speech is True
+        assert speech.confidence == pytest.approx(0.92, abs=1e-3)
+        assert is_speaking is False
+
+    def test_ros_audio_topic_freshness_timeout(self):
+        """DOA and VAD received via ROS topics expire after audio_freshness_s."""
+        from astro_base.standalone_gaze_ros_node import Float32, Bool
+        node = StandaloneGazeRosNode(
+            use_camera_source=False,
+            enable_audio=True,
+            audio_source_mode="topics",
+        )
+        node.audio_freshness_s = 0.50
+
+        # Feed fresh audio
+        node._on_audio_doa(Float32(data=30.0))
+        node._on_audio_vad(Bool(data=True))
+
+        t_now = time.monotonic()
+        # Immediately fresh
+        doa, speech, _ = node._sample_acoustic_state(t_now)
+        assert doa == pytest.approx(30.0, abs=1e-3)
+        assert speech is not None
+        assert speech.is_speech is True
+
+        # Advance past freshness window (0.60s > 0.50s)
+        doa_stale, speech_stale, _ = node._sample_acoustic_state(t_now + 0.60)
+        assert doa_stale is None
+        assert speech_stale is None
+
+    def test_ros_audio_topic_playback_active_suppression(self):
+        """When /audio/playback_active or /robot/is_speaking is True, is_speaking flag is True."""
+        from astro_base.standalone_gaze_ros_node import Bool
+        node = StandaloneGazeRosNode(
+            use_camera_source=False,
+            enable_audio=True,
+            audio_source_mode="topics",
+        )
+
+        node._on_playback_active(Bool(data=True))
+        _, _, is_speaking = node._sample_acoustic_state(time.monotonic())
+        assert is_speaking is True
+
+        node._on_playback_active(Bool(data=False))
+        node._on_robot_speaking(Bool(data=True))
+        _, _, is_speaking = node._sample_acoustic_state(time.monotonic())
+        assert is_speaking is True
+
+        node._on_robot_speaking(Bool(data=False))
+        _, _, is_speaking = node._sample_acoustic_state(time.monotonic())
+        assert is_speaking is False
+
+    def test_launch_file_graph(self):
+        """Verifies astro_social_gaze.launch.py brings up serial_bridge, standalone_gaze_ros_node, audio_stream_node, and astro_realtime_node."""
+        import importlib.util
+        from pathlib import Path
+        launch_file = Path(__file__).resolve().parents[2] / "astro_bringup" / "launch" / "astro_social_gaze.launch.py"
+        spec = importlib.util.spec_from_file_location("astro_social_gaze_launch", str(launch_file))
+        assert spec is not None and spec.loader is not None
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        ld = mod.generate_launch_description()
+        RosNode = mod.Node
+        nodes = [entity for entity in ld.entities if isinstance(entity, RosNode)]
+
+        node_execs = {
+            n.node_executable if hasattr(n, "node_executable") else getattr(n, "_Node__node_executable", None)
+            for n in nodes
+        }
+        node_pkgs = {
+            n.node_package if hasattr(n, "node_package") else getattr(n, "_Node__node_package", None)
+            for n in nodes
+        }
+
+        # Verify all 4 canonical nodes are declared
+        assert "serial_bridge" in node_execs
+        assert "standalone_gaze_ros" in node_execs
+        assert "audio_stream_node" in node_execs
+        assert "astro_realtime_node" in node_execs
+
+        assert "astro_base" in node_pkgs
+        assert "astro_audio" in node_pkgs
+        assert "astro_ai" in node_pkgs
+
+        # Ensure NO forbidden duplicate nodes exist
+        assert "social_gaze_node" not in node_execs
+        assert "face_detector_node" not in node_execs
+        assert len(nodes) == 4

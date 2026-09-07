@@ -142,7 +142,24 @@ def _coerce_bool(val: Any) -> bool:
         return bool(val)
     if isinstance(val, str):
         return val.strip().lower() in ("true", "1", "yes", "on")
-    return bool(val)
+class StandaloneSpeechVerdict:
+    """Lightweight speech verdict container conforming to GazeTracker and SpeechDetector interface."""
+
+    def __init__(
+        self,
+        is_speech: bool = True,
+        confidence: float = 0.85,
+        harmonicity: float = 0.5,
+        modulation: float = 0.5,
+        rms: float = 500.0,
+        reason: str = "ros_topic",
+    ):
+        self.is_speech = bool(is_speech)
+        self.confidence = float(confidence)
+        self.harmonicity = float(harmonicity)
+        self.modulation = float(modulation)
+        self.rms = float(rms)
+        self.reason = str(reason)
 
 
 class StandaloneGazeRosNode(Node):
@@ -165,6 +182,7 @@ class StandaloneGazeRosNode(Node):
         enable_audio: Optional[bool] = None,
         enable_voice: Optional[bool] = None,
         verbose_diagnostics: Optional[bool] = None,
+        audio_source_mode: Optional[str] = None,
     ):
         super().__init__("standalone_gaze_ros_node")
 
@@ -176,6 +194,7 @@ class StandaloneGazeRosNode(Node):
         self.declare_parameter("calibration_path", "")
         self.declare_parameter("camera_latency_s", 0.050)
         self.declare_parameter("enable_audio", True)
+        self.declare_parameter("audio_source_mode", "topics")
         self.declare_parameter("audio_device", -1)
         self.declare_parameter("mic_channels", "")
         self.declare_parameter("mic_spacing", DEFAULT_MIC_SPACING_M)
@@ -192,6 +211,14 @@ class StandaloneGazeRosNode(Node):
         self.camera_latency_s = float(self.get_parameter("camera_latency_s").value)
 
         use_audio = _coerce_bool(enable_audio if enable_audio is not None else self.get_parameter("enable_audio").value)
+        self.enable_audio = use_audio
+        audio_src_mode = str(
+            audio_source_mode
+            if audio_source_mode is not None
+            else self.get_parameter("audio_source_mode").value
+        ).strip().lower()
+        self.audio_source_mode = audio_src_mode
+
         audio_dev = int(self.get_parameter("audio_device").value)
         audio_dev = None if audio_dev < 0 else audio_dev
         mic_ch_str = str(self.get_parameter("mic_channels").value).strip()
@@ -238,45 +265,79 @@ class StandaloneGazeRosNode(Node):
         self.audio: Optional[AudioSource] = None
         self.voice_loop = None
 
-        # Initialize AudioSource and VoiceLoop (Non-blocking background workers)
+        # Thread-safe Audio Perception State from ROS topics
+        self._audio_lock = threading.Lock()
+        self._latest_doa_deg: Optional[float] = None
+        self._latest_doa_time: float = 0.0
+        self._latest_doa_conf: float = 0.85
+        self._latest_vad_active: bool = False
+        self._latest_vad_time: float = 0.0
+        self._playback_active: bool = False
+        self._robot_speaking: bool = False
+
+        # Audio Integration: ROS topic bridge (default) vs standalone hardware mode
         if use_audio:
-            try:
-                self.audio = AudioSource(
-                    device=audio_dev,
-                    mic_spacing_m=mic_spacing,
-                    mic_channels=mic_channels,
-                    max_age_s=self.audio_freshness_s,
+            if self.audio_source_mode in ("topics", "ros"):
+                self.sub_audio_doa = self.create_subscription(
+                    Float32, "/audio/doa", self._on_audio_doa, 10
                 )
-                self.audio.start()
-                if self.audio.available:
+                self.sub_audio_conf = self.create_subscription(
+                    Float32, "/audio/doa_confidence", self._on_audio_doa_conf, 10
+                )
+                self.sub_audio_vad = self.create_subscription(
+                    Bool, "/audio/vad", self._on_audio_vad, 10
+                )
+                self.sub_playback_active = self.create_subscription(
+                    Bool, "/audio/playback_active", self._on_playback_active, 10
+                )
+                self.sub_robot_speaking = self.create_subscription(
+                    Bool, "/robot/is_speaking", self._on_robot_speaking, 10
+                )
+                self.get_logger().info(
+                    "🎤 Audio Bridge active via ROS topics (/audio/doa, /audio/doa_confidence, /audio/vad, /audio/playback_active)"
+                )
+                if self.enable_voice:
                     self.get_logger().info(
-                        f"🎤 AudioSource initialized ({self.audio.mode} mode, {self.audio.device_name} @{self.audio.sample_rate}Hz)"
+                        "🗣️ Voice & conversation handled by external node (astro_realtime_node)"
                     )
-                    if self.enable_voice:
-                        try:
-                            import voice as voice_module
-                            self.voice_loop = voice_module.build_default_loop(
-                                self.audio, edge_tts_enabled=self.enable_edge_tts
-                            )
-                            if self.voice_loop is not None:
-                                self.get_logger().info(f"🗣️ VoiceLoop active — wake word: '{self.voice_loop.wake_word}'")
-                                if not getattr(self.voice_loop.tts, "edge_tts_enabled", False):
-                                    self.get_logger().info("[AUDIO] Edge-TTS unavailable")
-                            else:
-                                err = str(voice_module.LAST_SETUP_ERROR or "")
-                                if "key" in err.lower() or "openai" in err.lower() or "client" in err.lower():
-                                    self.get_logger().info("[AUDIO] OpenAI unavailable")
+            elif self.audio_source_mode in ("standalone", "hardware"):
+                try:
+                    self.audio = AudioSource(
+                        device=audio_dev,
+                        mic_spacing_m=mic_spacing,
+                        mic_channels=mic_channels,
+                        max_age_s=self.audio_freshness_s,
+                    )
+                    self.audio.start()
+                    if self.audio.available:
+                        self.get_logger().info(
+                            f"🎤 AudioSource initialized ({self.audio.mode} mode, {self.audio.device_name} @{self.audio.sample_rate}Hz)"
+                        )
+                        if self.enable_voice:
+                            try:
+                                import voice as voice_module
+                                self.voice_loop = voice_module.build_default_loop(
+                                    self.audio, edge_tts_enabled=self.enable_edge_tts
+                                )
+                                if self.voice_loop is not None:
+                                    self.get_logger().info(f"🗣️ VoiceLoop active — wake word: '{self.voice_loop.wake_word}'")
+                                    if not getattr(self.voice_loop.tts, "edge_tts_enabled", False):
+                                        self.get_logger().info("[AUDIO] Edge-TTS unavailable")
                                 else:
-                                    self.get_logger().info(f"[AUDIO] VoiceLoop inactive: {err}")
-                                if not self.enable_edge_tts:
-                                    self.get_logger().info("[AUDIO] Edge-TTS unavailable")
-                        except Exception as v_exc:
-                            self.get_logger().warning(f"🗣️ VoiceLoop setup skipped: {v_exc}")
-                            self.get_logger().info("[AUDIO] OpenAI unavailable")
-                else:
-                    self.get_logger().warning(f"🎤 AudioSource unavailable ({self.audio.error}) — continuing in vision-only mode")
-            except Exception as a_exc:
-                self.get_logger().warning(f"🎤 AudioSource setup error: {a_exc} — continuing in vision-only mode")
+                                    err = str(voice_module.LAST_SETUP_ERROR or "")
+                                    if "key" in err.lower() or "openai" in err.lower() or "client" in err.lower():
+                                        self.get_logger().info("[AUDIO] OpenAI unavailable")
+                                    else:
+                                        self.get_logger().info(f"[AUDIO] VoiceLoop inactive: {err}")
+                                    if not self.enable_edge_tts:
+                                        self.get_logger().info("[AUDIO] Edge-TTS unavailable")
+                            except Exception as v_exc:
+                                self.get_logger().warning(f"🗣️ VoiceLoop setup skipped: {v_exc}")
+                                self.get_logger().info("[AUDIO] OpenAI unavailable")
+                    else:
+                        self.get_logger().warning(f"🎤 AudioSource unavailable ({self.audio.error}) — continuing in vision-only mode")
+                except Exception as a_exc:
+                    self.get_logger().warning(f"🎤 AudioSource setup error: {a_exc} — continuing in vision-only mode")
 
         # 100-sample Diagnostic Ring Buffers for Center Isolation
         self._diag_raw_bearings: collections.deque = collections.deque(maxlen=100)
@@ -385,6 +446,93 @@ class StandaloneGazeRosNode(Node):
         self.runtime.tracker.fsm.set_sleep_mode(bool(msg.data))
 
     # =========================================================================
+    # Audio Topic Callbacks (Topic Bridge Mode)
+    # =========================================================================
+
+    def _on_audio_doa(self, msg: Float32) -> None:
+        """Receives DOA angle in degrees [0..359°] from /audio/doa."""
+        try:
+            val = float(msg.data)
+            now = time.monotonic()
+            with self._audio_lock:
+                self._latest_doa_deg = val
+                self._latest_doa_time = now
+        except Exception as e:
+            self.get_logger().debug(f"Error in _on_audio_doa: {e}")
+
+    def _on_audio_doa_conf(self, msg: Float32) -> None:
+        """Receives GCC-PHAT PSR confidence [0.0..1.0] from /audio/doa_confidence."""
+        try:
+            val = float(msg.data)
+            with self._audio_lock:
+                self._latest_doa_conf = max(0.0, min(1.0, val))
+        except Exception as e:
+            self.get_logger().debug(f"Error in _on_audio_doa_conf: {e}")
+
+    def _on_audio_vad(self, msg: Bool) -> None:
+        """Receives Voice Activity Detection status from /audio/vad."""
+        try:
+            val = bool(msg.data)
+            now = time.monotonic()
+            with self._audio_lock:
+                self._latest_vad_active = val
+                if val:
+                    self._latest_vad_time = now
+        except Exception as e:
+            self.get_logger().debug(f"Error in _on_audio_vad: {e}")
+
+    def _on_playback_active(self, msg: Bool) -> None:
+        """Receives DAC audio playback status from /audio/playback_active."""
+        try:
+            with self._audio_lock:
+                self._playback_active = bool(msg.data)
+        except Exception as e:
+            self.get_logger().debug(f"Error in _on_playback_active: {e}")
+
+    def _on_robot_speaking(self, msg: Bool) -> None:
+        """Receives robot speaking status from /robot/is_speaking."""
+        try:
+            with self._audio_lock:
+                self._robot_speaking = bool(msg.data)
+        except Exception as e:
+            self.get_logger().debug(f"Error in _on_robot_speaking: {e}")
+
+    def _sample_acoustic_state(
+        self, now: float
+    ) -> Tuple[Optional[float], Optional[Any], bool]:
+        """Samples acoustic state from ROS topics or standalone source with freshness check."""
+        if not self.enable_audio:
+            return None, None, False
+
+        # If direct AudioSource exists (standalone hardware mode)
+        if self.audio is not None and getattr(self.audio, "available", False):
+            doa_deg = self.audio.latest_doa_deg(now)
+            speech = self.audio.latest_speech(now)
+            if self.voice_loop is not None:
+                self.voice_loop.pump(now)
+            is_speaking = self.voice_loop.is_speaking_at(now) if self.voice_loop else False
+            return doa_deg, speech, is_speaking
+
+        # Default ROS topic bridge
+        with self._audio_lock:
+            # Check DOA freshness
+            doa_deg = None
+            if self._latest_doa_deg is not None:
+                if (now - self._latest_doa_time) <= self.audio_freshness_s:
+                    doa_deg = self._latest_doa_deg
+
+            # Check VAD / speech freshness
+            speech = None
+            if self._latest_vad_active:
+                if (now - self._latest_vad_time) <= self.audio_freshness_s:
+                    speech = StandaloneSpeechVerdict(
+                        is_speech=True, confidence=self._latest_doa_conf
+                    )
+
+            is_speaking = bool(self._playback_active or self._robot_speaking)
+            return doa_deg, speech, is_speaking
+
+    # =========================================================================
     # CameraSource Worker Loop
     # =========================================================================
 
@@ -406,11 +554,7 @@ class StandaloneGazeRosNode(Node):
                 arrival_ts = t_detect_done
 
                 # Sample latest acoustic state
-                doa_deg = self.audio.latest_doa_deg(arrival_ts) if (self.audio and self.audio.available) else None
-                speech = self.audio.latest_speech(arrival_ts) if (self.audio and self.audio.available) else None
-                if self.voice_loop is not None:
-                    self.voice_loop.pump(arrival_ts)
-                is_speaking = self.voice_loop.is_speaking_at(arrival_ts) if self.voice_loop else False
+                doa_deg, speech, is_speaking = self._sample_acoustic_state(arrival_ts)
 
                 self._step_frame_and_dispatch(
                     detections=detections,
@@ -453,14 +597,13 @@ class StandaloneGazeRosNode(Node):
             capture_ts = t_start - self.camera_latency_s
             arrival_ts = t_end
 
-        if doa_deg is None and self.audio and self.audio.available:
-            doa_deg = self.audio.latest_doa_deg(arrival_ts)
-        if speech is None and self.audio and self.audio.available:
-            speech = self.audio.latest_speech(arrival_ts)
-        if self.voice_loop is not None:
-            self.voice_loop.pump(arrival_ts)
+        s_doa, s_speech, s_speaking = self._sample_acoustic_state(arrival_ts)
+        if doa_deg is None:
+            doa_deg = s_doa
+        if speech is None:
+            speech = s_speech
         if is_robot_speaking is None:
-            is_robot_speaking = self.voice_loop.is_speaking_at(arrival_ts) if self.voice_loop else False
+            is_robot_speaking = s_speaking
 
         return self._step_frame_and_dispatch(
             detections=detections,

@@ -1,23 +1,57 @@
-"""ASTRO V1 — Canonical One-Command Social Gaze & Hardware Bringup Launch File.
+"""ASTRO V1 — Canonical One-Command Social Gaze, Audio & Realtime Bringup Launch File.
 
 Starts:
   1. serial_bridge (physical head motor communication via MCU)
-  2. standalone_gaze_ros (unified vision + audio + gaze + conversation runtime)
+  2. standalone_gaze_ros (authoritative gaze runtime: CameraSource -> GazeTracker -> /head/command)
+  3. audio_stream_node (ReSpeaker 4-Mic capture, GCC-PHAT DOA, VAD, DAC streaming playback)
+  4. astro_realtime_node (OpenAI Realtime WebSocket, wake word, memory, identity, Edge-TTS fallback)
 
 Enforces:
   - Strict Single Gaze Brain invariant (GazeTracker -> /head/command -> serial_bridge)
-  - CameraSource and AudioSource run directly inside standalone_gaze_ros process
+  - Audio and Realtime nodes NEVER publish motor commands
+  - Clean separation: audio_stream_node owns ReSpeaker hardware, standalone_gaze_ros subscribes to topics
   - Automatic .env injection (OPENAI_API_KEY, TTS settings)
-  - NO duplicate OAK nodes, NO face_detector_node, NO social_gaze_node
+  - NO duplicate OAK nodes, NO face_detector_node, NO duplicate social_gaze_node
 """
 
 import os
-from ament_index_python.packages import get_package_share_directory
-from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, SetEnvironmentVariable
-from launch.conditions import IfCondition
-from launch.substitutions import LaunchConfiguration
-from launch_ros.actions import Node
+
+try:
+    from launch import LaunchDescription
+    from launch.actions import DeclareLaunchArgument, SetEnvironmentVariable
+    from launch.conditions import IfCondition
+    from launch.substitutions import LaunchConfiguration
+    from launch_ros.actions import Node
+except ImportError:
+    class LaunchDescription:
+        def __init__(self, entities=None):
+            self.entities = list(entities or [])
+    class DeclareLaunchArgument:
+        def __init__(self, name, default_value="", description=""):
+            self.name = name
+            self.default_value = default_value
+            self.description = description
+    class SetEnvironmentVariable:
+        def __init__(self, name, value):
+            self.name = name
+            self.value = value
+    class IfCondition:
+        def __init__(self, predicate):
+            self.predicate = predicate
+    class LaunchConfiguration:
+        def __init__(self, name):
+            self.name = name
+    class Node:
+        def __init__(self, package="", executable="", name="", output="screen", condition=None, parameters=None):
+            self.package = package
+            self.executable = executable
+            self.name = name
+            self.output = output
+            self.condition = condition
+            self.parameters = parameters or []
+            self.node_package = package
+            self.node_executable = executable
+            self.node_name = name
 
 
 def _dotenv_launch_actions():
@@ -117,9 +151,37 @@ def generate_launch_description():
         parameters=[{
             "camera_device": LaunchConfiguration("camera_device"),
             "enable_audio": LaunchConfiguration("enable_audio"),
-            "enable_voice": LaunchConfiguration("enable_voice"),
+            "audio_source_mode": "topics",
             "verbose_diagnostics": LaunchConfiguration("verbose_diagnostics"),
         }],
     )
 
-    return LaunchDescription(actions + launch_args + [serial_bridge_node, standalone_gaze_node])
+    audio_stream_node = Node(
+        package="astro_audio",
+        executable="audio_stream_node",
+        name="audio_stream_node",
+        output="screen",
+        condition=IfCondition(LaunchConfiguration("enable_audio")),
+        parameters=[{
+            "input_channels": 0,
+        }],
+    )
+
+    astro_realtime_node = Node(
+        package="astro_ai",
+        executable="astro_realtime_node",
+        name="astro_realtime_node",
+        output="screen",
+        condition=IfCondition(LaunchConfiguration("enable_voice")),
+    )
+
+    return LaunchDescription(
+        actions
+        + launch_args
+        + [
+            serial_bridge_node,
+            standalone_gaze_node,
+            audio_stream_node,
+            astro_realtime_node,
+        ]
+    )
