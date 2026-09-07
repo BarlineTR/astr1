@@ -20,6 +20,7 @@ import time
 from dataclasses import replace
 from typing import Dict, List, Optional, Tuple
 
+from astro_base.gaze.gaze_runtime import GazeRuntimeCore
 from astro_base.gaze.gaze_tracker import Detection, GazeResult, GazeTracker
 
 SpeechEstimate = namedtuple("SpeechEstimate", ["is_speech", "confidence"])
@@ -303,11 +304,12 @@ class SocialGazeNode(Node):
         self.golden_step_stamp: float = 0.0
         self.head_feedback_stamp: float = 0.0
 
-        # Authoritative Golden Decision Reference (GazeTracker from core)
-        self.golden_tracker = GazeTracker(
+        # Authoritative Golden Decision Reference (GazeRuntimeCore wrapping GazeTracker)
+        self.runtime = GazeRuntimeCore(
             calibration=self.calib,
             coast_timeout_s=self.coast_timeout_s,
         )
+        self.golden_tracker = self.runtime.tracker
         self.latest_face_detections: List[Detection] = []
         self.latest_frame_size: Tuple[int, int] = (640, 480)
         self.latest_detection_time: float = 0.0
@@ -380,11 +382,9 @@ class SocialGazeNode(Node):
         if hasattr(msg, "position_deg") and not math.isnan(msg.position_deg):
             self.actual_head_yaw_deg = float(msg.position_deg)
             self._head_feedback_seen = True
-            self.golden_tracker.head_angle_deg = float(msg.position_deg)
-            self.golden_tracker.head_feedback_missing = False
-        if hasattr(msg, "velocity_deg_s") and not math.isnan(msg.velocity_deg_s):
-            self.actual_head_vel_deg_s = float(msg.velocity_deg_s)
-            self.golden_tracker.head_velocity_deg_s = float(msg.velocity_deg_s)
+            vel_val = float(msg.velocity_deg_s) if hasattr(msg, "velocity_deg_s") and not math.isnan(msg.velocity_deg_s) else 0.0
+            self.actual_head_vel_deg_s = vel_val
+            self.runtime.update_head_feedback(self.actual_head_yaw_deg, vel_val)
 
     def _on_joint_states(self, msg: JointState) -> None:
         """Fallback reader for head_yaw_joint actual position and velocity."""
@@ -395,13 +395,9 @@ class SocialGazeNode(Node):
             if not math.isnan(pos_val):
                 self.actual_head_yaw_deg = math.degrees(pos_val)
                 self._head_feedback_seen = True
-                self.golden_tracker.head_angle_deg = self.actual_head_yaw_deg
-                self.golden_tracker.head_feedback_missing = False
-            if len(msg.velocity) > idx:
-                vel_val = msg.velocity[idx]
-                if not math.isnan(vel_val):
-                    self.actual_head_vel_deg_s = math.degrees(vel_val)
-                    self.golden_tracker.head_velocity_deg_s = self.actual_head_vel_deg_s
+                vel_val = math.degrees(msg.velocity[idx]) if (len(msg.velocity) > idx and not math.isnan(msg.velocity[idx])) else 0.0
+                self.actual_head_vel_deg_s = vel_val
+                self.runtime.update_head_feedback(self.actual_head_yaw_deg, vel_val)
 
     def _on_doa_raw(self, msg: Int32) -> None:
         """Processes raw integer DOA from ReSpeaker firmware."""
@@ -538,7 +534,7 @@ class SocialGazeNode(Node):
             doa_val = self._latest_doa_deg if (speech is not None and speech.is_speech and doa_fresh) else None
             measured_head = None if self.head_feedback_missing() else self.actual_head_yaw_deg
 
-            self.golden_gaze_result = self.golden_tracker.step(
+            self.golden_gaze_result = self.runtime.step(
                 faces=det_objs,
                 frame_size=self.latest_frame_size,
                 doa_deg=doa_val,

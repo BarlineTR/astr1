@@ -254,6 +254,26 @@ class GazeTracker:
         )
         has_visual_lock = bool(has_visual_target and active_track_seen)
 
+        # Invariant: Zero-Coast on Valid Vision. If valid faces are present, resolve live track
+        has_valid_faces = any((getattr(f, "confidence", None) or UNSCORED_CONFIDENCE) >= 0.50 for f in faces)
+        if (not has_visual_lock) and (has_valid_faces or self._latest_tracks):
+            live_tr = next(
+                (tr for tr in self._latest_tracks
+                 if getattr(tr, "missed_frames", 0) == 0
+                 and getattr(tr, "tracking_state", getattr(tr, "state", None)) in (TrackingState.TRACKING, TrackingState.DETECTED)),
+                None
+            )
+            if live_tr is not None:
+                active_track = live_tr
+                active_track_seen = True
+                has_visual_lock = True
+                has_visual_target = True
+                tr_id = getattr(live_tr, "target_id", getattr(live_tr, "track_id", None))
+                matching_cand = next((c for c in target_state.candidate_targets if c.target_id == tr_id), None)
+                if matching_cand is not None:
+                    active_target = matching_cand
+
+
         # Invalidate old coast cache if target dropped or target switched
         if not has_visual_target:
             self._last_visual_target_yaw = None
@@ -319,9 +339,20 @@ class GazeTracker:
             command_source = "VISUAL"
             target_source = "CAMERA"
             self.commands_from_visual += 1
-            cmd_reason = f"VISUAL_HANDOVER_TARGET_{active_target.target_id}" if is_handover else f"VISUAL_LOCK_TARGET_{active_target.target_id}"
+            cmd_target_yaw = float(active_target.body_azimuth_deg) if active_target is not None else float(active_track.body_azimuth_deg)
+            target_id_val = active_target.target_id if active_target is not None else str(getattr(active_track, "target_id", getattr(active_track, "track_id", "person_1")))
+            psource = command.priority_source if command.priority_source in (PrioritySource.ACTIVE_SPEAKER, PrioritySource.DIRECT_DIALOGUE_INTENT) else PrioritySource.VISUAL_TRACKING
+            command = replace(
+                command,
+                target_yaw_deg=cmd_target_yaw,
+                priority_source=psource,
+                active_target_id=target_id_val,
+                gaze_state=GazeStateEnum.TRACKING,
+            )
+            cmd_reason = f"VISUAL_HANDOVER_TARGET_{target_id_val}" if is_handover else f"VISUAL_LOCK_TARGET_{target_id_val}"
         elif (
-            has_visual_target
+            not has_valid_faces
+            and has_visual_target
             and active_target is not None
             and self._was_visually_tracking
             and self._last_visual_target_id == active_target.target_id
@@ -339,6 +370,22 @@ class GazeTracker:
                 active_target_id=self._last_visual_target_id,
             )
             cmd_reason = f"COASTING_LAST_VISUAL_{self._last_visual_target_id}_AGE_{visual_target_age_ms:.0f}MS"
+        elif has_valid_faces and self._latest_tracks:
+            # Fallback direct visual recovery to maintain zero-coast invariant on valid vision
+            command_source = "VISUAL"
+            target_source = "CAMERA"
+            self.commands_from_visual += 1
+            best_tr = self._latest_tracks[0]
+            cmd_target_yaw = float(best_tr.body_azimuth_deg)
+            target_id_val = str(getattr(best_tr, "target_id", getattr(best_tr, "track_id", "person_1")))
+            command = replace(
+                command,
+                target_yaw_deg=cmd_target_yaw,
+                priority_source=PrioritySource.VISUAL_TRACKING,
+                active_target_id=target_id_val,
+                gaze_state=GazeStateEnum.TRACKING,
+            )
+            cmd_reason = f"VISUAL_RECOVERY_TARGET_{target_id_val}"
         elif (
             time_since_visual > self.coast_timeout_s
             and has_verified_speech
@@ -430,7 +477,7 @@ class GazeTracker:
         new_target_yaw = float(command.target_yaw_deg)
 
         active_target_at_command = str(target_state.active_target.target_id) if target_state.active_target else (str(self._last_visual_target_id) if coast_active else "NONE")
-        active_track_at_command = str(active_track.target_id) if active_track else "NONE"
+        active_track_at_command = str(getattr(active_track, "target_id", getattr(active_track, "track_id", "NONE"))) if active_track else "NONE"
         command_generation_reason = str(cmd_reason)
 
         cmd_telemetry = {

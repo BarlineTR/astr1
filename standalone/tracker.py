@@ -7,6 +7,7 @@ astro_base.gaze.gaze_tracker for standalone execution.
 
 import core_path  # noqa: F401
 
+from astro_base.gaze.gaze_runtime import GazeRuntimeCore
 from astro_base.gaze.gaze_tracker import (
     Detection,
     GazeResult,
@@ -20,7 +21,9 @@ __all__ = [
     "Detection",
     "GazeResult",
     "GazeTracker",
+    "GazeRuntimeCore",
     "UNSCORED_CONFIDENCE",
     "DEFAULT_CALIBRATION_PATH",
     "_load_calibration",
 ]
+

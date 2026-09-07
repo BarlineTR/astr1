@@ -26,6 +26,7 @@ setup(
         'console_scripts': [
             'serial_bridge = astro_base.serial_bridge:main',
             'social_gaze = astro_base.social_gaze_node:main',
+            'standalone_gaze = astro_base.standalone_gaze_node:main',
             'head_tracker = astro_base.head_tracker_node:main',
             'diff_drive = astro_base.diff_drive_node:main',
         ],
