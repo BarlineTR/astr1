@@ -246,6 +246,7 @@ class SocialGazeNode(Node):
         self.latest_visual_tracks: List[VisualTargetTrack] = []
         self.actual_head_yaw_deg: float = 0.0
         self.actual_head_vel_deg_s: float = 0.0
+        self.raw_encoder_deg: float = 0.0
         # Her kerteriz `body_azimuth = actual_head_yaw + kamera_acisi` ile hesaplanir.
         # Encoder hic konusmazsa bu deger 0'da kalir, kafa fiziksel olarak donse bile:
         # 20 derece donup kisiyi tam ortaya alan kafa, kisiyi 0 derecede sanip komutu
@@ -380,6 +381,7 @@ class SocialGazeNode(Node):
         """Reads real encoder position and velocity from HeadState message."""
         self.head_feedback_stamp = time.monotonic()
         if hasattr(msg, "position_deg") and not math.isnan(msg.position_deg):
+            self.raw_encoder_deg = float(msg.position_deg)
             self.actual_head_yaw_deg = float(msg.position_deg)
             self._head_feedback_seen = True
             vel_val = float(msg.velocity_deg_s) if hasattr(msg, "velocity_deg_s") and not math.isnan(msg.velocity_deg_s) else 0.0
@@ -393,7 +395,9 @@ class SocialGazeNode(Node):
             idx = msg.name.index("head_yaw_joint")
             pos_val = msg.position[idx]
             if not math.isnan(pos_val):
-                self.actual_head_yaw_deg = math.degrees(pos_val)
+                deg_pos = math.degrees(pos_val)
+                self.raw_encoder_deg = float(deg_pos)
+                self.actual_head_yaw_deg = float(deg_pos)
                 self._head_feedback_seen = True
                 vel_val = math.degrees(msg.velocity[idx]) if (len(msg.velocity) > idx and not math.isnan(msg.velocity[idx])) else 0.0
                 self.actual_head_vel_deg_s = vel_val
@@ -601,6 +605,8 @@ class SocialGazeNode(Node):
                 f"track_id={primary_track_id}\n"
                 f"target_id={primary_target_id}"
             )
+            tracker_head = getattr(self.golden_tracker, "head_angle_deg", self.actual_head_yaw_deg)
+            raw_enc = getattr(self, "raw_encoder_deg", self.actual_head_yaw_deg)
             cmd_log = (
                 f"COMMAND\n"
                 f"cycle_id={self._cycle_id}\n"
@@ -609,6 +615,9 @@ class SocialGazeNode(Node):
                 f"golden_target_yaw={authoritative_target_yaw:+.1f}°\n"
                 f"command_yaw={authoritative_target_yaw:+.1f}°\n"
                 f"actual_head={self.actual_head_yaw_deg:+.1f}°\n"
+                f"raw_encoder={raw_enc:+.1f}°\n"
+                f"golden_tracker.head_angle_deg={tracker_head:+.1f}°\n"
+                f"FEEDBACK_SYNC: command_yaw={authoritative_target_yaw:+.1f}° actual_head={self.actual_head_yaw_deg:+.1f}° raw_encoder={raw_enc:+.1f}° golden_tracker.head_angle_deg={tracker_head:+.1f}°\n"
                 f"source={res.command_source}"
             )
             forensic_msg = f"\n{frame_log}\n{cmd_log}"

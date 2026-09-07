@@ -124,6 +124,7 @@ class StandaloneGazeNode(Node):
         self.last_published_yaw: float = 0.0
         self.latest_result: Optional[GazeResult] = None
         self._head_feedback_seen: bool = False
+        self.raw_encoder_deg: float = 0.0
 
         # Publishers
         if HeadCmd is not None:
@@ -165,6 +166,7 @@ class StandaloneGazeNode(Node):
             vel = float(getattr(msg, "velocity_deg_s", 0.0))
             if math.isnan(vel):
                 vel = 0.0
+            self.raw_encoder_deg = float(msg.position_deg)
             self.runtime.update_head_feedback(msg.position_deg, vel)
             self._head_feedback_seen = True
 
@@ -175,7 +177,9 @@ class StandaloneGazeNode(Node):
             if not math.isnan(pos_rad):
                 vel_rad = msg.velocity[idx] if len(msg.velocity) > idx else 0.0
                 vel_deg = math.degrees(vel_rad) if not math.isnan(vel_rad) else 0.0
-                self.runtime.update_head_feedback(math.degrees(pos_rad), vel_deg)
+                deg_pos = math.degrees(pos_rad)
+                self.raw_encoder_deg = float(deg_pos)
+                self.runtime.update_head_feedback(deg_pos, vel_deg)
                 self._head_feedback_seen = True
 
     def _on_emergency_stop(self, msg: Bool) -> None:
@@ -277,6 +281,10 @@ class StandaloneGazeNode(Node):
                 f"track_id={primary_track_id}\n"
                 f"target_id={primary_target_id}"
             )
+            tracker_head = self.runtime.tracker.head_angle_deg
+            actual_head = self.runtime.actual_head_yaw_deg
+            raw_enc = getattr(self, "raw_encoder_deg", actual_head)
+
             cmd_log = (
                 f"COMMAND\n"
                 f"cycle_id={self.cycle_id}\n"
@@ -284,7 +292,10 @@ class StandaloneGazeNode(Node):
                 f"target_id={primary_target_id}\n"
                 f"golden_target_yaw={target_yaw:+.1f}°\n"
                 f"command_yaw={target_yaw:+.1f}°\n"
-                f"actual_head={self.runtime.actual_head_yaw_deg:+.1f}°\n"
+                f"actual_head={actual_head:+.1f}°\n"
+                f"raw_encoder={raw_enc:+.1f}°\n"
+                f"golden_tracker.head_angle_deg={tracker_head:+.1f}°\n"
+                f"FEEDBACK_SYNC: command_yaw={target_yaw:+.1f}° actual_head={actual_head:+.1f}° raw_encoder={raw_enc:+.1f}° golden_tracker.head_angle_deg={tracker_head:+.1f}°\n"
                 f"source={res.command_source}"
             )
             forensic_msg = f"\n{frame_log}\n{cmd_log}"
@@ -308,7 +319,7 @@ class StandaloneGazeNode(Node):
         DOES NOT update targets.
         DOES NOT update visual FSM.
         """
-        target_yaw = self.runtime.get_keepalive_yaw()
+        target_yaw = self.runtime.get_keepalive_yaw_deg()
         cmd_pos = Float32()
         cmd_pos.data = float(target_yaw)
         self.pub_head_cmd_pos.publish(cmd_pos)

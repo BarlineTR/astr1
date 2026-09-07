@@ -113,3 +113,8 @@ class GazeRuntimeCore:
         DOES NOT update visual FSM.
         """
         return self.last_target_yaw_deg
+
+    def get_keepalive_yaw(self) -> float:
+        """Alias for get_keepalive_yaw_deg."""
+        return self.get_keepalive_yaw_deg()
+
