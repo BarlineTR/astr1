@@ -27,9 +27,12 @@ try:
     from sensor_msgs.msg import JointState
     from std_msgs.msg import Bool, Float32, String
     try:
-        from astro_interfaces.msg import GazeStatus, HeadCmd, HeadState
+        from astro_base.msg import GazeStatus, HeadCmd, HeadState
     except ImportError:
-        HeadState = HeadCmd = GazeStatus = None
+        try:
+            from astro_interfaces.msg import GazeStatus, HeadCmd, HeadState
+        except ImportError:
+            HeadState = HeadCmd = GazeStatus = None
 except ImportError:
     class _MockRclpy:
         @staticmethod
@@ -96,6 +99,12 @@ except ImportError:
 
     Bool = Float32 = String = JointState = _MockMsg
     GazeStatus = HeadCmd = HeadState = None
+
+if HeadCmd is None:
+    class HeadCmd:  # type: ignore
+        def __init__(self, angle_deg: float = 0.0, velocity_deg_s: float = 0.0):
+            self.angle_deg = float(angle_deg)
+            self.velocity_deg_s = float(velocity_deg_s)
 
 from pathlib import Path
 import threading
