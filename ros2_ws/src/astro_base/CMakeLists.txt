@@ -62,6 +62,18 @@ install(PROGRAMS
   RENAME head_tracker
 )
 
+install(PROGRAMS
+  astro_base/standalone_gaze_node.py
+  DESTINATION lib/${PROJECT_NAME}
+  RENAME standalone_gaze
+)
+
+install(PROGRAMS
+  astro_base/standalone_gaze_ros_node.py
+  DESTINATION lib/${PROJECT_NAME}
+  RENAME standalone_gaze_ros
+)
+
 # Install launch and config directories
 install(DIRECTORY
   launch
