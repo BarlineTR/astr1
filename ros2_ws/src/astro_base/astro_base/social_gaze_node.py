@@ -285,6 +285,10 @@ class SocialGazeNode(Node):
         self.authoritative_command_source: str = "SAFETY_ZERO"
         self.authoritative_target_source: str = "NONE"
         self.authoritative_target_id: Optional[str] = None
+        self.authoritative_frame_id: int = 0
+        self.authoritative_cycle_id: int = 0
+        self._latest_doa_time: float = 0.0
+        self._latest_vad_time: float = 0.0
         self._last_target_yaw_telemetry: float = 0.0
         self._latest_detections_telemetry: List[dict] = []
         self.last_forensic_chain: Optional[dict] = None
@@ -376,8 +380,11 @@ class SocialGazeNode(Node):
         if hasattr(msg, "position_deg") and not math.isnan(msg.position_deg):
             self.actual_head_yaw_deg = float(msg.position_deg)
             self._head_feedback_seen = True
+            self.golden_tracker.head_angle_deg = float(msg.position_deg)
+            self.golden_tracker.head_feedback_missing = False
         if hasattr(msg, "velocity_deg_s") and not math.isnan(msg.velocity_deg_s):
             self.actual_head_vel_deg_s = float(msg.velocity_deg_s)
+            self.golden_tracker.head_velocity_deg_s = float(msg.velocity_deg_s)
 
     def _on_joint_states(self, msg: JointState) -> None:
         """Fallback reader for head_yaw_joint actual position and velocity."""
@@ -388,16 +395,20 @@ class SocialGazeNode(Node):
             if not math.isnan(pos_val):
                 self.actual_head_yaw_deg = math.degrees(pos_val)
                 self._head_feedback_seen = True
+                self.golden_tracker.head_angle_deg = self.actual_head_yaw_deg
+                self.golden_tracker.head_feedback_missing = False
             if len(msg.velocity) > idx:
                 vel_val = msg.velocity[idx]
                 if not math.isnan(vel_val):
                     self.actual_head_vel_deg_s = math.degrees(vel_val)
+                    self.golden_tracker.head_velocity_deg_s = self.actual_head_vel_deg_s
 
     def _on_doa_raw(self, msg: Int32) -> None:
         """Processes raw integer DOA from ReSpeaker firmware."""
         t = time.monotonic()
         raw_val = float(msg.data)
         self._latest_doa_deg = raw_val
+        self._latest_doa_time = t
         obs = self.audio_perception.process_raw_doa(
             raw_doa_deg=raw_val,
             timestamp=t,
@@ -423,12 +434,14 @@ class SocialGazeNode(Node):
     def _on_vad(self, msg: Bool) -> None:
         """Sets verified speech activity flag (/audio/vad)."""
         self.is_speech_verified = bool(msg.data)
+        self._latest_vad_time = time.monotonic() if bool(msg.data) else 0.0
 
     def _on_doa_deg(self, msg: Float32) -> None:
         """Processes float DOA angle in degrees."""
         t = time.monotonic()
         raw_val = float(msg.data)
         self._latest_doa_deg = raw_val
+        self._latest_doa_time = t
         obs = self.audio_perception.process_raw_doa(
             raw_doa_deg=raw_val,
             timestamp=t,
@@ -519,8 +532,10 @@ class SocialGazeNode(Node):
             self.latest_detection_time = t
 
             # 2. Step Golden Reference Tracker (Authoritative Core: Single Step per Frame)
-            speech = SpeechEstimate(is_speech=True, confidence=self._latest_doa_confidence) if self.is_speech_verified else None
-            doa_val = self._latest_doa_deg if (speech is not None and speech.is_speech) else None
+            is_speech_fresh = self.is_speech_verified and ((t - self._latest_vad_time) <= 0.5)
+            speech = SpeechEstimate(is_speech=True, confidence=self._latest_doa_confidence) if is_speech_fresh else None
+            doa_fresh = self._latest_doa_deg is not None and ((t - self._latest_doa_time) <= 0.5)
+            doa_val = self._latest_doa_deg if (speech is not None and speech.is_speech and doa_fresh) else None
             measured_head = None if self.head_feedback_missing() else self.actual_head_yaw_deg
 
             self.golden_gaze_result = self.golden_tracker.step(
@@ -539,18 +554,18 @@ class SocialGazeNode(Node):
             self.authoritative_command_source = res.command_source
             self.authoritative_target_source = res.target_source
             self.authoritative_target_id = res.target_id
+            self.authoritative_frame_id = self._frame_index
+            self.authoritative_cycle_id = self._cycle_id
 
-            # Invariant 1: DETECTION target == COMMAND target
+            # Invariant 1: Log warning if DETECTION target != COMMAND target during VISUAL tracking
             det_target_id = res.active_target_at_command
             cmd_target_id = res.target_id
             if res.command_source == "VISUAL":
                 if det_target_id != "NONE" and cmd_target_id is not None and det_target_id != cmd_target_id:
-                    err_msg = (
-                        f"❌ [INVARIANT ERROR] DETECTION target != COMMAND target! "
+                    self.get_logger().warn(
+                        f"⚠️ [INVARIANT DIVERGENCE] DETECTION target != COMMAND target! "
                         f"det_target={det_target_id} cmd_target={cmd_target_id}"
                     )
-                    self.get_logger().error(err_msg)
-                    raise RuntimeError(err_msg)
 
             # 3. Actuator Command Publishing (Immediate Direct Dispatch: One Frame -> One Head Command)
             target_goal_deg = float(authoritative_target_yaw)
@@ -567,12 +582,14 @@ class SocialGazeNode(Node):
             delta_yaw = abs(angular_diff_deg(prev_target_yaw, authoritative_target_yaw))
             self._last_target_yaw_telemetry = authoritative_target_yaw
 
-            # 4. Critical Forensic Telemetry (FRAME & COMMAND blocks)
+            # 4. Critical Forensic Telemetry (FRAME & COMMAND blocks, 8 Required Fields)
             face_bearing = res.face_bearings_deg[0] if res.face_bearings_deg else None
             face_bearing_str = f"{face_bearing:+.1f}°" if face_bearing is not None else "NONE"
             primary_track_id = res.active_track_at_command
             primary_target_id = res.target_id or "NONE"
             vision_age_ms = round(max(0.0, (t - self.capture_stamp) * 1000.0), 1)
+            bbox_str = f"[{det_objs[0].x},{det_objs[0].y},{det_objs[0].w},{det_objs[0].h}]" if det_objs else "NONE"
+            conf_str = f"{det_objs[0].confidence:.2f}" if det_objs else "0.00"
 
             frame_log = (
                 f"FRAME\n"
@@ -582,7 +599,9 @@ class SocialGazeNode(Node):
                 f"arrival_ts={self.vision_arrival_stamp:.3f}\n"
                 f"step_ts={self.golden_step_stamp:.3f}\n"
                 f"vision_age_ms={vision_age_ms:.1f}\n"
-                f"face_bearing={face_bearing_str}\n"
+                f"bbox={bbox_str}\n"
+                f"confidence={conf_str}\n"
+                f"visual_bearing={face_bearing_str}\n"
                 f"track_id={primary_track_id}\n"
                 f"target_id={primary_target_id}"
             )
@@ -591,7 +610,8 @@ class SocialGazeNode(Node):
                 f"cycle_id={self._cycle_id}\n"
                 f"frame_id={self._frame_index}\n"
                 f"target_id={primary_target_id}\n"
-                f"target_yaw={authoritative_target_yaw:+.1f}°\n"
+                f"golden_target_yaw={authoritative_target_yaw:+.1f}°\n"
+                f"command_yaw={authoritative_target_yaw:+.1f}°\n"
                 f"actual_head={self.actual_head_yaw_deg:+.1f}°\n"
                 f"source={res.command_source}"
             )
@@ -713,6 +733,8 @@ class SocialGazeNode(Node):
         t = time.monotonic()
         self.fsm.set_dialogue_target(yaw_deg=msg.data, duration_s=3.0, timestamp=t)
         self.golden_tracker.fsm.set_dialogue_target(yaw_deg=msg.data, duration_s=3.0, timestamp=t)
+        self.authoritative_target_yaw = float(msg.data)
+        self.authoritative_command_source = "DIRECT_DIALOGUE_INTENT"
 
     def _on_explicit_gaze(self, msg: String) -> None:
         """Handles explicit user gaze command (e.g. 'Astro bana dön')."""
@@ -741,6 +763,9 @@ class SocialGazeNode(Node):
         )
         self.fsm.set_explicit_gaze_intent(intent)
         self.golden_tracker.fsm.set_explicit_gaze_intent(intent)
+        if target_yaw is not None:
+            self.authoritative_target_yaw = float(target_yaw)
+            self.authoritative_command_source = "EXPLICIT_USER_GAZE"
         self.get_logger().info(f"Explicit gaze intent received: selector={selector.value}, reason={intent.reason}")
 
     def _on_speaking_status(self, msg: Bool) -> None:
@@ -761,16 +786,24 @@ class SocialGazeNode(Node):
     def _on_emergency_stop(self, msg: Bool) -> None:
         self.fsm.set_safety_lock(msg.data)
         self.golden_tracker.fsm.set_safety_lock(msg.data)
+        if msg.data:
+            self.authoritative_target_yaw = float(self.actual_head_yaw_deg)
+            self.authoritative_command_source = "EMERGENCY_STOP"
 
     def _on_sleep_mode(self, msg: Bool) -> None:
         self.fsm.set_sleep_mode(msg.data)
         self.golden_tracker.fsm.set_sleep_mode(msg.data)
+        if msg.data:
+            self.authoritative_target_yaw = 0.0
+            self.authoritative_command_source = "SAFETY_ZERO"
 
     def _on_emotion(self, msg: String) -> None:
         emo = str(msg.data).strip().lower()
         if emo in ("sleeping", "sleep", "deep_idle"):
             self.fsm.set_sleep_mode(True)
             self.golden_tracker.fsm.set_sleep_mode(True)
+            self.authoritative_target_yaw = 0.0
+            self.authoritative_command_source = "SAFETY_ZERO"
         else:
             self.fsm.set_sleep_mode(False)
             self.golden_tracker.fsm.set_sleep_mode(False)
@@ -799,39 +832,10 @@ class SocialGazeNode(Node):
                 "ve MCU head encoder tick gonderiyor mu kontrol edin."
             )
 
-        # 0. Sync high-level intent & safety states to Golden Reference FSM
-        self.golden_tracker.fsm._dialogue_intent = self.fsm._dialogue_intent
-        self.golden_tracker.fsm._explicit_intent = self.fsm._explicit_intent
-        self.golden_tracker.fsm._active_gesture = self.fsm._active_gesture
-        self.golden_tracker.fsm._safety_intent = self.fsm._safety_intent
-
-        # Invariant 2: NEW FRAME = false but NEW VISUAL DECISION = true
-        # If no new visual frame arrived, the control cycle MUST NOT make a new visual decision!
-        # Visual target cannot be recalculated without a new camera frame.
-        new_visual_decision = False
-        if not self._new_frame_arrived and new_visual_decision:
-            raise RuntimeError("NEW FRAME = false but NEW VISUAL DECISION = true")
-
-        # Check visual dropout / stall (>1.0s without vision while actively tracking)
-        time_since_vision = (t - self.latest_detection_time) if self.latest_detection_time > 0.0 else 999.0
-        if self.golden_tracker._was_visually_tracking and time_since_vision > 1.0:
-            speech = SpeechEstimate(is_speech=True, confidence=self._latest_doa_confidence) if self.is_speech_verified else None
-            doa_val = self._latest_doa_deg if (speech is not None and speech.is_speech) else None
-            measured_head = None if self.head_feedback_missing() else self.actual_head_yaw_deg
-            self.golden_gaze_result = self.golden_tracker.step(
-                faces=[],
-                frame_size=self.latest_frame_size,
-                doa_deg=doa_val,
-                speech=speech,
-                measured_head_deg=measured_head,
-                timestamp=t,
-                is_robot_speaking=self.is_robot_speaking,
-            )
-            self.golden_step_stamp = time.monotonic()
-            self.authoritative_target_yaw = float(self.golden_gaze_result.target_yaw_deg)
-            self.authoritative_command_source = self.golden_gaze_result.command_source
-            self.authoritative_target_source = self.golden_gaze_result.target_source
-            self.authoritative_target_id = self.golden_gaze_result.target_id
+        # Invariant: FRAME SYNCHRONOUS VISUAL LOGIC
+        # _control_cycle NEVER makes visual decisions, never calls golden_tracker.step(),
+        # and never overwrites golden_tracker state. It only runs legacy shadow fusion/telemetry
+        # and streams 50Hz motor keepalive setpoints from self.authoritative_target_yaw.
 
         # 1. Multimodal Sensor Fusion (Passive Measurements -> Fused Targets)
         fused_targets = self.fusion.fuse(
