@@ -56,6 +56,21 @@ class TestStandaloneLoggingPolicy:
         assert "head_feedback_source=" not in captured.out
         assert "sign(visual_bearing)" not in captured.out
 
+    def test_string_false_coercion_prevents_launch_spam(self, capsys):
+        """When verbose_diagnostics is passed as string 'false' from ROS launch, it coerces to False."""
+        node = StandaloneGazeRosNode(
+            use_camera_source=False,
+            enable_audio=False,
+            enable_voice=False,
+            verbose_diagnostics="false",
+        )
+        assert node.verbose_diagnostics is False
+
+        node.step_frame(detections=[], frame_size=(640, 480), timestamp=10.0)
+        captured = capsys.readouterr()
+        assert "CENTER_DIAG" not in captured.out
+        assert "FEEDBACK_SYNC:" not in captured.out
+
     def test_audio_state_changes_are_visible(self, caplog):
         """Audio state changes ([AUDIO] speech detected, DOA, owner=...) are clearly logged."""
         node = StandaloneGazeRosNode(

@@ -134,6 +134,17 @@ from astro_base.gaze.gaze_tracker import Detection, GazeResult, UNSCORED_CONFIDE
 from astro_base.gaze.types import PrioritySource
 
 
+def _coerce_bool(val: Any) -> bool:
+    """Robustly coerces booleans, numbers, and string representations ('false', '0', etc.)."""
+    if isinstance(val, bool):
+        return val
+    if isinstance(val, (int, float)):
+        return bool(val)
+    if isinstance(val, str):
+        return val.strip().lower() in ("true", "1", "yes", "on")
+    return bool(val)
+
+
 class StandaloneGazeRosNode(Node):
     """Thin ROS 2 wrapper mapping CameraSource, AudioSource, and ROS topics to the golden 2e0b70c standalone gaze runtime.
 
@@ -174,25 +185,25 @@ class StandaloneGazeRosNode(Node):
         self.declare_parameter("verbose_diagnostics", False)
 
         cam_dev = camera_device if camera_device is not None else int(self.get_parameter("camera_device").value)
-        use_cam = use_camera_source if use_camera_source is not None else bool(self.get_parameter("use_camera_source").value)
+        use_cam = _coerce_bool(use_camera_source if use_camera_source is not None else self.get_parameter("use_camera_source").value)
         control_rate = float(self.get_parameter("control_rate_hz").value)
         coast_timeout = float(self.get_parameter("coast_timeout_s").value)
         calib_path = str(self.get_parameter("calibration_path").value) or None
         self.camera_latency_s = float(self.get_parameter("camera_latency_s").value)
 
-        use_audio = enable_audio if enable_audio is not None else bool(self.get_parameter("enable_audio").value)
+        use_audio = _coerce_bool(enable_audio if enable_audio is not None else self.get_parameter("enable_audio").value)
         audio_dev = int(self.get_parameter("audio_device").value)
         audio_dev = None if audio_dev < 0 else audio_dev
         mic_ch_str = str(self.get_parameter("mic_channels").value).strip()
         mic_channels = [int(c.strip()) for c in mic_ch_str.split(",") if c.strip().isdigit()] if mic_ch_str else None
         mic_spacing = float(self.get_parameter("mic_spacing").value)
         self.audio_freshness_s = float(self.get_parameter("audio_freshness_s").value)
-        self.enable_voice = enable_voice if enable_voice is not None else bool(self.get_parameter("enable_voice").value)
-        self.enable_edge_tts = bool(self.get_parameter("enable_edge_tts").value)
-        self.verbose_diagnostics = (
+        self.enable_voice = _coerce_bool(enable_voice if enable_voice is not None else self.get_parameter("enable_voice").value)
+        self.enable_edge_tts = _coerce_bool(self.get_parameter("enable_edge_tts").value)
+        self.verbose_diagnostics = _coerce_bool(
             verbose_diagnostics
             if verbose_diagnostics is not None
-            else bool(self.get_parameter("verbose_diagnostics").value)
+            else self.get_parameter("verbose_diagnostics").value
         )
 
         # Rate-limiting and Event Transition State for INFO Logging
@@ -662,16 +673,14 @@ class StandaloneGazeRosNode(Node):
 
         forensic_msg = f"\n{frame_log}\n{cmd_log}\n{center_diag_line}\n{instrumentation_log}\n\n{audio_log}"
 
-        # 1. Forensic Telemetry (Exposed at DEBUG level or when verbose_diagnostics=True)
+        # 1. Forensic Telemetry (Exposed ONLY at DEBUG level, or printed if verbose_diagnostics=True)
+        self.get_logger().debug(sync_line)
+        self.get_logger().debug(forensic_msg)
         if self.verbose_diagnostics:
             try:
                 print(forensic_msg)
             except UnicodeEncodeError:
                 print(forensic_msg.encode("ascii", errors="replace").decode("ascii"))
-            self.get_logger().info(sync_line)
-        else:
-            self.get_logger().debug(sync_line)
-            self.get_logger().debug(forensic_msg)
 
         # 2. Audio State Changes & Event Logging (Quiet, meaningful, non-spamming)
         # A. Gaze owner transition
