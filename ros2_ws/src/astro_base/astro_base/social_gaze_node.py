@@ -252,6 +252,9 @@ class SocialGazeNode(Node):
         # 20 derece donup kisiyi tam ortaya alan kafa, kisiyi 0 derecede sanip komutu
         # merkeze geri cekiyor ve orada bekliyor. Sessizce olmasin diye izliyoruz.
         self._head_feedback_seen: bool = False
+        self._head_state_received: bool = False
+        self.diagnostic_joint_yaw_deg: float = 0.0
+        self.diagnostic_joint_vel_deg_s: float = 0.0
         self._warned_no_head_feedback: bool = False
         self.is_robot_speaking: bool = False
         self.is_playback_active: bool = False
@@ -378,30 +381,41 @@ class SocialGazeNode(Node):
     # =========================================================================
 
     def _on_head_state(self, msg) -> None:
-        """Reads real encoder position and velocity from HeadState message."""
-        self.head_feedback_stamp = time.monotonic()
+        """Authoritative reader for real encoder position and velocity from HeadState message."""
+        t = time.monotonic()
+        self.head_feedback_stamp = t
         if hasattr(msg, "position_deg") and not math.isnan(msg.position_deg):
-            self.raw_encoder_deg = float(msg.position_deg)
-            self.actual_head_yaw_deg = float(msg.position_deg)
+            pos = float(msg.position_deg)
+            self.raw_encoder_deg = pos
+            self.actual_head_yaw_deg = pos
             self._head_feedback_seen = True
+            self._head_state_received = True
             vel_val = float(msg.velocity_deg_s) if hasattr(msg, "velocity_deg_s") and not math.isnan(msg.velocity_deg_s) else 0.0
             self.actual_head_vel_deg_s = vel_val
-            self.runtime.update_head_feedback(self.actual_head_yaw_deg, vel_val)
+            self.runtime.update_head_feedback(pos, vel_val, timestamp=t, source="/head/state")
 
     def _on_joint_states(self, msg: JointState) -> None:
-        """Fallback reader for head_yaw_joint actual position and velocity."""
-        self.head_feedback_stamp = time.monotonic()
+        """Diagnostic reader for head_yaw_joint actual position and velocity.
+
+        /head/state is the sole authoritative source. When /head/state is active,
+        /joint_states is strictly diagnostic and will not overwrite authoritative feedback.
+        """
         if "head_yaw_joint" in msg.name:
             idx = msg.name.index("head_yaw_joint")
             pos_val = msg.position[idx]
             if not math.isnan(pos_val):
                 deg_pos = math.degrees(pos_val)
-                self.raw_encoder_deg = float(deg_pos)
-                self.actual_head_yaw_deg = float(deg_pos)
-                self._head_feedback_seen = True
                 vel_val = math.degrees(msg.velocity[idx]) if (len(msg.velocity) > idx and not math.isnan(msg.velocity[idx])) else 0.0
-                self.actual_head_vel_deg_s = vel_val
-                self.runtime.update_head_feedback(self.actual_head_yaw_deg, vel_val)
+                self.diagnostic_joint_yaw_deg = float(deg_pos)
+                self.diagnostic_joint_vel_deg_s = float(vel_val)
+                if not getattr(self, "_head_state_received", False):
+                    t = time.monotonic()
+                    self.head_feedback_stamp = t
+                    self.raw_encoder_deg = float(deg_pos)
+                    self.actual_head_yaw_deg = float(deg_pos)
+                    self._head_feedback_seen = True
+                    self.actual_head_vel_deg_s = vel_val
+                    self.runtime.update_head_feedback(deg_pos, vel_val, timestamp=t, source="/joint_states")
 
     def _on_doa_raw(self, msg: Int32) -> None:
         """Processes raw integer DOA from ReSpeaker firmware."""
@@ -607,6 +621,17 @@ class SocialGazeNode(Node):
             )
             tracker_head = getattr(self.golden_tracker, "head_angle_deg", self.actual_head_yaw_deg)
             raw_enc = getattr(self, "raw_encoder_deg", self.actual_head_yaw_deg)
+            fb_deg, fb_age, fb_src = self.runtime.get_feedback_telemetry(now=t)
+
+            sync_line = (
+                f"visual_bearing={face_bearing_str} "
+                f"command_yaw={authoritative_target_yaw:+.1f}° "
+                f"actual_head={self.actual_head_yaw_deg:+.1f}° "
+                f"head_feedback_deg={fb_deg:+.1f}° "
+                f"head_feedback_age_ms={fb_age:.1f}ms "
+                f"head_feedback_source={fb_src}"
+            )
+
             cmd_log = (
                 f"COMMAND\n"
                 f"cycle_id={self._cycle_id}\n"
@@ -617,7 +642,10 @@ class SocialGazeNode(Node):
                 f"actual_head={self.actual_head_yaw_deg:+.1f}°\n"
                 f"raw_encoder={raw_enc:+.1f}°\n"
                 f"golden_tracker.head_angle_deg={tracker_head:+.1f}°\n"
-                f"FEEDBACK_SYNC: command_yaw={authoritative_target_yaw:+.1f}° actual_head={self.actual_head_yaw_deg:+.1f}° raw_encoder={raw_enc:+.1f}° golden_tracker.head_angle_deg={tracker_head:+.1f}°\n"
+                f"head_feedback_deg={fb_deg:+.1f}°\n"
+                f"head_feedback_age_ms={fb_age:.1f}ms\n"
+                f"head_feedback_source={fb_src}\n"
+                f"FEEDBACK_SYNC: {sync_line}\n"
                 f"source={res.command_source}"
             )
             forensic_msg = f"\n{frame_log}\n{cmd_log}"

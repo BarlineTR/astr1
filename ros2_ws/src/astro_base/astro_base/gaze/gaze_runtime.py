@@ -42,6 +42,8 @@ class GazeRuntimeCore:
         self.actual_head_yaw_deg: float = 0.0
         self.actual_head_vel_deg_s: float = 0.0
         self.has_head_feedback: bool = False
+        self.last_feedback_time: float = 0.0
+        self.head_feedback_source: str = "NONE"
         self.last_result: Optional[GazeResult] = None
         self.last_target_yaw_deg: float = 0.0
         self.cycle_count: int = 0
@@ -54,25 +56,52 @@ class GazeRuntimeCore:
     def head_angle_deg(self) -> float:
         return self.actual_head_yaw_deg
 
+    @property
+    def head_feedback_deg(self) -> float:
+        return self.actual_head_yaw_deg
+
     def update_head_feedback(
         self,
         angle_deg: float,
         velocity_deg_s: float = 0.0,
+        timestamp: Optional[float] = None,
+        source: str = "/head/state",
     ) -> None:
         """Updates real encoder position and velocity from hardware feedback."""
+        t = time.monotonic() if timestamp is None else float(timestamp)
         self.actual_head_yaw_deg = float(angle_deg)
         self.actual_head_vel_deg_s = float(velocity_deg_s)
         self.has_head_feedback = True
+        self.last_feedback_time = t
+        self.head_feedback_source = str(source)
         self.tracker.head_angle_deg = float(angle_deg)
         self.tracker.head_velocity_deg_s = float(velocity_deg_s)
         self.tracker.head_feedback_missing = False
+        self.tracker.last_feedback_time = t
+        self.tracker.head_feedback_source = str(source)
+
+    def get_feedback_telemetry(self, now: Optional[float] = None) -> Tuple[float, float, str]:
+        """Returns (head_feedback_deg, head_feedback_age_ms, head_feedback_source)."""
+        t = time.monotonic() if now is None else float(now)
+        if self.has_head_feedback and self.last_feedback_time > 0.0:
+            age_ms = max(0.0, (t - self.last_feedback_time) * 1000.0)
+            return (self.actual_head_yaw_deg, age_ms, self.head_feedback_source)
+        return (self.actual_head_yaw_deg, 9999.0, "NONE")
+
+    def is_feedback_fresh(self, max_age_ms: float = 100.0, now: Optional[float] = None) -> bool:
+        """Returns True if authoritative head feedback was received within max_age_ms."""
+        if not self.has_head_feedback or self.last_feedback_time <= 0.0:
+            return False
+        t = time.monotonic() if now is None else float(now)
+        age_ms = (t - self.last_feedback_time) * 1000.0
+        return 0.0 <= age_ms <= max_age_ms
 
     def step(
         self,
         faces: Sequence[Detection],
         frame_size: Tuple["int", "int"] = (640, 480),
         doa_deg: Optional[float] = None,
-        speech= None,
+        speech=None,
         measured_head_deg: Optional[float] = None,
         timestamp: Optional[float] = None,
         is_robot_speaking: bool = False,
@@ -86,7 +115,7 @@ class GazeRuntimeCore:
             timestamp = time.monotonic()
 
         if measured_head_deg is not None:
-            self.update_head_feedback(measured_head_deg)
+            self.update_head_feedback(measured_head_deg, timestamp=timestamp)
 
         measured_head = self.actual_head_yaw_deg if self.has_head_feedback else None
 
@@ -98,6 +127,8 @@ class GazeRuntimeCore:
             measured_head_deg=measured_head,
             timestamp=timestamp,
             is_robot_speaking=is_robot_speaking,
+            feedback_source=self.head_feedback_source if self.has_head_feedback else None,
+            feedback_timestamp=self.last_feedback_time if self.has_head_feedback else None,
         )
 
         self.last_result = result

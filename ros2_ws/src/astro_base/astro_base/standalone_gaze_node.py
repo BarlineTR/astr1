@@ -124,6 +124,9 @@ class StandaloneGazeNode(Node):
         self.last_published_yaw: float = 0.0
         self.latest_result: Optional[GazeResult] = None
         self._head_feedback_seen: bool = False
+        self._head_state_received: bool = False
+        self.diagnostic_joint_yaw_deg: float = 0.0
+        self.diagnostic_joint_vel_deg_s: float = 0.0
         self.raw_encoder_deg: float = 0.0
 
         # Publishers
@@ -162,13 +165,17 @@ class StandaloneGazeNode(Node):
     # =========================================================================
 
     def _on_head_state(self, msg) -> None:
+        t = time.monotonic()
         if hasattr(msg, "position_deg") and not math.isnan(msg.position_deg):
             vel = float(getattr(msg, "velocity_deg_s", 0.0))
             if math.isnan(vel):
                 vel = 0.0
-            self.raw_encoder_deg = float(msg.position_deg)
-            self.runtime.update_head_feedback(msg.position_deg, vel)
+            pos = float(msg.position_deg)
+            self.raw_encoder_deg = pos
+            self.actual_head_yaw_deg = pos
+            self.runtime.update_head_feedback(pos, vel, timestamp=t, source="/head/state")
             self._head_feedback_seen = True
+            self._head_state_received = True
 
     def _on_joint_states(self, msg: JointState) -> None:
         if hasattr(msg, "name") and "head_yaw_joint" in msg.name:
@@ -178,9 +185,14 @@ class StandaloneGazeNode(Node):
                 vel_rad = msg.velocity[idx] if len(msg.velocity) > idx else 0.0
                 vel_deg = math.degrees(vel_rad) if not math.isnan(vel_rad) else 0.0
                 deg_pos = math.degrees(pos_rad)
-                self.raw_encoder_deg = float(deg_pos)
-                self.runtime.update_head_feedback(deg_pos, vel_deg)
-                self._head_feedback_seen = True
+                self.diagnostic_joint_yaw_deg = float(deg_pos)
+                self.diagnostic_joint_vel_deg_s = float(vel_deg)
+                if not getattr(self, "_head_state_received", False):
+                    t = time.monotonic()
+                    self.raw_encoder_deg = float(deg_pos)
+                    self.actual_head_yaw_deg = float(deg_pos)
+                    self.runtime.update_head_feedback(deg_pos, vel_deg, timestamp=t, source="/joint_states")
+                    self._head_feedback_seen = True
 
     def _on_emergency_stop(self, msg: Bool) -> None:
         self.runtime.tracker.fsm.set_safety_lock(bool(msg.data))
@@ -284,6 +296,16 @@ class StandaloneGazeNode(Node):
             tracker_head = self.runtime.tracker.head_angle_deg
             actual_head = self.runtime.actual_head_yaw_deg
             raw_enc = getattr(self, "raw_encoder_deg", actual_head)
+            fb_deg, fb_age, fb_src = self.runtime.get_feedback_telemetry(now=t_arrival)
+
+            sync_line = (
+                f"visual_bearing={face_bearing_str} "
+                f"command_yaw={target_yaw:+.1f}° "
+                f"actual_head={actual_head:+.1f}° "
+                f"head_feedback_deg={fb_deg:+.1f}° "
+                f"head_feedback_age_ms={fb_age:.1f}ms "
+                f"head_feedback_source={fb_src}"
+            )
 
             cmd_log = (
                 f"COMMAND\n"
@@ -295,7 +317,10 @@ class StandaloneGazeNode(Node):
                 f"actual_head={actual_head:+.1f}°\n"
                 f"raw_encoder={raw_enc:+.1f}°\n"
                 f"golden_tracker.head_angle_deg={tracker_head:+.1f}°\n"
-                f"FEEDBACK_SYNC: command_yaw={target_yaw:+.1f}° actual_head={actual_head:+.1f}° raw_encoder={raw_enc:+.1f}° golden_tracker.head_angle_deg={tracker_head:+.1f}°\n"
+                f"head_feedback_deg={fb_deg:+.1f}°\n"
+                f"head_feedback_age_ms={fb_age:.1f}ms\n"
+                f"head_feedback_source={fb_src}\n"
+                f"FEEDBACK_SYNC: {sync_line}\n"
                 f"source={res.command_source}"
             )
             forensic_msg = f"\n{frame_log}\n{cmd_log}"

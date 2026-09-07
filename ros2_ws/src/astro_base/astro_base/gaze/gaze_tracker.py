@@ -75,6 +75,9 @@ class GazeResult:
     active_target_at_command: str = "NONE"
     active_track_at_command: str = "NONE"
     command_generation_reason: str = "NONE"
+    head_feedback_deg: float = 0.0
+    head_feedback_age_ms: float = 0.0
+    head_feedback_source: str = "NONE"
 
 
 # A detection whose publisher reports no confidence: over the target manager's 0.40
@@ -127,6 +130,8 @@ class GazeTracker:
         self.head_angle_deg: float = 0.0
         self.head_velocity_deg_s: float = 0.0
         self.head_feedback_missing: bool = True
+        self.last_feedback_time: float = 0.0
+        self.head_feedback_source: str = "NONE"
         self.commands_from_audio: int = 0
         self.commands_from_visual: int = 0
         self.audio_reacquisition_count: int = 0
@@ -161,12 +166,19 @@ class GazeTracker:
         timestamp: float,
         speech=None,
         is_robot_speaking: bool = False,
+        feedback_source: Optional[str] = None,
+        feedback_timestamp: Optional[float] = None,
     ) -> GazeResult:
         """Runs one cycle: perception, fusion, arbitration, motion."""
         self._frame_index += 1
         if measured_head_deg is not None:
             self.head_angle_deg = float(measured_head_deg)
             self.head_feedback_missing = False
+            self.last_feedback_time = float(feedback_timestamp if feedback_timestamp is not None else timestamp)
+            if feedback_source is not None:
+                self.head_feedback_source = str(feedback_source)
+            elif self.head_feedback_source == "NONE":
+                self.head_feedback_source = "/head/state"
 
         if doa_deg is not None and speech is not None and speech.is_speech:
             self._ingest_audio(doa_deg, timestamp, float(speech.confidence),
@@ -521,6 +533,15 @@ class GazeTracker:
             self.head_angle_deg = float(trajectory.position_deg)
             self.head_velocity_deg_s = float(trajectory.velocity_deg_s)
 
+        if self.last_feedback_time > 0.0:
+            fb_age_ms = max(0.0, (float(timestamp) - self.last_feedback_time) * 1000.0)
+            fb_deg = float(self.head_angle_deg)
+            fb_src = self.head_feedback_source
+        else:
+            fb_age_ms = 9999.0
+            fb_deg = float(self.head_angle_deg)
+            fb_src = "NONE"
+
         return GazeResult(
             target_yaw_deg=float(command.target_yaw_deg),
             gaze_state=command.gaze_state,
@@ -528,7 +549,7 @@ class GazeTracker:
             target_id=command.active_target_id,
             confidence=float(command.confidence),
             head_angle_deg=self.head_angle_deg,
-            face_bearings_deg=tuple(t.body_azimuth_deg for t in self._latest_tracks),
+            face_bearings_deg=tuple(t.body_azimuth_deg for t in self._latest_tracks if getattr(t, "missed_frames", 0) == 0),
             target_source=target_source,
             visual_target=has_visual_target,
             audio_evidence=audio_evidence,
@@ -546,6 +567,9 @@ class GazeTracker:
             active_target_at_command=active_target_at_command,
             active_track_at_command=active_track_at_command,
             command_generation_reason=command_generation_reason,
+            head_feedback_deg=fb_deg,
+            head_feedback_age_ms=fb_age_ms,
+            head_feedback_source=fb_src,
         )
 
     @staticmethod
