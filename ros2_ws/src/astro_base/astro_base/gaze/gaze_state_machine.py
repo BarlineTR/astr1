@@ -59,7 +59,7 @@ class SocialGazeFSM:
 
     def __init__(
         self,
-        deadband_deg: float = 3.00,
+        deadband_deg: float = 2.50,
         idle_return_timeout_s: float = 8.0,
         min_attention_dwell_s: float = 2.50,
         target_lost_timeout_s: float = 1.0,

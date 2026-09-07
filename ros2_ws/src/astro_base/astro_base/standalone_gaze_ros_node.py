@@ -183,6 +183,8 @@ class StandaloneGazeRosNode(Node):
         self._diag_raw_bearings: collections.deque = collections.deque(maxlen=100)
         self._diag_target_yaws: collections.deque = collections.deque(maxlen=100)
         self._diag_measured_heads: collections.deque = collections.deque(maxlen=100)
+        self.latest_head_state_pos_deg: float = 0.0
+        self.latest_head_state_target_pos_deg: float = 0.0
 
         # Actuator Publishers
         if HeadCmd is not None:
@@ -254,6 +256,8 @@ class StandaloneGazeRosNode(Node):
                 vel = 0.0
             pos = float(msg.position_deg)
             self.raw_encoder_deg = pos
+            self.latest_head_state_pos_deg = pos
+            self.latest_head_state_target_pos_deg = float(getattr(msg, "target_position_deg", 0.0))
             self.runtime.update_head_feedback(pos, vel, timestamp=t, source="/head/state")
             self._head_feedback_seen = True
             self._head_state_received = True
@@ -468,7 +472,41 @@ class StandaloneGazeRosNode(Node):
             f"sigma_raw={std_raw:.2f} sigma_tgt={std_tgt:.2f} sigma_head={std_head:.2f}"
         )
 
-        forensic_msg = f"\n{frame_log}\n{cmd_log}\n{center_diag_line}"
+        # Structured Instrumentation for Forensic Isolation
+        sign_vis = 0 if abs(raw_bearing) < 1e-3 else (1 if raw_bearing > 0 else -1)
+        sign_tgt = 0 if abs(target_yaw - actual_head) < 1e-3 else (1 if (target_yaw - actual_head) > 0 else -1)
+        sign_pub = 0 if abs(self.last_published_yaw - actual_head) < 1e-3 else (1 if (self.last_published_yaw - actual_head) > 0 else -1)
+
+        instrumentation_log = (
+            f"RAW:\n"
+            f"bbox_center_x={bbox_cx:.1f}\n"
+            f"frame_center_x={frame_w / 2.0:.1f}\n"
+            f"\n"
+            f"VISION:\n"
+            f"visual_bearing_deg={raw_bearing:+.2f}\n"
+            f"\n"
+            f"FEEDBACK:\n"
+            f"measured_head_deg={actual_head:+.2f}\n"
+            f"head_feedback_timestamp={self.runtime.last_feedback_time:.3f}\n"
+            f"head_feedback_age_ms={fb_age:.1f}\n"
+            f"head_feedback_source={fb_src}\n"
+            f"\n"
+            f"CONTROL:\n"
+            f"visual_error_deg={diag_err:+.2f}\n"
+            f"target_yaw_deg={target_yaw:+.2f}\n"
+            f"published_command_deg={target_yaw:+.2f}\n"
+            f"\n"
+            f"ACTUATOR:\n"
+            f"actual_head_deg={self.latest_head_state_pos_deg:+.2f}\n"
+            f"target_position_deg={self.latest_head_state_target_pos_deg:+.2f}\n"
+            f"\n"
+            f"SIGNS:\n"
+            f"sign(visual_bearing)={sign_vis:+d}\n"
+            f"sign(target_yaw - measured_head)={sign_tgt:+d}\n"
+            f"sign(published_command - measured_head)={sign_pub:+d}"
+        )
+
+        forensic_msg = f"\n{frame_log}\n{cmd_log}\n{center_diag_line}\n{instrumentation_log}"
         try:
             print(forensic_msg)
         except UnicodeEncodeError:
