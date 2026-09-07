@@ -16,6 +16,7 @@ import json
 import math
 import os
 import time
+from dataclasses import replace
 from typing import Dict, List, Optional
 
 try:
@@ -95,6 +96,7 @@ except ImportError:
     Bool = Float32 = Header = Int32 = String = JointState = _MockMsg
     GazeStatus = HeadCmd = HeadState = None
 
+from astro_base.gaze.angle_math import angular_diff_deg
 from astro_base.gaze.audio_filter import AudioFilterCore
 from astro_base.gaze.audio_perception import AudioPerceptionCore
 from astro_base.gaze.coordinate_frames import CalibrationConfig, CoordinateTransformer
@@ -118,6 +120,7 @@ from astro_base.gaze.types import (
     PrioritySource,
     TargetSelectorType,
     TargetState,
+    TrackingState,
     TrajectoryPoint,
     VisualMeasurement,
     VisualObservation,
@@ -256,6 +259,19 @@ class SocialGazeNode(Node):
         self.commands_from_audio: int = 0
         self.commands_from_visual: int = 0
 
+        # Gaze ownership & controlled reacquisition state
+        self.coast_timeout_s: float = 1.0
+        self._last_visual_target_yaw: Optional[float] = None
+        self._last_visual_seen_time: float = 0.0
+        self._last_visual_target_id: Optional[str] = None
+        self._audio_reacq_active: bool = False
+        self._audio_reacq_target_yaw: Optional[float] = None
+        self._audio_reacq_start_time: float = 0.0
+        self._speech_in_progress: bool = False
+        self.audio_reacquisition_count: int = 0
+        self.visual_handover_count: int = 0
+        self.is_speech_verified: bool = False
+
         # -------------------------------------------------------------------------
         # 4. ROS 2 Publishers & Subscriptions
         # -------------------------------------------------------------------------
@@ -290,6 +306,7 @@ class SocialGazeNode(Node):
         # Bug #4 fix: GCC-PHAT PSR confidence companion — latched into
         # self._latest_doa_confidence so _on_doa_deg can pass it through.
         self.create_subscription(Float32, "/audio/doa_confidence", self._on_doa_confidence, 10)
+        self.create_subscription(Bool, "/audio/vad", self._on_vad, 10)
         self.create_subscription(String, "/vision/detections_json", self._on_vision_json, 10)
         self.create_subscription(String, "/vision/faces", self._on_vision_json, 10)
         self.create_subscription(Float32, "/vision/head_yaw", self._on_vision_head_yaw, 10)
@@ -359,6 +376,10 @@ class SocialGazeNode(Node):
         raw = float(msg.data)
         # Clamp to [0, 1] — guard against any sensor noise in the PSR ratio
         self._latest_doa_confidence = max(0.0, min(1.0, raw))
+
+    def _on_vad(self, msg: Bool) -> None:
+        """Sets verified speech activity flag (/audio/vad)."""
+        self.is_speech_verified = bool(msg.data)
 
     def _on_doa_deg(self, msg: Float32) -> None:
         """Processes float DOA angle in degrees."""
@@ -574,10 +595,157 @@ class SocialGazeNode(Node):
             actual_head_vel_deg_s=self.actual_head_vel_deg_s,
         )
 
+        # Determine visual target grounding and direct camera lock
+        has_visual_target = bool(
+            target_state.active_target is not None
+            and target_state.active_target.modality in (Modality.FUSED, Modality.VISION)
+        )
+        faces_detected = bool(
+            self.latest_visual_tracks and any(
+                tr.tracking_state == TrackingState.TRACKING and tr.missed_frames == 0
+                for tr in self.latest_visual_tracks
+            )
+        )
+        has_visual_lock = has_visual_target and faces_detected
+
+        if has_visual_lock:
+            self._last_visual_target_yaw = float(target_state.active_target.body_azimuth_deg)
+            self._last_visual_seen_time = t
+            self._last_visual_target_id = target_state.active_target.target_id
+        elif has_visual_target and self._last_visual_seen_time == 0.0:
+            self._last_visual_target_yaw = float(target_state.active_target.body_azimuth_deg)
+            self._last_visual_seen_time = t
+            self._last_visual_target_id = target_state.active_target.target_id
+
+        # Calculate visual target elapsed time
+        time_since_visual = (t - self._last_visual_seen_time) if self._last_visual_seen_time > 0.0 else 999.0
+        visual_target_age_ms = max(0.0, time_since_visual * 1000.0) if self._last_visual_seen_time > 0.0 else 99999.0
+
+        # Verified human speech and stabilized audio bearing evaluation
+        has_verified_speech = bool(
+            self.is_speech_verified
+            or (
+                self.latest_audio_state is not None
+                and self.latest_audio_state.valid
+                and self.latest_audio_state.confidence >= 0.50
+            )
+        )
+        audio_evidence = bool(self.latest_audio_state is not None and self.latest_audio_state.valid)
+        audio_bearing = float(self.latest_audio_state.azimuth_deg) if audio_evidence else 0.0
+        audio_bearing_age_ms = max(0.0, (t - self.latest_audio_state.timestamp) * 1000.0) if audio_evidence else 99999.0
+        audio_bearing_valid = bool(
+            audio_evidence
+            and audio_bearing_age_ms < 600.0
+            and not self.latest_audio_state.is_outlier
+            and getattr(self.latest_audio_state, "variance", 0.0) <= 1.0
+        )
+
+        # Single mechanical motor envelope: strictly [-75.0, +75.0]
+        # Angles outside this envelope (e.g. 119°, 153°, 180°, -135°) are rejected as INVALID_AUDIO_REACQUISITION
+        # and MUST NOT be clamped to ±75°
+        is_in_audio_envelope = bool(-75.0 <= audio_bearing <= 75.0)
+
+        # ---------------------------------------------------------------------
+        # 5-STATE ATTENTION OWNERSHIP & REACQUISITION MACHINE
+        # ---------------------------------------------------------------------
+        coast_active = False
+        audio_reacq_active = False
+
+        if gaze_cmd.priority_source in (
+            PrioritySource.EXPLICIT_USER_GAZE,
+            PrioritySource.DIRECT_DIALOGUE_INTENT,
+            PrioritySource.GESTURE_INTENT,
+            PrioritySource.EMERGENCY_STOP,
+        ):
+            command_source = gaze_cmd.priority_source.value
+            target_source = "CAMERA" if has_visual_lock else "NONE"
+        elif has_visual_lock:
+            # STATE 1: VISUAL_LOCK & STATE 4: VISUAL_HANDOVER
+            if self._audio_reacq_active:
+                # STATE 4: VISUAL_HANDOVER on first valid visual detection
+                self._audio_reacq_active = False
+                self._audio_reacq_target_yaw = None
+                self.visual_handover_count += 1
+            command_source = "VISUAL"
+            target_source = "CAMERA"
+            self.commands_from_visual += 1
+        elif self._last_visual_target_yaw is not None and time_since_visual <= self.coast_timeout_s:
+            # STATE 2: VISUAL_COAST (0.0 - 1.0s: hold last visual bearing, do not snap to 0.0°, block audio reacq)
+            coast_active = True
+            command_source = "VISUAL_COAST"
+            target_source = "COAST"
+            gaze_cmd = replace(
+                gaze_cmd,
+                target_yaw_deg=float(self._last_visual_target_yaw),
+                priority_source=PrioritySource.VISUAL_TRACKING,
+            )
+        elif (
+            time_since_visual > self.coast_timeout_s
+            and has_verified_speech
+            and audio_bearing_valid
+            and not self.is_robot_speaking
+            and is_in_audio_envelope
+        ):
+            # STATE 3: AUDIO_REACQUISITION (strictly within [-75°, +75°], single-episode limited)
+            if self._audio_reacq_active:
+                # Ongoing episode: target yaw is fixed, do NOT wander with repeated audio samples!
+                audio_reacq_active = True
+                command_source = "AUDIO_REACQUISITION"
+                target_source = "AUDIO_REACQUISITION"
+                gaze_cmd = replace(
+                    gaze_cmd,
+                    target_yaw_deg=float(self._audio_reacq_target_yaw),
+                    priority_source=PrioritySource.ACTIVE_SPEAKER,
+                    gaze_state=GazeStateEnum.ORIENTING,
+                )
+                err = abs(angular_diff_deg(self.actual_head_yaw_deg, self._audio_reacq_target_yaw))
+                elapsed = t - self._audio_reacq_start_time
+                if elapsed >= 2.5 or (err <= 2.5 and abs(self.actual_head_vel_deg_s) <= 3.0 and elapsed >= 0.3):
+                    # Arrived at orienting target without visual acquisition
+                    pass
+            elif not self._speech_in_progress:
+                # New verified speech episode starts single-shot reacquisition action
+                self._audio_reacq_active = True
+                self._audio_reacq_target_yaw = float(audio_bearing)
+                self._audio_reacq_start_time = t
+                self._speech_in_progress = True
+                self.audio_reacquisition_count += 1
+                audio_reacq_active = True
+                command_source = "AUDIO_REACQUISITION"
+                target_source = "AUDIO_REACQUISITION"
+                gaze_cmd = replace(
+                    gaze_cmd,
+                    target_yaw_deg=float(self._audio_reacq_target_yaw),
+                    priority_source=PrioritySource.ACTIVE_SPEAKER,
+                    gaze_state=GazeStateEnum.ORIENTING,
+                )
+            else:
+                # Speech episode already generated its one action and is still continuing: stay stationary
+                command_source = "SAFETY_ZERO"
+                target_source = "NONE"
+                gaze_cmd = replace(
+                    gaze_cmd,
+                    target_yaw_deg=float(self.actual_head_yaw_deg),
+                    priority_source=PrioritySource.IDLE,
+                )
+        else:
+            # STATE 5: IDLE / STATIONARY (no visual, no coast, no verified speech, or outside envelope)
+            if not has_verified_speech:
+                self._speech_in_progress = False
+                self._audio_reacq_active = False
+                self._audio_reacq_target_yaw = None
+            command_source = "SAFETY_ZERO"
+            target_source = "NONE"
+            gaze_cmd = replace(
+                gaze_cmd,
+                target_yaw_deg=float(self.actual_head_yaw_deg),
+                priority_source=PrioritySource.IDLE,
+            )
+
+        # Architectural Invariant: raw audio DOA -> head command MUST BE ZERO
+        self.commands_from_audio = 0
+
         # 4. Kinematic Motion Planning & Trajectory Generation
-        # Encoder susuyorsa planlayıcıya sahte bir konum verme: plan_step 25 dereceden
-        # büyük farkta kendini o konuma snap ediyor, uydurma 0 ile modellenen kafayı
-        # her çevrimde merkeze geri sürüklüyordu.
         measured_pos = None if self.head_feedback_missing() else self.actual_head_yaw_deg
         traj_point = self.planner.plan_step(
             gaze_cmd=gaze_cmd,
@@ -586,39 +754,8 @@ class SocialGazeNode(Node):
         )
 
         if self.head_feedback_missing():
-            # Ölçüm yoksa kafanın söylediğimiz yere gittiğini varsayıyoruz. Planlayıcı
-            # hız ve ivme limitli integrasyon yaptığı için bu, komutun kendisini
-            # kopyalamaktan daha dürüst: kafa gerçekten varana kadar at_target olmuyor.
-            # 0 varsaymak ise her kerterizi merkeze çökertip takibi durduruyordu.
             self.actual_head_yaw_deg = float(traj_point.position_deg)
             self.actual_head_vel_deg_s = float(traj_point.velocity_deg_s)
-
-        # Determine target source and validate visual grounding
-        has_visual_target = bool(
-            target_state.active_target is not None
-            and target_state.active_target.modality in (Modality.FUSED, Modality.VISION)
-        )
-        audio_evidence = bool(self.latest_audio_state is not None and self.latest_audio_state.valid)
-
-        if gaze_cmd.priority_source in (PrioritySource.ACTIVE_SPEAKER, PrioritySource.VISUAL_TRACKING):
-            if has_visual_target:
-                command_source = "VISUAL"
-                target_source = "CAMERA"
-                self.commands_from_visual += 1
-            else:
-                # Safety guard: commanded without visual target -> isolate from motor
-                command_source = "SAFETY_ZERO"
-                target_source = "NONE"
-                gaze_cmd.target_yaw_deg = float(self.actual_head_yaw_deg)
-        elif gaze_cmd.priority_source == PrioritySource.EXPLICIT_USER_GAZE:
-            command_source = "EXPLICIT"
-            target_source = "CAMERA" if has_visual_target else "NONE"
-        else:
-            command_source = "SAFETY_ZERO"
-            target_source = "NONE"
-
-        # Architectural Invariant: raw audio DOA -> head command MUST BE ZERO
-        self.commands_from_audio = 0
 
         # 5. Actuator Command Publishing (Direct Authoritative Goal Setpoint to Arduino PID)
         target_goal_deg = float(gaze_cmd.target_yaw_deg)
@@ -722,6 +859,14 @@ class SocialGazeNode(Node):
             "target_identity_correctness": target_identity_correctness,
             "attention_owner_correctness": attention_owner_correctness,
             "audio_valid": bool(self.latest_audio_state.valid) if self.latest_audio_state else False,
+            "audio_bearing_valid": audio_bearing_valid,
+            "audio_bearing": round(audio_bearing, 2),
+            "audio_bearing_age_ms": round(audio_bearing_age_ms, 1),
+            "visual_target_age_ms": round(visual_target_age_ms, 1),
+            "coast_active": coast_active,
+            "audio_reacquisition_active": audio_reacq_active,
+            "audio_reacquisition_count": self.audio_reacquisition_count,
+            "visual_handover_count": self.visual_handover_count,
             "audio_age_s": audio_age_s,
             "visual_valid": bool(self.latest_visual_tracks[0].confidence > 0.4) if self.latest_visual_tracks else False,
             "visual_age_s": visual_age_s,

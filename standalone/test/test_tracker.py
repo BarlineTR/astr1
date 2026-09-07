@@ -196,11 +196,11 @@ class TestOnlySpeechEarnsTheHead(unittest.TestCase):
         self.assertEqual(result.command_source, "VISUAL")
 
     def test_yuz_yokken_raw_doa_kafayi_ceviremez(self):
-        """Kritik mimari karar: Görsel hedef yoksa raw DOA motora komut veremez (commands_from_audio = 0)."""
+        """Kritik mimari karar: Görsel hedef yoksa ve konuşma doğrulanmamışsa raw DOA motora komut veremez."""
         from astro_audio.speech_detector import SpeechVerdict
 
-        speech = SpeechVerdict(is_speech=True, confidence=0.85, harmonicity=0.70,
-                               modulation=0.85, rms=0.2)
+        speech = SpeechVerdict(is_speech=False, confidence=0.0, harmonicity=0.20,
+                               modulation=0.10, rms=0.2)
 
         result = self._run(speech, faces=[])
 
@@ -309,6 +309,293 @@ class TestRobotDoesNotChaseItsOwnVoice(unittest.TestCase):
         result = self._run(is_robot_speaking=False)
 
         self.assertEqual(result.owner, PrioritySource.ACTIVE_SPEAKER)
+
+
+class TestControlledAudioReacquisition(unittest.TestCase):
+    """Rigorous acceptance tests for 5-state attention ownership and controlled audio reacquisition.
+
+    1. test_audio_episode_generates_only_one_reacquisition
+    2. test_repeated_audio_samples_do_not_change_active_reacquisition_target
+    3. test_visual_target_cancels_audio_reacquisition
+    4. test_audio_outside_75deg_cannot_reacquire
+    5. test_119deg_audio_cannot_reacquire
+    6. test_180deg_audio_cannot_reacquire
+    7. test_audio_reacquisition_does_not_spin
+    8. test_visual_coast_then_audio_reacquisition
+    9. test_visual_coast_then_idle
+    10. test_visual_target_blocks_audio_reacquisition
+    """
+
+    def _speech(self, is_speech=True, confidence=0.85):
+        from astro_audio.speech_detector import SpeechVerdict
+        return SpeechVerdict(
+            is_speech=is_speech,
+            confidence=confidence,
+            harmonicity=0.80,
+            modulation=0.80,
+            rms=0.25,
+        )
+
+    def test_audio_episode_generates_only_one_reacquisition(self):
+        tracker = GazeTracker()
+        speech = self._speech()
+        result = None
+        for i in range(25):
+            result = tracker.step(
+                faces=[],
+                frame_size=FRAME,
+                doa_deg=-30.0,
+                measured_head_deg=0.0,
+                timestamp=100.0 + i * 0.02,
+                speech=speech,
+            )
+
+        self.assertEqual(tracker.audio_reacquisition_count, 1)
+        self.assertEqual(result.commands_from_audio, 0)
+        self.assertEqual(result.command_source, "AUDIO_REACQUISITION")
+        self.assertTrue(result.audio_reacquisition_active)
+
+    def test_repeated_audio_samples_do_not_change_active_reacquisition_target(self):
+        tracker = GazeTracker()
+        speech = self._speech()
+        # Initialize and trigger reacquisition
+        for i in range(5):
+            result = tracker.step(
+                faces=[],
+                frame_size=FRAME,
+                doa_deg=-30.0,
+                measured_head_deg=0.0,
+                timestamp=100.0 + i * 0.02,
+                speech=speech,
+            )
+        self.assertEqual(tracker.audio_reacquisition_count, 1)
+        locked_yaw = result.target_yaw_deg
+
+        # Subsequent audio samples with shifting DOAs during ongoing speech
+        shifting_doas = [-45.0, -15.0, -50.0, -20.0, -35.0]
+        for i, doa in enumerate(shifting_doas):
+            res = tracker.step(
+                faces=[],
+                frame_size=FRAME,
+                doa_deg=doa,
+                measured_head_deg=0.0,
+                timestamp=100.1 + i * 0.02,
+                speech=speech,
+            )
+            self.assertEqual(res.target_yaw_deg, locked_yaw,
+                             "repeated audio samples shifted the locked reacquisition target")
+            self.assertEqual(tracker.audio_reacquisition_count, 1)
+
+    def test_visual_target_cancels_audio_reacquisition(self):
+        tracker = GazeTracker()
+        speech = self._speech()
+        # Start reacquisition without faces
+        for i in range(5):
+            tracker.step(
+                faces=[],
+                frame_size=FRAME,
+                doa_deg=-30.0,
+                measured_head_deg=0.0,
+                timestamp=100.0 + i * 0.02,
+                speech=speech,
+            )
+        self.assertTrue(tracker._audio_reacq_active)
+        self.assertEqual(tracker.audio_reacquisition_count, 1)
+
+        # Visual target appears: instant handover
+        face = _face_at(0.40, confidence=0.90)
+        result = tracker.step(
+            faces=[face],
+            frame_size=FRAME,
+            doa_deg=-30.0,
+            measured_head_deg=0.0,
+            timestamp=100.15,
+            speech=speech,
+        )
+        self.assertFalse(tracker._audio_reacq_active)
+        self.assertEqual(tracker.visual_handover_count, 1)
+        self.assertEqual(result.command_source, "VISUAL")
+
+    def test_audio_outside_75deg_cannot_reacquire(self):
+        tracker = GazeTracker()
+        speech = self._speech()
+        # 80 deg DOA -> transformed bearing exceeds [-75°, +75°]
+        for i in range(10):
+            result = tracker.step(
+                faces=[],
+                frame_size=FRAME,
+                doa_deg=80.0,
+                measured_head_deg=0.0,
+                timestamp=100.0 + i * 0.02,
+                speech=speech,
+            )
+
+        self.assertEqual(tracker.audio_reacquisition_count, 0)
+        self.assertNotEqual(result.command_source, "AUDIO_REACQUISITION")
+        self.assertEqual(result.target_yaw_deg, 0.0)
+
+    def test_119deg_audio_cannot_reacquire(self):
+        tracker = GazeTracker()
+        speech = self._speech()
+        for i in range(10):
+            result = tracker.step(
+                faces=[],
+                frame_size=FRAME,
+                doa_deg=119.0,
+                measured_head_deg=0.0,
+                timestamp=100.0 + i * 0.02,
+                speech=speech,
+            )
+
+        self.assertEqual(tracker.audio_reacquisition_count, 0)
+        self.assertNotEqual(result.command_source, "AUDIO_REACQUISITION")
+        self.assertNotEqual(result.target_yaw_deg, 75.0, "119 deg must not be clamped to 75 deg")
+        self.assertEqual(result.target_yaw_deg, 0.0)
+
+    def test_180deg_audio_cannot_reacquire(self):
+        tracker = GazeTracker()
+        speech = self._speech()
+        for i in range(10):
+            result = tracker.step(
+                faces=[],
+                frame_size=FRAME,
+                doa_deg=180.0,
+                measured_head_deg=0.0,
+                timestamp=100.0 + i * 0.02,
+                speech=speech,
+            )
+
+        self.assertEqual(tracker.audio_reacquisition_count, 0)
+        self.assertNotEqual(result.command_source, "AUDIO_REACQUISITION")
+        self.assertEqual(result.target_yaw_deg, 0.0)
+
+    def test_audio_reacquisition_does_not_spin(self):
+        tracker = GazeTracker()
+        speech = self._speech()
+        # Alternating left and right DOAs during one continuous speech episode
+        targets = []
+        for i in range(30):
+            doa = -35.0 if (i % 4 < 2) else 35.0
+            result = tracker.step(
+                faces=[],
+                frame_size=FRAME,
+                doa_deg=doa,
+                measured_head_deg=0.0,
+                timestamp=100.0 + i * 0.02,
+                speech=speech,
+            )
+            if result.command_source == "AUDIO_REACQUISITION":
+                targets.append(result.target_yaw_deg)
+
+        self.assertEqual(tracker.audio_reacquisition_count, 1)
+        # All recorded reacquisition targets must be identical (no flipping / spinning)
+        self.assertTrue(all(t == targets[0] for t in targets),
+                        f"target yaw flipped during speech episode: {targets}")
+
+    def test_visual_coast_then_audio_reacquisition(self):
+        tracker = GazeTracker()
+        speech = self._speech()
+        face = _face_at(0.30, confidence=0.85)
+
+        # 1. Lock onto visual target
+        for i in range(10):
+            tracker.step(
+                faces=[face],
+                frame_size=FRAME,
+                doa_deg=None,
+                measured_head_deg=0.0,
+                timestamp=100.0 + i * 0.02,
+                speech=None,
+            )
+
+        # 2. Visual target drops; audio speech arrives at t = 100.5s (< 1.0s coast)
+        for i in range(5):
+            res = tracker.step(
+                faces=[],
+                frame_size=FRAME,
+                doa_deg=-40.0,
+                measured_head_deg=0.0,
+                timestamp=100.3 + i * 0.02,
+                speech=speech,
+            )
+            self.assertEqual(res.command_source, "VISUAL_COAST")
+            self.assertTrue(res.coast_active)
+            self.assertEqual(tracker.audio_reacquisition_count, 0)
+
+        # 3. Advance time past coast timeout (1.0s) -> t = 101.5s
+        for i in range(5):
+            res = tracker.step(
+                faces=[],
+                frame_size=FRAME,
+                doa_deg=-40.0,
+                measured_head_deg=0.0,
+                timestamp=101.5 + i * 0.02,
+                speech=speech,
+            )
+
+        self.assertEqual(res.command_source, "AUDIO_REACQUISITION")
+        self.assertEqual(tracker.audio_reacquisition_count, 1)
+
+    def test_visual_coast_then_idle(self):
+        tracker = GazeTracker()
+        face = _face_at(0.30, confidence=0.85)
+
+        # 1. Lock onto visual target
+        for i in range(10):
+            tracker.step(
+                faces=[face],
+                frame_size=FRAME,
+                doa_deg=None,
+                measured_head_deg=0.0,
+                timestamp=100.0 + i * 0.02,
+                speech=None,
+            )
+
+        # 2. Visual drops, no speech: during coast (<= 1.0s)
+        res_coast = tracker.step(
+            faces=[],
+            frame_size=FRAME,
+            doa_deg=None,
+            measured_head_deg=0.0,
+            timestamp=100.5,
+            speech=None,
+        )
+        self.assertEqual(res_coast.command_source, "VISUAL_COAST")
+        self.assertTrue(res_coast.coast_active)
+
+        # 3. Coast expires (> 1.0s), still no speech: returns to stationary
+        res_idle = tracker.step(
+            faces=[],
+            frame_size=FRAME,
+            doa_deg=None,
+            measured_head_deg=0.0,
+            timestamp=102.0,
+            speech=None,
+        )
+        self.assertEqual(res_idle.command_source, "SAFETY_ZERO")
+        self.assertEqual(res_idle.owner, PrioritySource.IDLE)
+        self.assertFalse(res_idle.coast_active)
+
+    def test_visual_target_blocks_audio_reacquisition(self):
+        tracker = GazeTracker()
+        speech = self._speech()
+        face = _face_at(0.25, confidence=0.90)
+
+        # Visual target active while loud speech occurs at a different angle
+        for i in range(15):
+            res = tracker.step(
+                faces=[face],
+                frame_size=FRAME,
+                doa_deg=-60.0,
+                measured_head_deg=0.0,
+                timestamp=100.0 + i * 0.02,
+                speech=speech,
+            )
+
+        self.assertEqual(res.command_source, "VISUAL")
+        self.assertEqual(tracker.audio_reacquisition_count, 0)
+        self.assertEqual(res.commands_from_audio, 0)
+        self.assertFalse(res.audio_reacquisition_active)
 
 
 if __name__ == "__main__":
