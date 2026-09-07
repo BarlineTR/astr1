@@ -176,10 +176,12 @@ class VisualTrackerCore:
 
         self.tracks: Dict[str, KalmanTrack3D] = {}
         self._next_track_idx = 1
+        self.last_associations: Dict[int, str] = {}
 
     def reset(self) -> None:
         self.tracks.clear()
         self._next_track_idx = 1
+        self.last_associations.clear()
 
     def update(
         self,
@@ -197,8 +199,9 @@ class VisualTrackerCore:
           5. Initialization of new tracks for unassigned detections
           6. Purging of expired (LOST) tracks
         """
-        # Filter only valid observations
-        valid_obs = [o for o in observations if o.valid and o.depth_m > 0.1]
+        # Filter only valid observations while preserving original indices
+        valid_indices = [idx for idx, o in enumerate(observations) if o.valid and o.depth_m > 0.1]
+        valid_obs = [observations[idx] for idx in valid_indices]
 
         # 1. Prediction step for all existing tracks
         for track in self.tracks.values():
@@ -218,6 +221,7 @@ class VisualTrackerCore:
         track_ids = list(self.tracks.keys())
         matched_tracks = set()
         matched_obs = set()
+        self.last_associations.clear()
 
         if track_ids and obs_base_coords:
             # Build cost matrix (3D Euclidean distance)
@@ -239,6 +243,7 @@ class VisualTrackerCore:
                 t_idx, o_idx = min_idx
                 matched_tracks.add(track_ids[t_idx])
                 matched_obs.add(o_idx)
+                self.last_associations[valid_indices[o_idx]] = track_ids[t_idx]
 
                 # Update the matched track
                 self.tracks[track_ids[t_idx]].update(
@@ -266,6 +271,7 @@ class VisualTrackerCore:
                     obs=valid_obs[j],
                 )
                 self.tracks[new_id] = new_track
+                self.last_associations[valid_indices[j]] = new_id
 
         # 5. Purge expired LOST tracks
         active_tids = [tid for tid, t in self.tracks.items() if t.state != TrackingState.LOST]

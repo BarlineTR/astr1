@@ -598,5 +598,76 @@ class TestControlledAudioReacquisition(unittest.TestCase):
         self.assertFalse(res.audio_reacquisition_active)
 
 
+class TestForensicTelemetry(unittest.TestCase):
+    """Verifies that forensic telemetry captures complete causal chains without changing behavior."""
+
+    def test_forensic_telemetry_fields_and_causal_chain(self):
+        import io
+        from unittest.mock import patch
+
+        tracker = GazeTracker()
+        face = Detection(x=200, y=180, w=100, h=100, confidence=0.88, detector_source="yunet")
+
+        with patch("sys.stdout", new_callable=io.StringIO) as mock_stdout:
+            result = tracker.step(
+                faces=[face],
+                frame_size=FRAME,
+                doa_deg=None,
+                measured_head_deg=0.0,
+                timestamp=100.0,
+            )
+            output = mock_stdout.getvalue()
+
+        # 1. Verify forensic payload presence
+        self.assertIsNotNone(result.forensic)
+        forensic = result.forensic
+
+        # 2. Verify visual detection telemetry (8 fields)
+        self.assertEqual(len(forensic["detections"]), 1)
+        det = forensic["detections"][0]
+        self.assertIn("frame_id", det)
+        self.assertIn("timestamp", det)
+        self.assertIn("bbox", det)
+        self.assertIn("bearing", det)
+        self.assertIn("confidence", det)
+        self.assertIn("detector_source", det)
+        self.assertIn("track_id", det)
+        self.assertIn("track_state", det)
+        self.assertEqual(det["detector_source"], "yunet")
+        self.assertEqual(det["bbox"], [200, 180, 100, 100])
+        self.assertEqual(det["confidence"], 0.88)
+
+        # 3. Verify target manager telemetry (3 fields)
+        tm = forensic["target_manager"]
+        self.assertIn("previous_active_target", tm)
+        self.assertIn("new_active_target", tm)
+        self.assertIn("reason", tm)
+
+        # 4. Verify attention decision telemetry (4 fields)
+        att = forensic["attention"]
+        self.assertIn("old_owner", att)
+        self.assertIn("new_owner", att)
+        self.assertIn("reason", att)
+        self.assertIn("preempted_target", att)
+
+        # 5. Verify head command telemetry (5 fields)
+        cmd = forensic["command"]
+        self.assertIn("previous_target_yaw", cmd)
+        self.assertIn("new_target_yaw", cmd)
+        self.assertIn("command_source", cmd)
+        self.assertIn("target_source", cmd)
+        self.assertIn("reason", cmd)
+
+        # 6. Verify causal chain output when delta_yaw > 3.0 degrees
+        if forensic["delta_yaw"] > 3.0:
+            self.assertIn("DETECTION → TRACK → TARGET → ATTENTION → COMMAND", output)
+            self.assertIn("[FORENSIC CAUSAL CHAIN]", output)
+            self.assertIn("DETECTION:", output)
+            self.assertIn("TRACK    :", output)
+            self.assertIn("TARGET   :", output)
+            self.assertIn("ATTENTION:", output)
+            self.assertIn("COMMAND  :", output)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -103,10 +103,17 @@ def _is_duplicate(a: np.ndarray, b: np.ndarray) -> bool:
     return abs(float(np.dot(a, b)) / denom) >= DUPLICATE_CORRELATION
 
 
-def to_detections(found) -> List[Detection]:
+def to_detections(found, detector_source: Optional[str] = None) -> List[Detection]:
     """Turns the detector's (x, y, w, h, confidence) tuples into Detections."""
     return [
-        Detection(x=int(x), y=int(y), w=int(w), h=int(h), confidence=float(conf))
+        Detection(
+            x=int(x),
+            y=int(y),
+            w=int(w),
+            h=int(h),
+            confidence=float(conf),
+            detector_source=detector_source,
+        )
         for (x, y, w, h, conf) in found
     ]
 
@@ -209,7 +216,7 @@ class CameraSource:
             return False, None
 
     def detect(self, frame) -> List[Detection]:
-        return to_detections(self.detector.detect(frame))
+        return to_detections(self.detector.detect(frame), detector_source=self.detector_name)
 
     def close(self) -> None:
         try:

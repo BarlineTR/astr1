@@ -146,5 +146,59 @@ class TestUnscoredDetectionsNeedCorroboration(unittest.TestCase):
         self.assertNotEqual(self._looking_at(), "")
 
 
+class TestSocialGazeForensicTelemetry(unittest.TestCase):
+    """Verifies that SocialGazeNode produces complete forensic telemetry and logs causal chains."""
+
+    def test_detection_and_command_forensic_chain(self):
+        import io
+        from unittest.mock import patch
+
+        node = SocialGazeNode()
+        face_data = _face(x=100, y=120, width=80, height=80, confidence=0.92, detector_source="yunet")
+
+        with patch("sys.stdout", new_callable=io.StringIO) as mock_stdout:
+            node._on_vision_json(_Msg(json.dumps([face_data])))
+            node._control_cycle()
+            output = mock_stdout.getvalue()
+
+        # 1. Detection telemetry verification (8 fields)
+        self.assertTrue(len(node._latest_detections_telemetry) >= 1)
+        det = node._latest_detections_telemetry[0]
+        for field in ("frame_id", "timestamp", "bbox", "bearing", "confidence", "detector_source", "track_id", "track_state"):
+            self.assertIn(field, det)
+        self.assertEqual(det["detector_source"], "yunet")
+        self.assertEqual(det["confidence"], 0.92)
+
+        # 2. Forensic payload verification in node state
+        self.assertIsNotNone(node.last_forensic_chain)
+        forensic = node.last_forensic_chain
+
+        # Target manager (3 fields)
+        tm = forensic["target_manager"]
+        for field in ("previous_active_target", "new_active_target", "reason"):
+            self.assertIn(field, tm)
+
+        # Attention decision (4 fields)
+        att = forensic["attention"]
+        for field in ("old_owner", "new_owner", "reason", "preempted_target"):
+            self.assertIn(field, att)
+
+        # Head command (5 fields)
+        cmd = forensic["command"]
+        for field in ("previous_target_yaw", "new_target_yaw", "command_source", "target_source", "reason"):
+            self.assertIn(field, cmd)
+
+        # 3. Debug topic includes forensic payload
+        self.assertIsNotNone(node.pub_gaze_debug.last_msg)
+        diag = json.loads(node.pub_gaze_debug.last_msg.data)
+        self.assertIn("forensic", diag)
+        self.assertEqual(diag["forensic"]["command"]["new_target_yaw"], cmd["new_target_yaw"])
+
+        # 4. Causal chain output when target_yaw changes by > 3 degrees
+        if forensic["delta_yaw"] > 3.0:
+            self.assertIn("DETECTION → TRACK → TARGET → ATTENTION → COMMAND", output)
+            self.assertIn("[FORENSIC CAUSAL CHAIN]", output)
+
+
 if __name__ == "__main__":
     unittest.main()

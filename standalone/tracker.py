@@ -44,6 +44,7 @@ class Detection:
     w: int
     h: int
     confidence: Optional[float] = None
+    detector_source: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -69,6 +70,7 @@ class GazeResult:
     audio_reacquisition_active: bool = False
     audio_reacquisition_count: int = 0
     visual_handover_count: int = 0
+    forensic: Optional[dict] = None
 
 
 # A detection whose publisher reports no confidence: over the target manager's 0.40
@@ -146,6 +148,12 @@ class GazeTracker:
         self._audio_reacq_start_time: float = 0.0
         self._speech_in_progress: bool = False
 
+        # Forensic telemetry state
+        self._frame_index: int = 0
+        self._last_target_yaw_telemetry: float = 0.0
+        self._latest_detections_telemetry: List[dict] = []
+        self.last_forensic_chain: Optional[dict] = None
+
         self._latest_audio = None
         self._latest_tracks: List = []
 
@@ -160,6 +168,7 @@ class GazeTracker:
         is_robot_speaking: bool = False,
     ) -> GazeResult:
         """Runs one cycle: perception, fusion, arbitration, motion."""
+        self._frame_index += 1
         if measured_head_deg is not None:
             self.head_angle_deg = float(measured_head_deg)
             self.head_feedback_missing = False
@@ -170,8 +179,38 @@ class GazeTracker:
 
         self._ingest_vision(faces, frame_size, timestamp)
 
+        # 1. Target-Manager telemetry snapshot before update
+        prev_target = self.target_manager.active_target
+        prev_target_id = prev_target.target_id if prev_target else "NONE"
+
         fused = self.fusion.fuse(self._latest_audio, self._latest_tracks, timestamp)
         target_state = self.target_manager.update(fused, timestamp)
+
+        # 1. Target-Manager telemetry snapshot after update
+        new_target = target_state.active_target
+        new_target_id = new_target.target_id if new_target else "NONE"
+
+        if self.target_manager.last_target_birth is not None:
+            tm_reason = self.target_manager.last_target_birth.get("reason", f"TARGET_BIRTH_{new_target_id}")
+        elif prev_target is None and new_target is not None:
+            tm_reason = f"TARGET_ACQUIRED_{new_target.target_id}_{new_target.modality.value}"
+        elif prev_target is not None and new_target is None:
+            tm_reason = f"TARGET_LOST_{prev_target.target_id}"
+        elif prev_target is not None and new_target is not None and prev_target.target_id != new_target.target_id:
+            tm_reason = f"TURN_TAKING_SWITCH_{prev_target.target_id}_TO_{new_target.target_id}"
+        elif prev_target is not None and new_target is not None and prev_target.target_id == new_target.target_id:
+            tm_reason = f"TARGET_MAINTAINED_{new_target.target_id}"
+        else:
+            tm_reason = "NO_ACTIVE_TARGET"
+
+        tm_telemetry = {
+            "previous_active_target": prev_target_id,
+            "new_active_target": new_target_id,
+            "reason": tm_reason,
+        }
+
+        # 2. Attention decision telemetry snapshot before update
+        old_owner = self.fsm.active_priority.value
 
         command = self.fsm.update(
             target_state=target_state,
@@ -179,6 +218,22 @@ class GazeTracker:
             timestamp=timestamp,
             actual_head_vel_deg_s=self.head_velocity_deg_s,
         )
+
+        # 2. Attention decision telemetry snapshot after update
+        new_owner = self.fsm.active_priority.value
+        decision = self.fsm.last_decision
+        att_reason = decision.reason if decision else self.fsm.last_transition_reason
+        preempted_target = (
+            decision.preempted_target_id
+            if (decision and decision.is_preemption and decision.preempted_target_id)
+            else "NONE"
+        )
+        att_telemetry = {
+            "old_owner": old_owner,
+            "new_owner": new_owner,
+            "reason": att_reason,
+            "preempted_target": preempted_target,
+        }
 
         # Determine visual target grounding and direct camera lock
         has_visual_target = bool(
@@ -229,6 +284,8 @@ class GazeTracker:
         coast_active = False
         audio_reacq_active = False
 
+        cmd_reason = "NONE"
+
         if command.priority_source in (
             PrioritySource.EXPLICIT_USER_GAZE,
             PrioritySource.DIRECT_DIALOGUE_INTENT,
@@ -237,8 +294,10 @@ class GazeTracker:
         ):
             command_source = command.priority_source.value
             target_source = "CAMERA" if has_visual_lock else "NONE"
+            cmd_reason = f"PRIORITY_COMMAND_{command_source}"
         elif has_visual_lock:
             # STATE 1: VISUAL_LOCK & STATE 4: VISUAL_HANDOVER
+            is_handover = self._audio_reacq_active
             if self._audio_reacq_active:
                 # STATE 4: VISUAL_HANDOVER on first valid visual detection
                 self._audio_reacq_active = False
@@ -247,6 +306,7 @@ class GazeTracker:
             command_source = "VISUAL"
             target_source = "CAMERA"
             self.commands_from_visual += 1
+            cmd_reason = f"VISUAL_HANDOVER_TARGET_{target_state.active_target.target_id}" if is_handover else f"VISUAL_LOCK_TARGET_{target_state.active_target.target_id}"
         elif self._last_visual_target_yaw is not None and time_since_visual <= self.coast_timeout_s:
             # STATE 2: VISUAL_COAST (0.0 - 1.0s: hold last visual bearing, do not snap to 0.0°, block audio reacq)
             coast_active = True
@@ -257,6 +317,7 @@ class GazeTracker:
                 target_yaw_deg=float(self._last_visual_target_yaw),
                 priority_source=PrioritySource.VISUAL_TRACKING,
             )
+            cmd_reason = f"COASTING_LAST_VISUAL_{self._last_visual_target_id}_AGE_{visual_target_age_ms:.0f}MS"
         elif (
             time_since_visual > self.coast_timeout_s
             and has_verified_speech
@@ -281,6 +342,7 @@ class GazeTracker:
                 if elapsed >= 2.5 or (err <= 2.5 and abs(self.head_velocity_deg_s) <= 3.0 and elapsed >= 0.3):
                     # Arrived at orienting target without visual acquisition
                     pass
+                cmd_reason = f"AUDIO_REACQ_ONGOING_ORIENTING_TO_{self._audio_reacq_target_yaw:+.1f}DEG"
             elif not self._speech_in_progress:
                 # New verified speech episode starts single-shot reacquisition action
                 self._audio_reacq_active = True
@@ -297,6 +359,7 @@ class GazeTracker:
                     priority_source=PrioritySource.ACTIVE_SPEAKER,
                     gaze_state=GazeStateEnum.ORIENTING,
                 )
+                cmd_reason = f"AUDIO_REACQ_NEW_ORIENTING_TO_{self._audio_reacq_target_yaw:+.1f}DEG"
             else:
                 # Speech episode already generated its one action and is still continuing: stay stationary
                 command_source = "SAFETY_ZERO"
@@ -306,6 +369,7 @@ class GazeTracker:
                     target_yaw_deg=float(self.head_angle_deg),
                     priority_source=PrioritySource.IDLE,
                 )
+                cmd_reason = "AUDIO_REACQ_EPISODE_EXHAUSTED_HOLD_STATIONARY"
         else:
             # STATE 5: IDLE / STATIONARY (no visual, no coast, no verified speech, or outside envelope)
             if not has_verified_speech:
@@ -319,9 +383,42 @@ class GazeTracker:
                 target_yaw_deg=float(self.head_angle_deg),
                 priority_source=PrioritySource.IDLE,
             )
+            cmd_reason = f"STATIONARY_HOLD_HEAD_AT_{self.head_angle_deg:+.1f}DEG"
 
         # Architectural invariant: raw audio DOA -> head command MUST BE ZERO
         self.commands_from_audio = 0
+
+        # Head command telemetry computation
+        prev_target_yaw = float(self._last_target_yaw_telemetry)
+        new_target_yaw = float(command.target_yaw_deg)
+        cmd_telemetry = {
+            "previous_target_yaw": round(prev_target_yaw, 2),
+            "new_target_yaw": round(new_target_yaw, 2),
+            "command_source": command_source,
+            "target_source": target_source,
+            "reason": cmd_reason,
+        }
+        self._last_target_yaw_telemetry = new_target_yaw
+
+        delta_yaw = abs(angular_diff_deg(prev_target_yaw, new_target_yaw))
+        if delta_yaw > 3.0:
+            self._print_causal_chain(
+                delta_yaw=delta_yaw,
+                detections=self._latest_detections_telemetry,
+                tm=tm_telemetry,
+                att=att_telemetry,
+                cmd=cmd_telemetry,
+                tracks=self._latest_tracks,
+            )
+
+        forensic_payload = {
+            "detections": list(self._latest_detections_telemetry),
+            "target_manager": tm_telemetry,
+            "attention": att_telemetry,
+            "command": cmd_telemetry,
+            "delta_yaw": round(delta_yaw, 2),
+        }
+        self.last_forensic_chain = forensic_payload
 
         # With no encoder, assume the head went where it was told rather than that it
         # sits at zero: assuming zero makes a person centred after a turn compute back
@@ -358,7 +455,81 @@ class GazeTracker:
             audio_reacquisition_active=audio_reacq_active,
             audio_reacquisition_count=self.audio_reacquisition_count,
             visual_handover_count=self.visual_handover_count,
+            forensic=forensic_payload,
         )
+
+    @staticmethod
+    def _print_causal_chain(
+        delta_yaw: float,
+        detections: List[dict],
+        tm: dict,
+        att: dict,
+        cmd: dict,
+        tracks: Optional[List] = None,
+    ) -> str:
+        lines = [
+            f"[FORENSIC CAUSAL CHAIN] Δyaw={delta_yaw:+.1f}° (>3.0°)",
+            "DETECTION → TRACK → TARGET → ATTENTION → COMMAND",
+        ]
+        # 1. DETECTION
+        if detections:
+            det_strs = []
+            for d in detections:
+                det_strs.append(
+                    f"frame_id={d['frame_id']} ts={d['timestamp']:.3f} bbox={d['bbox']} "
+                    f"bearing={d['bearing']:+.1f}° conf={d['confidence']:.2f} "
+                    f"src={d['detector_source']} track_id={d['track_id']} track_state={d['track_state']}"
+                )
+            lines.append("  DETECTION: " + " | ".join(det_strs))
+        else:
+            lines.append("  DETECTION: NONE")
+
+        # 2. TRACK
+        target_id = tm.get("new_active_target")
+        track_info = None
+        if tracks:
+            for tr in tracks:
+                tr_id = getattr(tr, "target_id", getattr(tr, "track_id", None))
+                if tr_id == target_id:
+                    state_val = getattr(getattr(tr, "tracking_state", getattr(tr, "state", None)), "value", "NONE")
+                    bearing_val = getattr(tr, "body_azimuth_deg", 0.0)
+                    conf_val = getattr(tr, "confidence", 0.0)
+                    track_info = f"track_id={tr_id} state={state_val} bearing={bearing_val:+.1f}° conf={conf_val:.2f}"
+                    break
+            if not track_info and tracks:
+                tr = tracks[0]
+                tr_id = getattr(tr, "target_id", getattr(tr, "track_id", "NONE"))
+                state_val = getattr(getattr(tr, "tracking_state", getattr(tr, "state", None)), "value", "NONE")
+                bearing_val = getattr(tr, "body_azimuth_deg", 0.0)
+                conf_val = getattr(tr, "confidence", 0.0)
+                track_info = f"track_id={tr_id} state={state_val} bearing={bearing_val:+.1f}° conf={conf_val:.2f}"
+        if not track_info:
+            track_info = f"track_id={target_id} state=NONE"
+        lines.append(f"  TRACK    : {track_info}")
+
+        # 3. TARGET
+        lines.append(
+            f"  TARGET   : prev={tm['previous_active_target']} -> new={tm['new_active_target']} "
+            f"reason={tm['reason']}"
+        )
+
+        # 4. ATTENTION
+        lines.append(
+            f"  ATTENTION: old_owner={att['old_owner']} -> new_owner={att['new_owner']} "
+            f"reason={att['reason']} preempted={att['preempted_target']}"
+        )
+
+        # 5. COMMAND
+        lines.append(
+            f"  COMMAND  : prev_yaw={cmd['previous_target_yaw']:+.1f}° -> new_yaw={cmd['new_target_yaw']:+.1f}° "
+            f"cmd_src={cmd['command_source']} target_src={cmd['target_source']} reason={cmd['reason']}"
+        )
+        msg = "\n".join(lines)
+        try:
+            print(msg)
+        except UnicodeEncodeError:
+            print(msg.encode("ascii", errors="replace").decode("ascii"))
+        return msg
 
     def _ingest_audio(self, doa_deg: float, timestamp: float, confidence: float,
                       is_robot_speaking: bool = False) -> None:
@@ -395,7 +566,7 @@ class GazeTracker:
                     timestamp=timestamp,
                     actual_head_yaw_deg=self.head_angle_deg,
                     frame_width=width, frame_height=height,
-                    confidence=face.confidence if face.confidence else UNSCORED_CONFIDENCE,
+                    confidence=face.confidence if face.confidence is not None else UNSCORED_CONFIDENCE,
                 )
             )
         self._latest_tracks = self.visual_tracker.update(
@@ -403,6 +574,24 @@ class GazeTracker:
             timestamp=timestamp,
             actual_head_yaw_deg=self.head_angle_deg,
         )
+
+        self._latest_detections_telemetry = []
+        for face_idx, (face, obs) in enumerate(zip(faces, observations)):
+            tid = self.visual_tracker.last_associations.get(face_idx, "NONE")
+            t_state = "NONE"
+            if tid != "NONE" and tid in self.visual_tracker.tracks:
+                t_state = self.visual_tracker.tracks[tid].state.value
+            det_telem = {
+                "frame_id": self._frame_index,
+                "timestamp": round(float(timestamp), 3),
+                "bbox": [int(face.x), int(face.y), int(face.w), int(face.h)],
+                "bearing": round(float(obs.body_azimuth_deg), 1),
+                "confidence": round(float(face.confidence if face.confidence is not None else UNSCORED_CONFIDENCE), 2),
+                "detector_source": str(face.detector_source or "UNKNOWN"),
+                "track_id": str(tid),
+                "track_state": str(t_state),
+            }
+            self._latest_detections_telemetry.append(det_telem)
 
     @staticmethod
     def _estimate_distance(box_width_px: int, frame_width_px: int) -> float:
