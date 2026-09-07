@@ -44,15 +44,15 @@ def generate_launch_description():
             }],
         ),
 
-        # Greenfield Social Gaze Pipeline Node
+        # Authoritative Standalone Gaze & Hardware Pipeline Node
         Node(
             package='astro_base',
-            executable='social_gaze',
-            name='social_gaze_node',
+            executable='standalone_gaze_ros',
+            name='standalone_gaze_ros_node',
             output='screen',
             parameters=[
                 LaunchConfiguration('social_config_file'),
-                {'calibration_file': LaunchConfiguration('calib_config_file')},
+                {'calibration_path': LaunchConfiguration('calib_config_file')},
             ],
         ),
     ])

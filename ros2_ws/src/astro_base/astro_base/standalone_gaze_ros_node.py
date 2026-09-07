@@ -19,7 +19,7 @@ import math
 import os
 import sys
 import time
-from typing import List, Optional, Sequence, Tuple
+from typing import Any, List, Optional, Sequence, Tuple
 import numpy as np
 
 try:
@@ -126,24 +126,32 @@ _STANDALONE_DIR = _resolve_standalone_dir()
 if _STANDALONE_DIR not in sys.path:
     sys.path.insert(0, _STANDALONE_DIR)
 
-from sources import CameraSource
+from sources import CameraSource, AudioSource
+from stereo_doa import DEFAULT_MIC_SPACING_M
 from astro_base.gaze.gaze_runtime import GazeRuntimeCore
 from astro_base.gaze.gaze_tracker import Detection, GazeResult, UNSCORED_CONFIDENCE
 
 
 class StandaloneGazeRosNode(Node):
-    """Thin ROS 2 wrapper mapping CameraSource and ROS topics to the golden 2e0b70c standalone gaze runtime.
+    """Thin ROS 2 wrapper mapping CameraSource, AudioSource, and ROS topics to the golden 2e0b70c standalone gaze runtime.
 
     Strict Invariants:
     1. Gaze decisions (face tracking, target selection, gaze angle, coasting,
        reacquisition) are made SOLELY by the golden standalone runtime from 2e0b70c.
-    2. CameraSource runs directly inside the ROS process (no /vision/faces topic dependency).
+    2. CameraSource & AudioSource run directly inside the ROS process (no /vision/faces topic dependency).
     3. Exactly ONE frame -> ONE detection -> ONE tracker step -> ONE head command.
-    4. 50Hz keepalive timer only republishes last target yaw to feed the MCU watchdog without stepping tracker.
-    5. /head/state is the sole authoritative feedback source.
+    4. Visual target has absolute priority over audio; audio reacquisition activates only when target_id == NONE.
+    5. 50Hz keepalive timer only republishes last target yaw to feed the MCU watchdog without stepping tracker.
+    6. /head/state is the sole authoritative feedback source.
     """
 
-    def __init__(self, camera_device: Optional[int] = None, use_camera_source: Optional[bool] = None):
+    def __init__(
+        self,
+        camera_device: Optional[int] = None,
+        use_camera_source: Optional[bool] = None,
+        enable_audio: Optional[bool] = None,
+        enable_voice: Optional[bool] = None,
+    ):
         super().__init__("standalone_gaze_ros_node")
 
         # Declare parameters
@@ -153,6 +161,13 @@ class StandaloneGazeRosNode(Node):
         self.declare_parameter("coast_timeout_s", 1.0)
         self.declare_parameter("calibration_path", "")
         self.declare_parameter("camera_latency_s", 0.050)
+        self.declare_parameter("enable_audio", True)
+        self.declare_parameter("audio_device", -1)
+        self.declare_parameter("mic_channels", "")
+        self.declare_parameter("mic_spacing", DEFAULT_MIC_SPACING_M)
+        self.declare_parameter("audio_freshness_s", 1.0)
+        self.declare_parameter("enable_voice", True)
+        self.declare_parameter("enable_edge_tts", True)
 
         cam_dev = camera_device if camera_device is not None else int(self.get_parameter("camera_device").value)
         use_cam = use_camera_source if use_camera_source is not None else bool(self.get_parameter("use_camera_source").value)
@@ -160,6 +175,16 @@ class StandaloneGazeRosNode(Node):
         coast_timeout = float(self.get_parameter("coast_timeout_s").value)
         calib_path = str(self.get_parameter("calibration_path").value) or None
         self.camera_latency_s = float(self.get_parameter("camera_latency_s").value)
+
+        use_audio = enable_audio if enable_audio is not None else bool(self.get_parameter("enable_audio").value)
+        audio_dev = int(self.get_parameter("audio_device").value)
+        audio_dev = None if audio_dev < 0 else audio_dev
+        mic_ch_str = str(self.get_parameter("mic_channels").value).strip()
+        mic_channels = [int(c.strip()) for c in mic_ch_str.split(",") if c.strip().isdigit()] if mic_ch_str else None
+        mic_spacing = float(self.get_parameter("mic_spacing").value)
+        self.audio_freshness_s = float(self.get_parameter("audio_freshness_s").value)
+        self.enable_voice = enable_voice if enable_voice is not None else bool(self.get_parameter("enable_voice").value)
+        self.enable_edge_tts = bool(self.get_parameter("enable_edge_tts").value)
 
         # The Golden Standalone Runtime Core (Immutable 2e0b70c baseline)
         self.runtime = GazeRuntimeCore(
@@ -180,6 +205,39 @@ class StandaloneGazeRosNode(Node):
         self._running: bool = True
         self.camera: Optional[CameraSource] = None
         self._cam_thread: Optional[threading.Thread] = None
+        self.audio: Optional[AudioSource] = None
+        self.voice_loop = None
+
+        # Initialize AudioSource and VoiceLoop (Non-blocking background workers)
+        if use_audio:
+            try:
+                self.audio = AudioSource(
+                    device=audio_dev,
+                    mic_spacing_m=mic_spacing,
+                    mic_channels=mic_channels,
+                    max_age_s=self.audio_freshness_s,
+                )
+                self.audio.start()
+                if self.audio.available:
+                    self.get_logger().info(
+                        f"🎤 AudioSource initialized ({self.audio.mode} mode, {self.audio.device_name} @{self.audio.sample_rate}Hz)"
+                    )
+                    if self.enable_voice:
+                        try:
+                            import voice as voice_module
+                            self.voice_loop = voice_module.build_default_loop(
+                                self.audio, edge_tts_enabled=self.enable_edge_tts
+                            )
+                            if self.voice_loop is not None:
+                                self.get_logger().info(f"🗣️ VoiceLoop active — wake word: '{self.voice_loop.wake_word}'")
+                            else:
+                                self.get_logger().info(f"🗣️ VoiceLoop inactive: {voice_module.LAST_SETUP_ERROR}")
+                        except Exception as v_exc:
+                            self.get_logger().warning(f"🗣️ VoiceLoop setup skipped: {v_exc}")
+                else:
+                    self.get_logger().warning(f"🎤 AudioSource unavailable ({self.audio.error}) — continuing in vision-only mode")
+            except Exception as a_exc:
+                self.get_logger().warning(f"🎤 AudioSource setup error: {a_exc} — continuing in vision-only mode")
 
         # 100-sample Diagnostic Ring Buffers for Center Isolation
         self._diag_raw_bearings: collections.deque = collections.deque(maxlen=100)
@@ -317,12 +375,22 @@ class StandaloneGazeRosNode(Node):
                 capture_ts = t_read_done - self.camera_latency_s
                 arrival_ts = t_detect_done
 
+                # Sample latest acoustic state
+                doa_deg = self.audio.latest_doa_deg(arrival_ts) if (self.audio and self.audio.available) else None
+                speech = self.audio.latest_speech(arrival_ts) if (self.audio and self.audio.available) else None
+                if self.voice_loop is not None:
+                    self.voice_loop.pump(arrival_ts)
+                is_speaking = self.voice_loop.is_speaking_at(arrival_ts) if self.voice_loop else False
+
                 self._step_frame_and_dispatch(
                     detections=detections,
                     frame_w=frame_w,
                     frame_h=frame_h,
                     capture_ts=capture_ts,
                     arrival_ts=arrival_ts,
+                    doa_deg=doa_deg,
+                    speech=speech,
+                    is_robot_speaking=is_speaking,
                 )
             except Exception as exc:
                 self.get_logger().error(f"Error in CameraSource worker loop: {exc}")
@@ -332,7 +400,14 @@ class StandaloneGazeRosNode(Node):
     # Frame-Synchronous Visual Processing API
     # =========================================================================
 
-    def step_camera_frame(self, frame, timestamp: Optional[float] = None) -> GazeResult:
+    def step_camera_frame(
+        self,
+        frame,
+        timestamp: Optional[float] = None,
+        doa_deg: Optional[float] = None,
+        speech: Optional[Any] = None,
+        is_robot_speaking: Optional[bool] = None,
+    ) -> GazeResult:
         """Runs detector on frame and steps tracker (1:1 with standalone/track.py)."""
         t_start = time.monotonic()
         if self.camera is not None:
@@ -347,12 +422,25 @@ class StandaloneGazeRosNode(Node):
         else:
             capture_ts = t_start - self.camera_latency_s
             arrival_ts = t_end
+
+        if doa_deg is None and self.audio and self.audio.available:
+            doa_deg = self.audio.latest_doa_deg(arrival_ts)
+        if speech is None and self.audio and self.audio.available:
+            speech = self.audio.latest_speech(arrival_ts)
+        if self.voice_loop is not None:
+            self.voice_loop.pump(arrival_ts)
+        if is_robot_speaking is None:
+            is_robot_speaking = self.voice_loop.is_speaking_at(arrival_ts) if self.voice_loop else False
+
         return self._step_frame_and_dispatch(
             detections=detections,
             frame_w=frame_w,
             frame_h=frame_h,
             capture_ts=capture_ts,
             arrival_ts=arrival_ts,
+            doa_deg=doa_deg,
+            speech=speech,
+            is_robot_speaking=bool(is_robot_speaking),
         )
 
     def step_frame(
@@ -360,6 +448,9 @@ class StandaloneGazeRosNode(Node):
         detections: Sequence[Detection],
         frame_size: Tuple[int, int] = (640, 480),
         timestamp: Optional[float] = None,
+        doa_deg: Optional[float] = None,
+        speech: Optional[Any] = None,
+        is_robot_speaking: bool = False,
     ) -> GazeResult:
         """Direct frame step for testing/replay without ROS topics."""
         t = timestamp if timestamp is not None else time.monotonic()
@@ -369,6 +460,9 @@ class StandaloneGazeRosNode(Node):
             frame_h=frame_size[1],
             capture_ts=t,
             arrival_ts=t,
+            doa_deg=doa_deg,
+            speech=speech,
+            is_robot_speaking=is_robot_speaking,
         )
 
     def _step_frame_and_dispatch(
@@ -378,6 +472,9 @@ class StandaloneGazeRosNode(Node):
         frame_h: int,
         capture_ts: float,
         arrival_ts: float,
+        doa_deg: Optional[float] = None,
+        speech: Optional[Any] = None,
+        is_robot_speaking: bool = False,
     ) -> GazeResult:
         """Executes strictly ONE gaze engine step for ONE camera frame.
 
@@ -390,7 +487,10 @@ class StandaloneGazeRosNode(Node):
         res = self.runtime.step(
             faces=detections,
             frame_size=(frame_w, frame_h),
+            doa_deg=doa_deg,
+            speech=speech,
             timestamp=capture_ts,
+            is_robot_speaking=is_robot_speaking,
         )
         t_step_end = time.monotonic()
 
@@ -428,8 +528,12 @@ class StandaloneGazeRosNode(Node):
         raw_enc = getattr(self, "raw_encoder_deg", actual_head)
         fb_deg, fb_age, fb_src = self.runtime.get_feedback_telemetry(now=arrival_ts)
 
+        doa_str = f"{doa_deg:+.1f}°" if doa_deg is not None else "NONE"
+        owner_str = res.owner.value if hasattr(res.owner, "value") else str(res.owner)
         sync_line = (
             f"visual_bearing={face_bearing_str} "
+            f"audio_doa={doa_str} "
+            f"owner={owner_str} "
             f"command_yaw={target_yaw:+.1f}° "
             f"aligned_head={aligned_head:+.1f}° "
             f"actual_head={actual_head:+.1f}° "
@@ -528,7 +632,16 @@ class StandaloneGazeRosNode(Node):
             f"sign(published_command - measured_head)={sign_pub:+d}"
         )
 
-        forensic_msg = f"\n{frame_log}\n{cmd_log}\n{center_diag_line}\n{instrumentation_log}"
+        speech_conf = f"{speech.confidence:.2f}" if (speech and hasattr(speech, "confidence")) else "0.00"
+        audio_log = (
+            f"AUDIO:\n"
+            f"doa_deg={doa_str}\n"
+            f"speech_confidence={speech_conf}\n"
+            f"is_robot_speaking={is_robot_speaking}\n"
+            f"gaze_owner={owner_str}"
+        )
+
+        forensic_msg = f"\n{frame_log}\n{cmd_log}\n{center_diag_line}\n{instrumentation_log}\n\n{audio_log}"
         try:
             print(forensic_msg)
         except UnicodeEncodeError:
@@ -557,6 +670,27 @@ class StandaloneGazeRosNode(Node):
             hcmd = HeadCmd()
             hcmd.angle_deg = float(target_yaw)
             self.pub_head_command.publish(hcmd)
+
+    def destroy_node(self) -> bool:
+        self._running = False
+        if self._cam_thread is not None and self._cam_thread.is_alive():
+            self._cam_thread.join(timeout=1.0)
+        if self.camera is not None:
+            try:
+                self.camera.close()
+            except Exception:
+                pass
+        if self.audio is not None:
+            try:
+                self.audio.close()
+            except Exception:
+                pass
+        if self.voice_loop is not None:
+            try:
+                self.voice_loop.stop()
+            except Exception:
+                pass
+        return super().destroy_node()
 
 
 def main(args=None):

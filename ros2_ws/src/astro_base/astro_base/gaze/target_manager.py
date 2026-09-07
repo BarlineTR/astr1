@@ -83,6 +83,33 @@ class TargetManagerCore:
 
         # 1. Evaluate current active target if one exists
         if self.active_target is not None:
+            # Visual Primacy Rule: An audio target must immediately yield authority
+            # whenever a qualified visual or fused target appears.
+            if self.active_target.modality == Modality.AUDIO:
+                visual_cand = next(
+                    (
+                        t for t in self.candidate_targets
+                        if t.modality in (Modality.VISION, Modality.FUSED)
+                        and t.confidence >= self.acquisition_threshold
+                    ),
+                    None,
+                )
+                if visual_cand is not None:
+                    self.active_target = visual_cand
+                    self._active_target_start_time = timestamp
+                    self._last_active_observed_time = timestamp
+                    self._last_healthy_observed_time = timestamp
+                    self._new_speaker_candidate_id = None
+                    self.last_target_birth = {
+                        "timestamp": round(timestamp, 3),
+                        "target_id": visual_cand.target_id,
+                        "source": visual_cand.modality.value if hasattr(visual_cand.modality, "value") else str(visual_cand.modality),
+                        "bearing": round(visual_cand.body_azimuth_deg, 1),
+                        "confidence": round(visual_cand.confidence, 2),
+                        "freshness": round(max(0.0, 1.0 - (timestamp - visual_cand.timestamp)), 2),
+                        "reason": f"VISUAL_PREEMPT_AUDIO_{visual_cand.target_id}",
+                    }
+
             # Find matching target in current observations by ID
             matched = next((t for t in self.candidate_targets if t.target_id == self.active_target.target_id), None)
 

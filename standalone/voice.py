@@ -557,8 +557,19 @@ def build_default_loop(audio, api_key: Optional[str] = None, **kwargs):
         # (bkz. astro_audio/openai_tts_engine.py); brief'teki `client=client`
         # her çağrıda TypeError üretip sağlayıcı kurulumunu sessizce
         # düşürüyordu (üstteki `except Exception` bunu yutuyordu).
+        edge_enabled = kwargs.pop("edge_tts_enabled", True)
+        edge_engine = None
+        if edge_enabled:
+            try:
+                from astro_audio.edge_tts_engine import EdgeTTSEngine
+                edge_engine = EdgeTTSEngine(logger=_make_logger("edge_tts"))
+            except Exception:
+                edge_engine = None
+
         tts = TTSRouter(openai_tts_engine=OpenAITTSEngine(api_key=api_key),
-                        edge_tts_enabled=False, output_manager=output,
+                        edge_tts_engine=edge_engine,
+                        edge_tts_enabled=bool(edge_engine is not None and edge_enabled),
+                        output_manager=output,
                         logger=_make_logger("tts_router"))
         stt = STTRouter(openai_client=client, logger=_make_logger("stt"))
     except Exception as exc:

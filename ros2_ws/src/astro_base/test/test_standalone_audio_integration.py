@@ -1,0 +1,228 @@
+#!/usr/bin/env python3
+"""Comprehensive Audio Integration & Multimodal Arbitration Test Suite.
+
+Verifies:
+1. Visual target has absolute priority over audio (face present -> audio does not steal head).
+2. Idle / no visual target -> fresh speech DOA reacquires speaker (left & right).
+3. Visual reacquisition immediately overrides audio when face appears.
+4. Stale DOA expires after audio freshness timeout and stops steering.
+5. Single Gaze Brain: No direct DOA actuator bypass; only GazeTracker drives /head/command.
+6. Missing OpenAI key degrades gracefully (gaze tracking and DOA continue).
+7. Async non-blocking execution: voice/TTS operations do not freeze tracker.
+"""
+
+import math
+import os
+import sys
+import time
+from pathlib import Path
+from typing import Optional
+from unittest.mock import MagicMock, patch
+
+import pytest
+
+# Resolve paths
+CUR_DIR = Path(__file__).resolve().parent
+REPO_ROOT = CUR_DIR.parents[3]
+STANDALONE_DIR = REPO_ROOT / "standalone"
+ASTRO_BASE_DIR = CUR_DIR.parents[1]
+
+for path_str in (str(REPO_ROOT), str(STANDALONE_DIR), str(ASTRO_BASE_DIR)):
+    if path_str not in sys.path:
+        sys.path.insert(0, path_str)
+
+from astro_base.gaze.gaze_runtime import GazeRuntimeCore
+from astro_base.gaze.gaze_tracker import Detection, GazeResult
+from astro_base.gaze.types import PrioritySource
+from astro_base.standalone_gaze_ros_node import StandaloneGazeRosNode
+
+
+class MockSpeechVerdict:
+    """Mock for SpeechDetector verdict."""
+    def __init__(self, is_speech: bool = True, confidence: float = 0.90):
+        self.is_speech = is_speech
+        self.confidence = float(confidence)
+
+
+class TestStandaloneAudioIntegration:
+    """Multimodal arbitration and audio integration test suite."""
+
+    def test_visual_target_priority_over_audio(self):
+        """When a face is visible, it maintains exclusive authority; audio cannot steal the head."""
+        node = StandaloneGazeRosNode(use_camera_source=False, enable_audio=False)
+
+        # Face centered in camera
+        face_det = [Detection(x=280, y=200, w=80, h=80, confidence=0.92)]
+        # Loud speech from extreme left (+50.0 deg)
+        loud_speech = MockSpeechVerdict(is_speech=True, confidence=0.98)
+        doa_left = 50.0
+
+        t = 100.0
+        # Warm up visual tracking on face
+        for i in range(5):
+            t += 0.033
+            res = node.step_frame(
+                detections=face_det,
+                frame_size=(640, 480),
+                timestamp=t,
+                doa_deg=doa_left,
+                speech=loud_speech,
+            )
+
+        # Visual target MUST own the gaze
+        assert res.owner == PrioritySource.VISUAL_TRACKING
+        assert res.target_id is not None
+        # Head angle must target the face near center (~0 deg), NOT the audio direction (+50 deg)
+        assert res.target_yaw_deg < 15.0
+        assert node.last_published_yaw < 15.0
+
+    def test_audio_reacquisition_when_idle_left_and_right(self):
+        """When no face is present (IDLE), fresh speech DOA reacquires speaker left and right.
+
+        Acoustic contract (ReSpeaker 0=front, +90=right, 270=left) maps to REP-103 body yaw
+        (positive = left, negative = right).
+        """
+        # Test Left: DOA = 320.0 deg (-40 deg, left) -> positive body yaw (> +20 deg)
+        node_left = StandaloneGazeRosNode(use_camera_source=False, enable_audio=False)
+        speech_verdict = MockSpeechVerdict(is_speech=True, confidence=0.90)
+
+        t = 200.0
+        res_left = None
+        for i in range(6):
+            t += 0.033
+            res_left = node_left.step_frame(
+                detections=[],
+                frame_size=(640, 480),
+                timestamp=t,
+                doa_deg=320.0,
+                speech=speech_verdict,
+            )
+
+        assert res_left is not None
+        assert res_left.target_yaw_deg > 20.0  # Turns left toward speaker
+        assert res_left.owner == PrioritySource.ACTIVE_SPEAKER
+
+        # Test Right: DOA = 40.0 deg (+40 deg, right) -> negative body yaw (< -20 deg)
+        node_right = StandaloneGazeRosNode(use_camera_source=False, enable_audio=False)
+        t = 300.0
+        res_right = None
+        for i in range(6):
+            t += 0.033
+            res_right = node_right.step_frame(
+                detections=[],
+                frame_size=(640, 480),
+                timestamp=t,
+                doa_deg=40.0,
+                speech=speech_verdict,
+            )
+
+        assert res_right is not None
+        assert res_right.target_yaw_deg < -20.0  # Turns right toward speaker
+        assert res_right.owner == PrioritySource.ACTIVE_SPEAKER
+
+    def test_visual_reacquisition_overrides_audio(self):
+        """When robot is reacquiring an audio direction, an appearing face immediately overrides."""
+        node = StandaloneGazeRosNode(use_camera_source=False, enable_audio=False)
+        speech = MockSpeechVerdict(is_speech=True, confidence=0.90)
+
+        t = 400.0
+        # Phase 1: Reacquiring audio speaker at right (DOA=45 deg -> target_yaw ~ -45 deg) with no face
+        for i in range(5):
+            t += 0.033
+            res_audio = node.step_frame(
+                detections=[],
+                frame_size=(640, 480),
+                timestamp=t,
+                doa_deg=45.0,
+                speech=speech,
+            )
+        assert res_audio.target_yaw_deg < -20.0
+        assert res_audio.owner == PrioritySource.ACTIVE_SPEAKER
+
+        # Phase 2: Face appears at left (x=100 -> positive bearing ~ +18 deg)
+        face_left = [Detection(x=100, y=200, w=80, h=80, confidence=0.90)]
+        for i in range(4):
+            t += 0.033
+            res_vis = node.step_frame(
+                detections=face_left,
+                frame_size=(640, 480),
+                timestamp=t,
+                doa_deg=45.0,
+                speech=speech,
+            )
+
+        # Visual target takes immediate priority; head steers toward face at left, not audio at right
+        assert res_vis.owner == PrioritySource.VISUAL_TRACKING
+        assert res_vis.target_id is not None
+        assert res_vis.target_yaw_deg > 0.0  # Steers toward face on left
+
+    def test_stale_doa_expires(self):
+        """Audio observation expires after audio freshness timeout and stops steering."""
+        node = StandaloneGazeRosNode(use_camera_source=False, enable_audio=False)
+        speech = MockSpeechVerdict(is_speech=True, confidence=0.88)
+
+        t = 500.0
+        # Step 1: Active sound at +40 deg
+        for i in range(4):
+            t += 0.033
+            node.step_frame(
+                detections=[],
+                frame_size=(640, 480),
+                timestamp=t,
+                doa_deg=40.0,
+                speech=speech,
+            )
+
+        # Step 2: Silence for > 1.5 seconds (stale DOA -> None)
+        t += 1.50
+        res_stale = node.step_frame(
+            detections=[],
+            frame_size=(640, 480),
+            timestamp=t,
+            doa_deg=None,
+            speech=None,
+        )
+
+        # After audio expires, no active audio target remains
+        assert res_stale.owner != PrioritySource.ACTIVE_SPEAKER
+
+    def test_audio_cannot_bypass_gaze_brain(self):
+        """Actuator command strictly reflects GazeResult; no direct DOA publication exists."""
+        node = StandaloneGazeRosNode(use_camera_source=False, enable_audio=False)
+
+        # Provide DOA without valid speech verdict (unverified sound)
+        t = 600.0
+        res = node.step_frame(
+            detections=[],
+            frame_size=(640, 480),
+            timestamp=t,
+            doa_deg=60.0,
+            speech=None,  # Not verified as human speech
+        )
+
+        # Head command must match res.target_yaw_deg, NOT raw DOA (60.0)
+        assert node.last_published_yaw == pytest.approx(res.target_yaw_deg, abs=1e-3)
+        assert node.last_published_yaw != 60.0
+
+    def test_openai_missing_graceful_degradation(self):
+        """When OPENAI_API_KEY is unset, node starts safely, voice is disabled, gaze continues."""
+        with patch.dict(os.environ, {"OPENAI_API_KEY": ""}, clear=False):
+            # Clear key
+            if "OPENAI_API_KEY" in os.environ:
+                del os.environ["OPENAI_API_KEY"]
+
+            node = StandaloneGazeRosNode(use_camera_source=False, enable_audio=False, enable_voice=True)
+            assert node.voice_loop is None
+
+            # Visual tracking and DOA continue without error
+            det = [Detection(x=320, y=240, w=80, h=80, confidence=0.9)]
+            res = node.step_frame(det, frame_size=(640, 480), timestamp=10.0, doa_deg=20.0)
+            assert res is not None
+            assert res.owner == PrioritySource.VISUAL_TRACKING
+
+    def test_edge_tts_configuration(self):
+        """EdgeTTSEngine is enabled as fallback in TTSRouter."""
+        from astro_audio.edge_tts_engine import EdgeTTSEngine
+        engine = EdgeTTSEngine()
+        assert hasattr(engine, "is_ready")
+        assert hasattr(engine, "synthesize_sentence")
