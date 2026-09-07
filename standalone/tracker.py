@@ -71,6 +71,9 @@ class GazeResult:
     audio_reacquisition_count: int = 0
     visual_handover_count: int = 0
     forensic: Optional[dict] = None
+    active_target_at_command: str = "NONE"
+    active_track_at_command: str = "NONE"
+    command_generation_reason: str = "NONE"
 
 
 # A detection whose publisher reports no confidence: over the target manager's 0.40
@@ -142,6 +145,7 @@ class GazeTracker:
         self._last_visual_target_yaw: Optional[float] = None
         self._last_visual_seen_time: float = 0.0
         self._last_visual_target_id: Optional[str] = None
+        self._was_visually_tracking: bool = False
 
         self._audio_reacq_active: bool = False
         self._audio_reacq_target_yaw: Optional[float] = None
@@ -236,26 +240,46 @@ class GazeTracker:
         }
 
         # Determine visual target grounding and direct camera lock
+        active_target = target_state.active_target
         has_visual_target = bool(
-            target_state.active_target is not None
-            and target_state.active_target.modality in (Modality.FUSED, Modality.VISION)
+            active_target is not None
+            and active_target.modality in (Modality.FUSED, Modality.VISION)
         )
-        faces_detected = bool(faces) or bool(
-            self._latest_tracks and any(
-                tr.tracking_state == TrackingState.TRACKING and tr.missed_frames == 0
-                for tr in self._latest_tracks
-            )
+
+        # Active track resolution: only the track corresponding to active_target
+        active_track = None
+        if active_target is not None and self._latest_tracks:
+            for tr in self._latest_tracks:
+                tr_id = getattr(tr, "target_id", getattr(tr, "track_id", None))
+                if tr_id == active_target.target_id:
+                    active_track = tr
+                    break
+
+        active_track_seen = bool(
+            active_track is not None
+            and getattr(active_track, "missed_frames", 0) == 0
+            and getattr(active_track, "tracking_state", getattr(active_track, "state", None))
+            in (TrackingState.TRACKING, TrackingState.DETECTED)
         )
-        has_visual_lock = has_visual_target and faces_detected
+        has_visual_lock = bool(has_visual_target and active_track_seen)
+
+        # Invalidate old coast cache if target dropped or target switched
+        if not has_visual_target:
+            self._last_visual_target_yaw = None
+            self._last_visual_target_id = None
+            self._last_visual_seen_time = 0.0
+            self._was_visually_tracking = False
+        elif self._last_visual_target_id is not None and self._last_visual_target_id != active_target.target_id:
+            self._last_visual_target_yaw = None
+            self._last_visual_target_id = None
+            self._last_visual_seen_time = 0.0
+            self._was_visually_tracking = False
 
         if has_visual_lock:
-            self._last_visual_target_yaw = float(target_state.active_target.body_azimuth_deg)
+            self._last_visual_target_yaw = float(active_target.body_azimuth_deg)
             self._last_visual_seen_time = timestamp
-            self._last_visual_target_id = target_state.active_target.target_id
-        elif has_visual_target and self._last_visual_seen_time == 0.0:
-            self._last_visual_target_yaw = float(target_state.active_target.body_azimuth_deg)
-            self._last_visual_seen_time = timestamp
-            self._last_visual_target_id = target_state.active_target.target_id
+            self._last_visual_target_id = active_target.target_id
+            self._was_visually_tracking = True
 
         # Calculate visual target elapsed time
         time_since_visual = (timestamp - self._last_visual_seen_time) if self._last_visual_seen_time > 0.0 else 999.0
@@ -306,8 +330,15 @@ class GazeTracker:
             command_source = "VISUAL"
             target_source = "CAMERA"
             self.commands_from_visual += 1
-            cmd_reason = f"VISUAL_HANDOVER_TARGET_{target_state.active_target.target_id}" if is_handover else f"VISUAL_LOCK_TARGET_{target_state.active_target.target_id}"
-        elif self._last_visual_target_yaw is not None and time_since_visual <= self.coast_timeout_s:
+            cmd_reason = f"VISUAL_HANDOVER_TARGET_{active_target.target_id}" if is_handover else f"VISUAL_LOCK_TARGET_{active_target.target_id}"
+        elif (
+            has_visual_target
+            and active_target is not None
+            and self._was_visually_tracking
+            and self._last_visual_target_id == active_target.target_id
+            and self._last_visual_target_yaw is not None
+            and time_since_visual <= self.coast_timeout_s
+        ):
             # STATE 2: VISUAL_COAST (0.0 - 1.0s: hold last visual bearing, do not snap to 0.0°, block audio reacq)
             coast_active = True
             command_source = "VISUAL_COAST"
@@ -385,18 +416,48 @@ class GazeTracker:
             )
             cmd_reason = f"STATIONARY_HOLD_HEAD_AT_{self.head_angle_deg:+.1f}DEG"
 
+        # CRITICAL ACCEPTANCE INVARIANT GUARDS
+        if command_source in ("VISUAL_COAST", "VISUAL"):
+            if not has_visual_target or target_state.active_target is None or self._last_visual_target_id != active_target.target_id:
+                # Under NO_ACTIVE_TARGET / IDLE, VISUAL_COAST or VISUAL commands are strictly forbidden!
+                command_source = "SAFETY_ZERO"
+                target_source = "NONE"
+                command = replace(
+                    command,
+                    target_yaw_deg=float(self.head_angle_deg),
+                    priority_source=PrioritySource.IDLE,
+                )
+                if not cmd_reason.startswith("STATIONARY") and not cmd_reason.startswith("IDLE"):
+                    cmd_reason = f"IDLE_STATIONARY_HOLD_HEAD_AT_{self.head_angle_deg:+.1f}DEG"
+
+        if command_source == "VISUAL":
+            target_source = "CAMERA"
+        elif command_source == "VISUAL_COAST":
+            target_source = "COAST"
+        elif command_source in ("IDLE", "SAFETY_ZERO"):
+            target_source = "NONE"
+
+
         # Architectural invariant: raw audio DOA -> head command MUST BE ZERO
         self.commands_from_audio = 0
 
         # Head command telemetry computation
         prev_target_yaw = float(self._last_target_yaw_telemetry)
         new_target_yaw = float(command.target_yaw_deg)
+
+        active_target_at_command = str(target_state.active_target.target_id) if target_state.active_target else "NONE"
+        active_track_at_command = str(active_track.target_id) if active_track else "NONE"
+        command_generation_reason = str(cmd_reason)
+
         cmd_telemetry = {
             "previous_target_yaw": round(prev_target_yaw, 2),
             "new_target_yaw": round(new_target_yaw, 2),
             "command_source": command_source,
             "target_source": target_source,
             "reason": cmd_reason,
+            "active_target_at_command": active_target_at_command,
+            "active_track_at_command": active_track_at_command,
+            "command_generation_reason": command_generation_reason,
         }
         self._last_target_yaw_telemetry = new_target_yaw
 
@@ -456,7 +517,11 @@ class GazeTracker:
             audio_reacquisition_count=self.audio_reacquisition_count,
             visual_handover_count=self.visual_handover_count,
             forensic=forensic_payload,
+            active_target_at_command=active_target_at_command,
+            active_track_at_command=active_track_at_command,
+            command_generation_reason=command_generation_reason,
         )
+
 
     @staticmethod
     def _print_causal_chain(
@@ -522,7 +587,9 @@ class GazeTracker:
         # 5. COMMAND
         lines.append(
             f"  COMMAND  : prev_yaw={cmd['previous_target_yaw']:+.1f}° -> new_yaw={cmd['new_target_yaw']:+.1f}° "
-            f"cmd_src={cmd['command_source']} target_src={cmd['target_source']} reason={cmd['reason']}"
+            f"cmd_src={cmd['command_source']} target_src={cmd['target_source']} reason={cmd['reason']} "
+            f"act_target={cmd.get('active_target_at_command', 'NONE')} "
+            f"act_track={cmd.get('active_track_at_command', 'NONE')}"
         )
         msg = "\n".join(lines)
         try:
