@@ -152,12 +152,14 @@ class StandaloneGazeRosNode(Node):
         self.declare_parameter("control_rate_hz", 50.0)
         self.declare_parameter("coast_timeout_s", 1.0)
         self.declare_parameter("calibration_path", "")
+        self.declare_parameter("camera_latency_s", 0.050)
 
         cam_dev = camera_device if camera_device is not None else int(self.get_parameter("camera_device").value)
         use_cam = use_camera_source if use_camera_source is not None else bool(self.get_parameter("use_camera_source").value)
         control_rate = float(self.get_parameter("control_rate_hz").value)
         coast_timeout = float(self.get_parameter("coast_timeout_s").value)
         calib_path = str(self.get_parameter("calibration_path").value) or None
+        self.camera_latency_s = float(self.get_parameter("camera_latency_s").value)
 
         # The Golden Standalone Runtime Core (Immutable 2e0b70c baseline)
         self.runtime = GazeRuntimeCore(
@@ -249,7 +251,12 @@ class StandaloneGazeRosNode(Node):
 
     def _on_head_state(self, msg) -> None:
         """Authoritative reader for encoder position from HeadState message."""
-        t = time.monotonic()
+        if hasattr(msg, "timestamp") and msg.timestamp is not None:
+            t = float(msg.timestamp)
+        elif hasattr(msg, "header") and hasattr(msg.header, "stamp") and getattr(msg.header.stamp, "sec", 0) > 0:
+            t = float(msg.header.stamp.sec) + float(msg.header.stamp.nanosec) * 1e-9
+        else:
+            t = time.monotonic()
         if hasattr(msg, "position_deg") and not math.isnan(msg.position_deg):
             vel = float(getattr(msg, "velocity_deg_s", 0.0))
             if math.isnan(vel):
@@ -302,16 +309,20 @@ class StandaloneGazeRosNode(Node):
                     time.sleep(0.01)
                     continue
 
-                now = time.monotonic()
+                t_read_done = time.monotonic()
                 detections = self.camera.detect(frame)
+                t_detect_done = time.monotonic()
                 frame_h, frame_w = frame.shape[:2]
+
+                capture_ts = t_read_done - self.camera_latency_s
+                arrival_ts = t_detect_done
 
                 self._step_frame_and_dispatch(
                     detections=detections,
                     frame_w=frame_w,
                     frame_h=frame_h,
-                    capture_ts=now,
-                    arrival_ts=now,
+                    capture_ts=capture_ts,
+                    arrival_ts=arrival_ts,
                 )
             except Exception as exc:
                 self.get_logger().error(f"Error in CameraSource worker loop: {exc}")
@@ -323,18 +334,25 @@ class StandaloneGazeRosNode(Node):
 
     def step_camera_frame(self, frame, timestamp: Optional[float] = None) -> GazeResult:
         """Runs detector on frame and steps tracker (1:1 with standalone/track.py)."""
+        t_start = time.monotonic()
         if self.camera is not None:
             detections = self.camera.detect(frame)
         else:
             detections = []
+        t_end = time.monotonic()
         frame_h, frame_w = frame.shape[:2]
-        t = timestamp if timestamp is not None else time.monotonic()
+        if timestamp is not None:
+            capture_ts = float(timestamp)
+            arrival_ts = float(timestamp)
+        else:
+            capture_ts = t_start - self.camera_latency_s
+            arrival_ts = t_end
         return self._step_frame_and_dispatch(
             detections=detections,
             frame_w=frame_w,
             frame_h=frame_h,
-            capture_ts=t,
-            arrival_ts=t,
+            capture_ts=capture_ts,
+            arrival_ts=arrival_ts,
         )
 
     def step_frame(
@@ -405,13 +423,17 @@ class StandaloneGazeRosNode(Node):
 
         tracker_head = self.runtime.tracker.head_angle_deg
         actual_head = self.runtime.actual_head_yaw_deg
+        aligned_head, aligned_vel = self.runtime.get_head_position_at(capture_ts)
+        temporal_skew_ms = max(0.0, (arrival_ts - capture_ts) * 1000.0)
         raw_enc = getattr(self, "raw_encoder_deg", actual_head)
         fb_deg, fb_age, fb_src = self.runtime.get_feedback_telemetry(now=arrival_ts)
 
         sync_line = (
             f"visual_bearing={face_bearing_str} "
             f"command_yaw={target_yaw:+.1f}° "
+            f"aligned_head={aligned_head:+.1f}° "
             f"actual_head={actual_head:+.1f}° "
+            f"temporal_skew_ms={temporal_skew_ms:.1f}ms "
             f"head_feedback_deg={fb_deg:+.1f}° "
             f"head_feedback_age_ms={fb_age:.1f}ms "
             f"head_feedback_source={fb_src}"
@@ -437,6 +459,7 @@ class StandaloneGazeRosNode(Node):
             f"frame_id={self.frame_index}\n"
             f"target_id={primary_target_id}\n"
             f"command_yaw={target_yaw:+.1f}°\n"
+            f"aligned_head={aligned_head:+.1f}°\n"
             f"actual_head={actual_head:+.1f}°\n"
             f"raw_encoder={raw_enc:+.1f}°\n"
             f"FEEDBACK_SYNC: {sync_line}\n"
@@ -453,29 +476,26 @@ class StandaloneGazeRosNode(Node):
             bbox_cx = frame_w / 2.0
             raw_bearing = 0.0
 
-        diag_err = target_yaw - actual_head
+        diag_err = target_yaw - aligned_head
         self._diag_raw_bearings.append(raw_bearing)
         self._diag_target_yaws.append(target_yaw)
-        self._diag_measured_heads.append(actual_head)
+        self._diag_measured_heads.append(aligned_head)
 
-        if len(self._diag_raw_bearings) >= 2:
-            std_raw = float(np.std(self._diag_raw_bearings))
-            std_tgt = float(np.std(self._diag_target_yaws))
-            std_head = float(np.std(self._diag_measured_heads))
-        else:
-            std_raw = std_tgt = std_head = 0.0
+        std_raw = float(np.std(self._diag_raw_bearings)) if len(self._diag_raw_bearings) > 1 else 0.0
+        std_tgt = float(np.std(self._diag_target_yaws)) if len(self._diag_target_yaws) > 1 else 0.0
+        std_head = float(np.std(self._diag_measured_heads)) if len(self._diag_measured_heads) > 1 else 0.0
 
         center_diag_line = (
             f"CENTER_DIAG: bbox_cx={bbox_cx:.1f} frame_cx={frame_w / 2.0:.1f} "
-            f"raw_bearing={raw_bearing:+.2f}° measured_head={actual_head:+.2f}° "
+            f"raw_bearing={raw_bearing:+.2f}° measured_head={aligned_head:+.2f}° "
             f"target_yaw={target_yaw:+.2f}° error={diag_err:+.2f}° "
             f"sigma_raw={std_raw:.2f} sigma_tgt={std_tgt:.2f} sigma_head={std_head:.2f}"
         )
 
         # Structured Instrumentation for Forensic Isolation
         sign_vis = 0 if abs(raw_bearing) < 1e-3 else (1 if raw_bearing > 0 else -1)
-        sign_tgt = 0 if abs(target_yaw - actual_head) < 1e-3 else (1 if (target_yaw - actual_head) > 0 else -1)
-        sign_pub = 0 if abs(self.last_published_yaw - actual_head) < 1e-3 else (1 if (self.last_published_yaw - actual_head) > 0 else -1)
+        sign_tgt = 0 if abs(target_yaw - aligned_head) < 1e-3 else (1 if (target_yaw - aligned_head) > 0 else -1)
+        sign_pub = 0 if abs(self.last_published_yaw - aligned_head) < 1e-3 else (1 if (self.last_published_yaw - aligned_head) > 0 else -1)
 
         instrumentation_log = (
             f"RAW:\n"
@@ -486,7 +506,9 @@ class StandaloneGazeRosNode(Node):
             f"visual_bearing_deg={raw_bearing:+.2f}\n"
             f"\n"
             f"FEEDBACK:\n"
+            f"aligned_head_deg={aligned_head:+.2f}\n"
             f"measured_head_deg={actual_head:+.2f}\n"
+            f"temporal_skew_ms={temporal_skew_ms:.1f}\n"
             f"head_feedback_timestamp={self.runtime.last_feedback_time:.3f}\n"
             f"head_feedback_age_ms={fb_age:.1f}\n"
             f"head_feedback_source={fb_src}\n"
