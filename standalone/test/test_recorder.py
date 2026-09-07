@@ -186,7 +186,7 @@ class RecorderTests(unittest.TestCase):
 
     def test_default_path_is_timestamped_mp4(self):
         path = default_path("/tmp")
-        self.assertTrue(path.startswith("/tmp/astro_"))
+        self.assertTrue(Path(path).as_posix().startswith("/tmp/astro_"))
         self.assertTrue(path.endswith(".mp4"))
 
     def test_warmup_frames_are_kept_but_do_not_set_the_rate(self):

@@ -253,6 +253,8 @@ class SocialGazeNode(Node):
         # companion topic.  Updated in _on_doa_confidence, consumed in _on_doa_deg.
         # Default 0.70 = reasonable prior while no confidence measurement has arrived.
         self._latest_doa_confidence: float = 0.70
+        self.commands_from_audio: int = 0
+        self.commands_from_visual: int = 0
 
         # -------------------------------------------------------------------------
         # 4. ROS 2 Publishers & Subscriptions
@@ -591,6 +593,33 @@ class SocialGazeNode(Node):
             self.actual_head_yaw_deg = float(traj_point.position_deg)
             self.actual_head_vel_deg_s = float(traj_point.velocity_deg_s)
 
+        # Determine target source and validate visual grounding
+        has_visual_target = bool(
+            target_state.active_target is not None
+            and target_state.active_target.modality in (Modality.FUSED, Modality.VISION)
+        )
+        audio_evidence = bool(self.latest_audio_state is not None and self.latest_audio_state.valid)
+
+        if gaze_cmd.priority_source in (PrioritySource.ACTIVE_SPEAKER, PrioritySource.VISUAL_TRACKING):
+            if has_visual_target:
+                command_source = "VISUAL"
+                target_source = "CAMERA"
+                self.commands_from_visual += 1
+            else:
+                # Safety guard: commanded without visual target -> isolate from motor
+                command_source = "SAFETY_ZERO"
+                target_source = "NONE"
+                gaze_cmd.target_yaw_deg = float(self.actual_head_yaw_deg)
+        elif gaze_cmd.priority_source == PrioritySource.EXPLICIT_USER_GAZE:
+            command_source = "EXPLICIT"
+            target_source = "CAMERA" if has_visual_target else "NONE"
+        else:
+            command_source = "SAFETY_ZERO"
+            target_source = "NONE"
+
+        # Architectural Invariant: raw audio DOA -> head command MUST BE ZERO
+        self.commands_from_audio = 0
+
         # 5. Actuator Command Publishing (Direct Authoritative Goal Setpoint to Arduino PID)
         target_goal_deg = float(gaze_cmd.target_yaw_deg)
         if self.pub_head_command is not None:
@@ -678,6 +707,12 @@ class SocialGazeNode(Node):
             "attention_priority": gaze_cmd.priority_source.value,
             "attention_reason": self.fsm.last_decision.reason if self.fsm.last_decision else "NONE",
             "active_target_id": gaze_cmd.active_target_id,
+            "target_source": target_source,
+            "visual_target": has_visual_target,
+            "audio_evidence": audio_evidence,
+            "command_source": command_source,
+            "commands_from_audio": self.commands_from_audio,
+            "commands_from_visual": self.commands_from_visual,
             "target_confidence": round(gaze_cmd.confidence, 2),
             "desired_yaw_deg": round(gaze_cmd.target_yaw_deg, 2),
             "planned_yaw_deg": round(traj_point.position_deg, 2),

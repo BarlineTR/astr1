@@ -18,6 +18,7 @@ Features:
 import json
 import logging
 import os
+import time
 
 _LOG = logging.getLogger(__name__)
 
@@ -137,6 +138,13 @@ class SpatialVisionNode(Node):
         self._emotion_history = deque(maxlen=8)
         self.face_recognizer = FaceRecognizer()
 
+        # Telemetry counters
+        self.invalid_roi_count: int = 0
+        self.clipped_bbox_count: int = 0
+        self.head_yaw_fallback_count: int = 0
+        self.detector_exception_count: int = 0
+        self._last_perf_log_time: float = time.time()
+
         # Publishers
         self.pub_faces = self.create_publisher(String, "/vision/faces", 10)
         self.pub_person = self.create_publisher(Bool, "/vision/person_detected", 10)
@@ -194,51 +202,83 @@ class SpatialVisionNode(Node):
 
     def _estimate_head_yaw(self, face_roi_gray, w, h) -> tuple[float, bool]:
         """Calculates yaw angle and strictly verifies eye visibility to reject side/back-of-head false detections."""
-        roi = cv2.resize(face_roi_gray[:int(h * 0.6), :], (96, 54), interpolation=cv2.INTER_AREA) if w > 96 else face_roi_gray[:int(h * 0.6), :]
-        rw = roi.shape[1]
-        eyes = self.eye_cascade.detectMultiScale(roi, scaleFactor=1.12, minNeighbors=3, minSize=(10, 10))
-        if len(eyes) >= 2:
-            eyes_sorted = sorted(eyes, key=lambda e: e[0])
-            left_eye_center = eyes_sorted[0][0] + eyes_sorted[0][2] / 2.0
-            right_eye_center = eyes_sorted[-1][0] + eyes_sorted[-1][2] / 2.0
-            eye_midpoint = (left_eye_center + right_eye_center) / 2.0
-            face_center = rw / 2.0
-            yaw_deg = float(((eye_midpoint - face_center) / face_center) * 40.0)
-            return yaw_deg, True
-        elif len(eyes) == 1:
-            eye_x = eyes[0][0] + eyes[0][2] / 2.0
-            yaw_deg = -25.0 if eye_x < rw / 2.0 else 25.0
-            return yaw_deg, True
-        # If no eyes are detected, user is NOT looking at the robot!
-        return 45.0, False
+        if face_roi_gray is None or getattr(face_roi_gray, "size", 0) == 0 or w <= 0 or h <= 0 or int(h * 0.6) <= 0:
+            self.head_yaw_fallback_count += 1
+            self.get_logger().error(
+                f"_estimate_head_yaw: invalid ROI (face_roi_gray={face_roi_gray is not None}, "
+                f"size={getattr(face_roi_gray, 'size', 0)}, w={w}, h={h})"
+            )
+            return 0.0, False
+
+        try:
+            eye_slice = face_roi_gray[:int(h * 0.6), :]
+            if eye_slice is None or getattr(eye_slice, "size", 0) == 0 or eye_slice.shape[0] == 0 or eye_slice.shape[1] == 0:
+                self.head_yaw_fallback_count += 1
+                self.get_logger().error("_estimate_head_yaw: empty eye slice")
+                return 0.0, False
+
+            roi = cv2.resize(eye_slice, (96, 54), interpolation=cv2.INTER_AREA) if w > 96 else eye_slice
+            rw = roi.shape[1]
+            eyes = self.eye_cascade.detectMultiScale(roi, scaleFactor=1.12, minNeighbors=3, minSize=(10, 10))
+            if len(eyes) >= 2:
+                eyes_sorted = sorted(eyes, key=lambda e: e[0])
+                left_eye_center = eyes_sorted[0][0] + eyes_sorted[0][2] / 2.0
+                right_eye_center = eyes_sorted[-1][0] + eyes_sorted[-1][2] / 2.0
+                eye_midpoint = (left_eye_center + right_eye_center) / 2.0
+                face_center = rw / 2.0
+                yaw_deg = float(((eye_midpoint - face_center) / face_center) * 40.0)
+                return yaw_deg, True
+            elif len(eyes) == 1:
+                eye_x = eyes[0][0] + eyes[0][2] / 2.0
+                yaw_deg = -25.0 if eye_x < rw / 2.0 else 25.0
+                return yaw_deg, True
+            # If no eyes are detected, user is NOT looking at the robot!
+            return 45.0, False
+        except Exception as exc:
+            self.detector_exception_count += 1
+            self.head_yaw_fallback_count += 1
+            self.get_logger().error(f"_estimate_head_yaw exception: {exc}")
+            return 0.0, False
 
     def _detect_facial_emotion(self, face_roi_gray, w, h, yaw: float = 0.0, eyes_found: bool = False) -> str:
         """Determines emotion (happy, surprised, focused, neutral) based on mouth contrast, smile and gaze geometry."""
-        lower_face = cv2.resize(face_roi_gray[int(h * 0.5):, :], (96, 48), interpolation=cv2.INTER_AREA) if w > 96 else face_roi_gray[int(h * 0.5):, :]
-        smiles = self.smile_cascade.detectMultiScale(lower_face, scaleFactor=1.65, minNeighbors=10, minSize=(15, 15))
-        if len(smiles) > 0:
-            return "happy"
+        if face_roi_gray is None or getattr(face_roi_gray, "size", 0) == 0 or w <= 0 or h <= 0 or int(h * 0.5) <= 0:
+            return "neutral"
 
-        # Surprise detection: open oral cavity with dark center contrast + high variance in mouth region
         try:
-            mouth_region = lower_face[int(lower_face.shape[0] * 0.3):int(lower_face.shape[0] * 0.9), :]
-            if mouth_region.size > 0:
-                mean_val = float(np.mean(mouth_region))
-                std_val = float(np.std(mouth_region))
-                mh, mw = mouth_region.shape[:2]
-                center_patch = mouth_region[int(mh * 0.3):int(mh * 0.7), int(mw * 0.3):int(mw * 0.7)]
-                if center_patch.size > 0:
-                    center_mean = float(np.mean(center_patch))
-                    if center_mean < (mean_val - 18.0) and std_val > 22.0:
-                        return "surprised"
-        except Exception:
-            pass
+            mouth_slice = face_roi_gray[int(h * 0.5):, :]
+            if mouth_slice is None or getattr(mouth_slice, "size", 0) == 0 or mouth_slice.shape[0] == 0 or mouth_slice.shape[1] == 0:
+                return "neutral"
 
-        # Focused detection: direct frontal gaze with eyes clearly tracked and low head yaw
-        if eyes_found and abs(yaw) <= 8.0:
-            return "focused"
+            lower_face = cv2.resize(mouth_slice, (96, 48), interpolation=cv2.INTER_AREA) if w > 96 else mouth_slice
+            smiles = self.smile_cascade.detectMultiScale(lower_face, scaleFactor=1.65, minNeighbors=10, minSize=(15, 15))
+            if len(smiles) > 0:
+                return "happy"
 
-        return "neutral"
+            # Surprise detection: open oral cavity with dark center contrast + high variance in mouth region
+            try:
+                mouth_region = lower_face[int(lower_face.shape[0] * 0.3):int(lower_face.shape[0] * 0.9), :]
+                if mouth_region.size > 0:
+                    mean_val = float(np.mean(mouth_region))
+                    std_val = float(np.std(mouth_region))
+                    mh, mw = mouth_region.shape[:2]
+                    center_patch = mouth_region[int(mh * 0.3):int(mh * 0.7), int(mw * 0.3):int(mw * 0.7)]
+                    if center_patch.size > 0:
+                        center_mean = float(np.mean(center_patch))
+                        if center_mean < (mean_val - 18.0) and std_val > 22.0:
+                            return "surprised"
+            except Exception:
+                pass
+
+            # Focused detection: direct frontal gaze with eyes clearly tracked and low head yaw
+            if eyes_found and abs(yaw) <= 8.0:
+                return "focused"
+
+            return "neutral"
+        except Exception as exc:
+            self.detector_exception_count += 1
+            self.get_logger().error(f"_detect_facial_emotion exception: {exc}")
+            return "neutral"
 
     def _draw_hud(self, frame):
         """Son tespit sonuçlarını kareye çizer (her karede çağrılır)."""
@@ -324,77 +364,115 @@ class SpatialVisionNode(Node):
         top_recognized_person = {"name": "Misafir", "title": "Ziyaretçi", "formal_title": "Misafir", "confidence": 0.0, "is_known": False}
         hud_cache = []
 
+        # Telemetry: 5-second interval log
+        now = time.time()
+        if now - self._last_perf_log_time >= 5.0:
+            self.get_logger().info(
+                f"[VISION PERF] invalid_roi={self.invalid_roi_count}, "
+                f"clipped_bbox={self.clipped_bbox_count}, "
+                f"yaw_fallback={self.head_yaw_fallback_count}, "
+                f"exceptions={self.detector_exception_count}"
+            )
+            self._last_perf_log_time = now
+
         for idx, (x, y, w, h, detection_conf) in enumerate(faces):
-            face_roi_gray = gray[y:y + h, x:x + w]
-            face_roi_bgr = frame[y:y + h, x:x + w]
-            
-            # 1. 3D Head Yaw & Eye Verification
-            yaw, eyes_found = self._estimate_head_yaw(face_roi_gray, w, h)
-            head_yaw = yaw
+            try:
+                orig_x, orig_y, orig_w, orig_h = x, y, w, h
+                x = max(0, min(x, frame_w - 1))
+                y = max(0, min(y, frame_h - 1))
+                w = min(w, frame_w - x)
+                h = min(h, frame_h - y)
 
-            # Camera Optical Axis Azimuth Angle (HFOV ~ 72°, half = 36°)
-            # In ROS body frame: Image Right (+X) is Robot Right (-Yaw), Image Left (-X) is Robot Left (+Yaw)
-            face_center_x = x + (w / 2.0)
-            norm_offset = (face_center_x - (frame_w / 2.0)) / (frame_w / 2.0)
-            cam_azimuth = float(-norm_offset * 36.0)
-            if idx == 0:
-                face_camera_azimuth = cam_azimuth
+                if (x, y, w, h) != (orig_x, orig_y, orig_w, orig_h):
+                    self.clipped_bbox_count += 1
 
-            # 2. 3D Distance
-            dist_m = self._estimate_distance(x, y, w, h, frame_w, frame_h)
-            user_distance = dist_m
+                if w <= 0 or h <= 0:
+                    self.invalid_roi_count += 1
+                    continue
 
-            # 3. Direct Gaze: Eyes MUST be visible AND yaw <= 22 degrees AND strictly in Social Zone (0.40m - 2.20m)
-            direct_gaze = eyes_found and (abs(yaw) <= 22.0) and (0.40 <= dist_m <= 2.20)
-            if direct_gaze:
-                is_looking = True
+                face_roi_gray = gray[y:y + h, x:x + w]
+                face_roi_bgr = frame[y:y + h, x:x + w]
 
-            # 4. Face Recognition Matching
-            recog_name, recog_conf, recog_meta = self.face_recognizer.recognize_face(face_roi_bgr)
-            is_known = (recog_name is not None and recog_conf >= 0.45)
-            if is_known and recog_conf > top_recognized_person["confidence"]:
-                top_recognized_person = {
-                    "name": recog_name,
-                    "title": recog_meta.get("title", "Tanınan Kişi"),
-                    "formal_title": recog_meta.get("formal_title", recog_name),
-                    "confidence": recog_conf,
-                    "is_known": True,
-                    "distance_m": round(dist_m, 2)
+                if (
+                    face_roi_gray is None
+                    or getattr(face_roi_gray, "size", 0) == 0
+                    or face_roi_gray.shape[0] == 0
+                    or face_roi_gray.shape[1] == 0
+                ):
+                    self.invalid_roi_count += 1
+                    continue
+
+                # 1. 3D Head Yaw & Eye Verification
+                yaw, eyes_found = self._estimate_head_yaw(face_roi_gray, w, h)
+                head_yaw = yaw
+
+                # Camera Optical Axis Azimuth Angle (HFOV ~ 72°, half = 36°)
+                # In ROS body frame: Image Right (+X) is Robot Right (-Yaw), Image Left (-X) is Robot Left (+Yaw)
+                face_center_x = x + (w / 2.0)
+                norm_offset = (face_center_x - (frame_w / 2.0)) / (frame_w / 2.0)
+                cam_azimuth = float(-norm_offset * 36.0)
+                if idx == 0:
+                    face_camera_azimuth = cam_azimuth
+
+                # 2. 3D Distance
+                dist_m = self._estimate_distance(x, y, w, h, frame_w, frame_h)
+                user_distance = dist_m
+
+                # 3. Direct Gaze: Eyes MUST be visible AND yaw <= 22 degrees AND strictly in Social Zone (0.40m - 2.20m)
+                direct_gaze = eyes_found and (abs(yaw) <= 22.0) and (0.40 <= dist_m <= 2.20)
+                if direct_gaze:
+                    is_looking = True
+
+                # 4. Face Recognition Matching
+                recog_name, recog_conf, recog_meta = self.face_recognizer.recognize_face(face_roi_bgr)
+                is_known = (recog_name is not None and recog_conf >= 0.45)
+                if is_known and recog_conf > top_recognized_person["confidence"]:
+                    top_recognized_person = {
+                        "name": recog_name,
+                        "title": recog_meta.get("title", "Tanınan Kişi"),
+                        "formal_title": recog_meta.get("formal_title", recog_name),
+                        "confidence": recog_conf,
+                        "is_known": True,
+                        "distance_m": round(dist_m, 2)
+                    }
+
+                # 5. Emotion Detection
+                detected_emotion = self._detect_facial_emotion(face_roi_gray, w, h, yaw=yaw, eyes_found=eyes_found)
+
+                face_list.append({
+                    "x": int(x), "y": int(y), "width": int(w), "height": int(h),
+                    "confidence": round(float(detection_conf), 2),
+                    "frame_width": int(frame_w), "frame_height": int(frame_h),
+                    "yaw_deg": round(yaw, 1),
+                    "camera_azimuth_deg": round(cam_azimuth, 1),
+                    "distance_m": round(dist_m, 2),
+                    "looking_at_robot": direct_gaze,
+                    "emotion": detected_emotion,
+                    "recognized_name": recog_name if is_known else None,
+                    "recognized_title": recog_meta.get("formal_title") if is_known else None
+                })
+
+                # Build HUD overlay data
+                color_map = {
+                    "happy": (0, 255, 0),
+                    "surprised": (255, 255, 0),
+                    "neutral": (0, 200, 255),
+                    "sad": (0, 0, 255)
                 }
+                box_color = (0, 215, 255) if is_known else color_map.get(detected_emotion, (0, 255, 0))
+                cv2.rectangle(frame, (x, y), (x + w, y + h), box_color, 2)
 
-            # 5. Emotion Detection
-            detected_emotion = self._detect_facial_emotion(face_roi_gray, w, h, yaw=yaw, eyes_found=eyes_found)
+                tag_name = f"★ {recog_name} ({recog_meta.get('formal_title', '')})" if is_known else detected_emotion.upper()
+                gaze_txt = "BANA BAKIYOR" if direct_gaze else (f"YANA ({yaw:.0f}°)" if eyes_found else "BAKMIYOR (GÖZ YOK)")
+                hud_text = f"{tag_name} | {gaze_txt} | {dist_m:.2f}m"
+                cv2.putText(frame, hud_text, (x, max(22, y - 10)), cv2.FONT_HERSHEY_SIMPLEX, 0.55, box_color, 2)
 
-            face_list.append({
-                "x": int(x), "y": int(y), "width": int(w), "height": int(h),
-                "confidence": round(float(detection_conf), 2),
-                "frame_width": int(frame_w), "frame_height": int(frame_h),
-                "yaw_deg": round(yaw, 1),
-                "camera_azimuth_deg": round(cam_azimuth, 1),
-                "distance_m": round(dist_m, 2),
-                "looking_at_robot": direct_gaze,
-                "emotion": detected_emotion,
-                "recognized_name": recog_name if is_known else None,
-                "recognized_title": recog_meta.get("formal_title") if is_known else None
-            })
-
-            # Build HUD overlay data
-            color_map = {
-                "happy": (0, 255, 0),
-                "surprised": (255, 255, 0),
-                "neutral": (0, 200, 255),
-                "sad": (0, 0, 255)
-            }
-            box_color = (0, 215, 255) if is_known else color_map.get(detected_emotion, (0, 255, 0))
-            cv2.rectangle(frame, (x, y), (x + w, y + h), box_color, 2)
-            
-            tag_name = f"★ {recog_name} ({recog_meta.get('formal_title', '')})" if is_known else detected_emotion.upper()
-            gaze_txt = "BANA BAKIYOR" if direct_gaze else (f"YANA ({yaw:.0f}°)" if eyes_found else "BAKMIYOR (GÖZ YOK)")
-            hud_text = f"{tag_name} | {gaze_txt} | {dist_m:.2f}m"
-            cv2.putText(frame, hud_text, (x, max(22, y - 10)), cv2.FONT_HERSHEY_SIMPLEX, 0.55, box_color, 2)
-
-            # Cache for non-processed frames
-            hud_cache.append({"x": x, "y": y, "w": w, "h": h, "color": box_color, "text": hud_text})
+                # Cache for non-processed frames
+                hud_cache.append({"x": x, "y": y, "w": w, "h": h, "color": box_color, "text": hud_text})
+            except Exception as exc:
+                self.detector_exception_count += 1
+                self.get_logger().error(f"Detector exception processing face: {exc}")
+                continue
 
         # Son tespit sonuçlarını cache'le (aradaki karelerde çizilecek)
         self._cached_hud = hud_cache

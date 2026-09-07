@@ -155,14 +155,15 @@ class TestOnlySpeechEarnsTheHead(unittest.TestCase):
     kapabilmeli. Ikincisi olmadan birincisi "sesle takibi kapatmak" olurdu.
     """
 
-    NOISE_BEARING = 60.0
+    NOISE_BEARING = -18.0
 
-    def _run(self, speech, cycles=60):
+    def _run(self, speech, cycles=60, faces=None):
         tracker = GazeTracker()
         result = None
+        face_list = [_face_at(0.25, confidence=0.60)] if faces is None else faces
         for i in range(cycles):
             result = tracker.step(
-                faces=[], frame_size=FRAME, doa_deg=self.NOISE_BEARING,
+                faces=face_list, frame_size=FRAME, doa_deg=self.NOISE_BEARING,
                 speech=speech, measured_head_deg=0.0, timestamp=200.0 + i * 0.02,
             )
         return result
@@ -176,12 +177,12 @@ class TestOnlySpeechEarnsTheHead(unittest.TestCase):
 
         result = self._run(not_speech)
 
-        self.assertEqual(result.owner, PrioritySource.IDLE,
-                         "konusma olmayan bir ses hedefi ele gecirdi")
-        self.assertIsNone(result.target_id)
+        # Görsel hedef olsa bile gürültü ACTIVE_SPEAKER yapamaz, VISUAL_TRACKING kalır
+        self.assertNotEqual(result.owner, PrioritySource.ACTIVE_SPEAKER,
+                            "konusma olmayan bir ses aktif konusmaci oldu")
 
-    def test_konusma_hala_kafayi_kapabilir(self):
-        """Gurultuyu elerken sesle takibi de elememis olmaliyiz."""
+    def test_konusma_yuz_varken_kafayi_kapabilir(self):
+        """Görsel yüz ile eşleşen konuşma aktif konuşmacı olur."""
         from astro_audio.speech_detector import SpeechVerdict
 
         speech = SpeechVerdict(is_speech=True, confidence=0.76, harmonicity=0.59,
@@ -191,6 +192,21 @@ class TestOnlySpeechEarnsTheHead(unittest.TestCase):
 
         self.assertEqual(result.owner, PrioritySource.ACTIVE_SPEAKER,
                          "konusma kafayi cevirmedi -- gurultu filtresi ozelligi de kapatmis")
+        self.assertEqual(result.commands_from_audio, 0)
+        self.assertEqual(result.command_source, "VISUAL")
+
+    def test_yuz_yokken_raw_doa_kafayi_ceviremez(self):
+        """Kritik mimari karar: Görsel hedef yoksa raw DOA motora komut veremez (commands_from_audio = 0)."""
+        from astro_audio.speech_detector import SpeechVerdict
+
+        speech = SpeechVerdict(is_speech=True, confidence=0.85, harmonicity=0.70,
+                               modulation=0.85, rms=0.2)
+
+        result = self._run(speech, faces=[])
+
+        self.assertEqual(result.owner, PrioritySource.IDLE)
+        self.assertEqual(result.target_yaw_deg, 0.0)
+        self.assertEqual(result.commands_from_audio, 0)
 
     def test_guven_konusma_olcusunden_gelir_sabit_085_ten_degil(self):
         """Sabit 0.85, kestiricinin kendi guveni olcumde ayirt etmedigi icin konmustu
@@ -276,7 +292,7 @@ class TestRobotDoesNotChaseItsOwnVoice(unittest.TestCase):
         result = None
         for i in range(60):
             result = tracker.step(
-                faces=[], frame_size=FRAME, doa_deg=55.0, speech=speech,
+                faces=[_face_at(0.25)], frame_size=FRAME, doa_deg=-18.0, speech=speech,
                 is_robot_speaking=is_robot_speaking,
                 measured_head_deg=0.0, timestamp=300.0 + i * 0.02,
             )
@@ -285,8 +301,8 @@ class TestRobotDoesNotChaseItsOwnVoice(unittest.TestCase):
     def test_robot_konusurken_ses_hedefi_ele_geciremez(self):
         result = self._run(is_robot_speaking=True)
 
-        self.assertEqual(result.owner, PrioritySource.IDLE,
-                         "robot kendi sesine dondu")
+        self.assertNotEqual(result.owner, PrioritySource.ACTIVE_SPEAKER,
+                            "robot kendi sesine dondu")
 
     def test_robot_susarken_ayni_ses_hedefi_ele_gecirir(self):
         """Bastirma calisiyor diye ozelligi kapatmis olmayalim."""

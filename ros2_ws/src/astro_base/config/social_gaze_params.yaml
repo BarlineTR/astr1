@@ -43,7 +43,7 @@
       vision_freshness_half_life_s: 1.20 # Freshness decay half-life for visual tracks
       audio_weight_base: 0.40       # Weight factor for audio modality
       vision_weight_base: 0.85      # Weight factor for vision modality
-      fallback_enabled: true        # Support automatic fallback to Audio-Only or Vision-Only
+      fallback_enabled: false       # Support automatic fallback to Audio-Only or Vision-Only
 
     target_manager:
       acquisition_threshold: 0.75   # Confidence required to acquire and lock a new target

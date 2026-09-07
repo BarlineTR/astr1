@@ -14,7 +14,7 @@ the identical brain with none of that answers the question directly. If tracking
 clean here and ragged under ROS, the fault is the plumbing.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import List, Optional, Sequence, Tuple
 
@@ -30,7 +30,7 @@ from astro_base.gaze.motion_planner import MotionPlannerCore  # noqa: E402
 from astro_base.gaze.sensor_fusion import AudioVisualFusionCore  # noqa: E402
 from astro_base.gaze.spatial_memory import EpistemicSpatialMemory  # noqa: E402
 from astro_base.gaze.target_manager import TargetManagerCore  # noqa: E402
-from astro_base.gaze.types import GazeStateEnum, PrioritySource  # noqa: E402
+from astro_base.gaze.types import GazeStateEnum, Modality, PrioritySource  # noqa: E402
 from astro_base.gaze.visual_perception import VisualPerceptionCore  # noqa: E402
 from astro_base.gaze.visual_tracker import VisualTrackerCore  # noqa: E402
 
@@ -42,10 +42,10 @@ class Detection:
     y: int
     w: int
     h: int
-    confidence: float
+    confidence: Optional[float] = None
 
 
-@dataclass
+@dataclass(frozen=True)
 class GazeResult:
     """What the pipeline decided this cycle."""
     target_yaw_deg: float
@@ -55,6 +55,11 @@ class GazeResult:
     confidence: float
     head_angle_deg: float
     face_bearings_deg: Tuple[float, ...] = ()
+    target_source: str = "NONE"
+    visual_target: bool = False
+    audio_evidence: bool = False
+    command_source: str = "SAFETY_ZERO"
+    commands_from_audio: int = 0
 
 
 # A detection whose publisher reports no confidence: over the target manager's 0.40
@@ -89,7 +94,7 @@ class GazeTracker:
     """Holds the shared gaze objects and steps them once per frame."""
 
     def __init__(self, calibration: Optional[CalibrationConfig] = None,
-                 calibration_path=None):
+                 calibration_path=None, fallback_enabled: bool = False):
         self.calib = calibration or _load_calibration(calibration_path)
         self.transformer = CoordinateTransformer(self.calib)
         self.spatial_memory = EpistemicSpatialMemory()
@@ -98,7 +103,10 @@ class GazeTracker:
         self.visual_tracker = VisualTrackerCore(transformer=self.transformer)
         self.audio_perception = AudioPerceptionCore(transformer=self.transformer)
         self.audio_filter = AudioFilterCore()
-        self.fusion = AudioVisualFusionCore(spatial_memory=self.spatial_memory)
+        self.fusion = AudioVisualFusionCore(
+            spatial_memory=self.spatial_memory,
+            fallback_enabled=fallback_enabled,
+        )
         self.target_manager = TargetManagerCore()
         self.fsm = SocialGazeFSM(
             min_limit_deg=self.calib.head.min_angle_deg,
@@ -113,6 +121,8 @@ class GazeTracker:
         self.head_angle_deg: float = 0.0
         self.head_velocity_deg_s: float = 0.0
         self.head_feedback_missing: bool = True
+        self.commands_from_audio: int = 0
+        self.commands_from_visual: int = 0
         self._latest_audio = None
         self._latest_tracks: List = []
 
@@ -161,6 +171,32 @@ class GazeTracker:
             actual_head_vel_deg_s=self.head_velocity_deg_s,
         )
 
+        # Determine target source and validate visual grounding
+        has_visual_target = bool(
+            target_state.active_target is not None
+            and target_state.active_target.modality in (Modality.FUSED, Modality.VISION)
+        )
+        audio_evidence = bool(self._latest_audio is not None and self._latest_audio.valid)
+
+        if command.priority_source in (PrioritySource.ACTIVE_SPEAKER, PrioritySource.VISUAL_TRACKING):
+            if has_visual_target:
+                command_source = "VISUAL"
+                target_source = "CAMERA"
+                self.commands_from_visual += 1
+            else:
+                command_source = "SAFETY_ZERO"
+                target_source = "NONE"
+                command = replace(command, target_yaw_deg=self.head_angle_deg)
+        elif command.priority_source == PrioritySource.EXPLICIT_USER_GAZE:
+            command_source = "EXPLICIT"
+            target_source = "CAMERA" if has_visual_target else "NONE"
+        else:
+            command_source = "SAFETY_ZERO"
+            target_source = "NONE"
+
+        # Architectural invariant: raw audio DOA -> head command MUST BE ZERO
+        self.commands_from_audio = 0
+
         # With no encoder, assume the head went where it was told rather than that it
         # sits at zero: assuming zero makes a person centred after a turn compute back
         # to zero, which drives the head to centre and parks it. The planner's
@@ -183,6 +219,11 @@ class GazeTracker:
             confidence=float(command.confidence),
             head_angle_deg=self.head_angle_deg,
             face_bearings_deg=tuple(t.body_azimuth_deg for t in self._latest_tracks),
+            target_source=target_source,
+            visual_target=has_visual_target,
+            audio_evidence=audio_evidence,
+            command_source=command_source,
+            commands_from_audio=self.commands_from_audio,
         )
 
     def _ingest_audio(self, doa_deg: float, timestamp: float, confidence: float,
