@@ -336,6 +336,7 @@ class GazeTracker:
                 command,
                 target_yaw_deg=float(self._last_visual_target_yaw),
                 priority_source=PrioritySource.VISUAL_TRACKING,
+                active_target_id=self._last_visual_target_id,
             )
             cmd_reason = f"COASTING_LAST_VISUAL_{self._last_visual_target_id}_AGE_{visual_target_age_ms:.0f}MS"
         elif (
@@ -428,7 +429,7 @@ class GazeTracker:
         prev_target_yaw = float(self._last_target_yaw_telemetry)
         new_target_yaw = float(command.target_yaw_deg)
 
-        active_target_at_command = str(target_state.active_target.target_id) if target_state.active_target else "NONE"
+        active_target_at_command = str(target_state.active_target.target_id) if target_state.active_target else (str(self._last_visual_target_id) if coast_active else "NONE")
         active_track_at_command = str(active_track.target_id) if active_track else "NONE"
         command_generation_reason = str(cmd_reason)
 
