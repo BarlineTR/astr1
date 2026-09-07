@@ -18,7 +18,7 @@ import math
 import os
 import sys
 import time
-from typing import List, Optional
+from typing import List, Optional, Sequence, Tuple
 
 try:
     import rclpy
@@ -97,27 +97,53 @@ except ImportError:
     Bool = Float32 = String = JointState = _MockMsg
     GazeStatus = HeadCmd = HeadState = None
 
-# Ensure standalone tracker is importable
-_REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..", ".."))
-_STANDALONE_DIR = os.path.join(_REPO_ROOT, "standalone")
+from pathlib import Path
+import threading
+
+
+def _resolve_standalone_dir() -> str:
+    cur = Path(__file__).resolve().parent
+    while cur.parent != cur:
+        cand = cur / "standalone"
+        if (cand / "tracker.py").exists():
+            return str(cand)
+        cur = cur.parent
+    return str(Path(__file__).resolve().parents[5] / "standalone")
+
+
+_STANDALONE_DIR = _resolve_standalone_dir()
 if _STANDALONE_DIR not in sys.path:
     sys.path.insert(0, _STANDALONE_DIR)
 
+from sources import CameraSource
 from astro_base.gaze.gaze_runtime import GazeRuntimeCore
 from astro_base.gaze.gaze_tracker import Detection, GazeResult, UNSCORED_CONFIDENCE
 
 
 class StandaloneGazeRosNode(Node):
-    """Thin ROS 2 wrapper mapping ROS topics to the golden 2e0b70c standalone gaze runtime."""
+    """Thin ROS 2 wrapper mapping CameraSource and ROS topics to the golden 2e0b70c standalone gaze runtime.
 
-    def __init__(self):
+    Strict Invariants:
+    1. Gaze decisions (face tracking, target selection, gaze angle, coasting,
+       reacquisition) are made SOLELY by the golden standalone runtime from 2e0b70c.
+    2. CameraSource runs directly inside the ROS process (no /vision/faces topic dependency).
+    3. Exactly ONE frame -> ONE detection -> ONE tracker step -> ONE head command.
+    4. 50Hz keepalive timer only republishes last target yaw to feed the MCU watchdog without stepping tracker.
+    5. /head/state is the sole authoritative feedback source.
+    """
+
+    def __init__(self, camera_device: Optional[int] = None, use_camera_source: Optional[bool] = None):
         super().__init__("standalone_gaze_ros_node")
 
         # Declare parameters
+        self.declare_parameter("camera_device", 0)
+        self.declare_parameter("use_camera_source", True)
         self.declare_parameter("control_rate_hz", 50.0)
         self.declare_parameter("coast_timeout_s", 1.0)
         self.declare_parameter("calibration_path", "")
 
+        cam_dev = camera_device if camera_device is not None else int(self.get_parameter("camera_device").value)
+        use_cam = use_camera_source if use_camera_source is not None else bool(self.get_parameter("use_camera_source").value)
         control_rate = float(self.get_parameter("control_rate_hz").value)
         coast_timeout = float(self.get_parameter("coast_timeout_s").value)
         calib_path = str(self.get_parameter("calibration_path").value) or None
@@ -138,6 +164,9 @@ class StandaloneGazeRosNode(Node):
         self.raw_encoder_deg: float = 0.0
         self.diagnostic_joint_yaw_deg: float = 0.0
         self.diagnostic_joint_vel_deg_s: float = 0.0
+        self._running: bool = True
+        self.camera: Optional[CameraSource] = None
+        self._cam_thread: Optional[threading.Thread] = None
 
         # Actuator Publishers
         if HeadCmd is not None:
@@ -164,6 +193,23 @@ class StandaloneGazeRosNode(Node):
         self.create_subscription(Bool, "/safety/emergency_stop", self._on_emergency_stop, 10)
         self.create_subscription(Bool, "/system/sleep", self._on_sleep_mode, 10)
 
+        # Direct CameraSource Integration (Hardware pipeline)
+        if use_cam:
+            try:
+                self.camera = CameraSource(device=cam_dev)
+                if self.camera.available:
+                    self.get_logger().info(
+                        f"📷 CameraSource initialized ({self.camera.backend}) | detector: {self.camera.detector_name}"
+                    )
+                    self._cam_thread = threading.Thread(target=self._camera_worker_loop, daemon=True)
+                    self._cam_thread.start()
+                else:
+                    self.get_logger().info(
+                        f"📷 CameraSource device {cam_dev} not available ({self.camera.error or 'no camera'}) — fallback to test/topic mode"
+                    )
+            except Exception as exc:
+                self.get_logger().warn(f"📷 Could not start CameraSource: {exc}")
+
         # 50Hz Passive Motor Keepalive Timer (WATCHDOG FEED ONLY - NO TRACKER STEPS)
         period_s = 1.0 / max(1.0, control_rate)
         self.keepalive_timer = self.create_timer(period_s, self._passive_keepalive_cycle)
@@ -171,6 +217,15 @@ class StandaloneGazeRosNode(Node):
         self.get_logger().info(
             f"StandaloneGazeRosNode active — Sole visual authority: standalone 2e0b70c runtime (Keepalive: {control_rate:.1f}Hz)"
         )
+
+    def destroy_node(self):
+        self._running = False
+        if self.camera is not None:
+            try:
+                self.camera.close()
+            except Exception:
+                pass
+        super().destroy_node()
 
     # =========================================================================
     # Hardware State Callbacks (Authoritative Feedback)
@@ -217,15 +272,40 @@ class StandaloneGazeRosNode(Node):
         self.runtime.tracker.fsm.set_sleep_mode(bool(msg.data))
 
     # =========================================================================
-    # Frame-Synchronous Visual Processing
+    # CameraSource Worker Loop
+    # =========================================================================
+
+    def _camera_worker_loop(self) -> None:
+        """Continuously reads from CameraSource, runs detector, and steps gaze runtime."""
+        while self._running and self.camera is not None and self.camera.available:
+            try:
+                ok, frame = self.camera.read()
+                if not ok or frame is None:
+                    time.sleep(0.01)
+                    continue
+
+                now = time.monotonic()
+                detections = self.camera.detect(frame)
+                frame_h, frame_w = frame.shape[:2]
+
+                self._step_frame_and_dispatch(
+                    detections=detections,
+                    frame_w=frame_w,
+                    frame_h=frame_h,
+                    capture_ts=now,
+                    arrival_ts=now,
+                )
+            except Exception as exc:
+                self.get_logger().error(f"Error in CameraSource worker loop: {exc}")
+                time.sleep(0.05)
+
+    # =========================================================================
+    # Frame-Synchronous Visual Processing Core
     # =========================================================================
 
     def _on_vision_json(self, msg: String) -> None:
-        """Executes strictly ONE gaze engine step for ONE camera frame."""
+        """Test/replay harness input: converts JSON detections and delegates to _step_frame_and_dispatch."""
         t_arrival = time.monotonic()
-        self.cycle_id += 1
-        self.frame_index += 1
-
         try:
             raw_data = json.loads(msg.data)
             if isinstance(raw_data, dict):
@@ -257,90 +337,113 @@ class StandaloneGazeRosNode(Node):
                     )
                 )
 
-            # Step Shared Gaze Engine (ONE FRAME -> ONE STEP -> ONE RESULT)
-            t_step_start = time.monotonic()
-            res = self.runtime.step(
-                faces=det_objs,
-                frame_size=(frame_w, frame_h),
-                timestamp=capture_ts,
+            self._step_frame_and_dispatch(
+                detections=det_objs,
+                frame_w=frame_w,
+                frame_h=frame_h,
+                capture_ts=capture_ts,
+                arrival_ts=t_arrival,
             )
-            t_step_end = time.monotonic()
-
-            self.latest_result = res
-            target_yaw = float(res.target_yaw_deg)
-            self.last_published_yaw = target_yaw
-
-            # Direct Actuator Dispatch (ONE RESULT -> ONE AUTHORITATIVE TARGET)
-            if self.pub_head_command is not None:
-                hcmd = HeadCmd()
-                hcmd.angle_deg = target_yaw
-                self.pub_head_command.publish(hcmd)
-
-            cmd_pos = Float32()
-            cmd_pos.data = target_yaw
-            self.pub_head_cmd_pos.publish(cmd_pos)
-
-            if self.pub_active_target is not None:
-                tgt_msg = String()
-                tgt_msg.data = res.target_id or "NONE"
-                self.pub_active_target.publish(tgt_msg)
-
-            # Synchronized Telemetry
-            face_bearing = res.face_bearings_deg[0] if res.face_bearings_deg else None
-            face_bearing_str = f"{face_bearing:+.1f}°" if face_bearing is not None else "NONE"
-            primary_target_id = res.target_id or "NONE"
-            vision_age_ms = round(max(0.0, (t_arrival - capture_ts) * 1000.0), 1)
-            bbox_str = f"[{det_objs[0].x},{det_objs[0].y},{det_objs[0].w},{det_objs[0].h}]" if det_objs else "NONE"
-            conf_str = f"{det_objs[0].confidence:.2f}" if det_objs else "0.00"
-
-            tracker_head = self.runtime.tracker.head_angle_deg
-            actual_head = self.runtime.actual_head_yaw_deg
-            raw_enc = getattr(self, "raw_encoder_deg", actual_head)
-            fb_deg, fb_age, fb_src = self.runtime.get_feedback_telemetry(now=t_arrival)
-
-            sync_line = (
-                f"visual_bearing={face_bearing_str} "
-                f"command_yaw={target_yaw:+.1f}° "
-                f"actual_head={actual_head:+.1f}° "
-                f"head_feedback_deg={fb_deg:+.1f}° "
-                f"head_feedback_age_ms={fb_age:.1f}ms "
-                f"head_feedback_source={fb_src}"
-            )
-
-            frame_log = (
-                f"FRAME\n"
-                f"cycle_id={self.cycle_id}\n"
-                f"frame_id={self.frame_index}\n"
-                f"capture_ts={capture_ts:.3f}\n"
-                f"arrival_ts={t_arrival:.3f}\n"
-                f"step_ts={t_step_end:.3f}\n"
-                f"vision_age_ms={vision_age_ms:.1f}\n"
-                f"bbox={bbox_str}\n"
-                f"confidence={conf_str}\n"
-                f"visual_bearing={face_bearing_str}\n"
-                f"target_id={primary_target_id}"
-            )
-
-            cmd_log = (
-                f"COMMAND\n"
-                f"cycle_id={self.cycle_id}\n"
-                f"frame_id={self.frame_index}\n"
-                f"target_id={primary_target_id}\n"
-                f"command_yaw={target_yaw:+.1f}°\n"
-                f"actual_head={actual_head:+.1f}°\n"
-                f"raw_encoder={raw_enc:+.1f}°\n"
-                f"FEEDBACK_SYNC: {sync_line}\n"
-                f"source={getattr(res, 'command_source', 'VISUAL')}"
-            )
-            forensic_msg = f"\n{frame_log}\n{cmd_log}"
-            try:
-                print(forensic_msg)
-            except UnicodeEncodeError:
-                print(forensic_msg.encode("ascii", errors="replace").decode("ascii"))
-            self.get_logger().info(sync_line)
-
         except Exception as exc:
-            self.get_logger().error(f"Error processing vision message: {exc}")
+            self.get_logger().error(f"Error processing vision JSON message: {exc}")
+
+    def _step_frame_and_dispatch(
+        self,
+        detections: Sequence[Detection],
+        frame_w: int,
+        frame_h: int,
+        capture_ts: float,
+        arrival_ts: float,
+    ) -> GazeResult:
+        """Executes strictly ONE gaze engine step for ONE camera frame.
+
+        ONE FRAME -> ONE DETECTION -> ONE GAZE STEP -> ONE RESULT -> ONE HEAD TARGET
+        """
+        self.cycle_id += 1
+        self.frame_index += 1
+
+        t_step_start = time.monotonic()
+        res = self.runtime.step(
+            faces=detections,
+            frame_size=(frame_w, frame_h),
+            timestamp=capture_ts,
+        )
+        t_step_end = time.monotonic()
+
+        self.latest_result = res
+        target_yaw = float(res.target_yaw_deg)
+        self.last_published_yaw = target_yaw
+
+        # Direct Actuator Dispatch (ONE RESULT -> ONE AUTHORITATIVE TARGET)
+        if self.pub_head_command is not None:
+            hcmd = HeadCmd()
+            hcmd.angle_deg = target_yaw
+            self.pub_head_command.publish(hcmd)
+
+        cmd_pos = Float32()
+        cmd_pos.data = target_yaw
+        self.pub_head_cmd_pos.publish(cmd_pos)
+
+        if self.pub_active_target is not None:
+            tgt_msg = String()
+            tgt_msg.data = res.target_id or "NONE"
+            self.pub_active_target.publish(tgt_msg)
+
+        # Synchronized Telemetry
+        face_bearing = res.face_bearings_deg[0] if res.face_bearings_deg else None
+        face_bearing_str = f"{face_bearing:+.1f}°" if face_bearing is not None else "NONE"
+        primary_target_id = res.target_id or "NONE"
+        vision_age_ms = round(max(0.0, (arrival_ts - capture_ts) * 1000.0), 1)
+        bbox_str = f"[{detections[0].x},{detections[0].y},{detections[0].w},{detections[0].h}]" if detections else "NONE"
+        conf_str = f"{detections[0].confidence:.2f}" if detections else "0.00"
+
+        tracker_head = self.runtime.tracker.head_angle_deg
+        actual_head = self.runtime.actual_head_yaw_deg
+        raw_enc = getattr(self, "raw_encoder_deg", actual_head)
+        fb_deg, fb_age, fb_src = self.runtime.get_feedback_telemetry(now=arrival_ts)
+
+        sync_line = (
+            f"visual_bearing={face_bearing_str} "
+            f"command_yaw={target_yaw:+.1f}° "
+            f"actual_head={actual_head:+.1f}° "
+            f"head_feedback_deg={fb_deg:+.1f}° "
+            f"head_feedback_age_ms={fb_age:.1f}ms "
+            f"head_feedback_source={fb_src}"
+        )
+
+        frame_log = (
+            f"FRAME\n"
+            f"cycle_id={self.cycle_id}\n"
+            f"frame_id={self.frame_index}\n"
+            f"capture_ts={capture_ts:.3f}\n"
+            f"arrival_ts={arrival_ts:.3f}\n"
+            f"step_ts={t_step_end:.3f}\n"
+            f"vision_age_ms={vision_age_ms:.1f}\n"
+            f"bbox={bbox_str}\n"
+            f"confidence={conf_str}\n"
+            f"visual_bearing={face_bearing_str}\n"
+            f"target_id={primary_target_id}"
+        )
+
+        cmd_log = (
+            f"COMMAND\n"
+            f"cycle_id={self.cycle_id}\n"
+            f"frame_id={self.frame_index}\n"
+            f"target_id={primary_target_id}\n"
+            f"command_yaw={target_yaw:+.1f}°\n"
+            f"actual_head={actual_head:+.1f}°\n"
+            f"raw_encoder={raw_enc:+.1f}°\n"
+            f"FEEDBACK_SYNC: {sync_line}\n"
+            f"source={getattr(res, 'command_source', 'VISUAL')}"
+        )
+        forensic_msg = f"\n{frame_log}\n{cmd_log}"
+        try:
+            print(forensic_msg)
+        except UnicodeEncodeError:
+            print(forensic_msg.encode("ascii", errors="replace").decode("ascii"))
+        self.get_logger().info(sync_line)
+
+        return res
 
     # =========================================================================
     # Passive 50Hz Keepalive
