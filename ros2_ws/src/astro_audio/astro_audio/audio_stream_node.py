@@ -261,6 +261,7 @@ class AudioStreamNode(Node):
         self._respeaker = ReSpeakerHID()
         self._doa_estimator = AcousticDOAEstimator(sample_rate=HW_SAMPLE_RATE) if AcousticDOAEstimator else None
         self._capture_channels = 1
+        self._mic_channel_indices: tuple[int, ...] = (0, 1, 2, 3)
         self._last_doa_angle = 0.0
         self._last_mic_speech_time = 0.0
 
@@ -350,10 +351,9 @@ class AudioStreamNode(Node):
                 vad_msg.data = bool(is_speech)
                 self.pub_vad.publish(vad_msg)
 
-            # Publish genuine hardware DOA as fallback only when multi-channel GCC-PHAT is inactive
+            # Publish genuine hardware DOA as fallback ONLY when multi-channel capture is unavailable (< 4 channels)
             is_active_playback = self._is_playing or (self._output_stream and self._output_stream.active)
-            time_since_gcc = time.monotonic() - getattr(self, "_last_gcc_doa_time", 0.0)
-            if time_since_gcc > 0.5 and is_speech is True and doa_angle is not None and not is_active_playback:
+            if self._capture_channels < 4 and is_speech is True and doa_angle is not None and not is_active_playback:
                 doa_msg = Float32()
                 doa_msg.data = float(doa_angle)
                 self.pub_doa.publish(doa_msg)
@@ -413,10 +413,25 @@ class AudioStreamNode(Node):
 
             if pref_ch in (1, 2, 4, 6, 8):
                 self._capture_channels = pref_ch
+            elif max_in_ch >= 6:
+                self._capture_channels = 6
             elif max_in_ch >= 4:
                 self._capture_channels = 4
             else:
                 self._capture_channels = 1
+
+            # On ReSpeaker 4-Mic USB Array (6-channel layout):
+            #   Ch 0: Processed/Beamformed mono audio (AEC/NS from XMOS DSP) -> used for speech recognition
+            #   Ch 1: Raw Mic 0 (Front, 0 deg)
+            #   Ch 2: Raw Mic 1 (Right, +90 deg)
+            #   Ch 3: Raw Mic 2 (Back, 180 deg)
+            #   Ch 4: Raw Mic 3 (Left, -90 / 270 deg)
+            #   Ch 5: Playback loopback
+            # Matches standalone sources.py RESPEAKER_MIC_CHANNELS = (1, 2, 3, 4) exactly.
+            if self._capture_channels >= 6:
+                self._mic_channel_indices = (1, 2, 3, 4)
+            else:
+                self._mic_channel_indices = (0, 1, 2, 3)
 
             self._input_stream = sd.RawInputStream(
                 samplerate=HW_SAMPLE_RATE,
@@ -428,17 +443,29 @@ class AudioStreamNode(Node):
             )
             self._input_stream.start()
             self._input_stream_alive = True
+
+            mic_map_str = (
+                "    - Channel 0: Processed Mono (Beamformed / AEC)\n"
+                "    - Channel 1: Front Mic 0 (0 deg)\n"
+                "    - Channel 2: Right Mic 1 (+90 deg)\n"
+                "    - Channel 3: Back Mic 2 (180 deg)\n"
+                "    - Channel 4: Left Mic 3 (-90 / 270 deg)\n"
+                "    - Channel 5: Playback Loopback"
+                if self._capture_channels >= 6
+                else
+                "    - Channel 0: Front Mic 0 (0 deg)\n"
+                "    - Channel 1: Right Mic 1 (+90 deg)\n"
+                "    - Channel 2: Back Mic 2 (180 deg)\n"
+                "    - Channel 3: Left Mic 3 (-90 / 270 deg)"
+            )
             self.get_logger().info(
                 f"🎛️ [DOA HARDWARE & CHANNEL CONFIG]\n"
                 f"  device_index={self._in_dev_idx} | device_name=\"{self._in_device_name}\"\n"
                 f"  channel_count={self._capture_channels} | hardware_max_channels={max_in_ch}\n"
+                f"  selected_mic_channels={self._mic_channel_indices}\n"
                 f"  sample_rate={HW_SAMPLE_RATE} Hz | sample_format=int16 (16-bit PCM, 2 bytes/sample)\n"
                 f"  interleaving=interleaved [s0_ch0, s0_ch1, s0_ch2, s0_ch3, ...]\n"
-                f"  channel_mapping:\n"
-                f"    - Channel 0: Front Mic 0 (x=0.0m, y=+0.043m, 0 deg)\n"
-                f"    - Channel 1: Right Mic 1 (x=+0.043m, y=0.0m, +90 deg)\n"
-                f"    - Channel 2: Back Mic 2 (x=0.0m, y=-0.043m, 180 deg)\n"
-                f"    - Channel 3: Left Mic 3 (x=-0.043m, y=0.0m, -90 deg)\n"
+                f"  channel_mapping:\n{mic_map_str}\n"
                 f"  spatial_doa_engine=AcousticDOAEstimator (GCC-PHAT TDOA)"
             )
             self.get_logger().info(
@@ -524,7 +551,12 @@ class AudioStreamNode(Node):
 
             # Multi-Channel GCC-PHAT DOA Spatial Estimation (Primary high-precision acoustic tracking)
             if multi_ch is not None and self._doa_estimator and not is_active_playback and rms >= 300.0:
-                azimuth_deg, conf, valid = self._doa_estimator.estimate_from_multichannel_pcm(multi_ch[:4])
+                mic_indices = getattr(self, "_mic_channel_indices", (0, 1, 2, 3))
+                if multi_ch.shape[0] > max(mic_indices):
+                    mics = multi_ch[list(mic_indices)]
+                else:
+                    mics = multi_ch[:4]
+                azimuth_deg, conf, valid = self._doa_estimator.estimate_from_multichannel_pcm(mics)
                 if valid and azimuth_deg is not None:
                     raw_doa = azimuth_deg if azimuth_deg >= 0.0 else azimuth_deg + 360.0
                     doa_msg = Float32()

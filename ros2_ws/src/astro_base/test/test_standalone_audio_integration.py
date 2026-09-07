@@ -20,6 +20,7 @@ from typing import Optional
 from unittest.mock import MagicMock, patch
 
 import pytest
+import numpy as np
 
 # Resolve paths
 CUR_DIR = Path(__file__).resolve().parent
@@ -434,4 +435,64 @@ class TestStandaloneAudioIntegration:
         assert res is not None
         assert res.owner == PrioritySource.IDLE
         assert abs(res.target_yaw_deg) < 2.0
+
+    def test_gcc_phat_pair_signs_steer_head_correctly(self):
+        """Validates that GCC-PHAT on ReSpeaker channels [1..4] steers head left and right correctly."""
+        from astro_audio.doa_estimator import AcousticDOAEstimator
+
+        est = AcousticDOAEstimator(sample_rate=16000)
+
+        # 1. Synthesize RIGHT speaker (right mic leads): Mic 1 leads
+        rng = np.random.default_rng(55)
+        base = rng.normal(0, 1, 1024 * 3) * 6000.0
+        def take(l): return base[1024 + l: 1024 + l + 1024]
+        # ReSpeaker 6-channel layout
+        ch6_right = np.stack([
+            take(0),      # Ch 0: Processed beam
+            take(0),      # Ch 1: Front
+            take(+4),     # Ch 2: Right (leads)
+            take(0),      # Ch 3: Back
+            take(-4),     # Ch 4: Left (lags)
+            np.zeros(1024)
+        ])
+        az_r, _, valid_r = est.estimate_from_multichannel_pcm(ch6_right[1:5])
+        assert valid_r is True
+        circ_r = az_r if az_r >= 0 else az_r + 360.0
+        assert abs(circ_r - 90.0) < 1.0  # Right is 90° circular
+
+        # Feed to StandaloneGazeRosNode: 90° circular must steer head RIGHT (negative yaw)
+        node_r = StandaloneGazeRosNode(use_camera_source=False, enable_audio=False)
+        speech = MockSpeechVerdict(is_speech=True, confidence=0.85)
+        t = 900.0
+        res_r = None
+        for _ in range(4):
+            t += 0.033
+            res_r = node_r.step_frame(detections=[], frame_size=(640, 480), timestamp=t, doa_deg=circ_r, speech=speech)
+        assert res_r.owner == PrioritySource.ACTIVE_SPEAKER
+        assert res_r.target_yaw_deg < -20.0  # Negative = Right
+
+        # 2. Synthesize LEFT speaker (left mic leads): Mic 3 leads
+        ch6_left = np.stack([
+            take(0),      # Ch 0: Processed beam
+            take(0),      # Ch 1: Front
+            take(-4),     # Ch 2: Right (lags)
+            take(0),      # Ch 3: Back
+            take(+4),     # Ch 4: Left (leads)
+            np.zeros(1024)
+        ])
+        az_l, _, valid_l = est.estimate_from_multichannel_pcm(ch6_left[1:5])
+        assert valid_l is True
+        circ_l = az_l if az_l >= 0 else az_l + 360.0
+        assert abs(circ_l - 270.0) < 1.0  # Left is 270° circular
+
+        # Feed to StandaloneGazeRosNode: 270° circular must steer head LEFT (positive yaw)
+        node_l = StandaloneGazeRosNode(use_camera_source=False, enable_audio=False)
+        t = 1000.0
+        res_l = None
+        for _ in range(4):
+            t += 0.033
+            res_l = node_l.step_frame(detections=[], frame_size=(640, 480), timestamp=t, doa_deg=circ_l, speech=speech)
+        assert res_l.owner == PrioritySource.ACTIVE_SPEAKER
+        assert res_l.target_yaw_deg > 20.0  # Positive = Left
+
 

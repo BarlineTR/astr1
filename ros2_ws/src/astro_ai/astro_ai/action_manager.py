@@ -347,6 +347,11 @@ class ActionManager:
         """Processes 4-channel microphone buffer with GCC-PHAT to compute exact DOA."""
         if is_speaking or is_playback_active or self._acoustic_estimator is None:
             return
+        if hasattr(pcm_channels, "shape") and pcm_channels.ndim == 2:
+            if pcm_channels.shape[0] >= 6:
+                pcm_channels = pcm_channels[1:5]
+            elif pcm_channels.shape[0] > 4:
+                pcm_channels = pcm_channels[:4]
         azimuth, conf, is_valid = self._acoustic_estimator.estimate_from_multichannel_pcm(pcm_channels)
         if azimuth is not None:
             raw_doa = azimuth if azimuth >= 0 else azimuth + 360.0
