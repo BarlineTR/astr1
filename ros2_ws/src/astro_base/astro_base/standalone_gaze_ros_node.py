@@ -183,13 +183,11 @@ class StandaloneGazeRosNode(Node):
         self.pub_active_target = self.create_publisher(String, "/gaze/active_target", 10)
         self.pub_gaze_debug = self.create_publisher(String, "/gaze/debug", 10)
 
-        # Subscriptions
+        # Subscriptions (Authoritative Feedback & Diagnostic Only - NO ROS Vision Topics)
         qos_best_effort = QoSProfile(depth=10, reliability=ReliabilityPolicy.BEST_EFFORT)
         if HeadState is not None:
             self.create_subscription(HeadState, "/head/state", self._on_head_state, 10)
         self.create_subscription(JointState, "/joint_states", self._on_joint_states, qos_best_effort)
-        self.create_subscription(String, "/vision/detections_json", self._on_vision_json, 10)
-        self.create_subscription(String, "/vision/faces", self._on_vision_json, 10)
         self.create_subscription(Bool, "/safety/emergency_stop", self._on_emergency_stop, 10)
         self.create_subscription(Bool, "/system/sleep", self._on_sleep_mode, 10)
 
@@ -205,7 +203,7 @@ class StandaloneGazeRosNode(Node):
                     self._cam_thread.start()
                 else:
                     self.get_logger().info(
-                        f"📷 CameraSource device {cam_dev} not available ({self.camera.error or 'no camera'}) — fallback to test/topic mode"
+                        f"📷 CameraSource device {cam_dev} not available ({self.camera.error or 'no camera'}) — headless test mode"
                     )
             except Exception as exc:
                 self.get_logger().warn(f"📷 Could not start CameraSource: {exc}")
@@ -300,52 +298,40 @@ class StandaloneGazeRosNode(Node):
                 time.sleep(0.05)
 
     # =========================================================================
-    # Frame-Synchronous Visual Processing Core
+    # Frame-Synchronous Visual Processing API
     # =========================================================================
 
-    def _on_vision_json(self, msg: String) -> None:
-        """Test/replay harness input: converts JSON detections and delegates to _step_frame_and_dispatch."""
-        t_arrival = time.monotonic()
-        try:
-            raw_data = json.loads(msg.data)
-            if isinstance(raw_data, dict):
-                detections = raw_data.get("faces", [])
-                capture_ts = float(raw_data.get("timestamp", raw_data.get("capture_stamp", t_arrival)))
-            elif isinstance(raw_data, list):
-                detections = raw_data
-                capture_ts = float(detections[0].get("timestamp", t_arrival)) if detections else t_arrival
-            else:
-                detections = []
-                capture_ts = t_arrival
+    def step_camera_frame(self, frame, timestamp: Optional[float] = None) -> GazeResult:
+        """Runs detector on frame and steps tracker (1:1 with standalone/track.py)."""
+        if self.camera is not None:
+            detections = self.camera.detect(frame)
+        else:
+            detections = []
+        frame_h, frame_w = frame.shape[:2]
+        t = timestamp if timestamp is not None else time.monotonic()
+        return self._step_frame_and_dispatch(
+            detections=detections,
+            frame_w=frame_w,
+            frame_h=frame_h,
+            capture_ts=t,
+            arrival_ts=t,
+        )
 
-            frame_w = 640
-            frame_h = 480
-            det_objs: List[Detection] = []
-            for d in detections:
-                w_val = int(d.get("w", d.get("width", 50)))
-                h_val = int(d.get("h", d.get("height", 50)))
-                frame_w = int(d.get("frame_width", d.get("frame_w", frame_w)))
-                frame_h = int(d.get("frame_height", d.get("frame_h", frame_h)))
-                conf = float(d.get("confidence", UNSCORED_CONFIDENCE))
-                det_objs.append(
-                    Detection(
-                        x=int(d.get("x", 0)),
-                        y=int(d.get("y", 0)),
-                        w=w_val,
-                        h=h_val,
-                        confidence=conf,
-                    )
-                )
-
-            self._step_frame_and_dispatch(
-                detections=det_objs,
-                frame_w=frame_w,
-                frame_h=frame_h,
-                capture_ts=capture_ts,
-                arrival_ts=t_arrival,
-            )
-        except Exception as exc:
-            self.get_logger().error(f"Error processing vision JSON message: {exc}")
+    def step_frame(
+        self,
+        detections: Sequence[Detection],
+        frame_size: Tuple[int, int] = (640, 480),
+        timestamp: Optional[float] = None,
+    ) -> GazeResult:
+        """Direct frame step for testing/replay without ROS topics."""
+        t = timestamp if timestamp is not None else time.monotonic()
+        return self._step_frame_and_dispatch(
+            detections=detections,
+            frame_w=frame_size[0],
+            frame_h=frame_size[1],
+            capture_ts=t,
+            arrival_ts=t,
+        )
 
     def _step_frame_and_dispatch(
         self,
