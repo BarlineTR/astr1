@@ -338,3 +338,100 @@ class TestStandaloneAudioIntegration:
         assert "social_gaze_node" not in node_execs
         assert "face_detector_node" not in node_execs
         assert len(nodes) == 4
+
+    def test_audio_reacquisition_with_hardware_confidence_threshold(self):
+        """Audio targets with realistic hardware confidence (0.50..0.60) must succeed in reacquisition."""
+        node = StandaloneGazeRosNode(use_camera_source=False, enable_audio=False)
+        # 0.55 confidence is well below the old 0.75 hardcoded threshold, but above audio_acquisition_threshold 0.45
+        speech = MockSpeechVerdict(is_speech=True, confidence=0.55)
+
+        t = 600.0
+        res = None
+        for _ in range(6):
+            t += 0.033
+            res = node.step_frame(
+                detections=[],
+                frame_size=(640, 480),
+                timestamp=t,
+                doa_deg=45.0,  # Right in ReSpeaker -> negative body yaw
+                speech=speech,
+            )
+
+        assert res is not None
+        assert res.owner == PrioritySource.ACTIVE_SPEAKER
+        assert res.target_yaw_deg < -15.0  # Steers toward right speaker
+        assert node.last_published_yaw < -15.0
+
+    def test_raw_doa_without_speech_is_ignored(self):
+        """Raw DOA without valid speech verdict must never seize gaze authority or move the head."""
+        node = StandaloneGazeRosNode(use_camera_source=False, enable_audio=False)
+
+        t = 700.0
+        res = None
+        # Case A: speech=None
+        for _ in range(5):
+            t += 0.033
+            res = node.step_frame(
+                detections=[],
+                frame_size=(640, 480),
+                timestamp=t,
+                doa_deg=90.0,
+                speech=None,
+            )
+        assert res is not None
+        assert res.owner == PrioritySource.IDLE
+        assert abs(res.target_yaw_deg) < 1e-3
+
+        # Case B: speech verdict is_speech=False
+        no_speech = MockSpeechVerdict(is_speech=False, confidence=0.0)
+        for _ in range(5):
+            t += 0.033
+            res = node.step_frame(
+                detections=[],
+                frame_size=(640, 480),
+                timestamp=t,
+                doa_deg=90.0,
+                speech=no_speech,
+            )
+        assert res is not None
+        assert res.owner == PrioritySource.IDLE
+        assert abs(res.target_yaw_deg) < 1e-3
+
+    def test_audio_reacquisition_timeout_returns_to_center(self):
+        """When audio ceases and no face is found, FSM safely times out and returns to center."""
+        node = StandaloneGazeRosNode(use_camera_source=False, enable_audio=False)
+        speech = MockSpeechVerdict(is_speech=True, confidence=0.60)
+
+        t = 800.0
+        # 1. Turn to speaker at right (DOA=40.0)
+        res_first = None
+        for _ in range(3):
+            t += 0.033
+            res_first = node.step_frame(
+                detections=[],
+                frame_size=(640, 480),
+                timestamp=t,
+                doa_deg=40.0,
+                speech=speech,
+            )
+        assert res_first is not None
+        assert res_first.owner == PrioritySource.ACTIVE_SPEAKER
+        assert res_first.target_yaw_deg < -15.0
+
+        # 2. Sound stops; simulate time passing without any speech or face (> 4.0s)
+        res = None
+        for _ in range(120):
+            t += 0.033
+            res = node.step_frame(
+                detections=[],
+                frame_size=(640, 480),
+                timestamp=t,
+                doa_deg=None,
+                speech=None,
+            )
+
+        # After search timeout, robot must recover back to IDLE at center (0 deg)
+        assert res is not None
+        assert res.owner == PrioritySource.IDLE
+        assert abs(res.target_yaw_deg) < 2.0
+

@@ -129,6 +129,11 @@ def generate_launch_description():
             default_value="false",
             description="Enable verbose per-frame forensic telemetry output",
         ),
+        DeclareLaunchArgument(
+            "audio_input_channels",
+            default_value="0",
+            description="Audio input channels for ReSpeaker capture (0=auto-detect 4-mic/fallback)",
+        ),
     ]
 
     serial_bridge_node = Node(
@@ -163,7 +168,7 @@ def generate_launch_description():
         output="screen",
         condition=IfCondition(LaunchConfiguration("enable_audio")),
         parameters=[{
-            "input_channels": 0,
+            "input_channels": LaunchConfiguration("audio_input_channels"),
         }],
     )
 

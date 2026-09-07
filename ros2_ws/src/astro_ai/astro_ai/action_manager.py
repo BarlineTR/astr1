@@ -329,7 +329,7 @@ class ActionManager:
                     self._last_logged_valid = is_valid
                     self._last_logged_yaw = yaw
                     sign = "+" if yaw >= 0 else ""
-                    self._logger.info(
+                    self._logger.debug(
                         f"[DOA]\n"
                         f"azimuth_deg={sign}{yaw:.1f}\n"
                         f"confidence={conf:.2f}\n"

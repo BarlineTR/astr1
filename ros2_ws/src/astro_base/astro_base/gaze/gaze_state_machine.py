@@ -70,6 +70,8 @@ class SocialGazeFSM:
         position_tolerance_deg: float = 2.0,
         velocity_tolerance_deg_s: float = 3.0,
         settling_persistence_required: int = 3,
+        acquisition_threshold: float = 0.75,
+        audio_acquisition_threshold: float = 0.45,
         arbiter: Optional[AttentionArbiterCore] = None,
         spatial_memory: Optional[EpistemicSpatialMemory] = None,
     ):
@@ -84,6 +86,8 @@ class SocialGazeFSM:
         self.position_tolerance_deg = position_tolerance_deg
         self.velocity_tolerance_deg_s = velocity_tolerance_deg_s
         self.settling_persistence_required = settling_persistence_required
+        self.acquisition_threshold = acquisition_threshold
+        self.audio_acquisition_threshold = audio_acquisition_threshold
 
         # Spatial Memory for situational awareness and negative evidence
         self.spatial_memory = spatial_memory or EpistemicSpatialMemory()
@@ -375,9 +379,14 @@ class SocialGazeFSM:
                 # Debounce window (150ms) to reject single-frame glitch oscillations
                 time_in_lost = timestamp - self._state_entry_time
                 if time_in_lost >= 0.15:
+                    req_conf = (
+                        self.audio_acquisition_threshold
+                        if (target_state.active_target is not None and target_state.active_target.modality == Modality.AUDIO)
+                        else self.acquisition_threshold
+                    )
                     if (
                         target_state.active_target is not None
-                        and target_state.active_target.confidence >= 0.75
+                        and target_state.active_target.confidence >= req_conf
                         and (timestamp - target_state.active_target.timestamp) <= 0.25
                     ):
                         reacq_reason = (
@@ -396,7 +405,12 @@ class SocialGazeFSM:
             elif self.state == GazeStateEnum.IDLE:
                 # Strict IDLE Entry Guards (Failure 1):
                 # IDLE can NEVER jump directly to HOLDING_ATTENTION!
-                if target_state.active_target is not None and target_state.active_target.confidence >= 0.75:
+                req_conf = (
+                    self.audio_acquisition_threshold
+                    if (target_state.active_target is not None and target_state.active_target.modality == Modality.AUDIO)
+                    else self.acquisition_threshold
+                )
+                if target_state.active_target is not None and target_state.active_target.confidence >= req_conf:
                     self.target_yaw_deg = target_yaw
                     if err_deg > 6.0:
                         self._settling_persistence_count = 0
@@ -409,12 +423,19 @@ class SocialGazeFSM:
 
             elif self.state == GazeStateEnum.RECOVERING:
                 # Target detected during return to center
-                if target_state.active_target is not None and target_state.active_target.confidence >= 0.75:
+                req_conf = (
+                    self.audio_acquisition_threshold
+                    if (target_state.active_target is not None and target_state.active_target.modality == Modality.AUDIO)
+                    else self.acquisition_threshold
+                )
+                if target_state.active_target is not None and target_state.active_target.confidence >= req_conf:
                     self.target_yaw_deg = target_yaw
                     if err_deg > 8.0:
                         self._transition_to(GazeStateEnum.ORIENTING, timestamp, reason="RECOVERY_PREEMPTED_SACCADE")
-                    else:
+                    elif has_vision:
                         self._transition_to(GazeStateEnum.TRACKING, timestamp, reason="RECOVERY_PREEMPTED_TRACK")
+                    else:
+                        self._transition_to(GazeStateEnum.ACQUIRING, timestamp, reason="RECOVERY_PREEMPTED_AUDIO_ACQUIRE")
 
         elif decision.owner in (PrioritySource.DIRECT_DIALOGUE_INTENT, PrioritySource.GESTURE_INTENT):
             self.target_yaw_deg = decision.target_yaw_deg
