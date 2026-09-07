@@ -128,8 +128,10 @@ if _STANDALONE_DIR not in sys.path:
 
 from sources import CameraSource, AudioSource
 from stereo_doa import DEFAULT_MIC_SPACING_M
+from astro_base.gaze.angle_math import circular_distance_deg
 from astro_base.gaze.gaze_runtime import GazeRuntimeCore
 from astro_base.gaze.gaze_tracker import Detection, GazeResult, UNSCORED_CONFIDENCE
+from astro_base.gaze.types import PrioritySource
 
 
 class StandaloneGazeRosNode(Node):
@@ -151,6 +153,7 @@ class StandaloneGazeRosNode(Node):
         use_camera_source: Optional[bool] = None,
         enable_audio: Optional[bool] = None,
         enable_voice: Optional[bool] = None,
+        verbose_diagnostics: Optional[bool] = None,
     ):
         super().__init__("standalone_gaze_ros_node")
 
@@ -168,6 +171,7 @@ class StandaloneGazeRosNode(Node):
         self.declare_parameter("audio_freshness_s", 1.0)
         self.declare_parameter("enable_voice", True)
         self.declare_parameter("enable_edge_tts", True)
+        self.declare_parameter("verbose_diagnostics", False)
 
         cam_dev = camera_device if camera_device is not None else int(self.get_parameter("camera_device").value)
         use_cam = use_camera_source if use_camera_source is not None else bool(self.get_parameter("use_camera_source").value)
@@ -185,6 +189,21 @@ class StandaloneGazeRosNode(Node):
         self.audio_freshness_s = float(self.get_parameter("audio_freshness_s").value)
         self.enable_voice = enable_voice if enable_voice is not None else bool(self.get_parameter("enable_voice").value)
         self.enable_edge_tts = bool(self.get_parameter("enable_edge_tts").value)
+        self.verbose_diagnostics = (
+            verbose_diagnostics
+            if verbose_diagnostics is not None
+            else bool(self.get_parameter("verbose_diagnostics").value)
+        )
+
+        # Rate-limiting and Event Transition State for INFO Logging
+        self._last_logged_visual_time: float = 0.0
+        self._last_logged_target_id: Optional[str] = None
+        self._last_logged_owner: Optional[Any] = None
+        self._last_logged_command_yaw: float = 0.0
+        self._speech_was_active: bool = False
+        self._last_logged_speech_time: float = 0.0
+        self._last_logged_doa: Optional[float] = None
+        self._last_logged_doa_time: float = 0.0
 
         # The Golden Standalone Runtime Core (Immutable 2e0b70c baseline)
         self.runtime = GazeRuntimeCore(
@@ -230,10 +249,19 @@ class StandaloneGazeRosNode(Node):
                             )
                             if self.voice_loop is not None:
                                 self.get_logger().info(f"🗣️ VoiceLoop active — wake word: '{self.voice_loop.wake_word}'")
+                                if not getattr(self.voice_loop.tts, "edge_tts_enabled", False):
+                                    self.get_logger().info("[AUDIO] Edge-TTS unavailable")
                             else:
-                                self.get_logger().info(f"🗣️ VoiceLoop inactive: {voice_module.LAST_SETUP_ERROR}")
+                                err = str(voice_module.LAST_SETUP_ERROR or "")
+                                if "key" in err.lower() or "openai" in err.lower() or "client" in err.lower():
+                                    self.get_logger().info("[AUDIO] OpenAI unavailable")
+                                else:
+                                    self.get_logger().info(f"[AUDIO] VoiceLoop inactive: {err}")
+                                if not self.enable_edge_tts:
+                                    self.get_logger().info("[AUDIO] Edge-TTS unavailable")
                         except Exception as v_exc:
                             self.get_logger().warning(f"🗣️ VoiceLoop setup skipped: {v_exc}")
+                            self.get_logger().info("[AUDIO] OpenAI unavailable")
                 else:
                     self.get_logger().warning(f"🎤 AudioSource unavailable ({self.audio.error}) — continuing in vision-only mode")
             except Exception as a_exc:
@@ -284,7 +312,7 @@ class StandaloneGazeRosNode(Node):
                         f"📷 CameraSource device {cam_dev} not available ({self.camera.error or 'no camera'}) — headless test mode"
                     )
             except Exception as exc:
-                self.get_logger().warn(f"📷 Could not start CameraSource: {exc}")
+                self.get_logger().warning(f"📷 Could not start CameraSource: {exc}")
 
         # 50Hz Passive Motor Keepalive Timer (WATCHDOG FEED ONLY - NO TRACKER STEPS)
         period_s = 1.0 / max(1.0, control_rate)
@@ -293,15 +321,6 @@ class StandaloneGazeRosNode(Node):
         self.get_logger().info(
             f"StandaloneGazeRosNode active — Sole visual authority: standalone 2e0b70c runtime (Keepalive: {control_rate:.1f}Hz)"
         )
-
-    def destroy_node(self):
-        self._running = False
-        if self.camera is not None:
-            try:
-                self.camera.close()
-            except Exception:
-                pass
-        super().destroy_node()
 
     # =========================================================================
     # Hardware State Callbacks (Authoritative Feedback)
@@ -642,11 +661,74 @@ class StandaloneGazeRosNode(Node):
         )
 
         forensic_msg = f"\n{frame_log}\n{cmd_log}\n{center_diag_line}\n{instrumentation_log}\n\n{audio_log}"
-        try:
-            print(forensic_msg)
-        except UnicodeEncodeError:
-            print(forensic_msg.encode("ascii", errors="replace").decode("ascii"))
-        self.get_logger().info(sync_line)
+
+        # 1. Forensic Telemetry (Exposed at DEBUG level or when verbose_diagnostics=True)
+        if self.verbose_diagnostics:
+            try:
+                print(forensic_msg)
+            except UnicodeEncodeError:
+                print(forensic_msg.encode("ascii", errors="replace").decode("ascii"))
+            self.get_logger().info(sync_line)
+        else:
+            self.get_logger().debug(sync_line)
+            self.get_logger().debug(forensic_msg)
+
+        # 2. Audio State Changes & Event Logging (Quiet, meaningful, non-spamming)
+        # A. Gaze owner transition
+        if res.owner != self._last_logged_owner:
+            if res.owner == PrioritySource.ACTIVE_SPEAKER:
+                self.get_logger().info("[AUDIO] owner=AUDIO_REACQUISITION")
+            elif res.owner == PrioritySource.VISUAL_TRACKING:
+                self.get_logger().info("[AUDIO] owner=VISUAL_TRACKING")
+            elif res.owner == PrioritySource.IDLE and self._last_logged_owner in (
+                PrioritySource.ACTIVE_SPEAKER,
+                PrioritySource.VISUAL_TRACKING,
+            ):
+                self.get_logger().info("[AUDIO] owner=IDLE")
+
+        # B. Speech onset
+        is_speech = bool(speech is not None and getattr(speech, "is_speech", False))
+        if is_speech:
+            conf_val = float(getattr(speech, "confidence", 0.0))
+            if not self._speech_was_active or (arrival_ts - self._last_logged_speech_time >= 2.0):
+                self.get_logger().info(f"[AUDIO] speech detected confidence={conf_val:.2f}")
+                self._last_logged_speech_time = arrival_ts
+            self._speech_was_active = True
+        else:
+            self._speech_was_active = False
+
+        # C. Meaningful DOA update (only on arrival, shift >= 5°, or >= 1.0s periodic)
+        if doa_deg is not None and is_speech:
+            if (
+                self._last_logged_doa is None
+                or abs(circular_distance_deg(doa_deg, self._last_logged_doa)) >= 5.0
+                or (arrival_ts - self._last_logged_doa_time >= 1.0)
+            ):
+                self.get_logger().info(f"[AUDIO] DOA={doa_deg:+.1f}°")
+                self._last_logged_doa = doa_deg
+                self._last_logged_doa_time = arrival_ts
+        elif doa_deg is None:
+            self._last_logged_doa = None
+
+        # 3. Visual Tracking State (Rate-limited to ~1Hz or on material change)
+        target_changed = primary_target_id != self._last_logged_target_id
+        owner_changed = res.owner != self._last_logged_owner
+        cmd_jump = abs(target_yaw - self._last_logged_command_yaw) >= 3.0
+        large_error = abs(diag_err) >= 15.0 and (arrival_ts - self._last_logged_visual_time >= 1.0)
+        rate_limited_heartbeat = (
+            (arrival_ts - self._last_logged_visual_time >= 1.0)
+            and (primary_target_id != "NONE" or res.owner != PrioritySource.IDLE)
+        )
+
+        if target_changed or owner_changed or cmd_jump or large_error or rate_limited_heartbeat:
+            self.get_logger().info(
+                f"[VISUAL] target={primary_target_id} bearing={face_bearing_str} command={target_yaw:+.1f}° actual={aligned_head:+.1f}°"
+            )
+            self._last_logged_visual_time = arrival_ts
+            self._last_logged_command_yaw = target_yaw
+
+        self._last_logged_target_id = primary_target_id
+        self._last_logged_owner = res.owner
 
         return res
 

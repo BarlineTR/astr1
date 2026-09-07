@@ -90,6 +90,11 @@ def generate_launch_description():
             default_value="true",
             description="Enable Realtime / OpenAI conversation loop and Edge-TTS",
         ),
+        DeclareLaunchArgument(
+            "verbose_diagnostics",
+            default_value="false",
+            description="Enable verbose per-frame forensic telemetry output",
+        ),
     ]
 
     serial_bridge_node = Node(
@@ -113,6 +118,7 @@ def generate_launch_description():
             "camera_device": LaunchConfiguration("camera_device"),
             "enable_audio": LaunchConfiguration("enable_audio"),
             "enable_voice": LaunchConfiguration("enable_voice"),
+            "verbose_diagnostics": LaunchConfiguration("verbose_diagnostics"),
         }],
     )
 
