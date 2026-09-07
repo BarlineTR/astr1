@@ -330,7 +330,7 @@ class StandaloneGazeRosNode(Node):
         self.keepalive_timer = self.create_timer(period_s, self._passive_keepalive_cycle)
 
         self.get_logger().info(
-            f"StandaloneGazeRosNode active — Sole visual authority: standalone 2e0b70c runtime (Keepalive: {control_rate:.1f}Hz)"
+            f"StandaloneGazeRosNode active — Sole visual authority: standalone 2e0b70c runtime (Keepalive: {control_rate:.1f}Hz, verbose_diagnostics: {self.verbose_diagnostics})"
         )
 
     # =========================================================================
