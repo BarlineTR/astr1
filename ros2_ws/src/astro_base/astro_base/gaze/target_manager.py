@@ -91,21 +91,6 @@ class TargetManagerCore:
                 self.active_target = matched
                 self._last_active_observed_time = timestamp
 
-                # If current matched target is coasting, but another candidate is actively detected/tracked:
-                if getattr(matched, "tracking_state", None) == TrackingState.COASTING:
-                    live_cand = next(
-                        (t for t in self.candidate_targets
-                         if t.target_id != matched.target_id
-                         and getattr(t, "tracking_state", None) in (TrackingState.TRACKING, TrackingState.DETECTED)
-                         and t.confidence >= self.hold_threshold),
-                        None
-                    )
-                    if live_cand is not None:
-                        self.active_target = live_cand
-                        self._last_active_observed_time = timestamp
-                        self._active_target_start_time = timestamp
-                        matched = live_cand
-
                 # Check hold threshold
                 if matched.confidence >= self.hold_threshold:
                     self._last_healthy_observed_time = timestamp
@@ -115,21 +100,10 @@ class TargetManagerCore:
                         # Target lost due to sustained low confidence
                         self.active_target = None
             else:
-                # Active target missing in this frame -> check if a live candidate is available immediately
-                live_cand = next(
-                    (t for t in self.candidate_targets
-                     if getattr(t, "tracking_state", None) in (TrackingState.TRACKING, TrackingState.DETECTED)
-                     and t.confidence >= self.hold_threshold),
-                    None
-                )
-                if live_cand is not None:
-                    self.active_target = live_cand
-                    self._last_active_observed_time = timestamp
-                    self._active_target_start_time = timestamp
-                else:
-                    time_missing = timestamp - self._last_active_observed_time
-                    if time_missing > self.target_lost_timeout_s:
-                        self.active_target = None
+                # Active target missing in this frame -> check timeout
+                time_missing = timestamp - self._last_active_observed_time
+                if time_missing > self.target_lost_timeout_s:
+                    self.active_target = None
 
         # 2. Candidate Selection & Turn-Taking Arbitration
         if self.active_target is None:

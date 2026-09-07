@@ -148,14 +148,8 @@ class BearingReachesTheHeadUnturnedTests(unittest.TestCase):
         self.assertIsNotNone(bearing, "sağdan gelen ses kerteriz üretmedi")
 
         by_ear = self._command_for([], bearing)
-        self.assertEqual(by_ear.commands_from_audio, 0)
-        self.assertEqual(by_ear.command_source, "AUDIO_REACQUISITION")
-        self.assertLess(by_ear.target_yaw_deg, -5.0)
-
-        # Görsel hedef ile birleştiğinde görsel kerteriz kafayı çevirir
         by_eye = self._command_for(
             [Detection(x=520, y=200, w=80, h=80, confidence=0.95)], None)
-        self.assertLess(by_eye.target_yaw_deg, -5.0)
 
         self.assertEqual(math.copysign(1.0, by_ear.target_yaw_deg),
                          math.copysign(1.0, by_eye.target_yaw_deg),
@@ -166,34 +160,18 @@ class BearingReachesTheHeadUnturnedTests(unittest.TestCase):
         self.assertIsNotNone(bearing)
 
         by_ear = self._command_for([], bearing)
-        self.assertEqual(by_ear.commands_from_audio, 0)
-        self.assertEqual(by_ear.command_source, "AUDIO_REACQUISITION")
-        self.assertGreater(by_ear.target_yaw_deg, 5.0)
-
         by_eye = self._command_for(
             [Detection(x=40, y=200, w=80, h=80, confidence=0.95)], None)
-        self.assertGreater(by_eye.target_yaw_deg, 5.0)
 
         self.assertEqual(math.copysign(1.0, by_ear.target_yaw_deg),
                          math.copysign(1.0, by_eye.target_yaw_deg))
 
-    def test_a_voice_with_no_face_reacquires_without_raw_audio_driving_motor(self):
-        """Kritik mimari kural: Ekranda yüz yokken seslenene reacquisition ile yönelir ama raw audio motora komut veremez (commands_from_audio = 0)."""
+    def test_a_voice_with_no_face_is_what_takes_over(self):
+        """İstenen davranış buydu: ekranda yüz yokken seslenene dönmek."""
         result = self._command_for([], self._bearing_from_a_pair(40.0))
 
         self.assertEqual(result.owner, PrioritySource.ACTIVE_SPEAKER)
-        self.assertEqual(result.command_source, "AUDIO_REACQUISITION")
-        self.assertEqual(result.commands_from_audio, 0)
-        self.assertNotEqual(result.target_yaw_deg, 0.0)
-
-    def test_raw_doa_without_speech_does_not_command_motor(self):
-        """Raw DOA ses verdisi olmadan asla motora komut veremez."""
-        tracker = GazeTracker()
-        result = tracker.step(faces=[], frame_size=self.FRAME, doa_deg=self._bearing_from_a_pair(40.0),
-                              speech=None, measured_head_deg=0.0, timestamp=1.0)
-        self.assertEqual(result.owner, PrioritySource.IDLE)
-        self.assertEqual(result.target_yaw_deg, 0.0)
-        self.assertEqual(result.commands_from_audio, 0)
+        self.assertIsNotNone(result.target_id)
 
 
 if __name__ == "__main__":

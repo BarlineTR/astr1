@@ -167,6 +167,8 @@ class SocialGazeNode(Node):
         self.declare_parameter("spatial_gate_deg", 25.0)
         self.declare_parameter("idle_saccades_enabled", False)
         self.declare_parameter("self_speech_suppression", True)
+        self.declare_parameter("enable_actuator_output", False)
+        self.enable_actuator_output = bool(self.get_parameter("enable_actuator_output").value)
 
         # Load Calibration
         calib_file = self.get_parameter("calibration_file").get_parameter_value().string_value
@@ -581,16 +583,17 @@ class SocialGazeNode(Node):
                         f"det_target={det_target_id} cmd_target={cmd_target_id}"
                     )
 
-            # 3. Actuator Command Publishing (Immediate Direct Dispatch: One Frame -> One Head Command)
+            # 3. Actuator Command Publishing (Disabled by default: standalone_gaze_ros_node is sole actuator authority)
             target_goal_deg = float(authoritative_target_yaw)
-            if self.pub_head_command is not None:
-                hcmd = HeadCmd()
-                hcmd.angle_deg = target_goal_deg
-                self.pub_head_command.publish(hcmd)
+            if self.enable_actuator_output:
+                if self.pub_head_command is not None:
+                    hcmd = HeadCmd()
+                    hcmd.angle_deg = target_goal_deg
+                    self.pub_head_command.publish(hcmd)
 
-            cmd_msg = Float32()
-            cmd_msg.data = target_goal_deg
-            self.pub_head_cmd_pos.publish(cmd_msg)
+                cmd_msg = Float32()
+                cmd_msg.data = target_goal_deg
+                self.pub_head_cmd_pos.publish(cmd_msg)
 
             prev_target_yaw = float(self._last_target_yaw_telemetry)
             delta_yaw = abs(angular_diff_deg(prev_target_yaw, authoritative_target_yaw))
@@ -697,12 +700,15 @@ class SocialGazeNode(Node):
                 actual_head_yaw_deg=self.actual_head_yaw_deg,
             )
 
-            self._latest_detections_telemetry = []
+            last_assocs = getattr(self.visual_tracker, "last_associations", {})
+            tracks_dict = getattr(self.visual_tracker, "tracks", {})
             for face_idx, (d, obs) in enumerate(zip(detections, obs_list)):
-                tid = self.visual_tracker.last_associations.get(face_idx, "NONE")
+                tid = last_assocs.get(face_idx, "NONE") if isinstance(last_assocs, dict) else "NONE"
                 t_state = "NONE"
-                if tid != "NONE" and tid in self.visual_tracker.tracks:
-                    t_state = self.visual_tracker.tracks[tid].state.value
+                if tid != "NONE" and tid in tracks_dict:
+                    tr_obj = tracks_dict[tid]
+                    state_attr = getattr(tr_obj, "state", getattr(tr_obj, "tracking_state", None))
+                    t_state = getattr(state_attr, "value", str(state_attr)) if state_attr is not None else "NONE"
                 det_src = str(d.get("detector_source", d.get("source", "vision_json")))
                 det_telem = {
                     "frame_id": self._frame_index,
@@ -1256,16 +1262,17 @@ class SocialGazeNode(Node):
             self.actual_head_yaw_deg = float(traj_point.position_deg)
             self.actual_head_vel_deg_s = float(traj_point.velocity_deg_s)
 
-        # 5. Actuator Command Publishing (Direct Authoritative Setpoint from Golden Reference Core)
+        # 5. Actuator Command Publishing (Disabled by default: standalone_gaze_ros_node is sole actuator authority)
         target_goal_deg = float(authoritative_target_yaw)
-        if self.pub_head_command is not None:
-            hcmd = HeadCmd()
-            hcmd.angle_deg = target_goal_deg
-            self.pub_head_command.publish(hcmd)
+        if self.enable_actuator_output:
+            if self.pub_head_command is not None:
+                hcmd = HeadCmd()
+                hcmd.angle_deg = target_goal_deg
+                self.pub_head_command.publish(hcmd)
 
-        cmd_msg = Float32()
-        cmd_msg.data = target_goal_deg
-        self.pub_head_cmd_pos.publish(cmd_msg)
+            cmd_msg = Float32()
+            cmd_msg.data = target_goal_deg
+            self.pub_head_cmd_pos.publish(cmd_msg)
 
         # 6. Lifecycle Purging on IDLE (Failure 4)
         if self.fsm.state == GazeStateEnum.IDLE and not self.latest_visual_tracks and not (self.latest_audio_state and self.latest_audio_state.valid):

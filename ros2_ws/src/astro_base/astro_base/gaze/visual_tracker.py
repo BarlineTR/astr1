@@ -11,7 +11,7 @@ import math
 from typing import Dict, List, Optional, Tuple
 import numpy as np
 
-from astro_base.gaze.angle_math import angular_diff_deg, wrap_deg
+from astro_base.gaze.angle_math import wrap_deg
 from astro_base.gaze.coordinate_frames import CoordinateTransformer
 from astro_base.gaze.types import TrackingState, VisualObservation, VisualTargetTrack
 
@@ -176,12 +176,10 @@ class VisualTrackerCore:
 
         self.tracks: Dict[str, KalmanTrack3D] = {}
         self._next_track_idx = 1
-        self.last_associations: Dict[int, str] = {}
 
     def reset(self) -> None:
         self.tracks.clear()
         self._next_track_idx = 1
-        self.last_associations.clear()
 
     def update(
         self,
@@ -199,9 +197,8 @@ class VisualTrackerCore:
           5. Initialization of new tracks for unassigned detections
           6. Purging of expired (LOST) tracks
         """
-        # Filter only valid observations while preserving original indices
-        valid_indices = [idx for idx, o in enumerate(observations) if o.valid and o.depth_m > 0.1]
-        valid_obs = [observations[idx] for idx in valid_indices]
+        # Filter only valid observations
+        valid_obs = [o for o in observations if o.valid and o.depth_m > 0.1]
 
         # 1. Prediction step for all existing tracks
         for track in self.tracks.values():
@@ -221,37 +218,16 @@ class VisualTrackerCore:
         track_ids = list(self.tracks.keys())
         matched_tracks = set()
         matched_obs = set()
-        self.last_associations.clear()
 
         if track_ids and obs_base_coords:
-            # Build cost matrix (3D Euclidean distance + Angular & Depth-Ratio Gating)
-            cost_matrix = np.full((len(track_ids), len(obs_base_coords)), float("inf"), dtype=np.float64)
+            # Build cost matrix (3D Euclidean distance)
+            cost_matrix = np.zeros((len(track_ids), len(obs_base_coords)), dtype=np.float64)
             for i, tid in enumerate(track_ids):
                 track = self.tracks[tid]
                 tx, ty, tz = track.x[0], track.x[1], track.x[2]
-                t_dist = math.hypot(tx, ty)
-                t_az = math.degrees(math.atan2(ty, tx))
-                t_el = math.degrees(math.atan2(tz, max(0.1, t_dist)))
-
                 for j, (ox, oy, oz) in enumerate(obs_base_coords):
-                    o_dist = math.hypot(ox, oy)
-                    o_az = math.degrees(math.atan2(oy, ox))
-                    o_el = math.degrees(math.atan2(oz, max(0.1, o_dist)))
-
-                    dist_3d = math.sqrt((tx - ox) ** 2 + (ty - oy) ** 2 + (tz - oz) ** 2)
-                    ang_diff = abs(angular_diff_deg(t_az, o_az))
-                    el_diff = abs(t_el - o_el)
-                    depth_ratio = o_dist / max(0.1, t_dist)
-
-                    # Gate 1: 3D Euclidean distance within threshold
-                    if dist_3d <= self.gating_distance_m:
-                        cost_matrix[i, j] = dist_3d
-                    # Gate 2: Angular bearing match within spatial gate (25 deg) and consistent depth ratio
-                    elif ang_diff <= 25.0 and el_diff <= 25.0 and 0.35 <= depth_ratio <= 2.8:
-                        cost_matrix[i, j] = min(self.gating_distance_m - 0.05, 0.3 + (ang_diff / 25.0) * 0.4)
-                    # Gate 3: Single-track single-observation continuity within broad visual envelope
-                    elif len(track_ids) == 1 and len(obs_base_coords) == 1 and ang_diff <= 35.0 and 0.30 <= depth_ratio <= 3.0:
-                        cost_matrix[i, j] = min(self.gating_distance_m - 0.01, 0.4 + (ang_diff / 35.0) * 0.4)
+                    dist = math.sqrt((tx - ox) ** 2 + (ty - oy) ** 2 + (tz - oz) ** 2)
+                    cost_matrix[i, j] = dist
 
             # Greedy assignment of minimum distances below gating threshold
             while True:
@@ -263,7 +239,6 @@ class VisualTrackerCore:
                 t_idx, o_idx = min_idx
                 matched_tracks.add(track_ids[t_idx])
                 matched_obs.add(o_idx)
-                self.last_associations[valid_indices[o_idx]] = track_ids[t_idx]
 
                 # Update the matched track
                 self.tracks[track_ids[t_idx]].update(
@@ -291,7 +266,6 @@ class VisualTrackerCore:
                     obs=valid_obs[j],
                 )
                 self.tracks[new_id] = new_track
-                self.last_associations[valid_indices[j]] = new_id
 
         # 5. Purge expired LOST tracks
         active_tids = [tid for tid, t in self.tracks.items() if t.state != TrackingState.LOST]

@@ -1,20 +1,17 @@
+#!/usr/bin/env python3
 """Authoritative Shared Gaze Runtime Engine for ASTRO Robot Head.
 
-This module provides the shared runtime execution engine used by
-both:
-  - standalone/track.py (via standalone/tracker.py)
-  - RES 2 gaze nodes (standalone_gaze_node.py and social_gaze_node.py)
-
-Execution Semantics:
+Directly wraps the golden standalone GazeTracker from 2e0b70c.
+Enforces strict single-cycle semantics:
   ONE CAMERA FRAME -> ONE GAZE STEP -> ONE GazeResult -> ONE HEAD TARGET
 
 Passive 50Hz Motor Keepalive:
   Returns the last authoritative target_yaw_deg without stepping the tracker,
-  modifying targets, or updating visual FSM state.
+  modifying targets, or running visual state machines.
 """
 
 import time
-from typing import List, Optional, Sequence, Tuple
+from typing import Optional, Sequence, Tuple
 
 from astro_base.gaze.coordinate_frames import CalibrationConfig
 from astro_base.gaze.gaze_tracker import (
@@ -26,7 +23,7 @@ from astro_base.gaze.gaze_tracker import (
 
 
 class GazeRuntimeCore:
-    """The authoritative shared gaze runtime engine."""
+    """The authoritative shared gaze runtime engine wrapping 2e0b70c GazeTracker."""
 
     def __init__(
         self,
@@ -35,10 +32,7 @@ class GazeRuntimeCore:
         coast_timeout_s: float = 1.0,
     ):
         self.calib = calibration or _load_calibration(calibration_path)
-        self.tracker = GazeTracker(
-            calibration=self.calib,
-            coast_timeout_s=coast_timeout_s,
-        )
+        self.tracker = GazeTracker(calibration=self.calib)
         self.actual_head_yaw_deg: float = 0.0
         self.actual_head_vel_deg_s: float = 0.0
         self.has_head_feedback: bool = False
@@ -67,7 +61,7 @@ class GazeRuntimeCore:
         timestamp: Optional[float] = None,
         source: str = "/head/state",
     ) -> None:
-        """Updates real encoder position and velocity from hardware feedback."""
+        """Updates real encoder position and velocity from authoritative hardware feedback."""
         t = time.monotonic() if timestamp is None else float(timestamp)
         self.actual_head_yaw_deg = float(angle_deg)
         self.actual_head_vel_deg_s = float(velocity_deg_s)
@@ -77,8 +71,6 @@ class GazeRuntimeCore:
         self.tracker.head_angle_deg = float(angle_deg)
         self.tracker.head_velocity_deg_s = float(velocity_deg_s)
         self.tracker.head_feedback_missing = False
-        self.tracker.last_feedback_time = t
-        self.tracker.head_feedback_source = str(source)
 
     def get_feedback_telemetry(self, now: Optional[float] = None) -> Tuple[float, float, str]:
         """Returns (head_feedback_deg, head_feedback_age_ms, head_feedback_source)."""
@@ -99,7 +91,7 @@ class GazeRuntimeCore:
     def step(
         self,
         faces: Sequence[Detection],
-        frame_size: Tuple["int", "int"] = (640, 480),
+        frame_size: Tuple[int, int] = (640, 480),
         doa_deg: Optional[float] = None,
         speech=None,
         measured_head_deg: Optional[float] = None,
@@ -127,8 +119,6 @@ class GazeRuntimeCore:
             measured_head_deg=measured_head,
             timestamp=timestamp,
             is_robot_speaking=is_robot_speaking,
-            feedback_source=self.head_feedback_source if self.has_head_feedback else None,
-            feedback_timestamp=self.last_feedback_time if self.has_head_feedback else None,
         )
 
         self.last_result = result
@@ -148,4 +138,3 @@ class GazeRuntimeCore:
     def get_keepalive_yaw(self) -> float:
         """Alias for get_keepalive_yaw_deg."""
         return self.get_keepalive_yaw_deg()
-

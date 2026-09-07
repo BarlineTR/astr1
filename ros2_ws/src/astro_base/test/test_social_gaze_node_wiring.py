@@ -47,6 +47,7 @@ class TestHeadlessHarness(unittest.TestCase):
 
     def test_control_cycle_runs_and_publishes_a_head_command(self):
         node = SocialGazeNode()
+        node.enable_actuator_output = True
 
         node._control_cycle()
 

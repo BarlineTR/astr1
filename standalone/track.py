@@ -32,7 +32,7 @@ from recorder import OverlayRecorder, default_path  # noqa: E402
 from sources import AudioSource, CameraSource  # noqa: E402
 from stereo_doa import DEFAULT_MIC_SPACING_M  # noqa: E402
 from statuslog import StatusLog  # noqa: E402
-from tracker import GazeRuntimeCore, GazeTracker  # noqa: E402
+from tracker import GazeTracker  # noqa: E402
 
 BOX_COLOUR = (0, 215, 255)
 TEXT_COLOUR = (0, 255, 120)
@@ -139,7 +139,7 @@ def main(argv=None) -> int:
         print(f"🎬 Kayıt: {recorder.path}")
 
     status = StatusLog(interval_s=opts.log_interval)
-    tracker = GazeRuntimeCore()
+    tracker = GazeTracker()
     started = time.monotonic()
     frames, fps, last_fps_at, last_fps_frames = 0, 0.0, started, 0
 
