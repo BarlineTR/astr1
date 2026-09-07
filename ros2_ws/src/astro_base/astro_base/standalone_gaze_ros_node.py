@@ -13,12 +13,14 @@ Strict Invariants:
 4. /head/state is the sole authoritative feedback source.
 """
 
+import collections
 import json
 import math
 import os
 import sys
 import time
 from typing import List, Optional, Sequence, Tuple
+import numpy as np
 
 try:
     import rclpy
@@ -176,6 +178,11 @@ class StandaloneGazeRosNode(Node):
         self._running: bool = True
         self.camera: Optional[CameraSource] = None
         self._cam_thread: Optional[threading.Thread] = None
+
+        # 100-sample Diagnostic Ring Buffers for Center Isolation
+        self._diag_raw_bearings: collections.deque = collections.deque(maxlen=100)
+        self._diag_target_yaws: collections.deque = collections.deque(maxlen=100)
+        self._diag_measured_heads: collections.deque = collections.deque(maxlen=100)
 
         # Actuator Publishers
         if HeadCmd is not None:
@@ -431,7 +438,37 @@ class StandaloneGazeRosNode(Node):
             f"FEEDBACK_SYNC: {sync_line}\n"
             f"source={getattr(res, 'command_source', 'VISUAL')}"
         )
-        forensic_msg = f"\n{frame_log}\n{cmd_log}"
+        # Center Forensic Diagnostic Telemetry
+        if detections:
+            bbox_cx = float(detections[0].x + (detections[0].w / 2.0))
+            bbox_cy = float(detections[0].y + (detections[0].h / 2.0))
+            raw_bearing, _ = self.runtime.tracker.transformer.camera_pixel_to_optical_angles(
+                bbox_cx, bbox_cy, frame_w, frame_h
+            )
+        else:
+            bbox_cx = frame_w / 2.0
+            raw_bearing = 0.0
+
+        diag_err = target_yaw - actual_head
+        self._diag_raw_bearings.append(raw_bearing)
+        self._diag_target_yaws.append(target_yaw)
+        self._diag_measured_heads.append(actual_head)
+
+        if len(self._diag_raw_bearings) >= 2:
+            std_raw = float(np.std(self._diag_raw_bearings))
+            std_tgt = float(np.std(self._diag_target_yaws))
+            std_head = float(np.std(self._diag_measured_heads))
+        else:
+            std_raw = std_tgt = std_head = 0.0
+
+        center_diag_line = (
+            f"CENTER_DIAG: bbox_cx={bbox_cx:.1f} frame_cx={frame_w / 2.0:.1f} "
+            f"raw_bearing={raw_bearing:+.2f}° measured_head={actual_head:+.2f}° "
+            f"target_yaw={target_yaw:+.2f}° error={diag_err:+.2f}° "
+            f"sigma_raw={std_raw:.2f} sigma_tgt={std_tgt:.2f} sigma_head={std_head:.2f}"
+        )
+
+        forensic_msg = f"\n{frame_log}\n{cmd_log}\n{center_diag_line}"
         try:
             print(forensic_msg)
         except UnicodeEncodeError:
