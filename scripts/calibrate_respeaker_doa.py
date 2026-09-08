@@ -39,6 +39,32 @@ if hasattr(sys.stdout, "reconfigure"):
 
 import numpy as np
 
+try:
+    import sounddevice as sd
+    HAS_SOUNDDEVICE = True
+except ImportError:
+    sd = None
+    HAS_SOUNDDEVICE = False
+
+# Import ReSpeaker device resolver
+from respeaker_device import (
+    RESPEAKER_ALSA_DEVICE,
+    RESPEAKER_CARD_ID,
+    REQUIRED_CHANNELS,
+    REQUIRED_MIC_CHANNELS,
+    REQUIRED_SAMPLE_FORMAT,
+    REQUIRED_SAMPLE_RATE,
+    RespeakerDeviceInfo,
+    resolve_respeaker_capture_device,
+    validate_respeaker_device,
+)
+
+# Optional AcousticDOAEstimator for direct hardware capture
+try:
+    from astro_audio.doa_estimator import AcousticDOAEstimator
+except ImportError:
+    AcousticDOAEstimator = None
+
 # Optional ROS 2 import
 try:
     import rclpy
@@ -56,6 +82,8 @@ DEFAULT_POSITIONS = [0.0, 30.0, 60.0, 90.0, -30.0, -60.0, -90.0]
 DEFAULT_DURATION_S = 3.0
 DEFAULT_MIN_CONFIDENCE = 0.40  # Canonical min_confidence in AudioPerceptionCore & action_manager
 DEFAULT_OUTPUT_PATH = "config/respeaker_doa_calibration.json"
+HW_SAMPLE_RATE = REQUIRED_SAMPLE_RATE
+HW_BLOCK_SIZE = 320
 
 
 @dataclass
@@ -337,6 +365,84 @@ def run_simulated_capture(
     return samples
 
 
+class ReSpeakerHardwareCapture:
+    """Captures 6 channels, 16000 Hz, S16_LE from hw:CARD=ArrayUAC10,DEV=0 and estimates DOA via GCC-PHAT."""
+
+    def __init__(self, device_info: RespeakerDeviceInfo):
+        self.device_info = device_info
+        if AcousticDOAEstimator is None:
+            raise RuntimeError("AcousticDOAEstimator is required for hardware capture mode.")
+        self.estimator = AcousticDOAEstimator(sample_rate=device_info.sample_rate)
+        self._lock = threading.Lock()
+        self._recording = False
+        self._captured_samples: List[DOASample] = []
+        self._stream = None
+
+    def start(self) -> None:
+        if not HAS_SOUNDDEVICE or sd is None:
+            raise RuntimeError("sounddevice is not available.")
+        self._stream = sd.RawInputStream(
+            samplerate=self.device_info.sample_rate,
+            blocksize=HW_BLOCK_SIZE,
+            device=self.device_info.device_index,
+            channels=self.device_info.channels,
+            dtype="int16",
+            callback=self._input_callback,
+        )
+        self._stream.start()
+
+    def _input_callback(self, indata, frames, time_info, status):
+        if not self._recording or indata is None:
+            return
+        now = time.monotonic()
+        raw_arr = np.frombuffer(bytes(indata), dtype=np.int16)
+        if len(raw_arr) < (HW_BLOCK_SIZE * self.device_info.channels):
+            return
+        multi_ch = raw_arr.reshape(-1, self.device_info.channels).T  # Shape: (channels, frames)
+
+        # Extract verified raw mic channels [1, 2, 3, 4]
+        mics = multi_ch[list(self.device_info.mic_indices)]
+        mono = np.mean(mics.astype(np.float32), axis=0)
+        rms = float(np.sqrt(np.mean(mono ** 2)))
+        peak = float(np.max(np.abs(mono)))
+        is_speech = (rms >= 250.0) and (peak >= 700.0)
+
+        azimuth_deg, conf, valid = self.estimator.estimate_from_multichannel_pcm(mics)
+        if valid and azimuth_deg is not None:
+            raw_doa = azimuth_deg if azimuth_deg >= 0.0 else azimuth_deg + 360.0
+        else:
+            raw_doa = float(azimuth_deg or 0.0)
+
+        with self._lock:
+            if self._recording:
+                self._captured_samples.append(
+                    DOASample(
+                        timestamp=now,
+                        raw_doa_deg=raw_doa,
+                        confidence=float(conf),
+                        vad=is_speech and valid,
+                    )
+                )
+
+    def start_recording(self) -> None:
+        with self._lock:
+            self._captured_samples.clear()
+            self._recording = True
+
+    def stop_recording(self) -> List[DOASample]:
+        with self._lock:
+            self._recording = False
+            return list(self._captured_samples)
+
+    def close(self) -> None:
+        if self._stream is not None:
+            try:
+                self._stream.stop()
+                self._stream.close()
+            except Exception:
+                pass
+
+
 def run_calibration_session(
     positions: List[float],
     duration_s: float,
@@ -344,23 +450,39 @@ def run_calibration_session(
     output_path: str,
     simulate: bool = False,
     non_interactive: bool = False,
+    mode: str = "hardware",
+    device_override: Optional[Any] = None,
 ) -> List[PositionCalibrationResult]:
     """Runs the interactive calibration workflow across all requested physical angles."""
 
     results: List[PositionCalibrationResult] = []
     listener_node: Optional[Any] = None
     spin_thread: Optional[threading.Thread] = None
+    hw_capture: Optional[ReSpeakerHardwareCapture] = None
 
     if not simulate:
-        if not ROS2_AVAILABLE:
-            print("❌ ROS 2 (rclpy) is not available in this environment.")
-            print("   To test calibration in simulation mode, run with --simulate.")
-            sys.exit(1)
+        if mode == "ros":
+            if not ROS2_AVAILABLE:
+                print("❌ ROS 2 (rclpy) is not available in this environment.")
+                print("   To run with direct hardware capture, run with --mode hardware.")
+                print("   To test in simulation mode, run with --simulate.")
+                sys.exit(1)
 
-        rclpy.init()
-        listener_node = DOAListenerNode()
-        spin_thread = threading.Thread(target=rclpy.spin, args=(listener_node,), daemon=True)
-        spin_thread.start()
+            rclpy.init()
+            listener_node = DOAListenerNode()
+            spin_thread = threading.Thread(target=rclpy.spin, args=(listener_node,), daemon=True)
+            spin_thread.start()
+        else:
+            # Mode "hardware": Direct deterministic capture from hw:CARD=ArrayUAC10,DEV=0
+            device_info = resolve_respeaker_capture_device(
+                allow_simulation=simulate,
+                device_override=device_override,
+            )
+            if not validate_respeaker_device(device_info):
+                sys.exit(1)
+
+            hw_capture = ReSpeakerHardwareCapture(device_info)
+            hw_capture.start()
 
     try:
         for idx, pos in enumerate(positions, 1):
@@ -386,6 +508,10 @@ def run_calibration_session(
             if simulate:
                 time.sleep(min(duration_s, 0.2) if non_interactive else duration_s)
                 samples = run_simulated_capture(physical_deg=pos, duration_s=duration_s)
+            elif hw_capture is not None:
+                hw_capture.start_recording()
+                time.sleep(duration_s)
+                samples = hw_capture.stop_recording()
             else:
                 assert listener_node is not None
                 listener_node.start_recording()
@@ -422,6 +548,8 @@ def run_calibration_session(
                     break
 
     finally:
+        if hw_capture is not None:
+            hw_capture.close()
         if listener_node is not None and ROS2_AVAILABLE:
             listener_node.destroy_node()
             if rclpy.ok():
@@ -526,6 +654,18 @@ def main():
         help="Path to save JSON calibration results",
     )
     parser.add_argument(
+        "--mode",
+        choices=["hardware", "ros"],
+        default="hardware",
+        help="Capture mode: 'hardware' (direct ReSpeaker ALSA ArrayUAC10 capture) or 'ros' (subscribe to /audio/doa)",
+    )
+    parser.add_argument(
+        "--device",
+        type=str,
+        default=None,
+        help="Explicit ALSA capture device name or index (defaults to ReSpeaker hw:CARD=ArrayUAC10,DEV=0)",
+    )
+    parser.add_argument(
         "--simulate",
         action="store_true",
         help="Run in simulation mode without hardware or ROS 2 daemon",
@@ -545,6 +685,8 @@ def main():
         output_path=args.output,
         simulate=args.simulate,
         non_interactive=args.non_interactive,
+        mode=args.mode,
+        device_override=args.device,
     )
 
 

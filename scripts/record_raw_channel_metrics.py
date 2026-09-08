@@ -41,40 +41,23 @@ except ImportError:
     sd = None
     HAS_SOUNDDEVICE = False
 
+from respeaker_device import (
+    RESPEAKER_ALSA_DEVICE,
+    RESPEAKER_CARD_ID,
+    REQUIRED_CHANNELS,
+    REQUIRED_MIC_CHANNELS,
+    REQUIRED_SAMPLE_FORMAT,
+    REQUIRED_SAMPLE_RATE,
+    RespeakerDeviceInfo,
+    resolve_respeaker_capture_device,
+    validate_respeaker_device,
+)
 
 DEFAULT_POSITIONS = ["CENTER", "FRONT", "RIGHT", "BACK", "LEFT"]
-DEFAULT_DURATION_S = 3.0
+DEFAULT_DURATION_S = 10.0
 DEFAULT_OUTPUT_CSV = "config/raw_channel_metrics.csv"
-HW_SAMPLE_RATE = 16000
+HW_SAMPLE_RATE = REQUIRED_SAMPLE_RATE
 HW_BLOCK_SIZE = 320
-
-
-def find_respeaker_device() -> Tuple[Optional[int], str, Dict[str, Any]]:
-    """Discovers the ReSpeaker USB device via sounddevice."""
-    if not HAS_SOUNDDEVICE or sd is None:
-        return None, "sounddevice missing", {}
-
-    hints = ("respeaker", "uac1", "seeed", "arrayuac", "usb audio")
-    try:
-        devs = sd.query_devices()
-    except Exception as e:
-        return None, str(e), {}
-
-    # Match ReSpeaker
-    for idx, dev in enumerate(devs):
-        name = dev.get("name", "")
-        max_in = dev.get("max_input_channels", 0)
-        if max_in >= 4 and any(h in name.lower() for h in hints):
-            return idx, name, dev
-
-    # Fallback to any 4+ or 6-channel device
-    for idx, dev in enumerate(devs):
-        name = dev.get("name", "")
-        max_in = dev.get("max_input_channels", 0)
-        if max_in >= 4:
-            return idx, name, dev
-
-    return None, "No multichannel input device found", {}
 
 
 def normalized_correlation(x: np.ndarray, y: np.ndarray) -> float:
@@ -203,7 +186,7 @@ def run_raw_channel_investigation(
     positions: List[str],
     duration_s: float,
     output_csv: str,
-    device_override: Optional[int] = None,
+    device_override: Optional[Any] = None,
     simulate: bool = False,
     non_interactive: bool = False,
 ) -> None:
@@ -212,41 +195,13 @@ def run_raw_channel_investigation(
     print(" ASTRO ReSpeaker Raw Channel Investigation & Telemetry")
     print("=" * 60)
 
-    # STEP 1: Device discovery & format reporting
-    device_idx = None
-    dev_name = "SIMULATED_RESPEAKER_6CH"
-    dev_info: Dict[str, Any] = {}
-    channel_count = 6
-
-    if not simulate:
-        if device_override is not None:
-            device_idx = device_override
-            dev_info = sd.query_devices(device_idx) if sd else {}
-            dev_name = dev_info.get("name", f"Device #{device_idx}")
-        else:
-            device_idx, dev_name, dev_info = find_respeaker_device()
-
-        if device_idx is None:
-            print("❌ No multi-channel ReSpeaker audio device discovered!")
-            print("   Available devices:")
-            if sd:
-                for i, d in enumerate(sd.query_devices()):
-                    print(f"     [{i}] {d.get('name')} (in: {d.get('max_input_channels')})")
-            print("\n   To test in simulation mode, run with --simulate.")
-            sys.exit(1)
-
-        max_in = dev_info.get("max_input_channels", 1)
-        channel_count = 6 if max_in >= 6 else (4 if max_in >= 4 else max_in)
-
-    print("\n🎛️ [STEP 1: DEVICE FORMAT & RUNTIME CONFIGURATION]")
-    print(f"  ALSA device index:       {device_idx if device_idx is not None else 'SIMULATED'}")
-    print(f"  detected USB device:     \"{dev_name}\"")
-    print(f"  hw/card:                 \"{dev_info.get('name', dev_name)}\"")
-    print(f"  sample rate:             {HW_SAMPLE_RATE} Hz")
-    print(f"  sample format:           int16 (16-bit signed PCM, 2 bytes/sample)")
-    print(f"  channel count:           {channel_count}")
-    print(f"  period/frame size:       {HW_BLOCK_SIZE} samples ({(HW_BLOCK_SIZE / HW_SAMPLE_RATE) * 1000.0:.1f} ms)")
-    print(f"  physical mic candidates: {list(range(1, min(channel_count, 5)))}")
+    # STEP 1 & 2: Device discovery & strict validation
+    device_info = resolve_respeaker_capture_device(
+        allow_simulation=simulate,
+        device_override=device_override,
+    )
+    if not validate_respeaker_device(device_info):
+        sys.exit(1)
 
     csv_detailed_rows: List[Dict[str, Any]] = []
     csv_summary_rows: List[Dict[str, Any]] = []
@@ -258,30 +213,34 @@ def run_raw_channel_investigation(
 
         if not non_interactive:
             try:
-                input("Press ENTER when ready to capture (speak/play audio continuously)... ")
+                input(f"Press ENTER when ready to capture {duration_s:.1f}s at {pos} (speak/play audio continuously)... ")
             except (EOFError, KeyboardInterrupt):
                 print("\nInvestigation aborted by user.")
                 break
         else:
-            print("[Auto-mode] Capturing...")
+            print(f"[Auto-mode] Capturing for {duration_s:.1f}s...")
 
-        print(f"Recording {duration_s:.1f}s of raw audio...")
+        print(f"Recording {duration_s:.1f}s of raw audio from {device_info.alsa_device_string}...")
         if simulate:
-            pcm = simulate_physical_pcm(position=pos, channels=channel_count, duration_s=duration_s)
-        else:
-            assert device_idx is not None
-            pcm = record_physical_pcm(
-                device_idx=device_idx,
-                channels=channel_count,
+            pcm = simulate_physical_pcm(
+                position=pos,
+                channels=device_info.channels,
                 duration_s=duration_s,
-                sample_rate=HW_SAMPLE_RATE,
+                sample_rate=device_info.sample_rate,
+            )
+        else:
+            pcm = record_physical_pcm(
+                device_idx=device_info.device_index,
+                channels=device_info.channels,
+                duration_s=duration_s,
+                sample_rate=device_info.sample_rate,
             )
 
         num_ch, num_samples = pcm.shape
         print(f"\n[STEP 3: PROVEN PCM SHAPE]")
         print(f"  pcm_shape:              {pcm.shape} (channels, samples)")
         print(f"  capture_channels:       {num_ch}")
-        print(f"  duration_recorded:      {num_samples / HW_SAMPLE_RATE:.2f} seconds ({num_samples} frames)")
+        print(f"  duration_recorded:      {num_samples / device_info.sample_rate:.2f} seconds ({num_samples} frames)")
 
         # STEP 2: Per-channel telemetry
         print(f"\n[STEP 2: RAW CHANNEL TELEMETRY]")
@@ -300,10 +259,23 @@ def run_raw_channel_investigation(
                 "zcr": metrics["zcr"],
             })
 
+        # Explicit Requirement: Print ch1..ch4 RMS and pairwise correlations
+        print(f"\n[RAW MICROPHONE CHANNELS (1..4)]")
+        for mic_idx in (1, 2, 3, 4):
+            if mic_idx < num_ch:
+                print(f"  ch{mic_idx} RMS: {ch_metrics[mic_idx]['rms']:.1f}")
+
+        # Check non-zero raw mic channels
+        mics_rms = [ch_metrics[i]["rms"] for i in (1, 2, 3, 4) if i < num_ch]
+        if any(r < 10.0 for r in mics_rms):
+            print("  ⚠️ ALERT: One or more raw microphone channels report near-zero RMS (< 10.0)!")
+        else:
+            print("  ✓ Verified non-zero raw microphone channels (RMS > 10.0).")
+
         # STEP 5: Channel Distinctness (Normalized Correlations among channels 1..4)
         corrs: Dict[str, float] = {}
         if num_ch >= 5:
-            print(f"\n[STEP 5: CHANNEL DISTINCTNESS (PAIRS 1..4)]")
+            print(f"\n[STEP 5: PAIRWISE CORRELATIONS (CHANNELS 1..4)]")
             pairs = [(1, 2), (1, 3), (1, 4), (2, 3), (2, 4), (3, 4)]
             for c_a, c_b in pairs:
                 r_val = normalized_correlation(pcm[c_a], pcm[c_b])
