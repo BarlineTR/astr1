@@ -131,10 +131,98 @@ class PositionCalibrationResult:
         }
 
 
+def gcc_phat(
+    sig: np.ndarray,
+    refsig: np.ndarray,
+    fs: int = 16000,
+    max_tau: Optional[float] = None,
+    interp: int = 16,
+) -> Tuple[float, float]:
+    """Computes Generalized Cross-Correlation with Phase Transform (GCC-PHAT)."""
+    n = sig.shape[0] + refsig.shape[0]
+    SIG = np.fft.rfft(sig, n=n)
+    REFSIG = np.fft.rfft(refsig, n=n)
+    R = SIG * np.conj(REFSIG)
+    denom = np.abs(R)
+    denom[denom < 1e-6] = 1e-6
+    R_phat = R / denom
+
+    cc = np.fft.irfft(R_phat, n=interp * n)
+    max_shift = int(interp * fs * max_tau) if max_tau else int(interp * n / 2)
+    cc_windowed = np.concatenate((cc[-max_shift:], cc[: max_shift + 1]))
+
+    shift = max_shift - int(np.argmax(np.abs(cc_windowed)))
+    tau = shift / float(interp * fs)
+
+    peak_val = float(np.max(np.abs(cc_windowed)))
+    mean_val = float(np.mean(np.abs(cc_windowed)))
+    std_val = float(np.std(np.abs(cc_windowed)))
+    psr = (peak_val - mean_val) / max(1e-5, std_val)
+    quality = min(1.0, max(0.0, (psr - 1.5) / 5.0))
+    return tau, quality
+
+
+def compute_hardware_gcc_phat_doa(
+    mics_4ch: np.ndarray,
+    sample_rate: int = 16000,
+) -> Tuple[Optional[float], float]:
+    """Estimates sound DOA from 4 microphone channels using direct GCC-PHAT.
+
+    ReSpeaker 4-Mic Circular Array geometry (R = 43mm):
+      - mics_4ch[0]: Mic 0 (Front, 0 deg)
+      - mics_4ch[1]: Mic 1 (Right, +90 deg)
+      - mics_4ch[2]: Mic 2 (Back, 180 deg)
+      - mics_4ch[3]: Mic 3 (Left, 270 deg / -90 deg)
+
+    Returns:
+      (azimuth_deg_360, confidence)
+    """
+    if mics_4ch is None or mics_4ch.shape[0] < 4:
+        return None, 0.0
+
+    # Ensure shape is (4, samples)
+    if mics_4ch.shape[0] > mics_4ch.shape[1]:
+        mics_4ch = mics_4ch.T
+
+    # Opposing mic pair distance: 2 * 43mm = 86mm
+    speed_of_sound = 343.0
+    pair_dist = 0.086
+    max_tau = pair_dist / speed_of_sound
+
+    mic_front = mics_4ch[0].astype(np.float32)
+    mic_right = mics_4ch[1].astype(np.float32)
+    mic_back = mics_4ch[2].astype(np.float32)
+    mic_left = mics_4ch[3].astype(np.float32)
+
+    # If completely silent flat zeros across all mics, reject
+    if float(np.max(np.abs(mics_4ch))) < 1e-3:
+        return None, 0.0
+
+    # Pair 1: Mic 3 (Left) vs Mic 1 (Right) -> Left-Right axis
+    tau_lr, q_lr = gcc_phat(mic_left, mic_right, fs=sample_rate, max_tau=max_tau)
+    # Pair 2: Mic 2 (Back) vs Mic 0 (Front) -> Back-Front axis
+    tau_fb, q_fb = gcc_phat(mic_back, mic_front, fs=sample_rate, max_tau=max_tau)
+
+    # TDOA to spatial displacements in robot coordinate frame
+    # (dx > 0 when sound is on right, dy > 0 when sound is in front)
+    delta_x = -tau_lr * speed_of_sound
+    delta_y = -tau_fb * speed_of_sound
+
+    raw_azimuth = math.degrees(math.atan2(delta_x, delta_y))
+    # Map to [0..360)
+    raw_doa_360 = raw_azimuth if raw_azimuth >= 0.0 else raw_azimuth + 360.0
+    if abs(raw_doa_360) < 1e-5 or abs(raw_doa_360 - 360.0) < 1e-5:
+        raw_doa_360 = 0.0
+
+    confidence = round(float((q_lr + q_fb) / 2.0), 3)
+    return round(raw_doa_360, 2), confidence
+
+
 def compute_circular_stats(
     samples: List[DOASample],
     physical_deg: float = 0.0,
     min_confidence: float = DEFAULT_MIN_CONFIDENCE,
+    require_vad: bool = True,
 ) -> PositionCalibrationResult:
     """Computes circular angle statistics and acoustic validity metrics.
 
@@ -146,6 +234,8 @@ def compute_circular_stats(
         samples: List of DOASample objects captured during window.
         physical_deg: Physical ground-truth angle of speaker relative to robot.
         min_confidence: Threshold for accepting a sample as valid acoustic data.
+        require_vad: If True, requires sample.vad == True. If False (hardware mode),
+                     accepts any sample meeting confidence threshold.
 
     Returns:
         PositionCalibrationResult with all statistics and stability assessment.
@@ -153,12 +243,17 @@ def compute_circular_stats(
     total_count = len(samples)
     valid_samples = [
         s for s in samples
-        if s.vad and (s.confidence >= min_confidence) and math.isfinite(s.raw_doa_deg)
+        if (s.vad if require_vad else True) and (s.confidence >= min_confidence) and math.isfinite(s.raw_doa_deg)
     ]
     valid_count = len(valid_samples)
     valid_ratio = round(valid_count / total_count, 3) if total_count > 0 else 0.0
 
     if valid_count == 0:
+        msg = (
+            "NO_VALID_SPEECH (0 valid samples meet VAD & confidence)"
+            if require_vad
+            else f"NO_VALID_SAMPLES (0 valid samples meet confidence >= {min_confidence})"
+        )
         return PositionCalibrationResult(
             physical_deg=physical_deg,
             sample_count=0,
@@ -173,7 +268,7 @@ def compute_circular_stats(
             max_raw_deg=None,
             total_received=total_count,
             is_stable=False,
-            status_msg="NO_VALID_SPEECH (0 valid samples meet VAD & confidence)",
+            status_msg=msg,
         )
 
     angles_deg = [s.raw_doa_deg for s in valid_samples]
@@ -366,73 +461,155 @@ def run_simulated_capture(
 
 
 class ReSpeakerHardwareCapture:
-    """Captures 6 channels, 16000 Hz, S16_LE from hw:CARD=ArrayUAC10,DEV=0 and estimates DOA via GCC-PHAT."""
+    """Captures 6 channels, 16000 Hz, S16_LE from hw:CARD=ArrayUAC10,DEV=0 and estimates DOA via direct GCC-PHAT."""
 
-    def __init__(self, device_info: RespeakerDeviceInfo):
+    def __init__(self, device_info: RespeakerDeviceInfo, min_confidence: float = 0.0):
         self.device_info = device_info
-        if AcousticDOAEstimator is None:
-            raise RuntimeError("AcousticDOAEstimator is required for hardware capture mode.")
-        self.estimator = AcousticDOAEstimator(sample_rate=device_info.sample_rate)
+        self.min_confidence = min_confidence
         self._lock = threading.Lock()
         self._recording = False
         self._captured_samples: List[DOASample] = []
         self._stream = None
+        self._raw_blocks = 0
+        self._valid_doa_samples = 0
+        self._rejected_blocks = 0
 
     def start(self) -> None:
         if not HAS_SOUNDDEVICE or sd is None:
-            raise RuntimeError("sounddevice is not available.")
-        self._stream = sd.RawInputStream(
-            samplerate=self.device_info.sample_rate,
-            blocksize=HW_BLOCK_SIZE,
-            device=self.device_info.device_index,
-            channels=self.device_info.channels,
-            dtype="int16",
-            callback=self._input_callback,
+            raise RuntimeError("sounddevice is not available in this environment.")
+
+        devices_to_try = []
+        if self.device_info.device_index is not None:
+            devices_to_try.append(self.device_info.device_index)
+        if self.device_info.alsa_device_string:
+            devices_to_try.append(self.device_info.alsa_device_string)
+        if not devices_to_try:
+            devices_to_try.append(None)
+
+        last_err = None
+        for dev in devices_to_try:
+            try:
+                self._stream = sd.InputStream(
+                    samplerate=self.device_info.sample_rate,
+                    blocksize=HW_BLOCK_SIZE,
+                    device=dev,
+                    channels=self.device_info.channels,
+                    dtype="int16",
+                    callback=self._input_callback,
+                )
+                self._stream.start()
+                return
+            except Exception as e:
+                last_err = e
+                continue
+
+        # Fallback to RawInputStream if InputStream not accepted
+        for dev in devices_to_try:
+            try:
+                self._stream = sd.RawInputStream(
+                    samplerate=self.device_info.sample_rate,
+                    blocksize=HW_BLOCK_SIZE,
+                    device=dev,
+                    channels=self.device_info.channels,
+                    dtype="int16",
+                    callback=self._input_callback,
+                )
+                self._stream.start()
+                return
+            except Exception as e:
+                last_err = e
+                continue
+
+        raise RuntimeError(f"Failed to open audio stream on {self.device_info.alsa_device_string}: {last_err}")
+
+    def process_pcm_block(self, pcm_block: np.ndarray, timestamp: Optional[float] = None) -> Optional[DOASample]:
+        """Processes a single 6-channel PCM block and returns a DOASample if valid."""
+        now = timestamp if timestamp is not None else time.monotonic()
+        with self._lock:
+            self._raw_blocks += 1
+
+        # Handle shape: (frames, channels) or (channels, frames)
+        if pcm_block.ndim == 2 and pcm_block.shape[1] == self.device_info.channels:
+            multi_ch = pcm_block.T
+        elif pcm_block.ndim == 2 and pcm_block.shape[0] == self.device_info.channels:
+            multi_ch = pcm_block
+        else:
+            with self._lock:
+                self._rejected_blocks += 1
+            return None
+
+        if multi_ch.shape[0] < 5:
+            with self._lock:
+                self._rejected_blocks += 1
+            return None
+
+        # Extract verified raw mic channels [1, 2, 3, 4]
+        mic_indices = list(self.device_info.mic_indices)
+        mics = multi_ch[mic_indices]
+
+        raw_doa, conf = compute_hardware_gcc_phat_doa(
+            mics_4ch=mics,
+            sample_rate=self.device_info.sample_rate,
         )
-        self._stream.start()
+
+        if raw_doa is not None and conf >= self.min_confidence and math.isfinite(raw_doa):
+            sample = DOASample(
+                timestamp=now,
+                raw_doa_deg=float(raw_doa),
+                confidence=float(conf),
+                vad=True,
+            )
+            with self._lock:
+                self._valid_doa_samples += 1
+                if self._recording:
+                    self._captured_samples.append(sample)
+            return sample
+        else:
+            with self._lock:
+                self._rejected_blocks += 1
+            return None
 
     def _input_callback(self, indata, frames, time_info, status):
         if not self._recording or indata is None:
             return
         now = time.monotonic()
-        raw_arr = np.frombuffer(bytes(indata), dtype=np.int16)
-        if len(raw_arr) < (HW_BLOCK_SIZE * self.device_info.channels):
-            return
-        multi_ch = raw_arr.reshape(-1, self.device_info.channels).T  # Shape: (channels, frames)
-
-        # Extract verified raw mic channels [1, 2, 3, 4]
-        mics = multi_ch[list(self.device_info.mic_indices)]
-        mono = np.mean(mics.astype(np.float32), axis=0)
-        rms = float(np.sqrt(np.mean(mono ** 2)))
-        peak = float(np.max(np.abs(mono)))
-        is_speech = (rms >= 250.0) and (peak >= 700.0)
-
-        azimuth_deg, conf, valid = self.estimator.estimate_from_multichannel_pcm(mics)
-        if valid and azimuth_deg is not None:
-            raw_doa = azimuth_deg if azimuth_deg >= 0.0 else azimuth_deg + 360.0
-        else:
-            raw_doa = float(azimuth_deg or 0.0)
-
-        with self._lock:
-            if self._recording:
-                self._captured_samples.append(
-                    DOASample(
-                        timestamp=now,
-                        raw_doa_deg=raw_doa,
-                        confidence=float(conf),
-                        vad=is_speech and valid,
-                    )
-                )
+        try:
+            if isinstance(indata, np.ndarray):
+                arr = indata
+            else:
+                arr = np.frombuffer(bytes(indata), dtype=np.int16)
+                expected_len = self.device_info.channels * frames
+                if len(arr) >= expected_len:
+                    arr = arr[:expected_len].reshape(frames, self.device_info.channels)
+                else:
+                    with self._lock:
+                        self._rejected_blocks += 1
+                    return
+            self.process_pcm_block(arr, timestamp=now)
+        except Exception:
+            with self._lock:
+                self._rejected_blocks += 1
 
     def start_recording(self) -> None:
         with self._lock:
             self._captured_samples.clear()
+            self._raw_blocks = 0
+            self._valid_doa_samples = 0
+            self._rejected_blocks = 0
             self._recording = True
 
     def stop_recording(self) -> List[DOASample]:
         with self._lock:
             self._recording = False
             return list(self._captured_samples)
+
+    def get_live_stats(self) -> Dict[str, int]:
+        with self._lock:
+            return {
+                "raw_blocks": self._raw_blocks,
+                "valid_doa_samples": self._valid_doa_samples,
+                "rejected_blocks": self._rejected_blocks,
+            }
 
     def close(self) -> None:
         if self._stream is not None:
@@ -459,8 +636,11 @@ def run_calibration_session(
     listener_node: Optional[Any] = None
     spin_thread: Optional[threading.Thread] = None
     hw_capture: Optional[ReSpeakerHardwareCapture] = None
+    device_info: Optional[RespeakerDeviceInfo] = None
 
-    if not simulate:
+    if simulate:
+        device_info = resolve_respeaker_capture_device(allow_simulation=True)
+    else:
         if mode == "ros":
             if not ROS2_AVAILABLE:
                 print("❌ ROS 2 (rclpy) is not available in this environment.")
@@ -481,7 +661,7 @@ def run_calibration_session(
             if not validate_respeaker_device(device_info):
                 sys.exit(1)
 
-            hw_capture = ReSpeakerHardwareCapture(device_info)
+            hw_capture = ReSpeakerHardwareCapture(device_info, min_confidence=min_confidence)
             hw_capture.start()
 
     try:
@@ -503,14 +683,45 @@ def run_calibration_session(
             else:
                 print("\n[Auto-mode] Proceeding with capture...")
 
+            # Diagnostic logging before collecting calibration samples
+            hw_dev_str = device_info.alsa_device_string if (not simulate and device_info) else "SIMULATED:hw:CARD=ArrayUAC10,DEV=0"
+            ch_count = device_info.channels if device_info else REQUIRED_CHANNELS
+            mic_indices_list = list(device_info.mic_indices) if device_info else list(REQUIRED_MIC_CHANNELS)
+            print(f"hardware_device:   {hw_dev_str}")
+            print(f"pcm_shape:         ({ch_count}, {HW_BLOCK_SIZE})")
+            print(f"capture_channels:  {ch_count}")
+            print(f"selected_channels: {mic_indices_list}")
+
             print(f"Capturing DOA samples for {duration_s:.1f} seconds (please speak continuously)...")
 
             if simulate:
-                time.sleep(min(duration_s, 0.2) if non_interactive else duration_s)
+                start_t = time.monotonic()
+                last_report_t = start_t
+                target_sleep = min(duration_s, 0.2) if non_interactive else duration_s
+                while (time.monotonic() - start_t) < target_sleep:
+                    time.sleep(0.05)
+                    now = time.monotonic()
+                    if now - last_report_t >= 1.0:
+                        last_report_t = now
+                        elapsed = int(now - start_t)
+                        sim_blocks = elapsed * 50
+                        print(f"raw_blocks: {sim_blocks}")
+                        print(f"valid_doa_samples: {sim_blocks}")
+                        print(f"rejected_blocks: 0")
                 samples = run_simulated_capture(physical_deg=pos, duration_s=duration_s)
             elif hw_capture is not None:
                 hw_capture.start_recording()
-                time.sleep(duration_s)
+                start_t = time.monotonic()
+                last_report_t = start_t
+                while (time.monotonic() - start_t) < duration_s:
+                    time.sleep(0.05)
+                    now = time.monotonic()
+                    if now - last_report_t >= 1.0:
+                        last_report_t = now
+                        stats = hw_capture.get_live_stats()
+                        print(f"raw_blocks: {stats['raw_blocks']}")
+                        print(f"valid_doa_samples: {stats['valid_doa_samples']}")
+                        print(f"rejected_blocks: {stats['rejected_blocks']}")
                 samples = hw_capture.stop_recording()
             else:
                 assert listener_node is not None
@@ -518,11 +729,12 @@ def run_calibration_session(
                 time.sleep(duration_s)
                 samples = listener_node.stop_recording()
 
-            # Compute stats
+            # Compute stats (in hardware mode, do not gate on ROS VAD)
             pos_res = compute_circular_stats(
                 samples=samples,
                 physical_deg=pos,
                 min_confidence=min_confidence,
+                require_vad=(mode == "ros"),
             )
             results.append(pos_res)
 

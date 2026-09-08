@@ -31,10 +31,13 @@ for p in (root_dir, scripts_dir):
 from calibrate_respeaker_doa import (
     DOASample,
     PositionCalibrationResult,
+    ReSpeakerHardwareCapture,
     compute_circular_stats,
+    compute_hardware_gcc_phat_doa,
     run_calibration_session,
     run_simulated_capture,
 )
+from respeaker_device import RespeakerDeviceInfo
 
 
 class TestCircularStatisticsAndDOACalibration(unittest.TestCase):
@@ -236,6 +239,75 @@ class TestCircularStatisticsAndDOACalibration(unittest.TestCase):
         finally:
             if os.path.exists(tmp_path):
                 os.remove(tmp_path)
+
+    def test_direct_hardware_6ch_pcm_gcc_phat_extraction(self):
+        """CRITICAL: Verifies hardware calibration extracts channels [1,2,3,4] from 6-ch PCM,
+
+        runs direct GCC-PHAT without requiring ROS VAD or bringup stack, and returns valid DOA samples.
+        """
+        device_info = RespeakerDeviceInfo(
+            alsa_device_string="hw:CARD=ArrayUAC10,DEV=0",
+            device_index=2,
+            device_name="ReSpeaker 4 Mic Array (UAC1.0)",
+            card_id="ArrayUAC10",
+            sample_rate=16000,
+            sample_format="S16_LE",
+            channels=6,
+            mic_indices=(1, 2, 3, 4),
+            is_valid_respeaker=True,
+        )
+        hw_capture = ReSpeakerHardwareCapture(device_info, min_confidence=0.0)
+        hw_capture.start_recording()
+
+        # Cardinal test directions: (name, lead_front, lead_right, expected_deg)
+        cardinal_cases = [
+            ("FRONT (0°)",  4,  0,   0.0),
+            ("RIGHT (90°)", 0,  4,  90.0),
+            ("BACK (180°)", -4, 0, 180.0),
+            ("LEFT (270°)", 0, -4, 270.0),
+        ]
+
+        length = 640
+        for name, lf, lr, expected_deg in cardinal_cases:
+            rng = np.random.default_rng(42)
+            base = rng.normal(0, 1, length * 3).astype(np.float32) * 5000.0
+            mid = length
+            get_lag = lambda lead: base[mid + lead : mid + lead + length]
+
+            # Construct realistic 6-channel buffer where:
+            # Ch 0: Uncorrelated beam noise (must be ignored)
+            # Ch 1: Front mic
+            # Ch 2: Right mic
+            # Ch 3: Back mic
+            # Ch 4: Left mic
+            # Ch 5: Loopback channel (zeros)
+            ch0_beam = np.random.default_rng(999).normal(0, 500, length).astype(np.float32)
+            ch1_front = get_lag(+lf)
+            ch2_right = get_lag(+lr)
+            ch3_back = get_lag(-lf)
+            ch4_left = get_lag(-lr)
+            ch5_loop = np.zeros(length, dtype=np.float32)
+
+            pcm_6ch = np.stack([ch0_beam, ch1_front, ch2_right, ch3_back, ch4_left, ch5_loop]).astype(np.int16)
+
+            # Process block via ReSpeakerHardwareCapture
+            sample = hw_capture.process_pcm_block(pcm_6ch, timestamp=100.0)
+
+            # Verify sample is valid and DOA matches expected direction
+            self.assertIsNotNone(sample, f"{name}: Failed to return DOASample from 6-ch PCM")
+            self.assertAlmostEqual(sample.raw_doa_deg, expected_deg, delta=3.0,
+                                   msg=f"{name}: expected {expected_deg}°, got {sample.raw_doa_deg}°")
+            self.assertGreater(sample.confidence, 0.0)
+            self.assertTrue(sample.vad)
+
+        # Retrieve recorded samples
+        recorded = hw_capture.stop_recording()
+        self.assertEqual(len(recorded), 4)
+
+        # Verify statistics in hardware mode (require_vad=False)
+        stats = compute_circular_stats(recorded, physical_deg=0.0, min_confidence=0.0, require_vad=False)
+        self.assertEqual(stats.sample_count, 4)
+        self.assertGreater(stats.valid_ratio, 0.99)
 
 
 if __name__ == "__main__":
