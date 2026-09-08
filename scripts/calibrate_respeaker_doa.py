@@ -478,11 +478,23 @@ class ReSpeakerHardwareCapture:
         if not HAS_SOUNDDEVICE or sd is None:
             raise RuntimeError("sounddevice is not available in this environment.")
 
-        devices_to_try = []
+        devices_to_try: List[Any] = []
         if self.device_info.device_index is not None:
             devices_to_try.append(self.device_info.device_index)
-        if self.device_info.alsa_device_string:
-            devices_to_try.append(self.device_info.alsa_device_string)
+        if self.device_info.device_name and self.device_info.device_name != "NONE":
+            devices_to_try.append(self.device_info.device_name)
+
+        # Also discover any other ReSpeaker candidate indices from sounddevice
+        try:
+            for idx, d in enumerate(sd.query_devices()):
+                if d.get("max_input_channels", 0) >= 4:
+                    d_name = d.get("name", "").lower()
+                    if any(h in d_name for h in ("arrayuac", "respeaker", "seeed", "4 mic", "4-mic", "4mic")):
+                        if idx not in devices_to_try:
+                            devices_to_try.append(idx)
+        except Exception:
+            pass
+
         if not devices_to_try:
             devices_to_try.append(None)
 
@@ -520,7 +532,8 @@ class ReSpeakerHardwareCapture:
                 last_err = e
                 continue
 
-        raise RuntimeError(f"Failed to open audio stream on {self.device_info.alsa_device_string}: {last_err}")
+        target_repr = self.device_info.device_name if self.device_info.device_name != "NONE" else self.device_info.alsa_device_string
+        raise RuntimeError(f"Failed to open audio stream on {target_repr}: {last_err}")
 
     def process_pcm_block(self, pcm_block: np.ndarray, timestamp: Optional[float] = None) -> Optional[DOASample]:
         """Processes a single 6-channel PCM block and returns a DOASample if valid."""

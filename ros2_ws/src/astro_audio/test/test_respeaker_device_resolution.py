@@ -222,5 +222,62 @@ class TestRespeakerDeviceResolution(unittest.TestCase):
         self.assertEqual(info.card_id, "ArrayUAC10")
 
 
+    def test_decouple_alsa_card_index_from_portaudio_index(self):
+        """CRITICAL: ALSA card index 0 in /proc/asound/cards must NOT force sounddevice index 0.
+
+        If sounddevice index 0 is Tegra HDA (maxChans=2) and sounddevice index 2
+        is ReSpeaker ArrayUAC10 (maxChans=6), the resolver must choose PortAudio
+        index 2, NEVER index 0 (which would trigger channelCount <= maxChans).
+        """
+        asound_cards_card0 = """\
+ 0 [ArrayUAC10     ]: USB-Audio - ReSpeaker 4 Mic Array (UAC1.0)
+                      Seeed ReSpeaker 4 Mic Array (UAC1.0) at usb-3610000.xhci-2.3
+ 1 [HDA            ]: tegra-hda - NVIDIA Jetson Orin Nano HDA
+"""
+        sd_devices = [
+            {
+                "name": "tegra-hda: (hw:1,0)",
+                "hostapi": 0,
+                "max_input_channels": 2,  # Cannot handle 6 channels!
+                "max_output_channels": 2,
+                "default_samplerate": 48000.0,
+            },
+            {
+                "name": "tegra-ape: (hw:2,0)",
+                "hostapi": 0,
+                "max_input_channels": 16,
+                "max_output_channels": 16,
+                "default_samplerate": 48000.0,
+            },
+            {
+                "name": "ReSpeaker 4 Mic Array (UAC1.0): USB Audio (hw:0,0)",
+                "hostapi": 0,
+                "max_input_channels": 6,
+                "max_output_channels": 0,
+                "default_samplerate": 16000.0,
+            },
+        ]
+        info = resolve_respeaker_from_devices(sd_devices, asound_cards_text=asound_cards_card0)
+        self.assertTrue(info.is_valid_respeaker)
+        self.assertEqual(info.device_index, 2, "Must select PortAudio index 2 (6ch ReSpeaker), NOT index 0!")
+        self.assertEqual(info.channels, 6)
+
+    def test_portaudio_sysdefault_arrayuac10_accepted(self):
+        """Verify PortAudio sysdefault device name for ArrayUAC10 is recognized and not forbidden."""
+        sysdefault_devices = [
+            {
+                "name": "sysdefault:CARD=ArrayUAC10",
+                "hostapi": 0,
+                "max_input_channels": 6,
+                "max_output_channels": 0,
+                "default_samplerate": 16000.0,
+            }
+        ]
+        info = resolve_respeaker_from_devices(sysdefault_devices, asound_cards_text=None)
+        self.assertTrue(info.is_valid_respeaker)
+        self.assertEqual(info.device_index, 0)
+        self.assertEqual(info.channels, 6)
+
+
 if __name__ == "__main__":
     unittest.main()

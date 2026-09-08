@@ -40,11 +40,16 @@ FORBIDDEN_NAME_HINTS = (
     "tegra",
     "hda",
     "realtek",
-    "pulse",
-    "pipewire",
-    "default",
-    "sysdefault",
-    "dmix",
+)
+
+RESPEAKER_NAME_HINTS = (
+    "arrayuac",
+    "respeaker",
+    "seeed",
+    "uac1",
+    "4 mic",
+    "4-mic",
+    "4mic",
 )
 
 
@@ -97,66 +102,96 @@ def resolve_respeaker_from_devices(
         card_map = parse_asound_cards(asound_cards_text)
         card_idx_from_asound = card_map.get(RESPEAKER_CARD_ID)
 
-    # 1. Search query devices for positive ReSpeaker match
-    matched_device: Optional[Dict[str, Any]] = None
-    matched_idx: Optional[int] = None
+    # 1. Identify all non-forbidden candidates matching ReSpeaker hints or card index
+    candidates: List[Tuple[int, Dict[str, Any]]] = []
 
     for idx, dev in enumerate(devices):
         name = dev.get("name", "").lower()
         max_in = dev.get("max_input_channels", 0)
+        if max_in <= 0:
+            continue
 
-        # Strictly exclude onboard / virtual audio cards (like Jetson APE)
+        # Strictly exclude onboard / internal Jetson audio hardware
         if any(f in name for f in FORBIDDEN_NAME_HINTS):
             continue
 
-        # Positive identification
-        is_respeaker = (
-            ("arrayuac10" in name)
-            or ("respeaker" in name and "4 mic" in name)
-            or ("uac1.0" in name and "4 mic" in name)
-        )
-        if is_respeaker and max_in >= REQUIRED_CHANNELS:
-            matched_device = dev
-            matched_idx = idx
-            break
+        # Check positive ReSpeaker identification
+        matches_hint = any(h in name for h in RESPEAKER_NAME_HINTS)
+        matches_card = False
+        if card_idx_from_asound is not None:
+            if (
+                f"hw:{card_idx_from_asound}," in name
+                or f"(hw:{card_idx_from_asound}" in name
+                or f":card={card_idx_from_asound}" in name
+                or f":{card_idx_from_asound}," in name
+            ):
+                matches_card = True
 
-    # If positive match was found in sounddevice list
-    if matched_device is not None:
-        alsa_str = RESPEAKER_ALSA_DEVICE
-        hw_match = re.search(r"hw:(\d+),(\d+)", matched_device.get("name", ""))
-        dev_num = hw_match.group(2) if hw_match else "0"
-        alsa_str = f"hw:CARD={RESPEAKER_CARD_ID},DEV={dev_num}"
+        if matches_hint or matches_card:
+            candidates.append((idx, dev))
 
-        return RespeakerDeviceInfo(
-            alsa_device_string=alsa_str,
-            device_index=matched_idx,
-            device_name=matched_device.get("name", "ReSpeaker 4 Mic Array (UAC1.0), USB Audio"),
-            card_id=RESPEAKER_CARD_ID,
-            sample_rate=REQUIRED_SAMPLE_RATE,
-            channels=REQUIRED_CHANNELS,
-            sample_format=REQUIRED_SAMPLE_FORMAT,
-            mic_indices=REQUIRED_MIC_CHANNELS,
-            is_valid_respeaker=True,
-            diagnostic_notes=f"Resolved via device query index {matched_idx} ({matched_device.get('name')})",
-        )
+    # 2. If sounddevice check_input_settings is available, validate candidate with actual 6-channel check
+    if HAS_SOUNDDEVICE and sd is not None and hasattr(sd, "check_input_settings"):
+        for idx, dev in candidates:
+            try:
+                sd.check_input_settings(
+                    device=idx,
+                    channels=REQUIRED_CHANNELS,
+                    samplerate=REQUIRED_SAMPLE_RATE,
+                    dtype="int16",
+                )
+                return RespeakerDeviceInfo(
+                    alsa_device_string=f"hw:CARD={RESPEAKER_CARD_ID},DEV=0",
+                    device_index=idx,
+                    device_name=dev.get("name", "ReSpeaker 4 Mic Array (UAC1.0), USB Audio"),
+                    card_id=RESPEAKER_CARD_ID,
+                    sample_rate=REQUIRED_SAMPLE_RATE,
+                    channels=REQUIRED_CHANNELS,
+                    sample_format=REQUIRED_SAMPLE_FORMAT,
+                    mic_indices=REQUIRED_MIC_CHANNELS,
+                    is_valid_respeaker=True,
+                    diagnostic_notes=f"Validated via sounddevice index {idx} ({dev.get('name')}) for {REQUIRED_CHANNELS} channels",
+                )
+            except Exception:
+                continue
 
-    # If /proc/asound/cards has ArrayUAC10
-    if card_idx_from_asound is not None:
-        return RespeakerDeviceInfo(
-            alsa_device_string=f"hw:CARD={RESPEAKER_CARD_ID},DEV=0",
-            device_index=card_idx_from_asound,
-            device_name="ReSpeaker 4 Mic Array (UAC1.0), USB Audio",
-            card_id=RESPEAKER_CARD_ID,
-            sample_rate=REQUIRED_SAMPLE_RATE,
-            channels=REQUIRED_CHANNELS,
-            sample_format=REQUIRED_SAMPLE_FORMAT,
-            mic_indices=REQUIRED_MIC_CHANNELS,
-            is_valid_respeaker=True,
-            diagnostic_notes=f"Resolved via /proc/asound/cards card {card_idx_from_asound} (ArrayUAC10)",
-        )
+    # 3. Sort candidates by max_input_channels descending
+    candidates_sorted = sorted(candidates, key=lambda cd: cd[1].get("max_input_channels", 0), reverse=True)
 
-    # ReSpeaker was NOT found — do NOT fall back to any other device
-    rejected_summary = ", ".join(f"[{i}] {d.get('name')}" for i, d in enumerate(devices[:5]))
+    # First preference: candidate with max_in >= 6
+    for idx, dev in candidates_sorted:
+        if dev.get("max_input_channels", 0) >= REQUIRED_CHANNELS:
+            return RespeakerDeviceInfo(
+                alsa_device_string=f"hw:CARD={RESPEAKER_CARD_ID},DEV=0",
+                device_index=idx,
+                device_name=dev.get("name", "ReSpeaker 4 Mic Array (UAC1.0), USB Audio"),
+                card_id=RESPEAKER_CARD_ID,
+                sample_rate=REQUIRED_SAMPLE_RATE,
+                channels=REQUIRED_CHANNELS,
+                sample_format=REQUIRED_SAMPLE_FORMAT,
+                mic_indices=REQUIRED_MIC_CHANNELS,
+                is_valid_respeaker=True,
+                diagnostic_notes=f"Resolved via device query index {idx} ({dev.get('name')})",
+            )
+
+    # Second preference: candidate with max_in >= 4
+    for idx, dev in candidates_sorted:
+        if dev.get("max_input_channels", 0) >= 4:
+            return RespeakerDeviceInfo(
+                alsa_device_string=f"hw:CARD={RESPEAKER_CARD_ID},DEV=0",
+                device_index=idx,
+                device_name=dev.get("name", "ReSpeaker 4 Mic Array (UAC1.0), USB Audio"),
+                card_id=RESPEAKER_CARD_ID,
+                sample_rate=REQUIRED_SAMPLE_RATE,
+                channels=REQUIRED_CHANNELS,
+                sample_format=REQUIRED_SAMPLE_FORMAT,
+                mic_indices=REQUIRED_MIC_CHANNELS,
+                is_valid_respeaker=True,
+                diagnostic_notes=f"Resolved via device query index {idx} ({dev.get('name')}) (max_in={dev.get('max_input_channels')})",
+            )
+
+    # ReSpeaker was NOT found in audio devices — do NOT fall back to raw card index or other devices
+    rejected_summary = ", ".join(f"[{i}] {d.get('name')} (in={d.get('max_input_channels')})" for i, d in enumerate(devices[:6]))
     return RespeakerDeviceInfo(
         alsa_device_string="",
         device_index=None,
@@ -167,7 +202,7 @@ def resolve_respeaker_from_devices(
         sample_format=REQUIRED_SAMPLE_FORMAT,
         mic_indices=REQUIRED_MIC_CHANNELS,
         is_valid_respeaker=False,
-        diagnostic_notes=f"ReSpeaker ArrayUAC10 not detected. Evaluated devices: {rejected_summary}",
+        diagnostic_notes=f"ReSpeaker ArrayUAC10 not detected in audio inputs. Evaluated devices: {rejected_summary}",
     )
 
 
