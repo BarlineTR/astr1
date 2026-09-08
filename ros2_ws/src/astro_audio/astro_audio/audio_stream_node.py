@@ -348,14 +348,14 @@ class AudioStreamNode(Node):
             is_speech = self._respeaker.speech_detected()
             doa_angle = self._respeaker.doa_angle()
 
+            is_active_playback = self._is_playing or (self._output_stream and self._output_stream.active)
             if is_speech is not None:
                 vad_msg = Bool()
-                vad_msg.data = bool(is_speech)
+                vad_msg.data = bool(is_speech) and not is_active_playback
                 self.pub_vad.publish(vad_msg)
 
-            # Publish genuine hardware DOA as fallback ONLY when multi-channel capture is unavailable (< 4 channels)
-            is_active_playback = self._is_playing or (self._output_stream and self._output_stream.active)
-            if self._capture_channels < 4 and is_speech is True and doa_angle is not None and not is_active_playback:
+            # Primary hardware DOA source from ReSpeaker HID (Float32 topic contract preserved)
+            if is_speech is True and doa_angle is not None and not is_active_playback:
                 doa_msg = Float32()
                 doa_msg.data = float(doa_angle)
                 self.pub_doa.publish(doa_msg)
@@ -643,17 +643,6 @@ class AudioStreamNode(Node):
                     )
 
                 azimuth_deg, conf, valid = self._doa_estimator.estimate_from_multichannel_pcm(mics)
-                if valid and azimuth_deg is not None:
-                    raw_doa = azimuth_deg if azimuth_deg >= 0.0 else azimuth_deg + 360.0
-                    doa_msg = Float32()
-                    doa_msg.data = float(raw_doa)
-                    self.pub_doa.publish(doa_msg)
-                    # Bug #4 fix: preserve GCC-PHAT PSR confidence at topic boundary
-                    conf_msg = Float32()
-                    conf_msg.data = float(conf)
-                    self.pub_doa_confidence.publish(conf_msg)
-                    self.pub_vad.publish(Bool(data=True))
-                    self._last_gcc_doa_time = now
 
             # Software Echo Mute & Self-Voice Suppression (Zero Self-Hearing):
             if is_active_playback:
@@ -661,11 +650,31 @@ class AudioStreamNode(Node):
                 if self._playback_burst_active and burst_start > 0.0 and ((now - burst_start) * 1000.0 < self.barge_in_protection_ms):
                     return
 
-                # Adaptive barge-in threshold derived from ambient noise floor
-                adaptive_barge_in_rms = max(self.barge_in_min_rms, self._ambient_rms * self.barge_in_noise_mult)
+                # Target barge-in threshold during active playback: Requires intentional voice exceeding loudspeaker playback level
+                playback_barge_rms = float(getattr(self, "barge_in_playback_min_rms", 4500.0))
+                playback_barge_peak = int(getattr(self, "barge_in_playback_min_peak", 14000))
+                adaptive_barge_in_rms = max(playback_barge_rms, self._ambient_rms * self.barge_in_noise_mult)
+
+                # Channel correlation check: If all mic channels are highly correlated (internal speaker echo), suppress
+                if multi_ch is not None and multi_ch.shape[0] >= 5:
+                    def _corr(a: np.ndarray, b: np.ndarray) -> float:
+                        af = a.astype(np.float32) - float(np.mean(a))
+                        bf = b.astype(np.float32) - float(np.mean(b))
+                        d = float(np.sqrt(np.sum(af ** 2) * np.sum(bf ** 2)))
+                        return float(np.sum(af * bf) / d) if d > 1e-6 else 0.0
+
+                    c12 = _corr(multi_ch[1], multi_ch[2])
+                    c13 = _corr(multi_ch[1], multi_ch[3])
+                    c14 = _corr(multi_ch[1], multi_ch[4])
+                    if min(c12, c13, c14) >= 0.90:
+                        return
+                    if multi_ch.shape[0] >= 6:
+                        ch5_rms = float(np.sqrt(np.mean(multi_ch[5].astype(np.float32) ** 2)))
+                        if ch5_rms > 100.0 and _corr(multi_ch[speech_ch], multi_ch[5]) >= 0.70:
+                            return
 
                 # 2. Distinguish loud speech energy during active playback
-                is_genuine_barge_in = (rms >= adaptive_barge_in_rms and peak >= self.barge_in_min_peak)
+                is_genuine_barge_in = (rms >= adaptive_barge_in_rms and peak >= playback_barge_peak)
                 if not is_genuine_barge_in:
                     return
 
