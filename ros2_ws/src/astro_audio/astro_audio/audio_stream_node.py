@@ -17,6 +17,7 @@ import json
 import os
 import queue
 import struct
+import subprocess
 import sys
 import threading
 import time
@@ -78,12 +79,155 @@ except ImportError:
 
 
 RESPEAKER_NAME_HINTS = ("respeaker", "uac1", "seeed", "arrayuac", "usb audio")
+RESPEAKER_ALSA_DEVICE = "plughw:CARD=ArrayUAC10,DEV=0"
 HW_SAMPLE_RATE = 16000  # ReSpeaker native hardware rate
 TARGET_SAMPLE_RATE = 24000  # OpenAI Realtime standard
 CHANNELS = 1
 DTYPE = "int16"
 CHUNK_MS = 20  # 20ms chunks = 320 samples @ 16kHz
 HW_BLOCK_SIZE = int(HW_SAMPLE_RATE * (CHUNK_MS / 1000.0))  # 320
+
+
+class ArecordStream:
+    """Direct ALSA raw PCM capture via arecord subprocess.
+
+    Used when PortAudio/sounddevice cannot enumerate ReSpeaker hardware
+    or falls back to virtual pulse/default devices on Linux/Jetson.
+    Provides identical callback interface as sounddevice.RawInputStream.
+    """
+
+    def __init__(
+        self,
+        alsa_device: str,
+        channels: int,
+        rate: int,
+        blocksize: int,
+        callback,
+        logger=None,
+    ):
+        self.alsa_device = alsa_device
+        self.channels = channels
+        self.rate = rate
+        self.blocksize = blocksize
+        self.callback = callback
+        self.logger = logger
+        self.chunk_bytes = blocksize * channels * 2  # 16-bit signed = 2 bytes/sample
+        self._proc: Optional[subprocess.Popen] = None
+        self._thread: Optional[threading.Thread] = None
+        self._stop_event = threading.Event()
+        self.active = False
+        self.last_error: str = ""
+
+    def start(self):
+        cmd = [
+            "arecord",
+            "-D", self.alsa_device,
+            "-c", str(self.channels),
+            "-r", str(self.rate),
+            "-f", "S16_LE",
+            "-t", "raw",
+            "-q",
+        ]
+        try:
+            self._proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                bufsize=self.chunk_bytes * 4,
+            )
+        except FileNotFoundError:
+            self.last_error = "'arecord' binary not found in system PATH"
+            if self.logger:
+                self.logger.error(f"❌ [ARECORD ERROR] {self.last_error}")
+            return
+        except Exception as exc:
+            self.last_error = f"Failed to spawn arecord: {exc}"
+            if self.logger:
+                self.logger.error(f"❌ [ARECORD ERROR] {self.last_error}")
+            return
+
+        # Brief delay to detect immediate initialization failures (e.g. invalid device or busy)
+        time.sleep(0.08)
+        if self._proc.poll() is not None:
+            stderr_msg = ""
+            try:
+                if self._proc.stderr:
+                    stderr_msg = self._proc.stderr.read().decode("utf-8", errors="replace").strip()
+            except Exception:
+                pass
+            self.last_error = f"arecord exited immediately with code {self._proc.returncode}: {stderr_msg}"
+            if self.logger:
+                self.logger.error(f"❌ [ARECORD ERROR] {self.last_error}")
+            self._proc = None
+            return
+
+        self._stop_event.clear()
+        self.active = True
+        self._thread = threading.Thread(
+            target=self._reader_loop, daemon=True, name="arecord_capture_reader"
+        )
+        self._thread.start()
+
+    def _read_exact(self, n: int) -> bytes:
+        chunks = []
+        bytes_read = 0
+        while bytes_read < n:
+            if self._stop_event.is_set() or self._proc is None:
+                return b""
+            chunk = self._proc.stdout.read(n - bytes_read)
+            if not chunk:
+                return b""
+            chunks.append(chunk)
+            bytes_read += len(chunk)
+        return b"".join(chunks)
+
+    def _reader_loop(self):
+        while not self._stop_event.is_set() and self._proc and self._proc.poll() is None:
+            data = self._read_exact(self.chunk_bytes)
+            if not data or len(data) < self.chunk_bytes:
+                break
+            try:
+                # Delivers identical signature to sounddevice RawInputStream:
+                # indata (bytes), frames, time_info, status
+                self.callback(data, self.blocksize, None, None)
+            except Exception:
+                pass
+
+        self.active = False
+        try:
+            if self._proc and self._proc.poll() is not None and not self._stop_event.is_set():
+                stderr_msg = ""
+                try:
+                    if self._proc.stderr:
+                        stderr_msg = self._proc.stderr.read().decode("utf-8", errors="replace").strip()
+                except Exception:
+                    pass
+                self.last_error = f"arecord terminated unexpectedly (code {self._proc.returncode}): {stderr_msg}"
+                if self.logger:
+                    self.logger.error(f"❌ [ARECORD ERROR] {self.last_error}")
+        except Exception:
+            pass
+
+    def stop(self):
+        self._stop_event.set()
+        self.active = False
+        if self._proc:
+            try:
+                self._proc.terminate()
+                self._proc.wait(timeout=0.5)
+            except Exception:
+                try:
+                    self._proc.kill()
+                except Exception:
+                    pass
+            self._proc = None
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=0.5)
+            self._thread = None
+
+    def close(self):
+        self.stop()
+
 
 
 def resample_16k_to_24k(raw_16k_bytes: bytes) -> bytes:
@@ -378,32 +522,39 @@ class AudioStreamNode(Node):
         )
 
     def _start_input_stream(self):
-        if sd is None:
-            self._input_stream_alive = False
-            self.get_logger().error("sounddevice kütüphanesi eksik! Canlı ses yakalanamıyor.")
-            self.get_logger().error(
-                f"[AUDIO ERROR]\n"
-                f"  direction=input\n"
-                f"  device=[{self._in_dev_idx}] {self._in_device_name}\n"
-                f"  reason=sounddevice_missing"
-            )
-            return
-
-        # Testler `sd`'yi mock'ladığında sorun yok — mock donanıma dokunmaz.
-        if self._under_pytest() and getattr(sd, "__name__", "") == "sounddevice":
+        # Under pytest/unit test, avoid touching physical audio hardware
+        if self._under_pytest():
             self._input_stream_alive = False
             self.get_logger().info("[TEST] Gerçek ses donanımı açılmadı (pytest).")
             return
 
-        try:
-            # Query hardware input channel count
-            max_in_ch = 1
-            try:
-                dev_info = sd.query_devices(self._in_dev_idx) if (sd and self._in_dev_idx is not None) else {}
-                max_in_ch = dev_info.get("max_input_channels", 1) if isinstance(dev_info, dict) else 1
-            except Exception:
-                max_in_ch = 1
+        pref_in = os.getenv("AUDIO_INPUT_DEVICE", "")
+        alsa_target = pref_in if (pref_in.startswith("hw:") or pref_in.startswith("plughw:")) else RESPEAKER_ALSA_DEVICE
 
+        # Determine preference between direct ALSA arecord vs PortAudio sounddevice:
+        # 1. User explicitly specified an ALSA hardware device string (hw:... / plughw:...)
+        # 2. sounddevice is missing (sd is None)
+        # 3. sounddevice did NOT find a genuine ReSpeaker device, or selected pulse/default
+        in_name_lower = (self._in_device_name or "").lower()
+        is_sd_respeaker = any(h in in_name_lower for h in RESPEAKER_NAME_HINTS)
+        is_pulse_or_default = any(h in in_name_lower for h in ("pulse", "default", "pipewire", "sysdefault"))
+        prefer_arecord = (
+            pref_in.startswith("hw:")
+            or pref_in.startswith("plughw:")
+            or (sd is None)
+            or is_pulse_or_default
+            or (not is_sd_respeaker)
+        )
+
+        arecord_err = ""
+        sd_err = ""
+
+        # Primary or fallback path: Direct ALSA arecord subprocess capture
+        if prefer_arecord:
+            self.get_logger().info(
+                f"🎙️ [AUDIO CAPTURE] Attempting direct ALSA arecord capture: {alsa_target} "
+                f"(sounddevice candidate='{self._in_device_name}', prefer_arecord=True)..."
+            )
             param_val = 0
             try:
                 if hasattr(self, "has_parameter") and self.has_parameter("input_channels"):
@@ -412,98 +563,206 @@ class AudioStreamNode(Node):
                 param_val = 0
             env_val = int(os.getenv("AUDIO_INPUT_CHANNELS", "0"))
             pref_ch = param_val or env_val
-
-            if pref_ch in (1, 2, 4, 6, 8):
-                self._capture_channels = pref_ch
-            elif max_in_ch >= 6:
-                self._capture_channels = 6
-            elif max_in_ch >= 4:
-                self._capture_channels = 4
-            else:
-                self._capture_channels = 1
-
-            # On ReSpeaker 4-Mic USB Array (6-channel layout):
-            #   Ch 0: Processed/Beamformed mono audio (AEC/NS from XMOS DSP) -> used for speech recognition
-            #   Ch 1: Raw Mic 0 (Front, 0 deg)
-            #   Ch 2: Raw Mic 1 (Right, +90 deg)
-            #   Ch 3: Raw Mic 2 (Back, 180 deg)
-            #   Ch 4: Raw Mic 3 (Left, -90 / 270 deg)
-            #   Ch 5: Playback loopback
-            # Matches standalone sources.py RESPEAKER_MIC_CHANNELS = (1, 2, 3, 4) exactly.
+            self._capture_channels = pref_ch if pref_ch in (1, 2, 4, 6, 8) else 6
             if self._capture_channels >= 6:
                 self._mic_channel_indices = (1, 2, 3, 4)
             else:
                 self._mic_channel_indices = (0, 1, 2, 3)
 
-            self._input_stream = sd.RawInputStream(
-                samplerate=HW_SAMPLE_RATE,
-                blocksize=HW_BLOCK_SIZE,
-                device=self._in_dev_idx,
+            arecord_stream = ArecordStream(
+                alsa_device=alsa_target,
                 channels=self._capture_channels,
-                dtype=DTYPE,
+                rate=HW_SAMPLE_RATE,
+                blocksize=HW_BLOCK_SIZE,
                 callback=self._input_callback,
+                logger=self.get_logger(),
             )
-            self._input_stream.start()
-            self._input_stream_alive = True
+            arecord_stream.start()
 
-            mic_map_str = (
-                "    - Channel 0: Processed Mono (Beamformed / AEC)\n"
-                "    - Channel 1: Front Mic 0 (0 deg)\n"
-                "    - Channel 2: Right Mic 1 (+90 deg)\n"
-                "    - Channel 3: Back Mic 2 (180 deg)\n"
-                "    - Channel 4: Left Mic 3 (-90 / 270 deg)\n"
-                "    - Channel 5: Playback Loopback"
-                if self._capture_channels >= 6
-                else
-                "    - Channel 0: Front Mic 0 (0 deg)\n"
-                "    - Channel 1: Right Mic 1 (+90 deg)\n"
-                "    - Channel 2: Back Mic 2 (180 deg)\n"
-                "    - Channel 3: Left Mic 3 (-90 / 270 deg)"
-            )
-            hostapi_info = "?"
-            if sd and isinstance(dev_info, dict) and "hostapi" in dev_info:
-                try:
-                    hostapi_info = sd.query_hostapis(dev_info["hostapi"]).get("name", "?")
-                except Exception:
-                    hostapi_info = str(dev_info.get("hostapi", "?"))
-
-            self.get_logger().info(
-                f"🎛️ [DEVICE FORMAT FORENSICS]\n"
-                f"  ALSA device index: {self._in_dev_idx}\n"
-                f"  detected USB device name: \"{self._in_device_name}\"\n"
-                f"  hw/card: \"{dev_info.get('name', self._in_device_name) if isinstance(dev_info, dict) else self._in_device_name}\"\n"
-                f"  host API: {hostapi_info}\n"
-                f"  sample rate: {HW_SAMPLE_RATE} Hz\n"
-                f"  sample format: int16 (16-bit signed PCM, 2 bytes/sample)\n"
-                f"  channel count: {self._capture_channels} (hardware max: {max_in_ch})\n"
-                f"  period/frame size: {HW_BLOCK_SIZE} samples ({(HW_BLOCK_SIZE / HW_SAMPLE_RATE) * 1000.0:.1f} ms)\n"
-                f"  selected mic channels: {self._mic_channel_indices}\n"
-                f"  channel mapping:\n{mic_map_str}\n"
-                f"  spatial_doa_engine=AcousticDOAEstimator (GCC-PHAT TDOA)"
-            )
-            self.get_logger().info(
-                f"🔊 [AUDIO READY]\n"
-                f"  input_device=[{self._in_dev_idx}] {self._in_device_name}\n"
-                f"  input_callback=alive\n"
-                f"  audio_input_callback_alive=True"
-            )
-        except Exception as e:
-            self._input_stream_alive = False
-            self.get_logger().warn(
-                f"[AUDIO ERROR]\n"
-                f"  direction=input\n"
-                f"  device=[{self._in_dev_idx}] {self._in_device_name}\n"
-                f"  reason=device_unavailable\n"
-                f"  error={e}"
-            )
-            # Subscribe to audio_capture_node's /audio/speech_audio as fallback input transport
-            try:
-                from std_msgs.msg import Int16MultiArray
-                self.sub_fallback_audio = self.create_subscription(
-                    Int16MultiArray, "/audio/speech_audio", self._on_fallback_audio_msg, 20
+            if arecord_stream.active:
+                self._input_stream = arecord_stream
+                self._input_stream_alive = True
+                self._in_device_name = f"ALSA ({alsa_target}) [arecord]"
+                mic_map_str = (
+                    "    - Channel 0: Processed Mono (Beamformed / AEC)\n"
+                    "    - Channel 1: Front Mic 0 (0 deg)\n"
+                    "    - Channel 2: Right Mic 1 (+90 deg)\n"
+                    "    - Channel 3: Back Mic 2 (180 deg)\n"
+                    "    - Channel 4: Left Mic 3 (-90 / 270 deg)\n"
+                    "    - Channel 5: Playback Loopback"
+                    if self._capture_channels >= 6
+                    else
+                    "    - Channel 0: Front Mic 0 (0 deg)\n"
+                    "    - Channel 1: Right Mic 1 (+90 deg)\n"
+                    "    - Channel 2: Back Mic 2 (180 deg)\n"
+                    "    - Channel 3: Left Mic 3 (-90 / 270 deg)"
                 )
-            except Exception:
-                pass
+                self.get_logger().info(
+                    f"🎛️ [DEVICE FORMAT FORENSICS - ALSA DIRECT]\n"
+                    f"  capture backend: arecord subprocess pipe\n"
+                    f"  ALSA device: {alsa_target}\n"
+                    f"  sample rate: {HW_SAMPLE_RATE} Hz\n"
+                    f"  sample format: int16 (S16_LE)\n"
+                    f"  channel count: {self._capture_channels}\n"
+                    f"  period/frame size: {HW_BLOCK_SIZE} samples ({(HW_BLOCK_SIZE / HW_SAMPLE_RATE) * 1000.0:.1f} ms)\n"
+                    f"  chunk bytes: {HW_BLOCK_SIZE * self._capture_channels * 2} bytes\n"
+                    f"  selected mic channels: {self._mic_channel_indices}\n"
+                    f"  channel mapping:\n{mic_map_str}\n"
+                    f"  spatial_doa_engine=ReSpeaker HID Hardware DOA + AcousticDOAEstimator"
+                )
+                self.get_logger().info(
+                    f"🔊 [AUDIO READY]\n"
+                    f"  input_device={self._in_device_name}\n"
+                    f"  input_callback=alive\n"
+                    f"  audio_input_callback_alive=True"
+                )
+                return
+            else:
+                arecord_err = arecord_stream.last_error
+                self.get_logger().warn(
+                    f"[AUDIO WARN] Direct ALSA arecord capture could not start ({arecord_err}). "
+                    f"Falling back to sounddevice / PortAudio path..."
+                )
+
+        # Secondary path: sounddevice RawInputStream
+        if sd is not None and self._in_dev_idx is not None:
+            try:
+                max_in_ch = 1
+                try:
+                    dev_info = sd.query_devices(self._in_dev_idx) if (sd and self._in_dev_idx is not None) else {}
+                    max_in_ch = dev_info.get("max_input_channels", 1) if isinstance(dev_info, dict) else 1
+                except Exception:
+                    max_in_ch = 1
+
+                param_val = 0
+                try:
+                    if hasattr(self, "has_parameter") and self.has_parameter("input_channels"):
+                        param_val = int(self.get_parameter("input_channels").value)
+                except Exception:
+                    param_val = 0
+                env_val = int(os.getenv("AUDIO_INPUT_CHANNELS", "0"))
+                pref_ch = param_val or env_val
+
+                if pref_ch in (1, 2, 4, 6, 8):
+                    self._capture_channels = pref_ch
+                elif max_in_ch >= 6:
+                    self._capture_channels = 6
+                elif max_in_ch >= 4:
+                    self._capture_channels = 4
+                else:
+                    self._capture_channels = 1
+
+                if self._capture_channels >= 6:
+                    self._mic_channel_indices = (1, 2, 3, 4)
+                else:
+                    self._mic_channel_indices = (0, 1, 2, 3)
+
+                self._input_stream = sd.RawInputStream(
+                    samplerate=HW_SAMPLE_RATE,
+                    blocksize=HW_BLOCK_SIZE,
+                    device=self._in_dev_idx,
+                    channels=self._capture_channels,
+                    dtype=DTYPE,
+                    callback=self._input_callback,
+                )
+                self._input_stream.start()
+                self._input_stream_alive = True
+
+                mic_map_str = (
+                    "    - Channel 0: Processed Mono (Beamformed / AEC)\n"
+                    "    - Channel 1: Front Mic 0 (0 deg)\n"
+                    "    - Channel 2: Right Mic 1 (+90 deg)\n"
+                    "    - Channel 3: Back Mic 2 (180 deg)\n"
+                    "    - Channel 4: Left Mic 3 (-90 / 270 deg)\n"
+                    "    - Channel 5: Playback Loopback"
+                    if self._capture_channels >= 6
+                    else
+                    "    - Channel 0: Front Mic 0 (0 deg)\n"
+                    "    - Channel 1: Right Mic 1 (+90 deg)\n"
+                    "    - Channel 2: Back Mic 2 (180 deg)\n"
+                    "    - Channel 3: Left Mic 3 (-90 / 270 deg)"
+                )
+                hostapi_info = "?"
+                if sd and isinstance(dev_info, dict) and "hostapi" in dev_info:
+                    try:
+                        hostapi_info = sd.query_hostapis(dev_info["hostapi"]).get("name", "?")
+                    except Exception:
+                        hostapi_info = str(dev_info.get("hostapi", "?"))
+
+                self.get_logger().info(
+                    f"🎛️ [DEVICE FORMAT FORENSICS - SOUNDDEVICE]\n"
+                    f"  ALSA device index: {self._in_dev_idx}\n"
+                    f"  detected USB device name: \"{self._in_device_name}\"\n"
+                    f"  hw/card: \"{dev_info.get('name', self._in_device_name) if isinstance(dev_info, dict) else self._in_device_name}\"\n"
+                    f"  host API: {hostapi_info}\n"
+                    f"  sample rate: {HW_SAMPLE_RATE} Hz\n"
+                    f"  sample format: int16 (16-bit signed PCM, 2 bytes/sample)\n"
+                    f"  channel count: {self._capture_channels} (hardware max: {max_in_ch})\n"
+                    f"  period/frame size: {HW_BLOCK_SIZE} samples ({(HW_BLOCK_SIZE / HW_SAMPLE_RATE) * 1000.0:.1f} ms)\n"
+                    f"  selected mic channels: {self._mic_channel_indices}\n"
+                    f"  channel mapping:\n{mic_map_str}\n"
+                    f"  spatial_doa_engine=ReSpeaker HID Hardware DOA + AcousticDOAEstimator"
+                )
+                self.get_logger().info(
+                    f"🔊 [AUDIO READY]\n"
+                    f"  input_device=[{self._in_dev_idx}] {self._in_device_name}\n"
+                    f"  input_callback=alive\n"
+                    f"  audio_input_callback_alive=True"
+                )
+                return
+            except Exception as e:
+                sd_err = str(e)
+                self.get_logger().warn(
+                    f"[AUDIO WARN] sounddevice capture failed on device [{self._in_dev_idx}] {self._in_device_name}: {e}"
+                )
+                if not prefer_arecord:
+                    self.get_logger().info(f"Attempting fallback direct ALSA arecord capture: {alsa_target}...")
+                    arecord_stream = ArecordStream(
+                        alsa_device=alsa_target,
+                        channels=self._capture_channels,
+                        rate=HW_SAMPLE_RATE,
+                        blocksize=HW_BLOCK_SIZE,
+                        callback=self._input_callback,
+                        logger=self.get_logger(),
+                    )
+                    arecord_stream.start()
+                    if arecord_stream.active:
+                        self._input_stream = arecord_stream
+                        self._input_stream_alive = True
+                        self._in_device_name = f"ALSA ({alsa_target}) [arecord fallback]"
+                        self.get_logger().info(
+                            f"🔊 [AUDIO READY]\n"
+                            f"  input_device={self._in_device_name}\n"
+                            f"  input_callback=alive\n"
+                            f"  audio_input_callback_alive=True"
+                        )
+                        return
+                    else:
+                        arecord_err = arecord_stream.last_error
+        else:
+            if sd is None:
+                sd_err = "sounddevice library is not installed"
+            elif self._in_dev_idx is None:
+                sd_err = "no valid sounddevice input device index"
+
+        # If both direct ALSA arecord and sounddevice failed:
+        self._input_stream_alive = False
+        self.get_logger().error(
+            f"❌ [AUDIO ERROR]\n"
+            f"  direction=input\n"
+            f"  device=[{self._in_dev_idx}] {self._in_device_name}\n"
+            f"  reason=capture_unavailable\n"
+            f"  arecord_error={arecord_err or 'not_run'}\n"
+            f"  sounddevice_error={sd_err or 'not_run'}"
+        )
+        # Subscribe to audio_capture_node's /audio/speech_audio as fallback input transport
+        try:
+            from std_msgs.msg import Int16MultiArray
+            self.sub_fallback_audio = self.create_subscription(
+                Int16MultiArray, "/audio/speech_audio", self._on_fallback_audio_msg, 20
+            )
+        except Exception:
+            pass
 
     def _on_fallback_audio_msg(self, msg):
         """Receives 16kHz int16 PCM from audio_capture_node when direct hardware capture is occupied."""
