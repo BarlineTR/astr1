@@ -70,7 +70,7 @@ class StatusLogTests(unittest.TestCase):
 
     def test_line_shows_command_actual_and_their_difference(self):
         """The gap between commanded and measured is how the README's table is read."""
-        line = self.log.update(0.0, _Result(wanted=20.0, actual=5.0))
+        line = self.log.update(0.0, _Result(wanted=20.0, actual=5.0), head_feedback=True)
 
         self.assertIn("istenen +20.0", line)
         self.assertIn("gercek  +5.0", line)
@@ -100,6 +100,11 @@ class StatusLogTests(unittest.TestCase):
         log2 = StatusLog(interval_s=1.0, printer=self.out.append)
         without = log2.update(0.0, _Result(), head_feedback=False)
         self.assertIn("kafa:X", without)
+
+    def test_encodersiz_aci_olcum_diye_sunulmaz(self):
+        line = self.log.update(0.0, _Result(actual=8.0), head_feedback=False)
+        self.assertIn("tahmin", line)
+        self.assertNotIn("gercek", line)
 
     def test_summary_counts_what_was_written(self):
         self.log.update(0.0, _Result())
@@ -147,6 +152,18 @@ class SpeechInTheStatusLineTests(unittest.TestCase):
 
         self.assertIn("konusma", self.out[0].lower(),
                       f"kabul edilen konusma satirda gorunmuyor: {self.out[0]}")
+
+    def test_yon_olmasa_da_konusma_olculeri_gorunur(self):
+        from astro_audio.speech_detector import SpeechVerdict
+
+        speech = SpeechVerdict(False, 0.0, 0.71, 0.08, 0.01234,
+                               "harmonik ama hece modulasyonu yok")
+        line = self.log.update(0.0, _Result(), doa_deg=None, speech=speech)
+
+        self.assertIn("hece modulasyonu yok", line)
+        self.assertIn("rms=0.01234", line)
+        self.assertIn("harm=0.710", line)
+        self.assertIn("mod=0.080", line)
 
 
 if __name__ == "__main__":

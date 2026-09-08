@@ -38,7 +38,8 @@ BOX_COLOUR = (0, 215, 255)
 TEXT_COLOUR = (0, 255, 120)
 
 
-def draw_overlay(frame, detections, result, fps: float, audio_ok: bool, head_ok: bool):
+def draw_overlay(frame, detections, result, fps: float, audio_ok: bool, head_ok: bool,
+                 fixed_head: bool = False):
     """Boxes, plus the two lines that say which layer is speaking."""
     for det in detections:
         cv2.rectangle(frame, (det.x, det.y), (det.x + det.w, det.y + det.h), BOX_COLOUR, 2)
@@ -48,10 +49,11 @@ def draw_overlay(frame, detections, result, fps: float, audio_ok: bool, head_ok:
     height, width = frame.shape[:2]
     band = 60
     cv2.rectangle(frame, (0, height - band), (width, height), (0, 0, 0), -1)
+    pose_label = "sabit" if fixed_head else "gercek" if head_ok else "tahmin"
     lines = (
         f"{result.gaze_state.value}  owner={result.owner.value}  "
         f"hedef={result.target_id or '-'}  conf={result.confidence:.2f}",
-        f"istenen {result.target_yaw_deg:+.1f}  ->  gercek {result.head_angle_deg:+.1f}"
+        f"istenen {result.target_yaw_deg:+.1f}  ->  {pose_label} {result.head_angle_deg:+.1f}"
         f"   [{fps:.0f} fps  ses:{'V' if audio_ok else 'X'}  kafa:{'V' if head_ok else 'X'}]",
     )
     for i, text in enumerate(lines):
@@ -63,7 +65,11 @@ def draw_overlay(frame, detections, result, fps: float, audio_ok: bool, head_ok:
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description="ROS'suz ASTRO yüz/ses takibi")
     parser.add_argument("--camera", type=int, default=0, help="Kamera indeksi")
-    parser.add_argument("--serial", default=None, help="Arduino portu, örn. /dev/ttyACM0")
+    head_mode = parser.add_mutually_exclusive_group()
+    head_mode.add_argument("--serial", default=None, help="Arduino portu, örn. /dev/ttyACM0")
+    head_mode.add_argument("--fixed-head", action="store_true",
+                           help="Sabit dizüstü kamera/mikrofon teşhisi: kafa referansı "
+                                "0° kalır; motor bağlantısıyla birlikte kullanılmaz")
     parser.add_argument("--audio-device", type=int, default=None, help="Mikrofon indeksi")
     parser.add_argument("--mic-channels", type=str, default=None, metavar="A,B,C,D",
                         help="Dizide hangi kanalların (ön,sağ,arka,sol) mikrofon "
@@ -88,8 +94,11 @@ def main(argv=None) -> int:
     opts = parser.parse_args(argv)
 
     head = HeadLink(port=open_port(opts.serial) if opts.serial else None)
-    print("🔌 Arduino bağlı" if head.connected
-          else "🔌 Arduino yok — açık çevrim, kafa açısı tahmin edilecek")
+    if opts.fixed_head:
+        print("🔌 Sabit kamera/mikrofon teşhisi — kafa referansı 0°, encoder ölçümü yok")
+    else:
+        print("🔌 Arduino bağlı" if head.connected
+              else "🔌 Arduino yok — açık çevrim, kafa açısı tahmin edilecek")
 
     camera = CameraSource(device=opts.camera)
     if not camera.available:
@@ -169,12 +178,16 @@ def main(argv=None) -> int:
             if voice_loop is not None:
                 voice_loop.pump(now)
 
+            # Masadaki sensörler komutla dönmez. Bu modda bilinen sabit
+            # referansı ortak beyne veririz; encoder varmış gibi raporlamayız.
+            head_reference = (0.0 if opts.fixed_head else
+                              head.measured_angle_deg if head.has_feedback else None)
             result = tracker.step(
                 faces=detections,
                 frame_size=(frame.shape[1], frame.shape[0]),
                 doa_deg=doa_deg,
                 speech=speech,
-                measured_head_deg=head.measured_angle_deg if head.has_feedback else None,
+                measured_head_deg=head_reference,
                 timestamp=now,
                 is_robot_speaking=voice_loop.is_speaking_at(now) if voice_loop else False,
             )
@@ -195,13 +208,14 @@ def main(argv=None) -> int:
                 doa_deg=doa_deg,
                 head_feedback=head.has_feedback,
                 speech=speech,
+                fixed_head=opts.fixed_head,
             )
 
             # Bindirme bir kez çizilir: pencere ve kayıt aynı kareyi paylaşır.
             # İki kez çizmek, zaten takılan makinede kare başına maliyeti ikiye katlar.
             if recorder is not None or not opts.no_window:
                 overlaid = draw_overlay(frame, detections, result, fps,
-                                        audio.available, head.has_feedback)
+                                        audio.available, head.has_feedback, opts.fixed_head)
                 if recorder is not None:
                     recorder.add(overlaid, now)
                 if not opts.no_window:

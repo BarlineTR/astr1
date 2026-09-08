@@ -8,9 +8,33 @@ ROS yok: DDS yok, topic yok, launch yok, tek log, çalışan debugger.
 ./.venv/bin/python standalone/track.py --serial /dev/ttyACM0   # + kafa
 ./.venv/bin/python standalone/track.py --no-window --seconds 30
 ./.venv/bin/python standalone/track.py --no-voice          # yalnizca takip
+./.venv/bin/python standalone/track.py --no-voice --fixed-head  # sabit dizüstü sensörleri
 ```
 
 Çıkmak için pencerede `q` ya da `Esc`.
+
+## Dizüstünde ses yönünü ölçmek
+
+Kamera ve mikrofon masada sabitken `--fixed-head` kullanın. Bu mod kafa referansını
+0° tutar. Normal açık çevrim yolu komutun uygulandığını tahmin eder; sensörler
+fiziksel olarak dönmeyince aynı yüz açısı tahmine tekrar eklenir ve hedef limite
+sürüklenebilir. `--fixed-head` ile `--serial` birlikte kullanılamaz.
+
+```bash
+./.venv/bin/python standalone/track.py --no-voice --fixed-head --log-interval 0.5
+```
+
+Logda `gercek` encoder ölçümü, `tahmin` açık çevrim hesabı, `sabit` ise masaüstü
+referansıdır. `kafa:X` encoder olmadığını belirtmeye devam eder. Sabit referans,
+robotun dönüşünü veya ReSpeaker montajını doğrulamaz.
+
+Ölçümde önce kısa bir sessizlik bırakın, sonra laptopun solundan ve sağından
+normal cümleler söyleyin; hangi zaman aralığında nerede olduğunuzu kaydedin.
+Uzun “aaa” hece modülasyonu taşımadığı için konuşma filtresinden elenebilir.
+`rms`, `harm` ve `mod` sütunları ses düzeyini, harmonikliği ve hece modülasyonunu
+gösterir; yön bulunamadığında da konuşma penceresinin ölçüleri görünür.
+Yalnız sese göre hedef seçimini sınarken yüz kadraj dışında olmalı; görünür
+hedefin yeni konuşana geçişi engellemesi ayrıca ele alınacak bir karar kuralıdır.
 
 ## Neden var
 
@@ -67,7 +91,7 @@ ve yalnızca takip yapar — konuşma, görmenin önkoşulu değil.
 ./.venv/bin/python -m pytest standalone/test -q
 ```
 
-162 test; hiçbiri donanım istemez. Seri protokol (çerçeveleme, CRC, encoder
+Testler gerçek robot istemez. Seri protokol (çerçeveleme, CRC, encoder
 telemetrisi, heartbeat), kaynakların donanımsız davranışı ve takipçinin
 ROS tarafıyla aynı garantileri koruduğu kapsanıyor — kafa açısına göre kerteriz,
 encoder susunca merkeze çökmeme, ve sesin nişanı çekmemesi.
