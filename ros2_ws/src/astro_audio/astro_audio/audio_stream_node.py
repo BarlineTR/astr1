@@ -119,6 +119,7 @@ class ArecordStream:
         self.last_error: str = ""
 
     def start(self):
+        self.stop()
         cmd = [
             "arecord",
             "-D", self.alsa_device,
@@ -528,32 +529,42 @@ class AudioStreamNode(Node):
             self.get_logger().info("[TEST] Gerçek ses donanımı açılmadı (pytest).")
             return
 
+        # Ensure no existing input stream is holding ALSA pcmC0D0c in this process
+        if self._input_stream is not None:
+            try:
+                self._input_stream.stop()
+                self._input_stream.close()
+            except Exception:
+                pass
+            self._input_stream = None
+            self._input_stream_alive = False
+
         pref_in = os.getenv("AUDIO_INPUT_DEVICE", "")
         alsa_target = pref_in if (pref_in.startswith("hw:") or pref_in.startswith("plughw:")) else RESPEAKER_ALSA_DEVICE
 
-        # Determine preference between direct ALSA arecord vs PortAudio sounddevice:
-        # 1. User explicitly specified an ALSA hardware device string (hw:... / plughw:...)
-        # 2. sounddevice is missing (sd is None)
-        # 3. sounddevice did NOT find a genuine ReSpeaker device, or selected pulse/default
+        # Check candidate device:
+        # If candidate is pulse/default, or not a verified hardware ReSpeaker ("arrayuac"/"respeaker"),
+        # direct ALSA arecord MUST be chosen to avoid PortAudio capturing 0 RMS or locking pcmC0D0c.
         in_name_lower = (self._in_device_name or "").lower()
-        is_sd_respeaker = any(h in in_name_lower for h in RESPEAKER_NAME_HINTS)
         is_pulse_or_default = any(h in in_name_lower for h in ("pulse", "default", "pipewire", "sysdefault"))
+        is_real_hw_respeaker = ("arrayuac" in in_name_lower) or ("respeaker" in in_name_lower)
         prefer_arecord = (
             pref_in.startswith("hw:")
             or pref_in.startswith("plughw:")
             or (sd is None)
             or is_pulse_or_default
-            or (not is_sd_respeaker)
+            or (not is_real_hw_respeaker)
+            or sys.platform.startswith("linux")
         )
 
         arecord_err = ""
         sd_err = ""
 
-        # Primary or fallback path: Direct ALSA arecord subprocess capture
+        # Primary path: Direct ALSA arecord subprocess capture (sounddevice NOT opened)
         if prefer_arecord:
             self.get_logger().info(
-                f"🎙️ [AUDIO CAPTURE] Attempting direct ALSA arecord capture: {alsa_target} "
-                f"(sounddevice candidate='{self._in_device_name}', prefer_arecord=True)..."
+                f"🎙️ [AUDIO CAPTURE] Selecting direct ALSA arecord capture: {alsa_target} "
+                f"(PortAudio candidate='{self._in_device_name}')..."
             )
             param_val = 0
             try:
@@ -579,6 +590,7 @@ class AudioStreamNode(Node):
             )
             arecord_stream.start()
 
+            # If arecord succeeded, sounddevice input stream is NEVER opened!
             if arecord_stream.active:
                 self._input_stream = arecord_stream
                 self._input_stream_alive = True
