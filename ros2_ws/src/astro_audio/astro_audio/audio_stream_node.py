@@ -264,6 +264,8 @@ class AudioStreamNode(Node):
         self._mic_channel_indices: tuple[int, ...] = (0, 1, 2, 3)
         self._last_doa_angle = 0.0
         self._last_mic_speech_time = 0.0
+        self._last_forensic_telemetry_time: float = 0.0
+        self._last_gcc_snapshot_time: float = 0.0
 
         # Subscribers
         self.create_subscription(String, "/audio/realtime_output_pcm", self._on_output_pcm, 50)
@@ -458,14 +460,25 @@ class AudioStreamNode(Node):
                 "    - Channel 2: Back Mic 2 (180 deg)\n"
                 "    - Channel 3: Left Mic 3 (-90 / 270 deg)"
             )
+            hostapi_info = "?"
+            if sd and isinstance(dev_info, dict) and "hostapi" in dev_info:
+                try:
+                    hostapi_info = sd.query_hostapis(dev_info["hostapi"]).get("name", "?")
+                except Exception:
+                    hostapi_info = str(dev_info.get("hostapi", "?"))
+
             self.get_logger().info(
-                f"🎛️ [DOA HARDWARE & CHANNEL CONFIG]\n"
-                f"  device_index={self._in_dev_idx} | device_name=\"{self._in_device_name}\"\n"
-                f"  channel_count={self._capture_channels} | hardware_max_channels={max_in_ch}\n"
-                f"  selected_mic_channels={self._mic_channel_indices}\n"
-                f"  sample_rate={HW_SAMPLE_RATE} Hz | sample_format=int16 (16-bit PCM, 2 bytes/sample)\n"
-                f"  interleaving=interleaved [s0_ch0, s0_ch1, s0_ch2, s0_ch3, ...]\n"
-                f"  channel_mapping:\n{mic_map_str}\n"
+                f"🎛️ [DEVICE FORMAT FORENSICS]\n"
+                f"  ALSA device index: {self._in_dev_idx}\n"
+                f"  detected USB device name: \"{self._in_device_name}\"\n"
+                f"  hw/card: \"{dev_info.get('name', self._in_device_name) if isinstance(dev_info, dict) else self._in_device_name}\"\n"
+                f"  host API: {hostapi_info}\n"
+                f"  sample rate: {HW_SAMPLE_RATE} Hz\n"
+                f"  sample format: int16 (16-bit signed PCM, 2 bytes/sample)\n"
+                f"  channel count: {self._capture_channels} (hardware max: {max_in_ch})\n"
+                f"  period/frame size: {HW_BLOCK_SIZE} samples ({(HW_BLOCK_SIZE / HW_SAMPLE_RATE) * 1000.0:.1f} ms)\n"
+                f"  selected mic channels: {self._mic_channel_indices}\n"
+                f"  channel mapping:\n{mic_map_str}\n"
                 f"  spatial_doa_engine=AcousticDOAEstimator (GCC-PHAT TDOA)"
             )
             self.get_logger().info(
@@ -537,6 +550,54 @@ class AudioStreamNode(Node):
                 rms = 0.0
                 peak = 0
 
+            # STEP 2, 3, 5: RAW CHANNEL TELEMETRY & DISTINCTNESS FORENSICS (~1 Hz)
+            if multi_ch is not None and (now - getattr(self, "_last_forensic_telemetry_time", 0.0)) >= 1.0:
+                self._last_forensic_telemetry_time = now
+                num_ch = multi_ch.shape[0]
+
+                # STEP 2: Channel metrics (RMS, peak, mean, zero-crossing rate)
+                ch_lines = []
+                for c in range(num_ch):
+                    c_f = multi_ch[c].astype(np.float32)
+                    c_rms = float(np.sqrt(np.mean(c_f ** 2)))
+                    c_peak = int(np.max(np.abs(multi_ch[c])))
+                    c_mean = float(np.mean(c_f))
+                    c_zcr = float(np.mean(np.diff(np.signbit(c_f)) != 0)) if len(c_f) > 1 else 0.0
+                    ch_lines.append(f"  ch{c} rms={c_rms:7.1f} peak={c_peak:5d} mean={c_mean:+6.1f} zcr={c_zcr:.3f}")
+                ch_metrics_str = "\n".join(ch_lines)
+
+                # STEP 5: Channel distinctness normalized correlation among channels 1..4
+                if num_ch >= 5:
+                    def _norm_corr(x_arr: np.ndarray, y_arr: np.ndarray) -> float:
+                        xf = x_arr.astype(np.float32)
+                        yf = y_arr.astype(np.float32)
+                        xd = xf - np.mean(xf)
+                        yd = yf - np.mean(yf)
+                        denom = float(np.sqrt(np.sum(xd ** 2) * np.sum(yd ** 2)))
+                        return float(np.sum(xd * yd) / denom) if denom > 1e-6 else 0.0
+
+                    c12 = _norm_corr(multi_ch[1], multi_ch[2])
+                    c13 = _norm_corr(multi_ch[1], multi_ch[3])
+                    c14 = _norm_corr(multi_ch[1], multi_ch[4])
+                    c23 = _norm_corr(multi_ch[2], multi_ch[3])
+                    c24 = _norm_corr(multi_ch[2], multi_ch[4])
+                    c34 = _norm_corr(multi_ch[3], multi_ch[4])
+                    corr_str = (
+                        f"  corr(ch1,ch2)={c12:.4f} corr(ch1,ch3)={c13:.4f} corr(ch1,ch4)={c14:.4f}\n"
+                        f"  corr(ch2,ch3)={c23:.4f} corr(ch2,ch4)={c24:.4f} corr(ch3,ch4)={c34:.4f}"
+                    )
+                else:
+                    corr_str = "  (fewer than 5 channels available for 1..4 pair correlation)"
+
+                # STEP 3: Channel shape inspection
+                self.get_logger().info(
+                    f"[CHANNEL_SHAPE] pcm_shape={multi_ch.shape} capture_channels={self._capture_channels} selected_channels={getattr(self, '_mic_channel_indices', (0, 1, 2, 3))}\n"
+                    f"RAW_AUDIO:\n"
+                    f"{ch_metrics_str}\n"
+                    f"CHANNEL_CORRELATIONS:\n"
+                    f"{corr_str}"
+                )
+
             is_active_playback = (
                 self._is_playing
                 or (now - self._last_playback_time < self.echo_mute_cooldown_s)
@@ -556,6 +617,19 @@ class AudioStreamNode(Node):
                     mics = multi_ch[list(mic_indices)]
                 else:
                     mics = multi_ch[:4]
+
+                # STEP 7: GCC-PHAT INPUT SNAPSHOT (~1 Hz rate-limited)
+                if (now - getattr(self, "_last_gcc_snapshot_time", 0.0)) >= 1.0:
+                    self._last_gcc_snapshot_time = now
+                    mics_f = mics.astype(np.float32)
+                    mics_rms = [round(float(np.sqrt(np.mean(mics_f[i] ** 2))), 1) for i in range(mics.shape[0])]
+                    self.get_logger().info(
+                        f"[GCC_PHAT_SNAPSHOT]\n"
+                        f"  selected_pcm_shape={mics.shape}\n"
+                        f"  selected_channel_indices={list(mic_indices)}\n"
+                        f"  selected_channel_rms={mics_rms}"
+                    )
+
                 azimuth_deg, conf, valid = self._doa_estimator.estimate_from_multichannel_pcm(mics)
                 if valid and azimuth_deg is not None:
                     raw_doa = azimuth_deg if azimuth_deg >= 0.0 else azimuth_deg + 360.0

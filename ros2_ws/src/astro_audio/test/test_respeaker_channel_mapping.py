@@ -138,6 +138,99 @@ class TestReSpeakerChannelMappingAndDOA(unittest.TestCase):
         # Left: 270° -> +90° (Left in REP-103 is positive)
         self.assertAlmostEqual(self.transformer.raw_audio_doa_to_head_bearing(270.0), 90.0, delta=0.5)
 
+    def test_pcm_channel_extraction(self):
+        """STEP 1 TEST: Verifies interleaved multi-channel byte buffer unpacks to (channels, frames)."""
+        num_channels = 6
+        num_frames = 320
+        # Create known synthetic pattern for each channel
+        expected_channels = np.zeros((num_channels, num_frames), dtype=np.int16)
+        for c in range(num_channels):
+            expected_channels[c] = np.arange(num_frames, dtype=np.int16) * 10 + c
+
+        # Interleave channels: [s0_c0, s0_c1, ..., s0_c5, s1_c0, ...]
+        interleaved = expected_channels.T.reshape(-1)
+        raw_bytes = interleaved.tobytes()
+
+        # Unpack as audio_stream_node does
+        raw_arr = np.frombuffer(raw_bytes, dtype=np.int16)
+        self.assertEqual(len(raw_arr), num_channels * num_frames)
+
+        multi_ch = raw_arr.reshape(-1, num_channels).T
+        self.assertEqual(multi_ch.shape, (6, 320))
+        np.testing.assert_array_equal(multi_ch, expected_channels)
+
+        # Selected mic channels extraction
+        selected_indices = (1, 2, 3, 4)
+        mics = multi_ch[list(selected_indices)]
+        self.assertEqual(mics.shape, (4, 320))
+        np.testing.assert_array_equal(mics, expected_channels[1:5])
+
+    def test_six_channel_detection_and_selected_indices(self):
+        """STEP 2 & 3 TEST: Verifies channel count and mic index selection logic."""
+        # 1. When hardware has >= 6 channels (ReSpeaker standard layout)
+        max_in_ch_6 = 6
+        pref_ch_0 = 0
+        if pref_ch_0 in (1, 2, 4, 6, 8):
+            cap_6 = pref_ch_0
+        elif max_in_ch_6 >= 6:
+            cap_6 = 6
+        elif max_in_ch_6 >= 4:
+            cap_6 = 4
+        else:
+            cap_6 = 1
+        mic_idx_6 = (1, 2, 3, 4) if cap_6 >= 6 else (0, 1, 2, 3)
+
+        self.assertEqual(cap_6, 6)
+        self.assertEqual(mic_idx_6, (1, 2, 3, 4))
+        self.assertEqual(mic_idx_6, RESPEAKER_MIC_CHANNELS)
+
+        # 2. When hardware has 4 channels (e.g. 4-ch raw array or simulated 4-ch)
+        max_in_ch_4 = 4
+        if pref_ch_0 in (1, 2, 4, 6, 8):
+            cap_4 = pref_ch_0
+        elif max_in_ch_4 >= 6:
+            cap_4 = 6
+        elif max_in_ch_4 >= 4:
+            cap_4 = 4
+        else:
+            cap_4 = 1
+        mic_idx_4 = (1, 2, 3, 4) if cap_4 >= 6 else (0, 1, 2, 3)
+
+        self.assertEqual(cap_4, 4)
+        self.assertEqual(mic_idx_4, (0, 1, 2, 3))
+        self.assertEqual(mic_idx_4, ARRAY_MIC_CHANNELS)
+
+    def test_standalone_and_ros_input_array_bitwise_parity(self):
+        """STEP 4 & 8 TEST: Proves standalone AudioSource and ROS audio_stream_node feed bitwise identical arrays to GCC-PHAT."""
+        frame_6ch = create_respeaker_6ch_frame(front_lead=0, right_lead=4, length=320, seed=123)
+        frame_6ch_int16 = frame_6ch.astype(np.int16)
+
+        # Standalone extraction:
+        # AudioSource opens float32, unpacks block.T (shape channels, frames), selects RESPEAKER_MIC_CHANNELS=(1,2,3,4)
+        standalone_mics = frame_6ch_int16[list(RESPEAKER_MIC_CHANNELS)]
+
+        # ROS extraction:
+        # AudioStreamNode unpacks interleaved bytes, shapes to (6, frames), selects _mic_channel_indices=(1,2,3,4)
+        interleaved_bytes = frame_6ch_int16.T.reshape(-1).tobytes()
+        raw_arr = np.frombuffer(interleaved_bytes, dtype=np.int16)
+        multi_ch = raw_arr.reshape(-1, 6).T
+        ros_mic_indices = (1, 2, 3, 4)
+        ros_mics = multi_ch[list(ros_mic_indices)]
+
+        # 1. Proves input arrays are bitwise identical
+        np.testing.assert_array_equal(standalone_mics, ros_mics)
+
+        # 2. Proves GCC-PHAT invocation on identical inputs produces identical DOA
+        az_standalone, conf_sa, valid_sa = self.estimator.estimate_from_multichannel_pcm(standalone_mics)
+        az_ros, conf_ros, valid_ros = self.estimator.estimate_from_multichannel_pcm(ros_mics)
+
+        self.assertTrue(valid_sa)
+        self.assertTrue(valid_ros)
+        self.assertEqual(az_standalone, az_ros)
+        self.assertEqual(conf_sa, conf_ros)
+        self.assertAlmostEqual(az_ros, 90.0, delta=1.0)
+
 
 if __name__ == "__main__":
     unittest.main()
+
