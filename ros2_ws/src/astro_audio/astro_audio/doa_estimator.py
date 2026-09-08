@@ -57,10 +57,15 @@ def gcc_phat(
     REFSIG = np.fft.rfft(refsig, n=n)
     R = SIG * np.conj(REFSIG)
 
-    # Phase Transform weighting: 1 / |R|
+    # Phase Transform weighting: 1 / |R| restricted to speech band (300 Hz <= f <= 3400 Hz)
+    freqs = np.fft.rfftfreq(n, 1.0 / fs)
+    speech_mask = (freqs >= 300.0) & (freqs <= 3400.0)
+
     denom = np.abs(R)
     denom[denom < 1e-6] = 1e-6
-    R_phat = R / denom
+
+    R_phat = np.zeros_like(R, dtype=np.complex128)
+    R_phat[speech_mask] = R[speech_mask] / denom[speech_mask]
 
     # Inverse FFT with interpolation for sub-sample precision
     cc = np.fft.irfft(R_phat, n=interp * n)
@@ -80,13 +85,24 @@ def gcc_phat(
     # Ölçüldü: refsig sig'den 3 örnek geride iken bu satır düzeltilmeden tau -3.00
     # dönüyordu ve tam sağdaki bir kaynak -90° (sol) olarak raporlanıyordu — kafayı
     # konuşanın tersine çeviren 180°'lik sabit hata buradan geliyordu.
-    shift = max_shift - int(np.argmax(np.abs(cc_windowed)))
+    shift = max_shift - int(np.argmax(cc_windowed))
     tau = shift / float(interp * fs)
 
     # Calculate Peak-to-Sidelobe Ratio / normalized peak quality
-    peak_val = float(np.max(np.abs(cc_windowed)))
-    mean_val = float(np.mean(np.abs(cc_windowed)))
-    std_val = float(np.std(np.abs(cc_windowed)))
+    idx = int(np.argmax(cc_windowed))
+    peak_val = float(cc_windowed[idx])
+    mask_sidelobes = np.ones(len(cc_windowed), dtype=bool)
+    mainlobe_halfwidth = interp
+    mask_sidelobes[max(0, idx - mainlobe_halfwidth): min(len(cc_windowed), idx + mainlobe_halfwidth + 1)] = False
+
+    if np.any(mask_sidelobes):
+        sidelobes = np.abs(cc_windowed[mask_sidelobes])
+        mean_val = float(np.mean(sidelobes))
+        std_val = float(np.std(sidelobes))
+    else:
+        mean_val = float(np.mean(np.abs(cc_windowed)))
+        std_val = float(np.std(np.abs(cc_windowed)))
+
     psr = (peak_val - mean_val) / max(1e-5, std_val)
     quality = min(1.0, max(0.0, (psr - 1.5) / 5.0))
 

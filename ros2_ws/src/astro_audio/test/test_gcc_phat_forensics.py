@@ -44,7 +44,7 @@ for p in (root_dir, astro_audio_src):
 
 from astro_audio.doa_estimator import (
     ReSpeakerGeometry,
-    gcc_phat as current_production_gcc_phat,
+    gcc_phat,
 )
 
 
@@ -223,93 +223,96 @@ def variant_g_bandpass_phat(
 
 
 class TestGCCPHATForensics(unittest.TestCase):
-    """Forensic isolation tests for GCC-PHAT numerical behavior on short delays."""
+    """Regression tests for speech-band stabilized GCC-PHAT on short delays."""
 
-    def test_01_zero_delay_all_variants(self):
-        """1. Zero delay: All variants evaluate to ~0.0 samples."""
+    def test_01_zero_delay_recovery(self):
+        """1. Zero delay: gcc_phat evaluates to 0.0 samples."""
         sa, sb = synthesize_bandlimited_speech(delay_samples=0.0, N=1024, snr_db=20)
         raw_lag, _ = raw_xcorr(sa, sb)
-        tau_cur, _ = current_production_gcc_phat(sa, sb, fs=16000, max_tau=0.001)
-        cur_lag = tau_cur * 16000
-        unwhite_lag, _ = variant_c_unwhitened_gcc(sa, sb, fs=16000, max_tau=0.001)
-        bp_lag, _ = variant_g_bandpass_phat(sa, sb, fs=16000, max_tau=0.001)
+        tau_gcc, q_gcc = gcc_phat(sa, sb, fs=16000, max_tau=0.001)
+        gcc_lag = tau_gcc * 16000
 
         self.assertAlmostEqual(raw_lag, 0.0, delta=0.1)
-        self.assertAlmostEqual(cur_lag, 0.0, delta=0.2)
-        self.assertAlmostEqual(unwhite_lag, 0.0, delta=0.1)
-        self.assertAlmostEqual(bp_lag, 0.0, delta=0.1)
+        self.assertAlmostEqual(gcc_lag, 0.0, delta=0.1)
+        self.assertGreaterEqual(q_gcc, 0.5)
 
     def test_02_half_sample_delay_recovery(self):
-        """2. 0.5 sample delay: Raw xcorr and Unwhitened GCC recover 0.50 samples."""
+        """2. 0.5 sample delay: gcc_phat recovers 0.50 samples with high quality."""
         sa, sb = synthesize_bandlimited_speech(delay_samples=0.5, N=1024, snr_db=15)
         raw_lag, _ = raw_xcorr(sa, sb)
-        unwhite_lag, _ = variant_c_unwhitened_gcc(sa, sb, fs=16000, max_tau=0.001)
-        bp_lag, _ = variant_g_bandpass_phat(sa, sb, fs=16000, max_tau=0.001)
+        tau_gcc, q_gcc = gcc_phat(sa, sb, fs=16000, max_tau=0.001)
+        gcc_lag = tau_gcc * 16000
 
         self.assertAlmostEqual(raw_lag, 0.50, delta=0.15)
-        self.assertAlmostEqual(unwhite_lag, 0.50, delta=0.10)
-        self.assertAlmostEqual(bp_lag, 0.50, delta=0.15)
+        self.assertAlmostEqual(gcc_lag, 0.50, delta=0.10)
+        self.assertGreaterEqual(q_gcc, 0.5)
 
     def test_03_one_sample_delay_recovery(self):
-        """3. 1.0 sample delay: Raw xcorr and Unwhitened GCC recover 1.00 samples."""
+        """3. 1.0 sample delay: gcc_phat recovers 1.00 samples with high quality."""
         sa, sb = synthesize_bandlimited_speech(delay_samples=1.0, N=1024, snr_db=15)
         raw_lag, _ = raw_xcorr(sa, sb)
-        unwhite_lag, _ = variant_c_unwhitened_gcc(sa, sb, fs=16000, max_tau=0.001)
-        bp_lag, _ = variant_g_bandpass_phat(sa, sb, fs=16000, max_tau=0.001)
+        tau_gcc, q_gcc = gcc_phat(sa, sb, fs=16000, max_tau=0.001)
+        gcc_lag = tau_gcc * 16000
 
         self.assertAlmostEqual(raw_lag, 1.00, delta=0.15)
-        self.assertAlmostEqual(unwhite_lag, 1.00, delta=0.10)
-        self.assertAlmostEqual(bp_lag, 1.00, delta=0.15)
+        self.assertAlmostEqual(gcc_lag, 1.00, delta=0.10)
+        self.assertGreaterEqual(q_gcc, 0.5)
 
     def test_04_one_point_five_sample_delay_recovery(self):
-        """4. 1.5 sample delay: Verified across variants."""
+        """4. 1.5 sample delay: gcc_phat recovers 1.50 samples."""
         sa, sb = synthesize_bandlimited_speech(delay_samples=1.5, N=1024, snr_db=15)
         raw_lag, _ = raw_xcorr(sa, sb)
-        unwhite_lag, _ = variant_c_unwhitened_gcc(sa, sb, fs=16000, max_tau=0.001)
+        tau_gcc, q_gcc = gcc_phat(sa, sb, fs=16000, max_tau=0.001)
+        gcc_lag = tau_gcc * 16000
 
         self.assertAlmostEqual(raw_lag, 1.50, delta=0.15)
-        self.assertAlmostEqual(unwhite_lag, 1.50, delta=0.10)
+        self.assertAlmostEqual(gcc_lag, 1.50, delta=0.10)
+        self.assertGreaterEqual(q_gcc, 0.5)
 
     def test_05_two_sample_delay_recovery(self):
-        """5. 2.0 sample delay: Verified across variants."""
+        """5. 2.0 sample delay: gcc_phat recovers 2.00 samples."""
         sa, sb = synthesize_bandlimited_speech(delay_samples=2.0, N=1024, snr_db=15)
         raw_lag, _ = raw_xcorr(sa, sb)
-        unwhite_lag, _ = variant_c_unwhitened_gcc(sa, sb, fs=16000, max_tau=0.001)
+        tau_gcc, q_gcc = gcc_phat(sa, sb, fs=16000, max_tau=0.001)
+        gcc_lag = tau_gcc * 16000
 
         self.assertAlmostEqual(raw_lag, 2.00, delta=0.15)
-        self.assertAlmostEqual(unwhite_lag, 2.00, delta=0.10)
+        self.assertAlmostEqual(gcc_lag, 2.00, delta=0.10)
+        self.assertGreaterEqual(q_gcc, 0.5)
 
     def test_06_cardinal_direction_synthetic_array(self):
         """6. Cardinal direction synthetic array (0°, 90°, 180°, 270°)."""
         fs = 16000
         directions = [
-            (0.0, -4.01, 0.0),
-            (90.0, 0.0, 4.01),
-            (180.0, 4.01, 0.0),
-            (270.0, 0.0, -4.01),
+            (0.0, -4.01, 0.0),    # FRONT (0°): FB=-4.01, RL=0.00
+            (90.0, 0.0, 4.01),    # RIGHT (+90°): FB=0.00, RL=+4.01
+            (180.0, 4.01, 0.0),   # BACK (180°): FB=+4.01, RL=0.00
+            (270.0, 0.0, -4.01),  # LEFT (-90°): FB=0.00, RL=-4.01
         ]
         for angle, expected_fb, expected_rl in directions:
             sa_fb, sb_fb = synthesize_bandlimited_speech(delay_samples=expected_fb, N=1024, snr_db=20)
-            rec_fb, _ = variant_c_unwhitened_gcc(sa_fb, sb_fb, fs=fs, max_tau=0.001)
+            tau_fb, _ = gcc_phat(sa_fb, sb_fb, fs=fs, max_tau=0.001)
+            rec_fb = tau_fb * fs
             self.assertAlmostEqual(rec_fb, expected_fb, delta=0.25, msg=f"FB failed at {angle}°")
 
             sa_rl, sb_rl = synthesize_bandlimited_speech(delay_samples=expected_rl, N=1024, snr_db=20)
-            rec_rl, _ = variant_c_unwhitened_gcc(sa_rl, sb_rl, fs=fs, max_tau=0.001)
+            tau_rl, _ = gcc_phat(sa_rl, sb_rl, fs=fs, max_tau=0.001)
+            rec_rl = tau_rl * fs
             self.assertAlmostEqual(rec_rl, expected_rl, delta=0.25, msg=f"RL failed at {angle}°")
 
     def test_07_current_vs_candidate_gcc_parity(self):
-        """7. Current vs Candidate GCC parity on full-band white signal."""
+        """7. GCC parity on full-band white signal."""
         rng = np.random.default_rng(999)
         white_a = rng.normal(0, 1.0, 2048)
         white_b = np.roll(white_a, 2)
         white_a[:2] = 0
         white_b[:2] = 0
 
-        cur_tau, _ = current_production_gcc_phat(white_a.astype(np.float32), white_b.astype(np.float32), fs=16000, max_tau=0.001)
-        cur_lag = cur_tau * 16000
+        tau_gcc, _ = gcc_phat(white_a.astype(np.float32), white_b.astype(np.float32), fs=16000, max_tau=0.001)
+        gcc_lag = tau_gcc * 16000
         unwhite_lag, _ = variant_c_unwhitened_gcc(white_a, white_b, fs=16000, max_tau=0.001)
 
-        self.assertAlmostEqual(cur_lag, 2.0, delta=0.1)
+        self.assertAlmostEqual(gcc_lag, 2.0, delta=0.1)
         self.assertAlmostEqual(unwhite_lag, 2.0, delta=0.1)
 
     def test_08_raw_cross_correlation_vs_corrected_gcc(self):
@@ -317,11 +320,10 @@ class TestGCCPHATForensics(unittest.TestCase):
         for target_d in [0.0, 0.48, 0.99, 1.61]:
             sa, sb = synthesize_bandlimited_speech(delay_samples=target_d, N=1024, snr_db=15)
             raw_lag, _ = raw_xcorr(sa, sb)
-            unwhite_lag, _ = variant_c_unwhitened_gcc(sa, sb, fs=16000, max_tau=0.001)
-            bp_lag, _ = variant_g_bandpass_phat(sa, sb, fs=16000, max_tau=0.001)
+            tau_gcc, _ = gcc_phat(sa, sb, fs=16000, max_tau=0.001)
+            gcc_lag = tau_gcc * 16000
 
-            self.assertAlmostEqual(unwhite_lag, raw_lag, delta=0.15)
-            self.assertAlmostEqual(bp_lag, raw_lag, delta=0.20)
+            self.assertAlmostEqual(gcc_lag, raw_lag, delta=0.15)
 
 
 if __name__ == "__main__":
