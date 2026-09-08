@@ -457,6 +457,34 @@ def compute_self_voice_score(transcript: str, recent_robot_phrases: List[str]) -
     return min(1.0, max_score)
 
 
+def compute_pcm_self_voice_score(mic_pcm: bytes, ref_pcm: bytes, max_lag_samples: int = 4800) -> float:
+    """Computes acoustic correlation (0.0 to 1.0) between incoming mic frame and playback buffer."""
+    if not mic_pcm or not ref_pcm:
+        return 0.0
+    try:
+        mic = np.frombuffer(mic_pcm, dtype=np.int16).astype(np.float32)
+        ref = np.frombuffer(ref_pcm, dtype=np.int16).astype(np.float32)
+        if len(mic) == 0 or len(ref) == 0:
+            return 0.0
+        mic_c = mic - np.mean(mic)
+        mic_n = float(np.linalg.norm(mic_c))
+        if mic_n < 1e-4:
+            return 0.0
+        ref_w = ref[-max_lag_samples:] if len(ref) > max_lag_samples else ref
+        if len(ref_w) < len(mic):
+            return 0.0
+        ref_c = ref_w - np.mean(ref_w)
+        corr = np.correlate(ref_c, mic_c, mode='valid')
+        ref_sq = ref_c ** 2
+        w_energy = np.correlate(ref_sq, np.ones(len(mic), dtype=np.float32), mode='valid')
+        denom = mic_n * np.sqrt(np.maximum(w_energy, 1e-6))
+        norm_c = corr / denom
+        max_c = float(np.max(norm_c)) if len(norm_c) > 0 else 0.0
+        return round(max(0.0, min(1.0, max_c)), 4)
+    except Exception:
+        return 0.0
+
+
 def is_known_phantom_pattern(text: str) -> bool:
     """Checks if text contains known Whisper hallucination/phantom pattern without semantic context."""
     if not text:
@@ -728,6 +756,8 @@ class AstroRealtimeNode(Node):
         self.voice_recognizer = VoiceRecognizer() if VoiceRecognizer else None
         self.face_recognizer = FaceRecognizer() if FaceRecognizer else None
         self._user_speech_audio_buffer: List[bytes] = []
+        self._playback_ref_pcm: bytes = b""
+        self._playback_ref_lock = threading.Lock()
 
         # Provider & Model Capability Registry + Repetition Guard
         self.provider_registry = ProviderRegistry(logger=self.get_logger())
@@ -2001,6 +2031,13 @@ class AstroRealtimeNode(Node):
                 })
                 if getattr(self, "pub_output_pcm", None):
                     self.pub_output_pcm.publish(out_msg)
+
+                try:
+                    delta_raw = base64.b64decode(delta_b64.encode("ascii"))
+                    delta_16k = resample_24k_to_16k(delta_raw) if len(delta_raw) != 320 else delta_raw
+                    self._update_playback_reference(delta_16k)
+                except Exception:
+                    pass
 
                 self.get_logger().debug(
                     f"[REALTIME AUDIO DELTA] generation_id={self.active_generation_id or self.realtime_current_generation_id} bytes={delta_len}"
@@ -4546,6 +4583,36 @@ class AstroRealtimeNode(Node):
             self.get_logger().info(f"📝 [Kalıcı Hafıza Kaydı ({person_name})]: 'Önceki konuşma hafızaya kaydedildi -> {summary}'")
             self._sync_perception_to_session()
 
+    def _update_playback_reference(self, pcm_16k: bytes):
+        """Buffers recent output audio chunks for acoustic self-voice echo detection."""
+        if not pcm_16k:
+            return
+        if getattr(self, "voice_recognizer", None) and hasattr(self.voice_recognizer, "update_playback_reference"):
+            try:
+                self.voice_recognizer.update_playback_reference(pcm_16k)
+            except Exception:
+                pass
+        ref_lock = getattr(self, "_playback_ref_lock", None)
+        if ref_lock:
+            with ref_lock:
+                self._playback_ref_pcm = (getattr(self, "_playback_ref_pcm", b"") + pcm_16k)[-48000:]
+        else:
+            self._playback_ref_pcm = (getattr(self, "_playback_ref_pcm", b"") + pcm_16k)[-48000:]
+
+    def _clear_playback_reference(self):
+        """Clears playback reference buffer when playback stops or turn completes."""
+        if getattr(self, "voice_recognizer", None) and hasattr(self.voice_recognizer, "clear_playback_reference"):
+            try:
+                self.voice_recognizer.clear_playback_reference()
+            except Exception:
+                pass
+        ref_lock = getattr(self, "_playback_ref_lock", None)
+        if ref_lock:
+            with ref_lock:
+                self._playback_ref_pcm = b""
+        else:
+            self._playback_ref_pcm = b""
+
     def _flush_audio_buffers(self, reason: str = "transition"):
         """Completely purges all audio input buffers, queues, and VAD state during turn state transitions."""
         with self._lock:
@@ -4565,6 +4632,7 @@ class AstroRealtimeNode(Node):
         elif was_active and not self._is_playback_active:
             self._playback_end_time = time.monotonic()
             self._last_interaction_time = time.monotonic()
+            self._clear_playback_reference()
             if not self._is_processing_fallback:
                 self._is_responding = False
             self._flush_audio_buffers("playback_ended")
@@ -5332,6 +5400,11 @@ class AstroRealtimeNode(Node):
                     break
                 chunk = pcm_data[i : i + chunk_size]
                 if chunk:
+                    try:
+                        chunk_16k = resample_24k_to_16k(chunk) if len(chunk) != 320 else chunk
+                        self._update_playback_reference(chunk_16k)
+                    except Exception:
+                        pass
                     b64_str = base64.b64encode(chunk).decode("ascii")
                     msg_dict = {
                         "generation_id": effective_gen_id,
@@ -6232,6 +6305,12 @@ class AstroRealtimeNode(Node):
                     self_voice_score = self.voice_recognizer.score_self_voice(raw_16k)
                 except Exception:
                     self_voice_score = 0.0
+            if self_voice_score < 0.70 and hasattr(self, "_playback_ref_pcm") and self._playback_ref_pcm:
+                try:
+                    ref_score = compute_pcm_self_voice_score(raw_16k, self._playback_ref_pcm)
+                    self_voice_score = max(self_voice_score, ref_score)
+                except Exception:
+                    pass
 
             # 2. Self-Voice Rejection Check
             if self_voice_score >= 0.70:
@@ -6271,10 +6350,10 @@ class AstroRealtimeNode(Node):
             except Exception:
                 is_edge_tts_active = False
 
-            if is_edge_tts_active and not self._under_pytest():
+            if is_edge_tts_active:
                 # In Edge-TTS mode without hardware AEC subtraction, require substantial human speech
-                # (>=400ms continuity and elevated energy) to avoid microphone loudspeaker feedback false cuts.
-                effective_min_speech_ms = 400.0
+                # (>=400ms continuity in production, 120ms under pytest) to avoid microphone loudspeaker feedback false cuts.
+                effective_min_speech_ms = 120.0 if self._under_pytest() else 400.0
                 target_barge_in_rms = max(target_barge_in_rms * 1.5, 3000.0)
                 target_barge_in_peak = max(target_barge_in_peak, 8000)
             else:
@@ -6440,9 +6519,12 @@ class AstroRealtimeNode(Node):
             and self.realtime_session_state == "READY"
             and self._ws is not None
         ):
+            audio_b64 = getattr(msg, "data", None)
+            if audio_b64 is None and raw_bytes:
+                audio_b64 = base64.b64encode(raw_bytes).decode("ascii")
             payload = {
                 "type": "input_audio_buffer.append",
-                "audio": msg.data
+                "audio": audio_b64 or ""
             }
             try:
                 if self._loop is not None:
