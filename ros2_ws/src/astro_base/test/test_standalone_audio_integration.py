@@ -496,3 +496,27 @@ class TestStandaloneAudioIntegration:
         assert res_l.target_yaw_deg > 20.0  # Positive = Left
 
 
+def test_manual_target_yaw_override():
+    """Verify /head/target_yaw overrides visual tracking and keepalive output for 4.0s."""
+    from astro_base.standalone_gaze_ros_node import Float32
+    node = StandaloneGazeRosNode(use_camera_source=False, enable_audio=False)
+    
+    # Simulate a face right in front (0 deg)
+    face_det = [Detection(x=280, y=200, w=80, h=80, confidence=0.9)]
+    res = node.step_frame(detections=face_det, frame_size=(640, 480), timestamp=100.0)
+    assert node.last_published_yaw == pytest.approx(0.0, abs=5.0)
+    
+    # Receive /head/target_yaw manual override command for +35.0 degrees (e.g. from dialogue tool)
+    node._on_target_yaw(Float32(data=35.0))
+    
+    # Even with face at center, dispatched yaw must be manual target (+35.0 deg)
+    res_override = node.step_frame(detections=face_det, frame_size=(640, 480), timestamp=100.033)
+    assert node.last_published_yaw == pytest.approx(35.0, abs=1e-3)
+    assert node.pub_head_cmd_pos.last_msg.data == pytest.approx(35.0, abs=1e-3)
+    
+    # Keepalive cycle must also dispatch +35.0 deg
+    node._passive_keepalive_cycle()
+    assert node.pub_head_cmd_pos.last_msg.data == pytest.approx(35.0, abs=1e-3)
+
+
+

@@ -60,9 +60,12 @@ except ImportError:
         def create_timer(self, *args, **kwargs):
             return None
     class _MockMsg:
-        data: Any = None
-        status: List[Any] = []
-        ranges: List[float] = []
+        def __init__(self, data=None, **kwargs):
+            self.data = data
+            self.status = []
+            self.ranges = []
+            for k, v in kwargs.items():
+                setattr(self, k, v)
     class Twist:  # type: ignore
         class Vector3:
             def __init__(self, x=0.0, y=0.0, z=0.0):
@@ -714,9 +717,9 @@ class AstroRealtimeNode(Node):
 
         # Architecture Profile (Profile A: Baseline create_response=False + synchronous turn orchestration; Profile B: OpenAI-native create_response=True + async biometric side-channel)
         self.architecture_profile = os.getenv("REALTIME_ARCHITECTURE_PROFILE", "profile_a").lower()
-        self.vad_silence_duration_ms = int(os.getenv("REALTIME_VAD_SILENCE_MS", "700" if self.architecture_profile == "profile_a" else "750"))
-        self.vad_prefix_padding_ms = int(os.getenv("REALTIME_VAD_PREFIX_MS", "300"))
-        self.vad_threshold = float(os.getenv("REALTIME_VAD_THRESHOLD", "0.75"))
+        self.vad_silence_duration_ms = int(os.getenv("REALTIME_VAD_SILENCE_MS", "350" if self.architecture_profile == "profile_a" else "400"))
+        self.vad_prefix_padding_ms = int(os.getenv("REALTIME_VAD_PREFIX_MS", "200"))
+        self.vad_threshold = float(os.getenv("REALTIME_VAD_THRESHOLD", "0.50"))
         self._async_identity_in_flight: bool = False
         self._latest_async_identity_ms: float = 0.0
         self._latest_barge_in_reaction_ms: float = 0.0
@@ -1411,6 +1414,13 @@ class AstroRealtimeNode(Node):
             "- Yapılmayan eylemler için yapılmış gibi iddialarda bulunma."
         )
 
+        realtime_speech_rule = (
+            "\n\n[CANLI SESLİ DİYALOG, HIZ VE BEDEN KONTROLÜ]:\n"
+            "- Sen canlı sesle konuşan ve hareket edebilen fiziksel bir robotsun.\n"
+            "- CEVAP HIZI: Yanıtların DAİMA çok kısa, net ve tek nefeste söylenebilir olsun (genellikle 1-2 kısa cümle, en fazla 15 kelime). Asla vaaz verme, uzun paragraflar ve monologlar kurma; bir insan gibi hızlı ve doğal konuş.\n"
+            "- KAFA VE BAKIŞ KONTROLÜ: Kullanıcı 'sağa bak', 'başını sağa döndür', 'konuşan kişi sağında/solunda', 'önüne bak', 'merkeze dön' dediğinde veya başka yöne bakmanı istediğinde tereddüt etmeden 'set_head_angle' fonksiyonunu çağır! Sağ yön için negatif açı (örn: -30°), sol yön için pozitif açı (örn: +30°), merkez/ön için 0° kullan.\n"
+        )
+
         social_context_str = ""
         if getattr(self, "social_brain", None) and UnifiedPersonState:
             try:
@@ -1436,7 +1446,7 @@ class AstroRealtimeNode(Node):
             return f"Astro Default Instructions {bio_status}{social_context_str}"
         mem_ctx = self.memory.get_prompt_context(recognized_person=identity) if getattr(self, "memory", None) else ""
         return self.persona_engine.build_system_prompt(
-            memory_context=mem_ctx + bio_status + memory_rule + social_context_str,
+            memory_context=mem_ctx + bio_status + memory_rule + realtime_speech_rule + social_context_str,
             recognized_person=identity
         )
 
@@ -1491,9 +1501,9 @@ class AstroRealtimeNode(Node):
                         },
                         "turn_detection": {
                             "type": "server_vad",
-                            "threshold": getattr(self, "vad_threshold", 0.72),
-                            "prefix_padding_ms": getattr(self, "vad_prefix_padding_ms", 300),
-                            "silence_duration_ms": getattr(self, "vad_silence_duration_ms", 600),
+                            "threshold": getattr(self, "vad_threshold", 0.50),
+                            "prefix_padding_ms": getattr(self, "vad_prefix_padding_ms", 200),
+                            "silence_duration_ms": getattr(self, "vad_silence_duration_ms", 350),
                             "create_response": (getattr(self, "architecture_profile", "profile_a") == "profile_b")
                         }
                     },
@@ -1580,13 +1590,18 @@ class AstroRealtimeNode(Node):
                     {
                         "type": "function",
                         "name": "set_head_angle",
-                        "description": "Kullanıcı kafanın belirli bir dereceye dönmesini istediğinde çağrılır ('0 dereceye dön', '-30'a dön', '30 derece sağa bak', 'sola 45 derece bak', 'merkeze dön'). Açı -70 ile +70 derece arasındadır (0 = ileri, negatif = sağ, pozitif = sol).",
+                        "description": "Kullanıcı kafanın/başının belirli bir yöne veya dereceye dönmesini istediğinde çağrılır (örn: 'sağa dön', 'sola bak', 'başını otuz derece sağa döndür', 'konuşan kişi sağında', '0 dereceye dön', 'önüne bak', 'merkeze dön'). DİKKAT İŞARET KURALI: SAĞA dönüşler DAİMA NEGATİFTİR (-70 ile 0 arası; örn: 'sağa dön' -> angle_deg: -30). SOLA dönüşler DAİMA POZİTİFTİR (0 ile +70 arası; örn: 'sola dön' -> angle_deg: +30). MERKEZ/İLERİ 0 derecedir.",
                         "parameters": {
                             "type": "object",
                             "properties": {
                                 "angle_deg": {
                                     "type": "number",
-                                    "description": "Hedef kafa açısı (-70.0 ile +70.0 derece arası)"
+                                    "description": "Hedef kafa açısı (-70.0 ile +70.0 derece arası; SAĞ = negatif, SOL = pozitif, MERKEZ = 0)"
+                                },
+                                "direction": {
+                                    "type": "string",
+                                    "enum": ["right", "left", "center"],
+                                    "description": "Opsiyonel yön: 'right' (sağ), 'left' (sol), 'center' (merkez/ön)"
                                 }
                             },
                             "required": ["angle_deg"]
@@ -2913,6 +2928,13 @@ class AstroRealtimeNode(Node):
 
         elif name == "set_head_angle":
             angle = float(args.get("angle_deg", 0.0))
+            direction = str(args.get("direction", "")).lower().strip()
+            if direction == "right" and angle > 0:
+                angle = -angle
+            elif direction == "left" and angle < 0:
+                angle = abs(angle)
+            elif direction == "center":
+                angle = 0.0
             clamped = max(-70.0, min(70.0, angle))
             self.pub_head_target_yaw.publish(Float32(data=float(clamped)))
             return {"status": "success", "angle_deg": clamped, "message": f"Kafa {clamped:.1f} dereceye ayarlandı."}
@@ -3943,13 +3965,14 @@ class AstroRealtimeNode(Node):
 
         wake_keywords = (
             "hey astro", "astro", "selam astro", "merhaba astro",
-            "ey astro", "hay astro", "alo astro", "hey", "selam"
+            "ey astro", "hay astro", "alo astro", "hey", "selam",
+            "astrocum", "astrom", "astrocuğum", "astrocan"
         )
         if t_clean in wake_keywords:
             is_wake_pattern = True
             extracted_cmd = ""
         else:
-            for pfx in ("hey astro", "astro", "selam astro", "merhaba astro", "ey astro", "hay astro", "alo astro"):
+            for pfx in ("hey astro", "astro", "selam astro", "merhaba astro", "ey astro", "hay astro", "alo astro", "astrocum", "astrom", "astrocuğum", "astrocan"):
                 if t_clean.startswith(f"{pfx} ") or t_clean.startswith(f"{pfx},"):
                     is_wake_pattern = True
                     extracted_cmd = t_clean[len(pfx):].strip(", ").strip()
@@ -4604,7 +4627,7 @@ class AstroRealtimeNode(Node):
         chunk_size = 320
         speech_frames = 0
         total_frames = max(1, len(arr) // chunk_size)
-        speech_threshold = max(350.0, self._ambient_rms * 1.5)
+        speech_threshold = max(110.0, self._ambient_rms * 1.15)
         for i in range(0, len(arr) - chunk_size + 1, chunk_size):
             c_arr = arr[i : i + chunk_size]
             c_rms = float(np.sqrt(np.mean(c_arr.astype(np.float32) ** 2)))
@@ -4623,6 +4646,11 @@ class AstroRealtimeNode(Node):
         words = norm_text.split()
         is_short_utterance = (len(words) == 1 and words[0] in VALID_SHORT_UTTERANCES)
         is_suspect_phrase = any(sp in norm_text for sp in SUSPECT_PHRASES)
+        is_wake_cand = any(w in norm_text for w in (
+            "hey astro", "astro", "selam astro", "merhaba astro",
+            "ey astro", "hay astro", "alo astro", "hey", "selam",
+            "astrocum", "astrom", "astrocuğum", "astrocan"
+        ))
 
         rejected = False
         reject_reason = "none"
@@ -4655,7 +4683,11 @@ class AstroRealtimeNode(Node):
             reject_reason = "self_voice"
 
         # 3. Weak speech duration, low VAD confidence, or ambient noise floor
-        elif vad_confidence < 0.20 or speech_ms < 100 or total_rms < max(200.0, self._ambient_rms * 1.15):
+        elif (
+            (vad_confidence < 0.15 or speech_ms < 50 or total_rms < max(75.0, self._ambient_rms * 1.05))
+            if is_wake_cand
+            else (vad_confidence < 0.20 or speech_ms < 100 or total_rms < max(130.0, self._ambient_rms * 1.15))
+        ):
             rejected = True
             reject_reason = "no_speech"
 
@@ -4666,19 +4698,19 @@ class AstroRealtimeNode(Node):
 
         # 5. Short utterances (e.g. "Hey", "Lan", "Dur", "Tamam", "Ne?")
         elif len(words) == 1:
-            if is_short_utterance and speech_ms >= 70 and total_rms >= 280.0 and not is_playback_active:
+            if (is_short_utterance or is_wake_cand) and speech_ms >= 50 and total_rms >= max(75.0, self._ambient_rms * 1.05) and not is_playback_active:
                 rejected = False
-            elif not is_short_utterance and (speech_ms < 140 or total_rms < 380.0 or vad_confidence < 0.30):
+            elif not is_short_utterance and not is_wake_cand and (speech_ms < 140 or total_rms < 380.0 or vad_confidence < 0.30):
                 rejected = True
                 reject_reason = "low_confidence"
 
         # 6. Low quality speech / Repetitive Whisper hallucination gate (e.g. 'Türen, türen...', 'Hahaha')
-        elif vad_confidence < 0.35 and speech_ms < 220 and total_rms < 380.0:
+        elif not is_wake_cand and vad_confidence < 0.35 and speech_ms < 220 and total_rms < 380.0:
             rejected = True
             reject_reason = "low_confidence"
 
         # 7. General sentence threshold
-        elif speech_ms < 120 or total_rms < 240.0:
+        elif (speech_ms < 50 or total_rms < 90.0) if is_wake_cand else (speech_ms < 100 or total_rms < 140.0):
             rejected = True
             reject_reason = "low_confidence"
 

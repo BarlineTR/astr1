@@ -298,6 +298,8 @@ class StandaloneGazeRosNode(Node):
         self._latest_vad_time: float = 0.0
         self._playback_active: bool = False
         self._robot_speaking: bool = False
+        self._manual_target_yaw: float = 0.0
+        self._manual_target_deadline: float = 0.0
 
         # Audio Integration: ROS topic bridge (default) vs standalone hardware mode
         if use_audio:
@@ -400,6 +402,7 @@ class StandaloneGazeRosNode(Node):
         self.create_subscription(JointState, "/joint_states", self._on_joint_states, qos_best_effort)
         self.create_subscription(Bool, "/safety/emergency_stop", self._on_emergency_stop, 10)
         self.create_subscription(Bool, "/system/sleep", self._on_sleep_mode, 10)
+        self.create_subscription(Float32, "/head/target_yaw", self._on_target_yaw, 10)
 
         # Direct CameraSource Integration (Hardware pipeline)
         if use_cam:
@@ -528,6 +531,20 @@ class StandaloneGazeRosNode(Node):
                 self._robot_speaking = bool(msg.data)
         except Exception as e:
             self.get_logger().debug(f"Error in _on_robot_speaking: {e}")
+
+    def _on_target_yaw(self, msg) -> None:
+        """Handles explicit target yaw commands (e.g. from dialogue tools, turn_to_sound, manual commands)."""
+        raw_val = getattr(msg, "data", msg)
+        try:
+            target = float(raw_val)
+        except (ValueError, TypeError):
+            return
+        clamped = max(-70.0, min(70.0, target))
+        self._manual_target_yaw = clamped
+        self._manual_target_deadline = time.monotonic() + 4.0
+        self.get_logger().info(
+            f"🎯 [HEAD TARGET OVERRIDE] /head/target_yaw received: {clamped:+.1f}° (latched 4.0s)"
+        )
 
     def _sample_acoustic_state(
         self, now: float
@@ -719,7 +736,11 @@ class StandaloneGazeRosNode(Node):
         t_step_end = time.monotonic()
 
         self.latest_result = res
-        target_yaw = float(res.target_yaw_deg)
+        now_m = time.monotonic()
+        if now_m < getattr(self, "_manual_target_deadline", 0.0):
+            target_yaw = float(self._manual_target_yaw)
+        else:
+            target_yaw = float(res.target_yaw_deg)
         self.last_published_yaw = target_yaw
 
         # Direct Actuator Dispatch (ONE RESULT -> ONE AUTHORITATIVE TARGET)
@@ -946,7 +967,11 @@ class StandaloneGazeRosNode(Node):
         DOES NOT update targets.
         DOES NOT update visual FSM.
         """
-        target_yaw = self.runtime.get_keepalive_yaw_deg()
+        now_m = time.monotonic()
+        if now_m < getattr(self, "_manual_target_deadline", 0.0):
+            target_yaw = float(self._manual_target_yaw)
+        else:
+            target_yaw = float(self.runtime.get_keepalive_yaw_deg())
         cmd_pos = Float32()
         cmd_pos.data = float(target_yaw)
         self.pub_head_cmd_pos.publish(cmd_pos)

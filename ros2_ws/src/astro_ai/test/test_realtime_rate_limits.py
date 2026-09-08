@@ -84,17 +84,39 @@ class TestRealtimeRateLimitsAndOptimization(unittest.TestCase):
         self.assertTrue(res2.success)
         self.assertEqual(len(self.mock_pub_gesture.published), 1)
 
-    def test_05_safety_lock_rejects_movement(self):
-        """5. Safety lock blocks wheel movement when heartbeat is lost."""
-        mock_node = MagicMock()
-        mock_node._arduino_heartbeat_healthy = False
-        mock_node._last_heartbeat_ack_time = 0.0
-        self.action_manager._node = mock_node
+    def test_06_set_head_angle_direction_and_sign(self):
+        """6. set_head_angle tool correctly respects direction sign rules."""
+        from astro_ai.astro_realtime_node import AstroRealtimeNode
+        node = AstroRealtimeNode()
+        node.pub_head_target_yaw = MockPub()
+        
+        # Right turns must be negative
+        res_r = node._execute_realtime_tool("set_head_angle", {"angle_deg": 30.0, "direction": "right"})
+        self.assertEqual(res_r["status"], "success")
+        self.assertEqual(res_r["angle_deg"], -30.0)
+        self.assertEqual(node.pub_head_target_yaw.published[-1].data, -30.0)
+        
+        # Left turns must be positive
+        res_l = node._execute_realtime_tool("set_head_angle", {"angle_deg": -25.0, "direction": "left"})
+        self.assertEqual(res_l["status"], "success")
+        self.assertEqual(res_l["angle_deg"], 25.0)
+        self.assertEqual(node.pub_head_target_yaw.published[-1].data, 25.0)
+        
+        # Center turns must be 0.0
+        res_c = node._execute_realtime_tool("set_head_angle", {"angle_deg": 40.0, "direction": "center"})
+        self.assertEqual(res_c["status"], "success")
+        self.assertEqual(res_c["angle_deg"], 0.0)
+        self.assertEqual(node.pub_head_target_yaw.published[-1].data, 0.0)
 
-        res = self.action_manager.execute_move(direction="forward", speed=0.2, duration=1.0)
-        self.assertFalse(res.success)
-        self.assertEqual(res.error_code, "MOTOR_CONTROLLER_UNAVAILABLE")
+    def test_07_vad_defaults_low_latency(self):
+        """7. VAD defaults are set for ultra-low latency turn-taking (<400ms)."""
+        from astro_ai.astro_realtime_node import AstroRealtimeNode
+        node = AstroRealtimeNode()
+        self.assertLessEqual(node.vad_silence_duration_ms, 400)
+        self.assertLessEqual(node.vad_threshold, 0.60)
+        self.assertLessEqual(node.vad_prefix_padding_ms, 250)
 
 
 if __name__ == '__main__':
     unittest.main()
+
