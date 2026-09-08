@@ -3941,18 +3941,19 @@ class AstroRealtimeNode(Node):
         is_wake_pattern = False
         extracted_cmd = ""
 
-        if t_clean in ("hey astro", "astro", "hey", "selam", "selam astro"):
+        wake_keywords = (
+            "hey astro", "astro", "selam astro", "merhaba astro",
+            "ey astro", "hay astro", "alo astro", "hey", "selam"
+        )
+        if t_clean in wake_keywords:
             is_wake_pattern = True
             extracted_cmd = ""
-        elif t_clean.startswith("hey astro ") or t_clean.startswith("hey astro,"):
-            is_wake_pattern = True
-            extracted_cmd = t_clean[len("hey astro"):].strip()
-        elif t_clean.startswith("astro ") or t_clean.startswith("astro,"):
-            is_wake_pattern = True
-            extracted_cmd = t_clean[len("astro"):].strip()
-        elif t_clean.startswith("selam astro "):
-            is_wake_pattern = True
-            extracted_cmd = t_clean[len("selam astro"):].strip()
+        else:
+            for pfx in ("hey astro", "astro", "selam astro", "merhaba astro", "ey astro", "hay astro", "alo astro"):
+                if t_clean.startswith(f"{pfx} ") or t_clean.startswith(f"{pfx},"):
+                    is_wake_pattern = True
+                    extracted_cmd = t_clean[len(pfx):].strip(", ").strip()
+                    break
 
         if not is_wake_pattern:
             self.get_logger().info(
@@ -4731,11 +4732,14 @@ class AstroRealtimeNode(Node):
         return cleaned, telem
 
     def _post_transcription(self, url: str, api_key: str, model: str, wav_bytes: bytes,
-                            timeout: float) -> Optional[str]:
+                            timeout: float, prompt: str = "Astro, hey Astro, robot, Baran, Oktay.") -> Optional[str]:
         """multipart/form-data ile /audio/transcriptions çağırır. OpenAI ve Groq aynı şemayı kullanır."""
         boundary = "----AstroBoundary" + os.urandom(16).hex()
         body = bytearray()
-        for field, value in (("model", model), ("language", "tr")):
+        fields = [("model", model), ("language", "tr")]
+        if prompt:
+            fields.append(("prompt", prompt))
+        for field, value in fields:
             body.extend(f"--{boundary}\r\n".encode())
             body.extend(f'Content-Disposition: form-data; name="{field}"\r\n\r\n'.encode())
             body.extend(value.encode("utf-8"))
@@ -6128,13 +6132,16 @@ class AstroRealtimeNode(Node):
         # ====================================================================
         if self._is_sleeping or self.state_machine.is_deep_idle():
             if raw_16k:
-                is_speech_energy = (local_rms > max(420.0, self._ambient_rms * 1.45) and peak_val > 1000)
+                wake_min_rms = float(os.getenv("WAKE_MIN_RMS", "120.0"))
+                wake_min_peak = int(os.getenv("WAKE_MIN_PEAK", "350"))
+                is_speech_energy = (local_rms > max(wake_min_rms, self._ambient_rms * 1.20) and peak_val > wake_min_peak)
                 if is_speech_energy:
                     self._wake_last_voice_time = now
                     if not self._wake_listening:
                         self._wake_listening = True
                         with self._lock:
-                            pre_frames = list(self._user_speech_audio_buffer[-8:]) if len(self._user_speech_audio_buffer) >= 8 else []
+                            # 18 pre-roll frames (360ms) ensures full initial syllable (e.g. "Hey") is preserved
+                            pre_frames = list(self._user_speech_audio_buffer[-18:]) if len(self._user_speech_audio_buffer) >= 18 else list(self._user_speech_audio_buffer)
                         self._wake_audio_buffer = list(pre_frames) + [raw_16k]
                     else:
                         self._wake_audio_buffer.append(raw_16k)
@@ -6148,7 +6155,7 @@ class AstroRealtimeNode(Node):
                             raw_w = b"".join(self._wake_audio_buffer)
                             arr_w = np.frombuffer(raw_w, dtype=np.int16)
                             w_rms = float(np.sqrt(np.mean(arr_w.astype(np.float32) ** 2))) if len(arr_w) > 0 else 0.0
-                            if w_rms >= max(360.0, self._ambient_rms * 1.25):
+                            if w_rms >= max(100.0, self._ambient_rms * 1.15):
                                 buf_to_proc = list(self._wake_audio_buffer)
                                 self._wake_audio_buffer.clear()
                                 threading.Thread(target=self._process_wake_candidate, args=(buf_to_proc,), daemon=True).start()

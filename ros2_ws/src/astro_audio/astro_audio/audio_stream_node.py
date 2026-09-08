@@ -533,7 +533,19 @@ class AudioStreamNode(Node):
             raw_arr = np.frombuffer(raw_bytes, dtype=np.int16)
             if self._capture_channels >= 4 and len(raw_arr) >= (HW_BLOCK_SIZE * self._capture_channels):
                 multi_ch = raw_arr.reshape(-1, self._capture_channels).T  # Shape: (channels, frames)
-                arr = multi_ch[0]  # Front microphone for speech recognition
+                # On 6-channel ReSpeaker:
+                # ch0 is the XMOS DSP beamformed output, which heavily attenuates voice when off-axis.
+                # ch1 is the true physical Front Microphone (Mic 0, 0 deg).
+                # Default to ch1 (or AUDIO_SPEECH_CHANNEL override) for loud, unattenuated speech recognition.
+                if self._capture_channels >= 6:
+                    speech_ch = int(os.getenv("AUDIO_SPEECH_CHANNEL", "1"))
+                    if speech_ch >= multi_ch.shape[0]:
+                        speech_ch = 1
+                else:
+                    speech_ch = int(os.getenv("AUDIO_SPEECH_CHANNEL", "0"))
+                    if speech_ch >= multi_ch.shape[0]:
+                        speech_ch = 0
+                arr = multi_ch[speech_ch]
                 mono_raw_bytes = arr.tobytes()
             else:
                 multi_ch = None

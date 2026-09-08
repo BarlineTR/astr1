@@ -25,9 +25,9 @@ import numpy as np
 try:
     import rclpy
     from rclpy.node import Node
-    from rclpy.qos import QoSProfile, ReliabilityPolicy
-    from sensor_msgs.msg import JointState
-    from std_msgs.msg import Bool, Float32, String
+    from rclpy.qos import QoSProfile, ReliabilityPolicy, qos_profile_sensor_data
+    from sensor_msgs.msg import JointState, Image
+    from std_msgs.msg import Bool, Float32, String, Header
     try:
         from astro_base.msg import GazeStatus, HeadCmd, HeadState
     except ImportError:
@@ -93,13 +93,15 @@ except ImportError:
         BEST_EFFORT = 0
         RELIABLE = 1
 
+    qos_profile_sensor_data = QoSProfile()
+
     class _MockMsg:
         def __init__(self, data=None, **kwargs):
             self.data = data
             for key, val in kwargs.items():
                 setattr(self, key, val)
 
-    Bool = Float32 = String = JointState = _MockMsg
+    Bool = Float32 = String = JointState = Image = Header = _MockMsg
     GazeStatus = HeadCmd = HeadState = None
 
 if HeadCmd is None:
@@ -132,6 +134,21 @@ from astro_base.gaze.angle_math import circular_distance_deg
 from astro_base.gaze.gaze_runtime import GazeRuntimeCore
 from astro_base.gaze.gaze_tracker import Detection, GazeResult, UNSCORED_CONFIDENCE
 from astro_base.gaze.types import PrioritySource
+
+try:
+    from astro_vision.image_utils import bgr_to_imgmsg
+except ImportError:
+    import array
+    def bgr_to_imgmsg(frame: np.ndarray, header=None) -> Any:
+        msg = Image()
+        if header is not None:
+            msg.header = header
+        msg.height, msg.width = frame.shape[:2]
+        msg.encoding = "bgr8"
+        msg.is_bigendian = 0
+        msg.step = int(frame.shape[1] * 3)
+        msg.data = array.array("B", frame.tobytes())
+        return msg
 
 
 def _coerce_bool(val: Any) -> bool:
@@ -193,6 +210,9 @@ class StandaloneGazeRosNode(Node):
         self.declare_parameter("coast_timeout_s", 1.0)
         self.declare_parameter("calibration_path", "")
         self.declare_parameter("camera_latency_s", 0.050)
+        self.declare_parameter("publish_camera_image", True)
+        self.declare_parameter("camera_image_topic", "/oak/rgb/image_raw")
+        self.declare_parameter("camera_publish_fps", 15.0)
         self.declare_parameter("enable_audio", True)
         self.declare_parameter("audio_source_mode", "topics")
         self.declare_parameter("audio_device", -1)
@@ -209,6 +229,10 @@ class StandaloneGazeRosNode(Node):
         coast_timeout = float(self.get_parameter("coast_timeout_s").value)
         calib_path = str(self.get_parameter("calibration_path").value) or None
         self.camera_latency_s = float(self.get_parameter("camera_latency_s").value)
+        self.publish_camera_image = _coerce_bool(self.get_parameter("publish_camera_image").value)
+        self.camera_image_topic = str(self.get_parameter("camera_image_topic").value)
+        self.camera_publish_fps = float(self.get_parameter("camera_publish_fps").value)
+        self._last_camera_pub_time: float = 0.0
 
         use_audio = _coerce_bool(enable_audio if enable_audio is not None else self.get_parameter("enable_audio").value)
         self.enable_audio = use_audio
@@ -360,6 +384,14 @@ class StandaloneGazeRosNode(Node):
             self.pub_gaze_state = None
         self.pub_active_target = self.create_publisher(String, "/gaze/active_target", 10)
         self.pub_gaze_debug = self.create_publisher(String, "/gaze/debug", 10)
+
+        # Camera Image Publisher (makes camera frames available to vision tools and ai_brain_node)
+        if self.publish_camera_image:
+            self.pub_camera_image = self.create_publisher(
+                Image, self.camera_image_topic, qos_profile_sensor_data
+            )
+        else:
+            self.pub_camera_image = None
 
         # Subscriptions (Authoritative Feedback & Diagnostic Only - NO ROS Vision Topics)
         qos_best_effort = QoSProfile(depth=10, reliability=ReliabilityPolicy.BEST_EFFORT)
@@ -546,6 +578,16 @@ class StandaloneGazeRosNode(Node):
                     continue
 
                 t_read_done = time.monotonic()
+                if self.pub_camera_image is not None and (t_read_done - self._last_camera_pub_time) >= (1.0 / max(1.0, self.camera_publish_fps)):
+                    self._last_camera_pub_time = t_read_done
+                    try:
+                        hdr = Header()
+                        hdr.stamp = self.get_clock().now().to_msg()
+                        hdr.frame_id = "camera_link"
+                        self.pub_camera_image.publish(bgr_to_imgmsg(frame, hdr))
+                    except Exception as pub_err:
+                        self.get_logger().debug(f"Camera frame publish error: {pub_err}")
+
                 detections = self.camera.detect(frame)
                 t_detect_done = time.monotonic()
                 frame_h, frame_w = frame.shape[:2]
@@ -584,6 +626,15 @@ class StandaloneGazeRosNode(Node):
     ) -> GazeResult:
         """Runs detector on frame and steps tracker (1:1 with standalone/track.py)."""
         t_start = time.monotonic()
+        if self.pub_camera_image is not None and (t_start - self._last_camera_pub_time) >= (1.0 / max(1.0, self.camera_publish_fps)):
+            self._last_camera_pub_time = t_start
+            try:
+                hdr = Header()
+                hdr.stamp = self.get_clock().now().to_msg()
+                hdr.frame_id = "camera_link"
+                self.pub_camera_image.publish(bgr_to_imgmsg(frame, hdr))
+            except Exception:
+                pass
         if self.camera is not None:
             detections = self.camera.detect(frame)
         else:
