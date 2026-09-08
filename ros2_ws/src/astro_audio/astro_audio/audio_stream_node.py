@@ -213,8 +213,8 @@ class ReSpeakerHID:
             data = self.dev.ctrl_transfer(
                 usb.util.CTRL_IN | usb.util.CTRL_TYPE_VENDOR | usb.util.CTRL_RECIPIENT_DEVICE,
                 0,
+                0xC0,
                 param_id,
-                0,
                 8,
                 self.TIMEOUT_MS,
             )
