@@ -46,29 +46,40 @@ TEXT_COLOUR = (0, 255, 120)
 class ReSpeakerAudioLocalizer:
     """ReSpeaker XVF3000 DSP (VOICEACTIVITY + DOAANGLE) -> ASTRO Head Yaw Localizer.
 
-    Architecture:
+    Sector-based architecture (V2):
         ReSpeaker (VOICEACTIVITY + DOAANGLE)
                     ↓
-        circular filtering (atan2 mean, angle wrap-around safe)
+        DOA -> 3 sector mapping (LEFT / CENTER / RIGHT)
                     ↓
-        outlier rejection (single-spike rejection, 2-consecutive step change)
+        sector confirmation (N consecutive readings to switch)
                     ↓
-        calibrated DOA -> ASTRO head yaw (piecewise linear, bounded)
-                    ↓
-        deadband suppression (prevents servo jitter on minor fluctuations)
+        sector -> coarse target yaw (-45° / 0° / +45°)
                     ↓
         target_yaw_deg -> head.send_angle()
+
+    Why sectors instead of continuous angles:
+        ReSpeaker XVF3000 DOA output is unreliable for precise angular mapping.
+        Live testing showed DOA ~148° (calibrated RIGHT 83°) when the user was
+        physically in FRONT (visual confirmed ~-10° to +27°). The previous
+        piecewise linear calibration amplified DOA noise into 80°+ wrong-direction
+        turns. Sectors limit the worst-case error to ~45° and let visual tracking
+        refine the final heading.
     """
 
-    # Physical operating workspace & calibration measurements on robot:
-    # Operating workspace: LEFT <= 90° (yaw >= -90°), FRONT = 0°, RIGHT <= 90° (yaw <= +90°)
-    # 1) Left saturation: DOA 20.0°..25.0° -> Yaw -90.0°
-    # 2) Left interpolation: DOA 25.0°..32.0° -> Yaw -90.0°..-45.0°
-    # 3) Left-front interpolation: DOA 32.0°..78.0° -> Yaw -45.0°..0.0°
-    # 4) Front-right interpolation: DOA 78.0°..142.0° -> Yaw 0.0°..+45.0°
-    # 5) Far right interpolation: DOA 142.0°..149.0° -> Yaw +45.0°..+90.0°
-    # 6) Right saturation: DOA 149.0°..155.0° -> Yaw +90.0°
-    # Rear / ambiguous DOAs (outside [20.0°, 155.0°], e.g. ~285°-330°, 180°, etc.): INVALID
+    # ── Sector boundaries ──────────────────────────────────────────
+    # DOA ranges for the front operating hemisphere [20°, 155°].
+    # Generous margins prevent jitter at boundaries.
+    VALID_DOA_MIN = 20.0
+    VALID_DOA_MAX = 155.0
+
+    SECTOR_LEFT_MAX = 55.0     # DOA < 55° = LEFT
+    SECTOR_RIGHT_MIN = 100.0   # DOA >= 100° = RIGHT
+    #                            55°..100° = CENTER
+
+    SECTOR_TARGETS = {"LEFT": -45.0, "CENTER": 0.0, "RIGHT": 45.0}
+    SECTOR_CONFIRM_COUNT = 3   # consecutive readings to switch sector
+
+    # ── Legacy calibration (kept for backward-compat tests) ────────
     CALIBRATION_POINTS = (
         (25.0, -90.0),
         (32.0, -45.0),
@@ -76,8 +87,6 @@ class ReSpeakerAudioLocalizer:
         (142.0, 45.0),
         (149.0, 90.0),
     )
-    VALID_DOA_MIN = 20.0
-    VALID_DOA_MAX = 155.0
 
     def __init__(
         self,
@@ -89,19 +98,24 @@ class ReSpeakerAudioLocalizer:
     ):
         self.hid = hid
         self.hold_timeout_s = float(hold_timeout_s)
+        # Legacy params kept for CLI compat; unused in sector mode.
         self.deadband_deg = float(deadband_deg)
         self.outlier_threshold_deg = float(outlier_threshold_deg)
         self.filter_window_size = int(filter_window_size)
 
-        self.filtered_doa: Optional[float] = None
-        self._history: list[float] = []
-        self._outlier_candidate: Optional[float] = None
-        self._outlier_count: int = 0
+        # Sector state
+        self._confirmed_sector: Optional[str] = None
+        self._pending_sector: Optional[str] = None
+        self._pending_count: int = 0
 
+        # Target
         self.active_target_yaw: float = 0.0
         self._last_voice_activity_time: float = 0.0
         self._last_valid_target_time: float = 0.0
         self._tracking_active: bool = False
+
+        # Diagnostics / logging
+        self.last_raw_doa: Optional[float] = None
 
         # Polling cache
         self._last_poll_time: float = 0.0
@@ -109,6 +123,12 @@ class ReSpeakerAudioLocalizer:
         self._cached_doa: Optional[float] = None
         self._vad_warning_emitted: bool = False
         self._last_vad_warning_time: float = 0.0
+
+        # Legacy filter state (kept for backward-compat static methods/tests)
+        self.filtered_doa: Optional[float] = None
+        self._history: list[float] = []
+        self._outlier_candidate: Optional[float] = None
+        self._outlier_count: int = 0
 
     @staticmethod
     def circular_dist(a: float, b: float) -> float:
@@ -137,6 +157,29 @@ class ReSpeakerAudioLocalizer:
             return False
         raw = float(doa_deg) % 360.0
         return cls.VALID_DOA_MIN <= raw <= cls.VALID_DOA_MAX
+
+    @classmethod
+    def doa_to_sector(cls, doa_deg: float) -> Optional[str]:
+        """Maps a raw DOA reading to a coarse sector.
+
+        Returns:
+            "LEFT", "CENTER", or "RIGHT" for valid DOA in front hemisphere.
+            None for rear / invalid DOA.
+        """
+        raw = float(doa_deg) % 360.0
+        if not cls.is_valid_doa(raw):
+            return None
+        if raw < cls.SECTOR_LEFT_MAX:
+            return "LEFT"
+        elif raw >= cls.SECTOR_RIGHT_MIN:
+            return "RIGHT"
+        else:
+            return "CENTER"
+
+    @property
+    def confirmed_sector(self) -> Optional[str]:
+        """Currently confirmed sector, or None if not tracking."""
+        return self._confirmed_sector if self._tracking_active else None
 
     @classmethod
     def calibrated_yaw(cls, doa_deg: float) -> Optional[float]:
@@ -241,42 +284,71 @@ class ReSpeakerAudioLocalizer:
         voice_activity: bool,
         timestamp: float,
     ) -> float:
-        """Updates localizer state with new DOA and VAD readings."""
+        """Updates localizer state with new DOA and VAD readings.
+
+        Sector-based logic:
+        1. First valid reading → immediately accept sector (get moving fast)
+        2. Once in a sector, switching requires SECTOR_CONFIRM_COUNT consecutive
+           readings in the new sector (prevents DOA noise from flipping direction)
+        3. Within a sector, target stays at sector center (no jitter)
+        """
         is_valid = self.is_valid_doa(doa_raw)
 
         if voice_activity and is_valid:
+            assert doa_raw is not None
+            self.last_raw_doa = float(doa_raw)
             self._last_voice_activity_time = timestamp
             self._last_valid_target_time = timestamp
-            was_tracking = self._tracking_active
             self._tracking_active = True
 
-            assert doa_raw is not None
-            if not self.reject_outlier(doa_raw):
-                candidate = self.calibrated_yaw(self.filtered_doa)
-                if candidate is not None:
-                    candidate = max(-90.0, min(90.0, candidate))
-                    if not was_tracking:
-                        self.active_target_yaw = candidate
-                    else:
-                        self.apply_deadband(candidate)
-        else:
-            # VOICEACTIVITY is False or DOA is invalid/rear:
-            # Retain current valid target briefly (grace period hold_timeout_s).
-            # NEVER generate a new rear target.
+            sector = self.doa_to_sector(doa_raw)
+            if sector is not None:
+                if self._confirmed_sector is None:
+                    # First detection → accept immediately
+                    self._confirmed_sector = sector
+                    self._pending_sector = None
+                    self._pending_count = 0
+                    self.active_target_yaw = self.SECTOR_TARGETS[sector]
+                elif sector == self._confirmed_sector:
+                    # Same sector → reinforce, clear pending
+                    self._pending_sector = None
+                    self._pending_count = 0
+                elif sector == self._pending_sector:
+                    # Consecutive reading in different sector → count up
+                    self._pending_count += 1
+                    if self._pending_count >= self.SECTOR_CONFIRM_COUNT:
+                        self._confirmed_sector = sector
+                        self.active_target_yaw = self.SECTOR_TARGETS[sector]
+                        self._pending_sector = None
+                        self._pending_count = 0
+                else:
+                    # New pending sector
+                    self._pending_sector = sector
+                    self._pending_count = 1
+
+        elif voice_activity and not is_valid:
+            # VAD true but DOA is rear/invalid: hold current target, don't generate rear target
             if self._tracking_active:
                 if timestamp - self._last_valid_target_time > self.hold_timeout_s:
                     self._tracking_active = False
                     self.active_target_yaw = 0.0
-                    self.reset_filter()
+                    self._clear_sector_state()
+        else:
+            # VOICEACTIVITY is False: hold current target for grace period
+            if self._tracking_active:
+                if timestamp - self._last_valid_target_time > self.hold_timeout_s:
+                    self._tracking_active = False
+                    self.active_target_yaw = 0.0
+                    self._clear_sector_state()
 
         return self.target_yaw_deg
 
     @property
     def target_yaw_deg(self) -> float:
-        """Authoritative audio target yaw in [-90°, +90°]. Returns 0.0 when not tracking."""
+        """Authoritative audio target yaw. Returns 0.0 when not tracking."""
         if not self._tracking_active:
             return 0.0
-        return max(-90.0, min(90.0, self.active_target_yaw))
+        return self.active_target_yaw
 
     @property
     def motor_yaw_deg(self) -> float:
@@ -290,12 +362,18 @@ class ReSpeakerAudioLocalizer:
         if now is not None and (now - self._last_valid_target_time > self.hold_timeout_s):
             self._tracking_active = False
             self.active_target_yaw = 0.0
-            self.reset_filter()
+            self._clear_sector_state()
             return False
         return True
 
+    def _clear_sector_state(self) -> None:
+        """Clears sector confirmation state."""
+        self._confirmed_sector = None
+        self._pending_sector = None
+        self._pending_count = 0
+
     def reset_filter(self) -> None:
-        """Clears circular filter history and outlier state."""
+        """Clears circular filter history and outlier state (legacy compat)."""
         self.filtered_doa = None
         self._history.clear()
         self._outlier_candidate = None
@@ -307,6 +385,8 @@ class ReSpeakerAudioLocalizer:
         self.active_target_yaw = 0.0
         self._last_voice_activity_time = 0.0
         self._last_valid_target_time = 0.0
+        self._clear_sector_state()
+        self.last_raw_doa = None
         self.reset_filter()
 
     def on_vision_active(self) -> None:
@@ -570,7 +650,9 @@ def main(argv=None, hid=None) -> int:
                 result.gaze_state = GazeStateEnum.ORIENTING
                 result.target_id = "audio_speaker_1"
                 if last_audio_log_yaw != motor_yaw:
-                    print(f"AUDIO logical={target_yaw:+.1f} motor={motor_yaw:+.1f}")
+                    doa_str = f"{localizer.last_raw_doa:.0f}" if localizer.last_raw_doa is not None else "?"
+                    sector_str = localizer.confirmed_sector or "?"
+                    print(f"AUDIO sector={sector_str} DOA={doa_str} target={target_yaw:+.1f}")
                     last_audio_log_yaw = motor_yaw
             else:
                 target_yaw = 0.0
@@ -594,7 +676,7 @@ def main(argv=None, hid=None) -> int:
                 result=result,
                 fps=fps,
                 detections=len(detections),
-                doa_deg=localizer.filtered_doa if localizer.is_tracking() else None,
+                doa_deg=localizer.last_raw_doa if localizer.is_tracking() else None,
                 head_feedback=head.has_feedback,
                 speech=audio.latest_speech(now) if audio.available else None,
                 fixed_head=opts.fixed_head,
