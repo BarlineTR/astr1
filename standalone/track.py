@@ -28,6 +28,8 @@ import cv2
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import core_path  # noqa: F401,E402
+from astro_audio.respeaker_usb import ReSpeakerHID  # noqa: E402
+from astro_audio.speech_detector import SpeechVerdict  # noqa: E402
 from head_link import HeadLink, open_port  # noqa: E402
 from recorder import OverlayRecorder, default_path  # noqa: E402
 from sources import AudioSource, CameraSource  # noqa: E402
@@ -194,6 +196,7 @@ def resolve_target_yaw(
     target_retention: AudioTargetRetention,
     sector_mapper: AudioSectorMapper,
     now: float,
+    is_speech: bool = False,
 ) -> float:
     """Sektörel Audio -> Head Eşlemesi ve Hedef Koruma (Retention).
 
@@ -207,10 +210,12 @@ def resolve_target_yaw(
         sector_mapper.reset()
         return result.target_yaw_deg
 
-    if result.owner == PrioritySource.ACTIVE_SPEAKER:
+    if result.owner == PrioritySource.ACTIVE_SPEAKER or is_speech:
         held_yaw = target_retention.on_active_speaker(active_sector, now, getattr(result, "target_id", None))
         if held_yaw is not None:
             result.target_yaw_deg = held_yaw
+            result.owner = PrioritySource.ACTIVE_SPEAKER
+            result.target_id = target_retention.retained_target_id or result.target_id or "audio_speaker_1"
         else:
             result.target_yaw_deg = 0.0
         return result.target_yaw_deg
@@ -254,7 +259,7 @@ def draw_overlay(frame, detections, result, fps: float, audio_ok: bool, head_ok:
     return frame
 
 
-def main(argv=None) -> int:
+def main(argv=None, hid=None) -> int:
     parser = argparse.ArgumentParser(description="ROS'suz ASTRO yüz/ses takibi")
     parser.add_argument("--camera", type=int, default=0, help="Kamera indeksi")
     head_mode = parser.add_mutually_exclusive_group()
@@ -354,8 +359,11 @@ def main(argv=None) -> int:
     tracker = GazeTracker()
     sector_mapper = AudioSectorMapper()
     target_retention = AudioTargetRetention(hold_grace_s=opts.audio_hold_grace)
+    respeaker_hid = hid if hid is not None else ReSpeakerHID()
     started = time.monotonic()
     frames, fps, last_fps_at, last_fps_frames = 0, 0.0, started, 0
+    last_hid_poll = 0.0
+    cached_hid_speech = None
 
     try:
         while True:
@@ -380,6 +388,48 @@ def main(argv=None) -> int:
             doa_deg = audio.latest_doa_deg(now) if audio.available else None
             speech = audio.latest_speech(now) if audio.available else None
 
+            # ReSpeaker HID SPEECH_DETECTED authoritative VAD okuması (~20 Hz):
+            # Donanımsal DSP'nin SPEECH_DETECTED register'ı (19, 22) birincil VAD'dir;
+            # yazılımsal harmoniklik/modülasyon sınıflandırıcısının konuşmayı erken
+            # veya yanlış düşürmesini ("elendi: ne harmonik ne modulasyonlu") önler.
+            if now - last_hid_poll >= 0.05:
+                cached_hid_speech = respeaker_hid.speech_detected()
+                last_hid_poll = now
+
+            if cached_hid_speech is not None:
+                is_speech = cached_hid_speech
+                if is_speech:
+                    if speech is None:
+                        speech = SpeechVerdict(
+                            is_speech=True,
+                            confidence=0.85,
+                            harmonicity=1.0,
+                            modulation=1.0,
+                            rms=0.01,
+                            reason="hid_vad",
+                        )
+                    elif not speech.is_speech:
+                        speech = SpeechVerdict(
+                            is_speech=True,
+                            confidence=max(float(speech.confidence), 0.85),
+                            harmonicity=float(speech.harmonicity),
+                            modulation=float(speech.modulation),
+                            rms=float(speech.rms),
+                            reason="hid_vad",
+                        )
+                else:
+                    if speech is not None and speech.is_speech:
+                        speech = SpeechVerdict(
+                            is_speech=False,
+                            confidence=float(speech.confidence),
+                            harmonicity=float(speech.harmonicity),
+                            modulation=float(speech.modulation),
+                            rms=float(speech.rms),
+                            reason="hid_silent",
+                        )
+            else:
+                is_speech = bool(speech.is_speech) if speech is not None else False
+
             if voice_loop is not None:
                 voice_loop.pump(now)
 
@@ -388,7 +438,6 @@ def main(argv=None) -> int:
             head_reference = (0.0 if opts.fixed_head else
                               head.measured_angle_deg if head.has_feedback else None)
 
-            is_speech = bool(speech.is_speech) if speech is not None else False
             active_sector = sector_mapper.update(doa_deg, is_speech, now)
 
             result = tracker.step(
@@ -409,6 +458,7 @@ def main(argv=None) -> int:
                 target_retention=target_retention,
                 sector_mapper=sector_mapper,
                 now=now,
+                is_speech=is_speech,
             )
 
             head.send_angle(result.target_yaw_deg)

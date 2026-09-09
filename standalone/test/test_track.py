@@ -304,3 +304,140 @@ def test_audio_retention_prevents_continuous_doa_leak_to_idle():
     assert retention.retained_target_yaw is None
 
 
+def test_hid_authoritative_vad_overrides_software_classifier():
+    """ReSpeaker HID SPEECH_DETECTED=True olduğunda yazılımsal sınıflandırıcının
+    'elendi: ne harmonik ne modulasyonlu' demesi geçersiz kılınır;
+    AudioSectorMapper -55° sektörüne kilitlenir ve hedef ACTIVE_SPEAKER olur.
+    """
+    from unittest.mock import MagicMock
+    from track import AudioSectorMapper, AudioTargetRetention, resolve_target_yaw
+    from tracker import GazeResult, PrioritySource, GazeStateEnum
+    from astro_audio.speech_detector import SpeechVerdict
+
+    mapper = AudioSectorMapper(persistence_required=3)
+    retention = AudioTargetRetention(hold_grace_s=1.5)
+
+    # 1. Yazılımsal sınıflandırıcı konuşmayı elemiş olsun:
+    software_rejected_speech = SpeechVerdict(
+        is_speech=False,
+        confidence=0.0,
+        harmonicity=0.05,
+        modulation=0.02,
+        rms=0.003,
+        reason="ne harmonik ne modulasyonlu",
+    )
+
+    # HID donanımı konuşma algıladı:
+    mock_hid = MagicMock()
+    mock_hid.speech_detected.return_value = True
+
+    hid_speech = mock_hid.speech_detected()
+    assert hid_speech is True
+
+    # track.py içindeki terfi mantığı:
+    is_speech = hid_speech
+    if is_speech and not software_rejected_speech.is_speech:
+        promoted_speech = SpeechVerdict(
+            is_speech=True,
+            confidence=max(float(software_rejected_speech.confidence), 0.85),
+            harmonicity=float(software_rejected_speech.harmonicity),
+            modulation=float(software_rejected_speech.modulation),
+            rms=float(software_rejected_speech.rms),
+            reason="hid_vad",
+        )
+    else:
+        promoted_speech = software_rejected_speech
+
+    assert promoted_speech.is_speech is True
+    assert promoted_speech.reason == "hid_vad"
+
+    # 3 ardışık örnekle sol sektör kilitlenir
+    for i, doa in enumerate([40.0, 42.0, 45.0]):
+        sector = mapper.update(doa, is_speech=is_speech, timestamp=20.0 + i * 0.05)
+    assert sector == -55.0
+
+    result = GazeResult(
+        target_yaw_deg=-30.0,
+        gaze_state=GazeStateEnum.ORIENTING,
+        owner=PrioritySource.ACTIVE_SPEAKER,
+        target_id="audio_speaker_1",
+        confidence=0.85,
+        head_angle_deg=0.0,
+    )
+    target = resolve_target_yaw(
+        result=result,
+        detections=[],
+        active_sector=sector,
+        target_retention=retention,
+        sector_mapper=mapper,
+        now=20.15,
+        is_speech=is_speech,
+    )
+    assert target == -55.0
+    assert result.target_yaw_deg == -55.0
+    assert result.owner == PrioritySource.ACTIVE_SPEAKER
+
+    # 2. HID konuşma bittiğini bildirdi (dropout) -> 1.5s korunmalı:
+    mock_hid.speech_detected.return_value = False
+    hid_speech_dropout = mock_hid.speech_detected()
+    assert hid_speech_dropout is False
+    is_speech_dropout = hid_speech_dropout
+
+    res_dropout = GazeResult(
+        target_yaw_deg=-50.0,
+        gaze_state=GazeStateEnum.IDLE,
+        owner=PrioritySource.IDLE,
+        target_id=None,
+        confidence=0.0,
+        head_angle_deg=-40.0,
+    )
+    target_held = resolve_target_yaw(
+        result=res_dropout,
+        detections=[],
+        active_sector=sector,
+        target_retention=retention,
+        sector_mapper=mapper,
+        now=21.0,  # 0.85s sonra
+        is_speech=is_speech_dropout,
+    )
+    assert target_held == -55.0
+    assert res_dropout.target_yaw_deg == -55.0
+    assert res_dropout.owner == PrioritySource.ACTIVE_SPEAKER
+
+    # 3. 1.5s grace doldu (now=22.0, dropout üzerinden 1.85s geçti) -> hedef 0'a dönmeli:
+    res_expired = GazeResult(
+        target_yaw_deg=-59.4,
+        gaze_state=GazeStateEnum.IDLE,
+        owner=PrioritySource.IDLE,
+        target_id=None,
+        confidence=0.0,
+        head_angle_deg=-50.0,
+    )
+    target_expired = resolve_target_yaw(
+        result=res_expired,
+        detections=[],
+        active_sector=None,
+        target_retention=retention,
+        sector_mapper=mapper,
+        now=22.0,
+        is_speech=is_speech_dropout,
+    )
+    assert target_expired == 0.0
+    assert res_expired.target_yaw_deg == 0.0
+    assert res_expired.target_yaw_deg != -59.4
+    assert retention.retained_target_yaw is None
+
+
+def test_track_main_uses_hid_authoritative_vad():
+    from unittest.mock import MagicMock
+    mock_hid = MagicMock()
+    mock_hid.speech_detected.return_value = True
+    with patch.object(track, "CameraSource", _SabitKamera), \
+            patch.object(track, "AudioSource", _SessizKaynak):
+        code = track.main(["--fixed-head", "--no-window", "--no-voice", "--seconds", "0.05"], hid=mock_hid)
+        assert code == 0
+    assert mock_hid.speech_detected.called
+
+
+
+
