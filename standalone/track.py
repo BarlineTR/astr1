@@ -83,7 +83,7 @@ class ReSpeakerAudioLocalizer:
     #   DOA ~148 ("RIGHT" in calib) = robot's physical LEFT   → motor -60°
     # Evidence: visual tracking found user at -70.2° when DOA read 148;
     # +-60° puts both 45° and 70°-80° speakers squarely inside the camera FOV (69°).
-    SECTOR_CONFIRM_COUNT = 3   # consecutive readings to switch sector
+    SECTOR_CONFIRM_COUNT = 2   # consecutive readings to switch sector while tracking
 
     # ── Legacy calibration (kept for backward-compat tests) ────────
     CALIBRATION_POINTS = (
@@ -284,6 +284,8 @@ class ReSpeakerAudioLocalizer:
         """Alias for apply_deadband."""
         return self.apply_deadband(candidate_yaw)
 
+    # ── Tracking state update ─────────────────────────────────────────
+
     def update(
         self,
         doa_raw: Optional[float],
@@ -293,10 +295,10 @@ class ReSpeakerAudioLocalizer:
         """Updates localizer state with new DOA and VAD readings.
 
         Sector-based logic:
-        1. First valid reading → immediately accept sector (get moving fast)
-        2. Once in a sector, switching requires SECTOR_CONFIRM_COUNT consecutive
-           readings in the new sector (prevents DOA noise from flipping direction)
-        3. Within a sector, target stays at sector center (no jitter)
+        1. When idle (or first detection ever) → immediately accept sector (fast response)
+        2. While actively tracking, switching to a different sector requires
+           SECTOR_CONFIRM_COUNT consecutive readings (prevents phantom noise flip)
+        3. Within a sector, target stays at sector target (no jitter)
         """
         is_valid = self.is_valid_doa(doa_raw)
 
@@ -305,23 +307,24 @@ class ReSpeakerAudioLocalizer:
             self.last_raw_doa = float(doa_raw)
             self._last_voice_activity_time = timestamp
             self._last_valid_target_time = timestamp
+            was_tracking = self._tracking_active
             self._tracking_active = True
 
             sector = self.doa_to_sector(doa_raw)
             if sector is not None:
-                if self._confirmed_sector is None:
-                    # First detection ever → accept immediately
+                if not was_tracking or self._confirmed_sector is None:
+                    # Idle or first detection → accept immediately to react fast
                     self._confirmed_sector = sector
                     self._pending_sector = None
                     self._pending_count = 0
                     self.active_target_yaw = self.SECTOR_TARGETS[sector]
                 elif sector == self._confirmed_sector:
-                    # Same sector → resume/reinforce, restore target, clear pending
+                    # Same sector → refresh/reinforce, restore target, clear pending
                     self.active_target_yaw = self.SECTOR_TARGETS[sector]
                     self._pending_sector = None
                     self._pending_count = 0
                 elif sector == self._pending_sector:
-                    # Consecutive reading in different sector → count up
+                    # Consecutive reading in different sector while actively tracking → count up
                     self._pending_count += 1
                     if self._pending_count >= self.SECTOR_CONFIRM_COUNT:
                         self._confirmed_sector = sector
@@ -648,8 +651,8 @@ def main(argv=None, hid=None) -> int:
             )
 
             # Audio target'ın tek ve authoritative kaynağı ReSpeakerAudioLocalizer'dır.
-            # Vision önceliği: Görüntü yüz tespit ettiğinde audio derhal bırakılır.
-            if result.owner == PrioritySource.VISUAL_TRACKING or len(detections) > 0:
+            # Vision önceliği: Görsel takip bir yüze kilitlendiğinde audio bırakılır.
+            if result.owner == PrioritySource.VISUAL_TRACKING:
                 localizer.on_vision_active()
                 target_yaw = result.target_yaw_deg
                 motor_yaw = target_yaw

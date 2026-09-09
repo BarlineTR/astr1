@@ -191,7 +191,7 @@ def test_sector_same_sector_no_jitter():
 
 
 def test_sector_switch_requires_confirmation():
-    """Sector changes require SECTOR_CONFIRM_COUNT consecutive readings."""
+    """Sector changes while actively tracking require SECTOR_CONFIRM_COUNT consecutive readings."""
     from track import ReSpeakerAudioLocalizer
     loc = ReSpeakerAudioLocalizer()
 
@@ -199,17 +199,13 @@ def test_sector_switch_requires_confirmation():
     loc.update(doa_raw=32.0, voice_activity=True, timestamp=1.0)
     assert loc.confirmed_sector == "LEFT"
 
-    # Single reading in RIGHT → does NOT switch (needs 3)
+    # Single reading in RIGHT while tracking LEFT → does NOT switch (needs 2)
     loc.update(doa_raw=142.0, voice_activity=True, timestamp=1.1)
     assert loc.confirmed_sector == "LEFT"
     assert loc.target_yaw_deg == 60.0
 
-    # Second reading in RIGHT → still not enough
+    # Second reading in RIGHT → NOW it switches (count = 2)
     loc.update(doa_raw=142.0, voice_activity=True, timestamp=1.2)
-    assert loc.confirmed_sector == "LEFT"
-
-    # Third reading in RIGHT → NOW it switches
-    loc.update(doa_raw=142.0, voice_activity=True, timestamp=1.3)
     assert loc.confirmed_sector == "RIGHT"
     assert loc.target_yaw_deg == -60.0
 
@@ -222,20 +218,20 @@ def test_sector_switch_interrupted_resets_count():
     loc.update(doa_raw=32.0, voice_activity=True, timestamp=1.0)
     assert loc.confirmed_sector == "LEFT"
 
-    # Two readings in RIGHT
+    # One reading in RIGHT
     loc.update(doa_raw=142.0, voice_activity=True, timestamp=1.1)
-    loc.update(doa_raw=142.0, voice_activity=True, timestamp=1.2)
+    assert loc.confirmed_sector == "LEFT"
 
     # Back to LEFT → resets pending count
-    loc.update(doa_raw=32.0, voice_activity=True, timestamp=1.3)
+    loc.update(doa_raw=32.0, voice_activity=True, timestamp=1.2)
     assert loc.confirmed_sector == "LEFT"
 
-    # Now need fresh 3 consecutive RIGHT readings to switch
+    # Reading 1 in RIGHT → still not enough
+    loc.update(doa_raw=142.0, voice_activity=True, timestamp=1.3)
+    assert loc.confirmed_sector == "LEFT"
+
+    # Reading 2 in RIGHT → switches
     loc.update(doa_raw=142.0, voice_activity=True, timestamp=1.4)
-    assert loc.confirmed_sector == "LEFT"
-    loc.update(doa_raw=142.0, voice_activity=True, timestamp=1.5)
-    assert loc.confirmed_sector == "LEFT"
-    loc.update(doa_raw=142.0, voice_activity=True, timestamp=1.6)
     assert loc.confirmed_sector == "RIGHT"
 
 
@@ -302,17 +298,13 @@ def test_tracking_resumes_when_voice_activity_returns():
     assert loc.target_yaw_deg == 60.0
     assert loc.confirmed_sector == "LEFT"
 
-    # Speech resumes at DIFFERENT sector (RIGHT, DOA 142) → needs confirmation
+    # Speech resumes at DIFFERENT sector (RIGHT, DOA 142) while idle → immediate resume
     loc.update(doa_raw=None, voice_activity=False, timestamp=4.5)  # timeout
     loc.is_tracking(now=5.0)  # trigger timeout
     assert loc.target_yaw_deg == 0.0
 
     loc.update(doa_raw=142.0, voice_activity=True, timestamp=5.1)
-    assert loc.target_yaw_deg == 0.0  # not yet switched (1 reading)
-    loc.update(doa_raw=142.0, voice_activity=True, timestamp=5.2)
-    assert loc.target_yaw_deg == 0.0  # 2 readings
-    loc.update(doa_raw=142.0, voice_activity=True, timestamp=5.3)
-    assert loc.target_yaw_deg == -60.0  # 3 readings → confirmed RIGHT
+    assert loc.target_yaw_deg == -60.0  # idle -> accepts immediately!
     assert loc.confirmed_sector == "RIGHT"
 
 
@@ -412,7 +404,7 @@ def test_audio_target_sole_authoritative_source():
         confidence=0.95,
         head_angle_deg=0.0,
     )
-    if vision_result.owner == PrioritySource.VISUAL_TRACKING or len([det]) > 0:
+    if vision_result.owner == PrioritySource.VISUAL_TRACKING:
         loc.on_vision_active()
         head_target = vision_result.target_yaw_deg
 
@@ -479,12 +471,11 @@ def test_mock_hid_voice_activity_and_doa_mapping():
     assert localizer.confirmed_sector == "RIGHT"
 
     # 2. voice_activity() -> True, doa_angle() -> 32 => LEFT sector
-    # Need SECTOR_CONFIRM_COUNT (3) consecutive readings to switch
+    # Need SECTOR_CONFIRM_COUNT (2) consecutive readings to switch while tracking
     mock_hid.voice_activity.return_value = True
     mock_hid.doa_angle.return_value = 32.0
     localizer.read_and_update(now=1.1)
-    localizer.read_and_update(now=1.2)
-    target_2 = localizer.read_and_update(now=1.3)
+    target_2 = localizer.read_and_update(now=1.2)
     assert localizer.is_tracking() is True
     assert target_2 == pytest.approx(60.0, abs=1.0)
     assert localizer.confirmed_sector == "LEFT"
