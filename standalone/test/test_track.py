@@ -129,3 +129,30 @@ def test_audio_sector_persistence_three_samples():
     # 6. Sağ sektörde kalmaya devam eder
     assert mapper.update(200.0, is_speech=True, timestamp=1.50) == 55.0
 
+
+def test_audio_target_retention():
+    from track import AudioTargetRetention
+
+    ret = AudioTargetRetention(hold_grace_s=1.0)
+
+    # 1. Konuşmacı -55° sektöründe konuştu
+    assert ret.on_active_speaker(-55.0, 29.0) == -55.0
+
+    # 2. 500 ms sonra kısa duraklama (dropout) -> -55° korunmalı
+    assert ret.on_speech_dropout(active_sector=None, now=29.5) == -55.0
+
+    # 3. 900 ms sonra hala duraklama -> -55° korunmalı
+    assert ret.on_speech_dropout(active_sector=None, now=29.9) == -55.0
+
+    # 4. Grace süresi doldu (1.05s sonra) -> hedef düşmeli (None)
+    assert ret.on_speech_dropout(active_sector=None, now=30.05) is None
+
+    # 5. Yeni sektör teyit edilirse grace içinde bile anında yeni sektöre geçer
+    ret.on_active_speaker(-55.0, 40.0)
+    assert ret.on_speech_dropout(active_sector=55.0, now=40.4) == 55.0
+
+    # 6. Vision devreye girerse audio hedefi derhal iptal edilir
+    ret.on_vision_active()
+    assert ret.retained_target_yaw is None
+    assert ret.on_speech_dropout(active_sector=None, now=40.5) is None
+

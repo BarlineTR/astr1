@@ -130,6 +130,56 @@ class AudioSectorMapper:
         self._last_time = 0.0
 
 
+class AudioTargetRetention:
+    """Kısa VAD/konuşma duraklamalarında audio hedefini 0.8-1.0s korur.
+
+    Kurallar:
+    - ACTIVE_SPEAKER ile yeni sektör lock edildiğinde target_yaw sektörde kalır.
+    - Tek bir kısa VAD/speech kaybı hedefi hemen düşürmez (0.8-1.0s grace period).
+    - Bu süre boyunca son aktif sektörün target_yaw'i korunur.
+    - Yeni başka sektör doğrulanırsa yeni sektöre geçilir.
+    - Vision owner olduğu anda audio tamamen bırakılır.
+    - IDLE'ye geçişte grace süresi dolduktan sonra resetlenir.
+    """
+
+    def __init__(self, hold_grace_s: float = 1.0):
+        self.hold_grace_s = hold_grace_s
+        self.retained_target_yaw = None
+        self.hold_until = 0.0
+
+    def on_vision_active(self) -> None:
+        """Vision devreye girdiği anda audio hedefi derhal bırakılır."""
+        self.retained_target_yaw = None
+        self.hold_until = 0.0
+
+    def on_active_speaker(self, active_sector, now: float):
+        """ACTIVE_SPEAKER durumunda hedefi günceller ve grace süresini yeniler."""
+        if active_sector is not None:
+            self.retained_target_yaw = active_sector
+            self.hold_until = now + self.hold_grace_s
+            return self.retained_target_yaw
+        if self.retained_target_yaw is not None and now < self.hold_until:
+            return self.retained_target_yaw
+        return None
+
+    def on_speech_dropout(self, active_sector, now: float):
+        """Konuşma duraklamasında grace period boyunca hedefi tutar."""
+        if self.retained_target_yaw is not None and now < self.hold_until:
+            # Bu süre içinde yeni bir sektör doğrulanırsa ona geç
+            if active_sector is not None and active_sector != self.retained_target_yaw:
+                self.retained_target_yaw = active_sector
+                self.hold_until = now + self.hold_grace_s
+            return self.retained_target_yaw
+        # Grace period doldu
+        self.retained_target_yaw = None
+        self.hold_until = 0.0
+        return None
+
+    def reset(self) -> None:
+        self.retained_target_yaw = None
+        self.hold_until = 0.0
+
+
 def draw_overlay(frame, detections, result, fps: float, audio_ok: bool, head_ok: bool,
                  fixed_head: bool = False):
     """Boxes, plus the two lines that say which layer is speaking."""
@@ -251,6 +301,7 @@ def main(argv=None) -> int:
     status = StatusLog(interval_s=opts.log_interval)
     tracker = GazeTracker()
     sector_mapper = AudioSectorMapper()
+    target_retention = AudioTargetRetention(hold_grace_s=1.0)
     started = time.monotonic()
     frames, fps, last_fps_at, last_fps_frames = 0, 0.0, started, 0
 
@@ -298,15 +349,27 @@ def main(argv=None) -> int:
                 is_robot_speaking=voice_loop.is_speaking_at(now) if voice_loop else False,
             )
 
-            # Sektörel Audio -> Head Eşlemesi:
-            # ACTIVE_SPEAKER durumunda target_yaw kararlı sektöre (-55°, 0°, +55°) kilitlenir.
-            if result.owner == PrioritySource.ACTIVE_SPEAKER:
-                if active_sector is not None:
-                    result.target_yaw_deg = active_sector
+            # Sektörel Audio -> Head Eşlemesi ve Hedef Koruma (Retention):
+            if result.owner == PrioritySource.VISUAL_TRACKING or len(detections) > 0:
+                # Kural: Vision owner olduğu anda audio tamamen bırakılır
+                target_retention.on_vision_active()
+                sector_mapper.reset()
+            elif result.owner == PrioritySource.ACTIVE_SPEAKER:
+                held_yaw = target_retention.on_active_speaker(active_sector, now)
+                if held_yaw is not None:
+                    result.target_yaw_deg = held_yaw
                 else:
                     result.target_yaw_deg = head_reference if head_reference is not None else result.head_angle_deg
-            elif result.owner == PrioritySource.IDLE:
-                sector_mapper.reset()
+            else:
+                # ACTIVE_SPEAKER veya VISUAL değil (kısa speech dropout / IDLE / ACQUIRING)
+                held_yaw = target_retention.on_speech_dropout(active_sector, now)
+                if held_yaw is not None:
+                    result.target_yaw_deg = held_yaw
+                    result.owner = PrioritySource.ACTIVE_SPEAKER
+                else:
+                    target_retention.reset()
+                    if result.owner == PrioritySource.IDLE:
+                        sector_mapper.reset()
 
             head.send_angle(result.target_yaw_deg)
             head.tick(now)
