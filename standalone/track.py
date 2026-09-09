@@ -76,7 +76,12 @@ class ReSpeakerAudioLocalizer:
     SECTOR_RIGHT_MIN = 100.0   # DOA >= 100° = RIGHT
     #                            55°..100° = CENTER
 
-    SECTOR_TARGETS = {"LEFT": -45.0, "CENTER": 0.0, "RIGHT": 45.0}
+    SECTOR_TARGETS = {"LEFT": 45.0, "CENTER": 0.0, "RIGHT": -45.0}
+    # NOTE: LEFT/RIGHT targets are SWAPPED from the original calibration labels.
+    # Live testing proved calibration labels were from user's perspective (facing robot):
+    #   DOA ~32  ("LEFT" in calib)  = robot's physical RIGHT  → motor +45°
+    #   DOA ~148 ("RIGHT" in calib) = robot's physical LEFT   → motor -45°
+    # Evidence: visual tracking found user at -28.9° when DOA read 148.
     SECTOR_CONFIRM_COUNT = 3   # consecutive readings to switch sector
 
     # ── Legacy calibration (kept for backward-compat tests) ────────
