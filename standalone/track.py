@@ -604,6 +604,7 @@ def main(argv=None, hid=None) -> int:
     started = time.monotonic()
     frames, fps, last_fps_at, last_fps_frames = 0, 0.0, started, 0
     last_audio_log_yaw: Optional[float] = None
+    last_visual_target_id: Optional[str] = None
 
     try:
         while True:
@@ -652,12 +653,34 @@ def main(argv=None, hid=None) -> int:
 
             # Audio target'ın tek ve authoritative kaynağı ReSpeakerAudioLocalizer'dır.
             # Vision önceliği: Görsel takip bir yüze kilitlendiğinde audio bırakılır.
-            if result.owner == PrioritySource.VISUAL_TRACKING:
+            # Yüz algılamadaki anlık tek/birkaç karelik kesintilerde (hareket bulanıklığı, profil bakış vb.)
+            # GazeTracker'ın hedefi koruma (HOLDING_ATTENTION, TARGET_LOST, TRACKING, ORIENTING)
+            # ve setpoint açısını tutma mekanizması korunur; kafa hemen 0°'ye fırlatılmaz
+            # ve ses dikkati dağıtamaz.
+            vision_active = (
+                result.owner == PrioritySource.VISUAL_TRACKING
+                or result.gaze_state in (
+                    GazeStateEnum.TRACKING,
+                    GazeStateEnum.HOLDING_ATTENTION,
+                    GazeStateEnum.ORIENTING,
+                    GazeStateEnum.ACQUIRING,
+                    GazeStateEnum.TARGET_LOST,
+                )
+            )
+
+            if vision_active:
                 localizer.on_vision_active()
                 target_yaw = result.target_yaw_deg
                 motor_yaw = target_yaw
                 last_audio_log_yaw = None
+                if result.target_id:
+                    last_visual_target_id = result.target_id
+                if result.owner != PrioritySource.VISUAL_TRACKING:
+                    result.owner = PrioritySource.VISUAL_TRACKING
+                    if not result.target_id:
+                        result.target_id = last_visual_target_id
             elif localizer.is_tracking(now):
+                last_visual_target_id = None
                 target_yaw = localizer.target_yaw_deg
                 motor_yaw = target_yaw
                 result.target_yaw_deg = target_yaw
@@ -670,6 +693,7 @@ def main(argv=None, hid=None) -> int:
                     print(f"AUDIO sector={sector_str} DOA={doa_str} target={target_yaw:+.1f}")
                     last_audio_log_yaw = motor_yaw
             else:
+                last_visual_target_id = None
                 target_yaw = 0.0
                 motor_yaw = 0.0
                 result.target_yaw_deg = 0.0

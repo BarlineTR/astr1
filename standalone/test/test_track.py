@@ -605,3 +605,57 @@ def test_doa_noise_does_not_cause_opposite_turn():
     # DOA bounces back to RIGHT → resets pending
     loc.update(doa_raw=140.0, voice_activity=True, timestamp=1.2)
     assert loc.target_yaw_deg == -60.0  # still RIGHT
+
+
+# ── Visual Tracking Coasting & Resilience ─────────────────────────
+
+def test_visual_tracking_coasts_through_face_dropout_in_main():
+    """Görsel takip sırasında yüz birkaç kare algılanamadığında (hareket bulanıklığı vb.),
+    sistem hemen motor_yaw=0.0 göndermemeli veya audio'ya geçmemeli;
+    hedef açısını korumalıdır (HOLDING_ATTENTION / TARGET_LOST coasting).
+    """
+    class _CoastingKamera:
+        available = True
+        backend = "webcam"
+        detector_name = "test"
+        def __init__(self, **kwargs):
+            self.frame_idx = 0
+            self.frame = np.zeros((480, 640, 3), dtype=np.uint8)
+        def read(self):
+            self.frame_idx += 1
+            return self.frame_idx <= 12, self.frame
+        def detect(self, frame):
+            # İlk 5 kare: yüz sağda (x=400)
+            if self.frame_idx <= 5:
+                return [Detection(x=400, y=240, w=100, h=100, confidence=0.88)]
+            # Sonraki 7 kare: yüz geçici olarak algılanamadı
+            return []
+        def close(self):
+            pass
+
+    mock_hid = MagicMock(spec=["voice_activity", "doa_angle"])
+    mock_hid.voice_activity.return_value = True
+    mock_hid.doa_angle.return_value = 149.0  # RIGHT sector -> -60.0
+
+    mock_head = MagicMock()
+    mock_head.has_feedback = False
+
+    cikti = io.StringIO()
+    with patch.object(track, "CameraSource", _CoastingKamera), \
+         patch.object(track, "AudioSource", _SessizKaynak), \
+         patch.object(track, "HeadLink", return_value=mock_head), \
+         contextlib.redirect_stdout(cikti):
+        code = track.main(
+            ["--fixed-head", "--no-window", "--no-voice", "--seconds", "1.0"],
+            hid=mock_hid
+        )
+        assert code == 0
+
+    sent_angles = [call[0][0] for call in mock_head.send_angle.call_args_list]
+    assert len(sent_angles) == 12
+    # Yüz kaybolduğunda (kare 6..12) motor 0.0'a fırlamamalı ve audio (-60°) araya girmemeli
+    for angle in sent_angles[5:]:
+        assert angle != 0.0, f"Açı sıfıra fırladı: {angle}"
+        assert angle != -60.0, f"Ses görsel takibi böldü: {angle}"
+        assert pytest.approx(-13.3, abs=1.0) == angle
+
