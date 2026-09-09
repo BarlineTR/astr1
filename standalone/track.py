@@ -18,6 +18,7 @@ tahmin etmeden okumak için:
 """
 
 import argparse
+import math
 import sys
 import time
 from pathlib import Path
@@ -33,7 +34,7 @@ from astro_audio.speech_detector import SpeechVerdict  # noqa: E402
 from head_link import HeadLink, open_port  # noqa: E402
 from recorder import OverlayRecorder, default_path  # noqa: E402
 from sources import AudioSource, CameraSource  # noqa: E402
-from astro_base.gaze.types import PrioritySource  # noqa: E402
+from astro_base.gaze.types import GazeStateEnum, PrioritySource  # noqa: E402
 from stereo_doa import DEFAULT_MIC_SPACING_M  # noqa: E402
 from statuslog import StatusLog  # noqa: E402
 from tracker import GazeTracker  # noqa: E402
@@ -42,197 +43,266 @@ BOX_COLOUR = (0, 215, 255)
 TEXT_COLOUR = (0, 255, 120)
 
 
-class AudioSectorMapper:
-    """Raw HID DOA -> Sektörel Kafa Yönelimi (-55°, 0°, +55°).
+class ReSpeakerAudioLocalizer:
+    """ReSpeaker XVF3000 DSP (VOICEACTIVITY + DOAANGLE) -> ASTRO Head Yaw Localizer.
 
-    Raw HID DOA aralıkları:
-      0..55    -> LEFT   = -55°
-      55..95   -> CENTER = 0°
-      95..300  -> RIGHT  = +55°
-      300..360 -> LEFT   = -55°
-
-    Yeni sektöre geçiş için 3 ardışık aynı sektör örneği şartı.
-    Sektör kararlı kaldığı sürece target_yaw sabit kalır.
+    Architecture:
+        ReSpeaker (VOICEACTIVITY + DOAANGLE)
+                    ↓
+        circular filtering (atan2 mean, angle wrap-around safe)
+                    ↓
+        outlier rejection (single-spike rejection, 2-consecutive step change)
+                    ↓
+        calibrated DOA -> ASTRO head yaw (piecewise linear, bounded)
+                    ↓
+        deadband suppression (prevents servo jitter on minor fluctuations)
+                    ↓
+        target_yaw_deg -> head.send_angle()
     """
 
-    SECTOR_LEFT = -55.0
-    SECTOR_CENTER = 0.0
-    SECTOR_RIGHT = 55.0
+    # Physical calibration measurements on robot:
+    # 1) Front 0°: DOA 69.0° -> Yaw 0.0°
+    # 2) Left 45°: DOA 33.0° -> Yaw -45.0°
+    # 3) Right 45°: DOA 142.0° -> Yaw +45.0°
+    # 4) Right 90°: DOA 149.0° -> Yaw +90.0°
+    CALIBRATION_POINTS = (
+        (33.0, -45.0),
+        (69.0, 0.0),
+        (142.0, 45.0),
+        (149.0, 90.0),
+    )
 
-    def __init__(self, persistence_required: int = 3, timeout_s: float = 1.5):
-        self.persistence_required = persistence_required
-        self.timeout_s = timeout_s
-        self.active_sector = None
-        self._candidate_sector = None
-        self._candidate_hits = 0
-        self._last_raw_doa = None
-        self._last_time = 0.0
+    def __init__(
+        self,
+        hid=None,
+        hold_timeout_s: float = 1.2,
+        deadband_deg: float = 5.0,
+        outlier_threshold_deg: float = 30.0,
+        filter_window_size: int = 5,
+    ):
+        self.hid = hid
+        self.hold_timeout_s = float(hold_timeout_s)
+        self.deadband_deg = float(deadband_deg)
+        self.outlier_threshold_deg = float(outlier_threshold_deg)
+        self.filter_window_size = int(filter_window_size)
+
+        self.filtered_doa: Optional[float] = None
+        self._history: list[float] = []
+        self._outlier_candidate: Optional[float] = None
+        self._outlier_count: int = 0
+
+        self.active_target_yaw: float = 0.0
+        self._last_voice_activity_time: float = 0.0
+        self._tracking_active: bool = False
+
+        # Polling cache
+        self._last_poll_time: float = 0.0
+        self._cached_vad: Optional[bool] = None
+        self._cached_doa: Optional[float] = None
 
     @staticmethod
-    def classify_sector(raw_doa: float) -> float:
+    def circular_dist(a: float, b: float) -> float:
+        """Angular distance between two angles in degrees [0, 180]."""
+        diff = (float(a) - float(b) + 180.0) % 360.0 - 180.0
+        return abs(diff)
+
+    @staticmethod
+    def circular_mean(angles: Sequence[float]) -> float:
+        """Circular mean of angles in degrees, properly handling wrap-around."""
+        if not angles:
+            return 0.0
+        s = sum(math.sin(math.radians(float(a))) for a in angles)
+        c = sum(math.cos(math.radians(float(a))) for a in angles)
+        if abs(s) < 1e-9 and abs(c) < 1e-9:
+            return float(angles[-1]) % 360.0
+        return math.degrees(math.atan2(s, c)) % 360.0
+
+    @classmethod
+    def calibrated_yaw(cls, doa_deg: float) -> float:
+        """Monotonic piecewise linear calibration from ReSpeaker DOA to ASTRO Head Yaw.
+
+        Measurements (physically measured on robot):
+            DOA 33.0°  -> Yaw -45.0°
+            DOA 69.0°  -> Yaw   0.0°
+            DOA 142.0° -> Yaw +45.0°
+            DOA 149.0° -> Yaw +90.0°
+
+        Saturation:
+            DOA outside [33.0, 149.0] saturates safely to the nearest calibrated endpoint:
+            - Nearest to 33.0° -> -45.0° (e.g. 10.0°, 0.0°, 350.0°)
+            - Nearest to 149.0° -> +90.0° (e.g. 180.0°, 250.0°)
+        """
+        raw = float(doa_deg) % 360.0
+        if 33.0 <= raw <= 149.0:
+            if raw <= 69.0:
+                t = (raw - 33.0) / (69.0 - 33.0)
+                return -45.0 + t * 45.0
+            elif raw <= 142.0:
+                t = (raw - 69.0) / (142.0 - 69.0)
+                return 0.0 + t * 45.0
+            else:  # 142.0 < raw <= 149.0
+                t = (raw - 142.0) / (149.0 - 142.0)
+                return 45.0 + t * 45.0
+
+        dist_33 = cls.circular_dist(raw, 33.0)
+        dist_149 = cls.circular_dist(raw, 149.0)
+        return -45.0 if dist_33 <= dist_149 else 90.0
+
+    def reject_outlier(self, raw_doa: float) -> bool:
+        """Rejects single transient spikes in DOA angle.
+
+        Returns True if raw_doa is rejected as an outlier, False if accepted.
+        If 2 consecutive samples are at the new angle, it is accepted as a step change.
+        """
         raw = float(raw_doa) % 360.0
-        if 0.0 <= raw <= 55.0 or 300.0 <= raw <= 360.0:
-            return AudioSectorMapper.SECTOR_LEFT
-        elif 55.0 < raw <= 95.0:
-            return AudioSectorMapper.SECTOR_CENTER
-        else:  # 95.0 < raw < 300.0
-            return AudioSectorMapper.SECTOR_RIGHT
+        if self.filtered_doa is None:
+            self.filtered_doa = raw
+            self._history = [raw]
+            self._outlier_candidate = None
+            self._outlier_count = 0
+            return False
 
-    def update(self, raw_doa, is_speech: bool, timestamp: float):
-        if timestamp - self._last_time > self.timeout_s:
-            self._candidate_sector = None
-            self._candidate_hits = 0
+        dist = self.circular_dist(raw, self.filtered_doa)
+        if dist <= self.outlier_threshold_deg:
+            self._outlier_candidate = None
+            self._outlier_count = 0
+            self._history.append(raw)
+            if len(self._history) > self.filter_window_size:
+                self._history.pop(0)
+            self.filtered_doa = self.circular_mean(self._history)
+            return False
 
-        if raw_doa is None or not is_speech:
-            return self.active_sector
+        # dist > outlier_threshold_deg
+        if (
+            self._outlier_candidate is not None
+            and self.circular_dist(raw, self._outlier_candidate) <= self.outlier_threshold_deg
+        ):
+            # 2nd consecutive sample at new angle -> accept step change
+            self.filtered_doa = raw
+            self._history = [raw]
+            self._outlier_candidate = None
+            self._outlier_count = 0
+            return False
 
-        # Sadece yeni bir DOA değeri geldiğinde persistence sayacını işlet
-        if self._last_raw_doa is not None and abs(raw_doa - self._last_raw_doa) < 1e-4:
-            self._last_time = timestamp
-            return self.active_sector
+        self._outlier_candidate = raw
+        self._outlier_count = 1
+        return True
 
-        self._last_raw_doa = raw_doa
-        self._last_time = timestamp
+    def apply_deadband(self, candidate_yaw: float) -> float:
+        """Applies deadband to prevent servo jitter on small yaw changes."""
+        if abs(candidate_yaw - self.active_target_yaw) >= self.deadband_deg:
+            self.active_target_yaw = candidate_yaw
+        return self.active_target_yaw
 
-        target = self.classify_sector(raw_doa)
+    def target_yaw(self, candidate_yaw: float) -> float:
+        """Alias for apply_deadband."""
+        return self.apply_deadband(candidate_yaw)
 
-        if self.active_sector is None:
-            if target == self._candidate_sector:
-                self._candidate_hits += 1
-            else:
-                self._candidate_sector = target
-                self._candidate_hits = 1
+    def update(
+        self,
+        doa_raw: Optional[float],
+        voice_activity: bool,
+        timestamp: float,
+    ) -> float:
+        """Updates localizer state with new DOA and VAD readings."""
+        if voice_activity:
+            self._last_voice_activity_time = timestamp
+            was_tracking = self._tracking_active
+            self._tracking_active = True
 
-            if self._candidate_hits >= self.persistence_required:
-                self.active_sector = target
-                self._candidate_sector = None
-                self._candidate_hits = 0
+            if doa_raw is not None:
+                if not self.reject_outlier(doa_raw):
+                    candidate = self.calibrated_yaw(self.filtered_doa)
+                    if not was_tracking:
+                        self.active_target_yaw = candidate
+                    else:
+                        self.apply_deadband(candidate)
         else:
-            if target != self.active_sector:
-                if target == self._candidate_sector:
-                    self._candidate_hits += 1
-                else:
-                    self._candidate_sector = target
-                    self._candidate_hits = 1
+            # VOICEACTIVITY is False: do NOT update target with incoming DOA
+            if self._tracking_active:
+                if timestamp - self._last_voice_activity_time > self.hold_timeout_s:
+                    self._tracking_active = False
+                    self.active_target_yaw = 0.0
+                    self.reset_filter()
 
-                if self._candidate_hits >= self.persistence_required:
-                    self.active_sector = target
-                    self._candidate_sector = None
-                    self._candidate_hits = 0
-            else:
-                self._candidate_sector = None
-                self._candidate_hits = 0
+        return self.target_yaw_deg
 
-        return self.active_sector
+    @property
+    def target_yaw_deg(self) -> float:
+        """Authoritative audio target yaw. Returns 0.0 when not tracking."""
+        if not self._tracking_active:
+            return 0.0
+        return self.active_target_yaw
 
-    def reset(self):
-        self.active_sector = None
-        self._candidate_sector = None
-        self._candidate_hits = 0
-        self._last_raw_doa = None
-        self._last_time = 0.0
+    def is_tracking(self, now: Optional[float] = None) -> bool:
+        """Returns True if localizer is currently actively tracking speech."""
+        if not self._tracking_active:
+            return False
+        if now is not None and (now - self._last_voice_activity_time > self.hold_timeout_s):
+            self._tracking_active = False
+            self.active_target_yaw = 0.0
+            self.reset_filter()
+            return False
+        return True
 
-
-class AudioTargetRetention:
-    """Kısa VAD/konuşma duraklamalarında audio hedefini en az 1.5s korur.
-
-    Kurallar:
-    - ACTIVE_SPEAKER ile yeni sektör lock edildiğinde target_yaw sektörde kalır.
-    - Tek bir kısa VAD/speech kaybı hedefi hemen düşürmez (en az 1.5s grace period).
-    - Bu süre boyunca son aktif sektörün target_yaw'i korunur.
-    - Yeni başka sektör doğrulanırsa yeni sektöre geçilir.
-    - Vision owner olduğu anda audio tamamen bırakılır.
-    - IDLE'ye geçişte grace süresi dolduktan sonra resetlenir.
-    """
-
-    def __init__(self, hold_grace_s: float = 1.5):
-        self.hold_grace_s = hold_grace_s
-        self.retained_target_yaw = None
-        self.retained_target_id = None
-        self.hold_until = 0.0
-
-    def on_vision_active(self) -> None:
-        """Vision devreye girdiği anda audio hedefi derhal bırakılır."""
-        self.retained_target_yaw = None
-        self.retained_target_id = None
-        self.hold_until = 0.0
-
-    def on_active_speaker(self, active_sector, now: float, target_id: Optional[str] = None):
-        """ACTIVE_SPEAKER durumunda hedefi günceller ve grace süresini yeniler."""
-        if target_id:
-            self.retained_target_id = target_id
-        if active_sector is not None:
-            self.retained_target_yaw = active_sector
-            self.hold_until = now + self.hold_grace_s
-            return self.retained_target_yaw
-        if self.retained_target_yaw is not None and now < self.hold_until:
-            return self.retained_target_yaw
-        return None
-
-    def on_speech_dropout(self, active_sector, now: float):
-        """Konuşma duraklamasında grace period boyunca hedefi tutar."""
-        if self.retained_target_yaw is not None and now < self.hold_until:
-            # Bu süre içinde yeni bir sektör doğrulanırsa ona geç
-            if active_sector is not None and active_sector != self.retained_target_yaw:
-                self.retained_target_yaw = active_sector
-                self.hold_until = now + self.hold_grace_s
-            return self.retained_target_yaw
-        # Grace period doldu
-        self.retained_target_yaw = None
-        self.retained_target_id = None
-        self.hold_until = 0.0
-        return None
+    def reset_filter(self) -> None:
+        """Clears circular filter history and outlier state."""
+        self.filtered_doa = None
+        self._history.clear()
+        self._outlier_candidate = None
+        self._outlier_count = 0
 
     def reset(self) -> None:
-        self.retained_target_yaw = None
-        self.retained_target_id = None
-        self.hold_until = 0.0
+        """Full reset of localizer state."""
+        self._tracking_active = False
+        self.active_target_yaw = 0.0
+        self._last_voice_activity_time = 0.0
+        self.reset_filter()
 
+    def on_vision_active(self) -> None:
+        """Called when visual tracking is active; immediately drops audio tracking."""
+        self.reset()
 
-def resolve_target_yaw(
-    result,
-    detections,
-    active_sector: Optional[float],
-    target_retention: AudioTargetRetention,
-    sector_mapper: AudioSectorMapper,
-    now: float,
-    is_speech: bool = False,
-) -> float:
-    """Sektörel Audio -> Head Eşlemesi ve Hedef Koruma (Retention).
+    def read_voice_activity(self) -> Optional[bool]:
+        """Reads hardware VOICEACTIVITY from ReSpeaker XVF3000 (module 19, offset 32)."""
+        if self.hid is None:
+            return None
+        if hasattr(self.hid, "voice_activity") and callable(self.hid.voice_activity):
+            return self.hid.voice_activity()
+        if hasattr(self.hid, "_read_param") and callable(self.hid._read_param):
+            val = self.hid._read_param(19, 32)
+            return bool(val) if val in (0, 1) else None
+        return None
 
-    Audio aktif olduğu sürece tek authoritative kaynak AudioSectorMapper +
-    AudioTargetRetention'dır. GazeTracker.step() tarafından üretilen continuous
-    audio target asla kullanılmaz / dışarı sızmaz.
-    """
-    if result.owner == PrioritySource.VISUAL_TRACKING or len(detections) > 0:
-        # Kural: Vision owner olduğu anda audio tamamen bırakılır
-        target_retention.on_vision_active()
-        sector_mapper.reset()
-        return result.target_yaw_deg
+    def read_doa_angle(self) -> Optional[float]:
+        """Reads hardware DOAANGLE from ReSpeaker XVF3000 (module 21, offset 0)."""
+        if self.hid is None:
+            return None
+        if hasattr(self.hid, "doa_angle") and callable(self.hid.doa_angle):
+            return self.hid.doa_angle()
+        if hasattr(self.hid, "_read_param") and callable(self.hid._read_param):
+            val = self.hid._read_param(21, 0)
+            return float(val) if val is not None and 0 <= val <= 359 else None
+        return None
 
-    if result.owner == PrioritySource.ACTIVE_SPEAKER or is_speech:
-        held_yaw = target_retention.on_active_speaker(active_sector, now, getattr(result, "target_id", None))
-        if held_yaw is not None:
-            result.target_yaw_deg = held_yaw
-            result.owner = PrioritySource.ACTIVE_SPEAKER
-            result.target_id = target_retention.retained_target_id or result.target_id or "audio_speaker_1"
-        else:
-            result.target_yaw_deg = 0.0
-        return result.target_yaw_deg
+    def read_and_update(
+        self,
+        now: float,
+        fallback_doa: Optional[float] = None,
+        fallback_vad: bool = False,
+        poll_interval_s: float = 0.05,
+    ) -> float:
+        """Polls ReSpeaker hardware registers and updates localizer."""
+        if self.hid is not None:
+            if now - self._last_poll_time >= poll_interval_s or self._last_poll_time == 0.0:
+                self._cached_vad = self.read_voice_activity()
+                self._cached_doa = self.read_doa_angle()
+                self._last_poll_time = now
 
-    # ACTIVE_SPEAKER veya VISUAL değil (kısa speech dropout / IDLE / ACQUIRING)
-    held_yaw = target_retention.on_speech_dropout(active_sector, now)
-    if held_yaw is not None:
-        result.target_yaw_deg = held_yaw
-        result.owner = PrioritySource.ACTIVE_SPEAKER
-        result.target_id = target_retention.retained_target_id or result.target_id or "audio_speaker_1"
-    else:
-        target_retention.reset()
-        if result.owner == PrioritySource.IDLE:
-            sector_mapper.reset()
-        result.target_yaw_deg = 0.0
+        vad = self._cached_vad if self._cached_vad is not None else fallback_vad
+        doa = self._cached_doa if self._cached_doa is not None else fallback_doa
 
-    return result.target_yaw_deg
+        return self.update(doa_raw=doa, voice_activity=vad, timestamp=now)
 
 
 def draw_overlay(frame, detections, result, fps: float, audio_ok: bool, head_ok: bool,
@@ -288,8 +358,10 @@ def main(argv=None, hid=None) -> int:
     parser.add_argument("--log-interval", type=float, default=1.0, metavar="SN",
                         help="Terminale durum satiri basma araligi (0 = yalnizca "
                              "durum/hedef degisimlerinde bas)")
-    parser.add_argument("--audio-hold-grace", type=float, default=1.5,
-                        help="Audio hedefinin konuşma kesildikten sonra tutulacağı süre (saniye, varsayılan: 1.5)")
+    parser.add_argument("--audio-hold-grace", type=float, default=1.2,
+                        help="Audio hedefinin konuşma kesildikten sonra tutulacağı süre (saniye, varsayılan: 1.2)")
+    parser.add_argument("--audio-deadband", type=float, default=5.0,
+                        help="Audio hedefi deadband eşiği (derece, varsayılan: 5.0)")
     parser.add_argument("--record", nargs="?", const="", default=None, metavar="DOSYA",
                         help="Bindirilmiş görüntüyü videoya kaydet. Yol verilmezse "
                              "astro_<tarih>.mp4 kullanılır. Ekransız çalışırken "
@@ -357,13 +429,14 @@ def main(argv=None, hid=None) -> int:
 
     status = StatusLog(interval_s=opts.log_interval)
     tracker = GazeTracker()
-    sector_mapper = AudioSectorMapper()
-    target_retention = AudioTargetRetention(hold_grace_s=opts.audio_hold_grace)
     respeaker_hid = hid if hid is not None else ReSpeakerHID()
+    localizer = ReSpeakerAudioLocalizer(
+        hid=respeaker_hid,
+        hold_timeout_s=opts.audio_hold_grace,
+        deadband_deg=opts.audio_deadband,
+    )
     started = time.monotonic()
     frames, fps, last_fps_at, last_fps_frames = 0, 0.0, started, 0
-    last_hid_poll = 0.0
-    cached_hid_speech = None
 
     try:
         while True:
@@ -388,47 +461,12 @@ def main(argv=None, hid=None) -> int:
             doa_deg = audio.latest_doa_deg(now) if audio.available else None
             speech = audio.latest_speech(now) if audio.available else None
 
-            # ReSpeaker HID SPEECH_DETECTED authoritative VAD okuması (~20 Hz):
-            # Donanımsal DSP'nin SPEECH_DETECTED register'ı (19, 22) birincil VAD'dir;
-            # yazılımsal harmoniklik/modülasyon sınıflandırıcısının konuşmayı erken
-            # veya yanlış düşürmesini ("elendi: ne harmonik ne modulasyonlu") önler.
-            if now - last_hid_poll >= 0.05:
-                cached_hid_speech = respeaker_hid.speech_detected()
-                last_hid_poll = now
-
-            if cached_hid_speech is not None:
-                is_speech = cached_hid_speech
-                if is_speech:
-                    if speech is None:
-                        speech = SpeechVerdict(
-                            is_speech=True,
-                            confidence=0.85,
-                            harmonicity=1.0,
-                            modulation=1.0,
-                            rms=0.01,
-                            reason="hid_vad",
-                        )
-                    elif not speech.is_speech:
-                        speech = SpeechVerdict(
-                            is_speech=True,
-                            confidence=max(float(speech.confidence), 0.85),
-                            harmonicity=float(speech.harmonicity),
-                            modulation=float(speech.modulation),
-                            rms=float(speech.rms),
-                            reason="hid_vad",
-                        )
-                else:
-                    if speech is not None and speech.is_speech:
-                        speech = SpeechVerdict(
-                            is_speech=False,
-                            confidence=float(speech.confidence),
-                            harmonicity=float(speech.harmonicity),
-                            modulation=float(speech.modulation),
-                            rms=float(speech.rms),
-                            reason="hid_silent",
-                        )
-            else:
-                is_speech = bool(speech.is_speech) if speech is not None else False
+            # ReSpeaker XVF3000 DSP (VOICEACTIVITY + DOAANGLE) localizer update:
+            localizer.read_and_update(
+                now=now,
+                fallback_doa=doa_deg,
+                fallback_vad=speech.is_speech if speech else False,
+            )
 
             if voice_loop is not None:
                 voice_loop.pump(now)
@@ -438,30 +476,38 @@ def main(argv=None, hid=None) -> int:
             head_reference = (0.0 if opts.fixed_head else
                               head.measured_angle_deg if head.has_feedback else None)
 
-            active_sector = sector_mapper.update(doa_deg, is_speech, now)
-
+            # GazeTracker.step() çağrısına DOA beslenmez (doa_deg=None).
+            # Böylece eski continuous tracker DOA açılarının (-21.2, -36.9, -59.4 vb.)
+            # üretilmesi ve dışarı sızması %100 engellenir.
             result = tracker.step(
                 faces=detections,
                 frame_size=(frame.shape[1], frame.shape[0]),
-                doa_deg=doa_deg,
-                speech=speech,
+                doa_deg=None,
+                speech=None,
                 measured_head_deg=head_reference,
                 timestamp=now,
                 is_robot_speaking=voice_loop.is_speaking_at(now) if voice_loop else False,
             )
 
-            # Sektörel Audio -> Head Eşlemesi ve Hedef Koruma (Retention):
-            resolve_target_yaw(
-                result=result,
-                detections=detections,
-                active_sector=active_sector,
-                target_retention=target_retention,
-                sector_mapper=sector_mapper,
-                now=now,
-                is_speech=is_speech,
-            )
+            # Audio target'ın tek ve authoritative kaynağı ReSpeakerAudioLocalizer'dır.
+            # Vision önceliği: Görüntü yüz tespit ettiğinde audio derhal bırakılır.
+            if result.owner == PrioritySource.VISUAL_TRACKING or len(detections) > 0:
+                localizer.on_vision_active()
+                target_yaw = result.target_yaw_deg
+            elif localizer.is_tracking(now):
+                target_yaw = localizer.target_yaw_deg
+                result.target_yaw_deg = target_yaw
+                result.owner = PrioritySource.ACTIVE_SPEAKER
+                result.gaze_state = GazeStateEnum.ORIENTING
+                result.target_id = "audio_speaker_1"
+            else:
+                target_yaw = 0.0
+                result.target_yaw_deg = 0.0
+                result.owner = PrioritySource.IDLE
+                result.gaze_state = GazeStateEnum.IDLE
+                result.target_id = None
 
-            head.send_angle(result.target_yaw_deg)
+            head.send_angle(target_yaw)
             head.tick(now)
 
             frames += 1
@@ -474,7 +520,7 @@ def main(argv=None, hid=None) -> int:
                 result=result,
                 fps=fps,
                 detections=len(detections),
-                doa_deg=doa_deg,
+                doa_deg=localizer.filtered_doa if localizer.is_tracking() else doa_deg,
                 head_feedback=head.has_feedback,
                 speech=speech,
                 fixed_head=opts.fixed_head,

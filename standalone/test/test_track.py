@@ -76,220 +76,159 @@ def test_sabit_referans_motor_baglantisiyla_birlikte_acilamaz():
     assert exc.value.code == 2
 
 
-def test_audio_sector_classification():
-    from track import AudioSectorMapper
-
-    mapper = AudioSectorMapper()
-    # 0..55 -> LEFT (-55°)
-    assert mapper.classify_sector(0.0) == -55.0
-    assert mapper.classify_sector(30.0) == -55.0
-    assert mapper.classify_sector(55.0) == -55.0
-
-    # 55..95 -> CENTER (0°)
-    assert mapper.classify_sector(56.0) == 0.0
-    assert mapper.classify_sector(75.0) == 0.0
-    assert mapper.classify_sector(95.0) == 0.0
-
-    # 95..300 -> RIGHT (+55°)
-    assert mapper.classify_sector(96.0) == 55.0
-    assert mapper.classify_sector(150.0) == 55.0
-    assert mapper.classify_sector(299.0) == 55.0
-
-    # 300..360 -> LEFT (-55°)
-    assert mapper.classify_sector(300.0) == -55.0
-    assert mapper.classify_sector(330.0) == -55.0
-    assert mapper.classify_sector(359.9) == -55.0
+# 1. DOA 69 -> yaw 0
+def test_doa_69_maps_to_yaw_0():
+    from track import ReSpeakerAudioLocalizer
+    assert ReSpeakerAudioLocalizer.calibrated_yaw(69.0) == pytest.approx(0.0, abs=1e-3)
 
 
-def test_audio_sector_persistence_three_samples():
-    from track import AudioSectorMapper
-
-    mapper = AudioSectorMapper(persistence_required=3)
-
-    # 1. İlk 2 örnekte sektör kilitlenmez (None döner)
-    assert mapper.update(40.0, is_speech=True, timestamp=1.0) is None
-    assert mapper.update(45.0, is_speech=True, timestamp=1.05) is None
-
-    # 2. 3. ardışık örnekte sol sektör (-55°) kilitlenir
-    assert mapper.update(50.0, is_speech=True, timestamp=1.10) == -55.0
-
-    # 3. Sektör içinde kalan dalgalanmalarda target sabit kalır
-    assert mapper.update(35.0, is_speech=True, timestamp=1.15) == -55.0
-    assert mapper.update(20.0, is_speech=True, timestamp=1.20) == -55.0
-
-    # 4. Sağdan gelen tek bir glitch örneği sektörü bozmaz
-    assert mapper.update(180.0, is_speech=True, timestamp=1.25) == -55.0
-    assert mapper.update(40.0, is_speech=True, timestamp=1.30) == -55.0
-
-    # 5. Yeni sektöre (sağ: +55°) geçiş için 3 ardışık örnek şartı
-    assert mapper.update(150.0, is_speech=True, timestamp=1.35) == -55.0
-    assert mapper.update(160.0, is_speech=True, timestamp=1.40) == -55.0
-    assert mapper.update(155.0, is_speech=True, timestamp=1.45) == 55.0  # 3. örnekte sağa geçer
-
-    # 6. Sağ sektörde kalmaya devam eder
-    assert mapper.update(200.0, is_speech=True, timestamp=1.50) == 55.0
+# 2. DOA 33 -> yaw -45
+def test_doa_33_maps_to_yaw_minus_45():
+    from track import ReSpeakerAudioLocalizer
+    assert ReSpeakerAudioLocalizer.calibrated_yaw(33.0) == pytest.approx(-45.0, abs=1e-3)
 
 
-def test_audio_target_retention():
-    from track import AudioTargetRetention
-
-    ret = AudioTargetRetention(hold_grace_s=1.5)
-
-    # 1. Konuşmacı -55° sektöründe konuştu
-    assert ret.on_active_speaker(-55.0, 29.0) == -55.0
-
-    # 2. 500 ms sonra kısa duraklama (dropout) -> -55° korunmalı
-    assert ret.on_speech_dropout(active_sector=None, now=29.5) == -55.0
-
-    # 3. 1.2s sonra hala duraklama (en az 1.5s kuralı) -> -55° korunmalı
-    assert ret.on_speech_dropout(active_sector=None, now=30.2) == -55.0
-
-    # 4. Grace süresi doldu (1.6s sonra) -> hedef düşmeli (None)
-    assert ret.on_speech_dropout(active_sector=None, now=30.6) is None
-
-    # 5. Yeni sektör teyit edilirse grace içinde bile anında yeni sektöre geçer
-    ret.on_active_speaker(-55.0, 40.0)
-    assert ret.on_speech_dropout(active_sector=55.0, now=40.4) == 55.0
-
-    # 6. Vision devreye girerse audio hedefi derhal iptal edilir
-    ret.on_vision_active()
-    assert ret.retained_target_yaw is None
-    assert ret.on_speech_dropout(active_sector=None, now=40.5) is None
+# 3. DOA 142 -> yaw +45
+def test_doa_142_maps_to_yaw_plus_45():
+    from track import ReSpeakerAudioLocalizer
+    assert ReSpeakerAudioLocalizer.calibrated_yaw(142.0) == pytest.approx(45.0, abs=1e-3)
 
 
-def test_audio_retention_prevents_continuous_doa_leak_to_idle():
-    """Audio aktifken sektör kilidi (-55°), dropout sırasında en az 1.5s hedef koruma,
-    grace bitince doğrudan 0.0°'a dönme ve continuous audio yaw'ın (-21.2°, -36.9°, -59.4°)
-    ASLA dışarı sızmamasını doğrular.
-    """
-    from track import AudioSectorMapper, AudioTargetRetention, resolve_target_yaw
+# 4. DOA 149 -> yaw +90
+def test_doa_149_maps_to_yaw_plus_90():
+    from track import ReSpeakerAudioLocalizer
+    assert ReSpeakerAudioLocalizer.calibrated_yaw(149.0) == pytest.approx(90.0, abs=1e-3)
+
+
+# 5. circular wrap: 358, 359, 0, 1 -> ortalama ~0
+def test_circular_wrap_mean_near_zero():
+    from track import ReSpeakerAudioLocalizer
+    angles = [358.0, 359.0, 0.0, 1.0]
+    mean = ReSpeakerAudioLocalizer.circular_mean(angles)
+    dist = ReSpeakerAudioLocalizer.circular_dist(mean, 0.0)
+    assert dist < 1.0
+
+
+# 6. tek outlier reddi (örn. 69, 70, 71, 140, 70 -> 140 outlier)
+def test_single_outlier_rejection():
+    from track import ReSpeakerAudioLocalizer
+    loc = ReSpeakerAudioLocalizer(outlier_threshold_deg=30.0)
+    assert loc.reject_outlier(69.0) is False
+    assert loc.reject_outlier(70.0) is False
+    assert loc.reject_outlier(71.0) is False
+    # 140 is a single spike far from ~70 -> rejected
+    assert loc.reject_outlier(140.0) is True
+    # 70 is back near ~70 -> accepted
+    assert loc.reject_outlier(70.0) is False
+    assert loc.filtered_doa == pytest.approx(70.0, abs=2.0)
+    assert abs(loc.filtered_doa - 140.0) > 50.0
+
+
+# 7. deadband: küçük değişimlerde yeni head command yok
+def test_deadband_suppresses_small_changes():
+    from track import ReSpeakerAudioLocalizer
+    loc = ReSpeakerAudioLocalizer(deadband_deg=5.0)
+    loc.active_target_yaw = -45.0
+    # Changes smaller than 5.0 deg do not update target yaw
+    assert loc.apply_deadband(-43.0) == -45.0
+    assert loc.apply_deadband(-47.0) == -45.0
+    assert loc.apply_deadband(-41.0) == -45.0
+    # Change >= 5.0 deg updates target yaw
+    assert loc.apply_deadband(-39.0) == -39.0
+    assert loc.active_target_yaw == -39.0
+
+
+# 8. VOICEACTIVITY false iken yeni hedef üretilmiyor
+def test_voice_activity_false_produces_no_new_target():
+    from track import ReSpeakerAudioLocalizer
+    loc = ReSpeakerAudioLocalizer(hold_timeout_s=1.2)
+    # Speech active at DOA 33 -> target -45.0
+    loc.update(doa_raw=33.0, voice_activity=True, timestamp=1.0)
+    assert loc.is_tracking() is True
+    assert loc.target_yaw_deg == pytest.approx(-45.0, abs=1e-3)
+
+    # Speech inactive, new DOA 149 arrives -> target MUST NOT change
+    loc.update(doa_raw=149.0, voice_activity=False, timestamp=1.5)
+    assert loc.is_tracking() is True  # still holding within 1.2s timeout
+    assert loc.target_yaw_deg == pytest.approx(-45.0, abs=1e-3)
+    assert loc.target_yaw_deg != 90.0
+
+
+# 9. VOICEACTIVITY tekrar true olduğunda DOA tracking devam ediyor
+def test_tracking_resumes_when_voice_activity_returns():
+    from track import ReSpeakerAudioLocalizer
+    loc = ReSpeakerAudioLocalizer(hold_timeout_s=1.2)
+    loc.update(doa_raw=33.0, voice_activity=True, timestamp=1.0)
+    assert loc.target_yaw_deg == pytest.approx(-45.0, abs=1e-3)
+
+    # Hold timeout expires (1.5s > 1.2s)
+    loc.update(doa_raw=None, voice_activity=False, timestamp=2.5)
+    assert loc.is_tracking() is False
+    assert loc.target_yaw_deg == 0.0
+
+    # Speech resumes at DOA 142
+    loc.update(doa_raw=142.0, voice_activity=True, timestamp=3.0)
+    assert loc.is_tracking() is True
+    assert loc.target_yaw_deg == pytest.approx(45.0, abs=1e-3)
+
+
+# 10. calibration aralığı dışındaki DOA değerleri güvenli şekilde saturate ediliyor
+def test_out_of_range_doa_saturation():
+    from track import ReSpeakerAudioLocalizer
+    # Left saturation: DOA near/beyond left endpoint (33°) saturates to -45°
+    assert ReSpeakerAudioLocalizer.calibrated_yaw(10.0) == -45.0
+    assert ReSpeakerAudioLocalizer.calibrated_yaw(0.0) == -45.0
+    assert ReSpeakerAudioLocalizer.calibrated_yaw(350.0) == -45.0
+
+    # Right saturation: DOA beyond right endpoint (149°) saturates to +90°
+    assert ReSpeakerAudioLocalizer.calibrated_yaw(180.0) == 90.0
+    assert ReSpeakerAudioLocalizer.calibrated_yaw(250.0) == 90.0
+
+
+# 11. eski continuous tracker target_yaw değerleri (-21.2, -36.9, -59.4 gibi) yeni audio target olarak DIŞARI SIZMIYOR
+def test_continuous_tracker_angles_never_leak():
+    from track import ReSpeakerAudioLocalizer
+    from tracker import GazeTracker, PrioritySource
+
+    tracker = GazeTracker()
+    loc = ReSpeakerAudioLocalizer()
+
+    # In track.py, GazeTracker.step is called with doa_deg=None
+    result = tracker.step(
+        faces=[],
+        frame_size=(640, 480),
+        doa_deg=None,
+        measured_head_deg=0.0,
+        timestamp=10.0,
+        speech=None,
+    )
+    # Tracker itself never generates audio owner or continuous audio angles
+    assert result.owner == PrioritySource.IDLE
+    assert result.target_yaw_deg == 0.0
+    assert result.target_yaw_deg not in (-21.2, -36.9, -59.4)
+
+    # Audio target comes exclusively from ReSpeakerAudioLocalizer
+    loc.update(doa_raw=33.0, voice_activity=True, timestamp=10.0)
+    assert loc.target_yaw_deg == -45.0
+    assert loc.target_yaw_deg not in (-21.2, -36.9, -59.4)
+
+
+# 12. audio target tek authoritative kaynak olarak ReSpeakerAudioLocalizer oluyor
+def test_audio_target_sole_authoritative_source():
+    from track import ReSpeakerAudioLocalizer
     from tracker import GazeResult, PrioritySource, GazeStateEnum, Detection
 
-    mapper = AudioSectorMapper(persistence_required=3)
-    retention = AudioTargetRetention(hold_grace_s=1.5)
+    loc = ReSpeakerAudioLocalizer(hold_timeout_s=1.2)
 
-    # 1. ACTIVE_SPEAKER: Sol sektörde konuşma (-55° sektör kilidi)
-    # Tracker continuous raw DOA açısı (-36.9°) üretse bile...
-    sector = mapper.update(40.0, is_speech=True, timestamp=10.0)
-    assert sector is None  # 1. örnek
-    sector = mapper.update(45.0, is_speech=True, timestamp=10.05)
-    assert sector is None  # 2. örnek
-    sector = mapper.update(50.0, is_speech=True, timestamp=10.10)
-    assert sector == -55.0  # 3. örnekte -55° kilitlenir
+    # Step 1: Speech active -> localizer drives target (-45.0)
+    loc.update(doa_raw=33.0, voice_activity=True, timestamp=1.0)
+    assert loc.is_tracking() is True
+    target_yaw = loc.target_yaw_deg
+    assert target_yaw == -45.0
 
-    result = GazeResult(
-        target_yaw_deg=-36.9,  # Continuous audio DOA
-        gaze_state=GazeStateEnum.ORIENTING,
-        owner=PrioritySource.ACTIVE_SPEAKER,
-        target_id="audio_speaker_1",
-        confidence=0.85,
-        head_angle_deg=0.0,
-    )
-    target = resolve_target_yaw(
-        result=result,
-        detections=[],
-        active_sector=sector,
-        target_retention=retention,
-        sector_mapper=mapper,
-        now=10.10,
-    )
-    # Step 1 Assert: Hedef continuous (-36.9°) değil, sektör (-55.0°) olmalı
-    assert target == -55.0
-    assert result.target_yaw_deg == -55.0
-    assert result.owner == PrioritySource.ACTIVE_SPEAKER
-
-    # 2. & 3. Speech dropout: Konuşma kesildi
-    # Tracker IDLE/ACQUIRING'e düşüp continuous DOA (-54.5°, -21.2°) üretse bile...
-    sector = mapper.update(raw_doa=None, is_speech=False, timestamp=10.60)
-    result_dropout = GazeResult(
-        target_yaw_deg=-54.5,  # Continuous audio DOA
-        gaze_state=GazeStateEnum.IDLE,
-        owner=PrioritySource.IDLE,
-        target_id=None,
-        confidence=0.0,
-        head_angle_deg=-20.0,
-    )
-    target_held = resolve_target_yaw(
-        result=result_dropout,
-        detections=[],
-        active_sector=sector,
-        target_retention=retention,
-        sector_mapper=mapper,
-        now=10.60,
-    )
-    # Step 2 & 3 Assert (500ms): Grace period içinde (1.5s dolmadı) sektör (-55.0°) korunmalı
-    assert target_held == -55.0
-    assert result_dropout.target_yaw_deg == -55.0
-    assert result_dropout.owner == PrioritySource.ACTIVE_SPEAKER
-
-    # 1.2s sonra hala dropout içinde:
-    result_dropout_12 = GazeResult(
-        target_yaw_deg=-21.2,  # Continuous audio DOA
-        gaze_state=GazeStateEnum.IDLE,
-        owner=PrioritySource.IDLE,
-        target_id=None,
-        confidence=0.0,
-        head_angle_deg=-41.7,
-    )
-    target_held_12 = resolve_target_yaw(
-        result=result_dropout_12,
-        detections=[],
-        active_sector=sector,
-        target_retention=retention,
-        sector_mapper=mapper,
-        now=11.30,
-    )
-    # 1.2s sonra da -55.0° korunmalı (en az 1.5s kuralı)
-    assert target_held_12 == -55.0
-    assert result_dropout_12.target_yaw_deg == -55.0
-    assert result_dropout_12.target_yaw_deg != -21.2
-
-    # 4. Grace süresi doldu (dropout üzerinden 1.6s geçti, now=11.70)
-    # Tracker hala continuous DOA (-59.4°) üretse bile...
-    result_expired = GazeResult(
-        target_yaw_deg=-59.4,  # Continuous audio DOA
-        gaze_state=GazeStateEnum.IDLE,
-        owner=PrioritySource.IDLE,
-        target_id=None,
-        confidence=0.0,
-        head_angle_deg=-50.0,
-    )
-    target_expired = resolve_target_yaw(
-        result=result_expired,
-        detections=[],
-        active_sector=None,
-        target_retention=retention,
-        sector_mapper=mapper,
-        now=11.70,
-    )
-    # Step 4 Assert: Grace bitince hedef ASLA -59.4°, -36.9°, -21.2° olamaz! Kesinlikle 0.0° olmalı!
-    assert target_expired == 0.0
-    assert result_expired.target_yaw_deg == 0.0
-    assert result_expired.target_yaw_deg != -59.4
-    assert result_expired.target_yaw_deg != -36.9
-    assert result_expired.target_yaw_deg != -21.2
-    assert retention.retained_target_yaw is None
-
-    # 5. Vision devreye girdiğinde:
-    # Audio retention anında düşmeli ve vision hedefi %100 kullanılmalı
-    # Tekrar audio sektör kilidi alalım:
-    sector = mapper.update(40.0, is_speech=True, timestamp=15.0)
-    sector = mapper.update(45.0, is_speech=True, timestamp=15.05)
-    sector = mapper.update(50.0, is_speech=True, timestamp=15.10)
-    assert sector == -55.0
-    res_audio = GazeResult(
-        target_yaw_deg=-30.0,
-        gaze_state=GazeStateEnum.ORIENTING,
-        owner=PrioritySource.ACTIVE_SPEAKER,
-        target_id="audio_speaker_1",
-        confidence=0.8,
-        head_angle_deg=0.0,
-    )
-    resolve_target_yaw(res_audio, [], sector, retention, mapper, now=15.10)
-    assert retention.retained_target_yaw == -55.0
-
-    # Vision yüz gördü (örneğin azimuth +18.5°)
-    res_vision = GazeResult(
+    # Step 2: Vision detected -> vision overrides and localizer drops audio tracking
+    det = Detection(x=300, y=200, w=80, h=80, confidence=0.95)
+    vision_result = GazeResult(
         target_yaw_deg=18.5,
         gaze_state=GazeStateEnum.TRACKING,
         owner=PrioritySource.VISUAL_TRACKING,
@@ -297,146 +236,25 @@ def test_audio_retention_prevents_continuous_doa_leak_to_idle():
         confidence=0.95,
         head_angle_deg=0.0,
     )
-    det = Detection(x=300, y=200, w=80, h=80, confidence=0.95)
-    target_vis = resolve_target_yaw(res_vision, [det], sector, retention, mapper, now=15.15)
-    assert target_vis == 18.5
-    assert res_vision.target_yaw_deg == 18.5
-    assert retention.retained_target_yaw is None
+    if vision_result.owner == PrioritySource.VISUAL_TRACKING or len([det]) > 0:
+        loc.on_vision_active()
+        head_target = vision_result.target_yaw_deg
+
+    assert head_target == 18.5
+    assert loc.is_tracking() is False
+    assert loc.target_yaw_deg == 0.0
 
 
-def test_hid_authoritative_vad_overrides_software_classifier():
-    """ReSpeaker HID SPEECH_DETECTED=True olduğunda yazılımsal sınıflandırıcının
-    'elendi: ne harmonik ne modulasyonlu' demesi geçersiz kılınır;
-    AudioSectorMapper -55° sektörüne kilitlenir ve hedef ACTIVE_SPEAKER olur.
-    """
-    from unittest.mock import MagicMock
-    from track import AudioSectorMapper, AudioTargetRetention, resolve_target_yaw
-    from tracker import GazeResult, PrioritySource, GazeStateEnum
-    from astro_audio.speech_detector import SpeechVerdict
-
-    mapper = AudioSectorMapper(persistence_required=3)
-    retention = AudioTargetRetention(hold_grace_s=1.5)
-
-    # 1. Yazılımsal sınıflandırıcı konuşmayı elemiş olsun:
-    software_rejected_speech = SpeechVerdict(
-        is_speech=False,
-        confidence=0.0,
-        harmonicity=0.05,
-        modulation=0.02,
-        rms=0.003,
-        reason="ne harmonik ne modulasyonlu",
-    )
-
-    # HID donanımı konuşma algıladı:
-    mock_hid = MagicMock()
-    mock_hid.speech_detected.return_value = True
-
-    hid_speech = mock_hid.speech_detected()
-    assert hid_speech is True
-
-    # track.py içindeki terfi mantığı:
-    is_speech = hid_speech
-    if is_speech and not software_rejected_speech.is_speech:
-        promoted_speech = SpeechVerdict(
-            is_speech=True,
-            confidence=max(float(software_rejected_speech.confidence), 0.85),
-            harmonicity=float(software_rejected_speech.harmonicity),
-            modulation=float(software_rejected_speech.modulation),
-            rms=float(software_rejected_speech.rms),
-            reason="hid_vad",
-        )
-    else:
-        promoted_speech = software_rejected_speech
-
-    assert promoted_speech.is_speech is True
-    assert promoted_speech.reason == "hid_vad"
-
-    # 3 ardışık örnekle sol sektör kilitlenir
-    for i, doa in enumerate([40.0, 42.0, 45.0]):
-        sector = mapper.update(doa, is_speech=is_speech, timestamp=20.0 + i * 0.05)
-    assert sector == -55.0
-
-    result = GazeResult(
-        target_yaw_deg=-30.0,
-        gaze_state=GazeStateEnum.ORIENTING,
-        owner=PrioritySource.ACTIVE_SPEAKER,
-        target_id="audio_speaker_1",
-        confidence=0.85,
-        head_angle_deg=0.0,
-    )
-    target = resolve_target_yaw(
-        result=result,
-        detections=[],
-        active_sector=sector,
-        target_retention=retention,
-        sector_mapper=mapper,
-        now=20.15,
-        is_speech=is_speech,
-    )
-    assert target == -55.0
-    assert result.target_yaw_deg == -55.0
-    assert result.owner == PrioritySource.ACTIVE_SPEAKER
-
-    # 2. HID konuşma bittiğini bildirdi (dropout) -> 1.5s korunmalı:
-    mock_hid.speech_detected.return_value = False
-    hid_speech_dropout = mock_hid.speech_detected()
-    assert hid_speech_dropout is False
-    is_speech_dropout = hid_speech_dropout
-
-    res_dropout = GazeResult(
-        target_yaw_deg=-50.0,
-        gaze_state=GazeStateEnum.IDLE,
-        owner=PrioritySource.IDLE,
-        target_id=None,
-        confidence=0.0,
-        head_angle_deg=-40.0,
-    )
-    target_held = resolve_target_yaw(
-        result=res_dropout,
-        detections=[],
-        active_sector=sector,
-        target_retention=retention,
-        sector_mapper=mapper,
-        now=21.0,  # 0.85s sonra
-        is_speech=is_speech_dropout,
-    )
-    assert target_held == -55.0
-    assert res_dropout.target_yaw_deg == -55.0
-    assert res_dropout.owner == PrioritySource.ACTIVE_SPEAKER
-
-    # 3. 1.5s grace doldu (now=22.0, dropout üzerinden 1.85s geçti) -> hedef 0'a dönmeli:
-    res_expired = GazeResult(
-        target_yaw_deg=-59.4,
-        gaze_state=GazeStateEnum.IDLE,
-        owner=PrioritySource.IDLE,
-        target_id=None,
-        confidence=0.0,
-        head_angle_deg=-50.0,
-    )
-    target_expired = resolve_target_yaw(
-        result=res_expired,
-        detections=[],
-        active_sector=None,
-        target_retention=retention,
-        sector_mapper=mapper,
-        now=22.0,
-        is_speech=is_speech_dropout,
-    )
-    assert target_expired == 0.0
-    assert res_expired.target_yaw_deg == 0.0
-    assert res_expired.target_yaw_deg != -59.4
-    assert retention.retained_target_yaw is None
-
-
-def test_track_main_uses_hid_authoritative_vad():
+def test_track_main_uses_hid_voice_activity():
     from unittest.mock import MagicMock
     mock_hid = MagicMock()
-    mock_hid.speech_detected.return_value = True
+    mock_hid.voice_activity.return_value = True
+    mock_hid.doa_angle.return_value = 69.0
     with patch.object(track, "CameraSource", _SabitKamera), \
             patch.object(track, "AudioSource", _SessizKaynak):
         code = track.main(["--fixed-head", "--no-window", "--no-voice", "--seconds", "0.05"], hid=mock_hid)
         assert code == 0
-    assert mock_hid.speech_detected.called
+    assert mock_hid.voice_activity.called or mock_hid._read_param.called
 
 
 
