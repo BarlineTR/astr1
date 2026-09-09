@@ -47,10 +47,11 @@ MAX_SYLLABLE_HZ = 8.0
 # yeterli (Nyquist 100 Hz) ve blok başına maliyeti önemsiz kılıyor.
 ENVELOPE_RATE_HZ = 200.0
 
-# Eşikler ölçülen ayrımın ortasına konuldu, sınırına değil: konuşma 0.59/0.83,
-# en yakın konuşma-dışı 0.32/0.03. Kenardan geçen bir eşik ilk gerçek kayıtta düşer.
-DEFAULT_MIN_HARMONICITY = 0.45
-DEFAULT_MIN_MODULATION = 0.20
+# Eşikler gerçek ortam akustiği ve sentetik sahneler arasındaki ayrımı koruyacak
+# şekilde ayarlandı: konuşma (~0.25+ / 0.10+), trafik (~0.32 / 0.03 -> modülasyondan elenir),
+# sabit uğultu (~0.99 / 0.00 -> modülasyondan elenir).
+DEFAULT_MIN_HARMONICITY = 0.25
+DEFAULT_MIN_MODULATION = 0.10
 
 # Altında blok zaten sessiz sayılır ve yön iddia edilmez. float32 ölçeğinde.
 DEFAULT_MIN_RMS = 0.005

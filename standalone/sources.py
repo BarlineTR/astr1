@@ -54,7 +54,7 @@ UTTERANCE_BUFFER_S = 10.0
 # bearing was ever produced. The head could not turn toward a voice because it was
 # never told there was one — while the status band still read `ses:V`, which only
 # means the microphone opened.
-MIN_RMS = 0.01
+MIN_RMS = 0.005
 
 # The estimator is shared with the ROS audio stack, which feeds it int16 PCM: both its
 # energy gate (300.0) and its confidence term (rms / 1500.0) are calibrated for that
@@ -239,12 +239,23 @@ class AudioSource:
         stream_factory: Optional[Callable] = None,
         mic_spacing_m: float = DEFAULT_MIC_SPACING_M,
         mic_channels: Optional[Sequence[int]] = None,
+        min_harmonicity: float = 0.20,
+        min_modulation: float = 0.08,
+        min_rms: float = MIN_RMS,
     ):
         self.device = device
         self.max_age_s = max_age_s
         self._stream_factory = stream_factory
+        self.min_harmonicity = float(min_harmonicity)
+        self.min_modulation = float(min_modulation)
+        self.min_rms = float(min_rms)
         self._estimator = AcousticDOAEstimator(sample_rate=SAMPLE_RATE)
-        self._speech = SpeechDetector(sample_rate=SAMPLE_RATE)
+        self._speech = SpeechDetector(
+            sample_rate=SAMPLE_RATE,
+            min_harmonicity=self.min_harmonicity,
+            min_modulation=self.min_modulation,
+            min_rms=self.min_rms,
+        )
         self._window: Optional[np.ndarray] = None
         self._utterance: Optional[np.ndarray] = None
         self._written: int = 0        # tampona şimdiye kadar yazılan toplam örnek
@@ -293,7 +304,12 @@ class AudioSource:
             # `__init__`'teki varsayılan (16 kHz) donanımsız testler için duruyor;
             # burada gerçek hızla yeniden kuruluyor.
             self._estimator = AcousticDOAEstimator(sample_rate=rate)
-            self._speech = SpeechDetector(sample_rate=rate)
+            self._speech = SpeechDetector(
+                sample_rate=rate,
+                min_harmonicity=self.min_harmonicity,
+                min_modulation=self.min_modulation,
+                min_rms=self.min_rms,
+            )
             if self.mode == "stereo":
                 self._stereo = StereoDOA(sample_rate=rate,
                                          mic_spacing_m=self._mic_spacing_m)
@@ -406,9 +422,9 @@ class AudioSource:
         if channels.shape[0] < 2:
             return
 
-        self._observe_speech(channels.mean(axis=0), timestamp)
+        self._observe_speech(channels[0], timestamp)
 
-        if float(np.sqrt(np.mean(np.square(channels)))) < MIN_RMS:
+        if float(np.sqrt(np.mean(np.square(channels)))) < self.min_rms:
             return
 
         azimuth, _sharpness = self._stereo.estimate(channels[0], channels[1])
@@ -428,9 +444,14 @@ class AudioSource:
         # bozar hem de enerji ölçüsünü yanıltır.
         mics = channels[list(wanted)]
 
-        self._observe_speech(mics.mean(axis=0), timestamp)
+        # Konuşma sınıflandırmasında dairesel mikrofonların ortalaması (mics.mean)
+        # faz gecikmesi sebebiyle 1-3 kHz bandında yıkıcı faz girişimine (comb filtering)
+        # yol açar. Eğer 6 kanallı ReSpeaker DSP kanalı (channels[0]) varsa donanımsal
+        # filtrelenmiş sesi, yoksa ilk ham mikrofonu (mics[0]) kullan.
+        mono_speech = channels[0] if channels.shape[0] >= 6 else mics[0]
+        self._observe_speech(mono_speech, timestamp)
 
-        if float(np.sqrt(np.mean(np.square(mics)))) < MIN_RMS:
+        if float(np.sqrt(np.mean(np.square(mics)))) < self.min_rms:
             return
 
         if not self._array_is_real(mics):

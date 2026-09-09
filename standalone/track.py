@@ -84,6 +84,10 @@ def main(argv=None) -> int:
     parser.add_argument("--no-voice", action="store_true",
                         help="Sesli yanıtı kapat (yalnızca takip)")
     parser.add_argument("--seconds", type=float, default=None, help="Süre sınırı")
+    parser.add_argument("--speech-harmonicity", type=float, default=0.20,
+                        help="Konuşma tespiti için minimum harmoniklik eşiği (varsayılan: 0.20)")
+    parser.add_argument("--speech-modulation", type=float, default=0.08,
+                        help="Konuşma tespiti için minimum hece modülasyonu eşiği (varsayılan: 0.08)")
     parser.add_argument("--log-interval", type=float, default=1.0, metavar="SN",
                         help="Terminale durum satiri basma araligi (0 = yalnizca "
                              "durum/hedef degisimlerinde bas)")
@@ -113,8 +117,13 @@ def main(argv=None) -> int:
 
     mic_channels = ([int(c) for c in opts.mic_channels.split(",")]
                     if opts.mic_channels else None)
-    audio = AudioSource(device=opts.audio_device, mic_spacing_m=opts.mic_spacing,
-                        mic_channels=mic_channels)
+    audio = AudioSource(
+        device=opts.audio_device,
+        mic_spacing_m=opts.mic_spacing,
+        mic_channels=mic_channels,
+        min_harmonicity=opts.speech_harmonicity,
+        min_modulation=opts.speech_modulation,
+    )
     audio.start()
     if not audio.available:
         print(f"🎤 Ses yok ({audio.error}) — yalnızca görüntüyle takip")
