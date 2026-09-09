@@ -82,6 +82,41 @@ def test_doa_69_maps_to_yaw_0():
     assert ReSpeakerAudioLocalizer.calibrated_yaw(69.0) == pytest.approx(0.0, abs=1e-3)
 
 
+# Center dead-zone: 55..75 aralığı kesinlikle EXACT 0.0° olmalı
+@pytest.mark.parametrize("doa", [55.0, 57.0, 60.0, 65.0, 69.0, 72.0, 75.0])
+def test_center_zone_exact_zero(doa):
+    from track import ReSpeakerAudioLocalizer
+    assert ReSpeakerAudioLocalizer.calibrated_yaw(doa) == 0.0
+
+
+def test_doa_54_interpolates_negatively():
+    from track import ReSpeakerAudioLocalizer
+    yaw = ReSpeakerAudioLocalizer.calibrated_yaw(54.0)
+    assert yaw < 0.0
+    assert yaw == pytest.approx(-2.045, abs=0.01)
+
+
+def test_doa_76_interpolates_positively():
+    from track import ReSpeakerAudioLocalizer
+    yaw = ReSpeakerAudioLocalizer.calibrated_yaw(76.0)
+    assert yaw > 0.0
+    assert yaw == pytest.approx(0.672, abs=0.01)
+
+
+def test_front_jitter_sequence_keeps_target_at_zero():
+    """Tam karşıda sabit konuşurken DOA 57, 61, 64, 68, 72, 75, 63, 59 gibi dalgalansa bile
+    target_yaw = 0° kalmalı ve motor sağa/sola sürüklenmemelidir.
+    """
+    from track import ReSpeakerAudioLocalizer
+
+    loc = ReSpeakerAudioLocalizer()
+    jitter_sequence = [57.0, 61.0, 64.0, 68.0, 72.0, 75.0, 63.0, 59.0]
+    for i, doa in enumerate(jitter_sequence):
+        target = loc.update(doa_raw=doa, voice_activity=True, timestamp=1.0 + i * 0.05)
+        assert target == 0.0
+        assert loc.target_yaw_deg == 0.0
+
+
 # 2. DOA 33 -> yaw -45
 def test_doa_33_maps_to_yaw_minus_45():
     from track import ReSpeakerAudioLocalizer

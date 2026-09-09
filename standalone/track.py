@@ -60,14 +60,17 @@ class ReSpeakerAudioLocalizer:
         target_yaw_deg -> head.send_angle()
     """
 
-    # Physical calibration measurements on robot:
-    # 1) Front 0°: DOA 69.0° -> Yaw 0.0°
-    # 2) Left 45°: DOA 33.0° -> Yaw -45.0°
-    # 3) Right 45°: DOA 142.0° -> Yaw +45.0°
-    # 4) Right 90°: DOA 149.0° -> Yaw +90.0°
+    # Physical calibration measurements on robot & center dead-zone:
+    # 1) Left saturation: DOA < 33.0° -> Yaw -45.0°
+    # 2) Left interpolation: DOA 33.0°..55.0° -> Yaw -45.0°..0.0°
+    # 3) Center dead-zone: DOA 55.0°..75.0° -> EXACT Yaw 0.0° (suppresses frontend DOA jitter)
+    # 4) Right interpolation: DOA 75.0°..142.0° -> Yaw 0.0°..+45.0°
+    # 5) Far right interpolation: DOA 142.0°..149.0° -> Yaw +45.0°..+90.0°
+    # 6) Right saturation: DOA > 149.0° -> Yaw +90.0°
     CALIBRATION_POINTS = (
         (33.0, -45.0),
-        (69.0, 0.0),
+        (55.0, 0.0),
+        (75.0, 0.0),
         (142.0, 45.0),
         (149.0, 90.0),
     )
@@ -123,24 +126,23 @@ class ReSpeakerAudioLocalizer:
     def calibrated_yaw(cls, doa_deg: float) -> float:
         """Monotonic piecewise linear calibration from ReSpeaker DOA to ASTRO Head Yaw.
 
-        Measurements (physically measured on robot):
-            DOA 33.0°  -> Yaw -45.0°
-            DOA 69.0°  -> Yaw   0.0°
-            DOA 142.0° -> Yaw +45.0°
-            DOA 149.0° -> Yaw +90.0°
-
-        Saturation:
-            DOA outside [33.0, 149.0] saturates safely to the nearest calibrated endpoint:
-            - Nearest to 33.0° -> -45.0° (e.g. 10.0°, 0.0°, 350.0°)
-            - Nearest to 149.0° -> +90.0° (e.g. 180.0°, 250.0°)
+        Measurements & Center Zone:
+            DOA < 33.0°       -> -45.0° saturation
+            DOA 33.0°..55.0°  -> -45.0°..0.0° interpolation
+            DOA 55.0°..75.0°  -> EXACT 0.0° center dead-zone (prevents frontend DOA jitter drift)
+            DOA 75.0°..142.0° -> 0.0°..+45.0° interpolation
+            DOA 142.0°..149.0°-> +45.0°..+90.0° interpolation
+            DOA > 149.0°      -> +90.0° saturation
         """
         raw = float(doa_deg) % 360.0
         if 33.0 <= raw <= 149.0:
-            if raw <= 69.0:
-                t = (raw - 33.0) / (69.0 - 33.0)
+            if raw < 55.0:
+                t = (raw - 33.0) / (55.0 - 33.0)
                 return -45.0 + t * 45.0
+            elif raw <= 75.0:
+                return 0.0
             elif raw <= 142.0:
-                t = (raw - 69.0) / (142.0 - 69.0)
+                t = (raw - 75.0) / (142.0 - 75.0)
                 return 0.0 + t * 45.0
             else:  # 142.0 < raw <= 149.0
                 t = (raw - 142.0) / (149.0 - 142.0)
