@@ -72,6 +72,7 @@ class SocialGazeFSM:
         settling_persistence_required: int = 3,
         acquisition_threshold: float = 0.75,
         audio_acquisition_threshold: float = 0.45,
+        recovery_timeout_s: float = 2.0,
         arbiter: Optional[AttentionArbiterCore] = None,
         spatial_memory: Optional[EpistemicSpatialMemory] = None,
     ):
@@ -88,6 +89,7 @@ class SocialGazeFSM:
         self.settling_persistence_required = settling_persistence_required
         self.acquisition_threshold = acquisition_threshold
         self.audio_acquisition_threshold = audio_acquisition_threshold
+        self.recovery_timeout_s = recovery_timeout_s
 
         # Spatial Memory for situational awareness and negative evidence
         self.spatial_memory = spatial_memory or EpistemicSpatialMemory()
@@ -489,10 +491,16 @@ class SocialGazeFSM:
 
             elif self.state == GazeStateEnum.RECOVERING:
                 self.target_yaw_deg = 0.0
-                if abs(actual_head_yaw_deg) <= 1.5 and abs(actual_head_vel_deg_s) <= self.velocity_tolerance_deg_s:
+                time_in_recovering = timestamp - self._state_entry_time
+                settled_at_center = (
+                    abs(actual_head_yaw_deg) <= max(self.position_tolerance_deg, 2.5)
+                    and abs(actual_head_vel_deg_s) <= self.velocity_tolerance_deg_s
+                )
+                if settled_at_center or time_in_recovering >= self.recovery_timeout_s:
                     self.active_target_id = None
                     self.active_priority = PrioritySource.IDLE
-                    self._transition_to(GazeStateEnum.IDLE, timestamp, reason="RECOVERY_SETTLED_IDLE")
+                    reason = "RECOVERY_SETTLED_IDLE" if settled_at_center else "RECOVERY_TIMEOUT_IDLE"
+                    self._transition_to(GazeStateEnum.IDLE, timestamp, reason=reason)
 
             elif self.state == GazeStateEnum.IDLE:
                 self.target_yaw_deg = 0.0
