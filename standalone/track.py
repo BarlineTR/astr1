@@ -76,12 +76,13 @@ class ReSpeakerAudioLocalizer:
     SECTOR_RIGHT_MIN = 100.0   # DOA >= 100° = RIGHT
     #                            55°..100° = CENTER
 
-    SECTOR_TARGETS = {"LEFT": 45.0, "CENTER": 0.0, "RIGHT": -45.0}
+    SECTOR_TARGETS = {"LEFT": 60.0, "CENTER": 0.0, "RIGHT": -60.0}
     # NOTE: LEFT/RIGHT targets are SWAPPED from the original calibration labels.
     # Live testing proved calibration labels were from user's perspective (facing robot):
-    #   DOA ~32  ("LEFT" in calib)  = robot's physical RIGHT  → motor +45°
-    #   DOA ~148 ("RIGHT" in calib) = robot's physical LEFT   → motor -45°
-    # Evidence: visual tracking found user at -28.9° when DOA read 148.
+    #   DOA ~32  ("LEFT" in calib)  = robot's physical RIGHT  → motor +60°
+    #   DOA ~148 ("RIGHT" in calib) = robot's physical LEFT   → motor -60°
+    # Evidence: visual tracking found user at -70.2° when DOA read 148;
+    # +-60° puts both 45° and 70°-80° speakers squarely inside the camera FOV (69°).
     SECTOR_CONFIRM_COUNT = 3   # consecutive readings to switch sector
 
     # ── Legacy calibration (kept for backward-compat tests) ────────
@@ -96,7 +97,7 @@ class ReSpeakerAudioLocalizer:
     def __init__(
         self,
         hid=None,
-        hold_timeout_s: float = 2.5,
+        hold_timeout_s: float = 5.0,
         deadband_deg: float = 5.0,
         outlier_threshold_deg: float = 30.0,
         filter_window_size: int = 5,
@@ -520,8 +521,8 @@ def main(argv=None, hid=None) -> int:
     parser.add_argument("--log-interval", type=float, default=1.0, metavar="SN",
                         help="Terminale durum satiri basma araligi (0 = yalnizca "
                              "durum/hedef degisimlerinde bas)")
-    parser.add_argument("--audio-hold-grace", type=float, default=2.5,
-                        help="Audio hedefinin konuşma kesildikten sonra tutulacağı süre (saniye, varsayılan: 2.5)")
+    parser.add_argument("--audio-hold-grace", type=float, default=5.0,
+                        help="Audio hedefinin konuşma kesildikten sonra tutulacağı süre (saniye, varsayılan: 5.0)")
     parser.add_argument("--audio-deadband", type=float, default=5.0,
                         help="Audio hedefi deadband eşiği (derece, varsayılan: 5.0)")
     parser.add_argument("--record", nargs="?", const="", default=None, metavar="DOSYA",
