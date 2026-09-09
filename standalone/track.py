@@ -60,20 +60,24 @@ class ReSpeakerAudioLocalizer:
         target_yaw_deg -> head.send_angle()
     """
 
-    # Physical calibration measurements on robot & center dead-zone:
-    # 1) Left saturation: DOA < 33.0° -> Yaw -45.0°
-    # 2) Left interpolation: DOA 33.0°..55.0° -> Yaw -45.0°..0.0°
-    # 3) Center dead-zone: DOA 55.0°..75.0° -> EXACT Yaw 0.0° (suppresses frontend DOA jitter)
-    # 4) Right interpolation: DOA 75.0°..142.0° -> Yaw 0.0°..+45.0°
+    # Physical operating workspace & calibration measurements on robot:
+    # Operating workspace: LEFT <= 90° (yaw >= -90°), FRONT = 0°, RIGHT <= 90° (yaw <= +90°)
+    # 1) Left saturation: DOA 20.0°..25.0° -> Yaw -90.0°
+    # 2) Left interpolation: DOA 25.0°..32.0° -> Yaw -90.0°..-45.0°
+    # 3) Left-front interpolation: DOA 32.0°..78.0° -> Yaw -45.0°..0.0°
+    # 4) Front-right interpolation: DOA 78.0°..142.0° -> Yaw 0.0°..+45.0°
     # 5) Far right interpolation: DOA 142.0°..149.0° -> Yaw +45.0°..+90.0°
-    # 6) Right saturation: DOA > 149.0° -> Yaw +90.0°
+    # 6) Right saturation: DOA 149.0°..155.0° -> Yaw +90.0°
+    # Rear / ambiguous DOAs (outside [20.0°, 155.0°], e.g. ~285°-330°, 180°, etc.): INVALID
     CALIBRATION_POINTS = (
-        (33.0, -45.0),
-        (55.0, 0.0),
-        (75.0, 0.0),
+        (25.0, -90.0),
+        (32.0, -45.0),
+        (78.0, 0.0),
         (142.0, 45.0),
         (149.0, 90.0),
     )
+    VALID_DOA_MIN = 20.0
+    VALID_DOA_MAX = 155.0
 
     def __init__(
         self,
@@ -96,6 +100,7 @@ class ReSpeakerAudioLocalizer:
 
         self.active_target_yaw: float = 0.0
         self._last_voice_activity_time: float = 0.0
+        self._last_valid_target_time: float = 0.0
         self._tracking_active: bool = False
 
         # Polling cache
@@ -123,34 +128,62 @@ class ReSpeakerAudioLocalizer:
         return math.degrees(math.atan2(s, c)) % 360.0
 
     @classmethod
-    def calibrated_yaw(cls, doa_deg: float) -> float:
+    def is_valid_doa(cls, doa_deg: Optional[float]) -> bool:
+        """Returns True if doa_deg is within the valid front operating workspace.
+
+        Rear and ambiguous DOA regions (e.g. ~285-330°, 155-360°, 0-20°) are invalid.
+        """
+        if doa_deg is None:
+            return False
+        raw = float(doa_deg) % 360.0
+        return cls.VALID_DOA_MIN <= raw <= cls.VALID_DOA_MAX
+
+    @classmethod
+    def calibrated_yaw(cls, doa_deg: float) -> Optional[float]:
         """Monotonic piecewise linear calibration from ReSpeaker DOA to ASTRO Head Yaw.
 
-        Measurements & Center Zone:
-            DOA < 33.0°       -> -45.0° saturation
-            DOA 33.0°..55.0°  -> -45.0°..0.0° interpolation
-            DOA 55.0°..75.0°  -> EXACT 0.0° center dead-zone (prevents frontend DOA jitter drift)
-            DOA 75.0°..142.0° -> 0.0°..+45.0° interpolation
-            DOA 142.0°..149.0°-> +45.0°..+90.0° interpolation
-            DOA > 149.0°      -> +90.0° saturation
+        Operating workspace:
+            LEFT <= 90° (yaw >= -90.0°)
+            FRONT = 0° (yaw = 0.0°)
+            RIGHT <= 90° (yaw <= +90.0°)
+
+        Physical calibration measurements on robot:
+            DOA 32.0°  -> Yaw -45.0°
+            DOA 78.0°  -> Yaw   0.0°
+            DOA 142.0° -> Yaw +45.0°
+            DOA 149.0° -> Yaw +90.0°
+
+        Saturation within valid workspace [20.0°, 155.0°]:
+            DOA 20.0°..25.0°   -> -90.0°
+            DOA 25.0°..32.0°   -> -90.0°..-45.0° interpolation
+            DOA 32.0°..78.0°   -> -45.0°..0.0° interpolation
+            DOA 78.0°..142.0°  -> 0.0°..+45.0° interpolation
+            DOA 142.0°..149.0° -> +45.0°..+90.0° interpolation
+            DOA 149.0°..155.0° -> +90.0°
+
+        Returns:
+            Calibrated yaw in [-90.0°, +90.0°], or None if DOA is in the rear/invalid region.
         """
         raw = float(doa_deg) % 360.0
-        if 33.0 <= raw <= 149.0:
-            if raw < 55.0:
-                t = (raw - 33.0) / (55.0 - 33.0)
-                return -45.0 + t * 45.0
-            elif raw <= 75.0:
-                return 0.0
-            elif raw <= 142.0:
-                t = (raw - 75.0) / (142.0 - 75.0)
-                return 0.0 + t * 45.0
-            else:  # 142.0 < raw <= 149.0
-                t = (raw - 142.0) / (149.0 - 142.0)
-                return 45.0 + t * 45.0
+        if not cls.is_valid_doa(raw):
+            return None
 
-        dist_33 = cls.circular_dist(raw, 33.0)
-        dist_149 = cls.circular_dist(raw, 149.0)
-        return -45.0 if dist_33 <= dist_149 else 90.0
+        if raw <= 25.0:
+            return -90.0
+        elif raw <= 32.0:
+            t = (raw - 25.0) / (32.0 - 25.0)
+            return -90.0 + t * 45.0
+        elif raw <= 78.0:
+            t = (raw - 32.0) / (78.0 - 32.0)
+            return -45.0 + t * 45.0
+        elif raw <= 142.0:
+            t = (raw - 78.0) / (142.0 - 78.0)
+            return 0.0 + t * 45.0
+        elif raw <= 149.0:
+            t = (raw - 142.0) / (149.0 - 142.0)
+            return 45.0 + t * 45.0
+        else:  # 149.0 < raw <= 155.0
+            return 90.0
 
     def reject_outlier(self, raw_doa: float) -> bool:
         """Rejects single transient spikes in DOA angle.
@@ -209,22 +242,29 @@ class ReSpeakerAudioLocalizer:
         timestamp: float,
     ) -> float:
         """Updates localizer state with new DOA and VAD readings."""
-        if voice_activity:
+        is_valid = self.is_valid_doa(doa_raw)
+
+        if voice_activity and is_valid:
             self._last_voice_activity_time = timestamp
+            self._last_valid_target_time = timestamp
             was_tracking = self._tracking_active
             self._tracking_active = True
 
-            if doa_raw is not None:
-                if not self.reject_outlier(doa_raw):
-                    candidate = self.calibrated_yaw(self.filtered_doa)
+            assert doa_raw is not None
+            if not self.reject_outlier(doa_raw):
+                candidate = self.calibrated_yaw(self.filtered_doa)
+                if candidate is not None:
+                    candidate = max(-90.0, min(90.0, candidate))
                     if not was_tracking:
                         self.active_target_yaw = candidate
                     else:
                         self.apply_deadband(candidate)
         else:
-            # VOICEACTIVITY is False: do NOT update target with incoming DOA
+            # VOICEACTIVITY is False or DOA is invalid/rear:
+            # Retain current valid target briefly (grace period hold_timeout_s).
+            # NEVER generate a new rear target.
             if self._tracking_active:
-                if timestamp - self._last_voice_activity_time > self.hold_timeout_s:
+                if timestamp - self._last_valid_target_time > self.hold_timeout_s:
                     self._tracking_active = False
                     self.active_target_yaw = 0.0
                     self.reset_filter()
@@ -233,16 +273,16 @@ class ReSpeakerAudioLocalizer:
 
     @property
     def target_yaw_deg(self) -> float:
-        """Authoritative audio target yaw. Returns 0.0 when not tracking."""
+        """Authoritative audio target yaw in [-90°, +90°]. Returns 0.0 when not tracking."""
         if not self._tracking_active:
             return 0.0
-        return self.active_target_yaw
+        return max(-90.0, min(90.0, self.active_target_yaw))
 
     def is_tracking(self, now: Optional[float] = None) -> bool:
         """Returns True if localizer is currently actively tracking speech."""
         if not self._tracking_active:
             return False
-        if now is not None and (now - self._last_voice_activity_time > self.hold_timeout_s):
+        if now is not None and (now - self._last_valid_target_time > self.hold_timeout_s):
             self._tracking_active = False
             self.active_target_yaw = 0.0
             self.reset_filter()
@@ -261,6 +301,7 @@ class ReSpeakerAudioLocalizer:
         self._tracking_active = False
         self.active_target_yaw = 0.0
         self._last_voice_activity_time = 0.0
+        self._last_valid_target_time = 0.0
         self.reset_filter()
 
     def on_vision_active(self) -> None:
