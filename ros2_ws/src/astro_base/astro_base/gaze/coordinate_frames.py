@@ -134,71 +134,26 @@ class CoordinateTransformer:
 
     def __init__(self, calib: Optional[CalibrationConfig] = None):
         self.calib = calib or CalibrationConfig()
-        self._audio_sector: str = "CENTER"
-        self._candidate_sector: Optional[str] = None
-        self._candidate_count: int = 0
-        self.persistence_threshold: int = 3
 
     def raw_audio_doa_to_head_bearing(self, raw_doa_deg: float) -> float:
-        """Transforms raw ReSpeaker HID DOA (0..359°) into an IDLE visual search cue.
+        """Converts raw circular ReSpeaker DOA (0..359° clockwise) to head-relative bearing.
 
-        Applies state-dependent hysteresis across 3 discrete sectors with
-        a 3-consecutive-sample persistence filter to steer the head into
-        the speaker's sector so OAK-D Lite can acquire the face.
+        In REP-103 convention:
+          - 0° = Straight ahead
+          - +90° = Left
+          - -90° = Right
+          - ±180° = Directly behind
         """
-        raw = float(raw_doa_deg) % 360.0
-        current = self._audio_sector
-
-        # 1. State-dependent sector classification with hysteresis
-        if current == "CENTER":
-            if raw > 95.0:
-                target = "RIGHT"
-            elif raw < 55.0 or raw > 300.0:
-                target = "LEFT"
-            else:
-                target = "CENTER"
-        elif current == "RIGHT":
-            if raw < 55.0 or raw > 300.0:
-                target = "LEFT"
-            elif raw < 88.0:
-                target = "CENTER"
-            else:
-                target = "RIGHT"  # Retain RIGHT in 88°..95° deadband
-        elif current == "LEFT":
-            if raw > 95.0:
-                target = "RIGHT"
-            elif 58.0 <= raw <= 88.0:
-                target = "CENTER"
-            else:
-                target = "LEFT"  # Retain LEFT in 55°..58° and >300° wrap-around
+        raw = (raw_doa_deg + self.calib.audio.yaw_offset_deg) % 360.0
+        if raw <= 180.0:
+            yaw = raw
         else:
-            target = "CENTER"
+            yaw = raw - 360.0
 
-        # 2. 3-consecutive-sample persistence filter
-        if target != current:
-            if target == self._candidate_sector:
-                self._candidate_count += 1
-            else:
-                self._candidate_sector = target
-                self._candidate_count = 1
+        if self.calib.audio.invert:
+            yaw = -yaw
 
-            if self._candidate_count >= self.persistence_threshold:
-                self._audio_sector = target
-                self._candidate_sector = None
-                self._candidate_count = 0
-        else:
-            self._candidate_sector = None
-            self._candidate_count = 0
-
-        # 3. Discrete search yaw mapped to sectors & clamped to [-75°, +75°]
-        if self._audio_sector == "RIGHT":
-            yaw = 55.0
-        elif self._audio_sector == "LEFT":
-            yaw = -55.0
-        else:
-            yaw = 0.0
-
-        return float(clamp_deg(yaw, -75.0, 75.0))
+        return wrap_deg(yaw)
 
     def audio_head_bearing_to_body_yaw(
         self,

@@ -134,6 +134,7 @@ from astro_base.gaze.angle_math import circular_distance_deg
 from astro_base.gaze.gaze_runtime import GazeRuntimeCore
 from astro_base.gaze.gaze_tracker import Detection, GazeResult, UNSCORED_CONFIDENCE
 from astro_base.gaze.types import PrioritySource
+from astro_base.gaze.respeaker_sectors import ReSpeakerEyeSectors
 
 try:
     from astro_vision.image_utils import bgr_to_imgmsg
@@ -200,6 +201,7 @@ class StandaloneGazeRosNode(Node):
         enable_voice: Optional[bool] = None,
         verbose_diagnostics: Optional[bool] = None,
         audio_source_mode: Optional[str] = None,
+        audio_doa_profile: Optional[str] = None,
     ):
         super().__init__("standalone_gaze_ros_node")
 
@@ -215,6 +217,7 @@ class StandaloneGazeRosNode(Node):
         self.declare_parameter("camera_publish_fps", 15.0)
         self.declare_parameter("enable_audio", True)
         self.declare_parameter("audio_source_mode", "topics")
+        self.declare_parameter("audio_doa_profile", "geometric")
         self.declare_parameter("audio_device", -1)
         self.declare_parameter("mic_channels", "")
         self.declare_parameter("mic_spacing", DEFAULT_MIC_SPACING_M)
@@ -242,6 +245,10 @@ class StandaloneGazeRosNode(Node):
             else self.get_parameter("audio_source_mode").value
         ).strip().lower()
         self.audio_source_mode = audio_src_mode
+        self.audio_doa_profile = str(audio_doa_profile or self.get_parameter("audio_doa_profile").value)
+        if self.audio_doa_profile not in ("geometric", "respeaker_eye_20260908"):
+            raise ValueError(f"Bilinmeyen audio_doa_profile: {self.audio_doa_profile}")
+        self._audio_sectors = ReSpeakerEyeSectors() if self.audio_doa_profile == "respeaker_eye_20260908" else None
 
         audio_dev = int(self.get_parameter("audio_device").value)
         audio_dev = None if audio_dev < 0 else audio_dev
@@ -490,6 +497,12 @@ class StandaloneGazeRosNode(Node):
             val = float(msg.data)
             now = time.monotonic()
             with self._audio_lock:
+                if self._audio_sectors is not None:
+                    if self._playback_active or self._robot_speaking or not self._latest_vad_active:
+                        self._audio_sectors.reset()
+                        val = None
+                    else:
+                        val = self._audio_sectors.update(val, now)
                 self._latest_doa_deg = val
                 self._latest_doa_time = now
         except Exception as e:
@@ -513,6 +526,9 @@ class StandaloneGazeRosNode(Node):
                 self._latest_vad_active = val
                 if val:
                     self._latest_vad_time = now
+                elif self._audio_sectors is not None:
+                    self._audio_sectors.reset()
+                    self._latest_doa_deg = None
         except Exception as e:
             self.get_logger().debug(f"Error in _on_audio_vad: {e}")
 
@@ -521,6 +537,9 @@ class StandaloneGazeRosNode(Node):
         try:
             with self._audio_lock:
                 self._playback_active = bool(msg.data)
+                if self._playback_active and self._audio_sectors is not None:
+                    self._audio_sectors.reset()
+                    self._latest_doa_deg = None
         except Exception as e:
             self.get_logger().debug(f"Error in _on_playback_active: {e}")
 
@@ -529,6 +548,9 @@ class StandaloneGazeRosNode(Node):
         try:
             with self._audio_lock:
                 self._robot_speaking = bool(msg.data)
+                if self._robot_speaking and self._audio_sectors is not None:
+                    self._audio_sectors.reset()
+                    self._latest_doa_deg = None
         except Exception as e:
             self.get_logger().debug(f"Error in _on_robot_speaking: {e}")
 
