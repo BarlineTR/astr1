@@ -156,3 +156,128 @@ def test_audio_target_retention():
     assert ret.retained_target_yaw is None
     assert ret.on_speech_dropout(active_sector=None, now=40.5) is None
 
+
+def test_audio_retention_prevents_continuous_doa_leak_to_idle():
+    """Audio aktifken sektör kilidi (-55°), dropout sırasında hedef koruma,
+    grace bitince doğrudan 0.0°'a dönme ve continuous audio yaw'ın (-36.9°, -59.4°)
+    ASLA dışarı sızmamasını doğrular.
+    """
+    from track import AudioSectorMapper, AudioTargetRetention, resolve_target_yaw
+    from tracker import GazeResult, PrioritySource, GazeStateEnum, Detection
+
+    mapper = AudioSectorMapper(persistence_required=3)
+    retention = AudioTargetRetention(hold_grace_s=1.0)
+
+    # 1. ACTIVE_SPEAKER: Sol sektörde konuşma (-55° sektör kilidi)
+    # Tracker continuous raw DOA açısı (-36.9°) üretse bile...
+    sector = mapper.update(40.0, is_speech=True, timestamp=10.0)
+    assert sector is None  # 1. örnek
+    sector = mapper.update(45.0, is_speech=True, timestamp=10.05)
+    assert sector is None  # 2. örnek
+    sector = mapper.update(50.0, is_speech=True, timestamp=10.10)
+    assert sector == -55.0  # 3. örnekte -55° kilitlenir
+
+    result = GazeResult(
+        target_yaw_deg=-36.9,  # Continuous audio DOA
+        gaze_state=GazeStateEnum.ORIENTING,
+        owner=PrioritySource.ACTIVE_SPEAKER,
+        target_id="audio_speaker_1",
+        confidence=0.85,
+        head_angle_deg=0.0,
+    )
+    target = resolve_target_yaw(
+        result=result,
+        detections=[],
+        active_sector=sector,
+        target_retention=retention,
+        sector_mapper=mapper,
+        now=10.10,
+    )
+    # Step 1 Assert: Hedef continuous (-36.9°) değil, sektör (-55.0°) olmalı
+    assert target == -55.0
+    assert result.target_yaw_deg == -55.0
+    assert result.owner == PrioritySource.ACTIVE_SPEAKER
+
+    # 2. & 3. Speech dropout: 500 ms sonra konuşma kesildi
+    # Tracker IDLE/ACQUIRING'e düşüp continuous DOA (-54.5°) üretse bile...
+    sector = mapper.update(raw_doa=None, is_speech=False, timestamp=10.60)
+    result_dropout = GazeResult(
+        target_yaw_deg=-54.5,  # Continuous audio DOA
+        gaze_state=GazeStateEnum.IDLE,
+        owner=PrioritySource.IDLE,
+        target_id=None,
+        confidence=0.0,
+        head_angle_deg=-20.0,
+    )
+    target_held = resolve_target_yaw(
+        result=result_dropout,
+        detections=[],
+        active_sector=sector,
+        target_retention=retention,
+        sector_mapper=mapper,
+        now=10.60,
+    )
+    # Step 2 & 3 Assert: Grace period içinde (1.0s dolmadı) sektör (-55.0°) korunmalı
+    assert target_held == -55.0
+    assert result_dropout.target_yaw_deg == -55.0
+    assert result_dropout.owner == PrioritySource.ACTIVE_SPEAKER
+
+    # 4. Grace süresi doldu (dropout üzerinden 1.5s geçti, now=12.10)
+    # Tracker hala continuous DOA (-59.4°) üretse bile...
+    result_expired = GazeResult(
+        target_yaw_deg=-59.4,  # Continuous audio DOA
+        gaze_state=GazeStateEnum.IDLE,
+        owner=PrioritySource.IDLE,
+        target_id=None,
+        confidence=0.0,
+        head_angle_deg=-50.0,
+    )
+    target_expired = resolve_target_yaw(
+        result=result_expired,
+        detections=[],
+        active_sector=None,
+        target_retention=retention,
+        sector_mapper=mapper,
+        now=12.10,
+    )
+    # Step 4 Assert: Grace bitince hedef ASLA -59.4° ya da -36.9° olamaz! Kesinlikle 0.0° olmalı!
+    assert target_expired == 0.0
+    assert result_expired.target_yaw_deg == 0.0
+    assert result_expired.target_yaw_deg != -59.4
+    assert result_expired.target_yaw_deg != -36.9
+    assert retention.retained_target_yaw is None
+
+    # 5. Vision devreye girdiğinde:
+    # Audio retention anında düşmeli ve vision hedefi %100 kullanılmalı
+    # Tekrar audio sektör kilidi alalım:
+    sector = mapper.update(40.0, is_speech=True, timestamp=15.0)
+    sector = mapper.update(45.0, is_speech=True, timestamp=15.05)
+    sector = mapper.update(50.0, is_speech=True, timestamp=15.10)
+    assert sector == -55.0
+    res_audio = GazeResult(
+        target_yaw_deg=-30.0,
+        gaze_state=GazeStateEnum.ORIENTING,
+        owner=PrioritySource.ACTIVE_SPEAKER,
+        target_id="audio_speaker_1",
+        confidence=0.8,
+        head_angle_deg=0.0,
+    )
+    resolve_target_yaw(res_audio, [], sector, retention, mapper, now=15.10)
+    assert retention.retained_target_yaw == -55.0
+
+    # Vision yüz gördü (örneğin azimuth +18.5°)
+    res_vision = GazeResult(
+        target_yaw_deg=18.5,
+        gaze_state=GazeStateEnum.TRACKING,
+        owner=PrioritySource.VISUAL_TRACKING,
+        target_id="person_face_1",
+        confidence=0.95,
+        head_angle_deg=0.0,
+    )
+    det = Detection(x=300, y=200, w=80, h=80, confidence=0.95)
+    target_vis = resolve_target_yaw(res_vision, [det], sector, retention, mapper, now=15.15)
+    assert target_vis == 18.5
+    assert res_vision.target_yaw_deg == 18.5
+    assert retention.retained_target_yaw is None
+
+

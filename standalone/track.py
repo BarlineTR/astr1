@@ -21,6 +21,7 @@ import argparse
 import sys
 import time
 from pathlib import Path
+from typing import Optional, Sequence
 
 import cv2
 
@@ -178,6 +179,48 @@ class AudioTargetRetention:
     def reset(self) -> None:
         self.retained_target_yaw = None
         self.hold_until = 0.0
+
+
+def resolve_target_yaw(
+    result,
+    detections,
+    active_sector: Optional[float],
+    target_retention: AudioTargetRetention,
+    sector_mapper: AudioSectorMapper,
+    now: float,
+) -> float:
+    """Sektörel Audio -> Head Eşlemesi ve Hedef Koruma (Retention).
+
+    Audio aktif olduğu sürece tek authoritative kaynak AudioSectorMapper +
+    AudioTargetRetention'dır. GazeTracker.step() tarafından üretilen continuous
+    audio target asla kullanılmaz / dışarı sızmaz.
+    """
+    if result.owner == PrioritySource.VISUAL_TRACKING or len(detections) > 0:
+        # Kural: Vision owner olduğu anda audio tamamen bırakılır
+        target_retention.on_vision_active()
+        sector_mapper.reset()
+        return result.target_yaw_deg
+
+    if result.owner == PrioritySource.ACTIVE_SPEAKER:
+        held_yaw = target_retention.on_active_speaker(active_sector, now)
+        if held_yaw is not None:
+            result.target_yaw_deg = held_yaw
+        else:
+            result.target_yaw_deg = 0.0
+        return result.target_yaw_deg
+
+    # ACTIVE_SPEAKER veya VISUAL değil (kısa speech dropout / IDLE / ACQUIRING)
+    held_yaw = target_retention.on_speech_dropout(active_sector, now)
+    if held_yaw is not None:
+        result.target_yaw_deg = held_yaw
+        result.owner = PrioritySource.ACTIVE_SPEAKER
+    else:
+        target_retention.reset()
+        if result.owner == PrioritySource.IDLE:
+            sector_mapper.reset()
+        result.target_yaw_deg = 0.0
+
+    return result.target_yaw_deg
 
 
 def draw_overlay(frame, detections, result, fps: float, audio_ok: bool, head_ok: bool,
@@ -350,26 +393,14 @@ def main(argv=None) -> int:
             )
 
             # Sektörel Audio -> Head Eşlemesi ve Hedef Koruma (Retention):
-            if result.owner == PrioritySource.VISUAL_TRACKING or len(detections) > 0:
-                # Kural: Vision owner olduğu anda audio tamamen bırakılır
-                target_retention.on_vision_active()
-                sector_mapper.reset()
-            elif result.owner == PrioritySource.ACTIVE_SPEAKER:
-                held_yaw = target_retention.on_active_speaker(active_sector, now)
-                if held_yaw is not None:
-                    result.target_yaw_deg = held_yaw
-                else:
-                    result.target_yaw_deg = head_reference if head_reference is not None else result.head_angle_deg
-            else:
-                # ACTIVE_SPEAKER veya VISUAL değil (kısa speech dropout / IDLE / ACQUIRING)
-                held_yaw = target_retention.on_speech_dropout(active_sector, now)
-                if held_yaw is not None:
-                    result.target_yaw_deg = held_yaw
-                    result.owner = PrioritySource.ACTIVE_SPEAKER
-                else:
-                    target_retention.reset()
-                    if result.owner == PrioritySource.IDLE:
-                        sector_mapper.reset()
+            resolve_target_yaw(
+                result=result,
+                detections=detections,
+                active_sector=active_sector,
+                target_retention=target_retention,
+                sector_mapper=sector_mapper,
+                now=now,
+            )
 
             head.send_angle(result.target_yaw_deg)
             head.tick(now)
