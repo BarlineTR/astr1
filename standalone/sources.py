@@ -232,16 +232,22 @@ class AudioSource:
     would rather have nothing than something stale.
     """
 
+    min_rms: float = MIN_RMS
+    min_harmonicity: float = 0.20
+    min_modulation: float = 0.08
+    doa_min_confidence: float = 0.25
+
     def __init__(
         self,
         device: Optional[int] = None,
-        max_age_s: float = 0.5,
+        max_age_s: float = 1.0,
         stream_factory: Optional[Callable] = None,
         mic_spacing_m: float = DEFAULT_MIC_SPACING_M,
         mic_channels: Optional[Sequence[int]] = None,
         min_harmonicity: float = 0.20,
         min_modulation: float = 0.08,
         min_rms: float = MIN_RMS,
+        doa_min_confidence: float = 0.25,
     ):
         self.device = device
         self.max_age_s = max_age_s
@@ -249,7 +255,10 @@ class AudioSource:
         self.min_harmonicity = float(min_harmonicity)
         self.min_modulation = float(min_modulation)
         self.min_rms = float(min_rms)
-        self._estimator = AcousticDOAEstimator(sample_rate=SAMPLE_RATE)
+        self.doa_min_confidence = float(doa_min_confidence)
+        self._estimator = AcousticDOAEstimator(
+            sample_rate=SAMPLE_RATE, min_confidence=self.doa_min_confidence
+        )
         self._speech = SpeechDetector(
             sample_rate=SAMPLE_RATE,
             min_harmonicity=self.min_harmonicity,
@@ -303,7 +312,9 @@ class AudioSource:
             # kafa hiçbir zaman bir sese dönemiyordu (ölçüldü, bkz. review C1).
             # `__init__`'teki varsayılan (16 kHz) donanımsız testler için duruyor;
             # burada gerçek hızla yeniden kuruluyor.
-            self._estimator = AcousticDOAEstimator(sample_rate=rate)
+            self._estimator = AcousticDOAEstimator(
+                sample_rate=rate, min_confidence=self.doa_min_confidence
+            )
             self._speech = SpeechDetector(
                 sample_rate=rate,
                 min_harmonicity=self.min_harmonicity,

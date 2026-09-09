@@ -148,24 +148,30 @@ class AudioFilterCore:
         median_window_size: int = 5,
         kalman_q: float = 0.08,
         kalman_r: float = 0.45,
+        track_timeout_s: float = 1.5,
         motion_compensator: Optional[HeadMotionCompensator] = None,
     ):
         self.max_jump_deg = max_jump_deg
         self.outlier_persistence_count = outlier_persistence_count
+        self.track_timeout_s = track_timeout_s
         self.motion_compensator = motion_compensator or HeadMotionCompensator()
 
         self.median_filter = CircularMedianFilter(window_size=median_window_size)
         self.kalman = CircularKalmanEstimator(process_noise_q=kalman_q, measurement_noise_r=kalman_r)
 
         self._last_accepted_angle: Optional[float] = None
+        self._last_accepted_time: Optional[float] = None
         self._outlier_candidate_angle: Optional[float] = None
+        self._outlier_candidate_time: Optional[float] = None
         self._outlier_streak: int = 0
 
     def reset(self) -> None:
         self.median_filter.reset()
         self.kalman.reset()
         self._last_accepted_angle = None
+        self._last_accepted_time = None
         self._outlier_candidate_angle = None
+        self._outlier_candidate_time = None
         self._outlier_streak = 0
 
     def filter_observation(
@@ -193,19 +199,31 @@ class AudioFilterCore:
             timestamp=obs.timestamp,
         )
 
-        # 2. Outlier Gating
+        # 2. Outlier Gating with Track Expiry
         is_outlier = False
-        if self._last_accepted_angle is not None:
+        time_since_accepted = (
+            obs.timestamp - self._last_accepted_time
+            if self._last_accepted_time is not None
+            else float("inf")
+        )
+        if self._last_accepted_angle is not None and time_since_accepted <= self.track_timeout_s:
             jump = circular_distance_deg(raw_body_yaw, self._last_accepted_angle)
             if jump > self.max_jump_deg:
                 # Check persistence streak for genuine speaker switches
+                time_since_outlier = (
+                    obs.timestamp - self._outlier_candidate_time
+                    if self._outlier_candidate_time is not None
+                    else float("inf")
+                )
                 if (
                     self._outlier_candidate_angle is not None
+                    and time_since_outlier <= self.track_timeout_s
                     and circular_distance_deg(raw_body_yaw, self._outlier_candidate_angle) <= 15.0
                 ):
                     self._outlier_streak += 1
                 else:
                     self._outlier_candidate_angle = raw_body_yaw
+                    self._outlier_candidate_time = obs.timestamp
                     self._outlier_streak = 1
 
                 if self._outlier_streak < self.outlier_persistence_count:
@@ -214,16 +232,27 @@ class AudioFilterCore:
                 else:
                     # Sustained movement confirmed: accept new heading & reset sliding buffers
                     self._last_accepted_angle = raw_body_yaw
+                    self._last_accepted_time = obs.timestamp
                     self._outlier_candidate_angle = None
+                    self._outlier_candidate_time = None
                     self._outlier_streak = 0
                     self.median_filter.reset()
                     self.kalman.reset(initial_angle_deg=raw_body_yaw)
             else:
                 self._last_accepted_angle = raw_body_yaw
+                self._last_accepted_time = obs.timestamp
                 self._outlier_candidate_angle = None
+                self._outlier_candidate_time = None
                 self._outlier_streak = 0
         else:
+            # First observation or track expired: accept immediately as new sound track
             self._last_accepted_angle = raw_body_yaw
+            self._last_accepted_time = obs.timestamp
+            self._outlier_candidate_angle = None
+            self._outlier_candidate_time = None
+            self._outlier_streak = 0
+            self.median_filter.reset()
+            self.kalman.reset(initial_angle_deg=raw_body_yaw)
 
         if is_outlier:
             return FilteredAudioState(

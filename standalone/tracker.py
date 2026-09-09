@@ -122,6 +122,7 @@ class GazeTracker:
         self.head_angle_deg: float = 0.0
         self.head_velocity_deg_s: float = 0.0
         self.head_feedback_missing: bool = True
+        self._last_head_time: Optional[float] = None
         self._latest_audio = None
         self._latest_tracks: List = []
 
@@ -151,8 +152,17 @@ class GazeTracker:
         robotun sesi de konuşmadır.
         """
         if measured_head_deg is not None:
-            self.head_angle_deg = float(measured_head_deg)
+            new_angle = float(measured_head_deg)
+            if self._last_head_time is not None and timestamp > self._last_head_time:
+                dt = timestamp - self._last_head_time
+                self.head_velocity_deg_s = (new_angle - self.head_angle_deg) / dt
+            else:
+                self.head_velocity_deg_s = 0.0
+            self.head_angle_deg = new_angle
             self.head_feedback_missing = False
+            self._last_head_time = timestamp
+        else:
+            self.head_feedback_missing = True
 
         if doa_deg is not None and speech is not None and speech.is_speech:
             self._ingest_audio(doa_deg, timestamp, float(speech.confidence),
@@ -170,6 +180,10 @@ class GazeTracker:
             actual_head_vel_deg_s=self.head_velocity_deg_s,
         )
 
+        if command.gaze_state == GazeStateEnum.IDLE:
+            self.audio_filter.reset()
+            self._latest_audio = None
+
         # With no encoder, assume the head went where it was told rather than that it
         # sits at zero: assuming zero makes a person centred after a turn compute back
         # to zero, which drives the head to centre and parks it. The planner's
@@ -183,6 +197,7 @@ class GazeTracker:
         if self.head_feedback_missing:
             self.head_angle_deg = float(trajectory.position_deg)
             self.head_velocity_deg_s = float(trajectory.velocity_deg_s)
+            self._last_head_time = timestamp
 
         return GazeResult(
             target_yaw_deg=float(command.target_yaw_deg),

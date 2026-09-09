@@ -253,7 +253,7 @@ def _plane_wave_array(azimuth_deg, amplitude=0.15, samples=BLOCK_SAMPLES):
     distance to the source. This is the input the estimator is built for, so it is the
     input that proves whether the plumbing in front of it is right.
     """
-    radius = ReSpeakerGeometry.MIC_RADIUS_M if hasattr(ReSpeakerGeometry, "MIC_RADIUS_M") else 0.043
+    radius = getattr(ReSpeakerGeometry, "HALF_SPACING_M", 0.032)
     speed = ReSpeakerGeometry.SPEED_OF_SOUND_MPS
     rng = np.random.default_rng(7)
     burst = (rng.standard_normal(samples) * amplitude).astype(np.float32)
@@ -261,7 +261,7 @@ def _plane_wave_array(azimuth_deg, amplitude=0.15, samples=BLOCK_SAMPLES):
     freqs = np.fft.rfftfreq(samples, 1.0 / SAMPLE_RATE)
     spectrum = np.fft.rfft(burst)
     heading = np.array([np.sin(np.radians(azimuth_deg)), np.cos(np.radians(azimuth_deg))])
-    positions = [(0.0, radius), (radius, 0.0), (0.0, -radius), (-radius, 0.0)]
+    positions = [(-radius, 0.0), (0.0, -radius), (radius, 0.0), (0.0, radius)]
 
     channels = [
         np.fft.irfft(spectrum * np.exp(-2j * np.pi * freqs * (-np.dot(p, heading) / speed)),

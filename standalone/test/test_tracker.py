@@ -295,5 +295,53 @@ class TestRobotDoesNotChaseItsOwnVoice(unittest.TestCase):
         self.assertEqual(result.owner, PrioritySource.ACTIVE_SPEAKER)
 
 
+class TestSequentialSpeakersAfterIdle(unittest.TestCase):
+    """Sessizlik/bosta kalma sonrasinda farkli yondeki ses kafayi cevirmeli.
+
+    Onceki bir konusmacidan (orn. sagda, -60°) sonra robot bosa (IDLE) dustugunde
+    veya zaman asimi gectiginde, soldan gelen yeni bir konusma (orn. +45°)
+    'aykiri deger' (outlier) olarak cope atilmamali; kafayi hemen o yone cevirmeli.
+    """
+
+    def test_yeni_yondeki_ses_bostayken_hemen_kabul_edilir(self):
+        from astro_audio.speech_detector import SpeechVerdict
+
+        speech = SpeechVerdict(
+            is_speech=True, confidence=0.80, harmonicity=0.60,
+            modulation=0.70, rms=0.2,
+        )
+        tracker = GazeTracker()
+
+        # 1. Sagdaki konusmaci (doa 60° CW -> -60° REP-103)
+        res1 = None
+        for i in range(20):
+            res1 = tracker.step(
+                faces=[], frame_size=FRAME, doa_deg=60.0, speech=speech,
+                measured_head_deg=None, timestamp=10.0 + i * 0.05,
+            )
+        self.assertEqual(res1.owner, PrioritySource.ACTIVE_SPEAKER)
+        self.assertLess(res1.target_yaw_deg, -20.0)
+
+        # 2. Sessizlik ve robotun bosa (IDLE) donmesi
+        res_idle = None
+        for i in range(100):
+            t = 15.0 + i * 0.05
+            res_idle = tracker.step(
+                faces=[], frame_size=FRAME, doa_deg=None, speech=None,
+                measured_head_deg=0.0, timestamp=t,
+            )
+        self.assertEqual(res_idle.gaze_state, GazeStateEnum.IDLE)
+
+        # 3. Soldan yeni konusmaci (doa 300° CW -> +60° REP-103)
+        res2 = None
+        for i in range(5):
+            res2 = tracker.step(
+                faces=[], frame_size=FRAME, doa_deg=300.0, speech=speech,
+                measured_head_deg=0.0, timestamp=30.0 + i * 0.05,
+            )
+        self.assertEqual(res2.owner, PrioritySource.ACTIVE_SPEAKER)
+        self.assertGreater(res2.target_yaw_deg, 20.0)
+
+
 if __name__ == "__main__":
     unittest.main()
