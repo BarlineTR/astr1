@@ -99,6 +99,8 @@ class ReSpeakerAudioLocalizer:
         self._last_poll_time: float = 0.0
         self._cached_vad: Optional[bool] = None
         self._cached_doa: Optional[float] = None
+        self._vad_warning_emitted: bool = False
+        self._last_vad_warning_time: float = 0.0
 
     @staticmethod
     def circular_dist(a: float, b: float) -> float:
@@ -264,43 +266,64 @@ class ReSpeakerAudioLocalizer:
         self.reset()
 
     def read_voice_activity(self) -> Optional[bool]:
-        """Reads hardware VOICEACTIVITY from ReSpeaker XVF3000 (module 19, offset 32)."""
+        """Reads hardware VAD from ReSpeaker XVF3000.
+
+        Uses public ReSpeakerHID methods:
+        - voice_activity() if defined
+        - speech_detected() from respeaker_usb.py
+        Does NOT touch private _read_param.
+        """
         if self.hid is None:
             return None
         if hasattr(self.hid, "voice_activity") and callable(self.hid.voice_activity):
-            return self.hid.voice_activity()
-        if hasattr(self.hid, "_read_param") and callable(self.hid._read_param):
-            val = self.hid._read_param(19, 32)
-            return bool(val) if val in (0, 1) else None
+            val = self.hid.voice_activity()
+            return bool(val) if val is not None else None
+        if hasattr(self.hid, "speech_detected") and callable(self.hid.speech_detected):
+            val = self.hid.speech_detected()
+            return bool(val) if val is not None else None
         return None
 
     def read_doa_angle(self) -> Optional[float]:
-        """Reads hardware DOAANGLE from ReSpeaker XVF3000 (module 21, offset 0)."""
+        """Reads hardware DOA angle from ReSpeaker XVF3000.
+
+        Uses public ReSpeakerHID method:
+        - doa_angle()
+        Does NOT touch private _read_param.
+        """
         if self.hid is None:
             return None
         if hasattr(self.hid, "doa_angle") and callable(self.hid.doa_angle):
-            return self.hid.doa_angle()
-        if hasattr(self.hid, "_read_param") and callable(self.hid._read_param):
-            val = self.hid._read_param(21, 0)
+            val = self.hid.doa_angle()
             return float(val) if val is not None and 0 <= val <= 359 else None
         return None
 
     def read_and_update(
         self,
         now: float,
-        fallback_doa: Optional[float] = None,
-        fallback_vad: bool = False,
         poll_interval_s: float = 0.05,
     ) -> float:
-        """Polls ReSpeaker hardware registers and updates localizer."""
+        """Polls ReSpeaker hardware registers and updates localizer.
+
+        Authoritative VAD and DOA come strictly from hardware.
+        If hardware VAD cannot be read, tracking is disabled and a warning is logged.
+        No software VAD fallback is used for audio tracking.
+        """
         if self.hid is not None:
             if now - self._last_poll_time >= poll_interval_s or self._last_poll_time == 0.0:
                 self._cached_vad = self.read_voice_activity()
                 self._cached_doa = self.read_doa_angle()
                 self._last_poll_time = now
 
-        vad = self._cached_vad if self._cached_vad is not None else fallback_vad
-        doa = self._cached_doa if self._cached_doa is not None else fallback_doa
+        if self._cached_vad is None:
+            if not self._vad_warning_emitted or (now - self._last_vad_warning_time > 5.0):
+                print("⚠️  ReSpeaker Hardware VAD okunamıyor (donanım yok veya yanıt vermiyor) — ses takibi devre dışı")
+                self._vad_warning_emitted = True
+                self._last_vad_warning_time = now
+            self.reset()
+            return 0.0
+
+        vad = bool(self._cached_vad)
+        doa = self._cached_doa
 
         return self.update(doa_raw=doa, voice_activity=vad, timestamp=now)
 
@@ -458,15 +481,9 @@ def main(argv=None, hid=None) -> int:
                 print(f"🎤 {audio.error} — yalnızca görüntüyle takip")
                 audio_was_available = False
 
-            doa_deg = audio.latest_doa_deg(now) if audio.available else None
-            speech = audio.latest_speech(now) if audio.available else None
-
             # ReSpeaker XVF3000 DSP (VOICEACTIVITY + DOAANGLE) localizer update:
-            localizer.read_and_update(
-                now=now,
-                fallback_doa=doa_deg,
-                fallback_vad=speech.is_speech if speech else False,
-            )
+            # Audio target üretiminde AudioSource kullanılmaz; tek ve authoritative kaynak ReSpeakerAudioLocalizer'dır.
+            localizer.read_and_update(now=now)
 
             if voice_loop is not None:
                 voice_loop.pump(now)
@@ -520,9 +537,9 @@ def main(argv=None, hid=None) -> int:
                 result=result,
                 fps=fps,
                 detections=len(detections),
-                doa_deg=localizer.filtered_doa if localizer.is_tracking() else doa_deg,
+                doa_deg=localizer.filtered_doa if localizer.is_tracking() else None,
                 head_feedback=head.has_feedback,
-                speech=speech,
+                speech=audio.latest_speech(now) if audio.available else None,
                 fixed_head=opts.fixed_head,
             )
 

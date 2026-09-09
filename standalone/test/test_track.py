@@ -245,16 +245,107 @@ def test_audio_target_sole_authoritative_source():
     assert loc.target_yaw_deg == 0.0
 
 
+def test_mock_hid_voice_activity_and_doa_mapping():
+    """Mock HID with public methods:
+    - voice_activity() -> True, doa_angle() -> 142 => target_yaw ≈ +45
+    - voice_activity() -> True, doa_angle() -> 33  => target_yaw ≈ -45
+    - voice_activity() -> False, doa_angle() -> 149 => yeni target oluşmamalı
+    """
+    from unittest.mock import MagicMock
+    from track import ReSpeakerAudioLocalizer
+
+    mock_hid = MagicMock(spec=["voice_activity", "doa_angle"])
+    localizer = ReSpeakerAudioLocalizer(hid=mock_hid, hold_timeout_s=1.2)
+
+    # 1. voice_activity() -> True, doa_angle() -> 142 => target_yaw ≈ +45
+    mock_hid.voice_activity.return_value = True
+    mock_hid.doa_angle.return_value = 142.0
+    target_1 = localizer.read_and_update(now=1.0)
+    assert localizer.is_tracking() is True
+    assert target_1 == pytest.approx(45.0, abs=1.0)
+    assert localizer.target_yaw_deg == pytest.approx(45.0, abs=1.0)
+
+    # 2. voice_activity() -> True, doa_angle() -> 33 => target_yaw ≈ -45
+    # Step change: 2 consecutive samples at 33.0 confirm transition past outlier threshold
+    mock_hid.voice_activity.return_value = True
+    mock_hid.doa_angle.return_value = 33.0
+    localizer.read_and_update(now=1.1)
+    target_2 = localizer.read_and_update(now=1.2)
+    assert localizer.is_tracking() is True
+    assert target_2 == pytest.approx(-45.0, abs=1.0)
+    assert localizer.target_yaw_deg == pytest.approx(-45.0, abs=1.0)
+
+    # 3. voice_activity() -> False, doa_angle() -> 149 => yeni target oluşmamalı
+    mock_hid.voice_activity.return_value = False
+    mock_hid.doa_angle.return_value = 149.0
+    target_3 = localizer.read_and_update(now=1.5)
+    # Target yaw must remain at -45.0 (held), and NOT jump to +90.0 (149°)
+    assert target_3 == pytest.approx(-45.0, abs=1.0)
+    assert localizer.target_yaw_deg == pytest.approx(-45.0, abs=1.0)
+    assert target_3 != pytest.approx(90.0, abs=1.0)
+
+
+def test_mock_hid_speech_detected_compatibility():
+    from unittest.mock import MagicMock
+    from track import ReSpeakerAudioLocalizer
+
+    mock_hid = MagicMock(spec=["speech_detected", "doa_angle"])
+    mock_hid.speech_detected.return_value = True
+    mock_hid.doa_angle.return_value = 142.0
+    localizer = ReSpeakerAudioLocalizer(hid=mock_hid)
+
+    target = localizer.read_and_update(now=1.0)
+    assert localizer.is_tracking() is True
+    assert target == pytest.approx(45.0, abs=1.0)
+
+
+def test_hardware_vad_unreadable_disables_tracking():
+    from unittest.mock import MagicMock
+    from track import ReSpeakerAudioLocalizer
+
+    mock_hid = MagicMock(spec=["voice_activity", "doa_angle"])
+    mock_hid.voice_activity.return_value = None
+    mock_hid.doa_angle.return_value = 69.0
+    localizer = ReSpeakerAudioLocalizer(hid=mock_hid)
+
+    target = localizer.read_and_update(now=1.0)
+    assert localizer.is_tracking() is False
+    assert target == 0.0
+    assert localizer.target_yaw_deg == 0.0
+
+
+def test_audio_source_not_used_for_target_calculation():
+    """Audio target hesabında AudioSource kullanılmadığını kanıtlar."""
+    from unittest.mock import MagicMock
+    from track import ReSpeakerAudioLocalizer
+
+    mock_audio_source = MagicMock()
+    mock_audio_source.latest_doa_deg.return_value = 180.0
+    mock_audio_source.latest_speech.return_value = MagicMock(is_speech=True)
+
+    mock_hid = MagicMock(spec=["voice_activity", "doa_angle"])
+    mock_hid.voice_activity.return_value = True
+    mock_hid.doa_angle.return_value = 69.0
+
+    localizer = ReSpeakerAudioLocalizer(hid=mock_hid)
+    target = localizer.read_and_update(now=1.0)
+    assert target == pytest.approx(0.0, abs=1.0)
+
+    # AudioSource was never called for target calculation
+    assert not mock_audio_source.latest_doa_deg.called
+    assert not mock_audio_source.latest_speech.called
+
+
 def test_track_main_uses_hid_voice_activity():
     from unittest.mock import MagicMock
-    mock_hid = MagicMock()
+    mock_hid = MagicMock(spec=["voice_activity", "doa_angle"])
     mock_hid.voice_activity.return_value = True
     mock_hid.doa_angle.return_value = 69.0
     with patch.object(track, "CameraSource", _SabitKamera), \
             patch.object(track, "AudioSource", _SessizKaynak):
         code = track.main(["--fixed-head", "--no-window", "--no-voice", "--seconds", "0.05"], hid=mock_hid)
         assert code == 0
-    assert mock_hid.voice_activity.called or mock_hid._read_param.called
+    assert mock_hid.voice_activity.called
 
 
 
