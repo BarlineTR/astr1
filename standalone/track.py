@@ -30,12 +30,104 @@ import core_path  # noqa: F401,E402
 from head_link import HeadLink, open_port  # noqa: E402
 from recorder import OverlayRecorder, default_path  # noqa: E402
 from sources import AudioSource, CameraSource  # noqa: E402
+from astro_base.gaze.types import PrioritySource  # noqa: E402
 from stereo_doa import DEFAULT_MIC_SPACING_M  # noqa: E402
 from statuslog import StatusLog  # noqa: E402
 from tracker import GazeTracker  # noqa: E402
 
 BOX_COLOUR = (0, 215, 255)
 TEXT_COLOUR = (0, 255, 120)
+
+
+class AudioSectorMapper:
+    """Raw HID DOA -> Sektörel Kafa Yönelimi (-55°, 0°, +55°).
+
+    Raw HID DOA aralıkları:
+      0..55    -> LEFT   = -55°
+      55..95   -> CENTER = 0°
+      95..300  -> RIGHT  = +55°
+      300..360 -> LEFT   = -55°
+
+    Yeni sektöre geçiş için 3 ardışık aynı sektör örneği şartı.
+    Sektör kararlı kaldığı sürece target_yaw sabit kalır.
+    """
+
+    SECTOR_LEFT = -55.0
+    SECTOR_CENTER = 0.0
+    SECTOR_RIGHT = 55.0
+
+    def __init__(self, persistence_required: int = 3, timeout_s: float = 1.5):
+        self.persistence_required = persistence_required
+        self.timeout_s = timeout_s
+        self.active_sector = None
+        self._candidate_sector = None
+        self._candidate_hits = 0
+        self._last_raw_doa = None
+        self._last_time = 0.0
+
+    @staticmethod
+    def classify_sector(raw_doa: float) -> float:
+        raw = float(raw_doa) % 360.0
+        if 0.0 <= raw <= 55.0 or 300.0 <= raw <= 360.0:
+            return AudioSectorMapper.SECTOR_LEFT
+        elif 55.0 < raw <= 95.0:
+            return AudioSectorMapper.SECTOR_CENTER
+        else:  # 95.0 < raw < 300.0
+            return AudioSectorMapper.SECTOR_RIGHT
+
+    def update(self, raw_doa, is_speech: bool, timestamp: float):
+        if timestamp - self._last_time > self.timeout_s:
+            self._candidate_sector = None
+            self._candidate_hits = 0
+
+        if raw_doa is None or not is_speech:
+            return self.active_sector
+
+        # Sadece yeni bir DOA değeri geldiğinde persistence sayacını işlet
+        if self._last_raw_doa is not None and abs(raw_doa - self._last_raw_doa) < 1e-4:
+            self._last_time = timestamp
+            return self.active_sector
+
+        self._last_raw_doa = raw_doa
+        self._last_time = timestamp
+
+        target = self.classify_sector(raw_doa)
+
+        if self.active_sector is None:
+            if target == self._candidate_sector:
+                self._candidate_hits += 1
+            else:
+                self._candidate_sector = target
+                self._candidate_hits = 1
+
+            if self._candidate_hits >= self.persistence_required:
+                self.active_sector = target
+                self._candidate_sector = None
+                self._candidate_hits = 0
+        else:
+            if target != self.active_sector:
+                if target == self._candidate_sector:
+                    self._candidate_hits += 1
+                else:
+                    self._candidate_sector = target
+                    self._candidate_hits = 1
+
+                if self._candidate_hits >= self.persistence_required:
+                    self.active_sector = target
+                    self._candidate_sector = None
+                    self._candidate_hits = 0
+            else:
+                self._candidate_sector = None
+                self._candidate_hits = 0
+
+        return self.active_sector
+
+    def reset(self):
+        self.active_sector = None
+        self._candidate_sector = None
+        self._candidate_hits = 0
+        self._last_raw_doa = None
+        self._last_time = 0.0
 
 
 def draw_overlay(frame, detections, result, fps: float, audio_ok: bool, head_ok: bool,
@@ -158,6 +250,7 @@ def main(argv=None) -> int:
 
     status = StatusLog(interval_s=opts.log_interval)
     tracker = GazeTracker()
+    sector_mapper = AudioSectorMapper()
     started = time.monotonic()
     frames, fps, last_fps_at, last_fps_frames = 0, 0.0, started, 0
 
@@ -191,6 +284,10 @@ def main(argv=None) -> int:
             # referansı ortak beyne veririz; encoder varmış gibi raporlamayız.
             head_reference = (0.0 if opts.fixed_head else
                               head.measured_angle_deg if head.has_feedback else None)
+
+            is_speech = bool(speech.is_speech) if speech is not None else False
+            active_sector = sector_mapper.update(doa_deg, is_speech, now)
+
             result = tracker.step(
                 faces=detections,
                 frame_size=(frame.shape[1], frame.shape[0]),
@@ -200,6 +297,16 @@ def main(argv=None) -> int:
                 timestamp=now,
                 is_robot_speaking=voice_loop.is_speaking_at(now) if voice_loop else False,
             )
+
+            # Sektörel Audio -> Head Eşlemesi:
+            # ACTIVE_SPEAKER durumunda target_yaw kararlı sektöre (-55°, 0°, +55°) kilitlenir.
+            if result.owner == PrioritySource.ACTIVE_SPEAKER:
+                if active_sector is not None:
+                    result.target_yaw_deg = active_sector
+                else:
+                    result.target_yaw_deg = head_reference if head_reference is not None else result.head_angle_deg
+            elif result.owner == PrioritySource.IDLE:
+                sector_mapper.reset()
 
             head.send_angle(result.target_yaw_deg)
             head.tick(now)

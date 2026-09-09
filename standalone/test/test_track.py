@@ -75,3 +75,57 @@ def test_sabit_referans_motor_baglantisiyla_birlikte_acilamaz():
         track.main(["--fixed-head", "--serial", "/dev/test"])
     assert exc.value.code == 2
 
+
+def test_audio_sector_classification():
+    from track import AudioSectorMapper
+
+    mapper = AudioSectorMapper()
+    # 0..55 -> LEFT (-55°)
+    assert mapper.classify_sector(0.0) == -55.0
+    assert mapper.classify_sector(30.0) == -55.0
+    assert mapper.classify_sector(55.0) == -55.0
+
+    # 55..95 -> CENTER (0°)
+    assert mapper.classify_sector(56.0) == 0.0
+    assert mapper.classify_sector(75.0) == 0.0
+    assert mapper.classify_sector(95.0) == 0.0
+
+    # 95..300 -> RIGHT (+55°)
+    assert mapper.classify_sector(96.0) == 55.0
+    assert mapper.classify_sector(150.0) == 55.0
+    assert mapper.classify_sector(299.0) == 55.0
+
+    # 300..360 -> LEFT (-55°)
+    assert mapper.classify_sector(300.0) == -55.0
+    assert mapper.classify_sector(330.0) == -55.0
+    assert mapper.classify_sector(359.9) == -55.0
+
+
+def test_audio_sector_persistence_three_samples():
+    from track import AudioSectorMapper
+
+    mapper = AudioSectorMapper(persistence_required=3)
+
+    # 1. İlk 2 örnekte sektör kilitlenmez (None döner)
+    assert mapper.update(40.0, is_speech=True, timestamp=1.0) is None
+    assert mapper.update(45.0, is_speech=True, timestamp=1.05) is None
+
+    # 2. 3. ardışık örnekte sol sektör (-55°) kilitlenir
+    assert mapper.update(50.0, is_speech=True, timestamp=1.10) == -55.0
+
+    # 3. Sektör içinde kalan dalgalanmalarda target sabit kalır
+    assert mapper.update(35.0, is_speech=True, timestamp=1.15) == -55.0
+    assert mapper.update(20.0, is_speech=True, timestamp=1.20) == -55.0
+
+    # 4. Sağdan gelen tek bir glitch örneği sektörü bozmaz
+    assert mapper.update(180.0, is_speech=True, timestamp=1.25) == -55.0
+    assert mapper.update(40.0, is_speech=True, timestamp=1.30) == -55.0
+
+    # 5. Yeni sektöre (sağ: +55°) geçiş için 3 ardışık örnek şartı
+    assert mapper.update(150.0, is_speech=True, timestamp=1.35) == -55.0
+    assert mapper.update(160.0, is_speech=True, timestamp=1.40) == -55.0
+    assert mapper.update(155.0, is_speech=True, timestamp=1.45) == 55.0  # 3. örnekte sağa geçer
+
+    # 6. Sağ sektörde kalmaya devam eder
+    assert mapper.update(200.0, is_speech=True, timestamp=1.50) == 55.0
+
