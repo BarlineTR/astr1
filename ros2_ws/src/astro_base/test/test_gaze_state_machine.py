@@ -218,7 +218,38 @@ class TestGazeStateMachine(unittest.TestCase):
             self.assertEqual(cmd_settled.gaze_state, GazeStateEnum.VISUAL_ACQUIRE)
             self.assertEqual(cmd_settled.target_yaw_deg, target_pos)
 
+    def test_recovering_settles_with_deadband_offset(self):
+        """Head settling within deadband/tolerance (e.g. -2.3°) successfully transitions from RECOVERING to IDLE."""
+        fsm = SocialGazeFSM(recovery_timeout_s=2.0)
+        t = 10.0
+        fsm.state = GazeStateEnum.RECOVERING
+        fsm._state_entry_time = t
+
+        # Head is at -2.3° (stopped, vel=0.0) -> Within max(2.0, 2.5) = 2.5°
+        cmd = fsm.update(TargetState(active_target=None), actual_head_yaw_deg=-2.3, timestamp=t + 0.1, actual_head_vel_deg_s=0.0)
+        self.assertEqual(cmd.gaze_state, GazeStateEnum.IDLE)
+        self.assertEqual(cmd.priority_source, PrioritySource.IDLE)
+        self.assertEqual(fsm.last_transition_reason, "RECOVERY_SETTLED_IDLE")
+
+    def test_recovering_timeout_fallback_if_stuck(self):
+        """If head is stuck outside deadband (e.g. -5.0°), recovery_timeout_s guarantees return to IDLE."""
+        fsm = SocialGazeFSM(recovery_timeout_s=2.0)
+        t = 10.0
+        fsm.state = GazeStateEnum.RECOVERING
+        fsm._state_entry_time = t
+
+        # Head stuck at -5.0° before timeout -> stays RECOVERING
+        cmd1 = fsm.update(TargetState(active_target=None), actual_head_yaw_deg=-5.0, timestamp=t + 1.0, actual_head_vel_deg_s=0.0)
+        self.assertEqual(cmd1.gaze_state, GazeStateEnum.RECOVERING)
+
+        # After timeout (t + 2.1s >= 2.0s) -> forces IDLE
+        cmd2 = fsm.update(TargetState(active_target=None), actual_head_yaw_deg=-5.0, timestamp=t + 2.1, actual_head_vel_deg_s=0.0)
+        self.assertEqual(cmd2.gaze_state, GazeStateEnum.IDLE)
+        self.assertEqual(cmd2.priority_source, PrioritySource.IDLE)
+        self.assertEqual(fsm.last_transition_reason, "RECOVERY_TIMEOUT_IDLE")
+
 
 if __name__ == "__main__":
     unittest.main()
+
 

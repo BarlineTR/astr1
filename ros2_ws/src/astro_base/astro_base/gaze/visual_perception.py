@@ -72,20 +72,34 @@ class VisualPerceptionCore:
         emotion: str = "neutral",
         person_name: Optional[str] = None,
         is_known: bool = False,
+        cam_azimuth_deg: Optional[float] = None,
     ) -> VisualObservation:
         """Processes a single bounding box detection into a rich VisualObservation."""
         center_u = x + (w / 2.0)
         center_v = y + (h / 2.0)
 
-        # 1. 3D Camera coordinates
-        pos_3d_cam = self.pixel_and_depth_to_3d_camera(
-            center_u, center_v, depth_m, frame_width, frame_height
-        )
+        if cam_azimuth_deg is not None:
+            cam_azimuth = float(cam_azimuth_deg)
+            half_vfov = self.transformer.calib.camera.vfov_deg / 2.0
+            norm_v = (center_v - (frame_height / 2.0)) / (frame_height / 2.0)
+            cam_elevation = float(-norm_v * half_vfov + self.transformer.calib.camera.pitch_offset_deg)
+            z_opt = max(0.1, depth_m)
+            x_opt = -z_opt * math.tan(math.radians(cam_azimuth))
+            y_opt = z_opt * math.tan(math.radians(-cam_elevation))
+            pos_3d_cam = (float(x_opt), float(y_opt), float(z_opt))
+            norm_u = -cam_azimuth / (self.transformer.calib.camera.hfov_deg / 2.0)
+        else:
+            # 1. 3D Camera coordinates
+            pos_3d_cam = self.pixel_and_depth_to_3d_camera(
+                center_u, center_v, depth_m, frame_width, frame_height
+            )
 
-        # 2. Camera-relative azimuth and elevation angles
-        cam_azimuth, cam_elevation = self.transformer.camera_pixel_to_optical_angles(
-            center_u, center_v, frame_width, frame_height
-        )
+            # 2. Camera-relative azimuth and elevation angles
+            cam_azimuth, cam_elevation = self.transformer.camera_pixel_to_optical_angles(
+                center_u, center_v, frame_width, frame_height
+            )
+            norm_u = (center_u - (frame_width / 2.0)) / (frame_width / 2.0)
+            norm_v = (center_v - (frame_height / 2.0)) / (frame_height / 2.0)
 
         # 3. Transform to robot base body frame
         body_yaw = self.transformer.camera_bearing_to_body_yaw(cam_azimuth, actual_head_yaw_deg)

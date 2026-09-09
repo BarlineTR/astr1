@@ -165,6 +165,67 @@ class TestTargetManager(unittest.TestCase):
         self.assertEqual(st_final.active_target.target_id, "spk_b")
 
 
+    def _audio(self, conf, t, az=40.0):
+        return FusedTarget(
+            target_id="audio_speaker_1", modality=Modality.AUDIO, body_azimuth_deg=az,
+            body_elevation_deg=0.0, distance_m=1.8, confidence=conf,
+            is_speaking=True, eye_contact=False, person_name=None, is_known=False,
+            timestamp=t, tracking_state=TrackingState.TRACKING
+        )
+
+    def _vision(self, conf, t, az=10.0, tid="person_1"):
+        return FusedTarget(
+            target_id=tid, modality=Modality.VISION, body_azimuth_deg=az,
+            body_elevation_deg=0.0, distance_m=1.5, confidence=conf,
+            is_speaking=False, eye_contact=False, person_name=None, is_known=False,
+            timestamp=t, tracking_state=TrackingState.TRACKING
+        )
+
+    def test_sound_is_acquired_when_nothing_is_seen(self):
+        """A voice with nobody visible must move the head, not be ignored.
+
+        An audio-only target's confidence is DOA confidence times a freshness that
+        halves every 0.4 s, so it effectively never clears the 0.75 visual bar. Held to
+        that bar the robot sits still through a voice it can plainly hear — which is
+        what the recording showed: audio present, owner=IDLE, head parked.
+        """
+        tm = TargetManagerCore()
+        state = tm.update([self._audio(0.55, 1.0)], timestamp=1.0)
+
+        self.assertIsNotNone(state.active_target)
+        self.assertEqual(state.active_target.modality, Modality.AUDIO)
+
+    def test_sound_below_the_audio_bar_is_still_ignored(self):
+        """The lower bar is a bar, not an open door — faint bearings stay out."""
+        tm = TargetManagerCore()
+        state = tm.update([self._audio(0.30, 1.0)], timestamp=1.0)
+
+        self.assertIsNone(state.active_target)
+
+    def test_a_visible_face_still_wins_over_sound(self):
+        """Sound is a fallback. It must not outrank a face that cleared the visual bar,
+        or the head would turn away from someone it can see toward a reflection."""
+        tm = TargetManagerCore()
+        state = tm.update(
+            [self._vision(0.85, 1.0, az=10.0), self._audio(0.60, 1.0, az=70.0)],
+            timestamp=1.0,
+        )
+
+        self.assertIsNotNone(state.active_target)
+        self.assertEqual(state.active_target.modality, Modality.VISION)
+
+    def test_weak_face_does_not_block_the_audio_fallback(self):
+        """A face below the visual bar leaves nothing acquired, so sound should still
+        get its turn rather than the weak face suppressing it."""
+        tm = TargetManagerCore()
+        state = tm.update(
+            [self._vision(0.50, 1.0, az=10.0), self._audio(0.60, 1.0, az=70.0)],
+            timestamp=1.0,
+        )
+
+        self.assertIsNotNone(state.active_target)
+        self.assertEqual(state.active_target.modality, Modality.AUDIO)
+
 
 if __name__ == "__main__":
     unittest.main()

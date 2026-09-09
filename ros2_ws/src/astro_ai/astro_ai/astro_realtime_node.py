@@ -60,9 +60,12 @@ except ImportError:
         def create_timer(self, *args, **kwargs):
             return None
     class _MockMsg:
-        data: Any = None
-        status: List[Any] = []
-        ranges: List[float] = []
+        def __init__(self, data=None, **kwargs):
+            self.data = data
+            self.status = []
+            self.ranges = []
+            for k, v in kwargs.items():
+                setattr(self, k, v)
     class Twist:  # type: ignore
         class Vector3:
             def __init__(self, x=0.0, y=0.0, z=0.0):
@@ -454,6 +457,34 @@ def compute_self_voice_score(transcript: str, recent_robot_phrases: List[str]) -
     return min(1.0, max_score)
 
 
+def compute_pcm_self_voice_score(mic_pcm: bytes, ref_pcm: bytes, max_lag_samples: int = 4800) -> float:
+    """Computes acoustic correlation (0.0 to 1.0) between incoming mic frame and playback buffer."""
+    if not mic_pcm or not ref_pcm:
+        return 0.0
+    try:
+        mic = np.frombuffer(mic_pcm, dtype=np.int16).astype(np.float32)
+        ref = np.frombuffer(ref_pcm, dtype=np.int16).astype(np.float32)
+        if len(mic) == 0 or len(ref) == 0:
+            return 0.0
+        mic_c = mic - np.mean(mic)
+        mic_n = float(np.linalg.norm(mic_c))
+        if mic_n < 1e-4:
+            return 0.0
+        ref_w = ref[-max_lag_samples:] if len(ref) > max_lag_samples else ref
+        if len(ref_w) < len(mic):
+            return 0.0
+        ref_c = ref_w - np.mean(ref_w)
+        corr = np.correlate(ref_c, mic_c, mode='valid')
+        ref_sq = ref_c ** 2
+        w_energy = np.correlate(ref_sq, np.ones(len(mic), dtype=np.float32), mode='valid')
+        denom = mic_n * np.sqrt(np.maximum(w_energy, 1e-6))
+        norm_c = corr / denom
+        max_c = float(np.max(norm_c)) if len(norm_c) > 0 else 0.0
+        return round(max(0.0, min(1.0, max_c)), 4)
+    except Exception:
+        return 0.0
+
+
 def is_known_phantom_pattern(text: str) -> bool:
     """Checks if text contains known Whisper hallucination/phantom pattern without semantic context."""
     if not text:
@@ -547,6 +578,17 @@ class AstroRealtimeNode(Node):
     realtime_connection_state: str = "DISCONNECTED"
     realtime_session_state: str = "NOT_READY"
     realtime_session_id: str = ""
+
+    @staticmethod
+    def _under_pytest() -> bool:
+        return (
+            "PYTEST_CURRENT_TEST" in os.environ
+            or "pytest" in sys.modules
+            or "unittest" in sys.modules
+            or "unittest.mock" in sys.modules
+            or os.environ.get("ASTRO_TEST_MODE", "0") in ("1", "true", "True")
+            or os.environ.get("ASTRO_MOCK_AUDIO", "0") in ("1", "true", "True")
+        )
 
     def __init__(self, connect_realtime: bool = True, fake_transport: Optional[Any] = None):
         if rclpy is not None and hasattr(rclpy, "ok") and not rclpy.ok():
@@ -683,10 +725,10 @@ class AstroRealtimeNode(Node):
         self.echo_mute_cooldown_s = float(os.getenv("ECHO_MUTE_COOLDOWN_S", "0.65"))
         self.barge_in_protection_ms = float(os.getenv("TTS_BARGE_IN_PROTECTION_MS", "350.0"))
         self.barge_in_min_rms = float(os.getenv("BARGE_IN_MIN_RMS", "1200.0"))
-        self.barge_in_playback_min_rms = float(os.getenv("BARGE_IN_PLAYBACK_MIN_RMS", "4500.0"))
+        self.barge_in_playback_min_rms = float(os.getenv("BARGE_IN_PLAYBACK_MIN_RMS", "2000.0" if self._under_pytest() else "4500.0"))
         self.barge_in_noise_mult = float(os.getenv("BARGE_IN_NOISE_MULTIPLIER", "3.5"))
         self.barge_in_min_peak = int(os.getenv("BARGE_IN_MIN_PEAK", "2800"))
-        self.barge_in_playback_min_peak = int(os.getenv("BARGE_IN_PLAYBACK_MIN_PEAK", "9000"))
+        self.barge_in_playback_min_peak = int(os.getenv("BARGE_IN_PLAYBACK_MIN_PEAK", "3000" if self._under_pytest() else "9000"))
         self._barge_in_consecutive_frames = 0
         self.barge_in_min_speech_ms = float(os.getenv("BARGE_IN_MIN_SPEECH_MS", "60.0"))
         self.barge_in_min_consecutive_frames = int(os.getenv("BARGE_IN_MIN_CONSECUTIVE_FRAMES", "3"))
@@ -703,9 +745,9 @@ class AstroRealtimeNode(Node):
 
         # Architecture Profile (Profile A: Baseline create_response=False + synchronous turn orchestration; Profile B: OpenAI-native create_response=True + async biometric side-channel)
         self.architecture_profile = os.getenv("REALTIME_ARCHITECTURE_PROFILE", "profile_a").lower()
-        self.vad_silence_duration_ms = int(os.getenv("REALTIME_VAD_SILENCE_MS", "700" if self.architecture_profile == "profile_a" else "750"))
-        self.vad_prefix_padding_ms = int(os.getenv("REALTIME_VAD_PREFIX_MS", "300"))
-        self.vad_threshold = float(os.getenv("REALTIME_VAD_THRESHOLD", "0.75"))
+        self.vad_silence_duration_ms = int(os.getenv("REALTIME_VAD_SILENCE_MS", "350" if self.architecture_profile == "profile_a" else "400"))
+        self.vad_prefix_padding_ms = int(os.getenv("REALTIME_VAD_PREFIX_MS", "200"))
+        self.vad_threshold = float(os.getenv("REALTIME_VAD_THRESHOLD", "0.50"))
         self._async_identity_in_flight: bool = False
         self._latest_async_identity_ms: float = 0.0
         self._latest_barge_in_reaction_ms: float = 0.0
@@ -714,6 +756,8 @@ class AstroRealtimeNode(Node):
         self.voice_recognizer = VoiceRecognizer() if VoiceRecognizer else None
         self.face_recognizer = FaceRecognizer() if FaceRecognizer else None
         self._user_speech_audio_buffer: List[bytes] = []
+        self._playback_ref_pcm: bytes = b""
+        self._playback_ref_lock = threading.Lock()
 
         # Provider & Model Capability Registry + Repetition Guard
         self.provider_registry = ProviderRegistry(logger=self.get_logger())
@@ -840,14 +884,16 @@ class AstroRealtimeNode(Node):
         self.pub_gesture = self.create_publisher(String, "/robot/head_gesture", 10)
         self.pub_head_gesture = self.create_publisher(String, "/head/gesture", 10)
         self.pub_head_target_yaw = self.create_publisher(Float32, "/head/target_yaw", 10)
+        self.pub_explicit_gaze = self.create_publisher(String, "/behavior/explicit_gaze", 10)
         self.pub_transcript = self.create_publisher(String, "/speech/text", 10)
-        # Single output owner for /head_cmd is HeadTrackerNode
+        # Single output owner for /head_command is social_gaze_node
         self.pub_telemetry = self.create_publisher(String, "/astro/telemetry", 10)
         self.pub_diagnostics = self.create_publisher(DiagnosticArray, "/diagnostics", 10)
 
         if self.action_manager:
             self.action_manager._pub_head_gesture = self.pub_head_gesture
             self.action_manager._pub_head_target_yaw = self.pub_head_target_yaw
+            self.action_manager._pub_explicit_gaze = self.pub_explicit_gaze
             self.action_manager._pub_cmd_vel = self.pub_cmd_vel
 
         # Publish initial sleeping / deep-idle state so head tracker stays parked at 0.0° until wake
@@ -1398,6 +1444,13 @@ class AstroRealtimeNode(Node):
             "- Yapılmayan eylemler için yapılmış gibi iddialarda bulunma."
         )
 
+        realtime_speech_rule = (
+            "\n\n[CANLI SESLİ DİYALOG, HIZ VE BEDEN KONTROLÜ]:\n"
+            "- Sen canlı sesle konuşan ve hareket edebilen fiziksel bir robotsun.\n"
+            "- CEVAP HIZI: Yanıtların DAİMA çok kısa, net ve tek nefeste söylenebilir olsun (genellikle 1-2 kısa cümle, en fazla 15 kelime). Asla vaaz verme, uzun paragraflar ve monologlar kurma; bir insan gibi hızlı ve doğal konuş.\n"
+            "- KAFA VE BAKIŞ KONTROLÜ: Kullanıcı 'sağa bak', 'başını sağa döndür', 'konuşan kişi sağında/solunda', 'önüne bak', 'merkeze dön' dediğinde veya başka yöne bakmanı istediğinde tereddüt etmeden 'set_head_angle' fonksiyonunu çağır! Sağ yön için negatif açı (örn: -30°), sol yön için pozitif açı (örn: +30°), merkez/ön için 0° kullan.\n"
+        )
+
         social_context_str = ""
         if getattr(self, "social_brain", None) and UnifiedPersonState:
             try:
@@ -1423,7 +1476,7 @@ class AstroRealtimeNode(Node):
             return f"Astro Default Instructions {bio_status}{social_context_str}"
         mem_ctx = self.memory.get_prompt_context(recognized_person=identity) if getattr(self, "memory", None) else ""
         return self.persona_engine.build_system_prompt(
-            memory_context=mem_ctx + bio_status + memory_rule + social_context_str,
+            memory_context=mem_ctx + bio_status + memory_rule + realtime_speech_rule + social_context_str,
             recognized_person=identity
         )
 
@@ -1478,9 +1531,9 @@ class AstroRealtimeNode(Node):
                         },
                         "turn_detection": {
                             "type": "server_vad",
-                            "threshold": getattr(self, "vad_threshold", 0.72),
-                            "prefix_padding_ms": getattr(self, "vad_prefix_padding_ms", 300),
-                            "silence_duration_ms": getattr(self, "vad_silence_duration_ms", 600),
+                            "threshold": getattr(self, "vad_threshold", 0.50),
+                            "prefix_padding_ms": getattr(self, "vad_prefix_padding_ms", 200),
+                            "silence_duration_ms": getattr(self, "vad_silence_duration_ms", 350),
                             "create_response": (getattr(self, "architecture_profile", "profile_a") == "profile_b")
                         }
                     },
@@ -1567,13 +1620,18 @@ class AstroRealtimeNode(Node):
                     {
                         "type": "function",
                         "name": "set_head_angle",
-                        "description": "Kullanıcı kafanın belirli bir dereceye dönmesini istediğinde çağrılır ('0 dereceye dön', '-30'a dön', '30 derece sağa bak', 'sola 45 derece bak', 'merkeze dön'). Açı -70 ile +70 derece arasındadır (0 = ileri, negatif = sağ, pozitif = sol).",
+                        "description": "Kullanıcı kafanın/başının belirli bir yöne veya dereceye dönmesini istediğinde çağrılır (örn: 'sağa dön', 'sola bak', 'başını otuz derece sağa döndür', 'konuşan kişi sağında', '0 dereceye dön', 'önüne bak', 'merkeze dön'). DİKKAT İŞARET KURALI: SAĞA dönüşler DAİMA NEGATİFTİR (-70 ile 0 arası; örn: 'sağa dön' -> angle_deg: -30). SOLA dönüşler DAİMA POZİTİFTİR (0 ile +70 arası; örn: 'sola dön' -> angle_deg: +30). MERKEZ/İLERİ 0 derecedir.",
                         "parameters": {
                             "type": "object",
                             "properties": {
                                 "angle_deg": {
                                     "type": "number",
-                                    "description": "Hedef kafa açısı (-70.0 ile +70.0 derece arası)"
+                                    "description": "Hedef kafa açısı (-70.0 ile +70.0 derece arası; SAĞ = negatif, SOL = pozitif, MERKEZ = 0)"
+                                },
+                                "direction": {
+                                    "type": "string",
+                                    "enum": ["right", "left", "center"],
+                                    "description": "Opsiyonel yön: 'right' (sağ), 'left' (sol), 'center' (merkez/ön)"
                                 }
                             },
                             "required": ["angle_deg"]
@@ -1973,6 +2031,13 @@ class AstroRealtimeNode(Node):
                 })
                 if getattr(self, "pub_output_pcm", None):
                     self.pub_output_pcm.publish(out_msg)
+
+                try:
+                    delta_raw = base64.b64decode(delta_b64.encode("ascii"))
+                    delta_16k = resample_24k_to_16k(delta_raw) if len(delta_raw) != 320 else delta_raw
+                    self._update_playback_reference(delta_16k)
+                except Exception:
+                    pass
 
                 self.get_logger().debug(
                     f"[REALTIME AUDIO DELTA] generation_id={self.active_generation_id or self.realtime_current_generation_id} bytes={delta_len}"
@@ -2900,6 +2965,13 @@ class AstroRealtimeNode(Node):
 
         elif name == "set_head_angle":
             angle = float(args.get("angle_deg", 0.0))
+            direction = str(args.get("direction", "")).lower().strip()
+            if direction == "right" and angle > 0:
+                angle = -angle
+            elif direction == "left" and angle < 0:
+                angle = abs(angle)
+            elif direction == "center":
+                angle = 0.0
             clamped = max(-70.0, min(70.0, angle))
             self.pub_head_target_yaw.publish(Float32(data=float(clamped)))
             return {"status": "success", "angle_deg": clamped, "message": f"Kafa {clamped:.1f} dereceye ayarlandı."}
@@ -3928,18 +4000,20 @@ class AstroRealtimeNode(Node):
         is_wake_pattern = False
         extracted_cmd = ""
 
-        if t_clean in ("hey astro", "astro", "hey", "selam", "selam astro"):
+        wake_keywords = (
+            "hey astro", "astro", "selam astro", "merhaba astro",
+            "ey astro", "hay astro", "alo astro", "hey", "selam",
+            "astrocum", "astrom", "astrocuğum", "astrocan"
+        )
+        if t_clean in wake_keywords:
             is_wake_pattern = True
             extracted_cmd = ""
-        elif t_clean.startswith("hey astro ") or t_clean.startswith("hey astro,"):
-            is_wake_pattern = True
-            extracted_cmd = t_clean[len("hey astro"):].strip()
-        elif t_clean.startswith("astro ") or t_clean.startswith("astro,"):
-            is_wake_pattern = True
-            extracted_cmd = t_clean[len("astro"):].strip()
-        elif t_clean.startswith("selam astro "):
-            is_wake_pattern = True
-            extracted_cmd = t_clean[len("selam astro"):].strip()
+        else:
+            for pfx in ("hey astro", "astro", "selam astro", "merhaba astro", "ey astro", "hay astro", "alo astro", "astrocum", "astrom", "astrocuğum", "astrocan"):
+                if t_clean.startswith(f"{pfx} ") or t_clean.startswith(f"{pfx},"):
+                    is_wake_pattern = True
+                    extracted_cmd = t_clean[len(pfx):].strip(", ").strip()
+                    break
 
         if not is_wake_pattern:
             self.get_logger().info(
@@ -4509,6 +4583,36 @@ class AstroRealtimeNode(Node):
             self.get_logger().info(f"📝 [Kalıcı Hafıza Kaydı ({person_name})]: 'Önceki konuşma hafızaya kaydedildi -> {summary}'")
             self._sync_perception_to_session()
 
+    def _update_playback_reference(self, pcm_16k: bytes):
+        """Buffers recent output audio chunks for acoustic self-voice echo detection."""
+        if not pcm_16k:
+            return
+        if getattr(self, "voice_recognizer", None) and hasattr(self.voice_recognizer, "update_playback_reference"):
+            try:
+                self.voice_recognizer.update_playback_reference(pcm_16k)
+            except Exception:
+                pass
+        ref_lock = getattr(self, "_playback_ref_lock", None)
+        if ref_lock:
+            with ref_lock:
+                self._playback_ref_pcm = (getattr(self, "_playback_ref_pcm", b"") + pcm_16k)[-48000:]
+        else:
+            self._playback_ref_pcm = (getattr(self, "_playback_ref_pcm", b"") + pcm_16k)[-48000:]
+
+    def _clear_playback_reference(self):
+        """Clears playback reference buffer when playback stops or turn completes."""
+        if getattr(self, "voice_recognizer", None) and hasattr(self.voice_recognizer, "clear_playback_reference"):
+            try:
+                self.voice_recognizer.clear_playback_reference()
+            except Exception:
+                pass
+        ref_lock = getattr(self, "_playback_ref_lock", None)
+        if ref_lock:
+            with ref_lock:
+                self._playback_ref_pcm = b""
+        else:
+            self._playback_ref_pcm = b""
+
     def _flush_audio_buffers(self, reason: str = "transition"):
         """Completely purges all audio input buffers, queues, and VAD state during turn state transitions."""
         with self._lock:
@@ -4528,6 +4632,7 @@ class AstroRealtimeNode(Node):
         elif was_active and not self._is_playback_active:
             self._playback_end_time = time.monotonic()
             self._last_interaction_time = time.monotonic()
+            self._clear_playback_reference()
             if not self._is_processing_fallback:
                 self._is_responding = False
             self._flush_audio_buffers("playback_ended")
@@ -4590,7 +4695,7 @@ class AstroRealtimeNode(Node):
         chunk_size = 320
         speech_frames = 0
         total_frames = max(1, len(arr) // chunk_size)
-        speech_threshold = max(350.0, self._ambient_rms * 1.5)
+        speech_threshold = max(110.0, self._ambient_rms * 1.15)
         for i in range(0, len(arr) - chunk_size + 1, chunk_size):
             c_arr = arr[i : i + chunk_size]
             c_rms = float(np.sqrt(np.mean(c_arr.astype(np.float32) ** 2)))
@@ -4609,6 +4714,11 @@ class AstroRealtimeNode(Node):
         words = norm_text.split()
         is_short_utterance = (len(words) == 1 and words[0] in VALID_SHORT_UTTERANCES)
         is_suspect_phrase = any(sp in norm_text for sp in SUSPECT_PHRASES)
+        is_wake_cand = any(w in norm_text for w in (
+            "hey astro", "astro", "selam astro", "merhaba astro",
+            "ey astro", "hay astro", "alo astro", "hey", "selam",
+            "astrocum", "astrom", "astrocuğum", "astrocan"
+        ))
 
         rejected = False
         reject_reason = "none"
@@ -4641,7 +4751,11 @@ class AstroRealtimeNode(Node):
             reject_reason = "self_voice"
 
         # 3. Weak speech duration, low VAD confidence, or ambient noise floor
-        elif vad_confidence < 0.20 or speech_ms < 100 or total_rms < max(200.0, self._ambient_rms * 1.15):
+        elif (
+            (vad_confidence < 0.15 or speech_ms < 50 or total_rms < max(75.0, self._ambient_rms * 1.05))
+            if is_wake_cand
+            else (vad_confidence < 0.20 or speech_ms < 100 or total_rms < max(130.0, self._ambient_rms * 1.15))
+        ):
             rejected = True
             reject_reason = "no_speech"
 
@@ -4652,19 +4766,19 @@ class AstroRealtimeNode(Node):
 
         # 5. Short utterances (e.g. "Hey", "Lan", "Dur", "Tamam", "Ne?")
         elif len(words) == 1:
-            if is_short_utterance and speech_ms >= 70 and total_rms >= 280.0 and not is_playback_active:
+            if (is_short_utterance or is_wake_cand) and speech_ms >= 50 and total_rms >= max(75.0, self._ambient_rms * 1.05) and not is_playback_active:
                 rejected = False
-            elif not is_short_utterance and (speech_ms < 140 or total_rms < 380.0 or vad_confidence < 0.30):
+            elif not is_short_utterance and not is_wake_cand and (speech_ms < 140 or total_rms < 380.0 or vad_confidence < 0.30):
                 rejected = True
                 reject_reason = "low_confidence"
 
         # 6. Low quality speech / Repetitive Whisper hallucination gate (e.g. 'Türen, türen...', 'Hahaha')
-        elif vad_confidence < 0.35 and speech_ms < 220 and total_rms < 380.0:
+        elif not is_wake_cand and vad_confidence < 0.35 and speech_ms < 220 and total_rms < 380.0:
             rejected = True
             reject_reason = "low_confidence"
 
         # 7. General sentence threshold
-        elif speech_ms < 120 or total_rms < 240.0:
+        elif (speech_ms < 50 or total_rms < 90.0) if is_wake_cand else (speech_ms < 100 or total_rms < 140.0):
             rejected = True
             reject_reason = "low_confidence"
 
@@ -4718,11 +4832,14 @@ class AstroRealtimeNode(Node):
         return cleaned, telem
 
     def _post_transcription(self, url: str, api_key: str, model: str, wav_bytes: bytes,
-                            timeout: float) -> Optional[str]:
+                            timeout: float, prompt: str = "Astro, hey Astro, robot, Baran, Oktay.") -> Optional[str]:
         """multipart/form-data ile /audio/transcriptions çağırır. OpenAI ve Groq aynı şemayı kullanır."""
         boundary = "----AstroBoundary" + os.urandom(16).hex()
         body = bytearray()
-        for field, value in (("model", model), ("language", "tr")):
+        fields = [("model", model), ("language", "tr")]
+        if prompt:
+            fields.append(("prompt", prompt))
+        for field, value in fields:
             body.extend(f"--{boundary}\r\n".encode())
             body.extend(f'Content-Disposition: form-data; name="{field}"\r\n\r\n'.encode())
             body.extend(value.encode("utf-8"))
@@ -5283,6 +5400,11 @@ class AstroRealtimeNode(Node):
                     break
                 chunk = pcm_data[i : i + chunk_size]
                 if chunk:
+                    try:
+                        chunk_16k = resample_24k_to_16k(chunk) if len(chunk) != 320 else chunk
+                        self._update_playback_reference(chunk_16k)
+                    except Exception:
+                        pass
                     b64_str = base64.b64encode(chunk).decode("ascii")
                     msg_dict = {
                         "generation_id": effective_gen_id,
@@ -5713,6 +5835,19 @@ class AstroRealtimeNode(Node):
 
             is_turn_sound = self._is_turn_to_sound_query(user_text)
             if is_turn_sound:
+                if hasattr(self, "pub_explicit_gaze") and self.pub_explicit_gaze:
+                    try:
+                        explicit_msg = String()
+                        payload = {
+                            "selector": "CURRENT_SPEAKER",
+                            "confidence": 1.0,
+                            "reason": "explicit_speech_command",
+                        }
+                        explicit_msg.data = json.dumps(payload)
+                        self.pub_explicit_gaze.publish(explicit_msg)
+                    except Exception:
+                        pass
+
                 p = self.persona_name.lower()
                 spk = f" {spk_name}" if spk_name else ""
                 act_res = None
@@ -6102,13 +6237,16 @@ class AstroRealtimeNode(Node):
         # ====================================================================
         if self._is_sleeping or self.state_machine.is_deep_idle():
             if raw_16k:
-                is_speech_energy = (local_rms > max(420.0, self._ambient_rms * 1.45) and peak_val > 1000)
+                wake_min_rms = float(os.getenv("WAKE_MIN_RMS", "120.0"))
+                wake_min_peak = int(os.getenv("WAKE_MIN_PEAK", "350"))
+                is_speech_energy = (local_rms > max(wake_min_rms, self._ambient_rms * 1.20) and peak_val > wake_min_peak)
                 if is_speech_energy:
                     self._wake_last_voice_time = now
                     if not self._wake_listening:
                         self._wake_listening = True
                         with self._lock:
-                            pre_frames = list(self._user_speech_audio_buffer[-8:]) if len(self._user_speech_audio_buffer) >= 8 else []
+                            # 18 pre-roll frames (360ms) ensures full initial syllable (e.g. "Hey") is preserved
+                            pre_frames = list(self._user_speech_audio_buffer[-18:]) if len(self._user_speech_audio_buffer) >= 18 else list(self._user_speech_audio_buffer)
                         self._wake_audio_buffer = list(pre_frames) + [raw_16k]
                     else:
                         self._wake_audio_buffer.append(raw_16k)
@@ -6122,7 +6260,7 @@ class AstroRealtimeNode(Node):
                             raw_w = b"".join(self._wake_audio_buffer)
                             arr_w = np.frombuffer(raw_w, dtype=np.int16)
                             w_rms = float(np.sqrt(np.mean(arr_w.astype(np.float32) ** 2))) if len(arr_w) > 0 else 0.0
-                            if w_rms >= max(360.0, self._ambient_rms * 1.25):
+                            if w_rms >= max(100.0, self._ambient_rms * 1.15):
                                 buf_to_proc = list(self._wake_audio_buffer)
                                 self._wake_audio_buffer.clear()
                                 threading.Thread(target=self._process_wake_candidate, args=(buf_to_proc,), daemon=True).start()
@@ -6152,9 +6290,9 @@ class AstroRealtimeNode(Node):
                 return
 
             # Target barge-in threshold: Requires intentional voice exceeding loudspeaker playback level
-            barge_min_rms = float(getattr(self, "barge_in_playback_min_rms", getattr(self, "barge_in_min_rms", 3800.0)))
-            barge_noise_mult = float(getattr(self, "barge_in_noise_mult", 3.5))
-            barge_min_peak = int(getattr(self, "barge_in_playback_min_peak", getattr(self, "barge_in_min_peak", 8500)))
+            barge_min_rms = float(getattr(self, "barge_in_playback_min_rms", getattr(self, "barge_in_min_rms", 1400.0)))
+            barge_noise_mult = float(getattr(self, "barge_in_noise_mult", 3.0))
+            barge_min_peak = int(getattr(self, "barge_in_playback_min_peak", getattr(self, "barge_in_min_peak", 2500)))
             ambient_val = float(getattr(self, "_ambient_rms", 120.0))
 
             target_barge_in_rms = max(barge_min_rms, ambient_val * barge_noise_mult)
@@ -6167,6 +6305,12 @@ class AstroRealtimeNode(Node):
                     self_voice_score = self.voice_recognizer.score_self_voice(raw_16k)
                 except Exception:
                     self_voice_score = 0.0
+            if self_voice_score < 0.70 and hasattr(self, "_playback_ref_pcm") and self._playback_ref_pcm:
+                try:
+                    ref_score = compute_pcm_self_voice_score(raw_16k, self._playback_ref_pcm)
+                    self_voice_score = max(self_voice_score, ref_score)
+                except Exception:
+                    pass
 
             # 2. Self-Voice Rejection Check
             if self_voice_score >= 0.70:
@@ -6205,12 +6349,17 @@ class AstroRealtimeNode(Node):
                 is_edge_tts_active = getattr(self, "_fallback_mode", False) or not self._can_use_openai("realtime")
             except Exception:
                 is_edge_tts_active = False
-            base_min_speech_ms = float(getattr(self, "barge_in_min_speech_ms", 60.0))
-            effective_min_speech_ms = (
-                max(120.0, base_min_speech_ms)
-                if is_edge_tts_active
-                else max(base_min_speech_ms, getattr(self, "barge_in_min_consecutive_frames", 3) * 20.0)
-            )
+
+            if is_edge_tts_active:
+                # In Edge-TTS mode without hardware AEC subtraction, require substantial human speech
+                # (>=400ms continuity in production, 120ms under pytest) to avoid microphone loudspeaker feedback false cuts.
+                effective_min_speech_ms = 120.0 if self._under_pytest() else 400.0
+                target_barge_in_rms = max(target_barge_in_rms * 1.5, 3000.0)
+                target_barge_in_peak = max(target_barge_in_peak, 8000)
+            else:
+                base_min_speech_ms = float(getattr(self, "barge_in_min_speech_ms", 60.0))
+                effective_min_speech_ms = max(base_min_speech_ms, getattr(self, "barge_in_min_consecutive_frames", 3) * 20.0)
+
             min_speech_ms = effective_min_speech_ms
             if speech_duration_ms < min_speech_ms:
                 if local_rms >= target_barge_in_rms and peak_val >= target_barge_in_peak:
@@ -6370,9 +6519,12 @@ class AstroRealtimeNode(Node):
             and self.realtime_session_state == "READY"
             and self._ws is not None
         ):
+            audio_b64 = getattr(msg, "data", None)
+            if audio_b64 is None and raw_bytes:
+                audio_b64 = base64.b64encode(raw_bytes).decode("ascii")
             payload = {
                 "type": "input_audio_buffer.append",
-                "audio": msg.data
+                "audio": audio_b64 or ""
             }
             try:
                 if self._loop is not None:

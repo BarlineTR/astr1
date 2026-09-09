@@ -30,8 +30,8 @@ static constexpr float KP = 0.6f, KI = 0.2f, KD = 0.0f; // 50 Hz PID için örne
 static constexpr int PWM_MAX = 255;
 static constexpr float PID_INTEGRAL_LIMIT = 50.0f; // ✅ FIX: Daha dar anti-windup limit
 
-// Kalibre Edildi: 45 tick / 30 derece = 1.5000 tick/derece (540 tick / 360 derece)
-static constexpr float HEAD_TICKS_PER_DEG = 1.5000f;
+// Canonical Head Encoder Resolution: 440 ticks / 170.0 deg = 2.5882 ticks/deg (0.3864 deg/tick)
+static constexpr float HEAD_TICKS_PER_DEG = 2.5882f;
 
 
 
@@ -60,12 +60,35 @@ static constexpr int32_t HEAD_TICKS_PER_REV =
 
     (int32_t)(360.0f * HEAD_TICKS_PER_DEG + 0.5f);
 
-// Kafa motoru PWM limitleri ve statik sürtünme eşiği
-static constexpr int HEAD_PWM_LIMIT = 160;
-static constexpr int HEAD_PWM_MIN = 70;
+// Kafa motoru PWM limitleri ve statik sürtünme eşiği (ölçülen breakaway eşiği ~100-105 PWM, limit 200 PWM)
+static constexpr int HEAD_PWM_LIMIT = 200;
+static constexpr int HEAD_PWM_MIN = 105;
 
-static constexpr float HEAD_KP = 4.0f, HEAD_KD = 0.05f;
-static constexpr int32_t HEAD_DEADBAND_TICKS = 1;  // 1 tick ~= 0.78 derece
+// Kafa konum PID'i.
+//
+// HEAD_KD 0.05 iken sonmleme yok sayilirdi: 20 deg/s (~52 tick/s) hizda D terimi
+// 2.6 PWM ediyordu, yani 200'luk olcekte gorunmez. Sonumsuz bir PID, asagidaki
+// surtunme ileri beslemesiyle birlesince limit cevrimi uretir.
+//
+// Ama enkoder turevi kuantize: iki cevrim arasindaki tek bir tick 50 Hz'de zaten
+// 50 tick/s okunur. Ham turevi buyuk bir kazancla carpmak, sonumleme yerine gurultu
+// enjekte eder. Bu yuzden turev once suzuluyor (HEAD_D_FILTER), sonra kazanca giriyor.
+static constexpr float HEAD_KP = 5.0f, HEAD_KD = 0.60f;
+
+// Turev alcak geciren katsayisi (0..1). Kucuk = daha puruzsuz, daha gecikmeli.
+static constexpr float HEAD_D_FILTER = 0.25f;
+
+// PWM egim siniri: cikisin bir kontrol cevriminde degisebilecegi en buyuk miktar.
+// Olu bant kenarinda ileri besleme 0'dan 105'e basamak yapiyordu; 200'luk olcekte
+// bu, yarim skalalik bir darbe. 25 ile 105'e dort cevrimde (80 ms) ulasilir: darbe
+// yerine rampa, ama motor yine de kopma esigini gecmekte gecikmez.
+static constexpr int HEAD_PWM_SLEW = 25;
+// Dişli boşluğu 0.85 derece olarak ölçüldü (docs/final_validation_report.md) ve bir
+// tick 0.386 derece. Deadband boşluktan küçük olursa kontrolcü, mekanizmanın
+// kapatamayacağı bir hatayı kovalar: motor döner, çıkış takip etmez, hata durur,
+// tekrar döner — kafanın yüzü tutmaya çalışırken yaptığı sağ-sol salınım buydu.
+// 3 tick = 1.159 derece, boşluğu aşan ilk değer; sosyal mesafede görünmez.
+static constexpr int32_t HEAD_DEADBAND_TICKS = 3;  // 3 tick ~= 1.159 derece (boşluk 0.85)
 static constexpr uint32_t HEAD_STALL_MS = 1500;    // PWM'e rağmen tick değişmiyorsa kes (1.5s güvenli süre)
 
 
@@ -93,6 +116,7 @@ static float g_left_err_prev = 0.0f, g_right_err_prev = 0.0f;
 static int32_t g_head_target_ticks = 0;
 static int32_t g_head_err_prev = 0;
 static int g_head_pwm = 0;
+static float g_head_de_filt = 0.0f;   // suzulmus hata turevi (tick/s)
 static int32_t g_head_stall_ref = 0;
 static uint32_t g_head_stall_ms = 0;
 
@@ -252,11 +276,41 @@ void publishDiag(uint16_t vbat_mV, int16_t temp_cX100, uint32_t flags) {
   Proto::writePacket(Serial, Proto::DIAGNOSTICS, payload, sizeof(payload));
 }
 
+// Kafa motoru maksimum hız limiti: 20.0 derece/saniye (sakin, pürüzsüz takip).
+// Hız sınırlaması burada yapılır; ROS tarafındaki planlayıcının çıktısı Arduino'ya
+// gönderilmiyor (bkz. social_gaze_node), yani YAML'daki max_velocity_deg_s kafaya
+// ulaşmaz. Kafa hızını değiştirmek isteyen bu satırı değiştirmeli.
+static constexpr float HEAD_MAX_VEL_DEG_S = 20.0f;
+static constexpr float HEAD_MAX_TICKS_PER_SEC = HEAD_MAX_VEL_DEG_S * HEAD_TICKS_PER_DEG; // ~90.6 ticks/s
+
+static float g_head_profile_pos = 0.0f;
+static bool g_head_profile_inited = false;
+
 // Kafa konum PID'i. Limit switch olmadigi icin stall korumasi sart:
 // mekanik dayanaga dayanirsa motor akim ceker ve isinir.
 void headControl(uint32_t dt_ms) {
   int32_t pos = readTicks(g_head_ticks);
-  int32_t err = g_head_target_ticks - pos;
+
+  if (!g_head_profile_inited) {
+    g_head_profile_pos = (float)pos;
+    g_head_profile_inited = true;
+  }
+
+  // Yumuşak hız sınırlayıcı: 50 Hz (20ms) döngüsünde hedefi HEAD_MAX_VEL_DEG_S ile
+  // rampala. Bu yalnizca SETPOINT'i sinirlar, gercek hareketi degil: kafa olu bantta
+  // beklerken rampa ilerler, arada hata birikir, kafa kurtulunca PWM doyar ve gercek
+  // hiz rampayi asar. Kayittan olculen tepe 161 deg/s idi, rampa 20.
+  float dt_s = (float)dt_ms / 1000.0f;
+  float max_step = HEAD_MAX_TICKS_PER_SEC * dt_s;
+  float diff = (float)g_head_target_ticks - g_head_profile_pos;
+  if (abs(diff) <= max_step) {
+    g_head_profile_pos = (float)g_head_target_ticks;
+  } else {
+    g_head_profile_pos += (diff > 0.0f ? max_step : -max_step);
+  }
+
+  int32_t profile_target_tick = (int32_t)lroundf(g_head_profile_pos);
+  int32_t err = profile_target_tick - pos;
 
   // Kisa yay: hata yarim turu asiyorsa diger yonden gitmek daha kisadir.
   if (HEAD_CONTINUOUS_ROTATION) {
@@ -267,6 +321,7 @@ void headControl(uint32_t dt_ms) {
   if (!g_motors_enabled || !g_head_active) {
     setHeadPWM(0);
     g_head_err_prev = err;
+    g_head_de_filt = 0.0f;
     g_head_stall_ref = pos;
     g_head_stall_ms = millis();
     return;
@@ -276,18 +331,32 @@ void headControl(uint32_t dt_ms) {
   if (abs(err) <= HEAD_DEADBAND_TICKS) {
     setHeadPWM(0);
     g_head_err_prev = err;
+    g_head_de_filt = 0.0f;
     g_head_stall_ref = pos;
     g_head_stall_ms = millis();
     return;
   }
 
-  float de = (float)(err - g_head_err_prev) / (dt_ms / 1000.0f);
+  float de_raw = (float)(err - g_head_err_prev) / (dt_ms / 1000.0f);
   g_head_err_prev = err;
 
-  // PID + Statik sürtünme eşiği için feedforward tabanı
+  // Enkoder turevi kuantize: tek bir tick farki 50 Hz'de 50 tick/s okunur. Ham haliyle
+  // buyuk bir Kd ile carpmak sonumleme degil gurultu uretir, o yuzden once suzuyoruz.
+  g_head_de_filt += HEAD_D_FILTER * (de_raw - g_head_de_filt);
+
+  // PID + statik surtunme icin ileri besleme tabani.
   float ff = (err > 0) ? (float)HEAD_PWM_MIN : -(float)HEAD_PWM_MIN;
-  float u = ff + (HEAD_KP * (float)err) + (HEAD_KD * de);
+  float u = ff + (HEAD_KP * (float)err) + (HEAD_KD * g_head_de_filt);
   int pwm = (int)constrain(u, (float)-HEAD_PWM_LIMIT, (float)HEAD_PWM_LIMIT);
+
+  // Cikisi egimle sinirla. Olu bandi gecen an ileri besleme 0'dan 105'e basamak
+  // yapiyordu; motoru kopma esiginin cok otesine bir anda itmek, asimi ve ardindan
+  // ters yonde ayni darbeyi getiriyor — olculen 0.53 Hz'lik limit cevrimi buydu.
+  // Durdurma egime tabi degil: hedefe varinca ya da guvenlik kesince surus derhal
+  // kalkmali, motorun bosta donmesi sakincasiz.
+  int delta = pwm - g_head_pwm;
+  if (delta >  HEAD_PWM_SLEW) pwm = g_head_pwm + HEAD_PWM_SLEW;
+  if (delta < -HEAD_PWM_SLEW) pwm = g_head_pwm - HEAD_PWM_SLEW;
 
   setHeadPWM(pwm);
 
@@ -295,11 +364,12 @@ void headControl(uint32_t dt_ms) {
   if (abs(pos - g_head_stall_ref) >= 2) {
     g_head_stall_ref = pos;
     g_head_stall_ms = millis();
+    g_diag_flags &= ~FLAG_HEAD_STALL;
   } else if (millis() - g_head_stall_ms > HEAD_STALL_MS) {
     setHeadPWM(0);
-    // Hedefi bulunduğu yere çek: aksi halde motor dayanağa dayanmaya devam eder
-    g_head_target_ticks = pos;
-    g_head_err_prev = 0;
+    // Stall koruması: Motoru kes ve bayrağı kaldır.
+    // DİKKAT: Hedefi anlık konuma çekmiyoruz (g_head_target_ticks korunur),
+    // böylece teşhis telemetrisi gerçek hedefi ve hatayı raporlamaya devam eder.
     g_diag_flags |= FLAG_HEAD_STALL;
   }
 }
@@ -444,13 +514,17 @@ void processPacket(uint8_t msg_id, const uint8_t* pl, uint8_t len) {
       if (clamped != angle_deg) g_diag_flags |= FLAG_HEAD_LIMIT;
       else                      g_diag_flags &= ~FLAG_HEAD_LIMIT;
 
-      g_head_target_ticks = (int32_t)lroundf(clamped * HEAD_TICKS_PER_DEG);
-      g_head_active = true;
-      // Yeni hedef geldi: eski stall kilidini kaldır ve anlık konumu referans al
+      int32_t new_target_ticks = (int32_t)lroundf(clamped * HEAD_TICKS_PER_DEG);
 
-      g_head_stall_ref = readTicks(g_head_ticks);
-      g_head_stall_ms = millis();
-      g_diag_flags &= ~FLAG_HEAD_STALL;
+      // İdempotent Hedef Güncellemesi: Yalnızca hedef gerçekte değiştiğinde stall sayacını sıfırla
+      if (abs(new_target_ticks - g_head_target_ticks) > HEAD_DEADBAND_TICKS) {
+        g_head_target_ticks = new_target_ticks;
+        g_head_stall_ref = readTicks(g_head_ticks);
+        g_head_stall_ms = millis();
+        g_diag_flags &= ~FLAG_HEAD_STALL;
+      }
+
+      g_head_active = true;
       g_last_heartbeat_ms = millis();
       Serial2.print(F("[HEAD CMD] angle="));
       Serial2.println(angle_deg);

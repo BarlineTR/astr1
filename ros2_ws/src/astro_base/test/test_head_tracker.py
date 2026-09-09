@@ -56,8 +56,32 @@ class MockMsg:
         self.data = data
 
 
+def setUpModule():
+    try:
+        import rclpy
+        if not rclpy.ok():
+            rclpy.init()
+    except Exception:
+        pass
+
+
+def tearDownModule():
+    try:
+        import rclpy
+        if rclpy.ok():
+            rclpy.shutdown()
+    except Exception:
+        pass
+
+
 class TestSocialGazeLogic(unittest.TestCase):
     def setUp(self):
+        try:
+            import rclpy
+            if not rclpy.ok():
+                rclpy.init()
+        except Exception:
+            pass
         # Instantiate HeadTrackerNode with test defaults without requiring live ROS 2 daemon
         self.node = HeadTrackerNode()
         self.node.enabled = True

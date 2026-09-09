@@ -162,6 +162,7 @@ class ActionManager:
         pub_head_cmd: Any = None,
         pub_head_gesture: Any = None,
         pub_head_target_yaw: Any = None,
+        pub_explicit_gaze: Any = None,
         node: Any = None,
     ):
         self._logger = logger or logging.getLogger("ActionManager")
@@ -169,6 +170,7 @@ class ActionManager:
         self._pub_head_cmd = pub_head_cmd  # Kept for backward compatibility in mock tests
         self._pub_head_gesture = pub_head_gesture
         self._pub_head_target_yaw = pub_head_target_yaw
+        self._pub_explicit_gaze = pub_explicit_gaze
         self._node = node
         self._lock = threading.RLock()
 
@@ -177,9 +179,9 @@ class ActionManager:
 
         # DOA Tracking & Consensus
         self._latest_doa: Optional[SoundDirection] = None
-        self._doa_history: Deque[Tuple[float, float, float]] = collections.deque(maxlen=6)  # (timestamp, yaw, rms)
+        self._doa_history: Deque[Tuple[float, float, float]] = collections.deque(maxlen=60)  # (timestamp, yaw, rms)
         self._min_doa_confidence = 0.40
-        self._doa_freshness_timeout_s = 3.5
+        self._doa_freshness_timeout_s = 5.0
         self._ambient_rms = 120.0
         self._is_speaking = False
         self._is_playback_active = False
@@ -327,7 +329,7 @@ class ActionManager:
                     self._last_logged_valid = is_valid
                     self._last_logged_yaw = yaw
                     sign = "+" if yaw >= 0 else ""
-                    self._logger.info(
+                    self._logger.debug(
                         f"[DOA]\n"
                         f"azimuth_deg={sign}{yaw:.1f}\n"
                         f"confidence={conf:.2f}\n"
@@ -345,6 +347,11 @@ class ActionManager:
         """Processes 4-channel microphone buffer with GCC-PHAT to compute exact DOA."""
         if is_speaking or is_playback_active or self._acoustic_estimator is None:
             return
+        if hasattr(pcm_channels, "shape") and pcm_channels.ndim == 2:
+            if pcm_channels.shape[0] >= 6:
+                pcm_channels = pcm_channels[1:5]
+            elif pcm_channels.shape[0] > 4:
+                pcm_channels = pcm_channels[:4]
         azimuth, conf, is_valid = self._acoustic_estimator.estimate_from_multichannel_pcm(pcm_channels)
         if azimuth is not None:
             raw_doa = azimuth if azimuth >= 0 else azimuth + 360.0
@@ -398,8 +405,8 @@ class ActionManager:
             azimuth = None
             confidence = 0.0
 
-            # Prefer recent speech consensus (within 4.0s) that is not a rear wall bounce (>130°)
-            speech_doa = [y for ts, y, cur_rms in self._doa_history if (now - ts) <= 4.0 and abs(y) <= 130.0 and cur_rms >= 220.0]
+            # Prefer recent speech consensus (within 6.0s) that is not a rear wall bounce (>130°)
+            speech_doa = [y for ts, y, cur_rms in self._doa_history if (now - ts) <= 6.0 and abs(y) <= 130.0 and cur_rms >= 150.0]
             if speech_doa:
                 sin_s = sum(math.sin(math.radians(y)) for y in speech_doa)
                 cos_s = sum(math.cos(math.radians(y)) for y in speech_doa)
@@ -409,8 +416,8 @@ class ActionManager:
                 azimuth = sound_dir.azimuth_deg
                 confidence = sound_dir.confidence
             else:
-                # Secondary fallback: only recent speech within 4.5s
-                recent_doa = [y for ts, y, cur_rms in self._doa_history if (now - ts) <= 4.5 and abs(y) <= 130.0]
+                # Secondary fallback: speech within 10.0s
+                recent_doa = [y for ts, y, cur_rms in self._doa_history if (now - ts) <= 10.0 and abs(y) <= 130.0 and cur_rms >= 120.0]
                 if recent_doa:
                     sin_s = sum(math.sin(math.radians(y)) for y in recent_doa)
                     cos_s = sum(math.cos(math.radians(y)) for y in recent_doa)
@@ -453,21 +460,29 @@ class ActionManager:
                 return res
 
             if azimuth is None:
-                self._logger.warning("⚠️ [ActionManager] turn_to_sound reddedildi: NO_DIRECTION (DOA yok veya zayıf)")
-                res = ActionResult(
-                    success=False,
-                    action="turn_to_sound",
-                    action_id=act_id,
-                    generation_id=generation_id,
-                    error_code="NO_DIRECTION",
-                    error="Sesin yönü belirlenemedi (DOA unavailable veya sinyal zayıf).",
-                    reason="no_sound_direction",
-                    message="Sesin hangi yönden geldiği tespit edilemediği için robot hareket ettirilmedi.",
-                    hardware_ack=False,
-                )
-                self._recent_actions.append(res)
-                return res
-
+                # 3. Broader temporal history fallback (up to 15.0s with verified acoustic speech energy)
+                broader_doa = [y for ts, y, cur_rms in self._doa_history if (now - ts) <= 15.0 and abs(y) <= 130.0 and cur_rms >= 120.0]
+                if broader_doa:
+                    sin_s = sum(math.sin(math.radians(y)) for y in broader_doa)
+                    cos_s = sum(math.cos(math.radians(y)) for y in broader_doa)
+                    azimuth = float(math.degrees(math.atan2(sin_s, cos_s)))
+                    confidence = 0.45
+                    self._logger.info(f"👂 [ActionManager] Genişletilmiş zaman tamponundan ses yönü kurtarıldı -> {azimuth:.1f}°")
+                else:
+                    self._logger.warning("⚠️ [ActionManager] turn_to_sound: UNRESOLVED_CURRENT_SPEAKER_POSITION (DOA yok veya zayıf)")
+                    res = ActionResult(
+                        success=False,
+                        action="turn_to_sound",
+                        action_id=act_id,
+                        generation_id=generation_id,
+                        error_code="UNRESOLVED_CURRENT_SPEAKER_POSITION",
+                        error="Sesin yönü belirlenemedi (UNRESOLVED_CURRENT_SPEAKER_POSITION).",
+                        reason="UNRESOLVED_CURRENT_SPEAKER_POSITION",
+                        message="Sesin hangi yönden geldiği tespit edilemediği için robot hareket ettirilmedi.",
+                        hardware_ack=False,
+                    )
+                    self._recent_actions.append(res)
+                    return res
 
             # 2. Safety Gates (Heartbeat & LiDAR Freshness)
             blocked_reason = self._check_safety_gates(direction="turn")
@@ -488,14 +503,31 @@ class ActionManager:
                 self._recent_actions.append(res)
                 return res
 
-            # 3. Acoustic Orientation
-            # Steer head motor toward sound source via central arbitration in head_tracker_node
-            dir_str = "left" if azimuth > 0 else "right"
-            # Coarse acoustic sweep capped at +/-50° (ensures 72° HFOV camera encompasses speaker without overshooting)
-            target_clamped = float(max(-50.0, min(50.0, azimuth)))
+            # 3. Canonical Attention Arbiter Preemption
+            dir_str = "left" if (azimuth or 0.0) > 0 else "right"
+            target_clamped = float(max(-75.0, min(75.0, azimuth))) if azimuth is not None else None
+
+            pub_explicit = self._pub_explicit_gaze or getattr(self._node, "pub_explicit_gaze", None)
+            if pub_explicit:
+                try:
+                    explicit_msg = String()
+                    payload = {
+                        "selector": "CURRENT_SPEAKER",
+                        "confidence": float(confidence if confidence > 0 else 1.0),
+                        "reason": "action_manager_turn_to_sound",
+                    }
+                    # Only include explicit target_yaw_deg if azimuth is fresh (<0.8s) and high-confidence
+                    # Otherwise, let AttentionArbiter resolve directly via EpistemicSpatialMemory!
+                    if target_clamped is not None and confidence >= 0.85 and sound_dir is not None and (now - sound_dir.timestamp) <= 0.8:
+                        payload["target_yaw_deg"] = target_clamped
+                    explicit_msg.data = json.dumps(payload)
+                    pub_explicit.publish(explicit_msg)
+                    self._logger.info(f"🎯 [ActionManager -> AttentionArbiter] EXPLICIT_USER_GAZE (target={payload.get('target_yaw_deg', 'SPATIAL_MEMORY')})")
+                except Exception as ex:
+                    self._logger.debug(f"Explicit gaze publication failed: {ex}")
 
             pub_target_yaw = self._pub_head_target_yaw or getattr(self._node, "pub_head_target_yaw", None)
-            if pub_target_yaw:
+            if pub_target_yaw and target_clamped is not None:
                 try:
                     msg = Float32()
                     msg.data = target_clamped
@@ -503,7 +535,6 @@ class ActionManager:
                 except Exception as he:
                     self._logger.debug(f"Float32 target_yaw publication failed: {he}")
             else:
-                # Fallback for unit tests mocking pub_head_cmd directly
                 pub_head = self._pub_head_cmd or getattr(self._node, "pub_head_cmd", None)
                 if pub_head:
                     try:

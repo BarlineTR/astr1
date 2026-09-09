@@ -191,6 +191,9 @@ class SerialBridge(Node):
         self.declare_parameter("wheel_radius_right", 0.06)
         self.declare_parameter("wheel_separation", 0.26)
         self.declare_parameter("head_angle_scale", 1.0)
+        self.declare_parameter("head_ticks_per_deg", 2.5882)
+        self.declare_parameter("head_zero_offset_ticks", 0.0)
+        self.declare_parameter("head_sign", 1.0)
 
         self.port_param = self.get_parameter("port").get_parameter_value().string_value
         env_baud = os.getenv("ASTRO_SERIAL_BAUD")
@@ -209,6 +212,9 @@ class SerialBridge(Node):
         self.wheel_radius_r = float(self.get_parameter("wheel_radius_right").value)
         self.wheel_separation = float(self.get_parameter("wheel_separation").value)
         self.head_angle_scale = float(self.get_parameter("head_angle_scale").value)
+        self.head_ticks_per_deg = float(self.get_parameter("head_ticks_per_deg").value or 2.5882)
+        self.head_zero_offset_ticks = float(self.get_parameter("head_zero_offset_ticks").value or 0.0)
+        self.head_sign = float(self.get_parameter("head_sign").value or 1.0)
 
         qos_best_effort = QoSProfile(
             depth=10, reliability=ReliabilityPolicy.BEST_EFFORT
@@ -237,6 +243,11 @@ class SerialBridge(Node):
         self.sub_cmd_vel = self.create_subscription(
             Twist, "/cmd_vel", self.on_cmd_vel, 10
         )
+        # Canonical Actuator Command Subscription (/head/command -> HeadCmd)
+        self.sub_head_command = self.create_subscription(
+            HeadCmd, "/head/command", self.on_head_cmd, 10
+        )
+        # Legacy compatibility subscriptions
         self.sub_head = self.create_subscription(
             HeadCmd, "/head_cmd", self.on_head_cmd, 10
         )
@@ -617,7 +628,8 @@ class SerialBridge(Node):
         right_vel = d_right / dt_s if dt_s > 0 else 0.0
 
         if head_ticks is not None:
-            self.head_pos = float(head_ticks) / 2.5882
+            # Canonical formula: position_deg = (sign * (head_ticks - zero_offset_ticks)) / ticks_per_head_degree
+            self.head_pos = (self.head_sign * (float(head_ticks) - self.head_zero_offset_ticks)) / self.head_ticks_per_deg
             self.head_encoder_valid = True
         else:
             self.head_pos = float(getattr(self, "_last_sent_angle", 0.0))
@@ -630,9 +642,9 @@ class SerialBridge(Node):
         else:
             now_mono = time.monotonic()
             dt_head = now_mono - self._last_head_pos_time
-            if dt_head > 0.005:
+            if dt_head >= 0.020:
                 raw_vel = (self.head_pos - self._last_head_pos) / dt_head
-                self.head_vel = 0.8 * self.head_vel + 0.2 * raw_vel
+                self.head_vel = 0.85 * self.head_vel + 0.15 * raw_vel
                 self._last_head_pos_time = now_mono
                 self._last_head_pos = self.head_pos
 
@@ -779,7 +791,7 @@ class SerialBridge(Node):
                 self._mark_disconnected()
                 time.sleep(0.5)
             except Exception as exc:
-                self.get_logger().error(f"[SERIAL RX THREAD EXCEPTION] Unexpected error: {exc}", exc_info=True)
+                self.get_logger().error(f"[SERIAL RX THREAD EXCEPTION] Unexpected error: {exc}")
                 time.sleep(0.5)
 
     def handle_msg(self, msg_id: int, payload: bytes):

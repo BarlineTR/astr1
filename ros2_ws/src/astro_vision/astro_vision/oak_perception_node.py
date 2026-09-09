@@ -26,8 +26,10 @@ from std_msgs.msg import Bool, String, Float32, Int32
 
 try:
     from astro_vision.image_utils import bgr_to_imgmsg, imgmsg_to_bgr
+    from astro_vision.detection_quality import detect_faces_with_confidence
 except ImportError:
     from image_utils import bgr_to_imgmsg, imgmsg_to_bgr
+    from detection_quality import detect_faces_with_confidence
 
 
 class OakPerceptionNode(Node):
@@ -175,7 +177,8 @@ class OakPerceptionNode(Node):
         scale_ratio = 320.0 / float(frame_w) if frame_w > 320 else 1.0
         small_gray = cv2.resize(gray, (0, 0), fx=scale_ratio, fy=scale_ratio, interpolation=cv2.INTER_AREA) if scale_ratio < 1.0 else gray
 
-        detected_faces = self.face_cascade.detectMultiScale(
+        detected_faces = detect_faces_with_confidence(
+            self.face_cascade,
             small_gray,
             scaleFactor=1.1,
             minNeighbors=4,
@@ -183,9 +186,9 @@ class OakPerceptionNode(Node):
         )
 
         if len(detected_faces) > 0 and scale_ratio < 1.0:
-            faces = [[int(x / scale_ratio), int(y / scale_ratio), int(w / scale_ratio), int(h / scale_ratio)] for (x, y, w, h) in detected_faces]
+            faces = [[int(x / scale_ratio), int(y / scale_ratio), int(w / scale_ratio), int(h / scale_ratio), conf] for (x, y, w, h, conf) in detected_faces]
         else:
-            faces = list(detected_faces)
+            faces = [list(f) for f in detected_faces]
 
         # Temporal smoothing for dropout tolerance (up to 8 frames)
         if len(faces) == 0 and self._last_known_face is not None:
@@ -205,7 +208,7 @@ class OakPerceptionNode(Node):
         head_yaw = 0.0
         detected_emotion = "neutral"
 
-        for x, y, w, h in faces:
+        for x, y, w, h, detection_conf in faces:
             face_roi_gray = gray[y:y + h, x:x + w]
             yaw = self._estimate_head_yaw(face_roi_gray, w, h)
             head_yaw = yaw
@@ -219,6 +222,8 @@ class OakPerceptionNode(Node):
 
             face_list.append({
                 "x": int(x), "y": int(y), "width": int(w), "height": int(h),
+                "confidence": round(float(detection_conf), 2),
+                "frame_width": int(frame_w), "frame_height": int(frame_h),
                 "yaw_deg": round(yaw, 1),
                 "distance_m": round(dist_m, 2),
                 "looking_at_robot": direct_gaze,

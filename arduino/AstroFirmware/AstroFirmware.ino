@@ -1,9 +1,20 @@
 /*
  * AstroFirmware - Arduino IDE sürümü
  * ----------------------------------
- * arduino/astro_firmware (PlatformIO) projesinin Arduino IDE kopyası.
- * Kontrol mantığı main.cpp ile birebir aynıdır; farkı Serial Monitor'e
- * okunabilir açılış/durum mesajı basmasıdır.
+ * ⚠️  BU DOSYA GÜNCEL DEĞİL — ROBOTA BUNU YÜKLEMEYİN.
+ *
+ * Kanonik firmware: arduino/astro_firmware/src/main.cpp (PlatformIO).
+ * Bu kopya ondan koptu ve 535 satırın 147'sinde ayrışmış durumda. Kafa
+ * davranışını bozan iki fark:
+ *
+ *   1) HEAD_TICKS_PER_DEG burada 1.5000, kanonikte 2.5882 (kalibrasyonla
+ *      doğrulanmış: 440 tick / 170°). Bu kopya yüklenirse her açı 1.73 kat
+ *      büyük uygulanır — +20° komut ~+35° dönüş demektir.
+ *   2) headControl() burada hız rampası içermiyor; kanonikte hedefe 20 °/s
+ *      ile rampalanır. Rampa olmadan her komut tam hızlı basamak yanıtıdır.
+ *
+ * Arduino IDE yolu gerekiyorsa bu dosya main.cpp'den yeniden üretilmeli;
+ * elle bakılan ikinci bir motor kontrol kopyası kaçınılmaz olarak tekrar kayar.
  *
  * Kart      : Arduino Mega 2560
  * Seri hız  : 115200 baud (Serial Monitor da 115200 olmalı)

@@ -15,7 +15,7 @@ import numpy as np
 
 from astro_base.gaze.angle_math import wrap_deg
 from astro_base.gaze.coordinate_frames import CoordinateTransformer
-from astro_base.gaze.types import AudioObservation
+from astro_base.gaze.types import AudioEventCounters, AudioObservation
 
 
 class ReSpeaker4MicGeometry:
@@ -60,9 +60,15 @@ def gcc_phat(
     # Shift zero lag to center
     cc_windowed = np.concatenate((cc[-max_shift:], cc[: max_shift + 1]))
 
-    # Find peak index
+    # Find peak index.
+    #
+    # İşaret: R = SIG·conj(REFSIG) ters dönüştürülünce, refsig sig'den D kadar
+    # gecikmişse tepe -D'de çıkar. Docstring +D vaat ediyor ve aşağıdaki
+    # `delta_x = -tau·c` satırları o vaade göre yazılmış; ikisi ayrışınca açı 180°
+    # sabit hatayla, yani konuşanın tam tersine çıkıyordu. Aynı hatanın ikinci
+    # kopyası astro_audio/doa_estimator.py içinde — ikisi birlikte düzeltildi.
     peak_idx = int(np.argmax(np.abs(cc_windowed)))
-    shift = peak_idx - max_shift
+    shift = max_shift - peak_idx
     tau = shift / float(interp * fs)
 
     # Calculate Peak-to-Sidelobe Ratio (PSR)
@@ -77,6 +83,55 @@ def gcc_phat(
     return tau, quality
 
 
+class PersistentBearingGate:
+    """Admits a bearing only once it has repeated from roughly the same direction.
+
+    Reverberation off a wall arrives from a scattered direction each time; a person
+    talking stays put. Counting consecutive consistent reports separates them, which
+    is what makes it safe to listen behind the robot at all — the rear envelope was
+    closed precisely because single reflections used to drive the neck into its
+    mechanical limit.
+    """
+
+    def __init__(
+        self,
+        required_hits: int = 4,
+        tolerance_deg: float = 20.0,
+        expiry_s: float = 1.5,
+    ):
+        self.required_hits = required_hits
+        self.tolerance_deg = tolerance_deg
+        self.expiry_s = expiry_s
+        self._bearing: Optional[float] = None
+        self._hits: int = 0
+        self._last_time: float = 0.0
+
+    def reset(self) -> None:
+        self._bearing = None
+        self._hits = 0
+        self._last_time = 0.0
+
+    def admits(self, bearing_deg: float, timestamp: float) -> bool:
+        """Counts this report and says whether the direction has earned a turn yet."""
+        bearing = wrap_deg(bearing_deg)
+        expired = (self._bearing is None) or (timestamp - self._last_time > self.expiry_s)
+        consistent = (
+            self._bearing is not None
+            and abs(wrap_deg(bearing - self._bearing)) <= self.tolerance_deg
+        )
+
+        if expired or not consistent:
+            self._bearing = bearing
+            self._hits = 1
+        else:
+            # Track the source as it drifts rather than pinning the first report.
+            self._bearing = wrap_deg(self._bearing + 0.5 * wrap_deg(bearing - self._bearing))
+            self._hits += 1
+
+        self._last_time = timestamp
+        return self._hits >= self.required_hits
+
+
 class AudioPerceptionCore:
     """Core acoustic processor computing directional observations and energy features."""
 
@@ -87,15 +142,41 @@ class AudioPerceptionCore:
         vad_threshold: float = 450.0,
         min_confidence: float = 0.40,
         self_speech_suppression_factor: float = 0.15,
+        # Sohbet konisi: burada ses anında kabul edilir.
+        max_acoustic_envelope_deg: float = 75.0,
+        # Kafa limiti (85) + kamera yarı-FOV (36): bir kaynağın kafayı çevirerek
+        # kadraja sokulabileceği en uzak açı. Ötesinde kafa dönse de kişi görünmez,
+        # robot boşluğa bakıp hedefi kaybeder — düzeltilmeye çalışılan davranış bu.
+        # Gerçek arka (121-180) gövdenin dönmesini ister; bu yığında yok.
+        max_reachable_bearing_deg: float = 121.0,
     ):
         self.transformer = transformer or CoordinateTransformer()
         self.min_rms_energy = min_rms_energy
         self.vad_threshold = vad_threshold
         self.min_confidence = min_confidence
         self.self_speech_suppression_factor = self_speech_suppression_factor
+        self.max_acoustic_envelope_deg = max_acoustic_envelope_deg
+        self.max_reachable_bearing_deg = max_reachable_bearing_deg
+        # Sohbet konisinin dışı ısrar ister; içi eskisi gibi anında geçer.
+        self.rear_gate = PersistentBearingGate()
 
         self.noise_floor_rms = 120.0
         self.max_tau = ReSpeaker4MicGeometry.MAX_TAU_S
+        self.counters = AudioEventCounters()
+
+    def _bearing_is_admissible(
+        self, rel_bearing: float, body_yaw: float, timestamp: float
+    ) -> bool:
+        """Conversation cone passes at once; the reachable margin must persist.
+
+        Persistence is tracked in the body frame, not head-relative: a person standing
+        behind the robot keeps the same body bearing while the head sweeps around.
+        """
+        if abs(rel_bearing) <= self.max_acoustic_envelope_deg:
+            return True
+        if abs(rel_bearing) > self.max_reachable_bearing_deg:
+            return False
+        return self.rear_gate.admits(body_yaw, timestamp)
 
     def process_frame(
         self,
@@ -180,6 +261,10 @@ class AudioPerceptionCore:
         # delta_y > 0 when sound is in front (+Y in robot plane)
         delta_x = -tau_lr * ReSpeaker4MicGeometry.SPEED_OF_SOUND_MPS
         delta_y = -tau_fb * ReSpeaker4MicGeometry.SPEED_OF_SOUND_MPS
+        if abs(delta_x) < 1e-7:
+            delta_x = 0.0
+        if abs(delta_y) < 1e-7:
+            delta_y = 0.0
 
         # Azimuth angle in ReSpeaker circular frame [0..359°]
         raw_azimuth = math.degrees(math.atan2(delta_x, delta_y))
@@ -191,19 +276,33 @@ class AudioPerceptionCore:
         confidence = float(min(1.0, max(0.0, 0.65 * avg_quality + 0.35 * energy_factor)))
 
         # 6. Self-Speech Suppression
+        self.counters.raw_audio_events += 1
         if is_robot_speaking or is_playback_active:
+            self.counters.stale_audio_events += 1
             confidence *= self.self_speech_suppression_factor
-
-        is_valid = (confidence >= self.min_confidence) and (not is_robot_speaking)
 
         # 7. Coordinate transformations
         rel_bearing = self.transformer.raw_audio_doa_to_head_bearing(raw_azimuth_0_360)
         body_yaw = self.transformer.audio_head_bearing_to_body_yaw(rel_bearing, actual_head_yaw_deg)
 
+        # Strict conversational acoustic envelope gate (±75° relative to head)
+        # Sohbet konisi anında geçer; dışı, yankıyı gerçek konuşmacıdan ayırmak
+        # için ısrar ister (bkz. _bearing_is_admissible).
+        in_acoustic_fov = self._bearing_is_admissible(rel_bearing, body_yaw, timestamp)
+        if not in_acoustic_fov:
+            self.counters.invalid_angle_events += 1
+            confidence = 0.0
+
+        is_valid = (confidence >= self.min_confidence) and (not is_robot_speaking) and (not is_playback_active) and in_acoustic_fov
+        if is_valid:
+            self.counters.accepted_audio_events += 1
+        else:
+            self.counters.rejected_audio_events += 1
+
         return AudioObservation(
             timestamp=timestamp,
             valid=is_valid,
-            vad=vad_active,
+            vad=vad_active and in_acoustic_fov,
             raw_azimuth_deg=round(raw_azimuth_0_360, 1),
             relative_azimuth_deg=round(rel_bearing, 1),
             body_azimuth_deg=round(body_yaw, 1),
@@ -223,13 +322,28 @@ class AudioPerceptionCore:
         is_robot_speaking: bool = False,
     ) -> AudioObservation:
         """Processes a pre-calculated raw DOA angle (e.g. from ReSpeaker onboard DSP)."""
-        eff_conf = confidence
-        if is_robot_speaking:
-            eff_conf *= self.self_speech_suppression_factor
-
-        is_valid = (eff_conf >= self.min_confidence) and (not is_robot_speaking)
+        self.counters.raw_audio_events += 1
         rel_bearing = self.transformer.raw_audio_doa_to_head_bearing(raw_doa_deg)
         body_yaw = self.transformer.audio_head_bearing_to_body_yaw(rel_bearing, actual_head_yaw_deg)
+
+        eff_conf = confidence
+        if is_robot_speaking:
+            self.counters.stale_audio_events += 1
+            eff_conf *= self.self_speech_suppression_factor
+
+        # Reject rear acoustic blindspot reflections (> 75° relative to head) so neck never slams to mechanical limits
+        # Sohbet konisi anında geçer; dışı, yankıyı gerçek konuşmacıdan ayırmak
+        # için ısrar ister (bkz. _bearing_is_admissible).
+        in_acoustic_fov = self._bearing_is_admissible(rel_bearing, body_yaw, timestamp)
+        if not in_acoustic_fov:
+            self.counters.invalid_angle_events += 1
+            eff_conf = 0.0
+
+        is_valid = (eff_conf >= self.min_confidence) and (not is_robot_speaking) and in_acoustic_fov
+        if is_valid:
+            self.counters.accepted_audio_events += 1
+        else:
+            self.counters.rejected_audio_events += 1
 
         return AudioObservation(
             timestamp=timestamp,

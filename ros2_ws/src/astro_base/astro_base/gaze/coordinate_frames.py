@@ -13,15 +13,17 @@ from dataclasses import dataclass, field
 from typing import Optional, Tuple
 import yaml
 
-from astro_base.gaze.angle_math import wrap_deg
+from astro_base.gaze.angle_math import clamp_deg, wrap_deg
 
 
 @dataclass
 class HeadCalibration:
     """Head mechanical joint calibration parameters."""
     zero_offset_deg: float = 0.0
-    min_angle_deg: float = -180.0
-    max_angle_deg: float = 180.0
+    # 440 tick / 170 derece: boyun ±85 dönüyor. Kalibrasyon dosyası okunmadığında
+    # da bundan daha çekingen olmamalı, yoksa kafa erişebileceği kişide duruyor.
+    min_angle_deg: float = -85.0
+    max_angle_deg: float = 85.0
     ticks_per_deg: float = 1.5000
 
 
