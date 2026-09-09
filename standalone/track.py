@@ -278,6 +278,16 @@ class ReSpeakerAudioLocalizer:
             return 0.0
         return max(-90.0, min(90.0, self.active_target_yaw))
 
+    @property
+    def motor_yaw_deg(self) -> float:
+        """Motor command yaw with inverted coordinate sign for HeadLink/firmware.
+
+        logical yaw: LEFT = -45°, RIGHT = +45°
+        motor yaw:   LEFT = +45°, RIGHT = -45°
+        """
+        yaw = self.target_yaw_deg
+        return -yaw if yaw != 0.0 else 0.0
+
     def is_tracking(self, now: Optional[float] = None) -> bool:
         """Returns True if localizer is currently actively tracking speech."""
         if not self._tracking_active:
@@ -503,6 +513,7 @@ def main(argv=None, hid=None) -> int:
     )
     started = time.monotonic()
     frames, fps, last_fps_at, last_fps_frames = 0, 0.0, started, 0
+    last_audio_log_yaw: Optional[float] = None
 
     try:
         while True:
@@ -554,20 +565,34 @@ def main(argv=None, hid=None) -> int:
             if result.owner == PrioritySource.VISUAL_TRACKING or len(detections) > 0:
                 localizer.on_vision_active()
                 target_yaw = result.target_yaw_deg
+                motor_yaw = target_yaw
+                last_audio_log_yaw = None
             elif localizer.is_tracking(now):
                 target_yaw = localizer.target_yaw_deg
+                # ReSpeakerAudioLocalizer'ın calibrated_yaw çıktısından sonra,
+                # HeadLink'e gönderilmeden hemen önce koordinat terslenir:
+                # logical -45 -> motor +45 (fiziksel SOL)
+                # logical 0   -> motor 0   (fiziksel ÖN)
+                # logical +45 -> motor -45 (fiziksel SAĞ)
+                # logical +90 -> motor -90 (fiziksel SAĞ 90)
+                motor_yaw = -target_yaw if target_yaw != 0.0 else 0.0
                 result.target_yaw_deg = target_yaw
                 result.owner = PrioritySource.ACTIVE_SPEAKER
                 result.gaze_state = GazeStateEnum.ORIENTING
                 result.target_id = "audio_speaker_1"
+                if last_audio_log_yaw != motor_yaw:
+                    print(f"AUDIO logical={target_yaw:+.1f} motor={motor_yaw:+.1f}")
+                    last_audio_log_yaw = motor_yaw
             else:
                 target_yaw = 0.0
+                motor_yaw = 0.0
                 result.target_yaw_deg = 0.0
                 result.owner = PrioritySource.IDLE
                 result.gaze_state = GazeStateEnum.IDLE
                 result.target_id = None
+                last_audio_log_yaw = None
 
-            head.send_angle(target_yaw)
+            head.send_angle(motor_yaw)
             head.tick(now)
 
             frames += 1
