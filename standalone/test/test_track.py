@@ -296,10 +296,23 @@ def test_tracking_resumes_when_voice_activity_returns():
     assert loc.is_tracking() is False
     assert loc.target_yaw_deg == 0.0
 
-    # Speech resumes at DOA 142 → RIGHT sector
-    loc.update(doa_raw=142.0, voice_activity=True, timestamp=3.0)
+    # Speech resumes at same sector (LEFT, DOA 40) → immediate resume
+    loc.update(doa_raw=40.0, voice_activity=True, timestamp=3.0)
     assert loc.is_tracking() is True
-    assert loc.target_yaw_deg == -45.0
+    assert loc.target_yaw_deg == 45.0
+    assert loc.confirmed_sector == "LEFT"
+
+    # Speech resumes at DIFFERENT sector (RIGHT, DOA 142) → needs confirmation
+    loc.update(doa_raw=None, voice_activity=False, timestamp=4.5)  # timeout
+    loc.is_tracking(now=5.0)  # trigger timeout
+    assert loc.target_yaw_deg == 0.0
+
+    loc.update(doa_raw=142.0, voice_activity=True, timestamp=5.1)
+    assert loc.target_yaw_deg == 0.0  # not yet switched (1 reading)
+    loc.update(doa_raw=142.0, voice_activity=True, timestamp=5.2)
+    assert loc.target_yaw_deg == 0.0  # 2 readings
+    loc.update(doa_raw=142.0, voice_activity=True, timestamp=5.3)
+    assert loc.target_yaw_deg == -45.0  # 3 readings → confirmed RIGHT
     assert loc.confirmed_sector == "RIGHT"
 
 

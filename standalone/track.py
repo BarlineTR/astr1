@@ -96,7 +96,7 @@ class ReSpeakerAudioLocalizer:
     def __init__(
         self,
         hid=None,
-        hold_timeout_s: float = 1.2,
+        hold_timeout_s: float = 2.5,
         deadband_deg: float = 5.0,
         outlier_threshold_deg: float = 30.0,
         filter_window_size: int = 5,
@@ -309,13 +309,14 @@ class ReSpeakerAudioLocalizer:
             sector = self.doa_to_sector(doa_raw)
             if sector is not None:
                 if self._confirmed_sector is None:
-                    # First detection → accept immediately
+                    # First detection ever → accept immediately
                     self._confirmed_sector = sector
                     self._pending_sector = None
                     self._pending_count = 0
                     self.active_target_yaw = self.SECTOR_TARGETS[sector]
                 elif sector == self._confirmed_sector:
-                    # Same sector → reinforce, clear pending
+                    # Same sector → resume/reinforce, restore target, clear pending
+                    self.active_target_yaw = self.SECTOR_TARGETS[sector]
                     self._pending_sector = None
                     self._pending_count = 0
                 elif sector == self._pending_sector:
@@ -337,14 +338,18 @@ class ReSpeakerAudioLocalizer:
                 if timestamp - self._last_valid_target_time > self.hold_timeout_s:
                     self._tracking_active = False
                     self.active_target_yaw = 0.0
-                    self._clear_sector_state()
+                    # Keep _confirmed_sector so phantom DOA after timeout needs confirmation
+                    self._pending_sector = None
+                    self._pending_count = 0
         else:
             # VOICEACTIVITY is False: hold current target for grace period
             if self._tracking_active:
                 if timestamp - self._last_valid_target_time > self.hold_timeout_s:
                     self._tracking_active = False
                     self.active_target_yaw = 0.0
-                    self._clear_sector_state()
+                    # Keep _confirmed_sector so phantom DOA after timeout needs confirmation
+                    self._pending_sector = None
+                    self._pending_count = 0
 
         return self.target_yaw_deg
 
@@ -367,7 +372,8 @@ class ReSpeakerAudioLocalizer:
         if now is not None and (now - self._last_valid_target_time > self.hold_timeout_s):
             self._tracking_active = False
             self.active_target_yaw = 0.0
-            self._clear_sector_state()
+            self._pending_sector = None
+            self._pending_count = 0
             return False
         return True
 
@@ -514,8 +520,8 @@ def main(argv=None, hid=None) -> int:
     parser.add_argument("--log-interval", type=float, default=1.0, metavar="SN",
                         help="Terminale durum satiri basma araligi (0 = yalnizca "
                              "durum/hedef degisimlerinde bas)")
-    parser.add_argument("--audio-hold-grace", type=float, default=1.2,
-                        help="Audio hedefinin konuşma kesildikten sonra tutulacağı süre (saniye, varsayılan: 1.2)")
+    parser.add_argument("--audio-hold-grace", type=float, default=2.5,
+                        help="Audio hedefinin konuşma kesildikten sonra tutulacağı süre (saniye, varsayılan: 2.5)")
     parser.add_argument("--audio-deadband", type=float, default=5.0,
                         help="Audio hedefi deadband eşiği (derece, varsayılan: 5.0)")
     parser.add_argument("--record", nargs="?", const="", default=None, metavar="DOSYA",
