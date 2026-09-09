@@ -133,7 +133,7 @@ def test_audio_sector_persistence_three_samples():
 def test_audio_target_retention():
     from track import AudioTargetRetention
 
-    ret = AudioTargetRetention(hold_grace_s=1.0)
+    ret = AudioTargetRetention(hold_grace_s=1.5)
 
     # 1. Konuşmacı -55° sektöründe konuştu
     assert ret.on_active_speaker(-55.0, 29.0) == -55.0
@@ -141,11 +141,11 @@ def test_audio_target_retention():
     # 2. 500 ms sonra kısa duraklama (dropout) -> -55° korunmalı
     assert ret.on_speech_dropout(active_sector=None, now=29.5) == -55.0
 
-    # 3. 900 ms sonra hala duraklama -> -55° korunmalı
-    assert ret.on_speech_dropout(active_sector=None, now=29.9) == -55.0
+    # 3. 1.2s sonra hala duraklama (en az 1.5s kuralı) -> -55° korunmalı
+    assert ret.on_speech_dropout(active_sector=None, now=30.2) == -55.0
 
-    # 4. Grace süresi doldu (1.05s sonra) -> hedef düşmeli (None)
-    assert ret.on_speech_dropout(active_sector=None, now=30.05) is None
+    # 4. Grace süresi doldu (1.6s sonra) -> hedef düşmeli (None)
+    assert ret.on_speech_dropout(active_sector=None, now=30.6) is None
 
     # 5. Yeni sektör teyit edilirse grace içinde bile anında yeni sektöre geçer
     ret.on_active_speaker(-55.0, 40.0)
@@ -158,15 +158,15 @@ def test_audio_target_retention():
 
 
 def test_audio_retention_prevents_continuous_doa_leak_to_idle():
-    """Audio aktifken sektör kilidi (-55°), dropout sırasında hedef koruma,
-    grace bitince doğrudan 0.0°'a dönme ve continuous audio yaw'ın (-36.9°, -59.4°)
+    """Audio aktifken sektör kilidi (-55°), dropout sırasında en az 1.5s hedef koruma,
+    grace bitince doğrudan 0.0°'a dönme ve continuous audio yaw'ın (-21.2°, -36.9°, -59.4°)
     ASLA dışarı sızmamasını doğrular.
     """
     from track import AudioSectorMapper, AudioTargetRetention, resolve_target_yaw
     from tracker import GazeResult, PrioritySource, GazeStateEnum, Detection
 
     mapper = AudioSectorMapper(persistence_required=3)
-    retention = AudioTargetRetention(hold_grace_s=1.0)
+    retention = AudioTargetRetention(hold_grace_s=1.5)
 
     # 1. ACTIVE_SPEAKER: Sol sektörde konuşma (-55° sektör kilidi)
     # Tracker continuous raw DOA açısı (-36.9°) üretse bile...
@@ -198,8 +198,8 @@ def test_audio_retention_prevents_continuous_doa_leak_to_idle():
     assert result.target_yaw_deg == -55.0
     assert result.owner == PrioritySource.ACTIVE_SPEAKER
 
-    # 2. & 3. Speech dropout: 500 ms sonra konuşma kesildi
-    # Tracker IDLE/ACQUIRING'e düşüp continuous DOA (-54.5°) üretse bile...
+    # 2. & 3. Speech dropout: Konuşma kesildi
+    # Tracker IDLE/ACQUIRING'e düşüp continuous DOA (-54.5°, -21.2°) üretse bile...
     sector = mapper.update(raw_doa=None, is_speech=False, timestamp=10.60)
     result_dropout = GazeResult(
         target_yaw_deg=-54.5,  # Continuous audio DOA
@@ -217,12 +217,34 @@ def test_audio_retention_prevents_continuous_doa_leak_to_idle():
         sector_mapper=mapper,
         now=10.60,
     )
-    # Step 2 & 3 Assert: Grace period içinde (1.0s dolmadı) sektör (-55.0°) korunmalı
+    # Step 2 & 3 Assert (500ms): Grace period içinde (1.5s dolmadı) sektör (-55.0°) korunmalı
     assert target_held == -55.0
     assert result_dropout.target_yaw_deg == -55.0
     assert result_dropout.owner == PrioritySource.ACTIVE_SPEAKER
 
-    # 4. Grace süresi doldu (dropout üzerinden 1.5s geçti, now=12.10)
+    # 1.2s sonra hala dropout içinde:
+    result_dropout_12 = GazeResult(
+        target_yaw_deg=-21.2,  # Continuous audio DOA
+        gaze_state=GazeStateEnum.IDLE,
+        owner=PrioritySource.IDLE,
+        target_id=None,
+        confidence=0.0,
+        head_angle_deg=-41.7,
+    )
+    target_held_12 = resolve_target_yaw(
+        result=result_dropout_12,
+        detections=[],
+        active_sector=sector,
+        target_retention=retention,
+        sector_mapper=mapper,
+        now=11.30,
+    )
+    # 1.2s sonra da -55.0° korunmalı (en az 1.5s kuralı)
+    assert target_held_12 == -55.0
+    assert result_dropout_12.target_yaw_deg == -55.0
+    assert result_dropout_12.target_yaw_deg != -21.2
+
+    # 4. Grace süresi doldu (dropout üzerinden 1.6s geçti, now=11.70)
     # Tracker hala continuous DOA (-59.4°) üretse bile...
     result_expired = GazeResult(
         target_yaw_deg=-59.4,  # Continuous audio DOA
@@ -238,13 +260,14 @@ def test_audio_retention_prevents_continuous_doa_leak_to_idle():
         active_sector=None,
         target_retention=retention,
         sector_mapper=mapper,
-        now=12.10,
+        now=11.70,
     )
-    # Step 4 Assert: Grace bitince hedef ASLA -59.4° ya da -36.9° olamaz! Kesinlikle 0.0° olmalı!
+    # Step 4 Assert: Grace bitince hedef ASLA -59.4°, -36.9°, -21.2° olamaz! Kesinlikle 0.0° olmalı!
     assert target_expired == 0.0
     assert result_expired.target_yaw_deg == 0.0
     assert result_expired.target_yaw_deg != -59.4
     assert result_expired.target_yaw_deg != -36.9
+    assert result_expired.target_yaw_deg != -21.2
     assert retention.retained_target_yaw is None
 
     # 5. Vision devreye girdiğinde:

@@ -132,29 +132,33 @@ class AudioSectorMapper:
 
 
 class AudioTargetRetention:
-    """Kısa VAD/konuşma duraklamalarında audio hedefini 0.8-1.0s korur.
+    """Kısa VAD/konuşma duraklamalarında audio hedefini en az 1.5s korur.
 
     Kurallar:
     - ACTIVE_SPEAKER ile yeni sektör lock edildiğinde target_yaw sektörde kalır.
-    - Tek bir kısa VAD/speech kaybı hedefi hemen düşürmez (0.8-1.0s grace period).
+    - Tek bir kısa VAD/speech kaybı hedefi hemen düşürmez (en az 1.5s grace period).
     - Bu süre boyunca son aktif sektörün target_yaw'i korunur.
     - Yeni başka sektör doğrulanırsa yeni sektöre geçilir.
     - Vision owner olduğu anda audio tamamen bırakılır.
     - IDLE'ye geçişte grace süresi dolduktan sonra resetlenir.
     """
 
-    def __init__(self, hold_grace_s: float = 1.0):
+    def __init__(self, hold_grace_s: float = 1.5):
         self.hold_grace_s = hold_grace_s
         self.retained_target_yaw = None
+        self.retained_target_id = None
         self.hold_until = 0.0
 
     def on_vision_active(self) -> None:
         """Vision devreye girdiği anda audio hedefi derhal bırakılır."""
         self.retained_target_yaw = None
+        self.retained_target_id = None
         self.hold_until = 0.0
 
-    def on_active_speaker(self, active_sector, now: float):
+    def on_active_speaker(self, active_sector, now: float, target_id: Optional[str] = None):
         """ACTIVE_SPEAKER durumunda hedefi günceller ve grace süresini yeniler."""
+        if target_id:
+            self.retained_target_id = target_id
         if active_sector is not None:
             self.retained_target_yaw = active_sector
             self.hold_until = now + self.hold_grace_s
@@ -173,11 +177,13 @@ class AudioTargetRetention:
             return self.retained_target_yaw
         # Grace period doldu
         self.retained_target_yaw = None
+        self.retained_target_id = None
         self.hold_until = 0.0
         return None
 
     def reset(self) -> None:
         self.retained_target_yaw = None
+        self.retained_target_id = None
         self.hold_until = 0.0
 
 
@@ -202,7 +208,7 @@ def resolve_target_yaw(
         return result.target_yaw_deg
 
     if result.owner == PrioritySource.ACTIVE_SPEAKER:
-        held_yaw = target_retention.on_active_speaker(active_sector, now)
+        held_yaw = target_retention.on_active_speaker(active_sector, now, getattr(result, "target_id", None))
         if held_yaw is not None:
             result.target_yaw_deg = held_yaw
         else:
@@ -214,6 +220,7 @@ def resolve_target_yaw(
     if held_yaw is not None:
         result.target_yaw_deg = held_yaw
         result.owner = PrioritySource.ACTIVE_SPEAKER
+        result.target_id = target_retention.retained_target_id or result.target_id or "audio_speaker_1"
     else:
         target_retention.reset()
         if result.owner == PrioritySource.IDLE:
@@ -276,6 +283,8 @@ def main(argv=None) -> int:
     parser.add_argument("--log-interval", type=float, default=1.0, metavar="SN",
                         help="Terminale durum satiri basma araligi (0 = yalnizca "
                              "durum/hedef degisimlerinde bas)")
+    parser.add_argument("--audio-hold-grace", type=float, default=1.5,
+                        help="Audio hedefinin konuşma kesildikten sonra tutulacağı süre (saniye, varsayılan: 1.5)")
     parser.add_argument("--record", nargs="?", const="", default=None, metavar="DOSYA",
                         help="Bindirilmiş görüntüyü videoya kaydet. Yol verilmezse "
                              "astro_<tarih>.mp4 kullanılır. Ekransız çalışırken "
@@ -344,7 +353,7 @@ def main(argv=None) -> int:
     status = StatusLog(interval_s=opts.log_interval)
     tracker = GazeTracker()
     sector_mapper = AudioSectorMapper()
-    target_retention = AudioTargetRetention(hold_grace_s=1.0)
+    target_retention = AudioTargetRetention(hold_grace_s=opts.audio_hold_grace)
     started = time.monotonic()
     frames, fps, last_fps_at, last_fps_frames = 0, 0.0, started, 0
 
