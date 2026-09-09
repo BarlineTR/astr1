@@ -325,6 +325,21 @@ class AudioStreamNode(Node):
         if hasattr(self, "declare_parameter"):
             try:
                 self.declare_parameter("input_channels", 0)
+                self.declare_parameter("enable_hid_doa", True)
+            except Exception:
+                pass
+
+        self.enable_hid_doa = True
+        if hasattr(self, "get_parameter"):
+            try:
+                p_val = self.get_parameter("enable_hid_doa").value
+                if p_val is not None:
+                    if isinstance(p_val, bool):
+                        self.enable_hid_doa = p_val
+                    elif isinstance(p_val, str):
+                        self.enable_hid_doa = p_val.strip().lower() in ("true", "1", "yes")
+                    else:
+                        self.enable_hid_doa = bool(p_val)
             except Exception:
                 pass
 
@@ -339,7 +354,7 @@ class AudioStreamNode(Node):
         self.pub_vad = self.create_publisher(Bool, "/audio/vad", 10)
 
         # Hardware ReSpeaker HID & Acoustic DOA Estimator
-        self._respeaker = ReSpeakerHID()
+        self._respeaker = ReSpeakerHID() if self.enable_hid_doa else None
         self._hid_status = None
         self._doa_estimator = AcousticDOAEstimator(sample_rate=HW_SAMPLE_RATE) if AcousticDOAEstimator else None
         self._capture_channels = 1
@@ -419,11 +434,13 @@ class AudioStreamNode(Node):
         self.create_timer(0.1, self._publish_status)
 
         # ReSpeaker 4-Mic HID DOA & VAD polling timer (10 Hz)
-        if not self._under_pytest():
+        if not self._under_pytest() and self.enable_hid_doa and self._respeaker is not None:
             self.create_timer(0.1, self._poll_respeaker_hid)
 
     def _poll_respeaker_hid(self):
         """Polls ReSpeaker 4-Mic hardware parameters (DOA & VAD) and publishes to ROS topics."""
+        if self._respeaker is None:
+            return
         try:
             is_speech = self._respeaker.speech_detected()
             doa_angle = self._respeaker.doa_angle()

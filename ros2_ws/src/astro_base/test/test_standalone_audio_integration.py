@@ -83,7 +83,7 @@ class TestStandaloneAudioIntegration:
         Acoustic contract (ReSpeaker 0=front, +90=right, 270=left) maps to REP-103 body yaw
         (positive = left, negative = right).
         """
-        # Test Left: DOA = 320.0 deg (-40 deg, left) -> positive body yaw (> +20 deg)
+        # Test Left: DOA = 32.0 deg (Left sector) -> positive body yaw (+60.0 deg)
         node_left = StandaloneGazeRosNode(use_camera_source=False, enable_audio=False)
         speech_verdict = MockSpeechVerdict(is_speech=True, confidence=0.90)
 
@@ -95,15 +95,15 @@ class TestStandaloneAudioIntegration:
                 detections=[],
                 frame_size=(640, 480),
                 timestamp=t,
-                doa_deg=320.0,
+                doa_deg=32.0,
                 speech=speech_verdict,
             )
 
         assert res_left is not None
-        assert res_left.target_yaw_deg > 20.0  # Turns left toward speaker
+        assert res_left.target_yaw_deg > 20.0  # Turns left toward speaker (+60°)
         assert res_left.owner == PrioritySource.ACTIVE_SPEAKER
 
-        # Test Right: DOA = 40.0 deg (+40 deg, right) -> negative body yaw (< -20 deg)
+        # Test Right: DOA = 148.0 deg (Right sector) -> negative body yaw (-60.0 deg)
         node_right = StandaloneGazeRosNode(use_camera_source=False, enable_audio=False)
         t = 300.0
         res_right = None
@@ -113,12 +113,12 @@ class TestStandaloneAudioIntegration:
                 detections=[],
                 frame_size=(640, 480),
                 timestamp=t,
-                doa_deg=40.0,
+                doa_deg=148.0,
                 speech=speech_verdict,
             )
 
         assert res_right is not None
-        assert res_right.target_yaw_deg < -20.0  # Turns right toward speaker
+        assert res_right.target_yaw_deg < -20.0  # Turns right toward speaker (-60°)
         assert res_right.owner == PrioritySource.ACTIVE_SPEAKER
 
     def test_visual_reacquisition_overrides_audio(self):
@@ -127,14 +127,14 @@ class TestStandaloneAudioIntegration:
         speech = MockSpeechVerdict(is_speech=True, confidence=0.90)
 
         t = 400.0
-        # Phase 1: Reacquiring audio speaker at right (DOA=45 deg -> target_yaw ~ -45 deg) with no face
+        # Phase 1: Reacquiring audio speaker at right (DOA=148 deg -> target_yaw ~ -60 deg) with no face
         for i in range(5):
             t += 0.033
             res_audio = node.step_frame(
                 detections=[],
                 frame_size=(640, 480),
                 timestamp=t,
-                doa_deg=45.0,
+                doa_deg=148.0,
                 speech=speech,
             )
         assert res_audio.target_yaw_deg < -20.0
@@ -160,6 +160,7 @@ class TestStandaloneAudioIntegration:
     def test_stale_doa_expires(self):
         """Audio observation expires after audio freshness timeout and stops steering."""
         node = StandaloneGazeRosNode(use_camera_source=False, enable_audio=False)
+        node.localizer.hold_timeout_s = 1.0
         speech = MockSpeechVerdict(is_speech=True, confidence=0.88)
 
         t = 500.0
@@ -354,7 +355,7 @@ class TestStandaloneAudioIntegration:
                 detections=[],
                 frame_size=(640, 480),
                 timestamp=t,
-                doa_deg=45.0,  # Right in ReSpeaker -> negative body yaw
+                doa_deg=148.0,  # Right in ReSpeaker -> negative body yaw
                 speech=speech,
             )
 
@@ -376,7 +377,7 @@ class TestStandaloneAudioIntegration:
                 detections=[],
                 frame_size=(640, 480),
                 timestamp=t,
-                doa_deg=90.0,
+                doa_deg=32.0,
                 speech=None,
             )
         assert res is not None
@@ -391,7 +392,7 @@ class TestStandaloneAudioIntegration:
                 detections=[],
                 frame_size=(640, 480),
                 timestamp=t,
-                doa_deg=90.0,
+                doa_deg=32.0,
                 speech=no_speech,
             )
         assert res is not None
@@ -401,10 +402,11 @@ class TestStandaloneAudioIntegration:
     def test_audio_reacquisition_timeout_returns_to_center(self):
         """When audio ceases and no face is found, FSM safely times out and returns to center."""
         node = StandaloneGazeRosNode(use_camera_source=False, enable_audio=False)
+        node.localizer.hold_timeout_s = 2.0
         speech = MockSpeechVerdict(is_speech=True, confidence=0.60)
 
         t = 800.0
-        # 1. Turn to speaker at right (DOA=40.0)
+        # 1. Turn to speaker at right (DOA=148.0)
         res_first = None
         for _ in range(3):
             t += 0.033
@@ -412,16 +414,16 @@ class TestStandaloneAudioIntegration:
                 detections=[],
                 frame_size=(640, 480),
                 timestamp=t,
-                doa_deg=40.0,
+                doa_deg=148.0,
                 speech=speech,
             )
         assert res_first is not None
         assert res_first.owner == PrioritySource.ACTIVE_SPEAKER
         assert res_first.target_yaw_deg < -15.0
 
-        # 2. Sound stops; simulate time passing without any speech or face (> 4.0s)
+        # 2. Sound stops; simulate time passing without any speech or face (> 2.5s)
         res = None
-        for _ in range(120):
+        for _ in range(90):
             t += 0.033
             res = node.step_frame(
                 detections=[],
@@ -437,63 +439,27 @@ class TestStandaloneAudioIntegration:
         assert abs(res.target_yaw_deg) < 2.0
 
     def test_gcc_phat_pair_signs_steer_head_correctly(self):
-        """Validates that GCC-PHAT on ReSpeaker channels [1..4] steers head left and right correctly."""
-        from astro_audio.doa_estimator import AcousticDOAEstimator
-
-        est = AcousticDOAEstimator(sample_rate=16000)
-
-        # 1. Synthesize RIGHT speaker (right mic leads): Mic 1 leads
-        rng = np.random.default_rng(55)
-        base = rng.normal(0, 1, 1024 * 3) * 6000.0
-        def take(l): return base[1024 + l: 1024 + l + 1024]
-        # ReSpeaker 6-channel layout
-        ch6_right = np.stack([
-            take(0),      # Ch 0: Processed beam
-            take(0),      # Ch 1: Front
-            take(+4),     # Ch 2: Right (leads)
-            take(0),      # Ch 3: Back
-            take(-4),     # Ch 4: Left (lags)
-            np.zeros(1024)
-        ])
-        az_r, _, valid_r = est.estimate_from_multichannel_pcm(ch6_right[1:5])
-        assert valid_r is True
-        circ_r = az_r if az_r >= 0 else az_r + 360.0
-        assert abs(circ_r - 90.0) < 1.0  # Right is 90° circular
-
-        # Feed to StandaloneGazeRosNode: 90° circular must steer head RIGHT (negative yaw)
+        """Validates that ReSpeakerAudioLocalizer steers head left and right correctly."""
+        # 1. Synthesize RIGHT speaker: DOA = 148.0° (>= 100°) -> negative body yaw (-60.0°)
         node_r = StandaloneGazeRosNode(use_camera_source=False, enable_audio=False)
         speech = MockSpeechVerdict(is_speech=True, confidence=0.85)
         t = 900.0
         res_r = None
         for _ in range(4):
             t += 0.033
-            res_r = node_r.step_frame(detections=[], frame_size=(640, 480), timestamp=t, doa_deg=circ_r, speech=speech)
+            res_r = node_r.step_frame(detections=[], frame_size=(640, 480), timestamp=t, doa_deg=148.0, speech=speech)
         assert res_r.owner == PrioritySource.ACTIVE_SPEAKER
-        assert res_r.target_yaw_deg < -20.0  # Negative = Right
+        assert res_r.target_yaw_deg == pytest.approx(-60.0, abs=1e-3)  # Negative = Right
 
-        # 2. Synthesize LEFT speaker (left mic leads): Mic 3 leads
-        ch6_left = np.stack([
-            take(0),      # Ch 0: Processed beam
-            take(0),      # Ch 1: Front
-            take(-4),     # Ch 2: Right (lags)
-            take(0),      # Ch 3: Back
-            take(+4),     # Ch 4: Left (leads)
-            np.zeros(1024)
-        ])
-        az_l, _, valid_l = est.estimate_from_multichannel_pcm(ch6_left[1:5])
-        assert valid_l is True
-        circ_l = az_l if az_l >= 0 else az_l + 360.0
-        assert abs(circ_l - 270.0) < 1.0  # Left is 270° circular
-
-        # Feed to StandaloneGazeRosNode: 270° circular must steer head LEFT (positive yaw)
+        # 2. Synthesize LEFT speaker: DOA = 32.0° (< 55°) -> positive body yaw (+60.0°)
         node_l = StandaloneGazeRosNode(use_camera_source=False, enable_audio=False)
         t = 1000.0
         res_l = None
         for _ in range(4):
             t += 0.033
-            res_l = node_l.step_frame(detections=[], frame_size=(640, 480), timestamp=t, doa_deg=circ_l, speech=speech)
+            res_l = node_l.step_frame(detections=[], frame_size=(640, 480), timestamp=t, doa_deg=32.0, speech=speech)
         assert res_l.owner == PrioritySource.ACTIVE_SPEAKER
-        assert res_l.target_yaw_deg > 20.0  # Positive = Left
+        assert res_l.target_yaw_deg == pytest.approx(60.0, abs=1e-3)  # Positive = Left
 
 
 def test_manual_target_yaw_override():

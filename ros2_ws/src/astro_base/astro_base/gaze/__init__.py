@@ -13,3 +13,7 @@ Clean Greenfield Architecture:
 """
 
 __version__ = "2.0.0"
+
+from astro_base.gaze.respeaker_localizer import ReSpeakerAudioLocalizer
+
+__all__ = ["ReSpeakerAudioLocalizer"]

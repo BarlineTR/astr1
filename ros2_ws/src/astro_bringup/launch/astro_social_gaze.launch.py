@@ -135,9 +135,24 @@ def generate_launch_description():
             description="Audio input channels for ReSpeaker capture (0=auto-detect 4-mic/fallback)",
         ),
         DeclareLaunchArgument(
+            "audio_source_mode",
+            default_value="hardware",
+            description="Audio localizer mode ('hardware' for direct ReSpeaker HID matching track.py, or 'topics')",
+        ),
+        DeclareLaunchArgument(
+            "audio_hold_grace",
+            default_value="5.0",
+            description="Grace period in seconds to hold speaker heading before returning to center",
+        ),
+        DeclareLaunchArgument(
+            "audio_deadband",
+            default_value="5.0",
+            description="Angular deadband in degrees to suppress minor audio jitter",
+        ),
+        DeclareLaunchArgument(
             "audio_doa_profile",
-            default_value="respeaker_eye_20260908",
-            description="8 Eylül göz montajı sektörleri veya geometric (0=ön)",
+            default_value="respeaker_sectors",
+            description="ReSpeaker sector-based DOA profile (LEFT 60, CENTER 0, RIGHT -60)",
         ),
     ]
 
@@ -161,7 +176,9 @@ def generate_launch_description():
         parameters=[{
             "camera_device": LaunchConfiguration("camera_device"),
             "enable_audio": LaunchConfiguration("enable_audio"),
-            "audio_source_mode": "topics",
+            "audio_source_mode": LaunchConfiguration("audio_source_mode"),
+            "audio_hold_grace": LaunchConfiguration("audio_hold_grace"),
+            "audio_deadband": LaunchConfiguration("audio_deadband"),
             "audio_doa_profile": LaunchConfiguration("audio_doa_profile"),
             "verbose_diagnostics": LaunchConfiguration("verbose_diagnostics"),
         }],
@@ -175,6 +192,7 @@ def generate_launch_description():
         condition=IfCondition(LaunchConfiguration("enable_audio")),
         parameters=[{
             "input_channels": LaunchConfiguration("audio_input_channels"),
+            "enable_hid_doa": False,
         }],
     )
 

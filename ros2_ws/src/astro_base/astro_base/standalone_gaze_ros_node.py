@@ -133,8 +133,14 @@ from stereo_doa import DEFAULT_MIC_SPACING_M
 from astro_base.gaze.angle_math import circular_distance_deg
 from astro_base.gaze.gaze_runtime import GazeRuntimeCore
 from astro_base.gaze.gaze_tracker import Detection, GazeResult, UNSCORED_CONFIDENCE
-from astro_base.gaze.types import PrioritySource
+from astro_base.gaze.types import GazeStateEnum, PrioritySource
+from astro_base.gaze.respeaker_localizer import ReSpeakerAudioLocalizer
 from astro_base.gaze.respeaker_sectors import ReSpeakerEyeSectors
+
+try:
+    from astro_audio.respeaker_usb import ReSpeakerHID
+except ImportError:
+    ReSpeakerHID = None
 
 try:
     from astro_vision.image_utils import bgr_to_imgmsg
@@ -216,8 +222,10 @@ class StandaloneGazeRosNode(Node):
         self.declare_parameter("camera_image_topic", "/oak/rgb/image_raw")
         self.declare_parameter("camera_publish_fps", 15.0)
         self.declare_parameter("enable_audio", True)
-        self.declare_parameter("audio_source_mode", "topics")
-        self.declare_parameter("audio_doa_profile", "geometric")
+        self.declare_parameter("audio_source_mode", "hardware")
+        self.declare_parameter("audio_hold_grace", 5.0)
+        self.declare_parameter("audio_deadband", 5.0)
+        self.declare_parameter("audio_doa_profile", "respeaker_sectors")
         self.declare_parameter("audio_device", -1)
         self.declare_parameter("mic_channels", "")
         self.declare_parameter("mic_spacing", DEFAULT_MIC_SPACING_M)
@@ -245,10 +253,26 @@ class StandaloneGazeRosNode(Node):
             else self.get_parameter("audio_source_mode").value
         ).strip().lower()
         self.audio_source_mode = audio_src_mode
+        self.audio_hold_grace = float(self.get_parameter("audio_hold_grace").value)
+        self.audio_deadband = float(self.get_parameter("audio_deadband").value)
         self.audio_doa_profile = str(audio_doa_profile or self.get_parameter("audio_doa_profile").value)
-        if self.audio_doa_profile not in ("geometric", "respeaker_eye_20260908"):
-            raise ValueError(f"Bilinmeyen audio_doa_profile: {self.audio_doa_profile}")
         self._audio_sectors = ReSpeakerEyeSectors() if self.audio_doa_profile == "respeaker_eye_20260908" else None
+
+        self.respeaker_hid = None
+        if self.enable_audio and self.audio_source_mode in ("standalone", "hardware"):
+            if ReSpeakerHID is not None:
+                try:
+                    self.respeaker_hid = ReSpeakerHID()
+                except Exception as hid_exc:
+                    self.get_logger().warning(f"ReSpeakerHID başlatılamadı: {hid_exc}")
+
+        self.localizer = ReSpeakerAudioLocalizer(
+            hid=self.respeaker_hid,
+            hold_timeout_s=self.audio_hold_grace,
+            deadband_deg=self.audio_deadband,
+        )
+        self._last_visual_target_id: Optional[str] = None
+        self._last_audio_log_yaw: Optional[float] = None
 
         audio_dev = int(self.get_parameter("audio_device").value)
         audio_dev = None if audio_dev < 0 else audio_dev
@@ -497,14 +521,12 @@ class StandaloneGazeRosNode(Node):
             val = float(msg.data)
             now = time.monotonic()
             with self._audio_lock:
-                if self._audio_sectors is not None:
-                    if self._playback_active or self._robot_speaking or not self._latest_vad_active:
-                        self._audio_sectors.reset()
-                        val = None
-                    else:
-                        val = self._audio_sectors.update(val, now)
                 self._latest_doa_deg = val
                 self._latest_doa_time = now
+                if self.audio_source_mode in ("topics", "ros"):
+                    is_speaking = bool(self._playback_active or self._robot_speaking)
+                    vad_val = bool(self._latest_vad_active and not is_speaking)
+                    self.localizer.update(doa_raw=val, voice_activity=vad_val, timestamp=now)
         except Exception as e:
             self.get_logger().debug(f"Error in _on_audio_doa: {e}")
 
@@ -526,9 +548,10 @@ class StandaloneGazeRosNode(Node):
                 self._latest_vad_active = val
                 if val:
                     self._latest_vad_time = now
-                elif self._audio_sectors is not None:
-                    self._audio_sectors.reset()
-                    self._latest_doa_deg = None
+                if self.audio_source_mode in ("topics", "ros"):
+                    is_speaking = bool(self._playback_active or self._robot_speaking)
+                    vad_val = bool(val and not is_speaking)
+                    self.localizer.update(doa_raw=self._latest_doa_deg, voice_activity=vad_val, timestamp=now)
         except Exception as e:
             self.get_logger().debug(f"Error in _on_audio_vad: {e}")
 
@@ -537,9 +560,8 @@ class StandaloneGazeRosNode(Node):
         try:
             with self._audio_lock:
                 self._playback_active = bool(msg.data)
-                if self._playback_active and self._audio_sectors is not None:
-                    self._audio_sectors.reset()
-                    self._latest_doa_deg = None
+                if self._playback_active:
+                    self.localizer.reset()
         except Exception as e:
             self.get_logger().debug(f"Error in _on_playback_active: {e}")
 
@@ -548,9 +570,8 @@ class StandaloneGazeRosNode(Node):
         try:
             with self._audio_lock:
                 self._robot_speaking = bool(msg.data)
-                if self._robot_speaking and self._audio_sectors is not None:
-                    self._audio_sectors.reset()
-                    self._latest_doa_deg = None
+                if self._robot_speaking:
+                    self.localizer.reset()
         except Exception as e:
             self.get_logger().debug(f"Error in _on_robot_speaking: {e}")
 
@@ -746,33 +767,94 @@ class StandaloneGazeRosNode(Node):
         self.cycle_id += 1
         self.frame_index += 1
 
+        robot_is_speaking = bool(is_robot_speaking or self._playback_active or self._robot_speaking)
+
+        if (self.enable_audio or doa_deg is not None) and not robot_is_speaking:
+            if self.audio_source_mode in ("standalone", "hardware") and doa_deg is None:
+                self.localizer.read_and_update(now=arrival_ts)
+            else:
+                if doa_deg is not None or speech is not None:
+                    vad = bool(speech and getattr(speech, "is_speech", False))
+                    self.localizer.update(doa_raw=doa_deg, voice_activity=vad, timestamp=arrival_ts)
+        elif robot_is_speaking:
+            self.localizer.reset()
+
         t_step_start = time.monotonic()
+        # GazeTracker.step() call strictly receives doa_deg=None and speech=None.
+        # This completely eliminates continuous Kalman DOA angle leakage.
         res = self.runtime.step(
             faces=detections,
             frame_size=(frame_w, frame_h),
-            doa_deg=doa_deg,
-            speech=speech,
+            doa_deg=None,
+            speech=None,
             timestamp=capture_ts,
-            is_robot_speaking=is_robot_speaking,
+            is_robot_speaking=robot_is_speaking,
         )
         t_step_end = time.monotonic()
 
-        self.latest_result = res
-        now_m = time.monotonic()
+        # Authoritative 3-way arbitration matching standalone/track.py 1:1
+        vision_active = (
+            res.owner == PrioritySource.VISUAL_TRACKING
+            or res.gaze_state in (
+                GazeStateEnum.TRACKING,
+                GazeStateEnum.HOLDING_ATTENTION,
+                GazeStateEnum.ORIENTING,
+                GazeStateEnum.ACQUIRING,
+                GazeStateEnum.TARGET_LOST,
+            )
+        )
+
+        now_m = arrival_ts
         if now_m < getattr(self, "_manual_target_deadline", 0.0):
             target_yaw = float(self._manual_target_yaw)
-        else:
+            motor_yaw = target_yaw
+        elif vision_active:
+            self.localizer.on_vision_active()
             target_yaw = float(res.target_yaw_deg)
-        self.last_published_yaw = target_yaw
+            motor_yaw = target_yaw
+            self._last_audio_log_yaw = None
+            if res.target_id:
+                self._last_visual_target_id = res.target_id
+            if res.owner != PrioritySource.VISUAL_TRACKING:
+                res.owner = PrioritySource.VISUAL_TRACKING
+                if not res.target_id:
+                    res.target_id = self._last_visual_target_id
+        elif self.localizer.is_tracking(now_m):
+            self._last_visual_target_id = None
+            target_yaw = float(self.localizer.target_yaw_deg)
+            motor_yaw = target_yaw
+            res.target_yaw_deg = target_yaw
+            res.owner = PrioritySource.ACTIVE_SPEAKER
+            res.gaze_state = GazeStateEnum.ORIENTING
+            res.target_id = "audio_speaker_1"
+            if self._last_audio_log_yaw != motor_yaw:
+                doa_val = self.localizer.last_raw_doa
+                doa_str = f"{doa_val:.0f}" if doa_val is not None else "?"
+                sector_str = self.localizer.confirmed_sector or "?"
+                self.get_logger().info(f"AUDIO sector={sector_str} DOA={doa_str} target={target_yaw:+.1f}")
+                self._last_audio_log_yaw = motor_yaw
+        else:
+            self._last_visual_target_id = None
+            target_yaw = 0.0
+            motor_yaw = 0.0
+            res.target_yaw_deg = 0.0
+            res.owner = PrioritySource.IDLE
+            res.gaze_state = GazeStateEnum.IDLE
+            res.target_id = None
+            self._last_audio_log_yaw = None
+
+        self.latest_result = res
+        self.last_published_yaw = motor_yaw
+        self.runtime.last_target_yaw_deg = motor_yaw
 
         # Direct Actuator Dispatch (ONE RESULT -> ONE AUTHORITATIVE TARGET)
         if self.pub_head_command is not None:
             hcmd = HeadCmd()
-            hcmd.angle_deg = target_yaw
+            hcmd.angle_deg = motor_yaw
             self.pub_head_command.publish(hcmd)
 
         cmd_pos = Float32()
-        cmd_pos.data = target_yaw
+        cmd_pos.data = motor_yaw
         self.pub_head_cmd_pos.publish(cmd_pos)
 
         if self.pub_active_target is not None:
@@ -986,12 +1068,21 @@ class StandaloneGazeRosNode(Node):
         """Streams last authoritative target yaw to keep MCU watchdog fed.
 
         DOES NOT step tracker.
-        DOES NOT update targets.
-        DOES NOT update visual FSM.
+        DOES NOT update targets when camera is active.
+        If running headless without camera, updates audio localizer.
         """
         now_m = time.monotonic()
         if now_m < getattr(self, "_manual_target_deadline", 0.0):
             target_yaw = float(self._manual_target_yaw)
+        elif self.camera is None or not getattr(self.camera, "available", False):
+            # Headless or camera-less mode: localizer can be stepped if camera loop isn't driving
+            if self.enable_audio and self.audio_source_mode in ("standalone", "hardware"):
+                self.localizer.read_and_update(now=now_m)
+            if self.localizer.is_tracking(now_m):
+                target_yaw = float(self.localizer.target_yaw_deg)
+            else:
+                target_yaw = 0.0
+            self.runtime.last_target_yaw_deg = target_yaw
         else:
             target_yaw = float(self.runtime.get_keepalive_yaw_deg())
         cmd_pos = Float32()
