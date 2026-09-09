@@ -85,6 +85,38 @@ Gerçek mikrofonla bu yeni mod henüz çalıştırılmadı; sonraki kullanıcı 
 doğrulayacak. ROS kaynakları değişmediği için bu değişiklik için ROS derlemesi
 gerekmez.
 
+## Devam oturumundaki gerçek laptop ölçümleri
+
+`75d5b3db` üzerindeki sabit referans yolu gerçek webcam ve ALC294 stereo girişle
+30 s çalıştırıldı; log `/tmp/astro-ses-testi.log` içinde. Çıkış özeti 850 kare /
+30.1 s = 28.2 Hz. Yüz bütün 57 durum satırında görünür kaldı. Geçiş mesajları
+geciktiğinden ve kullanıcının fiili konuşma/yön zamanları doğrulanmadığından koşu
+kontrollü sol–sağ denemesi sayılmaz.
+
+Log örnekleri: 7 satırda yön, 4 satırda konuşma kabulü, 0 satırda ikisi birlikte.
+Bunlar bütün ses bloklarının sayımı değildir; yanlış ret veya yön doğruluk oranı
+hesaplanamaz. Sabit kafa referansı bütün satırlarda 0°, hedef +8.5° kaldı.
+
+ALSA okuması `Capture` için iki kanalda +30 dB ve `Internal Mic Boost` için iki
+kanalda +30 dB gösterdi. Aynı aygıttan, aynı 44100 Hz/iki kanal/float32 biçiminde
+ayrı 3 s örnek alındı. Tam skalaya yakın (`abs(sample) >= 0.999`) örnek oranları
+sol %32.938, sağ %33.135; tepe iki kanalda 1.0; RMS 0.62427/0.63713.
+Bu örnekte belirgin kırpılma var. Paylaşılan `StereoDOA` kestiricisi 4096 örneklik
+32 bloğun 23'ünde yön döndürdü; keskinlik min/medyan/max 1.736/4.043/16.934.
+Kaynak yönü etiketli olmadığından bunlar doğru yön sayısı değildir.
+
+`Internal Mic Boost` geçici olarak 0 dB'ye indirilerek ayrı 3 s örnek alındı:
+tam skalaya yakın örnek oranı %9.846/%10.114; RMS 0.35924/0.36124; tepe 1.0/1.0.
+32 bloğun 15'i yön döndürdü, keskinlik 1.683/2.854/16.934. İki kayıtta aynı
+akustik uyaran sağlanmadı; aradaki farktan iyileşme veya nedensellik çıkarılamaz.
+0 dB örneğinde de kırpılma sürdü. Önceki +30 dB boost ayarı `finally` içinde
+geri yüklendi ve `amixer` çıktısıyla doğrulandı. Ham ses dosyası saklanmadı.
+
+Sonraki adım kullanıcıdan bu sırada konuşma veya hoparlör/müzik olup olmadığını
+netleştirmek; ardından kullanıcı tarafından başlatılan, zamanları etiketli bir
+normal konuşma denemesiyle giriş seviyesini ve yön ölçümünü ayırmak. Konuşma
+eşikleri, yön kestiricisi ve hedef seçim kodu bu ölçüm turunda değiştirilmedi.
+
 ## 30° montaj açısı tek başına yeterli bilgi değil
 
 Aşağıdakiler geometrik çıkarımdır, üreticinin bu robot için ölçtüğü sonuçlar değildir. Düzlemsel dizide uzak alan gecikmesi `c·τij = (ri−rj)·u` ile modellenir. Tüm mikrofonlar yerel `z=0` düzlemindeyse gecikmeler `u_z` işaretini ayırt edemez: düzlemin iki tarafındaki ayna yönler aynı gecikmeleri üretebilir. Bu, “düzlemsel dizi hiçbir yükseklik bilgisi taşımaz” demek değildir; tam 3B yönün bu ölçümden tekil biçimde çıkarılamayacağı anlamına gelir. Seeed'in XVF3800 geometri örneğinde de dört mikrofonun z koordinatı sıfırdır; bu örnek robottaki ürünün ölçüsü olarak kullanılmamalıdır. [Seeed geometri sorgusu](https://wiki.seeedstudio.com/respeaker_xvf3800_introduction/)

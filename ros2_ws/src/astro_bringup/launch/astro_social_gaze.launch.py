@@ -134,6 +134,11 @@ def generate_launch_description():
             default_value="0",
             description="Audio input channels for ReSpeaker capture (0=auto-detect 4-mic/fallback)",
         ),
+        DeclareLaunchArgument(
+            "audio_doa_profile",
+            default_value="respeaker_eye_20260908",
+            description="8 Eylül göz montajı sektörleri veya geometric (0=ön)",
+        ),
     ]
 
     serial_bridge_node = Node(
@@ -157,6 +162,7 @@ def generate_launch_description():
             "camera_device": LaunchConfiguration("camera_device"),
             "enable_audio": LaunchConfiguration("enable_audio"),
             "audio_source_mode": "topics",
+            "audio_doa_profile": LaunchConfiguration("audio_doa_profile"),
             "verbose_diagnostics": LaunchConfiguration("verbose_diagnostics"),
         }],
     )

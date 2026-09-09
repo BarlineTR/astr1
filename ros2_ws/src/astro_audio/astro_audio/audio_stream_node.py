@@ -16,7 +16,6 @@ _LOG = logging.getLogger(__name__)
 import json
 import os
 import queue
-import struct
 import subprocess
 import sys
 import threading
@@ -315,70 +314,7 @@ def find_audio_device(is_input: bool = True, preferred: str = "") -> tuple[Optio
     return valid[0][0], valid[0][1]
 
 
-try:
-    import usb.core
-    import usb.util
-    HAS_USB = True
-except ImportError:
-    HAS_USB = False
-
-RESPEAKER_VID = 0x2886
-RESPEAKER_PID = 0x0018
-PARAM_SPEECH_DETECTED = 19
-PARAM_DOA_ANGLE = 21
-
-
-class ReSpeakerHID:
-    """Hardware HID interface for ReSpeaker 4-Mic USB Array parameters (VAD & DOA)."""
-    TIMEOUT_MS = 1000
-
-    def __init__(self):
-        self.dev = None
-        self._last_find_attempt = 0.0
-        self._find_device()
-
-    def _find_device(self):
-        if not HAS_USB:
-            return
-        now = time.monotonic()
-        if (now - self._last_find_attempt) < 5.0:
-            return
-        self._last_find_attempt = now
-        try:
-            self.dev = usb.core.find(idVendor=RESPEAKER_VID, idProduct=RESPEAKER_PID)
-        except Exception:
-            self.dev = None
-
-    def _read_param(self, param_id: int) -> Optional[int]:
-        if self.dev is None:
-            self._find_device()
-            if self.dev is None:
-                return None
-        try:
-            data = self.dev.ctrl_transfer(
-                usb.util.CTRL_IN | usb.util.CTRL_TYPE_VENDOR | usb.util.CTRL_RECIPIENT_DEVICE,
-                0,
-                0xC0,
-                param_id,
-                8,
-                self.TIMEOUT_MS,
-            )
-            if data and len(data) >= 4:
-                return struct.unpack_from("i", data, 0)[0]
-            return None
-        except Exception:
-            self.dev = None
-            return None
-
-    def speech_detected(self) -> Optional[bool]:
-        val = self._read_param(PARAM_SPEECH_DETECTED)
-        return (val == 1) if val is not None else None
-
-    def doa_angle(self) -> Optional[float]:
-        val = self._read_param(PARAM_DOA_ANGLE)
-        if val is not None and 0 <= val <= 359:
-            return float(val)
-        return None
+from astro_audio.respeaker_usb import ReSpeakerHID
 
 
 class AudioStreamNode(Node):
@@ -404,6 +340,7 @@ class AudioStreamNode(Node):
 
         # Hardware ReSpeaker HID & Acoustic DOA Estimator
         self._respeaker = ReSpeakerHID()
+        self._hid_status = None
         self._doa_estimator = AcousticDOAEstimator(sample_rate=HW_SAMPLE_RATE) if AcousticDOAEstimator else None
         self._capture_channels = 1
         self._mic_channel_indices: tuple[int, ...] = (0, 1, 2, 3)
@@ -487,30 +424,44 @@ class AudioStreamNode(Node):
 
     def _poll_respeaker_hid(self):
         """Polls ReSpeaker 4-Mic hardware parameters (DOA & VAD) and publishes to ROS topics."""
-        if not self._respeaker or not self._respeaker.dev:
-            return
         try:
             is_speech = self._respeaker.speech_detected()
             doa_angle = self._respeaker.doa_angle()
+            status = "ok" if is_speech is not None and doa_angle is not None else self._respeaker.last_error or "Geçersiz USB DOA/VAD yanıtı"
+            if status != self._hid_status:
+                self._hid_status = status
+                if status == "ok":
+                    self.get_logger().info("ReSpeaker USB DOA/VAD okunuyor; /audio/doa ham montaj açısıdır.")
+                else:
+                    self.get_logger().warning(f"ReSpeaker DOA/VAD yok: {status}; USB bağlantısı ve udev izinlerini kontrol edin. Yeniden denenecek.")
 
-            is_active_playback = self._is_playing or (self._output_stream and self._output_stream.active)
-            if is_speech is not None:
-                vad_msg = Bool()
-                vad_msg.data = bool(is_speech) and not is_active_playback
-                self.pub_vad.publish(vad_msg)
+            is_active_playback = self._acoustic_playback_active()
+            vad_msg = Bool()
+            vad_msg.data = is_speech is True and not is_active_playback
+            self.pub_vad.publish(vad_msg)
 
             # Primary hardware DOA source from ReSpeaker HID (Float32 topic contract preserved)
             if is_speech is True and doa_angle is not None and not is_active_playback:
                 doa_msg = Float32()
                 doa_msg.data = float(doa_angle)
                 self.pub_doa.publish(doa_msg)
-                # HID DOA has ±45° coarse resolution — publish conservative confidence
+                # Politika güveni; ölçülmüş açısal doğruluk veya olasılık değildir.
                 hid_conf_msg = Float32()
                 hid_conf_msg.data = 0.60
                 self.pub_doa_confidence.publish(hid_conf_msg)
 
         except Exception as exc:
             self.get_logger().debug(f"_poll_respeaker_hid error: {exc}")
+
+    def _acoustic_playback_active(self) -> bool:
+        """Açık DAC sessiz kalabilir; gerçek oynatma, kuyruk ve yankı kuyruğu esas."""
+        now = time.monotonic()
+        return bool(
+            self._is_playing
+            or not self._play_queue.empty()
+            or now - self._last_playback_time < self.echo_mute_cooldown_s
+            or now - self._last_output_chunk_time < self.echo_mute_cooldown_s
+        )
 
     @staticmethod
     def _under_pytest() -> bool:
@@ -881,11 +832,7 @@ class AudioStreamNode(Node):
                     f"{corr_str}"
                 )
 
-            is_active_playback = (
-                self._is_playing
-                or (now - self._last_playback_time < self.echo_mute_cooldown_s)
-                or (now - self._last_output_chunk_time < self.echo_mute_cooldown_s)
-            )
+            is_active_playback = self._acoustic_playback_active()
 
             if not is_active_playback and rms < 400.0:
                 # Continuously adapt ambient background noise floor during quiet periods
@@ -1188,10 +1135,11 @@ class AudioStreamNode(Node):
                 if chunk and len(chunk) > 0:
                     t_w_start = time.perf_counter()
                     with self._playback_lock:
+                        # İlk blocking write sürerken de robot konuşuyor.
+                        self._is_playing = True
                         out_stream.write(chunk)
                     t_w_end = time.perf_counter()
 
-                    self._is_playing = True
                     self._last_playback_time = time.monotonic()
                     gen_played_bytes += len(chunk)
                     self._current_gen_played_bytes = gen_played_bytes
@@ -1267,11 +1215,7 @@ class AudioStreamNode(Node):
 
     def _publish_status(self):
         msg = Bool()
-        msg.data = bool(
-            self._is_playing
-            or not self._play_queue.empty()
-            or (time.monotonic() - self._last_output_chunk_time) < self.echo_mute_cooldown_s
-        )
+        msg.data = self._acoustic_playback_active()
         self.pub_playback_active.publish(msg)
 
     def destroy_node(self):
