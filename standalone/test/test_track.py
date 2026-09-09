@@ -120,19 +120,19 @@ def test_front_jitter_suppressed_by_deadband():
     for i, doa in enumerate(jitter_sequence):
         target = loc.update(doa_raw=doa, voice_activity=True, timestamp=1.0 + i * 0.05)
         assert target == 0.0
-# 6b. ReSpeaker DOA -> logical yaw -> motor_yaw (-target_yaw) koordinat dönüşümü doğrulaması:
-# 32  -> logical -45 -> motor +45
+# 6b. ReSpeaker DOA -> logical yaw -> motor_yaw koordinat doğrulaması:
+# 32  -> logical -45 -> motor -45
 # 78  -> logical 0   -> motor 0
-# 142 -> logical +45 -> motor -45
-# 149 -> logical +90 -> motor -90
-def test_audio_logical_to_motor_yaw_inversion():
+# 142 -> logical +45 -> motor +45
+# 149 -> logical +90 -> motor +90
+def test_audio_logical_to_motor_yaw():
     from track import ReSpeakerAudioLocalizer
 
     cases = [
-        (32.0, -45.0, 45.0),
+        (32.0, -45.0, -45.0),
         (78.0, 0.0, 0.0),
-        (142.0, 45.0, -45.0),
-        (149.0, 90.0, -90.0),
+        (142.0, 45.0, 45.0),
+        (149.0, 90.0, 90.0),
     ]
 
     for doa, expected_logical, expected_motor in cases:
@@ -142,8 +142,8 @@ def test_audio_logical_to_motor_yaw_inversion():
         assert loc.motor_yaw_deg == pytest.approx(expected_motor, abs=1e-3)
 
 
-def test_track_main_sends_inverted_motor_yaw_and_logs():
-    """main() döngüsünde audio aktifken head.send_angle()'a motor_yaw = -target_yaw gönderildiğini
+def test_track_main_sends_motor_yaw_and_logs():
+    """main() döngüsünde audio aktifken head.send_angle()'a motor_yaw = target_yaw gönderildiğini
     ve 'AUDIO logical=... motor=...' logunun basıldığını doğrular.
     """
     import io
@@ -157,7 +157,7 @@ def test_track_main_sends_inverted_motor_yaw_and_logs():
 
     mock_hid = MagicMock(spec=["voice_activity", "doa_angle"])
     mock_hid.voice_activity.return_value = True
-    # DOA 32 -> logical -45 -> motor +45
+    # DOA 32 -> logical -45 -> motor -45
     mock_hid.doa_angle.return_value = 32.0
 
     mock_head = MagicMock()
@@ -176,8 +176,8 @@ def test_track_main_sends_inverted_motor_yaw_and_logs():
 
     assert mock_head.send_angle.called
     sent_angles = [call[0][0] for call in mock_head.send_angle.call_args_list]
-    assert any(pytest.approx(45.0, abs=1.0) == a for a in sent_angles)
-    assert "AUDIO logical=-45.0 motor=+45.0" in cikti.getvalue()
+    assert any(pytest.approx(-45.0, abs=1.0) == a for a in sent_angles)
+    assert "AUDIO logical=-45.0 motor=-45.0" in cikti.getvalue()
 
 
 # 5. circular wrap: 358, 359, 0, 1 -> ortalama ~0

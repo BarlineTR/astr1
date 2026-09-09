@@ -280,13 +280,8 @@ class ReSpeakerAudioLocalizer:
 
     @property
     def motor_yaw_deg(self) -> float:
-        """Motor command yaw with inverted coordinate sign for HeadLink/firmware.
-
-        logical yaw: LEFT = -45°, RIGHT = +45°
-        motor yaw:   LEFT = +45°, RIGHT = -45°
-        """
-        yaw = self.target_yaw_deg
-        return -yaw if yaw != 0.0 else 0.0
+        """Motor command yaw matching target_yaw_deg."""
+        return self.target_yaw_deg
 
     def is_tracking(self, now: Optional[float] = None) -> bool:
         """Returns True if localizer is currently actively tracking speech."""
@@ -569,13 +564,7 @@ def main(argv=None, hid=None) -> int:
                 last_audio_log_yaw = None
             elif localizer.is_tracking(now):
                 target_yaw = localizer.target_yaw_deg
-                # ReSpeakerAudioLocalizer'ın calibrated_yaw çıktısından sonra,
-                # HeadLink'e gönderilmeden hemen önce koordinat terslenir:
-                # logical -45 -> motor +45 (fiziksel SOL)
-                # logical 0   -> motor 0   (fiziksel ÖN)
-                # logical +45 -> motor -45 (fiziksel SAĞ)
-                # logical +90 -> motor -90 (fiziksel SAĞ 90)
-                motor_yaw = -target_yaw if target_yaw != 0.0 else 0.0
+                motor_yaw = target_yaw
                 result.target_yaw_deg = target_yaw
                 result.owner = PrioritySource.ACTIVE_SPEAKER
                 result.gaze_state = GazeStateEnum.ORIENTING
