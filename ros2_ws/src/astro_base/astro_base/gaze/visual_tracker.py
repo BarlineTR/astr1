@@ -122,16 +122,20 @@ class KalmanTrack3D:
             self.is_known = True
         self.eye_contact = obs.eye_contact
 
-    def mark_missed(self, timestamp: float, coast_timeout_s: float = 0.70) -> None:
+    def mark_missed(self, timestamp: float, coast_timeout_s: float = 2.0) -> None:
         """Marks track as unobserved in current frame; promotes to COASTING or LOST."""
         self.missed_frames += 1
-        self.confidence = max(0.1, self.confidence * 0.85)
+        self.confidence = max(0.1, self.confidence * 0.95)
 
         time_since_seen = timestamp - self.last_seen_time
         if time_since_seen > coast_timeout_s:
             self.state = TrackingState.LOST
         else:
             self.state = TrackingState.COASTING
+            for k in range(3, 6):
+                self.x[k] *= 0.80
+                if abs(self.x[k]) < 0.05:
+                    self.x[k] = 0.0
 
     def get_track_summary(self) -> VisualTargetTrack:
         """Generates a VisualTargetTrack summary dataclass."""
@@ -167,8 +171,8 @@ class VisualTrackerCore:
     def __init__(
         self,
         transformer: Optional[CoordinateTransformer] = None,
-        gating_distance_m: float = 0.85,
-        coasting_timeout_s: float = 0.70,
+        gating_distance_m: float = 1.10,
+        coasting_timeout_s: float = 2.0,
     ):
         self.transformer = transformer or CoordinateTransformer()
         self.gating_distance_m = gating_distance_m

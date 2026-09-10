@@ -344,6 +344,9 @@ class StandaloneGazeRosNode(Node):
         self._gesture_sequence: List[Tuple[float, float]] = []
         self._gesture_cooldown_until: float = 0.0
         self._post_speech_guard_until: float = 0.0
+        self._last_visual_active_time: float = 0.0
+        self._last_visual_yaw: float = 0.0
+        self.visual_deadband_deg: float = 2.5
 
         # Audio Integration: ROS topic bridge (default) vs standalone hardware mode
         if use_audio:
@@ -497,7 +500,13 @@ class StandaloneGazeRosNode(Node):
         if hasattr(msg, "timestamp") and msg.timestamp is not None:
             t = float(msg.timestamp)
         elif hasattr(msg, "header") and hasattr(msg.header, "stamp") and getattr(msg.header.stamp, "sec", 0) > 0:
-            t = float(msg.header.stamp.sec) + float(msg.header.stamp.nanosec) * 1e-9
+            raw_t = float(msg.header.stamp.sec) + float(msg.header.stamp.nanosec) * 1e-9
+            # If header.stamp is UNIX epoch (> 1e8) while camera uses monotonic (< 1e8),
+            # fall back to time.monotonic() to prevent 50-year time domain divergence
+            if raw_t > 1e8 and time.monotonic() < 1e8:
+                t = time.monotonic()
+            else:
+                t = raw_t
         else:
             t = time.monotonic()
         if hasattr(msg, "position_deg") and not math.isnan(msg.position_deg):
@@ -579,6 +588,9 @@ class StandaloneGazeRosNode(Node):
                 self._latest_vad_active = val
                 if val:
                     self._latest_vad_time = now
+                elif self._audio_sectors is not None:
+                    self._audio_sectors.reset()
+                    self._latest_doa_deg = None
                 # Post-speech echo guard: ignore VAD during reverb window
                 if now < self._post_speech_guard_until:
                     return
@@ -630,7 +642,7 @@ class StandaloneGazeRosNode(Node):
             target = float(raw_val)
         except (ValueError, TypeError):
             return
-        clamped = max(-70.0, min(70.0, target))
+        clamped = max(-80.0, min(80.0, target))
         self._manual_target_yaw = clamped
         self._manual_target_deadline = time.monotonic() + 4.0
         self.get_logger().info(
@@ -736,6 +748,8 @@ class StandaloneGazeRosNode(Node):
             if self._latest_doa_deg is not None and not in_reverb_guard:
                 if (now - self._latest_doa_time) <= self.audio_freshness_s:
                     doa_deg = self._latest_doa_deg
+                    if self._audio_sectors is not None:
+                        doa_deg = self._audio_sectors.update(doa_deg, now)
 
             # Check VAD / speech freshness
             speech = None
@@ -993,37 +1007,70 @@ class StandaloneGazeRosNode(Node):
         elif vision_active:
             self.localizer.on_vision_active()
             target_yaw = float(res.target_yaw_deg)
+
+            # Center deadband filter: when holding attention and face is already within ±2.5° of center,
+            # freeze target_yaw to avoid motor hunting / oscillation when sitting in front.
+            if res.gaze_state == GazeStateEnum.HOLDING_ATTENTION and detections:
+                bbox_cx = float(detections[0].x + (detections[0].w / 2.0))
+                bbox_cy = float(detections[0].y + (detections[0].h / 2.0))
+                raw_bearing, _ = self.runtime.tracker.transformer.camera_pixel_to_optical_angles(
+                    bbox_cx, bbox_cy, frame_w, frame_h
+                )
+                if abs(raw_bearing) <= getattr(self, "visual_deadband_deg", 2.5):
+                    if hasattr(self, "last_published_yaw") and self.last_published_yaw != 0.0:
+                        target_yaw = self.last_published_yaw
+
             motor_yaw = target_yaw
             self._last_audio_log_yaw = None
+            self._last_visual_active_time = now_m
+            self._last_visual_yaw = target_yaw
             if res.target_id:
                 self._last_visual_target_id = res.target_id
             if res.owner != PrioritySource.VISUAL_TRACKING:
                 res.owner = PrioritySource.VISUAL_TRACKING
                 if not res.target_id:
                     res.target_id = self._last_visual_target_id
-        elif self.localizer.is_tracking(now_m):
-            self._last_visual_target_id = None
-            target_yaw = float(self.localizer.target_yaw_deg)
+        elif (now_m - getattr(self, "_last_visual_active_time", 0.0)) < 1.5 and getattr(self, "_last_visual_target_id", None):
+            # Visual grace window: hold heading for 1.5s rather than immediately snapping to audio reacquisition or 0°
+            target_yaw = getattr(self, "_last_visual_yaw", 0.0)
             motor_yaw = target_yaw
             res.target_yaw_deg = target_yaw
-            res.owner = PrioritySource.ACTIVE_SPEAKER
-            res.gaze_state = GazeStateEnum.ORIENTING
-            res.target_id = "audio_speaker_1"
-            if self._last_audio_log_yaw != motor_yaw:
-                doa_val = self.localizer.last_raw_doa
-                doa_str = f"{doa_val:.0f}" if doa_val is not None else "?"
-                sector_str = self.localizer.confirmed_sector or "?"
-                self.get_logger().info(f"AUDIO sector={sector_str} DOA={doa_str} target={target_yaw:+.1f}")
-                self._last_audio_log_yaw = motor_yaw
+            res.owner = PrioritySource.VISUAL_TRACKING
+            res.gaze_state = GazeStateEnum.TARGET_LOST
+            res.target_id = self._last_visual_target_id
         else:
-            self._last_visual_target_id = None
-            target_yaw = 0.0
-            motor_yaw = 0.0
-            res.target_yaw_deg = 0.0
-            res.owner = PrioritySource.IDLE
-            res.gaze_state = GazeStateEnum.IDLE
-            res.target_id = None
-            self._last_audio_log_yaw = None
+            # Check for active audio reacquisition
+            is_speaking_device = bool(self._playback_active or self._robot_speaking)
+            fresh_speech = False
+            if not is_speaking_device and now_m >= getattr(self, "_post_speech_guard_until", 0.0):
+                if self.audio_source_mode in ("topics", "ros"):
+                    fresh_speech = bool((now_m - self._latest_vad_time <= 1.0) and self._latest_vad_active)
+                else:
+                    fresh_speech = bool((now_m - getattr(self.localizer, "_last_voice_activity_time", 0.0)) <= 1.0)
+
+            if self.localizer.is_tracking(now_m) and fresh_speech:
+                self._last_visual_target_id = None
+                target_yaw = float(self.localizer.target_yaw_deg)
+                motor_yaw = target_yaw
+                res.target_yaw_deg = target_yaw
+                res.owner = PrioritySource.ACTIVE_SPEAKER
+                res.gaze_state = GazeStateEnum.ORIENTING
+                res.target_id = "audio_speaker_1"
+                if self._last_audio_log_yaw != motor_yaw:
+                    doa_val = self.localizer.last_raw_doa
+                    doa_str = f"{doa_val:.0f}" if doa_val is not None else "?"
+                    sector_str = self.localizer.confirmed_sector or "?"
+                    self.get_logger().info(f"AUDIO sector={sector_str} DOA={doa_str} target={target_yaw:+.1f}")
+                    self._last_audio_log_yaw = motor_yaw
+            else:
+                self._last_visual_target_id = None
+                target_yaw = 0.0
+                motor_yaw = 0.0
+                res.target_yaw_deg = 0.0
+                res.owner = PrioritySource.IDLE
+                res.gaze_state = GazeStateEnum.IDLE
+                res.target_id = None
+                self._last_audio_log_yaw = None
 
         social_offset = self._current_social_offset(arrival_ts)
         if social_offset != 0.0:

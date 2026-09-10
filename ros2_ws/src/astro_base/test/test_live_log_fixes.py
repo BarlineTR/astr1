@@ -251,6 +251,105 @@ class TestLiveLogFixes(unittest.TestCase):
 
         bridge.destroy_node()
 
+    def test_visual_deadband_suppresses_hunting_when_centered(self):
+        """When settled in HOLDING_ATTENTION and face is within ±2.5° of camera center,
+        target_yaw must remain stable and not produce hunting motor jitter.
+        """
+        from tracker import Detection
+        from astro_base.gaze.types import GazeStateEnum
+        node = StandaloneGazeRosNode(use_camera_source=False, enable_audio=False)
+        det = [Detection(x=320, y=200, w=80, h=80, confidence=0.9)]
+
+        # Settle into HOLDING_ATTENTION
+        for i in range(50):
+            t = 10.0 + i * 0.033
+            node._on_head_state(type("HState", (), {"position_deg": node.last_published_yaw, "velocity_deg_s": 0.0})())
+            node.step_frame(detections=det, frame_size=(640, 480), timestamp=t)
+
+        self.assertEqual(node.latest_result.gaze_state, GazeStateEnum.HOLDING_ATTENTION)
+        prev_target = node.last_published_yaw
+
+        # Face slightly jitters (+1.1° optical bearing from center: x=310 instead of 320)
+        det_jitter = [Detection(x=310, y=200, w=80, h=80, confidence=0.9)]
+        res = node.step_frame(detections=det_jitter, frame_size=(640, 480), timestamp=10.0 + 51 * 0.033)
+
+        # target_yaw must be held at prev_target rather than hunting
+        self.assertEqual(node.last_published_yaw, prev_target)
+        node.destroy_node()
+
+    def test_kalman_velocity_damping_prevents_runaway(self):
+        """KalmanTrack3D must dampen velocity during coasting to prevent drift."""
+        from astro_base.gaze.visual_tracker import KalmanTrack3D
+        from astro_base.gaze.types import VisualObservation
+
+        mock_obs = VisualObservation(
+            timestamp=1.0,
+            valid=True,
+            bbox=(300, 200, 60, 60),
+            u_norm=0.0,
+            v_norm=0.0,
+            depth_m=1.0,
+            pos_3d_camera=(0.0, 0.0, 1.0),
+            camera_azimuth_deg=0.0,
+            camera_elevation_deg=0.0,
+            body_azimuth_deg=0.0,
+            confidence=0.85,
+        )
+        track = KalmanTrack3D(track_id="p1", initial_pos_3d=(1.0, 0.0, 0.0), timestamp=1.0, obs=mock_obs)
+        track.x[3:6] = [0.1, 0.5, 0.0]
+
+        for i in range(10):
+            track.mark_missed(timestamp=1.0 + (i + 1) * 0.05, coast_timeout_s=2.0)
+
+        speed = float((track.x[3]**2 + track.x[4]**2 + track.x[5]**2)**0.5)
+        self.assertLess(speed, 0.10)
+
+    def test_visual_grace_window_and_audio_reacq_vad_guard(self):
+        """Visual target loss must hold heading for 1.5s before allowing fallback.
+        Audio reacquisition must require fresh active speech VAD, preventing
+        background TV/noise from snapping the head to +60°.
+        """
+        from tracker import Detection
+        node = StandaloneGazeRosNode(use_camera_source=False, enable_audio=True)
+        node.audio_source_mode = "topics"
+        t0 = 50.0
+
+        # 1. Visual lock at +20.0°
+        face_det = [Detection(x=150, y=200, w=80, h=80, confidence=0.9)]
+        res = node.step_frame(detections=face_det, frame_size=(640, 480), timestamp=t0)
+        self.assertAlmostEqual(node._last_visual_yaw, node.last_published_yaw, places=1)
+        last_yaw = node._last_visual_yaw
+
+        # 2. Face is temporarily missed (0.5s later)
+        node.localizer._tracking_active = True
+        node.localizer.active_target_yaw = 60.0  # LEFT = +60.0°
+        node.localizer._last_valid_target_time = t0 + 0.5
+        node._latest_vad_active = False  # NO human speech currently active
+
+        res_missed = node.step_frame(detections=[], frame_size=(640, 480), timestamp=t0 + 0.5)
+
+        # Must HOLD last visual yaw due to 1.5s visual grace window, NOT snap to +60.0°!
+        self.assertEqual(node.last_published_yaw, last_yaw)
+        self.assertNotEqual(node.last_published_yaw, 60.0)
+
+        # 3. After visual tracking expires and goes to IDLE without active speech VAD
+        # Step through to t0 + 6.0
+        for dt in [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]:
+            res_expired = node.step_frame(detections=[], frame_size=(640, 480), timestamp=t0 + dt)
+        # Should go to IDLE (0.0°), NOT snap to +60.0°!
+        self.assertEqual(node.last_published_yaw, 0.0)
+
+        # 4. Now user actually speaks (VAD True)
+        node._latest_vad_active = True
+        node._latest_vad_time = t0 + 7.0
+        node.localizer._tracking_active = True
+        node.localizer.active_target_yaw = 60.0
+        node.localizer._last_valid_target_time = t0 + 7.0
+        res_speech = node.step_frame(detections=[], frame_size=(640, 480), timestamp=t0 + 7.0)
+        self.assertEqual(node.last_published_yaw, 60.0)
+
+        node.destroy_node()
+
 
 if __name__ == "__main__":
     unittest.main()
