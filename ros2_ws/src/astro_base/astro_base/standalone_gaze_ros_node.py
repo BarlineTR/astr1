@@ -339,6 +339,9 @@ class StandaloneGazeRosNode(Node):
         self._robot_speaking: bool = False
         self._manual_target_yaw: float = 0.0
         self._manual_target_deadline: float = 0.0
+        self._social_yaw_offset: float = 0.0
+        self._social_offset_expiry: float = 0.0
+        self._gesture_sequence: List[Tuple[float, float]] = []
 
         # Audio Integration: ROS topic bridge (default) vs standalone hardware mode
         if use_audio:
@@ -455,6 +458,8 @@ class StandaloneGazeRosNode(Node):
         self.create_subscription(Bool, "/safety/emergency_stop", self._on_emergency_stop, 10)
         self.create_subscription(Bool, "/system/sleep", self._on_sleep_mode, 10)
         self.create_subscription(Float32, "/head/target_yaw", self._on_target_yaw, 10)
+        self.create_subscription(Float32, "/head/social_offset_yaw", self._on_social_offset_yaw, 10)
+        self.create_subscription(String, "/head/gesture", self._on_head_gesture, 10)
 
         # Direct CameraSource Integration (Hardware pipeline)
         if use_cam:
@@ -609,6 +614,63 @@ class StandaloneGazeRosNode(Node):
         self.get_logger().info(
             f"🎯 [HEAD TARGET OVERRIDE] /head/target_yaw received: {clamped:+.1f}° (latched 4.0s)"
         )
+
+    def _on_social_offset_yaw(self, msg) -> None:
+        """Receives non-verbal social gaze aversion micro-offset (e.g. +3.0° during thinking)."""
+        raw_val = getattr(msg, "data", msg)
+        try:
+            val = float(raw_val)
+        except (ValueError, TypeError):
+            return
+        self._social_yaw_offset = max(-15.0, min(15.0, val))
+        self._social_offset_expiry = time.monotonic() + 3.0
+
+    def _on_head_gesture(self, msg) -> None:
+        """Executes non-verbal subtle head gestures (nod, shake, tilt) on top of active gaze."""
+        raw_val = getattr(msg, "data", msg)
+        if not raw_val:
+            return
+        g_name = str(raw_val).strip().lower()
+        now = time.monotonic()
+        if g_name in ("nod", "yes", "onayla"):
+            self._gesture_sequence = [
+                (2.5, now + 0.12),
+                (-2.0, now + 0.24),
+                (0.0, now + 0.36),
+            ]
+            self.get_logger().info("🎭 [Gesture] Dinleme onay baş sallaması (nod) uygulandı.")
+        elif g_name in ("shake", "no", "reddet"):
+            self._gesture_sequence = [
+                (5.0, now + 0.12),
+                (-5.0, now + 0.24),
+                (2.5, now + 0.36),
+                (0.0, now + 0.48),
+            ]
+            self.get_logger().info("🎭 [Gesture] Baş sallama (shake) uygulandı.")
+        elif g_name in ("tilt", "curious", "merak"):
+            self._gesture_sequence = [
+                (3.5, now + 0.20),
+                (0.0, now + 0.40),
+            ]
+            self.get_logger().info("🎭 [Gesture] Merak kafa eğme (tilt) uygulandı.")
+        elif g_name in ("center", "reset", "sifirla"):
+            self._gesture_sequence = []
+            self._social_yaw_offset = 0.0
+
+    def _current_social_offset(self, now: float) -> float:
+        """Computes current non-verbal head offset without disrupting gaze tracking."""
+        if self._gesture_sequence:
+            step_target, step_deadline = self._gesture_sequence[0]
+            if now < step_deadline:
+                return step_target
+            self._gesture_sequence.pop(0)
+            if self._gesture_sequence:
+                return self._gesture_sequence[0][0]
+        if self._social_yaw_offset != 0.0:
+            if now < self._social_offset_expiry:
+                return self._social_yaw_offset
+            self._social_yaw_offset = 0.0
+        return 0.0
 
     def _sample_acoustic_state(
         self, now: float
@@ -918,18 +980,21 @@ class StandaloneGazeRosNode(Node):
             res.target_id = None
             self._last_audio_log_yaw = None
 
+        social_offset = self._current_social_offset(arrival_ts)
+        effective_motor_yaw = float(max(-70.0, min(70.0, motor_yaw + social_offset)))
+
         self.latest_result = res
-        self.last_published_yaw = motor_yaw
-        self.runtime.last_target_yaw_deg = motor_yaw
+        self.last_published_yaw = effective_motor_yaw
+        self.runtime.last_target_yaw_deg = effective_motor_yaw
 
         # Direct Actuator Dispatch (ONE RESULT -> ONE AUTHORITATIVE TARGET)
         if self.pub_head_command is not None:
             hcmd = HeadCmd()
-            hcmd.angle_deg = motor_yaw
+            hcmd.angle_deg = effective_motor_yaw
             self.pub_head_command.publish(hcmd)
 
         cmd_pos = Float32()
-        cmd_pos.data = motor_yaw
+        cmd_pos.data = effective_motor_yaw
         self.pub_head_cmd_pos.publish(cmd_pos)
 
         if self.pub_active_target is not None:
@@ -1157,16 +1222,17 @@ class StandaloneGazeRosNode(Node):
                 target_yaw = float(self.localizer.target_yaw_deg)
             else:
                 target_yaw = 0.0
-            self.runtime.last_target_yaw_deg = target_yaw
         else:
             target_yaw = float(self.runtime.get_keepalive_yaw_deg())
+        social_offset = self._current_social_offset(now_m)
+        effective_yaw = float(max(-70.0, min(70.0, target_yaw + social_offset)))
         cmd_pos = Float32()
-        cmd_pos.data = float(target_yaw)
+        cmd_pos.data = float(effective_yaw)
         self.pub_head_cmd_pos.publish(cmd_pos)
 
         if self.pub_head_command is not None:
             hcmd = HeadCmd()
-            hcmd.angle_deg = float(target_yaw)
+            hcmd.angle_deg = float(effective_yaw)
             self.pub_head_command.publish(hcmd)
 
     def destroy_node(self) -> bool:

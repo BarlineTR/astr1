@@ -47,6 +47,15 @@ except ImportError:
     qos_profile_sensor_data = 10  # rclpy yoksa (mock/test modu) düz derinlik
     class HeadCmd:  # type: ignore
         angle_deg: float = 0.0
+    class _MockPublisher:
+        def __init__(self, topic=""):
+            self.topic = topic
+            self.last_msg = None
+            self.count = 0
+        def publish(self, msg):
+            self.last_msg = msg
+            self.count += 1
+
     class Node:  # type: ignore
         def __init__(self, *args, **kwargs):
             pass
@@ -55,8 +64,8 @@ except ImportError:
             return logging.getLogger("AstroRealtimeNode")
         def create_subscription(self, *args, **kwargs):
             return None
-        def create_publisher(self, *args, **kwargs):
-            return None
+        def create_publisher(self, msg_type, topic, *args, **kwargs):
+            return _MockPublisher(topic)
         def create_timer(self, *args, **kwargs):
             return None
     class _MockMsg:
@@ -884,8 +893,15 @@ class AstroRealtimeNode(Node):
         self.pub_gesture = self.create_publisher(String, "/robot/head_gesture", 10)
         self.pub_head_gesture = self.create_publisher(String, "/head/gesture", 10)
         self.pub_head_target_yaw = self.create_publisher(Float32, "/head/target_yaw", 10)
+        self.pub_social_offset_yaw = self.create_publisher(Float32, "/head/social_offset_yaw", 10)
         self.pub_explicit_gaze = self.create_publisher(String, "/behavior/explicit_gaze", 10)
         self.pub_transcript = self.create_publisher(String, "/speech/text", 10)
+
+        # Non-verbal Attentive Social Body Language State
+        self._user_speaking_active: bool = False
+        self._user_speech_start_time: float = 0.0
+        self._last_attentive_nod_time: float = 0.0
+        self._gaze_aversion_active: bool = False
         # Single output owner for /head_command is social_gaze_node
         self.pub_telemetry = self.create_publisher(String, "/astro/telemetry", 10)
         self.pub_diagnostics = self.create_publisher(DiagnosticArray, "/diagnostics", 10)
@@ -957,6 +973,7 @@ class AstroRealtimeNode(Node):
         self._last_summarized_turn_count = 0
         self.create_timer(1.0, self._check_session_lifecycle)
         self.create_timer(1.0, self._publish_system_telemetry)
+        self.create_timer(0.5, self._social_attentive_listener_tick)
 
         # Purge any corrupted / profanity records
         self._purge_corrupted_biometrics()
@@ -2010,6 +2027,14 @@ class AstroRealtimeNode(Node):
 
                 is_first = (self._packets_for_gen == 1)
                 if is_first:
+                    # Direct eye contact re-engagement: restore gaze offset to 0.0
+                    if getattr(self, "pub_social_offset_yaw", None) and getattr(self, "_gaze_aversion_active", False):
+                        self._gaze_aversion_active = False
+                        off_msg = Float32()
+                        off_msg.data = 0.0
+                        self.pub_social_offset_yaw.publish(off_msg)
+                        self.get_logger().info("👀 [Direct Eye Contact] Robot cevap veriyor — Göz teması yeniden kuruldu.")
+
                     self._first_audio_time = time.monotonic()
                     created_start = getattr(self, "_response_start_time", None) or self._first_audio_time
                     vad_start = getattr(self, "_vad_end_time", None) or created_start
@@ -2082,6 +2107,15 @@ class AstroRealtimeNode(Node):
 
         # 3. User Speech Started
         elif event_type == "input_audio_buffer.speech_started":
+            self._user_speaking_active = True
+            self._user_speech_start_time = time.monotonic()
+            self._last_attentive_nod_time = self._user_speech_start_time
+            if getattr(self, "pub_social_offset_yaw", None) and getattr(self, "_gaze_aversion_active", False):
+                self._gaze_aversion_active = False
+                off_msg = Float32()
+                off_msg.data = 0.0
+                self.pub_social_offset_yaw.publish(off_msg)
+
             # Acoustic protection: if playback just started (< 350ms), server speech_started is speaker echo onset!
             now_mono = time.monotonic()
             playback_elapsed_ms = (now_mono - getattr(self, "_playback_start_monotonic", 0.0)) * 1000.0
@@ -2133,6 +2167,15 @@ class AstroRealtimeNode(Node):
         elif event_type == "input_audio_buffer.speech_stopped":
             if self._is_sleeping:
                 return
+            self._user_speaking_active = False
+            self._user_speech_start_time = 0.0
+            # Thinking gaze aversion: look slightly aside (+3.0°) while generating response
+            if getattr(self, "pub_social_offset_yaw", None):
+                self._gaze_aversion_active = True
+                off_msg = Float32()
+                off_msg.data = 3.0
+                self.pub_social_offset_yaw.publish(off_msg)
+                self.get_logger().info("🤔 [Thinking Gaze Aversion] Robot düşünüyor — Bakış hafifçe kaçırıldı (+3.0°).")
             self._vad_end_time = time.monotonic()
             if getattr(self, "architecture_profile", "profile_a") == "profile_b":
                 self.get_logger().info("🤫 [Realtime Profile B] Cümle bitti, OpenAI native response bekleniyor (Async biometric side-channel başlatılıyor)...")
@@ -6809,14 +6852,47 @@ class AstroRealtimeNode(Node):
             )
 
     def _on_vad(self, msg: Bool):
-        self._vad_active = bool(msg.data)
+        val = bool(msg.data)
+        self._vad_active = val
+        if val and getattr(self, "_user_speech_start_time", 0.0) <= 0.0:
+            self._user_speech_start_time = time.monotonic()
+            self._last_attentive_nod_time = self._user_speech_start_time
+        elif not val and not getattr(self, "_user_speaking_active", False):
+            self._user_speech_start_time = 0.0
         if getattr(self, "action_manager", None):
             self.action_manager.update_audio_state(
-                vad_active=bool(msg.data),
+                vad_active=val,
                 rms_level=getattr(self, "_latest_mic_rms", None),
                 is_speaking=self._is_responding,
                 is_playback_active=self._is_playback_active,
             )
+
+    def _social_attentive_listener_tick(self):
+        """Provides subtle non-verbal listening cues (nodding) while user is actively talking."""
+        try:
+            now = time.monotonic()
+            is_user_talking = (
+                getattr(self, "_user_speaking_active", False)
+                or getattr(self, "_vad_active", False)
+            )
+            if not is_user_talking:
+                self._user_speech_start_time = 0.0
+                return
+
+            if getattr(self, "_user_speech_start_time", 0.0) <= 0.0:
+                self._user_speech_start_time = now
+                self._last_attentive_nod_time = now
+                return
+
+            if (now - getattr(self, "_last_attentive_nod_time", 0.0)) >= 2.5:
+                self._last_attentive_nod_time = now
+                if getattr(self, "pub_head_gesture", None):
+                    nod_msg = String()
+                    nod_msg.data = "nod"
+                    self.pub_head_gesture.publish(nod_msg)
+                    self.get_logger().info("👂 [Attentive Listening] Kullanıcı dinleniyor — Onay baş hareketi (nod) üretildi.")
+        except Exception as exc:
+            self.get_logger().debug(f"_social_attentive_listener_tick error: {exc}")
 
     def resolve_identities(self) -> Dict[str, Any]:
         """Separates and resolves:

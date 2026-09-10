@@ -126,3 +126,41 @@ class TestStandaloneCameraPublishing:
         assert payload["is_known"] is True
         assert payload["confidence"] == 0.90
         assert payload["formal_title"] == "Baran Bey"
+
+    def test_social_gaze_offset(self):
+        """Social offset (+3.0° during thinking) is smoothly added to head command without losing tracking."""
+        from types import SimpleNamespace
+        node = StandaloneGazeRosNode(use_camera_source=False, enable_audio=False)
+        # Publish social offset
+        node._on_social_offset_yaw(SimpleNamespace(data=3.0))
+        assert node._social_yaw_offset == 3.0
+
+        # Step a frame with target at 0.0°
+        node.step_frame([], (640, 480), timestamp=time.monotonic())
+        assert node.last_published_yaw == 3.0
+
+        # Reset offset to 0.0°
+        node._on_social_offset_yaw(SimpleNamespace(data=0.0))
+        node.step_frame([], (640, 480), timestamp=time.monotonic())
+        assert node.last_published_yaw == 0.0
+
+    def test_head_gesture_nod_sequence(self):
+        """Head nod gesture executes a subtle micro-motion sequence without breaking face tracking."""
+        from types import SimpleNamespace
+        node = StandaloneGazeRosNode(use_camera_source=False, enable_audio=False)
+        node._on_head_gesture(SimpleNamespace(data="nod"))
+        assert len(node._gesture_sequence) == 3
+
+        now = time.monotonic()
+        # First step offset
+        off1 = node._current_social_offset(now)
+        assert off1 == 2.5
+
+        # After first step (150ms)
+        off2 = node._current_social_offset(now + 0.15)
+        assert off2 == -2.0
+
+        # After sequence completes (400ms)
+        off3 = node._current_social_offset(now + 0.40)
+        assert off3 == 0.0
+
