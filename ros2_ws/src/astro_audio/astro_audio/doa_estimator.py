@@ -29,6 +29,7 @@ class ReSpeakerGeometry:
     """
     HALF_SPACING_M = 0.032
     PAIR_DIST_M = 0.064
+    RADIUS_M = 0.043
     SPEED_OF_SOUND_MPS = 343.0
     SAMPLE_RATE = 16000
 

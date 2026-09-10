@@ -942,8 +942,14 @@ class StandaloneGazeRosNode(Node):
         )
 
         now_m = arrival_ts
-        if vision_active:
-            self._manual_target_deadline = 0.0
+        if now_m < getattr(self, "_manual_target_deadline", 0.0):
+            target_yaw = float(self._manual_target_yaw)
+            motor_yaw = target_yaw
+            res.target_yaw_deg = target_yaw
+            res.owner = PrioritySource.ACTIVE_SPEAKER
+            res.gaze_state = GazeStateEnum.ORIENTING
+            res.target_id = "target_override"
+        elif vision_active:
             self.localizer.on_vision_active()
             target_yaw = float(res.target_yaw_deg)
             motor_yaw = target_yaw
@@ -968,13 +974,6 @@ class StandaloneGazeRosNode(Node):
                 sector_str = self.localizer.confirmed_sector or "?"
                 self.get_logger().info(f"AUDIO sector={sector_str} DOA={doa_str} target={target_yaw:+.1f}")
                 self._last_audio_log_yaw = motor_yaw
-        elif now_m < getattr(self, "_manual_target_deadline", 0.0):
-            target_yaw = float(self._manual_target_yaw)
-            motor_yaw = target_yaw
-            res.target_yaw_deg = target_yaw
-            res.owner = PrioritySource.ACTIVE_SPEAKER
-            res.gaze_state = GazeStateEnum.ORIENTING
-            res.target_id = "target_override"
         else:
             self._last_visual_target_id = None
             target_yaw = 0.0
@@ -986,7 +985,11 @@ class StandaloneGazeRosNode(Node):
             self._last_audio_log_yaw = None
 
         social_offset = self._current_social_offset(arrival_ts)
-        effective_motor_yaw = float(max(-70.0, min(70.0, motor_yaw + social_offset)))
+        if social_offset != 0.0:
+            max_limit = getattr(self.localizer, "max_yaw_deg", 75.0)
+            effective_motor_yaw = float(max(-max_limit, min(max_limit, motor_yaw + social_offset)))
+        else:
+            effective_motor_yaw = motor_yaw
 
         self.latest_result = res
         self.last_published_yaw = effective_motor_yaw
@@ -1230,7 +1233,11 @@ class StandaloneGazeRosNode(Node):
         else:
             target_yaw = float(self.runtime.get_keepalive_yaw_deg())
         social_offset = self._current_social_offset(now_m)
-        effective_yaw = float(max(-70.0, min(70.0, target_yaw + social_offset)))
+        if social_offset != 0.0:
+            max_limit = getattr(self.localizer, "max_yaw_deg", 75.0)
+            effective_yaw = float(max(-max_limit, min(max_limit, target_yaw + social_offset)))
+        else:
+            effective_yaw = float(target_yaw)
         cmd_pos = Float32()
         cmd_pos.data = float(effective_yaw)
         self.pub_head_cmd_pos.publish(cmd_pos)

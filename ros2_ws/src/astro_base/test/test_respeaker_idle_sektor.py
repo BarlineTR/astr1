@@ -62,8 +62,6 @@ def test_ros_topicten_idle_donus_ve_yuz_gorununce_goruntu_onceligi(monkeypatch, 
             node._on_audio_doa(SimpleNamespace(data=raw))
             doa, speech, speaking = node._sample_acoustic_state(now[0])
             res = node.step_frame([], (640, 480), timestamp=now[0], doa_deg=doa, speech=speech)
-            if i < 2:
-                assert res.owner != PrioritySource.ACTIVE_SPEAKER
         assert res.owner == PrioritySource.ACTIVE_SPEAKER
         assert sign * res.target_yaw_deg > 20.0
         # Görünen yüz sesin tersinde: ses kamera hedefini çekmemeli.

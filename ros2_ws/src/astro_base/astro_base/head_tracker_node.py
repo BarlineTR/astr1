@@ -404,7 +404,7 @@ class HeadTrackerNode(Node):
         quiet window after each command is the honest approximation; streaming head ticks
         back over the serial link would let this become exact.
         """
-        return (now - self._last_motion_cmd_time) < self.head_motion_settle_s
+        return (now - getattr(self, "_last_motion_cmd_time", 0.0)) < getattr(self, "head_motion_settle_s", 0.4)
 
     @property
     def _current_yaw(self) -> float:
@@ -513,9 +513,10 @@ class HeadTrackerNode(Node):
                 return
 
             # 2. Priority check: If gesture, safety, or active turn_to_sound is running, do NOT override
-            if self._command_source in (CommandSource.SAFETY, CommandSource.GESTURE):
+            cmd_src = getattr(self, "_command_source", CommandSource.IDLE)
+            if cmd_src in (CommandSource.SAFETY, CommandSource.GESTURE):
                 return
-            if self._command_source == CommandSource.TURN_TO_SOUND and self._turn_to_sound_active:
+            if cmd_src == CommandSource.TURN_TO_SOUND and getattr(self, "_turn_to_sound_active", False):
                 return
 
             # 3. Vision Priority: If camera actively sees a person/face, do NOT override with acoustic DOA
@@ -568,8 +569,8 @@ class HeadTrackerNode(Node):
                         break
 
             # 2D LiDAR (Radar) Fusion Association: Snap coarse acoustic angle to precise physical human/obstacle detected in zone
-            if not matched_person_name and self.lidar_fusion_enabled and getattr(self, "_lidar_person_detected", False):
-                if (now - getattr(self, "_lidar_last_seen_time", 0.0)) <= self.lidar_timeout_s:
+            if not matched_person_name and getattr(self, "lidar_fusion_enabled", False) and getattr(self, "_lidar_person_detected", False):
+                if (now - getattr(self, "_lidar_last_seen_time", 0.0)) <= getattr(self, "lidar_timeout_s", 2.0):
                     lidar_target = getattr(self, "_lidar_target_yaw", 0.0)
                     lidar_dist = getattr(self, "_lidar_distance_m", 0.0)
                     if abs(angular_diff_deg(candidate_yaw, lidar_target)) <= 35.0:

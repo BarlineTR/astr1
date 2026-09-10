@@ -90,6 +90,7 @@ except ImportError:
             self.key = str(key)
             self.value = str(value)
     Twist = Imu = JointState = Float32 = object
+    HeadState = None
 
 
 SOF1 = 0xAA
@@ -796,13 +797,13 @@ class SerialBridge(Node):
 
     def handle_msg(self, msg_id: int, payload: bytes):
         if msg_id == MSG_IMU_DATA:
-            self._rx_count_imu += 1
+            self._rx_count_imu = getattr(self, "_rx_count_imu", 0) + 1
             if len(payload) != 6 * 4 + 4:
                 return
             ax, ay, az, gx, gy, gz, micros_ts = struct.unpack("<ffffffI", payload)
             self.publish_imu(ax, ay, az, gx, gy, gz, micros_ts)
         elif msg_id == MSG_ENCODER_TICKS:
-            self._rx_count_enc += 1
+            self._rx_count_enc = getattr(self, "_rx_count_enc", 0) + 1
             if len(payload) == 16:
                 l, r, head_ticks, dt_us = struct.unpack("<iiiI", payload)
                 self.publish_joint_states(l, r, dt_us, head_ticks=head_ticks)
@@ -811,13 +812,13 @@ class SerialBridge(Node):
                 self.publish_joint_states(l, r, dt_us, head_ticks=None)
 
         elif msg_id == MSG_DIAGNOSTICS:
-            self._rx_count_diag += 1
+            self._rx_count_diag = getattr(self, "_rx_count_diag", 0) + 1
             if len(payload) != 8:
                 return
             vbat_mV, temp_cX100, flags = struct.unpack("<HhI", payload)
             self.publish_diag(vbat_mV, temp_cX100, flags)
         elif msg_id == MSG_HEARTBEAT_ACK:
-            self._rx_count_ack += 1
+            self._rx_count_ack = getattr(self, "_rx_count_ack", 0) + 1
             now_mono = time.monotonic()
             ack_seq = getattr(self, "_hb_seq", 0)
             if len(payload) >= 4:

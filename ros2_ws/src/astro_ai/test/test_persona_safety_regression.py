@@ -46,7 +46,7 @@ class TestPersonaAndSafetyRegression(unittest.TestCase):
         for query in user_provocations:
             self.assertTrue(ResponseSafetyGate.PROMPT_INJECTION_PATTERN.search(query))
         prompt = self.persona_engine.build_system_prompt()
-        self.assertIn("ÇİĞNEME", prompt.upper())
+        self.assertTrue("çiğneme" in prompt.lower() or "çiğneme" in prompt)
 
     def test_scenario_3_prompt_injection_jailbreak(self):
         jailbreaks = [
