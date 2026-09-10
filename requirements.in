@@ -53,3 +53,6 @@ pytest
 
 # ── Görü ────────────────────────────────────────────────────
 opencv-python<5         # face_detector_node Haar cascade kullanıyor (bkz. yukarıdaki not)
+
+# ── ROS 2 Colcon / Build uyumu ──────────────────────────────
+setuptools<70           # setuptools >= 80 setup.py develop/editable desteğini kaldırdığı için colcon --symlink-install bozuluyor
