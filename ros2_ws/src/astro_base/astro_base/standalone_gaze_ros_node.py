@@ -157,6 +157,14 @@ except ImportError:
         msg.data = array.array("B", frame.tobytes())
         return msg
 
+try:
+    from astro_vision.face_recognizer import FaceRecognizer
+except ImportError:
+    try:
+        from face_recognizer import FaceRecognizer
+    except ImportError:
+        FaceRecognizer = None
+
 
 def _coerce_bool(val: Any) -> bool:
     """Robustly coerces booleans, numbers, and string representations ('false', '0', etc.)."""
@@ -426,6 +434,19 @@ class StandaloneGazeRosNode(Node):
         else:
             self.pub_camera_image = None
 
+        # Face Recognition Publisher (Local 0-Token OpenCV SFace)
+        self.face_recognizer = None
+        if FaceRecognizer is not None:
+            try:
+                self.face_recognizer = FaceRecognizer()
+                self.get_logger().info("👤 [FaceRecognizer] SFace yerel yüz tanıma motoru yüklendi.")
+            except Exception as fr_err:
+                self.get_logger().debug(f"FaceRecognizer skipped: {fr_err}")
+
+        self.pub_recognized_person = self.create_publisher(String, "/vision/recognized_person", 10)
+        self._last_face_recog_time: float = 0.0
+        self._face_recog_interval_s: float = 1.5
+
         # Subscriptions (Authoritative Feedback & Diagnostic Only - NO ROS Vision Topics)
         qos_best_effort = QoSProfile(depth=10, reliability=ReliabilityPolicy.BEST_EFFORT)
         if HeadState is not None:
@@ -649,6 +670,7 @@ class StandaloneGazeRosNode(Node):
                         self.get_logger().debug(f"Camera frame publish error: {pub_err}")
 
                 detections = self.camera.detect(frame)
+                self._maybe_recognize_face(frame, detections)
                 t_detect_done = time.monotonic()
                 frame_h, frame_w = frame.shape[:2]
 
@@ -676,6 +698,58 @@ class StandaloneGazeRosNode(Node):
     # Frame-Synchronous Visual Processing API
     # =========================================================================
 
+    def _maybe_recognize_face(self, frame: Optional[np.ndarray], detections: Sequence[Detection]) -> None:
+        """Asynchronously and non-blockingly identifies faces via local OpenCV SFace."""
+        if not getattr(self, "face_recognizer", None) or not detections or frame is None:
+            return
+        now_m = time.monotonic()
+        if (now_m - getattr(self, "_last_face_recog_time", 0.0)) < getattr(self, "_face_recog_interval_s", 1.5):
+            return
+        self._last_face_recog_time = now_m
+
+        try:
+            best_det = max(detections, key=lambda d: d.w * d.h)
+            h, w = frame.shape[:2]
+            margin_x = int(best_det.w * 0.15)
+            margin_y = int(best_det.h * 0.15)
+            x1 = max(0, best_det.x - margin_x)
+            y1 = max(0, best_det.y - margin_y)
+            x2 = min(w, best_det.x + best_det.w + margin_x)
+            y2 = min(h, best_det.y + best_det.h + margin_y)
+            if x2 <= x1 or y2 <= y1:
+                return
+            face_roi = frame[y1:y2, x1:x2].copy()
+
+            def _worker(roi):
+                try:
+                    name, conf, meta = self.face_recognizer.recognize_face(roi)
+                    if name:
+                        payload = {
+                            "name": name,
+                            "confidence": float(conf) if conf is not None else 0.85,
+                            "is_known": True,
+                            "title": meta.get("title", ""),
+                            "formal_title": meta.get("formal_title", name)
+                        }
+                    else:
+                        payload = {
+                            "name": "Misafir",
+                            "confidence": float(conf) if conf is not None else 0.0,
+                            "is_known": False,
+                            "title": "Misafir",
+                            "formal_title": "Misafir"
+                        }
+                    msg = String()
+                    msg.data = json.dumps(payload)
+                    if getattr(self, "pub_recognized_person", None):
+                        self.pub_recognized_person.publish(msg)
+                except Exception as rec_err:
+                    self.get_logger().debug(f"_maybe_recognize_face worker notice: {rec_err}")
+
+            threading.Thread(target=_worker, args=(face_roi,), daemon=True).start()
+        except Exception as exc:
+            self.get_logger().debug(f"_maybe_recognize_face notice: {exc}")
+
     def step_camera_frame(
         self,
         frame,
@@ -699,6 +773,7 @@ class StandaloneGazeRosNode(Node):
             detections = self.camera.detect(frame)
         else:
             detections = []
+        self._maybe_recognize_face(frame, detections)
         t_end = time.monotonic()
         frame_h, frame_w = frame.shape[:2]
         if timestamp is not None:

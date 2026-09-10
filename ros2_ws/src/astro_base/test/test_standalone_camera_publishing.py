@@ -97,3 +97,32 @@ class TestStandaloneCameraPublishing:
         node._last_camera_pub_time = time.monotonic() - 0.15
         node.step_camera_frame(dummy_frame)
         assert node.pub_camera_image.count == initial_count + 1
+
+    def test_face_recognition_publishing(self):
+        """When face_recognizer is present, recognized_person message is published asynchronously."""
+        from unittest.mock import MagicMock
+        from tracker import Detection
+        import json
+
+        node = StandaloneGazeRosNode(use_camera_source=False, enable_audio=False)
+        assert node.pub_recognized_person is not None
+
+        mock_fr = MagicMock()
+        mock_fr.recognize_face.return_value = ("Baran", 0.90, {"title": "Baş Mühendis", "formal_title": "Baran Bey"})
+        node.face_recognizer = mock_fr
+
+        dummy_frame = np.zeros((480, 640, 3), dtype=np.uint8)
+        det = Detection(x=100, y=100, w=150, h=150, confidence=0.95)
+
+        node._last_face_recog_time = 0.0
+        node._maybe_recognize_face(dummy_frame, [det])
+
+        # Wait briefly for worker thread
+        time.sleep(0.1)
+
+        assert node.pub_recognized_person.last_msg is not None
+        payload = json.loads(node.pub_recognized_person.last_msg.data)
+        assert payload["name"] == "Baran"
+        assert payload["is_known"] is True
+        assert payload["confidence"] == 0.90
+        assert payload["formal_title"] == "Baran Bey"
