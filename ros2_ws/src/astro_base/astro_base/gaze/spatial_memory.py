@@ -142,6 +142,14 @@ class EpistemicSpatialMemory:
                 sec.registered_time = timestamp
                 return
 
+        # Purge stale person records near this empty bearing so we don't loop endlessly
+        stale_pids = [
+            pid for pid, rec in self._people_memory.items()
+            if circular_distance_deg(bearing, rec.last_seen_bearing_deg) <= 20.0
+        ]
+        for pid in stale_pids:
+            del self._people_memory[pid]
+
         self._reverb_sectors.append(
             AcousticReverbSector(
                 center_deg=bearing,

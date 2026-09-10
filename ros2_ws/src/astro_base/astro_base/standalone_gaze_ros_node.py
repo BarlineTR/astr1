@@ -234,7 +234,7 @@ class StandaloneGazeRosNode(Node):
         self.declare_parameter("audio_hold_grace", 5.0)
         self.declare_parameter("audio_deadband", 5.0)
         self.declare_parameter("audio_doa_profile", "respeaker_sectors")
-        self.declare_parameter("audio_confirm_from_idle", True)
+        self.declare_parameter("audio_confirm_from_idle", False)
         self.declare_parameter("audio_sector_confirm_count", 2)
         self.declare_parameter("audio_device", -1)
         self.declare_parameter("mic_channels", "")
@@ -998,7 +998,6 @@ class StandaloneGazeRosNode(Node):
                 GazeStateEnum.HOLDING_ATTENTION,
                 GazeStateEnum.ORIENTING,
                 GazeStateEnum.ACQUIRING,
-                GazeStateEnum.TARGET_LOST,
             )
         )
 
@@ -1036,14 +1035,6 @@ class StandaloneGazeRosNode(Node):
                 res.owner = PrioritySource.VISUAL_TRACKING
                 if not res.target_id:
                     res.target_id = self._last_visual_target_id
-        elif (now_m - getattr(self, "_last_visual_active_time", 0.0)) < 1.5 and getattr(self, "_last_visual_target_id", None):
-            # Visual grace window: hold heading for 1.5s rather than immediately snapping to audio reacquisition or 0°
-            target_yaw = getattr(self, "_last_visual_yaw", 0.0)
-            motor_yaw = target_yaw
-            res.target_yaw_deg = target_yaw
-            res.owner = PrioritySource.VISUAL_TRACKING
-            res.gaze_state = GazeStateEnum.TARGET_LOST
-            res.target_id = self._last_visual_target_id
         else:
             # Check for active audio reacquisition
             is_speaking_device = bool(self._playback_active or self._robot_speaking)

@@ -240,7 +240,6 @@ def main(argv=None, hid=None) -> int:
                     GazeStateEnum.HOLDING_ATTENTION,
                     GazeStateEnum.ORIENTING,
                     GazeStateEnum.ACQUIRING,
-                    GazeStateEnum.TARGET_LOST,
                 )
             )
 

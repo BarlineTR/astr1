@@ -135,6 +135,7 @@ class SocialGazeFSM:
         self._last_target_observed_time: float = 0.0
         self._last_idle_saccade_time: float = 0.0
         self._saccade_direction: int = 1
+        self._reorient_attempted: bool = False
 
     @property
     def safety_lock(self) -> bool:
@@ -309,6 +310,7 @@ class SocialGazeFSM:
                 self._transition_to(GazeStateEnum.HOLDING_ATTENTION, timestamp, reason=f"PREEMPTION_HOLD_{decision.reason}")
 
         elif decision.owner in (PrioritySource.ACTIVE_SPEAKER, PrioritySource.VISUAL_TRACKING):
+            self._reorient_attempted = False
             target_yaw = decision.target_yaw_deg
             err_deg = abs(angular_diff_deg(target_yaw, actual_head_yaw_deg))
             has_vision = (
@@ -465,10 +467,12 @@ class SocialGazeFSM:
                         )
                     # Conscious check: Do we know where a real human is in the room?
                     known_person_yaw = self.spatial_memory.get_most_likely_person_location(timestamp, max_age_s=15.0) if self.spatial_memory else None
-                    if known_person_yaw is not None and abs(angular_diff_deg(known_person_yaw, actual_head_yaw_deg)) > 15.0:
+                    if not self._reorient_attempted and known_person_yaw is not None and abs(angular_diff_deg(known_person_yaw, actual_head_yaw_deg)) > 15.0:
                         self.target_yaw_deg = known_person_yaw
+                        self._reorient_attempted = True
                         self._transition_to(GazeStateEnum.ORIENTING, timestamp, reason="REORIENT_TO_KNOWN_HUMAN")
                     else:
+                        self.active_target_id = None
                         self._transition_to(GazeStateEnum.TARGET_LOST, timestamp, reason="ACQUISITION_TIMEOUT_NO_TARGET")
 
             elif self.state == GazeStateEnum.TRACKING:
@@ -477,16 +481,19 @@ class SocialGazeFSM:
             elif self.state == GazeStateEnum.HOLDING_ATTENTION:
                 dwell_elapsed = timestamp - self._state_entry_time
                 if dwell_elapsed >= self.min_attention_dwell_s:
+                    self.active_target_id = None
                     self._transition_to(GazeStateEnum.TARGET_LOST, timestamp, reason="ATTENTION_DWELL_EXPIRED")
 
             elif self.state == GazeStateEnum.TARGET_LOST:
                 time_lost = timestamp - self._state_entry_time
                 if time_lost >= self.target_lost_timeout_s:
                     known_person_yaw = self.spatial_memory.get_most_likely_person_location(timestamp, max_age_s=15.0) if self.spatial_memory else None
-                    if known_person_yaw is not None and abs(angular_diff_deg(known_person_yaw, actual_head_yaw_deg)) > 15.0:
+                    if not self._reorient_attempted and known_person_yaw is not None and abs(angular_diff_deg(known_person_yaw, actual_head_yaw_deg)) > 15.0:
                         self.target_yaw_deg = known_person_yaw
+                        self._reorient_attempted = True
                         self._transition_to(GazeStateEnum.ORIENTING, timestamp, reason="LOST_REORIENT_TO_KNOWN_HUMAN")
                     else:
+                        self.active_target_id = None
                         self._transition_to(GazeStateEnum.RECOVERING, timestamp, reason="TARGET_LOST_TIMEOUT_RECOVER")
 
             elif self.state == GazeStateEnum.RECOVERING:
@@ -499,6 +506,7 @@ class SocialGazeFSM:
                 if settled_at_center or time_in_recovering >= self.recovery_timeout_s:
                     self.active_target_id = None
                     self.active_priority = PrioritySource.IDLE
+                    self._reorient_attempted = False
                     reason = "RECOVERY_SETTLED_IDLE" if settled_at_center else "RECOVERY_TIMEOUT_IDLE"
                     self._transition_to(GazeStateEnum.IDLE, timestamp, reason=reason)
 
