@@ -219,6 +219,23 @@ class PersistentProfile:
                 "Robotun geliştiricisinin ve üreticisinin adı Baran."
             ]
         self.data["verified_facts"] = clean_facts
+
+        # Guarantee owner in known_people
+        owner_name = self.data.get("owner_name", "Baran")
+        people = self.data.setdefault("known_people", {})
+        owner_norm = owner_name.strip().lower()
+        if owner_norm not in people:
+            people[owner_norm] = {
+                "name": owner_name.strip(),
+                "title": "Baş Mühendis & Geliştirici",
+                "formal_title": f"{owner_name} Bey",
+                "notes": "Robotun yaratıcısı ve baş mühendisi.",
+                "learned_facts": ["Robotik ve yazılımla ilgileniyor."],
+                "preferences": {},
+                "session_summaries": [],
+                "learned_at": time.time()
+            }
+
         self.save()
 
     def save(self):
@@ -313,9 +330,15 @@ class PersistentProfile:
     def get_known_person(self, name: str) -> Optional[Dict[str, Any]]:
         """Retrieves a known person profile by name."""
         with self._lock:
-            people = self.data.get("known_people", {})
+            people = self.data.setdefault("known_people", {})
             norm = name.strip().lower()
-            return people.get(norm)
+            if norm in people:
+                return people[norm]
+            owner_name = self.data.get("owner_name", "Baran")
+            if norm == owner_name.strip().lower():
+                self.add_known_person(owner_name, title="Baş Mühendis & Geliştirici", formal_title=f"{owner_name} Bey")
+                return people.get(norm)
+            return None
 
     def add_person_fact(self, name: str, fact: str) -> bool:
         """Adds a verified learned fact specifically to a known person's profile."""

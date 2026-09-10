@@ -1438,9 +1438,24 @@ class AstroRealtimeNode(Node):
                 f"3. Gerçekte işlem yapmadıysan 'kaydını yaptım', 'işleme aldım', 'kaydettim' gibi sahte iddialarda kesinlikle bulunma.\n"
             )
 
+        recent_sessions = []
+        if getattr(self, "memory", None) and hasattr(self.memory, "profile"):
+            recent_sessions = self.memory.profile.get_person_recent_sessions(name_val, limit=2)
+
+        prev_session_context = ""
+        if recent_sessions:
+            last_sess_text = recent_sessions[-1].get("summary", "")
+            last_sess_time = recent_sessions[-1].get("time_str", "")
+            if last_sess_text:
+                prev_session_context = (
+                    f"\n- [ÖNCEKİ GÖRÜŞME VE HAFIZA BAĞLAMI ({last_sess_time})]: {name_val} ile en son konuşulan konu: '{last_sess_text}'. "
+                    f"Sohbet başlarken veya uygun bir anda doğal, insansı ve samimi bir şekilde buna değinebilirsin (Örn: 'En son ... hakkında konuşmuştuk, nasıl gitti?')."
+                )
+
         memory_rule = (
             "\n\n[HAFIZA VE BAĞLAM KURALI]:\n"
             "- Kullanıcı geçmiş veya tercihlerle ilgili bir şey sorduğunda hafızandaki bilgileri samimiyetle kullan.\n"
+            f"{prev_session_context}\n"
             "- Yapılmayan eylemler için yapılmış gibi iddialarda bulunma."
         )
 
@@ -4540,47 +4555,92 @@ class AstroRealtimeNode(Node):
             f"{dialogue_text}"
         )
         summary = None
-        # 1. Try Groq (0 Token Cost)
+
+        # 1. Try Groq (0 Token Cost / Ultra-fast)
         if self.groq_api_key:
-            try:
-                import urllib.request
-                req_data = {
-                    "model": "llama-3.3-70b-versatile",
-                    "messages": [{"role": "user", "content": prompt}],
-                    "temperature": 0.2,
-                    "max_tokens": 50
-                }
-                req = urllib.request.Request(
-                    "https://api.groq.com/openai/v1/chat/completions",
-                    data=json.dumps(req_data).encode("utf-8"),
-                    headers={
-                        "Content-Type": "application/json",
-                        "Authorization": f"Bearer {self.groq_api_key}"
-                    },
-                    method="POST"
-                )
-                with urllib.request.urlopen(req, timeout=4.0) as resp:
-                    resp_json = json.loads(resp.read().decode("utf-8"))
-                    summary = resp_json["choices"][0]["message"]["content"].strip()
-            except Exception as _exc:
-                self.get_logger().debug(f"_async_summarize_and_save_session: yok sayılan hata ({_exc})")
+            active_groq = discover_groq_models(self.groq_api_key)
+            groq_candidates = active_groq if active_groq else [
+                "llama-3.3-70b-versatile",
+                "openai/gpt-oss-120b",
+                "llama-3.1-8b-instant",
+                "openai/gpt-oss-20b",
+                "qwen/qwen3.6-27b",
+            ]
+            for groq_model in groq_candidates:
+                try:
+                    import urllib.request
+                    req_data = {
+                        "model": groq_model,
+                        "messages": [{"role": "user", "content": prompt}],
+                        "temperature": 0.2,
+                        "max_tokens": 60
+                    }
+                    req = urllib.request.Request(
+                        "https://api.groq.com/openai/v1/chat/completions",
+                        data=json.dumps(req_data).encode("utf-8"),
+                        headers={
+                            "Content-Type": "application/json",
+                            "Authorization": f"Bearer {self.groq_api_key}"
+                        },
+                        method="POST"
+                    )
+                    with urllib.request.urlopen(req, timeout=4.0) as resp:
+                        resp_json = json.loads(resp.read().decode("utf-8"))
+                        cand = resp_json["choices"][0]["message"]["content"].strip()
+                        if cand and len(cand) > 5:
+                            summary = cand
+                            break
+                except Exception as _exc:
+                    self.get_logger().debug(f"_async_summarize_and_save_session Groq ({groq_model}) notice: {_exc}")
 
         # 2. Try Gemini REST (0 Token Cost fallback)
         if not summary and self.gemini_api_key:
-            try:
-                import urllib.request
-                url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={self.gemini_api_key}"
-                payload = {"contents": [{"parts": [{"text": prompt}]}], "generationConfig": {"temperature": 0.2, "maxOutputTokens": 50}}
-                req = urllib.request.Request(url, data=json.dumps(payload).encode("utf-8"), headers={"Content-Type": "application/json"})
-                with urllib.request.urlopen(req, timeout=4.0) as resp:
-                    res_json = json.loads(resp.read().decode("utf-8"))
-                    summary = res_json["candidates"][0]["content"]["parts"][0]["text"].strip()
-            except Exception as _exc:
-                self.get_logger().debug(f"_async_summarize_and_save_session: yok sayılan hata ({_exc})")
+            for gem_model in ["gemini-2.0-flash", "gemini-1.5-flash", "gemini-2.5-flash"]:
+                try:
+                    import urllib.request
+                    url = f"https://generativelanguage.googleapis.com/v1beta/models/{gem_model}:generateContent?key={self.gemini_api_key}"
+                    payload = {
+                        "contents": [{"parts": [{"text": prompt}]}],
+                        "generationConfig": {"temperature": 0.2, "maxOutputTokens": 60}
+                    }
+                    req = urllib.request.Request(url, data=json.dumps(payload).encode("utf-8"), headers={"Content-Type": "application/json"})
+                    with urllib.request.urlopen(req, timeout=4.0) as resp:
+                        res_json = json.loads(resp.read().decode("utf-8"))
+                        cand = res_json["candidates"][0]["content"]["parts"][0]["text"].strip()
+                        if cand and len(cand) > 5:
+                            summary = cand
+                            break
+                except Exception as _exc:
+                    self.get_logger().debug(f"_async_summarize_and_save_session Gemini ({gem_model}) notice: {_exc}")
+
+        # 3. Local Heuristic Distillation Fallback (100% on-device, 0 internet)
+        if not summary:
+            user_phrases = [
+                turn.split(":", 1)[1].strip()
+                for turn in dialogue_text.split(" | ")
+                if turn.startswith("user:") and len(turn.split(":", 1)) > 1
+            ]
+            if user_phrases:
+                summary = f"{person_name} ile {user_phrases[0][:50]} hakkında sohbet edildi."
+            else:
+                summary = f"{person_name} ile kısa bir sohbet gerçekleştirildi."
 
         if summary and len(summary) > 5:
             self.memory.profile.add_person_session_summary(person_name, summary)
             self.get_logger().info(f"📝 [Kalıcı Hafıza Kaydı ({person_name})]: 'Önceki konuşma hafızaya kaydedildi -> {summary}'")
+            if getattr(self, "social_brain", None) and hasattr(self.social_brain, "consolidation_engine"):
+                try:
+                    parsed_turns = [
+                        {"role": t.split(":", 1)[0].strip(), "content": t.split(":", 1)[1].strip()}
+                        for t in dialogue_text.split(" | ")
+                        if ":" in t
+                    ]
+                    self.social_brain.consolidation_engine.consolidate_session(
+                        person_name=person_name,
+                        dialogue_turns=parsed_turns,
+                    )
+                except Exception as sb_err:
+                    self.get_logger().debug(f"SocialBrain consolidation notice: {sb_err}")
             self._sync_perception_to_session()
 
     def _update_playback_reference(self, pcm_16k: bytes):
@@ -6695,8 +6755,16 @@ class AstroRealtimeNode(Node):
             self.get_logger().debug(f"_on_conversation_session_ended: {exc}")
 
     def _ground_speech_gesture(self, text: str):
-        """Speech gestures are disabled to maintain dedicated spatial tracking (Radar + Vision + Audio)."""
-        pass
+        """Maps conversational speech cues to non-verbal physical head gestures."""
+        if not text or not getattr(self, "action_manager", None):
+            return
+        t_low = text.lower()
+        if any(w in t_low for w in ["evet", "haklısın", "kesinlikle", "aynen", "tabii", "tamam"]):
+            self.action_manager.execute_gesture("nod")
+        elif any(w in t_low for w in ["hayır", "öyle bir şey", "değil", "olmaz", "yok"]):
+            self.action_manager.execute_gesture("shake")
+        elif any(w in t_low for w in ["acaba", "nasıl", "neden", "bilmiyorum", "?"]):
+            self.action_manager.execute_gesture("tilt")
 
     def _on_user_emotion(self, msg: String):
         self._user_emotion = msg.data.lower().strip()
