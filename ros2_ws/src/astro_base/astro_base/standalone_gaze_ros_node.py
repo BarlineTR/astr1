@@ -234,6 +234,8 @@ class StandaloneGazeRosNode(Node):
         self.declare_parameter("audio_hold_grace", 5.0)
         self.declare_parameter("audio_deadband", 5.0)
         self.declare_parameter("audio_doa_profile", "respeaker_sectors")
+        self.declare_parameter("audio_confirm_from_idle", True)
+        self.declare_parameter("audio_sector_confirm_count", 2)
         self.declare_parameter("audio_device", -1)
         self.declare_parameter("mic_channels", "")
         self.declare_parameter("mic_spacing", DEFAULT_MIC_SPACING_M)
@@ -264,6 +266,8 @@ class StandaloneGazeRosNode(Node):
         self.audio_hold_grace = float(self.get_parameter("audio_hold_grace").value)
         self.audio_deadband = float(self.get_parameter("audio_deadband").value)
         self.audio_doa_profile = str(audio_doa_profile or self.get_parameter("audio_doa_profile").value)
+        self.audio_confirm_from_idle = _coerce_bool(self.get_parameter("audio_confirm_from_idle").value)
+        self.audio_sector_confirm_count = int(self.get_parameter("audio_sector_confirm_count").value)
         self._audio_sectors = ReSpeakerEyeSectors() if self.audio_doa_profile == "respeaker_eye_20260908" else None
 
         self.respeaker_hid = None
@@ -278,6 +282,8 @@ class StandaloneGazeRosNode(Node):
             hid=self.respeaker_hid,
             hold_timeout_s=self.audio_hold_grace,
             deadband_deg=self.audio_deadband,
+            confirm_from_idle=self.audio_confirm_from_idle,
+            sector_confirm_count=self.audio_sector_confirm_count,
         )
         self._last_visual_target_id: Optional[str] = None
         self._last_audio_log_yaw: Optional[float] = None
@@ -1041,14 +1047,9 @@ class StandaloneGazeRosNode(Node):
         else:
             # Check for active audio reacquisition
             is_speaking_device = bool(self._playback_active or self._robot_speaking)
-            fresh_speech = False
-            if not is_speaking_device and now_m >= getattr(self, "_post_speech_guard_until", 0.0):
-                if self.audio_source_mode in ("topics", "ros"):
-                    fresh_speech = bool((now_m - self._latest_vad_time <= 1.0) and self._latest_vad_active)
-                else:
-                    fresh_speech = bool((now_m - getattr(self.localizer, "_last_voice_activity_time", 0.0)) <= 1.0)
+            in_reverb_guard = now_m < getattr(self, "_post_speech_guard_until", 0.0)
 
-            if self.localizer.is_tracking(now_m) and fresh_speech:
+            if not is_speaking_device and not in_reverb_guard and self.localizer.is_tracking(now_m):
                 self._last_visual_target_id = None
                 target_yaw = float(self.localizer.target_yaw_deg)
                 motor_yaw = target_yaw
@@ -1081,7 +1082,7 @@ class StandaloneGazeRosNode(Node):
 
         self.latest_result = res
         self.last_published_yaw = effective_motor_yaw
-        self.runtime.last_target_yaw_deg = effective_motor_yaw
+        self.runtime.last_target_yaw_deg = motor_yaw
 
         # Direct Actuator Dispatch (ONE RESULT -> ONE AUTHORITATIVE TARGET)
         if self.pub_head_command is not None:

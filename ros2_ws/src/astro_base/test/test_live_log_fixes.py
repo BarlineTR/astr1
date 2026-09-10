@@ -348,7 +348,96 @@ class TestLiveLogFixes(unittest.TestCase):
         res_speech = node.step_frame(detections=[], frame_size=(640, 480), timestamp=t0 + 7.0)
         self.assertEqual(node.last_published_yaw, 60.0)
 
+        # 5. User stops speaking 0.5s later (VAD False) -> MUST retain hold grace!
+        node._latest_vad_active = False
+        res_hold = node.step_frame(detections=[], frame_size=(640, 480), timestamp=t0 + 7.5)
+        self.assertEqual(node.last_published_yaw, 60.0)
+
+        # 6. After hold_grace expires (e.g. 5.5s after speech ended at t0 + 7.0 -> t0 + 12.5)
+        res_expired = node.step_frame(detections=[], frame_size=(640, 480), timestamp=t0 + 12.5)
+        self.assertEqual(node.last_published_yaw, 0.0)
+
         node.destroy_node()
+
+    def test_keepalive_does_not_double_add_social_offset(self):
+        """step_frame() and _passive_keepalive_cycle() must output the exact same
+        effective yaw when social_offset is active, eliminating 3° oscillation.
+        """
+        node = StandaloneGazeRosNode(use_camera_source=False, enable_audio=False)
+        t0 = 1000.0
+
+        # Set social offset = +3.0°
+        node._social_yaw_offset = 3.0
+        node._social_offset_expiry = t0 + 10.0
+
+        # Step frame with no detections (motor_yaw = 0.0)
+        res = node.step_frame(detections=[], frame_size=(640, 480), timestamp=t0)
+        self.assertEqual(node.last_published_yaw, 3.0)
+        self.assertEqual(node.runtime.last_target_yaw_deg, 0.0)  # Stores un-offset base motor_yaw!
+
+        # Capture published command from _passive_keepalive_cycle
+        published_cmds = []
+        node.pub_head_cmd_pos.publish = lambda msg: published_cmds.append(msg.data)
+        node.pub_head_command.publish = lambda msg: None
+
+        with patch("astro_base.standalone_gaze_ros_node.time.monotonic", return_value=t0 + 0.020):
+            node._passive_keepalive_cycle()
+
+        self.assertEqual(len(published_cmds), 1)
+        # Keepalive must publish 3.0°, NOT 6.0° (no doubling!)
+        self.assertEqual(published_cmds[0], 3.0)
+
+        # Now test with active audio target (motor_yaw = 60.0)
+        node.localizer._tracking_active = True
+        node.localizer.active_target_yaw = 60.0
+        node.localizer._last_valid_target_time = t0 + 1.0
+
+        res_audio = node.step_frame(detections=[], frame_size=(640, 480), timestamp=t0 + 1.0)
+        self.assertEqual(node.last_published_yaw, 63.0)  # 60.0 + 3.0
+        self.assertEqual(node.runtime.last_target_yaw_deg, 60.0)
+
+        published_cmds.clear()
+        with patch("astro_base.standalone_gaze_ros_node.time.monotonic", return_value=t0 + 1.020):
+            node._passive_keepalive_cycle()
+
+        self.assertEqual(len(published_cmds), 1)
+        # Keepalive must publish 63.0°, NOT 66.0°!
+        self.assertEqual(published_cmds[0], 63.0)
+
+        node.destroy_node()
+
+    def test_sector_confirmation_from_idle_filters_phantom_spikes(self):
+        """When confirm_from_idle=True, 1 reading must not trigger a turn;
+        2 consecutive readings in the same sector are required to confirm.
+        """
+        from astro_base.gaze.respeaker_localizer import ReSpeakerAudioLocalizer
+        loc = ReSpeakerAudioLocalizer(confirm_from_idle=True, sector_confirm_count=2)
+
+        # 1. Single phantom noise spike in LEFT (DOA 32)
+        loc.update(doa_raw=32.0, voice_activity=True, timestamp=10.0)
+        self.assertFalse(loc.is_tracking())
+        self.assertIsNone(loc.confirmed_sector)
+        self.assertEqual(loc.target_yaw_deg, 0.0)
+
+        # 2. Silence > 0.5s resets pending candidate
+        loc.update(doa_raw=None, voice_activity=False, timestamp=10.6)
+
+        # 3. Another isolated spike in RIGHT (DOA 142)
+        loc.update(doa_raw=142.0, voice_activity=True, timestamp=11.0)
+        self.assertFalse(loc.is_tracking())
+        self.assertIsNone(loc.confirmed_sector)
+        self.assertEqual(loc.target_yaw_deg, 0.0)
+
+        # 4. Sustained human speech: 2nd consecutive reading in RIGHT arrives 30ms later
+        loc.update(doa_raw=142.0, voice_activity=True, timestamp=11.030)
+        self.assertTrue(loc.is_tracking())
+        self.assertEqual(loc.confirmed_sector, "RIGHT")
+        self.assertEqual(loc.target_yaw_deg, -60.0)
+
+        # 5. Speech pauses (VAD False): tracking must remain active during hold grace
+        loc.update(doa_raw=None, voice_activity=False, timestamp=12.0)
+        self.assertTrue(loc.is_tracking(12.0))
+        self.assertEqual(loc.target_yaw_deg, -60.0)
 
 
 if __name__ == "__main__":

@@ -63,6 +63,8 @@ class ReSpeakerAudioLocalizer:
         deadband_deg: float = 5.0,
         outlier_threshold_deg: float = 30.0,
         filter_window_size: int = 5,
+        confirm_from_idle: bool = False,
+        sector_confirm_count: int = 2,
     ):
         self.hid = hid
         self.hold_timeout_s = float(hold_timeout_s)
@@ -70,6 +72,8 @@ class ReSpeakerAudioLocalizer:
         self.deadband_deg = float(deadband_deg)
         self.outlier_threshold_deg = float(outlier_threshold_deg)
         self.filter_window_size = int(filter_window_size)
+        self.confirm_from_idle = bool(confirm_from_idle)
+        self.sector_confirm_count = int(sector_confirm_count)
 
         # Sector state
         self._confirmed_sector: Optional[str] = None
@@ -267,29 +271,60 @@ class ReSpeakerAudioLocalizer:
         if voice_activity and is_valid:
             assert doa_raw is not None
             self.last_raw_doa = float(doa_raw)
+
+            # Silence > 0.5s resets pending candidate
+            if timestamp - self._last_voice_activity_time > 0.5:
+                self._pending_sector = None
+                self._pending_count = 0
+
             self._last_voice_activity_time = timestamp
-            self._last_valid_target_time = timestamp
             was_tracking = self._tracking_active
-            self._tracking_active = True
 
             sector = self.doa_to_sector(doa_raw)
             if sector is not None:
                 if not was_tracking or self._confirmed_sector is None:
-                    # Idle or first detection → accept immediately to react fast
-                    self._confirmed_sector = sector
-                    self._pending_sector = None
-                    self._pending_count = 0
-                    self.active_target_yaw = self.SECTOR_TARGETS[sector]
+                    if self.confirm_from_idle:
+                        if sector == self._confirmed_sector:
+                            # Re-activating previously confirmed sector immediately
+                            self._tracking_active = True
+                            self._last_valid_target_time = timestamp
+                            self.active_target_yaw = self.SECTOR_TARGETS[sector]
+                            self._pending_sector = None
+                            self._pending_count = 0
+                        elif sector == self._pending_sector:
+                            self._pending_count += 1
+                            if self._pending_count >= self.sector_confirm_count:
+                                self._confirmed_sector = sector
+                                self._tracking_active = True
+                                self._last_valid_target_time = timestamp
+                                self.active_target_yaw = self.SECTOR_TARGETS[sector]
+                                self._pending_sector = None
+                                self._pending_count = 0
+                        else:
+                            self._pending_sector = sector
+                            self._pending_count = 1
+                    else:
+                        # Idle or first detection → accept immediately to react fast
+                        self._confirmed_sector = sector
+                        self._tracking_active = True
+                        self._last_valid_target_time = timestamp
+                        self._pending_sector = None
+                        self._pending_count = 0
+                        self.active_target_yaw = self.SECTOR_TARGETS[sector]
                 elif sector == self._confirmed_sector:
                     # Same sector → refresh/reinforce, restore target, clear pending
+                    self._tracking_active = True
+                    self._last_valid_target_time = timestamp
                     self.active_target_yaw = self.SECTOR_TARGETS[sector]
                     self._pending_sector = None
                     self._pending_count = 0
                 elif sector == self._pending_sector:
                     # Consecutive reading in different sector while actively tracking → count up
                     self._pending_count += 1
-                    if self._pending_count >= self.SECTOR_CONFIRM_COUNT:
+                    if self._pending_count >= self.sector_confirm_count:
                         self._confirmed_sector = sector
+                        self._tracking_active = True
+                        self._last_valid_target_time = timestamp
                         self.active_target_yaw = self.SECTOR_TARGETS[sector]
                         self._pending_sector = None
                         self._pending_count = 0
