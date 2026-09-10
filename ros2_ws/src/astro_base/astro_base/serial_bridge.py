@@ -42,23 +42,40 @@ except ImportError:
             pass
     rclpy = _MockRclpy()  # type: ignore
     class Node:  # type: ignore
-        def __init__(self, *args, **kwargs): pass
+        def __init__(self, *args, **kwargs):
+            self._params = {}
         def get_logger(self):
             import logging
             return logging.getLogger("SerialBridge")
-        def declare_parameter(self, *args, **kwargs): pass
+        def declare_parameter(self, name, default=0.0):
+            if not hasattr(self, "_params"):
+                self._params = {}
+            self._params[name] = default
         def get_parameter(self, name):
+            val = getattr(self, "_params", {}).get(name, 0.0)
             class _P:
-                value = 0.0
+                value = val
                 def get_parameter_value(self):
                     class _PV:
-                        string_value = ""
-                        integer_value = 0
+                        string_value = str(val) if isinstance(val, str) else ""
+                        integer_value = int(val) if isinstance(val, (int, float)) else 0
                     return _PV()
             return _P()
-        def create_publisher(self, *args, **kwargs): return None
+        def create_publisher(self, *args, **kwargs):
+            class _Pub:
+                def publish(self, msg): pass
+            return _Pub()
         def create_subscription(self, *args, **kwargs): return None
         def create_timer(self, *args, **kwargs): return None
+        def get_clock(self):
+            class _Clock:
+                def now(self):
+                    class _Time:
+                        def to_msg(self):
+                            return None
+                    return _Time()
+            return _Clock()
+        def destroy_node(self): pass
     class QoSProfile:  # type: ignore
         def __init__(self, *args, **kwargs): pass
     class ReliabilityPolicy:  # type: ignore
@@ -89,7 +106,31 @@ except ImportError:
         def __init__(self, key="", value=""):
             self.key = str(key)
             self.value = str(value)
-    Twist = Imu = JointState = Float32 = object
+    class _DummyMsg:
+        def __init__(self, **kwargs):
+            self.__dict__.update(kwargs)
+    class JointState:
+        def __init__(self):
+            self.header = _MockHeader()
+            self.name = []
+            self.position = []
+            self.velocity = []
+            self.effort = []
+    class Imu:
+        def __init__(self):
+            self.header = _MockHeader()
+            self.linear_acceleration = _DummyMsg(x=0.0, y=0.0, z=0.0)
+            self.angular_velocity = _DummyMsg(x=0.0, y=0.0, z=0.0)
+            self.orientation_covariance = [0.0] * 9
+            self.linear_acceleration_covariance = [0.0] * 9
+            self.angular_velocity_covariance = [0.0] * 9
+    class Twist:
+        def __init__(self):
+            self.linear = _DummyMsg(x=0.0, y=0.0, z=0.0)
+            self.angular = _DummyMsg(x=0.0, y=0.0, z=0.0)
+    class Float32:
+        def __init__(self, data=0.0):
+            self.data = float(data)
     HeadState = None
 
 
@@ -579,9 +620,15 @@ class SerialBridge(Node):
         pkt = self.build_packet(MSG_HEAD_CMD, payload)
         try:
             with self.tx_lock:
-                # Transmit binary MSG_HEAD_CMD packet on change >=0.5 deg (full resolution across -70° to +70°)
+                # Transmit binary MSG_HEAD_CMD packet on change >=0.5 deg
+                # with 30ms minimum interval to prevent oscillation jitter
                 last_sent_angle = getattr(self, "_last_sent_angle", None)
-                if last_sent_angle is None or abs(msg.angle_deg - last_sent_angle) >= 0.5:
+                last_sent_time = getattr(self, "_last_sent_angle_time", 0.0)
+                angle_changed = (last_sent_angle is None or
+                                 abs(msg.angle_deg - last_sent_angle) >= 0.5)
+                min_interval_ok = (now - last_sent_time) >= 0.030
+
+                if angle_changed and min_interval_ok:
                     self.ser.write(pkt)
                     self._last_sent_angle = msg.angle_deg
                     self._last_sent_angle_time = now
@@ -619,8 +666,8 @@ class SerialBridge(Node):
         now = self.get_clock().now()
         dt_s = dt_us / 1e6
 
-        d_left = (left_ticks / self.tpr_l) * 2.0 * math.pi
-        d_right = (right_ticks / self.tpr_r) * 2.0 * math.pi
+        d_left = (left_ticks / self.tpr_l) * 2.0 * math.pi if self.tpr_l > 0 else 0.0
+        d_right = (right_ticks / self.tpr_r) * 2.0 * math.pi if self.tpr_r > 0 else 0.0
 
         self.left_pos += d_left
         self.right_pos += d_right
@@ -628,10 +675,25 @@ class SerialBridge(Node):
         left_vel = d_left / dt_s if dt_s > 0 else 0.0
         right_vel = d_right / dt_s if dt_s > 0 else 0.0
 
+        HEAD_ENCODER_MAX_DEG = 80.0
         if head_ticks is not None:
             # Canonical formula: position_deg = (sign * (head_ticks - zero_offset_ticks)) / ticks_per_head_degree
-            self.head_pos = (self.head_sign * (float(head_ticks) - self.head_zero_offset_ticks)) / self.head_ticks_per_deg
-            self.head_encoder_valid = True
+            raw_pos = (self.head_sign * (float(head_ticks) - self.head_zero_offset_ticks)) / self.head_ticks_per_deg
+            if abs(raw_pos) > HEAD_ENCODER_MAX_DEG:
+                # Encoder value exceeds mechanical limits — reject and use open-loop fallback
+                self.head_pos = float(getattr(self, "_last_sent_angle", 0.0))
+                self.head_encoder_valid = False
+                if not getattr(self, '_encoder_fault_logged', False):
+                    self.get_logger().warn(
+                        f"⚠️ [ENCODER FAULT] head_pos={raw_pos:+.1f}° exceeds "
+                        f"±{HEAD_ENCODER_MAX_DEG}° limit. Using command echo. "
+                        f"head_ticks={head_ticks}"
+                    )
+                    self._encoder_fault_logged = True
+            else:
+                self.head_pos = raw_pos
+                self.head_encoder_valid = True
+                self._encoder_fault_logged = False
         else:
             self.head_pos = float(getattr(self, "_last_sent_angle", 0.0))
             self.head_encoder_valid = False
@@ -885,7 +947,8 @@ class SerialBridge(Node):
 
     def destroy_node(self):
         self._mark_disconnected()
-        super().destroy_node()
+        if hasattr(super(), "destroy_node"):
+            super().destroy_node()
 
 
 def main():

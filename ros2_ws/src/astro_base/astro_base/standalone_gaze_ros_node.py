@@ -342,6 +342,8 @@ class StandaloneGazeRosNode(Node):
         self._social_yaw_offset: float = 0.0
         self._social_offset_expiry: float = 0.0
         self._gesture_sequence: List[Tuple[float, float]] = []
+        self._gesture_cooldown_until: float = 0.0
+        self._post_speech_guard_until: float = 0.0
 
         # Audio Integration: ROS topic bridge (default) vs standalone hardware mode
         if use_audio:
@@ -549,6 +551,9 @@ class StandaloneGazeRosNode(Node):
             with self._audio_lock:
                 self._latest_doa_deg = val
                 self._latest_doa_time = now
+                # Post-speech echo guard: ignore DOA during reverb window
+                if now < self._post_speech_guard_until:
+                    return
                 if self.audio_source_mode in ("topics", "ros"):
                     is_speaking = bool(self._playback_active or self._robot_speaking)
                     vad_val = bool(self._latest_vad_active and not is_speaking)
@@ -585,9 +590,15 @@ class StandaloneGazeRosNode(Node):
         """Receives DAC audio playback status from /audio/playback_active."""
         try:
             with self._audio_lock:
-                self._playback_active = bool(msg.data)
-                if self._playback_active:
+                new_val = bool(msg.data)
+                was_active = self._playback_active
+                self._playback_active = new_val
+                if new_val:
                     self.localizer.reset()
+                elif was_active and not new_val:
+                    # Playback just stopped — apply 1.5s post-speech guard
+                    # to prevent echo/reverb from triggering DOA swings
+                    self._post_speech_guard_until = time.monotonic() + 1.5
         except Exception as e:
             self.get_logger().debug(f"Error in _on_playback_active: {e}")
 
@@ -658,7 +669,13 @@ class StandaloneGazeRosNode(Node):
             self._social_yaw_offset = 0.0
 
     def _current_social_offset(self, now: float) -> float:
-        """Computes current non-verbal head offset without disrupting gaze tracking."""
+        """Computes current non-verbal head offset without disrupting gaze tracking.
+
+        Priority: gesture_sequence > gesture_cooldown > social_yaw_offset.
+        When a gesture (nod/shake/tilt) is executing, social_yaw_offset is
+        suppressed. After the gesture finishes, a 150ms cooldown prevents
+        immediate social_offset re-engagement from causing ±3° oscillation.
+        """
         if self._gesture_sequence:
             step_target, step_deadline = self._gesture_sequence[0]
             if now < step_deadline:
@@ -666,6 +683,13 @@ class StandaloneGazeRosNode(Node):
             self._gesture_sequence.pop(0)
             if self._gesture_sequence:
                 return self._gesture_sequence[0][0]
+            # Gesture just finished: apply cooldown to prevent immediate
+            # social_offset re-engagement from causing jitter
+            self._gesture_cooldown_until = now + 0.15
+            return 0.0
+        # Cooldown guard after gesture completion
+        if now < self._gesture_cooldown_until:
+            return 0.0
         if self._social_yaw_offset != 0.0:
             if now < self._social_offset_expiry:
                 return self._social_yaw_offset
