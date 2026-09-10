@@ -164,3 +164,28 @@ class TestStandaloneCameraPublishing:
         off3 = node._current_social_offset(now + 0.40)
         assert off3 == 0.0
 
+    def test_priority_vision_overrides_manual_target(self):
+        """When manual target (e.g. LiDAR curiosity) is active, a newly seen face instantly overrides it."""
+        from types import SimpleNamespace
+        from tracker import Detection, PrioritySource
+        node = StandaloneGazeRosNode(use_camera_source=False, enable_audio=False)
+        now = time.monotonic()
+
+        # 1. Manual target override set to +45.0°
+        node._on_target_yaw(SimpleNamespace(data=45.0))
+        assert node._manual_target_yaw == 45.0
+        assert node._manual_target_deadline > now
+
+        # With no faces, head follows manual target
+        res_idle = node.step_frame([], (640, 480), timestamp=now)
+        assert node.last_published_yaw == 45.0
+
+        # 2. A face suddenly enters camera FOV at center (x=320, y=240) -> target ~ 0.0°
+        det = Detection(x=300, y=200, w=100, h=100, confidence=0.90)
+        res_face = node.step_frame([det], (640, 480), timestamp=now + 0.033)
+
+        # Vision must override manual target!
+        assert res_face.owner == PrioritySource.VISUAL_TRACKING
+        assert abs(node.last_published_yaw) < 15.0  # Face tracked near center, NOT +45.0°!
+        assert node._manual_target_deadline == 0.0  # Override cleared!
+

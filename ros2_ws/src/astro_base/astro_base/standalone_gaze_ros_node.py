@@ -942,10 +942,8 @@ class StandaloneGazeRosNode(Node):
         )
 
         now_m = arrival_ts
-        if now_m < getattr(self, "_manual_target_deadline", 0.0):
-            target_yaw = float(self._manual_target_yaw)
-            motor_yaw = target_yaw
-        elif vision_active:
+        if vision_active:
+            self._manual_target_deadline = 0.0
             self.localizer.on_vision_active()
             target_yaw = float(res.target_yaw_deg)
             motor_yaw = target_yaw
@@ -970,6 +968,13 @@ class StandaloneGazeRosNode(Node):
                 sector_str = self.localizer.confirmed_sector or "?"
                 self.get_logger().info(f"AUDIO sector={sector_str} DOA={doa_str} target={target_yaw:+.1f}")
                 self._last_audio_log_yaw = motor_yaw
+        elif now_m < getattr(self, "_manual_target_deadline", 0.0):
+            target_yaw = float(self._manual_target_yaw)
+            motor_yaw = target_yaw
+            res.target_yaw_deg = target_yaw
+            res.owner = PrioritySource.ACTIVE_SPEAKER
+            res.gaze_state = GazeStateEnum.ORIENTING
+            res.target_id = "target_override"
         else:
             self._last_visual_target_id = None
             target_yaw = 0.0

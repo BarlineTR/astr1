@@ -75,3 +75,50 @@ class TestNonVerbalSocialBehavior:
 
         assert node._gaze_aversion_active is False
         assert node.pub_social_offset_yaw.last_msg.data == 0.0
+
+    def test_lidar_blindspot_approach_reflex(self, realtime_node):
+        """When IDLE, approaching entity in blind spot triggers curious head turn towards it."""
+        from astro_ai.contracts.spatial_state import SpatialPersonTrack
+        node = realtime_node
+        node._is_sleeping = False
+        node._is_responding = False
+        node._is_playback_active = False
+        node._user_speaking_active = False
+        node._vad_active = False
+        node._gaze_active_target = "NONE"
+        node._last_lidar_curiosity_time = 0.0
+
+        # Create mock approaching track at 45.0° azimuth, 1.5m away
+        mock_track = SpatialPersonTrack(
+            track_id="tr_1",
+            current_x=1.0,
+            current_y=1.0,
+            distance_m=1.41,
+            azimuth_deg=45.0,
+            velocity_mps=-0.15,
+            heading_deg=0.0,
+            last_update_ts=time.monotonic(),
+        )
+
+        mock_tracker = MagicMock()
+        mock_tracker.get_active_tracks.return_value = [mock_track]
+        node.lidar_tracker = mock_tracker
+
+        # 1. IDLE state: reflex fires!
+        node._evaluate_lidar_blindspot_approach()
+        assert node.pub_head_target_yaw.last_msg is not None
+        assert node.pub_head_target_yaw.last_msg.data == 45.0
+
+        # 2. Busy with conversation or face tracking: reflex does NOT fire
+        node._last_lidar_curiosity_time = 0.0
+        node.pub_head_target_yaw.last_msg = None
+        node._gaze_active_target = "face_track_1"  # Face actively tracking!
+        node._evaluate_lidar_blindspot_approach()
+        assert node.pub_head_target_yaw.last_msg is None
+
+        # 3. User talking (VAD active): reflex does NOT fire
+        node._gaze_active_target = "NONE"
+        node._vad_active = True
+        node._evaluate_lidar_blindspot_approach()
+        assert node.pub_head_target_yaw.last_msg is None
+

@@ -179,13 +179,16 @@ except ImportError:
 try:
     from astro_ai.brain.social_brain import SocialBrain
     from astro_ai.contracts.person_state import UnifiedPersonState
+    from astro_ai.spatial.lidar_tracker import LidarTracker
 except ImportError:
     try:
         from brain.social_brain import SocialBrain
         from contracts.person_state import UnifiedPersonState
+        from spatial.lidar_tracker import LidarTracker
     except ImportError:
         SocialBrain = None
         UnifiedPersonState = None
+        LidarTracker = None
 
 
 
@@ -902,6 +905,11 @@ class AstroRealtimeNode(Node):
         self._user_speech_start_time: float = 0.0
         self._last_attentive_nod_time: float = 0.0
         self._gaze_aversion_active: bool = False
+
+        # Spatial Perception & LiDAR Blind-Spot Reflex State
+        self.lidar_tracker = LidarTracker() if LidarTracker else None
+        self._last_lidar_curiosity_time: float = 0.0
+        self._gaze_active_target: str = "NONE"
         # Single output owner for /head_command is social_gaze_node
         self.pub_telemetry = self.create_publisher(String, "/astro/telemetry", 10)
         self.pub_diagnostics = self.create_publisher(DiagnosticArray, "/diagnostics", 10)
@@ -943,6 +951,7 @@ class AstroRealtimeNode(Node):
         self.create_subscription(LaserScan, "/scan_filtered", self._on_laser_scan, qos_profile_sensor_data)
         self.create_subscription(JointState, "/joint_states", self._on_joint_states, qos_profile_sensor_data)
         self.create_subscription(String, "/office/slack_command", self._on_slack_command, 10)
+        self.create_subscription(String, "/gaze/active_target", self._on_gaze_active_target, 10)
 
         # Tool execution deduplication
         self._executed_tool_calls: set[str] = set()
@@ -4214,6 +4223,13 @@ class AstroRealtimeNode(Node):
                 except Exception:
                     pass
 
+            if self.lidar_tracker is not None:
+                try:
+                    self.lidar_tracker.process_scan(ranges, timestamp=time.monotonic())
+                    self._evaluate_lidar_blindspot_approach()
+                except Exception:
+                    pass
+
             # Office Concierge: only trigger in true idle state (not during active conversation or speaking)
             if getattr(self, "office_concierge", None):
                 is_active = (
@@ -4232,6 +4248,60 @@ class AstroRealtimeNode(Node):
                         self._handle_office_welcome(welcome_act)
         except Exception as _exc:
             self.get_logger().debug(f"_on_laser_scan: {_exc}")
+
+    def _on_gaze_active_target(self, msg: Any):
+        self._gaze_active_target = str(getattr(msg, "data", msg) or "NONE").strip()
+
+    def _evaluate_lidar_blindspot_approach(self):
+        """Detects approaching entities in blind spots when IDLE, turning head curiously to look for face."""
+        now = time.monotonic()
+        # Rate limit: at least 4.0 seconds between LiDAR curiosity turns
+        if (now - getattr(self, "_last_lidar_curiosity_time", 0.0)) < 4.0:
+            return
+
+        # Condition 1: Robot must be strictly IDLE
+        if getattr(self, "_is_responding", False) or getattr(self, "_is_playback_active", False):
+            return
+        if getattr(self, "_user_speaking_active", False) or getattr(self, "_vad_active", False):
+            return
+        if getattr(self, "_gaze_active_target", "NONE") not in ("NONE", ""):
+            return
+        if getattr(self, "_is_sleeping", False):
+            return
+
+        if self.lidar_tracker is None:
+            return
+
+        active_tracks = self.lidar_tracker.get_active_tracks()
+        if not active_tracks:
+            return
+
+        # Find entity approaching in the peripheral / blind-spot angle (25° <= |azimuth| <= 70°)
+        # within social distance (< 2.5m)
+        best_candidate = None
+        for tr in active_tracks:
+            az = tr.azimuth_deg
+            if not (25.0 <= abs(az) <= 70.0):
+                continue
+            if tr.distance_m > 2.5 or tr.distance_m < 0.3:
+                continue
+            # Approaching towards robot (negative radial velocity) or entering personal space (< 1.6m)
+            if tr.velocity_mps < -0.05 or tr.distance_m < 1.6:
+                if best_candidate is None or tr.distance_m < best_candidate.distance_m:
+                    best_candidate = tr
+
+        if best_candidate is not None:
+            target_yaw = float(best_candidate.azimuth_deg)
+            self._last_lidar_curiosity_time = now
+            if getattr(self, "pub_head_target_yaw", None):
+                msg = Float32()
+                msg.data = target_yaw
+                self.pub_head_target_yaw.publish(msg)
+                self.get_logger().info(
+                    f"👀 [LiDAR Blindspot Reflex] Kör noktada yaklaşan varlık: "
+                    f"azimuth={target_yaw:+.1f}°, dist={best_candidate.distance_m:.2f}m, "
+                    f"vel={best_candidate.velocity_mps:+.2f}m/s. Merakla yöneliniyor..."
+                )
 
     def _handle_office_welcome(self, welcome_act: Dict[str, Any]):
         """Triggers proactive welcome speech for lobby guests without disruptive gestures."""
