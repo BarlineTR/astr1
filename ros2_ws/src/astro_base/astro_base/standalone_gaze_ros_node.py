@@ -579,6 +579,9 @@ class StandaloneGazeRosNode(Node):
                 self._latest_vad_active = val
                 if val:
                     self._latest_vad_time = now
+                # Post-speech echo guard: ignore VAD during reverb window
+                if now < self._post_speech_guard_until:
+                    return
                 if self.audio_source_mode in ("topics", "ros"):
                     is_speaking = bool(self._playback_active or self._robot_speaking)
                     vad_val = bool(val and not is_speaking)
@@ -596,8 +599,9 @@ class StandaloneGazeRosNode(Node):
                 if new_val:
                     self.localizer.reset()
                 elif was_active and not new_val:
-                    # Playback just stopped — apply 1.5s post-speech guard
+                    # Playback just stopped — reset localizer and apply 1.5s post-speech guard
                     # to prevent echo/reverb from triggering DOA swings
+                    self.localizer.reset()
                     self._post_speech_guard_until = time.monotonic() + 1.5
         except Exception as e:
             self.get_logger().debug(f"Error in _on_playback_active: {e}")
@@ -606,9 +610,16 @@ class StandaloneGazeRosNode(Node):
         """Receives robot speaking status from /robot/is_speaking."""
         try:
             with self._audio_lock:
-                self._robot_speaking = bool(msg.data)
-                if self._robot_speaking:
+                new_val = bool(msg.data)
+                was_speaking = self._robot_speaking
+                self._robot_speaking = new_val
+                if new_val:
                     self.localizer.reset()
+                elif was_speaking and not new_val:
+                    # Robot speaking just finished — reset localizer and apply 1.5s post-speech guard
+                    # to prevent echo/reverb from triggering DOA swings
+                    self.localizer.reset()
+                    self._post_speech_guard_until = time.monotonic() + 1.5
         except Exception as e:
             self.get_logger().debug(f"Error in _on_robot_speaking: {e}")
 
@@ -703,10 +714,16 @@ class StandaloneGazeRosNode(Node):
         if not self.enable_audio:
             return None, None, False
 
+        in_reverb_guard = (now < getattr(self, "_post_speech_guard_until", 0.0))
+
         # If direct AudioSource exists (standalone hardware mode)
         if self.audio is not None and getattr(self.audio, "available", False):
-            doa_deg = self.audio.latest_doa_deg(now)
-            speech = self.audio.latest_speech(now)
+            if in_reverb_guard:
+                doa_deg = None
+                speech = None
+            else:
+                doa_deg = self.audio.latest_doa_deg(now)
+                speech = self.audio.latest_speech(now)
             if self.voice_loop is not None:
                 self.voice_loop.pump(now)
             is_speaking = self.voice_loop.is_speaking_at(now) if self.voice_loop else False
@@ -716,13 +733,13 @@ class StandaloneGazeRosNode(Node):
         with self._audio_lock:
             # Check DOA freshness
             doa_deg = None
-            if self._latest_doa_deg is not None:
+            if self._latest_doa_deg is not None and not in_reverb_guard:
                 if (now - self._latest_doa_time) <= self.audio_freshness_s:
                     doa_deg = self._latest_doa_deg
 
             # Check VAD / speech freshness
             speech = None
-            if self._latest_vad_active:
+            if self._latest_vad_active and not in_reverb_guard:
                 if (now - self._latest_vad_time) <= self.audio_freshness_s:
                     speech = StandaloneSpeechVerdict(
                         is_speech=True, confidence=self._latest_doa_conf

@@ -605,7 +605,12 @@ class SerialBridge(Node):
         self.on_wheel_cmd(wheel_cmd)
 
     def on_head_pos_cmd(self, msg: Float32):
-        """Converts Float32 cmd_pos to HeadCmd for serial transmission."""
+        """Converts Float32 cmd_pos to HeadCmd for serial transmission.
+        Suppressed if an authoritative /head/command was received within 100ms
+        to prevent duplicate dispatch from dual-publishing nodes."""
+        now = time.monotonic()
+        if (now - getattr(self, "_last_canonical_head_cmd_time", 0.0)) < 0.100:
+            return
         cmd = HeadCmd()
         cmd.angle_deg = float(msg.data)
         self.on_head_cmd(cmd)
@@ -615,24 +620,34 @@ class SerialBridge(Node):
             return
 
         now = time.monotonic()
+        self._last_canonical_head_cmd_time = now
         scaled_angle = msg.angle_deg * getattr(self, "head_angle_scale", 1.0)
         payload = struct.pack("<f", scaled_angle)
         pkt = self.build_packet(MSG_HEAD_CMD, payload)
         try:
             with self.tx_lock:
                 # Transmit binary MSG_HEAD_CMD packet on change >=0.5 deg
-                # with 30ms minimum interval to prevent oscillation jitter
+                # with 30ms minimum interval to prevent oscillation jitter.
+                # Also refresh setpoint every 300ms if head hasn't converged (|actual - target| > 2.0°)
+                # so Arduino HEAD_STALL_MS (1.5s) doesn't permanently freeze the motor.
                 last_sent_angle = getattr(self, "_last_sent_angle", None)
                 last_sent_time = getattr(self, "_last_sent_angle_time", 0.0)
                 angle_changed = (last_sent_angle is None or
                                  abs(msg.angle_deg - last_sent_angle) >= 0.5)
                 min_interval_ok = (now - last_sent_time) >= 0.030
 
-                if angle_changed and min_interval_ok:
+                current_head = getattr(self, "head_pos", 0.0)
+                not_at_target = abs(current_head - msg.angle_deg) > 2.0
+                refresh_due = (now - last_sent_time) >= 0.300 and not_at_target
+
+                if (angle_changed and min_interval_ok) or refresh_due:
                     self.ser.write(pkt)
                     self._last_sent_angle = msg.angle_deg
                     self._last_sent_angle_time = now
-                    self.get_logger().info(f"🎯 [SERIAL HEAD CMD] binary_pkt angle_deg={msg.angle_deg:.1f} (scaled={scaled_angle:.2f}°)")
+                    if angle_changed:
+                        self.get_logger().info(f"🎯 [SERIAL HEAD CMD] binary_pkt angle_deg={msg.angle_deg:.1f} (scaled={scaled_angle:.2f}°)")
+                    else:
+                        self.get_logger().debug(f"🔄 [HEAD SETPOINT REFRESH] angle_deg={msg.angle_deg:.1f} actual={current_head:.1f}°")
         except serial.SerialException as exc:
             self.get_logger().error(f"HeadCmd write failed: {exc}")
             self._mark_disconnected()

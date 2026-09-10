@@ -1,9 +1,10 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 """Unit tests verifying live log bug fixes:
 1. Gesture sequence priority & 150ms cooldown over social_yaw_offset (prevents ±3° oscillation)
-2. Post-speech DOA guard (1.5s echo/reverb suppression window after playback ends)
-3. Serial head command throttling (30ms minimum interval guard)
-4. Encoder bounds sanity check (±80° mechanical limit protection & open-loop fallback)
+2. Comprehensive post-speech DOA/VAD/reverb guard (1.5s suppression across all callbacks & sampling)
+3. Serial head command throttling (30ms guard) AND periodic setpoint refresh (300ms when lagging)
+4. Duplicate /head/cmd_pos suppression when /head/command is active
+5. Encoder bounds sanity check (±80° mechanical limit protection & open-loop fallback)
 """
 
 import os
@@ -66,8 +67,9 @@ class TestLiveLogFixes(unittest.TestCase):
 
         node.destroy_node()
 
-    def test_post_speech_doa_guard_suppression(self):
-        """When playback stops, a 1.5s guard window must suppress DOA updates
+    def test_post_speech_doa_and_vad_guard_suppression(self):
+        """When playback or speech stops, a 1.5s guard window must suppress
+        both DOA and VAD updates, and _sample_acoustic_state must report is_speaking=True
         to prevent acoustic echoes/reverb from triggering spurious head turns.
         """
         node = StandaloneGazeRosNode(use_camera_source=False, enable_audio=True)
@@ -76,39 +78,51 @@ class TestLiveLogFixes(unittest.TestCase):
             now = 2000.0
             mock_time.return_value = now
 
-            # Simulate playback active
+            # 1. Simulate playback active -> playback ends
             node._on_playback_active(SimpleNamespace(data=True))
             self.assertTrue(node._playback_active)
-
-            # Playback ends
             node._on_playback_active(SimpleNamespace(data=False))
             self.assertFalse(node._playback_active)
             self.assertEqual(node._post_speech_guard_until, now + 1.5)
 
-            # Mock localizer update
+            # Mock localizer
             node.localizer = MagicMock()
 
-            # DOA message arrives during guard period (now + 0.5s)
+            # During guard (now + 0.5s): DOA arriving should be ignored
             mock_time.return_value = now + 0.5
             node._on_audio_doa(SimpleNamespace(data=142.0))
-
-            # Localizer must NOT have been updated
             node.localizer.update.assert_not_called()
 
-            # DOA message arrives AFTER guard period (now + 1.6s)
+            # During guard: VAD arriving should also be ignored
+            node._on_audio_vad(SimpleNamespace(data=True))
+            node.localizer.update.assert_not_called()
+
+            # During guard: _sample_acoustic_state must suppress DOA/speech
+            doa, speech, is_speaking = node._sample_acoustic_state(now + 0.5)
+            self.assertIsNone(doa)
+            self.assertIsNone(speech)
+
+            # 2. After guard expires (now + 1.6s)
             mock_time.return_value = now + 1.6
             node.audio_source_mode = "topics"
             node._latest_vad_active = True
             node._on_audio_doa(SimpleNamespace(data=142.0))
-
-            # Localizer should now be called
             node.localizer.update.assert_called_once()
+
+            # 3. Test /robot/is_speaking transition also triggers guard
+            mock_time.return_value = now + 10.0
+            node._on_robot_speaking(SimpleNamespace(data=True))
+            self.assertTrue(node._robot_speaking)
+            mock_time.return_value = now + 12.0
+            node._on_robot_speaking(SimpleNamespace(data=False))
+            self.assertFalse(node._robot_speaking)
+            self.assertEqual(node._post_speech_guard_until, now + 12.0 + 1.5)
 
         node.destroy_node()
 
     def test_serial_bridge_head_cmd_30ms_throttling(self):
         """SerialBridge on_head_cmd must not send packets faster than 30ms
-        even if the requested angle changes by >= 0.5°.
+        when the angle changes rapidly.
         """
         bridge = SerialBridge()
         bridge.ser = MagicMock()
@@ -135,6 +149,71 @@ class TestLiveLogFixes(unittest.TestCase):
             bridge.ser.write.assert_called_once()
             self.assertEqual(bridge._last_sent_angle, 3.0)
             self.assertEqual(bridge._last_sent_angle_time, 100.035)
+
+        bridge.destroy_node()
+
+    def test_serial_bridge_head_cmd_periodic_refresh_when_lagging(self):
+        """When the head command stays constant (e.g. 4.4°) but actual head position
+        has not converged (|actual - target| > 2.0°), on_head_cmd must re-transmit
+        the setpoint every 300ms to prevent Arduino stall lockup.
+        """
+        bridge = SerialBridge()
+        bridge.ser = MagicMock()
+        bridge.ser.is_open = True
+        bridge.arduino_alive = True
+        bridge.head_pos = 31.7  # Actual head lagging at 31.7°
+        bridge._last_sent_angle = 4.4
+        bridge._last_sent_angle_time = 100.0
+
+        with patch("astro_base.serial_bridge.time.monotonic") as mock_time:
+            cmd = SimpleNamespace(angle_deg=4.4)
+
+            # At t = 100.100 (100ms later): angle didn't change and dt < 300ms -> NOT sent
+            mock_time.return_value = 100.100
+            bridge.on_head_cmd(cmd)
+            bridge.ser.write.assert_not_called()
+
+            # At t = 100.350 (350ms later): angle didn't change BUT dt >= 300ms and |31.7 - 4.4| = 27.3° > 2.0°
+            # Must trigger periodic setpoint refresh!
+            mock_time.return_value = 100.350
+            bridge.on_head_cmd(cmd)
+            bridge.ser.write.assert_called_once()
+            self.assertEqual(bridge._last_sent_angle_time, 100.350)
+
+            # Once head reaches target (|4.4 - 4.4| = 0 <= 2.0°): no further refresh needed
+            bridge.ser.write.reset_mock()
+            bridge.head_pos = 4.5  # Reached target within 2°
+            mock_time.return_value = 100.700  # 350ms later again
+            bridge.on_head_cmd(cmd)
+            bridge.ser.write.assert_not_called()
+
+        bridge.destroy_node()
+
+    def test_on_head_pos_cmd_duplicate_suppression(self):
+        """When /head/command is actively transmitting, duplicate commands from
+        /head/cmd_pos within 100ms must be suppressed.
+        """
+        bridge = SerialBridge()
+        bridge.ser = MagicMock()
+        bridge.ser.is_open = True
+        bridge.arduino_alive = True
+
+        with patch("astro_base.serial_bridge.time.monotonic") as mock_time:
+            mock_time.return_value = 500.0
+            # Canonical /head/command arrives
+            bridge.on_head_cmd(SimpleNamespace(angle_deg=10.0))
+            self.assertEqual(bridge.ser.write.call_count, 1)
+
+            # Duplicate /head/cmd_pos arrives 2ms later
+            mock_time.return_value = 500.002
+            bridge.on_head_pos_cmd(SimpleNamespace(data=10.0))
+            # Must NOT trigger extra call
+            self.assertEqual(bridge.ser.write.call_count, 1)
+
+            # Standalone usage of /head/cmd_pos (e.g. from test script after 500ms without /head/command)
+            mock_time.return_value = 500.600
+            bridge.on_head_pos_cmd(SimpleNamespace(data=20.0))
+            self.assertEqual(bridge.ser.write.call_count, 2)
 
         bridge.destroy_node()
 
