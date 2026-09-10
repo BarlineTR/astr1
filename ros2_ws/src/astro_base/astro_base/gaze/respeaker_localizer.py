@@ -271,12 +271,6 @@ class ReSpeakerAudioLocalizer:
         if voice_activity and is_valid:
             assert doa_raw is not None
             self.last_raw_doa = float(doa_raw)
-
-            # Silence > 0.5s resets pending candidate
-            if timestamp - self._last_voice_activity_time > 0.5:
-                self._pending_sector = None
-                self._pending_count = 0
-
             self._last_voice_activity_time = timestamp
             was_tracking = self._tracking_active
 
@@ -285,7 +279,6 @@ class ReSpeakerAudioLocalizer:
                 if not was_tracking or self._confirmed_sector is None:
                     if self.confirm_from_idle:
                         if sector == self._confirmed_sector:
-                            # Re-activating previously confirmed sector immediately
                             self._tracking_active = True
                             self._last_valid_target_time = timestamp
                             self.active_target_yaw = self.SECTOR_TARGETS[sector]
@@ -304,7 +297,7 @@ class ReSpeakerAudioLocalizer:
                             self._pending_sector = sector
                             self._pending_count = 1
                     else:
-                        # Idle or first detection → accept immediately to react fast
+                        # Idle or first detection → accept immediately to react fast (track.py)
                         self._confirmed_sector = sector
                         self._tracking_active = True
                         self._last_valid_target_time = timestamp
@@ -320,16 +313,16 @@ class ReSpeakerAudioLocalizer:
                     self._pending_count = 0
                 elif sector == self._pending_sector:
                     # Consecutive reading in different sector while actively tracking → count up
+                    self._last_valid_target_time = timestamp
                     self._pending_count += 1
                     if self._pending_count >= self.sector_confirm_count:
                         self._confirmed_sector = sector
-                        self._tracking_active = True
-                        self._last_valid_target_time = timestamp
                         self.active_target_yaw = self.SECTOR_TARGETS[sector]
                         self._pending_sector = None
                         self._pending_count = 0
                 else:
                     # New pending sector
+                    self._last_valid_target_time = timestamp
                     self._pending_sector = sector
                     self._pending_count = 1
 
