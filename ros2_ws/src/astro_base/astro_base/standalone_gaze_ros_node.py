@@ -458,6 +458,7 @@ class StandaloneGazeRosNode(Node):
                 self.get_logger().debug(f"FaceRecognizer skipped: {fr_err}")
 
         self.pub_recognized_person = self.create_publisher(String, "/vision/recognized_person", 10)
+        self.pub_user_distance = self.create_publisher(Float32, "/vision/user_distance", 10)
         self._last_face_recog_time: float = 0.0
         self._face_recog_interval_s: float = 1.5
 
@@ -1089,6 +1090,16 @@ class StandaloneGazeRosNode(Node):
             tgt_msg = String()
             tgt_msg.data = res.target_id or "NONE"
             self.pub_active_target.publish(tgt_msg)
+
+        if detections and getattr(self, "pub_user_distance", None) is not None:
+            box_w = float(detections[0].w)
+            fw = float(frame_w) if frame_w > 0 else 640.0
+            if box_w > 0:
+                focal_px = fw * 0.8
+                est_dist = float(min(4.0, max(0.3, (0.16 * focal_px) / box_w)))
+                dist_msg = Float32()
+                dist_msg.data = round(est_dist, 2)
+                self.pub_user_distance.publish(dist_msg)
 
         # Synchronized Telemetry
         face_bearing = res.face_bearings_deg[0] if res.face_bearings_deg else None

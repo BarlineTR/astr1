@@ -99,7 +99,7 @@ def generate_launch_description():
             ),
             DeclareLaunchArgument(
                 "inverted",
-                default_value="true",
+                default_value="false",
                 description="Invert RPLIDAR scan (flips left/right for upside down or mirrored mount)",
             ),
             DeclareLaunchArgument(

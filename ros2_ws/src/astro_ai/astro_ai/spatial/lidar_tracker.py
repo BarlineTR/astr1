@@ -31,9 +31,9 @@ class LidarTracker:
     ):
         self.cluster_threshold_m = cluster_threshold_m
         self.min_cluster_points = min_cluster_points
-        self.max_cluster_width_m = max_cluster_width_m
+        self.max_cluster_width_m = max(1.35, max_cluster_width_m)
         self.person_min_width_m = person_min_width_m
-        self.person_max_width_m = person_max_width_m
+        self.person_max_width_m = max(1.25, person_max_width_m)
 
         self._lock = threading.Lock()
         self._last_clusters: List[LidarCluster] = []
@@ -149,8 +149,8 @@ class LidarTracker:
 
         center_x = float(np.mean(xs))
         center_y = float(np.mean(ys))
-        center_r = float(np.mean(rs))
-        center_az = float(np.mean(angles))
+        center_r = float(math.hypot(center_x, center_y))
+        center_az = float(math.degrees(math.atan2(center_y, center_x)))
 
         width = float(math.hypot(xs[-1] - xs[0], ys[-1] - ys[0]))
         if width > self.max_cluster_width_m:
@@ -231,10 +231,10 @@ class LidarTracker:
                     )
                     matched_track_ids.add(tid)
 
-        # Prune stale tracks (> 2.0s without observation)
+        # Prune stale tracks (> 3.0s without observation)
         stale = [
             tid for tid, tr in self._active_tracks.items()
-            if (now - tr.last_update_ts) > 2.0
+            if (now - tr.last_update_ts) > 3.0
         ]
         for tid in stale:
             del self._active_tracks[tid]

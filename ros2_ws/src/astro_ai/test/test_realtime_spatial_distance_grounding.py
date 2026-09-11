@@ -304,6 +304,85 @@ class TestRealtimeSpatialDistanceGrounding(unittest.TestCase):
         self.assertEqual(node._tracked_gaze_yaw, -45.5)
         self.assertGreater(node._last_tracked_gaze_time, 0.0)
 
+    def test_10_mirror_resilience_aligns_inverted_lidar_track(self):
+        """Verify that if LiDAR track is mirrored (+60° vs camera -60°), scoring pairs them and auto-aligns azimuth."""
+        import time
+        from astro_ai.astro_realtime_node import AstroRealtimeNode
+
+        node = MagicMock(spec=AstroRealtimeNode)
+        node.lidar_tracker = LidarTracker()
+        node._azimuth_to_sector = AstroRealtimeNode._azimuth_to_sector
+        node.get_spatial_user_perception = AstroRealtimeNode.get_spatial_user_perception.__get__(node, AstroRealtimeNode)
+
+        # Static clutter behind robot at 0.83m (+126°)
+        node.lidar_tracker._active_tracks["track_desk"] = SpatialPersonTrack(
+            track_id="track_desk",
+            current_x=-0.49,
+            current_y=0.67,
+            distance_m=0.83,
+            azimuth_deg=126.0,
+            velocity_mps=0.00,
+            heading_deg=0.0,
+            last_update_ts=time.monotonic(),
+            is_dynamic=False,
+        )
+
+        # Mirrored LiDAR track at +58.0° (Right side in reality, but seen as +Left in mirrored scan)
+        node.lidar_tracker._active_tracks["track_mirrored_person"] = SpatialPersonTrack(
+            track_id="track_mirrored_person",
+            current_x=0.74,
+            current_y=1.18,
+            distance_m=1.40,
+            azimuth_deg=58.0,
+            velocity_mps=-0.05,
+            heading_deg=0.0,
+            last_update_ts=time.monotonic(),
+            is_dynamic=True,
+        )
+
+        # Active gaze camera is locked to the RIGHT at -60.0°
+        node._tracked_gaze_yaw = -60.0
+        node._last_tracked_gaze_time = time.monotonic()
+        node._gaze_active_target = "person_4"
+        node._speaker_angle = None
+        node._last_doa_time = 0.0
+
+        perception = node.get_spatial_user_perception()
+        self.assertTrue(perception["has_target"])
+        self.assertEqual(perception["distance_m"], 1.40)
+        # Verify auto-alignment flipped the azimuth from +58.0 to -58.0 to match camera
+        self.assertEqual(perception["azimuth_deg"], -58.0)
+        self.assertIn("sağ", perception["sector"].lower())
+
+    def test_11_active_gaze_lock_fallback_never_blind(self):
+        """Verify that when camera is locked onto person_4 but LiDAR has no track, perception returns active gaze target."""
+        import time
+        from astro_ai.astro_realtime_node import AstroRealtimeNode
+
+        node = MagicMock(spec=AstroRealtimeNode)
+        node.lidar_tracker = LidarTracker()
+        node._azimuth_to_sector = AstroRealtimeNode._azimuth_to_sector
+        node.get_spatial_user_perception = AstroRealtimeNode.get_spatial_user_perception.__get__(node, AstroRealtimeNode)
+
+        # Empty LiDAR tracks
+        node.lidar_tracker._active_tracks = {}
+
+        # Camera actively tracking person_7 at +35.0°
+        node._tracked_gaze_yaw = 35.0
+        node._last_tracked_gaze_time = time.monotonic()
+        node._gaze_active_target = "person_7"
+        node._user_distance = 1.25
+        node._last_user_distance_time = time.monotonic()
+        node._speaker_angle = None
+        node._last_doa_time = 0.0
+
+        perception = node.get_spatial_user_perception()
+        self.assertTrue(perception["has_target"])
+        self.assertEqual(perception["distance_m"], 1.25)
+        self.assertEqual(perception["azimuth_deg"], 35.0)
+        self.assertEqual(perception["source"], "vision_gaze")
+
 
 if __name__ == "__main__":
     unittest.main()
+

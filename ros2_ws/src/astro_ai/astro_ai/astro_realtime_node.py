@@ -1467,12 +1467,14 @@ class AstroRealtimeNode(Node):
 
                 # 2. Visual Gaze Alignment (Highest priority: camera is looking at person!)
                 if gaze_fresh and gaze_yaw is not None:
-                    diff_gaze = abs((az - gaze_yaw + 180.0) % 360.0 - 180.0)
-                    if diff_gaze <= 25.0:
+                    diff_direct = abs((az - gaze_yaw + 180.0) % 360.0 - 180.0)
+                    diff_mirror = abs((-az - gaze_yaw + 180.0) % 360.0 - 180.0)
+                    diff_gaze = min(diff_direct, diff_mirror)
+                    if diff_gaze <= 30.0:
                         score += 90.0
-                    elif diff_gaze <= 45.0:
+                    elif diff_gaze <= 55.0:
                         score += 55.0
-                    elif diff_gaze <= 70.0:
+                    elif diff_gaze <= 75.0:
                         score += 20.0
                     else:
                         score -= 35.0
@@ -1487,7 +1489,10 @@ class AstroRealtimeNode(Node):
 
                 # 4. Acoustic DOA Alignment (Microphone array heard speech)
                 if doa_fresh and spk_angle is not None:
-                    diff_doa = abs((az - spk_angle + 180.0) % 360.0 - 180.0)
+                    diff_doa = min(
+                        abs((az - spk_angle + 180.0) % 360.0 - 180.0),
+                        abs((-az - spk_angle + 180.0) % 360.0 - 180.0),
+                    )
                     if diff_doa <= 30.0:
                         score += 50.0
                     elif diff_doa <= 55.0:
@@ -1523,6 +1528,12 @@ class AstroRealtimeNode(Node):
         if target_track is not None:
             dist_m = float(target_track.distance_m)
             az_deg = float(target_track.azimuth_deg)
+            # Auto-align mirrored azimuth with active gaze/DOA if mirror diff was closer
+            if gaze_fresh and gaze_yaw is not None:
+                d_dir = abs((az_deg - gaze_yaw + 180.0) % 360.0 - 180.0)
+                d_mir = abs((-az_deg - gaze_yaw + 180.0) % 360.0 - 180.0)
+                if d_mir + 15.0 < d_dir:
+                    az_deg = -az_deg
             vel_mps = float(target_track.velocity_mps)
             sec = self._azimuth_to_sector(az_deg)
             is_dyn = bool(getattr(target_track, "is_dynamic", False) or abs(vel_mps) >= 0.08)
@@ -1542,6 +1553,20 @@ class AstroRealtimeNode(Node):
                 "all_tracks_count": len(tracks),
             }
 
+        # Active gaze tracking fallback: if camera has locked on a person, never refuse perception!
+        if gaze_fresh and gaze_yaw is not None:
+            fallback_dist = v_dist if (v_fresh and v_dist > 0.2) else 1.50
+            return {
+                "has_target": True,
+                "source": "vision_gaze",
+                "distance_m": round(fallback_dist, 2),
+                "azimuth_deg": round(gaze_yaw, 1),
+                "sector": self._azimuth_to_sector(gaze_yaw),
+                "motion": "hareket ediyor",
+                "velocity_mps": 0.0,
+                "all_tracks_count": len(tracks),
+            }
+
         if v_fresh and v_dist > 0.2:
             return {
                 "has_target": True,
@@ -1551,7 +1576,7 @@ class AstroRealtimeNode(Node):
                 "sector": self._azimuth_to_sector(gaze_yaw) if (gaze_fresh and gaze_yaw is not None) else "tam karşımda / önümde",
                 "motion": "sabit duruyor",
                 "velocity_mps": 0.0,
-                "all_tracks_count": 0,
+                "all_tracks_count": len(tracks),
             }
 
         return {
@@ -1562,7 +1587,7 @@ class AstroRealtimeNode(Node):
             "sector": "bilinmiyor",
             "motion": "bilinmiyor",
             "velocity_mps": 0.0,
-            "all_tracks_count": 0,
+            "all_tracks_count": len(tracks),
         }
 
     def get_spatial_surroundings_report(self) -> Dict[str, Any]:
@@ -4476,6 +4501,18 @@ class AstroRealtimeNode(Node):
     def _on_laser_scan(self, msg: Any):
         """Monitors forward obstacle field via 2D LiDAR and updates health watchdog."""
         try:
+            # Deduplicate if both /scan and /scan_filtered are active
+            try:
+                hdr = getattr(msg, "header", None)
+                stamp = getattr(hdr, "stamp", None)
+                if stamp is not None:
+                    scan_stamp = float(getattr(stamp, "sec", 0)) + float(getattr(stamp, "nanosec", 0)) * 1e-9
+                    if scan_stamp > 0.0 and abs(scan_stamp - getattr(self, "_last_processed_scan_stamp", 0.0)) < 1e-4:
+                        return
+                    self._last_processed_scan_stamp = scan_stamp
+            except Exception:
+                pass
+
             self._last_laser_scan_time = time.monotonic()
             self._lidar_health = "HEALTHY"
             ranges = getattr(msg, "ranges", [])
