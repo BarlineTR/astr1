@@ -1399,6 +1399,111 @@ class AstroRealtimeNode(Node):
                     self.get_logger().warn(f"⚠️ [Realtime WS] Bağlantı koptu ({e}), 3 saniye sonra yeniden bağlanılacak...")
                     await asyncio.sleep(3.0)
 
+    @staticmethod
+    def _azimuth_to_sector(azimuth_deg: float) -> str:
+        """Converts angle in degrees (-180 to +180) to human-readable Turkish sector."""
+        norm = (float(azimuth_deg) + 180.0) % 360.0 - 180.0
+        if abs(norm) <= 25.0:
+            return "tam karşımda / önümde"
+        elif 25.0 < norm <= 65.0:
+            return "sol ön çaprazımda"
+        elif 65.0 < norm <= 115.0:
+            return "tam solumda"
+        elif 115.0 < norm <= 155.0:
+            return "sol arkamda"
+        elif -65.0 <= norm < -25.0:
+            return "sağ ön çaprazımda"
+        elif -115.0 <= norm < -65.0:
+            return "tam sağımda"
+        elif -155.0 <= norm < -115.0:
+            return "sağ arkamda"
+        else:
+            return "tam arkamda"
+
+    def get_spatial_user_perception(self) -> Dict[str, Any]:
+        """Returns the real-time distance, azimuth, and sector of the user/speaker from LiDAR & Vision."""
+        tracks = self.lidar_tracker.get_active_tracks() if getattr(self, "lidar_tracker", None) else []
+        spk_angle = getattr(self, "_speaker_angle", None)
+
+        target_track = None
+        if tracks:
+            if spk_angle is not None:
+                def _angle_diff(t):
+                    diff = abs(t.azimuth_deg - spk_angle)
+                    return min(diff, 360.0 - diff)
+                closest_by_angle = min(tracks, key=_angle_diff)
+                if _angle_diff(closest_by_angle) <= 45.0:
+                    target_track = closest_by_angle
+
+            if target_track is None:
+                target_track = min(tracks, key=lambda t: t.distance_m)
+
+        if target_track is not None:
+            dist_m = float(target_track.distance_m)
+            az_deg = float(target_track.azimuth_deg)
+            vel_mps = float(target_track.velocity_mps)
+            sec = self._azimuth_to_sector(az_deg)
+            motion = "bana doğru yaklaşıyor" if vel_mps < -0.15 else ("benden uzaklaşıyor" if vel_mps > 0.15 else "sabit duruyor")
+            return {
+                "has_target": True,
+                "source": "lidar",
+                "distance_m": round(dist_m, 2),
+                "azimuth_deg": round(az_deg, 1),
+                "sector": sec,
+                "motion": motion,
+                "velocity_mps": round(vel_mps, 2),
+                "all_tracks_count": len(tracks),
+            }
+
+        v_dist = getattr(self, "_user_distance", 0.0)
+        if v_dist > 0.2:
+            return {
+                "has_target": True,
+                "source": "vision",
+                "distance_m": round(v_dist, 2),
+                "azimuth_deg": 0.0,
+                "sector": "tam karşımda / önümde",
+                "motion": "sabit duruyor",
+                "velocity_mps": 0.0,
+                "all_tracks_count": 0,
+            }
+
+        return {
+            "has_target": False,
+            "source": "none",
+            "distance_m": None,
+            "azimuth_deg": None,
+            "sector": "bilinmiyor",
+            "motion": "bilinmiyor",
+            "velocity_mps": 0.0,
+            "all_tracks_count": 0,
+        }
+
+    def get_spatial_surroundings_report(self) -> Dict[str, Any]:
+        """Returns comprehensive 360-degree LiDAR and spatial environment report."""
+        user_sp = self.get_spatial_user_perception()
+        tracks = self.lidar_tracker.get_active_tracks() if getattr(self, "lidar_tracker", None) else []
+        track_summaries = []
+        for t in tracks:
+            sec = self._azimuth_to_sector(t.azimuth_deg)
+            track_summaries.append({
+                "track_id": t.track_id,
+                "distance_m": round(t.distance_m, 2),
+                "azimuth_deg": round(t.azimuth_deg, 1),
+                "sector": sec,
+                "velocity_mps": round(t.velocity_mps, 2),
+            })
+        return {
+            "speaker_perception": user_sp,
+            "detected_objects_count": len(tracks),
+            "surrounding_objects": track_summaries,
+            "summary_for_user": (
+                f"Kullanıcı yaklaşık {user_sp['distance_m']:.2f} metre {user_sp['sector']} duruyor."
+                if user_sp.get("has_target")
+                else "Yakında net tespit edilen insan varlığı yok."
+            )
+        }
+
     def _build_current_system_prompt(self, active_speaker: Optional[Dict[str, Any]] = None) -> str:
         """Builds system instructions with memory, identity, persona, and strict anti-hallucination rules."""
         identity = active_speaker or self.resolve_identities()
@@ -1492,16 +1597,40 @@ class AstroRealtimeNode(Node):
             "- KAFA VE BAKIŞ KONTROLÜ: Kullanıcı 'sağa bak', 'başını sağa döndür', 'konuşan kişi sağında/solunda', 'önüne bak', 'merkeze dön' dediğinde veya başka yöne bakmanı istediğinde tereddüt etmeden 'set_head_angle' fonksiyonunu çağır! Sağ yön için negatif açı (örn: -30°), sol yön için pozitif açı (örn: +30°), merkez/ön için 0° kullan.\n"
         )
 
+        # Real-time LiDAR radar and spatial perception
+        spatial_info = self.get_spatial_user_perception()
+        if spatial_info.get("has_target"):
+            dist_m = spatial_info["distance_m"]
+            az_deg = spatial_info["azimuth_deg"]
+            sec_str = spatial_info["sector"]
+            mot_str = spatial_info["motion"]
+            spatial_rule = (
+                f"\n\n[MEKÂNSAL RADAR (LİDAR) VE MESAFE ALGILAMA]:\n"
+                f"- Canlı 360° RPLIDAR lazer radarın ve OAK-D derinlik kameran aktiftir.\n"
+                f"- Karşındaki konuşmacının sana olan ANLIK MESAFESİ: {dist_m:.2f} metre, YÖNÜ: {az_deg:+.1f}° ({sec_str}), HAREKETİ: {mot_str}.\n"
+                f"- KESİN VE TAVİZSİZ KURAL: Kullanıcı 'sana ne kadar uzaktayım?', 'neredeyim?', 'bana olan mesafen ne?', 'aradaki mesafe kaç?', 'nerede duruyorum?' diye sorduğunda "
+                f"KESİNLİKLE 'mesafeni ölçemem', 'GPS'im yok', 'konumunu bilemem' gibi reddedici cevaplar VERME! "
+                f"Doğrudan ve kendinden emin şekilde 'Yaklaşık {dist_m:.2f} metre {sec_str} duruyorsun' diyerek mesafeni ve yönünü net olarak söyle!\n"
+            )
+        else:
+            spatial_rule = (
+                f"\n\n[MEKÂNSAL RADAR (LİDAR) VE MESAFE ALGILAMA]:\n"
+                f"- Canlı 360° RPLIDAR lazer radarın devrededir ve aktiftir.\n"
+                f"- Şu an 360° radar alanında net bir konuşmacı yansıması tespit edilemiyor veya menzil dışındasın.\n"
+                f"- KURAL: Kullanıcı mesafesini sorarsa 'Şu an radarımda net bir yansıma alamıyorum, biraz daha önüme/yakınıma gelir misin?' de. Asla 'GPS'im yok / ölçemem' deme!\n"
+            )
+
         social_context_str = ""
         if getattr(self, "social_brain", None) and UnifiedPersonState:
             try:
+                real_dist = spatial_info["distance_m"] if spatial_info.get("has_target") and spatial_info["distance_m"] else float(getattr(self, "_user_distance", 1.2))
                 person = UnifiedPersonState(
                     person_id=str(identity.get("user_id", name_val.lower())),
                     name=name_val,
                     formal_title=identity.get("formal_title", name_val),
                     is_known=is_known,
                     identity_confidence=float(identity.get("confidence", identity.get("score", 0.0))),
-                    distance_m=float(getattr(self, "_user_distance", 1.5)),
+                    distance_m=float(real_dist),
                     is_looking_at_robot=bool(getattr(self, "_looking_at_robot", False)),
                     is_present=True,
                 )
@@ -1514,10 +1643,10 @@ class AstroRealtimeNode(Node):
                 self.get_logger().debug(f"SocialBrain dialogue turn notice: {_sb_err}")
 
         if not getattr(self, "persona_engine", None):
-            return f"Astro Default Instructions {bio_status}{social_context_str}"
+            return f"Astro Default Instructions {bio_status}{spatial_rule}{social_context_str}"
         mem_ctx = self.memory.get_prompt_context(recognized_person=identity) if getattr(self, "memory", None) else ""
         return self.persona_engine.build_system_prompt(
-            memory_context=mem_ctx + bio_status + memory_rule + realtime_speech_rule + social_context_str,
+            memory_context=mem_ctx + bio_status + memory_rule + realtime_speech_rule + spatial_rule + social_context_str,
             recognized_person=identity
         )
 
@@ -1646,6 +1775,16 @@ class AstroRealtimeNode(Node):
                                 "focus": {"type": "string", "description": "İncelenmesi istenen nesne, detay, renk veya durum (örn: 'elimdeki nesne', 'kıyafet', 'çevre')"}
                             },
                             "required": ["focus"]
+                        }
+                    },
+                    {
+                        "type": "function",
+                        "name": "get_spatial_surroundings",
+                        "description": "Robotun 360 derece LiDAR lazer radarıyla çevresini tarayıp etraftaki varlıkların, engellerin ve insanların mesafelerini ve yönlerini sorgular. Kullanıcı 'sana ne kadar uzaktayım?', 'çevrende ne var?', 'sağımda/solumda ne var?', 'en yakın nesne nerede?' diye sorduğunda çağrılır.",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {},
+                            "required": []
                         }
                     },
                     {
@@ -1948,6 +2087,22 @@ class AstroRealtimeNode(Node):
                 "[ŞU AN KONUŞAN]: Kimliği doğrulanmamış misafir. "
                 "Kullanıcıya doğrudan, samimi ve doğal cevap ver; ezbere 'Baran' deme."
             )
+
+        # Per-turn live spatial radar grounding
+        sp_turn = self.get_spatial_user_perception() if hasattr(self, "get_spatial_user_perception") else {}
+        if sp_turn.get("has_target"):
+            p_dist = sp_turn["distance_m"]
+            p_sec = sp_turn["sector"]
+            p_az = sp_turn["azimuth_deg"]
+            spatial_turn_note = (
+                f" [MEKÂNSAL RADAR]: Konuşmacı robottan {p_dist:.2f} metre mesafede, {p_az:+.1f}° ({p_sec}) konumunda. "
+                f"Kullanıcı 'sana ne kadar uzaktayım?', 'neredeyim?' derse 'Yaklaşık {p_dist:.2f} metre {p_sec}sın' de, asla 'ölçemem/GPS yok' deme!"
+            )
+        else:
+            spatial_turn_note = (
+                " [MEKÂNSAL RADAR]: Radar menzilinde net varlık yok. Mesafe sorarsa 'Şu an seni net göremiyorum/radar menzili dışındasın' de."
+            )
+        per_turn_instructions = f"{per_turn_instructions}{spatial_turn_note}"
 
         # 5. response.create Dispatch
         t_resp_send = time.monotonic()
@@ -3038,6 +3193,10 @@ class AstroRealtimeNode(Node):
         elif name == "inspect_camera_view":
             focus = args.get("focus", "kullanıcının elindeki nesne, rengi ve çevre")
             return self._inspect_camera_view(focus)
+
+        elif name == "get_spatial_surroundings":
+            report = self.get_spatial_surroundings_report()
+            return {"status": "success", **report}
 
         elif name == "turn_to_sound":
             if getattr(self, "action_manager", None):
@@ -4249,6 +4408,7 @@ class AstroRealtimeNode(Node):
             if self.lidar_tracker is not None:
                 try:
                     self.lidar_tracker.process_scan(ranges, timestamp=time.monotonic())
+                    self._closest_lidar_track = self.lidar_tracker.get_closest_person_candidate()
                     self._evaluate_lidar_blindspot_approach()
                 except Exception:
                     pass
