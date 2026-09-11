@@ -18,6 +18,7 @@ import base64
 import inspect
 import io
 import json
+import math
 import os
 import re
 import subprocess
@@ -910,6 +911,10 @@ class AstroRealtimeNode(Node):
         self.lidar_tracker = LidarTracker() if LidarTracker else None
         self._last_lidar_curiosity_time: float = 0.0
         self._gaze_active_target: str = "NONE"
+        self._tracked_gaze_yaw: Optional[float] = None
+        self._last_tracked_gaze_time: float = 0.0
+        self._last_doa_time: float = 0.0
+        self._last_vision_distance_time: float = 0.0
         # Single output owner for /head_command is social_gaze_node
         self.pub_telemetry = self.create_publisher(String, "/astro/telemetry", 10)
         self.pub_diagnostics = self.create_publisher(DiagnosticArray, "/diagnostics", 10)
@@ -952,6 +957,7 @@ class AstroRealtimeNode(Node):
         self.create_subscription(JointState, "/joint_states", self._on_joint_states, qos_profile_sensor_data)
         self.create_subscription(String, "/office/slack_command", self._on_slack_command, 10)
         self.create_subscription(String, "/gaze/active_target", self._on_gaze_active_target, 10)
+        self.create_subscription(Float32, "/head/cmd_pos", self._on_head_cmd_pos, 10)
 
         # Tool execution deduplication
         self._executed_tool_calls: set[str] = set()
@@ -1422,28 +1428,109 @@ class AstroRealtimeNode(Node):
 
     def get_spatial_user_perception(self) -> Dict[str, Any]:
         """Returns the real-time distance, azimuth, and sector of the user/speaker from LiDAR & Vision."""
+        now = time.monotonic()
         tracks = self.lidar_tracker.get_active_tracks() if getattr(self, "lidar_tracker", None) else []
         spk_angle = getattr(self, "_speaker_angle", None)
+        last_doa = getattr(self, "_last_doa_time", 0.0)
+        doa_fresh = (spk_angle is not None and (last_doa == 0.0 or (now - last_doa < 4.0) or getattr(self, "_user_speaking_active", False) or getattr(self, "_vad_active", False)))
+
+        gaze_yaw = getattr(self, "_tracked_gaze_yaw", None)
+        gaze_target = getattr(self, "_gaze_active_target", "NONE")
+        last_gaze = getattr(self, "_last_tracked_gaze_time", 0.0)
+        gaze_fresh = (gaze_yaw is not None and gaze_target not in ("NONE", "", None) and (last_gaze == 0.0 or (now - last_gaze < 3.5)))
+
+        v_dist = getattr(self, "_user_distance", 0.0)
+        last_v = getattr(self, "_last_vision_distance_time", 0.0)
+        v_fresh = (v_dist > 0.25 and (last_v == 0.0 or (now - last_v < 3.5)))
 
         target_track = None
         if tracks:
-            if spk_angle is not None:
-                def _angle_diff(t):
-                    diff = abs(t.azimuth_deg - spk_angle)
-                    return min(diff, 360.0 - diff)
-                closest_by_angle = min(tracks, key=_angle_diff)
-                if _angle_diff(closest_by_angle) <= 45.0:
-                    target_track = closest_by_angle
+            best_track = None
+            best_score = -999.0
 
-            if target_track is None:
-                target_track = min(tracks, key=lambda t: t.distance_m)
+            for t in tracks:
+                score = 0.0
+                dist = float(t.distance_m)
+                az = float(t.azimuth_deg)
+                vel = float(t.velocity_mps)
+                is_dyn = bool(getattr(t, "is_dynamic", False) or abs(vel) >= 0.08)
+
+                # 1. Distance prior (Human interaction space: 0.5m - 3.5m)
+                if dist < 0.40:
+                    score -= 50.0  # Robot chassis / table clutter
+                elif 0.50 <= dist <= 2.60:
+                    score += 25.0
+                elif 2.60 < dist <= 4.0:
+                    score += 10.0
+                else:
+                    score -= 15.0
+
+                # 2. Visual Gaze Alignment (Highest priority: camera is looking at person!)
+                if gaze_fresh and gaze_yaw is not None:
+                    diff_gaze = abs((az - gaze_yaw + 180.0) % 360.0 - 180.0)
+                    if diff_gaze <= 25.0:
+                        score += 90.0
+                    elif diff_gaze <= 45.0:
+                        score += 55.0
+                    elif diff_gaze <= 70.0:
+                        score += 20.0
+                    else:
+                        score -= 35.0
+
+                # 3. Vision Distance Correlation
+                if v_fresh:
+                    dist_err = abs(dist - v_dist)
+                    if dist_err <= 0.35:
+                        score += 35.0
+                    elif dist_err <= 0.70:
+                        score += 15.0
+
+                # 4. Acoustic DOA Alignment (Microphone array heard speech)
+                if doa_fresh and spk_angle is not None:
+                    diff_doa = abs((az - spk_angle + 180.0) % 360.0 - 180.0)
+                    if diff_doa <= 30.0:
+                        score += 50.0
+                    elif diff_doa <= 55.0:
+                        score += 25.0
+
+                # 5. Dynamic Motion Bonus (Real human moving vs static furniture)
+                if is_dyn:
+                    score += 40.0
+                if vel < -0.12:  # Moving towards robot
+                    score += 15.0
+
+                # 6. Frontal bias when no active gaze tracker is locking peripheral
+                if not gaze_fresh:
+                    norm_az = abs((az + 180.0) % 360.0 - 180.0)
+                    if norm_az <= 35.0:
+                        score += 25.0
+                    elif norm_az <= 65.0:
+                        score += 10.0
+                    elif norm_az > 110.0:
+                        score -= 15.0  # Stationary clutter behind robot penalized
+
+                # Proximity tie-breaker (prefer reasonable personal interaction distance)
+                score += max(0.0, 3.0 - dist) * 2.0
+
+                if score > best_score:
+                    best_score = score
+                    best_track = t
+
+            min_thresh = 15.0 if (gaze_fresh or doa_fresh) else 10.0
+            if best_track is not None and best_score >= min_thresh:
+                target_track = best_track
 
         if target_track is not None:
             dist_m = float(target_track.distance_m)
             az_deg = float(target_track.azimuth_deg)
             vel_mps = float(target_track.velocity_mps)
             sec = self._azimuth_to_sector(az_deg)
-            motion = "bana doğru yaklaşıyor" if vel_mps < -0.15 else ("benden uzaklaşıyor" if vel_mps > 0.15 else "sabit duruyor")
+            is_dyn = bool(getattr(target_track, "is_dynamic", False) or abs(vel_mps) >= 0.08)
+            motion = (
+                "bana doğru yaklaşıyor" if vel_mps < -0.15
+                else ("benden uzaklaşıyor" if vel_mps > 0.15
+                else ("hareket ediyor" if is_dyn else "sabit duruyor"))
+            )
             return {
                 "has_target": True,
                 "source": "lidar",
@@ -1455,14 +1542,13 @@ class AstroRealtimeNode(Node):
                 "all_tracks_count": len(tracks),
             }
 
-        v_dist = getattr(self, "_user_distance", 0.0)
-        if v_dist > 0.2:
+        if v_fresh and v_dist > 0.2:
             return {
                 "has_target": True,
                 "source": "vision",
                 "distance_m": round(v_dist, 2),
-                "azimuth_deg": 0.0,
-                "sector": "tam karşımda / önümde",
+                "azimuth_deg": round(gaze_yaw, 1) if (gaze_fresh and gaze_yaw is not None) else 0.0,
+                "sector": self._azimuth_to_sector(gaze_yaw) if (gaze_fresh and gaze_yaw is not None) else "tam karşımda / önümde",
                 "motion": "sabit duruyor",
                 "velocity_mps": 0.0,
                 "all_tracks_count": 0,
@@ -4407,11 +4493,22 @@ class AstroRealtimeNode(Node):
 
             if self.lidar_tracker is not None:
                 try:
-                    self.lidar_tracker.process_scan(ranges, timestamp=time.monotonic())
+                    angle_min = float(getattr(msg, "angle_min", -math.pi))
+                    angle_inc = float(getattr(msg, "angle_increment", (2.0 * math.pi) / max(1, len(ranges))))
+                    range_min = float(getattr(msg, "range_min", 0.15))
+                    range_max = float(getattr(msg, "range_max", 12.0))
+                    self.lidar_tracker.process_scan(
+                        ranges,
+                        angle_min=angle_min,
+                        angle_increment=angle_inc,
+                        range_min=range_min,
+                        range_max=range_max,
+                        timestamp=time.monotonic(),
+                    )
                     self._closest_lidar_track = self.lidar_tracker.get_closest_person_candidate()
                     self._evaluate_lidar_blindspot_approach()
-                except Exception:
-                    pass
+                except Exception as _t_exc:
+                    self.get_logger().debug(f"lidar_tracker.process_scan: {_t_exc}")
 
             # Office Concierge: only trigger in true idle state (not during active conversation or speaking)
             if getattr(self, "office_concierge", None):
@@ -4434,6 +4531,14 @@ class AstroRealtimeNode(Node):
 
     def _on_gaze_active_target(self, msg: Any):
         self._gaze_active_target = str(getattr(msg, "data", msg) or "NONE").strip()
+
+    def _on_head_cmd_pos(self, msg: Float32):
+        """Captures real-time head gaze target yaw (in degrees) from social gaze tracker."""
+        try:
+            self._tracked_gaze_yaw = float(msg.data)
+            self._last_tracked_gaze_time = time.monotonic()
+        except Exception:
+            pass
 
     def _evaluate_lidar_blindspot_approach(self):
         """Detects approaching entities in blind spots when IDLE, turning head curiously to look for face."""
@@ -7084,9 +7189,11 @@ class AstroRealtimeNode(Node):
             self._last_seen_distance = new_dist
             # Local perception tracking (No cloud vision triggered purely by approach)
         self._user_distance = new_dist
+        self._last_vision_distance_time = time.monotonic()
 
     def _on_doa(self, msg: Float32):
         self._speaker_angle = float(msg.data)
+        self._last_doa_time = time.monotonic()
         if getattr(self, "action_manager", None):
             self.action_manager.update_audio_state(
                 raw_doa_deg=float(msg.data),

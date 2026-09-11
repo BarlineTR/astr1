@@ -202,6 +202,7 @@ class LidarTracker:
                 tr.distance_m = cl.center_distance_m
                 tr.azimuth_deg = cl.center_azimuth_deg
                 tr.velocity_mps = round(vel, 2)
+                tr.is_dynamic = bool(abs(vel) > 0.10 or cl.is_dynamic)
                 tr.last_update_ts = now
 
                 # Track consecutive approaching frames (human footsteps towards robot)
@@ -226,6 +227,7 @@ class LidarTracker:
                         heading_deg=0.0,
                         last_update_ts=now,
                         consecutive_approaching_count=0,
+                        is_dynamic=False,
                     )
                     matched_track_ids.add(tid)
 

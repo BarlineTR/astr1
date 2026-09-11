@@ -171,6 +171,139 @@ class TestRealtimeSpatialDistanceGrounding(unittest.TestCase):
         self.assertIn("santimetre hassasiyetinde", prompt)
         self.assertIn("GPS'im yok / ölçemem' deme", prompt)
 
+    def test_07_multimodal_scoring_rejects_static_clutter_and_picks_gaze_target(self):
+        """Verify that a stationary 0.83m obstacle is rejected when gaze and DOA point to user at 1.85m."""
+        import time
+        from astro_ai.astro_realtime_node import AstroRealtimeNode
+
+        node = MagicMock(spec=AstroRealtimeNode)
+        node.lidar_tracker = LidarTracker()
+        node._azimuth_to_sector = AstroRealtimeNode._azimuth_to_sector
+        node.get_spatial_user_perception = AstroRealtimeNode.get_spatial_user_perception.__get__(node, AstroRealtimeNode)
+
+        # Static clutter at 0.83m on the right/side (table leg)
+        node.lidar_tracker._active_tracks["track_clutter"] = SpatialPersonTrack(
+            track_id="track_clutter",
+            current_x=0.35,
+            current_y=-0.75,
+            distance_m=0.83,
+            azimuth_deg=-65.0,
+            velocity_mps=0.00,
+            heading_deg=0.0,
+            last_update_ts=time.monotonic(),
+            is_dynamic=False,
+        )
+
+        # Real moving human at 1.85m @ +20.0° (front-left)
+        node.lidar_tracker._active_tracks["track_human"] = SpatialPersonTrack(
+            track_id="track_human",
+            current_x=1.74,
+            current_y=0.63,
+            distance_m=1.85,
+            azimuth_deg=20.0,
+            velocity_mps=-0.16,
+            heading_deg=0.0,
+            last_update_ts=time.monotonic(),
+            is_dynamic=True,
+        )
+
+        # Gaze tracker locked on person at +22.0°
+        node._tracked_gaze_yaw = 22.0
+        node._last_tracked_gaze_time = time.monotonic()
+        node._gaze_active_target = "person_4"
+
+        # DOA heard speech from +18.0°
+        node._speaker_angle = 18.0
+        node._last_doa_time = time.monotonic()
+
+        perception = node.get_spatial_user_perception()
+        self.assertTrue(perception["has_target"])
+        self.assertEqual(perception["distance_m"], 1.85)
+        self.assertEqual(perception["azimuth_deg"], 20.0)
+        self.assertEqual(perception["sector"], "tam karşımda / önümde")
+        self.assertEqual(perception["motion"], "bana doğru yaklaşıyor")
+
+    def test_08_dynamic_motion_alone_beats_static_clutter(self):
+        """Verify that when no gaze or DOA is available, a walking user at 2.10m beats a static 0.83m obstacle."""
+        import time
+        from astro_ai.astro_realtime_node import AstroRealtimeNode
+
+        node = MagicMock(spec=AstroRealtimeNode)
+        node.lidar_tracker = LidarTracker()
+        node._azimuth_to_sector = AstroRealtimeNode._azimuth_to_sector
+        node.get_spatial_user_perception = AstroRealtimeNode.get_spatial_user_perception.__get__(node, AstroRealtimeNode)
+
+        # Static clutter at 0.83m behind robot (+126°)
+        node.lidar_tracker._active_tracks["track_desk"] = SpatialPersonTrack(
+            track_id="track_desk",
+            current_x=-0.49,
+            current_y=0.67,
+            distance_m=0.83,
+            azimuth_deg=126.0,
+            velocity_mps=0.00,
+            heading_deg=0.0,
+            last_update_ts=time.monotonic(),
+            is_dynamic=False,
+        )
+
+        # Moving user in front at 2.10m @ +10.0°
+        node.lidar_tracker._active_tracks["track_user"] = SpatialPersonTrack(
+            track_id="track_user",
+            current_x=2.07,
+            current_y=0.36,
+            distance_m=2.10,
+            azimuth_deg=10.0,
+            velocity_mps=-0.20,
+            heading_deg=0.0,
+            last_update_ts=time.monotonic(),
+            is_dynamic=True,
+        )
+
+        node._tracked_gaze_yaw = None
+        node._gaze_active_target = "NONE"
+        node._speaker_angle = None
+        node._last_doa_time = 0.0
+
+        perception = node.get_spatial_user_perception()
+        self.assertTrue(perception["has_target"])
+        self.assertEqual(perception["distance_m"], 2.10)
+        self.assertEqual(perception["azimuth_deg"], 10.0)
+        self.assertEqual(perception["motion"], "bana doğru yaklaşıyor")
+
+    def test_09_laser_scan_passes_angle_increment_and_head_cmd_pos_callback(self):
+        """Verify _on_laser_scan feeds scan angles and _on_head_cmd_pos updates gaze state."""
+        import time
+        from astro_ai.astro_realtime_node import AstroRealtimeNode
+
+        node = MagicMock(spec=AstroRealtimeNode)
+        node.lidar_tracker = MagicMock()
+        node.get_logger.return_value = MagicMock()
+        node._evaluate_lidar_blindspot_approach = MagicMock()
+        node.office_concierge = None
+        node._on_laser_scan = AstroRealtimeNode._on_laser_scan.__get__(node, AstroRealtimeNode)
+        node._on_head_cmd_pos = AstroRealtimeNode._on_head_cmd_pos.__get__(node, AstroRealtimeNode)
+
+        # Fake LaserScan msg with RPLIDAR A1 params (~1150 samples, increment ~0.0054 rad)
+        fake_scan = MagicMock()
+        fake_scan.ranges = [2.0] * 1150
+        fake_scan.angle_min = -math.pi
+        fake_scan.angle_increment = 0.00546
+        fake_scan.range_min = 0.15
+        fake_scan.range_max = 12.0
+
+        node._on_laser_scan(fake_scan)
+        node.lidar_tracker.process_scan.assert_called_once()
+        _, kwargs = node.lidar_tracker.process_scan.call_args
+        self.assertAlmostEqual(kwargs["angle_increment"], 0.00546)
+        self.assertAlmostEqual(kwargs["angle_min"], -math.pi)
+
+        # Test _on_head_cmd_pos
+        cmd_msg = MagicMock()
+        cmd_msg.data = -45.5
+        node._on_head_cmd_pos(cmd_msg)
+        self.assertEqual(node._tracked_gaze_yaw, -45.5)
+        self.assertGreater(node._last_tracked_gaze_time, 0.0)
+
 
 if __name__ == "__main__":
     unittest.main()

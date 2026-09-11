@@ -50,6 +50,7 @@ class SpatialPersonTrack:
     associated_camera_face_id: Optional[str] = None
     associated_speaker_id: Optional[str] = None
     consecutive_approaching_count: int = 0
+    is_dynamic: bool = False
 
 
 @dataclass
