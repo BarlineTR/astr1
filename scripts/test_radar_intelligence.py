@@ -215,6 +215,12 @@ def render_radar_dashboard(
         else:
             lines.append("• Gerekçe:             Kör noktada veya çevrede yaklaşan hiçbir varlık yok.")
         lines.append("• Kör Nokta Alarmı:    PASİF (Biri kör noktadan robota doğru yürümeye başladığında aktif olur).")
+    lines.append("-" * 88)
+    lines.append("📖 HIZLI LEJANT / SİMGE KILAVUZU:")
+    lines.append("• ▲: Robot (Öne bakar: 0°)   | °: Metre halkaları (1m, 2m, 3m)  | ·: Eksen çizgisi")
+    lines.append("• Sayılar (1, 2..): Nesnenin haritadaki tam konumu               | ⚡: Robota doğru yürüyen insan")
+    lines.append("• Açı: (+) = SOL taraf, (-) = SAĞ taraf                         | Hız: (-) = Yaklaşıyor, (+) = Uzaklaşıyor")
+    lines.append("• Refleks: Sadece kör noktadan (25°-70°) robota yaklaşanlar kafa merak refleksini tetikler.")
     lines.append("=" * 88)
 
     return "\n".join(lines)
