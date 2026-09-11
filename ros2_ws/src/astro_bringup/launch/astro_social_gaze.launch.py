@@ -18,8 +18,9 @@ import os
 
 try:
     from launch import LaunchDescription
-    from launch.actions import DeclareLaunchArgument, SetEnvironmentVariable
+    from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription, SetEnvironmentVariable
     from launch.conditions import IfCondition
+    from launch.launch_description_sources import PythonLaunchDescriptionSource
     from launch.substitutions import LaunchConfiguration
     from launch_ros.actions import Node
 except ImportError:
@@ -31,6 +32,14 @@ except ImportError:
             self.name = name
             self.default_value = default_value
             self.description = description
+    class IncludeLaunchDescription:
+        def __init__(self, source, condition=None, launch_arguments=None):
+            self.source = source
+            self.condition = condition
+            self.launch_arguments = launch_arguments or {}
+    class PythonLaunchDescriptionSource:
+        def __init__(self, path):
+            self.path = path
     class SetEnvironmentVariable:
         def __init__(self, name, value):
             self.name = name
@@ -154,6 +163,21 @@ def generate_launch_description():
             default_value="respeaker_sectors",
             description="ReSpeaker sector-based DOA profile (LEFT 60, CENTER 0, RIGHT -60)",
         ),
+        DeclareLaunchArgument(
+            "enable_lidar",
+            default_value="true",
+            description="Enable RPLIDAR 2D tracking & blindspot curiosity reflex",
+        ),
+        DeclareLaunchArgument(
+            "lidar_serial_port",
+            default_value="/dev/astro_lidar",
+            description="Serial device path for RPLIDAR (auto-resolves if not found)",
+        ),
+        DeclareLaunchArgument(
+            "inverted",
+            default_value="true",
+            description="Invert RPLIDAR scan (flips left/right for upside down or mirrored mount)",
+        ),
     ]
 
     serial_bridge_node = Node(
@@ -204,6 +228,38 @@ def generate_launch_description():
         condition=IfCondition(LaunchConfiguration("enable_voice")),
     )
 
+    lidar_launch_entity = None
+    try:
+        try:
+            from ament_index_python.packages import get_package_share_directory
+            lidar_share = get_package_share_directory("astro_lidar")
+            lidar_launch_path = os.path.join(lidar_share, "launch", "lidar.launch.py")
+        except Exception:
+            lidar_launch_path = ""
+
+        if not lidar_launch_path or not os.path.exists(lidar_launch_path):
+            source_candidate = os.path.abspath(
+                os.path.join(os.path.dirname(__file__), "..", "..", "astro_lidar", "launch", "lidar.launch.py")
+            )
+            if os.path.exists(source_candidate):
+                lidar_launch_path = source_candidate
+
+        if lidar_launch_path and os.path.exists(lidar_launch_path):
+            lidar_launch_entity = IncludeLaunchDescription(
+                PythonLaunchDescriptionSource(lidar_launch_path),
+                condition=IfCondition(LaunchConfiguration("enable_lidar")),
+                launch_arguments={
+                    "serial_port": LaunchConfiguration("lidar_serial_port"),
+                    "inverted": LaunchConfiguration("inverted"),
+                }.items(),
+            )
+    except Exception:
+        pass
+
+    extra_entities = []
+    if lidar_launch_entity is not None:
+        extra_entities.append(lidar_launch_entity)
+
     return LaunchDescription(
         actions
         + launch_args
@@ -213,4 +269,5 @@ def generate_launch_description():
             audio_stream_node,
             astro_realtime_node,
         ]
+        + extra_entities
     )
