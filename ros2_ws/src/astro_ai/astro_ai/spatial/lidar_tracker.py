@@ -187,9 +187,15 @@ class LidarTracker:
                 tr = self._active_tracks[best_track_id]
                 prev_dist = tr.distance_m
                 # Velocity: negative when approaching robot
-                vel = (cl.center_distance_m - prev_dist) / dt
+                # Low-pass filter (EMA) to eliminate single-sample optical laser jitter
+                raw_vel = (cl.center_distance_m - prev_dist) / dt if dt > 0 else 0.0
+                if tr.velocity_mps == 0.0:
+                    vel = raw_vel
+                else:
+                    vel = 0.6 * raw_vel + 0.4 * tr.velocity_mps
+
                 cl.radial_velocity_mps = round(vel, 2)
-                cl.is_dynamic = abs(vel) > 0.12
+                cl.is_dynamic = abs(vel) > 0.15
 
                 tr.current_x = cl.x_m
                 tr.current_y = cl.y_m
@@ -197,6 +203,13 @@ class LidarTracker:
                 tr.azimuth_deg = cl.center_azimuth_deg
                 tr.velocity_mps = round(vel, 2)
                 tr.last_update_ts = now
+
+                # Track consecutive approaching frames (human footsteps towards robot)
+                if tr.velocity_mps < -0.15:
+                    tr.consecutive_approaching_count = getattr(tr, "consecutive_approaching_count", 0) + 1
+                else:
+                    tr.consecutive_approaching_count = 0
+
                 matched_track_ids.add(best_track_id)
             else:
                 # Spawn new track if within human-like bounding size
@@ -212,6 +225,7 @@ class LidarTracker:
                         velocity_mps=0.0,
                         heading_deg=0.0,
                         last_update_ts=now,
+                        consecutive_approaching_count=0,
                     )
                     matched_track_ids.add(tid)
 

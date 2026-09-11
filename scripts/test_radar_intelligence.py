@@ -83,7 +83,8 @@ def render_radar_dashboard(
         az = tr.azimuth_deg
         # Blindspot sector: 25°..70° and social distance 0.3m..2.5m
         if 25.0 <= abs(az) <= 70.0 and 0.3 <= tr.distance_m <= 2.5:
-            if tr.velocity_mps < -0.08:
+            approach_streak = getattr(tr, "consecutive_approaching_count", 0)
+            if tr.velocity_mps < -0.15 and approach_streak >= 2:
                 if approaching_candidate is None or tr.distance_m < approaching_candidate.distance_m:
                     approaching_candidate = tr
 
@@ -107,18 +108,21 @@ def render_radar_dashboard(
         for tr in tracks:
             sec_name, badge, is_bs = get_sector_info(tr.azimuth_deg)
             tid_num = tr.track_id.replace("track_", "#")
+            approach_streak = getattr(tr, "consecutive_approaching_count", 0)
 
-            # Motion status
-            if tr.velocity_mps < -0.08:
+            # Motion status with 0.15 m/s threshold
+            if tr.velocity_mps < -0.15:
                 mot_status = "⚡ YAKLAŞIYOR"
-            elif tr.velocity_mps > 0.08:
+            elif tr.velocity_mps > 0.15:
                 mot_status = "↗️  UZAKLAŞIYOR"
             else:
                 mot_status = "⏸️  SABİT"
 
-            # Action evaluation
-            if is_bs and tr.velocity_mps < -0.08:
+            # Action evaluation (requires 2 consecutive approaching frames)
+            if is_bs and tr.velocity_mps < -0.15 and approach_streak >= 2:
                 action_str = f"👉 [REFLEKS AKTİF] Kafa {tr.azimuth_deg:+.1f}° açısına yöneliyor"
+            elif is_bs and tr.velocity_mps < -0.15 and approach_streak == 1:
+                action_str = "⏳ Doğrulanıyor (1. kare)"
             elif is_bs and tr.distance_m <= 2.5:
                 action_str = "Yoksayılıyor (Durgun nesne/mobilya)"
             elif abs(tr.azimuth_deg) <= 20.0:
@@ -206,7 +210,7 @@ def render_radar_dashboard(
     else:
         lines.append("• Robot Kafa Durumu:   [IDLE / SABİT (0.0°)]")
         if tracks:
-            lines.append("• Gerekçe:             Çevredeki tüm nesneler durgun (hız < 0.08 m/s). Duvar veya eşya olarak")
+            lines.append("• Gerekçe:             Çevredeki tüm nesneler durgun (hız < 0.15 m/s). Duvar veya eşya olarak")
             lines.append("                       değerlendirildi; gereksiz yere kafa çevrilmeyip enerji/motor korunuyor.")
         else:
             lines.append("• Gerekçe:             Kör noktada veya çevrede yaklaşan hiçbir varlık yok.")

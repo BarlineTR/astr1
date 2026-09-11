@@ -49,6 +49,7 @@ class SpatialPersonTrack:
     last_update_ts: float
     associated_camera_face_id: Optional[str] = None
     associated_speaker_id: Optional[str] = None
+    consecutive_approaching_count: int = 0
 
 
 @dataclass
