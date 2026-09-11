@@ -34,6 +34,8 @@ def _launch_setup(context, *args, **kwargs):
     port = _resolve_serial_port(serial_port_arg)
     nodes = []
 
+    inverted = LaunchConfiguration("inverted")
+
     if port is None:
         nodes.append(
             LogInfo(
@@ -56,7 +58,11 @@ def _launch_setup(context, *args, **kwargs):
                 output="screen",
                 parameters=[
                     params_file,
-                    {"serial_port": port, "use_sim_time": use_sim_time},
+                    {
+                        "serial_port": port,
+                        "use_sim_time": use_sim_time,
+                        "inverted": inverted,
+                    },
                 ],
             )
         )
@@ -85,6 +91,11 @@ def generate_launch_description():
                 "serial_port",
                 default_value="/dev/astro_lidar",
                 description="RPLIDAR serial port",
+            ),
+            DeclareLaunchArgument(
+                "inverted",
+                default_value="true",
+                description="Invert RPLIDAR scan (flips left/right for upside down or mirrored mount)",
             ),
             OpaqueFunction(function=_launch_setup),
         ]

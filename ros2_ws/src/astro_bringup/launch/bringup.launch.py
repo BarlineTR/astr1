@@ -98,6 +98,11 @@ def generate_launch_description():
                 description="Start RPLIDAR and scan filter",
             ),
             DeclareLaunchArgument(
+                "inverted",
+                default_value="true",
+                description="Invert RPLIDAR scan (flips left/right for upside down or mirrored mount)",
+            ),
+            DeclareLaunchArgument(
                 "enable_audio",
                 default_value="true",
                 description="Start ReSpeaker audio pipeline in cascaded mode",
@@ -143,6 +148,7 @@ def generate_launch_description():
                 launch_arguments={
                     "use_sim_time": use_sim_time,
                     "enable_lidar": enable_lidar,
+                    "inverted": LaunchConfiguration("inverted"),
                     "enable_audio": is_cascaded_audio,
                     "enable_vision": enable_vision,
                     "enable_ai": is_cascaded_ai,

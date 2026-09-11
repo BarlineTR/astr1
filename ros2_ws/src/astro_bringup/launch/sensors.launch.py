@@ -59,6 +59,11 @@ def generate_launch_description():
                 description="Start RPLIDAR and scan filter",
             ),
             DeclareLaunchArgument(
+                "inverted",
+                default_value="true",
+                description="Invert RPLIDAR scan (flips left/right for upside down or mirrored mount)",
+            ),
+            DeclareLaunchArgument(
                 "enable_audio",
                 default_value="true",
                 description="Start ReSpeaker audio pipeline",
@@ -78,7 +83,10 @@ def generate_launch_description():
                     os.path.join(lidar_pkg, "launch", "lidar.launch.py")
                 ),
                 condition=IfCondition(enable_lidar),
-                launch_arguments={"use_sim_time": use_sim_time}.items(),
+                launch_arguments={
+                    "use_sim_time": use_sim_time,
+                    "inverted": LaunchConfiguration("inverted"),
+                }.items(),
             ),
             IncludeLaunchDescription(
                 PythonLaunchDescriptionSource(

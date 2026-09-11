@@ -281,7 +281,7 @@ def run_simulation():
     print("\n🎉 Simülasyon başarıyla tamamlandı!")
 
 
-def run_live():
+def run_live(flip: bool = False):
     try:
         import rclpy
         from rclpy.node import Node
@@ -337,10 +337,16 @@ def run_live():
             )
             tracks = tracker.get_active_tracks()
 
+            if flip:
+                for tr in tracks:
+                    tr.azimuth_deg = -tr.azimuth_deg
+                    tr.current_y = -tr.current_y
+
+            src_label = "/scan (YÖN AYNALANDI [FLIP])" if flip else "/scan"
             dashboard = render_radar_dashboard(
                 tracks=tracks,
                 scan_hz=self.estimated_hz,
-                source_name="/scan",
+                source_name=src_label,
                 max_range_m=3.5,
             )
 
@@ -362,9 +368,10 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="ASTRO Radar Intelligence Dashboard")
     parser.add_argument("--sim", action="store_true", help="Simülasyon modunu çalıştır (donanımsız masabaşı testi)")
     parser.add_argument("--live", action="store_true", help="Canlı ROS 2 /scan konusunu dinle")
+    parser.add_argument("--flip", action="store_true", help="Sağ ve sol yönleri tersine çevir (Ayna tersliği düzeltmesi)")
     args = parser.parse_args()
 
     if args.live:
-        run_live()
+        run_live(flip=args.flip)
     else:
         run_simulation()
