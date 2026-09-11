@@ -2455,6 +2455,29 @@ class AstroRealtimeNode(Node):
                 next_turn = self._turn_queue.pop(0)
                 self._dispatch_turn(next_turn["generation_id"], next_turn["text"])
 
+        # 3e. Conversation Item Created (Sliding Window Context Pruning to prevent TPM limit exhaustion)
+        elif event_type == "conversation.item.created":
+            item = event.get("item", {})
+            item_id = item.get("id")
+            if item_id:
+                if not hasattr(self, "_active_conversation_item_ids"):
+                    self._active_conversation_item_ids = []
+                self._active_conversation_item_ids.append(item_id)
+                # Keep sliding window of at most 6 conversation items (~3 conversation turns).
+                # Delete older audio/message items to keep context window small (< 2000 tokens)
+                # and avoid hitting OpenAI's 40,000 TPM rate limit.
+                while len(self._active_conversation_item_ids) > 6:
+                    oldest_id = self._active_conversation_item_ids.pop(0)
+                    try:
+                        del_event = {"type": "conversation.item.delete", "item_id": oldest_id}
+                        if ws and hasattr(ws, "send"):
+                            res = ws.send(json.dumps(del_event))
+                            if asyncio.iscoroutine(res):
+                                await res
+                            self.get_logger().info(f"🧹 [Context Pruner] Eski oturum öğesi silindi ({oldest_id}) — TPM kotası korundu.")
+                    except Exception as _del_exc:
+                        self.get_logger().debug(f"Context pruner error: {_del_exc}")
+
         # 4. User Speech Transcription Completed
         elif event_type in ("conversation.item.input_audio_transcription.completed", "conversation.item.input_audio_transcription.done"):
             user_transcript = event.get("transcript", "").strip()
@@ -4285,8 +4308,8 @@ class AstroRealtimeNode(Node):
                 continue
             if tr.distance_m > 2.5 or tr.distance_m < 0.3:
                 continue
-            # Approaching towards robot (negative radial velocity) or entering personal space (< 1.6m)
-            if tr.velocity_mps < -0.05 or tr.distance_m < 1.6:
+            # Approaching towards robot (negative radial velocity)
+            if tr.velocity_mps < -0.08:
                 if best_candidate is None or tr.distance_m < best_candidate.distance_m:
                     best_candidate = tr
 
