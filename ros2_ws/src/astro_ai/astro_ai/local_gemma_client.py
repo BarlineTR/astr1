@@ -23,7 +23,7 @@ _LOG = logging.getLogger(__name__)
 
 DEFAULT_BASE_URL = os.getenv("LOCAL_GEMMA_BASE_URL", "http://127.0.0.1:8080")
 DEFAULT_TIMEOUT_S = float(os.getenv("LOCAL_GEMMA_TIMEOUT_S", "3.0"))
-DEFAULT_N_PREDICT = int(os.getenv("LOCAL_GEMMA_N_PREDICT", "12"))
+DEFAULT_N_PREDICT = int(os.getenv("LOCAL_GEMMA_N_PREDICT", "28"))
 DEFAULT_TEMPERATURE = float(os.getenv("LOCAL_GEMMA_TEMPERATURE", "0.2"))
 
 

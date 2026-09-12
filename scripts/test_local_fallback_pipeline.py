@@ -112,11 +112,12 @@ def play_pcm_to_speaker(pcm_24k: bytes, preferred_device: str = ""):
         if alt not in devices_to_try:
             devices_to_try.append(alt)
 
+    timeout_s = max(10.0, (len(pcm_16k) / 32000.0) + 5.0)
     played = False
     for dev in devices_to_try:
         try:
             cmd = ["aplay", "-D", dev, "-r", "16000", "-f", "S16_LE", "-c", "1"]
-            proc = subprocess.run(cmd, input=pcm_16k, capture_output=True, timeout=5.0)
+            proc = subprocess.run(cmd, input=pcm_16k, capture_output=True, timeout=timeout_s)
             if proc.returncode == 0:
                 print(f"  ✅ Ses {dev} üzerinden ReSpeaker hoparlörüne başarıyla verildi!")
                 played = True
@@ -260,31 +261,59 @@ def run_benchmark(
 
     # Wait for concurrent first-clause synthesis if already in flight
     if synth_thread:
-        synth_thread.join(timeout=4.0)
+        synth_thread.join(timeout=5.0)
 
-    # Fallback to synchronous synthesis if not already synthesized
+    all_pcm_chunks: List[bytes] = []
+
+    # 1. First clause synthesis
     if not first_clause_pcm:
-        print(f"🎵 [3/4] İlk Cümlecik Edge-TTS'e Gönderiliyor: \"{clause_to_synth}\"...", flush=True)
-        if edge_engine and edge_engine.is_installed:
-            t_tts_start = time.perf_counter()
-            try:
-                pcm = edge_engine.synthesize_sentence(clause_to_synth, generation_id=1)
-                t_tts_end = time.perf_counter()
-                tts_infer_ms = (t_tts_end - t_tts_start) * 1000.0
-                if pcm:
-                    first_clause_pcm = pcm
-                    t_first_audio = t_tts_end
-                    print(f"  ✅ TTS Sentezi Tamamlandı: {len(pcm)} bayt ({tts_infer_ms:.1f}ms)")
-                else:
-                    print("  ⚠️ TTS boş ses üretti.")
-            except Exception as tts_err:
-                print(f"  ⚠️ Edge-TTS hatası: {tts_err}")
-        else:
-            print("  ℹ️ Edge-TTS kütüphanesi ortamda yüklü değil (mock TTS süresi hesaplanıyor: ~120ms)")
-            tts_infer_ms = 120.0
-            t_first_audio = (t_first_clause or t_llm_end) + 0.120
+        clause_to_synth = first_clause_text or full_response
+        if clause_to_synth:
+            print(f"🎵 [3/4] İlk Cümlecik Edge-TTS'e Gönderiliyor: \"{clause_to_synth}\"...", flush=True)
+            if edge_engine and edge_engine.is_installed:
+                t_tts_start = time.perf_counter()
+                try:
+                    pcm = edge_engine.synthesize_sentence(clause_to_synth, generation_id=1)
+                    t_tts_end = time.perf_counter()
+                    tts_infer_ms = (t_tts_end - t_tts_start) * 1000.0
+                    if pcm:
+                        first_clause_pcm = pcm
+                        t_first_audio = t_tts_end
+                        print(f"  ✅ İlk Cümle TTS Sentezi: {len(pcm)} bayt ({tts_infer_ms:.1f}ms)")
+                    else:
+                        print("  ⚠️ TTS boş ses üretti.")
+                except Exception as tts_err:
+                    print(f"  ⚠️ Edge-TTS hatası: {tts_err}")
+            else:
+                print("  ℹ️ Edge-TTS kütüphanesi ortamda yüklü değil (mock TTS süresi hesaplanıyor: ~120ms)")
+                tts_infer_ms = 120.0
+                t_first_audio = (t_first_clause or t_llm_end) + 0.120
     else:
         print(f"🎵 [3/4] İlk Cümlecik Paralel Sentezlendi: \"{first_clause_text}\" ({tts_infer_ms:.1f}ms)", flush=True)
+
+    if first_clause_pcm:
+        all_pcm_chunks.append(first_clause_pcm)
+
+    # 2. Synthesize remaining clauses so the entire response is voiced
+    remaining_clauses = ready_clauses[1:] if len(ready_clauses) > 1 else []
+    if remaining_clauses:
+        print(f"🎵 [3.5/4] Kalan Cümlecikler Sentezleniyor ({len(remaining_clauses)} adet)...", flush=True)
+        for idx, cl in enumerate(remaining_clauses, start=2):
+            cl_clean = cl.strip()
+            if not cl_clean:
+                continue
+            if edge_engine and edge_engine.is_installed:
+                t_c0 = time.perf_counter()
+                try:
+                    pcm_c = edge_engine.synthesize_sentence(cl_clean, generation_id=1)
+                    t_c_ms = (time.perf_counter() - t_c0) * 1000.0
+                    if pcm_c:
+                        all_pcm_chunks.append(pcm_c)
+                        print(f"  ✅ Cümlecik {idx} Sentezlendi: \"{cl_clean}\" -> {len(pcm_c)} bayt ({t_c_ms:.1f}ms)")
+                except Exception as err:
+                    print(f"  ⚠️ Cümlecik {idx} sentez hatası: {err}")
+
+    complete_pcm = b"".join(all_pcm_chunks)
 
     # 4. Telemetry and Latency Calculations
     ttft_ms = ((t_first_token - t_start) * 1000.0) if t_first_token else 0.0
@@ -294,7 +323,7 @@ def run_benchmark(
     tok_count = len(tokens_received)
     tok_per_sec = (tok_count / (total_gen_ms / 1000.0)) if total_gen_ms > 0 else 0.0
 
-    audio_dur_s = (len(first_clause_pcm) / 2 / 24000.0) if first_clause_pcm else 0.0
+    audio_dur_s = (len(complete_pcm) / 2 / 24000.0) if complete_pcm else 0.0
 
     print("\n" + "=" * 76)
     print(" 📊 DETAYLI GECİKME VE PERFORMANS RAPORU")
@@ -302,14 +331,15 @@ def run_benchmark(
     print(f"  Üretilen Toplam Metin  : \"{full_response}\"")
     print(f"  Token Sayısı           : {tok_count} token")
     print(f"  Token Üretim Hızı      : {tok_per_sec:.1f} tok/s")
+    print(f"  Cümlecik Sayısı        : {len(ready_clauses)} adet (Sentezlenen: {len(all_pcm_chunks)})")
     print("-" * 76)
     print(f"  1. TTFT (İlk Token)    : {ttft_ms:6.1f} ms  (Kullanıcı konuşması bittikten ilk kelimeye)")
     print(f"  2. TTFC (İlk Cümlecik) : {ttfc_ms:6.1f} ms  (İlk anlamlı cümle TTS'e aktarılana kadar)")
-    print(f"  3. TTS Infer Süresi    : {tts_infer_ms:6.1f} ms  (Edge-TTS AhmetNeural sentez süresi)")
+    print(f"  3. TTS Infer (1. Cümle): {tts_infer_ms:6.1f} ms  (Edge-TTS AhmetNeural ilk cümle süresi)")
     print(f"  4. TTFA (İLK SES ANI)  : {ttfa_ms:6.1f} ms  🎯 (KULLANICININ HOPARLÖRDEN SESİ DUYMA ANI)")
     print(f"  5. Toplam LLM Süresi   : {total_gen_ms:6.1f} ms")
     if audio_dur_s > 0:
-        print(f"  6. Ses Süresi          : {audio_dur_s:6.2f} s   ({len(first_clause_pcm)} bayt, 24kHz int16)")
+        print(f"  6. Toplam Ses Süresi   : {audio_dur_s:6.2f} s   ({len(complete_pcm)} bayt, 24kHz int16)")
     print("=" * 76)
 
     # Acceptance threshold evaluation
@@ -320,16 +350,16 @@ def run_benchmark(
         print(f"  ⚠️ SONUÇ: TTFA {ttfa_ms:.1f}ms > {target_ttfa_ms}ms (Ağ veya model yüküne bağlı gecikme).")
     print("=" * 76 + "\n")
 
-    # Optional local speaker playback
-    if play_audio and first_clause_pcm:
-        play_pcm_to_speaker(first_clause_pcm, preferred_device=audio_device)
+    # Optional local speaker playback (play entire response)
+    if play_audio and complete_pcm:
+        play_pcm_to_speaker(complete_pcm, preferred_device=audio_device)
 
 
 def main():
     parser = argparse.ArgumentParser(description="ASTRO Local Gemma + Edge-TTS Pipeline Benchmark")
     parser.add_argument("--query", "-q", default="Merhaba Astro, bugün nasılsın?", help="Test edilecek kullanıcı sorusu")
     parser.add_argument("--url", default="http://127.0.0.1:8080", help="llama.cpp server base URL")
-    parser.add_argument("--n-predict", "-n", type=int, default=12, help="Üretilecek maksimum token sayısı")
+    parser.add_argument("--n-predict", "-n", type=int, default=int(os.getenv("LOCAL_GEMMA_N_PREDICT", "28")), help="Üretilecek maksimum token sayısı (varsayılan: 28)")
     parser.add_argument("--temperature", "-t", type=float, default=0.2, help="Üretim sıcaklığı")
     parser.add_argument("--simulate", "-s", action="store_true", help="llama-server yokken simüle token akışı ile test et")
     parser.add_argument("--play", "-p", action="store_true", help="Üretilen sesi yerel hoparlörde çal")

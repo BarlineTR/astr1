@@ -86,7 +86,7 @@ class TestLocalGemmaClient(unittest.TestCase):
         self.assertEqual(req.full_url, "http://127.0.0.1:8080/completion")
         body = json.loads(req.data.decode("utf-8"))
         self.assertEqual(body["prompt"], "Selam")
-        self.assertEqual(body["n_predict"], 12)
+        self.assertEqual(body["n_predict"], 28)
         self.assertEqual(body["temperature"], 0.2)
         self.assertFalse(body["stream"])
 

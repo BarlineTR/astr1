@@ -755,7 +755,7 @@ class ProviderRegistry:
         prompt: str,
         model_id: str = "gemma-4-E2B-it-Q4_K_S",
         client: Optional[Any] = None,
-        n_predict: int = 12,
+        n_predict: int = int(os.getenv("LOCAL_GEMMA_N_PREDICT", "28")),
         temperature: float = 0.2,
         timeout: float = 3.0,
     ) -> Generator[str, None, None]:

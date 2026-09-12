@@ -6470,7 +6470,7 @@ class AstroRealtimeNode(Node):
 
                     for token in self.local_gemma_client.stream(
                         prompt=gemma_prompt,
-                        n_predict=12,
+                        n_predict=int(os.getenv("LOCAL_GEMMA_N_PREDICT", "28")),
                         temperature=0.2,
                         timeout=3.0,
                     ):
