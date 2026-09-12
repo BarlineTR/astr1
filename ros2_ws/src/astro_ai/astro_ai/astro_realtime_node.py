@@ -154,6 +154,7 @@ try:
     )
     from astro_ai.state_machine import RobotState, StateMachine
     from astro_ai.provider_registry import ProviderRegistry, ProviderError, ErrorClass
+    from astro_ai.local_gemma_client import LocalGemmaClient, LocalGemmaError
     from astro_ai.repetition_guard import RepetitionGuard
     from astro_ai.action_manager import ActionManager, SoundDirection, ActionResult
     from astro_ai.robot_led import RobotLED
@@ -166,6 +167,11 @@ except ImportError:
     )
     from state_machine import RobotState, StateMachine
     from provider_registry import ProviderRegistry, ProviderError, ErrorClass
+    try:
+        from local_gemma_client import LocalGemmaClient, LocalGemmaError
+    except ImportError:
+        LocalGemmaClient = None  # type: ignore
+        LocalGemmaError = Exception  # type: ignore
     from repetition_guard import RepetitionGuard
     try:
         from action_manager import ActionManager, SoundDirection, ActionResult
@@ -846,6 +852,14 @@ class AstroRealtimeNode(Node):
                 )
             except Exception as e:
                 self.get_logger().debug(f"LocalOfflineTTSEngine notice: {e}")
+
+        # Local Gemma 4 E2B Q4_K_S Client (Zero-Cloud Local Fallback)
+        self.local_gemma_client: Optional[LocalGemmaClient] = None
+        if LocalGemmaClient:
+            try:
+                self.local_gemma_client = LocalGemmaClient(logger=self._safe_log)
+            except Exception as e:
+                self.get_logger().debug(f"LocalGemmaClient init notice: {e}")
 
         # Generation-level Barge-In Debounce State
         self._barge_in_latched = False
@@ -1709,20 +1723,23 @@ class AstroRealtimeNode(Node):
         )
 
         # Real-time LiDAR radar and spatial perception
-        spatial_info = self.get_spatial_user_perception()
-        if spatial_info.get("has_target"):
-            dist_m = spatial_info["distance_m"]
-            az_deg = spatial_info["azimuth_deg"]
-            sec_str = spatial_info["sector"]
-            mot_str = spatial_info["motion"]
-            spatial_rule = (
-                f"\n\n[MEKÂNSAL RADAR (LİDAR) VE MESAFE ALGILAMA]:\n"
-                f"- Canlı 360° RPLIDAR lazer radarın ve OAK-D derinlik kameran aktiftir.\n"
-                f"- Karşındaki konuşmacının sana olan ANLIK MESAFESİ: {dist_m:.2f} metre, YÖNÜ: {az_deg:+.1f}° ({sec_str}), HAREKETİ: {mot_str}.\n"
-                f"- KESİN VE TAVİZSİZ KURAL: Kullanıcı 'sana ne kadar uzaktayım?', 'neredeyim?', 'bana olan mesafen ne?', 'aradaki mesafe kaç?', 'nerede duruyorum?' diye sorduğunda "
-                f"KESİNLİKLE 'mesafeni ölçemem', 'GPS'im yok', 'konumunu bilemem' gibi reddedici cevaplar VERME! "
-                f"Doğrudan ve kendinden emin şekilde 'Yaklaşık {dist_m:.2f} metre {sec_str} duruyorsun' diyerek mesafeni ve yönünü net olarak söyle!\n"
-            )
+        spatial_info = self.get_spatial_user_perception() if callable(getattr(self, "get_spatial_user_perception", None)) else {}
+        if isinstance(spatial_info, dict) and spatial_info.get("has_target") is True:
+            try:
+                dist_m = float(spatial_info["distance_m"])
+                az_deg = float(spatial_info["azimuth_deg"])
+                sec_str = str(spatial_info["sector"])
+                mot_str = str(spatial_info["motion"])
+                spatial_rule = (
+                    f"\n\n[MEKÂNSAL RADAR (LİDAR) VE MESAFE ALGILAMA]:\n"
+                    f"- Canlı 360° RPLIDAR lazer radarın ve OAK-D derinlik kameran aktiftir.\n"
+                    f"- Karşındaki konuşmacının sana olan ANLIK MESAFESİ: {dist_m:.2f} metre, YÖNÜ: {az_deg:+.1f}° ({sec_str}), HAREKETİ: {mot_str}.\n"
+                    f"- KESİN VE TAVİZSİZ KURAL: Kullanıcı 'sana ne kadar uzaktayım?', 'neredeyim?', 'bana olan mesafen ne?', 'aradaki mesafe kaç?', 'nerede duruyorum?' diye sorduğunda "
+                    f"KESİNLİKLE 'mesafeni ölçemem', 'GPS'im yok', 'konumunu bilemem' gibi reddedici cevaplar VERME! "
+                    f"Doğrudan ve kendinden emin şekilde 'Yaklaşık {dist_m:.2f} metre {sec_str} duruyorsun' diyerek mesafeni ve yönünü net olarak söyle!\n"
+                )
+            except Exception:
+                spatial_rule = ""
         else:
             spatial_rule = (
                 f"\n\n[MEKÂNSAL RADAR (LİDAR) VE MESAFE ALGILAMA]:\n"
@@ -6437,8 +6454,98 @@ class AstroRealtimeNode(Node):
             total_audio_bytes = 0
             total_enqueued_chunks = 0
 
+            # Attempt 0: Local Gemma 4 E2B Q4_K_S (Zero-Cloud Local Fallback via llama.cpp /completion)
+            local_gemma_streamed_audio = False
+            if self.local_gemma_client and self.local_gemma_client.is_available():
+                t_local_start = time.monotonic()
+                gemma_prompt = (
+                    "ASTRO bir sosyal robot. Türkçe konuş. Kısa ve doğal cevap ver.\n\n"
+                    f"Kullanıcı: {user_text}\n"
+                    "ASTRO:"
+                )
+                try:
+                    local_chunker = SentenceChunker(min_first_clause_chars=18, min_clause_chars=28) if SentenceChunker else None
+                    first_token_seen = False
+                    current_gen_id = self._fallback_generation_id
+
+                    for token in self.local_gemma_client.stream(
+                        prompt=gemma_prompt,
+                        n_predict=12,
+                        temperature=0.2,
+                        timeout=3.0,
+                    ):
+                        if self._barge_in_latched or self._fallback_generation_id != current_gen_id:
+                            self.get_logger().info("🛑 [Local Gemma Interrupted] Barge-in detected during streaming.")
+                            break
+
+                        if not first_token_seen:
+                            llm_ttft_ms = (time.monotonic() - t_local_start) * 1000.0
+                            first_token_seen = True
+
+                        full_reply_parts.append(token)
+
+                        if local_chunker:
+                            ready_clauses = local_chunker.feed(token)
+                            for clause in ready_clauses:
+                                if self._barge_in_latched or self._fallback_generation_id != current_gen_id:
+                                    break
+                                pcm, s_ms, g_ms, q_ms = _synthesize_turn_clause(clause)
+                                total_synth_ms += s_ms
+                                total_gpu_ms += g_ms
+                                total_queue_wait_ms += q_ms
+                                if pcm:
+                                    if llm_first_clause_ms is None:
+                                        llm_first_clause_ms = (time.monotonic() - t_local_start) * 1000.0
+                                    if not first_audio_played:
+                                        first_audio_ms = (time.monotonic() - t_turn_start) * 1000.0
+                                        first_audio_played = True
+                                    total_audio_sec += (len(pcm) / 2) / 24000.0
+                                    total_audio_bytes += len(pcm)
+                                    _handle_and_play_clause_audio(pcm)
+                                    local_gemma_streamed_audio = True
+
+                    # Flush remaining text in chunker
+                    if not self._barge_in_latched and self._fallback_generation_id == current_gen_id:
+                        if local_chunker:
+                            rem_clause = local_chunker.flush()
+                            if rem_clause:
+                                pcm, s_ms, g_ms, q_ms = _synthesize_turn_clause(rem_clause)
+                                total_synth_ms += s_ms
+                                total_gpu_ms += g_ms
+                                total_queue_wait_ms += q_ms
+                                if pcm:
+                                    if llm_first_clause_ms is None:
+                                        llm_first_clause_ms = (time.monotonic() - t_local_start) * 1000.0
+                                    if not first_audio_played:
+                                        first_audio_ms = (time.monotonic() - t_turn_start) * 1000.0
+                                        first_audio_played = True
+                                    total_audio_sec += (len(pcm) / 2) / 24000.0
+                                    total_audio_bytes += len(pcm)
+                                    _handle_and_play_clause_audio(pcm)
+                                    local_gemma_streamed_audio = True
+
+                    if full_reply_parts:
+                        chosen_model = "gemma-4-E2B-it-Q4_K_S"
+                        chosen_provider = "local_gemma"
+                        llm_latency_ms = (time.monotonic() - t_local_start) * 1000.0
+                        attempts.append({
+                            "provider": "local_gemma",
+                            "model": chosen_model,
+                            "result": "success",
+                            "latency_ms": int(llm_latency_ms),
+                        })
+                except Exception as lge:
+                    self.get_logger().warning(f"⚠️ [Local Gemma Fallback Failed] Error: {lge} -> Falling back to cloud LLMs")
+                    attempts.append({
+                        "provider": "local_gemma",
+                        "model": "gemma-4-E2B-it-Q4_K_S",
+                        "result": "failed",
+                        "error": str(lge)[:80],
+                    })
+                    full_reply_parts = []
+
             # Attempt A: Streaming Groq LLMs (Fastest first, fallback on failure)
-            if self.groq_api_key and groq_candidates:
+            if not full_reply_parts and self.groq_api_key and groq_candidates:
                 for target_model in groq_candidates:
                     try:
                         t_model_start = time.monotonic()
@@ -6559,8 +6666,8 @@ class AstroRealtimeNode(Node):
                 if len(self._recent_robot_phrases) > 10:
                     self._recent_robot_phrases = self._recent_robot_phrases[-10:]
 
-            # Synthesize ONE single unified TTS generation for this logical turn
-            if full_reply_str:
+            # Synthesize ONE single unified TTS generation for this logical turn (if not already streamed)
+            if full_reply_str and not (chosen_provider == "local_gemma" and local_gemma_streamed_audio):
                 pcm, s_ms, g_ms, q_ms = _synthesize_turn_clause(full_reply_str)
                 total_synth_ms += s_ms
                 total_gpu_ms += g_ms

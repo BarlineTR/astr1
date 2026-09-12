@@ -145,6 +145,14 @@ OPENAI_PRODUCTION_MODELS: Set[str] = {
     "gpt-4o-realtime-preview",
 }
 
+LOCAL_GEMMA_PRODUCTION_MODELS: Set[str] = {
+    "gemma-4-E2B-it-Q4_K_S",
+}
+
+LOCAL_GEMMA_PREFERENCE_ORDER: List[str] = [
+    "gemma-4-E2B-it-Q4_K_S",
+]
+
 
 class ProviderRegistry:
     """Registry maintaining real-time model capabilities, availability, and error states."""
@@ -158,21 +166,25 @@ class ProviderRegistry:
             "gemini": ProviderHealth.UNINITIALIZED,
             "openai": ProviderHealth.HEALTHY,
             "local": ProviderHealth.HEALTHY,
+            "local_gemma": ProviderHealth.HEALTHY,
         }
         self._discovered_raw: Dict[str, List[str]] = {
             "groq": [],
             "gemini": [],
             "openai": list(OPENAI_PRODUCTION_MODELS),
+            "local_gemma": list(LOCAL_GEMMA_PRODUCTION_MODELS),
         }
         self._routeable_models: Dict[str, List[str]] = {
             "groq": list(GROQ_PREFERENCE_ORDER),
             "gemini": list(GEMINI_PREFERENCE_ORDER),
             "openai": ["gpt-4o-mini", "gpt-4o", "gpt-realtime-2.1-mini", "gpt-realtime-2.1", "gpt-realtime"],
+            "local_gemma": list(LOCAL_GEMMA_PREFERENCE_ORDER),
         }
         self._rejected_models: Dict[str, Dict[str, str]] = {
             "groq": {},
             "gemini": {},
             "openai": {},
+            "local_gemma": {},
         }
 
         # Initialize base model capabilities
@@ -204,6 +216,19 @@ class ProviderRegistry:
                     streaming_supported=True,
                     tool_calling_supported=True,
                     vision_supported=True,
+                    realtime_audio_supported=False,
+                )
+            )
+        # Local Gemma 4 E2B Q4_K_S (llama.cpp server)
+        for m in LOCAL_GEMMA_PRODUCTION_MODELS:
+            self.register_model(
+                ModelCapability(
+                    provider="local_gemma",
+                    model_id=m,
+                    chat_supported=True,
+                    streaming_supported=True,
+                    tool_calling_supported=False,
+                    vision_supported=False,
                     realtime_audio_supported=False,
                 )
             )
@@ -724,6 +749,44 @@ class ProviderRegistry:
             err_class = self.classify_error(0, str(ge), ge)
             self.record_error("groq", model_id, err_class, str(ge))
             raise ProviderError("groq", model_id, err_class, str(ge))
+
+    def stream_local_gemma_completion(
+        self,
+        prompt: str,
+        model_id: str = "gemma-4-E2B-it-Q4_K_S",
+        client: Optional[Any] = None,
+        n_predict: int = 12,
+        temperature: float = 0.2,
+        timeout: float = 3.0,
+    ) -> Generator[str, None, None]:
+        """Streams tokens from local Gemma 4 E2B Q4_K_S via llama.cpp /completion endpoint."""
+        try:
+            from astro_ai.local_gemma_client import LocalGemmaClient, LocalGemmaError
+        except ImportError:
+            from local_gemma_client import LocalGemmaClient, LocalGemmaError  # type: ignore
+
+        gemma_client = client or LocalGemmaClient(logger=self.logger)
+        t_start = time.perf_counter()
+        try:
+            for token in gemma_client.stream(prompt, n_predict=n_predict, temperature=temperature, timeout=timeout):
+                yield token
+            elapsed_ms = (time.perf_counter() - t_start) * 1000.0
+            self.record_success("local_gemma", model_id, elapsed_ms)
+        except LocalGemmaError as lge:
+            err_class = ErrorClass.SERVER_ERROR
+            err_name = type(lge).__name__.lower()
+            if "timeout" in err_name:
+                err_class = ErrorClass.TIMEOUT
+            elif "connection" in err_name:
+                err_class = ErrorClass.NETWORK_ERROR
+            elif "unavailable" in err_name:
+                err_class = ErrorClass.MODEL_NOT_FOUND
+            self.record_error("local_gemma", model_id, err_class, str(lge))
+            raise ProviderError("local_gemma", model_id, err_class, str(lge)) from lge
+        except Exception as ge:
+            err_class = ErrorClass.SERVER_ERROR
+            self.record_error("local_gemma", model_id, err_class, str(ge))
+            raise ProviderError("local_gemma", model_id, err_class, str(ge)) from ge
 
     def generate_gemini_content(
         self,
