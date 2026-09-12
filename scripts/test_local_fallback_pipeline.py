@@ -130,7 +130,8 @@ def run_benchmark(
         "ASTRO:"
     )
 
-    chunker = SentenceChunker(min_first_clause_chars=18, min_clause_chars=28) if SentenceChunker else None
+    chunker = SentenceChunker(min_first_clause_chars=6, min_clause_chars=20) if SentenceChunker else None
+    edge_engine = EdgeTTSEngine(voice="tr-TR-AhmetNeural", timeout_s=4.0) if EdgeTTSEngine else None
 
     # Performance tracking metrics
     t_start = time.perf_counter()
@@ -143,6 +144,20 @@ def run_benchmark(
     first_clause_text: Optional[str] = None
     first_clause_pcm: Optional[bytes] = None
     tts_infer_ms = 0.0
+    synth_thread: Optional[threading.Thread] = None
+
+    def _synth_worker(text_to_synth: str):
+        nonlocal first_clause_pcm, t_first_audio, tts_infer_ms
+        if edge_engine and edge_engine.is_installed:
+            t0_s = time.perf_counter()
+            try:
+                pcm = edge_engine.synthesize_sentence(text_to_synth, generation_id=1)
+                t1_s = time.perf_counter()
+                tts_infer_ms = (t1_s - t0_s) * 1000.0
+                first_clause_pcm = pcm
+                t_first_audio = t1_s
+            except Exception as _e:
+                tts_infer_ms = 0.0
 
     print("⚡ [2/4] Token Akışı Başlatılıyor...", flush=True)
 
@@ -173,6 +188,9 @@ def run_benchmark(
                     if t_first_clause is None:
                         t_first_clause = time.perf_counter()
                         first_clause_text = cl
+                        import threading
+                        synth_thread = threading.Thread(target=_synth_worker, args=(cl,), daemon=True)
+                        synth_thread.start()
 
         # Flush any trailing clause
         if chunker:
@@ -193,27 +211,33 @@ def run_benchmark(
     full_response = "".join(tokens_received).strip()
     clause_to_synth = first_clause_text or full_response
 
-    print(f"🎵 [3/4] İlk Cümlecik Edge-TTS'e Gönderiliyor: \"{clause_to_synth}\"...", flush=True)
+    # Wait for concurrent first-clause synthesis if already in flight
+    if synth_thread:
+        synth_thread.join(timeout=4.0)
 
-    edge_engine = EdgeTTSEngine(voice="tr-TR-AhmetNeural", timeout_s=4.0) if EdgeTTSEngine else None
-    if edge_engine and edge_engine.is_installed:
-        t_tts_start = time.perf_counter()
-        try:
-            pcm = edge_engine.synthesize_sentence(clause_to_synth, generation_id=1)
-            t_tts_end = time.perf_counter()
-            tts_infer_ms = (t_tts_end - t_tts_start) * 1000.0
-            if pcm:
-                first_clause_pcm = pcm
-                t_first_audio = t_tts_end
-                print(f"  ✅ TTS Sentezi Tamamlandı: {len(pcm)} bayt ({tts_infer_ms:.1f}ms)")
-            else:
-                print("  ⚠️ TTS boş ses üretti.")
-        except Exception as tts_err:
-            print(f"  ⚠️ Edge-TTS hatası: {tts_err}")
+    # Fallback to synchronous synthesis if not already synthesized
+    if not first_clause_pcm:
+        print(f"🎵 [3/4] İlk Cümlecik Edge-TTS'e Gönderiliyor: \"{clause_to_synth}\"...", flush=True)
+        if edge_engine and edge_engine.is_installed:
+            t_tts_start = time.perf_counter()
+            try:
+                pcm = edge_engine.synthesize_sentence(clause_to_synth, generation_id=1)
+                t_tts_end = time.perf_counter()
+                tts_infer_ms = (t_tts_end - t_tts_start) * 1000.0
+                if pcm:
+                    first_clause_pcm = pcm
+                    t_first_audio = t_tts_end
+                    print(f"  ✅ TTS Sentezi Tamamlandı: {len(pcm)} bayt ({tts_infer_ms:.1f}ms)")
+                else:
+                    print("  ⚠️ TTS boş ses üretti.")
+            except Exception as tts_err:
+                print(f"  ⚠️ Edge-TTS hatası: {tts_err}")
+        else:
+            print("  ℹ️ Edge-TTS kütüphanesi ortamda yüklü değil (mock TTS süresi hesaplanıyor: ~120ms)")
+            tts_infer_ms = 120.0
+            t_first_audio = (t_first_clause or t_llm_end) + 0.120
     else:
-        print("  ℹ️ Edge-TTS kütüphanesi ortamda yüklü değil (mock TTS süresi hesaplanıyor: ~120ms)")
-        tts_infer_ms = 120.0
-        t_first_audio = t_llm_end + 0.120
+        print(f"🎵 [3/4] İlk Cümlecik Paralel Sentezlendi: \"{first_clause_text}\" ({tts_infer_ms:.1f}ms)", flush=True)
 
     # 4. Telemetry and Latency Calculations
     ttft_ms = ((t_first_token - t_start) * 1000.0) if t_first_token else 0.0

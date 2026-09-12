@@ -6464,7 +6464,7 @@ class AstroRealtimeNode(Node):
                     "ASTRO:"
                 )
                 try:
-                    local_chunker = SentenceChunker(min_first_clause_chars=18, min_clause_chars=28) if SentenceChunker else None
+                    local_chunker = SentenceChunker(min_first_clause_chars=6, min_clause_chars=20) if SentenceChunker else None
                     first_token_seen = False
                     current_gen_id = self._fallback_generation_id
 
