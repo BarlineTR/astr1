@@ -2,6 +2,7 @@
 # ASTRO V1 — Local Gemma 4 E2B Q4_K_S llama-server Runner
 
 set -e
+export GGML_CUDA_ENABLE_UNIFIED_MEMORY=1
 
 # 1. Resolve llama-server binary
 LLAMA_SERVER_BIN=""
@@ -60,14 +61,26 @@ echo "  İkili (Binary) : $LLAMA_SERVER_BIN"
 echo "  Model          : $MODEL_PATH"
 echo "  Uç Nokta       : http://127.0.0.1:8080/completion"
 echo "  Sağlık Uç Nokta: http://127.0.0.1:8080/health"
-echo "  GPU Katmanları : -ngl 99 (Tam Orin GPU Hızlandırma)"
-echo "  Bağlam (Ctx)   : 2048"
+echo "  GPU Katmanları : -ngl 32 (Tam Orin GPU Hızlandırma)"
+echo "  Bağlam (Ctx)   : 512"
 echo "============================================================================"
 echo ""
 
+echo
+echo "🧹 Jetson page cache temizleniyor..."
+sudo sync
+echo 3 | sudo tee /proc/sys/vm/drop_caches >/dev/null
+echo "✅ Page cache temizlendi."
+echo
 exec "$LLAMA_SERVER_BIN" \
     -m "$MODEL_PATH" \
     --port 8080 \
     --host 127.0.0.1 \
-    -c 2048 \
-    -ngl 99
+    -c 512 \
+    -b 128 \
+    -ub 128 \
+    -ngl 32 \
+    --fit off \
+    --cache-ram 0 \
+    --no-warmup \
+    --no-op-offload
