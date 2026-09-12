@@ -86,6 +86,52 @@ def find_llama_server_binary() -> Optional[str]:
     return None
 
 
+def play_pcm_to_speaker(pcm_24k: bytes, preferred_device: str = ""):
+    """Plays 24kHz PCM to ReSpeaker hardware DAC by resampling to 16kHz and detecting ALSA card."""
+    if not pcm_24k:
+        return
+
+    pcm_16k = pcm_24k
+    detected_dev = preferred_device
+    try:
+        from astro_audio.audio_output_manager import find_alsa_respeaker_device, resample_24k_to_16k
+        pcm_16k = resample_24k_to_16k(pcm_24k)
+        if not detected_dev:
+            detected_dev = find_alsa_respeaker_device()
+    except Exception as _ex:
+        pass
+
+    if not detected_dev:
+        detected_dev = "default"
+
+    print(f"\n🔊 [Hoparlör Çalma]: Cihaz={detected_dev}, Örnekleme=16000Hz, Veri={len(pcm_16k)} bayt...", flush=True)
+
+    import subprocess
+    devices_to_try = [detected_dev]
+    for alt in ["plughw:CARD=ArrayUAC10,DEV=0", "plughw:1,0", "plughw:2,0", "default", "pulse"]:
+        if alt not in devices_to_try:
+            devices_to_try.append(alt)
+
+    played = False
+    for dev in devices_to_try:
+        try:
+            cmd = ["aplay", "-D", dev, "-r", "16000", "-f", "S16_LE", "-c", "1"]
+            proc = subprocess.run(cmd, input=pcm_16k, capture_output=True, timeout=5.0)
+            if proc.returncode == 0:
+                print(f"  ✅ Ses {dev} üzerinden ReSpeaker hoparlörüne başarıyla verildi!")
+                played = True
+                break
+            else:
+                err_msg = proc.stderr.decode("utf-8", errors="ignore").strip()
+                if "No such file or directory" not in err_msg and "Device or resource busy" in err_msg:
+                    print(f"  ⚠️ Cihaz {dev} meşgul (başka bir süreç kullanıyor olabilir): {err_msg}")
+        except Exception as e:
+            pass
+
+    if not played:
+        print("  ⚠️ Doğrudan donanım cihazı ile çalınamadı. 'aplay -l' çıktısını kontrol edin.")
+
+
 def run_benchmark(
     user_query: str,
     base_url: str = "http://127.0.0.1:8080",
@@ -93,6 +139,7 @@ def run_benchmark(
     temperature: float = 0.2,
     simulate: bool = False,
     play_audio: bool = False,
+    audio_device: str = "",
 ):
     print("\n" + "=" * 76)
     print(" 🚀 ASTRO LOCAL FALLBACK PIPELINE — LATENCY & PERFORMANCE BENCHMARK")
@@ -265,19 +312,6 @@ def run_benchmark(
         print(f"  6. Ses Süresi          : {audio_dur_s:6.2f} s   ({len(first_clause_pcm)} bayt, 24kHz int16)")
     print("=" * 76)
 
-    # Optional local speaker playback
-    if play_audio and first_clause_pcm:
-        print("\n🔊 [Hoparlör Çalma]: Sentezlenen ses çalınıyor...", flush=True)
-        try:
-            import subprocess
-            subprocess.run(
-                ["aplay", "-r", "24000", "-f", "S16_LE", "-c", "1", "-q"],
-                input=first_clause_pcm,
-                check=False,
-            )
-        except Exception as p_err:
-            print(f"  ⚠️ Hoparlör çalma uyarısı: {p_err}")
-
     # Acceptance threshold evaluation
     target_ttfa_ms = 850.0
     if ttfa_ms <= target_ttfa_ms:
@@ -285,6 +319,10 @@ def run_benchmark(
     else:
         print(f"  ⚠️ SONUÇ: TTFA {ttfa_ms:.1f}ms > {target_ttfa_ms}ms (Ağ veya model yüküne bağlı gecikme).")
     print("=" * 76 + "\n")
+
+    # Optional local speaker playback
+    if play_audio and first_clause_pcm:
+        play_pcm_to_speaker(first_clause_pcm, preferred_device=audio_device)
 
 
 def main():
@@ -294,7 +332,8 @@ def main():
     parser.add_argument("--n-predict", "-n", type=int, default=12, help="Üretilecek maksimum token sayısı")
     parser.add_argument("--temperature", "-t", type=float, default=0.2, help="Üretim sıcaklığı")
     parser.add_argument("--simulate", "-s", action="store_true", help="llama-server yokken simüle token akışı ile test et")
-    parser.add_argument("--play", "-p", action="store_true", help="Üretilen sesi yerel hoparlörde çal (varsa)")
+    parser.add_argument("--play", "-p", action="store_true", help="Üretilen sesi yerel hoparlörde çal")
+    parser.add_argument("--device", "-d", default="", help="Özel ALSA çıkış cihazı (örn: plughw:1,0)")
     args = parser.parse_args()
 
     run_benchmark(
@@ -304,6 +343,7 @@ def main():
         temperature=args.temperature,
         simulate=args.simulate,
         play_audio=args.play,
+        audio_device=args.device,
     )
 
 
