@@ -64,6 +64,28 @@ def simulate_gemma_tokens(user_query: str) -> Generator[str, None, None]:
         yield tok
 
 
+def find_llama_server_binary() -> Optional[str]:
+    """Finds llama-server executable in common build directories or PATH."""
+    import shutil
+    w = shutil.which("llama-server")
+    if w:
+        return w
+    home = os.path.expanduser("~")
+    candidates = [
+        os.path.join(home, "Desktop", "llama.cpp", "build", "bin", "llama-server"),
+        os.path.join(home, "Desktop", "llama.cpp", "llama-server"),
+        os.path.join(home, "Desktop", "llama.cpp", "build", "bin", "server"),
+        os.path.join(home, "Desktop", "llama.cpp", "server"),
+        os.path.join(home, "llama.cpp", "build", "bin", "llama-server"),
+        os.path.join(home, "llama.cpp", "llama-server"),
+        "/usr/local/bin/llama-server",
+    ]
+    for c in candidates:
+        if os.path.isfile(c):
+            return c
+    return None
+
+
 def run_benchmark(
     user_query: str,
     base_url: str = "http://127.0.0.1:8080",
@@ -90,10 +112,12 @@ def run_benchmark(
             print("✅ ÇEVRİMİÇİ (status: ok)")
         else:
             print("❌ ÇEVRİMDIŞI")
+            server_bin = find_llama_server_binary()
+            bin_cmd = server_bin if server_bin else "llama-server"
             print("\n" + "-" * 76)
             print("  ⚠️  llama-server 127.0.0.1:8080 üzerinde bulunamadı!")
-            print("  Gemma 4 E2B Q4_K_S modelini başlatmak için örnek komut:")
-            print("    llama-server -m gemma-4-E2B-it-Q4_K_S.gguf --port 8080 -c 2048 -ngl 99 --host 127.0.0.1")
+            print(f"  Gemma 4 E2B Q4_K_S modelini başlatmak için çalıştırın:")
+            print(f"    {bin_cmd} -m gemma-4-E2B-it-Q4_K_S.gguf --port 8080 -c 2048 -ngl 99 --host 127.0.0.1")
             print("  Boru hattı testine simülasyon moduyla (--simulate) devam ediliyor...")
             print("-" * 76 + "\n")
             simulate = True
@@ -175,7 +199,7 @@ def run_benchmark(
     if edge_engine and edge_engine.is_installed:
         t_tts_start = time.perf_counter()
         try:
-            pcm = edge_engine.synthesize(clause_to_synth)
+            pcm = edge_engine.synthesize_sentence(clause_to_synth, generation_id=1)
             t_tts_end = time.perf_counter()
             tts_infer_ms = (t_tts_end - t_tts_start) * 1000.0
             if pcm:
@@ -211,11 +235,24 @@ def run_benchmark(
     print(f"  1. TTFT (İlk Token)    : {ttft_ms:6.1f} ms  (Kullanıcı konuşması bittikten ilk kelimeye)")
     print(f"  2. TTFC (İlk Cümlecik) : {ttfc_ms:6.1f} ms  (İlk anlamlı cümle TTS'e aktarılana kadar)")
     print(f"  3. TTS Infer Süresi    : {tts_infer_ms:6.1f} ms  (Edge-TTS AhmetNeural sentez süresi)")
-    print(f"  4. TTFA (İLK SES - TTFA: {ttfa_ms:6.1f} ms  🎯 (KULLANICININ İLK SESİ DUYMA ANI)")
+    print(f"  4. TTFA (İLK SES ANI)  : {ttfa_ms:6.1f} ms  🎯 (KULLANICININ HOPARLÖRDEN SESİ DUYMA ANI)")
     print(f"  5. Toplam LLM Süresi   : {total_gen_ms:6.1f} ms")
     if audio_dur_s > 0:
-        print(f"  6. Ses Çalma Süresi    : {audio_dur_s:6.2f} s   ({len(first_clause_pcm)} bayt, 24kHz int16)")
+        print(f"  6. Ses Süresi          : {audio_dur_s:6.2f} s   ({len(first_clause_pcm)} bayt, 24kHz int16)")
     print("=" * 76)
+
+    # Optional local speaker playback
+    if play_audio and first_clause_pcm:
+        print("\n🔊 [Hoparlör Çalma]: Sentezlenen ses çalınıyor...", flush=True)
+        try:
+            import subprocess
+            subprocess.run(
+                ["aplay", "-r", "24000", "-f", "S16_LE", "-c", "1", "-q"],
+                input=first_clause_pcm,
+                check=False,
+            )
+        except Exception as p_err:
+            print(f"  ⚠️ Hoparlör çalma uyarısı: {p_err}")
 
     # Acceptance threshold evaluation
     target_ttfa_ms = 850.0
