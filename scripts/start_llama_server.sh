@@ -70,6 +70,4 @@ exec "$LLAMA_SERVER_BIN" \
     --port 8080 \
     --host 127.0.0.1 \
     -c 2048 \
-    -ngl 99 \
-    --embeddings false \
-    --metrics true
+    -ngl 99
