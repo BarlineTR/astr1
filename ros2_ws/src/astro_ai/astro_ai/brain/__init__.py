@@ -1,5 +1,6 @@
 """ASTRO V1 — Social Brain Package."""
 
+from astro_ai.brain.affective_state import AffectiveStateManager
 from astro_ai.brain.attention_manager import AttentionManager
 from astro_ai.brain.emotion_engine import EmotionEngine
 from astro_ai.brain.initiative_engine import InitiativeEngine
@@ -12,6 +13,7 @@ from astro_ai.brain.social_fsm import SocialFSM
 from astro_ai.brain.world_model import WorldModel
 
 __all__ = [
+    "AffectiveStateManager",
     "SocialBrain",
     "SelfModel",
     "WorldModel",

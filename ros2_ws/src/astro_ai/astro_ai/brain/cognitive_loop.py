@@ -17,10 +17,16 @@ import threading
 import time
 from typing import Any, Dict, List, Optional
 
+from astro_ai.brain.affective_state import AffectiveStateManager
 from astro_ai.brain.cognitive_event_bus import CognitiveEventBus
 from astro_ai.brain.perception_event_detector import PerceptionEventDetector
 from astro_ai.brain.world_model import WorldModel, WorldStateSnapshot
-from astro_ai.contracts.consciousness_types import CognitiveEvent, CognitiveEventType
+from astro_ai.contracts.consciousness_types import (
+    CognitiveEvent,
+    CognitiveEventType,
+    RobotAffectiveState,
+    SelfState,
+)
 
 
 @dataclass
@@ -36,6 +42,8 @@ class CognitiveCycleResult:
     active_people_count: int
     has_active_speaker: bool
     events_drained: List[str] = field(default_factory=list)
+    self_state: Optional[SelfState] = None
+    affective_state: Optional[RobotAffectiveState] = None
 
 
 class CognitiveLoop:
@@ -46,6 +54,8 @@ class CognitiveLoop:
         world_model: Optional[WorldModel] = None,
         event_bus: Optional[CognitiveEventBus] = None,
         event_detector: Optional[PerceptionEventDetector] = None,
+        self_state: Optional[SelfState] = None,
+        affective_manager: Optional[AffectiveStateManager] = None,
         target_hz: float = 10.0,
         temporal_history_size: int = 50,
     ):
@@ -64,6 +74,16 @@ class CognitiveLoop:
             event_detector
             if event_detector is not None
             else PerceptionEventDetector()
+        )
+        self.self_state = (
+            self_state
+            if self_state is not None
+            else SelfState()
+        )
+        self.affective_manager = (
+            affective_manager
+            if affective_manager is not None
+            else AffectiveStateManager()
         )
 
         self.target_hz = max(1.0, min(50.0, float(target_hz)))
@@ -151,6 +171,24 @@ class CognitiveLoop:
             # -----------------------------------------------------------------
             # [Phase 2 Extension Point: SelfState & Affective Modulator Update]
             # -----------------------------------------------------------------
+            # 1. Update SelfState dynamic physical and operational state
+            self.self_state.update_from_perception(active_perception)
+            self.self_state.timestamp = now
+
+            # 2. Modulate AffectiveState from events processed this cycle
+            if unprocessed_events:
+                for evt in unprocessed_events:
+                    self.affective_manager.update_from_event(evt)
+
+            # 3. Modulate AffectiveState from active perception features
+            self.affective_manager.update_from_perception(active_perception)
+
+            # 4. Perform step decay on affective modulators towards baselines
+            self.affective_manager.step_decay(dt=self.target_period_s)
+
+            # 5. Synchronize confidence and uncertainty into SelfState
+            self.self_state.overall_confidence = self.affective_manager.state.confidence
+            self.self_state.uncertainty_level = self.affective_manager.state.uncertainty
 
             # -----------------------------------------------------------------
             # [Phase 3 Extension Point: Cognitive Attention & Workspace Assembly]
@@ -175,6 +213,7 @@ class CognitiveLoop:
             duration_ms = (time.perf_counter() - t_start) * 1000.0
             self.last_cycle_duration_ms = duration_ms
             self.total_execution_time_ms += duration_ms
+            self.self_state.cycle_time_ms = duration_ms
 
             active_people = [p for p in world_snap.people if getattr(p, "is_present", True)]
             has_speaker = world_snap.active_speaker is not None
@@ -189,6 +228,8 @@ class CognitiveLoop:
                 active_people_count=len(active_people),
                 has_active_speaker=has_speaker,
                 events_drained=drained_event_ids,
+                self_state=self.self_state,
+                affective_state=self.affective_manager.state,
             )
 
     def run_consecutive_steps(
@@ -222,6 +263,8 @@ class CognitiveLoop:
             self.event_detector.reset()
             self.world_model.clear_temporal_history()
             self.event_bus.clear()
+            self.self_state = SelfState()
+            self.affective_manager.reset()
 
     @property
     def average_cycle_duration_ms(self) -> float:

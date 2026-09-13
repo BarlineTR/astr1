@@ -164,13 +164,37 @@ class RobotAffectiveState:
     arousal: float = 0.2             # 0.0 (calm/baseline) to 1.0 (high alert)
     urgency: float = 0.0             # 0.0 (relaxed) to 1.0 (strict deadline/safety)
     social_engagement: float = 0.0   # 0.0 (isolated) to 1.0 (active dialogue)
-    confidence: float = 0.7          # 0.0 (confused) to 1.0 (self-assured)
+    confidence: float = 0.7          # 0.1 (confused) to 1.0 (self-assured)
     uncertainty: float = 0.3         # 0.0 (clear certainty) to 1.0 (high ambiguity)
     curiosity: float = 0.3           # 0.0 (passive) to 1.0 (explorative/novelty seeking)
     frustration: float = 0.0         # 0.0 (smooth execution) to 1.0 (repeated failures)
 
+    def clamp(self) -> None:
+        """Clamps all modulators to their respective valid ranges."""
+        self.arousal = min(1.0, max(0.0, float(self.arousal)))
+        self.urgency = min(1.0, max(0.0, float(self.urgency)))
+        self.social_engagement = min(1.0, max(0.0, float(self.social_engagement)))
+        self.confidence = min(1.0, max(0.1, float(self.confidence)))
+        self.uncertainty = min(1.0, max(0.0, float(self.uncertainty)))
+        self.curiosity = min(1.0, max(0.0, float(self.curiosity)))
+        self.frustration = min(1.0, max(0.0, float(self.frustration)))
+
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
+
+    def get_reaction_speed_multiplier(self) -> float:
+        """Computes reaction speed factor (1.0 = normal, >1.0 = faster)."""
+        return 1.0 + (self.arousal * 0.4) + (self.urgency * 0.6)
+
+    def get_verbosity_multiplier(self) -> float:
+        """Computes dialogue verbosity factor (higher = more verbose, lower = concise)."""
+        base = 1.0 + (self.social_engagement * 0.3) + (self.confidence * 0.2)
+        penalty = (self.urgency * 0.5) + (self.frustration * 0.3)
+        return max(0.2, base - penalty)
+
+    def get_attention_sensitivity(self) -> float:
+        """Computes attention salience threshold sensitivity (higher = more reactive)."""
+        return 1.0 + (self.arousal * 0.5) + (self.curiosity * 0.3)
 
 
 @dataclass
@@ -190,14 +214,140 @@ class SelfState:
     active_prediction: Optional[Prediction] = None
     
     # Introspection metrics
-    overall_confidence: float = 0.8
-    uncertainty_level: float = 0.2
+    overall_confidence: float = 0.7
+    uncertainty_level: float = 0.3
     
     # Diagnostics & Capabilities
     active_capabilities: Set[str] = field(default_factory=set)
     degraded_capabilities: Set[str] = field(default_factory=set)
     cycle_time_ms: float = 0.0
     timestamp: float = field(default_factory=time.time)
+
+    # -------------------------------------------------------------------------
+    # Basic Introspection Queries
+    # -------------------------------------------------------------------------
+
+    def get_current_activity(self) -> str:
+        """Introspective answer to 'What am I doing?'"""
+        if self.is_speaking:
+            if self.focused_person_id:
+                return f"Speaking with {self.focused_person_id}"
+            return "Speaking"
+        if self.is_listening:
+            if self.focused_person_id:
+                return f"Listening to {self.focused_person_id}"
+            return "Listening"
+        if self.active_prediction is not None:
+            return f"Executing action ({self.active_prediction.action_id})"
+        if self.current_goal is not None:
+            return f"Pursuing goal: {self.current_goal.description}"
+        if self.operational_state == RobotState.THINKING:
+            return "Deliberating / reasoning"
+        if self.operational_state == RobotState.THINKING_ACK:
+            return "Processing acknowledgment"
+        if self.operational_state == RobotState.WAKE:
+            return "Awakening and orienting"
+        if self.operational_state == RobotState.ENROLLING:
+            return "Enrolling user profile"
+        if self.operational_state == RobotState.INTERRUPTED:
+            return "Interrupted / adapting"
+        if self.operational_state == RobotState.DEEP_IDLE:
+            return "Deep idle power-saving"
+        return "Idling / monitoring surroundings"
+
+    def get_operational_state(self) -> RobotState:
+        """Returns current operational state read from StateMachine."""
+        return self.operational_state
+
+    def get_focused_person(self) -> Optional[str]:
+        """Returns the ID of the person ASTRO is actively focusing on."""
+        return self.focused_person_id
+
+    def get_active_goal(self) -> Optional[Goal]:
+        """Returns the active cognitive goal if any."""
+        return self.current_goal
+
+    def is_executing_action(self) -> bool:
+        """Returns True if an action or vocal expression is actively executing."""
+        return self.active_prediction is not None or self.is_speaking
+
+    def get_confidence(self) -> float:
+        """Returns current epistemic confidence [0.1, 1.0]."""
+        return self.overall_confidence
+
+    def get_uncertainty(self) -> float:
+        """Returns current uncertainty level [0.0, 1.0]."""
+        return self.uncertainty_level
+
+    def get_degraded_capabilities(self) -> Set[str]:
+        """Returns set of degraded capabilities/sensors."""
+        return set(self.degraded_capabilities)
+
+    def get_introspection_summary(self) -> Dict[str, Any]:
+        """Returns a consolidated introspective snapshot answering core self-queries."""
+        return {
+            "activity": self.get_current_activity(),
+            "operational_state": self.operational_state.value if isinstance(self.operational_state, RobotState) else str(self.operational_state),
+            "focused_person_id": self.focused_person_id,
+            "active_goal_id": self.current_goal.goal_id if self.current_goal else None,
+            "active_action_id": self.active_prediction.action_id if self.active_prediction else None,
+            "is_executing_action": self.is_executing_action(),
+            "confidence": round(self.overall_confidence, 3),
+            "uncertainty": round(self.uncertainty_level, 3),
+            "degraded_capabilities": sorted(list(self.degraded_capabilities)),
+            "cycle_time_ms": round(self.cycle_time_ms, 2),
+            "timestamp": round(self.timestamp, 3),
+        }
+
+    # -------------------------------------------------------------------------
+    # State Synchronization (Strictly Read-Only from Source of Truth)
+    # -------------------------------------------------------------------------
+
+    def update_from_state_machine(self, state_machine: Any) -> None:
+        """Synchronizes operational state from StateMachine without mutating StateMachine."""
+        if hasattr(state_machine, "current_state"):
+            self.operational_state = state_machine.current_state
+            if self.operational_state == RobotState.LISTENING:
+                self.is_listening = True
+            elif self.operational_state == RobotState.SPEAKING:
+                self.is_speaking = True
+            elif self.operational_state == RobotState.IDLE:
+                self.is_speaking = False
+                self.is_listening = False
+
+    def update_from_perception(self, perception_data: Dict[str, Any]) -> None:
+        """Updates internal physical self-state from perception observation dictionary."""
+        if not perception_data:
+            return
+
+        if "tts_speaking" in perception_data:
+            self.is_speaking = bool(perception_data["tts_speaking"])
+        if "vad" in perception_data:
+            self.is_listening = bool(perception_data["vad"])
+
+        robot_state = perception_data.get("robot_state")
+        if isinstance(robot_state, dict):
+            if "is_speaking" in robot_state:
+                self.is_speaking = bool(robot_state["is_speaking"])
+            if "is_listening" in robot_state:
+                self.is_listening = bool(robot_state["is_listening"])
+            if "head_yaw_deg" in robot_state:
+                self.current_head_yaw_deg = float(robot_state["head_yaw_deg"])
+        elif "head_yaw_deg" in perception_data:
+            self.current_head_yaw_deg = float(perception_data["head_yaw_deg"])
+
+        if "active_target_id" in perception_data:
+            self.focused_person_id = perception_data["active_target_id"]
+        elif "focused_person_id" in perception_data:
+            self.focused_person_id = perception_data["focused_person_id"]
+
+    def set_confidence(self, val: float) -> None:
+        """Sets confidence clamped to [0.1, 1.0]."""
+        self.overall_confidence = min(1.0, max(0.1, float(val)))
+
+    def set_uncertainty(self, val: float) -> None:
+        """Sets uncertainty clamped to [0.0, 1.0]."""
+        self.uncertainty_level = min(1.0, max(0.0, float(val)))
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -210,8 +360,8 @@ class SelfState:
             "active_prediction": self.active_prediction.to_dict() if self.active_prediction else None,
             "overall_confidence": round(self.overall_confidence, 3),
             "uncertainty_level": round(self.uncertainty_level, 3),
-            "active_capabilities": list(self.active_capabilities),
-            "degraded_capabilities": list(self.degraded_capabilities),
+            "active_capabilities": sorted(list(self.active_capabilities)),
+            "degraded_capabilities": sorted(list(self.degraded_capabilities)),
             "cycle_time_ms": round(self.cycle_time_ms, 2),
             "timestamp": round(self.timestamp, 3),
         }

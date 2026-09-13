@@ -84,6 +84,7 @@ except ImportError:
 
     Bool = Float32 = String = LaserScan = _MockMsg  # type: ignore
 
+from astro_ai.brain.affective_state import AffectiveStateManager
 from astro_ai.brain.cognitive_event_bus import CognitiveEventBus
 from astro_ai.brain.cognitive_loop import CognitiveLoop
 from astro_ai.contracts.consciousness_types import (
@@ -116,13 +117,16 @@ class ConsciousnessNode(Node):
         param_hist = self.get_parameter("temporal_history_size").value
         self.temporal_history_size = int(param_hist) if param_hist is not None else 50
 
-        # Core Substrates (Phase 0A & 0B: Event Bus + Self State + Cognitive Loop)
+        # Core Substrates (Phase 0A, 0B, Phase 1 & Phase 2)
         self.event_bus = CognitiveEventBus(max_capacity=250)
         self.self_state = SelfState()
-        self.affective_state = RobotAffectiveState()
+        self.affective_manager = AffectiveStateManager()
+        self.affective_state = self.affective_manager.state
         self.loop = CognitiveLoop(
             world_model=None,
             event_bus=self.event_bus,
+            self_state=self.self_state,
+            affective_manager=self.affective_manager,
             target_hz=self.loop_hz,
             temporal_history_size=self.temporal_history_size,
         )
@@ -379,6 +383,7 @@ class ConsciousnessNode(Node):
                     "front_clearance_m": self._sensor_cache["min_front_distance_m"],
                 },
             })
+            self.affective_state = cycle_result.affective_state or self.affective_manager.state
 
             # 3. Telemetry Publishing (2 Hz)
             if (now - self._last_telemetry_ts) >= self._telemetry_interval_s:
@@ -395,6 +400,7 @@ class ConsciousnessNode(Node):
         try:
             state_dict = self.self_state.to_dict()
             state_dict["affective"] = self.affective_state.to_dict()
+            state_dict["introspection"] = self.self_state.get_introspection_summary()
             state_dict["cycle_count"] = self._cycle_count
 
             msg = String()
