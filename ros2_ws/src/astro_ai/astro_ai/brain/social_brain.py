@@ -9,14 +9,17 @@ import time
 from typing import Any, Dict, List, Optional, Tuple
 
 from astro_ai.brain.attention_manager import AttentionManager
+from astro_ai.brain.dialogue_policy_engine import DialoguePolicyEngine
 from astro_ai.brain.emotion_engine import EmotionEngine
 from astro_ai.brain.initiative_engine import InitiativeEngine
 from astro_ai.brain.intent_engine import IntentEngine
 from astro_ai.brain.relationship_manager import RelationshipManager
 from astro_ai.brain.response_planner import ResponsePlanner
 from astro_ai.brain.self_model import SelfModel
+from astro_ai.brain.social_dialogue_adapter import DialogueContextAdapter
 from astro_ai.brain.social_fsm import SocialFSM
 from astro_ai.brain.world_model import WorldModel
+from astro_ai.contracts.social_dialogue_types import DialogueContext, DialogueDirective
 from astro_ai.contracts.intent_emotion_types import (
     ConversationPhase,
     EmotionSignal,
@@ -76,6 +79,8 @@ class SocialBrain:
         self.social_fsm = SocialFSM()
         self.initiative_engine = InitiativeEngine()
         self.response_planner = ResponsePlanner()
+        self.dialogue_adapter = DialogueContextAdapter()
+        self.dialogue_policy = DialoguePolicyEngine()
 
     def process_dialogue_turn(
         self,
@@ -146,11 +151,53 @@ class SocialBrain:
                 active_persona=active_persona,
             )
 
-            # 7. Formulate Strategic Decision
+            # 7. Cognitive & Metacognitive Integration (Phase 5)
+            if person:
+                self.self_model.self_state.focused_person_id = person.person_id
+            self.dialogue_policy.handle_interlocutor_turn(
+                person.person_id if person else None, p_name
+            )
+
+            meta_state, cog_decision = self.self_model.evaluate_cognition(
+                perception_data={"person_distance": distance_m}
+            )
+
+            dialogue_ctx = self.dialogue_adapter.adapt(
+                self_model=self.self_model,
+                person_state=person,
+                person_name=p_name,
+                formal_title=p_title,
+                distance_m=distance_m,
+                social_phase=phase.value if hasattr(phase, "value") else str(phase),
+                cognitive_decision=cog_decision,
+            )
+            dialogue_directive = self.dialogue_policy.evaluate_policy(
+                dialogue_ctx,
+                affective_state=self.self_model.affective_manager.state,
+                cognitive_decision=cog_decision,
+            )
+            update_res = self.dialogue_adapter.check_delta(dialogue_ctx, directive=dialogue_directive)
+
+            # 8. Formulate Strategic Decision
             decision = self.response_planner.plan_response_strategy(context)
 
-            # 8. Construct Modular System Prompt
-            prompt = self._build_modular_prompt(context, decision, user_text)
+            # 9. Construct Modular System Prompt
+            prompt = self._build_modular_prompt(
+                context, decision, user_text, dialogue_ctx=dialogue_ctx, dialogue_directive=dialogue_directive
+            )
+
+            # Record continuity in SelfModel
+            self.self_model.continuity_tracker.record_transition(
+                transition_type="SOCIAL_DIALOGUE_TURN",
+                previous_value=None,
+                new_value=p_name,
+                cause="dialogue_turn",
+                metadata={
+                    "has_context_changed": update_res.has_changed,
+                    "fingerprint": update_res.fingerprint,
+                    "info_sufficiency": dialogue_ctx.information_sufficiency,
+                },
+            )
 
             # Record turn in episodic memory
             self.episodic_memory.record_turn("user", user_text)
@@ -166,12 +213,18 @@ class SocialBrain:
         context: SocialContext,
         decision: SocialDecision,
         user_text: str,
+        dialogue_ctx: Optional[DialogueContext] = None,
+        dialogue_directive: Optional[DialogueDirective] = None,
     ) -> str:
         """Constructs modularized system prompt without dumping unparsed database blobs."""
         parts = []
 
         # Part 1: Epistemic Self Model
         parts.append(self.self_model.get_self_description_prompt())
+
+        # Part 1.5: Cognitive-to-Social Dialogue Envelope (Phase 5)
+        if dialogue_ctx:
+            parts.append(dialogue_ctx.format_compact_prompt(directive=dialogue_directive))
 
         # Part 2: Social Context & Interlocutor
         parts.append(

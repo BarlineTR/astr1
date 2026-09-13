@@ -23,6 +23,7 @@ import os
 import subprocess
 import time
 from typing import Any, Dict, List, Optional, Set, Tuple
+import uuid
 
 from astro_ai.brain.support.budget_gate import LocalBudgetGate
 from astro_ai.brain.support.cache import ArchitectureSupportCache
@@ -36,7 +37,9 @@ from astro_ai.brain.support.contracts import (
     ArchitectureComparisonResult,
     ArchitectureSupportResponse,
     BudgetDecision,
+    ProposalStatus,
     ProposedChange,
+    StructuredChangeProposal,
     SupportControlMode,
     SupportRequest,
     SupportStatus,
@@ -76,12 +79,91 @@ class CognitiveArchitectureAssistant:
                 "groq": GroqQwenProvider(config=self.config),
             }
 
+        # Structured Change Proposal Registry & Deduplication (Hard Requirement)
+        self._proposals: Dict[str, StructuredChangeProposal] = {}
+        self._proposals_by_fingerprint: Dict[str, str] = {}
+        self.suppressed_duplicate_proposals: int = 0
+
     def register_provider(self, name: str, provider: BaseSupportProvider) -> None:
         """Allows registering additional architecture support providers in the future."""
         self._providers[name.lower().strip()] = provider
 
     def get_provider(self, name: str) -> Optional[BaseSupportProvider]:
         return self._providers.get(name.lower().strip())
+
+    # -------------------------------------------------------------------------
+    # Structured Change Proposal Management & Deduplication
+    # -------------------------------------------------------------------------
+
+    def propose_change(
+        self,
+        problem: str,
+        affected_files: List[str],
+        reason_for_each_file: Dict[str, str],
+        proposed_change: str,
+        risk: str = "LOW",
+        tests_required: Optional[List[str]] = None,
+        requires_approval: bool = True,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> Tuple[StructuredChangeProposal, bool]:
+        """Creates or reuses a structured change proposal with SHA-256 deduplication.
+
+        Returns (proposal, is_new).
+        If an equivalent proposal already exists in an active or reviewed state,
+        it suppresses duplicate creation and external LLM cost, returning the existing proposal.
+        """
+        candidate = StructuredChangeProposal(
+            proposal_id="",
+            problem=problem,
+            affected_files=affected_files,
+            reason_for_each_file=reason_for_each_file,
+            proposed_change=proposed_change,
+            risk=risk,
+            tests_required=tests_required or [],
+            requires_approval=requires_approval,
+            metadata=metadata or {},
+        )
+        fp = candidate.proposal_fingerprint
+
+        if fp in self._proposals_by_fingerprint:
+            existing_id = self._proposals_by_fingerprint[fp]
+            existing = self._proposals.get(existing_id)
+            if existing and existing.status in (
+                ProposalStatus.PROPOSED,
+                ProposalStatus.APPROVED,
+                ProposalStatus.APPLIED,
+                ProposalStatus.TESTED,
+                ProposalStatus.REJECTED,
+                ProposalStatus.COMMITTED,
+            ):
+                self.suppressed_duplicate_proposals += 1
+                return existing, False
+
+        # Register new proposal
+        prop_id = f"prop_{uuid.uuid4().hex[:10]}"
+        candidate.proposal_id = prop_id
+        self._proposals[prop_id] = candidate
+        self._proposals_by_fingerprint[fp] = prop_id
+        return candidate, True
+
+    def get_proposal(self, proposal_id: str) -> Optional[StructuredChangeProposal]:
+        """Retrieves a proposal by its unique ID."""
+        return self._proposals.get(proposal_id)
+
+    def list_proposals(self) -> List[StructuredChangeProposal]:
+        """Lists all registered change proposals."""
+        return list(self._proposals.values())
+
+    def update_proposal_status(
+        self, proposal_id: str, new_status: ProposalStatus, notes: str = ""
+    ) -> Optional[StructuredChangeProposal]:
+        """Transitions a proposal across its lifecycle (PROPOSED -> APPROVED -> APPLIED -> TESTED -> COMMITTED)."""
+        prop = self._proposals.get(proposal_id)
+        if prop:
+            prop.status = new_status
+            if notes:
+                prop.metadata["status_notes"] = notes
+        return prop
 
     # -------------------------------------------------------------------------
     # Core Architecture Analysis Entry Point
@@ -197,12 +279,26 @@ class CognitiveArchitectureAssistant:
         self.budget_gate.record_request_sent(target_provider.provider_name, estimated_tokens)
 
         # 8. Execute Model Call
-        response = target_provider.generate_analysis(
-            prompt=request.prompt,
-            context=context,
-            mode=request.mode,
-            request_id=request.request_id,
-        )
+        try:
+            response = target_provider.generate_analysis(
+                prompt=request.prompt,
+                context=context,
+                mode=request.mode,
+                request_id=request.request_id,
+            )
+        except Exception as exc:
+            err_str = str(exc)
+            is_429 = "429" in err_str
+            response = ArchitectureSupportResponse(
+                request_id=request.request_id,
+                provider=target_provider.provider_name,
+                model=target_provider.model_name,
+                mode=request.mode,
+                status=SupportStatus.ERROR,
+                summary=f"Provider call failed: {exc}",
+                error_code="HTTP_429" if is_429 else "PROVIDER_EXCEPTION",
+                confidence=0.0,
+            )
         response.budget_decision = decision
 
         # 9. Handle Success vs. Failure (Strict Zero-Cascade Fallback by default)

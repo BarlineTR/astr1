@@ -13,10 +13,24 @@ IMPORTANT ARCHITECTURAL INVARIANTS:
 from __future__ import annotations
 
 import enum
+import hashlib
+import json
 import time
 import uuid
 from dataclasses import asdict, dataclass, field
 from typing import Any, Dict, List, Optional, Set
+
+
+class ProposalStatus(str, enum.Enum):
+    """Lifecycle status for a structured architecture change proposal."""
+    PROPOSED = "PROPOSED"
+    APPROVED = "APPROVED"
+    APPLIED = "APPLIED"
+    TESTED = "TESTED"
+    COMMITTED = "COMMITTED"
+    REJECTED = "REJECTED"
+    BLOCKED = "BLOCKED"
+    FAILED = "FAILED"
 
 
 class SupportControlMode(str, enum.Enum):
@@ -86,6 +100,57 @@ class ProposedChange:
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
+
+
+@dataclass
+class StructuredChangeProposal:
+    """A formal machine-readable proposal to modify existing source files.
+
+    Enforces that file modifications are recorded with full provenance, risk assessment,
+    deduplication fingerprints, and strict lifecycle states.
+    """
+    proposal_id: str
+    problem: str
+    affected_files: List[str]
+    reason_for_each_file: Dict[str, str]
+    proposed_change: str
+    risk: str = "LOW"
+    tests_required: List[str] = field(default_factory=list)
+    requires_approval: bool = True
+    status: ProposalStatus = ProposalStatus.PROPOSED
+    proposal_fingerprint: str = ""
+    timestamp: float = field(default_factory=time.time)
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+    def compute_fingerprint(self) -> str:
+        """Calculates a stable SHA-256 fingerprint for deduplication."""
+        canonical = (
+            self.problem.strip().lower(),
+            tuple(sorted([f.strip().lower() for f in self.affected_files])),
+            self.proposed_change.strip().lower(),
+        )
+        serialized = json.dumps(canonical, sort_keys=True, ensure_ascii=False)
+        return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+
+    def __post_init__(self):
+        if not self.proposal_fingerprint:
+            self.proposal_fingerprint = self.compute_fingerprint()
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "proposal_id": self.proposal_id,
+            "problem": self.problem,
+            "affected_files": list(self.affected_files),
+            "reason_for_each_file": dict(self.reason_for_each_file),
+            "proposed_change": self.proposed_change,
+            "risk": self.risk,
+            "tests_required": list(self.tests_required),
+            "requires_approval": self.requires_approval,
+            "status": self.status.value if isinstance(self.status, ProposalStatus) else str(self.status),
+            "proposal_fingerprint": self.proposal_fingerprint,
+            "timestamp": self.timestamp,
+            "metadata": self.metadata,
+        }
 
 
 @dataclass

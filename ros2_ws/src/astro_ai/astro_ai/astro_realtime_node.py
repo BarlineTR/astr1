@@ -6458,7 +6458,17 @@ class AstroRealtimeNode(Node):
             local_gemma_streamed_audio = False
             if self.local_gemma_client and self.local_gemma_client.is_available():
                 t_local_start = time.monotonic()
+                cog_envelope = ""
+                if getattr(self, "social_brain", None) and hasattr(self.social_brain, "dialogue_adapter"):
+                    try:
+                        last_ctx = getattr(self.social_brain.dialogue_adapter, "_last_context", None)
+                        if last_ctx:
+                            cog_envelope = last_ctx.format_compact_prompt() + "\n\n"
+                    except Exception:
+                        cog_envelope = ""
+
                 gemma_prompt = (
+                    f"{cog_envelope}"
                     "ASTRO bir sosyal robot. Türkçe konuş. Kısa ve doğal cevap ver.\n\n"
                     f"Kullanıcı: {user_text}\n"
                     "ASTRO:"
