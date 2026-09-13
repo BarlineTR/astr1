@@ -61,6 +61,7 @@ class CognitiveEventType(str, Enum):
     # Attention & Cognitive Events
     NOVELTY_DETECTED = "NOVELTY_DETECTED"
     ATTENTION_SHIFTED = "ATTENTION_SHIFTED"
+    TARGET_CHANGED = "TARGET_CHANGED"
     REASONING_REQUESTED = "REASONING_REQUESTED"
     
     # System & Degradation Events

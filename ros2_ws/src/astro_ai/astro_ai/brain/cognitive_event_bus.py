@@ -49,6 +49,7 @@ DEFAULT_SALIENCE_MAP: Dict[CognitiveEventType, float] = {
     CognitiveEventType.GOAL_COMPLETED: 0.55,
     CognitiveEventType.GOAL_FAILED: 0.75,
     CognitiveEventType.ATTENTION_SHIFTED: 0.45,
+    CognitiveEventType.TARGET_CHANGED: 0.50,
     CognitiveEventType.OPERATIONAL_STATE_CHANGED: 0.30,
     CognitiveEventType.SOCIAL_PHASE_CHANGED: 0.40,
     CognitiveEventType.SENSOR_RECOVERED: 0.60,

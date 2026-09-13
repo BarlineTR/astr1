@@ -18,6 +18,7 @@ import time
 from typing import Any, Dict, List, Optional
 
 from astro_ai.brain.cognitive_event_bus import CognitiveEventBus
+from astro_ai.brain.perception_event_detector import PerceptionEventDetector
 from astro_ai.brain.world_model import WorldModel, WorldStateSnapshot
 from astro_ai.contracts.consciousness_types import CognitiveEvent, CognitiveEventType
 
@@ -44,6 +45,7 @@ class CognitiveLoop:
         self,
         world_model: Optional[WorldModel] = None,
         event_bus: Optional[CognitiveEventBus] = None,
+        event_detector: Optional[PerceptionEventDetector] = None,
         target_hz: float = 10.0,
         temporal_history_size: int = 50,
     ):
@@ -57,6 +59,11 @@ class CognitiveLoop:
             event_bus
             if event_bus is not None
             else CognitiveEventBus(max_capacity=250)
+        )
+        self.event_detector = (
+            event_detector
+            if event_detector is not None
+            else PerceptionEventDetector()
         )
 
         self.target_hz = max(1.0, min(50.0, float(target_hz)))
@@ -120,8 +127,12 @@ class CognitiveLoop:
                 self.world_model.update_conversation_state(**active_perception["conversation_state"])
 
             # -----------------------------------------------------------------
-            # 2. EVENT: Process cognitive event bus & record significant changes
+            # 2. EVENT: Detect perception transitions & process event bus
             # -----------------------------------------------------------------
+            new_events = self.event_detector.detect_transitions(active_perception, timestamp=now)
+            for evt in new_events:
+                self.event_bus.publish(evt)
+
             unprocessed_events = self.event_bus.get_unprocessed_events()
             drained_event_ids: List[str] = []
 
@@ -208,6 +219,7 @@ class CognitiveLoop:
             self.last_cycle_timestamp = 0.0
             self.total_execution_time_ms = 0.0
             self._cached_perception.clear()
+            self.event_detector.reset()
             self.world_model.clear_temporal_history()
             self.event_bus.clear()
 

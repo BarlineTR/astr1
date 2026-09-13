@@ -181,41 +181,85 @@ class ConsciousnessNode(Node):
         self.create_subscription(String, "/vision/faces", self._on_faces_msg, qos_profile_sensor_data)
         self.create_subscription(Bool, "/vision/person_detected", self._on_person_detected_msg, qos_profile_sensor_data)
         self.create_subscription(Bool, "/vision/looking_at_robot", self._on_looking_msg, qos_profile_sensor_data)
+        self.create_subscription(String, "/vision/recognized_person", self._on_recognized_person_msg, 10)
         self.create_subscription(Bool, "/audio/vad", self._on_audio_vad_msg, qos_profile_sensor_data)
         self.create_subscription(Float32, "/audio/doa", self._on_audio_doa_msg, qos_profile_sensor_data)
         self.create_subscription(Bool, "/tts/speaking", self._on_tts_speaking_msg, 10)
         self.create_subscription(String, "/speech/text", self._on_speech_text_msg, 10)
         self.create_subscription(LaserScan, "/scan", self._on_scan_msg, qos_profile_sensor_data)
         self.create_subscription(Float32, "/head/state", self._on_head_state_msg, qos_profile_sensor_data)
+        self.create_subscription(String, "/gaze/active_target", self._on_active_target_msg, 10)
 
     # -------------------------------------------------------------------------
     # Perception Callbacks (O(1) Non-Blocking Caches)
     # -------------------------------------------------------------------------
 
     def _on_faces_msg(self, msg: Any) -> None:
+        raw_txt = getattr(msg, "data", "[]")
+        now = time.time()
+        people_list: List[UnifiedPersonState] = []
+        try:
+            face_data = json.loads(raw_txt)
+            if isinstance(face_data, list):
+                for idx, f in enumerate(face_data):
+                    name = f.get("recognized_name") or f.get("name") or "Misafir"
+                    is_known = bool(f.get("is_known") or (f.get("recognized_name") is not None))
+                    pid = f"person_{name.lower().replace(' ', '_')}" if is_known else f"person_visual_{idx+1}"
+                    people_list.append(UnifiedPersonState(
+                        person_id=pid,
+                        name=name,
+                        formal_title=f.get("recognized_title") or f.get("formal_title") or name,
+                        is_known=is_known,
+                        distance_m=float(f.get("distance_m", 1.5)),
+                        azimuth_deg=float(f.get("camera_azimuth_deg", f.get("yaw_deg", 0.0))),
+                        is_looking_at_robot=bool(f.get("looking_at_robot", False)),
+                        is_present=True,
+                    ))
+        except Exception:
+            pass
+
         with self._lock:
-            self._sensor_cache["faces_json"] = getattr(msg, "data", "[]")
-            self._sensor_cache["last_sensor_update_ts"] = time.time()
+            self._sensor_cache["faces_json"] = raw_txt
+            if people_list:
+                self._sensor_cache["people"] = people_list
+            self._sensor_cache["last_sensor_update_ts"] = now
+
+        self.loop.event_detector.notify_sensor_active("camera", now)
+
+    def _on_recognized_person_msg(self, msg: Any) -> None:
+        val = str(getattr(msg, "data", "")).strip()
+        with self._lock:
+            self._sensor_cache["recognized_person"] = val if val else None
+
+    def _on_active_target_msg(self, msg: Any) -> None:
+        val = str(getattr(msg, "data", "")).strip()
+        now = time.time()
+        with self._lock:
+            self._sensor_cache["active_target_id"] = val if val else None
+        self.loop.event_detector.notify_sensor_active("gaze", now)
 
     def _on_person_detected_msg(self, msg: Any) -> None:
         val = bool(getattr(msg, "data", False))
         prev = self._sensor_cache["person_detected"]
+        now = time.time()
         with self._lock:
             self._sensor_cache["person_detected"] = val
-            self._sensor_cache["last_sensor_update_ts"] = time.time()
+            self._sensor_cache["last_sensor_update_ts"] = now
+
+        self.loop.event_detector.notify_sensor_active("camera", now)
 
         # Emit perception events on state transitions
         if val and not prev:
             self.event_bus.create_and_publish(
                 event_type=CognitiveEventType.PERSON_APPEARED,
                 source="vision",
-                data={"timestamp": time.time()},
+                data={"timestamp": now},
             )
         elif not val and prev:
             self.event_bus.create_and_publish(
                 event_type=CognitiveEventType.PERSON_DISAPPEARED,
                 source="vision",
-                data={"timestamp": time.time()},
+                data={"timestamp": now},
             )
 
     def _on_looking_msg(self, msg: Any) -> None:
@@ -225,9 +269,13 @@ class ConsciousnessNode(Node):
     def _on_audio_vad_msg(self, msg: Any) -> None:
         val = bool(getattr(msg, "data", False))
         prev = self._sensor_cache["vad"]
+        now = time.time()
         with self._lock:
             self._sensor_cache["vad"] = val
             self.self_state.is_listening = val
+
+        self.loop.event_detector.notify_sensor_active("audio", now)
+
         if val and not prev:
             self.event_bus.create_and_publish(
                 event_type=CognitiveEventType.PERSON_SPOKE,
@@ -236,8 +284,10 @@ class ConsciousnessNode(Node):
             )
 
     def _on_audio_doa_msg(self, msg: Any) -> None:
+        now = time.time()
         with self._lock:
             self._sensor_cache["doa_deg"] = float(getattr(msg, "data", 0.0))
+        self.loop.event_detector.notify_sensor_active("audio", now)
 
     def _on_tts_speaking_msg(self, msg: Any) -> None:
         val = bool(getattr(msg, "data", False))
@@ -258,9 +308,11 @@ class ConsciousnessNode(Node):
 
     def _on_speech_text_msg(self, msg: Any) -> None:
         text = str(getattr(msg, "data", "")).strip()
+        now = time.time()
         if text:
             with self._lock:
                 self._sensor_cache["last_speech_text"] = text
+            self.loop.event_detector.notify_sensor_active("audio", now)
             self.event_bus.create_and_publish(
                 event_type=CognitiveEventType.PERSON_SPOKE,
                 source="speech_recognition",
@@ -269,17 +321,21 @@ class ConsciousnessNode(Node):
 
     def _on_scan_msg(self, msg: Any) -> None:
         ranges = getattr(msg, "ranges", [])
+        now = time.time()
         if ranges:
             valid_ranges = [r for r in ranges if 0.15 < r < 12.0]
             if valid_ranges:
                 with self._lock:
                     self._sensor_cache["min_front_distance_m"] = min(valid_ranges)
+        self.loop.event_detector.notify_sensor_active("lidar", now)
 
     def _on_head_state_msg(self, msg: Any) -> None:
         yaw = float(getattr(msg, "data", 0.0))
+        now = time.time()
         with self._lock:
             self._sensor_cache["head_yaw_deg"] = yaw
             self.self_state.current_head_yaw_deg = yaw
+        self.loop.event_detector.notify_sensor_active("head", now)
 
     # -------------------------------------------------------------------------
     # Cognitive Cycle (Timer Callback - Nominal 10 Hz)
@@ -309,6 +365,12 @@ class ConsciousnessNode(Node):
 
             # 3. Step CognitiveLoop (Perceive -> Event -> World Temporal Update)
             cycle_result = self.loop.step({
+                "people": self._sensor_cache.get("people", None),
+                "person_detected": self._sensor_cache["person_detected"],
+                "vad": self._sensor_cache["vad"],
+                "doa_deg": self._sensor_cache["doa_deg"],
+                "tts_speaking": self._sensor_cache["tts_speaking"],
+                "active_target_id": self._sensor_cache.get("active_target_id", None),
                 "robot_state": {
                     "head_yaw_deg": self._sensor_cache["head_yaw_deg"],
                     "is_speaking": self._sensor_cache["tts_speaking"],

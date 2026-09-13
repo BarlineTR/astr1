@@ -75,6 +75,7 @@ class WorldModel:
             current_ids = set()
 
             for p in people_list:
+                p.is_present = True
                 self._people[p.person_id] = p
                 current_ids.add(p.person_id)
 
