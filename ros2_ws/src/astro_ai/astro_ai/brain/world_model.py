@@ -4,6 +4,7 @@ Maintains the authoritative real-time representation of the environment,
 active people, spatial objects, conversational context, and recent events.
 """
 
+from collections import deque
 import threading
 import time
 from dataclasses import dataclass, field
@@ -30,8 +31,10 @@ class WorldStateSnapshot:
 class WorldModel:
     """Thread-safe dynamic world model coordinating all sensory and situational state."""
 
-    def __init__(self):
+    def __init__(self, temporal_history_size: int = 50):
         self._lock = threading.RLock()
+        self._temporal_history_size = max(10, temporal_history_size)
+        self._temporal_history: deque[WorldStateSnapshot] = deque(maxlen=self._temporal_history_size)
 
         self._people: Dict[str, UnifiedPersonState] = {}
         self._active_speaker: Optional[UnifiedPersonState] = None
@@ -126,3 +129,45 @@ class WorldModel:
                 conversation_state=dict(self._conversation_state),
                 recent_events=events_formatted,
             )
+
+    # -------------------------------------------------------------------------
+    # Temporal History & Short-Window Memory Extensions
+    # -------------------------------------------------------------------------
+
+    def commit_temporal_snapshot(
+        self, snapshot: Optional[WorldStateSnapshot] = None
+    ) -> WorldStateSnapshot:
+        """Commits an immutable snapshot into the bounded temporal ring buffer."""
+        with self._lock:
+            snap = snapshot or self.get_snapshot()
+            self._temporal_history.append(snap)
+            return snap
+
+    def get_temporal_window(
+        self, limit: Optional[int] = None
+    ) -> List[WorldStateSnapshot]:
+        """Returns a read-only list of recent world snapshots in chronological order."""
+        with self._lock:
+            history_list = list(self._temporal_history)
+            if limit is not None and limit > 0:
+                return history_list[-limit:]
+            return history_list
+
+    def get_latest_temporal_snapshot(self) -> Optional[WorldStateSnapshot]:
+        """Returns the most recent committed temporal snapshot, if any."""
+        with self._lock:
+            if self._temporal_history:
+                return self._temporal_history[-1]
+            return None
+
+    def clear_temporal_history(self) -> None:
+        """Clears the temporal history buffer."""
+        with self._lock:
+            self._temporal_history.clear()
+
+    @property
+    def temporal_history_len(self) -> int:
+        """Returns current number of snapshots stored in the temporal ring buffer."""
+        with self._lock:
+            return len(self._temporal_history)
+
