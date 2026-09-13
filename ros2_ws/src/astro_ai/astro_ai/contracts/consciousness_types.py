@@ -94,6 +94,37 @@ class PredictionStatus(str, Enum):
     EXPIRED = "EXPIRED"
 
 
+class InformationSufficiency(str, Enum):
+    """Machine evaluation of whether sensory information is adequate for current goal."""
+    SUFFICIENT = "SUFFICIENT"
+    INSUFFICIENT = "INSUFFICIENT"
+    STALE = "STALE"
+    CONFLICTING = "CONFLICTING"
+    UNKNOWN = "UNKNOWN"
+
+
+class CognitiveDecisionType(str, Enum):
+    """Internal cognitive-level intent categories.
+
+    IMPORTANT: These are cognitive processing decisions, NOT motor/ActionIntent commands.
+    """
+    CONTINUE = "CONTINUE"
+    REASSESS = "REASSESS"
+    SEEK_INFORMATION = "SEEK_INFORMATION"
+    REEVALUATE_GOAL = "REEVALUATE_GOAL"
+    REVIEW_STRATEGY = "REVIEW_STRATEGY"
+    WAIT_FOR_OUTCOME = "WAIT_FOR_OUTCOME"
+
+
+class StrategyStatus(str, Enum):
+    """Lifecycle status of a cognitive strategy."""
+    ACTIVE = "ACTIVE"
+    SUSPENDED = "SUSPENDED"
+    COMPLETED = "COMPLETED"
+    FAILED = "FAILED"
+    ABANDONED = "ABANDONED"
+
+
 # =============================================================================
 # 2. DATACLASSES
 # =============================================================================
@@ -495,6 +526,248 @@ class CognitiveWorkspace:
         }
 
 
+@dataclass
+class CognitiveStrategy:
+    """An explicit, machine-readable pattern of cognitive processing."""
+    strategy_id: str
+    strategy_type: str = "DEFAULT"
+    name: str = ""
+    description: str = ""
+    related_goal_id: Optional[str] = None
+    created_at: float = field(default_factory=time.time)
+    confidence: float = 0.7
+    status: StrategyStatus = StrategyStatus.ACTIVE
+    rationale: str = ""
+    success_count: int = 0
+    failure_count: int = 0
+    last_used: float = field(default_factory=time.time)
+    cooldown_until: float = 0.0
+    parameters: Dict[str, Any] = field(default_factory=dict)
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+    def is_on_cooldown(self, now: Optional[float] = None) -> bool:
+        """Returns True if this strategy is in cooldown."""
+        current = time.time() if now is None else now
+        return current < self.cooldown_until
+
+    def record_success(self) -> None:
+        """Increments success counter."""
+        self.success_count += 1
+        self.last_used = time.time()
+
+    def record_failure(self) -> None:
+        """Increments failure counter."""
+        self.failure_count += 1
+        self.last_used = time.time()
+
+    def record_outcome(self, success: bool) -> None:
+        """Convenience method to record success or failure."""
+        if success:
+            self.record_success()
+        else:
+            self.record_failure()
+
+    def get_success_rate(self) -> float:
+        """Returns empirical success rate in [0.0, 1.0]."""
+        total = self.success_count + self.failure_count
+        if total == 0:
+            return 1.0
+        return float(self.success_count) / float(total)
+
+    def to_dict(self) -> Dict[str, Any]:
+        d = asdict(self)
+        d["status"] = self.status.value if hasattr(self.status, "value") else str(self.status)
+        d["success_rate"] = round(self.get_success_rate(), 3)
+        return d
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> CognitiveStrategy:
+        status_val = data.get("status", StrategyStatus.ACTIVE.value)
+        if isinstance(status_val, str):
+            try:
+                status_enum = StrategyStatus(status_val)
+            except ValueError:
+                status_enum = StrategyStatus.ACTIVE
+        else:
+            status_enum = status_val
+
+        return cls(
+            strategy_id=data["strategy_id"],
+            strategy_type=data.get("strategy_type", "DEFAULT"),
+            name=data.get("name", ""),
+            description=data.get("description", ""),
+            related_goal_id=data.get("related_goal_id"),
+            created_at=float(data.get("created_at", time.time())),
+            confidence=float(data.get("confidence", 0.7)),
+            status=status_enum,
+            rationale=data.get("rationale", ""),
+            success_count=int(data.get("success_count", 0)),
+            failure_count=int(data.get("failure_count", 0)),
+            last_used=float(data.get("last_used", time.time())),
+            cooldown_until=float(data.get("cooldown_until", 0.0)),
+            parameters=dict(data.get("parameters", {})),
+            metadata=dict(data.get("metadata", {})),
+        )
+
+
+@dataclass
+class CognitiveConflict:
+    """A detected contradiction or structural incompatibility in active cognition."""
+    conflict_id: str
+    conflict_type: str
+    severity: float = 0.5            # 0.0 (minor) to 1.0 (critical safety override)
+    involved_goal_ids: List[str] = field(default_factory=list)
+    involved_strategy_ids: List[str] = field(default_factory=list)
+    evidence: Dict[str, Any] = field(default_factory=dict)
+    detected_at: float = field(default_factory=time.time)
+    status: str = "ACTIVE"           # ACTIVE, RESOLVED, IGNORED
+    resolution_notes: str = ""
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> CognitiveConflict:
+        return cls(
+            conflict_id=data["conflict_id"],
+            conflict_type=data["conflict_type"],
+            severity=float(data.get("severity", 0.5)),
+            involved_goal_ids=list(data.get("involved_goal_ids", [])),
+            involved_strategy_ids=list(data.get("involved_strategy_ids", [])),
+            evidence=dict(data.get("evidence", {})),
+            detected_at=float(data.get("detected_at", time.time())),
+            status=data.get("status", "ACTIVE"),
+            resolution_notes=data.get("resolution_notes", ""),
+        )
+
+
+@dataclass
+class CognitiveDecision:
+    """An internal cognitive processing intent emitted by metacognitive control.
+
+    IMPORTANT: CognitiveDecision != ActionIntent.
+    It guides internal processing (e.g. REASSESS, SEEK_INFORMATION), not hardware actuators.
+    """
+    decision_id: str
+    decision_type: CognitiveDecisionType
+    reason: str
+    target_goal_id: Optional[str] = None
+    target_strategy_id: Optional[str] = None
+    timestamp: float = field(default_factory=time.time)
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> Dict[str, Any]:
+        d = asdict(self)
+        d["decision_type"] = self.decision_type.value if hasattr(self.decision_type, "value") else str(self.decision_type)
+        return d
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> CognitiveDecision:
+        dtype_val = data.get("decision_type", CognitiveDecisionType.CONTINUE.value)
+        if isinstance(dtype_val, str):
+            try:
+                dtype_enum = CognitiveDecisionType(dtype_val)
+            except ValueError:
+                dtype_enum = CognitiveDecisionType.CONTINUE
+        else:
+            dtype_enum = dtype_val
+
+        return cls(
+            decision_id=data["decision_id"],
+            decision_type=dtype_enum,
+            reason=data.get("reason", ""),
+            target_goal_id=data.get("target_goal_id"),
+            target_strategy_id=data.get("target_strategy_id"),
+            timestamp=float(data.get("timestamp", time.time())),
+            metadata=dict(data.get("metadata", {})),
+        )
+
+
+@dataclass
+class MetacognitiveState:
+    """Aggregate assessment snapshot of ASTRO's cognitive health and strategy efficacy.
+
+    Strictly an evaluative read representation: does NOT own operational state or StateMachine.
+    """
+    cognitive_status: str = "NORMAL" # NORMAL, EVALUATING, DEGRADED, CONFLICTED, REASSESSING
+    current_strategy_id: Optional[str] = None
+    strategy_confidence: float = 0.7
+    knowledge_confidence: float = 0.7
+    uncertainty_level: float = 0.3
+    information_sufficiency: InformationSufficiency = InformationSufficiency.UNKNOWN
+    recent_prediction_success_rate: float = 1.0
+    recent_prediction_error_rate: float = 0.0
+    repeated_failure_count: int = 0
+    cognitive_conflict_state: str = "NONE" # NONE, DETECTED, RESOLVING
+    need_for_reassessment: bool = False
+    last_reassessment_reason: str = ""
+    current_cognitive_load_estimate: float = 0.2
+    timestamp: float = field(default_factory=time.time)
+
+    def clamp(self) -> None:
+        """Clamps all metrics to valid bounded intervals and prevents NaNs/infinities."""
+        self.strategy_confidence = min(1.0, max(0.0, float(self.strategy_confidence)))
+        self.knowledge_confidence = min(1.0, max(0.0, float(self.knowledge_confidence)))
+        self.uncertainty_level = min(1.0, max(0.0, float(self.uncertainty_level)))
+        self.recent_prediction_success_rate = min(1.0, max(0.0, float(self.recent_prediction_success_rate)))
+        self.recent_prediction_error_rate = min(1.0, max(0.0, float(self.recent_prediction_error_rate)))
+        self.current_cognitive_load_estimate = min(1.0, max(0.0, float(self.current_cognitive_load_estimate)))
+        self.repeated_failure_count = max(0, int(self.repeated_failure_count))
+
+    def to_dict(self) -> Dict[str, Any]:
+        self.clamp()
+        return {
+            "cognitive_status": self.cognitive_status,
+            "current_strategy_id": self.current_strategy_id,
+            "strategy_confidence": round(self.strategy_confidence, 3),
+            "knowledge_confidence": round(self.knowledge_confidence, 3),
+            "uncertainty_level": round(self.uncertainty_level, 3),
+            "information_sufficiency": (
+                self.information_sufficiency.value
+                if hasattr(self.information_sufficiency, "value")
+                else str(self.information_sufficiency)
+            ),
+            "recent_prediction_success_rate": round(self.recent_prediction_success_rate, 3),
+            "recent_prediction_error_rate": round(self.recent_prediction_error_rate, 3),
+            "repeated_failure_count": self.repeated_failure_count,
+            "cognitive_conflict_state": self.cognitive_conflict_state,
+            "need_for_reassessment": self.need_for_reassessment,
+            "last_reassessment_reason": self.last_reassessment_reason,
+            "current_cognitive_load_estimate": round(self.current_cognitive_load_estimate, 3),
+            "timestamp": round(self.timestamp, 3),
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> MetacognitiveState:
+        info_suff_val = data.get("information_sufficiency", InformationSufficiency.UNKNOWN.value)
+        if isinstance(info_suff_val, str):
+            try:
+                info_suff_enum = InformationSufficiency(info_suff_val)
+            except ValueError:
+                info_suff_enum = InformationSufficiency.UNKNOWN
+        else:
+            info_suff_enum = info_suff_val
+
+        state = cls(
+            cognitive_status=data.get("cognitive_status", "NORMAL"),
+            current_strategy_id=data.get("current_strategy_id"),
+            strategy_confidence=float(data.get("strategy_confidence", 0.7)),
+            knowledge_confidence=float(data.get("knowledge_confidence", 0.7)),
+            uncertainty_level=float(data.get("uncertainty_level", 0.3)),
+            information_sufficiency=info_suff_enum,
+            recent_prediction_success_rate=float(data.get("recent_prediction_success_rate", 1.0)),
+            recent_prediction_error_rate=float(data.get("recent_prediction_error_rate", 0.0)),
+            repeated_failure_count=int(data.get("repeated_failure_count", 0)),
+            cognitive_conflict_state=data.get("cognitive_conflict_state", "NONE"),
+            need_for_reassessment=bool(data.get("need_for_reassessment", False)),
+            last_reassessment_reason=data.get("last_reassessment_reason", ""),
+            current_cognitive_load_estimate=float(data.get("current_cognitive_load_estimate", 0.2)),
+            timestamp=float(data.get("timestamp", time.time())),
+        )
+        state.clamp()
+        return state
+
+
 @dataclass(frozen=True)
 class CognitiveContext:
     """Immutable read-model synthesizing ASTRO's integrated machine cognitive state.
@@ -520,6 +793,7 @@ class CognitiveContext:
     recent_events_summary: List[str] = field(default_factory=list)
     perception_summary: Dict[str, Any] = field(default_factory=dict)
     self_state_snapshot: Optional[Dict[str, Any]] = None
+    metacognitive_state: Optional[Dict[str, Any]] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -539,4 +813,5 @@ class CognitiveContext:
             "recent_events_summary": list(self.recent_events_summary),
             "perception_summary": dict(self.perception_summary),
             "self_state_snapshot": self.self_state_snapshot,
+            "metacognitive_state": self.metacognitive_state,
         }

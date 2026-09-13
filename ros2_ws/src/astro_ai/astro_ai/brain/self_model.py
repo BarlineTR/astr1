@@ -8,18 +8,26 @@ from typing import Any, Dict, List, Optional, Set
 
 from astro_ai.brain.affective_state import AffectiveStateManager
 from astro_ai.brain.cognitive_continuity import CognitiveContinuityTracker
+from astro_ai.brain.metacognitive_engine import MetacognitiveEngine
 from astro_ai.brain.prediction_engine import PredictionEngine
 from astro_ai.contracts.consciousness_types import (
     ActualOutcome,
+    CognitiveConflict,
     CognitiveContext,
+    CognitiveDecision,
+    CognitiveDecisionType,
     CognitiveEvent,
+    CognitiveStrategy,
     CognitiveTransition,
     Goal,
     GoalChangeCause,
+    InformationSufficiency,
+    MetacognitiveState,
     Prediction,
     PredictionError,
     RobotAffectiveState,
     SelfState,
+    StrategyStatus,
 )
 from astro_ai.state_machine import RobotState, StateMachine
 
@@ -66,11 +74,12 @@ class SelfModel:
         ]
     )
 
-    # Dynamic Runtime Self-State & Introspection (Phase 2 & Phase 3 Extensions)
+    # Dynamic Runtime Self-State & Introspection (Phase 2, 3 & 4 Extensions)
     self_state: SelfState = field(default_factory=SelfState)
     affective_manager: AffectiveStateManager = field(default_factory=AffectiveStateManager)
     prediction_engine: PredictionEngine = field(default_factory=PredictionEngine)
     continuity_tracker: CognitiveContinuityTracker = field(default_factory=CognitiveContinuityTracker)
+    metacognitive_engine: MetacognitiveEngine = field(default_factory=MetacognitiveEngine)
     current_goal_cause: str = ""
     current_goal_source: str = ""
 
@@ -270,6 +279,9 @@ class SelfModel:
                 metadata={"delta": round(pred_error.uncertainty_impact, 3)},
             )
 
+        # Update metacognitive strategy and outcome performance tracking
+        self.metacognitive_engine.record_outcome_for_strategy(matched=pred_error.matched)
+
         return pred_error
 
     def check_prediction_expirations(
@@ -303,6 +315,8 @@ class SelfModel:
                 cause="timeout",
                 metadata=err.to_dict(),
             )
+            # Record expiration as an error in strategy tracker
+            self.metacognitive_engine.record_outcome_for_strategy(matched=False)
         return expired_errors
 
     # -------------------------------------------------------------------------
@@ -320,6 +334,99 @@ class SelfModel:
     def get_last_transition(self) -> Optional[CognitiveTransition]:
         """Returns the most recently recorded cognitive transition."""
         return self.continuity_tracker.get_last_transition()
+
+    # -------------------------------------------------------------------------
+    # Metacognitive Control & Reflective Cognition (Phase 4 Core API)
+    # -------------------------------------------------------------------------
+
+    def get_metacognitive_state(self) -> MetacognitiveState:
+        """Returns the current MetacognitiveState assessment snapshot."""
+        return self.metacognitive_engine.current_state
+
+    def set_active_strategy(
+        self, strategy: CognitiveStrategy | str, rationale: str = ""
+    ) -> Optional[CognitiveStrategy]:
+        """Registers and/or activates a cognitive strategy, recording the transition."""
+        if isinstance(strategy, str):
+            strat_obj = self.metacognitive_engine.get_strategy(strategy)
+            strat_id = strategy
+        else:
+            strat_obj = strategy
+            strat_id = strategy.strategy_id
+            self.metacognitive_engine.register_strategy(strat_obj)
+
+        prev_strat = self.metacognitive_engine.get_active_strategy()
+        prev_id = prev_strat.strategy_id if prev_strat else None
+        activated = self.metacognitive_engine.set_active_strategy(strat_id, rationale=rationale)
+
+        if activated:
+            self.continuity_tracker.record_transition(
+                transition_type="STRATEGY_CHANGE",
+                previous_value=prev_id,
+                new_value=strat_id,
+                cause=rationale or (strat_obj.rationale if strat_obj else "") or "strategy_selection",
+                metadata=strat_obj.to_dict() if strat_obj else {},
+            )
+        return activated
+
+    def get_active_strategy(self) -> Optional[CognitiveStrategy]:
+        """Returns the active cognitive strategy."""
+        return self.metacognitive_engine.get_active_strategy()
+
+    def assess_information_sufficiency(
+        self, perception_data: Optional[Dict[str, Any]] = None
+    ) -> InformationSufficiency:
+        """Evaluates whether current perception data is adequate for the active goal."""
+        return self.metacognitive_engine.assess_information_sufficiency(
+            active_goal=self.self_state.current_goal,
+            perception_data=perception_data,
+            uncertainty=self.get_uncertainty(),
+        )
+
+    def detect_conflicts(
+        self, perception_data: Optional[Dict[str, Any]] = None
+    ) -> List[CognitiveConflict]:
+        """Detects cognitive conflicts and logs new conflicts in continuity tracker."""
+        conflicts = self.metacognitive_engine.detect_conflicts(
+            active_goal=self.self_state.current_goal,
+            perception_data=perception_data,
+            confidence=self.get_confidence(),
+            uncertainty=self.get_uncertainty(),
+        )
+        for conf in conflicts:
+            self.continuity_tracker.record_transition(
+                transition_type="CONFLICT_DETECTED",
+                previous_value=None,
+                new_value=conf.conflict_type,
+                cause="conflict_detection",
+                metadata=conf.to_dict(),
+            )
+        return conflicts
+
+    def evaluate_cognition(
+        self, perception_data: Optional[Dict[str, Any]] = None
+    ) -> Tuple[MetacognitiveState, Optional[CognitiveDecision]]:
+        """Evaluates cognitive health, conflicts, and policy, returning state and decision."""
+        state, decision = self.metacognitive_engine.evaluate_metacognitive_state(
+            active_goal=self.self_state.current_goal,
+            perception_data=perception_data,
+            confidence=self.get_confidence(),
+            uncertainty=self.get_uncertainty(),
+        )
+
+        if decision and decision.decision_type in (
+            CognitiveDecisionType.REASSESS,
+            CognitiveDecisionType.REEVALUATE_GOAL,
+            CognitiveDecisionType.REVIEW_STRATEGY,
+        ):
+            self.continuity_tracker.record_transition(
+                transition_type="REASSESSMENT_TRIGGERED",
+                previous_value=state.cognitive_status,
+                new_value=decision.decision_type.value,
+                cause=decision.reason,
+                metadata=decision.to_dict(),
+            )
+        return state, decision
 
     def get_cognitive_context(
         self,
@@ -358,4 +465,5 @@ class SelfModel:
             recent_events_summary=events_summary[-10:],
             perception_summary=dict(perception_data or {}),
             self_state_snapshot=self.self_state.to_dict(),
+            metacognitive_state=self.metacognitive_engine.current_state.to_dict(),
         )

@@ -20,13 +20,16 @@ from typing import Any, Dict, List, Optional
 from astro_ai.brain.affective_state import AffectiveStateManager
 from astro_ai.brain.cognitive_continuity import CognitiveContinuityTracker
 from astro_ai.brain.cognitive_event_bus import CognitiveEventBus
+from astro_ai.brain.metacognitive_engine import MetacognitiveEngine
 from astro_ai.brain.perception_event_detector import PerceptionEventDetector
 from astro_ai.brain.prediction_engine import PredictionEngine
 from astro_ai.brain.world_model import WorldModel, WorldStateSnapshot
 from astro_ai.contracts.consciousness_types import (
     CognitiveContext,
+    CognitiveDecision,
     CognitiveEvent,
     CognitiveEventType,
+    MetacognitiveState,
     PredictionError,
     RobotAffectiveState,
     SelfState,
@@ -50,6 +53,8 @@ class CognitiveCycleResult:
     affective_state: Optional[RobotAffectiveState] = None
     cognitive_context: Optional[CognitiveContext] = None
     prediction_errors: List[PredictionError] = field(default_factory=list)
+    metacognitive_state: Optional[MetacognitiveState] = None
+    cognitive_decision: Optional[CognitiveDecision] = None
 
 
 class CognitiveLoop:
@@ -64,6 +69,7 @@ class CognitiveLoop:
         affective_manager: Optional[AffectiveStateManager] = None,
         prediction_engine: Optional[PredictionEngine] = None,
         continuity_tracker: Optional[CognitiveContinuityTracker] = None,
+        metacognitive_engine: Optional[MetacognitiveEngine] = None,
         target_hz: float = 10.0,
         temporal_history_size: int = 50,
     ):
@@ -102,6 +108,11 @@ class CognitiveLoop:
             continuity_tracker
             if continuity_tracker is not None
             else CognitiveContinuityTracker()
+        )
+        self.metacognitive_engine = (
+            metacognitive_engine
+            if metacognitive_engine is not None
+            else MetacognitiveEngine()
         )
 
         self.target_hz = max(1.0, min(50.0, float(target_hz)))
@@ -226,6 +237,11 @@ class CognitiveLoop:
                     cause="timeout",
                     metadata=err.to_dict(),
                 )
+                self.metacognitive_engine.record_outcome_for_strategy(
+                    success=False,
+                    prediction_error=err,
+                    confidence=self.self_state.overall_confidence,
+                )
                 pred_errors.append(err)
 
             # 2. Check focus change
@@ -239,7 +255,43 @@ class CognitiveLoop:
                 )
                 self._last_focused_person = current_focus
 
-            # 3. Assemble CognitiveContext integration/read snapshot
+            # 3. [Phase 4 Extension Point: Metacognitive Evaluation & Reflective Control]
+            prev_strat_id = self.metacognitive_engine.current_state.current_strategy_id
+            meta_state, cog_decision = self.metacognitive_engine.evaluate_metacognitive_state(
+                active_goal=self.self_state.current_goal,
+                perception_data=active_perception,
+                confidence=self.self_state.overall_confidence,
+                uncertainty=self.self_state.uncertainty_level,
+                now=now,
+            )
+
+            # Track transitions in cognitive continuity
+            if meta_state.current_strategy_id != prev_strat_id and meta_state.current_strategy_id is not None:
+                self.continuity_tracker.record_transition(
+                    transition_type="STRATEGY_CHANGE",
+                    previous_value=prev_strat_id,
+                    new_value=meta_state.current_strategy_id,
+                    cause="metacognitive_evaluation",
+                )
+
+            if meta_state.cognitive_conflict_state == "DETECTED":
+                self.continuity_tracker.record_transition(
+                    transition_type="CONFLICT_DETECTED",
+                    previous_value="NONE",
+                    new_value="DETECTED",
+                    cause=meta_state.last_reassessment_reason or "conflict",
+                    metadata={"load": meta_state.current_cognitive_load_estimate},
+                )
+
+            if meta_state.need_for_reassessment:
+                self.continuity_tracker.record_transition(
+                    transition_type="REASSESSMENT_TRIGGERED",
+                    previous_value="NORMAL",
+                    new_value="REASSESS",
+                    cause=meta_state.last_reassessment_reason,
+                )
+
+            # 4. Assemble CognitiveContext integration/read snapshot
             events_summary = [
                 f"{evt.event_type.value}: {evt.source}"
                 for evt in (unprocessed_events or [])
@@ -270,23 +322,20 @@ class CognitiveLoop:
                 recent_events_summary=events_summary[-10:],
                 perception_summary=dict(active_perception),
                 self_state_snapshot=self.self_state.to_dict(),
+                metacognitive_state=meta_state.to_dict(),
             )
-
-            # -----------------------------------------------------------------
-            # [Phase 4 Extension Point: Goal Management & Action Intent Decision]
-            # -----------------------------------------------------------------
 
             # -----------------------------------------------------------------
             # [Phase 5 Extension Point: Action Prediction & Outcome Evaluation]
             # -----------------------------------------------------------------
 
             # -----------------------------------------------------------------
-            # 3. WORLD TEMPORAL UPDATE: Commit ring-buffer snapshot
+            # 5. WORLD TEMPORAL UPDATE: Commit ring-buffer snapshot
             # -----------------------------------------------------------------
             world_snap = self.world_model.commit_temporal_snapshot()
 
             # -----------------------------------------------------------------
-            # 4. CYCLE RESULT & TIMING: Evaluate cycle performance
+            # 6. CYCLE RESULT & TIMING: Evaluate cycle performance
             # -----------------------------------------------------------------
             duration_ms = (time.perf_counter() - t_start) * 1000.0
             self.last_cycle_duration_ms = duration_ms
@@ -310,6 +359,8 @@ class CognitiveLoop:
                 affective_state=self.affective_manager.state,
                 cognitive_context=cog_context,
                 prediction_errors=pred_errors,
+                metacognitive_state=meta_state,
+                cognitive_decision=cog_decision,
             )
 
     def run_consecutive_steps(
@@ -347,6 +398,7 @@ class CognitiveLoop:
             self.affective_manager.reset()
             self.prediction_engine.clear()
             self.continuity_tracker.clear()
+            self.metacognitive_engine.reset()
             self._last_focused_person = None
 
     @property

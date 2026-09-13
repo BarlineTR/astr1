@@ -6,6 +6,7 @@ from astro_ai.brain.cognitive_continuity import CognitiveContinuityTracker
 from astro_ai.brain.emotion_engine import EmotionEngine
 from astro_ai.brain.initiative_engine import InitiativeEngine
 from astro_ai.brain.intent_engine import IntentEngine
+from astro_ai.brain.metacognitive_engine import MetacognitiveEngine
 from astro_ai.brain.prediction_engine import PredictionEngine
 from astro_ai.brain.relationship_manager import RelationshipManager
 from astro_ai.brain.response_planner import ResponsePlanner
@@ -17,6 +18,7 @@ from astro_ai.brain.world_model import WorldModel
 __all__ = [
     "AffectiveStateManager",
     "CognitiveContinuityTracker",
+    "MetacognitiveEngine",
     "PredictionEngine",
     "SocialBrain",
     "SelfModel",
