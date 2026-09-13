@@ -18,12 +18,16 @@ import time
 from typing import Any, Dict, List, Optional
 
 from astro_ai.brain.affective_state import AffectiveStateManager
+from astro_ai.brain.cognitive_continuity import CognitiveContinuityTracker
 from astro_ai.brain.cognitive_event_bus import CognitiveEventBus
 from astro_ai.brain.perception_event_detector import PerceptionEventDetector
+from astro_ai.brain.prediction_engine import PredictionEngine
 from astro_ai.brain.world_model import WorldModel, WorldStateSnapshot
 from astro_ai.contracts.consciousness_types import (
+    CognitiveContext,
     CognitiveEvent,
     CognitiveEventType,
+    PredictionError,
     RobotAffectiveState,
     SelfState,
 )
@@ -44,6 +48,8 @@ class CognitiveCycleResult:
     events_drained: List[str] = field(default_factory=list)
     self_state: Optional[SelfState] = None
     affective_state: Optional[RobotAffectiveState] = None
+    cognitive_context: Optional[CognitiveContext] = None
+    prediction_errors: List[PredictionError] = field(default_factory=list)
 
 
 class CognitiveLoop:
@@ -56,6 +62,8 @@ class CognitiveLoop:
         event_detector: Optional[PerceptionEventDetector] = None,
         self_state: Optional[SelfState] = None,
         affective_manager: Optional[AffectiveStateManager] = None,
+        prediction_engine: Optional[PredictionEngine] = None,
+        continuity_tracker: Optional[CognitiveContinuityTracker] = None,
         target_hz: float = 10.0,
         temporal_history_size: int = 50,
     ):
@@ -85,6 +93,16 @@ class CognitiveLoop:
             if affective_manager is not None
             else AffectiveStateManager()
         )
+        self.prediction_engine = (
+            prediction_engine
+            if prediction_engine is not None
+            else PredictionEngine()
+        )
+        self.continuity_tracker = (
+            continuity_tracker
+            if continuity_tracker is not None
+            else CognitiveContinuityTracker()
+        )
 
         self.target_hz = max(1.0, min(50.0, float(target_hz)))
         self.target_period_s = 1.0 / self.target_hz
@@ -93,6 +111,7 @@ class CognitiveLoop:
         self.last_cycle_duration_ms = 0.0
         self.last_cycle_timestamp = 0.0
         self.total_execution_time_ms = 0.0
+        self._last_focused_person: Optional[str] = None
 
         # Cached latest perception state for standalone/async feeds
         self._cached_perception: Dict[str, Any] = {}
@@ -191,8 +210,67 @@ class CognitiveLoop:
             self.self_state.uncertainty_level = self.affective_manager.state.uncertainty
 
             # -----------------------------------------------------------------
-            # [Phase 3 Extension Point: Cognitive Attention & Workspace Assembly]
+            # [Phase 3 Extension Point: Prediction Expirations & Continuity Tracking]
             # -----------------------------------------------------------------
+            # 1. Check expired predictions
+            pred_errors: List[PredictionError] = []
+            expired_errors = self.prediction_engine.check_expirations(now=now)
+            for err in expired_errors:
+                self.affective_manager.update_confidence(err.confidence_impact)
+                self.affective_manager.update_uncertainty(err.uncertainty_impact)
+                self.affective_manager.modulate_frustration(0.1)
+                self.continuity_tracker.record_transition(
+                    transition_type="PREDICTION_EXPIRED",
+                    previous_value=err.expectation_id,
+                    new_value="EXPIRED",
+                    cause="timeout",
+                    metadata=err.to_dict(),
+                )
+                pred_errors.append(err)
+
+            # 2. Check focus change
+            current_focus = self.self_state.focused_person_id
+            if current_focus != self._last_focused_person:
+                self.continuity_tracker.record_transition(
+                    transition_type="FOCUS_CHANGE",
+                    previous_value=self._last_focused_person,
+                    new_value=current_focus,
+                    cause="perception_update",
+                )
+                self._last_focused_person = current_focus
+
+            # 3. Assemble CognitiveContext integration/read snapshot
+            events_summary = [
+                f"{evt.event_type.value}: {evt.source}"
+                for evt in (unprocessed_events or [])
+            ]
+            cog_context = CognitiveContext(
+                timestamp=now,
+                activity=self.self_state.get_current_activity(),
+                operational_state=(
+                    self.self_state.operational_state.value
+                    if hasattr(self.self_state.operational_state, "value")
+                    else str(self.self_state.operational_state)
+                ),
+                focused_person_id=current_focus,
+                active_goal=self.self_state.current_goal.to_dict() if self.self_state.current_goal else None,
+                active_prediction=self.self_state.active_prediction.to_dict() if self.self_state.active_prediction else None,
+                confidence=round(self.self_state.overall_confidence, 3),
+                uncertainty=round(self.self_state.uncertainty_level, 3),
+                affective_state=self.affective_manager.state.to_dict(),
+                degraded_capabilities=sorted(list(self.self_state.degraded_capabilities)),
+                identity={
+                    "name": "Astro",
+                    "creator": "Baran",
+                    "location": "Bitlis / Ahlat",
+                    "version": "ASTRO V1 (Cognitive Embodied Social Robot)",
+                },
+                capabilities=[],
+                recent_transitions=self.continuity_tracker.to_list()[-10:],
+                recent_events_summary=events_summary[-10:],
+                perception_summary=dict(active_perception),
+                self_state_snapshot=self.self_state.to_dict(),
+            )
 
             # -----------------------------------------------------------------
             # [Phase 4 Extension Point: Goal Management & Action Intent Decision]
@@ -230,6 +308,8 @@ class CognitiveLoop:
                 events_drained=drained_event_ids,
                 self_state=self.self_state,
                 affective_state=self.affective_manager.state,
+                cognitive_context=cog_context,
+                prediction_errors=pred_errors,
             )
 
     def run_consecutive_steps(
@@ -265,6 +345,9 @@ class CognitiveLoop:
             self.event_bus.clear()
             self.self_state = SelfState()
             self.affective_manager.reset()
+            self.prediction_engine.clear()
+            self.continuity_tracker.clear()
+            self._last_focused_person = None
 
     @property
     def average_cycle_duration_ms(self) -> float:

@@ -147,11 +147,77 @@ class Prediction:
     created_at: float = field(default_factory=time.time)
     status: PredictionStatus = PredictionStatus.PENDING
     confidence_weight: float = 1.0   # Impact weight on confidence on mismatch
+    source: str = ""
+    related_goal_id: Optional[str] = None
+    target_person_id: Optional[str] = None
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+    def is_expired(self, now: Optional[float] = None) -> bool:
+        """Returns True if the expectation's deadline has passed."""
+        current = time.time() if now is None else now
+        return current > self.expected_by
 
     def to_dict(self) -> Dict[str, Any]:
         d = asdict(self)
         d["status"] = self.status.value
         return d
+
+
+@dataclass
+class ActualOutcome:
+    """A structured representation of an observed real-world outcome."""
+    outcome_id: str
+    actual_state: Dict[str, Any]
+    expectation_id: Optional[str] = None
+    timestamp: float = field(default_factory=time.time)
+    source: str = ""
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass
+class PredictionError:
+    """Discrepancy calculation between an expectation and actual outcome."""
+    expectation_id: str
+    matched: bool
+    mismatch_score: float              # 0.0 (exact match) to 1.0 (total mismatch)
+    mismatch_type: str = "NONE"       # NONE, VALUE_MISMATCH, MISSING_KEY, TIMEOUT_EXPIRED
+    confidence_impact: float = 0.0    # Signed delta applied to confidence
+    uncertainty_impact: float = 0.0   # Signed delta applied to uncertainty
+    details: Dict[str, Any] = field(default_factory=dict)
+    timestamp: float = field(default_factory=time.time)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
+class GoalChangeCause(str, Enum):
+    """Machine-readable causes for goal state changes."""
+    USER_REQUEST = "USER_REQUEST"
+    SAFETY_OVERRIDE = "SAFETY_OVERRIDE"
+    PREDICTION_ERROR = "PREDICTION_ERROR"
+    TIMEOUT = "TIMEOUT"
+    COMPLETION = "COMPLETION"
+    PERCEPTION_TRIGGER = "PERCEPTION_TRIGGER"
+    MANUAL = "MANUAL"
+    INTERNAL_HOMEOSTASIS = "INTERNAL_HOMEOSTASIS"
+
+
+@dataclass
+class CognitiveTransition:
+    """Structured record of a cognitive state change."""
+    transition_id: str
+    timestamp: float
+    transition_type: str
+    previous_value: Any
+    new_value: Any
+    cause: str = ""
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
 
 
 @dataclass
@@ -426,4 +492,51 @@ class CognitiveWorkspace:
             "affective_modulators": self.affective_modulators.to_dict() if self.affective_modulators else None,
             "reasoning_flag": self.reasoning_flag,
             "reasoning_rationale": self.reasoning_rationale,
+        }
+
+
+@dataclass(frozen=True)
+class CognitiveContext:
+    """Immutable read-model synthesizing ASTRO's integrated machine cognitive state.
+
+    Integrates SelfState, SelfModel identity, capabilities, active goal,
+    predictions, affective modulators, and recent transitions into a unified
+    read snapshot.
+    Does NOT own or mutate operational state or StateMachine.
+    """
+    timestamp: float = 0.0
+    activity: str = "Idling"
+    operational_state: str = "IDLE"
+    focused_person_id: Optional[str] = None
+    active_goal: Optional[Dict[str, Any]] = None
+    active_prediction: Optional[Dict[str, Any]] = None
+    confidence: float = 0.7
+    uncertainty: float = 0.3
+    affective_state: Dict[str, float] = field(default_factory=dict)
+    degraded_capabilities: List[str] = field(default_factory=list)
+    identity: Dict[str, str] = field(default_factory=dict)
+    capabilities: List[str] = field(default_factory=list)
+    recent_transitions: List[Dict[str, Any]] = field(default_factory=list)
+    recent_events_summary: List[str] = field(default_factory=list)
+    perception_summary: Dict[str, Any] = field(default_factory=dict)
+    self_state_snapshot: Optional[Dict[str, Any]] = None
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "timestamp": round(self.timestamp, 3),
+            "activity": self.activity,
+            "operational_state": self.operational_state,
+            "focused_person_id": self.focused_person_id,
+            "active_goal": self.active_goal,
+            "active_prediction": self.active_prediction,
+            "confidence": round(self.confidence, 3),
+            "uncertainty": round(self.uncertainty, 3),
+            "affective_state": dict(self.affective_state),
+            "degraded_capabilities": list(self.degraded_capabilities),
+            "identity": dict(self.identity),
+            "capabilities": list(self.capabilities),
+            "recent_transitions": list(self.recent_transitions),
+            "recent_events_summary": list(self.recent_events_summary),
+            "perception_summary": dict(self.perception_summary),
+            "self_state_snapshot": self.self_state_snapshot,
         }

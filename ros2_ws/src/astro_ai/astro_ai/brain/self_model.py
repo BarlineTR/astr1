@@ -3,13 +3,21 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import time
 from typing import Any, Dict, List, Optional, Set
 
 from astro_ai.brain.affective_state import AffectiveStateManager
+from astro_ai.brain.cognitive_continuity import CognitiveContinuityTracker
+from astro_ai.brain.prediction_engine import PredictionEngine
 from astro_ai.contracts.consciousness_types import (
+    ActualOutcome,
+    CognitiveContext,
     CognitiveEvent,
+    CognitiveTransition,
     Goal,
+    GoalChangeCause,
     Prediction,
+    PredictionError,
     RobotAffectiveState,
     SelfState,
 )
@@ -58,9 +66,13 @@ class SelfModel:
         ]
     )
 
-    # Dynamic Runtime Self-State & Introspection (Phase 2 Extension)
+    # Dynamic Runtime Self-State & Introspection (Phase 2 & Phase 3 Extensions)
     self_state: SelfState = field(default_factory=SelfState)
     affective_manager: AffectiveStateManager = field(default_factory=AffectiveStateManager)
+    prediction_engine: PredictionEngine = field(default_factory=PredictionEngine)
+    continuity_tracker: CognitiveContinuityTracker = field(default_factory=CognitiveContinuityTracker)
+    current_goal_cause: str = ""
+    current_goal_source: str = ""
 
     def get_self_description_prompt(self) -> str:
         """Returns structured epistemic guidelines for the LLM."""
@@ -149,3 +161,201 @@ class SelfModel:
         self.affective_manager.step_decay(dt)
         self.self_state.overall_confidence = self.affective_manager.state.confidence
         self.self_state.uncertainty_level = self.affective_manager.state.uncertainty
+
+    # -------------------------------------------------------------------------
+    # Goal & Prediction Integration (Phase 3 Core API)
+    # -------------------------------------------------------------------------
+
+    def set_active_goal(
+        self,
+        goal: Optional[Goal],
+        cause: str = GoalChangeCause.MANUAL.value,
+        source: str = "",
+    ) -> None:
+        """Updates the active cognitive goal and records the transition with its cause."""
+        prev_goal = self.self_state.current_goal
+        prev_id = prev_goal.goal_id if prev_goal else None
+        new_id = goal.goal_id if goal else None
+
+        self.self_state.current_goal = goal
+        self.current_goal_cause = str(cause)
+        self.current_goal_source = str(source)
+
+        if prev_id != new_id or (prev_goal and goal and prev_goal.status != goal.status):
+            self.continuity_tracker.record_transition(
+                transition_type="GOAL_CHANGE",
+                previous_value=prev_goal.to_dict() if prev_goal else None,
+                new_value=goal.to_dict() if goal else None,
+                cause=str(cause),
+                metadata={"source": source, "previous_id": prev_id, "new_id": new_id},
+            )
+
+    def get_current_goal_cause(self) -> str:
+        """Returns the machine-readable cause of the current goal assignment."""
+        return self.current_goal_cause
+
+    def get_current_goal_description(self) -> str:
+        """Introspective answer to 'What am I currently trying to accomplish?'"""
+        if self.self_state.current_goal:
+            return self.self_state.current_goal.description
+        return "No active goal"
+
+    def register_prediction(self, prediction: Prediction) -> None:
+        """Registers an action prediction and records the transition."""
+        self.prediction_engine.register_prediction(prediction)
+        self.self_state.active_prediction = prediction
+        self.continuity_tracker.record_transition(
+            transition_type="PREDICTION_REGISTERED",
+            previous_value=None,
+            new_value=prediction.prediction_id,
+            cause=prediction.source or "action_execution",
+            metadata={"action_id": prediction.action_id, "expected_by": prediction.expected_by},
+        )
+
+    def evaluate_outcome(
+        self, outcome: ActualOutcome, now: Optional[float] = None
+    ) -> PredictionError:
+        """Evaluates an actual outcome against active predictions and applies bounded updates."""
+        prev_conf = self.affective_manager.state.confidence
+        prev_unc = self.affective_manager.state.uncertainty
+
+        pred_error = self.prediction_engine.evaluate_outcome(outcome, now=now)
+
+        # Authoritative update in AffectiveStateManager
+        self.affective_manager.update_confidence(pred_error.confidence_impact)
+        self.affective_manager.update_uncertainty(pred_error.uncertainty_impact)
+        if pred_error.matched:
+            self.affective_manager.modulate_frustration(-0.1)
+        else:
+            self.affective_manager.modulate_frustration(pred_error.mismatch_score * 0.15)
+
+        # Synchronize resulting state to SelfState read representation
+        new_conf = self.affective_manager.state.confidence
+        new_unc = self.affective_manager.state.uncertainty
+        self.self_state.overall_confidence = new_conf
+        self.self_state.uncertainty_level = new_unc
+
+        # If active prediction matches evaluated prediction, update or clear it
+        if (
+            self.self_state.active_prediction
+            and self.self_state.active_prediction.prediction_id == pred_error.expectation_id
+        ):
+            if pred_error.matched:
+                self.self_state.active_prediction = None
+
+        # Record transition in continuity tracker
+        self.continuity_tracker.record_transition(
+            transition_type="PREDICTION_EVALUATED" if pred_error.matched else "PREDICTION_ERROR",
+            previous_value={"confidence": round(prev_conf, 3), "uncertainty": round(prev_unc, 3)},
+            new_value={"confidence": round(new_conf, 3), "uncertainty": round(new_unc, 3)},
+            cause=pred_error.mismatch_type,
+            metadata=pred_error.to_dict(),
+        )
+
+        if abs(new_conf - prev_conf) >= 0.05:
+            self.continuity_tracker.record_transition(
+                transition_type="CONFIDENCE_CHANGE",
+                previous_value=round(prev_conf, 3),
+                new_value=round(new_conf, 3),
+                cause="prediction_evaluation",
+                metadata={"delta": round(pred_error.confidence_impact, 3)},
+            )
+
+        if abs(new_unc - prev_unc) >= 0.05:
+            self.continuity_tracker.record_transition(
+                transition_type="UNCERTAINTY_CHANGE",
+                previous_value=round(prev_unc, 3),
+                new_value=round(new_unc, 3),
+                cause="prediction_evaluation",
+                metadata={"delta": round(pred_error.uncertainty_impact, 3)},
+            )
+
+        return pred_error
+
+    def check_prediction_expirations(
+        self, now: Optional[float] = None
+    ) -> List[PredictionError]:
+        """Checks and processes any expired predictions."""
+        expired_errors = self.prediction_engine.check_expirations(now=now)
+        for err in expired_errors:
+            prev_conf = self.affective_manager.state.confidence
+            prev_unc = self.affective_manager.state.uncertainty
+
+            self.affective_manager.update_confidence(err.confidence_impact)
+            self.affective_manager.update_uncertainty(err.uncertainty_impact)
+            self.affective_manager.modulate_frustration(0.1)
+
+            new_conf = self.affective_manager.state.confidence
+            new_unc = self.affective_manager.state.uncertainty
+            self.self_state.overall_confidence = new_conf
+            self.self_state.uncertainty_level = new_unc
+
+            if (
+                self.self_state.active_prediction
+                and self.self_state.active_prediction.prediction_id == err.expectation_id
+            ):
+                self.self_state.active_prediction = None
+
+            self.continuity_tracker.record_transition(
+                transition_type="PREDICTION_EXPIRED",
+                previous_value=err.expectation_id,
+                new_value="EXPIRED",
+                cause="timeout",
+                metadata=err.to_dict(),
+            )
+        return expired_errors
+
+    # -------------------------------------------------------------------------
+    # Cognitive Continuity & Introspective Transitions
+    # -------------------------------------------------------------------------
+
+    def get_recent_transitions(self, limit: int = 10) -> List[CognitiveTransition]:
+        """Returns recent cognitive transitions up to limit."""
+        return self.continuity_tracker.get_recent_transitions(limit=limit)
+
+    def get_transitions_by_type(self, transition_type: str) -> List[CognitiveTransition]:
+        """Returns recent cognitive transitions of a specific type."""
+        return self.continuity_tracker.get_transitions_by_type(transition_type=transition_type)
+
+    def get_last_transition(self) -> Optional[CognitiveTransition]:
+        """Returns the most recently recorded cognitive transition."""
+        return self.continuity_tracker.get_last_transition()
+
+    def get_cognitive_context(
+        self,
+        recent_events: Optional[List[CognitiveEvent]] = None,
+        perception_data: Optional[Dict[str, Any]] = None,
+    ) -> CognitiveContext:
+        """Constructs an immutable CognitiveContext read snapshot."""
+        now = time.time()
+        events_summary = [
+            f"{evt.event_type.value}: {evt.source}"
+            for evt in (recent_events or [])
+        ]
+        return CognitiveContext(
+            timestamp=now,
+            activity=self.get_current_activity(),
+            operational_state=(
+                self.get_operational_state().value
+                if isinstance(self.get_operational_state(), RobotState)
+                else str(self.get_operational_state())
+            ),
+            focused_person_id=self.get_focused_person(),
+            active_goal=self.self_state.current_goal.to_dict() if self.self_state.current_goal else None,
+            active_prediction=self.self_state.active_prediction.to_dict() if self.self_state.active_prediction else None,
+            confidence=round(self.get_confidence(), 3),
+            uncertainty=round(self.get_uncertainty(), 3),
+            affective_state=self.affective_manager.state.to_dict(),
+            degraded_capabilities=sorted(list(self.get_degraded_capabilities())),
+            identity={
+                "name": self.name,
+                "creator": self.creator,
+                "location": self.location,
+                "version": self.version,
+            },
+            capabilities=list(self.capabilities),
+            recent_transitions=self.continuity_tracker.to_list()[-10:],
+            recent_events_summary=events_summary[-10:],
+            perception_summary=dict(perception_data or {}),
+            self_state_snapshot=self.self_state.to_dict(),
+        )
