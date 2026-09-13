@@ -25,8 +25,10 @@ from astro_ai.brain.perception_event_detector import PerceptionEventDetector
 from astro_ai.brain.prediction_engine import PredictionEngine
 from astro_ai.brain.world_model import WorldModel, WorldStateSnapshot
 from astro_ai.contracts.consciousness_types import (
+    ActualOutcome,
     CognitiveContext,
     CognitiveDecision,
+    CognitiveDecisionType,
     CognitiveEvent,
     CognitiveEventType,
     MetacognitiveState,
@@ -160,9 +162,9 @@ class CognitiveLoop:
                 else dict(self._cached_perception)
             )
 
-            # Synchronize people
+            # Synchronize people with lifecycle tracking
             if "people" in active_perception and isinstance(active_perception["people"], list):
-                self.world_model.update_people(active_perception["people"])
+                self.world_model.update_people(active_perception["people"], now=now)
 
             # Synchronize robot state
             if "robot_state" in active_perception and isinstance(active_perception["robot_state"], dict):
@@ -175,6 +177,22 @@ class CognitiveLoop:
             # Synchronize conversation state
             if "conversation_state" in active_perception and isinstance(active_perception["conversation_state"], dict):
                 self.world_model.update_conversation_state(**active_perception["conversation_state"])
+
+            # Phase 6: Augment active perception with World Model situational intelligence
+            world_conflicts = self.world_model.detect_conflicts()
+            if world_conflicts:
+                active_perception["world_conflicts"] = world_conflicts
+                active_perception["conflicting_signals"] = True
+
+            acoustic_cand = self.world_model.get_acoustic_attention_candidate()
+            if acoustic_cand:
+                active_perception["acoustic_attention_candidate"] = acoustic_cand
+
+            curr_focus = self.self_state.focused_person_id
+            if curr_focus and curr_focus in self.world_model._people:
+                fp = self.world_model._people[curr_focus]
+                if not fp.is_present and getattr(fp, "occlusion_duration_s", 0.0) > 0:
+                    active_perception["focused_person_occluded"] = True
 
             # -----------------------------------------------------------------
             # 2. EVENT: Detect perception transitions & process event bus
@@ -290,6 +308,49 @@ class CognitiveLoop:
                     new_value="REASSESS",
                     cause=meta_state.last_reassessment_reason,
                 )
+
+            # Phase 6: Active Perception Attention Reallocation & Expectation Loop
+            if (
+                cog_decision
+                and getattr(cog_decision, "decision_type", None) == CognitiveDecisionType.SEEK_INFORMATION
+                and hasattr(cog_decision, "metadata")
+                and cog_decision.metadata.get("stimulus_type") == "AUDIO"
+            ):
+                target_yaw = float(cog_decision.metadata.get("target_yaw_deg", 0.0))
+                self.continuity_tracker.record_transition(
+                    transition_type="ATTENTION_REALLOCATION",
+                    previous_value=self.self_state.current_head_yaw_deg,
+                    new_value=f"BEARING_{round(target_yaw, 1)}",
+                    cause="active_perception_acoustic_attention",
+                    metadata=cog_decision.metadata,
+                )
+                self.prediction_engine.create_perceptual_prediction(
+                    prediction_type="EXPECT_FACE_AFTER_HEAD_ATTENTION",
+                    target_id=str(cog_decision.metadata.get("entity_id", "acoustic_source")),
+                    expected_state={"face_detected": True},
+                    timeout_seconds=2.0,
+                    now=now,
+                )
+
+            # Perceptual outcome verification for active expectations
+            active_preds = self.prediction_engine.get_active_predictions()
+            for p in active_preds:
+                if p.action_id == "EXPECT_FACE_AFTER_HEAD_ATTENTION":
+                    visual_people = [
+                        per for per in self.world_model._people.values()
+                        if per.is_present and getattr(per, "has_vision", False)
+                    ]
+                    if visual_people:
+                        outcome = ActualOutcome(
+                            outcome_id=f"out_face_{int(now * 1000)}",
+                            expectation_id=p.prediction_id,
+                            actual_state={"face_detected": True},
+                            timestamp=now,
+                        )
+                        p_err = self.prediction_engine.evaluate_outcome(outcome, now=now)
+                        pred_errors.append(p_err)
+                        self.affective_manager.update_confidence(p_err.confidence_impact)
+                        self.affective_manager.update_uncertainty(p_err.uncertainty_impact)
 
             # 4. Assemble CognitiveContext integration/read snapshot
             events_summary = [

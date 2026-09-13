@@ -10,7 +10,7 @@ import time
 from typing import Any, Dict, List, Optional
 
 from astro_ai.contracts.intent_emotion_types import EmotionSignal, RelationshipRole
-from astro_ai.contracts.person_state import UnifiedPersonState
+from astro_ai.contracts.person_state import EntityLifecycleState, UnifiedPersonState
 from astro_ai.contracts.spatial_state import SpatialPersonTrack
 from astro_ai.spatial.lidar_tracker import LidarTracker
 
@@ -52,10 +52,22 @@ class SpatialFusionEngine:
         doa_deg: Optional[float] = None,
         speaker_id_dict: Optional[Dict[str, Any]] = None,
         is_speaking: bool = False,
+        vad_active: Optional[bool] = None,
+        rms_level: Optional[float] = None,
     ):
-        """Updates cache with latest acoustic perception from audio_capture and voice_recognizer."""
+        """Updates cache with latest acoustic perception from audio_capture and voice_recognizer.
+
+        Strict physical rule:
+        - 0.0° uncalibrated default / idle reading without VAD/RMS is rejected.
+        """
         with self._lock:
-            self._latest_audio_doa = doa_deg
+            validated_doa = doa_deg
+            if doa_deg is not None:
+                vad = vad_active if vad_active is not None else is_speaking
+                if abs(float(doa_deg)) < 0.5 and not vad and (rms_level is None or rms_level < 450.0):
+                    validated_doa = None
+
+            self._latest_audio_doa = validated_doa
             self._latest_speaker_data = speaker_id_dict
             self._is_speaking = is_speaking
 
@@ -77,14 +89,19 @@ class SpatialFusionEngine:
         )
 
     def compute_fusion(self, now: Optional[float] = None) -> List[UnifiedPersonState]:
-        """Performs spatial alignment and association across Camera, Audio, and LiDAR."""
+        """Performs evidence-based spatial alignment and association across Camera, Audio, and LiDAR.
+
+        Does not forcibly fuse vision and audio if directions diverge significantly (>25°).
+        Produces distinct VisualEntity and AcousticEntity when evidence is disjoint.
+        """
         t_now = now or time.time()
         with self._lock:
             self._last_fusion_time = t_now
             lidar_tracks = self.lidar_tracker.get_active_tracks()
             fused_list: List[UnifiedPersonState] = []
+            audio_associated = False
 
-            # Case A: Visual Face Detected
+            # Case A: Visual Face(s) Detected
             if self._latest_face_data:
                 for idx, face in enumerate(self._latest_face_data):
                     name = face.get("name", "Misafir")
@@ -108,12 +125,20 @@ class SpatialFusionEngine:
                             best_angle_diff = angle_diff
                             matched_lidar_track = tr
 
-                    # Acoustic association
+                    # Acoustic association with angular and identity evidence
                     voice_matched = False
                     spk_name = self._latest_speaker_data.get("name") if self._latest_speaker_data else None
-                    if self._is_speaking and spk_name:
-                        if name.lower() == spk_name.lower():
+                    angle_diff_audio = 999.0
+                    if self._latest_audio_doa is not None:
+                        angle_diff_audio = abs((self._latest_audio_doa - cam_yaw + 180.0) % 360.0 - 180.0)
+
+                    if self._is_speaking:
+                        if spk_name and name.lower() == spk_name.lower():
                             voice_matched = True
+                            audio_associated = True
+                        elif self._latest_audio_doa is not None and angle_diff_audio <= 25.0:
+                            voice_matched = True
+                            audio_associated = True
 
                     # Fused distance & velocity
                     fused_dist = matched_lidar_track.distance_m if matched_lidar_track else cam_dist
@@ -121,6 +146,17 @@ class SpatialFusionEngine:
                     azimuth = matched_lidar_track.azimuth_deg if matched_lidar_track else cam_yaw
 
                     person_id = f"person_{name.lower().replace(' ', '_')}" if is_known else f"person_visual_{idx+1}"
+
+                    # Determine lifecycle state from radial velocity
+                    if approach_vel < -0.15:
+                        lifecycle = EntityLifecycleState.APPROACHING
+                    elif approach_vel > 0.15:
+                        lifecycle = EntityLifecycleState.DEPARTING
+                    else:
+                        lifecycle = EntityLifecycleState.STATIONARY
+
+                    has_lidar_flag = (matched_lidar_track is not None)
+                    uncertainty = 0.05 if (has_lidar_flag and is_known) else (0.15 if (has_lidar_flag or voice_matched) else 0.35)
 
                     fused_person = UnifiedPersonState(
                         person_id=person_id,
@@ -139,18 +175,86 @@ class SpatialFusionEngine:
                         visual_emotion=EmotionSignal(self._vision_emotion.lower()) if self._vision_emotion.lower() in [e.value for e in EmotionSignal] else EmotionSignal.NEUTRAL,
                         visual_confidence=conf,
                         is_speaking=self._is_speaking and voice_matched,
-                        audio_doa_deg=self._latest_audio_doa,
+                        audio_doa_deg=self._latest_audio_doa if voice_matched else None,
                         voice_match_confidence=float(self._latest_speaker_data.get("confidence", 0.0)) if (self._latest_speaker_data and voice_matched) else 0.0,
                         last_seen_ts=t_now,
+                        last_spoken_ts=t_now if (self._is_speaking and voice_matched) else 0.0,
+                        tracking_state=lifecycle,
+                        entity_type="PERSON",
+                        has_vision=True,
+                        has_lidar=has_lidar_flag,
+                        has_audio=voice_matched,
+                        spatial_uncertainty=uncertainty,
                     )
                     fused_list.append(fused_person)
                     self._fused_people[person_id] = fused_person
 
-            # Case B: LiDAR Only Dynamic Track (Person approaching from side/behind or in dark)
+                # Check if there is an unassociated active acoustic source (Disjoint Acoustic Entity)
+                if self._is_speaking and self._latest_audio_doa is not None and not audio_associated:
+                    # Match closest lidar track near audio direction if any
+                    matched_lidar_audio = None
+                    best_l_diff = 30.0
+                    for tr in lidar_tracks:
+                        ad = abs((tr.azimuth_deg - self._latest_audio_doa + 180.0) % 360.0 - 180.0)
+                        if ad < best_l_diff:
+                            best_l_diff = ad
+                            matched_lidar_audio = tr
+
+                    spk_name = self._latest_speaker_data.get("name", "Misafir") if self._latest_speaker_data else "Misafir"
+                    a_dist = matched_lidar_audio.distance_m if matched_lidar_audio else 2.5
+                    a_vel = matched_lidar_audio.velocity_mps if matched_lidar_audio else 0.0
+                    a_pid = f"person_acoustic_{int(abs(self._latest_audio_doa))}"
+
+                    acoustic_person = UnifiedPersonState(
+                        person_id=a_pid,
+                        name=spk_name,
+                        formal_title=spk_name,
+                        role=RelationshipRole.CREATOR if spk_name.lower() == "baran" else RelationshipRole.UNKNOWN,
+                        is_known=(spk_name.lower() == "baran"),
+                        identity_confidence=0.40 if self._latest_speaker_data else 0.20,
+                        distance_m=round(a_dist, 2),
+                        azimuth_deg=round(self._latest_audio_doa, 1),
+                        x_m=round(a_dist * math.cos(math.radians(self._latest_audio_doa)), 2),
+                        y_m=round(a_dist * math.sin(math.radians(self._latest_audio_doa)), 2),
+                        approach_velocity_mps=round(a_vel, 2),
+                        is_present=True,
+                        is_looking_at_robot=False,
+                        is_speaking=True,
+                        audio_doa_deg=self._latest_audio_doa,
+                        voice_match_confidence=float(self._latest_speaker_data.get("confidence", 0.0)) if self._latest_speaker_data else 0.0,
+                        last_seen_ts=t_now,
+                        last_spoken_ts=t_now,
+                        tracking_state=EntityLifecycleState.APPROACHING if a_vel < -0.15 else (
+                            EntityLifecycleState.DEPARTING if a_vel > 0.15 else EntityLifecycleState.STATIONARY
+                        ),
+                        entity_type="ACOUSTIC_ENTITY",
+                        has_vision=False,
+                        has_lidar=(matched_lidar_audio is not None),
+                        has_audio=True,
+                        spatial_uncertainty=0.40 if matched_lidar_audio else 0.65,
+                    )
+                    fused_list.append(acoustic_person)
+                    self._fused_people[a_pid] = acoustic_person
+
+            # Case B: LiDAR Only Dynamic Track(s) (Person outside camera FOV or in darkness)
             elif lidar_tracks:
                 for tr in lidar_tracks:
                     if tr.distance_m < 4.0:
                         pid = f"person_spatial_{tr.track_id}"
+                        is_audio_match = self._is_speaking and (
+                            self._latest_audio_doa is not None
+                            and abs((self._latest_audio_doa - tr.azimuth_deg + 180.0) % 360.0 - 180.0) < 30.0
+                        )
+                        if is_audio_match:
+                            audio_associated = True
+
+                        if tr.velocity_mps < -0.15:
+                            lifecycle = EntityLifecycleState.APPROACHING
+                        elif tr.velocity_mps > 0.15:
+                            lifecycle = EntityLifecycleState.DEPARTING
+                        else:
+                            lifecycle = EntityLifecycleState.STATIONARY
+
                         fused_person = UnifiedPersonState(
                             person_id=pid,
                             name="Misafir",
@@ -165,12 +269,85 @@ class SpatialFusionEngine:
                             approach_velocity_mps=round(tr.velocity_mps, 2),
                             is_present=True,
                             is_looking_at_robot=False,
-                            is_speaking=self._is_speaking and (self._latest_audio_doa and abs(self._latest_audio_doa - tr.azimuth_deg) < 30.0),
-                            audio_doa_deg=self._latest_audio_doa,
+                            is_speaking=is_audio_match,
+                            audio_doa_deg=self._latest_audio_doa if is_audio_match else None,
                             last_seen_ts=t_now,
+                            last_spoken_ts=t_now if is_audio_match else 0.0,
+                            tracking_state=lifecycle,
+                            entity_type="PERSON",
+                            has_vision=False,
+                            has_lidar=True,
+                            has_audio=is_audio_match,
+                            spatial_uncertainty=0.25,
                         )
                         fused_list.append(fused_person)
                         self._fused_people[pid] = fused_person
+
+                # If audio is speaking without nearby lidar track
+                if self._is_speaking and self._latest_audio_doa is not None and not audio_associated:
+                    spk_name = self._latest_speaker_data.get("name", "Misafir") if self._latest_speaker_data else "Misafir"
+                    a_pid = f"person_acoustic_{int(abs(self._latest_audio_doa))}"
+                    acoustic_person = UnifiedPersonState(
+                        person_id=a_pid,
+                        name=spk_name,
+                        formal_title=spk_name,
+                        role=RelationshipRole.CREATOR if spk_name.lower() == "baran" else RelationshipRole.UNKNOWN,
+                        is_known=(spk_name.lower() == "baran"),
+                        identity_confidence=0.40 if self._latest_speaker_data else 0.20,
+                        distance_m=2.5,
+                        azimuth_deg=round(self._latest_audio_doa, 1),
+                        x_m=round(2.5 * math.cos(math.radians(self._latest_audio_doa)), 2),
+                        y_m=round(2.5 * math.sin(math.radians(self._latest_audio_doa)), 2),
+                        approach_velocity_mps=0.0,
+                        is_present=True,
+                        is_looking_at_robot=False,
+                        is_speaking=True,
+                        audio_doa_deg=self._latest_audio_doa,
+                        voice_match_confidence=float(self._latest_speaker_data.get("confidence", 0.0)) if self._latest_speaker_data else 0.0,
+                        last_seen_ts=t_now,
+                        last_spoken_ts=t_now,
+                        tracking_state=EntityLifecycleState.STATIONARY,
+                        entity_type="ACOUSTIC_ENTITY",
+                        has_vision=False,
+                        has_lidar=False,
+                        has_audio=True,
+                        spatial_uncertainty=0.65,
+                    )
+                    fused_list.append(acoustic_person)
+                    self._fused_people[a_pid] = acoustic_person
+
+            # Case C: Audio Only (No vision, no LiDAR tracks, but valid acoustic speech)
+            elif self._is_speaking and self._latest_audio_doa is not None:
+                spk_name = self._latest_speaker_data.get("name", "Misafir") if self._latest_speaker_data else "Misafir"
+                a_pid = f"person_acoustic_{int(abs(self._latest_audio_doa))}"
+                acoustic_person = UnifiedPersonState(
+                    person_id=a_pid,
+                    name=spk_name,
+                    formal_title=spk_name,
+                    role=RelationshipRole.CREATOR if spk_name.lower() == "baran" else RelationshipRole.UNKNOWN,
+                    is_known=(spk_name.lower() == "baran"),
+                    identity_confidence=0.40 if self._latest_speaker_data else 0.20,
+                    distance_m=2.5,
+                    azimuth_deg=round(self._latest_audio_doa, 1),
+                    x_m=round(2.5 * math.cos(math.radians(self._latest_audio_doa)), 2),
+                    y_m=round(2.5 * math.sin(math.radians(self._latest_audio_doa)), 2),
+                    approach_velocity_mps=0.0,
+                    is_present=True,
+                    is_looking_at_robot=False,
+                    is_speaking=True,
+                    audio_doa_deg=self._latest_audio_doa,
+                    voice_match_confidence=float(self._latest_speaker_data.get("confidence", 0.0)) if self._latest_speaker_data else 0.0,
+                    last_seen_ts=t_now,
+                    last_spoken_ts=t_now,
+                    tracking_state=EntityLifecycleState.STATIONARY,
+                    entity_type="ACOUSTIC_ENTITY",
+                    has_vision=False,
+                    has_lidar=False,
+                    has_audio=True,
+                    spatial_uncertainty=0.65,
+                )
+                fused_list.append(acoustic_person)
+                self._fused_people[a_pid] = acoustic_person
 
             return fused_list
 

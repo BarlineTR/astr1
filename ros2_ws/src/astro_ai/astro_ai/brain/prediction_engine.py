@@ -83,6 +83,39 @@ class PredictionEngine:
         with self._lock:
             self._predictions.clear()
 
+    def create_perceptual_prediction(
+        self,
+        prediction_type: str,
+        target_id: str,
+        expected_state: Dict[str, Any],
+        timeout_seconds: float = 2.0,
+        confidence_weight: float = 1.0,
+        now: Optional[float] = None,
+    ) -> Prediction:
+        """Helper to create and register a structured perceptual prediction for World Model.
+
+        Canonical Phase 6 prediction types:
+          - EXPECT_PERSON_APPROACHING
+          - EXPECT_PERSON_REAPPEAR
+          - EXPECT_FACE_AFTER_HEAD_ATTENTION
+          - EXPECT_AUDIO_SOURCE_CONTINUES
+        """
+        with self._lock:
+            ts = time.time() if now is None else now
+            pred_id = f"pred_{prediction_type.lower()}_{target_id}_{int(ts * 1000) % 100000}"
+            pred = Prediction(
+                prediction_id=pred_id,
+                action_id=prediction_type,
+                expected_state=expected_state,
+                expected_by=ts + max(0.2, timeout_seconds),
+                confidence_weight=confidence_weight,
+                created_at=ts,
+                target_person_id=target_id,
+                status=PredictionStatus.PENDING,
+            )
+            self._predictions[pred_id] = pred
+            return pred
+
     # -------------------------------------------------------------------------
     # Evaluation Logic
     # -------------------------------------------------------------------------

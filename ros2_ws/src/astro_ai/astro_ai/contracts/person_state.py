@@ -4,7 +4,21 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
+from enum import Enum
 from astro_ai.contracts.intent_emotion_types import EmotionSignal, RelationshipRole
+
+
+class EntityLifecycleState(str, Enum):
+    """Lifecycle states of an entity tracked within the spatio-temporal world model."""
+
+    APPEARED = "APPEARED"
+    TRACKED = "TRACKED"
+    APPROACHING = "APPROACHING"
+    STATIONARY = "STATIONARY"
+    DEPARTING = "DEPARTING"
+    OCCLUDED = "OCCLUDED"
+    LOST = "LOST"
+    REAPPEARED = "REAPPEARED"
 
 
 @dataclass
@@ -52,3 +66,13 @@ class UnifiedPersonState:
     last_spoken_ts: float = 0.0
     interaction_turn_count: int = 0
     raw_attributes: Dict[str, Any] = field(default_factory=dict)
+
+    # Phase 6 Spatio-Temporal Tracking & Modality Attributes
+    tracking_state: EntityLifecycleState = EntityLifecycleState.TRACKED
+    entity_type: str = "PERSON"  # "PERSON", "VISUAL_ENTITY", "ACOUSTIC_ENTITY"
+    has_vision: bool = True
+    has_lidar: bool = False
+    has_audio: bool = False
+    spatial_uncertainty: float = 0.0
+    occlusion_duration_s: float = 0.0
+    trajectory_history: List[Dict[str, Any]] = field(default_factory=list)

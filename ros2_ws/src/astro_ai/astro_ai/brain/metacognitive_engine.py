@@ -203,13 +203,25 @@ class MetacognitiveEngine:
             if last_ts is not None and (ts - float(last_ts)) > DEFAULT_STALE_PERCEPTION_SECONDS:
                 return InformationSufficiency.STALE
 
-            # 2. Epistemic uncertainty check
+            if perc.get("has_stale_entities", False):
+                return InformationSufficiency.STALE
+
+            # 2. Epistemic uncertainty & cross-modal sensor conflict check
+            if perc.get("conflicting_signals", False) or len(perc.get("world_conflicts", [])) > 0:
+                return InformationSufficiency.CONFLICTING
+
             if uncertainty >= DEFAULT_HIGH_UNCERTAINTY_THRESHOLD:
-                if perc.get("conflicting_signals", False):
-                    return InformationSufficiency.CONFLICTING
                 return InformationSufficiency.INSUFFICIENT
 
-            # 3. Goal-specific information requirements
+            # 3. Unverified acoustic stimulus requiring visual confirmation (Active Perception)
+            if perc.get("acoustic_attention_candidate") is not None:
+                return InformationSufficiency.INSUFFICIENT
+
+            # 4. Occluded focused person
+            if perc.get("focused_person_occluded", False):
+                return InformationSufficiency.INSUFFICIENT
+
+            # 5. Goal-specific information requirements
             if active_goal is not None:
                 if active_goal.goal_type == GoalType.SOCIAL:
                     # Social goals require a detectable or focused person
@@ -325,6 +337,21 @@ class MetacognitiveEngine:
                     )
                 )
 
+            # Conflict 4: WORLD_MODEL_CROSS_MODAL_CONFLICT
+            world_conflicts = perc.get("world_conflicts", [])
+            for wc in world_conflicts:
+                conflicts.append(
+                    CognitiveConflict(
+                        conflict_id=f"conf_wm_{uuid.uuid4().hex[:6]}",
+                        conflict_type=wc.get("type", "CROSS_MODAL_CONFLICT"),
+                        severity=0.65,
+                        involved_goal_ids=[active_goal.goal_id] if active_goal else [],
+                        evidence=wc,
+                        detected_at=ts,
+                        resolution_notes=f"Cross-modal sensory conflict detected by WorldModel: {wc.get('type')}",
+                    )
+                )
+
             self._active_conflicts = conflicts[:10]  # Bounded storage
             return list(self._active_conflicts)
 
@@ -387,11 +414,12 @@ class MetacognitiveEngine:
         """Evaluates cognitive health, conflicts, and policy to produce MetacognitiveState and CognitiveDecision."""
         with self._lock:
             ts = time.time() if now is None else now
+            perc = perception_data or {}
 
             # 1. Assess information sufficiency
             info_sufficiency = self.assess_information_sufficiency(
                 active_goal=active_goal,
-                perception_data=perception_data,
+                perception_data=perc,
                 uncertainty=uncertainty,
                 now=ts,
             )
@@ -443,13 +471,28 @@ class MetacognitiveEngine:
                     )
 
             elif info_sufficiency in (InformationSufficiency.INSUFFICIENT, InformationSufficiency.STALE):
-                decision = CognitiveDecision(
-                    decision_id=f"dec_info_{uuid.uuid4().hex[:8]}",
-                    decision_type=CognitiveDecisionType.SEEK_INFORMATION,
-                    reason=f"information_sufficiency_{info_sufficiency.value}",
-                    target_goal_id=active_goal.goal_id if active_goal else None,
-                    timestamp=ts,
-                )
+                acoustic_cand = perc.get("acoustic_attention_candidate")
+                if acoustic_cand is not None:
+                    decision = CognitiveDecision(
+                        decision_id=f"dec_seek_{uuid.uuid4().hex[:8]}",
+                        decision_type=CognitiveDecisionType.SEEK_INFORMATION,
+                        reason="active_perception_acoustic_attention",
+                        target_goal_id=active_goal.goal_id if active_goal else None,
+                        metadata={
+                            "target_yaw_deg": acoustic_cand.get("target_yaw_deg", 0.0),
+                            "stimulus_type": "AUDIO",
+                            "entity_id": acoustic_cand.get("entity_id"),
+                        },
+                        timestamp=ts,
+                    )
+                else:
+                    decision = CognitiveDecision(
+                        decision_id=f"dec_info_{uuid.uuid4().hex[:8]}",
+                        decision_type=CognitiveDecisionType.SEEK_INFORMATION,
+                        reason=f"information_sufficiency_{info_sufficiency.value}",
+                        target_goal_id=active_goal.goal_id if active_goal else None,
+                        timestamp=ts,
+                    )
 
             else:
                 decision = CognitiveDecision(
