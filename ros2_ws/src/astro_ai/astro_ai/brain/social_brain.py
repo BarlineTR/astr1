@@ -43,7 +43,7 @@ from astro_ai.spatial.spatial_fusion import SpatialFusionEngine
 class SocialBrain:
     """Master Cognitive Engine for ASTRO Social Robot."""
 
-    def __init__(self, db_path: Optional[str] = None):
+    def __init__(self, db_path: Optional[str] = None, enable_migration: Optional[bool] = None):
         self._lock = threading.RLock()
 
         # 1. Epistemic & World Models
@@ -62,11 +62,14 @@ class SocialBrain:
             self.semantic_memory, self.relationship_memory, self.episodic_memory
         )
 
-        # Automatic Migration on Startup
+        # Automatic Migration on Startup (only run on default persistent DB, not isolated test DBs)
         self.migrator = MemoryMigrator(
             self.storage, self.semantic_memory, self.relationship_memory, self.spatial_memory
         )
-        self.migrator.migrate_if_needed()
+        if enable_migration is None:
+            enable_migration = (db_path is None)
+        if enable_migration:
+            self.migrator.migrate_if_needed()
 
         # 3. Spatial & Sensory Fusion
         self.spatial_fusion = SpatialFusionEngine()

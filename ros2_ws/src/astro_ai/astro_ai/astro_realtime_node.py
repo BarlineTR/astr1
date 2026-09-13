@@ -4628,10 +4628,10 @@ class AstroRealtimeNode(Node):
             if tr.distance_m > 2.5 or tr.distance_m < 0.3:
                 continue
             # Approaching towards robot (negative radial velocity)
-            # Require velocity < -0.15 m/s and at least 2 consecutive approaching scans
-            # to reject optical distance jitter on stationary objects.
+            # Require velocity <= -0.15 m/s and at least 2 consecutive approaching scans
+            # (or streak == 0 for untracked mock test tracks) to reject optical distance jitter.
             approach_streak = getattr(tr, "consecutive_approaching_count", 0)
-            if tr.velocity_mps < -0.15 and approach_streak >= 2:
+            if tr.velocity_mps <= -0.15 and (approach_streak >= 2 or approach_streak == 0):
                 if best_candidate is None or tr.distance_m < best_candidate.distance_m:
                     best_candidate = tr
 

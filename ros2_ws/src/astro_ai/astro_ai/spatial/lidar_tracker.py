@@ -152,7 +152,9 @@ class LidarTracker:
         center_r = float(math.hypot(center_x, center_y))
         center_az = float(math.degrees(math.atan2(center_y, center_x)))
 
-        width = float(math.hypot(xs[-1] - xs[0], ys[-1] - ys[0]))
+        span_x = max(xs) - min(xs)
+        span_y = max(ys) - min(ys)
+        width = float(math.hypot(span_x, span_y))
         if width > self.max_cluster_width_m:
             return None
 
@@ -231,10 +233,10 @@ class LidarTracker:
                     )
                     matched_track_ids.add(tid)
 
-        # Prune stale tracks (> 3.0s without observation)
+        # Prune stale tracks (>= 2.0s without observation)
         stale = [
             tid for tid, tr in self._active_tracks.items()
-            if (now - tr.last_update_ts) > 3.0
+            if (now - tr.last_update_ts) >= 2.0
         ]
         for tid in stale:
             del self._active_tracks[tid]
