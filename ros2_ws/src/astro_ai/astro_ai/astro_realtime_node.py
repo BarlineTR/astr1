@@ -185,15 +185,18 @@ except ImportError:
 
 try:
     from astro_ai.brain.social_brain import SocialBrain
+    from astro_ai.brain.cognitive_loop import CognitiveLoop
     from astro_ai.contracts.person_state import UnifiedPersonState
     from astro_ai.spatial.lidar_tracker import LidarTracker
 except ImportError:
     try:
         from brain.social_brain import SocialBrain
+        from brain.cognitive_loop import CognitiveLoop
         from contracts.person_state import UnifiedPersonState
         from spatial.lidar_tracker import LidarTracker
     except ImportError:
         SocialBrain = None
+        CognitiveLoop = None
         UnifiedPersonState = None
         LidarTracker = None
 
@@ -673,6 +676,7 @@ class AstroRealtimeNode(Node):
 
         # Social Cognitive Brain Subsystem (authoritative unified world model & social intelligence)
         self.social_brain = None
+        self.cognitive_loop = None
         if SocialBrain:
             try:
                 db_dir = os.path.expanduser("~/.astro")
@@ -680,6 +684,11 @@ class AstroRealtimeNode(Node):
                 cognitive_db_path = os.path.join(db_dir, "cognitive.db")
                 self.social_brain = SocialBrain(db_path=cognitive_db_path)
                 self.get_logger().info(f"🧠 [SocialBrain] Başlatıldı. Bilişsel veritabanı: {cognitive_db_path}")
+                if CognitiveLoop:
+                    self.cognitive_loop = CognitiveLoop(
+                        world_model=self.social_brain.world_model,
+                        on_telemetry=self.get_logger().info,
+                    )
             except Exception as e:
                 self.get_logger().warn(f"⚠️ [SocialBrain] Başlatma uyarısı: {e}")
 
@@ -1003,6 +1012,8 @@ class AstroRealtimeNode(Node):
         self.create_timer(1.0, self._check_session_lifecycle)
         self.create_timer(1.0, self._publish_system_telemetry)
         self.create_timer(0.5, self._social_attentive_listener_tick)
+        if getattr(self, "cognitive_loop", None):
+            self.create_timer(0.1, self._cognitive_cycle_tick)
 
         # Purge any corrupted / profanity records
         self._purge_corrupted_biometrics()
@@ -1019,6 +1030,41 @@ class AstroRealtimeNode(Node):
             self._ws_thread = None
             self.get_logger().info("🧪 [Astro Realtime Node] Offline/Test modu aktif — Arka plan WebSocket başlatılmadı.")
         self.get_logger().info("💤 [Astro Uyku Modu]: Düğüm başlatıldı — Astro DEEP_IDLE modunda (😴). Wake listener aktif.")
+
+    def _cognitive_cycle_tick(self) -> None:
+        """Executes 10 Hz deterministic cognitive step inside AstroRealtimeNode."""
+        if not getattr(self, "cognitive_loop", None):
+            return
+        try:
+            active_p = []
+            if getattr(self, "_recognized_person", None) and UnifiedPersonState:
+                p_name = self._recognized_person.get("name", "Misafir")
+                p_id = str(self._recognized_person.get("user_id", p_name.lower()))
+                active_p.append(UnifiedPersonState(
+                    person_id=p_id,
+                    name=p_name,
+                    distance_m=float(getattr(self, "_user_distance", 1.5) or 1.5),
+                    azimuth_deg=float(getattr(self, "_speaker_angle", 0.0) or 0.0),
+                    is_looking_at_robot=bool(getattr(self, "_looking_at_robot", False)),
+                    is_present=True,
+                ))
+
+            self.cognitive_loop.step({
+                "people": active_p,
+                "person_detected": bool(getattr(self, "_recognized_person", None) is not None),
+                "vad": bool(getattr(self, "_user_speaking_active", False)),
+                "doa_deg": float(getattr(self, "_speaker_angle", 0.0) or 0.0),
+                "tts_speaking": bool(getattr(self, "_is_playback_active", False)),
+                "robot_state": {
+                    "is_speaking": bool(getattr(self, "_is_playback_active", False)),
+                    "head_yaw_deg": float(getattr(self, "_current_head_angle_deg", 0.0) or 0.0),
+                },
+                "environment": {
+                    "front_clearance_m": float(getattr(self, "_lidar_min_dist", 5.0) or 5.0),
+                },
+            })
+        except Exception as exc:
+            self.get_logger().debug(f"Cognitive loop tick notice: {exc}")
 
     def _safe_log(self, lvl: str, msg: str):
         """Safe ROS2 logger wrapper preventing Cython/rcutils 'Logger severity cannot be changed between calls' error."""
@@ -1764,9 +1810,15 @@ class AstroRealtimeNode(Node):
                 )
                 self.social_brain.world_model.update_people([person])
                 last_txt = getattr(self, "_last_user_transcript", "merhaba") or "merhaba"
-                _, _, brain_prompt = self.social_brain.process_dialogue_turn(last_txt, person_state=person)
+                soc_ctx, soc_dec, brain_prompt = self.social_brain.process_dialogue_turn(last_txt, person_state=person)
                 if brain_prompt:
                     social_context_str = f"\n\n[SOSYAL ROBOT BİLİŞSEL BAĞLAMI]:\n{brain_prompt}\n"
+                intent_val = soc_ctx.intent.value if hasattr(soc_ctx.intent, "value") else str(soc_ctx.intent)
+                directive_val = soc_dec.directive.value if hasattr(soc_dec.directive, "value") else str(soc_dec.directive)
+                action_val = soc_dec.action.value if hasattr(soc_dec.action, "value") else str(soc_dec.action)
+                self.get_logger().info(
+                    f"🧠 [SocialBrain Turn] focus={person.name} | intent={intent_val} | directive={directive_val} | action={action_val}"
+                )
             except Exception as _sb_err:
                 self.get_logger().debug(f"SocialBrain dialogue turn notice: {_sb_err}")
 
@@ -2400,6 +2452,7 @@ class AstroRealtimeNode(Node):
         # 3. User Speech Started
         elif event_type == "input_audio_buffer.speech_started":
             self._user_speaking_active = True
+            self.get_logger().info("🎙️ [Realtime Audio] User speech onset detected (speech_started).")
             self._user_speech_start_time = time.monotonic()
             self._last_attentive_nod_time = self._user_speech_start_time
             if getattr(self, "pub_social_offset_yaw", None) and getattr(self, "_gaze_aversion_active", False):

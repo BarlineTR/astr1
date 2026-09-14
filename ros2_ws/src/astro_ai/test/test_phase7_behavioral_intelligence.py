@@ -629,3 +629,84 @@ class TestPhase7BehavioralIntelligence:
 
         print(f"\n[Phase 7 Benchmark] BehaviorEngine avg step time: {avg_ms:.4f} ms")
         assert avg_ms < 1.0, f"BehaviorEngine took {avg_ms:.4f} ms, expected < 1.0 ms"
+
+    # -------------------------------------------------------------------------
+    # Test 21: Runtime Telemetry Formatting & All 9 Required Fields
+    # -------------------------------------------------------------------------
+    def test_21_runtime_telemetry_formatting_and_required_fields(self):
+        """Verifies that format_runtime_telemetry generates a single-line banner containing all 9 required fields."""
+        wm = WorldModel()
+        person = UnifiedPersonState(
+            person_id="p_baran",
+            name="Baran",
+            distance_m=2.2,
+            azimuth_deg=5.0,
+            is_present=True,
+            is_looking_at_robot=True,
+        )
+        wm.update_people([person])
+        self_st = SelfState()
+        self_st.focused_person_id = "p_baran"
+
+        loop = CognitiveLoop(world_model=wm, self_state=self_st)
+        result = loop.step({"people": [person], "person_detected": True})
+
+        banner = loop.format_runtime_telemetry(result)
+        assert banner.startswith("🧠 [Cognition -> Behavior]")
+
+        # Verify all 9 required fields
+        assert "focus=" in banner
+        assert "world=" in banner
+        assert "conf=" in banner
+        assert "unc=" in banner
+        assert "suff=" in banner
+        assert "decision=" in banner
+        assert "intent=" in banner
+        assert "reason=" in banner
+        assert "target=" in banner
+
+        # Verify specific content
+        assert "Baran" in banner or "p_baran" in banner
+
+    # -------------------------------------------------------------------------
+    # Test 22: Runtime Telemetry Transition Gating & Anti-Spam (Speech Onset)
+    # -------------------------------------------------------------------------
+    def test_22_runtime_telemetry_transition_emission_anti_spam(self):
+        """Verifies that telemetry is emitted only on state/decision transitions (anti-spam) and immediately on speech onset."""
+        logged_banners = []
+
+        def mock_telemetry(msg: str):
+            logged_banners.append(msg)
+
+        person = UnifiedPersonState(
+            person_id="p_user",
+            name="User",
+            distance_m=1.8,
+            azimuth_deg=0.0,
+            is_present=True,
+        )
+        loop = CognitiveLoop(on_telemetry=mock_telemetry)
+
+        # 1. First step: Initial state transition -> MUST log 1 banner
+        loop.step({"people": [person], "person_detected": True, "vad": False})
+        assert len(logged_banners) == 1
+        assert "target=p_user" in logged_banners[0] or "target=None" in logged_banners[0]
+
+        # 2. Subsequent 10 steps with identical perception -> MUST NOT spam
+        for _ in range(10):
+            loop.step({"people": [person], "person_detected": True, "vad": False})
+        assert len(logged_banners) == 1, "Spam detected: telemetry was logged on static cycles!"
+
+        # 3. Speech onset (User starts speaking: vad=True) -> MUST log immediately
+        loop.step({"people": [person], "person_detected": True, "vad": True})
+        assert len(logged_banners) == 2, "Speech onset failed to trigger telemetry transition!"
+        assert "🧠 [Cognition -> Behavior]" in logged_banners[1]
+
+        # 4. Continuing speech -> MUST NOT spam while speaking
+        for _ in range(5):
+            loop.step({"people": [person], "person_detected": True, "vad": True})
+        assert len(logged_banners) == 2, "Spam detected during ongoing speech!"
+
+        # 5. Speech ends (vad=False) -> Transition -> MUST log
+        loop.step({"people": [person], "person_detected": True, "vad": False})
+        assert len(logged_banners) == 3

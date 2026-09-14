@@ -129,6 +129,7 @@ class ConsciousnessNode(Node):
             affective_manager=self.affective_manager,
             target_hz=self.loop_hz,
             temporal_history_size=self.temporal_history_size,
+            on_telemetry=self.get_logger().info,
         )
 
         # Ephemeral Sensor Caches (Thread-safe)
@@ -254,12 +255,14 @@ class ConsciousnessNode(Node):
 
         # Emit perception events on state transitions
         if val and not prev:
+            self.get_logger().info("👁️ [Perception: Vision] Person detected in camera field of view")
             self.event_bus.create_and_publish(
                 event_type=CognitiveEventType.PERSON_APPEARED,
                 source="vision",
                 data={"timestamp": now},
             )
         elif not val and prev:
+            self.get_logger().info("👁️ [Perception: Vision] Person departed camera field of view")
             self.event_bus.create_and_publish(
                 event_type=CognitiveEventType.PERSON_DISAPPEARED,
                 source="vision",
@@ -281,6 +284,7 @@ class ConsciousnessNode(Node):
         self.loop.event_detector.notify_sensor_active("audio", now)
 
         if val and not prev:
+            self.get_logger().info(f"🎙️ [Perception: Audio] User speech onset detected (DOA: {self._sensor_cache['doa_deg']:.1f}°)")
             self.event_bus.create_and_publish(
                 event_type=CognitiveEventType.PERSON_SPOKE,
                 source="audio",
@@ -317,6 +321,7 @@ class ConsciousnessNode(Node):
             with self._lock:
                 self._sensor_cache["last_speech_text"] = text
             self.loop.event_detector.notify_sensor_active("audio", now)
+            self.get_logger().info(f"🗣️ [Perception: Speech] User transcript: \"{text}\"")
             self.event_bus.create_and_publish(
                 event_type=CognitiveEventType.PERSON_SPOKE,
                 source="speech_recognition",

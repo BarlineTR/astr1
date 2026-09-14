@@ -13,9 +13,12 @@ Goals, Prediction/Outcome).
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import logging
 import threading
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
+
+_LOG = logging.getLogger(__name__)
 
 from astro_ai.brain.affective_state import AffectiveStateManager
 from astro_ai.brain.behavior_engine import BehaviorEngine
@@ -83,8 +86,11 @@ class CognitiveLoop:
         behavior_engine: Optional[BehaviorEngine] = None,
         target_hz: float = 10.0,
         temporal_history_size: int = 50,
+        on_telemetry: Optional[Callable[[str], None]] = None,
     ):
         self._lock = threading.RLock()
+        self._on_telemetry = on_telemetry
+        self._last_telemetry_sig: Optional[Tuple[Any, ...]] = None
         self.world_model = (
             world_model
             if world_model is not None
@@ -444,7 +450,7 @@ class CognitiveLoop:
             active_people = [p for p in world_snap.people if getattr(p, "is_present", True)]
             has_speaker = world_snap.active_speaker is not None
 
-            return CognitiveCycleResult(
+            result = CognitiveCycleResult(
                 cycle_index=self.cycle_count,
                 timestamp=now,
                 duration_ms=duration_ms,
@@ -463,6 +469,120 @@ class CognitiveLoop:
                 behavioral_intent=beh_intent,
                 action_intent=act_intent,
             )
+
+            # Runtime Telemetry Evaluation (Transition-Driven, Anti-Spam)
+            current_sig = (
+                self.self_state.focused_person_id,
+                cog_decision.decision_type.value if (cog_decision and hasattr(cog_decision.decision_type, "value")) else (cog_decision.decision_type if cog_decision else None),
+                cog_decision.reason if cog_decision else None,
+                beh_intent.behavior_type.value if (beh_intent and hasattr(beh_intent.behavior_type, "value")) else (beh_intent.behavior_type if beh_intent else None),
+                beh_intent.reason if beh_intent else None,
+                beh_intent.target_id if beh_intent else None,
+                self.self_state.is_listening,
+                self.self_state.is_speaking,
+                world_snap.active_speaker.person_id if world_snap.active_speaker else None,
+                len(active_people),
+                meta_state.cognitive_conflict_state if meta_state else None,
+                meta_state.information_sufficiency.value if (meta_state and hasattr(meta_state.information_sufficiency, "value")) else None,
+            )
+
+            if current_sig != self._last_telemetry_sig:
+                self._last_telemetry_sig = current_sig
+                telemetry_banner = self.format_runtime_telemetry(result)
+                if self._on_telemetry is not None:
+                    self._on_telemetry(telemetry_banner)
+                else:
+                    _LOG.info(telemetry_banner)
+
+            return result
+
+    def format_runtime_telemetry(self, result: CognitiveCycleResult) -> str:
+        """Formats an INFO-level, human-readable runtime telemetry snapshot.
+
+        Output fields:
+          - focus
+          - world model state
+          - confidence
+          - uncertainty
+          - information sufficiency
+          - cognitive decision
+          - selected BehavioralIntent
+          - behavior reason
+          - related target
+        """
+        # 1. Focus
+        focus = result.self_state.focused_person_id or "None"
+
+        # 2. World Model State
+        active_people = [p for p in (result.world_snapshot.people or []) if getattr(p, "is_present", True)]
+        people_part = f"{len(active_people)} person" if len(active_people) == 1 else f"{len(active_people)} people"
+        if active_people:
+            names = [p.name for p in active_people if getattr(p, "name", None)]
+            if names:
+                people_part += f" ({', '.join(names[:2])})"
+        if result.world_snapshot.active_speaker:
+            spk = result.world_snapshot.active_speaker
+            spk_name = getattr(spk, "name", None) or getattr(spk, "person_id", "speaker")
+            speaker_part = f"speaker={spk_name}"
+        else:
+            speaker_part = "speaker=None"
+        env = getattr(result.world_snapshot, "environment", {}) or {}
+        clear_m = float(env.get("front_clearance_m", 5.0))
+        clear_part = f"clear={clear_m:.1f}m"
+        world_parts = [people_part, speaker_part, clear_part]
+        if getattr(result.world_snapshot, "conflicts", None):
+            world_parts.append(f"conflicts={len(result.world_snapshot.conflicts)}")
+        world_desc = ", ".join(world_parts)
+
+        # 3. Confidence & Uncertainty
+        conf_str = f"{result.self_state.overall_confidence:.2f}"
+        unc_str = f"{result.self_state.uncertainty_level:.2f}"
+
+        # 4. Information Sufficiency
+        suff = "UNKNOWN"
+        if result.metacognitive_state:
+            info_suff = getattr(result.metacognitive_state, "information_sufficiency", None)
+            suff = info_suff.value if hasattr(info_suff, "value") else str(info_suff or "UNKNOWN")
+
+        # 5. Cognitive Decision
+        dec_str = "NONE"
+        if result.cognitive_decision:
+            d_val = (
+                result.cognitive_decision.decision_type.value
+                if hasattr(result.cognitive_decision.decision_type, "value")
+                else str(result.cognitive_decision.decision_type)
+            )
+            dec_str = d_val
+            if result.cognitive_decision.reason:
+                dec_str += f" ({result.cognitive_decision.reason})"
+
+        # 6. Selected BehavioralIntent & Reason & Target
+        intent_str = "NONE"
+        reason_str = "none"
+        target_str = (
+            result.behavioral_intent.target_id
+            if (result.behavioral_intent and result.behavioral_intent.target_id)
+            else (result.self_state.focused_person_id or "None")
+        )
+        if result.behavioral_intent:
+            b_val = (
+                result.behavioral_intent.behavior_type.value
+                if hasattr(result.behavioral_intent.behavior_type, "value")
+                else str(result.behavioral_intent.behavior_type)
+            )
+            intent_str = b_val
+            reason_str = result.behavioral_intent.reason or "routine"
+
+        return (
+            f"🧠 [Cognition -> Behavior] "
+            f"focus={focus} | "
+            f"world={world_desc} | "
+            f"conf={conf_str} unc={unc_str} suff={suff} | "
+            f"decision={dec_str} | "
+            f"intent={intent_str} | "
+            f"reason={reason_str} | "
+            f"target={target_str}"
+        )
 
     def run_consecutive_steps(
         self,
@@ -502,6 +622,7 @@ class CognitiveLoop:
             self.metacognitive_engine.reset()
             self.behavior_engine.reset()
             self._last_focused_person = None
+            self._last_telemetry_sig = None
 
     @property
     def average_cycle_duration_ms(self) -> float:
