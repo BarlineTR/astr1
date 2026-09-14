@@ -110,7 +110,7 @@ class TestPhase3CognitiveArchitectureSupport(unittest.TestCase):
         """2. Gemini provider configures model identifier and availability."""
         gemini = GeminiFlashProvider(config=self.config)
         self.assertTrue(gemini.is_available())
-        self.assertEqual(gemini.model_name, "gemini-2.5-flash")
+        self.assertEqual(gemini.model_name, "gemini-3.6-flash")
 
     # -------------------------------------------------------------------------
     # 3. Groq Configuration
@@ -645,6 +645,131 @@ class TestPhase3CognitiveArchitectureSupport(unittest.TestCase):
         summary = self_state.get_introspection_summary()
         self.assertIn("activity", summary)
         self.assertIn("operational_state", summary)
+
+    # -------------------------------------------------------------------------
+    # 32. Proposed Changes Normalization (No-Op Strings)
+    # -------------------------------------------------------------------------
+    def test_32_proposed_changes_normalization_noop_strings(self):
+        """32. No-op string values are safely normalized to empty list without raising."""
+        noop_cases = ["None", "No changes required", "N/A", "GEMINI_OK", "none", "ok", "[]", "null"]
+        normalized = BaseSupportProvider.normalize_proposed_changes(noop_cases)
+        self.assertEqual(normalized, [])
+
+        # Non-list input also safely normalizes to []
+        self.assertEqual(BaseSupportProvider.normalize_proposed_changes("None"), [])
+        self.assertEqual(BaseSupportProvider.normalize_proposed_changes(None), [])
+        self.assertEqual(BaseSupportProvider.normalize_proposed_changes(123), [])
+
+    # -------------------------------------------------------------------------
+    # 33. Proposed Changes Normalization (Malformed Types Ignored)
+    # -------------------------------------------------------------------------
+    def test_33_proposed_changes_normalization_malformed_types_ignored(self):
+        """33. Malformed items and free-form strings are discarded, NOT converted to fake ProposedChange."""
+        malformed = [
+            "Random advice string",
+            12345,
+            {"description": "No file specified"},
+            {"description": "No changes needed", "rationale": "none"},
+        ]
+        normalized = BaseSupportProvider.normalize_proposed_changes(malformed)
+        self.assertEqual(normalized, [])
+
+    # -------------------------------------------------------------------------
+    # 34. Proposed Changes Normalization (Valid Dicts)
+    # -------------------------------------------------------------------------
+    def test_34_proposed_changes_normalization_valid_dicts(self):
+        """34. Valid dict structures are safely constructed into ProposedChange instances."""
+        valid_dicts = [
+            {
+                "file_path": "astro_ai/brain/self_model.py",
+                "description": "Add read-only accessor",
+                "rationale": "Enforce single authoritative state",
+                "diff_snippet": "+ def get_state(): ...",
+                "target_invariants": ["single_authoritative_state"],
+            }
+        ]
+        normalized = BaseSupportProvider.normalize_proposed_changes(valid_dicts)
+        self.assertEqual(len(normalized), 1)
+        self.assertIsInstance(normalized[0], ProposedChange)
+        self.assertEqual(normalized[0].file_path, "astro_ai/brain/self_model.py")
+        self.assertEqual(normalized[0].description, "Add read-only accessor")
+        self.assertEqual(normalized[0].target_invariants, ["single_authoritative_state"])
+
+    # -------------------------------------------------------------------------
+    # 35. Cache Roundtrip With Proposed Changes and Strict Serialization
+    # -------------------------------------------------------------------------
+    def test_35_cache_roundtrip_with_proposed_changes(self):
+        """35. Cache serialization safely round-trips responses with ProposedChange objects."""
+        change = ProposedChange(
+            file_path="astro_ai/brain/world_model.py",
+            description="Add clearance check",
+            rationale="Safety invariant",
+        )
+        response = ArchitectureSupportResponse(
+            request_id="req_test_cache",
+            provider="gemini",
+            model="gemini-3.6-flash",
+            mode=SupportControlMode.PROPOSE,
+            status=SupportStatus.SUCCESS,
+            summary="Test proposal summary",
+            proposed_changes=[change],
+            confidence=0.9,
+        )
+
+        # to_dict must produce serializable structure with valid proposed_changes
+        serialized = response.to_dict()
+        self.assertIn("proposed_changes", serialized)
+        self.assertEqual(len(serialized["proposed_changes"]), 1)
+        self.assertEqual(serialized["proposed_changes"][0]["file_path"], "astro_ai/brain/world_model.py")
+
+        # Put into cache and retrieve
+        self.cache.put("cache_test_key", response)
+        retrieved = self.cache.get("cache_test_key")
+        self.assertIsNotNone(retrieved)
+        self.assertEqual(len(retrieved.proposed_changes), 1)
+        self.assertIsInstance(retrieved.proposed_changes[0], ProposedChange)
+        self.assertEqual(retrieved.proposed_changes[0].file_path, "astro_ai/brain/world_model.py")
+
+    # -------------------------------------------------------------------------
+    # 36. Gemini Provider Mock Simulation With No-Op String Changes
+    # -------------------------------------------------------------------------
+    def test_36_gemini_provider_mock_with_noop_string_changes(self):
+        """36. Simulates real Gemini response returning no-op strings in proposed_changes; verifies caching."""
+        mock_client = MagicMock()
+        mock_response = MagicMock()
+        mock_response.text = (
+            '{"summary": "GEMINI_OK", "observations": ["Model responsive"], '
+            '"proposed_changes": ["GEMINI_OK", "No changes required"], "confidence": 0.95}'
+        )
+        mock_client.models.generate_content.return_value = mock_response
+
+        gemini = GeminiFlashProvider(config=self.config, client=mock_client)
+        assistant = CognitiveArchitectureAssistant(
+            config=self.config,
+            budget_gate=self.budget_gate,
+            cache=self.cache,
+            debouncer=self.debouncer,
+            context_builder=self.context_builder,
+            providers={"gemini": gemini},
+        )
+
+        req = SupportRequest(topic="gemini_ok_healthcheck", prompt="Healthcheck", provider_override="gemini")
+        resp = assistant.analyze_architecture(req)
+
+        self.assertEqual(resp.status, SupportStatus.SUCCESS)
+        self.assertEqual(resp.summary, "GEMINI_OK")
+        self.assertEqual(resp.proposed_changes, [])
+
+        # Verify response was successfully stored in cache without AttributeError
+        cached_resp = self.cache.get(self.cache.compute_cache_key(
+            topic="gemini_ok_healthcheck",
+            context_hash=self.context_builder.build_context("gemini_ok_healthcheck")[1]["context_hash"],
+            prompt="Healthcheck",
+            provider="gemini",
+        ))
+        self.assertIsNotNone(cached_resp)
+        self.assertEqual(cached_resp.summary, "GEMINI_OK")
+        self.assertEqual(cached_resp.proposed_changes, [])
 
 
 if __name__ == "__main__":

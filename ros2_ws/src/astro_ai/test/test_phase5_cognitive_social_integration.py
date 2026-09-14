@@ -813,7 +813,7 @@ class TestPhase5CognitiveSocialIntegration(unittest.TestCase):
         )
         mock_gemini = MagicMock()
         mock_gemini.provider_name = "gemini"
-        mock_gemini.model_name = "gemini-2.5-flash"
+        mock_gemini.model_name = "gemini-3.6-flash"
         mock_gemini.is_available.return_value = True
         mock_gemini.generate_analysis.side_effect = Exception("429 Resource Exhausted")
 

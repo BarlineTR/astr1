@@ -76,3 +76,70 @@ class BaseSupportProvider(abc.ABC):
             "test_plan": ["Run cognitive test suite to verify no regressions."],
             "confidence": 0.8,
         }
+
+    @staticmethod
+    def normalize_proposed_changes(raw_changes: Any) -> List[ProposedChange]:
+        """Safely normalizes raw 'proposed_changes' from LLM JSON to a strict List[ProposedChange].
+
+        Invariants enforced:
+        - Must return a list containing ONLY ProposedChange instances.
+        - No-op strings like 'None', 'No changes required', 'N/A', 'GEMINI_OK' are filtered to [].
+        - Arbitrary strings/malformed types are NEVER converted into fake ProposedChange objects.
+        - Valid dicts are converted to ProposedChange with safe field extraction.
+        """
+        if not isinstance(raw_changes, list):
+            return []
+
+        no_op_strings = {
+            "none",
+            "no changes",
+            "no changes required",
+            "no change",
+            "no change needed",
+            "no changes needed",
+            "n/a",
+            "na",
+            "gemini_ok",
+            "ok",
+            "[]",
+            "{}",
+            "null",
+        }
+
+        normalized: List[ProposedChange] = []
+        for item in raw_changes:
+            if isinstance(item, ProposedChange):
+                normalized.append(item)
+            elif isinstance(item, dict):
+                file_path = str(item.get("file_path") or item.get("file") or "").strip()
+                description = str(item.get("description") or item.get("change") or "").strip()
+                rationale = str(item.get("rationale") or item.get("reason") or "").strip()
+
+                # If dict represents an empty or no-op statement without a target file
+                if not file_path:
+                    continue
+                if description.lower() in no_op_strings or rationale.lower() in no_op_strings:
+                    continue
+
+                diff_snippet = str(item.get("diff_snippet") or "")
+                raw_inv = item.get("target_invariants")
+                target_invariants = [str(x) for x in raw_inv] if isinstance(raw_inv, list) else []
+
+                normalized.append(
+                    ProposedChange(
+                        file_path=file_path,
+                        description=description,
+                        rationale=rationale,
+                        diff_snippet=diff_snippet,
+                        target_invariants=target_invariants,
+                    )
+                )
+            elif isinstance(item, str):
+                # Strings (e.g. "None", "No changes required", "GEMINI_OK", or free-form comments)
+                # are explicitly discarded from proposed_changes to preserve the strict List[ProposedChange] contract.
+                continue
+            else:
+                # Any other corrupted/unsupported type is safely ignored.
+                continue
+
+        return normalized

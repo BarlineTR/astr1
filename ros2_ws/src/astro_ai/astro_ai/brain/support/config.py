@@ -54,7 +54,7 @@ class SupportConfig:
     groq_api_key: str = ""
 
     # Model identifiers
-    gemini_support_model: str = "gemini-2.5-flash"
+    gemini_support_model: str = "gemini-3.6-flash"
     groq_support_model: str = "qwen/qwen-2.5-coder-32b"
 
     # Local Safety Budget Limits (Conservatively lower than actual provider quotas)
@@ -81,7 +81,7 @@ class SupportConfig:
             groq_support_enabled=_bool_env("GROQ_SUPPORT_ENABLED", False),
             gemini_api_key=os.getenv("GEMINI_API_KEY", "").strip(),
             groq_api_key=os.getenv("GROQ_API_KEY", "").strip(),
-            gemini_support_model=os.getenv("GEMINI_SUPPORT_MODEL", "gemini-2.5-flash").strip(),
+            gemini_support_model=os.getenv("GEMINI_SUPPORT_MODEL", "gemini-3.6-flash").strip(),
             groq_support_model=os.getenv("GROQ_SUPPORT_MODEL", "qwen/qwen-2.5-coder-32b").strip(),
             max_requests_per_minute=_int_env("SUPPORT_MAX_REQUESTS_PER_MINUTE", 3),
             max_requests_per_hour=_int_env("SUPPORT_MAX_REQUESTS_PER_HOUR", 15),

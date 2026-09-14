@@ -80,7 +80,11 @@ class GroqQwenProvider(BaseSupportProvider):
             "You do NOT possess runtime consciousness or motor control authority. "
             "Always respond with a valid JSON object containing keys: "
             "'summary', 'observations', 'architectural_concerns', 'proposed_changes', "
-            "'invariant_checks', 'test_plan', 'confidence'."
+            "'invariant_checks', 'test_plan', 'confidence'. "
+            "The 'proposed_changes' field must be a JSON array of objects, where each object has "
+            "the fields 'file_path' (string), 'description' (string), 'rationale' (string), "
+            "and optionally 'diff_snippet' (string) and 'target_invariants' (list of strings). "
+            "If no architectural changes are proposed or needed, 'proposed_changes' MUST be an empty array []."
         )
 
         user_content = f"[ARCHITECTURAL CONTEXT]:\n{context}\n\n[QUERY]:\n{prompt}"
@@ -99,10 +103,7 @@ class GroqQwenProvider(BaseSupportProvider):
 
             raw_text = chat_completion.choices[0].message.content or ""
             parsed = self.parse_structured_json(raw_text, default_summary="Groq Qwen analysis completed.")
-            changes = [
-                ProposedChange(**c) if isinstance(c, dict) else c
-                for c in parsed.get("proposed_changes", [])
-            ]
+            changes = self.normalize_proposed_changes(parsed.get("proposed_changes", []))
 
             return ArchitectureSupportResponse(
                 request_id=request_id,

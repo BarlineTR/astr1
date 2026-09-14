@@ -80,7 +80,7 @@ class ArchitectureSupportCache:
 
                 data = json.loads(response_json)
                 changes = [
-                    ProposedChange(**c) for c in data.get("proposed_changes", [])
+                    ProposedChange(**c) for c in data.get("proposed_changes", []) if isinstance(c, dict)
                 ]
                 return ArchitectureSupportResponse(
                     request_id=data.get("request_id", ""),
