@@ -6,7 +6,7 @@ rplidar_node:
     frame_id: "laser_frame"
     inverted: false
     angle_compensate: true
-    scan_mode: "Standard"
+    scan_mode: ""
     scan_frequency: 10.0
     auto_standby: false
 

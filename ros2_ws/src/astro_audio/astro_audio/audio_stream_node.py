@@ -865,17 +865,17 @@ class AudioStreamNode(Node):
                 else:
                     mics = multi_ch[:4]
 
-            # STEP 7: GCC-PHAT INPUT SNAPSHOT (~1 Hz rate-limited)
-            if (now - getattr(self, "_last_gcc_snapshot_time", 0.0)) >= 1.0:
-                self._last_gcc_snapshot_time = now
-                mics_f = mics.astype(np.float32)
-                mics_rms = [round(float(np.sqrt(np.mean(mics_f[i] ** 2))), 1) for i in range(mics.shape[0])]
-                self.get_logger().debug(
-                    f"[GCC_PHAT_SNAPSHOT]\n"
-                    f"  selected_pcm_shape={mics.shape}\n"
-                    f"  selected_channel_indices={list(mic_indices)}\n"
-                    f"  selected_channel_rms={mics_rms}"
-                )
+                # STEP 7: GCC-PHAT INPUT SNAPSHOT (~1 Hz rate-limited)
+                if (now - getattr(self, "_last_gcc_snapshot_time", 0.0)) >= 1.0:
+                    self._last_gcc_snapshot_time = now
+                    mics_f = mics.astype(np.float32)
+                    mics_rms = [round(float(np.sqrt(np.mean(mics_f[i] ** 2))), 1) for i in range(mics.shape[0])]
+                    self.get_logger().debug(
+                        f"[GCC_PHAT_SNAPSHOT]\n"
+                        f"  selected_pcm_shape={mics.shape}\n"
+                        f"  selected_channel_indices={list(mic_indices)}\n"
+                        f"  selected_channel_rms={mics_rms}"
+                    )
 
                 azimuth_deg, conf, valid = self._doa_estimator.estimate_from_multichannel_pcm(mics)
 

@@ -181,10 +181,39 @@ class ArduinoState:
     SAFETY_BLOCKED = "SAFETY_BLOCKED"
 
 
+def _is_lidar_port(dev_path: str) -> bool:
+    try:
+        for l_path in ("/dev/astro_lidar", "/dev/rplidar"):
+            if os.path.exists(l_path) and os.path.realpath(dev_path) == os.path.realpath(l_path):
+                return True
+    except Exception:
+        pass
+    try:
+        import serial.tools.list_ports
+        for port_info in serial.tools.list_ports.comports():
+            if port_info.device == dev_path and getattr(port_info, "vid", None) == 0x10C4:
+                return True
+    except Exception:
+        pass
+    try:
+        bname = os.path.basename(dev_path)
+        for sys_v_path in (
+            f"/sys/class/tty/{bname}/device/../idVendor",
+            f"/sys/class/tty/{bname}/device/idVendor",
+        ):
+            if os.path.exists(sys_v_path):
+                with open(sys_v_path, "r") as f:
+                    if f.read().strip().lower() == "10c4":
+                        return True
+    except Exception:
+        pass
+    return False
+
+
 def resolve_serial_port(primary: str = "/dev/astro_arduino", logger=None, baud: int = 115200) -> str:
     candidates = []
     # 1. Primary rule (if it's not a lidar port)
-    if primary and primary not in ("/dev/astro_lidar", "/dev/rplidar") and os.path.exists(primary):
+    if primary and primary not in ("/dev/astro_lidar", "/dev/rplidar") and not _is_lidar_port(primary) and os.path.exists(primary):
         if logger:
             logger.info(f"[ARDUINO PORT DISCOVERY]\n  candidate={primary}\n  selected={primary}\n  baud={baud}")
         return primary
@@ -201,7 +230,7 @@ def resolve_serial_port(primary: str = "/dev/astro_arduino", logger=None, baud: 
     for pattern in search_patterns:
         matched = sorted(glob.glob(pattern))
         for p in matched:
-            if p in ("/dev/astro_lidar", "/dev/rplidar"):
+            if p in ("/dev/astro_lidar", "/dev/rplidar") or _is_lidar_port(p):
                 continue
             if p not in candidates:
                 candidates.append(p)
