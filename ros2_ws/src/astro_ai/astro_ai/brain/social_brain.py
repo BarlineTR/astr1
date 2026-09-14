@@ -154,7 +154,24 @@ class SocialBrain:
                 silence_duration_s=0.0,
             )
 
-            # 6. Formulate Normalized Social Context
+            # 6. Formulate Normalized Social Context with Epistemic Grounding (Camera = Eye)
+            can_see = getattr(person, "can_claim_vision", True) if person else True
+            in_cone = getattr(person, "in_optical_cone", True) if person else True
+
+            if person and not can_see:
+                if getattr(person, "has_audio", False) or getattr(person, "is_speaking", False):
+                    epistemic_inst = (
+                        "Kişi kameranın görüş alanı dışında ya da doğrudan görülmüyor. YALNIZCA SESİ DUYULUYOR. "
+                        "Kişinin kıyafeti, yüzü, gözleri, yaşı veya görünüşü hakkında sahte görsel iddialarda bulunma. "
+                        "Gerektiğinde 'Sesini duyuyorum ama şu an seni göremiyorum' gerçeğini belirt."
+                    )
+                else:
+                    epistemic_inst = "Kişi kameranın görüş konisi dışında. Görsel iddia uydurma."
+            elif person and can_see:
+                epistemic_inst = "Kişi kameranın görüş konisi içinde doğrudan görülüyor ('Görüyorum')."
+            else:
+                epistemic_inst = "Görsel kanıt yok."
+
             context = SocialContext(
                 person_id=person.person_id if person else "person_guest",
                 person_name=p_name,
@@ -172,6 +189,9 @@ class SocialBrain:
                 distance_m=distance_m,
                 relevant_memories=relevant_mems,
                 active_persona=active_persona,
+                can_claim_vision=can_see,
+                in_optical_cone=in_cone,
+                epistemic_instruction=epistemic_inst,
             )
 
             # 7. Cognitive & Metacognitive Integration (Phase 5)
@@ -258,6 +278,17 @@ class SocialBrain:
             f"- Kullanıcı Ruh Hali: {context.user_mood} (Valence: {context.user_valence}, Arousal: {context.user_arousal})\n"
             f"- Mesafe: {context.distance_m:.2f} metre, Bakış: {'Robota Bakıyor' if context.is_looking_at_robot else 'Başka Yere Bakıyor'}"
         )
+
+        # Part 2.5: Epistemic Sensory Boundary (Camera = Eye)
+        if getattr(context, "epistemic_instruction", ""):
+            vis_claim_str = "AKTİF (Görülüyor)" if getattr(context, "can_claim_vision", True) else "YASAK (Yalnızca Ses/Radar)"
+            cone_str = "Görüş Konisi İçinde" if getattr(context, "in_optical_cone", True) else "Görüş Konisi Dışında"
+            parts.append(
+                f"=== KAMERA = GÖZ (EPISTEMIK SINIR) ===\n"
+                f"- Görsel İddia: {vis_claim_str}\n"
+                f"- Kamera Görüş Konisi: {cone_str}\n"
+                f"- Kural: {context.epistemic_instruction}"
+            )
 
         # Part 3: Relevant Retrieved Memories
         if context.relevant_memories:

@@ -47,6 +47,12 @@ class SocialContext:
     environmental_cues: Dict[str, Any] = field(default_factory=dict)
     robot_current_state: str = "IDLE"
     active_persona: str = "playful"
+
+    # Epistemic Camera = Eye Sensory Fields
+    can_claim_vision: bool = True
+    in_optical_cone: bool = True
+    epistemic_instruction: str = ""
+
     timestamp: float = field(default_factory=time.time)
 
 

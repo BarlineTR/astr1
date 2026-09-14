@@ -76,3 +76,8 @@ class UnifiedPersonState:
     spatial_uncertainty: float = 0.0
     occlusion_duration_s: float = 0.0
     trajectory_history: List[Dict[str, Any]] = field(default_factory=list)
+
+    # Epistemic Camera = Eye Boundary Fields
+    in_optical_cone: bool = True
+    can_claim_vision: bool = True
+    epistemic_status: str = "GORUYORUM"

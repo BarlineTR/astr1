@@ -1843,6 +1843,19 @@ class AstroRealtimeNode(Node):
         if getattr(self, "social_brain", None) and UnifiedPersonState:
             try:
                 real_dist = spatial_info["distance_m"] if spatial_info.get("has_target") and spatial_info["distance_m"] else float(getattr(self, "_user_distance", 1.2))
+                az_val = float(spatial_info.get("azimuth_deg", 0.0)) if spatial_info.get("has_target") else 0.0
+                has_visual_face = bool(getattr(self, "_looking_at_robot", False) or getattr(self, "_user_distance", 0.0) > 0.1)
+
+                from astro_ai.spatial.epistemic_cone import evaluate_epistemic_grounding
+                head_yaw = float(getattr(self, "_current_head_yaw", 0.0))
+                epistemic = evaluate_epistemic_grounding(
+                    has_vision=has_visual_face,
+                    has_audio=True,
+                    azimuth_deg=az_val,
+                    head_yaw_deg=head_yaw,
+                    has_lidar=bool(spatial_info.get("has_target")),
+                )
+
                 person = UnifiedPersonState(
                     person_id=str(identity.get("user_id", name_val.lower())),
                     name=name_val,
@@ -1850,17 +1863,27 @@ class AstroRealtimeNode(Node):
                     is_known=is_known,
                     identity_confidence=float(identity.get("confidence", identity.get("score", 0.0))),
                     distance_m=float(real_dist),
+                    azimuth_deg=az_val,
                     is_looking_at_robot=bool(getattr(self, "_looking_at_robot", False)),
                     is_present=True,
+                    has_vision=has_visual_face,
+                    has_audio=True,
+                    has_lidar=bool(spatial_info.get("has_target")),
+                    in_optical_cone=epistemic.in_camera_cone,
+                    can_claim_vision=epistemic.can_claim_vision,
+                    epistemic_status=epistemic.status.value,
                 )
                 self.social_brain.world_model.update_people([person])
                 last_txt = getattr(self, "_last_user_transcript", "merhaba") or "merhaba"
                 soc_ctx, soc_dec, brain_prompt = self.social_brain.process_dialogue_turn(last_txt, person_state=person)
                 if brain_prompt:
                     social_context_str = f"\n\n[SOSYAL ROBOT BİLİŞSEL BAĞLAMI]:\n{brain_prompt}\n"
-                intent_val = soc_ctx.intent.value if hasattr(soc_ctx.intent, "value") else str(soc_ctx.intent)
-                directive_val = soc_dec.directive.value if hasattr(soc_dec.directive, "value") else str(soc_dec.directive)
-                action_val = soc_dec.action.value if hasattr(soc_dec.action, "value") else str(soc_dec.action)
+                intent_raw = getattr(soc_ctx, "user_intent", getattr(soc_ctx, "intent", "UNKNOWN"))
+                intent_val = intent_raw.value if hasattr(intent_raw, "value") else str(intent_raw)
+                directive_raw = getattr(soc_dec, "directive", getattr(soc_dec, "initiative_reason", "RESPOND"))
+                directive_val = directive_raw.value if hasattr(directive_raw, "value") else str(directive_raw)
+                action_raw = getattr(soc_dec, "action", getattr(soc_dec, "should_speak", True))
+                action_val = action_raw.value if hasattr(action_raw, "value") else str(action_raw)
                 self.get_logger().info(
                     f"🧠 [SocialBrain Turn] focus={person.name} | intent={intent_val} | directive={directive_val} | action={action_val}"
                 )
@@ -6581,8 +6604,15 @@ class AstroRealtimeNode(Node):
                     except Exception:
                         cog_envelope = ""
 
+                epistemic_gemma_rule = ""
+                if "KAMERA = GÖZ" in system_prompt or "EPISTEMIK" in system_prompt:
+                    for section in system_prompt.split("\n\n"):
+                        if "KAMERA = GÖZ" in section or "EPISTEMIK" in section:
+                            epistemic_gemma_rule += section.strip() + "\n\n"
+
                 gemma_prompt = (
                     f"{cog_envelope}"
+                    f"{epistemic_gemma_rule}"
                     "ASTRO bir sosyal robot. Türkçe konuş. Kısa ve doğal cevap ver.\n\n"
                     f"Kullanıcı: {user_text}\n"
                     "ASTRO:"

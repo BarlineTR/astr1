@@ -12,6 +12,7 @@ from typing import Any, Dict, List, Optional
 from astro_ai.contracts.intent_emotion_types import EmotionSignal, RelationshipRole
 from astro_ai.contracts.person_state import EntityLifecycleState, UnifiedPersonState
 from astro_ai.contracts.spatial_state import SpatialPersonTrack
+from astro_ai.spatial.epistemic_cone import evaluate_epistemic_grounding
 from astro_ai.spatial.lidar_tracker import LidarTracker
 
 
@@ -157,6 +158,13 @@ class SpatialFusionEngine:
 
                     has_lidar_flag = (matched_lidar_track is not None)
                     uncertainty = 0.05 if (has_lidar_flag and is_known) else (0.15 if (has_lidar_flag or voice_matched) else 0.35)
+                    epistemic = evaluate_epistemic_grounding(
+                        has_vision=True,
+                        has_audio=voice_matched,
+                        azimuth_deg=azimuth,
+                        head_yaw_deg=0.0,
+                        has_lidar=has_lidar_flag,
+                    )
 
                     fused_person = UnifiedPersonState(
                         person_id=person_id,
@@ -185,6 +193,9 @@ class SpatialFusionEngine:
                         has_lidar=has_lidar_flag,
                         has_audio=voice_matched,
                         spatial_uncertainty=uncertainty,
+                        in_optical_cone=epistemic.in_camera_cone,
+                        can_claim_vision=epistemic.can_claim_vision,
+                        epistemic_status=epistemic.status.value,
                     )
                     fused_list.append(fused_person)
                     self._fused_people[person_id] = fused_person
@@ -210,6 +221,14 @@ class SpatialFusionEngine:
                             if adiff <= 25.0:
                                 a_pid = existing_pid
                                 break
+
+                    epistemic_audio = evaluate_epistemic_grounding(
+                        has_vision=False,
+                        has_audio=True,
+                        azimuth_deg=self._latest_audio_doa,
+                        head_yaw_deg=0.0,
+                        has_lidar=(matched_lidar_audio is not None),
+                    )
 
                     acoustic_person = UnifiedPersonState(
                         person_id=a_pid,
@@ -238,6 +257,9 @@ class SpatialFusionEngine:
                         has_lidar=(matched_lidar_audio is not None),
                         has_audio=True,
                         spatial_uncertainty=0.40 if matched_lidar_audio else 0.65,
+                        in_optical_cone=epistemic_audio.in_camera_cone,
+                        can_claim_vision=epistemic_audio.can_claim_vision,
+                        epistemic_status=epistemic_audio.status.value,
                     )
                     fused_list.append(acoustic_person)
                     self._fused_people[a_pid] = acoustic_person
@@ -260,6 +282,14 @@ class SpatialFusionEngine:
                             lifecycle = EntityLifecycleState.DEPARTING
                         else:
                             lifecycle = EntityLifecycleState.STATIONARY
+
+                        epistemic_lidar = evaluate_epistemic_grounding(
+                            has_vision=False,
+                            has_audio=is_audio_match,
+                            azimuth_deg=tr.azimuth_deg,
+                            head_yaw_deg=0.0,
+                            has_lidar=True,
+                        )
 
                         fused_person = UnifiedPersonState(
                             person_id=pid,
@@ -285,6 +315,9 @@ class SpatialFusionEngine:
                             has_lidar=True,
                             has_audio=is_audio_match,
                             spatial_uncertainty=0.25,
+                            in_optical_cone=epistemic_lidar.in_camera_cone,
+                            can_claim_vision=epistemic_lidar.can_claim_vision,
+                            epistemic_status=epistemic_lidar.status.value,
                         )
                         fused_list.append(fused_person)
                         self._fused_people[pid] = fused_person
@@ -299,6 +332,13 @@ class SpatialFusionEngine:
                             if adiff <= 25.0:
                                 a_pid = existing_pid
                                 break
+                    epistemic_audio = evaluate_epistemic_grounding(
+                        has_vision=False,
+                        has_audio=True,
+                        azimuth_deg=self._latest_audio_doa,
+                        head_yaw_deg=0.0,
+                        has_lidar=False,
+                    )
                     acoustic_person = UnifiedPersonState(
                         person_id=a_pid,
                         name=spk_name,
@@ -324,6 +364,9 @@ class SpatialFusionEngine:
                         has_lidar=False,
                         has_audio=True,
                         spatial_uncertainty=0.65,
+                        in_optical_cone=epistemic_audio.in_camera_cone,
+                        can_claim_vision=epistemic_audio.can_claim_vision,
+                        epistemic_status=epistemic_audio.status.value,
                     )
                     fused_list.append(acoustic_person)
                     self._fused_people[a_pid] = acoustic_person
@@ -338,6 +381,13 @@ class SpatialFusionEngine:
                         if adiff <= 25.0:
                             a_pid = existing_pid
                             break
+                epistemic_audio = evaluate_epistemic_grounding(
+                    has_vision=False,
+                    has_audio=True,
+                    azimuth_deg=self._latest_audio_doa,
+                    head_yaw_deg=0.0,
+                    has_lidar=False,
+                )
                 acoustic_person = UnifiedPersonState(
                     person_id=a_pid,
                     name=spk_name,
@@ -363,6 +413,9 @@ class SpatialFusionEngine:
                     has_lidar=False,
                     has_audio=True,
                     spatial_uncertainty=0.65,
+                    in_optical_cone=epistemic_audio.in_camera_cone,
+                    can_claim_vision=epistemic_audio.can_claim_vision,
+                    epistemic_status=epistemic_audio.status.value,
                 )
                 fused_list.append(acoustic_person)
                 self._fused_people[a_pid] = acoustic_person
