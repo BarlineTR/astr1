@@ -43,12 +43,25 @@ from astro_ai.spatial.spatial_fusion import SpatialFusionEngine
 class SocialBrain:
     """Master Cognitive Engine for ASTRO Social Robot."""
 
-    def __init__(self, db_path: Optional[str] = None, enable_migration: Optional[bool] = None):
+    def __init__(
+        self,
+        db_path: Optional[str] = None,
+        enable_migration: Optional[bool] = None,
+        self_model: Optional[SelfModel] = None,
+        world_model: Optional[WorldModel] = None,
+        cognitive_loop: Optional[Any] = None,
+    ):
         self._lock = threading.RLock()
 
-        # 1. Epistemic & World Models
-        self.self_model = SelfModel()
-        self.world_model = WorldModel()
+        # 1. Epistemic & World Models (Shared single-self reference architecture)
+        if cognitive_loop is not None:
+            self.cognitive_loop = cognitive_loop
+            self.self_model = SelfModel.from_cognitive_loop(cognitive_loop)
+            self.world_model = cognitive_loop.world_model
+        else:
+            self.cognitive_loop = None
+            self.self_model = self_model or SelfModel()
+            self.world_model = world_model or WorldModel()
 
         # 2. Memory V2 Cognitive Architecture
         self.storage = SQLiteMemoryStorage(db_path)
@@ -84,6 +97,13 @@ class SocialBrain:
         self.response_planner = ResponsePlanner()
         self.dialogue_adapter = DialogueContextAdapter()
         self.dialogue_policy = DialoguePolicyEngine()
+
+    def bind_cognitive_loop(self, loop: Any) -> None:
+        """Binds this SocialBrain to a live CognitiveLoop, sharing authoritative self and world models."""
+        with self._lock:
+            self.cognitive_loop = loop
+            self.self_model.bind_cognitive_loop(loop)
+            self.world_model = loop.world_model
 
     def process_dialogue_turn(
         self,

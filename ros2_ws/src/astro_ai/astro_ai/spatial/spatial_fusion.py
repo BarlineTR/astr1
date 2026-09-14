@@ -203,7 +203,13 @@ class SpatialFusionEngine:
                     spk_name = self._latest_speaker_data.get("name", "Misafir") if self._latest_speaker_data else "Misafir"
                     a_dist = matched_lidar_audio.distance_m if matched_lidar_audio else 2.5
                     a_vel = matched_lidar_audio.velocity_mps if matched_lidar_audio else 0.0
-                    a_pid = f"person_acoustic_{int(abs(self._latest_audio_doa))}"
+                    a_pid = "audio_speaker_1"
+                    for existing_pid, ep in self._fused_people.items():
+                        if getattr(ep, "entity_type", "") == "ACOUSTIC_ENTITY":
+                            adiff = abs((ep.azimuth_deg - self._latest_audio_doa + 180.0) % 360.0 - 180.0)
+                            if adiff <= 25.0:
+                                a_pid = existing_pid
+                                break
 
                     acoustic_person = UnifiedPersonState(
                         person_id=a_pid,
@@ -286,7 +292,13 @@ class SpatialFusionEngine:
                 # If audio is speaking without nearby lidar track
                 if self._is_speaking and self._latest_audio_doa is not None and not audio_associated:
                     spk_name = self._latest_speaker_data.get("name", "Misafir") if self._latest_speaker_data else "Misafir"
-                    a_pid = f"person_acoustic_{int(abs(self._latest_audio_doa))}"
+                    a_pid = "audio_speaker_1"
+                    for existing_pid, ep in self._fused_people.items():
+                        if getattr(ep, "entity_type", "") == "ACOUSTIC_ENTITY":
+                            adiff = abs((ep.azimuth_deg - self._latest_audio_doa + 180.0) % 360.0 - 180.0)
+                            if adiff <= 25.0:
+                                a_pid = existing_pid
+                                break
                     acoustic_person = UnifiedPersonState(
                         person_id=a_pid,
                         name=spk_name,
@@ -319,7 +331,13 @@ class SpatialFusionEngine:
             # Case C: Audio Only (No vision, no LiDAR tracks, but valid acoustic speech)
             elif self._is_speaking and self._latest_audio_doa is not None:
                 spk_name = self._latest_speaker_data.get("name", "Misafir") if self._latest_speaker_data else "Misafir"
-                a_pid = f"person_acoustic_{int(abs(self._latest_audio_doa))}"
+                a_pid = "audio_speaker_1"
+                for existing_pid, ep in self._fused_people.items():
+                    if getattr(ep, "entity_type", "") == "ACOUSTIC_ENTITY":
+                        adiff = abs((ep.azimuth_deg - self._latest_audio_doa + 180.0) % 360.0 - 180.0)
+                        if adiff <= 25.0:
+                            a_pid = existing_pid
+                            break
                 acoustic_person = UnifiedPersonState(
                     person_id=a_pid,
                     name=spk_name,

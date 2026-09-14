@@ -95,6 +95,7 @@ from astro_ai.contracts.consciousness_types import (
     RobotAffectiveState,
     SelfState,
 )
+from astro_ai.spatial.spatial_fusion import SpatialFusionEngine
 from astro_ai.state_machine import RobotState
 
 
@@ -122,6 +123,7 @@ class ConsciousnessNode(Node):
         self.self_state = SelfState()
         self.affective_manager = AffectiveStateManager()
         self.affective_state = self.affective_manager.state
+        self.spatial_fusion = SpatialFusionEngine()
         self.loop = CognitiveLoop(
             world_model=None,
             event_bus=self.event_bus,
@@ -131,6 +133,7 @@ class ConsciousnessNode(Node):
             temporal_history_size=self.temporal_history_size,
             on_telemetry=self.get_logger().info,
         )
+        self.self_model = self.loop.self_model
 
         # Ephemeral Sensor Caches (Thread-safe)
         self._sensor_cache: Dict[str, Any] = {
@@ -202,32 +205,21 @@ class ConsciousnessNode(Node):
     def _on_faces_msg(self, msg: Any) -> None:
         raw_txt = getattr(msg, "data", "[]")
         now = time.time()
-        people_list: List[UnifiedPersonState] = []
+        face_data: List[Dict[str, Any]] = []
         try:
-            face_data = json.loads(raw_txt)
-            if isinstance(face_data, list):
-                for idx, f in enumerate(face_data):
-                    name = f.get("recognized_name") or f.get("name") or "Misafir"
-                    is_known = bool(f.get("is_known") or (f.get("recognized_name") is not None))
-                    pid = f"person_{name.lower().replace(' ', '_')}" if is_known else f"person_visual_{idx+1}"
-                    people_list.append(UnifiedPersonState(
-                        person_id=pid,
-                        name=name,
-                        formal_title=f.get("recognized_title") or f.get("formal_title") or name,
-                        is_known=is_known,
-                        distance_m=float(f.get("distance_m", 1.5)),
-                        azimuth_deg=float(f.get("camera_azimuth_deg", f.get("yaw_deg", 0.0))),
-                        is_looking_at_robot=bool(f.get("looking_at_robot", False)),
-                        is_present=True,
-                    ))
+            parsed = json.loads(raw_txt)
+            if isinstance(parsed, list):
+                face_data = parsed
         except Exception:
             pass
 
         with self._lock:
             self._sensor_cache["faces_json"] = raw_txt
-            if people_list:
-                self._sensor_cache["people"] = people_list
             self._sensor_cache["last_sensor_update_ts"] = now
+            self.spatial_fusion.update_vision_perception(
+                faces=face_data,
+                looking_at_robot=self._sensor_cache.get("looking_at_robot", False),
+            )
 
         self.loop.event_detector.notify_sensor_active("camera", now)
 
@@ -270,8 +262,19 @@ class ConsciousnessNode(Node):
             )
 
     def _on_looking_msg(self, msg: Any) -> None:
+        val = bool(getattr(msg, "data", False))
         with self._lock:
-            self._sensor_cache["looking_at_robot"] = bool(getattr(msg, "data", False))
+            self._sensor_cache["looking_at_robot"] = val
+            try:
+                face_data = json.loads(self._sensor_cache.get("faces_json", "[]"))
+                if not isinstance(face_data, list):
+                    face_data = []
+            except Exception:
+                face_data = []
+            self.spatial_fusion.update_vision_perception(
+                faces=face_data,
+                looking_at_robot=val,
+            )
 
     def _on_audio_vad_msg(self, msg: Any) -> None:
         val = bool(getattr(msg, "data", False))
@@ -280,6 +283,11 @@ class ConsciousnessNode(Node):
         with self._lock:
             self._sensor_cache["vad"] = val
             self.self_state.is_listening = val
+            self.spatial_fusion.update_audio_perception(
+                doa_deg=self._sensor_cache.get("doa_deg", 0.0),
+                is_speaking=val,
+                vad_active=val,
+            )
 
         self.loop.event_detector.notify_sensor_active("audio", now)
 
@@ -293,8 +301,14 @@ class ConsciousnessNode(Node):
 
     def _on_audio_doa_msg(self, msg: Any) -> None:
         now = time.time()
+        doa = float(getattr(msg, "data", 0.0))
         with self._lock:
-            self._sensor_cache["doa_deg"] = float(getattr(msg, "data", 0.0))
+            self._sensor_cache["doa_deg"] = doa
+            self.spatial_fusion.update_audio_perception(
+                doa_deg=doa,
+                is_speaking=self._sensor_cache.get("vad", False),
+                vad_active=self._sensor_cache.get("vad", False),
+            )
         self.loop.event_detector.notify_sensor_active("audio", now)
 
     def _on_tts_speaking_msg(self, msg: Any) -> None:
@@ -336,6 +350,17 @@ class ConsciousnessNode(Node):
             if valid_ranges:
                 with self._lock:
                     self._sensor_cache["min_front_distance_m"] = min(valid_ranges)
+            angle_min = getattr(msg, "angle_min", -math.pi)
+            angle_increment = getattr(msg, "angle_increment", math.radians(1.0))
+            range_min = getattr(msg, "range_min", 0.15)
+            range_max = getattr(msg, "range_max", 12.0)
+            self.spatial_fusion.update_lidar_scan(
+                ranges=list(ranges),
+                angle_min=angle_min,
+                angle_increment=angle_increment,
+                range_min=range_min,
+                range_max=range_max,
+            )
         self.loop.event_detector.notify_sensor_active("lidar", now)
 
     def _on_head_state_msg(self, msg: Any) -> None:
@@ -364,6 +389,9 @@ class ConsciousnessNode(Node):
             self.self_state.is_listening = self._sensor_cache["vad"]
             self.self_state.current_head_yaw_deg = self._sensor_cache["head_yaw_deg"]
 
+            # Authoritative single spatial fusion pathway
+            fused_people = self.spatial_fusion.compute_fusion(now=now)
+
             # 2. Publish any unprocessed events to ROS2 telemetric stream
             unprocessed = self.event_bus.get_unprocessed_events()
             if unprocessed:
@@ -374,8 +402,8 @@ class ConsciousnessNode(Node):
 
             # 3. Step CognitiveLoop (Perceive -> Event -> World Temporal Update)
             cycle_result = self.loop.step({
-                "people": self._sensor_cache.get("people", None),
-                "person_detected": self._sensor_cache["person_detected"],
+                "people": fused_people,
+                "person_detected": bool(fused_people) or self._sensor_cache["person_detected"],
                 "vad": self._sensor_cache["vad"],
                 "doa_deg": self._sensor_cache["doa_deg"],
                 "tts_speaking": self._sensor_cache["tts_speaking"],

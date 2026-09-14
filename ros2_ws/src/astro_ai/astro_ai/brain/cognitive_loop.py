@@ -14,6 +14,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import logging
+import re
 import threading
 import time
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -25,8 +26,11 @@ from astro_ai.brain.behavior_engine import BehaviorEngine
 from astro_ai.brain.cognitive_continuity import CognitiveContinuityTracker
 from astro_ai.brain.cognitive_event_bus import CognitiveEventBus
 from astro_ai.brain.metacognitive_engine import MetacognitiveEngine
+from astro_ai.brain.outcome_resolver import OutcomeResolver
 from astro_ai.brain.perception_event_detector import PerceptionEventDetector
 from astro_ai.brain.prediction_engine import PredictionEngine
+from astro_ai.brain.prediction_factory import ActionExpectationFactory
+from astro_ai.brain.self_model import SelfModel
 from astro_ai.brain.world_model import WorldModel, WorldStateSnapshot
 from astro_ai.contracts.person_state import UnifiedPersonState
 from astro_ai.contracts.behavior_types import (
@@ -43,9 +47,17 @@ from astro_ai.contracts.consciousness_types import (
     CognitiveEventType,
     MetacognitiveState,
     PredictionError,
+    PredictionStatus,
     RobotAffectiveState,
     SelfState,
 )
+
+
+def normalize_reason_for_signature(reason: Optional[str]) -> Optional[str]:
+    """Filters dynamic continuous float numbers from reason strings to prevent telemetry spam."""
+    if not reason:
+        return None
+    return re.sub(r"\d+\.\d+", "*", str(reason))
 
 
 @dataclass
@@ -85,6 +97,7 @@ class CognitiveLoop:
         continuity_tracker: Optional[CognitiveContinuityTracker] = None,
         metacognitive_engine: Optional[MetacognitiveEngine] = None,
         behavior_engine: Optional[BehaviorEngine] = None,
+        self_model: Optional[SelfModel] = None,
         target_hz: float = 10.0,
         temporal_history_size: int = 50,
         on_telemetry: Optional[Callable[[str], None]] = None,
@@ -92,6 +105,8 @@ class CognitiveLoop:
         self._lock = threading.RLock()
         self._on_telemetry = on_telemetry
         self._last_telemetry_sig: Optional[Tuple[Any, ...]] = None
+        self._last_behavior_sig: Optional[Tuple[Any, ...]] = None
+        self._last_predicted_action_sig: Optional[Tuple[Any, ...]] = None
         self.world_model = (
             world_model
             if world_model is not None
@@ -137,6 +152,12 @@ class CognitiveLoop:
             if behavior_engine is not None
             else BehaviorEngine()
         )
+        # Shared single-self representation layer
+        if self_model is not None:
+            self.self_model = self_model
+            self.self_model.bind_cognitive_loop(self)
+        else:
+            self.self_model = SelfModel.from_cognitive_loop(self)
 
         self.target_hz = max(1.0, min(50.0, float(target_hz)))
         self.target_period_s = 1.0 / self.target_hz
@@ -184,28 +205,40 @@ class CognitiveLoop:
             )
 
             # Synchronize people with lifecycle tracking
-            if "people" in active_perception and isinstance(active_perception["people"], list):
-                self.world_model.update_people(active_perception["people"], now=now)
+            people_to_update = list(active_perception.get("people") or [])
 
             # Ingest active acoustic stimulus when VAD is active and DOA is reported
             if active_perception.get("vad") and "doa_deg" in active_perception:
                 doa_val = float(active_perception["doa_deg"])
-                has_acoustic = any(
-                    getattr(p, "has_audio", False) and p.is_present
-                    for p in self.world_model._people.values()
-                )
-                if not has_acoustic:
-                    ac_entity = UnifiedPersonState(
-                        person_id="acoustic_source",
-                        distance_m=2.0,
-                        azimuth_deg=doa_val,
-                        is_present=True,
-                        has_audio=True,
-                        has_vision=False,
-                        is_speaking=True,
-                        entity_type="ACOUSTIC_ENTITY",
+                if abs(doa_val) > 0.5 or active_perception.get("vad"):
+                    has_acoustic = any(
+                        getattr(p, "has_audio", False) and getattr(p, "is_present", True)
+                        for p in people_to_update
                     )
-                    self.world_model.update_people([ac_entity], now=now)
+                    if not has_acoustic:
+                        stable_id = "audio_speaker_1"
+                        for ep_id, ep in self.world_model._people.items():
+                            if getattr(ep, "entity_type", "") == "ACOUSTIC_ENTITY":
+                                if abs((ep.azimuth_deg - doa_val + 180.0) % 360.0 - 180.0) <= 25.0:
+                                    stable_id = ep_id
+                                    break
+                        ac_entity = UnifiedPersonState(
+                            person_id=stable_id,
+                            name="Misafir",
+                            formal_title="Misafir",
+                            distance_m=2.0,
+                            azimuth_deg=doa_val,
+                            is_present=True,
+                            has_audio=True,
+                            has_vision=False,
+                            is_speaking=True,
+                            entity_type="ACOUSTIC_ENTITY",
+                        )
+                        people_to_update.append(ac_entity)
+
+            # Single authoritative call to update_people with all entities
+            if people_to_update or "people" in active_perception:
+                self.world_model.update_people(people_to_update, now=now)
 
             # Synchronize robot state
             if "robot_state" in active_perception and isinstance(active_perception["robot_state"], dict):
@@ -229,11 +262,24 @@ class CognitiveLoop:
             if acoustic_cand:
                 active_perception["acoustic_attention_candidate"] = acoustic_cand
 
+            # Focus validation & orphan focus prevention
             curr_focus = self.self_state.focused_person_id
-            if curr_focus and curr_focus in self.world_model._people:
-                fp = self.world_model._people[curr_focus]
-                if not fp.is_present and getattr(fp, "occlusion_duration_s", 0.0) >= 0:
-                    active_perception["focused_person_occluded"] = True
+            if curr_focus:
+                if curr_focus in self.world_model._people:
+                    fp = self.world_model._people[curr_focus]
+                    if not fp.has_vision and fp.has_audio:
+                        active_perception["focused_person_acoustic_only"] = True
+                    if not fp.is_present and getattr(fp, "occlusion_duration_s", 0.0) >= 0:
+                        active_perception["focused_person_occluded"] = True
+                else:
+                    active_perception["focus_orphan"] = True
+                    if self.world_model._active_speaker:
+                        self.self_state.focused_person_id = self.world_model._active_speaker.person_id
+                    else:
+                        present_p = [p for p in self.world_model._people.values() if p.is_present]
+                        self.self_state.focused_person_id = present_p[0].person_id if present_p else None
+                    curr_focus = self.self_state.focused_person_id
+            self.world_model.focus_target = curr_focus
 
             # -----------------------------------------------------------------
             # 2. EVENT: Detect perception transitions & process event bus
@@ -373,25 +419,43 @@ class CognitiveLoop:
                     now=now,
                 )
 
-            # Perceptual outcome verification for active expectations
+            # Perceptual & Physical Outcome Resolution using OutcomeResolver
             active_preds = self.prediction_engine.get_active_predictions()
-            for p in active_preds:
-                if p.action_id == "EXPECT_FACE_AFTER_HEAD_ATTENTION":
-                    visual_people = [
-                        per for per in self.world_model._people.values()
-                        if per.is_present and getattr(per, "has_vision", False)
-                    ]
-                    if visual_people:
-                        outcome = ActualOutcome(
-                            outcome_id=f"out_face_{int(now * 1000)}",
-                            expectation_id=p.prediction_id,
-                            actual_state={"face_detected": True},
-                            timestamp=now,
-                        )
-                        p_err = self.prediction_engine.evaluate_outcome(outcome, now=now)
-                        pred_errors.append(p_err)
-                        self.affective_manager.update_confidence(p_err.confidence_impact)
-                        self.affective_manager.update_uncertainty(p_err.uncertainty_impact)
+            if active_preds:
+                resolved_outcomes = OutcomeResolver.resolve_outcomes(
+                    active_predictions=active_preds,
+                    self_state=self.self_state,
+                    world_model=self.world_model,
+                    perception_data=active_perception,
+                    now=now,
+                )
+                for outcome in resolved_outcomes:
+                    p_err = self.prediction_engine.evaluate_outcome(outcome, now=now)
+                    pred_errors.append(p_err)
+                    self.affective_manager.update_confidence(p_err.confidence_impact)
+                    self.affective_manager.update_uncertainty(p_err.uncertainty_impact)
+                    if p_err.matched:
+                        self.affective_manager.modulate_frustration(-0.1)
+                        if (
+                            self.self_state.active_prediction
+                            and self.self_state.active_prediction.prediction_id == p_err.expectation_id
+                        ):
+                            self.self_state.active_prediction = None
+                    else:
+                        self.affective_manager.modulate_frustration(p_err.mismatch_score * 0.15)
+
+                    self.continuity_tracker.record_transition(
+                        transition_type="PREDICTION_EVALUATED" if p_err.matched else "PREDICTION_ERROR",
+                        previous_value={"confidence": round(self.self_state.overall_confidence, 3)},
+                        new_value={"confidence": round(self.self_state.overall_confidence + p_err.confidence_impact, 3)},
+                        cause=p_err.mismatch_type,
+                        metadata=p_err.to_dict(),
+                    )
+                    self.metacognitive_engine.record_outcome_for_strategy(
+                        matched=p_err.matched,
+                        prediction_error=p_err,
+                        confidence=self.self_state.overall_confidence,
+                    )
 
             # 4. Assemble CognitiveContext integration/read snapshot
             events_summary = [
@@ -430,11 +494,6 @@ class CognitiveLoop:
             # -----------------------------------------------------------------
             # [Phase 7 Extension Point: Behavioral Intelligence & Action Mapping]
             # -----------------------------------------------------------------
-            prev_beh_id = (
-                self.behavior_engine.active_behavior.behavior_id
-                if self.behavior_engine.active_behavior
-                else None
-            )
             beh_intent = self.behavior_engine.step(
                 world_model=self.world_model,
                 self_state=self.self_state,
@@ -446,14 +505,58 @@ class CognitiveLoop:
             )
             act_intent = behavior_intent_to_action_intent(beh_intent) if beh_intent else None
 
-            if beh_intent and beh_intent.behavior_id != prev_beh_id:
+            # Semantic behavior change detection (Bug A)
+            current_behavior_sig = (
+                beh_intent.behavior_type,
+                beh_intent.target_id,
+            ) if beh_intent else None
+
+            if current_behavior_sig != self._last_behavior_sig:
+                prev_val = self._last_behavior_sig[0].value if self._last_behavior_sig else None
+                new_val = beh_intent.behavior_type.value if beh_intent else None
                 self.continuity_tracker.record_transition(
                     transition_type="BEHAVIOR_CHANGE",
-                    previous_value=prev_beh_id,
-                    new_value=beh_intent.behavior_type.value,
-                    cause=beh_intent.reason or "behavior_selection",
-                    metadata=beh_intent.to_dict(),
+                    previous_value=prev_val,
+                    new_value=new_val,
+                    cause=beh_intent.reason if beh_intent else "behavior_cleared",
+                    metadata=beh_intent.to_dict() if beh_intent else {},
                 )
+                self._last_behavior_sig = current_behavior_sig
+
+            # Sync current behavior to SelfState (Bug E)
+            self.self_state.current_behavior = (
+                beh_intent.behavior_type.value if beh_intent else None
+            )
+            self.self_state.current_behavior_reason = (
+                beh_intent.reason if beh_intent else None
+            )
+
+            # Action Expectation Generation (Episode-driven, Anti-Duplication)
+            if act_intent is not None:
+                param_items = tuple(sorted((k, str(v)) for k, v in act_intent.parameters.items()))
+                action_sig = (act_intent.action_type, act_intent.target, param_items)
+                if action_sig != self._last_predicted_action_sig:
+                    self._last_predicted_action_sig = action_sig
+                    has_active_perceptual_seek = any(
+                        p.action_id == "EXPECT_FACE_AFTER_HEAD_ATTENTION" and p.status == PredictionStatus.PENDING
+                        for p in self.prediction_engine.get_active_predictions()
+                    )
+                    if not (has_active_perceptual_seek and act_intent.action_type == "turn_head"):
+                        action_pred = ActionExpectationFactory.create_expectation(
+                            act_intent, current_state=self.self_state, now=now
+                        )
+                        if action_pred is not None:
+                            self.prediction_engine.register_prediction(action_pred)
+                            self.self_state.active_prediction = action_pred
+                            self.continuity_tracker.record_transition(
+                                transition_type="PREDICTION_REGISTERED",
+                                previous_value=None,
+                                new_value=action_pred.prediction_id,
+                                cause=action_pred.source or "action_execution",
+                                metadata={"action_id": action_pred.action_id, "expected_by": action_pred.expected_by},
+                            )
+            else:
+                self._last_predicted_action_sig = None
 
             # -----------------------------------------------------------------
             # 5. WORLD TEMPORAL UPDATE: Commit ring-buffer snapshot
@@ -492,12 +595,15 @@ class CognitiveLoop:
             )
 
             # Runtime Telemetry Evaluation (Transition-Driven, Anti-Spam)
+            norm_beh_reason = normalize_reason_for_signature(beh_intent.reason) if beh_intent else None
+            norm_dec_reason = normalize_reason_for_signature(cog_decision.reason) if cog_decision else None
+
             current_sig = (
                 self.self_state.focused_person_id,
                 cog_decision.decision_type.value if (cog_decision and hasattr(cog_decision.decision_type, "value")) else (cog_decision.decision_type if cog_decision else None),
-                cog_decision.reason if cog_decision else None,
+                norm_dec_reason,
                 beh_intent.behavior_type.value if (beh_intent and hasattr(beh_intent.behavior_type, "value")) else (beh_intent.behavior_type if beh_intent else None),
-                beh_intent.reason if beh_intent else None,
+                norm_beh_reason,
                 beh_intent.target_id if beh_intent else None,
                 self.self_state.is_listening,
                 self.self_state.is_speaking,

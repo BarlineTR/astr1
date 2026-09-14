@@ -8,7 +8,9 @@ from astro_ai.brain.emotion_engine import EmotionEngine
 from astro_ai.brain.initiative_engine import InitiativeEngine
 from astro_ai.brain.intent_engine import IntentEngine
 from astro_ai.brain.metacognitive_engine import MetacognitiveEngine
+from astro_ai.brain.outcome_resolver import OutcomeResolver
 from astro_ai.brain.prediction_engine import PredictionEngine
+from astro_ai.brain.prediction_factory import ActionExpectationFactory
 from astro_ai.brain.relationship_manager import RelationshipManager
 from astro_ai.brain.response_planner import ResponsePlanner
 from astro_ai.brain.self_model import SelfModel
@@ -18,11 +20,13 @@ from astro_ai.brain.social_fsm import SocialFSM
 from astro_ai.brain.world_model import WorldModel
 
 __all__ = [
+    "ActionExpectationFactory",
     "AffectiveStateManager",
     "CognitiveContinuityTracker",
     "DialogueContextAdapter",
     "DialoguePolicyEngine",
     "MetacognitiveEngine",
+    "OutcomeResolver",
     "PredictionEngine",
     "SocialBrain",
     "SelfModel",

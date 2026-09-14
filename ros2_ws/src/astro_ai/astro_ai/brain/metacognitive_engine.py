@@ -196,7 +196,18 @@ class MetacognitiveEngine:
         """Evaluates whether available perception and epistemic certainty suffice for active pursuit."""
         with self._lock:
             ts = time.time() if now is None else now
-            perc = perception_data or {}
+            if isinstance(perception_data, dict):
+                perc = perception_data
+            else:
+                perc = {}
+                if hasattr(perception_data, "_people"):
+                    curr_focus = getattr(perception_data, "focus_target", None)
+                    if curr_focus and curr_focus in getattr(perception_data, "_people", {}):
+                        fp = perception_data._people[curr_focus]
+                        if not getattr(fp, "has_vision", True):
+                            perc["focused_person_acoustic_only"] = True
+                    elif curr_focus:
+                        perc["focus_orphan"] = True
 
             # 1. Staleness check: if perception timestamp is older than threshold
             last_ts = perc.get("timestamp") or perc.get("last_sensor_update_ts")
@@ -213,7 +224,13 @@ class MetacognitiveEngine:
             if uncertainty >= DEFAULT_HIGH_UNCERTAINTY_THRESHOLD:
                 return InformationSufficiency.INSUFFICIENT
 
-            # 3. Unverified acoustic stimulus requiring visual confirmation (Active Perception)
+            # 3. Unverified acoustic stimulus or acoustic-only focus requiring visual confirmation
+            if perc.get("focused_person_acoustic_only", False):
+                return InformationSufficiency.INSUFFICIENT
+
+            if perc.get("focus_orphan", False):
+                return InformationSufficiency.INSUFFICIENT
+
             if perc.get("acoustic_attention_candidate") is not None:
                 return InformationSufficiency.INSUFFICIENT
 

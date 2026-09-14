@@ -83,6 +83,33 @@ class SelfModel:
     current_goal_cause: str = ""
     current_goal_source: str = ""
 
+    @classmethod
+    def from_cognitive_loop(cls, loop: Any, **kwargs) -> SelfModel:
+        """Creates a SelfModel directly bound to a live CognitiveLoop's components.
+
+        Prevents duplicate independent engines and secondary SelfState instances.
+        """
+        return cls(
+            self_state=loop.self_state,
+            affective_manager=loop.affective_manager,
+            prediction_engine=loop.prediction_engine,
+            continuity_tracker=loop.continuity_tracker,
+            metacognitive_engine=loop.metacognitive_engine,
+            **kwargs,
+        )
+
+    def bind_cognitive_loop(self, loop: Any) -> None:
+        """Binds this SelfModel to a live CognitiveLoop, sharing authoritative references."""
+        self.self_state = loop.self_state
+        self.affective_manager = loop.affective_manager
+        self.prediction_engine = loop.prediction_engine
+        self.continuity_tracker = loop.continuity_tracker
+        self.metacognitive_engine = loop.metacognitive_engine
+
+    def get_self_state(self) -> SelfState:
+        """Returns the authoritative live SelfState."""
+        return self.self_state
+
     def get_self_description_prompt(self) -> str:
         """Returns structured epistemic guidelines for the LLM."""
         return (

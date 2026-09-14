@@ -68,6 +68,7 @@ class WorldModel:
         }
 
         self._recent_events: List[Tuple[float, str]] = []  # (ts, desc)
+        self.focus_target: Optional[str] = None
 
     def update_people(self, people_list: List[UnifiedPersonState], now: Optional[float] = None):
         """Synchronizes tracked people with the world state, managing entity lifecycle and trajectory."""
@@ -119,6 +120,11 @@ class WorldModel:
             # Determine active speaker
             active_speakers = [p for p in self._people.values() if p.is_speaking and p.is_present]
             self._active_speaker = active_speakers[0] if active_speakers else None
+
+    def get_person(self, person_id: str) -> Optional[UnifiedPersonState]:
+        """Retrieves a tracked person by ID."""
+        with self._lock:
+            return self._people.get(person_id)
 
     def update_robot_state(self, **kwargs):
         with self._lock:

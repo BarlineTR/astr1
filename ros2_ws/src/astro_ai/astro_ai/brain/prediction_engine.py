@@ -73,6 +73,11 @@ class PredictionEngine:
                 if p.status == PredictionStatus.PENDING
             ]
 
+    @property
+    def active_predictions(self) -> List[Prediction]:
+        """Convenience property returning all active pending predictions."""
+        return self.get_active_predictions()
+
     def remove_prediction(self, prediction_id: str) -> Optional[Prediction]:
         """Removes a prediction from tracking."""
         with self._lock:
@@ -143,7 +148,14 @@ class PredictionEngine:
             else:
                 act_val = actual[key]
                 if isinstance(exp_val, (int, float)) and isinstance(act_val, (int, float)):
-                    if not math.isclose(float(exp_val), float(act_val), abs_tol=1e-3):
+                    tol = 1e-3
+                    if "yaw" in key or "deg" in key or "bearing" in key:
+                        tol = 5.0
+                    elif "vel" in key or "speed" in key:
+                        tol = 0.05
+                    elif "dist" in key or "clearance" in key:
+                        tol = 0.2
+                    if not math.isclose(float(exp_val), float(act_val), abs_tol=tol):
                         mismatched_keys.append(key)
                         details[key] = {"expected": exp_val, "actual": act_val, "reason": "VALUE_DIFF"}
                 elif exp_val != act_val:

@@ -193,6 +193,14 @@ class Prediction:
         d["status"] = self.status.value
         return d
 
+    @property
+    def expected_outcome(self) -> Dict[str, Any]:
+        return self.expected_state
+
+    @property
+    def action_type(self) -> str:
+        return self.action_id
+
 
 @dataclass
 class ActualOutcome:
@@ -309,6 +317,8 @@ class SelfState:
     focused_person_id: Optional[str] = None
     current_goal: Optional[Goal] = None
     active_prediction: Optional[Prediction] = None
+    current_behavior: Optional[str] = None
+    current_behavior_reason: Optional[str] = None
     
     # Introspection metrics
     overall_confidence: float = 0.7
@@ -336,8 +346,30 @@ class SelfState:
             return "Listening"
         if self.active_prediction is not None:
             return f"Executing action ({self.active_prediction.action_id})"
-        if self.current_goal is not None:
-            return f"Pursuing goal: {self.current_goal.description}"
+        if self.current_behavior:
+            cb = self.current_behavior.upper()
+            if "SAFETY_HALT" in cb:
+                return "Safety halt"
+            if "SEARCH" in cb or "ACTIVE_PERCEPTION" in cb:
+                return "Searching for acoustic source"
+            if "ATTEND" in cb or "ACOUSTIC" in cb or "ORIENT" in cb:
+                if self.focused_person_id:
+                    return f"Attending acoustic source ({self.focused_person_id})"
+                return "Attending acoustic source"
+            if "ENGAGE" in cb or "MAINTAIN_GAZE" in cb or "TRACK" in cb:
+                if self.focused_person_id:
+                    return f"Tracking interlocutor ({self.focused_person_id})"
+                return "Tracking interlocutor"
+            if "RETREAT" in cb:
+                return "Retreating for proxemic comfort"
+            if "EXPLORE" in cb:
+                return "Exploring surroundings"
+            if "APPROACH" in cb:
+                if self.focused_person_id:
+                    return f"Approaching {self.focused_person_id}"
+                return "Approaching target"
+            if "STOP" in cb:
+                return "Stopped and holding position"
         if self.operational_state == RobotState.THINKING:
             return "Deliberating / reasoning"
         if self.operational_state == RobotState.THINKING_ACK:
@@ -350,6 +382,8 @@ class SelfState:
             return "Interrupted / adapting"
         if self.operational_state == RobotState.DEEP_IDLE:
             return "Deep idle power-saving"
+        if self.focused_person_id:
+            return f"Attending {self.focused_person_id}"
         return "Idling / monitoring surroundings"
 
     def get_operational_state(self) -> RobotState:
@@ -389,6 +423,8 @@ class SelfState:
             "active_goal_id": self.current_goal.goal_id if self.current_goal else None,
             "active_action_id": self.active_prediction.action_id if self.active_prediction else None,
             "is_executing_action": self.is_executing_action(),
+            "current_behavior": self.current_behavior,
+            "current_behavior_reason": self.current_behavior_reason,
             "confidence": round(self.overall_confidence, 3),
             "uncertainty": round(self.uncertainty_level, 3),
             "degraded_capabilities": sorted(list(self.degraded_capabilities)),
@@ -455,6 +491,8 @@ class SelfState:
             "focused_person_id": self.focused_person_id,
             "current_goal": self.current_goal.to_dict() if self.current_goal else None,
             "active_prediction": self.active_prediction.to_dict() if self.active_prediction else None,
+            "current_behavior": self.current_behavior,
+            "current_behavior_reason": self.current_behavior_reason,
             "overall_confidence": round(self.overall_confidence, 3),
             "uncertainty_level": round(self.uncertainty_level, 3),
             "active_capabilities": sorted(list(self.active_capabilities)),
@@ -467,8 +505,8 @@ class SelfState:
 @dataclass
 class ActionIntent:
     """A proposed action emitted by Consciousness to existing ROS2 subsystems."""
-    intent_id: str
-    action_type: str                 # e.g., "gaze_hint", "speak_request", "tool_call", "motion_request"
+    intent_id: str = field(default_factory=lambda: f"act_{uuid.uuid4().hex[:8]}")
+    action_type: str = ""            # e.g., "gaze_hint", "speak_request", "tool_call", "motion_request"
     target: Optional[str] = None     # Target person/entity ID or direction
     parameters: Dict[str, Any] = field(default_factory=dict)
     priority: float = 0.5            # 0.0 to 1.0

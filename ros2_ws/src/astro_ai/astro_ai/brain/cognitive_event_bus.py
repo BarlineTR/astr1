@@ -129,6 +129,14 @@ class CognitiveEventBus:
                     count += 1
         return count
 
+    def drain_events(self) -> List[CognitiveEvent]:
+        """Marks all unprocessed events as processed and returns them."""
+        with self._lock:
+            unprocessed = [e for e in self._events if not e.processed]
+            for e in unprocessed:
+                e.processed = True
+            return unprocessed
+
     def get_recent_events(self, limit: int = 10) -> List[CognitiveEvent]:
         """Returns the most recent N events (newest first)."""
         with self._lock:
