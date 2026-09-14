@@ -53,3 +53,8 @@ pytest
 
 # ── Görü ────────────────────────────────────────────────────
 opencv-python<5         # face_detector_node Haar cascade kullanıyor (bkz. yukarıdaki not)
+
+# ── ROS 2 / Colcon Derleme Uyumu ────────────────────────────
+# setuptools >= 80.0.0 sürümünde legacy develop API'si değiştirildiğinden
+# colcon build --symlink-install "error: option --editable not recognized" hatası verir.
+setuptools<80.0.0

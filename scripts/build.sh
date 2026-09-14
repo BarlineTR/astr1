@@ -43,6 +43,19 @@ source "$ROS_SETUP"
 set -u
 
 cd "$WS"
+
+# setuptools >= 80.0.0, colcon build --symlink-install ile uyumsuzdur ("error: option --editable not recognized").
+# venv'deki setuptools sürümünü kontrol et ve gerekirse <80.0.0 sürümüne çek.
+if ! "$VPY" -c "import setuptools, sys; sys.exit(0 if int(''.join(c for c in setuptools.__version__.split('.')[0] if c.isdigit()) or 0) < 80 else 1)" >/dev/null 2>&1; then
+  echo "⚠️  setuptools >= 80 algılandı (colcon --symlink-install için <80.0.0 zorunludur)."
+  echo "    setuptools 75.8.2 sürümüne sabitleniyor..."
+  if command -v uv >/dev/null 2>&1; then
+    VIRTUAL_ENV="$ROOT/.venv" uv pip install --quiet "setuptools<80.0.0"
+  else
+    "$VPY" -m pip install --quiet "setuptools<80.0.0"
+  fi
+fi
+
 COLCON=("$VPY" -m colcon)
 if ! "$VPY" -c "import colcon_core" >/dev/null 2>&1; then
   echo "⚠️  colcon venv'den import edilemiyor (python3-colcon-common-extensions kurulu mu?)."

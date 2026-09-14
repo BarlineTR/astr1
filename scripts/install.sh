@@ -142,6 +142,7 @@ else
 fi
 
 VIRTUAL_ENV="$VENV" uv pip install -r "$ROOT/requirements.txt" --quiet
+VIRTUAL_ENV="$VENV" uv pip install --quiet "setuptools<80.0.0"
 ok "requirements.txt kuruldu ($(VIRTUAL_ENV="$VENV" uv pip list 2>/dev/null | tail -n +3 | wc -l) paket)"
 
 # Jetson (aarch64): NVIDIA'nın torch derlemesi NumPy 1.x'e karşı derlenmiştir.
