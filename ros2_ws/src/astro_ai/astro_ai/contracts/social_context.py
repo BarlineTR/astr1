@@ -53,6 +53,11 @@ class SocialContext:
     in_optical_cone: bool = True
     epistemic_instruction: str = ""
 
+    # Phase 4 Activity Episode Continuity Fields
+    episode_guidance: str = ""
+    is_reengagement: bool = False
+    suppress_greeting: bool = False
+
     timestamp: float = field(default_factory=time.time)
 
 

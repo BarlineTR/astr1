@@ -6605,9 +6605,10 @@ class AstroRealtimeNode(Node):
                         cog_envelope = ""
 
                 epistemic_gemma_rule = ""
-                if any(k in system_prompt for k in ["KAMERA = GÖZ", "EPISTEMIK", "ETKİLEŞİM VE SÖZEL"]):
+                rule_keys = ["KAMERA = GÖZ", "EPISTEMIK", "ETKİLEŞİM VE SÖZEL", "AKTİVİTE OTURUMU"]
+                if any(k in system_prompt for k in rule_keys):
                     for section in system_prompt.split("\n\n"):
-                        if any(k in section for k in ["KAMERA = GÖZ", "EPISTEMIK", "ETKİLEŞİM VE SÖZEL"]):
+                        if any(k in section for k in rule_keys):
                             epistemic_gemma_rule += section.strip() + "\n\n"
 
                 gemma_prompt = (

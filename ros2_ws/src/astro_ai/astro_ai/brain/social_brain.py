@@ -8,6 +8,7 @@ import threading
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
+from astro_ai.brain.activity_episode import ActivityEpisodeTracker
 from astro_ai.brain.attention_manager import AttentionManager
 from astro_ai.brain.dialogue_policy_engine import DialoguePolicyEngine
 from astro_ai.brain.emotion_engine import EmotionEngine
@@ -105,6 +106,7 @@ class SocialBrain:
         self.dialogue_adapter = DialogueContextAdapter()
         self.dialogue_policy = DialoguePolicyEngine()
         self.interaction_gate = InteractionGate()
+        self.episode_tracker = ActivityEpisodeTracker()
 
     def bind_cognitive_loop(self, loop: Any) -> None:
         """Binds this SocialBrain to a live CognitiveLoop, sharing authoritative self and world models."""
@@ -180,6 +182,18 @@ class SocialBrain:
             else:
                 epistemic_inst = "Görsel kanıt yok."
 
+            # Episode tracking & continuity (Phase 4)
+            episode = self.episode_tracker.update(person)
+            pid = person.person_id if person else "person_guest"
+            episode_guide = self.episode_tracker.get_continuity_guidance(pid)
+            suppress_greet = self.episode_tracker.should_suppress_greeting(pid)
+            is_reeng = bool(episode and episode.is_reengagement)
+
+            clean_ut = user_text.lower()
+            if any(w in clean_ut for w in ["merhaba", "selam", "günaydın", "iyi günler", "hey"]):
+                self.episode_tracker.record_greeting(pid)
+            self.episode_tracker.record_turn(pid, user_text)
+
             context = SocialContext(
                 person_id=person.person_id if person else "person_guest",
                 person_name=p_name,
@@ -200,6 +214,9 @@ class SocialBrain:
                 can_claim_vision=can_see,
                 in_optical_cone=in_cone,
                 epistemic_instruction=epistemic_inst,
+                episode_guidance=episode_guide,
+                is_reengagement=is_reeng,
+                suppress_greeting=suppress_greet,
             )
 
             # 7. Cognitive & Metacognitive Integration (Phase 5)
@@ -329,6 +346,10 @@ class SocialBrain:
                 f"- Sözel Yanıt İzni: {'EVET' if getattr(decision, 'should_speak', True) else 'HAYIR (Sessiz Kal / Dinle)'}\n"
                 f"- Kural: {decision.gate_instruction}"
             )
+
+        # Part 2.7: Activity Episode Continuity (Phase 4)
+        if getattr(context, "episode_guidance", ""):
+            parts.append(f"=== AKTİVİTE OTURUMU VE SÜREKLİLİK ===\n{context.episode_guidance}")
 
         # Part 3: Relevant Retrieved Memories
         if context.relevant_memories:
