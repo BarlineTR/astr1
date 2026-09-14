@@ -18,13 +18,19 @@ import time
 from typing import Any, Dict, List, Optional
 
 from astro_ai.brain.affective_state import AffectiveStateManager
+from astro_ai.brain.behavior_engine import BehaviorEngine
 from astro_ai.brain.cognitive_continuity import CognitiveContinuityTracker
 from astro_ai.brain.cognitive_event_bus import CognitiveEventBus
 from astro_ai.brain.metacognitive_engine import MetacognitiveEngine
 from astro_ai.brain.perception_event_detector import PerceptionEventDetector
 from astro_ai.brain.prediction_engine import PredictionEngine
 from astro_ai.brain.world_model import WorldModel, WorldStateSnapshot
+from astro_ai.contracts.behavior_types import (
+    BehavioralIntent,
+    behavior_intent_to_action_intent,
+)
 from astro_ai.contracts.consciousness_types import (
+    ActionIntent,
     ActualOutcome,
     CognitiveContext,
     CognitiveDecision,
@@ -57,6 +63,8 @@ class CognitiveCycleResult:
     prediction_errors: List[PredictionError] = field(default_factory=list)
     metacognitive_state: Optional[MetacognitiveState] = None
     cognitive_decision: Optional[CognitiveDecision] = None
+    behavioral_intent: Optional[BehavioralIntent] = None
+    action_intent: Optional[ActionIntent] = None
 
 
 class CognitiveLoop:
@@ -72,6 +80,7 @@ class CognitiveLoop:
         prediction_engine: Optional[PredictionEngine] = None,
         continuity_tracker: Optional[CognitiveContinuityTracker] = None,
         metacognitive_engine: Optional[MetacognitiveEngine] = None,
+        behavior_engine: Optional[BehaviorEngine] = None,
         target_hz: float = 10.0,
         temporal_history_size: int = 50,
     ):
@@ -115,6 +124,11 @@ class CognitiveLoop:
             metacognitive_engine
             if metacognitive_engine is not None
             else MetacognitiveEngine()
+        )
+        self.behavior_engine = (
+            behavior_engine
+            if behavior_engine is not None
+            else BehaviorEngine()
         )
 
         self.target_hz = max(1.0, min(50.0, float(target_hz)))
@@ -387,8 +401,32 @@ class CognitiveLoop:
             )
 
             # -----------------------------------------------------------------
-            # [Phase 5 Extension Point: Action Prediction & Outcome Evaluation]
+            # [Phase 7 Extension Point: Behavioral Intelligence & Action Mapping]
             # -----------------------------------------------------------------
+            prev_beh_id = (
+                self.behavior_engine.active_behavior.behavior_id
+                if self.behavior_engine.active_behavior
+                else None
+            )
+            beh_intent = self.behavior_engine.step(
+                world_model=self.world_model,
+                self_state=self.self_state,
+                active_goal=self.self_state.current_goal,
+                cognitive_decision=cog_decision,
+                affective_state=self.affective_manager.state,
+                social_phase=self.world_model._robot_state.get("social_phase"),
+                now=now,
+            )
+            act_intent = behavior_intent_to_action_intent(beh_intent) if beh_intent else None
+
+            if beh_intent and beh_intent.behavior_id != prev_beh_id:
+                self.continuity_tracker.record_transition(
+                    transition_type="BEHAVIOR_CHANGE",
+                    previous_value=prev_beh_id,
+                    new_value=beh_intent.behavior_type.value,
+                    cause=beh_intent.reason or "behavior_selection",
+                    metadata=beh_intent.to_dict(),
+                )
 
             # -----------------------------------------------------------------
             # 5. WORLD TEMPORAL UPDATE: Commit ring-buffer snapshot
@@ -422,6 +460,8 @@ class CognitiveLoop:
                 prediction_errors=pred_errors,
                 metacognitive_state=meta_state,
                 cognitive_decision=cog_decision,
+                behavioral_intent=beh_intent,
+                action_intent=act_intent,
             )
 
     def run_consecutive_steps(
@@ -460,6 +500,7 @@ class CognitiveLoop:
             self.prediction_engine.clear()
             self.continuity_tracker.clear()
             self.metacognitive_engine.reset()
+            self.behavior_engine.reset()
             self._last_focused_person = None
 
     @property

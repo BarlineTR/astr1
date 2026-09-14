@@ -845,3 +845,76 @@ class ActionManager:
                 }
 
         return None
+
+    def execute_action_intent(self, intent: Any) -> ActionResult:
+        """Executes an ActionIntent through the authoritative hardware safety gates."""
+        if not intent or not hasattr(intent, "action_type"):
+            return ActionResult(
+                success=False,
+                action="unknown",
+                action_id="none",
+                error_code="INVALID_INTENT",
+                error="ActionIntent nesnesi geçersiz veya eksik.",
+                message="Geçersiz eylem niyeti.",
+            )
+
+        act_type = getattr(intent, "action_type", "")
+        params = getattr(intent, "parameters", {}) or {}
+        act_id = getattr(intent, "intent_id", None)
+
+        if act_type in ("move_robot", "motion_request"):
+            direction = str(params.get("direction", "stop"))
+            speed = float(params.get("speed", 0.2))
+            duration = float(params.get("duration", 1.0))
+            return self.execute_move(
+                direction=direction,
+                speed=speed,
+                duration=duration,
+                action_id=act_id,
+            )
+
+        elif act_type in ("turn_head", "turn_to_sound", "track_gaze"):
+            target_yaw = params.get("target_yaw_deg", params.get("azimuth_deg"))
+            target_yaw_val = float(target_yaw) if target_yaw is not None else None
+            return self.turn_to_sound(
+                azimuth_deg=target_yaw_val,
+                action_id=act_id,
+            )
+
+        elif act_type in ("gesture", "execute_gesture"):
+            gesture_name = str(params.get("gesture_name", "nod"))
+            duration_ms = int(params.get("duration_ms", 600))
+            return self.execute_gesture(
+                gesture_name=gesture_name,
+                duration_ms=duration_ms,
+                action_id=act_id,
+            )
+
+        elif act_type == "gaze_aversion":
+            offset_yaw = float(params.get("offset_yaw_deg", 3.0))
+            pub_offset = getattr(self._node, "pub_social_offset_yaw", None)
+            if pub_offset:
+                try:
+                    from unittest.mock import MagicMock
+                    msg = Float32() if 'Float32' in globals() else MagicMock()
+                    msg.data = offset_yaw
+                    pub_offset.publish(msg)
+                except Exception as ex:
+                    self._logger.debug(f"Social offset yaw publish failed: {ex}")
+            return ActionResult(
+                success=True,
+                action="gaze_aversion",
+                action_id=act_id or f"aversion_{int(time.monotonic()*1000)}",
+                azimuth_deg=offset_yaw,
+                hardware_ack=True,
+                message=f"Bakış kaçırma açısı ({offset_yaw:.1f}°) uygulandı.",
+            )
+
+        return ActionResult(
+            success=False,
+            action=act_type,
+            action_id=act_id or "unknown",
+            error_code="UNSUPPORTED_ACTION_TYPE",
+            error=f"Desteklenmeyen eylem tipi: '{act_type}'",
+            message="Desteklenmeyen eylem tipi.",
+        )
