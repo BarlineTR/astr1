@@ -19,6 +19,7 @@ from astro_ai.brain.intent_engine import IntentEngine
 from astro_ai.brain.relationship_manager import RelationshipManager
 from astro_ai.brain.response_planner import ResponsePlanner
 from astro_ai.brain.self_model import SelfModel
+from astro_ai.brain.social_initiative import SocialInitiativeManager
 from astro_ai.contracts.adaptive_persona_types import AgeGroup
 from astro_ai.brain.social_dialogue_adapter import DialogueContextAdapter
 from astro_ai.brain.social_fsm import SocialFSM
@@ -110,6 +111,7 @@ class SocialBrain:
         self.interaction_gate = InteractionGate()
         self.episode_tracker = ActivityEpisodeTracker()
         self.adaptive_persona = AdaptivePersonaEngine()
+        self.social_initiative = SocialInitiativeManager(compliment_cooldown_s=120.0)
 
     def bind_cognitive_loop(self, loop: Any) -> None:
         """Binds this SocialBrain to a live CognitiveLoop, sharing authoritative self and world models."""
@@ -273,10 +275,21 @@ class SocialBrain:
                 is_quiet_mode=False,
             )
 
+            # Social Initiative & Controlled Visual Compliments (Phase 6)
+            compliment_dec = self.social_initiative.evaluate_visual_compliment(
+                person=person,
+                gate_mode=gate_decision.mode.value,
+                age_group=age_group.value,
+            )
+            if compliment_dec.should_compliment:
+                context.compliment_directive = compliment_dec.prompt_directive
+
             # 8. Formulate Strategic Decision
             decision = self.response_planner.plan_response_strategy(context)
             if persona_policy.effective_persona != active_persona:
                 decision.suggested_tone = persona_policy.recommended_tone
+            if compliment_dec.should_compliment:
+                decision.response_strategy.append(compliment_dec.prompt_directive)
             decision.gate_mode = gate_decision.mode.value
             decision.gate_instruction = gate_decision.gating_prompt_instruction
             if not gate_decision.should_respond_verbally:
@@ -365,6 +378,10 @@ class SocialBrain:
         # Part 2.8: Adaptive Persona Directive (Phase 5)
         if getattr(context, "persona_adaptation_instruction", ""):
             parts.append(f"=== UYARLANABİLİR KİŞİLİK POLİTİKASI ===\n{context.persona_adaptation_instruction}")
+
+        # Part 2.9: Social Initiative & Compliment Directive (Phase 6)
+        if getattr(context, "compliment_directive", ""):
+            parts.append(f"=== SOSYAL İNİSİYATİF VE İLTİFAT DİREKTİFİ ===\n{context.compliment_directive}")
 
         # Part 3: Relevant Retrieved Memories
         if context.relevant_memories:

@@ -62,6 +62,9 @@ class SocialContext:
     target_age_group: str = "UNKNOWN"
     persona_adaptation_instruction: str = ""
 
+    # Phase 6 Social Initiative & Controlled Compliments
+    compliment_directive: str = ""
+
     timestamp: float = field(default_factory=time.time)
 
 
