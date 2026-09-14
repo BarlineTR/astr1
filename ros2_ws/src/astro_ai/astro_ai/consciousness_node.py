@@ -390,6 +390,10 @@ class ConsciousnessNode(Node):
             })
             self.affective_state = cycle_result.affective_state or self.affective_manager.state
 
+            # Emit ActionIntent to /consciousness/action_intent stream
+            if cycle_result.action_intent is not None:
+                self.emit_action_intent(cycle_result.action_intent)
+
             # 3. Telemetry Publishing (2 Hz)
             if (now - self._last_telemetry_ts) >= self._telemetry_interval_s:
                 self._last_telemetry_ts = now

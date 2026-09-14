@@ -454,6 +454,29 @@ class MetacognitiveEngine:
                             target_goal_id=active_goal.goal_id,
                             timestamp=ts,
                         )
+                else:
+                    acoustic_cand = perc.get("acoustic_attention_candidate")
+                    if acoustic_cand is not None:
+                        decision = CognitiveDecision(
+                            decision_id=f"dec_seek_{uuid.uuid4().hex[:8]}",
+                            decision_type=CognitiveDecisionType.SEEK_INFORMATION,
+                            reason="active_perception_acoustic_attention",
+                            target_goal_id=active_goal.goal_id if active_goal else None,
+                            metadata={
+                                "target_yaw_deg": acoustic_cand.get("target_yaw_deg", 0.0),
+                                "stimulus_type": "AUDIO",
+                                "entity_id": acoustic_cand.get("entity_id"),
+                            },
+                            timestamp=ts,
+                        )
+                    else:
+                        decision = CognitiveDecision(
+                            decision_id=f"dec_conf_{uuid.uuid4().hex[:8]}",
+                            decision_type=CognitiveDecisionType.REVIEW_STRATEGY,
+                            reason=f"conflict_detected_{conflicts[0].conflict_type}",
+                            target_goal_id=active_goal.goal_id if active_goal else None,
+                            timestamp=ts,
+                        )
 
             elif self._consecutive_failures >= self.repeated_failure_threshold:
                 need_reassessment = True

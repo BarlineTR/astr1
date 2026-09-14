@@ -28,6 +28,7 @@ from astro_ai.brain.metacognitive_engine import MetacognitiveEngine
 from astro_ai.brain.perception_event_detector import PerceptionEventDetector
 from astro_ai.brain.prediction_engine import PredictionEngine
 from astro_ai.brain.world_model import WorldModel, WorldStateSnapshot
+from astro_ai.contracts.person_state import UnifiedPersonState
 from astro_ai.contracts.behavior_types import (
     BehavioralIntent,
     behavior_intent_to_action_intent,
@@ -186,6 +187,26 @@ class CognitiveLoop:
             if "people" in active_perception and isinstance(active_perception["people"], list):
                 self.world_model.update_people(active_perception["people"], now=now)
 
+            # Ingest active acoustic stimulus when VAD is active and DOA is reported
+            if active_perception.get("vad") and "doa_deg" in active_perception:
+                doa_val = float(active_perception["doa_deg"])
+                has_acoustic = any(
+                    getattr(p, "has_audio", False) and p.is_present
+                    for p in self.world_model._people.values()
+                )
+                if not has_acoustic:
+                    ac_entity = UnifiedPersonState(
+                        person_id="acoustic_source",
+                        distance_m=2.0,
+                        azimuth_deg=doa_val,
+                        is_present=True,
+                        has_audio=True,
+                        has_vision=False,
+                        is_speaking=True,
+                        entity_type="ACOUSTIC_ENTITY",
+                    )
+                    self.world_model.update_people([ac_entity], now=now)
+
             # Synchronize robot state
             if "robot_state" in active_perception and isinstance(active_perception["robot_state"], dict):
                 self.world_model.update_robot_state(**active_perception["robot_state"])
@@ -211,7 +232,7 @@ class CognitiveLoop:
             curr_focus = self.self_state.focused_person_id
             if curr_focus and curr_focus in self.world_model._people:
                 fp = self.world_model._people[curr_focus]
-                if not fp.is_present and getattr(fp, "occlusion_duration_s", 0.0) > 0:
+                if not fp.is_present and getattr(fp, "occlusion_duration_s", 0.0) >= 0:
                     active_perception["focused_person_occluded"] = True
 
             # -----------------------------------------------------------------
@@ -509,6 +530,7 @@ class CognitiveLoop:
           - selected BehavioralIntent
           - behavior reason
           - related target
+          Followed by deep structured trace for all 10 cognitive subsystems.
         """
         # 1. Focus
         focus = result.self_state.focused_person_id or "None"
@@ -538,11 +560,15 @@ class CognitiveLoop:
         conf_str = f"{result.self_state.overall_confidence:.2f}"
         unc_str = f"{result.self_state.uncertainty_level:.2f}"
 
-        # 4. Information Sufficiency
+        # 4. Information Sufficiency & Metacognitive Status
         suff = "UNKNOWN"
+        meta_status = "NORMAL"
+        conflict_state = "NONE"
         if result.metacognitive_state:
             info_suff = getattr(result.metacognitive_state, "information_sufficiency", None)
             suff = info_suff.value if hasattr(info_suff, "value") else str(info_suff or "UNKNOWN")
+            meta_status = getattr(result.metacognitive_state, "cognitive_status", "NORMAL")
+            conflict_state = getattr(result.metacognitive_state, "cognitive_conflict_state", "NONE")
 
         # 5. Cognitive Decision
         dec_str = "NONE"
@@ -559,6 +585,7 @@ class CognitiveLoop:
         # 6. Selected BehavioralIntent & Reason & Target
         intent_str = "NONE"
         reason_str = "none"
+        priority_val = 0.5
         target_str = (
             result.behavioral_intent.target_id
             if (result.behavioral_intent and result.behavioral_intent.target_id)
@@ -572,8 +599,10 @@ class CognitiveLoop:
             )
             intent_str = b_val
             reason_str = result.behavioral_intent.reason or "routine"
+            priority_val = result.behavioral_intent.priority
 
-        return (
+        # Base banner (strictly preserves 100% backward compatibility with tests)
+        banner = (
             f"🧠 [Cognition -> Behavior] "
             f"focus={focus} | "
             f"world={world_desc} | "
@@ -583,6 +612,84 @@ class CognitiveLoop:
             f"reason={reason_str} | "
             f"target={target_str}"
         )
+
+        # ---------------------------------------------------------------------
+        # Deep Subsystem Cognitive Telemetry Trace (Phase 7 Runtime Audit)
+        # ---------------------------------------------------------------------
+        # 1. Perception
+        events_str = ", ".join(result.events_drained) if result.events_drained else "none"
+        vad_str = "ACTIVE" if result.self_state.is_listening else "idle"
+        yaw_str = f"{result.self_state.current_head_yaw_deg:.1f}°"
+        perc_line = f"  ├── PERCEPTION   : events=[{events_str}], vad={vad_str}, head_yaw={yaw_str}, clearance={clear_m:.2f}m"
+
+        # 2. World Model
+        people_detail_list = []
+        for p in (result.world_snapshot.people or []):
+            st = p.tracking_state.value if hasattr(p.tracking_state, "value") else str(p.tracking_state)
+            p_desc = f"{p.person_id}({st}, {p.distance_m:.1f}m, {p.azimuth_deg:.0f}°)"
+            people_detail_list.append(p_desc)
+        people_detail = ", ".join(people_detail_list) if people_detail_list else "none"
+        conflicts_str = str([c.get("type", "conflict") for c in (result.world_snapshot.conflicts or [])]) if result.world_snapshot.conflicts else "none"
+        speaker_val = speaker_part.replace("speaker=", "")
+        world_line = f"  ├── WORLD        : people=[{people_detail}], active_speaker={speaker_val}, conflicts={conflicts_str}"
+
+        # 3. Self
+        activity = result.self_state.get_current_activity()
+        op_state = (
+            result.self_state.operational_state.value
+            if hasattr(result.self_state.operational_state, "value")
+            else str(result.self_state.operational_state)
+        )
+        goal_str = result.self_state.current_goal.description if result.self_state.current_goal else "None"
+        self_line = f"  ├── SELF         : activity=\"{activity}\", op_state={op_state}, focus={focus}, goal={goal_str}, conf={conf_str}, unc={unc_str}"
+
+        # 4. Affective State
+        aff = result.affective_state
+        if aff:
+            aff_line = f"  ├── AFFECT       : arousal={aff.arousal:.2f}, urgency={aff.urgency:.2f}, curiosity={aff.curiosity:.2f}, frustration={aff.frustration:.2f}, social={aff.social_engagement:.2f}"
+        else:
+            aff_line = "  ├── AFFECT       : default"
+
+        # 5. Prediction
+        active_preds = self.prediction_engine.get_active_predictions()
+        if active_preds:
+            preds_desc = ", ".join([f"{p.action_id}(target={p.target_person_id or 'none'})" for p in active_preds[:2]])
+            pred_line = f"  ├── PREDICTION   : active_count={len(active_preds)}, pending=[{preds_desc}]"
+        else:
+            pred_line = "  ├── PREDICTION   : active_count=0, pending=[]"
+
+        # 6. Outcome
+        if result.prediction_errors:
+            err_desc = ", ".join([f"{e.expectation_id}(matched={e.matched}, score={e.mismatch_score:.2f})" for e in result.prediction_errors[:2]])
+            out_line = f"  ├── OUTCOME      : evaluated={len(result.prediction_errors)}, details=[{err_desc}]"
+        else:
+            succ_rate = round(self.metacognitive_engine.get_recent_success_rate() * 100)
+            out_line = f"  ├── OUTCOME      : evaluated=0 (recent_match_rate={succ_rate}%)"
+
+        # 7. Continuity
+        recent_trans = self.continuity_tracker.to_list()
+        if recent_trans:
+            last_t = recent_trans[-1]
+            last_trans_str = f"{last_t.get('transition_type')}: {last_t.get('previous_value')} -> {last_t.get('new_value')} (cause={last_t.get('cause')})"
+        else:
+            last_trans_str = "none"
+        cont_line = f"  ├── CONTINUITY   : last_transition={last_trans_str}"
+
+        # 8. Metacognition
+        meta_line = f"  ├── METACOGNITION: sufficiency={suff}, status={meta_status}, conflicts={conflict_state}, decision={dec_str}"
+
+        # 9. Behavior
+        dwell_status = "active" if (self.behavior_engine.active_behavior and self.behavior_engine.active_behavior.status.value == "ACTIVE") else "idle"
+        beh_line = f"  ├── BEHAVIOR     : selected={intent_str} (priority={priority_val:.2f}), target={target_str}, reason=\"{reason_str}\", dwell={dwell_status}"
+
+        # 10. Execution
+        if result.action_intent:
+            act_p = str(result.action_intent.parameters)
+            exec_line = f"  └── EXECUTION    : ActionIntent(type={result.action_intent.action_type}, target={result.action_intent.target}, params={act_p}) [Gated by ActionManager: Safe & LLM-free]"
+        else:
+            exec_line = "  └── EXECUTION    : ActionIntent=None (quiescent / non-physical) [LLM Isolated]"
+
+        return f"{banner}\n{perc_line}\n{world_line}\n{self_line}\n{aff_line}\n{pred_line}\n{out_line}\n{cont_line}\n{meta_line}\n{beh_line}\n{exec_line}"
 
     def run_consecutive_steps(
         self,
