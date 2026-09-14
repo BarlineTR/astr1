@@ -69,6 +69,16 @@ except ImportError:
             return _MockPublisher(topic)
         def create_timer(self, *args, **kwargs):
             return None
+        def declare_parameter(self, name, value=None):
+            pass
+        def has_parameter(self, name):
+            return False
+        def get_parameter(self, name):
+            class _Param:
+                value = None
+            return _Param()
+        def destroy_node(self):
+            pass
     class _MockMsg:
         def __init__(self, data=None, **kwargs):
             self.data = data
@@ -612,7 +622,12 @@ class AstroRealtimeNode(Node):
             or os.environ.get("ASTRO_MOCK_AUDIO", "0") in ("1", "true", "True")
         )
 
-    def __init__(self, connect_realtime: bool = True, fake_transport: Optional[Any] = None):
+    def __init__(
+        self,
+        connect_realtime: bool = True,
+        fake_transport: Optional[Any] = None,
+        use_realtime: Optional[bool] = None,
+    ):
         if rclpy is not None and hasattr(rclpy, "ok") and not rclpy.ok():
             try:
                 rclpy.init()
@@ -646,7 +661,31 @@ class AstroRealtimeNode(Node):
             or self.openai_api_key.startswith("sk-test")
             or self.openai_api_key.startswith("test_")
         )
-        self.connect_realtime = bool(connect_realtime and not is_test_mode)
+
+        # ROS 2 parameter & environment variable resolution for use_realtime
+        param_use_realtime = True
+        if hasattr(self, "declare_parameter"):
+            try:
+                if hasattr(self, "has_parameter") and self.has_parameter("use_realtime"):
+                    param_val = self.get_parameter("use_realtime").value
+                else:
+                    self.declare_parameter("use_realtime", True)
+                    param_val = self.get_parameter("use_realtime").value
+                if param_val is not None:
+                    param_use_realtime = bool(param_val)
+            except Exception:
+                param_use_realtime = True
+
+        env_use_realtime = os.environ.get("USE_REALTIME", "true").strip().lower() not in ("0", "false", "no", "off")
+
+        if use_realtime is not None:
+            self.use_realtime = bool(use_realtime)
+        elif not param_use_realtime or not env_use_realtime:
+            self.use_realtime = False
+        else:
+            self.use_realtime = True
+
+        self.connect_realtime = bool(self.use_realtime and connect_realtime and not is_test_mode)
         self.fake_transport = fake_transport
         self.persona_name = os.environ.get("PERSONA", "playful").strip().lower()
         self.realtime_voice = raw_voice if raw_voice in VALID_REALTIME_VOICES else PERSONA_DEFAULT_VOICES.get(self.persona_name, "echo")
@@ -718,7 +757,7 @@ class AstroRealtimeNode(Node):
         self._active_person_name = "Misafir"
         self._person_hold_until = 0.0
         # Realtime State Tracking (Socket, Session, and Generation Lifecycle)
-        self.realtime_provider_state = "AVAILABLE"
+        self.realtime_provider_state = "AVAILABLE" if self.use_realtime else "LOCAL_FALLBACK"
         self.realtime_connection_state = "DISCONNECTED"
         self.realtime_session_state = "NOT_READY"
         self.realtime_response_state = "IDLE"
@@ -793,7 +832,7 @@ class AstroRealtimeNode(Node):
         threading.Thread(target=self._discover_providers_background, daemon=True).start()
 
         # Zero-Cost Fallback Engine (Groq STT + ProviderRegistry + XTTS GPU / Edge-TTS)
-        self._fallback_mode = False
+        self._fallback_mode = not self.use_realtime
         self._fallback_speaking = False
         self._fallback_speech_start = 0.0
         self._last_speech_time = 0.0
@@ -852,8 +891,9 @@ class AstroRealtimeNode(Node):
         )
 
         # Local Offline Backup TTS Engine (Zero internet local resilience fallback)
+        # When use_realtime=False (local mode), espeak/local_offline_tts is strictly excluded from TTSRouter
         self.local_offline_tts: Optional[LocalOfflineTTSEngine] = None
-        if LocalOfflineTTSEngine:
+        if LocalOfflineTTSEngine and self.use_realtime:
             try:
                 self.local_offline_tts = LocalOfflineTTSEngine(
                     language=os.getenv("TTS_LANGUAGE", "tr"),
@@ -882,7 +922,7 @@ class AstroRealtimeNode(Node):
 
         self.tts_router = TTSRouter(
             local_xtts=self.local_xtts,
-            local_offline_tts=self.local_offline_tts,
+            local_offline_tts=self.local_offline_tts if self.use_realtime else None,
             edge_tts_synth_func=self._synthesize_edge_tts_pcm24k,
             edge_tts_enabled=self.edge_tts_enabled,
             logger=self._safe_log,
@@ -985,8 +1025,11 @@ class AstroRealtimeNode(Node):
         # Tool execution deduplication
         self._executed_tool_calls: set[str] = set()
 
-        # Publish initial realtime state (DISCONNECTED / NOT_READY)
-        self._publish_realtime_state("DISCONNECTED", "init")
+        # Publish initial realtime state (DISCONNECTED / NOT_READY or LOCAL_FALLBACK)
+        if self.use_realtime:
+            self._publish_realtime_state("DISCONNECTED", "init")
+        else:
+            self._publish_realtime_state("LOCAL_FALLBACK", "use_realtime_disabled")
 
         # Sleep Mode (Test mode starts sleeping for invariant testing; Production starts active and ready)
         is_test = (
@@ -1028,7 +1071,7 @@ class AstroRealtimeNode(Node):
             self.get_logger().info(f"🚀 [Astro Realtime Node] OpenAI Realtime WebSocket Başlatılıyor... Ses: [{self.realtime_voice}], Kişilik: [{self.persona_name.upper()}]")
         else:
             self._ws_thread = None
-            self.get_logger().info("🧪 [Astro Realtime Node] Offline/Test modu aktif — Arka plan WebSocket başlatılmadı.")
+            self.get_logger().info("ℹ️ [Astro Realtime Node] use_realtime=False: OpenAI WebSocket başlatılmadı. Yerel ses motoru (Local Gemma + Edge-TTS) aktif.")
         self.get_logger().info("💤 [Astro Uyku Modu]: Düğüm başlatıldı — Astro DEEP_IDLE modunda (😴). Wake listener aktif.")
 
     def _cognitive_cycle_tick(self) -> None:
@@ -1115,13 +1158,15 @@ class AstroRealtimeNode(Node):
         global OPENAI_HARD_DISABLED
         if getattr(self, "_openai_hard_disabled", False):
             return False
+        if not getattr(self, "use_realtime", True) and surface in ("realtime", "all"):
+            return False
         # In unit tests with FakeRealtimeTransport, use instance-level lockout
         is_isolated_test = (getattr(self, "fake_transport", None) is not None or not getattr(self, "connect_realtime", False))
         if OPENAI_HARD_DISABLED and not is_isolated_test:
             return False
         if getattr(self, "_fallback_mode", False):
             return False
-        if getattr(self, "realtime_provider_state", "") == "EXHAUSTED":
+        if getattr(self, "realtime_provider_state", "") in ("EXHAUSTED", "LOCAL_FALLBACK"):
             return False
         cb = getattr(self, "circuit_breaker", None)
         if cb and (cb.is_exhausted("openai") or not cb.is_available("openai", f"openai_{surface}" if surface != "all" else "openai_realtime")):
@@ -4576,10 +4621,13 @@ class AstroRealtimeNode(Node):
                 hdr = getattr(msg, "header", None)
                 stamp = getattr(hdr, "stamp", None)
                 if stamp is not None:
-                    scan_stamp = float(getattr(stamp, "sec", 0)) + float(getattr(stamp, "nanosec", 0)) * 1e-9
-                    if scan_stamp > 0.0 and abs(scan_stamp - getattr(self, "_last_processed_scan_stamp", 0.0)) < 1e-4:
-                        return
-                    self._last_processed_scan_stamp = scan_stamp
+                    sec = getattr(stamp, "sec", None)
+                    nanosec = getattr(stamp, "nanosec", None)
+                    if isinstance(sec, (int, float)) and isinstance(nanosec, (int, float)):
+                        scan_stamp = float(sec) + float(nanosec) * 1e-9
+                        if scan_stamp > 0.0 and abs(scan_stamp - getattr(self, "_last_processed_scan_stamp", 0.0)) < 1e-4:
+                            return
+                        self._last_processed_scan_stamp = scan_stamp
             except Exception:
                 pass
 
@@ -6247,7 +6295,7 @@ class AstroRealtimeNode(Node):
                 tts_mode_str = "network_cloud"
                 tts_source_name = "edge_tts_cloud"
                 tts_model_name = "tr_tr_ahmet"
-            elif self.local_offline_tts and self.local_offline_tts.is_ready():
+            elif self.use_realtime and self.local_offline_tts and self.local_offline_tts.is_ready():
                 turn_tts_engine = "local_offline_tts"
                 tts_ready_flag = True
                 tts_mode_str = "local_offline"
@@ -7749,7 +7797,12 @@ class AstroRealtimeNode(Node):
                 self.robot_led.shutdown()
         except Exception:
             pass
-        return super().destroy_node()
+        if hasattr(super(), "destroy_node"):
+            try:
+                return super().destroy_node()
+            except Exception:
+                pass
+        return None
 
 
 def main(args=None):

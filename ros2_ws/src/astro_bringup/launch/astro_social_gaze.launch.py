@@ -134,6 +134,11 @@ def generate_launch_description():
             description="Enable Realtime / OpenAI conversation loop and Edge-TTS",
         ),
         DeclareLaunchArgument(
+            "use_realtime",
+            default_value="true",
+            description="Enable OpenAI Realtime WebSocket connection (if false, runs local voice via Local Gemma + Edge-TTS)",
+        ),
+        DeclareLaunchArgument(
             "verbose_diagnostics",
             default_value="false",
             description="Enable verbose per-frame forensic telemetry output",
@@ -226,6 +231,9 @@ def generate_launch_description():
         name="astro_realtime_node",
         output="screen",
         condition=IfCondition(LaunchConfiguration("enable_voice")),
+        parameters=[{
+            "use_realtime": LaunchConfiguration("use_realtime"),
+        }],
     )
 
     lidar_launch_entity = None

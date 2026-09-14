@@ -341,6 +341,14 @@ class TestStandaloneAudioIntegration:
         assert "face_detector_node" not in node_execs
         assert len(nodes) == 4
 
+        # Verify launch argument use_realtime is declared with default true
+        launch_args = {
+            e.name: str(e.default_value) for e in ld.entities if hasattr(e, "name") and hasattr(e, "default_value")
+        }
+        assert "use_realtime" in launch_args
+        assert launch_args["use_realtime"] == "true"
+        assert "enable_voice" in launch_args
+
     def test_audio_reacquisition_with_hardware_confidence_threshold(self):
         """Audio targets with realistic hardware confidence (0.50..0.60) must succeed in reacquisition."""
         node = StandaloneGazeRosNode(use_camera_source=False, enable_audio=False)
@@ -485,4 +493,53 @@ def test_manual_target_yaw_override():
     assert node.pub_head_cmd_pos.last_msg.data == pytest.approx(35.0, abs=1e-3)
 
 
+def test_astro_realtime_node_use_realtime_true():
+    """Verify use_realtime=True preserves default production/test behavior."""
+    from astro_ai.astro_realtime_node import AstroRealtimeNode
+    node = AstroRealtimeNode(connect_realtime=True)
+    try:
+        assert node.use_realtime is True
+        assert node._fallback_mode is False
+        assert node.realtime_provider_state == "AVAILABLE"
+        assert node._can_use_openai("realtime") is True
+        assert node.tts_router.local_offline_tts is not None
+        assert node.edge_tts_enabled is True
+    finally:
+        node.destroy_node()
 
+
+def test_astro_realtime_node_use_realtime_false():
+    """Verify use_realtime=False initializes LOCAL_FALLBACK, 0 websocket thread, and 0 espeak."""
+    from astro_ai.astro_realtime_node import AstroRealtimeNode
+    node = AstroRealtimeNode(use_realtime=False)
+    try:
+        assert node.use_realtime is False
+        assert node.connect_realtime is False
+        assert node._fallback_mode is True
+        assert node.realtime_provider_state == "LOCAL_FALLBACK"
+        assert node._ws_thread is None
+        assert node._can_use_openai("realtime") is False
+        assert node._can_use_openai("all") is False
+        assert node.local_offline_tts is None
+        assert node.tts_router.local_offline_tts is None
+        assert node.edge_tts_enabled is True
+    finally:
+        node.destroy_node()
+
+
+def test_astro_realtime_node_use_realtime_env_override(monkeypatch):
+    """Verify USE_REALTIME='false' env variable disables Realtime WebSocket and espeak."""
+    monkeypatch.setenv("USE_REALTIME", "false")
+    from astro_ai.astro_realtime_node import AstroRealtimeNode
+    node = AstroRealtimeNode(connect_realtime=True)
+    try:
+        assert node.use_realtime is False
+        assert node.connect_realtime is False
+        assert node._fallback_mode is True
+        assert node.realtime_provider_state == "LOCAL_FALLBACK"
+        assert node._ws_thread is None
+        assert node._can_use_openai("realtime") is False
+        assert node.local_offline_tts is None
+        assert node.tts_router.local_offline_tts is None
+    finally:
+        node.destroy_node()
