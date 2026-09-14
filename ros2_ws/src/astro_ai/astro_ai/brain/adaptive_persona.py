@@ -53,7 +53,7 @@ class AdaptivePersonaEngine:
                 pass
 
         # 3. Direct string category
-        cat_val = str(raw.get("age_group", "")).upper()
+        cat_val = str(raw.get("age_group", "") or getattr(person, "estimated_age_group", "")).upper()
         if cat_val in AgeGroup.__members__:
             return AgeGroup[cat_val], 0.80
 
