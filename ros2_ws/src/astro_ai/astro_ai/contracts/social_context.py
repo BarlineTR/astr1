@@ -65,6 +65,10 @@ class SocialContext:
     # Phase 6 Social Initiative & Controlled Compliments
     compliment_directive: str = ""
 
+    # Phase 7 Quiet/Sleep Social Awareness
+    quiet_mode_active: bool = False
+    quiet_awareness_directive: str = ""
+
     timestamp: float = field(default_factory=time.time)
 
 

@@ -16,6 +16,7 @@ from astro_ai.brain.emotion_engine import EmotionEngine
 from astro_ai.brain.initiative_engine import InitiativeEngine
 from astro_ai.brain.interaction_gate import InteractionGate
 from astro_ai.brain.intent_engine import IntentEngine
+from astro_ai.brain.quiet_awareness import QuietAwarenessEvaluator
 from astro_ai.brain.relationship_manager import RelationshipManager
 from astro_ai.brain.response_planner import ResponsePlanner
 from astro_ai.brain.self_model import SelfModel
@@ -112,6 +113,7 @@ class SocialBrain:
         self.episode_tracker = ActivityEpisodeTracker()
         self.adaptive_persona = AdaptivePersonaEngine()
         self.social_initiative = SocialInitiativeManager(compliment_cooldown_s=120.0)
+        self.quiet_evaluator = QuietAwarenessEvaluator()
 
     def bind_cognitive_loop(self, loop: Any) -> None:
         """Binds this SocialBrain to a live CognitiveLoop, sharing authoritative self and world models."""
@@ -126,6 +128,7 @@ class SocialBrain:
         person_state: Optional[UnifiedPersonState] = None,
         active_persona: str = "playful",
         acoustic_energy_rms: float = 500.0,
+        is_quiet_mode: bool = False,
     ) -> Tuple[SocialContext, SocialDecision, str]:
         """Executes full cognitive reasoning loop for an incoming dialogue turn.
 
@@ -272,8 +275,18 @@ class SocialBrain:
                 attention_state=att_state,
                 identity_certainty=id_cert,
                 user_text=user_text,
-                is_quiet_mode=False,
+                is_quiet_mode=is_quiet_mode,
             )
+
+            # Quiet / Sleep Social Awareness Directive (Phase 7)
+            quiet_decision = self.quiet_evaluator.evaluate_overhearing(
+                user_text=user_text,
+                person=person,
+                is_quiet_mode=is_quiet_mode,
+            )
+            if is_quiet_mode:
+                context.quiet_mode_active = True
+                context.quiet_awareness_directive = quiet_decision.prompt_instruction
 
             # Social Initiative & Controlled Visual Compliments (Phase 6)
             compliment_dec = self.social_initiative.evaluate_visual_compliment(
@@ -382,6 +395,10 @@ class SocialBrain:
         # Part 2.9: Social Initiative & Compliment Directive (Phase 6)
         if getattr(context, "compliment_directive", ""):
             parts.append(f"=== SOSYAL İNİSİYATİF VE İLTİFAT DİREKTİFİ ===\n{context.compliment_directive}")
+
+        # Part 2.10: Quiet/Sleep Social Awareness Directive (Phase 7)
+        if getattr(context, "quiet_awareness_directive", ""):
+            parts.append(f"=== SESSİZ/UYKU SOSYAL FARKINDALIK ===\n{context.quiet_awareness_directive}")
 
         # Part 3: Relevant Retrieved Memories
         if context.relevant_memories:

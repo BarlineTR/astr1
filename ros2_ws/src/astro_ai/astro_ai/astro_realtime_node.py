@@ -1875,7 +1875,10 @@ class AstroRealtimeNode(Node):
                 )
                 self.social_brain.world_model.update_people([person])
                 last_txt = getattr(self, "_last_user_transcript", "merhaba") or "merhaba"
-                soc_ctx, soc_dec, brain_prompt = self.social_brain.process_dialogue_turn(last_txt, person_state=person)
+                is_quiet = bool(getattr(self, "_is_quiet_mode", False) or getattr(self, "quiet_mode", False))
+                soc_ctx, soc_dec, brain_prompt = self.social_brain.process_dialogue_turn(
+                    last_txt, person_state=person, is_quiet_mode=is_quiet
+                )
                 if brain_prompt:
                     social_context_str = f"\n\n[SOSYAL ROBOT BİLİŞSEL BAĞLAMI]:\n{brain_prompt}\n"
                 intent_raw = getattr(soc_ctx, "user_intent", getattr(soc_ctx, "intent", "UNKNOWN"))
@@ -6605,7 +6608,15 @@ class AstroRealtimeNode(Node):
                         cog_envelope = ""
 
                 epistemic_gemma_rule = ""
-                rule_keys = ["KAMERA = GÖZ", "EPISTEMIK", "ETKİLEŞİM VE SÖZEL", "AKTİVİTE OTURUMU", "UYARLANABİLİR KİŞİLİK", "SOSYAL İNİSİYATİF"]
+                rule_keys = [
+                    "KAMERA = GÖZ",
+                    "EPISTEMIK",
+                    "ETKİLEŞİM VE SÖZEL",
+                    "AKTİVİTE OTURUMU",
+                    "UYARLANABİLİR KİŞİLİK",
+                    "SOSYAL İNİSİYATİF",
+                    "SESSİZ/UYKU",
+                ]
                 if any(k in system_prompt for k in rule_keys):
                     for section in system_prompt.split("\n\n"):
                         if any(k in section for k in rule_keys):

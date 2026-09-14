@@ -14,6 +14,10 @@ from astro_ai.contracts.interaction_gate_types import (
     InteractionGateMode,
     TemporalAttentionState,
 )
+from astro_ai.contracts.quiet_awareness_types import (
+    QuietDecisionMode,
+)
+from astro_ai.brain.quiet_awareness import QuietAwarenessEvaluator
 from astro_ai.contracts.person_state import UnifiedPersonState
 
 
@@ -22,6 +26,7 @@ class InteractionGate:
 
     def __init__(self, social_distance_limit_m: float = 3.0):
         self.social_distance_limit_m = social_distance_limit_m
+        self.quiet_evaluator = QuietAwarenessEvaluator()
 
     def is_directly_addressed(self, user_text: str) -> bool:
         """Checks if text contains direct vocatives or references to Astro."""
@@ -43,6 +48,32 @@ class InteractionGate:
         is_quiet_mode: bool = False,
     ) -> InteractionGateDecision:
         """Computes authoritative InteractionGateDecision."""
+        # Rule 0: Quiet/Sleep Social Awareness (Phase 7)
+        if is_quiet_mode:
+            quiet_dec = self.quiet_evaluator.evaluate_overhearing(
+                user_text=user_text, person=person, is_quiet_mode=True
+            )
+            if quiet_dec.mode == QuietDecisionMode.ENGAGE:
+                return InteractionGateDecision(
+                    mode=InteractionGateMode.ENGAGED,
+                    attention_state=attention_state,
+                    identity_certainty=identity_certainty,
+                    should_respond_verbally=True,
+                    should_track_with_gaze=True,
+                    reason=f"QUIET_MODE_WAKEUP_{quiet_dec.reason}",
+                    gating_prompt_instruction=quiet_dec.prompt_instruction,
+                )
+            else:
+                return InteractionGateDecision(
+                    mode=InteractionGateMode.OBSERVING,
+                    attention_state=attention_state,
+                    identity_certainty=identity_certainty,
+                    should_respond_verbally=False,
+                    should_track_with_gaze=True,
+                    reason=f"QUIET_MODE_SILENT_{quiet_dec.reason}",
+                    gating_prompt_instruction=quiet_dec.prompt_instruction,
+                )
+
         addressed = self.is_directly_addressed(user_text)
 
         # Rule 1: Explicit direct address ALWAYS forces ENGAGED
@@ -57,21 +88,6 @@ class InteractionGate:
                 gating_prompt_instruction=(
                     "ETKİLEŞİM KAPISI [AÇIK — DOĞRUDAN HİTAP]: Kullanıcı doğrudan sana seslendi. "
                     "Doğal ve net bir şekilde sözel yanıt ver."
-                ),
-            )
-
-        # Rule 2: Quiet/Sleep mode without direct address remains OBSERVING or BYPASS
-        if is_quiet_mode:
-            return InteractionGateDecision(
-                mode=InteractionGateMode.OBSERVING,
-                attention_state=attention_state,
-                identity_certainty=identity_certainty,
-                should_respond_verbally=False,
-                should_track_with_gaze=True,
-                reason="QUIET_MODE_SILENT_OBSERVING",
-                gating_prompt_instruction=(
-                    "ETKİLEŞİM KAPISI [SESSİZ MOD / OBSERVING]: Robot dinleme/gözlem modunda. "
-                    "Sana doğrudan hitap edilmedikçe sözel konuşma yapma."
                 ),
             )
 
