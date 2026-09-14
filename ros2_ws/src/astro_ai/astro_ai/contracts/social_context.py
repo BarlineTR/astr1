@@ -58,6 +58,10 @@ class SocialContext:
     is_reengagement: bool = False
     suppress_greeting: bool = False
 
+    # Phase 5 Adaptive Persona Fields
+    target_age_group: str = "UNKNOWN"
+    persona_adaptation_instruction: str = ""
+
     timestamp: float = field(default_factory=time.time)
 
 

@@ -81,3 +81,6 @@ class UnifiedPersonState:
     in_optical_cone: bool = True
     can_claim_vision: bool = True
     epistemic_status: str = "GORUYORUM"
+
+    # Phase 5 Adaptive Persona & Demographic Attributes
+    estimated_age_group: str = "UNKNOWN"

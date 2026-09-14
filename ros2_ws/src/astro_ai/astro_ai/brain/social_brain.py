@@ -9,6 +9,7 @@ import time
 from typing import Any, Dict, List, Optional, Tuple
 
 from astro_ai.brain.activity_episode import ActivityEpisodeTracker
+from astro_ai.brain.adaptive_persona import AdaptivePersonaEngine
 from astro_ai.brain.attention_manager import AttentionManager
 from astro_ai.brain.dialogue_policy_engine import DialoguePolicyEngine
 from astro_ai.brain.emotion_engine import EmotionEngine
@@ -18,6 +19,7 @@ from astro_ai.brain.intent_engine import IntentEngine
 from astro_ai.brain.relationship_manager import RelationshipManager
 from astro_ai.brain.response_planner import ResponsePlanner
 from astro_ai.brain.self_model import SelfModel
+from astro_ai.contracts.adaptive_persona_types import AgeGroup
 from astro_ai.brain.social_dialogue_adapter import DialogueContextAdapter
 from astro_ai.brain.social_fsm import SocialFSM
 from astro_ai.brain.world_model import WorldModel
@@ -107,6 +109,7 @@ class SocialBrain:
         self.dialogue_policy = DialoguePolicyEngine()
         self.interaction_gate = InteractionGate()
         self.episode_tracker = ActivityEpisodeTracker()
+        self.adaptive_persona = AdaptivePersonaEngine()
 
     def bind_cognitive_loop(self, loop: Any) -> None:
         """Binds this SocialBrain to a live CognitiveLoop, sharing authoritative self and world models."""
@@ -194,6 +197,10 @@ class SocialBrain:
                 self.episode_tracker.record_greeting(pid)
             self.episode_tracker.record_turn(pid, user_text)
 
+            # Adaptive Persona & Demographic Reasoning (Phase 5)
+            age_group, age_conf = self.adaptive_persona.estimate_age_group(person)
+            persona_policy = self.adaptive_persona.evaluate_policy(active_persona, age_group)
+
             context = SocialContext(
                 person_id=person.person_id if person else "person_guest",
                 person_name=p_name,
@@ -217,6 +224,8 @@ class SocialBrain:
                 episode_guidance=episode_guide,
                 is_reengagement=is_reeng,
                 suppress_greeting=suppress_greet,
+                target_age_group=age_group.value,
+                persona_adaptation_instruction=persona_policy.policy_prompt_instruction,
             )
 
             # 7. Cognitive & Metacognitive Integration (Phase 5)
@@ -266,6 +275,8 @@ class SocialBrain:
 
             # 8. Formulate Strategic Decision
             decision = self.response_planner.plan_response_strategy(context)
+            if persona_policy.effective_persona != active_persona:
+                decision.suggested_tone = persona_policy.recommended_tone
             decision.gate_mode = gate_decision.mode.value
             decision.gate_instruction = gate_decision.gating_prompt_instruction
             if not gate_decision.should_respond_verbally:
@@ -350,6 +361,10 @@ class SocialBrain:
         # Part 2.7: Activity Episode Continuity (Phase 4)
         if getattr(context, "episode_guidance", ""):
             parts.append(f"=== AKTİVİTE OTURUMU VE SÜREKLİLİK ===\n{context.episode_guidance}")
+
+        # Part 2.8: Adaptive Persona Directive (Phase 5)
+        if getattr(context, "persona_adaptation_instruction", ""):
+            parts.append(f"=== UYARLANABİLİR KİŞİLİK POLİTİKASI ===\n{context.persona_adaptation_instruction}")
 
         # Part 3: Relevant Retrieved Memories
         if context.relevant_memories:
