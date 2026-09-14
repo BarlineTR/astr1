@@ -448,13 +448,27 @@ class SerialBridge(Node):
                 self.get_logger().debug(f"_try_connect: yok sayılan hata ({_exc})")
             self.ser = None
 
+        self._connect_attempts = getattr(self, "_connect_attempts", 0) + 1
+        if self._connect_attempts > 3:
+            if hasattr(self, "connect_timer") and self.connect_timer is not None:
+                self.connect_timer.cancel()
+            return
+
         port = resolve_serial_port(self.port_param, logger=self.get_logger())
         if port is None:
             self.state = ArduinoState.DISCONNECTED
-            self.get_logger().warn(
-                f"Arduino port not found (expected {self.port_param}). "
-                "Install udev rules or connect USB. Retrying..."
-            )
+            if self._connect_attempts < 3:
+                self.get_logger().warn(
+                    f"Arduino port not found (attempt {self._connect_attempts}/3, expected {self.port_param}). "
+                    "Install udev rules or connect USB. Retrying..."
+                )
+            else:
+                self.get_logger().warn(
+                    f"Arduino port not found (attempt 3/3, expected {self.port_param}). "
+                    "Max retry limit reached. Stopping reconnection attempts to prevent log spam."
+                )
+                if hasattr(self, "connect_timer") and self.connect_timer is not None:
+                    self.connect_timer.cancel()
             return
 
         try:
@@ -487,15 +501,7 @@ class SerialBridge(Node):
                 f"  dsrdtr={self.ser.dsrdtr}"
             )
 
-            # GEÇİCİ FORENSIC TEST: reset_input_buffer / reset_output_buffer çağrıları,
-            # Arduino DTR reset sonrası gelen ilk baytları temizleyip RX senkronizasyonunu
-            # etkileyip etkilemediğini test etmek için geçici olarak yoruma alındı.
-            # try:
-            #     self.ser.reset_input_buffer()
-            #     self.ser.reset_output_buffer()
-            # except Exception:
-            #     pass
-
+            self._connect_attempts = 0
             self.port = port
             self.port_connected_time = time.monotonic()
             self.last_hb_ack_time = time.monotonic()
@@ -509,7 +515,12 @@ class SerialBridge(Node):
                 self.rx_thread.start()
                 self.get_logger().info(f"[RX THREAD LAUNCHED] thread_name={self.rx_thread.name} alive={self.rx_thread.is_alive()}")
         except serial.SerialException as exc:
-            self.get_logger().warn(f"Could not open {port}: {exc}. Retrying...")
+            if self._connect_attempts < 3:
+                self.get_logger().warn(f"Could not open {port} (attempt {self._connect_attempts}/3): {exc}. Retrying...")
+            else:
+                self.get_logger().warn(f"Could not open {port} (attempt 3/3): {exc}. Max retries reached. Stopping reconnection attempts.")
+                if hasattr(self, "connect_timer") and self.connect_timer is not None:
+                    self.connect_timer.cancel()
             self.ser = None
             self.state = ArduinoState.DISCONNECTED
 
