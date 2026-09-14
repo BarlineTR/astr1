@@ -282,6 +282,51 @@ ros2 launch astro_lidar lidar.launch.py
 ros2 launch astro_audio audio.launch.py
 ```
 
+### 👁️ Social Gaze & Bilişsel Mimari (Phase 7 Runtime Telemetry)
+
+ASTRO'nun çok modlu sosyal bakış (OAK-D yüz takibi + ReSpeaker ses yönü) ve 10 Hz bilişsel karar döngüsünü (World Model, Metacognitive Engine, Behavior Engine) çalıştırmak ve telemetri loglarını izlemek için:
+
+#### 1. Güncelleme ve Temiz Derleme
+```bash
+# Güncellemeleri çek
+git pull origin main
+
+# Temiz derlemeyi başlat (build.sh otomatik olarak setuptools<80 kontrolünü yapar ve derlemeyi tamamlar)
+./scripts/build.sh --clean
+```
+
+#### 2. Çalıştırma Seçenekleri
+
+##### Seçenek A: Realtime (Ses/OpenAI) Olmadan — Yalnızca Donanım, Bakış ve Canlı Bilişsel Telemetri
+OpenAI API tüketimi olmadan sadece motorlar, kamera takibi, mikrofon yönelimi ve 10 Hz bilişsel karar telemetrisini test etmek için:
+
+**Terminal 1 (Donanım motor köprüsü + Bakış takibi + Mikrofon/DOA):**
+```bash
+source .venv/bin/activate
+source ros2_ws/install/setup.bash
+ros2 launch astro_bringup astro_social_gaze.launch.py enable_voice:=false
+```
+
+**Terminal 2 (Bilinç, World Model ve Davranış Karar Döngüsü — 10 Hz Canlı Telemetri):**
+```bash
+source .venv/bin/activate
+source ros2_ws/install/setup.bash
+ros2 run astro_ai consciousness_node
+```
+
+Bu terminalde her anlamlı durum veya niyet değişiminde canlı telemetri logları akar:
+```text
+🧠 [Cognition -> Behavior] focus=TARGET_TRACKING | wm_state=TRACKING | conf=0.88 unc=0.12 suff=YES | dec=STABLE | intent=ENGAGE_ATTENTION | reason=target_tracking_active | target=Yunus
+```
+
+##### Seçenek B: Tam Entegre Sistem (Ses + Realtime + Bilişsel Döngü)
+Mikrofon, hoparlör, OpenAI Realtime sesli diyalog ve dahili bilişsel döngünün tamamını tek komutla başlatmak için:
+```bash
+source .venv/bin/activate
+source ros2_ws/install/setup.bash
+ros2 launch astro_bringup astro_social_gaze.launch.py
+```
+
 ## 🗺️ Simulation, mapping and navigation
 
 A Gazebo Harmonic simulation of the robot, used to develop LiDAR mapping and
