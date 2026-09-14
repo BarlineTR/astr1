@@ -12,6 +12,7 @@ from astro_ai.brain.attention_manager import AttentionManager
 from astro_ai.brain.dialogue_policy_engine import DialoguePolicyEngine
 from astro_ai.brain.emotion_engine import EmotionEngine
 from astro_ai.brain.initiative_engine import InitiativeEngine
+from astro_ai.brain.interaction_gate import InteractionGate
 from astro_ai.brain.intent_engine import IntentEngine
 from astro_ai.brain.relationship_manager import RelationshipManager
 from astro_ai.brain.response_planner import ResponsePlanner
@@ -19,6 +20,12 @@ from astro_ai.brain.self_model import SelfModel
 from astro_ai.brain.social_dialogue_adapter import DialogueContextAdapter
 from astro_ai.brain.social_fsm import SocialFSM
 from astro_ai.brain.world_model import WorldModel
+from astro_ai.contracts.interaction_gate_types import (
+    IdentityCertainty,
+    InteractionGateDecision,
+    InteractionGateMode,
+    TemporalAttentionState,
+)
 from astro_ai.contracts.social_dialogue_types import DialogueContext, DialogueDirective
 from astro_ai.contracts.intent_emotion_types import (
     ConversationPhase,
@@ -97,6 +104,7 @@ class SocialBrain:
         self.response_planner = ResponsePlanner()
         self.dialogue_adapter = DialogueContextAdapter()
         self.dialogue_policy = DialoguePolicyEngine()
+        self.interaction_gate = InteractionGate()
 
     def bind_cognitive_loop(self, loop: Any) -> None:
         """Binds this SocialBrain to a live CognitiveLoop, sharing authoritative self and world models."""
@@ -221,8 +229,31 @@ class SocialBrain:
             )
             update_res = self.dialogue_adapter.check_delta(dialogue_ctx, directive=dialogue_directive)
 
+            # 7.5 Identity Fusion, Temporal Attention & Interaction Gate (Phase 3)
+            id_cert, canon_name = self.attention_manager.evaluate_identity_certainty(
+                face_name=person.name if (person and person.has_vision) else None,
+                face_confidence=person.visual_confidence if person else 0.0,
+                voice_name=person.name if (person and person.has_audio) else None,
+                voice_confidence=person.voice_match_confidence if person else 0.0,
+            )
+            has_cue = bool(person and (person.is_looking_at_robot or person.is_speaking or (user_text and len(user_text.strip()) > 0)))
+            att_state = self.attention_manager.update_temporal_attention(has_cue)
+
+            gate_decision = self.interaction_gate.evaluate(
+                person=person,
+                attention_state=att_state,
+                identity_certainty=id_cert,
+                user_text=user_text,
+                is_quiet_mode=False,
+            )
+
             # 8. Formulate Strategic Decision
             decision = self.response_planner.plan_response_strategy(context)
+            decision.gate_mode = gate_decision.mode.value
+            decision.gate_instruction = gate_decision.gating_prompt_instruction
+            if not gate_decision.should_respond_verbally:
+                decision.should_speak = False
+                decision.initiative_reason = f"GATE_{gate_decision.mode.value}_{gate_decision.reason}"
 
             # 9. Construct Modular System Prompt
             prompt = self._build_modular_prompt(
@@ -288,6 +319,15 @@ class SocialBrain:
                 f"- Görsel İddia: {vis_claim_str}\n"
                 f"- Kamera Görüş Konisi: {cone_str}\n"
                 f"- Kural: {context.epistemic_instruction}"
+            )
+
+        # Part 2.6: Interaction Gate Directive (Phase 3)
+        if getattr(decision, "gate_instruction", ""):
+            parts.append(
+                f"=== ETKİLEŞİM VE SÖZEL DİYALOG KAPISI ===\n"
+                f"- Mod: {getattr(decision, 'gate_mode', 'ENGAGED')}\n"
+                f"- Sözel Yanıt İzni: {'EVET' if getattr(decision, 'should_speak', True) else 'HAYIR (Sessiz Kal / Dinle)'}\n"
+                f"- Kural: {decision.gate_instruction}"
             )
 
         # Part 3: Relevant Retrieved Memories

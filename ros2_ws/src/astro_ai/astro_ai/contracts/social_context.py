@@ -66,6 +66,8 @@ class SocialDecision:
     response_strategy: List[str] = field(default_factory=list)
     suggested_tone: str = "warm_and_natural"
     recommended_verbosity: str = "concise" # "concise", "moderate", "elaborate"
+    gate_mode: str = "ENGAGED"
+    gate_instruction: str = ""
     humor_level: float = 0.3               # 0.0 to 1.0
     empathy_level: float = 0.5             # 0.0 to 1.0
     directness_level: float = 0.7          # 0.0 to 1.0
