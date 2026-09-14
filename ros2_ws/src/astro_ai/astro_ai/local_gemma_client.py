@@ -22,7 +22,8 @@ from typing import Any, Callable, Dict, Generator, Optional
 _LOG = logging.getLogger(__name__)
 
 DEFAULT_BASE_URL = os.getenv("LOCAL_GEMMA_BASE_URL", "http://127.0.0.1:8080")
-DEFAULT_TIMEOUT_S = float(os.getenv("LOCAL_GEMMA_TIMEOUT_S", "3.0"))
+DEFAULT_TIMEOUT_S = float(os.getenv("LOCAL_GEMMA_TIMEOUT_S", "5.0"))
+DEFAULT_FIRST_TOKEN_TIMEOUT_S = float(os.getenv("LOCAL_GEMMA_FIRST_TOKEN_TIMEOUT_S", "8.0"))
 DEFAULT_N_PREDICT = int(os.getenv("LOCAL_GEMMA_N_PREDICT", "28"))
 DEFAULT_TEMPERATURE = float(os.getenv("LOCAL_GEMMA_TEMPERATURE", "0.2"))
 
@@ -68,10 +69,12 @@ class LocalGemmaClient:
         self,
         base_url: str = DEFAULT_BASE_URL,
         timeout_s: float = DEFAULT_TIMEOUT_S,
+        first_token_timeout_s: Optional[float] = None,
         logger: Optional[Callable[[str, str], None]] = None,
     ):
         self.base_url = base_url.rstrip("/")
         self.timeout_s = float(timeout_s)
+        self.first_token_timeout_s = float(first_token_timeout_s if first_token_timeout_s is not None else DEFAULT_FIRST_TOKEN_TIMEOUT_S)
         self._log = logger or (lambda lvl, msg: None)
         self.completion_url = f"{self.base_url}/completion"
         self.health_url = f"{self.base_url}/health"
@@ -200,6 +203,7 @@ class LocalGemmaClient:
         n_predict: int = DEFAULT_N_PREDICT,
         temperature: float = DEFAULT_TEMPERATURE,
         timeout: Optional[float] = None,
+        first_token_timeout: Optional[float] = None,
     ) -> Generator[str, None, None]:
         """Streams text chunks via SSE (`data: {...}`, `[DONE]`, `stop: true`).
 
@@ -209,6 +213,7 @@ class LocalGemmaClient:
             return
 
         effective_timeout = float(timeout or self.timeout_s)
+        effective_first_token_timeout = float(first_token_timeout or self.first_token_timeout_s or effective_timeout)
         payload: Dict[str, Any] = {
             "prompt": prompt,
             "n_predict": int(n_predict),
@@ -228,7 +233,7 @@ class LocalGemmaClient:
         )
 
         try:
-            resp = urllib.request.urlopen(req, timeout=effective_timeout)
+            resp = urllib.request.urlopen(req, timeout=effective_first_token_timeout)
         except urllib.error.HTTPError as http_err:
             code = http_err.code
             body = http_err.read().decode("utf-8", errors="ignore")
@@ -238,10 +243,10 @@ class LocalGemmaClient:
         except urllib.error.URLError as url_err:
             reason = getattr(url_err, "reason", None)
             if isinstance(reason, (socket.timeout, TimeoutError)) or "timed out" in str(reason).lower():
-                raise LocalGemmaTimeoutError(f"Connection timed out after {effective_timeout}s: {url_err}") from url_err
+                raise LocalGemmaTimeoutError(f"Connection timed out after {effective_first_token_timeout}s: {url_err}") from url_err
             raise LocalGemmaConnectionError(f"Cannot connect to llama-server at {self.completion_url}: {url_err}") from url_err
         except (socket.timeout, TimeoutError) as t_err:
-            raise LocalGemmaTimeoutError(f"Request timed out after {effective_timeout}s: {t_err}") from t_err
+            raise LocalGemmaTimeoutError(f"Request timed out after {effective_first_token_timeout}s: {t_err}") from t_err
         except Exception as exc:
             raise LocalGemmaConnectionError(f"Failed to open stream: {exc}") from exc
 

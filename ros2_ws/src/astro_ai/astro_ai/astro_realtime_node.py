@@ -6003,8 +6003,15 @@ class AstroRealtimeNode(Node):
         tts_provider: str = "xtts_gpu",
         tts_model: str = "xtts_finetuned",
         tts_source: str = "xtts_worker",
+        is_final_clause: bool = True,
+        blocking_pace: bool = True,
     ):
-        """Streams 24kHz int16 PCM audio chunks directly to audio output node with smooth 20ms pacing, end sentinel, and drain synchronization."""
+        """Streams 24kHz int16 PCM audio chunks directly to audio output node.
+
+        When is_final_clause is False and blocking_pace is False, chunks are
+        streamed asynchronously into audio_stream_node's queue without freezing
+        the token generator thread.
+        """
         if not pcm_data:
             return
         self._is_playback_active = True
@@ -6037,10 +6044,13 @@ class AstroRealtimeNode(Node):
                     out_msg = String()
                     out_msg.data = json.dumps(msg_dict)
                     self.pub_output_pcm.publish(out_msg)
-                    time.sleep(0.018)
+                    if blocking_pace:
+                        time.sleep(0.018)
+                    else:
+                        time.sleep(0.001)
 
-            # Send end sentinel if not interrupted by barge-in
-            if not self._barge_in_latched:
+            # Send end sentinel if not interrupted by barge-in, only on final clause
+            if is_final_clause and not self._barge_in_latched:
                 end_dict = {
                     "generation_id": effective_gen_id,
                     "tts_provider": tts_provider,
@@ -6062,10 +6072,11 @@ class AstroRealtimeNode(Node):
                         break
                     time.sleep(0.02)
         finally:
-            self._is_playback_active = False
-            self._playback_end_time = time.monotonic()
-            if self.state_machine.current_state == RobotState.SPEAKING:
-                self.state_machine.transition_to(RobotState.LISTENING)
+            if is_final_clause:
+                self._is_playback_active = False
+                self._playback_end_time = time.monotonic()
+                if self.state_machine.current_state == RobotState.SPEAKING:
+                    self.state_machine.transition_to(RobotState.LISTENING)
 
     def _process_fallback_turn(self, audio_chunks: Optional[List[bytes]] = None, direct_text: Optional[str] = None):
         """Processes turn using capability-aware ProviderRegistry + Streaming LLM + Pipelined TTS."""
@@ -6339,7 +6350,7 @@ class AstroRealtimeNode(Node):
                 tts_model_name = route_res.model_name
                 return route_res.pcm, route_res.duration_ms, route_res.infer_ms, route_res.queue_wait_ms
 
-            def _handle_and_play_clause_audio(pcm_audio: bytes):
+            def _handle_and_play_clause_audio(pcm_audio: bytes, is_final_clause: bool = True):
                 if not pcm_audio:
                     return
                 # Debug WAV & verification log on first real XTTS synthesis
@@ -6379,6 +6390,8 @@ class AstroRealtimeNode(Node):
                     tts_provider=active_engine,
                     tts_model=tts_model_name,
                     tts_source=tts_source_name,
+                    is_final_clause=is_final_clause,
+                    blocking_pace=is_final_clause,
                 )
 
             # 6. Instant Intent Interception (Sub-250ms Direct Execution)
@@ -6578,12 +6591,13 @@ class AstroRealtimeNode(Node):
                     local_chunker = SentenceChunker(min_first_clause_chars=6, min_clause_chars=20) if SentenceChunker else None
                     first_token_seen = False
                     current_gen_id = self._fallback_generation_id
+                    gemma_timeout = getattr(self.local_gemma_client, "timeout_s", 5.0)
 
                     for token in self.local_gemma_client.stream(
                         prompt=gemma_prompt,
                         n_predict=int(os.getenv("LOCAL_GEMMA_N_PREDICT", "28")),
                         temperature=0.2,
-                        timeout=3.0,
+                        timeout=gemma_timeout,
                     ):
                         if self._barge_in_latched or self._fallback_generation_id != current_gen_id:
                             self.get_logger().info("🛑 [Local Gemma Interrupted] Barge-in detected during streaming.")
@@ -6612,7 +6626,7 @@ class AstroRealtimeNode(Node):
                                         first_audio_played = True
                                     total_audio_sec += (len(pcm) / 2) / 24000.0
                                     total_audio_bytes += len(pcm)
-                                    _handle_and_play_clause_audio(pcm)
+                                    _handle_and_play_clause_audio(pcm, is_final_clause=False)
                                     local_gemma_streamed_audio = True
 
                     # Flush remaining text in chunker
@@ -6632,8 +6646,23 @@ class AstroRealtimeNode(Node):
                                         first_audio_played = True
                                     total_audio_sec += (len(pcm) / 2) / 24000.0
                                     total_audio_bytes += len(pcm)
-                                    _handle_and_play_clause_audio(pcm)
+                                    _handle_and_play_clause_audio(pcm, is_final_clause=True)
                                     local_gemma_streamed_audio = True
+                            elif local_gemma_streamed_audio:
+                                # All previous clauses sent non-blocking; send end sentinel now
+                                end_dict = {
+                                    "generation_id": current_gen_id,
+                                    "tts_provider": active_engine,
+                                    "tts_model": tts_model_name,
+                                    "tts_source": tts_source_name,
+                                    "playback_source": tts_source_name,
+                                    "is_done": True,
+                                    "data": "",
+                                }
+                                end_msg = String()
+                                end_msg.data = json.dumps(end_dict)
+                                self.pub_output_pcm.publish(end_msg)
+                                self._is_playback_active = False
 
                     if full_reply_parts:
                         chosen_model = "gemma-4-E2B-it-Q4_K_S"
@@ -6646,7 +6675,7 @@ class AstroRealtimeNode(Node):
                             "latency_ms": int(llm_latency_ms),
                         })
                 except Exception as lge:
-                    self.get_logger().warning(f"⚠️ [Local Gemma Fallback Failed] Error: {lge} -> Falling back to cloud LLMs")
+                    self.get_logger().warning(f"⚠️ [Local Gemma Fallback Failed] Error: {lge}")
                     attempts.append({
                         "provider": "local_gemma",
                         "model": "gemma-4-E2B-it-Q4_K_S",
@@ -6656,7 +6685,8 @@ class AstroRealtimeNode(Node):
                     full_reply_parts = []
 
             # Attempt A: Streaming Groq LLMs (Fastest first, fallback on failure)
-            if not full_reply_parts and self.groq_api_key and groq_candidates:
+            # STRICT POLICY: When use_realtime=false, cloud LLM fallback is COMPLETELY OFF (zero cloud leakage)
+            if not full_reply_parts and self.use_realtime and self.groq_api_key and groq_candidates:
                 for target_model in groq_candidates:
                     try:
                         t_model_start = time.monotonic()
@@ -6706,7 +6736,8 @@ class AstroRealtimeNode(Node):
                         continue
 
             # Attempt B: Google Gemini REST Fallback (if Groq produced no tokens)
-            if not full_reply_parts and self.gemini_api_key:
+            # STRICT POLICY: When use_realtime=false, cloud LLM fallback is COMPLETELY OFF (zero cloud leakage)
+            if not full_reply_parts and self.use_realtime and self.gemini_api_key:
                 gemini_candidates = self.provider_registry.get_candidate_models("gemini")
                 for g_mod in gemini_candidates:
                     try:
@@ -6750,6 +6781,9 @@ class AstroRealtimeNode(Node):
                             # Quota/rate-limit is provider-wide; do not loop through other models on this provider
                             break
                         continue
+
+            if not self.use_realtime and not full_reply_parts:
+                self.get_logger().info("ℹ️ [Local Voice Mode] use_realtime=False: Cloud LLM fallback skipped (zero cloud leakage).")
 
 
             full_reply_str = clean_tts_text("".join(full_reply_parts))
@@ -6865,15 +6899,27 @@ class AstroRealtimeNode(Node):
                 resp_words = len(full_reply_str.split())
                 rt_state = getattr(self, "realtime_provider_state", "AVAILABLE")
                 rt_state_name = rt_state if isinstance(rt_state, str) else (rt_state.value if hasattr(rt_state, "value") else "AVAILABLE")
-                rt_fail_reason = "quota_exhausted" if getattr(self, "_fallback_mode", False) else "none"
+
+                if not self.use_realtime:
+                    req_provider = "local_gemma"
+                    rt_state_val = "LOCAL_ACTIVE"
+                    rt_fail_reason = "none"
+                else:
+                    req_provider = "openai_realtime"
+                    rt_state_val = rt_state_name
+                    rt_fail_reason = "quota_exhausted" if getattr(self, "_fallback_mode", False) else "none"
 
                 self.get_logger().info(
                     f"[Turn Telemetry]\n"
                     f"generation_id={self._fallback_generation_id}\n"
-                    f"realtime_state={rt_state_name}\n"
+                    f"realtime_state={rt_state_val}\n"
                     f"realtime_failure_reason={rt_fail_reason}\n"
-                    f"requested_provider=openai_realtime\n"
+                    f"requested_provider={req_provider}\n"
                     f"actual_provider={active_engine}\n"
+                    f"llm_provider={chosen_provider}\n"
+                    f"llm_model={chosen_model}\n"
+                    f"tts_provider={active_engine}\n"
+                    f"tts_model={tts_model_name}\n"
                     f"response_chars={resp_chars}\n"
                     f"response_words={resp_words}\n"
                     f"tts_ttfa_ms={int(total_synth_ms)}\n"
@@ -7667,9 +7713,18 @@ class AstroRealtimeNode(Node):
             ard_alive = ard_hb and (ard_age <= 2.5)
             ard_level = DiagnosticStatus.OK if ard_alive else DiagnosticStatus.ERROR
 
-            ws_conn = getattr(self, "_is_connected", False)
-            ws_state = getattr(self, "_realtime_state", "DISCONNECTED")
-            ws_level = DiagnosticStatus.OK if ws_conn else (DiagnosticStatus.WARN if ws_state == "CONNECTING" else DiagnosticStatus.ERROR)
+            if not getattr(self, "use_realtime", True):
+                ws_conn = True
+                ws_state = "LOCAL_ACTIVE"
+                ws_level = DiagnosticStatus.OK
+                ws_name = "Astro Voice / Local Engine"
+                ws_msg = "Active: Local Gemma + Edge-TTS (use_realtime=False)"
+            else:
+                ws_conn = getattr(self, "_is_connected", False)
+                ws_state = getattr(self, "_realtime_state", "DISCONNECTED")
+                ws_level = DiagnosticStatus.OK if ws_conn else (DiagnosticStatus.WARN if ws_state == "CONNECTING" else DiagnosticStatus.ERROR)
+                ws_name = "Astro Realtime / OpenAI WebSocket"
+                ws_msg = f"State: {ws_state}"
 
             # 2. Latency Metrics
             lat_stats = self.session.latency_tracker.get_stats() if hasattr(self.session, "latency_tracker") else {}
@@ -7697,6 +7752,7 @@ class AstroRealtimeNode(Node):
             if getattr(self, "pub_telemetry", None):
                 telem_payload = {
                     "timestamp": time.time(),
+                    "voice_mode": "local" if not getattr(self, "use_realtime", True) else "realtime",
                     "latency": {
                         "p50_total_ms": p50_ms,
                         "p95_total_ms": p95_ms,
@@ -7713,6 +7769,7 @@ class AstroRealtimeNode(Node):
                     "realtime_ws": {
                         "connected": ws_conn,
                         "state": ws_state,
+                        "mode": "local" if not getattr(self, "use_realtime", True) else "realtime",
                     },
                     "social_state": {
                         "active_person": active_p,
@@ -7732,9 +7789,9 @@ class AstroRealtimeNode(Node):
             if getattr(self, "pub_diagnostics", None) and 'DiagnosticArray' in globals():
                 diag_arr = DiagnosticArray()
                 st_ws = DiagnosticStatus(
-                    name="Astro Realtime / OpenAI WebSocket",
+                    name=ws_name,
                     level=ws_level,
-                    message=f"State: {ws_state}",
+                    message=ws_msg,
                     values=[
                         KeyValue("connected", str(ws_conn)),
                         KeyValue("p50_ms", str(p50_ms)),

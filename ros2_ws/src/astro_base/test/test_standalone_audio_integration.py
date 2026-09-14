@@ -543,3 +543,95 @@ def test_astro_realtime_node_use_realtime_env_override(monkeypatch):
         assert node.tts_router.local_offline_tts is None
     finally:
         node.destroy_node()
+
+
+def test_local_gemma_two_stage_timeout():
+    """Verify LocalGemmaClient supports two-stage configurable timeout (first token and inter-token)."""
+    from astro_ai.local_gemma_client import LocalGemmaClient
+    client = LocalGemmaClient(timeout_s=4.0, first_token_timeout_s=7.0)
+    assert client.timeout_s == 4.0
+    assert client.first_token_timeout_s == 7.0
+
+
+def test_local_mode_cloud_fallback_isolation():
+    """Verify that when use_realtime=False, cloud LLMs (Groq, Gemini) are NEVER invoked even if Local Gemma fails."""
+    from unittest.mock import MagicMock, patch
+    from astro_ai.astro_realtime_node import AstroRealtimeNode
+
+    node = AstroRealtimeNode(use_realtime=False)
+    try:
+        # Mock Local Gemma to fail
+        mock_gemma = MagicMock()
+        mock_gemma.is_available.return_value = True
+        mock_gemma.stream.side_effect = RuntimeError("llama-server unavailable")
+        node.local_gemma_client = mock_gemma
+
+        # Set up keys and candidates for Groq & Gemini
+        node.groq_api_key = "gsk_test_key"
+        node.gemini_api_key = "gem_test_key"
+        node.provider_registry = MagicMock()
+        node.provider_registry.get_candidate_models.return_value = ["llama-3.3-70b-versatile"]
+
+        # Run direct text turn
+        node._process_fallback_turn(direct_text="Merhaba Astro")
+
+        # Invariant: Groq and Gemini stream/generation MUST NOT be called!
+        assert node.provider_registry.stream_groq_completion.call_count == 0
+        assert node.provider_registry.generate_gemini_content.call_count == 0
+    finally:
+        node.destroy_node()
+
+
+def test_local_mode_system_telemetry_truthfulness():
+    """Verify that when use_realtime=False, system telemetry and diagnostics report LOCAL_ACTIVE and OK."""
+    from astro_ai.astro_realtime_node import AstroRealtimeNode, DiagnosticStatus
+
+    node = AstroRealtimeNode(use_realtime=False)
+    try:
+        published_msgs = []
+        node.pub_telemetry = MagicMock()
+        node.pub_telemetry.publish = lambda m: published_msgs.append(m)
+
+        published_diags = []
+        node.pub_diagnostics = MagicMock()
+        node.pub_diagnostics.publish = lambda d: published_diags.append(d)
+
+        node._publish_system_telemetry()
+
+        assert len(published_msgs) == 1
+        import json
+        telem = json.loads(published_msgs[0].data)
+        assert telem["voice_mode"] == "local"
+        assert telem["realtime_ws"]["state"] == "LOCAL_ACTIVE"
+        assert telem["realtime_ws"]["connected"] is True
+
+        assert len(published_diags) == 1
+        diag_arr = published_diags[0]
+        voice_diag = [s for s in diag_arr.status if "Local Engine" in s.name or "Voice" in s.name][0]
+        assert voice_diag.level == DiagnosticStatus.OK
+        assert "use_realtime=False" in voice_diag.message
+    finally:
+        node.destroy_node()
+
+
+def test_non_blocking_clause_playback_streaming():
+    """Verify that _play_pcm_chunks with is_final_clause=False executes in non-blocking mode without drain sleeps."""
+    import time
+    from unittest.mock import MagicMock
+    from astro_ai.astro_realtime_node import AstroRealtimeNode
+
+    node = AstroRealtimeNode(use_realtime=False)
+    try:
+        node.pub_output_pcm = MagicMock()
+        # 1.0 second of dummy 24kHz int16 audio = 48000 bytes
+        dummy_pcm = b"\x00\x01" * 24000
+
+        t0 = time.perf_counter()
+        node._play_pcm_chunks(dummy_pcm, generation_id=99, is_final_clause=False, blocking_pace=False)
+        elapsed = time.perf_counter() - t0
+
+        # Must return almost instantly (< 150ms), NOT sleep for 1.0s DAC duration!
+        assert elapsed < 0.20, f"Streaming clause blocked for {elapsed:.3f}s!"
+        assert node.pub_output_pcm.publish.call_count > 0
+    finally:
+        node.destroy_node()
