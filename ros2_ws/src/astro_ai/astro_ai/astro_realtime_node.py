@@ -978,6 +978,9 @@ class AstroRealtimeNode(Node):
         self._last_tracked_gaze_time: float = 0.0
         self._last_doa_time: float = 0.0
         self._last_vision_distance_time: float = 0.0
+        self._last_vision_looking_time: float = 0.0
+        self._last_vision_faces_time: float = 0.0
+        self.visual_evidence_ttl_s: float = float(os.getenv("VISUAL_EVIDENCE_TTL_S", "2.5"))
         # Single output owner for /head_command is social_gaze_node
         self.pub_telemetry = self.create_publisher(String, "/astro/telemetry", 10)
         self.pub_diagnostics = self.create_publisher(DiagnosticArray, "/diagnostics", 10)
@@ -1720,6 +1723,36 @@ class AstroRealtimeNode(Node):
             )
         }
 
+    def is_visual_evidence_fresh(self, now: Optional[float] = None) -> bool:
+        """Checks whether recent OAK-D visual face or distance evidence is fresh within visual_evidence_ttl_s."""
+        t = now if now is not None else time.monotonic()
+        ttl = getattr(self, "visual_evidence_ttl_s", 2.5)
+        last_d = getattr(self, "_last_vision_distance_time", 0.0)
+        last_l = getattr(self, "_last_vision_looking_time", 0.0)
+        last_f = getattr(self, "_last_vision_faces_time", 0.0)
+        dist_fresh = bool(last_d > 0.0 and (t - last_d) <= ttl and getattr(self, "_user_distance", 0.0) > 0.1)
+        look_fresh = bool(last_l > 0.0 and (t - last_l) <= ttl and getattr(self, "_looking_at_robot", False))
+        faces_fresh = bool(last_f > 0.0 and (t - last_f) <= ttl)
+        return dist_fresh or look_fresh or faces_fresh
+
+    def get_fresh_visual_distance(self, now: Optional[float] = None) -> float:
+        """Returns visual distance if fresh within visual_evidence_ttl_s, else 0.0."""
+        t = now if now is not None else time.monotonic()
+        ttl = getattr(self, "visual_evidence_ttl_s", 2.5)
+        last_d = getattr(self, "_last_vision_distance_time", 0.0)
+        if last_d > 0.0 and (t - last_d) <= ttl:
+            return float(getattr(self, "_user_distance", 0.0))
+        return 0.0
+
+    def get_fresh_looking_at_robot(self, now: Optional[float] = None) -> bool:
+        """Returns gaze looking state if fresh within visual_evidence_ttl_s, else False."""
+        t = now if now is not None else time.monotonic()
+        ttl = getattr(self, "visual_evidence_ttl_s", 2.5)
+        last_l = getattr(self, "_last_vision_looking_time", 0.0)
+        if last_l > 0.0 and (t - last_l) <= ttl:
+            return bool(getattr(self, "_looking_at_robot", False))
+        return False
+
     def _build_current_system_prompt(self, active_speaker: Optional[Dict[str, Any]] = None) -> str:
         """Builds system instructions with memory, identity, persona, and strict anti-hallucination rules."""
         identity = active_speaker or self.resolve_identities()
@@ -1842,9 +1875,13 @@ class AstroRealtimeNode(Node):
         social_context_str = ""
         if getattr(self, "social_brain", None) and UnifiedPersonState:
             try:
-                real_dist = spatial_info["distance_m"] if spatial_info.get("has_target") and spatial_info["distance_m"] else float(getattr(self, "_user_distance", 1.2))
+                now_mono = time.monotonic()
+                has_visual_face = self.is_visual_evidence_fresh(now=now_mono)
+                fresh_looking = self.get_fresh_looking_at_robot(now=now_mono)
+                fresh_v_dist = self.get_fresh_visual_distance(now=now_mono)
+
+                real_dist = spatial_info["distance_m"] if spatial_info.get("has_target") and spatial_info["distance_m"] else (fresh_v_dist if fresh_v_dist > 0.1 else float(getattr(self, "_user_distance", 1.2)))
                 az_val = float(spatial_info.get("azimuth_deg", 0.0)) if spatial_info.get("has_target") else 0.0
-                has_visual_face = bool(getattr(self, "_looking_at_robot", False) or getattr(self, "_user_distance", 0.0) > 0.1)
 
                 from astro_ai.spatial.epistemic_cone import evaluate_epistemic_grounding
                 head_yaw = float(getattr(self, "_current_head_yaw", 0.0))
@@ -1864,7 +1901,7 @@ class AstroRealtimeNode(Node):
                     identity_confidence=float(identity.get("confidence", identity.get("score", 0.0))),
                     distance_m=float(real_dist),
                     azimuth_deg=az_val,
-                    is_looking_at_robot=bool(getattr(self, "_looking_at_robot", False)),
+                    is_looking_at_robot=fresh_looking,
                     is_present=True,
                     has_vision=has_visual_face,
                     has_audio=True,
@@ -7444,11 +7481,16 @@ class AstroRealtimeNode(Node):
                     chosen, score = self.social_brain.attention_manager.select_focus_target(candidates)
                     if chosen:
                         with self._lock:
+                            now_mono = time.monotonic()
                             if chosen.is_known and chosen.name.lower() != "misafir":
                                 self._active_person_name = chosen.name
-                                self._person_hold_until = time.monotonic() + 30.0
+                                self._person_hold_until = now_mono + 30.0
                             self._user_distance = chosen.distance_m
                             self._looking_at_robot = chosen.is_looking_at_robot
+                            self._last_vision_faces_time = now_mono
+                            self._last_vision_distance_time = now_mono
+                            if chosen.is_looking_at_robot:
+                                self._last_vision_looking_time = now_mono
         except Exception as _exc:
             self.get_logger().debug(f"_on_faces: {_exc}")
 
@@ -7524,6 +7566,8 @@ class AstroRealtimeNode(Node):
         elif not new_state:
             self._last_looking_state = False
         self._looking_at_robot = new_state
+        if new_state:
+            self._last_vision_looking_time = time.monotonic()
 
     def _on_user_distance(self, msg: Float32):
         new_dist = float(msg.data)
