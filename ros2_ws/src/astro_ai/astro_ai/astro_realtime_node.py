@@ -2403,6 +2403,18 @@ class AstroRealtimeNode(Node):
             )
         per_turn_instructions = f"{per_turn_instructions}{spatial_turn_note}"
 
+        # INTERACTION GATE HARD BLOCK (Realtime):
+        # Deterministically suppresses response.create dispatch when verbal response is gated
+        soc_dec = getattr(self, "_last_social_decision", None)
+        if soc_dec and not getattr(soc_dec, "should_speak", True):
+            gate_mode = getattr(soc_dec, "gate_mode", "OBSERVING")
+            gate_reason = getattr(soc_dec, "initiative_reason", "gate_closed")
+            if hasattr(self, "get_logger") and callable(self.get_logger):
+                self.get_logger().info(
+                    f"🛑 [InteractionGate Hard Block (Realtime)]: response.create engellendi (mode={gate_mode}, reason={gate_reason}) — 0 token."
+                )
+            return
+
         # 5. response.create Dispatch
         t_resp_send = time.monotonic()
         id_to_resp_ms = (t_resp_send - t_id_done) * 1000.0
@@ -6675,6 +6687,19 @@ class AstroRealtimeNode(Node):
 
             # 7. Cognitive LLM via ProviderRegistry (Streaming Groq -> Gemini -> Contextual Persona)
             system_prompt = self._build_current_system_prompt(active_speaker=active_speaker_dict)
+
+            # INTERACTION GATE HARD BLOCK:
+            # Deterministically suppresses Local Gemma, Cloud Providers, and TTS when verbal response is gated
+            soc_dec = getattr(self, "_last_social_decision", None)
+            if soc_dec and not getattr(soc_dec, "should_speak", True):
+                gate_mode = getattr(soc_dec, "gate_mode", "OBSERVING")
+                gate_reason = getattr(soc_dec, "initiative_reason", "interaction_gate_closed")
+                self.get_logger().info(
+                    f"🛑 [InteractionGate Hard Block]: Sözel yanıt engellendi (mode={gate_mode}, reason={gate_reason}) — 0 LLM / 0 TTS."
+                )
+                self.state_machine.transition_to(RobotState.LISTENING if not self.is_in_quiet_or_sleep_state() else RobotState.DEEP_IDLE)
+                return
+
             messages = [{"role": "system", "content": system_prompt}]
             recent_msgs = self.memory.episodic.get_messages()[-6:]
             for m in recent_msgs:
