@@ -1176,7 +1176,7 @@ class AstroRealtimeNode(Node):
         global OPENAI_HARD_DISABLED
         if getattr(self, "_openai_hard_disabled", False):
             return False
-        if not getattr(self, "use_realtime", True) and surface in ("realtime", "all"):
+        if not getattr(self, "use_realtime", True):
             return False
         # In unit tests with FakeRealtimeTransport, use instance-level lockout
         is_isolated_test = (getattr(self, "fake_transport", None) is not None or not getattr(self, "connect_realtime", False))
@@ -1266,8 +1266,8 @@ class AstroRealtimeNode(Node):
             if not self._can_use_openai("realtime") or not self._ws or not self._loop or not self._is_connected:
                 self.realtime_current_generation_id = gen_id
                 self.get_logger().warn(
-                    f"[REALTIME NO AUDIO]\ngeneration_id={gen_id}\nreason={'openai_hard_disabled' if not self._can_use_openai('realtime') else 'websocket_not_connected'}\n"
-                    f"[TTS FALLBACK]\nfrom=openai_realtime\nto=edge_tts\nreason=realtime_unavailable"
+                    f"[REALTIME NO AUDIO]\ngeneration_id={gen_id}\nreason={'local_mode_configured' if not self.use_realtime else ('openai_hard_disabled' if not self._can_use_openai('realtime') else 'websocket_not_connected')}\n"
+                    f"[TTS FALLBACK]\nfrom={'openai_realtime' if self.use_realtime else 'local_gemma'}\nto=edge_tts\nreason={'realtime_unavailable' if self.use_realtime else 'local_mode_configured'}"
                 )
                 # Forward to tts_node for Edge-TTS fallback
                 fb_msg = String()
@@ -5264,7 +5264,7 @@ class AstroRealtimeNode(Node):
         summary = None
 
         # 1. Try Groq (0 Token Cost / Ultra-fast)
-        if self.groq_api_key:
+        if self.use_realtime and self.groq_api_key:
             active_groq = discover_groq_models(self.groq_api_key)
             groq_candidates = active_groq if active_groq else [
                 "llama-3.3-70b-versatile",
@@ -5301,7 +5301,7 @@ class AstroRealtimeNode(Node):
                     self.get_logger().debug(f"_async_summarize_and_save_session Groq ({groq_model}) notice: {_exc}")
 
         # 2. Try Gemini REST (0 Token Cost fallback)
-        if not summary and self.gemini_api_key:
+        if not summary and self.use_realtime and self.gemini_api_key:
             for gem_model in ["gemini-2.0-flash", "gemini-1.5-flash", "gemini-2.5-flash"]:
                 try:
                     import urllib.request
@@ -6529,7 +6529,7 @@ class AstroRealtimeNode(Node):
                 f"  playback_source=audio_stream_node\n"
                 f"  tts_state={tts_mode_str}\n"
                 f"  tts_ready={tts_ready_flag}\n"
-                f"  fallback_reason=realtime_unavailable"
+                f"  fallback_reason={'realtime_unavailable' if self.use_realtime else 'local_mode_configured'}"
             )
 
             def _synthesize_turn_clause(clause_text: str) -> Tuple[Optional[bytes], float, float, float]:

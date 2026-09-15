@@ -39,6 +39,9 @@ class GeminiFlashProvider(BaseSupportProvider):
 
     def is_available(self) -> bool:
         """Checks if Gemini support is enabled and API key is present."""
+        import os
+        if os.getenv("USE_REALTIME", "true").lower() in ("false", "0", "no"):
+            return False
         return bool(self.config.gemini_support_enabled and self.config.gemini_api_key)
 
     def _get_client(self) -> Any:
@@ -62,14 +65,16 @@ class GeminiFlashProvider(BaseSupportProvider):
     ) -> ArchitectureSupportResponse:
         """Invokes Gemini Flash for architecture reasoning."""
         if not self.is_available():
+            import os
+            is_local = os.getenv("USE_REALTIME", "true").lower() in ("false", "0", "no")
             return ArchitectureSupportResponse(
                 request_id=request_id,
                 provider=self.provider_name,
                 model=self.model_name,
                 mode=mode,
                 status=SupportStatus.PROVIDER_UNAVAILABLE,
-                summary="Gemini support is disabled or GEMINI_API_KEY is not configured.",
-                error_code="GEMINI_UNAVAILABLE",
+                summary="Gemini support is disabled in local mode (USE_REALTIME=false)." if is_local else "Gemini support is disabled or GEMINI_API_KEY is not configured.",
+                error_code="LOCAL_MODE_ACTIVE" if is_local else "GEMINI_UNAVAILABLE",
                 confidence=0.0,
             )
 
