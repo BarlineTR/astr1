@@ -164,7 +164,7 @@ try:
     )
     from astro_ai.state_machine import RobotState, StateMachine
     from astro_ai.provider_registry import ProviderRegistry, ProviderError, ErrorClass
-    from astro_ai.local_gemma_client import LocalGemmaClient, LocalGemmaError
+    from astro_ai.local_gemma_client import LocalGemmaClient, LocalGemmaError, estimate_tokens, bound_messages_to_context
     from astro_ai.repetition_guard import RepetitionGuard
     from astro_ai.action_manager import ActionManager, SoundDirection, ActionResult
     from astro_ai.robot_led import RobotLED
@@ -178,10 +178,12 @@ except ImportError:
     from state_machine import RobotState, StateMachine
     from provider_registry import ProviderRegistry, ProviderError, ErrorClass
     try:
-        from local_gemma_client import LocalGemmaClient, LocalGemmaError
+        from local_gemma_client import LocalGemmaClient, LocalGemmaError, estimate_tokens, bound_messages_to_context
     except ImportError:
         LocalGemmaClient = None  # type: ignore
         LocalGemmaError = Exception  # type: ignore
+        estimate_tokens = lambda text: max(1, len(text.split()))  # type: ignore
+        bound_messages_to_context = lambda m, max_tokens=450: m  # type: ignore
     from repetition_guard import RepetitionGuard
     try:
         from action_manager import ActionManager, SoundDirection, ActionResult
@@ -6689,6 +6691,11 @@ class AstroRealtimeNode(Node):
                 played: bool,
                 dur_synth_ms: float,
                 gpu_ms: float = 0.0,
+                prompt_build_ms: float = 0.0,
+                inference_request_ms: float = 0.0,
+                first_token_ms: float = 0.0,
+                generation_ms: float = 0.0,
+                total_llm_ms: float = 0.0,
             ):
                 r_chars = len(rep_text)
                 r_words = len(rep_text.split())
@@ -6744,6 +6751,11 @@ class AstroRealtimeNode(Node):
                     "llm_inference_completed": llm_inference_completed,
                     "response_origin": origin,
                     "llm_duration_ms": int(llm_inference_duration_ms),
+                    "prompt_build_ms": round(prompt_build_ms, 1),
+                    "inference_request_ms": round(inference_request_ms, 1),
+                    "first_token_ms": round(first_token_ms, 1),
+                    "generation_ms": round(generation_ms, 1),
+                    "total_llm_ms": round(total_llm_ms, 1),
                     "tts_provider": active_engine,
                     "tts_model": tts_model_name,
                     "response_chars": r_chars,
@@ -6772,6 +6784,11 @@ class AstroRealtimeNode(Node):
                     f"llm_inference_completed={llm_inference_completed}\n"
                     f"response_origin={origin}\n"
                     f"llm_duration_ms={int(llm_inference_duration_ms)}\n"
+                    f"prompt_build_ms={prompt_build_ms:.1f}\n"
+                    f"inference_request_ms={inference_request_ms:.1f}\n"
+                    f"first_token_ms={first_token_ms:.1f}\n"
+                    f"generation_ms={generation_ms:.1f}\n"
+                    f"total_llm_ms={total_llm_ms:.1f}\n"
                     f"tts_provider={active_engine}\n"
                     f"tts_model={tts_model_name}\n"
                     f"response_chars={r_chars}\n"
@@ -6997,48 +7014,100 @@ class AstroRealtimeNode(Node):
             total_audio_bytes = 0
             total_enqueued_chunks = 0
 
+            # Timing variables for latency trace telemetry (Problem 3)
+            prompt_build_ms = 0.0
+            inference_request_ms = 0.0
+            first_token_ms = 0.0
+            generation_ms = 0.0
+            total_llm_ms = 0.0
+
             # Attempt 0: Local Gemma 4 E2B Q4_K_S (Zero-Cloud Local Fallback via llama.cpp /completion)
             local_gemma_streamed_audio = False
             if self.local_gemma_client and self.local_gemma_client.is_available():
                 llm_inference_started = True
                 local_model_name = getattr(self.local_gemma_client, "model_name", "gemma-4-E2B-it-Q4_K_S")
                 chosen_model = local_model_name
-                t_local_start = time.monotonic()
-                cog_envelope = ""
+
+                t_build_start = time.perf_counter()
+
+                # Memory & Identity Grounding for Local Gemma (Problem 4)
+                spk_id = active_speaker_dict if active_speaker_dict else self._get_active_biometric_identity()
+                spk_name = spk_id.get("name") or spk_id.get("speaker_name") or "Misafir"
+                is_known_spk = bool(spk_id.get("is_known", False) and spk_name.lower() != "misafir")
+
+                owner_name = "Baran"
+                if hasattr(self, "memory") and hasattr(self.memory, "profile") and hasattr(self.memory.profile, "data"):
+                    owner_name = self.memory.profile.data.get("owner_name", "Baran")
+
+                user_query_lower = user_text.lower().strip()
+                is_identity_query = any(q in user_query_lower for q in [
+                    "ben kimim", "kimim ben", "benim adim ne", "benim adım ne",
+                    "adımı biliyor musun", "adimi biliyor musun", "beni tanıyor musun",
+                    "beni taniyor musun", "beni hatırladın mı", "beni hatirladin mi",
+                    "ben kim", "tanıyor musun beni", "taniyor musun beni"
+                ])
+
+                grounding_lines = []
+                if is_known_spk:
+                    if spk_name.lower() == owner_name.lower():
+                        grounding_lines.append(f"Karşındaki kişi: {spk_name} (Hitap: {spk_name}). {spk_name} senin sahibin, yaratıcın ve baş mühendisin.")
+                    else:
+                        grounding_lines.append(f"Karşındaki kişi: {spk_name} (Hitap: {spk_name}).")
+
+                    # Fetch profile facts if available (bounded to 1-2 facts)
+                    if hasattr(self, "memory") and hasattr(self.memory, "profile"):
+                        try:
+                            kp = self.memory.profile.get_known_person(spk_name)
+                            if kp:
+                                k_facts = kp.get("learned_facts", [])
+                                if k_facts:
+                                    grounding_lines.append(f"Hakkında bildiklerin: {'; '.join(k_facts[-2:])}.")
+                        except Exception:
+                            pass
+
+                    if is_identity_query:
+                        grounding_lines.append(f"Kullanıcı sana kim olduğunu soruyor. Karşındaki kişi {spk_name}'dır. Doğrudan onun {spk_name} olduğunu belirterek cevap ver.")
+                else:
+                    grounding_lines.append("Karşındaki kişi: Misafir (henüz tanınmıyor).")
+                    if is_identity_query:
+                        grounding_lines.append("Kullanıcı sana kim olduğunu soruyor fakat henüz tanınmıyor. Henüz tanışmadığınızı veya adını bilmediğini nazikçe söyle.")
+
+                # Concise social context (bounded, at most 1 line)
+                compact_social = ""
                 if getattr(self, "social_brain", None) and hasattr(self.social_brain, "dialogue_adapter"):
                     try:
                         last_ctx = getattr(self.social_brain.dialogue_adapter, "_last_context", None)
-                        if last_ctx:
-                            cog_envelope = last_ctx.format_compact_prompt() + "\n\n"
+                        if last_ctx and hasattr(last_ctx, "social_context"):
+                            s_state = getattr(last_ctx.social_context, "activity_name", "") or getattr(last_ctx.social_context, "current_activity", "")
+                            if s_state:
+                                compact_social = f"Mevcut durum: {s_state}"
                     except Exception:
-                        cog_envelope = ""
+                        compact_social = ""
 
-                epistemic_gemma_rule = ""
-                rule_keys = [
-                    "KAMERA = GÖZ",
-                    "EPISTEMIK",
-                    "ETKİLEŞİM VE SÖZEL",
-                    "AKTİVİTE OTURUMU",
-                    "UYARLANABİLİR KİŞİLİK",
-                    "SOSYAL İNİSİYATİF",
-                    "SESSİZ/UYKU",
+                # Build compact bounded prompt (Problem 2: bounded to ~80-120 tokens, strictly <= 450)
+                prompt_sections = [
+                    "Sen ASTRO'sun, sevimli, zeki ve yardımsever bir sosyal robotsun. Türkçe konuş. Kısa, samimi ve doğal cevap ver (en fazla 1-2 cümle). Bilmediğin şeyleri uydurma.",
                 ]
-                if any(k in system_prompt for k in rule_keys):
-                    for section in system_prompt.split("\n\n"):
-                        if any(k in section for k in rule_keys):
-                            epistemic_gemma_rule += section.strip() + "\n\n"
+                if compact_social:
+                    prompt_sections.append(compact_social)
+                prompt_sections.extend(grounding_lines)
+                prompt_sections.append(f"Kullanıcı: {user_text}\nASTRO:")
 
-                gemma_prompt = (
-                    f"{cog_envelope}"
-                    f"{epistemic_gemma_rule}"
-                    "ASTRO bir sosyal robot. Türkçe konuş. Kısa ve doğal cevap ver.\n\n"
-                    f"Kullanıcı: {user_text}\n"
-                    "ASTRO:"
-                )
+                gemma_prompt = "\n".join(prompt_sections)
+
+                # Deterministic bounding guard: enforce <= 450 tokens
+                if estimate_tokens(gemma_prompt) > 420:
+                    gemma_prompt = f"Sen ASTRO'sun. Türkçe konuş. Kısa cevap ver.\n{' '.join(grounding_lines)}\nKullanıcı: {user_text[:200]}\nASTRO:"
+
+                prompt_build_ms = (time.perf_counter() - t_build_start) * 1000.0
                 llm_prompt_used = gemma_prompt
+
                 self.get_logger().info(
-                    f"🦙 [Local Gemma Inference Start] model={local_model_name} | prompt_len={len(gemma_prompt)}"
+                    f"🦙 [Local Gemma Inference Start] model={local_model_name} | prompt_len={len(gemma_prompt)} | prompt_build_ms={prompt_build_ms:.1f}"
                 )
+
+                t_infer_start = time.perf_counter()
+                t_first_token = None
                 try:
                     local_chunker = SentenceChunker(min_first_clause_chars=6, min_clause_chars=20) if SentenceChunker else None
                     first_token_seen = False
@@ -7056,7 +7125,10 @@ class AstroRealtimeNode(Node):
                             break
 
                         if not first_token_seen:
-                            llm_ttft_ms = (time.monotonic() - t_local_start) * 1000.0
+                            t_first_token = time.perf_counter()
+                            first_token_ms = (t_first_token - t_infer_start) * 1000.0
+                            inference_request_ms = first_token_ms
+                            llm_ttft_ms = first_token_ms
                             first_token_seen = True
 
                         full_reply_parts.append(token)
@@ -7072,7 +7144,7 @@ class AstroRealtimeNode(Node):
                                 total_queue_wait_ms += q_ms
                                 if pcm:
                                     if llm_first_clause_ms is None:
-                                        llm_first_clause_ms = (time.monotonic() - t_local_start) * 1000.0
+                                        llm_first_clause_ms = (time.perf_counter() - t_infer_start) * 1000.0
                                     if not first_audio_played:
                                         first_audio_ms = (time.monotonic() - t_turn_start) * 1000.0
                                         first_audio_played = True
@@ -7092,7 +7164,7 @@ class AstroRealtimeNode(Node):
                                 total_queue_wait_ms += q_ms
                                 if pcm:
                                     if llm_first_clause_ms is None:
-                                        llm_first_clause_ms = (time.monotonic() - t_local_start) * 1000.0
+                                        llm_first_clause_ms = (time.perf_counter() - t_infer_start) * 1000.0
                                     if not first_audio_played:
                                         first_audio_ms = (time.monotonic() - t_turn_start) * 1000.0
                                         first_audio_played = True
@@ -7116,47 +7188,75 @@ class AstroRealtimeNode(Node):
                                 self.pub_output_pcm.publish(end_msg)
                                 self._is_playback_active = False
 
-                    llm_inference_duration_ms = (time.monotonic() - t_local_start) * 1000.0
+                    t_infer_end = time.perf_counter()
+                    total_llm_ms = (t_infer_end - t_infer_start) * 1000.0
+                    llm_inference_duration_ms = total_llm_ms
+                    if t_first_token is not None:
+                        generation_ms = (t_infer_end - t_first_token) * 1000.0
+                    else:
+                        first_token_ms = 0.0
+                        inference_request_ms = total_llm_ms
+                        generation_ms = 0.0
+
                     if full_reply_parts:
                         chosen_model = local_model_name
                         chosen_provider = "local_gemma"
                         response_origin = "local_gemma"
                         llm_inference_completed = True
-                        llm_latency_ms = llm_inference_duration_ms
+                        llm_latency_ms = total_llm_ms
                         self.get_logger().info(
-                            f"🦙 [Local Gemma Inference Success] model={chosen_model} | duration_ms={llm_inference_duration_ms:.1f} | tokens={len(full_reply_parts)}"
+                            f"🦙 [Local Gemma Inference Success] model={chosen_model} | duration_ms={total_llm_ms:.1f} | "
+                            f"prompt_build_ms={prompt_build_ms:.1f} | first_token_ms={first_token_ms:.1f} | generation_ms={generation_ms:.1f} | tokens={len(full_reply_parts)}"
                         )
                         attempts.append({
                             "provider": "local_gemma",
                             "model": chosen_model,
                             "result": "success",
-                            "latency_ms": int(llm_latency_ms),
+                            "latency_ms": int(total_llm_ms),
+                            "prompt_build_ms": round(prompt_build_ms, 1),
+                            "inference_request_ms": round(inference_request_ms, 1),
+                            "first_token_ms": round(first_token_ms, 1),
+                            "generation_ms": round(generation_ms, 1),
+                            "total_llm_ms": round(total_llm_ms, 1),
                         })
                     else:
                         llm_inference_completed = False
                         chosen_provider = "none"
                         chosen_model = "none"
                         self.get_logger().warning(
-                            f"🦙 [Local Gemma Inference Empty] duration_ms={llm_inference_duration_ms:.1f}"
+                            f"🦙 [Local Gemma Inference Empty] duration_ms={total_llm_ms:.1f}"
                         )
                         attempts.append({
                             "provider": "local_gemma",
                             "model": local_model_name,
                             "result": "empty",
-                            "latency_ms": int(llm_inference_duration_ms),
+                            "latency_ms": int(total_llm_ms),
+                            "prompt_build_ms": round(prompt_build_ms, 1),
+                            "inference_request_ms": round(inference_request_ms, 1),
+                            "first_token_ms": round(first_token_ms, 1),
+                            "generation_ms": round(generation_ms, 1),
+                            "total_llm_ms": round(total_llm_ms, 1),
                         })
                 except Exception as lge:
                     llm_inference_completed = False
                     chosen_provider = "none"
                     chosen_model = "none"
-                    llm_inference_duration_ms = (time.monotonic() - t_local_start) * 1000.0
-                    self.get_logger().warning(f"⚠️ [Local Gemma Fallback Failed] duration_ms={llm_inference_duration_ms:.1f} | Error: {lge}")
+                    t_infer_end = time.perf_counter()
+                    total_llm_ms = (t_infer_end - t_infer_start) * 1000.0
+                    llm_inference_duration_ms = total_llm_ms
+                    inference_request_ms = total_llm_ms
+                    self.get_logger().warning(f"⚠️ [Local Gemma Fallback Failed] duration_ms={total_llm_ms:.1f} | Error: {lge}")
                     attempts.append({
                         "provider": "local_gemma",
                         "model": local_model_name,
                         "result": "failed",
                         "error": str(lge)[:80],
-                        "latency_ms": int(llm_inference_duration_ms),
+                        "latency_ms": int(total_llm_ms),
+                        "prompt_build_ms": round(prompt_build_ms, 1),
+                        "inference_request_ms": round(inference_request_ms, 1),
+                        "first_token_ms": round(first_token_ms, 1),
+                        "generation_ms": round(generation_ms, 1),
+                        "total_llm_ms": round(total_llm_ms, 1),
                     })
                     full_reply_parts = []
 
@@ -7266,8 +7366,31 @@ class AstroRealtimeNode(Node):
                             break
                         continue
 
+            # Problem 1: STRICT LOCAL MODE SILENCE GATE
+            # When use_realtime=False and Local Gemma produced no reply, STRICTLY ENFORCE SILENCE.
+            # Do NOT fall back to cloud, do NOT invoke hardcoded/template persona, do NOT synthesize TTS, do NOT start playback.
             if not self.use_realtime and not full_reply_parts:
-                self.get_logger().info("ℹ️ [Local Voice Mode] use_realtime=False: Cloud LLM fallback skipped (zero cloud leakage).")
+                self.get_logger().warning(
+                    "🛑 [Local Voice Mode Gemma Failure]: Local Gemma produced no response. "
+                    "Enforcing strict silence in local mode (0 TTS, 0 playback, 0 template fallback)."
+                )
+                chosen_provider = "local_gemma"
+                chosen_model = local_model_name if 'local_model_name' in locals() else "gemma-4-E2B-it-Q4_K_S"
+                response_origin = "local_gemma_failure"
+                llm_inference_completed = False
+                _record_turn_telemetry(
+                    "",
+                    origin=response_origin,
+                    played=False,
+                    dur_synth_ms=0.0,
+                    gpu_ms=0.0,
+                    prompt_build_ms=prompt_build_ms,
+                    inference_request_ms=inference_request_ms,
+                    first_token_ms=first_token_ms,
+                    generation_ms=generation_ms,
+                    total_llm_ms=total_llm_ms,
+                )
+                return
 
 
             full_reply_str = clean_tts_text("".join(full_reply_parts))
@@ -7391,6 +7514,11 @@ class AstroRealtimeNode(Node):
                     played=first_audio_played,
                     dur_synth_ms=total_synth_ms,
                     gpu_ms=total_gpu_ms,
+                    prompt_build_ms=prompt_build_ms,
+                    inference_request_ms=inference_request_ms,
+                    first_token_ms=first_token_ms,
+                    generation_ms=generation_ms,
+                    total_llm_ms=total_llm_ms,
                 )
 
                 if active_engine == "xtts_gpu" and not getattr(self, "_first_xtts_synthesis_verified", False):

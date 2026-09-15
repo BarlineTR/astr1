@@ -26,6 +26,76 @@ DEFAULT_TIMEOUT_S = float(os.getenv("LOCAL_GEMMA_TIMEOUT_S", "5.0"))
 DEFAULT_FIRST_TOKEN_TIMEOUT_S = float(os.getenv("LOCAL_GEMMA_FIRST_TOKEN_TIMEOUT_S", "8.0"))
 DEFAULT_N_PREDICT = int(os.getenv("LOCAL_GEMMA_N_PREDICT", "28"))
 DEFAULT_TEMPERATURE = float(os.getenv("LOCAL_GEMMA_TEMPERATURE", "0.2"))
+DEFAULT_MAX_CONTEXT_TOKENS = int(os.getenv("LOCAL_GEMMA_MAX_CONTEXT_TOKENS", "450"))
+
+
+def estimate_tokens(text: str) -> int:
+    """Heuristic token estimator for multilingual/Turkish text (~3.2-3.8 chars per token)."""
+    if not text:
+        return 0
+    return max(len(text.split()), int(len(text) / 3.2) + 1)
+
+
+def bound_messages_to_context(
+    messages: Any,
+    max_tokens: int = DEFAULT_MAX_CONTEXT_TOKENS,
+) -> Any:
+    """Deterministically bounds messages list so total token count <= max_tokens (<= 512 context limit).
+
+    Priority order for pruning:
+      1. Older conversation turns / intermediate assistant or user turns
+      2. Non-essential prefix context in user/system messages
+    Preserved:
+      - Latest user utterance
+      - Core system prompt identity / safety instructions
+    """
+    if not messages:
+        return []
+    if isinstance(messages, str):
+        est = estimate_tokens(messages)
+        if est <= max_tokens:
+            return messages
+        max_chars = int(max_tokens * 3.0)
+        return messages[:max_chars].rsplit(" ", 1)[0] + "..."
+
+    if not isinstance(messages, list):
+        return messages
+
+    msg_list = list(messages)
+    total_est = sum(estimate_tokens(str(m.get("content", ""))) for m in msg_list if isinstance(m, dict))
+    if total_est <= max_tokens:
+        return msg_list
+
+    # If messages list has multiple entries, keep the last user message and prune earlier ones
+    if len(msg_list) > 1:
+        pruned = [msg_list[-1]]
+        cur_tokens = estimate_tokens(str(pruned[0].get("content", "")))
+        for msg in reversed(msg_list[:-1]):
+            msg_tok = estimate_tokens(str(msg.get("content", "")))
+            if cur_tokens + msg_tok <= max_tokens:
+                pruned.insert(0, msg)
+                cur_tokens += msg_tok
+            else:
+                break
+        if cur_tokens <= max_tokens:
+            return pruned
+        msg_list = pruned
+
+    # If single remaining message still exceeds max_tokens, deterministically truncate its content
+    bounded_msgs = []
+    for msg in msg_list:
+        if isinstance(msg, dict):
+            content = str(msg.get("content", ""))
+            est = estimate_tokens(content)
+            if est > max_tokens:
+                max_chars = int(max_tokens * 3.0)
+                truncated_content = content[:max_chars].rsplit(" ", 1)[0] + "..."
+                bounded_msgs.append({"role": msg.get("role", "user"), "content": truncated_content})
+            else:
+                bounded_msgs.append(dict(msg))
+        else:
+            bounded_msgs.append(msg)
+    return bounded_msgs
 
 
 class LocalGemmaError(Exception):
@@ -161,6 +231,8 @@ class LocalGemmaClient:
         else:
             messages = [{"role": "user", "content": str(prompt)}]
 
+        messages = bound_messages_to_context(messages, max_tokens=int(os.getenv("LOCAL_GEMMA_MAX_CONTEXT_TOKENS", "450")))
+
         effective_timeout = float(timeout or self.timeout_s)
         payload: Dict[str, Any] = {
             "model": self.model_name,
@@ -254,6 +326,8 @@ class LocalGemmaClient:
             messages = prompt
         else:
             messages = [{"role": "user", "content": str(prompt)}]
+
+        messages = bound_messages_to_context(messages, max_tokens=int(os.getenv("LOCAL_GEMMA_MAX_CONTEXT_TOKENS", "450")))
 
         effective_timeout = float(timeout or self.timeout_s)
         effective_first_token_timeout = float(first_token_timeout or self.first_token_timeout_s or effective_timeout)
