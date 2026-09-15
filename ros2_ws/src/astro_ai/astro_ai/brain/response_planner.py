@@ -44,8 +44,16 @@ class ResponsePlanner:
             strategies.append("Düzeltmeyi anlayışla kabul et ve bilginin güncellendiğini belirt")
             directness = 0.9
 
-        elif context.user_intent == IntentType.QUESTION:
+        elif context.user_intent in (IntentType.QUESTION, IntentType.DIALOGUE_QUESTION):
             strategies.append("Soruya net ve doğru yanıt ver; gereksiz gevezelikten kaçın")
+
+        elif context.user_intent in (IntentType.ACTIVITY_QUERY, IntentType.SELF_REFERENCE):
+            strategies.append("Kullanıcının mevcut aktivitesi veya durumu hakkındaki görsel ve bağlamsal algını doğrudan açıkla")
+            directness = 0.95
+
+        elif context.user_intent == IntentType.SOCIAL_BID:
+            strategies.append("Sosyal çağrıya samimi ve canlı bir karşılık ver")
+            humor = 0.5
 
         # 3. Contextual Memory Integration
         if context.relevant_memories:

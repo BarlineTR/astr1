@@ -10,13 +10,24 @@ class IntentEngine:
     """Classifies user utterance into structured pragmatic communicative acts."""
 
     GREETING_PATTERNS = [
-        r"\b(?:merhaba|selam|günaydın|gunaydin|iyi günler|iyi aksamlar|iyi akşamlar|hey astro|astro)\b"
+        r"\b(?:merhaba|selam|günaydın|gunaydin|iyi günler|iyi aksamlar|iyi akşamlar|hoş geldin|hos geldin)\b",
+        r"^(?:hey\s+)?astro[!\.]?$",
     ]
     FAREWELL_PATTERNS = [
         r"\b(?:görüşürüz|gorusuruz|hoşça kal|hosca kal|kendine iyi bak|bay bay|güle güle|iyi geceler)\b"
     ]
+    ACTIVITY_QUERY_PATTERNS = [
+        r"\b(?:ben\s+)?(?:şu\s*an(?:da)?\s+)?ne\s+yap(?:ıyorum|ıyoruz|ıyorsun)\b",
+        r"\bneyle\s+(?:meşgul(?:üm|sün)|uğraş(?:ıyorum|ıyorsun))\b",
+        r"\bne\s+yap(?:ıyorum|ıyoruz|ıyorsun)\b",
+        r"\b(?:şu\s*an(?:da)?\s+)?benim\s+aktivitem\b",
+    ]
+    SOCIAL_BID_PATTERNS = [
+        r"\b(?:ne\s+haber|naber|ne\s+var\s+ne\s+yok)\b",
+        r"\b(?:neler\s+yapıyorsun|neler\s+dönüyor)\b",
+    ]
     QUESTION_PATTERNS = [
-        r"(?:\?|kimdir|nedir|nasıl|nasil|kaç|kac|nerede|ne zaman|var mı|mısın|misin|musun|müsün)"
+        r"(?:\?|kimdir|nedir|nasıl|nasil|kaç|kac|nerede|ne zaman|var mı|mısın|misin|musun|müsün|miyim|miyiz|kim\b)"
     ]
     REQUEST_PATTERNS = [
         r"\b(?:yapar mısın|eder misin|lütfen|bakar mısın|anlatır mısın|söyler misin)\b"
@@ -48,6 +59,14 @@ class IntentEngine:
 
         t = text.lower().strip(" .,!?:;")
 
+        # Normalize/clean leading/trailing wake addressing tokens if other text is present
+        # e.g., "astro ben şu anda ne yapıyorum" -> "ben şu anda ne yapıyorum"
+        # e.g., "merhaba astro" -> "merhaba"
+        cleaned = re.sub(r"^(?:hey\s+)?astro[\s,]+", "", t)
+        cleaned = re.sub(r"[\s,]+(?:hey\s+)?astro$", "", cleaned).strip(" .,!?:;")
+
+        target_texts = [cleaned, t] if cleaned and cleaned != t else [t]
+
         # 1. Exact Confirmations / Denials
         if any(re.search(p, t) for p in cls.CONFIRMATION_PATTERNS):
             return IntentType.CONFIRMATION, 0.98
@@ -55,36 +74,44 @@ class IntentEngine:
             return IntentType.DENIAL, 0.98
 
         # 2. Corrections
-        if any(re.search(p, t) for p in cls.CORRECTION_PATTERNS):
+        if any(re.search(p, txt) for txt in target_texts for p in cls.CORRECTION_PATTERNS):
             return IntentType.CORRECTION, 0.90
 
-        # 3. Memory Queries
-        if any(re.search(p, t) for p in cls.MEMORY_QUERY_PATTERNS):
+        # 3. Activity Queries (high priority to prevent GREETING / STATEMENT fallthrough)
+        if any(re.search(p, txt) for txt in target_texts for p in cls.ACTIVITY_QUERY_PATTERNS):
+            return IntentType.ACTIVITY_QUERY, 0.95
+
+        # 4. Memory Queries
+        if any(re.search(p, txt) for txt in target_texts for p in cls.MEMORY_QUERY_PATTERNS):
             return IntentType.MEMORY_QUERY, 0.95
 
-        # 4. Memory Updates
-        if any(re.search(p, t) for p in cls.MEMORY_UPDATE_PATTERNS):
+        # 5. Memory Updates
+        if any(re.search(p, txt) for txt in target_texts for p in cls.MEMORY_UPDATE_PATTERNS):
             return IntentType.MEMORY_UPDATE, 0.90
 
-        # 5. Greetings
-        if any(re.search(p, t) for p in cls.GREETING_PATTERNS):
+        # 6. Social Bids (e.g. "ne haber?", "naber")
+        if any(re.search(p, txt) for txt in target_texts for p in cls.SOCIAL_BID_PATTERNS):
+            return IntentType.SOCIAL_BID, 0.90
+
+        # 7. Greetings
+        if any(re.search(p, txt) for txt in target_texts for p in cls.GREETING_PATTERNS):
             return IntentType.GREETING, 0.95
 
-        # 6. Farewells
-        if any(re.search(p, t) for p in cls.FAREWELL_PATTERNS):
+        # 8. Farewells
+        if any(re.search(p, txt) for txt in target_texts for p in cls.FAREWELL_PATTERNS):
             return IntentType.FAREWELL, 0.95
 
-        # 7. Emotional Disclosure
-        if any(re.search(p, t) for p in cls.EMOTIONAL_PATTERNS):
+        # 9. Emotional Disclosure
+        if any(re.search(p, txt) for txt in target_texts for p in cls.EMOTIONAL_PATTERNS):
             return IntentType.EMOTIONAL_DISCLOSURE, 0.88
 
-        # 8. Requests
-        if any(re.search(p, t) for p in cls.REQUEST_PATTERNS):
+        # 10. Requests
+        if any(re.search(p, txt) for txt in target_texts for p in cls.REQUEST_PATTERNS):
             return IntentType.REQUEST, 0.85
 
-        # 9. Questions
-        if any(re.search(p, t) for p in cls.QUESTION_PATTERNS):
+        # 11. Questions
+        if any(re.search(p, txt) for txt in target_texts for p in cls.QUESTION_PATTERNS):
             return IntentType.QUESTION, 0.80
 
-        # 10. General Statements
+        # 12. General Statements
         return IntentType.STATEMENT, 0.65
