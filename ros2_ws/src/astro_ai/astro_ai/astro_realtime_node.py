@@ -708,6 +708,11 @@ class AstroRealtimeNode(Node):
         )
 
 
+        # Proactive speech policy gate (default OFF as per forensic invariant)
+        self.proactive_speech_enabled = os.environ.get("ASTRO_PROACTIVE_SPEECH", "0").strip().lower() in ("1", "true", "yes", "on")
+        self._last_explicit_user_turn: bool = False
+        self._current_turn_explicit_user_turn: bool = False
+
         # Modular Cognitive Subsystems
         self.memory = MemoryManager()
         self.persona_engine = PersonaEngine(self.persona_name)
@@ -2408,15 +2413,20 @@ class AstroRealtimeNode(Node):
             )
         per_turn_instructions = f"{per_turn_instructions}{spatial_turn_note}"
 
-        # INTERACTION GATE HARD BLOCK (Realtime):
-        # Deterministically suppresses response.create dispatch when verbal response is gated
+        # INTERACTION GATE & EXPLICIT USER TURN HARD BLOCK (Realtime):
+        # Deterministically suppresses response.create dispatch when verbal response is gated or without explicit user turn
         soc_dec = getattr(self, "_last_social_decision", None)
-        if soc_dec and not getattr(soc_dec, "should_speak", True):
-            gate_mode = getattr(soc_dec, "gate_mode", "OBSERVING")
-            gate_reason = getattr(soc_dec, "initiative_reason", "gate_closed")
+        should_speak = getattr(soc_dec, "should_speak", True) if soc_dec else True
+        is_active_session = bool(self.session and self.session.is_active())
+        is_engaged = bool(soc_dec and getattr(soc_dec, "gate_mode", "") == "ENGAGED")
+        explicit_user_turn = bool(getattr(self, "_last_explicit_user_turn", False) or is_active_session or is_engaged)
+
+        if not (should_speak and explicit_user_turn):
+            gate_mode = getattr(soc_dec, "gate_mode", "OBSERVING") if soc_dec else "NO_TURN"
+            gate_reason = getattr(soc_dec, "initiative_reason", "no_explicit_turn" if not explicit_user_turn else "gate_closed") if soc_dec else "no_explicit_turn"
             if hasattr(self, "get_logger") and callable(self.get_logger):
                 self.get_logger().info(
-                    f"🛑 [InteractionGate Hard Block (Realtime)]: response.create engellendi (mode={gate_mode}, reason={gate_reason}) — 0 token."
+                    f"🛑 [InteractionGate Hard Block (Realtime)]: response.create engellendi (should_speak={should_speak}, explicit_turn={explicit_user_turn}, mode={gate_mode}, reason={gate_reason}) — 0 token."
                 )
             return
 
@@ -4884,6 +4894,8 @@ class AstroRealtimeNode(Node):
 
     def _handle_office_welcome(self, welcome_act: Dict[str, Any]):
         """Triggers proactive welcome speech for lobby guests without disruptive gestures."""
+        if not getattr(self, "proactive_speech_enabled", False):
+            return
         speech_text = welcome_act.get("speech_text", "")
         if speech_text and self._ws and self._loop and self._is_connected:
             welcome_event = {
@@ -5175,8 +5187,8 @@ class AstroRealtimeNode(Node):
         for r in due:
             topic = r["topic"]
             self.get_logger().info(f"⏰ [Realtime Alarm]: '{topic}' zamanı geldi!")
-            # Trigger proactive realtime message
-            if self._ws and self._loop and self._is_connected:
+            # Trigger proactive realtime message (only if proactive speech is explicitly enabled)
+            if getattr(self, "proactive_speech_enabled", False) and self._ws and self._loop and self._is_connected:
                 alarm_event = {
                     "type": "conversation.item.create",
                     "item": {
@@ -6147,6 +6159,9 @@ class AstroRealtimeNode(Node):
         """
         if not pcm_data:
             return
+        if not getattr(self, "_current_turn_explicit_user_turn", False):
+            self.get_logger().warning("🛑 [Playback Blocked]: No explicit user turn.")
+            return
         self._is_playback_active = True
         self._playback_start_monotonic = time.monotonic()
         self.state_machine.transition_to(RobotState.SPEAKING)
@@ -6245,6 +6260,11 @@ class AstroRealtimeNode(Node):
         try:
             if direct_text:
                 user_text = direct_text.strip()
+                self._current_turn_explicit_user_turn = True
+                self._last_explicit_user_turn = True
+                if self.session:
+                    self.session.activate_session(reason="direct_text")
+                    self.session.record_user_speech()
                 self._last_user_transcript = user_text
                 if not self.is_in_quiet_or_sleep_state() or getattr(self, "_is_sleeping", False) or self.state_machine.is_deep_idle():
                     self._wake_up()
@@ -6331,23 +6351,40 @@ class AstroRealtimeNode(Node):
                 if norm_wake_check in wake_tokens:
                     self._wake_up()
                     self._is_sleeping = False
+                    if self.session:
+                        self.session.activate_session(reason="wake_word")
                     self.state_machine.transition_to(RobotState.LISTENING)
                     self.get_logger().info(
                         f"⚡ [Active Wake-Only]: \"{validated_text}\" -> Woke to LISTENING (wake_only=True, turn_created=False, 0 LLM / 0 TTS)."
                     )
+                    self._is_processing_fallback = False
+                    self._is_responding = False
                     return
 
-                # If robot is not in quiet or sleep mode, wake up immediately
-                if not self.is_in_quiet_or_sleep_state():
-                    self._wake_up()
-
                 # Check if user said "Hey Astro, <command>" or "Astro, <command>"
+                has_wake = False
                 if norm_wake_check.startswith("hey astro "):
                     validated_text = validated_text[len("hey astro"):].lstrip(" ,.")
+                    has_wake = True
                 elif norm_wake_check.startswith("astro "):
                     validated_text = validated_text[len("astro"):].lstrip(" ,.")
+                    has_wake = True
                 elif norm_wake_check.startswith("selam astro "):
                     validated_text = validated_text[len("selam astro"):].lstrip(" ,.")
+                    has_wake = True
+
+                # Determine explicit user turn:
+                # Must have validated wake phrase + command/query OR be in an already active conversation session!
+                is_session_active = bool(self.session and self.session.is_active())
+                explicit_turn = bool(has_wake or is_session_active)
+
+                if not explicit_turn:
+                    self.get_logger().info(
+                        f"🛑 [No User Turn Dropped]: \"{raw_transcript}\" -> No wake word and no active conversation session (explicit_user_turn=False, 0 LLM / 0 TTS)."
+                    )
+                    self._is_processing_fallback = False
+                    self._is_responding = False
+                    return
 
                 valid_cmd, cmd_reason = is_valid_user_command(validated_text)
                 if not valid_cmd:
@@ -6355,7 +6392,18 @@ class AstroRealtimeNode(Node):
                     self.get_logger().info(
                         f"⚡ [Wake + Invalid Command Dropped]: \"{raw_transcript}\" (reason={cmd_reason}) -> Transitioned to LISTENING (0 LLM / 0 TTS)."
                     )
+                    self._is_processing_fallback = False
+                    self._is_responding = False
                     return
+
+                # If robot is not in quiet or sleep mode, wake up immediately
+                if not self.is_in_quiet_or_sleep_state():
+                    self._wake_up()
+
+                self._current_turn_explicit_user_turn = True
+                self._last_explicit_user_turn = True
+                if self.session:
+                    self.session.record_user_speech()
 
                 user_text = validated_text
                 self._last_user_transcript = user_text
@@ -6482,6 +6530,10 @@ class AstroRealtimeNode(Node):
             )
 
             def _synthesize_turn_clause(clause_text: str) -> Tuple[Optional[bytes], float, float, float]:
+                if not getattr(self, "_current_turn_explicit_user_turn", False):
+                    self.get_logger().warning("🛑 [TTS Synthesis Blocked]: No explicit user turn (0 TTS).")
+                    return None, 0.0, 0.0, 0.0
+
                 clean_text = response_length_gate(clause_text, user_query=user_text, max_words=35, max_sentences=2)
                 if not clean_text:
                     return None, 0.0, 0.0, 0.0
@@ -6774,16 +6826,21 @@ class AstroRealtimeNode(Node):
                     return
 
             # 7. Cognitive LLM via ProviderRegistry (Streaming Groq -> Gemini -> Contextual Persona)
-            system_prompt = self._build_current_system_prompt(active_speaker=active_speaker_dict, explicit_user_turn=True)
+            system_prompt = self._build_current_system_prompt(
+                active_speaker=active_speaker_dict,
+                explicit_user_turn=self._current_turn_explicit_user_turn,
+            )
 
-            # INTERACTION GATE HARD BLOCK:
+            # INTERACTION GATE & EXPLICIT USER TURN HARD BLOCK:
             # Deterministically suppresses Local Gemma, Cloud Providers, and TTS when verbal response is gated
             soc_dec = getattr(self, "_last_social_decision", None)
-            if soc_dec and not getattr(soc_dec, "should_speak", True):
-                gate_mode = getattr(soc_dec, "gate_mode", "OBSERVING")
-                gate_reason = getattr(soc_dec, "initiative_reason", "interaction_gate_closed")
+            should_speak = getattr(soc_dec, "should_speak", True) if soc_dec else True
+            explicit_user_turn = getattr(self, "_current_turn_explicit_user_turn", False)
+            if not (should_speak and explicit_user_turn):
+                gate_mode = getattr(soc_dec, "gate_mode", "OBSERVING") if soc_dec else "NO_TURN"
+                gate_reason = getattr(soc_dec, "initiative_reason", "gate_closed" if not should_speak else "no_explicit_turn") if soc_dec else "gate_closed"
                 self.get_logger().info(
-                    f"🛑 [InteractionGate Hard Block]: Sözel yanıt engellendi (mode={gate_mode}, reason={gate_reason}) — 0 LLM / 0 TTS."
+                    f"🛑 [InteractionGate Hard Block]: Sözel yanıt engellendi (should_speak={should_speak}, explicit_user_turn={explicit_user_turn}, mode={gate_mode}, reason={gate_reason}) — 0 LLM / 0 TTS."
                 )
                 self.state_machine.transition_to(RobotState.LISTENING if not self.is_in_quiet_or_sleep_state() else RobotState.DEEP_IDLE)
                 return
@@ -7573,6 +7630,9 @@ class AstroRealtimeNode(Node):
 
     def _trigger_proactive_greeting(self, name: str, formal_title: str):
         """Sends proactive greeting message to Realtime session."""
+        if not getattr(self, "proactive_speech_enabled", False):
+            self.get_logger().debug("🛑 [Proactive Speech Blocked]: proactive_speech_enabled is False (default OFF).")
+            return
         if not self._ws or not self._loop or not self._is_connected:
             return
 
@@ -7616,12 +7676,13 @@ class AstroRealtimeNode(Node):
                         self._last_seen_person = name
                         threading.Thread(target=self._evaluate_vision_event, args=("new_person",), daemon=True).start()
 
-                    # Proactive greeting check: greet once every 2 minutes per person
+                    # Proactive greeting check: greet once every 2 minutes per person ONLY IF proactive_speech_enabled is True
                     last_greet = self._greeted_people.get(name, 0.0)
                     if (now - last_greet) > 120.0 and not self._is_responding and not self._is_playback_active:
-                        self._greeted_people[name] = now
-                        self.get_logger().info(f"👋 [Proaktif Selamlama]: {name} ({formal_title}) algılandı — Selamlama başlatılıyor!")
-                        self._trigger_proactive_greeting(name, formal_title)
+                        if getattr(self, "proactive_speech_enabled", False):
+                            self._greeted_people[name] = now
+                            self.get_logger().info(f"👋 [Proaktif Selamlama]: {name} ({formal_title}) algılandı — Selamlama başlatılıyor!")
+                            self._trigger_proactive_greeting(name, formal_title)
 
             self._sync_perception_to_session()
         except Exception as _exc:

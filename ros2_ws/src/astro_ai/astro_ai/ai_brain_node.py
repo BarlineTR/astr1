@@ -328,6 +328,7 @@ class AiBrainNode(Node):
         self._node_start_time = time.monotonic()
         self._latest_frame = None
         self._latest_frame_time = 0.0
+        self.proactive_speech_enabled = os.environ.get("ASTRO_PROACTIVE_SPEECH", "0").strip().lower() in ("1", "true", "yes", "on")
 
         # Multimodal Perception & Social Context Engine
         self.social_context_engine = SocialContextEngine() if SocialContextEngine else None
@@ -651,9 +652,10 @@ class AiBrainNode(Node):
                                 speaker_gender=self._speaker_gender
                             )
                             self._publish_emotion(greeting_emo)
-                            self.get_logger().info(f"👤 [Proaktif Yüz Karşılama] ({p_name}): \"{proactive_greeting}\"")
                             self._publish_gesture("nod")
-                            self._publish_tts(proactive_greeting)
+                            if getattr(self, "proactive_speech_enabled", False):
+                                self.get_logger().info(f"👤 [Proaktif Yüz Karşılama] ({p_name}): \"{proactive_greeting}\"")
+                                self._publish_tts(proactive_greeting)
         except Exception as _exc:
             self.get_logger().debug(f"_on_recognized_person: yok sayılan hata ({_exc})")
 
@@ -717,6 +719,9 @@ class AiBrainNode(Node):
         return {"name": "Misafir", "title": "Ziyaretçi", "formal_title": "Misafir", "is_known": False, "confidence": 0.0}
 
     def _check_proactive_gaze(self):
+        if not getattr(self, "proactive_speech_enabled", False):
+            return
+
         with self._gaze_lock:
             looking = self._looking_at_robot
             look_start = self._looking_start_time
