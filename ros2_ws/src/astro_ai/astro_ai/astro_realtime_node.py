@@ -1030,6 +1030,8 @@ class AstroRealtimeNode(Node):
         self.create_subscription(String, "/office/slack_command", self._on_slack_command, 10)
         self.create_subscription(String, "/gaze/active_target", self._on_gaze_active_target, 10)
         self.create_subscription(Float32, "/head/cmd_pos", self._on_head_cmd_pos, 10)
+        self.create_subscription(Bool, "/astro/quiet_mode", self._on_quiet_mode, 10)
+        self.create_subscription(Bool, "/astro/sleep_mode", self._on_sleep_mode, 10)
 
         # Tool execution deduplication
         self._executed_tool_calls: set[str] = set()
@@ -1048,6 +1050,7 @@ class AstroRealtimeNode(Node):
         )
         self._node_start_time = time.monotonic()
         self._is_sleeping = is_test
+        self._is_quiet_mode: bool = False
         if not is_test:
             self.state_machine.transition_to(RobotState.LISTENING)
 
@@ -1918,10 +1921,12 @@ class AstroRealtimeNode(Node):
                 )
                 self.social_brain.world_model.update_people([person])
                 last_txt = getattr(self, "_last_user_transcript", "merhaba") or "merhaba"
-                is_quiet = bool(getattr(self, "_is_quiet_mode", False) or getattr(self, "quiet_mode", False))
+                is_quiet = self.is_in_quiet_or_sleep_state()
                 soc_ctx, soc_dec, brain_prompt = self.social_brain.process_dialogue_turn(
                     last_txt, person_state=person, is_quiet_mode=is_quiet
                 )
+                self._last_social_decision = soc_dec
+                self._last_social_context = soc_ctx
                 if brain_prompt:
                     social_context_str = f"\n\n[SOSYAL ROBOT BİLİŞSEL BAĞLAMI]:\n{brain_prompt}\n"
                 intent_raw = getattr(soc_ctx, "user_intent", getattr(soc_ctx, "intent", "UNKNOWN"))
@@ -4446,21 +4451,63 @@ class AstroRealtimeNode(Node):
         if not self._is_sleeping:
             idle_seconds = now - getattr(self, "_last_interaction_time", now)
             if idle_seconds >= 15.0:
-                self._is_sleeping = True
-                self.state_machine.transition_to(RobotState.DEEP_IDLE)
-                self.get_logger().info("💤 [Astro Uyku Modu]: 15 saniye hareketsizlik — Astro DEEP_IDLE moduna geçti (😴). Wake listener aktif.")
+                self._go_to_sleep(reason="15_seconds_inactivity")
 
-                # 1. Publish sleeping emotion for face/display
-                if self.pub_emotion is not None:
-                    emo_msg = String()
-                    emo_msg.data = "sleeping"
-                    self.pub_emotion.publish(emo_msg)
+    def _go_to_sleep(self, reason: str = "inactivity"):
+        """Transitions Astro into sleep mode, notifying state machine and publishing gestures."""
+        self._is_sleeping = True
+        if hasattr(self, "state_machine") and self.state_machine:
+            self.state_machine.transition_to(RobotState.DEEP_IDLE)
+        self.get_logger().info(f"💤 [Astro Uyku Modu]: {reason} — Astro DEEP_IDLE moduna geçti (😴). Wake listener aktif.")
+        if getattr(self, "pub_emotion", None) is not None:
+            emo_msg = String()
+            emo_msg.data = "sleeping"
+            self.pub_emotion.publish(emo_msg)
+        if getattr(self, "pub_gesture", None) is not None:
+            gest_msg = String()
+            gest_msg.data = "sleep"
+            self.pub_gesture.publish(gest_msg)
 
-                # 2. Publish sleep head gesture
-                if self.pub_gesture is not None:
-                    gest_msg = String()
-                    gest_msg.data = "sleep"
-                    self.pub_gesture.publish(gest_msg)
+    def _on_sleep_mode(self, msg: Bool):
+        """Authoritative ROS 2 callback for /astro/sleep_mode."""
+        try:
+            val = bool(msg.data)
+            with self._lock:
+                self._is_sleeping = val
+            if val:
+                self._go_to_sleep(reason="ros_sleep_topic")
+            else:
+                self._wake_up()
+            self.get_logger().info(f"💤 [Sleep Mode Topic]: {'UYKU' if val else 'UYANDI'}")
+        except Exception as exc:
+            self.get_logger().debug(f"_on_sleep_mode error: {exc}")
+
+    def _on_quiet_mode(self, msg: Bool):
+        """Authoritative ROS 2 callback for /astro/quiet_mode."""
+        try:
+            val = bool(msg.data)
+            with self._lock:
+                self._is_quiet_mode = val
+            self.get_logger().info(f"🤫 [Quiet Mode Topic]: {'AKTİF' if val else 'PASİF'}")
+        except Exception as exc:
+            self.get_logger().debug(f"_on_quiet_mode error: {exc}")
+
+    def is_in_quiet_or_sleep_state(self) -> bool:
+        """Determines if the robot is authoritatively in quiet mode, sleep mode, or deep idle."""
+        if getattr(self, "_is_quiet_mode", False):
+            return True
+        if getattr(self, "_is_sleeping", False):
+            return True
+        if hasattr(self, "state_machine") and self.state_machine and hasattr(self.state_machine, "is_deep_idle"):
+            if self.state_machine.is_deep_idle():
+                return True
+        if hasattr(self, "cognitive_loop") and self.cognitive_loop:
+            self_model = getattr(self.cognitive_loop, "self_model", None)
+            if self_model:
+                curr_act = getattr(getattr(self_model, "self_state", None), "current_activity", None)
+                if curr_act and ("sleep" in str(curr_act).lower() or "quiet" in str(curr_act).lower()):
+                    return True
+        return False
 
     def _wake_up(self):
         """Wakes Astro up from sleep mode upon speech or user interaction."""
@@ -6251,17 +6298,21 @@ class AstroRealtimeNode(Node):
                 if not validated_text:
                     return
 
-                # Valid human speech confirmed — wake Astro up from DEEP_IDLE / Sleep
-                self._wake_up()
-
-                # Check for pure wake word in active mode (e.g. "Astro.", "Hey Astro", "Selam")
+                # Check for pure wake word in active/sleep mode (e.g. "Astro.", "Hey Astro", "Uyan")
                 norm_wake_check = re.sub(r"[^\w\s]", "", validated_text.lower()).strip()
-                if norm_wake_check in ("astro", "hey astro", "selam astro", "hey", "selam"):
+                wake_tokens = ("astro", "hey astro", "selam astro", "hey", "selam", "uyan", "uyan astro", "astro uyan")
+                if norm_wake_check in wake_tokens:
+                    self._wake_up()
+                    self._is_sleeping = False
                     self.state_machine.transition_to(RobotState.LISTENING)
                     self.get_logger().info(
                         f"⚡ [Active Wake-Only]: \"{validated_text}\" -> Woke to LISTENING (wake_only=True, turn_created=False, 0 LLM / 0 TTS)."
                     )
                     return
+
+                # If robot is not in quiet or sleep mode, wake up immediately
+                if not self.is_in_quiet_or_sleep_state():
+                    self._wake_up()
 
                 # Check if user said "Hey Astro, <command>" or "Astro, <command>"
                 if norm_wake_check.startswith("hey astro "):
