@@ -71,11 +71,13 @@ class LocalGemmaClient:
         timeout_s: float = DEFAULT_TIMEOUT_S,
         first_token_timeout_s: Optional[float] = None,
         logger: Optional[Callable[[str, str], None]] = None,
+        model_name: Optional[str] = None,
     ):
         self.base_url = base_url.rstrip("/")
         self.timeout_s = float(timeout_s)
         self.first_token_timeout_s = float(first_token_timeout_s if first_token_timeout_s is not None else DEFAULT_FIRST_TOKEN_TIMEOUT_S)
         self._log = logger or (lambda lvl, msg: None)
+        self.model_name = model_name or os.getenv("LOCAL_GEMMA_MODEL", "gemma-4-E2B-it-Q4_K_S")
         self.completion_url = f"{self.base_url}/completion"
         self.health_url = f"{self.base_url}/health"
         self._last_health_status: bool = False

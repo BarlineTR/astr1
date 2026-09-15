@@ -919,6 +919,7 @@ class AstroRealtimeNode(Node):
         # Generation-level Barge-In Debounce State
         self._barge_in_latched = False
         self.edge_tts_enabled = os.getenv("EDGE_TTS_ENABLED", "true").lower() in ("1", "true", "yes")
+        self._last_turn_telemetry: Dict[str, Any] = {}
 
         # Single Unified TTSRouter
         try:
@@ -1762,7 +1763,11 @@ class AstroRealtimeNode(Node):
             return bool(getattr(self, "_looking_at_robot", False))
         return False
 
-    def _build_current_system_prompt(self, active_speaker: Optional[Dict[str, Any]] = None) -> str:
+    def _build_current_system_prompt(
+        self,
+        active_speaker: Optional[Dict[str, Any]] = None,
+        explicit_user_turn: bool = False,
+    ) -> str:
         """Builds system instructions with memory, identity, persona, and strict anti-hallucination rules."""
         identity = active_speaker or self.resolve_identities()
         is_known = identity.get("is_known", False) and identity.get("name", "Misafir").lower() != "misafir"
@@ -1920,10 +1925,10 @@ class AstroRealtimeNode(Node):
                     epistemic_status=epistemic.status.value,
                 )
                 self.social_brain.world_model.update_people([person])
-                last_txt = getattr(self, "_last_user_transcript", "merhaba") or "merhaba"
+                last_txt = getattr(self, "_last_user_transcript", "") or ""
                 is_quiet = self.is_in_quiet_or_sleep_state()
                 soc_ctx, soc_dec, brain_prompt = self.social_brain.process_dialogue_turn(
-                    last_txt, person_state=person, is_quiet_mode=is_quiet
+                    last_txt, person_state=person, is_quiet_mode=is_quiet, explicit_user_turn=explicit_user_turn
                 )
                 self._last_social_decision = soc_dec
                 self._last_social_context = soc_ctx
@@ -6218,6 +6223,11 @@ class AstroRealtimeNode(Node):
         t_turn_start = time.monotonic()
         chosen_model = "none"
         chosen_provider = "none"
+        response_origin = "none"
+        llm_inference_started = False
+        llm_inference_completed = False
+        llm_prompt_used = ""
+        llm_inference_duration_ms = 0.0
         llm_status = "ok"
         error_class_str = "none"
         model_error_str = "none"
@@ -6235,6 +6245,11 @@ class AstroRealtimeNode(Node):
         try:
             if direct_text:
                 user_text = direct_text.strip()
+                self._last_user_transcript = user_text
+                if not self.is_in_quiet_or_sleep_state() or getattr(self, "_is_sleeping", False) or self.state_machine.is_deep_idle():
+                    self._wake_up()
+                    self._is_sleeping = False
+                self.state_machine.transition_to(RobotState.THINKING)
                 self.get_logger().info(f"🗣️ [Siz (Yedek Zeka)]: \"{user_text}\"")
                 self.memory.episodic.add_message("user", user_text)
                 raw_pcm = b""
@@ -6343,6 +6358,7 @@ class AstroRealtimeNode(Node):
                     return
 
                 user_text = validated_text
+                self._last_user_transcript = user_text
                 self.get_logger().info(f"🗣️ [Siz (0-Maliyet)]: \"{user_text}\"")
                 self.memory.episodic.add_message("user", user_text)
                 self.state_machine.transition_to(RobotState.THINKING)
@@ -6526,6 +6542,74 @@ class AstroRealtimeNode(Node):
                     blocking_pace=is_final_clause,
                 )
 
+            def _record_turn_telemetry(
+                rep_text: str,
+                origin: str,
+                played: bool,
+                dur_synth_ms: float,
+                gpu_ms: float = 0.0,
+            ):
+                r_chars = len(rep_text)
+                r_words = len(rep_text.split())
+                rt_state = getattr(self, "realtime_provider_state", "AVAILABLE")
+                rt_state_name = rt_state if isinstance(rt_state, str) else (rt_state.value if hasattr(rt_state, "value") else "AVAILABLE")
+                if not self.use_realtime:
+                    req_p = "local_gemma"
+                    rt_s_val = "LOCAL_ACTIVE"
+                    rt_f_reason = "none"
+                else:
+                    req_p = "openai_realtime"
+                    rt_s_val = rt_state_name
+                    rt_f_reason = "quota_exhausted" if getattr(self, "_fallback_mode", False) else "none"
+
+                synth_fin = bool(dur_synth_ms > 0 or played)
+                telem = {
+                    "generation_id": self._fallback_generation_id,
+                    "realtime_state": rt_s_val,
+                    "realtime_failure_reason": rt_f_reason,
+                    "requested_provider": req_p,
+                    "actual_provider": active_engine,
+                    "llm_provider": chosen_provider,
+                    "llm_model": chosen_model,
+                    "llm_inference_started": llm_inference_started,
+                    "llm_inference_completed": llm_inference_completed,
+                    "response_origin": origin,
+                    "llm_duration_ms": int(llm_inference_duration_ms),
+                    "tts_provider": active_engine,
+                    "tts_model": tts_model_name,
+                    "response_chars": r_chars,
+                    "response_words": r_words,
+                    "tts_ttfa_ms": int(dur_synth_ms),
+                    "tts_total_ms": int(dur_synth_ms),
+                    "playback_started": played,
+                    "playback_finished": played and synth_fin,
+                    "playback_failed": not played and synth_fin,
+                }
+                self._last_turn_telemetry = telem
+                self.get_logger().info(
+                    f"[Turn Telemetry]\n"
+                    f"generation_id={self._fallback_generation_id}\n"
+                    f"realtime_state={rt_s_val}\n"
+                    f"realtime_failure_reason={rt_f_reason}\n"
+                    f"requested_provider={req_p}\n"
+                    f"actual_provider={active_engine}\n"
+                    f"llm_provider={chosen_provider}\n"
+                    f"llm_model={chosen_model}\n"
+                    f"llm_inference_started={llm_inference_started}\n"
+                    f"llm_inference_completed={llm_inference_completed}\n"
+                    f"response_origin={origin}\n"
+                    f"llm_duration_ms={int(llm_inference_duration_ms)}\n"
+                    f"tts_provider={active_engine}\n"
+                    f"tts_model={tts_model_name}\n"
+                    f"response_chars={r_chars}\n"
+                    f"response_words={r_words}\n"
+                    f"tts_ttfa_ms={int(dur_synth_ms)}\n"
+                    f"tts_total_ms={int(dur_synth_ms)}\n"
+                    f"playback_started={played}\n"
+                    f"playback_finished={played and synth_fin}\n"
+                    f"playback_failed={not played and synth_fin}"
+                )
+
             # 6. Instant Intent Interception (Sub-250ms Direct Execution)
             is_weather, w_city = self._is_weather_query(user_text)
             if is_weather:
@@ -6553,6 +6637,7 @@ class AstroRealtimeNode(Node):
                     self.get_logger().info(f"🤖 [Astro (Canlı Hava Durumu)]: \"{reply_text}\"")
                     self.memory.episodic.add_message("assistant", reply_text)
                     self.session.record_robot_speech()
+                    _record_turn_telemetry(reply_text, origin="deterministic_policy", played=True, dur_synth_ms=total_synth_ms, gpu_ms=total_gpu_ms)
                     _handle_and_play_clause_audio(pcm)
                     return
 
@@ -6594,6 +6679,7 @@ class AstroRealtimeNode(Node):
                     self.get_logger().info(f"🤖 [Astro (Açı Komutu)]: \"{reply_text}\"")
                     self.memory.episodic.add_message("assistant", reply_text)
                     self.session.record_robot_speech()
+                    _record_turn_telemetry(reply_text, origin="deterministic_policy", played=True, dur_synth_ms=total_synth_ms, gpu_ms=total_gpu_ms)
                     _handle_and_play_clause_audio(pcm)
                     return
 
@@ -6647,6 +6733,7 @@ class AstroRealtimeNode(Node):
                     self.get_logger().info(f"🤖 [Astro (Ses Yönelimi)]: \"{reply_text}\"")
                     self.memory.episodic.add_message("assistant", reply_text)
                     self.session.record_robot_speech()
+                    _record_turn_telemetry(reply_text, origin="deterministic_policy", played=True, dur_synth_ms=total_synth_ms, gpu_ms=total_gpu_ms)
                     _handle_and_play_clause_audio(pcm)
                     return
 
@@ -6682,11 +6769,12 @@ class AstroRealtimeNode(Node):
                     self.get_logger().info(f"🤖 [Astro (Hareket Komutu)]: \"{reply_text}\"")
                     self.memory.episodic.add_message("assistant", reply_text)
                     self.session.record_robot_speech()
+                    _record_turn_telemetry(reply_text, origin="deterministic_policy", played=True, dur_synth_ms=total_synth_ms, gpu_ms=total_gpu_ms)
                     _handle_and_play_clause_audio(pcm)
                     return
 
             # 7. Cognitive LLM via ProviderRegistry (Streaming Groq -> Gemini -> Contextual Persona)
-            system_prompt = self._build_current_system_prompt(active_speaker=active_speaker_dict)
+            system_prompt = self._build_current_system_prompt(active_speaker=active_speaker_dict, explicit_user_turn=True)
 
             # INTERACTION GATE HARD BLOCK:
             # Deterministically suppresses Local Gemma, Cloud Providers, and TTS when verbal response is gated
@@ -6716,6 +6804,9 @@ class AstroRealtimeNode(Node):
             # Attempt 0: Local Gemma 4 E2B Q4_K_S (Zero-Cloud Local Fallback via llama.cpp /completion)
             local_gemma_streamed_audio = False
             if self.local_gemma_client and self.local_gemma_client.is_available():
+                llm_inference_started = True
+                local_model_name = getattr(self.local_gemma_client, "model_name", "gemma-4-E2B-it-Q4_K_S")
+                chosen_model = local_model_name
                 t_local_start = time.monotonic()
                 cog_envelope = ""
                 if getattr(self, "social_brain", None) and hasattr(self.social_brain, "dialogue_adapter"):
@@ -6747,6 +6838,10 @@ class AstroRealtimeNode(Node):
                     "ASTRO bir sosyal robot. Türkçe konuş. Kısa ve doğal cevap ver.\n\n"
                     f"Kullanıcı: {user_text}\n"
                     "ASTRO:"
+                )
+                llm_prompt_used = gemma_prompt
+                self.get_logger().info(
+                    f"🦙 [Local Gemma Inference Start] model={local_model_name} | prompt_len={len(gemma_prompt)}"
                 )
                 try:
                     local_chunker = SentenceChunker(min_first_clause_chars=6, min_clause_chars=20) if SentenceChunker else None
@@ -6825,23 +6920,47 @@ class AstroRealtimeNode(Node):
                                 self.pub_output_pcm.publish(end_msg)
                                 self._is_playback_active = False
 
+                    llm_inference_duration_ms = (time.monotonic() - t_local_start) * 1000.0
                     if full_reply_parts:
-                        chosen_model = "gemma-4-E2B-it-Q4_K_S"
+                        chosen_model = local_model_name
                         chosen_provider = "local_gemma"
-                        llm_latency_ms = (time.monotonic() - t_local_start) * 1000.0
+                        response_origin = "local_gemma"
+                        llm_inference_completed = True
+                        llm_latency_ms = llm_inference_duration_ms
+                        self.get_logger().info(
+                            f"🦙 [Local Gemma Inference Success] model={chosen_model} | duration_ms={llm_inference_duration_ms:.1f} | tokens={len(full_reply_parts)}"
+                        )
                         attempts.append({
                             "provider": "local_gemma",
                             "model": chosen_model,
                             "result": "success",
                             "latency_ms": int(llm_latency_ms),
                         })
+                    else:
+                        llm_inference_completed = False
+                        chosen_provider = "none"
+                        chosen_model = "none"
+                        self.get_logger().warning(
+                            f"🦙 [Local Gemma Inference Empty] duration_ms={llm_inference_duration_ms:.1f}"
+                        )
+                        attempts.append({
+                            "provider": "local_gemma",
+                            "model": local_model_name,
+                            "result": "empty",
+                            "latency_ms": int(llm_inference_duration_ms),
+                        })
                 except Exception as lge:
-                    self.get_logger().warning(f"⚠️ [Local Gemma Fallback Failed] Error: {lge}")
+                    llm_inference_completed = False
+                    chosen_provider = "none"
+                    chosen_model = "none"
+                    llm_inference_duration_ms = (time.monotonic() - t_local_start) * 1000.0
+                    self.get_logger().warning(f"⚠️ [Local Gemma Fallback Failed] duration_ms={llm_inference_duration_ms:.1f} | Error: {lge}")
                     attempts.append({
                         "provider": "local_gemma",
-                        "model": "gemma-4-E2B-it-Q4_K_S",
+                        "model": local_model_name,
                         "result": "failed",
                         "error": str(lge)[:80],
+                        "latency_ms": int(llm_inference_duration_ms),
                     })
                     full_reply_parts = []
 
@@ -6870,7 +6989,11 @@ class AstroRealtimeNode(Node):
                         if full_reply_parts:
                             chosen_model = target_model
                             chosen_provider = "groq"
+                            response_origin = "groq"
+                            llm_inference_started = True
+                            llm_inference_completed = True
                             llm_latency_ms = (time.monotonic() - t_model_start) * 1000.0
+                            llm_inference_duration_ms = llm_latency_ms
                             self.provider_registry.record_success("groq", target_model, llm_latency_ms)
                             attempts.append({
                                 "provider": "groq",
@@ -6916,7 +7039,11 @@ class AstroRealtimeNode(Node):
                             full_reply_parts = [gem_text]
                             chosen_model = g_mod
                             chosen_provider = "gemini"
+                            response_origin = "gemini"
+                            llm_inference_started = True
+                            llm_inference_completed = True
                             llm_latency_ms = (time.monotonic() - t_gem_start) * 1000.0
+                            llm_inference_duration_ms = llm_latency_ms
                             llm_ttft_ms = llm_latency_ms
                             llm_first_clause_ms = llm_latency_ms
                             self.provider_registry.record_success("gemini", g_mod, llm_latency_ms)
@@ -6954,6 +7081,7 @@ class AstroRealtimeNode(Node):
                 full_reply_str = self._generate_contextual_persona_fallback(user_text)
                 chosen_model = "contextual_grounding"
                 chosen_provider = "local_persona"
+                response_origin = "hardcoded_template"
                 llm_status = "degraded"
                 attempts.append({
                     "provider": "local_persona",
@@ -7061,33 +7189,12 @@ class AstroRealtimeNode(Node):
                 rt_state = getattr(self, "realtime_provider_state", "AVAILABLE")
                 rt_state_name = rt_state if isinstance(rt_state, str) else (rt_state.value if hasattr(rt_state, "value") else "AVAILABLE")
 
-                if not self.use_realtime:
-                    req_provider = "local_gemma"
-                    rt_state_val = "LOCAL_ACTIVE"
-                    rt_fail_reason = "none"
-                else:
-                    req_provider = "openai_realtime"
-                    rt_state_val = rt_state_name
-                    rt_fail_reason = "quota_exhausted" if getattr(self, "_fallback_mode", False) else "none"
-
-                self.get_logger().info(
-                    f"[Turn Telemetry]\n"
-                    f"generation_id={self._fallback_generation_id}\n"
-                    f"realtime_state={rt_state_val}\n"
-                    f"realtime_failure_reason={rt_fail_reason}\n"
-                    f"requested_provider={req_provider}\n"
-                    f"actual_provider={active_engine}\n"
-                    f"llm_provider={chosen_provider}\n"
-                    f"llm_model={chosen_model}\n"
-                    f"tts_provider={active_engine}\n"
-                    f"tts_model={tts_model_name}\n"
-                    f"response_chars={resp_chars}\n"
-                    f"response_words={resp_words}\n"
-                    f"tts_ttfa_ms={int(total_synth_ms)}\n"
-                    f"tts_total_ms={int(total_synth_ms)}\n"
-                    f"playback_started={first_audio_played}\n"
-                    f"playback_finished={first_audio_played and tts_synth_finished_flag}\n"
-                    f"playback_failed={not first_audio_played and tts_synth_started_flag}"
+                _record_turn_telemetry(
+                    full_reply_str,
+                    origin=response_origin,
+                    played=first_audio_played,
+                    dur_synth_ms=total_synth_ms,
+                    gpu_ms=total_gpu_ms,
                 )
 
                 if active_engine == "xtts_gpu" and not getattr(self, "_first_xtts_synthesis_verified", False):

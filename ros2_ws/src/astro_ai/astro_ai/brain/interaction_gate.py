@@ -46,6 +46,7 @@ class InteractionGate:
         identity_certainty: IdentityCertainty,
         user_text: str = "",
         is_quiet_mode: bool = False,
+        explicit_user_turn: bool = False,
     ) -> InteractionGateDecision:
         """Computes authoritative InteractionGateDecision."""
         # Rule 0: Quiet/Sleep Social Awareness (Phase 7)
@@ -76,15 +77,15 @@ class InteractionGate:
 
         addressed = self.is_directly_addressed(user_text)
 
-        # Rule 1: Explicit direct address ALWAYS forces ENGAGED
-        if addressed:
+        # Rule 1: Explicit direct address or validated user turn ALWAYS forces ENGAGED
+        if addressed or explicit_user_turn:
             return InteractionGateDecision(
                 mode=InteractionGateMode.ENGAGED,
                 attention_state=attention_state,
                 identity_certainty=identity_certainty,
                 should_respond_verbally=True,
                 should_track_with_gaze=True,
-                reason="DIRECT_ADDRESS",
+                reason="DIRECT_ADDRESS" if addressed else "EXPLICIT_USER_TURN",
                 gating_prompt_instruction=(
                     "ETKİLEŞİM KAPISI [AÇIK — DOĞRUDAN HİTAP]: Kullanıcı doğrudan sana seslendi. "
                     "Doğal ve net bir şekilde sözel yanıt ver."

@@ -129,6 +129,7 @@ class SocialBrain:
         active_persona: str = "playful",
         acoustic_energy_rms: float = 500.0,
         is_quiet_mode: bool = False,
+        explicit_user_turn: bool = False,
     ) -> Tuple[SocialContext, SocialDecision, str]:
         """Executes full cognitive reasoning loop for an incoming dialogue turn.
 
@@ -276,6 +277,7 @@ class SocialBrain:
                 identity_certainty=id_cert,
                 user_text=user_text,
                 is_quiet_mode=is_quiet_mode,
+                explicit_user_turn=explicit_user_turn,
             )
 
             # Quiet / Sleep Social Awareness Directive (Phase 7)
