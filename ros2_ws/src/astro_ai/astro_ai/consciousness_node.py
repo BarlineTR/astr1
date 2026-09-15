@@ -163,7 +163,7 @@ class ConsciousnessNode(Node):
         # Periodic Timer (Nominal 10 Hz)
         self._timer = self.create_timer(self.timer_period, self._on_cycle)
         self.get_logger().info(
-            f"ASTRO ConsciousnessNode initialized successfully at {self.loop_hz} Hz."
+            f"🧠 [Bilinç Düğümü] ASTRO Bilinç Mimarisi {self.loop_hz} Hz frekansında başarıyla başlatıldı."
         )
 
     # -------------------------------------------------------------------------
@@ -248,14 +248,14 @@ class ConsciousnessNode(Node):
 
         # Emit perception events on state transitions
         if val and not prev:
-            self.get_logger().info("👁️ [Perception: Vision] Person detected in camera field of view")
+            self.get_logger().info("👁️ [Bilinç: Görme Algısı] Kamera görüş alanında kişi algılandı")
             self.event_bus.create_and_publish(
                 event_type=CognitiveEventType.PERSON_APPEARED,
                 source="vision",
                 data={"timestamp": now},
             )
         elif not val and prev:
-            self.get_logger().info("👁️ [Perception: Vision] Person departed camera field of view")
+            self.get_logger().info("👁️ [Bilinç: Görme Algısı] Kişi kamera görüş alanından ayrıldı")
             self.event_bus.create_and_publish(
                 event_type=CognitiveEventType.PERSON_DISAPPEARED,
                 source="vision",
@@ -293,7 +293,7 @@ class ConsciousnessNode(Node):
         self.loop.event_detector.notify_sensor_active("audio", now)
 
         if val and not prev:
-            self.get_logger().info(f"🎙️ [Perception: Audio] User speech onset detected (DOA: {self._sensor_cache['doa_deg']:.1f}°)")
+            self.get_logger().info(f"🎙️ [Bilinç: İşitsel Algı] Kullanıcı konuşma başlangıcı algılandı (Ses Açısı: {self._sensor_cache['doa_deg']:.1f}°)")
             self.event_bus.create_and_publish(
                 event_type=CognitiveEventType.PERSON_SPOKE,
                 source="audio",
@@ -336,7 +336,7 @@ class ConsciousnessNode(Node):
             with self._lock:
                 self._sensor_cache["last_speech_text"] = text
             self.loop.event_detector.notify_sensor_active("audio", now)
-            self.get_logger().info(f"🗣️ [Perception: Speech] User transcript: \"{text}\"")
+            self.get_logger().info(f"🗣️ [Bilinç: Konuşma Tanıma] Kullanıcı metni: \"{text}\"")
             self.event_bus.create_and_publish(
                 event_type=CognitiveEventType.PERSON_SPOKE,
                 source="speech_recognition",
@@ -445,7 +445,7 @@ class ConsciousnessNode(Node):
             msg.data = json.dumps(state_dict, ensure_ascii=False)
             self._pub_state.publish(msg)
         except Exception as exc:
-            self.get_logger().error(f"Error publishing telemetry: {exc}")
+            self.get_logger().error(f"❌ [Bilinç Telemetrisi] Telemetri yayınlama hatası: {exc}")
 
     def emit_action_intent(self, intent: ActionIntent) -> None:
         """Emits an ActionIntent to downstream arbiters via /consciousness/action_intent."""
@@ -454,13 +454,13 @@ class ConsciousnessNode(Node):
             msg.data = json.dumps(intent.to_dict(), ensure_ascii=False)
             self._pub_action_intent.publish(msg)
         except Exception as exc:
-            self.get_logger().error(f"Error publishing action intent: {exc}")
+            self.get_logger().error(f"❌ [Bilinç Eylem Amacı] Eylem amacı yayınlama hatası: {exc}")
 
 
 def main(args=None):
     if rclpy is None:
         logging.basicConfig(level=logging.INFO)
-        _LOG.info("rclpy not installed; running ConsciousnessNode in standalone test mode.")
+        _LOG.info("rclpy yüklü değil; Bilinç Düğümü (ConsciousnessNode) bağımsız test modunda çalıştırılıyor.")
         node = ConsciousnessNode()
         for _ in range(5):
             node._on_cycle()

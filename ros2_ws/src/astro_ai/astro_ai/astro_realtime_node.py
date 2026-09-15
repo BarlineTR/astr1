@@ -1125,7 +1125,7 @@ class AstroRealtimeNode(Node):
                 },
             })
         except Exception as exc:
-            self.get_logger().debug(f"Cognitive loop tick notice: {exc}")
+            self.get_logger().debug(f"🧠 [Bilinç Döngüsü] Bilişsel döngü adımı bildirimi: {exc}")
 
     def _safe_log(self, lvl: str, msg: str):
         """Safe ROS2 logger wrapper preventing Cython/rcutils 'Logger severity cannot be changed between calls' error."""
