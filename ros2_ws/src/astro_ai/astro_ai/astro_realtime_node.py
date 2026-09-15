@@ -1962,6 +1962,76 @@ class AstroRealtimeNode(Node):
             recognized_person=identity
         )
 
+    def emit_response_trace(
+        self,
+        generation_id: int,
+        user_turn_id: str,
+        user_audio: str,
+        stt: str,
+        user_turn_created: bool,
+        social_intent: str,
+        should_speak: bool,
+        llm_provider: str,
+        llm_inference: str,
+        response_text: str,
+        tts: str,
+        playback: str,
+        response_origin: str = "none",
+        termination_reason: str = "none",
+    ) -> Dict[str, Any]:
+        """Produces and logs single end-to-end trace chain for spoken response or early termination.
+
+        Trace Pipeline:
+        USER_AUDIO → STT → USER_TURN_CREATED → SOCIAL_INTENT → SHOULD_SPEAK → LLM_PROVIDER → LLM_INFERENCE → RESPONSE_TEXT → TTS → PLAYBACK
+        """
+        if not user_turn_created:
+            trace_chain = (
+                f"USER_AUDIO({user_audio}) → STT({stt}) → USER_TURN_CREATED[FALSE] "
+                f"🛑 [CHAIN TERMINATED: {termination_reason or 'NO_USER_TURN'}]"
+            )
+        elif not should_speak:
+            trace_chain = (
+                f"USER_AUDIO({user_audio}) → STT({stt}) → USER_TURN_CREATED({user_turn_id}) → "
+                f"SOCIAL_INTENT({social_intent}) → SHOULD_SPEAK[FALSE] "
+                f"🛑 [CHAIN TERMINATED: {termination_reason or 'SPEECH_SUPPRESSED'}]"
+            )
+        else:
+            trace_chain = (
+                f"USER_AUDIO({user_audio}) → STT({stt}) → USER_TURN_CREATED({user_turn_id}) → "
+                f"SOCIAL_INTENT({social_intent}) → SHOULD_SPEAK(True) → "
+                f"LLM_PROVIDER({llm_provider}) → LLM_INFERENCE({llm_inference}) → "
+                f"RESPONSE_TEXT(\"{response_text[:40]}\"...) → TTS({tts}) → PLAYBACK({playback})"
+            )
+
+        is_term = bool((not user_turn_created) or (not should_speak))
+        trace_record = {
+            "generation_id": generation_id,
+            "user_turn_id": user_turn_id,
+            "response_origin": response_origin,
+            "explicit_user_turn": user_turn_created,
+            "should_speak": should_speak,
+            "user_turn_created": user_turn_created,
+            "trace_chain": trace_chain,
+            "is_terminated": is_term,
+            "termination_reason": termination_reason if is_term else "none",
+            "llm_provider": llm_provider,
+            "tts_provider": tts,
+            "response_text": response_text,
+        }
+        self._last_response_trace = trace_record
+
+        header = "🛑 [RESPONSE TRACE TERMINATED]" if is_term else "🔗 [RESPONSE TRACE COMPLETE]"
+        self.get_logger().info(
+            f"{header}\n"
+            f"  generation_id: {generation_id}\n"
+            f"  user_turn_id: {user_turn_id}\n"
+            f"  response_origin: {response_origin}\n"
+            f"  explicit_user_turn: {user_turn_created}\n"
+            f"  should_speak: {should_speak}\n"
+            f"  trace: {trace_chain}"
+        )
+        return trace_record
+
     @staticmethod
     def validate_session_update_schema(payload: Dict[str, Any]) -> Tuple[bool, str]:
         """Validates session.update payload against OpenAI Realtime API requirements."""
@@ -6385,6 +6455,22 @@ class AstroRealtimeNode(Node):
                     self.get_logger().info(
                         f"🛑 [No User Turn Dropped]: \"{raw_transcript}\" -> No wake word and no active conversation session (explicit_user_turn=False, 0 LLM / 0 TTS)."
                     )
+                    self.emit_response_trace(
+                        generation_id=self._fallback_generation_id,
+                        user_turn_id=f"turn_{self._fallback_generation_id}",
+                        user_audio=f"{len(raw_pcm)}B",
+                        stt=f"groq_whisper: '{raw_transcript}'",
+                        user_turn_created=False,
+                        social_intent="none",
+                        should_speak=False,
+                        llm_provider="none",
+                        llm_inference="none",
+                        response_text="",
+                        tts="none",
+                        playback="none",
+                        response_origin="none",
+                        termination_reason="NO_EXPLICIT_USER_TURN",
+                    )
                     self._is_processing_fallback = False
                     self._is_responding = False
                     return
@@ -6618,8 +6704,35 @@ class AstroRealtimeNode(Node):
                     rt_f_reason = "quota_exhausted" if getattr(self, "_fallback_mode", False) else "none"
 
                 synth_fin = bool(dur_synth_ms > 0 or played)
+                u_turn_id = f"turn_{self._fallback_generation_id}"
+                soc_ctx = getattr(self, "_last_social_context", None)
+                intent_val = getattr(soc_ctx, "user_intent", "DIALOGUE") if soc_ctx else "DIALOGUE"
+                explicit_turn = getattr(self, "_current_turn_explicit_user_turn", False)
+                should_spk = getattr(soc_dec, "should_speak", True) if soc_dec else True
+
+                trace_rec = self.emit_response_trace(
+                    generation_id=self._fallback_generation_id,
+                    user_turn_id=u_turn_id,
+                    user_audio=f"{len(raw_pcm)}B" if raw_pcm else "direct_text",
+                    stt=f"verified: '{user_text}'",
+                    user_turn_created=explicit_turn,
+                    social_intent=str(getattr(intent_val, "value", intent_val)),
+                    should_speak=should_spk,
+                    llm_provider=chosen_provider,
+                    llm_inference=f"{int(llm_inference_duration_ms)}ms",
+                    response_text=rep_text,
+                    tts=active_engine,
+                    playback="STARTED" if played else "NONE",
+                    response_origin=origin,
+                )
+
                 telem = {
                     "generation_id": self._fallback_generation_id,
+                    "user_turn_id": u_turn_id,
+                    "response_origin": origin,
+                    "explicit_user_turn": explicit_turn,
+                    "should_speak": should_spk,
+                    "response_trace": trace_rec.get("trace_chain", ""),
                     "realtime_state": rt_s_val,
                     "realtime_failure_reason": rt_f_reason,
                     "requested_provider": req_p,
@@ -6644,6 +6757,10 @@ class AstroRealtimeNode(Node):
                 self.get_logger().info(
                     f"[Turn Telemetry]\n"
                     f"generation_id={self._fallback_generation_id}\n"
+                    f"user_turn_id={u_turn_id}\n"
+                    f"response_origin={origin}\n"
+                    f"explicit_user_turn={explicit_turn}\n"
+                    f"should_speak={should_spk}\n"
                     f"realtime_state={rt_s_val}\n"
                     f"realtime_failure_reason={rt_f_reason}\n"
                     f"requested_provider={req_p}\n"
@@ -6844,6 +6961,24 @@ class AstroRealtimeNode(Node):
                 gate_reason = getattr(soc_dec, "initiative_reason", "gate_closed" if not should_speak else "no_explicit_turn") if soc_dec else "gate_closed"
                 self.get_logger().info(
                     f"🛑 [InteractionGate Hard Block]: Sözel yanıt engellendi (should_speak={should_speak}, explicit_user_turn={explicit_user_turn}, mode={gate_mode}, reason={gate_reason}) — 0 LLM / 0 TTS."
+                )
+                soc_ctx = getattr(self, "_last_social_context", None)
+                intent_val = getattr(soc_ctx, "user_intent", "UNKNOWN") if soc_ctx else "UNKNOWN"
+                self.emit_response_trace(
+                    generation_id=self._fallback_generation_id,
+                    user_turn_id=f"turn_{self._fallback_generation_id}",
+                    user_audio=f"{len(raw_pcm)}B" if raw_pcm else "direct_text",
+                    stt=f"verified: '{user_text}'",
+                    user_turn_created=explicit_user_turn,
+                    social_intent=str(getattr(intent_val, "value", intent_val)),
+                    should_speak=should_speak,
+                    llm_provider="none",
+                    llm_inference="none",
+                    response_text="",
+                    tts="none",
+                    playback="none",
+                    response_origin="none",
+                    termination_reason=f"GATE_CLOSED_{gate_mode}_{gate_reason}",
                 )
                 self.state_machine.transition_to(RobotState.LISTENING if not self.is_in_quiet_or_sleep_state() else RobotState.DEEP_IDLE)
                 return
