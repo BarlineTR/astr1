@@ -6708,7 +6708,8 @@ class AstroRealtimeNode(Node):
                 soc_ctx = getattr(self, "_last_social_context", None)
                 intent_val = getattr(soc_ctx, "user_intent", "DIALOGUE") if soc_ctx else "DIALOGUE"
                 explicit_turn = getattr(self, "_current_turn_explicit_user_turn", False)
-                should_spk = getattr(soc_dec, "should_speak", True) if soc_dec else True
+                soc_dec_cur = getattr(self, "_last_social_decision", None)
+                should_spk = getattr(soc_dec_cur, "should_speak", True) if soc_dec_cur else True
 
                 trace_rec = self.emit_response_trace(
                     generation_id=self._fallback_generation_id,

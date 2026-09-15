@@ -62,6 +62,11 @@ class LocalGemmaModelUnavailableError(LocalGemmaError):
     pass
 
 
+class LocalGemmaEmptyResponseError(LocalGemmaError):
+    """Raised when server returns empty content or only reasoning/whitespace."""
+    pass
+
+
 class LocalGemmaClient:
     """Zero-cloud client for local Gemma 4 E2B Q4_K_S served by llama.cpp."""
 
@@ -78,7 +83,8 @@ class LocalGemmaClient:
         self.first_token_timeout_s = float(first_token_timeout_s if first_token_timeout_s is not None else DEFAULT_FIRST_TOKEN_TIMEOUT_S)
         self._log = logger or (lambda lvl, msg: None)
         self.model_name = model_name or os.getenv("LOCAL_GEMMA_MODEL", "gemma-4-E2B-it-Q4_K_S")
-        self.completion_url = f"{self.base_url}/completion"
+        self.completion_url = f"{self.base_url}/v1/chat/completions"
+        self.chat_url = self.completion_url
         self.health_url = f"{self.base_url}/health"
         self._last_health_status: bool = False
         self._last_health_check_ts: float = 0.0
@@ -133,25 +139,39 @@ class LocalGemmaClient:
 
     def generate(
         self,
-        prompt: str,
+        prompt: Any,
         n_predict: int = DEFAULT_N_PREDICT,
         temperature: float = DEFAULT_TEMPERATURE,
         timeout: Optional[float] = None,
     ) -> str:
-        """Synchronously generates text from llama.cpp `/completion`.
+        """Synchronously generates text from llama.cpp `/v1/chat/completions`.
 
-        Payload matches exact llama.cpp specification.
+        Payload matches exact OpenAI /v1/chat/completions specification with
+        chat_template_kwargs.enable_thinking = false to disable Gemma 4 thinking
+        for deterministic, concise social responses.
         """
-        if not prompt or not prompt.strip():
-            return ""
+        if isinstance(prompt, str):
+            if not prompt or not prompt.strip():
+                return ""
+            messages = [{"role": "user", "content": prompt}]
+        elif isinstance(prompt, list):
+            if not prompt:
+                return ""
+            messages = prompt
+        else:
+            messages = [{"role": "user", "content": str(prompt)}]
 
         effective_timeout = float(timeout or self.timeout_s)
         payload: Dict[str, Any] = {
-            "prompt": prompt,
+            "model": self.model_name,
+            "messages": messages,
             "n_predict": int(n_predict),
+            "max_tokens": int(n_predict),
             "temperature": float(temperature),
             "stream": False,
-            "cache_prompt": True,
+            "chat_template_kwargs": {
+                "enable_thinking": False
+            },
         }
 
         req = urllib.request.Request(
@@ -177,10 +197,22 @@ class LocalGemmaClient:
                 except Exception as jde:
                     raise LocalGemmaInvalidResponseError(f"Malformed JSON: {jde}") from jde
 
-                content = data.get("content", "")
+                content = ""
+                choices = data.get("choices")
+                if choices and isinstance(choices, list) and len(choices) > 0:
+                    first_choice = choices[0]
+                    msg = first_choice.get("message", {})
+                    # Strict: ONLY message.content, reasoning_content is ignored and discarded
+                    content = msg.get("content") or ""
+                elif "content" in data:
+                    content = data.get("content") or ""
+
+                if not content or not str(content).strip():
+                    raise LocalGemmaEmptyResponseError("Local Gemma returned empty response content")
+
                 elapsed_ms = (time.perf_counter() - t_start) * 1000.0
                 self._safe_log("debug", f"LocalGemma generate finished in {elapsed_ms:.1f}ms")
-                return str(content)
+                return str(content).strip()
         except urllib.error.HTTPError as http_err:
             code = http_err.code
             body = http_err.read().decode("utf-8", errors="ignore")
@@ -201,7 +233,7 @@ class LocalGemmaClient:
 
     def stream(
         self,
-        prompt: str,
+        prompt: Any,
         n_predict: int = DEFAULT_N_PREDICT,
         temperature: float = DEFAULT_TEMPERATURE,
         timeout: Optional[float] = None,
@@ -209,19 +241,32 @@ class LocalGemmaClient:
     ) -> Generator[str, None, None]:
         """Streams text chunks via SSE (`data: {...}`, `[DONE]`, `stop: true`).
 
-        Yields individual token strings as they arrive from llama-server.
+        Enforces chat_template_kwargs: {"enable_thinking": False}.
+        Yields ONLY delta.content, strictly discarding delta.reasoning_content.
         """
-        if not prompt or not prompt.strip():
-            return
+        if isinstance(prompt, str):
+            if not prompt or not prompt.strip():
+                return
+            messages = [{"role": "user", "content": prompt}]
+        elif isinstance(prompt, list):
+            if not prompt:
+                return
+            messages = prompt
+        else:
+            messages = [{"role": "user", "content": str(prompt)}]
 
         effective_timeout = float(timeout or self.timeout_s)
         effective_first_token_timeout = float(first_token_timeout or self.first_token_timeout_s or effective_timeout)
         payload: Dict[str, Any] = {
-            "prompt": prompt,
+            "model": self.model_name,
+            "messages": messages,
             "n_predict": int(n_predict),
+            "max_tokens": int(n_predict),
             "temperature": float(temperature),
             "stream": True,
-            "cache_prompt": True,
+            "chat_template_kwargs": {
+                "enable_thinking": False
+            },
         }
 
         req = urllib.request.Request(
@@ -267,12 +312,24 @@ class LocalGemmaClient:
                     except json.JSONDecodeError as jde:
                         raise LocalGemmaInvalidResponseError(f"Malformed SSE JSON: {data_str}") from jde
 
-                    token = chunk_json.get("content", "")
-                    if token:
-                        yield token
-
-                    if chunk_json.get("stop", False):
-                        break
+                    token = ""
+                    choices = chunk_json.get("choices")
+                    if choices and isinstance(choices, list) and len(choices) > 0:
+                        first_choice = choices[0]
+                        delta = first_choice.get("delta", {})
+                        # Strictly yield only delta.content, never delta.reasoning_content
+                        token = delta.get("content") or ""
+                        finish_reason = first_choice.get("finish_reason")
+                        if token:
+                            yield token
+                        if finish_reason is not None:
+                            break
+                    else:
+                        token = chunk_json.get("content", "")
+                        if token:
+                            yield token
+                        if chunk_json.get("stop", False):
+                            break
         except (socket.timeout, TimeoutError) as t_err:
             raise LocalGemmaTimeoutError(f"Stream read timed out after {effective_timeout}s: {t_err}") from t_err
         except LocalGemmaError:

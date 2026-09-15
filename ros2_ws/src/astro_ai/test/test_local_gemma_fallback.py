@@ -37,6 +37,7 @@ from astro_ai.local_gemma_client import (
     LocalGemmaHTTPError,
     LocalGemmaInvalidResponseError,
     LocalGemmaModelUnavailableError,
+    LocalGemmaEmptyResponseError,
 )
 from astro_ai.provider_registry import (
     ProviderRegistry,
@@ -74,25 +75,104 @@ class TestLocalGemmaClient(unittest.TestCase):
     def test_generate_sync(self, mock_urlopen):
         mock_resp = MagicMock()
         mock_resp.status = 200
-        mock_resp.read.return_value = json.dumps({"content": "Merhaba dünya!"}).encode("utf-8")
+        mock_resp.read.return_value = json.dumps({
+            "choices": [{"message": {"role": "assistant", "content": "Merhaba dünya!"}}]
+        }).encode("utf-8")
         mock_resp.__enter__.return_value = mock_resp
         mock_urlopen.return_value = mock_resp
 
         result = self.client.generate("Selam")
         self.assertEqual(result, "Merhaba dünya!")
 
-        # Verify request parameters
+        # Verify request parameters match /v1/chat/completions and disable thinking
         req = mock_urlopen.call_args[0][0]
-        self.assertEqual(req.full_url, "http://127.0.0.1:8080/completion")
+        self.assertEqual(req.full_url, "http://127.0.0.1:8080/v1/chat/completions")
         body = json.loads(req.data.decode("utf-8"))
-        self.assertEqual(body["prompt"], "Selam")
-        self.assertEqual(body["n_predict"], 28)
+        self.assertEqual(body["messages"], [{"role": "user", "content": "Selam"}])
+        self.assertEqual(body["chat_template_kwargs"], {"enable_thinking": False})
         self.assertEqual(body["temperature"], 0.2)
         self.assertFalse(body["stream"])
 
     def test_generate_empty_prompt(self):
         self.assertEqual(self.client.generate(""), "")
         self.assertEqual(self.client.generate("   "), "")
+
+    @patch("urllib.request.urlopen")
+    def test_chat_template_kwargs_enable_thinking_false(self, mock_urlopen):
+        """Verifies request payload explicitly sets enable_thinking=False."""
+        mock_resp = MagicMock()
+        mock_resp.status = 200
+        mock_resp.read.return_value = json.dumps({
+            "choices": [{"message": {"role": "assistant", "content": "Test"}}]
+        }).encode("utf-8")
+        mock_resp.__enter__.return_value = mock_resp
+        mock_urlopen.return_value = mock_resp
+
+        self.client.generate("Deneme")
+        req = mock_urlopen.call_args[0][0]
+        body = json.loads(req.data.decode("utf-8"))
+        self.assertIn("chat_template_kwargs", body)
+        self.assertFalse(body["chat_template_kwargs"]["enable_thinking"])
+
+    @patch("urllib.request.urlopen")
+    def test_response_parsing_ignores_reasoning_content(self, mock_urlopen):
+        """Verifies reasoning_content is never returned and only content is extracted."""
+        mock_resp = MagicMock()
+        mock_resp.status = 200
+        mock_resp.read.return_value = json.dumps({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "reasoning_content": "Düşünüyorum, kullanıcı selam verdi...",
+                    "content": "Merhaba! Nasıl yardımcı olabilirim?"
+                }
+            }]
+        }).encode("utf-8")
+        mock_resp.__enter__.return_value = mock_resp
+        mock_urlopen.return_value = mock_resp
+
+        res = self.client.generate("Selam")
+        self.assertEqual(res, "Merhaba! Nasıl yardımcı olabilirim?")
+        self.assertNotIn("Düşünüyorum", res)
+
+    @patch("urllib.request.urlopen")
+    def test_empty_content_raises_empty_response_error(self, mock_urlopen):
+        """Verifies empty content (or only reasoning_content) raises LocalGemmaEmptyResponseError."""
+        mock_resp = MagicMock()
+        mock_resp.status = 200
+        mock_resp.read.return_value = json.dumps({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "reasoning_content": "Max tokens reached during thinking...",
+                    "content": ""
+                }
+            }]
+        }).encode("utf-8")
+        mock_resp.__enter__.return_value = mock_resp
+        mock_urlopen.return_value = mock_resp
+
+        with self.assertRaises(LocalGemmaEmptyResponseError):
+            self.client.generate("Soru")
+
+    @patch("urllib.request.urlopen")
+    def test_stream_discards_reasoning_content(self, mock_urlopen):
+        """Verifies stream yields ONLY delta.content and strictly ignores delta.reasoning_content."""
+        sse_data = [
+            b"data: {\"choices\": [{\"delta\": {\"reasoning_content\": \"Gizli mantik\"}, \"finish_reason\": null}]}\n\n",
+            b"data: {\"choices\": [{\"delta\": {\"content\": \"Evet\"}, \"finish_reason\": null}]}\n\n",
+            b"data: {\"choices\": [{\"delta\": {\"content\": \", hazirim.\"}, \"finish_reason\": \"stop\"}]}\n\n",
+            b"data: [DONE]\n\n",
+        ]
+        mock_resp = MagicMock()
+        mock_resp.status = 200
+        mock_resp.__iter__.return_value = iter(sse_data)
+        mock_resp.__enter__.return_value = mock_resp
+        mock_urlopen.return_value = mock_resp
+
+        chunks = list(self.client.stream("Hazir misin?"))
+        self.assertEqual(chunks, ["Evet", ", hazirim."])
+        self.assertNotIn("Gizli mantik", "".join(chunks))
 
     @patch("urllib.request.urlopen")
     def test_stream_sse_parsing(self, mock_urlopen):
@@ -127,7 +207,7 @@ class TestLocalGemmaClient(unittest.TestCase):
     @patch("urllib.request.urlopen")
     def test_stream_http_503_unavailable(self, mock_urlopen):
         mock_err = urllib.error.HTTPError(
-            url="http://127.0.0.1:8080/completion",
+            url="http://127.0.0.1:8080/v1/chat/completions",
             code=503,
             msg="Service Unavailable",
             hdrs={},
