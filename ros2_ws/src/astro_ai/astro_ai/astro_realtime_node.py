@@ -198,17 +198,23 @@ try:
     from astro_ai.brain.cognitive_loop import CognitiveLoop
     from astro_ai.contracts.person_state import UnifiedPersonState
     from astro_ai.spatial.lidar_tracker import LidarTracker
+    from astro_ai.brain.attention_manager import AttentionManager
+    from astro_ai.contracts.interaction_gate_types import IdentityCertainty
 except ImportError:
     try:
         from brain.social_brain import SocialBrain
         from brain.cognitive_loop import CognitiveLoop
         from contracts.person_state import UnifiedPersonState
         from spatial.lidar_tracker import LidarTracker
+        from brain.attention_manager import AttentionManager
+        from contracts.interaction_gate_types import IdentityCertainty
     except ImportError:
         SocialBrain = None
         CognitiveLoop = None
         UnifiedPersonState = None
         LidarTracker = None
+        AttentionManager = None
+        IdentityCertainty = None
 
 
 
@@ -7412,6 +7418,7 @@ class AstroRealtimeNode(Node):
             now = time.monotonic()
             with self._lock:
                 self._recognized_person = data
+                self._last_vision_faces_time = now
                 if data.get("is_known") and data.get("confidence", 0.0) >= 0.45:
                     if self._is_sleeping:
                         self._wake_up()
@@ -7647,7 +7654,7 @@ class AstroRealtimeNode(Node):
     def resolve_identities(self) -> Dict[str, Any]:
         """Separates and resolves:
         - SESSION_IDENTITY: Default user for context, system prompt, and memory retrieval.
-        - BIOMETRIC_IDENTITY: Person genuinely verified by acoustic voice recognition / face sensor.
+        - BIOMETRIC_IDENTITY: Person genuinely verified by multimodal fusion (face + voice).
         - ACTIVE_HOLD: Temporary continuation hint of previous speaker during multi-turn dialogue.
         """
         now = time.monotonic()
@@ -7664,18 +7671,74 @@ class AstroRealtimeNode(Node):
             held_name = getattr(self, "_active_person_name", "")
             hold_until = getattr(self, "_person_hold_until", 0.0)
 
-        # 1. BIOMETRIC IDENTITY (Acoustic / Visual Ground Truth)
+        # Visual freshness check: face evidence expires if older than visual_evidence_ttl_s
+        is_face_fresh = self.is_visual_evidence_fresh(now=now) if hasattr(self, "is_visual_evidence_fresh") else True
+
+        # Extract multimodal candidate evidence
+        f_name = None
+        f_conf = 0.0
+        if is_face_fresh and face:
+            raw_f = face.get("name") or face.get("recognized_name")
+            if raw_f and str(raw_f).strip().lower() != "misafir":
+                f_name = str(raw_f).strip()
+                f_conf = float(face.get("confidence", 0.0))
+
+        v_name = None
+        v_conf = 0.0
+        if spk:
+            raw_v = spk.get("name")
+            if raw_v and str(raw_v).strip().lower() != "misafir":
+                v_name = str(raw_v).strip()
+                v_conf = float(spk.get("confidence", 0.0))
+
+        # Evaluate multimodal identity fusion via AttentionManager
+        att_mgr = None
+        if hasattr(self, "social_brain") and self.social_brain and hasattr(self.social_brain, "attention_manager"):
+            att_mgr = self.social_brain.attention_manager
+        elif AttentionManager is not None:
+            att_mgr = AttentionManager()
+
+        if att_mgr is not None:
+            cert, fused_name = att_mgr.evaluate_identity_certainty(
+                face_name=f_name,
+                face_confidence=f_conf,
+                voice_name=v_name,
+                voice_confidence=v_conf,
+            )
+        else:
+            cert = IdentityCertainty.UNKNOWN if IdentityCertainty else "UNKNOWN"
+            fused_name = None
+
+        # 1. BIOMETRIC IDENTITY (Multimodal Sensor Fusion)
         bio_id = "unknown"
         bio_source = "none"
         bio_conf = 0.0
-        if spk.get("is_known") and spk.get("confidence", 0.0) >= 0.40 and spk.get("name", "").lower() != "misafir":
-            bio_id = spk.get("name")
-            bio_source = "voice"
-            bio_conf = float(spk.get("confidence", 0.0))
-        elif face.get("is_known") and face.get("confidence", 0.0) >= 0.45 and face.get("name", "").lower() != "misafir":
-            bio_id = face.get("name")
-            bio_source = "face"
-            bio_conf = float(face.get("confidence", 0.0))
+        bio_status = "unknown"
+
+        is_conflict = (cert == IdentityCertainty.AMBIGUOUS) if IdentityCertainty else (str(cert).upper() == "AMBIGUOUS")
+        is_known_cert = (cert == IdentityCertainty.KNOWN) if IdentityCertainty else (str(cert).upper() == "KNOWN")
+        is_probable_cert = (cert == IdentityCertainty.PROBABLE) if IdentityCertainty else (str(cert).upper() == "PROBABLE")
+
+        if is_conflict:
+            bio_id = "ambiguous_conflict"
+            bio_source = "conflict"
+            bio_conf = max(f_conf, v_conf)
+            bio_status = "ambiguous"
+        elif (is_known_cert or is_probable_cert) and fused_name:
+            bio_id = fused_name
+            bio_status = "verified" if is_known_cert else "probable"
+            if f_name and v_name and f_name.lower() == v_name.lower():
+                bio_source = "fused_multimodal"
+                bio_conf = max(f_conf, v_conf)
+            elif v_name and v_name.lower() == fused_name.lower():
+                bio_source = "voice"
+                bio_conf = v_conf
+            elif f_name and f_name.lower() == fused_name.lower():
+                bio_source = "face"
+                bio_conf = f_conf
+            else:
+                bio_source = "multimodal"
+                bio_conf = max(f_conf, v_conf)
 
         # 2. ACTIVE HOLD (Continuation Hint)
         has_active_hold = bool(now < hold_until and held_name and held_name.lower() != "misafir")
@@ -7687,10 +7750,14 @@ class AstroRealtimeNode(Node):
             owner_name = self.memory.profile.data.get("owner_name", "Baran")
 
         # 4. SESSION IDENTITY RESOLUTION (Final effective user for context and memory)
-        if bio_id != "unknown":
+        if is_conflict:
+            # Cross-modal conflict strictly forces guest fallback for safety
+            user_name = "Misafir"
+            user_source = "biometric_conflict_guest"
+            is_known = False
+        elif bio_id != "unknown":
             user_name = bio_id
             user_source = f"biometric_{bio_source}"
-            bio_status = "verified"
             is_known = True
         elif has_active_hold:
             user_name = held_name
@@ -7707,6 +7774,8 @@ class AstroRealtimeNode(Node):
             user_source = "guest_fallback"
             bio_status = "unknown"
             is_known = False
+
+        certainty_val = cert.value if hasattr(cert, "value") else str(cert)
 
         identity_dict = {
             # 1. SESSION IDENTITY (Context / System Prompt / Memory)
@@ -7725,6 +7794,7 @@ class AstroRealtimeNode(Node):
             "biometric_source": bio_source,
             "biometric_status": bio_status,
             "biometric_confidence": bio_conf,
+            "identity_certainty": certainty_val,
 
             # 3. ACTIVE HOLD (Multi-turn continuation hint)
             "active_hold_speaker": held_name if has_active_hold else "",
