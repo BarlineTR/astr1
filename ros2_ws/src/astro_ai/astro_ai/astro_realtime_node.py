@@ -1941,9 +1941,12 @@ class AstroRealtimeNode(Node):
                     social_context_str = f"\n\n[SOSYAL ROBOT BİLİŞSEL BAĞLAMI]:\n{brain_prompt}\n"
                 intent_raw = getattr(soc_ctx, "user_intent", getattr(soc_ctx, "intent", "UNKNOWN"))
                 intent_val = intent_raw.value if hasattr(intent_raw, "value") else str(intent_raw)
-                directive_raw = getattr(soc_dec, "directive", getattr(soc_dec, "initiative_reason", "RESPOND"))
+                from astro_ai.contracts.social_context import SocialAction
+                directive_raw = getattr(soc_dec, "directive", getattr(soc_dec, "initiative_reason", "observe"))
                 directive_val = directive_raw.value if hasattr(directive_raw, "value") else str(directive_raw)
-                action_raw = getattr(soc_dec, "action", getattr(soc_dec, "should_speak", True))
+                action_raw = getattr(soc_dec, "action", None)
+                if action_raw is None or isinstance(action_raw, bool):
+                    action_raw = SocialAction.DIALOGUE_RESPONSE if (getattr(soc_dec, "should_speak", False) and explicit_user_turn) else SocialAction.OBSERVE
                 action_val = action_raw.value if hasattr(action_raw, "value") else str(action_raw)
                 self.get_logger().info(
                     f"🧠 [SocialBrain Turn] focus={person.name} | intent={intent_val} | directive={directive_val} | action={action_val}"

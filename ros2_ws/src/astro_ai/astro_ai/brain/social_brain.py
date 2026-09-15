@@ -4,6 +4,7 @@ Integrates Perception, World Model, Self Model, Memory V2, Intent, Emotion,
 Attention, Relationship Evolution, Social FSM, Initiative, and Response Planning.
 """
 
+import re
 import threading
 import time
 from typing import Any, Dict, List, Optional, Tuple
@@ -39,7 +40,7 @@ from astro_ai.contracts.intent_emotion_types import (
     RelationshipRole,
 )
 from astro_ai.contracts.person_state import UnifiedPersonState
-from astro_ai.contracts.social_context import SocialContext, SocialDecision
+from astro_ai.contracts.social_context import SocialAction, SocialContext, SocialDecision
 from astro_ai.memory_v2.autobiographical_memory import AutobiographicalMemory
 from astro_ai.memory_v2.consolidation_engine import ConsolidationEngine
 from astro_ai.memory_v2.episodic_memory import EpisodicMemoryV2
@@ -129,13 +130,18 @@ class SocialBrain:
         active_persona: str = "playful",
         acoustic_energy_rms: float = 500.0,
         is_quiet_mode: bool = False,
-        explicit_user_turn: bool = False,
+        explicit_user_turn: Optional[bool] = None,
     ) -> Tuple[SocialContext, SocialDecision, str]:
         """Executes full cognitive reasoning loop for an incoming dialogue turn.
 
         Returns (SocialContext, SocialDecision, StructuredSystemPrompt).
         """
         with self._lock:
+            # Resolve explicit_user_turn if not explicitly provided
+            if explicit_user_turn is None:
+                ut_lower = (user_text or "").lower().strip()
+                has_wake = bool(re.search(r"\b(astro|hey astro|selam astro|uyan)\b", ut_lower))
+                explicit_user_turn = bool(has_wake or (person_state and getattr(person_state, "is_speaking", False)))
             # 1. Identity & Attention Resolution
             person = person_state or self.spatial_fusion.get_fused_primary_person()
             p_name = person.name if person else "Misafir"
@@ -232,6 +238,7 @@ class SocialBrain:
                 suppress_greeting=suppress_greet,
                 target_age_group=age_group.value,
                 persona_adaptation_instruction=persona_policy.policy_prompt_instruction,
+                explicit_user_turn=explicit_user_turn,
             )
 
             # 7. Cognitive & Metacognitive Integration (Phase 5)
@@ -307,9 +314,24 @@ class SocialBrain:
                 decision.response_strategy.append(compliment_dec.prompt_directive)
             decision.gate_mode = gate_decision.mode.value
             decision.gate_instruction = gate_decision.gating_prompt_instruction
-            if not gate_decision.should_respond_verbally:
+
+            # Strict FIX 4 Semantics:
+            # dialogue_response and should_speak=True can ONLY occur on a validated user turn
+            if not explicit_user_turn:
                 decision.should_speak = False
+                decision.action = SocialAction.REMAIN_QUIET if is_quiet_mode else SocialAction.OBSERVE
+                decision.directive = "remain_quiet" if is_quiet_mode else "observe"
+                decision.initiative_reason = "PERCEPTION_STIMULUS_NO_USER_TURN"
+            elif not gate_decision.should_respond_verbally:
+                decision.should_speak = False
+                decision.action = SocialAction.REMAIN_QUIET if is_quiet_mode else SocialAction.OBSERVE
+                decision.directive = "remain_quiet" if is_quiet_mode else "observe"
                 decision.initiative_reason = f"GATE_{gate_decision.mode.value}_{gate_decision.reason}"
+            else:
+                decision.should_speak = True
+                decision.action = SocialAction.DIALOGUE_RESPONSE
+                decision.directive = "dialogue_response"
+                decision.initiative_reason = "dialogue_response"
 
             # 9. Construct Modular System Prompt
             prompt = self._build_modular_prompt(
@@ -337,6 +359,43 @@ class SocialBrain:
                 self.relationship_manager.record_turn_interaction(p_name, valence=affect["valence"])
 
             return context, decision, prompt
+
+    def process_perception_stimulus(
+        self,
+        stimulus_type: str,
+        person_state: Optional[UnifiedPersonState] = None,
+        is_quiet_mode: bool = False,
+    ) -> SocialDecision:
+        """Processes perception/stimulus event without initiating speech.
+
+        Perception events (person_detected, orient_to_stimulus, gaze, etc.)
+        must NEVER produce dialogue_response or should_speak=True.
+        """
+        with self._lock:
+            person = person_state or self.spatial_fusion.get_fused_primary_person()
+            stim_clean = stimulus_type.lower()
+            if is_quiet_mode:
+                action = SocialAction.REMAIN_QUIET
+                directive = "remain_quiet"
+            elif any(k in stim_clean for k in ("orient", "orient_to_stimulus", "face", "gaze", "head")):
+                action = SocialAction.ORIENT
+                directive = "orient"
+            elif any(k in stim_clean for k in ("engage", "engaged", "approach")):
+                action = SocialAction.ENGAGE
+                directive = "engage"
+            else:
+                action = SocialAction.OBSERVE
+                directive = "observe"
+
+            return SocialDecision(
+                should_speak=False,
+                initiative_reason=f"PERCEPTION_STIMULUS_{stimulus_type.upper()}",
+                target_person=person,
+                action=action,
+                directive=directive,
+                gate_mode="QUIET" if is_quiet_mode else "PERCEPTION",
+                gate_instruction="Perception stimulus only. Do not produce verbal dialogue.",
+            )
 
     def _build_modular_prompt(
         self,

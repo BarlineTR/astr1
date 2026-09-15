@@ -3,7 +3,7 @@
 from typing import Any, Dict, List
 
 from astro_ai.contracts.intent_emotion_types import IntentType, RelationshipRole
-from astro_ai.contracts.social_context import SocialContext, SocialDecision
+from astro_ai.contracts.social_context import SocialAction, SocialContext, SocialDecision
 
 
 class ResponsePlanner:
@@ -61,9 +61,16 @@ class ResponsePlanner:
             if top_fact.predicate not in ("verified_fact", "fact"):
                 strategies.append(f"Uygunsa {top_fact.subject}'in {top_fact.predicate} ({top_fact.value}) bilgisini doğal şekilde sohbete bağla")
 
+        is_quiet = getattr(context, "quiet_mode_active", False)
+        explicit_turn = getattr(context, "explicit_user_turn", True)
+
+        action = SocialAction.DIALOGUE_RESPONSE if explicit_turn else (SocialAction.REMAIN_QUIET if is_quiet else SocialAction.OBSERVE)
+        directive = "dialogue_response" if explicit_turn else ("remain_quiet" if is_quiet else "observe")
+        reason = "dialogue_response" if explicit_turn else "PERCEPTION_STIMULUS_NO_USER_TURN"
+
         return SocialDecision(
-            should_speak=True,
-            initiative_reason="dialogue_response",
+            should_speak=bool(explicit_turn),
+            initiative_reason=reason,
             response_strategy=strategies,
             suggested_tone=tone,
             recommended_verbosity=verbosity,
@@ -71,4 +78,6 @@ class ResponsePlanner:
             empathy_level=empathy,
             directness_level=directness,
             interruption_allowed=False,
+            action=action,
+            directive=directive,
         )

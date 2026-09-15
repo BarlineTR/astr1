@@ -15,7 +15,7 @@ from astro_ai.contracts.memory_models import (
     SpatialMemoryItem,
 )
 from astro_ai.contracts.person_state import UnifiedPersonState
-from astro_ai.contracts.social_context import SocialContext, SocialDecision
+from astro_ai.contracts.social_context import SocialAction, SocialContext, SocialDecision
 from astro_ai.contracts.spatial_state import (
     LidarCluster,
     LidarScanSnapshot,
@@ -36,6 +36,7 @@ __all__ = [
     "SpatialMemoryItem",
     "UnifiedPersonState",
     "SocialContext",
+    "SocialAction",
     "SocialDecision",
     "LidarCluster",
     "LidarScanSnapshot",

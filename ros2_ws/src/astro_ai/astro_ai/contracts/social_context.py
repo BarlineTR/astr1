@@ -2,6 +2,7 @@
 
 import time
 from dataclasses import dataclass, field
+from enum import Enum
 from typing import Any, Dict, List, Optional
 
 from astro_ai.contracts.intent_emotion_types import (
@@ -12,6 +13,15 @@ from astro_ai.contracts.intent_emotion_types import (
 )
 from astro_ai.contracts.memory_models import MemoryRecord
 from astro_ai.contracts.person_state import UnifiedPersonState
+
+
+class SocialAction(str, Enum):
+    """Authoritative semantic actions produced by the Social Brain."""
+    ORIENT = "orient"
+    OBSERVE = "observe"
+    REMAIN_QUIET = "remain_quiet"
+    ENGAGE = "engage"
+    DIALOGUE_RESPONSE = "dialogue_response"
 
 
 @dataclass
@@ -68,6 +78,7 @@ class SocialContext:
     # Phase 7 Quiet/Sleep Social Awareness
     quiet_mode_active: bool = False
     quiet_awareness_directive: str = ""
+    explicit_user_turn: bool = True
 
     timestamp: float = field(default_factory=time.time)
 
@@ -89,3 +100,5 @@ class SocialDecision:
     directness_level: float = 0.7          # 0.0 to 1.0
     interruption_allowed: bool = False
     cooldown_s: float = 0.0
+    action: SocialAction = SocialAction.OBSERVE
+    directive: str = "observe"
