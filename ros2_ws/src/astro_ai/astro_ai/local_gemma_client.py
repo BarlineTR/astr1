@@ -27,6 +27,10 @@ DEFAULT_FIRST_TOKEN_TIMEOUT_S = float(os.getenv("LOCAL_GEMMA_FIRST_TOKEN_TIMEOUT
 DEFAULT_N_PREDICT = int(os.getenv("LOCAL_GEMMA_N_PREDICT", "28"))
 DEFAULT_TEMPERATURE = float(os.getenv("LOCAL_GEMMA_TEMPERATURE", "0.2"))
 DEFAULT_MAX_CONTEXT_TOKENS = int(os.getenv("LOCAL_GEMMA_MAX_CONTEXT_TOKENS", "450"))
+DEFAULT_TOP_K = int(os.getenv("LOCAL_GEMMA_TOP_K", "40"))
+DEFAULT_HEALTH_CACHE_TTL_S = float(os.getenv("LOCAL_GEMMA_HEALTH_CACHE_TTL_S", "10.0"))
+DEFAULT_STOP_TOKENS = ["\nKullanıcı:", "\nUser:", "\nASTRO:", "<end_of_turn>", "<eos>"]
+
 
 
 def estimate_tokens(text: str) -> int:
@@ -200,8 +204,8 @@ class LocalGemmaClient:
             self._safe_log("debug", f"LocalGemmaClient health check failed: {exc}")
             return False
 
-    def is_available(self, cache_ttl_s: float = 2.0) -> bool:
-        """Cached availability check to prevent socket flood during high-frequency evaluation."""
+    def is_available(self, cache_ttl_s: float = DEFAULT_HEALTH_CACHE_TTL_S) -> bool:
+        """Cached availability check to prevent socket flood and redundant health probes."""
         now = time.monotonic()
         if (now - self._last_health_check_ts) < cache_ttl_s:
             return self._last_health_status
@@ -213,12 +217,15 @@ class LocalGemmaClient:
         n_predict: int = DEFAULT_N_PREDICT,
         temperature: float = DEFAULT_TEMPERATURE,
         timeout: Optional[float] = None,
+        cache_prompt: bool = True,
+        stop: Optional[list] = None,
     ) -> str:
         """Synchronously generates text from llama.cpp `/v1/chat/completions`.
 
         Payload matches exact OpenAI /v1/chat/completions specification with
         chat_template_kwargs.enable_thinking = false to disable Gemma 4 thinking
-        for deterministic, concise social responses.
+        for deterministic, concise social responses. Includes cache_prompt=True,
+        stop sequences, and top_k pruning for minimal latency on edge hardware.
         """
         if isinstance(prompt, str):
             if not prompt or not prompt.strip():
@@ -240,6 +247,9 @@ class LocalGemmaClient:
             "n_predict": int(n_predict),
             "max_tokens": int(n_predict),
             "temperature": float(temperature),
+            "top_k": DEFAULT_TOP_K,
+            "cache_prompt": bool(cache_prompt),
+            "stop": stop if stop is not None else list(DEFAULT_STOP_TOKENS),
             "stream": False,
             "chat_template_kwargs": {
                 "enable_thinking": False
@@ -252,6 +262,7 @@ class LocalGemmaClient:
             headers={
                 "Content-Type": "application/json",
                 "User-Agent": "Astro-LocalGemmaClient/1.0",
+                "Connection": "keep-alive",
             },
             method="POST",
         )
@@ -260,9 +271,13 @@ class LocalGemmaClient:
         try:
             with urllib.request.urlopen(req, timeout=effective_timeout) as resp:
                 if resp.status != 200:
+                    self._last_health_status = False
+                    self._last_health_check_ts = time.monotonic()
                     raise LocalGemmaHTTPError(resp.status, f"Unexpected status code {resp.status}")
                 raw = resp.read().decode("utf-8", errors="ignore").strip()
                 if not raw:
+                    self._last_health_status = False
+                    self._last_health_check_ts = time.monotonic()
                     raise LocalGemmaInvalidResponseError("Empty response body from llama-server")
                 try:
                     data = json.loads(raw)
@@ -282,26 +297,35 @@ class LocalGemmaClient:
                 if not content or not str(content).strip():
                     raise LocalGemmaEmptyResponseError("Local Gemma returned empty response content")
 
+                self._last_health_status = True
+                self._last_health_check_ts = time.monotonic()
                 elapsed_ms = (time.perf_counter() - t_start) * 1000.0
                 self._safe_log("debug", f"LocalGemma generate finished in {elapsed_ms:.1f}ms")
                 return str(content).strip()
         except urllib.error.HTTPError as http_err:
+            self._last_health_status = False
+            self._last_health_check_ts = time.monotonic()
             code = http_err.code
             body = http_err.read().decode("utf-8", errors="ignore")
             if code == 503 or "loading" in body.lower():
                 raise LocalGemmaModelUnavailableError(f"Model unavailable (503): {body}") from http_err
             raise LocalGemmaHTTPError(code, body) from http_err
         except urllib.error.URLError as url_err:
+            self._last_health_status = False
+            self._last_health_check_ts = time.monotonic()
             reason = getattr(url_err, "reason", None)
             if isinstance(reason, (socket.timeout, TimeoutError)) or "timed out" in str(reason).lower():
                 raise LocalGemmaTimeoutError(f"Connection timed out after {effective_timeout}s: {url_err}") from url_err
             raise LocalGemmaConnectionError(f"Cannot connect to llama-server at {self.completion_url}: {url_err}") from url_err
         except (socket.timeout, TimeoutError) as t_err:
+            self._last_health_status = False
+            self._last_health_check_ts = time.monotonic()
             raise LocalGemmaTimeoutError(f"Request timed out after {effective_timeout}s: {t_err}") from t_err
         except LocalGemmaError:
             raise
         except Exception as exc:
             raise LocalGemmaError(f"Unexpected generation error: {exc}") from exc
+
 
     def stream(
         self,
@@ -310,10 +334,13 @@ class LocalGemmaClient:
         temperature: float = DEFAULT_TEMPERATURE,
         timeout: Optional[float] = None,
         first_token_timeout: Optional[float] = None,
+        cache_prompt: bool = True,
+        stop: Optional[list] = None,
     ) -> Generator[str, None, None]:
         """Streams text chunks via SSE (`data: {...}`, `[DONE]`, `stop: true`).
 
-        Enforces chat_template_kwargs: {"enable_thinking": False}.
+        Enforces chat_template_kwargs: {"enable_thinking": False}. Includes
+        cache_prompt=True, stop sequences, and top_k pruning for minimal latency.
         Yields ONLY delta.content, strictly discarding delta.reasoning_content.
         """
         if isinstance(prompt, str):
@@ -337,6 +364,9 @@ class LocalGemmaClient:
             "n_predict": int(n_predict),
             "max_tokens": int(n_predict),
             "temperature": float(temperature),
+            "top_k": DEFAULT_TOP_K,
+            "cache_prompt": bool(cache_prompt),
+            "stop": stop if stop is not None else list(DEFAULT_STOP_TOKENS),
             "stream": True,
             "chat_template_kwargs": {
                 "enable_thinking": False
@@ -349,26 +379,37 @@ class LocalGemmaClient:
             headers={
                 "Content-Type": "application/json",
                 "User-Agent": "Astro-LocalGemmaClient/1.0",
+                "Connection": "keep-alive",
             },
             method="POST",
         )
 
         try:
             resp = urllib.request.urlopen(req, timeout=effective_first_token_timeout)
+            self._last_health_status = True
+            self._last_health_check_ts = time.monotonic()
         except urllib.error.HTTPError as http_err:
+            self._last_health_status = False
+            self._last_health_check_ts = time.monotonic()
             code = http_err.code
             body = http_err.read().decode("utf-8", errors="ignore")
             if code == 503 or "loading" in body.lower():
                 raise LocalGemmaModelUnavailableError(f"Model unavailable (503): {body}") from http_err
             raise LocalGemmaHTTPError(code, body) from http_err
         except urllib.error.URLError as url_err:
+            self._last_health_status = False
+            self._last_health_check_ts = time.monotonic()
             reason = getattr(url_err, "reason", None)
             if isinstance(reason, (socket.timeout, TimeoutError)) or "timed out" in str(reason).lower():
                 raise LocalGemmaTimeoutError(f"Connection timed out after {effective_first_token_timeout}s: {url_err}") from url_err
             raise LocalGemmaConnectionError(f"Cannot connect to llama-server at {self.completion_url}: {url_err}") from url_err
         except (socket.timeout, TimeoutError) as t_err:
+            self._last_health_status = False
+            self._last_health_check_ts = time.monotonic()
             raise LocalGemmaTimeoutError(f"Request timed out after {effective_first_token_timeout}s: {t_err}") from t_err
         except Exception as exc:
+            self._last_health_status = False
+            self._last_health_check_ts = time.monotonic()
             raise LocalGemmaConnectionError(f"Failed to open stream: {exc}") from exc
 
         try:

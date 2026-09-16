@@ -204,5 +204,36 @@ class TestTargetedPerformanceRepair(unittest.TestCase):
         self.assertEqual(intent, IntentType.ACTIVITY_QUERY)
 
 
+    @patch("urllib.request.urlopen")
+    def test_problem_3_local_gemma_latency_optimizations_payload_and_caching(self, mock_urlopen):
+        client = LocalGemmaClient(base_url="http://127.0.0.1:8080")
+        mock_resp = MagicMock()
+        mock_resp.status = 200
+        mock_resp.__iter__.return_value = [
+            b'data: {"choices": [{"delta": {"content": "Merhaba!"}, "finish_reason": "stop"}]}\n\n',
+            b'data: [DONE]\n\n',
+        ]
+        mock_resp.__enter__.return_value = mock_resp
+        mock_urlopen.return_value = mock_resp
+
+        tokens = list(client.stream("Selam"))
+        self.assertEqual(tokens, ["Merhaba!"])
+
+        # Verify optimized payload sent to llama-server
+        req = mock_urlopen.call_args[0][0]
+        payload = json.loads(req.data.decode("utf-8"))
+        self.assertTrue(payload.get("cache_prompt"))
+        self.assertIn("stop", payload)
+        self.assertIn("\nKullanıcı:", payload["stop"])
+        self.assertIn("<end_of_turn>", payload["stop"])
+        self.assertEqual(payload.get("top_k"), 40)
+        self.assertEqual(req.headers.get("Connection"), "keep-alive")
+
+        # Verify client health status was cached after successful streaming
+        self.assertTrue(client.is_available())
+        # No extra urlopen call for /health was needed because health was refreshed by inference
+        self.assertEqual(mock_urlopen.call_count, 1)
+
+
 if __name__ == "__main__":
     unittest.main()
