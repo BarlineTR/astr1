@@ -266,6 +266,14 @@ def _load_env():
     Aday listesi tts_node/ai_brain_node ile aynı; son çare find_dotenv(usecwd=True)
     CWD'den yukarı doğru yürüdüğü için ros2_ws içinden çalıştırıldığında da bulur.
     """
+    explicit_profile = os.getenv("ASTRO_ENV_FILE", "").strip()
+    if explicit_profile:
+        explicit_profile = os.path.abspath(os.path.expanduser(explicit_profile))
+        if not os.path.isfile(explicit_profile):
+            raise FileNotFoundError(f"ASTRO_ENV_FILE bulunamadı: {explicit_profile}")
+        load_dotenv(dotenv_path=explicit_profile, override=True)
+        return explicit_profile
+
     # Test sürecinde .env YÜKLENMEZ. Bu düğüm gerçek bir anahtar bulduğu anda
     # websocket'i açıyor, discover_realtime_models() ile OpenAI'a HTTPS isteği
     # atıyor ve idle-learning döngüsünü başlatıyor. Testler düğümü onlarca kez
@@ -649,6 +657,9 @@ class AstroRealtimeNode(Node):
         # _load_env() anahtarlar OKUNMADAN ÖNCE çağrılmalı; aksi halde düğüm
         # yalnızca kendisini başlatan sürecin ortamına bağımlı kalır.
         _loaded_env = _load_env()
+        self._local_stt_model = None
+        self._local_stt_lock = threading.Lock()
+        self._last_stt_provider = "none"
         self.openai_api_key = os.environ.get("OPENAI_API_KEY", "").strip("\"' \t\n\r")
         self.groq_api_key = os.environ.get("GROQ_API_KEY", "").strip("\"' \t\n\r")
         raw_gem = os.environ.get("GEMINI_API_KEY", "").strip("\"' \t\n\r")
@@ -731,7 +742,7 @@ class AstroRealtimeNode(Node):
             try:
                 db_dir = os.path.expanduser("~/.astro")
                 os.makedirs(db_dir, exist_ok=True)
-                cognitive_db_path = os.path.join(db_dir, "cognitive.db")
+                cognitive_db_path = os.path.expanduser(os.getenv("ASTRO_COGNITIVE_DB", os.path.join(db_dir, "cognitive.db")))
                 self.social_brain = SocialBrain(db_path=cognitive_db_path)
                 self.get_logger().info(f"🧠 [SocialBrain] Başlatıldı. Bilişsel veritabanı: {cognitive_db_path}")
                 if CognitiveLoop:
@@ -5743,6 +5754,9 @@ class AstroRealtimeNode(Node):
         yalnızca LLM_FALLBACK_ENABLED=true iken ve OpenAI cevap veremediğinde
         devreye girer.
         """
+        if os.getenv("STT_ENGINE", "openai").strip().lower() in ("faster-whisper", "faster_whisper"):
+            return self._transcribe_local_whisper(wav_bytes)
+
         # If OpenAI is exhausted or hard disabled, directly use Groq Whisper
         if not self._can_use_openai("stt"):
             return self._transcribe_groq_whisper(wav_bytes) or ""
@@ -5761,6 +5775,35 @@ class AstroRealtimeNode(Node):
         if result and self.groq_api_key and not getattr(self, "_fallback_mode", False):
             self.get_logger().warn("⚠️ [STT FALLBACK] OpenAI cevap vermedi, Groq Whisper kullanıldı.")
         return result or text
+
+    def _transcribe_local_whisper(self, wav_bytes: bytes) -> str:
+        """Decode real wake/dialogue audio locally, without a cloud fallback.
+
+        Called on existing STT worker threads, never on the cognitive timer.
+        Serialize lazy initialization and inference across wake candidates.
+        """
+        try:
+            with self._local_stt_lock:
+                if self._local_stt_model is None:
+                    from faster_whisper import WhisperModel
+                    model_name = os.getenv("STT_FW_MODEL", "small")
+                    device = os.getenv("STT_FW_DEVICE", "cpu")
+                    compute = os.getenv("STT_FW_COMPUTE_TYPE", "int8")
+                    self._local_stt_model = WhisperModel(model_name, device=device, compute_type=compute)
+                    self._safe_log("info", f"[STT LOCAL READY] model={model_name} device={device}")
+                started = time.monotonic()
+                segments, _ = self._local_stt_model.transcribe(
+                    io.BytesIO(wav_bytes), language="tr", beam_size=1,
+                    condition_on_previous_text=False, vad_filter=True,
+                    initial_prompt="Astro, hey Astro, merhaba Astro, robot.",
+                )
+                text = "".join(segment.text for segment in segments).strip()
+                self._last_stt_provider = "faster_whisper"
+                self._safe_log("info", f"[STT LOCAL] text={text!r} duration_ms={(time.monotonic()-started)*1000:.0f}")
+                return text
+        except Exception as exc:
+            self._safe_log("error", f"[STT LOCAL FAILED] {exc}")
+            return ""
 
     def _transcribe_groq_whisper(self, wav_bytes: bytes) -> Optional[str]:
         """Transcribes 16kHz WAV audio using free Groq Whisper Large V3 Turbo API in <200ms."""
@@ -6459,7 +6502,7 @@ class AstroRealtimeNode(Node):
                         generation_id=self._fallback_generation_id,
                         user_turn_id=f"turn_{self._fallback_generation_id}",
                         user_audio=f"{len(raw_pcm)}B",
-                        stt=f"groq_whisper: '{raw_transcript}'",
+                        stt=f"{getattr(self, '_last_stt_provider', 'unknown')}: '{raw_transcript}'",
                         user_turn_created=False,
                         social_intent="none",
                         should_speak=False,
