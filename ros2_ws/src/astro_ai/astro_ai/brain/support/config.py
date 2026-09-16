@@ -12,14 +12,20 @@ HARD SAFETY INVARIANTS:
 from __future__ import annotations
 
 import os
+import sys
 from dataclasses import dataclass
 from typing import Optional
 
-try:
-    from dotenv import load_dotenv
-    load_dotenv()
-except ImportError:
-    pass
+# Test sürecinde .env YÜKLENMEZ — astro_realtime_node._load_env ile aynı kural.
+# Bu modül import edildiği anda .env'i os.environ'a döküyordu; STT_ENGINE gibi
+# çalışma zamanı anahtarları tüm pytest sürecine sızıyor ve düğümü test modunda
+# yerel Whisper'a yönlendirip model indirmeye (ağ tripwire'ı) sokuyordu.
+if "PYTEST_CURRENT_TEST" not in os.environ and "pytest" not in sys.modules:
+    try:
+        from dotenv import load_dotenv
+        load_dotenv()
+    except ImportError:
+        pass
 
 
 def _bool_env(key: str, default: bool) -> bool:

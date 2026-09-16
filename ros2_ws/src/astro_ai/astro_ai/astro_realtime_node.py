@@ -3429,11 +3429,21 @@ class AstroRealtimeNode(Node):
                 weather_text = resp.read().decode("utf-8").strip()
             return self._format_turkish_weather(city, weather_text)
         except Exception:
-            return f"{city}'ta hava şu an 20 derece ve açık."
+            # Ağ yoksa uydurma sıcaklık söylemektense bilmediğini söyle.
+            # (Canlı testte sabit "20 derece ve açık" gerçek veriymiş gibi seslendirildi.)
+            return f"{city} için hava durumunu şu an alamıyorum."
 
     def _is_weather_query(self, text: str) -> Tuple[bool, str]:
         text_l = text.lower()
-        if any(w in text_l for w in ["hava nasıl", "hava durumu", "hava kaç derece", "havalar nasıl", "yağmur var mı", "kar var mı", "sıcaklık kaç", "hava"]):
+        # Düz "hava" alt dizesi KULLANILMAZ: bozuk transkriptler ("...senlerine hava
+        # zanaç...") ve "havaalanı/havalimanı/odanın havası" gibi cümleler LLM'i
+        # tamamen atlayıp uydurma hava raporuna düşüyordu.
+        weather_phrases = [
+            "hava nasıl", "hava durumu", "hava kaç derece", "havalar nasıl",
+            "hava ne olacak", "hava sıcak", "hava soğuk", "hava yağmurlu",
+            "yağmur var mı", "kar var mı", "sıcaklık kaç", "kaç derece",
+        ]
+        if any(w in text_l for w in weather_phrases):
             if "ahlat" in text_l or "ahlattı" in text_l or "ahlatta" in text_l:
                 return True, "Ahlat"
             if "bitlis" in text_l:
@@ -3446,6 +3456,62 @@ class AstroRealtimeNode(Node):
                 return True, "Ankara"
             return True, "Ahlat"
         return False, ""
+
+    # Yerel modda (use_realtime=false) hiçbir araç çağrısı çalışmaz; kalıcı hafızaya
+    # yazan tek yol `_execute_realtime_tool` (save_user_memory / enroll_user_biometrics)
+    # ve oraya sadece OpenAI Realtime araç çağrısıyla girilir. Bu yüzden Ollama/yerel
+    # modda "benim adım X" hiçbir zaman diske yazılmıyordu. Aşağıdaki iki yardımcı,
+    # kendini tanıtma cümlesini deterministik olarak yakalar ve profile yazar; cevabı
+    # LLM üretmeye devam eder (hazır cümle basılmaz).
+    _NAME_TOKEN = r"[A-ZÇĞİÖŞÜ][a-zçğıöşü]{1,}"
+    _NAME_STOPWORDS = {
+        "astro", "ben", "bir", "tamam", "evet", "hayır", "kimim", "şu", "bu",
+        "hey", "selam", "merhaba", "sen", "biz", "robot",
+    }
+
+    def _extract_self_introduced_name(self, text: str) -> Optional[str]:
+        """Kullanıcının kendi adını verdiği cümleden adı çıkarır, yoksa None.
+
+        Türkçe 'İ' harfi re.IGNORECASE ile güvenilir eşleşmediği için (İ.lower()
+        iki kod noktası üretir) anahtar kelimeler açıkça yazıldı.
+        """
+        if not text or not text.strip():
+            return None
+        raw = text.strip()
+        tok = self._NAME_TOKEN
+        name = None
+
+        m = re.search(rf"(?:[bB]enim\s+)?(?:[iİ]smim|[aA]d[ıiİI]m)\s+({tok}(?:\s+{tok})?)", raw)
+        if m:
+            name = m.group(1)
+        elif re.search(r"kaydet|hatırla|unutma|tanı", raw, flags=re.IGNORECASE):
+            m = re.search(rf"\b[bB]en\s+({tok}(?:\s+{tok})?)", raw)
+            if m:
+                name = m.group(1)
+
+        if not name:
+            return None
+        first = name.split()[0].lower()
+        if first in self._NAME_STOPWORDS or len(first) < 2:
+            return None
+        return name.strip()
+
+    def _learn_user_name_locally(self, text: str) -> Optional[str]:
+        """Kendini tanıtma cümlesini kalıcı profile yazar. Öğrenilen adı döndürür."""
+        name = self._extract_self_introduced_name(text)
+        if not name or not getattr(self, "memory", None):
+            return None
+        try:
+            self.memory.profile.add_known_person(name, title="Tanışılan Kişi", formal_title=name)
+            self.memory.profile.set_user_fact(name, "Ad", name)
+            # Eski ad bilgisi kalırsa prompt iki isim birden taşır; önce onu temizle.
+            self.memory.profile.remove_facts_containing("Konuştuğun kişinin adı")
+            self.memory.profile.add_verified_fact(f"Konuştuğun kişinin adı {name}.")
+            self._safe_log("info", f"🧠 [Yerel Hafıza] Kullanıcı adı kaydedildi: {name}")
+            return name
+        except Exception as exc:
+            self._safe_log("warn", f"[Yerel Hafıza] Ad kaydedilemedi: {exc}")
+            return None
 
     def _is_turn_to_sound_query(self, text: str) -> bool:
         """Detects explicit acoustic gaze orientation commands."""
@@ -4654,6 +4720,31 @@ class AstroRealtimeNode(Node):
                 self.pub_gesture.publish(gest_msg)
 
             self.state_machine.transition_to(RobotState.LISTENING)
+
+    def _flush_wake_buffer(self, reason: str = "silence"):
+        """Uyandırma tamponunu STT'ye yollar ve dinleme durumunu sıfırlar.
+
+        `reason="max_utterance"` üst sınır yolu: ses hiç susmadığı için zorla
+        boşaltma. Bu durum neredeyse her zaman mikrofon kazancının doyuma
+        girdiğini gösterir, o yüzden (en fazla 30 sn'de bir) uyarı basar.
+        """
+        buf = list(self._wake_audio_buffer)
+        self._wake_audio_buffer.clear()
+        self._wake_listening = False
+        self._wake_last_voice_time = 0.0
+        if len(buf) < 10:
+            return
+        if reason == "max_utterance":
+            now_w = time.monotonic()
+            if now_w - getattr(self, "_wake_cap_warn_time", 0.0) > 30.0:
+                self._wake_cap_warn_time = now_w
+                self._safe_log(
+                    "warn",
+                    f"⚠️ [Wake Buffer Cap] Ses {len(buf) * 0.02:.1f} sn boyunca eşiğin altına hiç inmedi "
+                    f"(ambient_rms={getattr(self, '_ambient_rms', 0.0):.0f}). Mikrofon kazancı doyuma "
+                    f"girmiş olabilir — kontrol: pactl get-source-volume @DEFAULT_SOURCE@",
+                )
+        threading.Thread(target=self._process_wake_candidate, args=(buf,), daemon=True).start()
 
     def _process_wake_candidate(self, audio_chunks: List[bytes]):
         """Processes potential wake utterance during sleep with strict wake phrase gating and full telemetry tracking."""
@@ -6826,6 +6917,11 @@ class AstroRealtimeNode(Node):
                     f"playback_failed={not played and synth_fin}"
                 )
 
+            # Yerel modda araç çağrısı olmadığı için kendini tanıtma cümlesi
+            # burada yakalanıp kalıcı hafızaya yazılır.
+            if not self.use_realtime:
+                self._learn_user_name_locally(user_text)
+
             # 6. Instant Intent Interception (Sub-250ms Direct Execution)
             is_weather, w_city = self._is_weather_query(user_text)
             if is_weather:
@@ -7071,10 +7167,51 @@ class AstroRealtimeNode(Node):
                         if any(k in section for k in rule_keys):
                             epistemic_gemma_rule += section.strip() + "\n\n"
 
+                # Bulut yolu geçmişi `messages` listesiyle taşıyor; yerel yol kendi
+                # prompt'unu kurduğu için hafızayı ayrıca eklemek zorunda. Bu blok
+                # olmadan prompt her turda yalnızca güncel cümleyi içeriyordu
+                # (ölçüldü: 14 turda prompt_len sabit ~1050) ve "en son ne
+                # söylemiştim?" gibi sorular cevapsız kalıyordu.
+                memory_block = ""
+                try:
+                    mem_identity = self._get_active_biometric_identity()
+                except Exception:
+                    mem_identity = None
+                try:
+                    mem_ctx_local = (
+                        self.memory.get_prompt_context(recognized_person=mem_identity)
+                        if getattr(self, "memory", None) else ""
+                    )
+                except Exception:
+                    mem_ctx_local = ""
+                if mem_ctx_local.strip():
+                    memory_block = "=== HAFIZAN ===\n" + mem_ctx_local.strip() + "\n\n"
+
+                history_block = ""
+                hist_lines = []
+                for m in recent_msgs:
+                    content = (m.get("content") or "").strip()
+                    if not content:
+                        continue
+                    role = m.get("role", "user")
+                    hist_lines.append(f"{'Kullanıcı' if role == 'user' else 'ASTRO'}: {content}")
+                # Güncel cümle epizodik tampona zaten eklendiyse sonda tekrar etmesin.
+                if hist_lines and hist_lines[-1] == f"Kullanıcı: {user_text.strip()}":
+                    hist_lines.pop()
+                if hist_lines:
+                    history_block = "=== SON KONUŞMA ===\n" + "\n".join(hist_lines) + "\n\n"
+
                 gemma_prompt = (
                     f"{cog_envelope}"
                     f"{epistemic_gemma_rule}"
-                    "ASTRO bir sosyal robot. Türkçe konuş. Kısa ve doğal cevap ver.\n\n"
+                    f"{memory_block}"
+                    "ASTRO bir sosyal robot. Türkçe konuş. Kısa ve doğal cevap ver.\n"
+                    # "her turda yeniden selamlama" ifadesi Türkçede hem isim hem
+                    # olumsuz emir okunuyordu; gemma4:e2b bunu izin sanıp her cevaba
+                    # "Merhaba!" ile başladı (2026-09-16 canlı koşusu, 4 turun 3'ü).
+                    "Sohbet zaten başladı: selamlama cümlesi kurma, önceki cevabını "
+                    "tekrarlama, yalnızca son söylenene yanıt ver.\n\n"
+                    f"{history_block}"
                     f"Kullanıcı: {user_text}\n"
                     "ASTRO:"
                 )
@@ -7522,6 +7659,14 @@ class AstroRealtimeNode(Node):
                         self._wake_audio_buffer = list(pre_frames) + [raw_16k]
                     else:
                         self._wake_audio_buffer.append(raw_16k)
+                        # Doymuş ya da çok gürültülü mikrofonda enerji eşiğin altına
+                        # hiç inmez; aşağıdaki 0,5 sn'lik sessizlik koşulu hiç
+                        # gerçekleşmez ve tampon sınırsız büyür. 2026-09-15 canlı
+                        # testinde tek "cümle" 91.540 ms'ye ulaştı, STT hiç
+                        # tetiklenmedi ve logda tek hata satırı bile yoktu.
+                        max_wake_s = float(os.getenv("WAKE_MAX_UTTERANCE_S", "12.0"))
+                        if (len(self._wake_audio_buffer) * 0.020) >= max_wake_s:
+                            self._flush_wake_buffer(reason="max_utterance")
                 elif self._wake_listening:
                     self._wake_audio_buffer.append(raw_16k)
                     # Silence pause (0.50s after speech ends) triggers wake verification
