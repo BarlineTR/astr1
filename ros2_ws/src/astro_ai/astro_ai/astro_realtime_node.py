@@ -233,7 +233,16 @@ except ImportError:
         AttentionManager = None
         IdentityCertainty = None
 
-
+try:
+    from astro_ai.brain.dialogue_state_manager import DialogueStateManager
+except ImportError:
+    try:
+        from brain.dialogue_state_manager import DialogueStateManager
+    except ImportError:
+        try:
+            from dialogue_state_manager import DialogueStateManager
+        except ImportError:
+            DialogueStateManager = None
 
 try:
     from astro_audio.voice_recognizer import VoiceRecognizer
@@ -271,23 +280,16 @@ except ImportError:
 
 
 def _load_env():
-    """astr1/.env dosyasını os.environ'a yükler; bulunan yolu döndürür.
+    """astr1/.env dosyasını os.environ'a yükler; bulunan yolu döndürür."""
+    explicit_profile = os.getenv("ASTRO_ENV_FILE", "").strip()
+    if explicit_profile:
+        explicit_profile = os.path.abspath(os.path.expanduser(explicit_profile))
+        if not os.path.isfile(explicit_profile):
+            raise FileNotFoundError(f"ASTRO_ENV_FILE bulunamadı: {explicit_profile}")
+        load_dotenv(dotenv_path=explicit_profile, override=True)
+        return explicit_profile
 
-    Bu düğüm daha önce .env'i HİÇ okumuyordu, yalnızca os.environ'a bakıyordu.
-    Yani anahtarlar yalnızca onu başlatan sürecin ortamına konmuşsa çalışıyordu:
-    bringup.launch.py bunu SetEnvironmentVariable ile yapıyor, ama
-    realtime_sensors.launch.py .env'i yalnızca CWD repo köküyse buluyor ve
-    `ros2 run astro_ai astro_realtime_node` hiçbir şey yüklemiyor. Üçünde de
-    sonuç "❌ OPENAI_API_KEY eksik" oluyordu.
-
-    Aday listesi tts_node/ai_brain_node ile aynı; son çare find_dotenv(usecwd=True)
-    CWD'den yukarı doğru yürüdüğü için ros2_ws içinden çalıştırıldığında da bulur.
-    """
-    # Test sürecinde .env YÜKLENMEZ. Bu düğüm gerçek bir anahtar bulduğu anda
-    # websocket'i açıyor, discover_realtime_models() ile OpenAI'a HTTPS isteği
-    # atıyor ve idle-learning döngüsünü başlatıyor. Testler düğümü onlarca kez
-    # örneklediği için bu hem kullanıcının kotasını harcıyor hem de canlı SSL
-    # iş parçacıkları + rclpy yıkımı bir arada segfault üretiyordu.
+    # Test sürecinde .env YÜKLENMEZ.
     if "PYTEST_CURRENT_TEST" in os.environ or "pytest" in sys.modules:
         return None
 
@@ -740,6 +742,10 @@ class AstroRealtimeNode(Node):
             on_session_end=self._on_conversation_session_ended,
         )
         self.action_manager = ActionManager(logger=self.get_logger(), node=self) if ActionManager else None
+        self.dialogue_state_manager = DialogueStateManager() if DialogueStateManager else None
+        self._local_stt_model = None
+        self._local_stt_lock = threading.Lock()
+        self._last_stt_provider = "none"
 
         # Social Cognitive Brain Subsystem (authoritative unified world model & social intelligence)
         self.social_brain = None
@@ -748,7 +754,7 @@ class AstroRealtimeNode(Node):
             try:
                 db_dir = os.path.expanduser("~/.astro")
                 os.makedirs(db_dir, exist_ok=True)
-                cognitive_db_path = os.path.join(db_dir, "cognitive.db")
+                cognitive_db_path = os.path.expanduser(os.getenv("ASTRO_COGNITIVE_DB", os.path.join(db_dir, "cognitive.db")))
                 self.social_brain = SocialBrain(db_path=cognitive_db_path)
                 self.get_logger().info(f"🧠 [SocialBrain] Başlatıldı. Bilişsel veritabanı: {cognitive_db_path}")
                 if CognitiveLoop:
@@ -3437,11 +3443,19 @@ class AstroRealtimeNode(Node):
                 weather_text = resp.read().decode("utf-8").strip()
             return self._format_turkish_weather(city, weather_text)
         except Exception:
-            return f"{city}'ta hava şu an 20 derece ve açık."
+            # Ağ yoksa veya hata oluşursa sabit/sahte sıcaklık üretmektense bilmediğini söyle
+            return f"{city} için hava durumunu şu an alamıyorum."
 
     def _is_weather_query(self, text: str) -> Tuple[bool, str]:
         text_l = text.lower()
-        if any(w in text_l for w in ["hava nasıl", "hava durumu", "hava kaç derece", "havalar nasıl", "yağmur var mı", "kar var mı", "sıcaklık kaç", "hava"]):
+        # Düz "hava" alt dizesi KULLANILMAZ: bozuk transkriptler ("...senlerine hava zanaç...")
+        # ve "havaalanı/havalimanı/odanın havası" gibi cümleler sahte hava raporuna düşüyordu.
+        weather_phrases = [
+            "hava nasıl", "hava durumu", "hava kaç derece", "havalar nasıl",
+            "hava ne olacak", "hava sıcak", "hava soğuk", "hava yağmurlu",
+            "yağmur var mı", "kar var mı", "sıcaklık kaç", "kaç derece",
+        ]
+        if any(w in text_l for w in weather_phrases):
             if "ahlat" in text_l or "ahlattı" in text_l or "ahlatta" in text_l:
                 return True, "Ahlat"
             if "bitlis" in text_l:
@@ -3454,6 +3468,68 @@ class AstroRealtimeNode(Node):
                 return True, "Ankara"
             return True, "Ahlat"
         return False, ""
+
+    # Yerel modda kendini tanıtma cümlesini yakalama ve kalıcı profile kaydetme
+    _NAME_TOKEN = r"[A-ZÇĞİÖŞÜ][a-zçğıöşü]{1,}"
+    _NAME_STOPWORDS = {
+        "astro", "ben", "bir", "tamam", "evet", "hayır", "kimim", "şu", "bu",
+        "hey", "selam", "merhaba", "sen", "biz", "robot", "ne", "yapıyorum",
+        "yapıyordur", "yaptığımı", "spor", "koşuyorum", "iyiyim", "buradayım",
+        "oturuyorum", "çalışıyorum", "yemek", "film", "kitap", "ders", "şey",
+    }
+
+    def _extract_self_introduced_name(self, text: str) -> Optional[str]:
+        """Kullanıcının kendi adını verdiği cümleden adı çıkarır, yoksa None.
+
+        Strict invariant: Only explicit self-introduction patterns are recognized.
+        Ordinary sentences like 'Ben ... yapıyorum', 'Ben spor yapıyorum' must NEVER
+        be recognized as names.
+        """
+        if not text or not text.strip():
+            return None
+        raw = text.strip()
+        tok = self._NAME_TOKEN
+
+        # Explicit negative filters for ordinary activity, state, or conversation
+        low = raw.lower()
+        if any(w in low for w in ["yapıyorum", "yapıyordur", "yaptığımı", "çalışıyorum", "oturuyorum", "koşuyorum", "iyiyim", "nasılsın", "ne yap"]):
+            return None
+
+        name = None
+        m = re.search(rf"(?:[bB]enim\s+)?(?:[iİ]smim|[aA]d[ıiİI]m)\s+({tok}(?:\s+{tok})?)", raw)
+        if m:
+            name = m.group(1)
+        elif re.search(r"\b(?:kaydet|hatırla|unutma|tanı)\b", raw, flags=re.IGNORECASE):
+            m = re.search(rf"\b[bB]en\s+({tok}(?:\s+{tok})?)\b", raw)
+            if m:
+                name = m.group(1)
+
+        if not name:
+            return None
+
+        tokens = name.split()
+        first = tokens[0].lower()
+        if first in self._NAME_STOPWORDS or len(first) < 2:
+            return None
+        if len(tokens) > 1 and tokens[1].lower() in self._NAME_STOPWORDS:
+            return None
+        return name.strip()
+
+    def _learn_user_name_locally(self, text: str) -> Optional[str]:
+        """Kendini tanıtma cümlesini kalıcı profile yazar. Öğrenilen adı döndürür."""
+        name = self._extract_self_introduced_name(text)
+        if not name or not getattr(self, "memory", None) or not hasattr(self.memory, "profile"):
+            return None
+        try:
+            self.memory.profile.add_known_person(name, title="Tanışılan Kişi", formal_title=name)
+            self.memory.profile.set_user_fact(name, "Ad", name)
+            self.memory.profile.remove_facts_containing("Konuştuğun kişinin adı")
+            self.memory.profile.add_verified_fact(f"Konuştuğun kişinin adı {name}.")
+            self._safe_log("info", f"🧠 [Yerel Hafıza] Kullanıcı adı kaydedildi: {name}")
+            return name
+        except Exception as exc:
+            self._safe_log("warn", f"[Yerel Hafıza] Ad kaydedilemedi: {exc}")
+            return None
 
     def _is_turn_to_sound_query(self, text: str) -> bool:
         """Detects explicit acoustic gaze orientation commands."""
@@ -4931,7 +5007,36 @@ class AstroRealtimeNode(Node):
                 gest_msg.data = "wake"
                 self.pub_gesture.publish(gest_msg)
 
-            self.state_machine.transition_to(RobotState.LISTENING)
+    def _flush_wake_buffer(self, reason: str = "silence"):
+        """Uyandırma tamponunu STT'ye yollar ve dinleme durumunu sıfırlar.
+
+        `reason="max_utterance"` üst sınır yolu: ses hiç susmadığı için zorla
+        boşaltma. Bu durum neredeyse her zaman mikrofon kazancının doyuma
+        girdiğini gösterir, o yüzden (en fazla 30 sn'de bir) uyarı basar.
+        """
+        buf = list(self._wake_audio_buffer)
+        self._wake_audio_buffer.clear()
+        self._wake_listening = False
+        self._wake_last_voice_time = 0.0
+        if len(buf) < 10:
+            return
+        if reason == "max_utterance":
+            now_w = time.monotonic()
+            if now_w - getattr(self, "_wake_cap_warn_time", 0.0) > 30.0:
+                self._wake_cap_warn_time = now_w
+                self._safe_log(
+                    "warn",
+                    f"⚠️ [Wake Buffer Cap] Ses {len(buf) * 0.02:.1f} sn boyunca eşiğin altına hiç inmedi "
+                    f"(ambient_rms={getattr(self, '_ambient_rms', 0.0):.0f}). Mikrofon kazancı doyuma "
+                    f"girmiş olabilir — kontrol: pactl get-source-volume @DEFAULT_SOURCE@",
+                )
+        else:
+            raw_w = b"".join(buf)
+            arr_w = np.frombuffer(raw_w, dtype=np.int16)
+            w_rms = float(np.sqrt(np.mean(arr_w.astype(np.float32) ** 2))) if len(arr_w) > 0 else 0.0
+            if w_rms < max(100.0, getattr(self, "_ambient_rms", 120.0) * 1.15):
+                return
+        threading.Thread(target=self._process_wake_candidate, args=(buf,), daemon=True).start()
 
     def _process_wake_candidate(self, audio_chunks: List[bytes]):
         """Processes potential wake utterance during sleep with strict wake phrase gating and full telemetry tracking."""
@@ -6032,6 +6137,9 @@ class AstroRealtimeNode(Node):
         yalnızca LLM_FALLBACK_ENABLED=true iken ve OpenAI cevap veremediğinde
         devreye girer.
         """
+        if os.getenv("STT_ENGINE", "openai").strip().lower() in ("faster-whisper", "faster_whisper"):
+            return self._transcribe_local_whisper(wav_bytes)
+
         # If OpenAI is exhausted or hard disabled, directly use Groq Whisper
         if not self._can_use_openai("stt"):
             return self._transcribe_groq_whisper(wav_bytes) or ""
@@ -6041,6 +6149,35 @@ class AstroRealtimeNode(Node):
             return text
 
         return self._transcribe_groq_whisper(wav_bytes) or ""
+
+    def _transcribe_local_whisper(self, wav_bytes: bytes) -> str:
+        """Decode real wake/dialogue audio locally, without a cloud fallback.
+
+        Called on existing STT worker threads, never on the cognitive timer.
+        Serialize lazy initialization and inference across wake candidates.
+        """
+        try:
+            with self._local_stt_lock:
+                if self._local_stt_model is None:
+                    from faster_whisper import WhisperModel
+                    model_name = os.getenv("STT_FW_MODEL", "small")
+                    device = os.getenv("STT_FW_DEVICE", "cpu")
+                    compute = os.getenv("STT_FW_COMPUTE_TYPE", "int8")
+                    self._local_stt_model = WhisperModel(model_name, device=device, compute_type=compute)
+                    self._safe_log("info", f"[STT LOCAL READY] model={model_name} device={device}")
+                started = time.monotonic()
+                segments, _ = self._local_stt_model.transcribe(
+                    io.BytesIO(wav_bytes), language="tr", beam_size=1,
+                    condition_on_previous_text=False, vad_filter=True,
+                    initial_prompt="Astro, hey Astro, merhaba Astro, robot.",
+                )
+                text = "".join(segment.text for segment in segments).strip()
+                self._last_stt_provider = "faster_whisper"
+                self._safe_log("info", f"[STT LOCAL] text={text!r} duration_ms={(time.monotonic()-started)*1000:.0f}")
+                return text
+        except Exception as exc:
+            self._safe_log("error", f"[STT LOCAL FAILED] {exc}")
+            return ""
 
         fallback_on = os.environ.get("LLM_FALLBACK_ENABLED", "true").strip().lower() in ("1", "true", "yes")
         if not fallback_on:
@@ -7398,6 +7535,80 @@ class AstroRealtimeNode(Node):
                 self.state_machine.transition_to(RobotState.LISTENING if not self.is_in_quiet_or_sleep_state() else RobotState.DEEP_IDLE)
                 return
 
+            # Yerel modda kendini tanıtma cümlesi hafızaya kaydedilir
+            if not self.use_realtime:
+                self._learn_user_name_locally(user_text)
+
+            # Dialogue Continuity & Referential Resolution Interception
+            if getattr(self, "dialogue_state_manager", None):
+                self.dialogue_state_manager.update_interlocutor(spk_name)
+                is_det_dialogue, det_dialogue_reply, det_dialogue_type = self.dialogue_state_manager.process_user_turn(
+                    user_text, intent_name=str(getattr(turn_intent, "value", turn_intent)) if turn_intent else None
+                )
+                if is_det_dialogue and det_dialogue_reply:
+                    reply_text = self._format_deterministic_response(
+                        fact_text=det_dialogue_reply,
+                        spk_name=spk_name,
+                        is_known=spk_known,
+                        is_child=is_child,
+                    )
+                    t_response_ready = time.monotonic()
+                    response_generation_ms = (t_response_ready - t_intent_resolved) * 1000.0
+
+                    with self._lock:
+                        self._recent_robot_phrases.append(reply_text.lower())
+                        if len(self._recent_robot_phrases) > 10:
+                            self._recent_robot_phrases = self._recent_robot_phrases[-10:]
+
+                    self._speech_authorization = SpeechAuthorization(
+                        user_turn_id=u_turn_id,
+                        generation_id=self._fallback_generation_id,
+                        explicit_user_turn=True,
+                        should_speak=True,
+                        response_origin="deterministic_dialogue_state",
+                        llm_inference_completed=True,
+                        response_final=True,
+                    )
+                    t_tts_request_started = time.monotonic()
+                    pcm, s_ms, g_ms, q_ms = _synthesize_turn_clause(
+                        reply_text,
+                        is_final_response=True,
+                        is_deterministic=True,
+                        is_llm_completed=True,
+                        caller_reason="deterministic_dialogue_state",
+                    )
+                    t_tts_first_audio = time.monotonic()
+                    tts_ttfa_ms = (t_tts_first_audio - t_tts_request_started) * 1000.0
+                    total_synth_ms += s_ms
+                    total_gpu_ms += g_ms
+                    total_queue_wait_ms += q_ms
+                    if pcm:
+                        t_playback_started = time.monotonic()
+                        end_to_end_first_audio_ms = (t_playback_started - t_stt_finished) * 1000.0
+                        self.get_logger().info(f"🤖 [Astro (Diyalog Durumu)]: \"{reply_text}\"")
+                        self.memory.episodic.add_message("assistant", reply_text)
+                        self.session.record_robot_speech()
+                        self.dialogue_state_manager.record_assistant_turn(reply_text)
+                        _record_turn_telemetry(
+                            reply_text,
+                            origin="deterministic_dialogue_state",
+                            played=True,
+                            dur_synth_ms=total_synth_ms,
+                            gpu_ms=total_gpu_ms,
+                            t_stt_finished_ts=t_stt_finished,
+                            t_intent_resolved_ts=t_intent_resolved,
+                            t_response_ready_ts=t_response_ready,
+                            t_tts_request_started_ts=t_tts_request_started,
+                            t_tts_first_audio_ts=t_tts_first_audio,
+                            t_playback_started_ts=t_playback_started,
+                            intent_resolution_ms_val=intent_resolution_ms,
+                            response_generation_ms_val=response_generation_ms,
+                            tts_ttfa_ms_val=tts_ttfa_ms,
+                            end_to_end_first_audio_ms_val=end_to_end_first_audio_ms,
+                        )
+                        _handle_and_play_clause_audio(pcm, is_final_clause=True)
+                        return
+
             # 7. Instant Intent Interception (Sub-250ms Direct Execution)
             is_weather, w_city = self._is_weather_query(user_text)
             if is_weather:
@@ -7444,6 +7655,8 @@ class AstroRealtimeNode(Node):
                     self.get_logger().info(f"🤖 [Astro (Canlı Hava Durumu)]: \"{reply_text}\"")
                     self.memory.episodic.add_message("assistant", reply_text)
                     self.session.record_robot_speech()
+                    if getattr(self, "dialogue_state_manager", None):
+                        self.dialogue_state_manager.record_assistant_turn(reply_text)
                     _record_turn_telemetry(
                         reply_text,
                         origin="deterministic_policy",
@@ -7509,6 +7722,8 @@ class AstroRealtimeNode(Node):
                     self.get_logger().info(f"🤖 [Astro (Aktivite Durumu)]: \"{reply_text}\"")
                     self.memory.episodic.add_message("assistant", reply_text)
                     self.session.record_robot_speech()
+                    if getattr(self, "dialogue_state_manager", None):
+                        self.dialogue_state_manager.record_assistant_turn(reply_text)
                     _record_turn_telemetry(
                         reply_text,
                         origin="deterministic_policy",
@@ -7574,6 +7789,8 @@ class AstroRealtimeNode(Node):
                     self.get_logger().info(f"🤖 [Astro (Görsel Algı Durumu)]: \"{reply_text}\"")
                     self.memory.episodic.add_message("assistant", reply_text)
                     self.session.record_robot_speech()
+                    if getattr(self, "dialogue_state_manager", None):
+                        self.dialogue_state_manager.record_assistant_turn(reply_text)
                     _record_turn_telemetry(
                         reply_text,
                         origin="deterministic_policy",
@@ -7639,6 +7856,8 @@ class AstroRealtimeNode(Node):
                     self.get_logger().info(f"🤖 [Astro (Robot Durumu)]: \"{reply_text}\"")
                     self.memory.episodic.add_message("assistant", reply_text)
                     self.session.record_robot_speech()
+                    if getattr(self, "dialogue_state_manager", None):
+                        self.dialogue_state_manager.record_assistant_turn(reply_text)
                     _record_turn_telemetry(
                         reply_text,
                         origin="deterministic_policy",
@@ -7712,6 +7931,8 @@ class AstroRealtimeNode(Node):
                     self.get_logger().info(f"🤖 [Astro (Açı Komutu)]: \"{reply_text}\"")
                     self.memory.episodic.add_message("assistant", reply_text)
                     self.session.record_robot_speech()
+                    if getattr(self, "dialogue_state_manager", None):
+                        self.dialogue_state_manager.record_assistant_turn(reply_text)
                     _record_turn_telemetry(
                         reply_text,
                         origin="deterministic_policy",
@@ -7800,6 +8021,8 @@ class AstroRealtimeNode(Node):
                     self.get_logger().info(f"🤖 [Astro (Ses Yönelimi)]: \"{reply_text}\"")
                     self.memory.episodic.add_message("assistant", reply_text)
                     self.session.record_robot_speech()
+                    if getattr(self, "dialogue_state_manager", None):
+                        self.dialogue_state_manager.record_assistant_turn(reply_text)
                     _record_turn_telemetry(
                         reply_text,
                         origin="deterministic_policy",
@@ -7883,6 +8106,8 @@ class AstroRealtimeNode(Node):
                     self.get_logger().info(f"🤖 [Astro (Hareket Komutu)]: \"{reply_text}\"")
                     self.memory.episodic.add_message("assistant", reply_text)
                     self.session.record_robot_speech()
+                    if getattr(self, "dialogue_state_manager", None):
+                        self.dialogue_state_manager.record_assistant_turn(reply_text)
                     _record_turn_telemetry(
                         reply_text,
                         origin="deterministic_policy",
@@ -8076,14 +8301,56 @@ class AstroRealtimeNode(Node):
                         except Exception:
                             compact_social = ""
 
+                    memory_block = ""
+                    try:
+                        mem_identity = self._get_active_biometric_identity()
+                    except Exception:
+                        mem_identity = None
+                    try:
+                        mem_ctx_local = (
+                            self.memory.get_prompt_context(recognized_person=mem_identity)
+                            if getattr(self, "memory", None) else ""
+                        )
+                    except Exception:
+                        mem_ctx_local = ""
+                    if mem_ctx_local.strip():
+                        memory_block = "=== HAFIZAN ===\n" + mem_ctx_local.strip()
+
+                    dialogue_state_block = ""
+                    if getattr(self, "dialogue_state_manager", None):
+                        ds_str = self.dialogue_state_manager.state.format_dialogue_state_prompt()
+                        if ds_str.strip():
+                            dialogue_state_block = ds_str.strip()
+
+                    history_block = ""
+                    hist_lines = []
+                    for m in recent_msgs:
+                        content = (m.get("content") or "").strip()
+                        if not content:
+                            continue
+                        role = m.get("role", "user")
+                        hist_lines.append(f"{'Kullanıcı' if role == 'user' else 'ASTRO'}: {content}")
+                    # Güncel cümle epizodik tampona zaten eklendiyse sonda tekrar etmesin.
+                    if hist_lines and hist_lines[-1] == f"Kullanıcı: {user_text.strip()}":
+                        hist_lines.pop()
+                    if hist_lines:
+                        history_block = "=== SON KONUŞMA ===\n" + "\n".join(hist_lines[-6:])
+
                     prompt_sections = [
-                        "Sen ASTRO'sun, sevimli, zeki ve yardımsever bir sosyal robotsun. Türkçe konuş. Kısa, samimi ve doğal cevap ver (en fazla 1-2 cümle). Bilmediğin şeyleri uydurma.",
+                        "Sen ASTRO'sun, sevimli, zeki ve yardımsever bir sosyal robotsun. Türkçe konuş. Kısa ve doğal cevap ver (1-2 cümle).\n"
+                        "Sohbet zaten başladı: selamlama cümlesi kurma, önceki cevabını tekrarlama, yalnızca son söylenene yanıt ver.",
                     ]
+                    if memory_block:
+                        prompt_sections.append(memory_block)
+                    if dialogue_state_block:
+                        prompt_sections.append(dialogue_state_block)
                     if compact_social:
                         prompt_sections.append(compact_social)
                     prompt_sections.extend(grounding_lines)
+                    if history_block:
+                        prompt_sections.append(history_block)
                     prompt_sections.append(f"Kullanıcı: {user_text}\nASTRO:")
-                    gemma_prompt = "\n".join(prompt_sections)
+                    gemma_prompt = "\n\n".join(prompt_sections)
 
                 # Deterministic bounding guard: enforce <= 450 tokens
                 prompt_tok_est = estimate_tokens(gemma_prompt)
@@ -8393,6 +8660,8 @@ class AstroRealtimeNode(Node):
                 self.get_logger().info(f"🤖 [Astro ({chosen_provider}/{chosen_model})]: \"{full_reply_str}\"")
                 self.memory.episodic.add_message("assistant", full_reply_str)
                 self.session.record_robot_speech()
+                if getattr(self, "dialogue_state_manager", None):
+                    self.dialogue_state_manager.record_assistant_turn(full_reply_str)
 
                 xtts_info = self.local_xtts.get_telemetry() if self.local_xtts else {}
                 is_xtts_actually_ready = bool(self.local_xtts and self.local_xtts.is_ready())
@@ -8567,24 +8836,14 @@ class AstroRealtimeNode(Node):
                         self._wake_audio_buffer = list(pre_frames) + [raw_16k]
                     else:
                         self._wake_audio_buffer.append(raw_16k)
+                        max_wake_s = float(os.getenv("WAKE_MAX_UTTERANCE_S", "12.0"))
+                        if (len(self._wake_audio_buffer) * 0.020) >= max_wake_s:
+                            self._flush_wake_buffer(reason="max_utterance")
                 elif self._wake_listening:
                     self._wake_audio_buffer.append(raw_16k)
                     # Silence pause (0.50s after speech ends) triggers wake verification
                     if (now - self._wake_last_voice_time) > 0.50:
-                        self._wake_listening = False
-                        if len(self._wake_audio_buffer) >= 10:
-                            # Pre-STT local VAD energy check
-                            raw_w = b"".join(self._wake_audio_buffer)
-                            arr_w = np.frombuffer(raw_w, dtype=np.int16)
-                            w_rms = float(np.sqrt(np.mean(arr_w.astype(np.float32) ** 2))) if len(arr_w) > 0 else 0.0
-                            if w_rms >= max(100.0, self._ambient_rms * 1.15):
-                                buf_to_proc = list(self._wake_audio_buffer)
-                                self._wake_audio_buffer.clear()
-                                threading.Thread(target=self._process_wake_candidate, args=(buf_to_proc,), daemon=True).start()
-                            else:
-                                self._wake_audio_buffer.clear()
-                        else:
-                            self._wake_audio_buffer.clear()
+                        self._flush_wake_buffer(reason="silence")
             return
 
         # ====================================================================

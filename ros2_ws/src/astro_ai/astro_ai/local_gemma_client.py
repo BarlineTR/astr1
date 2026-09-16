@@ -151,7 +151,11 @@ class LocalGemmaClient:
         first_token_timeout_s: Optional[float] = None,
         logger: Optional[Callable[[str, str], None]] = None,
         model_name: Optional[str] = None,
+        backend: Optional[str] = None,
     ):
+        self.backend = (backend or os.getenv("LOCAL_GEMMA_BACKEND", "llama_cpp")).strip().lower()
+        if self.backend not in ("llama_cpp", "ollama"):
+            raise ValueError("LOCAL_GEMMA_BACKEND must be llama_cpp or ollama")
         self.base_url = base_url.rstrip("/")
         self.timeout_s = float(timeout_s)
         self.first_token_timeout_s = float(first_token_timeout_s if first_token_timeout_s is not None else DEFAULT_FIRST_TOKEN_TIMEOUT_S)
@@ -159,7 +163,7 @@ class LocalGemmaClient:
         self.model_name = model_name or os.getenv("LOCAL_GEMMA_MODEL", "gemma-4-E2B-it-Q4_K_S")
         self.completion_url = f"{self.base_url}/v1/chat/completions"
         self.chat_url = self.completion_url
-        self.health_url = f"{self.base_url}/health"
+        self.health_url = f"{self.base_url}/api/tags" if self.backend == "ollama" else f"{self.base_url}/health"
         self._last_health_status: bool = False
         self._last_health_check_ts: float = 0.0
 
@@ -173,11 +177,7 @@ class LocalGemmaClient:
             pass
 
     def health_check(self, timeout_s: float = 1.0) -> bool:
-        """Lightweight health probe querying `GET /health` on llama-server.
-
-        Expected response: `{"status": "ok"}`
-        Returns True if healthy, False if down/unreachable/loading.
-        """
+        """Check llama.cpp health or whether Ollama has the selected model."""
         try:
             req = urllib.request.Request(
                 self.health_url,
@@ -193,8 +193,14 @@ class LocalGemmaClient:
                     self._last_health_status = False
                     return False
                 data = json.loads(raw)
-                status_val = str(data.get("status", "")).strip().lower()
-                is_ok = (status_val == "ok")
+                if self.backend == "ollama":
+                    is_ok = any(
+                        model.get("name") == self.model_name
+                        for model in data.get("models", [])
+                    )
+                else:
+                    status_val = str(data.get("status", "")).strip().lower()
+                    is_ok = (status_val == "ok")
                 self._last_health_status = is_ok
                 self._last_health_check_ts = time.monotonic()
                 return is_ok
@@ -255,6 +261,9 @@ class LocalGemmaClient:
                 "enable_thinking": False
             },
         }
+
+        if self.backend == "ollama":
+            payload["reasoning_effort"] = "none"
 
         req = urllib.request.Request(
             self.completion_url,
@@ -372,6 +381,9 @@ class LocalGemmaClient:
                 "enable_thinking": False
             },
         }
+
+        if self.backend == "ollama":
+            payload["reasoning_effort"] = "none"
 
         req = urllib.request.Request(
             self.completion_url,

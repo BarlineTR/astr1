@@ -15,11 +15,14 @@ import os
 from dataclasses import dataclass
 from typing import Optional
 
-try:
-    from dotenv import load_dotenv
-    load_dotenv()
-except ImportError:
-    pass
+import sys
+
+if "PYTEST_CURRENT_TEST" not in os.environ and "pytest" not in sys.modules:
+    try:
+        from dotenv import load_dotenv
+        load_dotenv()
+    except ImportError:
+        pass
 
 
 def _bool_env(key: str, default: bool) -> bool:
