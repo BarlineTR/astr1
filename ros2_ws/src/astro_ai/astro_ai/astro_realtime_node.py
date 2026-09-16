@@ -245,6 +245,22 @@ except ImportError:
             DialogueStateManager = None
 
 try:
+    from astro_ai.contracts.spatial_state import SpatialObjectState
+    from astro_ai.spatial.person_object_association import PersonObjectAssociator
+    from astro_ai.brain.activity_recognition import TemporalActivityEngine, HumanActivity, ACTIVITY_DESCRIPTIONS_TR
+except ImportError:
+    try:
+        from contracts.spatial_state import SpatialObjectState
+        from spatial.person_object_association import PersonObjectAssociator
+        from brain.activity_recognition import TemporalActivityEngine, HumanActivity, ACTIVITY_DESCRIPTIONS_TR
+    except ImportError:
+        SpatialObjectState = None
+        PersonObjectAssociator = None
+        TemporalActivityEngine = None
+        HumanActivity = None
+        ACTIVITY_DESCRIPTIONS_TR = {}
+
+try:
     from astro_audio.voice_recognizer import VoiceRecognizer
 except ImportError:
     try:
@@ -978,6 +994,12 @@ class AstroRealtimeNode(Node):
         self._oak_xlink_error_count = 0
         self._oak_connection_state = "DISCONNECTED"
 
+        # Real Perception Engines (Phase 1, 3, 4)
+        self._person_object_associator = PersonObjectAssociator() if PersonObjectAssociator else None
+        self._temporal_activity_engine = TemporalActivityEngine() if TemporalActivityEngine else None
+        self._last_detected_objects: List[Any] = []
+        self._last_detected_objects_time: float = 0.0
+
         # Autonomous Idle Learning (Cognitive Memory Reflection only, 0 camera calls)
         self._enable_idle_learning = os.environ.get("ENABLE_IDLE_LEARNING", "true").lower() == "true"
         self._last_idle_learning_time = 0.0
@@ -1042,6 +1064,8 @@ class AstroRealtimeNode(Node):
         self.create_subscription(Bool, "/audio/playback_active", self._on_playback_active, 10)
         self.create_subscription(String, "/vision/recognized_person", self._on_recognized_person, 10)
         self.create_subscription(String, "/vision/faces", self._on_faces, 10)
+        self.create_subscription(String, "/vision/detected_objects", self._on_detected_objects, 10)
+        self.create_subscription(String, "/vision/visual_attributes", self._on_visual_attributes, 10)
         self.create_subscription(String, "/audio/speaker_id", self._on_speaker_id, 10)
         self.create_subscription(String, "/vision/user_emotion", self._on_user_emotion, 10)
         self.create_subscription(Bool, "/vision/looking_at_robot", self._on_looking_at_robot, 10)
@@ -3657,6 +3681,58 @@ class AstroRealtimeNode(Node):
 
         return False, 0.0, ""
 
+    def _format_detected_objects_tr(self, objects: List[Any]) -> str:
+        """Translates and counts detected objects into natural Turkish phrases."""
+        if not objects:
+            return ""
+        from collections import Counter
+        class_counts = Counter()
+        for obj in objects:
+            cname = getattr(obj, "class_name", "") or getattr(obj, "category", "") or ""
+            if cname:
+                class_counts[cname] += 1
+
+        tr_map = {
+            "cup": "bardak",
+            "bottle": "su şişesi",
+            "cell phone": "telefon",
+            "laptop": "dizüstü bilgisayar",
+            "book": "kitap",
+            "backpack": "sırt çantası",
+            "handbag": "çanta",
+            "suitcase": "valiz",
+            "remote": "kumanda",
+            "bowl": "kase",
+            "fork": "çatal",
+            "knife": "bıçak",
+            "spoon": "kaşık",
+            "chair": "sandalye",
+            "couch": "koltuk",
+            "keyboard": "klavye",
+            "mouse": "fare",
+            "banana": "muz",
+            "apple": "elma",
+            "sandwich": "sandviç",
+            "orange": "portakal",
+            "pizza": "pizza",
+            "cake": "kek",
+        }
+
+        phrases = []
+        for cname, count in class_counts.items():
+            tr_name = tr_map.get(cname, cname)
+            if count == 1:
+                phrases.append(f"bir {tr_name}")
+            else:
+                phrases.append(f"{count} {tr_name}")
+
+        if len(phrases) == 1:
+            return phrases[0]
+        elif len(phrases) == 2:
+            return f"{phrases[0]} ve {phrases[1]}"
+        else:
+            return ", ".join(phrases[:-1]) + f" ve {phrases[-1]}"
+
     def _is_activity_query(self, text: str) -> Tuple[bool, str]:
         """Detects explicit queries about user's current activity (e.g. 'ne yapıyorum', 'ben ne yapıyordur şu anda').
 
@@ -3693,17 +3769,44 @@ class AstroRealtimeNode(Node):
         vis_person_det = vis_state.get("visual_person_detected", False)
 
         if not vis_cam_avail or v_state == "UNKNOWN":
-            reply = "Kameram şu anda aktif olmadığı için ne yaptığını göremiyorum."
+            return True, "Kameram şu anda aktif olmadığı için ne yaptığını göremiyorum."
         elif v_state == "STALE":
-            reply = "Şu an görüntüm güncel olmadığı için ne yaptığını göremiyorum."
-        elif vis_person_det:
-            # VISIBLE + activity UNKNOWN
-            reply = "Seni görüyorum ama ne yaptığını ayırt edemiyorum."
-        else:
-            # NOT VISIBLE
-            reply = "Şu an seni kameramda göremiyorum."
+            return True, "Şu an görüntüm güncel olmadığı için ne yaptığını göremiyorum."
+        elif not vis_person_det:
+            return True, "Şu an seni kameramda göremiyorum."
 
-        return True, reply
+        # Read active interlocutor from WorldModel
+        wm = getattr(self.social_brain, "world_model", None) if getattr(self, "social_brain", None) else None
+        interlocutor = None
+        if wm and hasattr(wm, "get_active_speaker"):
+            interlocutor = wm.get_active_speaker()
+        if interlocutor is None and wm and hasattr(wm, "_people"):
+            with getattr(wm, "_lock", threading.Lock()):
+                present = [p for p in wm._people.values() if getattr(p, "is_present", False)]
+                if present:
+                    interlocutor = present[0]
+
+        # Multi-modal Identity Isolation Safeguard:
+        # If speaker is verified (e.g. Baran) but camera sees a different person (e.g. Misafir),
+        # do NOT attribute Misafir's activity to the speaker!
+        speaker_name = getattr(self, "_active_person_name", "") or ""
+        if interlocutor and speaker_name and speaker_name.lower() != "misafir":
+            int_name = getattr(interlocutor, "name", "") or ""
+            if int_name and int_name.lower() != speaker_name.lower():
+                return True, f"Şu an kameramda karşımda {int_name} duruyor, senin ne yaptığını doğrudan göremiyorum."
+
+        # Read grounded human activity
+        activity = getattr(interlocutor, "current_activity", "UNKNOWN") if interlocutor else "UNKNOWN"
+        activity_conf = float(getattr(interlocutor, "activity_confidence", 0.0)) if interlocutor else 0.0
+
+        if activity_conf >= 0.55 and activity != "UNKNOWN":
+            act_enum = getattr(HumanActivity, activity, None) if HumanActivity else None
+            desc = ACTIVITY_DESCRIPTIONS_TR.get(act_enum) if act_enum else None
+            if desc:
+                return True, desc
+
+        # Truthful Unknown Fallback
+        return True, "Seni görüyorum ama şu an tam olarak ne yaptığını ayırt edemiyorum."
 
     def _is_visual_state_query(self, text: str) -> Tuple[bool, str]:
         """Detects visual capability and perception queries (e.g. 'beni görüyor musun', 'kameranda neler görüyorsun').
@@ -3724,11 +3827,17 @@ class AstroRealtimeNode(Node):
             r"\b(?:karşında\s+|etrafta\s+|etrafımda\s+)?kim(?:i|ler)\s+var\b",
             r"\b(?:beni\s+)?takip\s+ediyor\s+musun(?:\s+beni)?\b",
             r"\b(?:etrafımda|etrafta|çevrende)\s+ne\s+görüyorsun\b",
+            r"\b(?:ben\s+)?ne\s+içiyorum\b",
+            r"\belimde\s+ne\s+var\b",
+            r"\btelefonu(?:m|mu)\s+(?:gör(?:üyor|ebiliyor)\s+musun|nerede)\b",
+            r"\bbilgisayarı(?:m|mı)|laptop(?:ı|ımı)?\s+gör(?:üyor|ebiliyor)\s+musun\b",
+            r"\bbardağı(?:m|mı)|kupa(?:m|mı)\s+gör(?:üyor|ebiliyor)\s+musun\b",
         ]
         is_match = any(re.search(p, t) for p in patterns) or any(q in t for q in [
             "beni görüyor musun", "beni görebiliyor musun", "kamerandan beni görebiliyor musun",
             "kameradan beni görebiliyor musun", "kameranda neler görüyorsun", "kameranda ne görüyorsun",
-            "kimi görüyorsun", "beni takip ediyor musun", "görüyor musun beni"
+            "kimi görüyorsun", "beni takip ediyor musun", "görüyor musun beni",
+            "ne içiyorum", "elimde ne var", "telefonumu görüyor musun", "bilgisayarımı görüyor musun", "bardağımı görüyor musun"
         ])
         if not is_match:
             return False, ""
@@ -3745,16 +3854,87 @@ class AstroRealtimeNode(Node):
         if v_state == "STALE":
             return True, "Şu an görüntüm güncel değil, seni doğrulayamıyorum."
 
-        if not vis_person_det:
-            if any(w in t for w in ["kimi", "neler", "ne görüyorsun", "kim var"]):
-                return True, "Şu an kameramda kimseyi göremiyorum."
-            return True, "Şu an kameramda seni göremiyorum."
+        # Fetch fresh objects from WorldModel
+        wm = getattr(self.social_brain, "world_model", None) if getattr(self, "social_brain", None) else None
+        fresh_objects: List[Any] = []
+        if wm and hasattr(wm, "get_spatial_objects"):
+            fresh_objects = wm.get_spatial_objects(max_age_s=3.0, min_confidence=0.45)
+        if not fresh_objects and hasattr(self, "_last_detected_objects"):
+            now_m = time.monotonic()
+            if (now_m - getattr(self, "_last_detected_objects_time", 0.0)) <= 3.0:
+                fresh_objects = [o for o in self._last_detected_objects if getattr(o, "confidence", 1.0) >= 0.45]
 
+        # Interlocutor state
+        interlocutor = None
+        if wm and hasattr(wm, "_people"):
+            with getattr(wm, "_lock", threading.Lock()):
+                present = [p for p in wm._people.values() if getattr(p, "is_present", False)]
+                if present:
+                    interlocutor = present[0]
+
+        # 1. Specific Query: "ne içiyorum"
+        if "içiyorum" in t or "ne iciyorum" in t:
+            act = getattr(interlocutor, "current_activity", "UNKNOWN") if interlocutor else "UNKNOWN"
+            inter_objs = getattr(interlocutor, "interacting_objects", []) if interlocutor else []
+            cup_seen = any(getattr(o, "class_name", "") in ("cup", "bottle", "wine glass") for o in fresh_objects)
+            if act == "DRINKING" or "cup" in inter_objs or "bottle" in inter_objs or cup_seen:
+                return True, "Elindeki bardaktan bir şeyler içtiğini görüyorum."
+            return True, "Şu an bir şeyler içtiğini göremiyorum."
+
+        # 2. Specific Query: "elimde ne var"
+        if "elimde ne var" in t or "elimde ne görüyorsun" in t:
+            inter_objs = getattr(interlocutor, "interacting_objects", []) if interlocutor else []
+            holding_objs = [o for o in fresh_objects if getattr(o, "interaction_type", "") == "holding"]
+            target_classes = inter_objs or [getattr(o, "class_name", "") for o in holding_objs]
+            if target_classes:
+                tr_name = {"cup": "bardak", "bottle": "su şişesi", "cell phone": "telefon", "book": "kitap"}.get(target_classes[0], target_classes[0])
+                return True, f"Elinde bir {tr_name} tuttuğunu görüyorum."
+            return True, "Şu an elinde belirgin bir nesne göremiyorum."
+
+        # 3. Specific Query: "telefonumu görüyor musun" / "telefon nerede"
+        if "telefon" in t:
+            has_phone = any(getattr(o, "class_name", "") == "cell phone" for o in fresh_objects)
+            if has_phone:
+                return True, "Evet, kameramda telefonunu görüyorum."
+            return True, "Şu an kameramda telefonunu göremiyorum."
+
+        # 4. Specific Query: "bilgisayarımı görüyor musun" / "laptop"
+        if "bilgisayar" in t or "laptop" in t:
+            has_laptop = any(getattr(o, "class_name", "") in ("laptop", "keyboard") for o in fresh_objects)
+            if has_laptop:
+                return True, "Evet, kameramda dizüstü bilgisayarını görüyorum."
+            return True, "Şu an kameramda bilgisayarını göremiyorum."
+
+        # 5. Specific Query: "bardağımı görüyor musun"
+        if "bardak" in t or "kupa" in t:
+            has_cup = any(getattr(o, "class_name", "") in ("cup", "bottle") for o in fresh_objects)
+            if has_cup:
+                return True, "Evet, kameramda bardağını görüyorum."
+            return True, "Şu an kameramda bardağını göremiyorum."
+
+        # 6. Specific Query: "kimi görüyorsun" / "kim var"
         dist_str = f"yaklaşık {vis_dist:.1f}".replace(".", ",") + " metre mesafeden " if (vis_dist and vis_dist > 0.1) else ""
+        if any(w in t for w in ["kimi", "kim var"]):
+            if vis_person_det:
+                return True, f"Kameramda seni {dist_str}görüyorum."
+            return True, "Şu an kameramda kimseyi göremiyorum."
+
+        # 7. General Object / Environment Queries ("neler görüyorsun", "ne görüyorsun", "etrafta ne var")
+        if any(w in t for w in ["neler", "ne görüyorsun", "neler var", "ne var", "çevrende"]):
+            obj_text = self._format_detected_objects_tr(fresh_objects)
+            if vis_person_det and obj_text:
+                return True, f"Kameramda seni {dist_str}görüyorum. Ayrıca {obj_text} görüyorum."
+            elif vis_person_det and not obj_text:
+                return True, f"Kameramda seni {dist_str}görüyorum, fakat etrafında belirgin bir nesne göremiyorum."
+            elif not vis_person_det and obj_text:
+                return True, f"Kameramda şu an kimseyi göremiyorum ama {obj_text} görüyorum."
+            else:
+                return True, "Şu an kameramda herhangi bir kişi veya nesne göremiyorum."
+
         if "takip" in t:
             return True, f"Evet, seni {dist_str}kameramdan görüyorum ve takip ediyorum."
-        elif any(w in t for w in ["kimi", "neler", "ne görüyorsun", "kim var"]):
-            return True, f"Kameramda seni {dist_str}görüyorum ve takip ediyorum."
+        elif not vis_person_det:
+            return True, "Şu an kameramda seni göremiyorum."
         else:
             return True, f"Evet, seni {dist_str}kameramdan görüyorum ve takip ediyorum."
 
@@ -9194,8 +9374,24 @@ class AstroRealtimeNode(Node):
                 looking = bool(f.get("looking_at_robot", False))
                 yaw = float(f.get("yaw_deg", 0.0))
                 p_id = str(f.get("person_id") or f"person_{name_val.lower()}_{idx}")
+                age_grp = f.get("age_group", "UNKNOWN")
+                age_conf = float(f.get("age_confidence", 0.0))
+                dom_color = f.get("dominant_clothing_color_tr") or f.get("dominant_clothing_color", "")
+                dom_color_conf = float(f.get("clothing_color_confidence", 0.0))
+                access_list = f.get("accessories", [])
+                fb_box = (int(f.get("x", 0)), int(f.get("y", 0)), int(f.get("width", 0)), int(f.get("height", 0)))
 
                 if UnifiedPersonState:
+                    raw_attrs = {
+                        "age_group": age_grp,
+                        "age_confidence": age_conf,
+                        "dominant_clothing_color": dom_color,
+                        "dominant_clothing_color_tr": dom_color,
+                        "clothing_color_confidence": dom_color_conf,
+                        "accessories": access_list,
+                        "face_bbox": fb_box,
+                        "expression": f.get("emotion", "neutral"),
+                    }
                     p_state = UnifiedPersonState(
                         person_id=p_id,
                         name=name_val,
@@ -9207,11 +9403,29 @@ class AstroRealtimeNode(Node):
                         azimuth_deg=yaw,
                         is_looking_at_robot=looking,
                         is_present=True,
+                        estimated_age_group=age_grp,
+                        age_confidence=age_conf,
+                        dominant_clothing_color=dom_color,
+                        visual_accessories=access_list,
+                        face_bbox=fb_box,
+                        raw_attributes=raw_attrs,
                     )
                     candidates.append(p_state)
 
             if getattr(self, "social_brain", None):
                 self.social_brain.world_model.update_people(candidates)
+
+                # Real Perception Fusion: Person-Object Association & Temporal Activity
+                wm = self.social_brain.world_model
+                fresh_objs = wm.get_spatial_objects(max_age_s=3.0)
+                if hasattr(self, "_person_object_associator") and self._person_object_associator and fresh_objs:
+                    self._person_object_associator.associate(candidates, fresh_objs)
+
+                if hasattr(self, "_temporal_activity_engine") and self._temporal_activity_engine:
+                    for c_person in candidates:
+                        person_objs = [obj for obj in fresh_objs if getattr(obj, "associated_person_id", None) == c_person.person_id]
+                        act, act_conf, evidence = self._temporal_activity_engine.evaluate(c_person, person_objs)
+                        wm.update_person_activity(c_person.person_id, act.value, act_conf, evidence)
 
                 # Focus target selection via AttentionManager
                 if hasattr(self.social_brain, "attention_manager") and candidates:
@@ -9230,6 +9444,91 @@ class AstroRealtimeNode(Node):
                                 self._last_vision_looking_time = now_mono
         except Exception as _exc:
             self.get_logger().debug(f"_on_faces: {_exc}")
+
+    def _on_detected_objects(self, msg: String):
+        """Processes real-time object detection stream and feeds WorldModel."""
+        try:
+            raw = (msg.data or "").strip()
+            if not raw:
+                return
+            data = json.loads(raw)
+            if not isinstance(data, list):
+                return
+            now = time.time()
+            spatial_objects = []
+            for item in data:
+                if not isinstance(item, dict):
+                    continue
+                cname = item.get("class_name", "")
+                conf = float(item.get("confidence", 0.0))
+                if conf < 0.40 or not cname:
+                    continue
+                obj_id = item.get("object_id", f"{cname}_{len(spatial_objects)}")
+                bbox = tuple(item.get("bbox", [0, 0, 0, 0]))
+                center = tuple(item.get("center", [0.0, 0.0]))
+                dist_m = float(item.get("distance_m", 0.0)) if item.get("distance_m") is not None else 0.0
+                coords = item.get("spatial_coords")
+                x = coords[0] if coords and len(coords) > 0 else 0.0
+                y = coords[1] if coords and len(coords) > 1 else 0.0
+                z = coords[2] if coords and len(coords) > 2 else dist_m
+
+                if SpatialObjectState:
+                    s_obj = SpatialObjectState(
+                        object_id=obj_id,
+                        class_name=cname,
+                        category=cname,
+                        confidence=conf,
+                        x_m=x,
+                        y_m=y,
+                        z_m=z,
+                        distance_m=dist_m,
+                        bbox=bbox,
+                        center=center,
+                        last_observed_ts=now,
+                        freshness="FRESH",
+                        source_frame_id=item.get("source", "oak_rgb"),
+                    )
+                    spatial_objects.append(s_obj)
+
+            if getattr(self, "social_brain", None) and hasattr(self.social_brain, "world_model"):
+                wm = self.social_brain.world_model
+                wm.update_spatial_objects(spatial_objects)
+                wm.remove_stale_spatial_objects(ttl_s=15.0, now=now)
+
+                # Update person-object associations with newly arrived objects
+                if hasattr(self, "_person_object_associator") and self._person_object_associator:
+                    with getattr(wm, "_lock", threading.Lock()):
+                        people = list(wm._people.values())
+                    if people:
+                        self._person_object_associator.associate(people, spatial_objects)
+                        if hasattr(self, "_temporal_activity_engine") and self._temporal_activity_engine:
+                            for p in people:
+                                p_objs = [o for o in spatial_objects if getattr(o, "associated_person_id", None) == p.person_id]
+                                act, act_conf, ev = self._temporal_activity_engine.evaluate(p, p_objs)
+                                wm.update_person_activity(p.person_id, act.value, act_conf, ev)
+
+            with self._lock:
+                self._last_detected_objects = spatial_objects
+                self._last_detected_objects_time = time.monotonic()
+        except Exception as _exc:
+            self.get_logger().debug(f"_on_detected_objects: {_exc}")
+
+    def _on_visual_attributes(self, msg: String):
+        """Processes visual attributes and updates tracked people in WorldModel."""
+        try:
+            raw = (msg.data or "").strip()
+            if not raw:
+                return
+            data = json.loads(raw)
+            if not isinstance(data, dict):
+                return
+            wm = getattr(self.social_brain, "world_model", None) if getattr(self, "social_brain", None) else None
+            if wm:
+                with getattr(wm, "_lock", threading.Lock()):
+                    for pid in list(wm._people.keys()):
+                        wm.update_person_visual_attributes(pid, data)
+        except Exception as _exc:
+            self.get_logger().debug(f"_on_visual_attributes: {_exc}")
 
     def _on_speaker_id(self, msg: String):
         try:

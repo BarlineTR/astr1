@@ -90,20 +90,80 @@ class SocialInitiativeManager:
                     timestamp=t,
                 )
 
-        # Topic & content selection adapted to age group
-        if age_group == "CHILD":
+        # Prerequisite 6: Grounding in Verified Visual Observation (Phase 8)
+        # Compliments must NEVER be hallucinated without concrete perceptual facts.
+        raw_attrs = getattr(person, "raw_attributes", {}) or {}
+        color_tr = getattr(person, "dominant_clothing_color", "") or raw_attrs.get("dominant_clothing_color_tr") or raw_attrs.get("dominant_clothing_color", "")
+        color_conf = float(raw_attrs.get("clothing_color_confidence", 0.0) or 0.0)
+        is_smiling = bool(
+            getattr(person, "visual_emotion", None) and getattr(person.visual_emotion, "value", "").lower() == "happy"
+            or raw_attrs.get("expression") == "smiling"
+        )
+        activity = getattr(person, "current_activity", "UNKNOWN")
+        interacting = getattr(person, "interacting_objects", []) or []
+
+        has_verified_visual_fact = False
+        topic = ComplimentTopic.NONE
+        suggestion = ""
+
+        # Condition 1: Confirmed smile / positive expression
+        if is_smiling:
+            has_verified_visual_fact = True
             topic = ComplimentTopic.SMILE_ENERGY
-            suggestion = "Gözlerinin içi parlıyor, çok neşelisin!"
-        elif age_group == "SENIOR":
+            if age_group == "CHILD":
+                suggestion = "Gözlerinin içi parlıyor, çok neşelisin!"
+            elif age_group == "SENIOR":
+                suggestion = "Tebessümünüz ortama çok güzel bir neşe katıyor, çok zarifsiniz."
+            else:
+                suggestion = "Gülümsemen enerjini çok güzel yansıtıyor, harika bir havan var bugün!"
+
+        # Condition 2: Measured distinctive clothing color (confidence >= 0.45)
+        elif color_tr and color_conf >= 0.45:
+            has_verified_visual_fact = True
+            topic = ComplimentTopic.CLOTHING_STYLE
+            if age_group == "SENIOR":
+                suggestion = f"{color_tr.capitalize()} kıyafetiniz size çok yakışmış, çok şıksınız."
+            else:
+                suggestion = f"{color_tr.capitalize()} kıyafetin sana çok yakışmış."
+
+        # Condition 3: Grounded activity (Drinking coffee/tea or reading)
+        elif activity == "DRINKING" or "cup" in interacting:
+            has_verified_visual_fact = True
             topic = ComplimentTopic.PRESENCE_AURA
-            suggestion = "Sizinle sohbet etmek çok keyifli, çok zarifsiniz."
-        else:
-            topic = ComplimentTopic.SMILE_ENERGY
-            suggestion = "Enerjin harika görünüyor bugün!"
+            suggestion = "Kahve veya çay keyfi yapıyorsun sanırım, afiyet olsun."
+
+        elif activity == "READING" or "book" in interacting:
+            has_verified_visual_fact = True
+            topic = ComplimentTopic.PRESENCE_AURA
+            suggestion = "Kitap okuduğunu görüyorum, ne güzel bir alışkanlık."
+
+        # Condition 4: Direct mutual gaze + close proximity verified
+        elif getattr(person, "is_looking_at_robot", False) and getattr(person, "distance_m", 99.0) <= 2.0:
+            has_verified_visual_fact = True
+            if age_group == "CHILD":
+                topic = ComplimentTopic.SMILE_ENERGY
+                suggestion = "Gözlerinin içi parlıyor, çok neşelisin!"
+            elif age_group == "SENIOR":
+                topic = ComplimentTopic.PRESENCE_AURA
+                suggestion = "Sizinle sohbet etmek çok keyifli, çok zarifsiniz."
+            else:
+                topic = ComplimentTopic.PRESENCE_AURA
+                suggestion = "Enerjin harika görünüyor bugün!"
+
+        # Strict Epistemic Gate: If no objective visual fact was observed, do NOT compliment!
+        if not has_verified_visual_fact:
+            return VisualComplimentDecision(
+                should_compliment=False,
+                topic=ComplimentTopic.NONE,
+                compliment_text_suggestion="",
+                prompt_directive="",
+                reason="NO_VERIFIED_VISUAL_FACT",
+                timestamp=t,
+            )
 
         directive = (
-            f"SOSYAL İNİSİYATİF [KONTROLLÜ GÖRSEL İLTİFAT]: Kişi kamerada doğrudan görülüyor ve göz teması var. "
-            f"Sohbet akışına uygun bir anda doğal şekilde şu iltifatta bulunabilirsin: '{suggestion}'."
+            f"SOSYAL İNİSİYATİF [KONTROLLÜ GÖRSEL İLTİFAT]: Kişi kamerada doğrudan görülüyor, göz teması var ve "
+            f"somut bir görsel gerçek doğrulandı. Sohbet akışına uygun bir anda doğal şekilde şu iltifatta bulunabilirsin: '{suggestion}'."
         )
 
         self._last_compliment_ts[pid] = t

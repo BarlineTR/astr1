@@ -138,6 +138,122 @@ class WorldModel:
         with self._lock:
             self._conversation_state.update(kwargs)
 
+    # -------------------------------------------------------------------------
+    # Spatial Objects & Real Visual Perception Extensions (Phase 1 & 4)
+    # -------------------------------------------------------------------------
+
+    def update_spatial_object(self, obj: SpatialObjectState, now: Optional[float] = None) -> None:
+        """Updates or registers a tracked spatial object."""
+        with self._lock:
+            key = obj.object_id or f"{obj.class_name or obj.category}_{len(self._spatial_objects)}"
+            if now is not None:
+                obj.last_observed_ts = now
+            elif getattr(obj, "last_observed_ts", 0.0) <= 0.0:
+                obj.last_observed_ts = time.time()
+            self._spatial_objects[key] = obj
+
+    def update_spatial_objects(self, objects: List[SpatialObjectState], now: Optional[float] = None) -> None:
+        """Batch updates tracked spatial objects and refreshes their freshness state."""
+        with self._lock:
+            t = now if now is not None else time.time()
+            for obj in objects:
+                key = obj.object_id or f"{obj.class_name or obj.category}_{len(self._spatial_objects)}"
+                if now is not None:
+                    obj.last_observed_ts = now
+                elif getattr(obj, "last_observed_ts", 0.0) <= 0.0:
+                    obj.last_observed_ts = t
+                obj.freshness = "FRESH"
+                self._spatial_objects[key] = obj
+
+    def remove_stale_spatial_objects(self, ttl_s: float = 15.0, now: Optional[float] = None) -> int:
+        """Prunes expired spatial objects whose last observation age exceeds ttl_s."""
+        with self._lock:
+            t = now if now is not None else time.time()
+            stale_keys = [
+                k for k, obj in self._spatial_objects.items()
+                if (t - obj.last_observed_ts) > ttl_s
+            ]
+            for k in stale_keys:
+                del self._spatial_objects[k]
+            return len(stale_keys)
+
+    def get_spatial_objects(
+        self,
+        max_age_s: float = 2.5,
+        min_confidence: float = 0.50,
+        now: Optional[float] = None,
+    ) -> List[SpatialObjectState]:
+        """Returns currently fresh, high-confidence spatial objects."""
+        with self._lock:
+            t = now if now is not None else time.time()
+            valid = []
+            for obj in self._spatial_objects.values():
+                age = t - obj.last_observed_ts
+                if age <= max_age_s and obj.confidence >= min_confidence:
+                    obj.freshness = "FRESH"
+                    valid.append(obj)
+                elif age <= 10.0:
+                    obj.freshness = "STALE"
+                else:
+                    obj.freshness = "EXPIRED"
+            return valid
+
+    def get_recent_spatial_objects(
+        self,
+        max_age_s: float = 10.0,
+        min_confidence: float = 0.50,
+        now: Optional[float] = None,
+    ) -> List[SpatialObjectState]:
+        """Returns spatial objects observed recently (within max_age_s)."""
+        with self._lock:
+            t = now if now is not None else time.time()
+            valid = []
+            for obj in self._spatial_objects.values():
+                age = t - obj.last_observed_ts
+                if age <= max_age_s and obj.confidence >= min_confidence:
+                    obj.freshness = "FRESH" if age <= 2.5 else "STALE"
+                    valid.append(obj)
+            return valid
+
+    def update_person_activity(
+        self,
+        person_id: str,
+        activity: str,
+        confidence: float,
+        evidence: Optional[List[str]] = None,
+        now: Optional[float] = None,
+    ) -> bool:
+        """Updates the verified physical activity of a tracked person."""
+        with self._lock:
+            person = self._people.get(person_id)
+            if person is None:
+                return False
+            t = now if now is not None else time.time()
+            setattr(person, "current_activity", activity)
+            setattr(person, "activity_confidence", confidence)
+            setattr(person, "last_activity_ts", t)
+            if evidence is not None:
+                setattr(person, "activity_evidence", list(evidence))
+            return True
+
+    def update_person_visual_attributes(
+        self,
+        person_id: str,
+        attributes: Dict[str, Any],
+    ) -> bool:
+        """Updates measured visual attributes (clothing color, accessory, smile) of a tracked person."""
+        with self._lock:
+            person = self._people.get(person_id)
+            if person is None:
+                return False
+            raw = getattr(person, "raw_attributes", {}) or {}
+            raw.update(attributes)
+            person.raw_attributes = raw
+            for k, v in attributes.items():
+                if hasattr(person, k):
+                    setattr(person, k, v)
+            return True
+
     def record_event(self, event_description: str):
         with self._lock:
             now = time.time()
@@ -215,10 +331,10 @@ class WorldModel:
                 "relative_speaker_bearing_deg": speaker_yaw,
             }
 
-    def get_snapshot(self) -> WorldStateSnapshot:
+    def get_snapshot(self, now: Optional[float] = None) -> WorldStateSnapshot:
         """Returns a consistent immutable snapshot of current world state."""
         with self._lock:
-            now = time.time()
+            t = now if now is not None else time.time()
             people_copy = list(self._people.values())
             events_formatted = [
                 f"[{time.strftime('%H:%M:%S', time.localtime(ts))}] {desc}"
@@ -227,10 +343,10 @@ class WorldModel:
             active_conflicts = self.detect_conflicts()
 
             return WorldStateSnapshot(
-                timestamp=now,
+                timestamp=t,
                 people=people_copy,
                 active_speaker=self._active_speaker,
-                spatial_objects=list(self._spatial_objects.values()),
+                spatial_objects=self.get_spatial_objects(max_age_s=5.0, now=t),
                 robot_state=dict(self._robot_state),
                 environment=dict(self._environment),
                 conversation_state=dict(self._conversation_state),

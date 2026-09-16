@@ -34,9 +34,23 @@ except ImportError:
 try:
     from astro_vision.image_utils import bgr_to_imgmsg
     from astro_vision.detection_quality import detect_faces_with_confidence
+    from astro_vision.face_recognizer import FaceRecognizer
+    from astro_vision.object_detector import ObjectDetectorEngine
+    from astro_vision.age_estimator import VisualAgeEstimator
+    from astro_vision.visual_attributes import VisualAttributeExtractor
 except ImportError:
-    from image_utils import bgr_to_imgmsg
-    from detection_quality import detect_faces_with_confidence
+    try:
+        from image_utils import bgr_to_imgmsg
+        from detection_quality import detect_faces_with_confidence
+        from face_recognizer import FaceRecognizer
+        from object_detector import ObjectDetectorEngine
+        from age_estimator import VisualAgeEstimator
+        from visual_attributes import VisualAttributeExtractor
+    except ImportError:
+        FaceRecognizer = None
+        ObjectDetectorEngine = None
+        VisualAgeEstimator = None
+        VisualAttributeExtractor = None
 
 
 class OakSpatialNativeNode(Node):
@@ -62,6 +76,15 @@ class OakSpatialNativeNode(Node):
         self.pub_emotion = self.create_publisher(String, "/vision/user_emotion", 10)
         self.pub_faces = self.create_publisher(String, "/vision/faces", 10)
         self.pub_face_image = self.create_publisher(Image, "/vision/face_image", 10)
+        self.pub_recognized_person = self.create_publisher(String, "/vision/recognized_person", 10)
+        self.pub_detected_objects = self.create_publisher(String, "/vision/detected_objects", 10)
+        self.pub_visual_attributes = self.create_publisher(String, "/vision/visual_attributes", 10)
+
+        # Perception Engines
+        self._face_recognizer = FaceRecognizer() if FaceRecognizer else None
+        self._age_estimator = VisualAgeEstimator() if VisualAgeEstimator else None
+        self._visual_attributes = VisualAttributeExtractor() if VisualAttributeExtractor else None
+        self._object_engine = ObjectDetectorEngine() if ObjectDetectorEngine else None
 
         self._running = False
         self._device = None
@@ -257,6 +280,48 @@ class OakSpatialNativeNode(Node):
                     if direct_gaze:
                         is_looking = True
 
+                    # 4. Face Recognition
+                    recog_name = "Misafir"
+                    recog_title = "Misafir"
+                    recog_conf = 0.0
+                    is_known = False
+                    face_roi_bgr = frame[y:y + bh, x:x + bw]
+
+                    if self._face_recognizer and face_roi_bgr.size > 0:
+                        try:
+                            r_name, r_conf, r_meta = self._face_recognizer.recognize_face(face_roi_bgr)
+                            if r_name and r_conf > 0.40:
+                                recog_name = r_name
+                                recog_conf = float(r_conf)
+                                is_known = True
+                                recog_title = r_meta.get("formal_title", r_name)
+                        except Exception:
+                            pass
+
+                    # 5. Age Group Estimation
+                    age_group_val = "UNKNOWN"
+                    age_conf = 0.0
+                    if self._age_estimator and face_roi_bgr.size > 0:
+                        try:
+                            ag_res, ag_conf = self._age_estimator.estimate(face_roi_bgr)
+                            age_group_val = ag_res.value
+                            age_conf = float(ag_conf)
+                        except Exception:
+                            pass
+
+                    # 6. Visual Attributes (Clothing color, glasses, expression)
+                    dominant_color = ""
+                    dominant_color_tr = ""
+                    accessories = []
+                    if self._visual_attributes:
+                        try:
+                            attrs = self._visual_attributes.extract(frame, (x, y, bw, bh), is_smiling=False)
+                            dominant_color = attrs.dominant_clothing_color
+                            dominant_color_tr = attrs.dominant_clothing_color_tr
+                            accessories = attrs.accessories
+                        except Exception:
+                            pass
+
                     face_list.append({
                         "x": x, "y": y, "width": bw, "height": bh,
                         "confidence": round(float(detection_conf), 2),
@@ -265,15 +330,33 @@ class OakSpatialNativeNode(Node):
                         "distance_m": round(float(dist_m), 2),
                         "yaw_deg": round(yaw_deg, 1),
                         "looking_at_robot": direct_gaze,
-                        "emotion": "neutral"
+                        "emotion": "neutral",
+                        "recognized_name": recog_name,
+                        "recognized_title": recog_title,
+                        "is_known": is_known,
+                        "recognition_confidence": round(recog_conf, 2),
+                        "age_group": age_group_val,
+                        "age_confidence": round(age_conf, 2),
+                        "dominant_clothing_color": dominant_color,
+                        "dominant_clothing_color_tr": dominant_color_tr,
+                        "accessories": accessories,
                     })
 
                     # HUD Overlay
                     color = (0, 255, 0) if direct_gaze else (0, 200, 255)
                     cv2.rectangle(frame, (x, y), (x + bw, y + bh), color, 2)
                     gaze_txt = "BANA BAKIYOR" if direct_gaze else f"AÇI: {yaw_deg:.0f}°"
-                    hud_text = f"{gaze_txt} | {dist_m:.2f}m"
+                    known_str = f" [{recog_name}]" if is_known else ""
+                    hud_text = f"{gaze_txt}{known_str} | {dist_m:.2f}m"
                     cv2.putText(frame, hud_text, (x, max(22, y - 10)), cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2)
+
+                # 7. Object Detection & Spatial Perception
+                detected_objs = []
+                if self._object_engine:
+                    try:
+                        detected_objs = self._object_engine.process_frame(frame, depth_frame)
+                    except Exception:
+                        pass
 
                 # Publish Standard ROS 2 Topics
                 rgb_msg = bgr_to_imgmsg(frame, header)
@@ -304,8 +387,30 @@ class OakSpatialNativeNode(Node):
                 self.pub_emotion.publish(emo_msg)
 
                 faces_msg = String()
-                faces_msg.data = json.dumps(face_list)
+                faces_msg.data = json.dumps(face_list, ensure_ascii=False)
                 self.pub_faces.publish(faces_msg)
+
+                # Publish Recognized Person
+                recog_msg = String()
+                top_face = max(face_list, key=lambda f: f.get("recognition_confidence", 0.0), default={})
+                recog_payload = {
+                    "name": top_face.get("recognized_name", "Misafir"),
+                    "title": top_face.get("recognized_title", "Misafir"),
+                    "formal_title": top_face.get("recognized_title", "Misafir"),
+                    "confidence": top_face.get("recognition_confidence", 0.0),
+                    "is_known": top_face.get("is_known", False),
+                    "age_group": top_face.get("age_group", "UNKNOWN"),
+                    "dominant_clothing_color": top_face.get("dominant_clothing_color", ""),
+                    "dominant_clothing_color_tr": top_face.get("dominant_clothing_color_tr", ""),
+                    "accessories": top_face.get("accessories", []),
+                }
+                recog_msg.data = json.dumps(recog_payload, ensure_ascii=False)
+                self.pub_recognized_person.publish(recog_msg)
+
+                # Publish Object Detections
+                obj_msg = String()
+                obj_msg.data = json.dumps([o.to_dict() for o in detected_objs], ensure_ascii=False)
+                self.pub_detected_objects.publish(obj_msg)
 
                 hud_msg = bgr_to_imgmsg(frame, header)
                 self.pub_face_image.publish(hud_msg)

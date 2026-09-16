@@ -52,13 +52,14 @@ class AdaptivePersonaEngine:
             except (ValueError, TypeError):
                 pass
 
-        # 3. Direct string category
+        # 3. Direct string category from real vision pipeline
         cat_val = str(raw.get("age_group", "") or getattr(person, "estimated_age_group", "")).upper()
-        if cat_val in AgeGroup.__members__:
-            return AgeGroup[cat_val], 0.80
+        if cat_val in AgeGroup.__members__ and cat_val != "UNKNOWN":
+            age_conf = float(raw.get("age_confidence", getattr(person, "age_confidence", 0.80)) or 0.80)
+            return AgeGroup[cat_val], age_conf
 
-        # Default for visually confirmed person
-        return AgeGroup.ADULT, 0.50
+        # Epistemic truthfulness: If no vision model confirmed age, state UNKNOWN
+        return AgeGroup.UNKNOWN, 0.0
 
     def evaluate_policy(
         self,
@@ -103,11 +104,28 @@ class AdaptivePersonaEngine:
                 ),
             )
 
-        # Nominal Adult / Teen / Unknown
+        elif age_group == AgeGroup.UNKNOWN:
+            # Unknown Age: Safe, respectful, balanced baseline. Profanity blocked.
+            eff_p = "playful" if p_clean in ("kufurbaz", "flirt") else p_clean
+            return AdaptivePersonaPolicy(
+                target_age_group=AgeGroup.UNKNOWN,
+                age_confidence=0.0,
+                effective_persona=eff_p,
+                style=PersonaStyle.NOMINAL_ADULT,
+                allow_profanity=False,
+                vocabulary_complexity="normal",
+                recommended_tone="nazik, saygılı, dengeli ve doğal",
+                policy_prompt_instruction=(
+                    "UYARLANABİLİR KİŞİLİK [BİLİNMEYEN YAŞ GRUBU]: Karşındaki kişinin yaş grubu henüz doğrulanmadı. "
+                    "Nazik, dengeli ve doğal Astro kimliğini koru; kaba veya aşırı laubali ifadelerden kaçın."
+                ),
+            )
+
+        # Nominal Adult
         allow_prof = (p_clean == "kufurbaz")
         return AdaptivePersonaPolicy(
-            target_age_group=age_group,
-            age_confidence=0.80 if age_group == AgeGroup.ADULT else 0.50,
+            target_age_group=AgeGroup.ADULT,
+            age_confidence=0.80,
             effective_persona=p_clean,
             style=PersonaStyle.NOMINAL_ADULT,
             allow_profanity=allow_prof,

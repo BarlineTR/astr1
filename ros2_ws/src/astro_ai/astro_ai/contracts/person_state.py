@@ -2,7 +2,7 @@
 
 import time
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from enum import Enum
 from astro_ai.contracts.intent_emotion_types import EmotionSignal, RelationshipRole
@@ -84,3 +84,15 @@ class UnifiedPersonState:
 
     # Phase 5 Adaptive Persona & Demographic Attributes
     estimated_age_group: str = "UNKNOWN"
+    age_confidence: float = 0.0
+
+    # Real Perception Extensions (Phase 3, 4, 7)
+    current_activity: str = "UNKNOWN"
+    activity_confidence: float = 0.0
+    activity_started_ts: float = 0.0
+    last_activity_ts: float = 0.0
+    activity_evidence: List[str] = field(default_factory=list)
+    interacting_objects: List[str] = field(default_factory=list)
+    face_bbox: Optional[Tuple[int, int, int, int]] = None
+    dominant_clothing_color: str = ""
+    visual_accessories: List[str] = field(default_factory=list)
