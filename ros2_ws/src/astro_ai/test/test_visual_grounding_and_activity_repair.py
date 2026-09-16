@@ -326,6 +326,93 @@ class TestVisualGroundingAndActivityRepair(unittest.TestCase):
             self.assertTrue(is_angle, f"Expected True for '{text}'")
             self.assertAlmostEqual(target_angle, exp_angle, delta=1.0, msg=f"Angle mismatch for '{text}'")
 
+    def test_13_turn_to_sound_rejection_and_acceptance(self):
+        """Verifies _is_turn_to_sound_query rejects conversational phrases and accepts explicit orientation commands."""
+        # Conversational / storytelling phrases that must NOT trigger deterministic turn-to-sound
+        negatives = [
+            "bana anlat bakalım",
+            "bana bir masal anlatır mısın",
+            "bana dün ne yaptığını hatırla bakalım",
+            "bana bir şey söyle bakalım",
+            "bana yardım et",
+            "bana bir masal oku",
+            "bana şarkı söyle",
+            "baksana bana ne anlatacağım",
+            "döndüm ulan işte",
+            "bana bakıp gülme",
+            "bana göre hava hoş",
+        ]
+        for text in negatives:
+            res = self.node._is_turn_to_sound_query(text)
+            self.assertFalse(res, f"Expected False for conversational phrase '{text}', but got True")
+
+        # Explicit acoustic orientation commands that MUST trigger
+        positives = [
+            "sesime dön",
+            "sesime bak",
+            "sesime doğru dön",
+            "sesin geldiği yöne dön",
+            "sesimin geldiği yere dön",
+            "bana dön",
+            "bana doğru dön",
+            "buraya dön",
+            "yüzüme dön",
+            "bana bakar mısın",
+            "sesime döner misin",
+        ]
+        for text in positives:
+            res = self.node._is_turn_to_sound_query(text)
+            self.assertTrue(res, f"Expected True for command '{text}', but got False")
+
+    def test_14_activity_query_prompt_compact_and_strictly_bounded(self):
+        """Activity query prompt must be compact (<=150 tokens, <=450 chars), zero profile facts, zero topic change."""
+        now = time.monotonic()
+        self.node._oak_connection_state = "CONNECTED"
+        self.node._oak_last_frame_time = now
+        self.node._last_vision_faces_time = now
+        self.node._user_distance = 1.1
+        self.node._looking_at_robot = True
+
+        # Inject profile facts into memory
+        if hasattr(self.node, "memory") and hasattr(self.node.memory, "profile"):
+            self.node.memory.profile.get_known_person = MagicMock(return_value={
+                "name": "Baran",
+                "learned_facts": ["robotik ve yazılımla ilgileniyor", "ROS2 ve LLM uzmanı"]
+            })
+
+        for query in ["Ne yapıyorum?", "Ben şu anda ne yapıyorum?"]:
+            prompts_captured = []
+            def fake_stream(prompt, **kwargs):
+                prompts_captured.append(prompt)
+                yield "Şu an karşımda duruyorsun Baran, ancak fiziksel olarak ne yaptığını göremiyorum."
+
+            with patch.object(self.node.local_gemma_client, "stream", side_effect=fake_stream):
+                with patch.object(self.node.local_gemma_client, "is_available", return_value=True):
+                    self.node._process_fallback_turn(direct_text=query)
+
+            self.assertEqual(len(prompts_captured), 1, f"Expected exactly 1 prompt captured for {query}")
+            p = prompts_captured[0]
+
+            # 1. Strictly bounded token count: well under 450 tokens, target <= 150
+            tok_est = estimate_tokens(p)
+            self.assertLessEqual(tok_est, 150, f"Token count {tok_est} exceeds 150 for query '{query}'")
+
+            # 2. Compact character length: <= 450 characters
+            self.assertLessEqual(len(p), 450, f"Prompt character length {len(p)} exceeds 450 for query '{query}'")
+
+            # 3. Persistent profile facts strictly excluded
+            self.assertNotIn("robotik", p)
+            self.assertNotIn("yazılım", p)
+            self.assertNotIn("ROS2", p)
+            self.assertNotIn("uzmanı", p)
+
+            # 4. Mandatory activity grounding directives
+            self.assertIn("Kullanıcı şu anda ne yaptığını soruyor", p)
+            self.assertIn("tam olarak ne yaptığını kamerandan göremediğini açıkça ve dürüstçe söyle", p)
+            self.assertIn("Konuyu değiştirme!", p)
+            self.assertIn("ASLA aktivite olarak söyleme!", p)
+
 
 if __name__ == "__main__":
     unittest.main()
+

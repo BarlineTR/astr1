@@ -3457,19 +3457,41 @@ class AstroRealtimeNode(Node):
 
     def _is_turn_to_sound_query(self, text: str) -> bool:
         """Detects explicit acoustic gaze orientation commands."""
+        if not text or not str(text).strip():
+            return False
         t = text.lower().strip()
         direct_phrases = [
             "sesime dön", "sesime don", "sesime bak", "sesime doğru dön", "sesime dogru don",
-            "bana dön", "bana don", "bana bak", "bana doğru dön", "bana dogru don",
-            "yüzüme bak", "yuzume bak", "buraya bak", "buraya dön", "buraya don",
-            "sesin geldiği yere dön", "sesin geldiği yöne dön", "sesin geldigi yone don",
             "sesime doğru bak", "sesime dogru bak", "sesime doğru", "sesime dogru",
+            "sesin geldiği yere dön", "sesin geldiği yöne dön", "sesin geldigi yone don",
+            "sesimin geldiği yere dön", "sesimin geldiği yöne dön", "sesimin geldigi yone don",
+            "bana dön", "bana don", "bana bak", "bana doğru dön", "bana dogru don",
+            "bana doğru bak", "bana dogru bak",
+            "yüzüme bak", "yuzume bak", "yüzüme dön", "yuzume don",
+            "buraya bak", "buraya dön", "buraya don",
+            "sesime bakar mısın", "sesime bakar misin", "sesime döner misin", "sesime doner misin",
+            "bana bakar mısın", "bana bakar misin", "bana döner misin", "bana doner misin",
         ]
-        if any(p in t for p in direct_phrases):
+        for p in direct_phrases:
+            if re.search(r"\b" + re.escape(p) + r"\b", t):
+                # Reject conversational storytelling or commands with distinct action verbs
+                if any(w in t for w in ["anlat", "masal", "hikaye", "şarkı", "sarki", "fıkra", "fikra", "söyle", "soyle"]):
+                    continue
+                return True
+
+        # Strict regex: target token followed immediately or within 1 word by orientation imperative
+        # MUST use word boundaries so that conversational words like 'bakalım', 'baksana', 'dönem' NEVER match!
+        turn_pattern = (
+            r"\b(sesime|sesimin\s+(?:geldiği\s+)?(?:yöne|tarafa|yere)|bana\s+doğru|bana|buraya|yüzüme)\s+"
+            r"(?:doğru\s+)?"
+            r"(dön|don|bak|yönel|yonel|döner\s+misin|doner\s+misin|bakar\s+mısın|bakar\s+misin)\b"
+        )
+        if re.search(turn_pattern, t):
+            # Reject conversational questions or storytelling
+            if any(w in t for w in ["bakalım", "bakalim", "baksana", "anlat", "masal", "hikaye", "şarkı", "sarki", "fıkra", "fikra", "söyle", "soyle", "bahset", "oku", "yaz", "yardım"]):
+                return False
             return True
-        has_target = any(k in t for k in ["sesime", "sesimin", "bana", "buraya", "yüzüme", "yuzume"])
-        has_action = any(a in t for a in ["dön", "don", "bak", "yönel", "yonel"])
-        return bool(has_target and has_action)
+        return False
 
     def _is_head_angle_query(self, text: str) -> Tuple[bool, float, str]:
         """Detects explicit head angular positioning commands (e.g. '0 dereceye dön', '-30'a dön', '30 derece sağa bak')."""
@@ -7317,99 +7339,133 @@ class AstroRealtimeNode(Node):
                     ])
                 )
 
-                # Authoritative Visual Grounding (OAK-D as Camera = Eye)
+                # Visual Grounding State (OAK-D is authoritative camera eye)
                 vis_state = self._get_current_visual_grounding()
                 vis_cam_avail = vis_state.get("visual_camera_available", False)
                 vis_person_det = vis_state.get("visual_person_detected", False)
                 vis_dist = vis_state.get("visual_distance")
                 vis_looking = vis_state.get("visual_looking_at_robot", False)
 
-                grounding_lines = []
-                if is_known_spk:
-                    if spk_name.lower() == owner_name.lower():
-                        grounding_lines.append(f"Karşındaki kişi: {spk_name} (Hitap: {spk_name}). {spk_name} senin sahibin, yaratıcın ve baş mühendisin.")
-                    else:
-                        grounding_lines.append(f"Karşındaki kişi: {spk_name} (Hitap: {spk_name}).")
-
-                    # Fetch profile facts ONLY for identity queries, strictly NEVER for activity or visual queries!
-                    if is_identity_query and not is_activity_query:
-                        if hasattr(self, "memory") and hasattr(self.memory, "profile"):
-                            try:
-                                kp = self.memory.profile.get_known_person(spk_name)
-                                if kp:
-                                    k_facts = kp.get("learned_facts", [])
-                                    if k_facts:
-                                        grounding_lines.append(f"Hakkında bildiklerin: {'; '.join(k_facts[-2:])}.")
-                            except Exception:
-                                pass
-
-                    if is_identity_query:
-                        grounding_lines.append(f"Kullanıcı sana kim olduğunu soruyor. Karşındaki kişi {spk_name}'dır. Doğrudan onun {spk_name} olduğunu belirterek cevap ver.")
-                else:
-                    grounding_lines.append("Karşındaki kişi: Misafir (henüz tanınmıyor).")
-                    if is_identity_query:
-                        grounding_lines.append("Kullanıcı sana kim olduğunu soruyor fakat henüz tanınmıyor. Henüz tanışmadığınızı veya adını bilmediğini nazikçe söyle.")
-
-                # Visual Grounding State (OAK-D is authoritative camera eye)
-                if vis_cam_avail:
-                    if vis_person_det:
-                        dist_str = f" Mesafe: ~{vis_dist}m." if vis_dist else ""
-                        look_str = " Doğrudan sana bakıyor." if vis_looking else ""
-                        grounding_lines.append(f"Görsel Durum: Kamera aktif. Karşındaki kişiyi kamerandan görüyorsun ve takip ediyorsun.{dist_str}{look_str}")
-                    else:
-                        grounding_lines.append("Görsel Durum: Kamera aktif fakat karşında şu an görsel olarak insan tespit edilmedi.")
-                else:
-                    grounding_lines.append("Görsel Durum: Kamera şu anda aktif değil / görüntü alınamıyor.")
-
-                # Specific query directives
-                if is_visual_query:
-                    if vis_cam_avail and vis_person_det:
-                        dist_hint = f" (yaklaşık {vis_dist} metre mesafede)" if vis_dist else ""
-                        grounding_lines.append(f"Yönerge: Kullanıcı onu kameradan görüp görmediğini soruyor. Onu kamerandan gördüğünü{dist_hint} ve takip ettiğini net olarak söyle.")
-                    elif vis_cam_avail and not vis_person_det:
-                        grounding_lines.append("Yönerge: Kullanıcı onu kameradan görüp görmediğini soruyor. Kameran açık ama şu an karşında kimseyi göremediğini dürüstçe belirt.")
-                    else:
-                        grounding_lines.append("Yönerge: Kullanıcı onu kameradan görüp görmediğini soruyor. Kameranın şu anda bağlı veya aktif olmadığını dürüstçe belirt.")
-
                 if is_activity_query:
+                    # 1. Specialized ultra-compact prompt for activity queries (strictly <= 125 tokens, fits in single batch of 128)
+                    user_desc = f"Karşındaki kişi: {spk_name}." if is_known_spk else "Karşındaki kişi: Misafir."
                     if vis_cam_avail and vis_person_det:
                         look_hint = "sana baktığını ve " if vis_looking else ""
-                        grounding_lines.append(f"Yönerge: Kullanıcı şu anda ne yaptığını soruyor. Karşında durduğunu, {look_hint}seninle konuştuğunu belirt; ancak tam olarak ne yaptığını / fiziksel eylemini kamerandan göremediğini dürüstçe söyle. Geçmiş profil bilgisini (robotik vb.) ASLA aktivite olarak söyleme!")
+                        vis_desc = f"Görsel Durum: Kamera aktif, {spk_name} karşında görünüyor."
+                        act_guide = (
+                            f"Yönerge: Kullanıcı şu anda ne yaptığını soruyor. Karşında durduğunu, {look_hint}seninle konuştuğunu belirt; "
+                            "ancak tam olarak ne yaptığını kamerandan göremediğini açıkça ve dürüstçe söyle. "
+                            "Konuyu değiştirme! Profil bilgisi verme! ASLA aktivite olarak söyleme!"
+                        )
+                    elif vis_cam_avail and not vis_person_det:
+                        vis_desc = "Görsel Durum: Kamera aktif fakat karşında insan tespit edilmedi."
+                        act_guide = (
+                            "Yönerge: Kullanıcı şu anda ne yaptığını soruyor. Karşında tespit olmadığı için "
+                            "şu an ne yaptığını göremediğini açıkça söyle. Konuyu değiştirme! ASLA aktivite olarak söyleme!"
+                        )
                     else:
-                        grounding_lines.append("Yönerge: Kullanıcı şu anda ne yaptığını soruyor. Karşında görsel tespit olmadığı için şu an ne yaptığını göremediğini dürüstçe söyle. Geçmiş profil bilgisini ASLA aktivite olarak söyleme!")
+                        vis_desc = "Görsel Durum: Kamera aktif değil / görüntü alınamıyor."
+                        act_guide = (
+                            "Yönerge: Kullanıcı şu anda ne yaptığını soruyor. Kamera aktif olmadığı için "
+                            "ne yaptığını göremediğini açıkça söyle. Konuyu değiştirme! ASLA aktivite olarak söyleme!"
+                        )
+                    prompt_sections = [
+                        "Sen ASTRO'sun. Türkçe kısa ve net cevap ver (1-2 cümle). Bilmediğini uydurma.",
+                        user_desc,
+                        vis_desc,
+                        act_guide,
+                        f"Kullanıcı: {user_text}\nASTRO:"
+                    ]
+                    gemma_prompt = "\n".join(prompt_sections)
 
-                # Concise social context (bounded, at most 1 line)
-                compact_social = ""
-                if getattr(self, "social_brain", None) and hasattr(self.social_brain, "dialogue_adapter"):
-                    try:
-                        last_ctx = getattr(self.social_brain.dialogue_adapter, "_last_context", None)
-                        if last_ctx and hasattr(last_ctx, "social_context"):
-                            s_state = getattr(last_ctx.social_context, "activity_name", "") or getattr(last_ctx.social_context, "current_activity", "")
-                            if s_state:
-                                compact_social = f"Mevcut durum: {s_state}"
-                    except Exception:
-                        compact_social = ""
+                elif is_visual_query:
+                    # 2. Specialized compact prompt for camera presence queries (Camera = Eye authoritative)
+                    user_desc = f"Karşındaki kişi: {spk_name}." if is_known_spk else "Karşındaki kişi: Misafir."
+                    if vis_cam_avail and vis_person_det:
+                        dist_hint = f" (yaklaşık {vis_dist} metre mesafede)" if vis_dist else ""
+                        vis_desc = f"Görsel Durum: Kamera aktif. {spk_name} karşında görünüyor ve takip ediliyor.{dist_hint}"
+                        guide = f"Yönerge: Kullanıcı onu kameradan görüp görmediğini soruyor. Onu kamerandan gördüğünü{dist_hint} ve takip ettiğini net olarak söyle."
+                    elif vis_cam_avail and not vis_person_det:
+                        vis_desc = "Görsel Durum: Kamera aktif fakat karşında şu an görsel olarak insan tespit edilmedi."
+                        guide = "Yönerge: Kullanıcı onu kameradan görüp görmediğini soruyor. Kameran açık ama şu an karşında kimseyi göremediğini dürüstçe belirt."
+                    else:
+                        vis_desc = "Görsel Durum: Kamera şu anda aktif değil / görüntü alınamıyor."
+                        guide = "Yönerge: Kullanıcı onu kameradan görüp görmediğini soruyor. Kameranın şu anda bağlı veya aktif olmadığını dürüstçe belirt."
+                    prompt_sections = [
+                        "Sen ASTRO'sun. Türkçe kısa ve doğrudan cevap ver (1-2 cümle). Bilmediğini uydurma.",
+                        user_desc,
+                        vis_desc,
+                        guide,
+                        f"Kullanıcı: {user_text}\nASTRO:"
+                    ]
+                    gemma_prompt = "\n".join(prompt_sections)
 
-                # Build compact bounded prompt (Problem 2: bounded to ~80-120 tokens, strictly <= 450)
-                prompt_sections = [
-                    "Sen ASTRO'sun, sevimli, zeki ve yardımsever bir sosyal robotsun. Türkçe konuş. Kısa, samimi ve doğal cevap ver (en fazla 1-2 cümle). Bilmediğin şeyleri uydurma.",
-                ]
-                if compact_social:
-                    prompt_sections.append(compact_social)
-                prompt_sections.extend(grounding_lines)
-                prompt_sections.append(f"Kullanıcı: {user_text}\nASTRO:")
+                else:
+                    # 3. General & identity queries
+                    grounding_lines = []
+                    if is_known_spk:
+                        if spk_name.lower() == owner_name.lower():
+                            grounding_lines.append(f"Karşındaki kişi: {spk_name} (Hitap: {spk_name}). {spk_name} senin sahibin, yaratıcın ve baş mühendisin.")
+                        else:
+                            grounding_lines.append(f"Karşındaki kişi: {spk_name} (Hitap: {spk_name}).")
 
-                gemma_prompt = "\n".join(prompt_sections)
+                        if is_identity_query:
+                            if hasattr(self, "memory") and hasattr(self.memory, "profile"):
+                                try:
+                                    kp = self.memory.profile.get_known_person(spk_name)
+                                    if kp:
+                                        k_facts = kp.get("learned_facts", [])
+                                        if k_facts:
+                                            grounding_lines.append(f"Hakkında bildiklerin: {'; '.join(k_facts[-2:])}.")
+                                except Exception:
+                                    pass
+                            grounding_lines.append(f"Kullanıcı sana kim olduğunu soruyor. Karşındaki kişi {spk_name}'dır. Doğrudan onun {spk_name} olduğunu belirterek cevap ver.")
+                    else:
+                        grounding_lines.append("Karşındaki kişi: Misafir (henüz tanınmıyor).")
+                        if is_identity_query:
+                            grounding_lines.append("Kullanıcı sana kim olduğunu soruyor fakat henüz tanınmıyor. Henüz tanışmadığınızı veya adını bilmediğini nazikçe söyle.")
+
+                    if vis_cam_avail:
+                        if vis_person_det:
+                            dist_str = f" Mesafe: ~{vis_dist}m." if vis_dist else ""
+                            look_str = " Doğrudan sana bakıyor." if vis_looking else ""
+                            grounding_lines.append(f"Görsel Durum: Kamera aktif. Karşındaki kişiyi kamerandan görüyorsun ve takip ediyorsun.{dist_str}{look_str}")
+                        else:
+                            grounding_lines.append("Görsel Durum: Kamera aktif fakat karşında şu an görsel olarak insan tespit edilmedi.")
+                    else:
+                        grounding_lines.append("Görsel Durum: Kamera şu anda aktif değil / görüntü alınamıyor.")
+
+                    compact_social = ""
+                    if getattr(self, "social_brain", None) and hasattr(self.social_brain, "dialogue_adapter"):
+                        try:
+                            last_ctx = getattr(self.social_brain.dialogue_adapter, "_last_context", None)
+                            if last_ctx and hasattr(last_ctx, "social_context"):
+                                s_state = getattr(last_ctx.social_context, "activity_name", "") or getattr(last_ctx.social_context, "current_activity", "")
+                                if s_state:
+                                    compact_social = f"Mevcut durum: {s_state}"
+                        except Exception:
+                            compact_social = ""
+
+                    prompt_sections = [
+                        "Sen ASTRO'sun, sevimli, zeki ve yardımsever bir sosyal robotsun. Türkçe konuş. Kısa, samimi ve doğal cevap ver (en fazla 1-2 cümle). Bilmediğin şeyleri uydurma.",
+                    ]
+                    if compact_social:
+                        prompt_sections.append(compact_social)
+                    prompt_sections.extend(grounding_lines)
+                    prompt_sections.append(f"Kullanıcı: {user_text}\nASTRO:")
+                    gemma_prompt = "\n".join(prompt_sections)
 
                 # Deterministic bounding guard: enforce <= 450 tokens
-                if estimate_tokens(gemma_prompt) > 420:
-                    gemma_prompt = f"Sen ASTRO'sun. Türkçe konuş. Kısa cevap ver.\n{' '.join(grounding_lines)}\nKullanıcı: {user_text[:200]}\nASTRO:"
+                prompt_tok_est = estimate_tokens(gemma_prompt)
+                if prompt_tok_est > 420:
+                    gemma_prompt = f"Sen ASTRO'sun. Türkçe konuş. Kısa cevap ver.\nKarşındaki kişi: {spk_name}.\nKullanıcı: {user_text[:200]}\nASTRO:"
+                    prompt_tok_est = estimate_tokens(gemma_prompt)
 
                 prompt_build_ms = (time.perf_counter() - t_build_start) * 1000.0
                 llm_prompt_used = gemma_prompt
 
                 self.get_logger().info(
-                    f"🦙 [Local Gemma Inference Start] model={local_model_name} | prompt_len={len(gemma_prompt)} | prompt_build_ms={prompt_build_ms:.1f}"
+                    f"🦙 [Local Gemma Inference Start] model={local_model_name} | prompt_len={len(gemma_prompt)} | prompt_tokens={prompt_tok_est} | prompt_build_ms={prompt_build_ms:.1f}"
                 )
 
                 t_infer_start = time.perf_counter()
