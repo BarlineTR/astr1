@@ -55,6 +55,14 @@ class ResponsePlanner:
             strategies.append("Kamera ve görsel algı durumunu net ve dürüstçe açıkla")
             directness = 0.95
 
+        elif context.user_intent == IntentType.MOTION_COMMAND:
+            strategies.append("Hareket veya durma komutunu güvenlik kontrollerine uygun şekilde uygula ve durumu kısaca bildir")
+            directness = 1.0
+
+        elif context.user_intent == IntentType.TURN_TO_SOUND_COMMAND:
+            strategies.append("Ses yönüne dönme eylemini gerçekleştir ve kullanıcıya odaklandığını bildir")
+            directness = 1.0
+
         elif context.user_intent == IntentType.SOCIAL_BID:
             strategies.append("Sosyal çağrıya samimi ve canlı bir karşılık ver")
             humor = 0.5

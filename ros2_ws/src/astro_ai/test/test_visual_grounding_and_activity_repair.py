@@ -447,6 +447,123 @@ class TestVisualGroundingAndActivityRepair(unittest.TestCase):
             is_move, _, _, _ = self.node._is_movement_query(ns)
             self.assertFalse(is_move, f"Phrase '{ns}' must NOT be recognized as movement stop command")
 
+    def test_19_semantic_intents_motion_and_turn(self):
+        """Semantic intents for motion, acoustic turn, activity and vision are accurately classified."""
+        engine = IntentEngine()
+
+        # Stop commands -> MOTION_COMMAND(stop)
+        for q in ["dur", "dursana", "acil dur", "Hey Astro, dur."]:
+            intent, conf = engine.classify_intent(q)
+            self.assertEqual(intent, IntentType.MOTION_COMMAND, f"'{q}' should match MOTION_COMMAND")
+            self.assertEqual(str(intent), "MOTION_COMMAND(stop)")
+            self.assertEqual(intent.direction, "stop")
+
+        # Directional motion commands -> MOTION_COMMAND(forward|right|left)
+        int_f, _ = engine.classify_intent("ileri git")
+        self.assertEqual(int_f, IntentType.MOTION_COMMAND)
+        self.assertEqual(int_f.direction, "forward")
+
+        int_r, _ = engine.classify_intent("sağa dön")
+        self.assertEqual(int_r, IntentType.MOTION_COMMAND)
+        self.assertEqual(int_r.direction, "right")
+
+        int_l, _ = engine.classify_intent("sola dön")
+        self.assertEqual(int_l, IntentType.MOTION_COMMAND)
+        self.assertEqual(int_l.direction, "left")
+
+        # Acoustic turn commands -> TURN_TO_SOUND_COMMAND
+        for q in ["sesime dön", "bana doğru dön", "Hey Astro, sesime dön."]:
+            intent, conf = engine.classify_intent(q)
+            self.assertEqual(intent, IntentType.TURN_TO_SOUND_COMMAND, f"'{q}' should match TURN_TO_SOUND_COMMAND")
+
+        # Activity queries -> ACTIVITY_QUERY
+        for q in ["ben ne yapıyorum?", "ben ne yapıyordur şu anda?", "Hey Astro, ben ne yapıyordur şu anda?"]:
+            intent, conf = engine.classify_intent(q)
+            self.assertEqual(intent, IntentType.ACTIVITY_QUERY, f"'{q}' should match ACTIVITY_QUERY")
+
+        # Visual state queries -> VISUAL_STATE_QUERY
+        for q in ["kameranda neler görüyorsun?", "kimi görüyorsun?"]:
+            intent, conf = engine.classify_intent(q)
+            self.assertEqual(intent, IntentType.VISUAL_STATE_QUERY, f"'{q}' should match VISUAL_STATE_QUERY")
+
+    def test_20_fact_persona_separation_and_child_safety(self):
+        """Fact ground truth is strictly preserved, child safety cleanses profanity, and unverified speakers are nameless."""
+        fact = "Kameramda seni yaklaşık 1,2 metre mesafeden görüyorum ve takip ediyorum."
+
+        # Case 1: Unverified speaker -> No name used in response
+        res_unverified = self.node._format_deterministic_response(
+            fact_text=fact,
+            spk_name="Baran",
+            is_known=False,
+            is_child=False,
+        )
+        self.assertNotIn("Baran", res_unverified)
+        self.assertIn(fact.lower(), res_unverified.lower())
+
+        # Case 2: Verified adult with kufurbaz persona -> Prefixes Ulan, preserves fact
+        self.node.persona_name = "kufurbaz"
+        res_kufurbaz_adult = self.node._format_deterministic_response(
+            fact_text=fact,
+            spk_name="Baran",
+            is_known=True,
+            is_child=False,
+        )
+        self.assertTrue(res_kufurbaz_adult.startswith("Ulan Baran,"))
+        self.assertIn("kameramda seni", res_kufurbaz_adult)
+
+        # Case 3: CHILD SAFETY INVARIANT -> Even with kufurbaz persona, sanitized to playful (ZERO Ulan/profanity)
+        res_kufurbaz_child = self.node._format_deterministic_response(
+            fact_text=fact,
+            spk_name="Baran",
+            is_known=True,
+            is_child=True,
+        )
+        self.assertNotIn("Ulan", res_kufurbaz_child)
+        self.assertNotIn("ulan", res_kufurbaz_child)
+        self.assertIn("kameramda seni", res_kufurbaz_child)
+
+        # Case 4: Stop command with Child Safety
+        stop_fact = "Durdum."
+        res_stop_child = self.node._format_deterministic_response(
+            fact_text=stop_fact,
+            spk_name=None,
+            is_known=False,
+            is_child=True,
+        )
+        self.assertEqual(res_stop_child, "Durdum.")
+        self.assertNotIn("Ulan", res_stop_child)
+
+    def test_21_end_to_end_latency_telemetry_breakdown(self):
+        """Real end-to-end latency telemetry tracks distinct timestamps and breakdown latencies with 0ms LLM."""
+        query = "Hey Astro, dur."
+        self.node._process_fallback_turn(direct_text=query)
+
+        telem = self.node._last_turn_telemetry
+        self.assertIsNotNone(telem, "Turn telemetry must be recorded")
+        self.assertEqual(telem.get("response_origin"), "deterministic_policy")
+        self.assertEqual(telem.get("llm_duration_ms"), 0, "LLM duration must be 0 for deterministic policy")
+
+        # Check distinct timestamps
+        self.assertIn("timestamps", telem)
+        ts = telem["timestamps"]
+        self.assertIn("stt_finished", ts)
+        self.assertIn("intent_resolved", ts)
+        self.assertIn("response_ready", ts)
+        self.assertIn("tts_request_started", ts)
+        self.assertIn("tts_first_audio", ts)
+        self.assertIn("playback_started", ts)
+        self.assertGreater(ts["stt_finished"], 0)
+        self.assertGreater(ts["intent_resolved"], 0)
+        self.assertGreater(ts["response_ready"], 0)
+
+        # Check calculated durations
+        self.assertIn("intent_resolution_ms", telem)
+        self.assertIn("response_generation_ms", telem)
+        self.assertIn("tts_ttfa_ms", telem)
+        self.assertIn("end_to_end_first_audio_ms", telem)
+        self.assertGreaterEqual(telem["end_to_end_first_audio_ms"], 0)
+
 
 if __name__ == "__main__":
     unittest.main()
+

@@ -3,7 +3,7 @@
 import re
 from typing import Optional, Tuple
 
-from astro_ai.contracts.intent_emotion_types import IntentType
+from astro_ai.contracts.intent_emotion_types import IntentType, SemanticIntent
 
 
 class IntentEngine:
@@ -34,6 +34,30 @@ class IntentEngine:
         r"\b(?:beni\s+)?takip\s+ediyor\s+musun(?:\s+beni)?\b",
         r"\b(?:etrafımda|etrafta|çevrende)\s+ne\s+görüyorsun\b",
     ]
+    TURN_TO_SOUND_PATTERNS = [
+        r"\b(?:sesime|sesimin\s+geldiği\s+yöne|sesin\s+geldiği\s+yöne|sesime\s+doğru)\s+(?:dön(?:er\s+misin)?|bak(?:ar\s+mısın)?)\b",
+        r"\b(?:bana|bana\s+doğru|buraya|yüzüme)\s+dön(?:er\s+misin)?\b",
+        r"\b(?:sesime|sesimin\s+geldiği\s+yere)\s+dön\b",
+        r"\b(?:bana|sesime)\s+bakar\s+mısın\b",
+    ]
+    MOTION_PATTERNS = {
+        "stop": [
+            r"\b(acil\s+dur|hemen\s+dur|dur\s+artık|artık\s+dur|hareketi\s+kes|bekle\s+orada|hareket\s+etme|dur\s+orada|dur\s+robot|dursana|dur\s+lütfen|lütfen\s+dur)\b",
+            r"^(?:hey\s+)?(?:astro\s*[,:\.]?\s*)?dur[!\.]?$",
+        ],
+        "forward": [
+            r"\b(ileri\s+git|öne\s+git|one\s+git|ilerle|ileri\s+sür|öne\s+doğru\s+git)\b",
+        ],
+        "backward": [
+            r"\b(geri\s+gel|geriye\s+git|gerile|geri\s+sür|arkaya\s+git)\b",
+        ],
+        "right": [
+            r"\b(sağa\s+dön|saga\s+don|sağa\s+kıvrıl)\b",
+        ],
+        "left": [
+            r"\b(sola\s+dön|sola\s+don|sola\s+kıvrıl)\b",
+        ],
+    }
     SOCIAL_BID_PATTERNS = [
         r"\b(?:ne\s+haber|naber|ne\s+var\s+ne\s+yok)\b",
         r"\b(?:neler\s+yapıyorsun|neler\s+dönüyor)\b",
@@ -64,10 +88,27 @@ class IntentEngine:
     ]
 
     @classmethod
-    def classify_intent(cls, text: str) -> Tuple[IntentType, float]:
-        """Classifies speech intent and returns (IntentType, confidence)."""
+    def get_motion_direction(cls, text: str) -> Optional[str]:
+        """Returns normalized motion direction ('stop', 'forward', 'backward', 'right', 'left') or None."""
+        if not text:
+            return None
+        t = text.lower().strip(" .,!?:;")
+        # Exclude questions or perception query tokens from being motion commands
+        if any(q in t for q in ["ne ", "ne?", "ne!", "nedir", "neler", "kim", "nasıl", "nasil", "mısın", "misin", "musun", "mu ", "?"]):
+            return None
+        cleaned = re.sub(r"^(?:hey\s+)?astro[\s,]+", "", t)
+        cleaned = re.sub(r"[\s,]+(?:hey\s+)?astro$", "", cleaned).strip(" .,!?:;")
+        targets = [cleaned, t] if cleaned and cleaned != t else [t]
+        for direction, patterns in cls.MOTION_PATTERNS.items():
+            if any(re.search(p, txt) for txt in targets for p in patterns):
+                return direction
+        return None
+
+    @classmethod
+    def classify_intent(cls, text: str) -> Tuple[SemanticIntent, float]:
+        """Classifies speech intent and returns (SemanticIntent, confidence)."""
         if not text or not text.strip():
-            return IntentType.UNKNOWN, 0.0
+            return SemanticIntent(IntentType.UNKNOWN), 0.0
 
         t = text.lower().strip(" .,!?:;")
 
@@ -81,53 +122,63 @@ class IntentEngine:
 
         # 1. Exact Confirmations / Denials
         if any(re.search(p, t) for p in cls.CONFIRMATION_PATTERNS):
-            return IntentType.CONFIRMATION, 0.98
+            return SemanticIntent(IntentType.CONFIRMATION), 0.98
         if any(re.search(p, t) for p in cls.DENIAL_PATTERNS):
-            return IntentType.DENIAL, 0.98
+            return SemanticIntent(IntentType.DENIAL), 0.98
 
         # 2. Corrections
         if any(re.search(p, txt) for txt in target_texts for p in cls.CORRECTION_PATTERNS):
-            return IntentType.CORRECTION, 0.90
+            return SemanticIntent(IntentType.CORRECTION), 0.90
 
         # 3. Activity Queries (high priority to prevent GREETING / STATEMENT fallthrough)
         if any(re.search(p, txt) for txt in target_texts for p in cls.ACTIVITY_QUERY_PATTERNS):
-            return IntentType.ACTIVITY_QUERY, 0.95
+            return SemanticIntent(IntentType.ACTIVITY_QUERY), 0.95
 
         # 4. Visual State Queries (high priority: camera/vision state queries)
         if any(re.search(p, txt) for txt in target_texts for p in cls.VISUAL_STATE_QUERY_PATTERNS):
-            return IntentType.VISUAL_STATE_QUERY, 0.95
+            return SemanticIntent(IntentType.VISUAL_STATE_QUERY), 0.95
 
-        # 5. Memory Queries
+        # 5. Turn-to-Sound Acoustic Gaze Commands (high priority before general request/statement)
+        is_conversational = any(k in t for k in ["anlat", "söyle", "oku", "masal", "yardım", "şarkı", "dinle", "haber"])
+        if not is_conversational and any(re.search(p, txt) for txt in target_texts for p in cls.TURN_TO_SOUND_PATTERNS):
+            return SemanticIntent(IntentType.TURN_TO_SOUND_COMMAND), 0.95
+
+        # 6. Motion Mobility Commands (high priority: stop, forward, backward, left, right)
+        motion_dir = cls.get_motion_direction(t)
+        if motion_dir:
+            return SemanticIntent(IntentType.MOTION_COMMAND, motion_dir), 0.95
+
+        # 7. Memory Queries
         if any(re.search(p, txt) for txt in target_texts for p in cls.MEMORY_QUERY_PATTERNS):
-            return IntentType.MEMORY_QUERY, 0.95
+            return SemanticIntent(IntentType.MEMORY_QUERY), 0.95
 
-        # 5. Memory Updates
+        # 8. Memory Updates
         if any(re.search(p, txt) for txt in target_texts for p in cls.MEMORY_UPDATE_PATTERNS):
-            return IntentType.MEMORY_UPDATE, 0.90
+            return SemanticIntent(IntentType.MEMORY_UPDATE), 0.90
 
-        # 6. Social Bids (e.g. "ne haber?", "naber")
+        # 9. Social Bids (e.g. "ne haber?", "naber")
         if any(re.search(p, txt) for txt in target_texts for p in cls.SOCIAL_BID_PATTERNS):
-            return IntentType.SOCIAL_BID, 0.90
+            return SemanticIntent(IntentType.SOCIAL_BID), 0.90
 
-        # 7. Greetings
+        # 10. Greetings
         if any(re.search(p, txt) for txt in target_texts for p in cls.GREETING_PATTERNS):
-            return IntentType.GREETING, 0.95
+            return SemanticIntent(IntentType.GREETING), 0.95
 
-        # 8. Farewells
+        # 11. Farewells
         if any(re.search(p, txt) for txt in target_texts for p in cls.FAREWELL_PATTERNS):
-            return IntentType.FAREWELL, 0.95
+            return SemanticIntent(IntentType.FAREWELL), 0.95
 
-        # 9. Emotional Disclosure
+        # 12. Emotional Disclosure
         if any(re.search(p, txt) for txt in target_texts for p in cls.EMOTIONAL_PATTERNS):
-            return IntentType.EMOTIONAL_DISCLOSURE, 0.88
+            return SemanticIntent(IntentType.EMOTIONAL_DISCLOSURE), 0.88
 
-        # 10. Requests
+        # 13. Requests
         if any(re.search(p, txt) for txt in target_texts for p in cls.REQUEST_PATTERNS):
-            return IntentType.REQUEST, 0.85
+            return SemanticIntent(IntentType.REQUEST), 0.85
 
-        # 11. Questions
+        # 14. Questions
         if any(re.search(p, txt) for txt in target_texts for p in cls.QUESTION_PATTERNS):
-            return IntentType.QUESTION, 0.80
+            return SemanticIntent(IntentType.QUESTION), 0.80
 
-        # 12. General Statements
-        return IntentType.STATEMENT, 0.65
+        # 15. General Statements
+        return SemanticIntent(IntentType.STATEMENT), 0.65

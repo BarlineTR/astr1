@@ -3749,6 +3749,66 @@ class AstroRealtimeNode(Node):
 
         return False, "stop", 0.0, 0.0
 
+    def _format_deterministic_response(
+        self,
+        fact_text: str,
+        spk_name: Optional[str] = None,
+        is_known: bool = False,
+        is_child: bool = False,
+    ) -> str:
+        """Formats a deterministic ground-truth fact through the active persona presentation layer.
+
+        Invariants:
+        1. Ground truth fact (fact_text) is never altered, distorted, or contradicted.
+        2. If interlocutor is a CHILD, persona is strictly sanitized to playful (zero profanity, no 'Ulan' or harsh tone).
+        3. If interlocutor identity is not verified (is_known is False or spk_name is 'Misafir'), never use personal name.
+        """
+        if not fact_text:
+            return ""
+
+        # Verified interlocutor name gate: only use name if verified & not Misafir/empty
+        valid_name = spk_name.strip() if (is_known and spk_name and spk_name.lower() != "misafir") else None
+
+        # Determine presentation persona (Child safety invariant)
+        persona = getattr(self, "persona_name", "playful").lower()
+        if is_child and persona in ("kufurbaz", "hostile", "rude"):
+            persona = "playful"
+
+        fact_clean = fact_text.strip()
+
+        if persona == "kufurbaz" and not is_child:
+            fact_lower_first = fact_clean[0].lower() + fact_clean[1:] if len(fact_clean) > 1 else fact_clean.lower()
+            if valid_name:
+                return f"Ulan {valid_name}, {fact_lower_first}"
+            else:
+                return f"Ulan, {fact_lower_first}"
+
+        elif persona == "flirt":
+            fact_lower_first = fact_clean[0].lower() + fact_clean[1:] if len(fact_clean) > 1 else fact_clean.lower()
+            if valid_name:
+                return f"Canım {valid_name}, {fact_lower_first}"
+            else:
+                return f"Canım benim, {fact_lower_first}"
+
+        elif persona == "playful":
+            if valid_name:
+                if fact_clean.startswith("Evet,"):
+                    return fact_clean.replace("Evet,", f"Evet {valid_name},", 1)
+                elif not fact_clean.startswith(valid_name):
+                    fact_lower_first = fact_clean[0].lower() + fact_clean[1:] if len(fact_clean) > 1 else fact_clean.lower()
+                    return f"{valid_name}, {fact_lower_first}"
+            return fact_clean
+
+        else:
+            # Default / formal / neutral persona
+            if valid_name:
+                if fact_clean.startswith("Evet,"):
+                    return fact_clean.replace("Evet,", f"Evet {valid_name},", 1)
+                elif not fact_clean.startswith(valid_name):
+                    fact_lower_first = fact_clean[0].lower() + fact_clean[1:] if len(fact_clean) > 1 else fact_clean.lower()
+                    return f"{valid_name}, {fact_lower_first}"
+            return fact_clean
+
     def _execute_realtime_tool(self, name: str, args: Dict[str, Any]) -> Dict[str, Any]:
         """Executes integrated robot tools in real time."""
         if name == "get_live_weather":
@@ -6656,6 +6716,7 @@ class AstroRealtimeNode(Node):
         self._speech_authorization = None
         self._barge_in_latched = False  # Reset single logical barge-in debounce for new turn
         t_turn_start = time.monotonic()
+        t_stt_finished = t_turn_start
         chosen_model = "none"
         chosen_provider = "none"
         response_origin = "none"
@@ -6737,6 +6798,7 @@ class AstroRealtimeNode(Node):
                 t_stt_start = time.monotonic()
                 raw_transcript = self._transcribe_wav(wav_bytes)
                 t_stt_end = time.monotonic()
+                t_stt_finished = t_stt_end
                 stt_ms = (t_stt_end - t_stt_start) * 1000.0
 
                 # 3. Multi-Signal Validation Gate (Transcript + Acoustics + VAD + Playback + Self-Voice)
@@ -7061,6 +7123,16 @@ class AstroRealtimeNode(Node):
                 first_token_ms: float = 0.0,
                 generation_ms: float = 0.0,
                 total_llm_ms: float = 0.0,
+                t_stt_finished_ts: float = 0.0,
+                t_intent_resolved_ts: float = 0.0,
+                t_response_ready_ts: float = 0.0,
+                t_tts_request_started_ts: float = 0.0,
+                t_tts_first_audio_ts: float = 0.0,
+                t_playback_started_ts: float = 0.0,
+                intent_resolution_ms_val: float = 0.0,
+                response_generation_ms_val: float = 0.0,
+                tts_ttfa_ms_val: float = 0.0,
+                end_to_end_first_audio_ms_val: float = 0.0,
             ):
                 r_chars = len(rep_text)
                 r_words = len(rep_text.split())
@@ -7099,6 +7171,18 @@ class AstroRealtimeNode(Node):
                     response_origin=origin,
                 )
 
+                stt_fin = t_stt_finished_ts if t_stt_finished_ts > 0 else t_stt_finished
+                int_res = t_intent_resolved_ts if t_intent_resolved_ts > 0 else (t_intent_resolved if 't_intent_resolved' in locals() else 0.0)
+                resp_rdy = t_response_ready_ts if t_response_ready_ts > 0 else (t_response_ready if 't_response_ready' in locals() else 0.0)
+                tts_req = t_tts_request_started_ts if t_tts_request_started_ts > 0 else 0.0
+                tts_fa = t_tts_first_audio_ts if t_tts_first_audio_ts > 0 else 0.0
+                pb_start = t_playback_started_ts if t_playback_started_ts > 0 else (time.monotonic() if played else 0.0)
+
+                int_res_ms = intent_resolution_ms_val if intent_resolution_ms_val > 0 else ((int_res - t_turn_start) * 1000.0 if int_res > 0 else 0.0)
+                resp_gen_ms = response_generation_ms_val if response_generation_ms_val > 0 else ((resp_rdy - int_res) * 1000.0 if (resp_rdy > 0 and int_res > 0) else 0.0)
+                ttfa_ms = tts_ttfa_ms_val if tts_ttfa_ms_val > 0 else dur_synth_ms
+                e2e_ms = end_to_end_first_audio_ms_val if end_to_end_first_audio_ms_val > 0 else ((pb_start - stt_fin) * 1000.0 if (played and stt_fin > 0) else 0.0)
+
                 telem = {
                     "generation_id": self._fallback_generation_id,
                     "user_turn_id": u_turn_id,
@@ -7114,7 +7198,6 @@ class AstroRealtimeNode(Node):
                     "llm_model": chosen_model,
                     "llm_inference_started": llm_inference_started,
                     "llm_inference_completed": llm_inference_completed,
-                    "response_origin": origin,
                     "llm_duration_ms": int(llm_inference_duration_ms),
                     "prompt_build_ms": round(prompt_build_ms, 1),
                     "inference_request_ms": round(inference_request_ms, 1),
@@ -7125,11 +7208,29 @@ class AstroRealtimeNode(Node):
                     "tts_model": tts_model_name,
                     "response_chars": r_chars,
                     "response_words": r_words,
-                    "tts_ttfa_ms": int(dur_synth_ms),
+                    "tts_ttfa_ms": int(ttfa_ms),
                     "tts_total_ms": int(dur_synth_ms),
                     "playback_started": played,
                     "playback_finished": played and synth_fin,
                     "playback_failed": not played and synth_fin,
+                    # Real End-to-End Latency Telemetry
+                    "stt_finished": round(stt_fin, 4),
+                    "intent_resolved": round(int_res, 4),
+                    "response_ready": round(resp_rdy, 4),
+                    "tts_request_started": round(tts_req, 4),
+                    "tts_first_audio": round(tts_fa, 4),
+                    "playback_started_ts": round(pb_start, 4),
+                    "intent_resolution_ms": round(int_res_ms, 2),
+                    "response_generation_ms": round(resp_gen_ms, 2),
+                    "end_to_end_first_audio_ms": round(e2e_ms, 2),
+                    "timestamps": {
+                        "stt_finished": round(stt_fin, 4),
+                        "intent_resolved": round(int_res, 4),
+                        "response_ready": round(resp_rdy, 4),
+                        "tts_request_started": round(tts_req, 4),
+                        "tts_first_audio": round(tts_fa, 4),
+                        "playback_started": round(pb_start, 4),
+                    },
                 }
                 self._last_turn_telemetry = telem
                 self.get_logger().info(
@@ -7147,7 +7248,6 @@ class AstroRealtimeNode(Node):
                     f"llm_model={chosen_model}\n"
                     f"llm_inference_started={llm_inference_started}\n"
                     f"llm_inference_completed={llm_inference_completed}\n"
-                    f"response_origin={origin}\n"
                     f"llm_duration_ms={int(llm_inference_duration_ms)}\n"
                     f"prompt_build_ms={prompt_build_ms:.1f}\n"
                     f"inference_request_ms={inference_request_ms:.1f}\n"
@@ -7158,22 +7258,60 @@ class AstroRealtimeNode(Node):
                     f"tts_model={tts_model_name}\n"
                     f"response_chars={r_chars}\n"
                     f"response_words={r_words}\n"
-                    f"tts_ttfa_ms={int(dur_synth_ms)}\n"
+                    f"tts_ttfa_ms={int(ttfa_ms)}\n"
                     f"tts_total_ms={int(dur_synth_ms)}\n"
                     f"playback_started={played}\n"
                     f"playback_finished={played and synth_fin}\n"
-                    f"playback_failed={not played and synth_fin}"
+                    f"playback_failed={not played and synth_fin}\n"
+                    f"[End-to-End Latency Breakdown]\n"
+                    f"  stt_finished: {stt_fin:.4f}\n"
+                    f"  intent_resolved: {int_res:.4f} (+{int_res_ms:.1f}ms)\n"
+                    f"  response_ready: {resp_rdy:.4f} (+{resp_gen_ms:.1f}ms)\n"
+                    f"  tts_request_started: {tts_req:.4f}\n"
+                    f"  tts_first_audio: {tts_fa:.4f} (+{ttfa_ms:.1f}ms)\n"
+                    f"  playback_started: {pb_start:.4f}\n"
+                    f"  TOTAL E2E (stt_finished -> playback_started): {e2e_ms:.1f}ms"
                 )
 
             # 6. Interaction Gate & System Prompt
+            t_intent_start = time.monotonic()
             system_prompt = self._build_current_system_prompt(
                 active_speaker=active_speaker_dict,
                 explicit_user_turn=self._current_turn_explicit_user_turn,
             )
+            t_intent_resolved = time.monotonic()
+            intent_resolution_ms = (t_intent_resolved - t_intent_start) * 1000.0
+
+            # Synchronize semantic intent and check child status
+            soc_ctx = getattr(self, "_last_social_context", None)
+            soc_dec = getattr(self, "_last_social_decision", None)
+            turn_intent = None
+            if hasattr(self, "intent_engine"):
+                turn_intent, _ = self.intent_engine.classify_intent(user_text)
+            elif getattr(self, "social_brain", None) and hasattr(self.social_brain, "intent_engine"):
+                turn_intent, _ = self.social_brain.intent_engine.classify_intent(user_text)
+            if turn_intent and soc_ctx:
+                soc_ctx.user_intent = turn_intent
+
+            is_child = False
+            try:
+                if soc_dec and getattr(soc_dec, "target_age_group", "") == "CHILD":
+                    is_child = True
+                elif soc_ctx and getattr(soc_ctx, "target_age_group", "") == "CHILD":
+                    is_child = True
+                elif getattr(self, "social_brain", None) and hasattr(self.social_brain, "world_model"):
+                    wm = self.social_brain.world_model
+                    people = getattr(wm, "people", {})
+                    if isinstance(people, dict):
+                        for p in people.values():
+                            if getattr(p, "is_present", False) and (getattr(p, "age_group", "") == "CHILD" or getattr(p, "target_age_group", "") == "CHILD"):
+                                is_child = True
+                                break
+            except Exception:
+                is_child = False
 
             # INTERACTION GATE & EXPLICIT USER TURN HARD BLOCK:
             # Deterministically suppresses Local Gemma, Cloud Providers, Deterministic Policies, and TTS when verbal response is gated
-            soc_dec = getattr(self, "_last_social_decision", None)
             should_speak = getattr(soc_dec, "should_speak", True) if soc_dec else True
             explicit_user_turn = getattr(self, "_current_turn_explicit_user_turn", False)
             if not (should_speak and explicit_user_turn):
@@ -7182,8 +7320,7 @@ class AstroRealtimeNode(Node):
                 self.get_logger().info(
                     f"🛑 [InteractionGate Hard Block]: Sözel yanıt engellendi (should_speak={should_speak}, explicit_user_turn={explicit_user_turn}, mode={gate_mode}, reason={gate_reason}) — 0 LLM / 0 TTS."
                 )
-                soc_ctx = getattr(self, "_last_social_context", None)
-                intent_val = getattr(soc_ctx, "user_intent", "UNKNOWN") if soc_ctx else "UNKNOWN"
+                intent_val = getattr(soc_ctx, "user_intent", turn_intent or "UNKNOWN") if soc_ctx else (turn_intent or "UNKNOWN")
                 self.emit_response_trace(
                     generation_id=self._fallback_generation_id,
                     user_turn_id=u_turn_id,
@@ -7207,14 +7344,14 @@ class AstroRealtimeNode(Node):
             is_weather, w_city = self._is_weather_query(user_text)
             if is_weather:
                 weather_info = self._execute_fallback_weather(w_city)
-                p = self.persona_name.lower()
-                spk = spk_name if spk_name else ""
-                if p == "kufurbaz":
-                    reply_text = f"Ulan {spk}, {weather_info} Dışarı çıkacaksan ona göre giyin!".strip()
-                elif p == "flirt":
-                    reply_text = f"Canım benim, {weather_info} Kendine çok dikkat et!".strip()
-                else:
-                    reply_text = f"{spk} {weather_info}".strip()
+                reply_text = self._format_deterministic_response(
+                    fact_text=weather_info,
+                    spk_name=spk_name,
+                    is_known=spk_known,
+                    is_child=is_child,
+                )
+                t_response_ready = time.monotonic()
+                response_generation_ms = (t_response_ready - t_intent_resolved) * 1000.0
 
                 with self._lock:
                     self._recent_robot_phrases.append(reply_text.lower())
@@ -7230,6 +7367,7 @@ class AstroRealtimeNode(Node):
                     llm_inference_completed=True,
                     response_final=True,
                 )
+                t_tts_request_started = time.monotonic()
                 pcm, s_ms, g_ms, q_ms = _synthesize_turn_clause(
                     reply_text,
                     is_final_response=True,
@@ -7237,29 +7375,48 @@ class AstroRealtimeNode(Node):
                     is_llm_completed=True,
                     caller_reason="deterministic_policy",
                 )
+                t_tts_first_audio = time.monotonic()
+                tts_ttfa_ms = (t_tts_first_audio - t_tts_request_started) * 1000.0
                 total_synth_ms += s_ms
                 total_gpu_ms += g_ms
                 total_queue_wait_ms += q_ms
                 if pcm:
-                    first_audio_ms = (time.monotonic() - t_turn_start) * 1000.0
+                    t_playback_started = time.monotonic()
+                    end_to_end_first_audio_ms = (t_playback_started - t_stt_finished) * 1000.0
                     self.get_logger().info(f"🤖 [Astro (Canlı Hava Durumu)]: \"{reply_text}\"")
                     self.memory.episodic.add_message("assistant", reply_text)
                     self.session.record_robot_speech()
-                    _record_turn_telemetry(reply_text, origin="deterministic_policy", played=True, dur_synth_ms=total_synth_ms, gpu_ms=total_gpu_ms)
+                    _record_turn_telemetry(
+                        reply_text,
+                        origin="deterministic_policy",
+                        played=True,
+                        dur_synth_ms=total_synth_ms,
+                        gpu_ms=total_gpu_ms,
+                        t_stt_finished_ts=t_stt_finished,
+                        t_intent_resolved_ts=t_intent_resolved,
+                        t_response_ready_ts=t_response_ready,
+                        t_tts_request_started_ts=t_tts_request_started,
+                        t_tts_first_audio_ts=t_tts_first_audio,
+                        t_playback_started_ts=t_playback_started,
+                        intent_resolution_ms_val=intent_resolution_ms,
+                        response_generation_ms_val=response_generation_ms,
+                        tts_ttfa_ms_val=tts_ttfa_ms,
+                        end_to_end_first_audio_ms_val=end_to_end_first_audio_ms,
+                    )
                     _handle_and_play_clause_audio(pcm, is_final_clause=True)
                     return
 
             # Instant Activity Query (Sub-250ms Direct Execution, 0ms LLM)
             is_activity, act_reply = self._is_activity_query(user_text)
             if is_activity:
-                p = self.persona_name.lower()
-                spk = f"{spk_name}" if spk_name else ""
-                if p == "kufurbaz":
-                    reply_text = f"Ulan {spk}, {act_reply[0].lower() + act_reply[1:]}" if spk else f"Ulan, {act_reply[0].lower() + act_reply[1:]}"
-                elif p == "flirt":
-                    reply_text = f"Canım {spk}, {act_reply[0].lower() + act_reply[1:]}" if spk else f"Canım benim, {act_reply[0].lower() + act_reply[1:]}"
-                else:
-                    reply_text = f"{spk}, {act_reply[0].lower() + act_reply[1:]}" if spk else act_reply
+                reply_text = self._format_deterministic_response(
+                    fact_text=act_reply,
+                    spk_name=spk_name,
+                    is_known=spk_known,
+                    is_child=is_child,
+                )
+                t_response_ready = time.monotonic()
+                response_generation_ms = (t_response_ready - t_intent_resolved) * 1000.0
 
                 with self._lock:
                     self._recent_robot_phrases.append(reply_text.lower())
@@ -7275,6 +7432,7 @@ class AstroRealtimeNode(Node):
                     llm_inference_completed=True,
                     response_final=True,
                 )
+                t_tts_request_started = time.monotonic()
                 pcm, s_ms, g_ms, q_ms = _synthesize_turn_clause(
                     reply_text,
                     is_final_response=True,
@@ -7282,34 +7440,48 @@ class AstroRealtimeNode(Node):
                     is_llm_completed=True,
                     caller_reason="deterministic_policy",
                 )
+                t_tts_first_audio = time.monotonic()
+                tts_ttfa_ms = (t_tts_first_audio - t_tts_request_started) * 1000.0
                 total_synth_ms += s_ms
                 total_gpu_ms += g_ms
                 total_queue_wait_ms += q_ms
                 if pcm:
-                    first_audio_ms = (time.monotonic() - t_turn_start) * 1000.0
+                    t_playback_started = time.monotonic()
+                    end_to_end_first_audio_ms = (t_playback_started - t_stt_finished) * 1000.0
                     self.get_logger().info(f"🤖 [Astro (Aktivite Durumu)]: \"{reply_text}\"")
                     self.memory.episodic.add_message("assistant", reply_text)
                     self.session.record_robot_speech()
-                    _record_turn_telemetry(reply_text, origin="deterministic_policy", played=True, dur_synth_ms=total_synth_ms, gpu_ms=total_gpu_ms)
+                    _record_turn_telemetry(
+                        reply_text,
+                        origin="deterministic_policy",
+                        played=True,
+                        dur_synth_ms=total_synth_ms,
+                        gpu_ms=total_gpu_ms,
+                        t_stt_finished_ts=t_stt_finished,
+                        t_intent_resolved_ts=t_intent_resolved,
+                        t_response_ready_ts=t_response_ready,
+                        t_tts_request_started_ts=t_tts_request_started,
+                        t_tts_first_audio_ts=t_tts_first_audio,
+                        t_playback_started_ts=t_playback_started,
+                        intent_resolution_ms_val=intent_resolution_ms,
+                        response_generation_ms_val=response_generation_ms,
+                        tts_ttfa_ms_val=tts_ttfa_ms,
+                        end_to_end_first_audio_ms_val=end_to_end_first_audio_ms,
+                    )
                     _handle_and_play_clause_audio(pcm, is_final_clause=True)
                     return
 
             # Instant Visual State Query (Sub-250ms Direct Execution, 0ms LLM)
             is_vis, vis_reply = self._is_visual_state_query(user_text)
             if is_vis:
-                p = self.persona_name.lower()
-                spk = f"{spk_name}" if spk_name else ""
-                if p == "kufurbaz":
-                    reply_text = f"Ulan {spk}, {vis_reply[0].lower() + vis_reply[1:]}" if spk else f"Ulan, {vis_reply[0].lower() + vis_reply[1:]}"
-                elif p == "flirt":
-                    reply_text = f"Canım {spk}, {vis_reply[0].lower() + vis_reply[1:]}" if spk else f"Canım benim, {vis_reply[0].lower() + vis_reply[1:]}"
-                else:
-                    if spk and vis_reply.startswith("Evet,"):
-                        reply_text = vis_reply.replace("Evet,", f"Evet {spk},", 1)
-                    elif spk and not vis_reply.startswith(spk):
-                        reply_text = f"{spk}, {vis_reply[0].lower() + vis_reply[1:]}"
-                    else:
-                        reply_text = vis_reply
+                reply_text = self._format_deterministic_response(
+                    fact_text=vis_reply,
+                    spk_name=spk_name,
+                    is_known=spk_known,
+                    is_child=is_child,
+                )
+                t_response_ready = time.monotonic()
+                response_generation_ms = (t_response_ready - t_intent_resolved) * 1000.0
 
                 with self._lock:
                     self._recent_robot_phrases.append(reply_text.lower())
@@ -7325,6 +7497,7 @@ class AstroRealtimeNode(Node):
                     llm_inference_completed=True,
                     response_final=True,
                 )
+                t_tts_request_started = time.monotonic()
                 pcm, s_ms, g_ms, q_ms = _synthesize_turn_clause(
                     reply_text,
                     is_final_response=True,
@@ -7332,34 +7505,48 @@ class AstroRealtimeNode(Node):
                     is_llm_completed=True,
                     caller_reason="deterministic_policy",
                 )
+                t_tts_first_audio = time.monotonic()
+                tts_ttfa_ms = (t_tts_first_audio - t_tts_request_started) * 1000.0
                 total_synth_ms += s_ms
                 total_gpu_ms += g_ms
                 total_queue_wait_ms += q_ms
                 if pcm:
-                    first_audio_ms = (time.monotonic() - t_turn_start) * 1000.0
+                    t_playback_started = time.monotonic()
+                    end_to_end_first_audio_ms = (t_playback_started - t_stt_finished) * 1000.0
                     self.get_logger().info(f"🤖 [Astro (Görsel Algı Durumu)]: \"{reply_text}\"")
                     self.memory.episodic.add_message("assistant", reply_text)
                     self.session.record_robot_speech()
-                    _record_turn_telemetry(reply_text, origin="deterministic_policy", played=True, dur_synth_ms=total_synth_ms, gpu_ms=total_gpu_ms)
+                    _record_turn_telemetry(
+                        reply_text,
+                        origin="deterministic_policy",
+                        played=True,
+                        dur_synth_ms=total_synth_ms,
+                        gpu_ms=total_gpu_ms,
+                        t_stt_finished_ts=t_stt_finished,
+                        t_intent_resolved_ts=t_intent_resolved,
+                        t_response_ready_ts=t_response_ready,
+                        t_tts_request_started_ts=t_tts_request_started,
+                        t_tts_first_audio_ts=t_tts_first_audio,
+                        t_playback_started_ts=t_playback_started,
+                        intent_resolution_ms_val=intent_resolution_ms,
+                        response_generation_ms_val=response_generation_ms,
+                        tts_ttfa_ms_val=tts_ttfa_ms,
+                        end_to_end_first_audio_ms_val=end_to_end_first_audio_ms,
+                    )
                     _handle_and_play_clause_audio(pcm, is_final_clause=True)
                     return
 
             # Instant Robot Self-State Query (Sub-250ms Direct Execution, 0ms LLM)
             is_rob, rob_reply = self._is_robot_state_query(user_text)
             if is_rob:
-                p = self.persona_name.lower()
-                spk = f"{spk_name}" if spk_name else ""
-                if p == "kufurbaz":
-                    reply_text = f"Ulan {spk}, {rob_reply[0].lower() + rob_reply[1:]}" if spk else f"Ulan, {rob_reply[0].lower() + rob_reply[1:]}"
-                elif p == "flirt":
-                    reply_text = f"Canım {spk}, {rob_reply[0].lower() + rob_reply[1:]}" if spk else f"Canım benim, {rob_reply[0].lower() + rob_reply[1:]}"
-                else:
-                    if spk and rob_reply.startswith("Evet,"):
-                        reply_text = rob_reply.replace("Evet,", f"Evet {spk},", 1)
-                    elif spk and not rob_reply.startswith(spk):
-                        reply_text = f"{spk}, {rob_reply[0].lower() + rob_reply[1:]}"
-                    else:
-                        reply_text = rob_reply
+                reply_text = self._format_deterministic_response(
+                    fact_text=rob_reply,
+                    spk_name=spk_name,
+                    is_known=spk_known,
+                    is_child=is_child,
+                )
+                t_response_ready = time.monotonic()
+                response_generation_ms = (t_response_ready - t_intent_resolved) * 1000.0
 
                 with self._lock:
                     self._recent_robot_phrases.append(reply_text.lower())
@@ -7375,6 +7562,7 @@ class AstroRealtimeNode(Node):
                     llm_inference_completed=True,
                     response_final=True,
                 )
+                t_tts_request_started = time.monotonic()
                 pcm, s_ms, g_ms, q_ms = _synthesize_turn_clause(
                     reply_text,
                     is_final_response=True,
@@ -7382,41 +7570,56 @@ class AstroRealtimeNode(Node):
                     is_llm_completed=True,
                     caller_reason="deterministic_policy",
                 )
+                t_tts_first_audio = time.monotonic()
+                tts_ttfa_ms = (t_tts_first_audio - t_tts_request_started) * 1000.0
                 total_synth_ms += s_ms
                 total_gpu_ms += g_ms
                 total_queue_wait_ms += q_ms
                 if pcm:
-                    first_audio_ms = (time.monotonic() - t_turn_start) * 1000.0
+                    t_playback_started = time.monotonic()
+                    end_to_end_first_audio_ms = (t_playback_started - t_stt_finished) * 1000.0
                     self.get_logger().info(f"🤖 [Astro (Robot Durumu)]: \"{reply_text}\"")
                     self.memory.episodic.add_message("assistant", reply_text)
                     self.session.record_robot_speech()
-                    _record_turn_telemetry(reply_text, origin="deterministic_policy", played=True, dur_synth_ms=total_synth_ms, gpu_ms=total_gpu_ms)
+                    _record_turn_telemetry(
+                        reply_text,
+                        origin="deterministic_policy",
+                        played=True,
+                        dur_synth_ms=total_synth_ms,
+                        gpu_ms=total_gpu_ms,
+                        t_stt_finished_ts=t_stt_finished,
+                        t_intent_resolved_ts=t_intent_resolved,
+                        t_response_ready_ts=t_response_ready,
+                        t_tts_request_started_ts=t_tts_request_started,
+                        t_tts_first_audio_ts=t_tts_first_audio,
+                        t_playback_started_ts=t_playback_started,
+                        intent_resolution_ms_val=intent_resolution_ms,
+                        response_generation_ms_val=response_generation_ms,
+                        tts_ttfa_ms_val=tts_ttfa_ms,
+                        end_to_end_first_audio_ms_val=end_to_end_first_audio_ms,
+                    )
                     _handle_and_play_clause_audio(pcm, is_final_clause=True)
                     return
 
             # Explicit Head Angle Command (e.g. '0 dereceye dön', '-30'a dön', '30 derece sağa bak')
             is_angle, target_angle, angle_label = self._is_head_angle_query(user_text)
             if is_angle:
-                p = self.persona_name.lower()
-                spk = f" {spk_name}" if spk_name else ""
                 self.pub_head_target_yaw.publish(Float32(data=float(target_angle)))
                 self.get_logger().info(f"🎯 [Head Manual Command]: Kafa açısı komutla ayarlandı -> {target_angle:.1f}° ({angle_label})")
 
-                if p == "kufurbaz":
-                    if abs(target_angle) < 0.1:
-                        reply_text = f"Kafayı tam ortaya sıfırladım{spk}, düz bakıyorum işte!"
-                    else:
-                        reply_text = f"Kafayı {int(target_angle)} dereceye çevirdim{spk}, rahatladın mı!"
-                elif p == "flirt":
-                    if abs(target_angle) < 0.1:
-                        reply_text = f"Hemen tam karşına bakıyorum canım benim{spk}."
-                    else:
-                        reply_text = f"Senin için {int(target_angle)} dereceye döndüm tatlım{spk}."
+                if abs(target_angle) < 0.1:
+                    fact_reply = "Kafa konumu 0 derece merkeze hizalandı."
                 else:
-                    if abs(target_angle) < 0.1:
-                        reply_text = f"Kafa konumu 0 derece merkeze hizalandı{spk}."
-                    else:
-                        reply_text = f"Kafa konumu {int(target_angle)} dereceye ayarlandı{spk}."
+                    fact_reply = f"Kafa konumu {int(target_angle)} dereceye ayarlandı."
+
+                reply_text = self._format_deterministic_response(
+                    fact_text=fact_reply,
+                    spk_name=spk_name,
+                    is_known=spk_known,
+                    is_child=is_child,
+                )
+                t_response_ready = time.monotonic()
+                response_generation_ms = (t_response_ready - t_intent_resolved) * 1000.0
 
                 with self._lock:
                     self._recent_robot_phrases.append(reply_text.lower())
@@ -7432,6 +7635,7 @@ class AstroRealtimeNode(Node):
                     llm_inference_completed=True,
                     response_final=True,
                 )
+                t_tts_request_started = time.monotonic()
                 pcm, s_ms, g_ms, q_ms = _synthesize_turn_clause(
                     reply_text,
                     is_final_response=True,
@@ -7439,15 +7643,34 @@ class AstroRealtimeNode(Node):
                     is_llm_completed=True,
                     caller_reason="deterministic_policy",
                 )
+                t_tts_first_audio = time.monotonic()
+                tts_ttfa_ms = (t_tts_first_audio - t_tts_request_started) * 1000.0
                 total_synth_ms += s_ms
                 total_gpu_ms += g_ms
                 total_queue_wait_ms += q_ms
                 if pcm:
-                    first_audio_ms = (time.monotonic() - t_turn_start) * 1000.0
+                    t_playback_started = time.monotonic()
+                    end_to_end_first_audio_ms = (t_playback_started - t_stt_finished) * 1000.0
                     self.get_logger().info(f"🤖 [Astro (Açı Komutu)]: \"{reply_text}\"")
                     self.memory.episodic.add_message("assistant", reply_text)
                     self.session.record_robot_speech()
-                    _record_turn_telemetry(reply_text, origin="deterministic_policy", played=True, dur_synth_ms=total_synth_ms, gpu_ms=total_gpu_ms)
+                    _record_turn_telemetry(
+                        reply_text,
+                        origin="deterministic_policy",
+                        played=True,
+                        dur_synth_ms=total_synth_ms,
+                        gpu_ms=total_gpu_ms,
+                        t_stt_finished_ts=t_stt_finished,
+                        t_intent_resolved_ts=t_intent_resolved,
+                        t_response_ready_ts=t_response_ready,
+                        t_tts_request_started_ts=t_tts_request_started,
+                        t_tts_first_audio_ts=t_tts_first_audio,
+                        t_playback_started_ts=t_playback_started,
+                        intent_resolution_ms_val=intent_resolution_ms,
+                        response_generation_ms_val=response_generation_ms,
+                        tts_ttfa_ms_val=tts_ttfa_ms,
+                        end_to_end_first_audio_ms_val=end_to_end_first_audio_ms,
+                    )
                     _handle_and_play_clause_audio(pcm, is_final_clause=True)
                     return
 
@@ -7466,8 +7689,6 @@ class AstroRealtimeNode(Node):
                     except Exception:
                         pass
 
-                p = self.persona_name.lower()
-                spk = f" {spk_name}" if spk_name else ""
                 act_res = None
                 if getattr(self, "action_manager", None):
                     act_res = self.action_manager.execute_turn_to_sound(
@@ -7475,17 +7696,18 @@ class AstroRealtimeNode(Node):
                     )
 
                 if act_res and act_res.success:
-                    if p == "kufurbaz":
-                        reply_text = f"Döndüm ulan işte{spk}, söyle bakalım ne diyorsun!"
-                    elif p == "flirt":
-                        reply_text = f"Hemen sana döndüm canım benim{spk}, seni dinliyorum."
-                    else:
-                        reply_text = f"Sesine döndüm{spk}, seni dinliyorum."
+                    fact_reply = "Sesine döndüm, seni dinliyorum."
                 else:
-                    if p == "kufurbaz":
-                        reply_text = f"Sesinin yönünü tam kestiremedim ama buradayım ulan, anlat!"
-                    else:
-                        reply_text = f"Sesinin yönünü tam kestiremedim ama buradayım{spk}, seni dinliyorum."
+                    fact_reply = "Sesinin yönünü tam kestiremedim ama buradayım, seni dinliyorum."
+
+                reply_text = self._format_deterministic_response(
+                    fact_text=fact_reply,
+                    spk_name=spk_name,
+                    is_known=spk_known,
+                    is_child=is_child,
+                )
+                t_response_ready = time.monotonic()
+                response_generation_ms = (t_response_ready - t_intent_resolved) * 1000.0
 
                 with self._lock:
                     self._recent_robot_phrases.append(reply_text.lower())
@@ -7501,6 +7723,7 @@ class AstroRealtimeNode(Node):
                     llm_inference_completed=True,
                     response_final=True,
                 )
+                t_tts_request_started = time.monotonic()
                 pcm, s_ms, g_ms, q_ms = _synthesize_turn_clause(
                     reply_text,
                     is_final_response=True,
@@ -7508,22 +7731,39 @@ class AstroRealtimeNode(Node):
                     is_llm_completed=True,
                     caller_reason="deterministic_policy",
                 )
+                t_tts_first_audio = time.monotonic()
+                tts_ttfa_ms = (t_tts_first_audio - t_tts_request_started) * 1000.0
                 total_synth_ms += s_ms
                 total_gpu_ms += g_ms
                 total_queue_wait_ms += q_ms
                 if pcm:
-                    first_audio_ms = (time.monotonic() - t_turn_start) * 1000.0
+                    t_playback_started = time.monotonic()
+                    end_to_end_first_audio_ms = (t_playback_started - t_stt_finished) * 1000.0
                     self.get_logger().info(f"🤖 [Astro (Ses Yönelimi)]: \"{reply_text}\"")
                     self.memory.episodic.add_message("assistant", reply_text)
                     self.session.record_robot_speech()
-                    _record_turn_telemetry(reply_text, origin="deterministic_policy", played=True, dur_synth_ms=total_synth_ms, gpu_ms=total_gpu_ms)
+                    _record_turn_telemetry(
+                        reply_text,
+                        origin="deterministic_policy",
+                        played=True,
+                        dur_synth_ms=total_synth_ms,
+                        gpu_ms=total_gpu_ms,
+                        t_stt_finished_ts=t_stt_finished,
+                        t_intent_resolved_ts=t_intent_resolved,
+                        t_response_ready_ts=t_response_ready,
+                        t_tts_request_started_ts=t_tts_request_started,
+                        t_tts_first_audio_ts=t_tts_first_audio,
+                        t_playback_started_ts=t_playback_started,
+                        intent_resolution_ms_val=intent_resolution_ms,
+                        response_generation_ms_val=response_generation_ms,
+                        tts_ttfa_ms_val=tts_ttfa_ms,
+                        end_to_end_first_audio_ms_val=end_to_end_first_audio_ms,
+                    )
                     _handle_and_play_clause_audio(pcm, is_final_clause=True)
                     return
 
             is_move, move_dir, move_spd, move_dur = self._is_movement_query(user_text)
             if is_move:
-                p = self.persona_name.lower()
-                spk = f" {spk_name}" if spk_name else ""
                 act_res = None
                 if getattr(self, "action_manager", None):
                     act_res = self.action_manager.execute_move(
@@ -7537,11 +7777,25 @@ class AstroRealtimeNode(Node):
                 dir_tr = dir_names_tr.get(move_dir, move_dir)
                 if act_res and act_res.success:
                     if move_dir == "stop":
-                        reply_text = f"Durdum{spk}."
+                        fact_reply = "Durdum."
                     else:
-                        reply_text = f"{dir_tr.capitalize()} hareket ediyorum{spk}."
+                        fact_reply = f"{dir_tr.capitalize()} hareket ediyorum."
                 else:
-                    reply_text = f"Güvenlik kilidi devrede veya hareket engellendi{spk}."
+                    fact_reply = "Güvenlik kilidi devrede veya hareket engellendi."
+
+                reply_text = self._format_deterministic_response(
+                    fact_text=fact_reply,
+                    spk_name=spk_name,
+                    is_known=spk_known,
+                    is_child=is_child,
+                )
+                t_response_ready = time.monotonic()
+                response_generation_ms = (t_response_ready - t_intent_resolved) * 1000.0
+
+                with self._lock:
+                    self._recent_robot_phrases.append(reply_text.lower())
+                    if len(self._recent_robot_phrases) > 10:
+                        self._recent_robot_phrases = self._recent_robot_phrases[-10:]
 
                 self._speech_authorization = SpeechAuthorization(
                     user_turn_id=u_turn_id,
@@ -7552,6 +7806,7 @@ class AstroRealtimeNode(Node):
                     llm_inference_completed=True,
                     response_final=True,
                 )
+                t_tts_request_started = time.monotonic()
                 pcm, s_ms, g_ms, q_ms = _synthesize_turn_clause(
                     reply_text,
                     is_final_response=True,
@@ -7559,15 +7814,34 @@ class AstroRealtimeNode(Node):
                     is_llm_completed=True,
                     caller_reason="deterministic_policy",
                 )
+                t_tts_first_audio = time.monotonic()
+                tts_ttfa_ms = (t_tts_first_audio - t_tts_request_started) * 1000.0
                 total_synth_ms += s_ms
                 total_gpu_ms += g_ms
                 total_queue_wait_ms += q_ms
                 if pcm:
-                    first_audio_ms = (time.monotonic() - t_turn_start) * 1000.0
+                    t_playback_started = time.monotonic()
+                    end_to_end_first_audio_ms = (t_playback_started - t_stt_finished) * 1000.0
                     self.get_logger().info(f"🤖 [Astro (Hareket Komutu)]: \"{reply_text}\"")
                     self.memory.episodic.add_message("assistant", reply_text)
                     self.session.record_robot_speech()
-                    _record_turn_telemetry(reply_text, origin="deterministic_policy", played=True, dur_synth_ms=total_synth_ms, gpu_ms=total_gpu_ms)
+                    _record_turn_telemetry(
+                        reply_text,
+                        origin="deterministic_policy",
+                        played=True,
+                        dur_synth_ms=total_synth_ms,
+                        gpu_ms=total_gpu_ms,
+                        t_stt_finished_ts=t_stt_finished,
+                        t_intent_resolved_ts=t_intent_resolved,
+                        t_response_ready_ts=t_response_ready,
+                        t_tts_request_started_ts=t_tts_request_started,
+                        t_tts_first_audio_ts=t_tts_first_audio,
+                        t_playback_started_ts=t_playback_started,
+                        intent_resolution_ms_val=intent_resolution_ms,
+                        response_generation_ms_val=response_generation_ms,
+                        tts_ttfa_ms_val=tts_ttfa_ms,
+                        end_to_end_first_audio_ms_val=end_to_end_first_audio_ms,
+                    )
                     _handle_and_play_clause_audio(pcm, is_final_clause=True)
                     return
 

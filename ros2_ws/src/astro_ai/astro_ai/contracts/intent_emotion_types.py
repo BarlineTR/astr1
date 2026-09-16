@@ -18,6 +18,8 @@ class IntentType(str, Enum):
     MEMORY_UPDATE = "MEMORY_UPDATE"
     ACTIVITY_QUERY = "ACTIVITY_QUERY"
     VISUAL_STATE_QUERY = "VISUAL_STATE_QUERY"
+    MOTION_COMMAND = "MOTION_COMMAND"
+    TURN_TO_SOUND_COMMAND = "TURN_TO_SOUND_COMMAND"
     SELF_REFERENCE = "SELF_REFERENCE"
     CORRECTION = "CORRECTION"
     ATTENTION_SEEKING = "ATTENTION_SEEKING"
@@ -25,6 +27,55 @@ class IntentType(str, Enum):
     CONFIRMATION = "CONFIRMATION"
     DENIAL = "DENIAL"
     UNKNOWN = "UNKNOWN"
+
+    def __call__(self, arg=None):
+        if arg:
+            return f"{self.value}({arg})"
+        return self.value
+
+
+class SemanticIntent(str):
+    """Rich semantic intent string that equals both its IntentType and its parametric form (e.g. MOTION_COMMAND(stop))."""
+
+    def __new__(cls, base_intent: IntentType, param=None):
+        val = str(base_intent.value)
+        obj = str.__new__(cls, val)
+        obj.intent_type = base_intent
+        obj.param = param
+        return obj
+
+    def __eq__(self, other):
+        if isinstance(other, IntentType):
+            return self.intent_type == other
+        if isinstance(other, str):
+            if self.param and other == f"{self.intent_type.value}({self.param})":
+                return True
+            return str(self) == other or self.intent_type.value == other
+        return super().__eq__(other)
+
+    def __hash__(self):
+        return hash(self.intent_type)
+
+    def __str__(self):
+        if self.param:
+            return f"{self.intent_type.value}({self.param})"
+        return self.intent_type.value
+
+    def __repr__(self):
+        if self.param:
+            return f"{self.intent_type.value}({self.param})"
+        return self.intent_type.value
+
+    @property
+    def value(self):
+        if self.param:
+            return f"{self.intent_type.value}({self.param})"
+        return self.intent_type.value
+
+    @property
+    def direction(self):
+        return self.param
+
 
 
 class EmotionSignal(str, Enum):
