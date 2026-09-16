@@ -155,7 +155,7 @@ class TTSRouter:
 
         if realtime_fallback_reason is not None:
             effective_fallback_reason = realtime_fallback_reason
-            if realtime_fallback_reason in ("realtime_no_audio", "realtime_unavailable", "realtime_quota_exhausted"):
+            if realtime_fallback_reason in ("realtime_no_audio", "realtime_unavailable", "realtime_quota_exhausted", "local_mode_configured"):
                 realtime_available = False
         elif realtime_available:
             effective_fallback_reason = "none"
@@ -164,11 +164,14 @@ class TTSRouter:
         else:
             effective_fallback_reason = "openai_realtime_unavailable"
 
-        if realtime_available:
+        if effective_fallback_reason == "local_mode_configured":
+            realtime_available = False
+            self._safe_log("info", f'[TTS REQUESTED] generation_id={generation_id} selected_tts_provider=edge_tts tts_source=edge_tts_cloud selection_reason=local_mode_configured text="{clean_text}"')
+        elif realtime_available:
             self._safe_log("info", f'[TTS REQUESTED] generation_id={generation_id} requested_provider=openai_realtime text="{clean_text}"')
             fallback_chain.append("openai_realtime")
         else:
-            self._safe_log("info", f'[TTS REQUESTED] generation_id={generation_id} requested_provider=edge_tts selection_reason={effective_fallback_reason} text="{clean_text}"')
+            self._safe_log("info", f'[TTS REQUESTED] generation_id={generation_id} selected_tts_provider=edge_tts tts_source=edge_tts_cloud selection_reason={effective_fallback_reason} text="{clean_text}"')
             if effective_fallback_reason == "realtime_no_audio":
                 self._safe_log(
                     "warn",

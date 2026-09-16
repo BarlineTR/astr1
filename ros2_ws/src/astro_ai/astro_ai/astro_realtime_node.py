@@ -28,7 +28,22 @@ import time
 import urllib.request
 import urllib.error
 import wave
+from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple, Union
+
+
+@dataclass
+class SpeechAuthorization:
+    user_turn_id: str
+    generation_id: int
+    explicit_user_turn: bool
+    should_speak: bool
+    response_origin: str = "local_gemma"
+    llm_inference_completed: bool = False
+    response_final: bool = False
+    consumed: bool = False
+    invalidated: bool = False
+    created_at: float = field(default_factory=time.monotonic)
 
 try:
     import rclpy
@@ -852,6 +867,8 @@ class AstroRealtimeNode(Node):
         self._fallback_audio_buffer: List[bytes] = []
         self._is_processing_fallback = False
         self._fallback_generation_id = 0
+        self._current_user_turn_id: Optional[str] = None
+        self._speech_authorization: Optional[SpeechAuthorization] = None
 
         # Dedicated Wake Detector (Active in SLEEP / DEEP_IDLE with Ultra-low CPU)
         self._wake_audio_buffer: List[bytes] = []
@@ -6156,6 +6173,128 @@ class AstroRealtimeNode(Node):
         self.repetition_guard.record_response(default_resp)
         return default_resp
 
+    def authorize_speech(
+        self,
+        user_turn_id: Optional[str],
+        generation_id: Optional[int],
+        response_text: str,
+        is_final_response: bool = True,
+        is_deterministic: bool = False,
+        is_llm_completed: bool = False,
+        caller_reason: str = "user_turn_response",
+    ) -> Tuple[bool, str]:
+        """TTS Hard Authorization Gate enforcing Rule 1-12 lifecycle contracts."""
+        auth = getattr(self, "_speech_authorization", None)
+        curr_turn_id = getattr(self, "_current_user_turn_id", None)
+        curr_gen_id = getattr(self, "_fallback_generation_id", None)
+        explicit_turn = bool(getattr(self, "_current_turn_explicit_user_turn", False))
+        auth_consumed = bool(auth.consumed if auth else False)
+        should_speak_val = bool(auth.should_speak if auth else False)
+
+        def _log_gate_decision(authorized: bool, reason_code: str):
+            if authorized:
+                self.get_logger().info(
+                    f"✅ [TTS AUTHORIZED]\n"
+                    f"  speech_authorized=True\n"
+                    f"  authorization_reason={reason_code}\n"
+                    f"  user_turn_id={user_turn_id}\n"
+                    f"  generation_id={generation_id}\n"
+                    f"  authorization_consumed=False\n"
+                    f"  explicit_user_turn={explicit_turn}\n"
+                    f"  should_speak={should_speak_val}\n"
+                    f"  response_final={is_final_response}\n"
+                    f"  tts_allowed=True"
+                )
+            else:
+                self.get_logger().warning(
+                    f"🛑 [TTS BLOCKED: {reason_code}]\n"
+                    f"  speech_authorized=False\n"
+                    f"  authorization_reason={reason_code}\n"
+                    f"  user_turn_id={user_turn_id}\n"
+                    f"  generation_id={generation_id}\n"
+                    f"  authorization_consumed={auth_consumed}\n"
+                    f"  explicit_user_turn={explicit_turn}\n"
+                    f"  should_speak={should_speak_val}\n"
+                    f"  response_final={is_final_response}\n"
+                    f"  tts_allowed=False"
+                )
+
+        # 1. Cognition-only / perception event check
+        cognition_reasons = (
+            "person_detected", "orient_to_stimulus", "active_social_engagement",
+            "gaze", "visual_tracking", "face_detection", "world_model_update",
+            "behavior_change", "curiosity", "affect", "prediction",
+            "metacognition", "speaking_active_dialogue_engagement", "cognition_only",
+        )
+        if caller_reason.lower() in cognition_reasons:
+            _log_gate_decision(False, "cognition_only")
+            return False, "cognition_only"
+
+        # 2. Quiet or Sleep Check
+        if getattr(self, "_is_quiet_mode", False) or (not explicit_turn and (getattr(self, "_is_sleeping", False) or self.is_in_quiet_or_sleep_state())):
+            _log_gate_decision(False, "quiet_or_sleep")
+            return False, "quiet_or_sleep"
+
+        # 3. User turn existence check
+        if not user_turn_id or not curr_turn_id:
+            _log_gate_decision(False, "no_user_turn")
+            return False, "no_user_turn"
+
+        # 4. Stale turn check
+        if user_turn_id != curr_turn_id:
+            _log_gate_decision(False, "stale_turn")
+            return False, "stale_turn"
+
+        # 5. Explicit user turn check
+        if not explicit_turn:
+            _log_gate_decision(False, "no_user_turn")
+            return False, "no_user_turn"
+
+        # 6. Generation ID checks
+        if generation_id is None or generation_id != curr_gen_id:
+            _log_gate_decision(False, "duplicate_generation")
+            return False, "duplicate_generation"
+
+        # 7. Authorization object check
+        if auth is None or getattr(auth, "invalidated", False):
+            _log_gate_decision(False, "no_user_turn")
+            return False, "no_user_turn"
+
+        if auth.user_turn_id != user_turn_id:
+            _log_gate_decision(False, "stale_turn")
+            return False, "stale_turn"
+
+        if auth.generation_id != generation_id:
+            _log_gate_decision(False, "duplicate_generation")
+            return False, "duplicate_generation"
+
+        # 8. Authorization consumed check (Single TTS per turn guarantee)
+        if auth.consumed:
+            self.get_logger().warning(f"🛑 REJECT_DUPLICATE_SPEECH_AUTH: generation_id={generation_id} user_turn_id={user_turn_id}")
+            _log_gate_decision(False, "authorization_consumed")
+            return False, "authorization_consumed"
+
+        # 9. Should speak check
+        if not auth.should_speak:
+            _log_gate_decision(False, "no_user_turn")
+            return False, "no_user_turn"
+
+        # 10. LLM inference completion check (unless deterministic policy)
+        if not is_deterministic:
+            if not (is_llm_completed or auth.llm_inference_completed):
+                _log_gate_decision(False, "llm_not_completed")
+                return False, "llm_not_completed"
+
+        # 11. Final response text check
+        if not is_final_response or not response_text or not str(response_text).strip():
+            _log_gate_decision(False, "no_final_response")
+            return False, "no_final_response"
+
+        # All hard gate checks passed! Consume authorization immediately.
+        auth.consumed = True
+        _log_gate_decision(True, caller_reason)
+        return True, "authorized"
+
     def _synthesize_speech_pcm(self, text: str) -> Tuple[bytes, str, float, bool]:
         """Synthesizes speech to int16 PCM using:
         1. ElevenLabs Flash v2.5 (Primary Remote TTS ~75ms)
@@ -6237,6 +6376,10 @@ class AstroRealtimeNode(Node):
         if not getattr(self, "_current_turn_explicit_user_turn", False):
             self.get_logger().warning("🛑 [Playback Blocked]: No explicit user turn.")
             return
+        auth = getattr(self, "_speech_authorization", None)
+        if not auth or getattr(auth, "invalidated", False):
+            self.get_logger().warning("🛑 [Playback Blocked]: No valid speech authorization.")
+            return
         self._is_playback_active = True
         self._playback_start_monotonic = time.monotonic()
         self.state_machine.transition_to(RobotState.SPEAKING)
@@ -6309,6 +6452,10 @@ class AstroRealtimeNode(Node):
         self._is_processing_fallback = True
         self._is_responding = True
         self._fallback_generation_id += 1
+        current_gen_id = self._fallback_generation_id
+        u_turn_id = f"turn_{self._fallback_generation_id}"
+        self._current_user_turn_id = u_turn_id
+        self._speech_authorization = None
         self._barge_in_latched = False  # Reset single logical barge-in debounce for new turn
         t_turn_start = time.monotonic()
         chosen_model = "none"
@@ -6487,9 +6634,10 @@ class AstroRealtimeNode(Node):
                     self._is_responding = False
                     return
 
-                # If robot is not in quiet or sleep mode, wake up immediately
-                if not self.is_in_quiet_or_sleep_state():
+                # Wake up from sleep upon valid wake phrase / command
+                if not getattr(self, "_is_quiet_mode", False):
                     self._wake_up()
+                    self._is_sleeping = False
 
                 self._current_turn_explicit_user_turn = True
                 self._last_explicit_user_turn = True
@@ -6620,9 +6768,26 @@ class AstroRealtimeNode(Node):
                 f"  fallback_reason={'realtime_unavailable' if self.use_realtime else 'local_mode_configured'}"
             )
 
-            def _synthesize_turn_clause(clause_text: str) -> Tuple[Optional[bytes], float, float, float]:
-                if not getattr(self, "_current_turn_explicit_user_turn", False):
-                    self.get_logger().warning("🛑 [TTS Synthesis Blocked]: No explicit user turn (0 TTS).")
+            def _synthesize_turn_clause(
+                clause_text: str,
+                is_final_response: bool = True,
+                is_deterministic: bool = False,
+                is_llm_completed: bool = False,
+                caller_reason: str = "user_turn_response",
+            ) -> Tuple[Optional[bytes], float, float, float]:
+                if not clause_text or not str(clause_text).strip():
+                    return None, 0.0, 0.0, 0.0
+
+                allowed, reason = self.authorize_speech(
+                    user_turn_id=u_turn_id,
+                    generation_id=self._fallback_generation_id,
+                    response_text=clause_text,
+                    is_final_response=is_final_response,
+                    is_deterministic=is_deterministic,
+                    is_llm_completed=is_llm_completed,
+                    caller_reason=caller_reason,
+                )
+                if not allowed:
                     return None, 0.0, 0.0, 0.0
 
                 clean_text = response_length_gate(clause_text, user_query=user_text, max_words=35, max_sentences=2)
@@ -6631,10 +6796,12 @@ class AstroRealtimeNode(Node):
 
                 nonlocal active_engine, tts_source_name, tts_model_name
 
+                fb_reason = "realtime_unavailable" if self.use_realtime else "local_mode_configured"
                 route_res = self.tts_router.synthesize(
                     clean_text,
                     generation_id=self._fallback_generation_id,
                     language=os.getenv("TTS_LANGUAGE", "tr"),
+                    realtime_fallback_reason=fb_reason,
                 )
                 active_engine = route_res.actual_provider
                 tts_source_name = route_res.source_name
@@ -6800,7 +6967,45 @@ class AstroRealtimeNode(Node):
                     f"playback_failed={not played and synth_fin}"
                 )
 
-            # 6. Instant Intent Interception (Sub-250ms Direct Execution)
+            # 6. Interaction Gate & System Prompt
+            system_prompt = self._build_current_system_prompt(
+                active_speaker=active_speaker_dict,
+                explicit_user_turn=self._current_turn_explicit_user_turn,
+            )
+
+            # INTERACTION GATE & EXPLICIT USER TURN HARD BLOCK:
+            # Deterministically suppresses Local Gemma, Cloud Providers, Deterministic Policies, and TTS when verbal response is gated
+            soc_dec = getattr(self, "_last_social_decision", None)
+            should_speak = getattr(soc_dec, "should_speak", True) if soc_dec else True
+            explicit_user_turn = getattr(self, "_current_turn_explicit_user_turn", False)
+            if not (should_speak and explicit_user_turn):
+                gate_mode = getattr(soc_dec, "gate_mode", "OBSERVING") if soc_dec else "NO_TURN"
+                gate_reason = getattr(soc_dec, "initiative_reason", "gate_closed" if not should_speak else "no_explicit_turn") if soc_dec else "gate_closed"
+                self.get_logger().info(
+                    f"🛑 [InteractionGate Hard Block]: Sözel yanıt engellendi (should_speak={should_speak}, explicit_user_turn={explicit_user_turn}, mode={gate_mode}, reason={gate_reason}) — 0 LLM / 0 TTS."
+                )
+                soc_ctx = getattr(self, "_last_social_context", None)
+                intent_val = getattr(soc_ctx, "user_intent", "UNKNOWN") if soc_ctx else "UNKNOWN"
+                self.emit_response_trace(
+                    generation_id=self._fallback_generation_id,
+                    user_turn_id=u_turn_id,
+                    user_audio=f"{len(raw_pcm)}B" if raw_pcm else "direct_text",
+                    stt=f"verified: '{user_text}'",
+                    user_turn_created=explicit_user_turn,
+                    social_intent=str(getattr(intent_val, "value", intent_val)),
+                    should_speak=should_speak,
+                    llm_provider="none",
+                    llm_inference="none",
+                    response_text="",
+                    tts="none",
+                    playback="none",
+                    response_origin="none",
+                    termination_reason=f"GATE_CLOSED_{gate_mode}_{gate_reason}",
+                )
+                self.state_machine.transition_to(RobotState.LISTENING if not self.is_in_quiet_or_sleep_state() else RobotState.DEEP_IDLE)
+                return
+
+            # 7. Instant Intent Interception (Sub-250ms Direct Execution)
             is_weather, w_city = self._is_weather_query(user_text)
             if is_weather:
                 weather_info = self._execute_fallback_weather(w_city)
@@ -6818,7 +7023,22 @@ class AstroRealtimeNode(Node):
                     if len(self._recent_robot_phrases) > 10:
                         self._recent_robot_phrases = self._recent_robot_phrases[-10:]
 
-                pcm, s_ms, g_ms, q_ms = _synthesize_turn_clause(reply_text)
+                self._speech_authorization = SpeechAuthorization(
+                    user_turn_id=u_turn_id,
+                    generation_id=self._fallback_generation_id,
+                    explicit_user_turn=True,
+                    should_speak=True,
+                    response_origin="deterministic_policy",
+                    llm_inference_completed=True,
+                    response_final=True,
+                )
+                pcm, s_ms, g_ms, q_ms = _synthesize_turn_clause(
+                    reply_text,
+                    is_final_response=True,
+                    is_deterministic=True,
+                    is_llm_completed=True,
+                    caller_reason="deterministic_policy",
+                )
                 total_synth_ms += s_ms
                 total_gpu_ms += g_ms
                 total_queue_wait_ms += q_ms
@@ -6828,7 +7048,7 @@ class AstroRealtimeNode(Node):
                     self.memory.episodic.add_message("assistant", reply_text)
                     self.session.record_robot_speech()
                     _record_turn_telemetry(reply_text, origin="deterministic_policy", played=True, dur_synth_ms=total_synth_ms, gpu_ms=total_gpu_ms)
-                    _handle_and_play_clause_audio(pcm)
+                    _handle_and_play_clause_audio(pcm, is_final_clause=True)
                     return
 
             # Explicit Head Angle Command (e.g. '0 dereceye dön', '-30'a dön', '30 derece sağa bak')
@@ -6860,7 +7080,22 @@ class AstroRealtimeNode(Node):
                     if len(self._recent_robot_phrases) > 10:
                         self._recent_robot_phrases = self._recent_robot_phrases[-10:]
 
-                pcm, s_ms, g_ms, q_ms = _synthesize_turn_clause(reply_text)
+                self._speech_authorization = SpeechAuthorization(
+                    user_turn_id=u_turn_id,
+                    generation_id=self._fallback_generation_id,
+                    explicit_user_turn=True,
+                    should_speak=True,
+                    response_origin="deterministic_policy",
+                    llm_inference_completed=True,
+                    response_final=True,
+                )
+                pcm, s_ms, g_ms, q_ms = _synthesize_turn_clause(
+                    reply_text,
+                    is_final_response=True,
+                    is_deterministic=True,
+                    is_llm_completed=True,
+                    caller_reason="deterministic_policy",
+                )
                 total_synth_ms += s_ms
                 total_gpu_ms += g_ms
                 total_queue_wait_ms += q_ms
@@ -6870,7 +7105,7 @@ class AstroRealtimeNode(Node):
                     self.memory.episodic.add_message("assistant", reply_text)
                     self.session.record_robot_speech()
                     _record_turn_telemetry(reply_text, origin="deterministic_policy", played=True, dur_synth_ms=total_synth_ms, gpu_ms=total_gpu_ms)
-                    _handle_and_play_clause_audio(pcm)
+                    _handle_and_play_clause_audio(pcm, is_final_clause=True)
                     return
 
             is_turn_sound = self._is_turn_to_sound_query(user_text)
@@ -6914,7 +7149,22 @@ class AstroRealtimeNode(Node):
                     if len(self._recent_robot_phrases) > 10:
                         self._recent_robot_phrases = self._recent_robot_phrases[-10:]
 
-                pcm, s_ms, g_ms, q_ms = _synthesize_turn_clause(reply_text)
+                self._speech_authorization = SpeechAuthorization(
+                    user_turn_id=u_turn_id,
+                    generation_id=self._fallback_generation_id,
+                    explicit_user_turn=True,
+                    should_speak=True,
+                    response_origin="deterministic_policy",
+                    llm_inference_completed=True,
+                    response_final=True,
+                )
+                pcm, s_ms, g_ms, q_ms = _synthesize_turn_clause(
+                    reply_text,
+                    is_final_response=True,
+                    is_deterministic=True,
+                    is_llm_completed=True,
+                    caller_reason="deterministic_policy",
+                )
                 total_synth_ms += s_ms
                 total_gpu_ms += g_ms
                 total_queue_wait_ms += q_ms
@@ -6924,7 +7174,7 @@ class AstroRealtimeNode(Node):
                     self.memory.episodic.add_message("assistant", reply_text)
                     self.session.record_robot_speech()
                     _record_turn_telemetry(reply_text, origin="deterministic_policy", played=True, dur_synth_ms=total_synth_ms, gpu_ms=total_gpu_ms)
-                    _handle_and_play_clause_audio(pcm)
+                    _handle_and_play_clause_audio(pcm, is_final_clause=True)
                     return
 
             is_move, move_dir, move_spd, move_dur = self._is_movement_query(user_text)
@@ -6950,7 +7200,22 @@ class AstroRealtimeNode(Node):
                 else:
                     reply_text = f"Güvenlik kilidi devrede veya hareket engellendi{spk}."
 
-                pcm, s_ms, g_ms, q_ms = _synthesize_turn_clause(reply_text)
+                self._speech_authorization = SpeechAuthorization(
+                    user_turn_id=u_turn_id,
+                    generation_id=self._fallback_generation_id,
+                    explicit_user_turn=True,
+                    should_speak=True,
+                    response_origin="deterministic_policy",
+                    llm_inference_completed=True,
+                    response_final=True,
+                )
+                pcm, s_ms, g_ms, q_ms = _synthesize_turn_clause(
+                    reply_text,
+                    is_final_response=True,
+                    is_deterministic=True,
+                    is_llm_completed=True,
+                    caller_reason="deterministic_policy",
+                )
                 total_synth_ms += s_ms
                 total_gpu_ms += g_ms
                 total_queue_wait_ms += q_ms
@@ -6960,46 +7225,8 @@ class AstroRealtimeNode(Node):
                     self.memory.episodic.add_message("assistant", reply_text)
                     self.session.record_robot_speech()
                     _record_turn_telemetry(reply_text, origin="deterministic_policy", played=True, dur_synth_ms=total_synth_ms, gpu_ms=total_gpu_ms)
-                    _handle_and_play_clause_audio(pcm)
+                    _handle_and_play_clause_audio(pcm, is_final_clause=True)
                     return
-
-            # 7. Cognitive LLM via ProviderRegistry (Streaming Groq -> Gemini -> Contextual Persona)
-            system_prompt = self._build_current_system_prompt(
-                active_speaker=active_speaker_dict,
-                explicit_user_turn=self._current_turn_explicit_user_turn,
-            )
-
-            # INTERACTION GATE & EXPLICIT USER TURN HARD BLOCK:
-            # Deterministically suppresses Local Gemma, Cloud Providers, and TTS when verbal response is gated
-            soc_dec = getattr(self, "_last_social_decision", None)
-            should_speak = getattr(soc_dec, "should_speak", True) if soc_dec else True
-            explicit_user_turn = getattr(self, "_current_turn_explicit_user_turn", False)
-            if not (should_speak and explicit_user_turn):
-                gate_mode = getattr(soc_dec, "gate_mode", "OBSERVING") if soc_dec else "NO_TURN"
-                gate_reason = getattr(soc_dec, "initiative_reason", "gate_closed" if not should_speak else "no_explicit_turn") if soc_dec else "gate_closed"
-                self.get_logger().info(
-                    f"🛑 [InteractionGate Hard Block]: Sözel yanıt engellendi (should_speak={should_speak}, explicit_user_turn={explicit_user_turn}, mode={gate_mode}, reason={gate_reason}) — 0 LLM / 0 TTS."
-                )
-                soc_ctx = getattr(self, "_last_social_context", None)
-                intent_val = getattr(soc_ctx, "user_intent", "UNKNOWN") if soc_ctx else "UNKNOWN"
-                self.emit_response_trace(
-                    generation_id=self._fallback_generation_id,
-                    user_turn_id=f"turn_{self._fallback_generation_id}",
-                    user_audio=f"{len(raw_pcm)}B" if raw_pcm else "direct_text",
-                    stt=f"verified: '{user_text}'",
-                    user_turn_created=explicit_user_turn,
-                    social_intent=str(getattr(intent_val, "value", intent_val)),
-                    should_speak=should_speak,
-                    llm_provider="none",
-                    llm_inference="none",
-                    response_text="",
-                    tts="none",
-                    playback="none",
-                    response_origin="none",
-                    termination_reason=f"GATE_CLOSED_{gate_mode}_{gate_reason}",
-                )
-                self.state_machine.transition_to(RobotState.LISTENING if not self.is_in_quiet_or_sleep_state() else RobotState.DEEP_IDLE)
-                return
 
             messages = [{"role": "system", "content": system_prompt}]
             recent_msgs = self.memory.episodic.get_messages()[-6:]
@@ -7109,7 +7336,6 @@ class AstroRealtimeNode(Node):
                 t_infer_start = time.perf_counter()
                 t_first_token = None
                 try:
-                    local_chunker = SentenceChunker(min_first_clause_chars=6, min_clause_chars=20) if SentenceChunker else None
                     first_token_seen = False
                     current_gen_id = self._fallback_generation_id
                     gemma_timeout = getattr(self.local_gemma_client, "timeout_s", 5.0)
@@ -7132,61 +7358,6 @@ class AstroRealtimeNode(Node):
                             first_token_seen = True
 
                         full_reply_parts.append(token)
-
-                        if local_chunker:
-                            ready_clauses = local_chunker.feed(token)
-                            for clause in ready_clauses:
-                                if self._barge_in_latched or self._fallback_generation_id != current_gen_id:
-                                    break
-                                pcm, s_ms, g_ms, q_ms = _synthesize_turn_clause(clause)
-                                total_synth_ms += s_ms
-                                total_gpu_ms += g_ms
-                                total_queue_wait_ms += q_ms
-                                if pcm:
-                                    if llm_first_clause_ms is None:
-                                        llm_first_clause_ms = (time.perf_counter() - t_infer_start) * 1000.0
-                                    if not first_audio_played:
-                                        first_audio_ms = (time.monotonic() - t_turn_start) * 1000.0
-                                        first_audio_played = True
-                                    total_audio_sec += (len(pcm) / 2) / 24000.0
-                                    total_audio_bytes += len(pcm)
-                                    _handle_and_play_clause_audio(pcm, is_final_clause=False)
-                                    local_gemma_streamed_audio = True
-
-                    # Flush remaining text in chunker
-                    if not self._barge_in_latched and self._fallback_generation_id == current_gen_id:
-                        if local_chunker:
-                            rem_clause = local_chunker.flush()
-                            if rem_clause:
-                                pcm, s_ms, g_ms, q_ms = _synthesize_turn_clause(rem_clause)
-                                total_synth_ms += s_ms
-                                total_gpu_ms += g_ms
-                                total_queue_wait_ms += q_ms
-                                if pcm:
-                                    if llm_first_clause_ms is None:
-                                        llm_first_clause_ms = (time.perf_counter() - t_infer_start) * 1000.0
-                                    if not first_audio_played:
-                                        first_audio_ms = (time.monotonic() - t_turn_start) * 1000.0
-                                        first_audio_played = True
-                                    total_audio_sec += (len(pcm) / 2) / 24000.0
-                                    total_audio_bytes += len(pcm)
-                                    _handle_and_play_clause_audio(pcm, is_final_clause=True)
-                                    local_gemma_streamed_audio = True
-                            elif local_gemma_streamed_audio:
-                                # All previous clauses sent non-blocking; send end sentinel now
-                                end_dict = {
-                                    "generation_id": current_gen_id,
-                                    "tts_provider": active_engine,
-                                    "tts_model": tts_model_name,
-                                    "tts_source": tts_source_name,
-                                    "playback_source": tts_source_name,
-                                    "is_done": True,
-                                    "data": "",
-                                }
-                                end_msg = String()
-                                end_msg.data = json.dumps(end_dict)
-                                self.pub_output_pcm.publish(end_msg)
-                                self._is_playback_active = False
 
                     t_infer_end = time.perf_counter()
                     total_llm_ms = (t_infer_end - t_infer_start) * 1000.0
@@ -7378,6 +7549,9 @@ class AstroRealtimeNode(Node):
                 chosen_model = local_model_name if 'local_model_name' in locals() else "gemma-4-E2B-it-Q4_K_S"
                 response_origin = "local_gemma_failure"
                 llm_inference_completed = False
+                if getattr(self, "_speech_authorization", None):
+                    self._speech_authorization.invalidated = True
+                    self._speech_authorization = None
                 _record_turn_telemetry(
                     "",
                     origin=response_origin,
@@ -7419,9 +7593,24 @@ class AstroRealtimeNode(Node):
                 if len(self._recent_robot_phrases) > 10:
                     self._recent_robot_phrases = self._recent_robot_phrases[-10:]
 
-            # Synthesize ONE single unified TTS generation for this logical turn (if not already streamed)
-            if full_reply_str and not (chosen_provider == "local_gemma" and local_gemma_streamed_audio):
-                pcm, s_ms, g_ms, q_ms = _synthesize_turn_clause(full_reply_str)
+            # Synthesize ONE single unified TTS generation for this logical turn
+            if full_reply_str and not self._barge_in_latched and self._fallback_generation_id == current_gen_id:
+                self._speech_authorization = SpeechAuthorization(
+                    user_turn_id=u_turn_id,
+                    generation_id=self._fallback_generation_id,
+                    explicit_user_turn=True,
+                    should_speak=True,
+                    response_origin=response_origin,
+                    llm_inference_completed=True,
+                    response_final=True,
+                )
+                pcm, s_ms, g_ms, q_ms = _synthesize_turn_clause(
+                    full_reply_str,
+                    is_final_response=True,
+                    is_deterministic=False,
+                    is_llm_completed=True,
+                    caller_reason="user_turn_response",
+                )
                 total_synth_ms += s_ms
                 total_gpu_ms += g_ms
                 total_queue_wait_ms += q_ms
@@ -7430,7 +7619,7 @@ class AstroRealtimeNode(Node):
                     total_audio_bytes = len(pcm)
                     first_audio_ms = (time.monotonic() - t_turn_start) * 1000.0
                     first_audio_played = True
-                    _handle_and_play_clause_audio(pcm)
+                    _handle_and_play_clause_audio(pcm, is_final_clause=True)
 
             t_total_end = time.monotonic()
             total_turn_ms = (t_total_end - t_turn_start) * 1000.0
@@ -7538,6 +7727,11 @@ class AstroRealtimeNode(Node):
         except Exception as e:
             self.get_logger().warn(f"Fallback turn notice: {e}")
         finally:
+            if getattr(self, "_speech_authorization", None):
+                self._speech_authorization.invalidated = True
+                self._speech_authorization = None
+            self._current_user_turn_id = None
+            self._current_turn_explicit_user_turn = False
             self._is_processing_fallback = False
             self._is_responding = False
             self._playback_end_time = time.monotonic()
