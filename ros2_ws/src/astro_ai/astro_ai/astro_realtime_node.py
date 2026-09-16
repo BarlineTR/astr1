@@ -3612,15 +3612,20 @@ class AstroRealtimeNode(Node):
 
         # Grounded response from real-time perception state
         vis_state = self._get_current_visual_grounding()
+        v_state = vis_state.get("visual_state", "UNKNOWN")
         vis_cam_avail = vis_state.get("visual_camera_available", False)
         vis_person_det = vis_state.get("visual_person_detected", False)
 
-        if vis_cam_avail and vis_person_det:
-            reply = "Seni görüyorum ve benimle konuştuğunu fark ediyorum; ama şu an fiziksel olarak ne yaptığını kameramdan ayırt edemiyorum."
-        elif vis_cam_avail and not vis_person_det:
-            reply = "Şu an kameramda seni göremediğim için ne yaptığını söyleyemem."
-        else:
+        if not vis_cam_avail or v_state == "UNKNOWN":
             reply = "Kameram şu anda aktif olmadığı için ne yaptığını göremiyorum."
+        elif v_state == "STALE":
+            reply = "Şu an görüntüm güncel olmadığı için ne yaptığını göremiyorum."
+        elif vis_person_det:
+            # VISIBLE + activity UNKNOWN
+            reply = "Seni görüyorum ama ne yaptığını ayırt edemiyorum."
+        else:
+            # NOT VISIBLE
+            reply = "Şu an seni kameramda göremiyorum."
 
         return True, reply
 
@@ -3653,19 +3658,15 @@ class AstroRealtimeNode(Node):
             return False, ""
 
         vis_state = self._get_current_visual_grounding()
+        v_state = vis_state.get("visual_state", "UNKNOWN")
         vis_cam_avail = vis_state.get("visual_camera_available", False)
         vis_person_det = vis_state.get("visual_person_detected", False)
         vis_dist = vis_state.get("visual_distance")
 
-        # Staleness guard
-        last_face_t = getattr(self, "_last_vision_faces_time", 0.0)
-        now = time.monotonic()
-        is_stale = (now - last_face_t) > 4.0 if last_face_t > 0 else False
+        if not vis_cam_avail or v_state == "UNKNOWN":
+            return True, "Seni şu an doğrulayamıyorum, kameram aktif değil."
 
-        if not vis_cam_avail:
-            return True, "Kameram şu anda aktif değil veya görüntü alınamıyor."
-
-        if is_stale and not vis_person_det:
+        if v_state == "STALE":
             return True, "Şu an görüntüm güncel değil, seni doğrulayamıyorum."
 
         if not vis_person_det:
@@ -3675,7 +3676,7 @@ class AstroRealtimeNode(Node):
 
         dist_str = f"yaklaşık {vis_dist:.1f}".replace(".", ",") + " metre mesafeden " if (vis_dist and vis_dist > 0.1) else ""
         if "takip" in t:
-            return True, "Evet, seni kameramdan görüyorum ve takip ediyorum."
+            return True, f"Evet, seni {dist_str}kameramdan görüyorum ve takip ediyorum."
         elif any(w in t for w in ["kimi", "neler", "ne görüyorsun", "kim var"]):
             return True, f"Kameramda seni {dist_str}görüyorum ve takip ediyorum."
         else:
@@ -3760,8 +3761,10 @@ class AstroRealtimeNode(Node):
 
         Invariants:
         1. Ground truth fact (fact_text) is never altered, distorted, or contradicted.
-        2. If interlocutor is a CHILD, persona is strictly sanitized to playful (zero profanity, no 'Ulan' or harsh tone).
-        3. If interlocutor identity is not verified (is_known is False or spk_name is 'Misafir'), never use personal name.
+        2. Persona is strictly a presentation layer. Factual truth is core.
+        3. If interlocutor is a CHILD, persona is strictly sanitized to playful (zero profanity, zero 'Ulan', zero adult slang).
+        4. If interlocutor identity is not verified (is_known is False or spk_name is 'Misafir'), NEVER use personal name.
+        5. In adult mode: avoid repetitive robotic 'Ulan <Name>' prefixing; use natural, fluent Turkish variation.
         """
         if not fact_text:
             return ""
@@ -3776,38 +3779,47 @@ class AstroRealtimeNode(Node):
 
         fact_clean = fact_text.strip()
 
-        if persona == "kufurbaz" and not is_child:
-            fact_lower_first = fact_clean[0].lower() + fact_clean[1:] if len(fact_clean) > 1 else fact_clean.lower()
-            if valid_name:
-                return f"Ulan {valid_name}, {fact_lower_first}"
-            else:
-                return f"Ulan, {fact_lower_first}"
-
-        elif persona == "flirt":
-            fact_lower_first = fact_clean[0].lower() + fact_clean[1:] if len(fact_clean) > 1 else fact_clean.lower()
-            if valid_name:
-                return f"Canım {valid_name}, {fact_lower_first}"
-            else:
-                return f"Canım benim, {fact_lower_first}"
-
-        elif persona == "playful":
-            if valid_name:
-                if fact_clean.startswith("Evet,"):
-                    return fact_clean.replace("Evet,", f"Evet {valid_name},", 1)
-                elif not fact_clean.startswith(valid_name):
-                    fact_lower_first = fact_clean[0].lower() + fact_clean[1:] if len(fact_clean) > 1 else fact_clean.lower()
-                    return f"{valid_name}, {fact_lower_first}"
+        # If speaker is unverified, return ground truth fact with no personal name
+        if not valid_name:
             return fact_clean
 
-        else:
-            # Default / formal / neutral persona
-            if valid_name:
-                if fact_clean.startswith("Evet,"):
-                    return fact_clean.replace("Evet,", f"Evet {valid_name},", 1)
-                elif not fact_clean.startswith(valid_name):
-                    fact_lower_first = fact_clean[0].lower() + fact_clean[1:] if len(fact_clean) > 1 else fact_clean.lower()
-                    return f"{valid_name}, {fact_lower_first}"
-            return fact_clean
+        # Natural, fluent adult/playful integration of verified interlocutor name
+        if fact_clean == "Durdum.":
+            return f"Durdum {valid_name}."
+
+        if fact_clean.startswith("Sesine döndüm,"):
+            return fact_clean.replace("Sesine döndüm,", f"Sesine döndüm {valid_name},", 1)
+
+        if fact_clean.startswith("Sesinin yönünü tam kestiremedim"):
+            return fact_clean.replace("Sesinin yönünü tam kestiremedim", f"Sesinin yönünü tam kestiremedim {valid_name},", 1)
+
+        if fact_clean.startswith("Evet,"):
+            return fact_clean.replace("Evet,", f"Evet {valid_name},", 1)
+
+        if "seni görüyorum ama ne yaptığını ayırt edemiyorum" in fact_clean.lower():
+            return fact_clean.replace("Seni görüyorum ama", f"Seni görüyorum {valid_name}, ama", 1)
+
+        if "şu an seni kameramda göremiyorum" in fact_clean.lower():
+            if fact_clean.endswith("."):
+                return f"{fact_clean[:-1]} {valid_name}."
+            return f"{fact_clean} {valid_name}."
+
+        if "şu an görüntüm güncel değil," in fact_clean.lower():
+            return fact_clean.replace("Şu an görüntüm güncel değil,", f"Şu an görüntüm güncel değil {valid_name},", 1)
+
+        if "seni şu an doğrulayamıyorum," in fact_clean.lower():
+            return fact_clean.replace("Seni şu an doğrulayamıyorum,", f"Seni şu an doğrulayamıyorum {valid_name},", 1)
+
+        if persona == "flirt":
+            fact_lower_first = fact_clean[0].lower() + fact_clean[1:] if len(fact_clean) > 1 else fact_clean.lower()
+            return f"Canım {valid_name}, {fact_lower_first}"
+
+        # General sentence ending integration (e.g. "Kameramda seni ... takip ediyorum Baran.")
+        if fact_clean.endswith(".") and not fact_clean.endswith(f" {valid_name}."):
+            return f"{fact_clean[:-1]} {valid_name}."
+
+        fact_lower_first = fact_clean[0].lower() + fact_clean[1:] if len(fact_clean) > 1 else fact_clean.lower()
+        return f"{valid_name}, {fact_lower_first}"
 
     def _execute_realtime_tool(self, name: str, args: Dict[str, Any]) -> Dict[str, Any]:
         """Executes integrated robot tools in real time."""
@@ -7183,6 +7195,24 @@ class AstroRealtimeNode(Node):
                 ttfa_ms = tts_ttfa_ms_val if tts_ttfa_ms_val > 0 else dur_synth_ms
                 e2e_ms = end_to_end_first_audio_ms_val if end_to_end_first_audio_ms_val > 0 else ((pb_start - stt_fin) * 1000.0 if (played and stt_fin > 0) else 0.0)
 
+                vis_ground = self._get_current_visual_grounding()
+                v_state_val = vis_ground.get("visual_state", "UNKNOWN")
+                v_age_ms_val = vis_ground.get("visual_age_ms", -1)
+                v_pres_val = vis_ground.get("visual_present", False)
+                v_track_val = vis_ground.get("visual_tracking", False)
+                v_tgt_id_val = vis_ground.get("visual_target_id", "none")
+                v_tgt_dist_val = vis_ground.get("visual_target_distance")
+                act_state_val = "UNKNOWN"
+                id_conf_val = 0.0
+                rec_p = getattr(self, "_recognized_person", {})
+                if isinstance(rec_p, dict) and rec_p.get("confidence") is not None:
+                    try:
+                        id_conf_val = float(rec_p.get("confidence", 0.0))
+                    except Exception:
+                        id_conf_val = 0.0
+                if id_conf_val == 0.0 and (getattr(self, "current_speaker_verified", False) or (soc_ctx and getattr(soc_ctx, "current_speaker_verified", False))):
+                    id_conf_val = 1.0
+
                 telem = {
                     "generation_id": self._fallback_generation_id,
                     "user_turn_id": u_turn_id,
@@ -7231,6 +7261,25 @@ class AstroRealtimeNode(Node):
                         "tts_first_audio": round(tts_fa, 4),
                         "playback_started": round(pb_start, 4),
                     },
+                    # Perception Snapshot Freshness & Grounding
+                    "visual_state": v_state_val,
+                    "visual_age_ms": v_age_ms_val,
+                    "visual_present": v_pres_val,
+                    "visual_tracking": v_track_val,
+                    "visual_target_id": v_tgt_id_val,
+                    "visual_target_distance": v_tgt_dist_val,
+                    "activity_state": act_state_val,
+                    "identity_confidence": round(id_conf_val, 2),
+                    "perception_snapshot": {
+                        "visual_state": v_state_val,
+                        "visual_age_ms": v_age_ms_val,
+                        "visual_present": v_pres_val,
+                        "visual_tracking": v_track_val,
+                        "visual_target_id": v_tgt_id_val,
+                        "visual_target_distance": v_tgt_dist_val,
+                        "activity_state": act_state_val,
+                        "identity_confidence": round(id_conf_val, 2),
+                    },
                 }
                 self._last_turn_telemetry = telem
                 self.get_logger().info(
@@ -7263,6 +7312,15 @@ class AstroRealtimeNode(Node):
                     f"playback_started={played}\n"
                     f"playback_finished={played and synth_fin}\n"
                     f"playback_failed={not played and synth_fin}\n"
+                    f"[Perception Snapshot]\n"
+                    f"  visual_state: {v_state_val}\n"
+                    f"  visual_age_ms: {v_age_ms_val}\n"
+                    f"  visual_present: {v_pres_val}\n"
+                    f"  visual_tracking: {v_track_val}\n"
+                    f"  visual_target_id: {v_tgt_id_val}\n"
+                    f"  visual_target_distance: {v_tgt_dist_val}\n"
+                    f"  activity_state: {act_state_val}\n"
+                    f"  identity_confidence: {id_conf_val:.2f}\n"
                     f"[End-to-End Latency Breakdown]\n"
                     f"  stt_finished: {stt_fin:.4f}\n"
                     f"  intent_resolved: {int_res:.4f} (+{int_res_ms:.1f}ms)\n"
@@ -9232,27 +9290,44 @@ class AstroRealtimeNode(Node):
         """
         now = time.monotonic()
 
-        # 1. Camera availability
+        # 1. Camera availability and age
         mock_cam = os.getenv("ASTRO_MOCK_CAMERA_AVAILABLE", "0").strip().lower() in ("1", "true", "yes")
+        oak_state = getattr(self, "_oak_connection_state", "DISCONNECTED")
+        last_f = getattr(self, "_oak_last_frame_time", 0.0)
+        last_face = getattr(self, "_last_vision_faces_time", 0.0)
+        ref_t = last_face if last_face > 0.0 else last_f
+        visual_age_ms = int((now - ref_t) * 1000.0) if ref_t > 0.0 else -1
+
         cam_fresh = False
         if mock_cam:
             cam_fresh = True
+            if visual_age_ms < 0:
+                visual_age_ms = 10
         else:
-            oak_state = getattr(self, "_oak_connection_state", "DISCONNECTED")
-            last_f = getattr(self, "_oak_last_frame_time", 0.0)
-            last_i = getattr(self, "_oak_last_camera_info_time", 0.0)
             has_recent_frame = (last_f > 0.0 and (now - last_f) < 4.0)
-            has_recent_info = (last_i > 0.0 and (now - last_i) < 4.0)
+            has_recent_info = (getattr(self, "_oak_last_camera_info_time", 0.0) > 0.0 and (now - getattr(self, "_oak_last_camera_info_time", 0.0)) < 4.0)
             has_frame_obj = getattr(self, "_latest_camera_frame", None) is not None
             cam_fresh = bool(oak_state == "CONNECTED" or has_recent_frame or has_recent_info or has_frame_obj)
+
+        if not cam_fresh or ref_t <= 0.0:
+            visual_state = "UNKNOWN"
+        elif visual_age_ms > 4000:
+            visual_state = "STALE"
+        else:
+            visual_state = "FRESH"
 
         if not cam_fresh:
             return {
                 "visual_camera_available": False,
+                "visual_state": "UNKNOWN",
+                "visual_age_ms": visual_age_ms,
+                "visual_present": False,
                 "visual_person_detected": False,
                 "visual_target": "none",
+                "visual_target_id": "none",
                 "visual_tracking": False,
                 "visual_distance": None,
+                "visual_target_distance": None,
                 "visual_looking_at_robot": False,
                 "visual_azimuth_deg": 0.0,
                 "target_name": None,
@@ -9289,7 +9364,7 @@ class AstroRealtimeNode(Node):
                 pass
 
         # Fallback to direct vision topic state if fresh
-        if not person_detected and (self.is_visual_evidence_fresh(now=now) or (getattr(self, "_last_vision_faces_time", 0.0) > 0 and (now - getattr(self, "_last_vision_faces_time", 0.0)) < 4.0)):
+        if not person_detected and (self.is_visual_evidence_fresh(now=now) or (last_face > 0.0 and (now - last_face) < 4.0)):
             person_detected = True
             v_dist = self.get_fresh_visual_distance(now=now) or getattr(self, "_user_distance", 0.0)
             if v_dist > 0.1:
@@ -9309,11 +9384,16 @@ class AstroRealtimeNode(Node):
             is_tracking = True
 
         return {
-            "visual_camera_available": True,
+            "visual_camera_available": cam_fresh,
+            "visual_state": visual_state,
+            "visual_age_ms": visual_age_ms,
+            "visual_present": person_detected,
             "visual_person_detected": person_detected,
             "visual_target": target_id if person_detected else "none",
+            "visual_target_id": target_id if person_detected else "none",
             "visual_tracking": is_tracking if person_detected else False,
             "visual_distance": target_dist,
+            "visual_target_distance": target_dist,
             "visual_looking_at_robot": target_looking if person_detected else False,
             "visual_azimuth_deg": target_yaw,
             "target_name": target_name,

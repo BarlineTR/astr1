@@ -500,16 +500,17 @@ class TestVisualGroundingAndActivityRepair(unittest.TestCase):
         self.assertNotIn("Baran", res_unverified)
         self.assertIn(fact.lower(), res_unverified.lower())
 
-        # Case 2: Verified adult with kufurbaz persona -> Prefixes Ulan, preserves fact
+        # Case 2: Verified adult -> Natural variation with verified name, NO repetitive robotic 'Ulan' prefix, preserves fact truth
         self.node.persona_name = "kufurbaz"
-        res_kufurbaz_adult = self.node._format_deterministic_response(
+        res_adult = self.node._format_deterministic_response(
             fact_text=fact,
             spk_name="Baran",
             is_known=True,
             is_child=False,
         )
-        self.assertTrue(res_kufurbaz_adult.startswith("Ulan Baran,"))
-        self.assertIn("kameramda seni", res_kufurbaz_adult)
+        self.assertFalse(res_adult.startswith("Ulan Baran,"), "Repetitive robotic 'Ulan' prefix must NOT be forced")
+        self.assertIn("Baran", res_adult)
+        self.assertIn("kameramda seni", res_adult.lower())
 
         # Case 3: CHILD SAFETY INVARIANT -> Even with kufurbaz persona, sanitized to playful (ZERO Ulan/profanity)
         res_kufurbaz_child = self.node._format_deterministic_response(
@@ -520,10 +521,18 @@ class TestVisualGroundingAndActivityRepair(unittest.TestCase):
         )
         self.assertNotIn("Ulan", res_kufurbaz_child)
         self.assertNotIn("ulan", res_kufurbaz_child)
-        self.assertIn("kameramda seni", res_kufurbaz_child)
+        self.assertIn("kameramda seni", res_kufurbaz_child.lower())
 
-        # Case 4: Stop command with Child Safety
+        # Case 4: Stop command with Verified Adult & Child Safety
         stop_fact = "Durdum."
+        res_stop_adult = self.node._format_deterministic_response(
+            fact_text=stop_fact,
+            spk_name="Baran",
+            is_known=True,
+            is_child=False,
+        )
+        self.assertEqual(res_stop_adult, "Durdum Baran.")
+
         res_stop_child = self.node._format_deterministic_response(
             fact_text=stop_fact,
             spk_name=None,
