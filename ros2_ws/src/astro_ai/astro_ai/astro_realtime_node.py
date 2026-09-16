@@ -3581,19 +3581,172 @@ class AstroRealtimeNode(Node):
 
         return False, 0.0, ""
 
+    def _is_activity_query(self, text: str) -> Tuple[bool, str]:
+        """Detects explicit queries about user's current activity (e.g. 'ne yapıyorum', 'ben ne yapıyordur şu anda').
+
+        Returns (is_activity_query, deterministic_reply_text).
+        Yields grounded, truthful natural Turkish from current sensor state with 0ms LLM overhead.
+        """
+        if not text or not str(text).strip():
+            return False, ""
+        t = text.lower().strip()
+
+        # Explicit negative filter: commands must never be treated as activity queries
+        if t in ("dur", "dursana", "hareket etme", "dur artık", "dön", "sağına dön", "sesime dön", "bana dön"):
+            return False, ""
+
+        patterns = [
+            r"\b(?:ben\s+)?(?:(?:şu\s*an(?:da)?|şuan)\s+)?ne\s+yap(?:ıyor(?:dur)?|ıyorum|ıyoruz|ıyorsun|maktayım|tığımı)\b",
+            r"\b(?:ben\s+)?ne\s+yap(?:ıyor(?:dur)?|ıyorum|ıyoruz|ıyorsun|maktayım|tığımı)(?:\s+(?:şu\s*an(?:da)?|şuan))?\b",
+            r"\b(?:benim\s+)?ne\s+yaptığımı\s+(?:gör(?:üyor\s+musun|ebiliyor\s+musun|üyorsun)|bil(?:iyor\s+musun|ebilir\s+misin))\b",
+            r"\bbeni\s+görüyorsun,?\s*(?:ben\s+)?ne\s+yap(?:ıyor(?:dur)?|ıyorum|ıyorsun)\b",
+            r"\bneyle\s+(?:meşgul(?:üm|sün)|uğraş(?:ıyor(?:dur)?|ıyorum|ıyorsun))\b",
+            r"\b(?:şu\s*an(?:da)?\s+)?benim\s+aktivitem\b",
+        ]
+        is_match = any(re.search(p, t) for p in patterns) or any(q in t for q in [
+            "ben ne yapıyorum", "ben ne yapıyordur", "şu anda ne yapıyorum", "şu an ne yapıyorum",
+            "ben şu anda ne yapıyorum", "ne yapıyorum şu anda", "ne yapıyorum", "ne yapmaktayım"
+        ])
+        if not is_match:
+            return False, ""
+
+        # Grounded response from real-time perception state
+        vis_state = self._get_current_visual_grounding()
+        vis_cam_avail = vis_state.get("visual_camera_available", False)
+        vis_person_det = vis_state.get("visual_person_detected", False)
+
+        if vis_cam_avail and vis_person_det:
+            reply = "Seni görüyorum ve benimle konuştuğunu fark ediyorum; ama şu an fiziksel olarak ne yaptığını kameramdan ayırt edemiyorum."
+        elif vis_cam_avail and not vis_person_det:
+            reply = "Şu an kameramda seni göremediğim için ne yaptığını söyleyemem."
+        else:
+            reply = "Kameram şu anda aktif olmadığı için ne yaptığını göremiyorum."
+
+        return True, reply
+
+    def _is_visual_state_query(self, text: str) -> Tuple[bool, str]:
+        """Detects visual capability and perception queries (e.g. 'beni görüyor musun', 'kameranda neler görüyorsun').
+
+        Returns (is_visual_state_query, deterministic_reply_text).
+        Yields grounded, truthful natural Turkish from OAK-D / WorldModel with 0ms LLM overhead.
+        """
+        if not text or not str(text).strip():
+            return False, ""
+        t = text.lower().strip()
+
+        patterns = [
+            r"\b(?:beni\s+)?(?:kameran(?:dan)?\s+)?gör(?:üyor|ebiliyor)\s+musun(?:\s+beni)?\b",
+            r"\b(?:kameran(?:da|dan)?\s+)?neler\s+görüyorsun\b",
+            r"\b(?:kameran(?:da|dan)?\s+)?ne\s+görüyorsun\b",
+            r"\b(?:kamerada|kameranda)\s+(?:neler\s+var|ne\s+var)\b",
+            r"\b(?:karşında\s+|etrafta\s+|etrafımda\s+)?kimi\s+görüyorsun\b",
+            r"\b(?:karşında\s+|etrafta\s+|etrafımda\s+)?kim(?:i|ler)\s+var\b",
+            r"\b(?:beni\s+)?takip\s+ediyor\s+musun(?:\s+beni)?\b",
+            r"\b(?:etrafımda|etrafta|çevrende)\s+ne\s+görüyorsun\b",
+        ]
+        is_match = any(re.search(p, t) for p in patterns) or any(q in t for q in [
+            "beni görüyor musun", "beni görebiliyor musun", "kamerandan beni görebiliyor musun",
+            "kameradan beni görebiliyor musun", "kameranda neler görüyorsun", "kameranda ne görüyorsun",
+            "kimi görüyorsun", "beni takip ediyor musun", "görüyor musun beni"
+        ])
+        if not is_match:
+            return False, ""
+
+        vis_state = self._get_current_visual_grounding()
+        vis_cam_avail = vis_state.get("visual_camera_available", False)
+        vis_person_det = vis_state.get("visual_person_detected", False)
+        vis_dist = vis_state.get("visual_distance")
+
+        # Staleness guard
+        last_face_t = getattr(self, "_last_vision_faces_time", 0.0)
+        now = time.monotonic()
+        is_stale = (now - last_face_t) > 4.0 if last_face_t > 0 else False
+
+        if not vis_cam_avail:
+            return True, "Kameram şu anda aktif değil veya görüntü alınamıyor."
+
+        if is_stale and not vis_person_det:
+            return True, "Şu an görüntüm güncel değil, seni doğrulayamıyorum."
+
+        if not vis_person_det:
+            if any(w in t for w in ["kimi", "neler", "ne görüyorsun", "kim var"]):
+                return True, "Şu an kameramda kimseyi göremiyorum."
+            return True, "Şu an kameramda seni göremiyorum."
+
+        dist_str = f"yaklaşık {vis_dist:.1f}".replace(".", ",") + " metre mesafeden " if (vis_dist and vis_dist > 0.1) else ""
+        if "takip" in t:
+            return True, "Evet, seni kameramdan görüyorum ve takip ediyorum."
+        elif any(w in t for w in ["kimi", "neler", "ne görüyorsun", "kim var"]):
+            return True, f"Kameramda seni {dist_str}görüyorum ve takip ediyorum."
+        else:
+            return True, f"Evet, seni {dist_str}kameramdan görüyorum ve takip ediyorum."
+
+    def _is_robot_state_query(self, text: str) -> Tuple[bool, str]:
+        """Detects robot self-state queries (motion, motors, head orientation).
+
+        Returns (is_robot_state_query, deterministic_reply_text).
+        Yields direct status from hardware/action managers with 0ms LLM overhead.
+        """
+        if not text or not str(text).strip():
+            return False, ""
+        t = text.lower().strip()
+
+        # Motion status query: "hareket ediyor musun", "gidiyor musun"
+        if re.search(r"\b(hareket\s+ediyor\s+musun|hareket\s+halinde\s+misin|gidiyor\s+musun)\b", t):
+            is_moving = False
+            if hasattr(self, "action_manager") and hasattr(self.action_manager, "is_moving"):
+                is_moving = bool(self.action_manager.is_moving)
+            if is_moving:
+                return True, "Evet, şu anda hareket halindeyim."
+            return True, "Şu anda hareket etmiyorum, sabit duruyorum."
+
+        # Motor status query: "motorların aktif mi", "motorlar açık mı"
+        if re.search(r"\bmotorlar(?:ın|in)?\s+(?:aktif|açık|acik|calisiyor|çalışıyor)\s+m[ıiuü]\b", t):
+            return True, "Evet, motorlarım ve hareket sistemim aktif durumda."
+
+        # Head direction query: "kafa hangi yöne dönük", "kafan nereye bakıyor"
+        if re.search(r"\b(?:kafa(?:n)?|başın)\s+(?:hangi\s+yöne\s+dönük|nereye\s+bakıyor|ne\s+tarafa\s+dönük)\b", t):
+            angle = float(getattr(self, "_current_head_angle", 0.0))
+            if abs(angle) < 5.0:
+                return True, "Kafam tam merkeze, karşıya dönük."
+            elif angle > 0:
+                return True, f"Kafam sola, yaklaşık {int(angle)} dereceye dönük."
+            else:
+                return True, f"Kafam sağa, yaklaşık {int(abs(angle))} dereceye dönük."
+
+        return False, ""
+
     def _is_movement_query(self, text: str) -> Tuple[bool, str, float, float]:
         """Detects base mobility commands in fallback mode."""
+        if not text or not str(text).strip():
+            return False, "stop", 0.0, 0.0
         t = text.lower().strip()
-        if any(p in t for p in ["ileri git", "öne git", "one git", "ilerle", "ileri sür", "öne doğru git"]):
-            return True, "forward", 0.2, 1.5
-        if any(p in t for p in ["geri gel", "geriye git", "gerile", "geri sür", "arkaya git"]):
-            return True, "backward", 0.2, 1.5
-        if any(p in t for p in ["sağa dön", "saga don", "sağa bak", "saga bak", "sağa kıvrıl"]):
-            return True, "right", 0.2, 1.0
-        if any(p in t for p in ["sola dön", "sola don", "sola bak", "sola kıvrıl"]):
-            return True, "left", 0.2, 1.0
-        if any(p in t for p in ["dur", "dur orada", "dur robot", "hareketi kes", "bekle orada"]):
+
+        # Questions, perceptions, or activity queries are NEVER movement commands!
+        question_or_perception_tokens = [
+            "ne ", "ne?", "ne!", "nedir", "neler", "kim", "nasıl", "nasil",
+            "mısın", "misin", "musun", "müsün", "mu ", "mü ", "?", "gör", "yap"
+        ]
+        if any(q in t for q in question_or_perception_tokens):
+            return False, "stop", 0.0, 0.0
+
+        # Hard stop commands: word-bounded regex, strictly never matching as substring
+        stop_pattern = (
+            r"\b(acil\s+dur|hemen\s+dur|dur\s+artık|artık\s+dur|hareketi\s+kes|bekle\s+orada|"
+            r"hareket\s+etme|dur\s+orada|dur\s+robot|dursana|dur\s+lütfen|lütfen\s+dur)\b"
+        )
+        if re.search(stop_pattern, t) or re.search(r"^(?:hey\s+)?(?:astro\s*[,:\.]?\s*)?dur[!\.]?$", t):
             return True, "stop", 0.0, 0.0
+
+        if re.search(r"\b(ileri\s+git|öne\s+git|one\s+git|ilerle|ileri\s+sür|öne\s+doğru\s+git)\b", t):
+            return True, "forward", 0.2, 1.5
+        if re.search(r"\b(geri\s+gel|geriye\s+git|gerile|geri\s+sür|arkaya\s+git)\b", t):
+            return True, "backward", 0.2, 1.5
+        if re.search(r"\b(sağa\s+dön|saga\s+don|sağa\s+kıvrıl)\b", t):
+            return True, "right", 0.2, 1.0
+        if re.search(r"\b(sola\s+dön|sola\s+don|sola\s+kıvrıl)\b", t):
+            return True, "left", 0.2, 1.0
+
         return False, "stop", 0.0, 0.0
 
     def _execute_realtime_tool(self, name: str, args: Dict[str, Any]) -> Dict[str, Any]:
@@ -7096,6 +7249,151 @@ class AstroRealtimeNode(Node):
                     _handle_and_play_clause_audio(pcm, is_final_clause=True)
                     return
 
+            # Instant Activity Query (Sub-250ms Direct Execution, 0ms LLM)
+            is_activity, act_reply = self._is_activity_query(user_text)
+            if is_activity:
+                p = self.persona_name.lower()
+                spk = f"{spk_name}" if spk_name else ""
+                if p == "kufurbaz":
+                    reply_text = f"Ulan {spk}, {act_reply[0].lower() + act_reply[1:]}" if spk else f"Ulan, {act_reply[0].lower() + act_reply[1:]}"
+                elif p == "flirt":
+                    reply_text = f"Canım {spk}, {act_reply[0].lower() + act_reply[1:]}" if spk else f"Canım benim, {act_reply[0].lower() + act_reply[1:]}"
+                else:
+                    reply_text = f"{spk}, {act_reply[0].lower() + act_reply[1:]}" if spk else act_reply
+
+                with self._lock:
+                    self._recent_robot_phrases.append(reply_text.lower())
+                    if len(self._recent_robot_phrases) > 10:
+                        self._recent_robot_phrases = self._recent_robot_phrases[-10:]
+
+                self._speech_authorization = SpeechAuthorization(
+                    user_turn_id=u_turn_id,
+                    generation_id=self._fallback_generation_id,
+                    explicit_user_turn=True,
+                    should_speak=True,
+                    response_origin="deterministic_policy",
+                    llm_inference_completed=True,
+                    response_final=True,
+                )
+                pcm, s_ms, g_ms, q_ms = _synthesize_turn_clause(
+                    reply_text,
+                    is_final_response=True,
+                    is_deterministic=True,
+                    is_llm_completed=True,
+                    caller_reason="deterministic_policy",
+                )
+                total_synth_ms += s_ms
+                total_gpu_ms += g_ms
+                total_queue_wait_ms += q_ms
+                if pcm:
+                    first_audio_ms = (time.monotonic() - t_turn_start) * 1000.0
+                    self.get_logger().info(f"🤖 [Astro (Aktivite Durumu)]: \"{reply_text}\"")
+                    self.memory.episodic.add_message("assistant", reply_text)
+                    self.session.record_robot_speech()
+                    _record_turn_telemetry(reply_text, origin="deterministic_policy", played=True, dur_synth_ms=total_synth_ms, gpu_ms=total_gpu_ms)
+                    _handle_and_play_clause_audio(pcm, is_final_clause=True)
+                    return
+
+            # Instant Visual State Query (Sub-250ms Direct Execution, 0ms LLM)
+            is_vis, vis_reply = self._is_visual_state_query(user_text)
+            if is_vis:
+                p = self.persona_name.lower()
+                spk = f"{spk_name}" if spk_name else ""
+                if p == "kufurbaz":
+                    reply_text = f"Ulan {spk}, {vis_reply[0].lower() + vis_reply[1:]}" if spk else f"Ulan, {vis_reply[0].lower() + vis_reply[1:]}"
+                elif p == "flirt":
+                    reply_text = f"Canım {spk}, {vis_reply[0].lower() + vis_reply[1:]}" if spk else f"Canım benim, {vis_reply[0].lower() + vis_reply[1:]}"
+                else:
+                    if spk and vis_reply.startswith("Evet,"):
+                        reply_text = vis_reply.replace("Evet,", f"Evet {spk},", 1)
+                    elif spk and not vis_reply.startswith(spk):
+                        reply_text = f"{spk}, {vis_reply[0].lower() + vis_reply[1:]}"
+                    else:
+                        reply_text = vis_reply
+
+                with self._lock:
+                    self._recent_robot_phrases.append(reply_text.lower())
+                    if len(self._recent_robot_phrases) > 10:
+                        self._recent_robot_phrases = self._recent_robot_phrases[-10:]
+
+                self._speech_authorization = SpeechAuthorization(
+                    user_turn_id=u_turn_id,
+                    generation_id=self._fallback_generation_id,
+                    explicit_user_turn=True,
+                    should_speak=True,
+                    response_origin="deterministic_policy",
+                    llm_inference_completed=True,
+                    response_final=True,
+                )
+                pcm, s_ms, g_ms, q_ms = _synthesize_turn_clause(
+                    reply_text,
+                    is_final_response=True,
+                    is_deterministic=True,
+                    is_llm_completed=True,
+                    caller_reason="deterministic_policy",
+                )
+                total_synth_ms += s_ms
+                total_gpu_ms += g_ms
+                total_queue_wait_ms += q_ms
+                if pcm:
+                    first_audio_ms = (time.monotonic() - t_turn_start) * 1000.0
+                    self.get_logger().info(f"🤖 [Astro (Görsel Algı Durumu)]: \"{reply_text}\"")
+                    self.memory.episodic.add_message("assistant", reply_text)
+                    self.session.record_robot_speech()
+                    _record_turn_telemetry(reply_text, origin="deterministic_policy", played=True, dur_synth_ms=total_synth_ms, gpu_ms=total_gpu_ms)
+                    _handle_and_play_clause_audio(pcm, is_final_clause=True)
+                    return
+
+            # Instant Robot Self-State Query (Sub-250ms Direct Execution, 0ms LLM)
+            is_rob, rob_reply = self._is_robot_state_query(user_text)
+            if is_rob:
+                p = self.persona_name.lower()
+                spk = f"{spk_name}" if spk_name else ""
+                if p == "kufurbaz":
+                    reply_text = f"Ulan {spk}, {rob_reply[0].lower() + rob_reply[1:]}" if spk else f"Ulan, {rob_reply[0].lower() + rob_reply[1:]}"
+                elif p == "flirt":
+                    reply_text = f"Canım {spk}, {rob_reply[0].lower() + rob_reply[1:]}" if spk else f"Canım benim, {rob_reply[0].lower() + rob_reply[1:]}"
+                else:
+                    if spk and rob_reply.startswith("Evet,"):
+                        reply_text = rob_reply.replace("Evet,", f"Evet {spk},", 1)
+                    elif spk and not rob_reply.startswith(spk):
+                        reply_text = f"{spk}, {rob_reply[0].lower() + rob_reply[1:]}"
+                    else:
+                        reply_text = rob_reply
+
+                with self._lock:
+                    self._recent_robot_phrases.append(reply_text.lower())
+                    if len(self._recent_robot_phrases) > 10:
+                        self._recent_robot_phrases = self._recent_robot_phrases[-10:]
+
+                self._speech_authorization = SpeechAuthorization(
+                    user_turn_id=u_turn_id,
+                    generation_id=self._fallback_generation_id,
+                    explicit_user_turn=True,
+                    should_speak=True,
+                    response_origin="deterministic_policy",
+                    llm_inference_completed=True,
+                    response_final=True,
+                )
+                pcm, s_ms, g_ms, q_ms = _synthesize_turn_clause(
+                    reply_text,
+                    is_final_response=True,
+                    is_deterministic=True,
+                    is_llm_completed=True,
+                    caller_reason="deterministic_policy",
+                )
+                total_synth_ms += s_ms
+                total_gpu_ms += g_ms
+                total_queue_wait_ms += q_ms
+                if pcm:
+                    first_audio_ms = (time.monotonic() - t_turn_start) * 1000.0
+                    self.get_logger().info(f"🤖 [Astro (Robot Durumu)]: \"{reply_text}\"")
+                    self.memory.episodic.add_message("assistant", reply_text)
+                    self.session.record_robot_speech()
+                    _record_turn_telemetry(reply_text, origin="deterministic_policy", played=True, dur_synth_ms=total_synth_ms, gpu_ms=total_gpu_ms)
+                    _handle_and_play_clause_audio(pcm, is_final_clause=True)
+                    return
+
             # Explicit Head Angle Command (e.g. '0 dereceye dön', '-30'a dön', '30 derece sağa bak')
             is_angle, target_angle, angle_label = self._is_head_angle_query(user_text)
             if is_angle:
@@ -7863,6 +8161,7 @@ class AstroRealtimeNode(Node):
             self.get_logger().warn(f"Fallback turn notice: {e}")
         finally:
             if getattr(self, "_speech_authorization", None):
+                self._last_speech_authorization = self._speech_authorization
                 self._speech_authorization.invalidated = True
                 self._speech_authorization = None
             self._current_user_turn_id = None

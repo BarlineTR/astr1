@@ -51,6 +51,10 @@ class ResponsePlanner:
             strategies.append("Kullanıcının mevcut aktivitesi veya durumu hakkındaki görsel ve bağlamsal algını doğrudan açıkla")
             directness = 0.95
 
+        elif context.user_intent == IntentType.VISUAL_STATE_QUERY:
+            strategies.append("Kamera ve görsel algı durumunu net ve dürüstçe açıkla")
+            directness = 0.95
+
         elif context.user_intent == IntentType.SOCIAL_BID:
             strategies.append("Sosyal çağrıya samimi ve canlı bir karşılık ver")
             humor = 0.5

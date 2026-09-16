@@ -17,10 +17,22 @@ class IntentEngine:
         r"\b(?:görüşürüz|gorusuruz|hoşça kal|hosca kal|kendine iyi bak|bay bay|güle güle|iyi geceler)\b"
     ]
     ACTIVITY_QUERY_PATTERNS = [
-        r"\b(?:ben\s+)?(?:şu\s*an(?:da)?\s+)?ne\s+yap(?:ıyorum|ıyoruz|ıyorsun)\b",
-        r"\bneyle\s+(?:meşgul(?:üm|sün)|uğraş(?:ıyorum|ıyorsun))\b",
-        r"\bne\s+yap(?:ıyorum|ıyoruz|ıyorsun)\b",
+        r"\b(?:ben\s+)?(?:(?:şu\s*an(?:da)?|şuan)\s+)?ne\s+yap(?:ıyor(?:dur)?|ıyorum|ıyoruz|ıyorsun|maktayım|tığımı)\b",
+        r"\b(?:ben\s+)?ne\s+yap(?:ıyor(?:dur)?|ıyorum|ıyoruz|ıyorsun|maktayım|tığımı)(?:\s+(?:şu\s*an(?:da)?|şuan))?\b",
+        r"\b(?:benim\s+)?ne\s+yaptığımı\s+(?:gör(?:üyor\s+musun|ebiliyor\s+musun|üyorsun)|bil(?:iyor\s+musun|ebilir\s+misin))\b",
+        r"\bbeni\s+görüyorsun,?\s*(?:ben\s+)?ne\s+yap(?:ıyor(?:dur)?|ıyorum|ıyorsun)\b",
+        r"\bneyle\s+(?:meşgul(?:üm|sün)|uğraş(?:ıyor(?:dur)?|ıyorum|ıyorsun))\b",
         r"\b(?:şu\s*an(?:da)?\s+)?benim\s+aktivitem\b",
+    ]
+    VISUAL_STATE_QUERY_PATTERNS = [
+        r"\b(?:beni\s+)?(?:kameran(?:dan)?\s+)?gör(?:üyor|ebiliyor)\s+musun(?:\s+beni)?\b",
+        r"\b(?:kameran(?:da|dan)?\s+)?neler\s+görüyorsun\b",
+        r"\b(?:kameran(?:da|dan)?\s+)?ne\s+görüyorsun\b",
+        r"\b(?:kamerada|kameranda)\s+(?:neler\s+var|ne\s+var)\b",
+        r"\b(?:karşında\s+|etrafta\s+|etrafımda\s+)?kimi\s+görüyorsun\b",
+        r"\b(?:karşında\s+|etrafta\s+|etrafımda\s+)?kim(?:i|ler)\s+var\b",
+        r"\b(?:beni\s+)?takip\s+ediyor\s+musun(?:\s+beni)?\b",
+        r"\b(?:etrafımda|etrafta|çevrende)\s+ne\s+görüyorsun\b",
     ]
     SOCIAL_BID_PATTERNS = [
         r"\b(?:ne\s+haber|naber|ne\s+var\s+ne\s+yok)\b",
@@ -81,7 +93,11 @@ class IntentEngine:
         if any(re.search(p, txt) for txt in target_texts for p in cls.ACTIVITY_QUERY_PATTERNS):
             return IntentType.ACTIVITY_QUERY, 0.95
 
-        # 4. Memory Queries
+        # 4. Visual State Queries (high priority: camera/vision state queries)
+        if any(re.search(p, txt) for txt in target_texts for p in cls.VISUAL_STATE_QUERY_PATTERNS):
+            return IntentType.VISUAL_STATE_QUERY, 0.95
+
+        # 5. Memory Queries
         if any(re.search(p, txt) for txt in target_texts for p in cls.MEMORY_QUERY_PATTERNS):
             return IntentType.MEMORY_QUERY, 0.95
 

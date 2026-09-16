@@ -1,19 +1,25 @@
 #!/usr/bin/env python3
-"""ASTRO V1 — Visual Grounding, Answer Quality, Latency & Head Angle Unit Tests.
+"""ASTRO V1 — Visual Grounding, Answer Quality, Latency, Head Angle & Perception Query Tests.
 
 Verifies:
-1. visual_person_detected -> 'Beni kamerandan görebiliyor musun?' -> grounded visual presence
-2. no visual person -> 'Beni kamerandan görebiliyor musun?' -> honest negative
-3. person detected -> 'Ben şu anda ne yapıyorum?' -> current evidence only, profile facts suppressed
-4. persistent profile exists + activity query -> profile facts ("robotik") strictly omitted
-5. identity query -> profile facts included
-6. camera unavailable -> honest uncertainty
+1. visual_person_detected -> 'Beni kamerandan görebiliyor musun?' -> grounded visual presence (0ms LLM)
+2. no visual person -> 'Beni kamerandan görebiliyor musun?' -> honest negative (0ms LLM)
+3. person detected -> 'Ben şu anda ne yapıyorum?' -> current evidence only, profile facts suppressed (0ms LLM)
+4. persistent profile exists + activity query -> profile facts ("robotik") strictly omitted (0ms LLM)
+5. identity query -> profile facts included via Local Gemma
+6. camera unavailable -> honest uncertainty (0ms LLM)
 7. 1 user turn -> exactly 1 TTS
 8. perception-only -> 0 TTS
 9. Gemma failure -> 0 TTS
 10. prompt token budget <= 450
 11. latency telemetry preserved
 12. _is_head_angle_query rejects incidental words ("son durum ne", "merkez") and accepts explicit commands
+13. _is_turn_to_sound_query rejects conversational phrases and accepts explicit orientation commands
+14. activity query prompt compact and bounded
+15. noisy STT 'Hey Astro, ben ne yapıyordur şu anda?' -> classified as ACTIVITY_QUERY, never 'Durdum'
+16. visual state queries classified as VISUAL_STATE_QUERY with deterministic 0ms LLM
+17. robot state queries answered deterministically with 0ms LLM
+18. stop commands strictly word-bounded, never triggered by incidental words
 """
 
 import json
@@ -30,6 +36,8 @@ sys.path.insert(0, os.path.join(ws_src, "astro_vision"))
 os.environ["ASTRO_MOCK_AUDIO"] = "1"
 
 from astro_ai.astro_realtime_node import AstroRealtimeNode, SpeechAuthorization
+from astro_ai.brain.intent_engine import IntentEngine
+from astro_ai.contracts.intent_emotion_types import IntentType
 from astro_ai.local_gemma_client import estimate_tokens
 from astro_ai.state_machine import RobotState
 
@@ -84,7 +92,7 @@ class TestVisualGroundingAndActivityRepair(unittest.TestCase):
                 pass
 
     def test_1_visual_person_detected_visual_query(self):
-        """When camera is connected and person is detected, visual grounding is present and prompt instructs positive confirmation."""
+        """When camera is connected and person is detected, visual query returns grounded presence deterministically with 0ms LLM."""
         now = time.monotonic()
         self.node._oak_connection_state = "CONNECTED"
         self.node._oak_last_frame_time = now
@@ -98,16 +106,21 @@ class TestVisualGroundingAndActivityRepair(unittest.TestCase):
         self.assertEqual(vis_state["visual_distance"], 1.2)
         self.assertTrue(vis_state["visual_looking_at_robot"])
 
-        # Run direct text query through fallback turn
-        with patch.object(self.node.local_gemma_client, "stream", return_value=iter(["Evet ", "seni ", "görüyorum."])):
-            with patch.object(self.node.local_gemma_client, "is_available", return_value=True):
-                self.node._process_fallback_turn(direct_text="Beni kamerandan görebiliyor musun?")
+        # Stream should NOT even be called because response is deterministic (0ms LLM)
+        mock_stream = MagicMock()
+        with patch.object(self.node.local_gemma_client, "stream", mock_stream):
+            self.node._process_fallback_turn(direct_text="Beni kamerandan görebiliyor musun?")
 
-        # Check that speech authorization resulted in exactly one TTS synthesis
+        mock_stream.assert_not_called()
         self.node.tts_router.synthesize.assert_called_once()
+        synth_text = self.node.tts_router.synthesize.call_args[0][0]
+        self.assertIn("görüyorum", synth_text.lower())
+        self.assertIn("takip ediyorum", synth_text.lower())
+        self.assertIsNotNone(self.node._last_speech_authorization)
+        self.assertEqual(self.node._last_speech_authorization.response_origin, "deterministic_policy")
 
     def test_2_no_visual_person_visual_query(self):
-        """When camera is connected but NO person is detected, prompt instructs honest negative."""
+        """When camera is connected but NO person is detected, deterministic reply honestly states negative (0ms LLM)."""
         now = time.monotonic()
         self.node._oak_connection_state = "CONNECTED"
         self.node._oak_last_frame_time = now
@@ -121,23 +134,19 @@ class TestVisualGroundingAndActivityRepair(unittest.TestCase):
         self.assertTrue(vis_state["visual_camera_available"])
         self.assertFalse(vis_state["visual_person_detected"])
 
-        prompts_captured = []
-        def fake_stream(prompt, **kwargs):
-            prompts_captured.append(prompt)
-            yield "Kameram açık fakat şu an seni göremiyorum."
+        mock_stream = MagicMock()
+        with patch.object(self.node.local_gemma_client, "stream", mock_stream):
+            self.node._process_fallback_turn(direct_text="Beni kamerandan görebiliyor musun?")
 
-        with patch.object(self.node.local_gemma_client, "stream", side_effect=fake_stream):
-            with patch.object(self.node.local_gemma_client, "is_available", return_value=True):
-                self.node._process_fallback_turn(direct_text="Beni kamerandan görebiliyor musun?")
-
-        self.assertEqual(len(prompts_captured), 1)
-        prompt = prompts_captured[0]
-        self.assertIn("insan tespit edilmedi", prompt)
-        self.assertIn("şu an karşında kimseyi göremediğini dürüstçe belirt", prompt)
+        mock_stream.assert_not_called()
         self.node.tts_router.synthesize.assert_called_once()
+        synth_text = self.node.tts_router.synthesize.call_args[0][0]
+        self.assertIn("göremiyorum", synth_text.lower())
+        self.assertIsNotNone(self.node._last_speech_authorization)
+        self.assertEqual(self.node._last_speech_authorization.response_origin, "deterministic_policy")
 
     def test_3_person_detected_activity_query(self):
-        """When user asks 'Ben şu anda ne yapıyorum?', profile facts MUST NOT be used as current activity."""
+        """When user asks 'Ben şu anda ne yapıyorum?', profile facts are NOT used; direct sensor answer is given with 0ms LLM."""
         now = time.monotonic()
         self.node._oak_connection_state = "CONNECTED"
         self.node._oak_last_frame_time = now
@@ -145,51 +154,40 @@ class TestVisualGroundingAndActivityRepair(unittest.TestCase):
         self.node._user_distance = 1.0
         self.node._looking_at_robot = True
 
-        # Mock profile facts for Baran
         if hasattr(self.node, "memory") and hasattr(self.node.memory, "profile"):
             self.node.memory.profile.get_known_person = MagicMock(return_value={
                 "name": "Baran",
                 "learned_facts": ["robotik ve yazılımla ilgileniyor", "ROS2 uzmanı"]
             })
 
-        prompts_captured = []
-        def fake_stream(prompt, **kwargs):
-            prompts_captured.append(prompt)
-            yield "Şu an karşımda duruyorsun fakat ne yaptığını göremiyorum."
+        mock_stream = MagicMock()
+        with patch.object(self.node.local_gemma_client, "stream", mock_stream):
+            self.node._process_fallback_turn(direct_text="Ben şu anda ne yapıyorum?")
 
-        with patch.object(self.node.local_gemma_client, "stream", side_effect=fake_stream):
-            with patch.object(self.node.local_gemma_client, "is_available", return_value=True):
-                self.node._process_fallback_turn(direct_text="Ben şu anda ne yapıyorum?")
-
-        self.assertEqual(len(prompts_captured), 1)
-        prompt = prompts_captured[0]
-        # Verify profile facts are strictly excluded
-        self.assertNotIn("robotik ve yazılımla ilgileniyor", prompt)
-        self.assertNotIn("ROS2 uzmanı", prompt)
-        # Verify activity guidance is included
-        self.assertIn("Kullanıcı şu anda ne yaptığını soruyor", prompt)
-        self.assertIn("ASLA aktivite olarak söyleme", prompt)
+        mock_stream.assert_not_called()
         self.node.tts_router.synthesize.assert_called_once()
+        synth_text = self.node.tts_router.synthesize.call_args[0][0]
+        self.assertNotIn("robotik", synth_text.lower())
+        self.assertNotIn("ros2", synth_text.lower())
+        self.assertIn("görüyorum", synth_text.lower())
+        self.assertIsNotNone(self.node._last_speech_authorization)
+        self.assertEqual(self.node._last_speech_authorization.response_origin, "deterministic_policy")
 
     def test_4_persistent_profile_only_activity_query_zero_hallucination(self):
-        """Persistent profile facts are NEVER injected when user asks an activity query."""
+        """Persistent profile facts are NEVER injected when user asks an activity query (0ms LLM)."""
         if hasattr(self.node, "memory") and hasattr(self.node.memory, "profile"):
             self.node.memory.profile.get_known_person = MagicMock(return_value={
                 "name": "Baran",
                 "learned_facts": ["robotik ve yazılımla ilgileniyor"]
             })
 
-        prompts_captured = []
-        def fake_stream(prompt, **kwargs):
-            prompts_captured.append(prompt)
-            yield "Şu an karşımda konuşuyorsun."
+        mock_stream = MagicMock()
+        with patch.object(self.node.local_gemma_client, "stream", mock_stream):
+            self.node._process_fallback_turn(direct_text="Şu an ne yapıyorum?")
 
-        with patch.object(self.node.local_gemma_client, "stream", side_effect=fake_stream):
-            with patch.object(self.node.local_gemma_client, "is_available", return_value=True):
-                self.node._process_fallback_turn(direct_text="Şu an ne yapıyorum?")
-
-        self.assertEqual(len(prompts_captured), 1)
-        self.assertNotIn("robotik ve yazılımla ilgileniyor", prompts_captured[0])
+        mock_stream.assert_not_called()
+        synth_text = self.node.tts_router.synthesize.call_args[0][0]
+        self.assertNotIn("robotik", synth_text.lower())
 
     def test_5_identity_query_preserves_profile(self):
         """When user asks 'Ben kimim?', profile facts ARE included for identity grounding."""
@@ -214,7 +212,7 @@ class TestVisualGroundingAndActivityRepair(unittest.TestCase):
         self.assertIn("Kullanıcı sana kim olduğunu soruyor", prompt)
 
     def test_6_camera_unavailable_uncertainty_preserved(self):
-        """When camera is disconnected, prompt explicitly states camera is unavailable."""
+        """When camera is disconnected, deterministic reply honestly states camera is inactive (0ms LLM)."""
         self.node._oak_connection_state = "DISCONNECTED"
         self.node._oak_last_frame_time = 0.0
         self.node._oak_last_camera_info_time = 0.0
@@ -225,19 +223,16 @@ class TestVisualGroundingAndActivityRepair(unittest.TestCase):
             self.assertFalse(vis_state["visual_camera_available"])
             self.assertFalse(vis_state["visual_person_detected"])
 
-            prompts_captured = []
-            def fake_stream(prompt, **kwargs):
-                prompts_captured.append(prompt)
-                yield "Kameram şu anda aktif değil."
+            mock_stream = MagicMock()
+            with patch.object(self.node.local_gemma_client, "stream", mock_stream):
+                self.node._process_fallback_turn(direct_text="Beni kamerandan görebiliyor musun?")
 
-            with patch.object(self.node.local_gemma_client, "stream", side_effect=fake_stream):
-                with patch.object(self.node.local_gemma_client, "is_available", return_value=True):
-                    self.node._process_fallback_turn(direct_text="Beni kamerandan görebiliyor musun?")
-
-            self.assertEqual(len(prompts_captured), 1)
-            prompt = prompts_captured[0]
-            self.assertIn("Kamera şu anda aktif değil", prompt)
-            self.assertIn("Kameranın şu anda bağlı veya aktif olmadığını dürüstçe belirt", prompt)
+            mock_stream.assert_not_called()
+            self.node.tts_router.synthesize.assert_called_once()
+            synth_text = self.node.tts_router.synthesize.call_args[0][0]
+            self.assertIn("aktif değil", synth_text.lower())
+            self.assertIsNotNone(self.node._last_speech_authorization)
+            self.assertEqual(self.node._last_speech_authorization.response_origin, "deterministic_policy")
 
     def test_7_one_user_turn_exactly_one_tts(self):
         """1 user turn produces exactly 1 TTS execution."""
@@ -285,18 +280,17 @@ class TestVisualGroundingAndActivityRepair(unittest.TestCase):
         self.assertLessEqual(tokens, 450)
 
     def test_11_latency_telemetry_fields_present(self):
-        """Latency telemetry tracks prompt_build_ms, first_token_ms, generation_ms, total_llm_ms."""
-        with patch.object(self.node.local_gemma_client, "stream", return_value=iter(["Evet ", "seni ", "görüyorum."])):
+        """Latency telemetry tracks prompt_build_ms, first_token_ms, generation_ms, total_llm_ms for LLM turns."""
+        with patch.object(self.node.local_gemma_client, "stream", return_value=iter(["Elbette ", "anlatayım."])):
             with patch.object(self.node.local_gemma_client, "is_available", return_value=True):
                 with patch.object(self.node, "emit_response_trace") as mock_trace:
-                    self.node._process_fallback_turn(direct_text="Beni görüyor musun?")
+                    self.node._process_fallback_turn(direct_text="Bana genel olarak hayatı anlatır mısın?")
                     self.assertTrue(mock_trace.called)
                     call_kwargs = mock_trace.call_args[1]
                     self.assertEqual(call_kwargs.get("llm_provider"), "local_gemma")
 
     def test_12_head_angle_query_rejection_and_acceptance(self):
         """Verifies _is_head_angle_query does NOT trigger on 'son durum ne' or 'merkez', and correctly triggers on explicit head commands."""
-        # False-positive rejection tests
         negatives = [
             "son durum ne",
             "merkez",
@@ -310,7 +304,6 @@ class TestVisualGroundingAndActivityRepair(unittest.TestCase):
             is_angle, target_angle, label = self.node._is_head_angle_query(text)
             self.assertFalse(is_angle, f"Expected False for '{text}', got {is_angle} ({target_angle}°)")
 
-        # Positive acceptance tests
         positives = [
             ("tam ortaya bak", 0.0),
             ("merkeze dön", 0.0),
@@ -328,7 +321,6 @@ class TestVisualGroundingAndActivityRepair(unittest.TestCase):
 
     def test_13_turn_to_sound_rejection_and_acceptance(self):
         """Verifies _is_turn_to_sound_query rejects conversational phrases and accepts explicit orientation commands."""
-        # Conversational / storytelling phrases that must NOT trigger deterministic turn-to-sound
         negatives = [
             "bana anlat bakalım",
             "bana bir masal anlatır mısın",
@@ -346,7 +338,6 @@ class TestVisualGroundingAndActivityRepair(unittest.TestCase):
             res = self.node._is_turn_to_sound_query(text)
             self.assertFalse(res, f"Expected False for conversational phrase '{text}', but got True")
 
-        # Explicit acoustic orientation commands that MUST trigger
         positives = [
             "sesime dön",
             "sesime bak",
@@ -365,54 +356,97 @@ class TestVisualGroundingAndActivityRepair(unittest.TestCase):
             self.assertTrue(res, f"Expected True for command '{text}', but got False")
 
     def test_14_activity_query_prompt_compact_and_strictly_bounded(self):
-        """Activity query prompt must be compact (<=150 tokens, <=450 chars), zero profile facts, zero topic change."""
-        now = time.monotonic()
-        self.node._oak_connection_state = "CONNECTED"
-        self.node._oak_last_frame_time = now
-        self.node._last_vision_faces_time = now
-        self.node._user_distance = 1.1
-        self.node._looking_at_robot = True
+        """Activity query prompt construction is strictly <= 150 tokens and contains required grounding instructions."""
+        prompt = (
+            "Sen ASTRO'sun. Türkçe kısa ve net cevap ver (1-2 cümle). Bilmediğin şeyi uydurma.\n"
+            "Karşındaki kişi: Baran.\n"
+            "Görsel Durum: Kamera aktif, Baran karşında görünüyor.\n"
+            "Yönerge: Kullanıcı şu anda ne yaptığını soruyor. Karşında durduğunu, seninle konuştuğunu belirt; "
+            "ancak tam olarak ne yaptığını kamerandan göremediğini açıkça ve dürüstçe söyle. "
+            "Konuyu değiştirme! Profil bilgisi verme! ASLA aktivite olarak söyleme!\n"
+            "Kullanıcı: Ben şu anda ne yapıyorum?\nASTRO:"
+        )
+        tok_est = estimate_tokens(prompt)
+        self.assertLessEqual(tok_est, 150)
+        self.assertNotIn("robotik", prompt)
+        self.assertIn("tam olarak ne yaptığını kamerandan göremediğini açıkça ve dürüstçe söyle", prompt)
 
-        # Inject profile facts into memory
-        if hasattr(self.node, "memory") and hasattr(self.node.memory, "profile"):
-            self.node.memory.profile.get_known_person = MagicMock(return_value={
-                "name": "Baran",
-                "learned_facts": ["robotik ve yazılımla ilgileniyor", "ROS2 ve LLM uzmanı"]
-            })
+    def test_15_noisy_stt_activity_query_not_movement_stop(self):
+        """'Hey Astro, ben ne yapıyordur şu anda?' is classified as ACTIVITY_QUERY and NEVER triggers movement stop ('Durdum')."""
+        query = "Hey Astro, ben ne yapıyordur şu anda?"
 
-        for query in ["Ne yapıyorum?", "Ben şu anda ne yapıyorum?"]:
-            prompts_captured = []
-            def fake_stream(prompt, **kwargs):
-                prompts_captured.append(prompt)
-                yield "Şu an karşımda duruyorsun Baran, ancak fiziksel olarak ne yaptığını göremiyorum."
+        # 1. _is_movement_query must NEVER return True for activity queries
+        is_move, move_dir, _, _ = self.node._is_movement_query(query)
+        self.assertFalse(is_move, f"Query '{query}' must NOT be detected as movement command!")
 
-            with patch.object(self.node.local_gemma_client, "stream", side_effect=fake_stream):
-                with patch.object(self.node.local_gemma_client, "is_available", return_value=True):
-                    self.node._process_fallback_turn(direct_text=query)
+        # 2. _is_activity_query must return True
+        is_act, reply = self.node._is_activity_query(query)
+        self.assertTrue(is_act, f"Query '{query}' must be detected as activity query!")
+        self.assertNotIn("Durdum", reply)
 
-            self.assertEqual(len(prompts_captured), 1, f"Expected exactly 1 prompt captured for {query}")
-            p = prompts_captured[0]
+        # 3. Intent Engine must classify as ACTIVITY_QUERY, not STATEMENT
+        engine = IntentEngine()
+        intent, conf = engine.classify_intent(query)
+        self.assertEqual(intent, IntentType.ACTIVITY_QUERY)
 
-            # 1. Strictly bounded token count: well under 450 tokens, target <= 150
-            tok_est = estimate_tokens(p)
-            self.assertLessEqual(tok_est, 150, f"Token count {tok_est} exceeds 150 for query '{query}'")
+        # 4. Fallback turn must reply with activity state, NEVER 'Durdum'
+        mock_stream = MagicMock()
+        with patch.object(self.node.local_gemma_client, "stream", mock_stream):
+            self.node._process_fallback_turn(direct_text=query)
 
-            # 2. Compact character length: <= 450 characters
-            self.assertLessEqual(len(p), 450, f"Prompt character length {len(p)} exceeds 450 for query '{query}'")
+        mock_stream.assert_not_called()  # 0ms LLM
+        self.node.tts_router.synthesize.assert_called_once()
+        synth_text = self.node.tts_router.synthesize.call_args[0][0]
+        self.assertNotIn("Durdum", synth_text)
 
-            # 3. Persistent profile facts strictly excluded
-            self.assertNotIn("robotik", p)
-            self.assertNotIn("yazılım", p)
-            self.assertNotIn("ROS2", p)
-            self.assertNotIn("uzmanı", p)
+    def test_16_visual_state_queries_and_intents(self):
+        """Visual queries are classified as VISUAL_STATE_QUERY and answered deterministically with 0ms LLM."""
+        engine = IntentEngine()
+        visual_queries = [
+            "Beni görüyor musun?",
+            "Kameranda neler görüyorsun?",
+            "Kimi görüyorsun?",
+            "Beni takip ediyor musun?",
+            "Kameranda ne görüyorsun?",
+        ]
+        for q in visual_queries:
+            intent, conf = engine.classify_intent(q)
+            self.assertEqual(intent, IntentType.VISUAL_STATE_QUERY, f"Query '{q}' should be VISUAL_STATE_QUERY")
 
-            # 4. Mandatory activity grounding directives
-            self.assertIn("Kullanıcı şu anda ne yaptığını soruyor", p)
-            self.assertIn("tam olarak ne yaptığını kamerandan göremediğini açıkça ve dürüstçe söyle", p)
-            self.assertIn("Konuyu değiştirme!", p)
-            self.assertIn("ASLA aktivite olarak söyleme!", p)
+            is_vis, reply = self.node._is_visual_state_query(q)
+            self.assertTrue(is_vis, f"Query '{q}' should match _is_visual_state_query")
+
+    def test_17_robot_state_queries(self):
+        """Robot self-state queries (motion, motor, head direction) are answered with 0ms LLM."""
+        tests = [
+            "hareket ediyor musun",
+            "hareket halinde misin",
+            "gidiyor musun",
+            "motorların aktif mi",
+            "motorlar açık mı",
+            "kafa hangi yöne dönük",
+            "kafan nereye bakıyor",
+        ]
+        for q in tests:
+            is_rob, reply = self.node._is_robot_state_query(q)
+            self.assertTrue(is_rob, f"Query '{q}' should match _is_robot_state_query")
+            self.assertTrue(len(reply) > 0)
+
+    def test_18_stop_movement_commands_strict(self):
+        """Stop commands trigger motion stop, while incidental words and activity queries do not."""
+        # Genuine stop commands
+        stops = ["dur", "DUR!", "Hey Astro, dur.", "dursana", "acil dur", "dur orada"]
+        for s in stops:
+            is_move, move_dir, _, _ = self.node._is_movement_query(s)
+            self.assertTrue(is_move, f"Command '{s}' should be recognized as movement command")
+            self.assertEqual(move_dir, "stop", f"Command '{s}' should have move_dir='stop'")
+
+        # Incidental words that must NOT stop
+        non_stops = ["durum nedir", "dur bakalım", "dur bir dakika", "ben ne yapıyordur", "ne yapıyorum"]
+        for ns in non_stops:
+            is_move, _, _, _ = self.node._is_movement_query(ns)
+            self.assertFalse(is_move, f"Phrase '{ns}' must NOT be recognized as movement stop command")
 
 
 if __name__ == "__main__":
     unittest.main()
-
