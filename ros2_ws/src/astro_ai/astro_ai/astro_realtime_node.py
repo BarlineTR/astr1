@@ -3473,29 +3473,56 @@ class AstroRealtimeNode(Node):
 
     def _is_head_angle_query(self, text: str) -> Tuple[bool, float, str]:
         """Detects explicit head angular positioning commands (e.g. '0 dereceye dön', '-30'a dön', '30 derece sağa bak')."""
+        if not text or not str(text).strip():
+            return False, 0.0, ""
         t = text.lower().strip()
 
-        # 1. Direct Center words
-        center_words = [
-            "merkeze dön", "merkeze don", "merkeze bak", "merkez", "düz bak", "duz bak",
-            "öne bak", "one bak", "düz dur", "duz dur", "karşıya bak", "karsiya bak",
-            "karşıya dön", "karsiya don", "ortaya bak", "ortaya dön", "ortaya don",
+        # 1. Direct Center explicit multi-word commands (strict, never isolated 'merkez')
+        center_commands = [
+            "merkeze dön", "merkeze don", "merkeze bak", "merkeze çevir", "merkeze cevir",
+            "düz bak", "duz bak", "öne bak", "one bak",
+            "karşıya bak", "karsiya bak", "karşıya dön", "karsiya don",
+            "ortaya bak", "ortaya dön", "ortaya don", "ortaya çevir", "ortaya cevir",
+            "tam ortaya bak", "tam ortaya dön", "tam ortaya don", "tam ortaya çevir", "tam ortaya cevir",
+            "kafanı sıfırla", "kafani sifirla", "kafayı sıfırla", "kafayi sifirla",
+            "kafanı merkeze", "kafani merkeze", "kafayı merkeze", "kafayi merkeze",
+            "kafayı ortaya", "kafanı ortaya",
+            "sıfır dereceye dön", "sifir dereceye don", "sıfır dereceye bak",
         ]
-        if any(p in t for p in center_words):
-            return True, 0.0, "0°"
+        if any(cmd in t for cmd in center_commands) or re.search(r"\b0\s+dereceye?\s*(dön|don|bak|çevir|cevir)?\b", t):
+            # Ensure it's not a negative 0 or part of another number
+            if not re.search(r"-\s*0\b", t):
+                return True, 0.0, "0°"
 
-        # 2. Number parsing with directional keywords (sağa/sola)
+        # 2. Number parsing with explicit directional/angle keywords
         tr_words = {
-            "sıfır": 0, "sifir": 0, "on": 10, "on beş": 15, "onbes": 15,
+            "on": 10, "on beş": 15, "onbes": 15,
             "yirmi": 20, "yirmi beş": 25, "yirmibes": 25, "otuz": 30,
             "otuz beş": 35, "otuzbes": 35, "kırk": 40, "kirk": 40,
             "kırk beş": 45, "kirkbes": 45, "elli": 50, "altmış": 60,
             "atmış": 60, "yetmiş": 70, "yetmis": 70,
         }
 
-        is_negative = bool("eksi" in t or "negatif" in t or bool(re.search(r"(?:^|\s)-\d+", t)))
-        is_right = bool("sağa" in t or "saga" in t or "sağ" in t or "sag" in t)
-        is_left = bool("sola" in t or "sol" in t)
+        # Must have explicit head/angle intent keyword
+        has_angle_intent = bool(re.search(r"\b(derece|dereceye|açı|aci|açıya|aciya|kafa|kafayı|kafani|kafanı)\b", t))
+        is_right = bool(re.search(r"\b(sağa|saga|sağ|sag)\b", t))
+        is_left = bool(re.search(r"\b(sola|sol)\b", t))
+        has_action_verb = bool(re.search(r"\b(dön|don|bak|çevir|cevir|ayarla|hizala)\b", t))
+
+        # Relative left/right commands without number
+        has_num = bool(re.search(r"\d+", t) or any(re.search(r"\b" + re.escape(w) + r"\b", t) for w in tr_words))
+        if not has_num:
+            if is_right and has_action_verb and not is_left:
+                if re.search(r"\b(sağa|saga)\s+(bak|dön|don|çevir|cevir)\b", t):
+                    return True, -35.0, "sağ 35°"
+            if is_left and has_action_verb and not is_right:
+                if re.search(r"\b(sola)\s+(bak|dön|don|çevir|cevir)\b", t):
+                    return True, 35.0, "sol 35°"
+
+        if not (has_angle_intent and has_action_verb):
+            return False, 0.0, ""
+
+        is_negative = bool(re.search(r"\b(eksi|negatif)\b", t) or re.search(r"(?:^|\s)-\d+", t))
 
         target_angle = None
 
@@ -3511,10 +3538,13 @@ class AstroRealtimeNode(Node):
                 pass
 
         if target_angle is None:
-            for w_name, w_val in tr_words.items():
-                if w_name in t:
-                    target_angle = float(-w_val if is_negative else w_val)
-                    break
+            if re.search(r"\b(sıfır|sifir)\b", t):
+                target_angle = 0.0
+            else:
+                for w_name, w_val in tr_words.items():
+                    if re.search(r"\b" + re.escape(w_name) + r"\b", t):
+                        target_angle = float(-w_val if is_negative else w_val)
+                        break
 
         if target_angle is not None:
             # In ROS body frame: Right is negative, Left is positive
@@ -3523,16 +3553,9 @@ class AstroRealtimeNode(Node):
             elif is_left and target_angle < 0:
                 target_angle = abs(target_angle)
 
-            if any(k in t for k in ["dön", "don", "bak", "çevir", "cevir", "derece", "açı", "aci", "'a", "'e", "'ye", "'ya", "dur"]):
-                clamped = max(-70.0, min(70.0, target_angle))
-                sign_str = f"{clamped:+.0f}°" if clamped != 0 else "0°"
-                return True, clamped, sign_str
-
-        # 3. Simple relative left/right commands without number
-        if "sağa bak" in t or "sağa dön" in t or "saga bak" in t or "saga don" in t:
-            return True, -35.0, "sağ 35°"
-        if "sola bak" in t or "sola dön" in t or "sola bak" in t or "sola don" in t:
-            return True, 35.0, "sol 35°"
+            clamped = max(-70.0, min(70.0, target_angle))
+            sign_str = f"{clamped:+.0f}°" if clamped != 0 else "0°"
+            return True, clamped, sign_str
 
         return False, 0.0, ""
 
@@ -7267,12 +7290,39 @@ class AstroRealtimeNode(Node):
                     owner_name = self.memory.profile.data.get("owner_name", "Baran")
 
                 user_query_lower = user_text.lower().strip()
-                is_identity_query = any(q in user_query_lower for q in [
-                    "ben kimim", "kimim ben", "benim adim ne", "benim adım ne",
-                    "adımı biliyor musun", "adimi biliyor musun", "beni tanıyor musun",
-                    "beni taniyor musun", "beni hatırladın mı", "beni hatirladin mi",
-                    "ben kim", "tanıyor musun beni", "taniyor musun beni"
-                ])
+                is_identity_query = bool(
+                    re.search(r"\b(ben\s+kimim|kimim\s+ben|benim\s+adım\s+ne|benim\s+adim\s+ne|ben\s+kim|adımı\s+biliyor\s+musun|beni\s+tanıyor\s+musun|beni\s+taniyor\s+musun|tanıyor\s+musun\s+beni|hakkımda\s+ne\s+biliyorsun|beni\s+hatırladın\s+mı)\b", user_query_lower)
+                    or any(q in user_query_lower for q in [
+                        "ben kimim", "kimim ben", "benim adim ne", "benim adım ne",
+                        "adımı biliyor musun", "adimi biliyor musun", "beni tanıyor musun",
+                        "beni taniyor musun", "beni hatırladın mı", "beni hatirladin mi",
+                        "ben kim", "tanıyor musun beni", "taniyor musun beni"
+                    ])
+                )
+                is_visual_query = bool(
+                    re.search(r"\b(görüyor\s+musun|görebiliyor\s+musun|görüyor\s+mu|görüyor\s+musun\s+beni|beni\s+gör(üyor|ebiliyor))\b", user_query_lower)
+                    or ("kamera" in user_query_lower and any(v in user_query_lower for v in ["gör", "bak", "tespit", "açık", "acik"]))
+                    or any(q in user_query_lower for q in [
+                        "beni kamerandan görebiliyor musun", "kamerandan beni görebiliyor musun",
+                        "beni görüyor musun", "beni görebiliyor musun", "görüyor musun beni",
+                        "kameradan görüyor musun", "kamerandan görüyor musun"
+                    ])
+                )
+                is_activity_query = bool(
+                    re.search(r"\b(ne\s+yapıyorum|ne\s+yapmaktayım|neyle\s+uğraşıyorum|neyle\s+ugrasiyorum|ne\s+yaptığımı)\b", user_query_lower)
+                    or (("şu an" in user_query_lower or "su an" in user_query_lower or "şu anda" in user_query_lower) and "ne yap" in user_query_lower)
+                    or any(q in user_query_lower for q in [
+                        "ben şu anda ne yapıyorum", "şu an ne yapıyorum", "ne yapıyorum",
+                        "ne yapmaktayım", "şu anda ne yapıyorum", "ben ne yapıyorum"
+                    ])
+                )
+
+                # Authoritative Visual Grounding (OAK-D as Camera = Eye)
+                vis_state = self._get_current_visual_grounding()
+                vis_cam_avail = vis_state.get("visual_camera_available", False)
+                vis_person_det = vis_state.get("visual_person_detected", False)
+                vis_dist = vis_state.get("visual_distance")
+                vis_looking = vis_state.get("visual_looking_at_robot", False)
 
                 grounding_lines = []
                 if is_known_spk:
@@ -7281,16 +7331,17 @@ class AstroRealtimeNode(Node):
                     else:
                         grounding_lines.append(f"Karşındaki kişi: {spk_name} (Hitap: {spk_name}).")
 
-                    # Fetch profile facts if available (bounded to 1-2 facts)
-                    if hasattr(self, "memory") and hasattr(self.memory, "profile"):
-                        try:
-                            kp = self.memory.profile.get_known_person(spk_name)
-                            if kp:
-                                k_facts = kp.get("learned_facts", [])
-                                if k_facts:
-                                    grounding_lines.append(f"Hakkında bildiklerin: {'; '.join(k_facts[-2:])}.")
-                        except Exception:
-                            pass
+                    # Fetch profile facts ONLY for identity queries, strictly NEVER for activity or visual queries!
+                    if is_identity_query and not is_activity_query:
+                        if hasattr(self, "memory") and hasattr(self.memory, "profile"):
+                            try:
+                                kp = self.memory.profile.get_known_person(spk_name)
+                                if kp:
+                                    k_facts = kp.get("learned_facts", [])
+                                    if k_facts:
+                                        grounding_lines.append(f"Hakkında bildiklerin: {'; '.join(k_facts[-2:])}.")
+                            except Exception:
+                                pass
 
                     if is_identity_query:
                         grounding_lines.append(f"Kullanıcı sana kim olduğunu soruyor. Karşındaki kişi {spk_name}'dır. Doğrudan onun {spk_name} olduğunu belirterek cevap ver.")
@@ -7298,6 +7349,34 @@ class AstroRealtimeNode(Node):
                     grounding_lines.append("Karşındaki kişi: Misafir (henüz tanınmıyor).")
                     if is_identity_query:
                         grounding_lines.append("Kullanıcı sana kim olduğunu soruyor fakat henüz tanınmıyor. Henüz tanışmadığınızı veya adını bilmediğini nazikçe söyle.")
+
+                # Visual Grounding State (OAK-D is authoritative camera eye)
+                if vis_cam_avail:
+                    if vis_person_det:
+                        dist_str = f" Mesafe: ~{vis_dist}m." if vis_dist else ""
+                        look_str = " Doğrudan sana bakıyor." if vis_looking else ""
+                        grounding_lines.append(f"Görsel Durum: Kamera aktif. Karşındaki kişiyi kamerandan görüyorsun ve takip ediyorsun.{dist_str}{look_str}")
+                    else:
+                        grounding_lines.append("Görsel Durum: Kamera aktif fakat karşında şu an görsel olarak insan tespit edilmedi.")
+                else:
+                    grounding_lines.append("Görsel Durum: Kamera şu anda aktif değil / görüntü alınamıyor.")
+
+                # Specific query directives
+                if is_visual_query:
+                    if vis_cam_avail and vis_person_det:
+                        dist_hint = f" (yaklaşık {vis_dist} metre mesafede)" if vis_dist else ""
+                        grounding_lines.append(f"Yönerge: Kullanıcı onu kameradan görüp görmediğini soruyor. Onu kamerandan gördüğünü{dist_hint} ve takip ettiğini net olarak söyle.")
+                    elif vis_cam_avail and not vis_person_det:
+                        grounding_lines.append("Yönerge: Kullanıcı onu kameradan görüp görmediğini soruyor. Kameran açık ama şu an karşında kimseyi göremediğini dürüstçe belirt.")
+                    else:
+                        grounding_lines.append("Yönerge: Kullanıcı onu kameradan görüp görmediğini soruyor. Kameranın şu anda bağlı veya aktif olmadığını dürüstçe belirt.")
+
+                if is_activity_query:
+                    if vis_cam_avail and vis_person_det:
+                        look_hint = "sana baktığını ve " if vis_looking else ""
+                        grounding_lines.append(f"Yönerge: Kullanıcı şu anda ne yaptığını soruyor. Karşında durduğunu, {look_hint}seninle konuştuğunu belirt; ancak tam olarak ne yaptığını / fiziksel eylemini kamerandan göremediğini dürüstçe söyle. Geçmiş profil bilgisini (robotik vb.) ASLA aktivite olarak söyleme!")
+                    else:
+                        grounding_lines.append("Yönerge: Kullanıcı şu anda ne yaptığını soruyor. Karşında görsel tespit olmadığı için şu an ne yaptığını göremediğini dürüstçe söyle. Geçmiş profil bilgisini ASLA aktivite olarak söyleme!")
 
                 # Concise social context (bounded, at most 1 line)
                 compact_social = ""
@@ -7342,7 +7421,7 @@ class AstroRealtimeNode(Node):
 
                     for token in self.local_gemma_client.stream(
                         prompt=gemma_prompt,
-                        n_predict=int(os.getenv("LOCAL_GEMMA_N_PREDICT", "28")),
+                        n_predict=int(os.getenv("LOCAL_GEMMA_N_PREDICT", "32")),
                         temperature=0.2,
                         timeout=gemma_timeout,
                     ):
@@ -8513,6 +8592,104 @@ class AstroRealtimeNode(Node):
 
     def _get_active_biometric_identity(self) -> Dict[str, Any]:
         return self.resolve_identities()
+
+    def _get_current_visual_grounding(self) -> Dict[str, Any]:
+        """Collects authoritative, real-time visual grounding state from OAK-D and WorldModel.
+
+        Rules:
+        - OAK-D (or mock) is the sole visual authority.
+        - Acoustic presence != visual presence.
+        - Arduino connection is NOT required for visual grounding.
+        """
+        now = time.monotonic()
+
+        # 1. Camera availability
+        mock_cam = os.getenv("ASTRO_MOCK_CAMERA_AVAILABLE", "0").strip().lower() in ("1", "true", "yes")
+        cam_fresh = False
+        if mock_cam:
+            cam_fresh = True
+        else:
+            oak_state = getattr(self, "_oak_connection_state", "DISCONNECTED")
+            last_f = getattr(self, "_oak_last_frame_time", 0.0)
+            last_i = getattr(self, "_oak_last_camera_info_time", 0.0)
+            has_recent_frame = (last_f > 0.0 and (now - last_f) < 4.0)
+            has_recent_info = (last_i > 0.0 and (now - last_i) < 4.0)
+            has_frame_obj = getattr(self, "_latest_camera_frame", None) is not None
+            cam_fresh = bool(oak_state == "CONNECTED" or has_recent_frame or has_recent_info or has_frame_obj)
+
+        if not cam_fresh:
+            return {
+                "visual_camera_available": False,
+                "visual_person_detected": False,
+                "visual_target": "none",
+                "visual_tracking": False,
+                "visual_distance": None,
+                "visual_looking_at_robot": False,
+                "visual_azimuth_deg": 0.0,
+                "target_name": None,
+            }
+
+        # 2. Person detection and tracking from WorldModel and vision topics
+        person_detected = False
+        target_name = None
+        target_id = "none"
+        target_dist = None
+        target_looking = False
+        target_yaw = 0.0
+        is_tracking = False
+
+        # Check WorldModel first if available
+        wm = getattr(self.social_brain, "world_model", None) if getattr(self, "social_brain", None) else None
+        if wm and hasattr(wm, "_people"):
+            try:
+                with getattr(wm, "_lock", threading.Lock()):
+                    for pid, p in wm._people.items():
+                        if getattr(p, "is_present", False) and getattr(p, "has_vision", False) and getattr(p, "can_claim_vision", True):
+                            person_detected = True
+                            target_id = pid
+                            target_name = getattr(p, "name", None)
+                            if target_name and target_name.lower() == "misafir":
+                                target_name = None
+                            d = getattr(p, "distance_m", 0.0)
+                            if d > 0.1:
+                                target_dist = round(d, 2)
+                            target_looking = bool(getattr(p, "is_looking_at_robot", False))
+                            target_yaw = float(getattr(p, "azimuth_deg", 0.0))
+                            break
+            except Exception:
+                pass
+
+        # Fallback to direct vision topic state if fresh
+        if not person_detected and (self.is_visual_evidence_fresh(now=now) or (getattr(self, "_last_vision_faces_time", 0.0) > 0 and (now - getattr(self, "_last_vision_faces_time", 0.0)) < 4.0)):
+            person_detected = True
+            v_dist = self.get_fresh_visual_distance(now=now) or getattr(self, "_user_distance", 0.0)
+            if v_dist > 0.1:
+                target_dist = round(float(v_dist), 2)
+            target_looking = bool(getattr(self, "_looking_at_robot", False) or self.get_fresh_looking_at_robot(now=now))
+            rec_p = getattr(self, "_recognized_person", {})
+            if isinstance(rec_p, dict) and rec_p.get("name") and rec_p.get("name", "").lower() != "misafir":
+                target_name = rec_p.get("name")
+            if target_id == "none":
+                target_id = "person_1"
+
+        # Check gaze tracking state
+        gaze_tgt = getattr(self, "_gaze_active_target", "NONE")
+        if gaze_tgt not in ("NONE", "", "SCAN") and person_detected:
+            is_tracking = True
+        elif person_detected:
+            is_tracking = True
+
+        return {
+            "visual_camera_available": True,
+            "visual_person_detected": person_detected,
+            "visual_target": target_id if person_detected else "none",
+            "visual_tracking": is_tracking if person_detected else False,
+            "visual_distance": target_dist,
+            "visual_looking_at_robot": target_looking if person_detected else False,
+            "visual_azimuth_deg": target_yaw,
+            "target_name": target_name,
+        }
+
 
     def _sync_perception_to_session(self):
         """Dynamically syncs persona & recognized identity to the active OpenAI Realtime session ONLY when identity changes."""
