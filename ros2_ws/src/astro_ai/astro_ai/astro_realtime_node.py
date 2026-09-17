@@ -8378,11 +8378,14 @@ class AstroRealtimeNode(Node):
             recent_msgs = self.memory.episodic.get_messages()[-6:]
             for m in recent_msgs:
                 messages.append({"role": m.get("role", "user"), "content": m.get("content", "")})
+            if not messages or messages[-1].get("role") != "user":
+                messages.append({"role": "user", "content": user_text})
 
             groq_candidates = self.provider_registry.get_candidate_models("groq") if self.groq_api_key else []
             full_reply_parts = []
             chunker = SentenceChunker(min_first_clause_chars=18, min_clause_chars=28) if SentenceChunker else None
             t_llm_start = time.monotonic()
+            current_gen_id = self._fallback_generation_id
 
             total_audio_bytes = 0
             total_enqueued_chunks = 0
@@ -8394,9 +8397,66 @@ class AstroRealtimeNode(Node):
             generation_ms = 0.0
             total_llm_ms = 0.0
 
+            # Attempt 4O: Streaming OpenAI gpt-4o-mini (Primary when USE_4O=true)
+            if not full_reply_parts and getattr(self, "use_4o", False) and self.openai_api_key:
+                target_model = getattr(self, "openai_chat_model", "gpt-4o-mini")
+                llm_inference_started = True
+                try:
+                    t_model_start = time.monotonic()
+                    first_token_seen = False
+
+                    self.get_logger().info(f"🤖 [OpenAI 4o-mini Inference Start] model={target_model}")
+                    for token in self.provider_registry.stream_openai_completion(
+                        self.openai_api_key,
+                        target_model,
+                        messages,
+                        max_tokens=80,
+                        temperature=0.65,
+                        timeout=5.0,
+                    ):
+                        if self._barge_in_latched or self._fallback_generation_id != current_gen_id:
+                            self.get_logger().info("🛑 [OpenAI 4o-mini Interrupted] Barge-in detected during streaming.")
+                            break
+
+                        if not first_token_seen:
+                            llm_ttft_ms = (time.monotonic() - t_model_start) * 1000.0
+                            first_token_ms = llm_ttft_ms
+                            inference_request_ms = llm_ttft_ms
+                            first_token_seen = True
+
+                        full_reply_parts.append(token)
+
+                    if full_reply_parts:
+                        chosen_model = target_model
+                        chosen_provider = "openai"
+                        response_origin = "openai_chat"
+                        llm_inference_completed = True
+                        llm_latency_ms = (time.monotonic() - t_model_start) * 1000.0
+                        llm_inference_duration_ms = llm_latency_ms
+                        total_llm_ms = llm_latency_ms
+                        self.provider_registry.record_success("openai", target_model, llm_latency_ms)
+                        self.get_logger().info(
+                            f"🤖 [OpenAI 4o-mini Inference Success] model={target_model} | latency_ms={llm_latency_ms:.1f} | tokens={len(full_reply_parts)}"
+                        )
+                        attempts.append({
+                            "provider": "openai",
+                            "model": target_model,
+                            "result": "success",
+                            "latency_ms": int(llm_latency_ms)
+                        })
+                except Exception as oe:
+                    self.get_logger().warn(f"⚠️ [OpenAI Chat {target_model} Failed]: {oe}")
+                    attempts.append({
+                        "provider": "openai",
+                        "model": target_model,
+                        "result": "failed",
+                        "error": str(oe)[:80]
+                    })
+                    full_reply_parts = []
+
             # Attempt 0: Local Gemma 4 E2B Q4_K_S (Zero-Cloud Local Fallback via llama.cpp /completion)
             local_gemma_streamed_audio = False
-            if self.local_gemma_client and self.local_gemma_client.is_available():
+            if not full_reply_parts and not getattr(self, "use_4o", False) and self.local_gemma_client and self.local_gemma_client.is_available():
                 llm_inference_started = True
                 local_model_name = getattr(self.local_gemma_client, "model_name", "gemma-4-E2B-it-Q4_K_S")
                 chosen_model = local_model_name
@@ -8706,52 +8766,6 @@ class AstroRealtimeNode(Node):
                         "first_token_ms": round(first_token_ms, 1),
                         "generation_ms": round(generation_ms, 1),
                         "total_llm_ms": round(total_llm_ms, 1),
-                    })
-                    full_reply_parts = []
-
-            # Attempt 4O: Streaming OpenAI gpt-4o-mini (Active when use_4o=True or explicit OpenAI Chat requested)
-            if not full_reply_parts and getattr(self, "use_4o", False) and self.openai_api_key:
-                target_model = getattr(self, "openai_chat_model", "gpt-4o-mini")
-                try:
-                    t_model_start = time.monotonic()
-                    first_token_seen = False
-
-                    for token in self.provider_registry.stream_openai_completion(
-                        self.openai_api_key,
-                        target_model,
-                        messages,
-                        max_tokens=80,
-                        temperature=0.65,
-                        timeout=5.0,
-                    ):
-                        if not first_token_seen:
-                            llm_ttft_ms = (time.monotonic() - t_model_start) * 1000.0
-                            first_token_seen = True
-
-                        full_reply_parts.append(token)
-
-                    if full_reply_parts:
-                        chosen_model = target_model
-                        chosen_provider = "openai"
-                        response_origin = "openai_chat"
-                        llm_inference_started = True
-                        llm_inference_completed = True
-                        llm_latency_ms = (time.monotonic() - t_model_start) * 1000.0
-                        llm_inference_duration_ms = llm_latency_ms
-                        self.provider_registry.record_success("openai", target_model, llm_latency_ms)
-                        attempts.append({
-                            "provider": "openai",
-                            "model": target_model,
-                            "result": "success",
-                            "latency_ms": int(llm_latency_ms)
-                        })
-                except Exception as oe:
-                    self.get_logger().warn(f"⚠️ [OpenAI Chat {target_model} Failed]: {oe}")
-                    attempts.append({
-                        "provider": "openai",
-                        "model": target_model,
-                        "result": "failed",
-                        "error": str(oe)[:80]
                     })
                     full_reply_parts = []
 
