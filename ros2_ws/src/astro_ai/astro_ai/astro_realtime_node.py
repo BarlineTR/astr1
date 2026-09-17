@@ -2581,10 +2581,17 @@ class AstroRealtimeNode(Node):
         # INTERACTION GATE & EXPLICIT USER TURN HARD BLOCK (Realtime):
         # Deterministically suppresses response.create dispatch when verbal response is gated or without explicit user turn
         soc_dec = getattr(self, "_last_social_decision", None)
-        should_speak = getattr(soc_dec, "should_speak", True) if soc_dec else True
-        is_active_session = bool(self.session and self.session.is_active())
+        sess = getattr(self, "session", None)
+        is_active_session = bool(sess and sess.is_active())
         is_engaged = bool(soc_dec and getattr(soc_dec, "gate_mode", "") == "ENGAGED")
         explicit_user_turn = bool(getattr(self, "_last_explicit_user_turn", False) or is_active_session or is_engaged)
+
+        # Stale boot/idle perception artifact override: If the only reason was lack of user turn during background perception,
+        # but we now have an explicit validated user speech turn, allow speech.
+        if soc_dec and getattr(soc_dec, "initiative_reason", "") == "PERCEPTION_STIMULUS_NO_USER_TURN" and explicit_user_turn:
+            should_speak = True
+        else:
+            should_speak = getattr(soc_dec, "should_speak", True) if soc_dec else True
 
         if not (should_speak and explicit_user_turn):
             gate_mode = getattr(soc_dec, "gate_mode", "OBSERVING") if soc_dec else "NO_TURN"
@@ -2818,6 +2825,10 @@ class AstroRealtimeNode(Node):
             else:
                 self._is_responding = False
                 self.get_logger().debug(f"🎤 [Realtime] Kullanıcı konuşmaya başladı (response_state={self.active_response_state})...")
+            self._last_explicit_user_turn = True
+            self._last_interaction_time = time.monotonic()
+            if getattr(self, "session", None):
+                self.session.record_user_speech()
 
         # 3b. User Speech Stopped
         elif event_type == "input_audio_buffer.speech_stopped":
@@ -2825,6 +2836,7 @@ class AstroRealtimeNode(Node):
                 return
             self._user_speaking_active = False
             self._user_speech_start_time = 0.0
+            self._last_explicit_user_turn = True
             # Thinking gaze aversion: look slightly aside (+3.0°) while generating response
             if getattr(self, "pub_social_offset_yaw", None):
                 self._gaze_aversion_active = True
@@ -5206,6 +5218,10 @@ class AstroRealtimeNode(Node):
         was_sleeping = self._is_sleeping or self.state_machine.is_deep_idle()
         if was_sleeping:
             self._is_sleeping = False
+            self._last_explicit_user_turn = True
+            if getattr(self, "session", None):
+                self.session.activate_session(reason="wake")
+                self.session.record_user_speech()
             self.state_machine.transition_to(RobotState.WAKE)
             self._flush_audio_buffers("wake_up")
             self.get_logger().info("⏰ [Astro Uyandı]: Wake algılandı — Astro uykudan uyandı ve dinliyor (LISTENING)!")
