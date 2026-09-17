@@ -279,6 +279,13 @@ class CognitiveLoop:
                         present_p = [p for p in self.world_model._people.values() if p.is_present]
                         self.self_state.focused_person_id = present_p[0].person_id if present_p else None
                     curr_focus = self.self_state.focused_person_id
+            else:
+                if self.world_model._active_speaker:
+                    self.self_state.focused_person_id = self.world_model._active_speaker.person_id
+                else:
+                    present_p = [p for p in self.world_model._people.values() if p.is_present]
+                    self.self_state.focused_person_id = present_p[0].person_id if present_p else None
+                curr_focus = self.self_state.focused_person_id
             self.world_model.focus_target = curr_focus
 
             # -----------------------------------------------------------------
@@ -732,12 +739,15 @@ class CognitiveLoop:
         people_detail_list = []
         for p in (result.world_snapshot.people or []):
             st = p.tracking_state.value if hasattr(p.tracking_state, "value") else str(p.tracking_state)
-            p_desc = f"{p.person_id}({st}, {p.distance_m:.1f}m, {p.azimuth_deg:.0f}°)"
+            act_str = f", {p.current_activity}" if getattr(p, "current_activity", None) and p.current_activity != "UNKNOWN" else ""
+            p_desc = f"{p.person_id}({st}, {p.distance_m:.1f}m, {p.azimuth_deg:.0f}°{act_str})"
             people_detail_list.append(p_desc)
         people_detail = ", ".join(people_detail_list) if people_detail_list else "yok"
         conflicts_str = str([c.get("type", "conflict") for c in (result.world_snapshot.conflicts or [])]) if result.world_snapshot.conflicts else "yok"
         speaker_val = speaker_part.replace("speaker=", "")
-        world_line = f"  ├── DÜNYA (WORLD)           : kişiler=[{people_detail}], aktif_konuşmacı={speaker_val}, çelişkiler={conflicts_str}"
+        objs_list = [f"{o.class_name}({o.distance_m:.1f}m)" for o in (getattr(result.world_snapshot, "spatial_objects", []) or [])]
+        objs_str = ", ".join(objs_list[:4]) if objs_list else "yok"
+        world_line = f"  ├── DÜNYA (WORLD)           : kişiler=[{people_detail}], nesneler=[{objs_str}], aktif_konuşmacı={speaker_val}, çelişkiler={conflicts_str}"
 
         # 3. Self / Benlik & Öz Durum
         activity = result.self_state.get_current_activity()

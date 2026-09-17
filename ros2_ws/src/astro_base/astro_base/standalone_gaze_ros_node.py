@@ -906,6 +906,7 @@ class StandaloneGazeRosNode(Node):
                             "name": payload["name"],
                             "recognized_name": payload["name"],
                             "recognized_title": payload.get("formal_title", payload["name"]),
+                            "person_id": payload.get("user_id", payload["name"].lower()),
                             "is_known": payload["is_known"],
                             "confidence": payload["confidence"],
                             "x": int(best_det.x),

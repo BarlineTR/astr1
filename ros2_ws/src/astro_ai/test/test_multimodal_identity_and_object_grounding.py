@@ -157,6 +157,87 @@ class TestMultimodalIdentityAndObjectGrounding(unittest.TestCase):
             self.assertTrue(is_query)
             self.assertIn("dizüstü bilgisayar", reply.lower())
 
+    def test_cognitive_loop_focus_resolution_and_telemetry_grounding(self):
+        """When initial focus is None, CognitiveLoop must acquire present person as focus and target."""
+        from astro_ai.brain.cognitive_loop import CognitiveLoop
+        from astro_ai.contracts.spatial_state import SpatialObjectState
+
+        wm = WorldModel()
+        loop = CognitiveLoop(world_model=wm)
+
+        # Person in front of robot
+        baran = UnifiedPersonState(
+            person_id="baran",
+            name="Baran",
+            distance_m=1.2,
+            azimuth_deg=0.0,
+            is_known=True,
+            is_present=True,
+        )
+        cup = SpatialObjectState(
+            object_id="cup_1",
+            class_name="cup",
+            confidence=0.90,
+            distance_m=1.1,
+            last_observed_ts=time.time(),
+        )
+        wm.update_spatial_object(cup)
+
+        # Step 1: User is present, robot is idle -> Focus acquired as Baran
+        res1 = loop.step({"people": [baran], "person_detected": True, "vad": False})
+        self.assertEqual(res1.self_state.focused_person_id, "baran")
+        banner1 = loop.format_runtime_telemetry(res1)
+        self.assertIn("focus=baran", banner1)
+        self.assertIn("nesneler=[cup(1.1m)]", banner1)
+
+        # Step 2: Robot speaks -> Behavioral intent MUST target Baran, NOT None!
+        res2 = loop.step({
+            "people": [baran],
+            "person_detected": True,
+            "vad": False,
+            "tts_speaking": True,
+            "robot_state": {"is_speaking": True},
+        })
+        self.assertEqual(res2.behavioral_intent.target_id, "baran")
+        banner2 = loop.format_runtime_telemetry(res2)
+        self.assertIn("focus=baran", banner2)
+        self.assertIn("target=baran", banner2)
+        self.assertNotIn("target=None", banner2)
+
+    def test_activity_preservation_and_continuous_evaluation(self):
+        """WorldModel and cognitive tick must preserve recognized activity across cycles."""
+        wm = WorldModel()
+        now = time.time()
+
+        p = UnifiedPersonState(
+            person_id="baran",
+            name="Baran",
+            distance_m=1.0,
+            azimuth_deg=0.0,
+            is_present=True,
+        )
+        wm.update_people([p], now=now)
+        wm.update_person_activity("baran", "DRINKING", 0.90, ["cup_holding"], now=now)
+
+        # Re-update people with generic tick state (current_activity not set / UNKNOWN)
+        now += 0.1
+        tick_p = UnifiedPersonState(
+            person_id="baran",
+            name="Baran",
+            distance_m=1.0,
+            azimuth_deg=0.0,
+            is_present=True,
+            current_activity="UNKNOWN",
+        )
+        wm.update_people([tick_p], now=now)
+
+        # Verified activity MUST NOT be wiped out to UNKNOWN!
+        saved_p = wm.get_person("baran")
+        self.assertIsNotNone(saved_p)
+        self.assertEqual(saved_p.current_activity, "DRINKING")
+        self.assertAlmostEqual(saved_p.activity_confidence, 0.90)
+
 
 if __name__ == "__main__":
     unittest.main()
+

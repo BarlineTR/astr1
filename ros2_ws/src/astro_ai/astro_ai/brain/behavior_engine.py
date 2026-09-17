@@ -219,6 +219,12 @@ class BehaviorEngine:
         )
         if is_robot_speaking:
             focused_pid = self_state.focused_person_id
+            if not focused_pid:
+                if world_model._active_speaker:
+                    focused_pid = world_model._active_speaker.person_id
+                else:
+                    present_p = [p for p in world_model._people.values() if p.is_present]
+                    focused_pid = present_p[0].person_id if present_p else None
             target_p = world_model._people.get(focused_pid) if focused_pid else None
             candidates.append(
                 BehavioralIntent(

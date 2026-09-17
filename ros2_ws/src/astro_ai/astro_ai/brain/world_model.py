@@ -112,6 +112,32 @@ class WorldModel:
                     new_hist = new_hist[-10:]
                 p.trajectory_history = new_hist
 
+                if prev is not None:
+                    # Preserve activity and visual attributes if incoming entity has defaults/unknown
+                    incoming_act = getattr(p, "current_activity", None)
+                    if (not incoming_act or incoming_act == "UNKNOWN") and getattr(prev, "current_activity", None) and prev.current_activity != "UNKNOWN":
+                        if (t_now - getattr(prev, "last_activity_ts", 0.0)) <= 10.0:
+                            p.current_activity = prev.current_activity
+                            p.activity_confidence = prev.activity_confidence
+                            p.last_activity_ts = prev.last_activity_ts
+                            p.activity_evidence = list(getattr(prev, "activity_evidence", []))
+                            p.interacting_objects = list(getattr(prev, "interacting_objects", []))
+
+                    if not getattr(p, "dominant_clothing_color", None) and getattr(prev, "dominant_clothing_color", None):
+                        p.dominant_clothing_color = prev.dominant_clothing_color
+                    if not getattr(p, "visual_accessories", None) and getattr(prev, "visual_accessories", None):
+                        p.visual_accessories = list(prev.visual_accessories)
+                    prev_age = getattr(prev, "estimated_age_group", None)
+                    curr_age = getattr(p, "estimated_age_group", None)
+                    curr_age_val = curr_age.value if hasattr(curr_age, "value") else str(curr_age or "")
+                    if (not curr_age or curr_age_val == "UNKNOWN") and prev_age:
+                        p.estimated_age_group = prev_age
+                        p.age_confidence = getattr(prev, "age_confidence", 0.0)
+                    if not getattr(p, "raw_attributes", None) and getattr(prev, "raw_attributes", None):
+                        p.raw_attributes = dict(prev.raw_attributes)
+                    if not getattr(p, "face_bbox", None) and getattr(prev, "face_bbox", None):
+                        p.face_bbox = prev.face_bbox
+
                 p.is_present = True
                 self._people[p.person_id] = p
                 current_ids.add(p.person_id)

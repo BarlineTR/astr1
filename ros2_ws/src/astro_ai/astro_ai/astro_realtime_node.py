@@ -1230,7 +1230,21 @@ class AstroRealtimeNode(Node):
                 vad_speaking = bool(getattr(self, "_user_speaking_active", False))
                 has_vad = bool(vad_speaking or getattr(self, "_vad_active", False))
 
-                active_p.append(UnifiedPersonState(
+                wm = getattr(getattr(self, "social_brain", None), "world_model", None)
+                existing_p = wm.get_person(p_id) if wm else None
+
+                p_act = getattr(existing_p, "current_activity", "UNKNOWN") if existing_p else "UNKNOWN"
+                p_act_conf = getattr(existing_p, "activity_confidence", 0.0) if existing_p else 0.0
+                p_act_ev = list(getattr(existing_p, "activity_evidence", [])) if existing_p else []
+                p_act_objs = list(getattr(existing_p, "interacting_objects", [])) if existing_p else []
+                p_color = getattr(existing_p, "dominant_clothing_color", None) if existing_p else None
+                p_access = list(getattr(existing_p, "visual_accessories", [])) if existing_p else []
+                p_age = getattr(existing_p, "estimated_age_group", "UNKNOWN") if existing_p else "UNKNOWN"
+                p_age_conf = getattr(existing_p, "age_confidence", 0.0) if existing_p else 0.0
+                p_raw_attrs = dict(getattr(existing_p, "raw_attributes", {})) if existing_p else {}
+                p_fb = getattr(existing_p, "face_bbox", None) if existing_p else None
+
+                person_entity = UnifiedPersonState(
                     person_id=p_id,
                     name=p_name,
                     formal_title=p_formal,
@@ -1244,7 +1258,31 @@ class AstroRealtimeNode(Node):
                     has_vision=True,
                     has_audio=has_vad,
                     is_speaking=vad_speaking,
-                ))
+                    current_activity=p_act,
+                    activity_confidence=p_act_conf,
+                    activity_evidence=p_act_ev,
+                    interacting_objects=p_act_objs,
+                    dominant_clothing_color=p_color,
+                    visual_accessories=p_access,
+                    estimated_age_group=p_age,
+                    age_confidence=p_age_conf,
+                    raw_attributes=p_raw_attrs,
+                    face_bbox=p_fb,
+                )
+                active_p.append(person_entity)
+
+                # Continuous activity evaluation with fresh spatial objects
+                if wm and hasattr(self, "_person_object_associator") and self._person_object_associator:
+                    fresh_objs = wm.get_spatial_objects(max_age_s=3.0)
+                    if fresh_objs:
+                        self._person_object_associator.associate(active_p, fresh_objs)
+                        if hasattr(self, "_temporal_activity_engine") and self._temporal_activity_engine:
+                            p_objs = [o for o in fresh_objs if getattr(o, "associated_person_id", None) == p_id]
+                            act, act_conf, ev = self._temporal_activity_engine.evaluate(person_entity, p_objs)
+                            wm.update_person_activity(p_id, act.value, act_conf, ev)
+                            person_entity.current_activity = act.value
+                            person_entity.activity_confidence = act_conf
+                            person_entity.activity_evidence = ev
 
             self.cognitive_loop.step({
                 "people": active_p,
@@ -9541,12 +9579,21 @@ class AstroRealtimeNode(Node):
             for idx, f in enumerate(faces_data):
                 if not isinstance(f, dict):
                     continue
+                ident = self.resolve_identities() if callable(getattr(self, "resolve_identities", None)) else {}
+                bio_status = ident.get("biometric_status", "unknown")
+                is_bio_verified = bio_status in ("verified", "probable", "session_active")
+
                 name_val = f.get("recognized_name") or f.get("name") or "Misafir"
-                is_known = bool(f.get("is_known", False) or (name_val.lower() != "misafir"))
-                dist = float(f.get("distance_m", 1.5))
-                looking = bool(f.get("looking_at_robot", False))
-                yaw = float(f.get("yaw_deg", 0.0))
-                p_id = str(f.get("person_id") or f"person_{name_val.lower()}_{idx}")
+                if is_bio_verified and name_val.lower() == "misafir":
+                    name_val = ident.get("session_identity", "Baran")
+                    p_id = str(ident.get("user_id", name_val.lower()))
+                    is_known = True
+                elif name_val.lower() != "misafir":
+                    p_id = str(f.get("person_id") or name_val.lower())
+                    is_known = True
+                else:
+                    p_id = str(f.get("person_id") or f"person_{name_val.lower()}_{idx}")
+                    is_known = bool(f.get("is_known", False))
                 age_grp = f.get("age_group", "UNKNOWN")
                 age_conf = float(f.get("age_confidence", 0.0))
                 dom_color = f.get("dominant_clothing_color_tr") or f.get("dominant_clothing_color", "")
