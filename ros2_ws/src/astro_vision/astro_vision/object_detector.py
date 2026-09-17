@@ -203,12 +203,20 @@ class OpenCvDnnObjectDetector(BaseObjectDetector):
         if model_path and os.path.exists(model_path):
             try:
                 import cv2
-                self._net = cv2.dnn.readNet(model_path)
-                # Attempt to use CUDA if available, fallback to CPU
+                # Safely test if OpenCV CUDA backend is truly available
+                has_cuda = False
                 try:
-                    self._net.setPreferableBackend(cv2.dnn.DNN_BACKEND_CUDA)
-                    self._net.setPreferableTarget(cv2.dnn.DNN_TARGET_CUDA)
+                    if hasattr(cv2, "cuda") and cv2.cuda.getCudaEnabledDeviceCount() > 0:
+                        self._net.setPreferableBackend(cv2.dnn.DNN_BACKEND_CUDA)
+                        self._net.setPreferableTarget(cv2.dnn.DNN_TARGET_CUDA)
+                        dummy = np.zeros((1, 3, self.input_size[1], self.input_size[0]), dtype=np.float32)
+                        self._net.setInput(dummy)
+                        self._net.forward()
+                        has_cuda = True
                 except Exception:
+                    has_cuda = False
+
+                if not has_cuda:
                     self._net.setPreferableBackend(cv2.dnn.DNN_BACKEND_OPENCV)
                     self._net.setPreferableTarget(cv2.dnn.DNN_TARGET_CPU)
                 self._is_ready = True

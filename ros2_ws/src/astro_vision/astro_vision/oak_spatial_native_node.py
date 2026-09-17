@@ -357,19 +357,30 @@ class OakSpatialNativeNode(Node):
                 if self._object_engine:
                     try:
                         detected_objs = self._object_engine.process_frame(frame, depth_frame)
-                    except Exception:
-                        pass
+                    except Exception as _oe_err:
+                        self.get_logger().debug(f"Object detection error: {_oe_err}")
+
+                # Fuse person detection: face detection OR YOLO person body detection
+                person_objs = [o for o in detected_objs if getattr(o, "class_name", "") == "person"]
+                if person_objs:
+                    person_detected = True
+                    if closest_dist <= 0.1:
+                        p_dist = getattr(person_objs[0], "distance_m", 0.0)
+                        if p_dist > 0.1:
+                            closest_dist = float(p_dist)
+
+                non_person_objs = [o for o in detected_objs if getattr(o, "class_name", "") != "person"]
 
                 # Publish Standard ROS 2 Topics
                 rgb_msg = bgr_to_imgmsg(frame, header)
                 self.pub_rgb.publish(rgb_msg)
 
                 p_msg = Bool()
-                p_msg.data = person_detected
+                p_msg.data = bool(person_detected)
                 self.pub_person_detected.publish(p_msg)
 
                 cnt_msg = Int32()
-                cnt_msg.data = len(faces)
+                cnt_msg.data = max(len(faces), len(person_objs))
                 self.pub_person_count.publish(cnt_msg)
 
                 d_msg = Float32()
@@ -432,7 +443,7 @@ class OakSpatialNativeNode(Node):
                 now_mono = time.monotonic()
                 if (now_mono - getattr(self, "_last_log_time", 0.0)) >= 3.0:
                     self._last_log_time = now_mono
-                    obj_summary = ", ".join([f"{getattr(o, 'class_name_tr', getattr(o, 'class_name', 'nesne'))} ({getattr(o, 'distance_m', 0.0):.1f}m)" for o in detected_objs]) if detected_objs else "Yok"
+                    obj_summary = ", ".join([f"{getattr(o, 'class_name_tr', getattr(o, 'class_name', 'nesne'))} ({getattr(o, 'distance_m', 0.0):.1f}m)" for o in non_person_objs]) if non_person_objs else "Yok"
                     person_summary = f"Var ({closest_dist:.1f}m, '{recog_payload.get('name', 'Misafir')}')" if person_detected else "Yok"
                     self.get_logger().info(f"👁️ [Görsel Algı Canlı] Kişi: {person_summary} | Nesneler: {obj_summary}")
 
