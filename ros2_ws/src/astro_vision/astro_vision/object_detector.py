@@ -203,6 +203,7 @@ class OpenCvDnnObjectDetector(BaseObjectDetector):
         if model_path and os.path.exists(model_path):
             try:
                 import cv2
+                self._net = cv2.dnn.readNet(model_path)
                 # Safely test if OpenCV CUDA backend is truly available
                 has_cuda = False
                 try:
@@ -293,7 +294,7 @@ class OpenCvDnnObjectDetector(BaseObjectDetector):
                 dist_m = None
                 spatial_coords = None
                 if depth_map is not None:
-                    dist_m = self._calculate_depth(depth_map, xmin, ymin, xmax, ymax)
+                    dist_m = self._calculate_depth(depth_map, xmin, ymin, xmax, ymax, w, h)
                     if dist_m is not None:
                         spatial_coords = self._pixel_to_camera_coords(center_x, center_y, dist_m, w, h)
 
@@ -311,17 +312,28 @@ class OpenCvDnnObjectDetector(BaseObjectDetector):
 
         return detections
 
-    def _calculate_depth(self, depth_map: np.ndarray, xmin: int, ymin: int, xmax: int, ymax: int) -> Optional[float]:
+    def _calculate_depth(
+        self, depth_map: np.ndarray, xmin: int, ymin: int, xmax: int, ymax: int, img_w: int = 0, img_h: int = 0
+    ) -> Optional[float]:
         """Samples median depth from the central 50% region of the bounding box."""
+        dh, dw = depth_map.shape[:2]
+        if img_w > 0 and img_h > 0 and (dw != img_w or dh != img_h):
+            sx = dw / float(img_w)
+            sy = dh / float(img_h)
+            xmin = int(xmin * sx)
+            xmax = int(xmax * sx)
+            ymin = int(ymin * sy)
+            ymax = int(ymax * sy)
+
         cw = max(2, int((xmax - xmin) * 0.5))
         ch = max(2, int((ymax - ymin) * 0.5))
         cx = int((xmin + xmax) / 2)
         cy = int((ymin + ymax) / 2)
 
         x1 = max(0, cx - cw // 2)
-        x2 = min(depth_map.shape[1], cx + cw // 2)
+        x2 = min(dw, cx + cw // 2)
         y1 = max(0, cy - ch // 2)
-        y2 = min(depth_map.shape[0], cy + ch // 2)
+        y2 = min(dh, cy + ch // 2)
 
         roi = depth_map[y1:y2, x1:x2]
         valid = roi[roi > 100]  # Valid stereo depths (mm)
@@ -360,7 +372,7 @@ class ObjectDetectorEngine:
             self.detector = detector
         else:
             m_path = model_path or os.environ.get("ASTRO_YOLO_MODEL", os.path.expanduser("~/.astro/models/yolov8n.onnx"))
-            self.detector = OpenCvDnnObjectDetector(model_path=m_path)
+            self.detector = OpenCvDnnObjectDetector(model_path=m_path, confidence_threshold=0.35)
 
         self.max_rate_hz = max_rate_hz
         self.min_interval_s = 1.0 / max_rate_hz
@@ -387,7 +399,7 @@ class ObjectDetectorEngine:
         self,
         image_bgr: np.ndarray,
         depth_map: Optional[np.ndarray] = None,
-        min_confidence: float = 0.50,
+        min_confidence: float = 0.35,
         now: Optional[float] = None,
     ) -> List[DetectedObject]:
         t = now if now is not None else time.time()

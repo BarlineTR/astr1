@@ -222,13 +222,13 @@ class OakSpatialNativeNode(Node):
                 h, w = frame.shape[:2]
 
                 gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-                # Scale down for fast detection
-                scale_ratio = 320.0 / float(w) if w > 320 else 1.0
+                # Scale down for fast detection (target 640px max width)
+                scale_ratio = 640.0 / float(w) if w > 640 else 1.0
                 small_gray = cv2.resize(gray, (0, 0), fx=scale_ratio, fy=scale_ratio, interpolation=cv2.INTER_AREA) if scale_ratio < 1.0 else gray
 
                 detected_faces = detect_faces_with_confidence(
                     face_cascade, small_gray, scaleFactor=1.1, minNeighbors=4,
-                    minSize=(int(30 * scale_ratio), int(30 * scale_ratio))
+                    minSize=(24, 24)
                 )
 
                 faces = [[int(x / scale_ratio), int(y / scale_ratio), int(bw / scale_ratio), int(bh / scale_ratio), conf] for (x, y, bw, bh, conf) in detected_faces] if scale_ratio < 1.0 else [list(f) for f in detected_faces]
@@ -365,8 +365,8 @@ class OakSpatialNativeNode(Node):
                 if person_objs:
                     person_detected = True
                     if closest_dist <= 0.1:
-                        p_dist = getattr(person_objs[0], "distance_m", 0.0)
-                        if p_dist > 0.1:
+                        p_dist = getattr(person_objs[0], "distance_m", None)
+                        if p_dist is not None and p_dist > 0.1:
                             closest_dist = float(p_dist)
 
                 non_person_objs = [o for o in detected_objs if getattr(o, "class_name", "") != "person"]
@@ -443,7 +443,15 @@ class OakSpatialNativeNode(Node):
                 now_mono = time.monotonic()
                 if (now_mono - getattr(self, "_last_log_time", 0.0)) >= 3.0:
                     self._last_log_time = now_mono
-                    obj_summary = ", ".join([f"{getattr(o, 'class_name_tr', getattr(o, 'class_name', 'nesne'))} ({getattr(o, 'distance_m', 0.0):.1f}m)" for o in non_person_objs]) if non_person_objs else "Yok"
+                    obj_strs = []
+                    for o in non_person_objs:
+                        c_name = getattr(o, 'class_name_tr', getattr(o, 'class_name', 'nesne'))
+                        d_m = getattr(o, 'distance_m', None)
+                        if d_m is not None and d_m > 0.0:
+                            obj_strs.append(f"{c_name} ({d_m:.1f}m)")
+                        else:
+                            obj_strs.append(f"{c_name}")
+                    obj_summary = ", ".join(obj_strs) if obj_strs else "Yok"
                     person_summary = f"Var ({closest_dist:.1f}m, '{recog_payload.get('name', 'Misafir')}')" if person_detected else "Yok"
                     self.get_logger().info(f"👁️ [Görsel Algı Canlı] Kişi: {person_summary} | Nesneler: {obj_summary}")
 
