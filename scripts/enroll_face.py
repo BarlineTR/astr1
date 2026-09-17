@@ -61,7 +61,79 @@ def enroll_from_photos(engine: FaceEngine, name: str, folder: Path, replace: boo
     return len(features)
 
 
+def enroll_from_depthai(engine: FaceEngine, name: str, count: int, replace: bool) -> int:
+    try:
+        import depthai as dai
+    except ImportError:
+        return 0
+
+    devices = dai.Device.getAllAvailableDevices()
+    if not devices:
+        return 0
+
+    print(f"📷 OAK-D kamerası aktif. Yüzünüzü kameraya gösterin; {count} kare alınacak.")
+    print("   Her kare arasında açınızı biraz değiştirin (sağa/sola bakın).")
+
+    pipeline = dai.Pipeline()
+    # Support universal node creation across depthai versions
+    if hasattr(pipeline, "createColorCamera"):
+        cam = pipeline.createColorCamera()
+    else:
+        cam = dai.node.ColorCamera(pipeline)
+
+    cam.setResolution(dai.ColorCameraProperties.SensorResolution.THE_1080_P)
+    cam.setInterleaved(False)
+    cam.setColorOrder(dai.ColorCameraProperties.ColorOrder.BGR)
+
+    if hasattr(pipeline, "createXLinkOut"):
+        xout = pipeline.createXLinkOut()
+    else:
+        xout = dai.node.XLinkOut(pipeline)
+
+    xout.setStreamName("rgb")
+    cam.video.link(xout.input)
+
+    features = []
+    attempts = 0
+    try:
+        with dai.Device(pipeline) as device:
+            q = device.getOutputQueue(name="rgb", maxSize=4, blocking=False)
+            while len(features) < count and attempts < count * 40:
+                attempts += 1
+                in_frame = q.tryGet()
+                if in_frame is None:
+                    time.sleep(0.05)
+                    continue
+                frame = in_frame.getCvFrame()
+                feature = engine.embed_largest(frame)
+                if feature is None:
+                    if attempts % 20 == 0:
+                        print("   ... yüz aranıyor, kameraya bakın")
+                    time.sleep(0.1)
+                    continue
+                features.append(feature)
+                print(f"   ✓ kare {len(features)}/{count}")
+                time.sleep(1.0)
+    except Exception as exc:
+        print(f"⚠️ OAK-D çekim hatası: {exc}")
+        return 0
+
+    if features:
+        engine.add_person(name, features, replace=replace)
+        engine.save()
+        print(f"✅ Başarılı: '{name}' için {len(features)} kare kaydedildi!")
+    return len(features)
+
+
 def enroll_from_camera(engine: FaceEngine, name: str, camera: int, count: int, replace: bool) -> int:
+    # Try OAK-D DepthAI camera first
+    try:
+        dai_count = enroll_from_depthai(engine, name, count, replace)
+        if dai_count > 0:
+            return dai_count
+    except Exception:
+        pass
+
     cap = cv2.VideoCapture(camera)
     if not cap.isOpened():
         print(f"❌ Kamera açılamadı: /dev/video{camera}")
@@ -92,6 +164,7 @@ def enroll_from_camera(engine: FaceEngine, name: str, camera: int, count: int, r
     if features:
         engine.add_person(name, features, replace=replace)
         engine.save()
+        print(f"✅ Başarılı: '{name}' için {len(features)} kare kaydedildi!")
     return len(features)
 
 
