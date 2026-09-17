@@ -623,6 +623,8 @@ def test_non_blocking_clause_playback_streaming():
     node = AstroRealtimeNode(use_realtime=False)
     try:
         node.pub_output_pcm = MagicMock()
+        node._current_turn_explicit_user_turn = True
+        node._speech_authorization = MagicMock(invalidated=False)
         # 1.0 second of dummy 24kHz int16 audio = 48000 bytes
         dummy_pcm = b"\x00\x01" * 24000
 

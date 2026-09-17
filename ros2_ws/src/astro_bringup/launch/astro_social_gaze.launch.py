@@ -150,8 +150,8 @@ def generate_launch_description():
         ),
         DeclareLaunchArgument(
             "audio_source_mode",
-            default_value="hardware",
-            description="Audio localizer mode ('hardware' for direct ReSpeaker HID matching track.py, or 'topics')",
+            default_value="topics",
+            description="Audio localizer mode ('topics' for clean ROS topic subscription from audio_stream_node, or 'hardware')",
         ),
         DeclareLaunchArgument(
             "audio_hold_grace",

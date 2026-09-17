@@ -143,45 +143,86 @@ class CameraSource:
             try:
                 self.pipeline = dai.Pipeline()
 
-                cam = self.pipeline.create(dai.node.Camera).build()
+                # Robust ColorCamera node creation across DepthAI versions
+                node_cls = None
+                for container in [getattr(dai, "node", None), getattr(dai, "nodes", None), dai]:
+                    if container is not None and hasattr(container, "ColorCamera"):
+                        node_cls = getattr(container, "ColorCamera")
+                        break
 
-                output = cam.requestOutput(
-                    (width, height),
-                    dai.ImgFrame.Type.BGR888p,
-                    dai.ImgResizeMode.CROP,
-                    30.0,
-                )
+                if node_cls is not None and hasattr(self.pipeline, "create"):
+                    try:
+                        cam = self.pipeline.create(node_cls)
+                    except Exception:
+                        cam = node_cls(self.pipeline)
+                elif hasattr(self.pipeline, "createColorCamera"):
+                    cam = self.pipeline.createColorCamera()
+                else:
+                    cam = dai.node.ColorCamera(self.pipeline)
 
-                self.queue = output.createOutputQueue(
-                    maxSize=2,
-                    blocking=True,
-                )
+                cam.setResolution(dai.ColorCameraProperties.SensorResolution.THE_1080_P)
+                cam.setInterleaved(False)
+                cam.setColorOrder(dai.ColorCameraProperties.ColorOrder.BGR)
+                cam.setFps(30.0)
+                if hasattr(cam, "setPreviewSize"):
+                    cam.setPreviewSize(width, height)
 
-                self.pipeline.start()
-                self.device = self.pipeline.getDefaultDevice()
+                # Robust XLinkOut node creation
+                xout_cls = None
+                for container in [getattr(dai, "node", None), getattr(dai, "nodes", None), dai]:
+                    if container is not None and hasattr(container, "XLinkOut"):
+                        xout_cls = getattr(container, "XLinkOut")
+                        break
+
+                if xout_cls is not None and hasattr(self.pipeline, "create"):
+                    try:
+                        xout = self.pipeline.create(xout_cls)
+                    except Exception:
+                        xout = xout_cls(self.pipeline)
+                elif hasattr(self.pipeline, "createXLinkOut"):
+                    xout = self.pipeline.createXLinkOut()
+                else:
+                    xout = dai.node.XLinkOut(self.pipeline)
+
+                xout.setStreamName("rgb")
+                if hasattr(cam, "preview"):
+                    cam.preview.link(xout.input)
+                else:
+                    cam.video.link(xout.input)
+
+                self.device = dai.Device(self.pipeline)
+                self.queue = self.device.getOutputQueue(name="rgb", maxSize=2, blocking=False)
                 self.available = True
                 self.backend = "OAK-D"
 
             except Exception as exc:
-                # No OAK-D attached, or the pipeline would not build. Keep the reason —
-                # it is the difference between "no camera plugged in" and "the OAK-D is
-                # there but the pipeline is wrong", which are not the same problem.
                 self.error = str(exc)
                 self.available = False
                 self.queue = None
                 self.pipeline = None
+                if self.device is not None:
+                    try:
+                        self.device.close()
+                    except Exception:
+                        pass
                 self.device = None
 
-                fallback = cv2.VideoCapture(device)
-                if fallback.isOpened():
-                    fallback.set(cv2.CAP_PROP_FRAME_WIDTH, width)
-                    fallback.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
-                    fallback.set(cv2.CAP_PROP_FPS, 30.0)
-                    self.capture = fallback
-                    self.available = True
-                    self.backend = "webcam"
-                else:
-                    fallback.release()
+                # Only attempt VideoCapture if /dev/video{device} exists on Linux to avoid noisy V4L2/FFmpeg warnings
+                video_dev_path = f"/dev/video{device}"
+                if os.name != "posix" or os.path.exists(video_dev_path):
+                    try:
+                        fallback = cv2.VideoCapture(device)
+                        if fallback.isOpened():
+                            fallback.set(cv2.CAP_PROP_FRAME_WIDTH, width)
+                            fallback.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+                            fallback.set(cv2.CAP_PROP_FPS, 30.0)
+                            self.capture = fallback
+                            self.available = True
+                            self.backend = "webcam"
+                        else:
+                            fallback.release()
+                    except Exception:
+                        pass
 
         model_dir = os.path.expanduser(
             os.getenv("FACE_MODEL_DIR", "~/.astro/models")
@@ -202,11 +243,15 @@ class CameraSource:
         if self.capture is not None:
             return self.capture.read()
 
-        try:
-            frame = self.queue.get().getCvFrame()
-            return True, frame
-        except Exception:
-            return False, None
+        if self.queue is not None:
+            try:
+                in_frame = self.queue.tryGet() if hasattr(self.queue, "tryGet") else self.queue.get()
+                if in_frame is not None:
+                    return True, in_frame.getCvFrame()
+            except Exception:
+                return False, None
+
+        return False, None
 
     def detect(self, frame) -> List[Detection]:
         return to_detections(self.detector.detect(frame))
@@ -219,10 +264,11 @@ class CameraSource:
             pass
 
         try:
-            if self.pipeline is not None:
-                self.pipeline.stop()
+            if self.device is not None:
+                self.device.close()
         except Exception:
             pass
+        self.available = False
 class AudioSource:
     """A 4-channel microphone array reduced to one bearing at a time.
 
