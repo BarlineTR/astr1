@@ -24,7 +24,7 @@ import numpy as np
 import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import Image
-from std_msgs.msg import Bool, Float32, Int32, String
+from std_msgs.msg import Bool, Float32, Header, Int32, String
 
 try:
     import depthai as dai
@@ -216,7 +216,9 @@ class OakSpatialNativeNode(Node):
             depth_frame = in_depth.getFrame() if in_depth is not None else None
 
             if frame is not None:
-                header = self.get_clock().now().to_msg()
+                header = Header()
+                header.stamp = self.get_clock().now().to_msg()
+                header.frame_id = "oak_rgb_camera_optical_frame"
                 h, w = frame.shape[:2]
 
                 gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
