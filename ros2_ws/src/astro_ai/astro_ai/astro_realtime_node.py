@@ -755,10 +755,15 @@ class AstroRealtimeNode(Node):
         else:
             self.use_4o = False
 
-        # Minimal model selector: use_4o=True selects gpt-4o-realtime-preview
+        # Minimal model selector & mode resolution:
+        # use_4o=False: Default flagship Realtime WebSocket (gpt-realtime-2.1-mini)
+        # use_4o=True: 100x lower-cost, ultra-fast OpenAI Chat API (gpt-4o-mini) + STT + Edge-TTS
         if self.use_4o:
-            self.realtime_model = os.environ.get("REALTIME_4O_MODEL", "gpt-4o-realtime-preview").strip()
+            self.openai_chat_model = os.environ.get("OPENAI_CHAT_MODEL", "gpt-4o-mini").strip()
+            self.realtime_model = self.openai_chat_model
+            self.use_realtime = False
         else:
+            self.openai_chat_model = "gpt-4o-mini"
             self.realtime_model = os.environ.get("REALTIME_MODEL", "gpt-realtime-2.1-mini").strip()
 
         self.connect_realtime = bool(self.use_realtime and connect_realtime and not is_test_mode)
@@ -5410,7 +5415,7 @@ class AstroRealtimeNode(Node):
                 f"command_reject_reason=none | "
                 f"wake_only=False | wake_rejected=False | conversation_turn_created=True | llm_started=True | tts_started=True"
             )
-            if self._can_use_openai("realtime") and self._ws and self._loop and self._is_connected:
+            if not getattr(self, "use_4o", False) and self._can_use_openai("realtime") and self._ws and self._loop and self._is_connected:
                 turn_event = {
                     "type": "conversation.item.create",
                     "item": {
@@ -5423,7 +5428,7 @@ class AstroRealtimeNode(Node):
                 asyncio.run_coroutine_threadsafe(self._ws.send(json.dumps(turn_event)), self._loop)
                 asyncio.run_coroutine_threadsafe(self._ws.send(json.dumps(resp_event)), self._loop)
             else:
-                threading.Thread(target=self._process_fallback_turn, args=(audio_chunks,), daemon=True).start()
+                threading.Thread(target=self._process_fallback_turn, args=(audio_chunks,), kwargs={"direct_text": extracted_cmd}, daemon=True).start()
 
     def _on_camera_info(self, msg: Any):
         """Monitors OAK-D Lite camera_info topic stream for XLink/hardware liveness."""
@@ -8704,9 +8709,55 @@ class AstroRealtimeNode(Node):
                     })
                     full_reply_parts = []
 
+            # Attempt 4O: Streaming OpenAI gpt-4o-mini (Active when use_4o=True or explicit OpenAI Chat requested)
+            if not full_reply_parts and getattr(self, "use_4o", False) and self.openai_api_key:
+                target_model = getattr(self, "openai_chat_model", "gpt-4o-mini")
+                try:
+                    t_model_start = time.monotonic()
+                    first_token_seen = False
+
+                    for token in self.provider_registry.stream_openai_completion(
+                        self.openai_api_key,
+                        target_model,
+                        messages,
+                        max_tokens=80,
+                        temperature=0.65,
+                        timeout=5.0,
+                    ):
+                        if not first_token_seen:
+                            llm_ttft_ms = (time.monotonic() - t_model_start) * 1000.0
+                            first_token_seen = True
+
+                        full_reply_parts.append(token)
+
+                    if full_reply_parts:
+                        chosen_model = target_model
+                        chosen_provider = "openai"
+                        response_origin = "openai_chat"
+                        llm_inference_started = True
+                        llm_inference_completed = True
+                        llm_latency_ms = (time.monotonic() - t_model_start) * 1000.0
+                        llm_inference_duration_ms = llm_latency_ms
+                        self.provider_registry.record_success("openai", target_model, llm_latency_ms)
+                        attempts.append({
+                            "provider": "openai",
+                            "model": target_model,
+                            "result": "success",
+                            "latency_ms": int(llm_latency_ms)
+                        })
+                except Exception as oe:
+                    self.get_logger().warn(f"⚠️ [OpenAI Chat {target_model} Failed]: {oe}")
+                    attempts.append({
+                        "provider": "openai",
+                        "model": target_model,
+                        "result": "failed",
+                        "error": str(oe)[:80]
+                    })
+                    full_reply_parts = []
+
             # Attempt A: Streaming Groq LLMs (Fastest first, fallback on failure)
             # STRICT POLICY: When use_realtime=false, cloud LLM fallback is COMPLETELY OFF (zero cloud leakage)
-            if not full_reply_parts and self.use_realtime and self.groq_api_key and groq_candidates:
+            if not full_reply_parts and (self.use_realtime or getattr(self, "use_4o", False)) and self.groq_api_key and groq_candidates:
                 for target_model in groq_candidates:
                     try:
                         t_model_start = time.monotonic()
@@ -8813,7 +8864,7 @@ class AstroRealtimeNode(Node):
             # Problem 1: STRICT LOCAL MODE SILENCE GATE
             # When use_realtime=False and Local Gemma produced no reply, STRICTLY ENFORCE SILENCE.
             # Do NOT fall back to cloud, do NOT invoke hardcoded/template persona, do NOT synthesize TTS, do NOT start playback.
-            if not self.use_realtime and not full_reply_parts:
+            if not self.use_realtime and not getattr(self, "use_4o", False) and not full_reply_parts:
                 self.get_logger().warning(
                     "🛑 [Local Voice Mode Gemma Failure]: Local Gemma produced no response. "
                     "Enforcing strict silence in local mode (0 TTS, 0 playback, 0 template fallback)."
@@ -9275,9 +9326,9 @@ class AstroRealtimeNode(Node):
             if self._is_sleeping:
                 self._wake_up()
 
-        # --- 0-Cost Fallback Mode (Groq STT + Groq LLM + Edge-TTS) ---
+        # --- 0-Cost Fallback Mode / OpenAI Chat Mode (STT + LLM + Edge-TTS) ---
         is_ws_connected = (self._is_connected or self.realtime_connection_state == "CONNECTED")
-        if self._fallback_mode or not self._can_use_openai("realtime") or not is_ws_connected or self._ws is None:
+        if self._fallback_mode or getattr(self, "use_4o", False) or not self._can_use_openai("realtime") or not is_ws_connected or self._ws is None:
             if raw_16k:
                 try:
                     speech_start_condition = (local_rms > max(380.0, self._ambient_rms * 1.40) and peak_val > 900)

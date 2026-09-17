@@ -47,14 +47,12 @@ class TestUse4oModelToggle(unittest.TestCase):
 
     @patch.dict(os.environ, {"ASTRO_TEST_MODE": "1", "OPENAI_API_KEY": "sk-mock-key"})
     def test_02_use_4o_true_selects_4o_model(self):
-        """use_4o=True selects gpt-4o-realtime-preview cleanly."""
+        """use_4o=True selects gpt-4o-mini via Chat API and disables WebSocket realtime."""
         node = AstroRealtimeNode(use_4o=True)
         self.assertTrue(node.use_4o)
-        self.assertEqual(node.realtime_model, "gpt-4o-realtime-preview")
-
-        # Discover list starts with 4o model
-        candidates = discover_realtime_models(node.openai_api_key, node.realtime_model)
-        self.assertEqual(candidates[0], "gpt-4o-realtime-preview")
+        self.assertEqual(node.realtime_model, "gpt-4o-mini")
+        self.assertEqual(node.openai_chat_model, "gpt-4o-mini")
+        self.assertFalse(node.use_realtime)
 
     def test_03_use_4o_env_variable_toggle(self):
         """USE_4O environment variable dynamically controls model selection."""
@@ -62,13 +60,16 @@ class TestUse4oModelToggle(unittest.TestCase):
         with patch.dict(os.environ, {"ASTRO_TEST_MODE": "1", "OPENAI_API_KEY": "sk-mock-key", "USE_4O": "true"}):
             node_env_true = AstroRealtimeNode()
             self.assertTrue(node_env_true.use_4o)
-            self.assertEqual(node_env_true.realtime_model, "gpt-4o-realtime-preview")
+            self.assertEqual(node_env_true.realtime_model, "gpt-4o-mini")
+            self.assertEqual(node_env_true.openai_chat_model, "gpt-4o-mini")
+            self.assertFalse(node_env_true.use_realtime)
 
         # Case B: USE_4O="false"
         with patch.dict(os.environ, {"ASTRO_TEST_MODE": "1", "OPENAI_API_KEY": "sk-mock-key", "USE_4O": "false"}):
             node_env_false = AstroRealtimeNode()
             self.assertFalse(node_env_false.use_4o)
             self.assertEqual(node_env_false.realtime_model, "gpt-realtime-2.1-mini")
+            self.assertTrue(node_env_false.use_realtime)
 
     @patch.dict(os.environ, {"ASTRO_TEST_MODE": "1", "OPENAI_API_KEY": "sk-mock-key"})
     def test_04_audio_config_and_transport_identical(self):
@@ -80,8 +81,9 @@ class TestUse4oModelToggle(unittest.TestCase):
         self.assertEqual(node_default.realtime_voice, node_4o.realtime_voice)
         # Audio buffer parameters identical
         self.assertEqual(node_default.xtts_startup_grace_s, node_4o.xtts_startup_grace_s)
-        # Fallback modes identical
-        self.assertEqual(node_default._fallback_mode, node_4o._fallback_mode)
+        # Fallback modes: node_default uses realtime WS, node_4o uses Chat/Edge-TTS pipeline
+        self.assertFalse(node_default._fallback_mode)
+        self.assertTrue(node_4o._fallback_mode)
         # Active response state initialization identical
         self.assertEqual(node_default.active_response_state, node_4o.active_response_state)
         self.assertEqual(node_default.realtime_response_state, node_4o.realtime_response_state)

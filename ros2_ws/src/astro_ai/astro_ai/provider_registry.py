@@ -750,6 +750,62 @@ class ProviderRegistry:
             self.record_error("groq", model_id, err_class, str(ge))
             raise ProviderError("groq", model_id, err_class, str(ge))
 
+    def stream_openai_completion(
+        self,
+        api_key: str,
+        model_id: str,
+        messages: List[Dict[str, Any]],
+        temperature: float = 0.65,
+        max_tokens: int = 80,
+        timeout: float = 5.0,
+    ) -> Generator[str, None, None]:
+        """Streams tokens from OpenAI Chat Completions API with strict error classification."""
+        payload: Dict[str, Any] = {
+            "model": model_id,
+            "messages": messages,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+            "stream": True,
+        }
+
+        req = urllib.request.Request(
+            "https://api.openai.com/v1/chat/completions",
+            data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+                "User-Agent": "Astro-V1-SocialRobot/2.0",
+            },
+            method="POST",
+        )
+
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                for raw_line in resp:
+                    line = raw_line.decode("utf-8", errors="ignore").strip()
+                    if not line.startswith("data:"):
+                        continue
+                    data_str = line[5:].strip()
+                    if data_str == "[DONE]":
+                        break
+                    try:
+                        chunk_json = json.loads(data_str)
+                        delta = chunk_json.get("choices", [{}])[0].get("delta", {})
+                        token = delta.get("content", "")
+                        if token:
+                            yield token
+                    except Exception as _exc:
+                        self._log("debug", f"stream_openai_completion: yok sayılan hata ({_exc})")
+        except urllib.error.HTTPError as http_e:
+            err_body = http_e.read().decode("utf-8", errors="ignore")
+            err_class = self.classify_error(http_e.code, err_body, http_e)
+            self.record_error("openai", model_id, err_class, err_body)
+            raise ProviderError("openai", model_id, err_class, err_body, http_e.code)
+        except Exception as ge:
+            err_class = self.classify_error(0, str(ge), ge)
+            self.record_error("openai", model_id, err_class, str(ge))
+            raise ProviderError("openai", model_id, err_class, str(ge))
+
     def stream_local_gemma_completion(
         self,
         prompt: str,
