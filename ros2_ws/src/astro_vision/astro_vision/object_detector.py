@@ -66,6 +66,8 @@ CLASS_TRANSLATIONS_TR: Dict[str, str] = {
 UNSUPPORTED_ABSTRACT_CLASSES: Set[str] = {
     "food",   # Generic abstract food (only specific edibles like apple/sandwich exist in COCO)
     "plate",  # Plate is in LVIS/OpenImages, NOT in standard COCO 80 (only bowl exists)
+    "tea",    # Abstract beverage/liquid (detector only detects container like cup/bottle)
+    "coffee", # Abstract beverage/liquid (detector only detects container like cup/bottle)
 }
 
 
@@ -342,16 +344,36 @@ class ObjectDetectorEngine:
     def __init__(
         self,
         detector: Optional[BaseObjectDetector] = None,
+        model_path: Optional[str] = None,
         max_rate_hz: float = 10.0,
         temporal_track_ttl_s: float = 3.0,
     ):
-        self.detector = detector or SyntheticObjectDetector()
+        if detector is not None:
+            self.detector = detector
+        else:
+            m_path = model_path or os.environ.get("ASTRO_YOLO_MODEL", os.path.expanduser("~/.astro/models/yolov8n.onnx"))
+            self.detector = OpenCvDnnObjectDetector(model_path=m_path)
+
         self.max_rate_hz = max_rate_hz
         self.min_interval_s = 1.0 / max_rate_hz
         self.track_ttl_s = temporal_track_ttl_s
         self._last_inference_ts: float = 0.0
         self._tracked_objects: Dict[str, DetectedObject] = {}
         self._next_track_id: int = 1
+
+    @property
+    def is_ready(self) -> bool:
+        if hasattr(self.detector, "is_ready"):
+            return bool(self.detector.is_ready)
+        return True
+
+    @property
+    def status(self) -> str:
+        if hasattr(self.detector, "is_ready"):
+            return "READY" if self.detector.is_ready else "MODEL_NOT_AVAILABLE / HARDWARE_NOT_VERIFIED"
+        if isinstance(self.detector, SyntheticObjectDetector):
+            return "SYNTHETIC_FIXTURE_ONLY"
+        return "UNKNOWN"
 
     def process_frame(
         self,

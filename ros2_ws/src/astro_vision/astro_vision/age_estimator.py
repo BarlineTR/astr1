@@ -27,13 +27,18 @@ class VisualAgeEstimator:
     def __init__(self, model_path: Optional[str] = None):
         self._net = None
         self._is_model_loaded = False
-        if model_path and os.path.exists(model_path):
+        target_path = model_path or os.environ.get("ASTRO_AGE_MODEL", os.path.expanduser("~/.astro/models/age_net.onnx"))
+        if target_path and os.path.exists(target_path):
             try:
                 import cv2
-                self._net = cv2.dnn.readNet(model_path)
+                self._net = cv2.dnn.readNet(target_path)
                 self._is_model_loaded = True
             except Exception:
                 self._is_model_loaded = False
+
+    @property
+    def is_ready(self) -> bool:
+        return self._is_model_loaded
 
     def estimate(self, face_bgr: Optional[np.ndarray]) -> Tuple[AgeGroup, float]:
         """Evaluates face image and returns (AgeGroup, confidence)."""
@@ -41,36 +46,37 @@ class VisualAgeEstimator:
             return AgeGroup.UNKNOWN, 0.0
 
         h, w = face_bgr.shape[:2]
-        # Quality check: reject tiny or heavily degraded crops
         if h < 45 or w < 45:
-            return AgeGroup.UNKNOWN, 0.25
+            return AgeGroup.UNKNOWN, 0.0
+
+        # Model not available -> strictly return UNKNOWN (no ungrounded guessing)
+        if not self._is_model_loaded or self._net is None:
+            return AgeGroup.UNKNOWN, 0.0
 
         # 1. Deep Learning Backend (if model weights available)
-        if self._is_model_loaded and self._net is not None:
-            try:
-                import cv2
-                blob = cv2.dnn.blobFromImage(
-                    face_bgr, 1.0, (227, 227), (78.4263377603, 87.7689143744, 114.895847746), swapRB=False
-                )
-                self._net.setInput(blob)
-                preds = self._net.forward()[0]
-                idx = int(np.argmax(preds))
-                conf = float(preds[idx])
+        try:
+            import cv2
+            blob = cv2.dnn.blobFromImage(
+                face_bgr, 1.0, (227, 227), (78.4263377603, 87.7689143744, 114.895847746), swapRB=False
+            )
+            self._net.setInput(blob)
+            preds = self._net.forward()[0]
+            idx = int(np.argmax(preds))
+            conf = float(preds[idx])
 
-                # Mapping 8 standard age brackets: (0-2), (4-6), (8-12), (15-20), (25-32), (38-43), (48-53), (60-100)
-                if idx in (0, 1, 2):
-                    return AgeGroup.CHILD, conf
-                elif idx == 3:
-                    return AgeGroup.TEEN, conf
-                elif idx in (4, 5, 6):
-                    return AgeGroup.ADULT, conf
-                elif idx == 7:
-                    return AgeGroup.SENIOR, conf
-            except Exception:
-                pass
+            # Mapping 8 standard age brackets: (0-2), (4-6), (8-12), (15-20), (25-32), (38-43), (48-53), (60-100)
+            if idx in (0, 1, 2):
+                return AgeGroup.CHILD, conf
+            elif idx == 3:
+                return AgeGroup.TEEN, conf
+            elif idx in (4, 5, 6):
+                return AgeGroup.ADULT, conf
+            elif idx == 7:
+                return AgeGroup.SENIOR, conf
+        except Exception:
+            pass
 
-        # 2. Algorithmic Anthropometric & Texture Feature Fallback
-        return self._estimate_from_features(face_bgr)
+        return AgeGroup.UNKNOWN, 0.0
 
     def _estimate_from_features(self, face_bgr: np.ndarray) -> Tuple[AgeGroup, float]:
         import cv2

@@ -416,6 +416,7 @@ def discover_realtime_models(api_key: str, preferred: str = "") -> list[str]:
         "gpt-realtime-2.1",
         "gpt-realtime-2",
         "gpt-realtime",
+        "gpt-4o-realtime-preview",
     ]
     candidates = []
     if preferred:
@@ -668,6 +669,7 @@ class AstroRealtimeNode(Node):
         connect_realtime: bool = True,
         fake_transport: Optional[Any] = None,
         use_realtime: Optional[bool] = None,
+        use_4o: Optional[bool] = None,
     ):
         if rclpy is not None and hasattr(rclpy, "ok") and not rclpy.ok():
             try:
@@ -688,7 +690,6 @@ class AstroRealtimeNode(Node):
         self.groq_api_key = os.environ.get("GROQ_API_KEY", "").strip("\"' \t\n\r")
         raw_gem = os.environ.get("GEMINI_API_KEY", "").strip("\"' \t\n\r")
         self.gemini_api_key = raw_gem if (raw_gem and not raw_gem.startswith("sk-")) else ""
-        self.realtime_model = os.environ.get("REALTIME_MODEL", "gpt-realtime-2.1-mini").strip()
         self.realtime_transcribe_model = os.environ.get(
             "REALTIME_TRANSCRIBE_MODEL", "gpt-live-transcribe").strip() or "gpt-live-transcribe"
         raw_voice = os.environ.get("REALTIME_VOICE", os.environ.get("OPENAI_TTS_VOICE", os.environ.get("TTS_VOICE", "echo"))).strip().lower()
@@ -725,6 +726,35 @@ class AstroRealtimeNode(Node):
             self.use_realtime = False
         else:
             self.use_realtime = True
+
+        # ROS 2 parameter & environment variable resolution for use_4o
+        param_use_4o = False
+        if hasattr(self, "declare_parameter"):
+            try:
+                if hasattr(self, "has_parameter") and self.has_parameter("use_4o"):
+                    param_val_4o = self.get_parameter("use_4o").value
+                else:
+                    self.declare_parameter("use_4o", False)
+                    param_val_4o = self.get_parameter("use_4o").value
+                if param_val_4o is not None:
+                    param_use_4o = bool(param_val_4o)
+            except Exception:
+                param_use_4o = False
+
+        env_use_4o = os.environ.get("USE_4O", "false").strip().lower() in ("1", "true", "yes", "on")
+
+        if use_4o is not None:
+            self.use_4o = bool(use_4o)
+        elif param_use_4o or env_use_4o:
+            self.use_4o = True
+        else:
+            self.use_4o = False
+
+        # Minimal model selector: use_4o=True selects gpt-4o-realtime-preview
+        if self.use_4o:
+            self.realtime_model = os.environ.get("REALTIME_4O_MODEL", "gpt-4o-realtime-preview").strip()
+        else:
+            self.realtime_model = os.environ.get("REALTIME_MODEL", "gpt-realtime-2.1-mini").strip()
 
         self.connect_realtime = bool(self.use_realtime and connect_realtime and not is_test_mode)
         self.fake_transport = fake_transport
@@ -3889,7 +3919,9 @@ class AstroRealtimeNode(Node):
             if target_classes:
                 tr_name = {"cup": "bardak", "bottle": "su şişesi", "cell phone": "telefon", "book": "kitap"}.get(target_classes[0], target_classes[0])
                 return True, f"Elinde bir {tr_name} tuttuğunu görüyorum."
-            return True, "Şu an elinde belirgin bir nesne göremiyorum."
+            if vis_person_det:
+                return True, "Seni görüyorum ama şu an elinde ne olduğunu doğrulayamıyorum."
+            return True, "Şu an kameramda seni göremiyorum."
 
         # 3. Specific Query: "telefonumu görüyor musun" / "telefon nerede"
         if "telefon" in t:
