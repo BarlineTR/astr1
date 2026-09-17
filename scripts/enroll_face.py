@@ -75,8 +75,20 @@ def enroll_from_depthai(engine: FaceEngine, name: str, count: int, replace: bool
     print("   Her kare arasında açınızı biraz değiştirin (sağa/sola bakın).")
 
     pipeline = dai.Pipeline()
-    # Support universal node creation across depthai versions
-    if hasattr(pipeline, "createColorCamera"):
+
+    # Robust ColorCamera node creation across DepthAI versions
+    node_cls = None
+    for container in [getattr(dai, "node", None), getattr(dai, "nodes", None), dai]:
+        if container is not None and hasattr(container, "ColorCamera"):
+            node_cls = getattr(container, "ColorCamera")
+            break
+
+    if node_cls is not None and hasattr(pipeline, "create"):
+        try:
+            cam = pipeline.create(node_cls)
+        except Exception:
+            cam = node_cls(pipeline)
+    elif hasattr(pipeline, "createColorCamera"):
         cam = pipeline.createColorCamera()
     else:
         cam = dai.node.ColorCamera(pipeline)
@@ -85,13 +97,28 @@ def enroll_from_depthai(engine: FaceEngine, name: str, count: int, replace: bool
     cam.setInterleaved(False)
     cam.setColorOrder(dai.ColorCameraProperties.ColorOrder.BGR)
 
-    if hasattr(pipeline, "createXLinkOut"):
+    # Robust XLinkOut node creation
+    xout_cls = None
+    for container in [getattr(dai, "node", None), getattr(dai, "nodes", None), dai]:
+        if container is not None and hasattr(container, "XLinkOut"):
+            xout_cls = getattr(container, "XLinkOut")
+            break
+
+    if xout_cls is not None and hasattr(pipeline, "create"):
+        try:
+            xout = pipeline.create(xout_cls)
+        except Exception:
+            xout = xout_cls(pipeline)
+    elif hasattr(pipeline, "createXLinkOut"):
         xout = pipeline.createXLinkOut()
     else:
         xout = dai.node.XLinkOut(pipeline)
 
     xout.setStreamName("rgb")
-    cam.video.link(xout.input)
+    if hasattr(cam, "video"):
+        cam.video.link(xout.input)
+    elif hasattr(cam, "preview"):
+        cam.preview.link(xout.input)
 
     features = []
     attempts = 0
@@ -131,8 +158,8 @@ def enroll_from_camera(engine: FaceEngine, name: str, camera: int, count: int, r
         dai_count = enroll_from_depthai(engine, name, count, replace)
         if dai_count > 0:
             return dai_count
-    except Exception:
-        pass
+    except Exception as d_err:
+        print(f"⚠️ OAK-D denemesi başarısız ({d_err}), V4L2 web kamerasına geçiliyor...")
 
     cap = cv2.VideoCapture(camera)
     if not cap.isOpened():

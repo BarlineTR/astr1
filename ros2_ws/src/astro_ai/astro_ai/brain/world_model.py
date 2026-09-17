@@ -76,6 +76,16 @@ class WorldModel:
             t_now = now or time.time()
             current_ids = set()
 
+            # If any incoming person is an identified known user, purge placeholder anonymous records
+            for p in people_list:
+                if getattr(p, "is_known", False) and str(p.person_id).lower() not in ("misafir", "guest"):
+                    for anon_id in ["misafir", "guest", "audio_speaker_1"]:
+                        if anon_id in self._people and anon_id != p.person_id:
+                            # Inherit trajectory history if target didn't have one
+                            if not getattr(p, "trajectory_history", None):
+                                p.trajectory_history = getattr(self._people[anon_id], "trajectory_history", [])
+                            del self._people[anon_id]
+
             for p in people_list:
                 p.last_seen_ts = t_now
                 prev = self._people.get(p.person_id)

@@ -165,6 +165,14 @@ except ImportError:
     except ImportError:
         FaceRecognizer = None
 
+try:
+    from astro_vision.object_detector import ObjectDetectorEngine
+except ImportError:
+    try:
+        from object_detector import ObjectDetectorEngine
+    except ImportError:
+        ObjectDetectorEngine = None
+
 
 def _coerce_bool(val: Any) -> bool:
     """Robustly coerces booleans, numbers, and string representations ('false', '0', etc.)."""
@@ -457,10 +465,28 @@ class StandaloneGazeRosNode(Node):
             except Exception as fr_err:
                 self.get_logger().debug(f"FaceRecognizer skipped: {fr_err}")
 
+        # Object Detection Publisher (Local YOLO COCO-80 via ObjectDetectorEngine)
+        self.object_engine = None
+        if ObjectDetectorEngine is not None:
+            try:
+                self.object_engine = ObjectDetectorEngine()
+                if getattr(self.object_engine, "is_ready", False):
+                    self.get_logger().info("📦 [ObjectDetector] YOLO COCO-80 nesne algılama motoru yüklendi.")
+                else:
+                    self.get_logger().info(f"📦 [ObjectDetector] Durum: {getattr(self.object_engine, 'status', 'NOT_READY')}")
+            except Exception as oe_err:
+                self.get_logger().debug(f"ObjectDetectorEngine skipped: {oe_err}")
+
         self.pub_recognized_person = self.create_publisher(String, "/vision/recognized_person", 10)
+        self.pub_detected_objects = self.create_publisher(String, "/vision/detected_objects", 10)
+        self.pub_faces = self.create_publisher(String, "/vision/faces", 10)
         self.pub_user_distance = self.create_publisher(Float32, "/vision/user_distance", 10)
         self._last_face_recog_time: float = 0.0
         self._face_recog_interval_s: float = 1.5
+        self._last_object_det_time: float = 0.0
+        self._object_det_interval_s: float = 1.0
+        self._object_det_busy: bool = False
+        self._last_faces_published_count: int = 0
 
         # Subscriptions (Authoritative Feedback & Diagnostic Only - NO ROS Vision Topics)
         qos_best_effort = QoSProfile(depth=10, reliability=ReliabilityPolicy.BEST_EFFORT)
@@ -795,6 +821,13 @@ class StandaloneGazeRosNode(Node):
 
                 detections = self.camera.detect(frame)
                 self._maybe_recognize_face(frame, detections)
+                self._maybe_detect_objects(frame)
+                if not detections and getattr(self, "_last_faces_published_count", 0) > 0:
+                    if getattr(self, "pub_faces", None):
+                        f_msg = String()
+                        f_msg.data = "[]"
+                        self.pub_faces.publish(f_msg)
+                    self._last_faces_published_count = 0
                 t_detect_done = time.monotonic()
                 frame_h, frame_w = frame.shape[:2]
 
@@ -867,12 +900,60 @@ class StandaloneGazeRosNode(Node):
                     msg.data = json.dumps(payload)
                     if getattr(self, "pub_recognized_person", None):
                         self.pub_recognized_person.publish(msg)
+
+                    if getattr(self, "pub_faces", None):
+                        faces_list = [{
+                            "name": payload["name"],
+                            "recognized_name": payload["name"],
+                            "recognized_title": payload.get("formal_title", payload["name"]),
+                            "is_known": payload["is_known"],
+                            "confidence": payload["confidence"],
+                            "x": int(best_det.x),
+                            "y": int(best_det.y),
+                            "width": int(best_det.w),
+                            "height": int(best_det.h),
+                            "distance_m": float(getattr(self, "_last_estimated_dist", 1.5) or 1.5),
+                            "looking_at_robot": bool(getattr(best_det, "is_looking", False)),
+                        }]
+                        f_msg = String()
+                        f_msg.data = json.dumps(faces_list)
+                        self.pub_faces.publish(f_msg)
+                        self._last_faces_published_count = len(faces_list)
                 except Exception as rec_err:
                     self.get_logger().debug(f"_maybe_recognize_face worker notice: {rec_err}")
 
             threading.Thread(target=_worker, args=(face_roi,), daemon=True).start()
         except Exception as exc:
             self.get_logger().debug(f"_maybe_recognize_face notice: {exc}")
+
+    def _maybe_detect_objects(self, frame: Optional[np.ndarray]) -> None:
+        """Asynchronously runs YOLO COCO-80 object detection without blocking gaze tracking loop."""
+        if not getattr(self, "object_engine", None) or frame is None:
+            return
+        now_m = time.monotonic()
+        if (now_m - getattr(self, "_last_object_det_time", 0.0)) < getattr(self, "_object_det_interval_s", 1.0):
+            return
+        if getattr(self, "_object_det_busy", False):
+            return
+        self._last_object_det_time = now_m
+        self._object_det_busy = True
+
+        frame_copy = frame.copy()
+
+        def _worker(img):
+            try:
+                objs = self.object_engine.process_frame(img, now=time.time())
+                if getattr(self, "pub_detected_objects", None):
+                    payload = [o.to_dict() for o in objs]
+                    msg = String()
+                    msg.data = json.dumps(payload, ensure_ascii=False)
+                    self.pub_detected_objects.publish(msg)
+            except Exception as err:
+                self.get_logger().debug(f"_maybe_detect_objects worker notice: {err}")
+            finally:
+                self._object_det_busy = False
+
+        threading.Thread(target=_worker, args=(frame_copy,), daemon=True).start()
 
     def step_camera_frame(
         self,
@@ -898,6 +979,7 @@ class StandaloneGazeRosNode(Node):
         else:
             detections = []
         self._maybe_recognize_face(frame, detections)
+        self._maybe_detect_objects(frame)
         t_end = time.monotonic()
         frame_h, frame_w = frame.shape[:2]
         if timestamp is not None:

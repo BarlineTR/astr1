@@ -37,13 +37,14 @@ except ImportError:
 
 def bgr_to_imgmsg(frame: np.ndarray, header=None) -> Image:
     msg = Image()
-    if isinstance(header, Header):
+    if not hasattr(msg, "header") or msg.header is None:
+        msg.header = Header()
+
+    if isinstance(header, Header) or header is not None:
         msg.header = header
     elif hasattr(header, "sec") and hasattr(header, "nanosec"):
         msg.header.stamp = header
         msg.header.frame_id = "oak_rgb_camera_optical_frame"
-    elif hasattr(header, "header") and isinstance(header.header, Header):
-        msg.header = header.header
     else:
         msg.header.frame_id = "oak_rgb_camera_optical_frame"
 

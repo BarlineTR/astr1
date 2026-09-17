@@ -1188,15 +1188,62 @@ class AstroRealtimeNode(Node):
         try:
             active_p = []
             if getattr(self, "_recognized_person", None) and UnifiedPersonState:
-                p_name = self._recognized_person.get("name", "Misafir")
-                p_id = str(self._recognized_person.get("user_id", p_name.lower()))
+                ident = self.resolve_identities() if callable(getattr(self, "resolve_identities", None)) else {}
+                bio_status = ident.get("biometric_status", "unknown")
+                is_conflict = bio_status == "ambiguous"
+                is_bio_verified = bio_status in ("verified", "probable", "session_active")
+
+                raw_recog = self._recognized_person
+                raw_name = raw_recog.get("name") or raw_recog.get("recognized_name")
+                raw_known = bool(raw_recog.get("is_known", False) and raw_name and raw_name.lower() != "misafir")
+
+                if is_conflict:
+                    p_name = "Misafir"
+                    p_id = "misafir"
+                    is_known = False
+                    p_formal = "Misafir"
+                    p_conf = 0.20
+                    p_fam = 0.20
+                elif raw_known:
+                    p_name = raw_name
+                    p_id = str(raw_recog.get("user_id", p_name.lower()))
+                    is_known = True
+                    p_formal = raw_recog.get("formal_title", raw_recog.get("title", p_name))
+                    p_conf = float(raw_recog.get("confidence", 0.85))
+                    p_fam = 0.85
+                elif is_bio_verified:
+                    # Verified speaker / session in front of the robot
+                    p_name = ident.get("session_identity", "Misafir")
+                    p_id = str(ident.get("user_id", p_name.lower()))
+                    is_known = bool(ident.get("is_known", True) and p_name.lower() != "misafir")
+                    p_formal = ident.get("formal_title", ident.get("title", p_name))
+                    p_conf = float(ident.get("biometric_confidence", 0.85))
+                    p_fam = 0.80
+                else:
+                    p_name = "Misafir"
+                    p_id = "misafir"
+                    is_known = False
+                    p_formal = "Misafir"
+                    p_conf = 0.20
+                    p_fam = 0.20
+
+                vad_speaking = bool(getattr(self, "_user_speaking_active", False))
+                has_vad = bool(vad_speaking or getattr(self, "_vad_active", False))
+
                 active_p.append(UnifiedPersonState(
                     person_id=p_id,
                     name=p_name,
+                    formal_title=p_formal,
+                    is_known=is_known,
+                    identity_confidence=p_conf,
+                    familiarity_score=p_fam,
                     distance_m=float(getattr(self, "_user_distance", 1.5) or 1.5),
                     azimuth_deg=float(getattr(self, "_speaker_angle", 0.0) or 0.0),
                     is_looking_at_robot=bool(getattr(self, "_looking_at_robot", False)),
                     is_present=True,
+                    has_vision=True,
+                    has_audio=has_vad,
+                    is_speaking=vad_speaking,
                 ))
 
             self.cognitive_loop.step({
