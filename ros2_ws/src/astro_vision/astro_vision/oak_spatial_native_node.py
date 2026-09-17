@@ -325,23 +325,23 @@ class OakSpatialNativeNode(Node):
                             pass
 
                     face_list.append({
-                        "x": x, "y": y, "width": bw, "height": bh,
+                        "x": int(x), "y": int(y), "width": int(bw), "height": int(bh),
                         "confidence": round(float(detection_conf), 2),
                         "frame_width": int(w), "frame_height": int(h),
                         "spatial_x_m": round(float(spatial_x_m), 2),
                         "distance_m": round(float(dist_m), 2),
-                        "yaw_deg": round(yaw_deg, 1),
-                        "looking_at_robot": direct_gaze,
+                        "yaw_deg": round(float(yaw_deg), 1),
+                        "looking_at_robot": bool(direct_gaze),
                         "emotion": "neutral",
-                        "recognized_name": recog_name,
-                        "recognized_title": recog_title,
-                        "is_known": is_known,
-                        "recognition_confidence": round(recog_conf, 2),
-                        "age_group": age_group_val,
-                        "age_confidence": round(age_conf, 2),
-                        "dominant_clothing_color": dominant_color,
-                        "dominant_clothing_color_tr": dominant_color_tr,
-                        "accessories": accessories,
+                        "recognized_name": str(recog_name),
+                        "recognized_title": str(recog_title),
+                        "is_known": bool(is_known),
+                        "recognition_confidence": round(float(recog_conf), 2),
+                        "age_group": str(age_group_val),
+                        "age_confidence": round(float(age_conf), 2),
+                        "dominant_clothing_color": str(dominant_color),
+                        "dominant_clothing_color_tr": str(dominant_color_tr),
+                        "accessories": list(accessories),
                     })
 
                     # HUD Overlay
@@ -388,8 +388,19 @@ class OakSpatialNativeNode(Node):
                 emo_msg.data = "neutral"
                 self.pub_emotion.publish(emo_msg)
 
+                def _json_default(obj):
+                    if isinstance(obj, (np.bool_, bool)):
+                        return bool(obj)
+                    if isinstance(obj, (np.integer, int)):
+                        return int(obj)
+                    if isinstance(obj, (np.floating, float)):
+                        return float(obj)
+                    if isinstance(obj, np.ndarray):
+                        return obj.tolist()
+                    return str(obj)
+
                 faces_msg = String()
-                faces_msg.data = json.dumps(face_list, ensure_ascii=False)
+                faces_msg.data = json.dumps(face_list, default=_json_default, ensure_ascii=False)
                 self.pub_faces.publish(faces_msg)
 
                 # Publish Recognized Person
@@ -400,18 +411,18 @@ class OakSpatialNativeNode(Node):
                     "title": top_face.get("recognized_title", "Misafir"),
                     "formal_title": top_face.get("recognized_title", "Misafir"),
                     "confidence": top_face.get("recognition_confidence", 0.0),
-                    "is_known": top_face.get("is_known", False),
+                    "is_known": bool(top_face.get("is_known", False)),
                     "age_group": top_face.get("age_group", "UNKNOWN"),
                     "dominant_clothing_color": top_face.get("dominant_clothing_color", ""),
                     "dominant_clothing_color_tr": top_face.get("dominant_clothing_color_tr", ""),
                     "accessories": top_face.get("accessories", []),
                 }
-                recog_msg.data = json.dumps(recog_payload, ensure_ascii=False)
+                recog_msg.data = json.dumps(recog_payload, default=_json_default, ensure_ascii=False)
                 self.pub_recognized_person.publish(recog_msg)
 
                 # Publish Object Detections
                 obj_msg = String()
-                obj_msg.data = json.dumps([o.to_dict() for o in detected_objs], ensure_ascii=False)
+                obj_msg.data = json.dumps([o.to_dict() for o in detected_objs], default=_json_default, ensure_ascii=False)
                 self.pub_detected_objects.publish(obj_msg)
 
                 hud_msg = bgr_to_imgmsg(frame, header)
