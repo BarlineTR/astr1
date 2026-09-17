@@ -428,6 +428,14 @@ class OakSpatialNativeNode(Node):
                 hud_msg = bgr_to_imgmsg(frame, header)
                 self.pub_face_image.publish(hud_msg)
 
+                # Periodic Throttled Status Log (Every 3 seconds)
+                now_mono = time.monotonic()
+                if (now_mono - getattr(self, "_last_log_time", 0.0)) >= 3.0:
+                    self._last_log_time = now_mono
+                    obj_summary = ", ".join([f"{getattr(o, 'class_name_tr', getattr(o, 'class_name', 'nesne'))} ({getattr(o, 'distance_m', 0.0):.1f}m)" for o in detected_objs]) if detected_objs else "Yok"
+                    person_summary = f"Var ({closest_dist:.1f}m, '{recog_payload.get('name', 'Misafir')}')" if person_detected else "Yok"
+                    self.get_logger().info(f"👁️ [Görsel Algı Canlı] Kişi: {person_summary} | Nesneler: {obj_summary}")
+
             time.sleep(0.01)
 
     def destroy_node(self):
