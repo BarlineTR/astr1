@@ -441,14 +441,19 @@ def discover_realtime_models(api_key: str, preferred: str = "") -> list[str]:
         req = urllib.request.Request("https://api.openai.com/v1/models", headers={"Authorization": f"Bearer {api_key}", "User-Agent": "Mozilla/5.0"})
         with urllib.request.urlopen(req, timeout=4) as resp:
             data = json.loads(resp.read().decode())
-            avail_ids = [m["id"] for m in data.get("data", []) if "realtime" in m.get("id", "")]
-            # Sort available models by priority
-            for fm in flagship_realtime_models:
-                if fm in avail_ids and fm not in candidates:
-                    candidates.append(fm)
-            for mid in avail_ids:
-                if mid not in candidates:
-                    candidates.append(mid)
+            avail_ids = set(m["id"] for m in data.get("data", []) if "realtime" in m.get("id", ""))
+            if avail_ids:
+                candidates = [c for c in candidates if c in avail_ids]
+                # Auto-upgrade or alias deprecated gpt-4o-realtime-preview to gpt-realtime if account lacks the preview name
+                if preferred == "gpt-4o-realtime-preview" and "gpt-4o-realtime-preview" not in avail_ids and "gpt-realtime" in avail_ids:
+                    candidates.insert(0, "gpt-realtime")
+                # Sort available models by priority
+                for fm in flagship_realtime_models:
+                    if fm in avail_ids and fm not in candidates:
+                        candidates.append(fm)
+                for mid in sorted(avail_ids):
+                    if mid not in candidates:
+                        candidates.append(mid)
     except Exception as _exc:
         _LOG.debug("discover_realtime_models: yok sayılan hata (%s)", _exc)
 
@@ -1519,7 +1524,15 @@ class AstroRealtimeNode(Node):
                     self._publish_realtime_state("CONNECTED")
 
                     # Send Initial Session Update
-                    await self._send_session_update(ws)
+                    success = await self._send_session_update(ws)
+                    if not success:
+                        model_idx += 1
+                        try:
+                            await ws.close()
+                        except Exception:
+                            pass
+                        await asyncio.sleep(1.0)
+                        continue
 
                     # Listen for Realtime Events
                     async for message in ws:
