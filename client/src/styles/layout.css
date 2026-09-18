@@ -66,18 +66,66 @@
   .btn--quiet { display: none; }
 }
 
-/* ═══════════════════════════  Film  ═══════════════════════════ */
+/* ═══════════════════════════  Giriş bölümü  ═══════════════════════════ */
 
 /*
- * Sayfanın ilk bölümü tek bir sahnedir: tuval yapışkan olarak ekranda kalır,
- * metin ekranları onun üzerinden akar. Giriş ve özellik adımları aynı tuvali
- * paylaşır — ikinci bir sahne, 95 bin üçgenlik modeli ve dokularını ekran
- * kartına ikinci kez yüklerdi.
+ * Giriş akışta kayar; yapışkan değildir.
+ *
+ * Tek bir yapışkan tuval giriş ile gösteri arasında paylaşıldığında, giriş metni
+ * ve rakam şeridi yukarı kayarken sabit duran modelin ortasından geçiyordu.
+ * Bölüm akışta kaldığında model, metniyle birlikte hareket eder ve bu kesişme
+ * yapısal olarak imkânsız hale gelir.
  */
+.hero {
+  position: relative;
+  min-height: 100vh;
+  min-height: 100svh;
+  display: flex;
+  align-items: center;
+  overflow: hidden;
+}
 
-.film { position: relative; }
+.hero__stage {
+  position: absolute;
+  inset: 0;
+  z-index: 0;
+  /* Model, isim ekrandayken görünmez; açılış bitince belirir. */
+  opacity: 0;
+  transition: opacity var(--intro-settle) var(--ease-scene);
+}
 
-.film__sticky {
+.hero.is-settled .hero__stage { opacity: 1; }
+
+/* Metnin okunabilmesi için soldan sağa sönümlenen perde. */
+.hero::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity var(--intro-settle) var(--ease-scene);
+  background: linear-gradient(
+    100deg,
+    var(--bg) 0%,
+    color-mix(in srgb, var(--bg) 82%, transparent) 34%,
+    transparent 62%
+  );
+}
+
+.hero.is-settled::after { opacity: 1; }
+
+.hero__inner { position: relative; z-index: 2; }
+
+/* ═══════════════════════════  Özellik gösterisi  ═══════════════════════════ */
+
+/*
+ * Gösterinin kendi sahnesi vardır ve yalnızca bu bölüm boyunca yapışır.
+ * Girişten ayrı olması, iki bölümün birbirinin çerçevesini bozmasını önler.
+ */
+.showcase { position: relative; }
+
+.showcase__sticky {
   position: sticky;
   top: 0;
   height: 100vh;
@@ -86,28 +134,26 @@
   z-index: 0;
 }
 
-.film__stage { position: absolute; inset: 0; }
+.showcase__stage { position: absolute; inset: 0; }
 
 /*
- * Ekranlar yapışkan tuvalin üzerine bindirilir. Negatif üst boşluk, akışta
- * yapışkan öğenin kapladığı yüksekliği geri alır; böylece ilk ekran tam
- * tuvalin üstüne oturur.
+ * Geniş ekranda adımlar sahnenin üstüne bindirilir: negatif üst boşluk, akışta
+ * yapışkan öğenin kapladığı yüksekliği geri alır.
  */
-.film__screens {
+.showcase__steps {
   position: relative;
   z-index: 2;
-  margin-top: -100vh;
+  list-style: none;
+  margin: -100vh 0 0;
   margin-top: -100svh;
-  /* Tuvalin fare ile döndürülebilmesi için boşluklar tıklamayı geçirir. */
+  padding: 0;
   pointer-events: none;
 }
 
-.film__screens > *,
-.film__screens .page { pointer-events: auto; }
+.showcase__steps > *,
+.showcase__steps .page { pointer-events: auto; }
 
-.film__steps { list-style: none; margin: 0; padding: 0; }
-
-.screen {
+.step {
   position: relative;
   min-height: 100vh;
   min-height: 100svh;
@@ -115,8 +161,7 @@
   align-items: center;
 }
 
-/* Metnin okunabilmesi için soldan sağa sönümlenen perde. */
-.screen::before {
+.step::before {
   content: "";
   position: absolute;
   inset: 0;
@@ -154,6 +199,9 @@
   left: 0;
   right: 0;
   bottom: 0;
+  /* Perde z-index 1'de duruyor; şerit onun üstünde olmalı yoksa solda tamamen
+     örtülür. */
+  z-index: 2;
   border-top: 1px solid var(--rule);
   background: color-mix(in srgb, var(--bg) 78%, transparent);
   backdrop-filter: blur(6px);
@@ -195,8 +243,8 @@
  * koyar. Koşulsuz gizlenseydi ve denetleyici hiç başlamasaydı (sahne yüklenemedi,
  * gözlemci desteklenmiyor) bütün özellik metinleri görünmez kalırdı.
  */
-.film__steps.is-driven .step__inner { opacity: 0; transform: translateY(0.75rem); }
-.film__steps.is-driven .step.is-active .step__inner { opacity: 1; transform: none; }
+.showcase__steps.is-driven .step__inner { opacity: 0; transform: translateY(0.75rem); }
+.showcase__steps.is-driven .step.is-active .step__inner { opacity: 1; transform: none; }
 
 .step__index { font-size: var(--t-micro); letter-spacing: 0.16em; color: var(--accent); }
 
@@ -277,14 +325,7 @@
   text-align: center;
   padding-inline: var(--gutter);
   pointer-events: none;
-  /* Dev tipografinin model üstünde okunabilmesi için perde; kenarlara doğru
-     tamamen saydam, böylece model kaybolmaz. */
-  background: radial-gradient(
-    ellipse 70% 52% at 50% 50%,
-    color-mix(in srgb, var(--bg) 82%, transparent) 0%,
-    color-mix(in srgb, var(--bg) 55%, transparent) 45%,
-    transparent 78%
-  );
+  /* Arkasında perde yok: model, isim silinene kadar zaten görünmüyor. */
   transition:
     opacity var(--intro-exit) var(--ease-scene),
     transform var(--intro-exit) var(--ease-scene);
@@ -328,8 +369,8 @@
   to   { opacity: 1; transform: none; }
 }
 
-.film.is-exiting .intro,
-.film.is-settled .intro {
+.hero.is-exiting .intro,
+.hero.is-settled .intro {
   opacity: 0;
   transform: translateY(-0.5rem);
 }
@@ -341,20 +382,16 @@
     transform var(--intro-settle) var(--ease-scene);
 }
 
-.film.is-intro .hero__inner,
-.film.is-exiting .hero__inner { opacity: 0; transform: translateY(0.875rem); }
+.hero.is-intro .hero__inner,
+.hero.is-exiting .hero__inner { opacity: 0; transform: translateY(0.875rem); }
 
-.film.is-intro .figures,
-.film.is-exiting .figures { opacity: 0; transform: translateY(0.5rem); }
+.hero.is-intro .figures,
+.hero.is-exiting .figures { opacity: 0; transform: translateY(0.5rem); }
 
-.film.is-settled .hero__inner,
-.film.is-settled .figures { opacity: 1; transform: none; }
+.hero.is-settled .hero__inner,
+.hero.is-settled .figures { opacity: 1; transform: none; }
 
-.film.is-settled .figures { transition-delay: 100ms; }
-
-/* Giriş sürerken adımların perdesi görünmemeli. */
-.film.is-intro .screen::before,
-.film.is-exiting .screen::before { opacity: 0; }
+.hero.is-settled .figures { transition-delay: 100ms; }
 
 /* ═══════════════════════════  Kaydırma belirmeleri  ═══════════════════════════ */
 
@@ -373,7 +410,7 @@
   .intro, .hero__inner, .figures, .step__inner, .mark, .reveal {
     transition: none;
   }
-  .reveal, .film__steps.is-driven .step__inner { opacity: 1; transform: none; }
+  .reveal, .showcase__steps.is-driven .step__inner { opacity: 1; transform: none; }
 }
 
 /* ═══════════════════════════  Sayfa başlığı ve metin  ═══════════════════════════ */
@@ -495,37 +532,100 @@
 
 /* ═══════════════════════════  Dar ekran  ═══════════════════════════ */
 
-/*
- * Yatayda metin için yer yok: ayrım dikey yapılır. Tuval üst yarıda kalır,
- * metin altta, aralarında aşağı doğru koyulaşan bir perde.
- */
 @media (max-width: 60rem) {
-  .screen { align-items: flex-end; padding-bottom: var(--s-5); }
-
-  /* Perde sahneyle sabit kalır; her metin ekranıyla yukarı kaymaz. */
-  .screen::before { display: none; }
-  .film__sticky::after {
-    content: "";
-    position: absolute;
-    inset: 0;
-    pointer-events: none;
-    background: linear-gradient(
-      to bottom,
-      transparent 0%,
-      transparent 30%,
-      color-mix(in srgb, var(--bg) 78%, transparent) 52%,
-      var(--bg) 78%
-    );
+  /*
+   * Giriş: yatayda metin için yer yok, ayrım dikey yapılır. Model üstte kalır
+   * (kamera onu yukarı kaldırır), metin aşağı doğru koyulaşan bir perdenin
+   * üstünde durur.
+   */
+  /*
+   * Giriş üç satırlı bir ızgara olur: model, metin, rakamlar.
+   *
+   * Modeli tam ekrana yayıp metni perdeyle okutmayı denemek yetmiyordu — perde
+   * ne kadar ayarlanırsa ayarlansın, görüş konisinin çizgileri başlığın üstünden
+   * geçiyordu. Modele kendi satırı verilince çakışma imkânsız hale gelir.
+   */
+  .hero {
+    display: grid;
+    grid-template-rows: minmax(11rem, 1fr) auto auto;
+    align-items: stretch;
+    padding-bottom: 0;
   }
 
-  .screen--hero { padding-bottom: 8.5rem; }
+  .hero__stage { position: relative; grid-row: 1; }
+  .hero__inner { grid-row: 2; padding-block: var(--s-3) var(--s-4); }
+
+  .figures {
+    position: static;
+    grid-row: 3;
+    backdrop-filter: none;
+    background: var(--bg);
+  }
+
+  /* Geniş ekranın soldan sağa perdesi burada işe yaramaz; sahnenin kendi alt
+     kenarı zemine bağlanır. */
+  .hero::after { display: none; }
+
+  .hero__stage::after {
+    content: "";
+    position: absolute;
+    inset: auto 0 0 0;
+    height: 30%;
+    pointer-events: none;
+    background: linear-gradient(to bottom, transparent, var(--bg));
+  }
 
   .hero__title { max-width: none; font-size: clamp(2.25rem, 9vw, 3.25rem); }
   .hero__lead { font-size: var(--t-body); max-width: none; }
 
+  /*
+   * Gösteri: adımlar sahnenin ÜSTÜNE bindirilmez, ALTINDAN akar.
+   *
+   * Geniş ekranda metin modelin yanında durabiliyor; telefonda duramaz. Metni
+   * modelin üzerine bindirmek iki sorunu birden doğuruyordu — yazı modelin
+   * detaylı yüzeyinde okunmuyor, ve her adımda ekranın tamamı yeniden boyandığı
+   * için kaydırma takılıyordu. Sahne üstte sabitlenip metin altından akınca
+   * ikisi de kalkar: boyanan alan küçülür ve metin düz zemine oturur.
+   */
+  /*
+   * Sahne ile adım yüksekliği birbirine bağlıdır.
+   *
+   * Sahnenin altında kalan okuma penceresi = ekran − başlık − sahne. Adım
+   * aralığı bu pencereden büyük olursa, bir adımın metni sahnenin arkasına
+   * girdikten sonra bir sonraki daha ekrana girmemiş olur ve arada hiçbir yazının
+   * görünmediği boşluklar oluşur. 42 + 48 oranı pencereyi adımdan geniş tutar.
+   */
+  .showcase__sticky {
+    top: 3.75rem;
+    height: 42svh;
+    border-bottom: 1px solid var(--rule);
+    /*
+     * Sahne adımların üstünde ve opak durur.
+     *
+     * Yapışkan öğe sabitlendiğinde altındaki adımlar onun hizasından geçer;
+     * adımlar z-index 2'de olduğu için metin, sabitlenmiş modelin üzerine
+     * çizilirdi. Sahne üste alınıp zemini doldurulunca metin arkasından akar.
+     */
+    z-index: 3;
+    background: var(--bg);
+  }
+
+  .showcase__steps { margin-top: 0; }
+
+  .step {
+    min-height: 48svh;
+    padding-block: var(--s-4);
+    align-items: flex-start;
+  }
+
+  .step::before { display: none; }
+
   .step__title { font-size: clamp(1.75rem, 7vw, 2.5rem); }
   .step__body { font-size: var(--t-body); max-width: none; }
-  .film__steps.is-driven .step.is-seen .step__inner { opacity: 1; transform: none; }
+
+  /* Okunmuş adımlar görünür kalır: telefonda kaydırma sıçradığında metin
+     yanıp sönmesin. */
+  .showcase__steps.is-driven .step.is-seen .step__inner { opacity: 1; transform: none; }
 
   .figures__inner { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: var(--s-2) var(--s-3); }
   .figures__value { font-size: 1.125rem; }

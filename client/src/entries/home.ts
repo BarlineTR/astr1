@@ -14,49 +14,48 @@ if (!root) throw new Error("#app bulunamadı");
 const view = renderHome(root);
 const reducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
 const motion = getComputedStyle(document.documentElement);
+
 const INTRO_HOLD_MS = 1800;
 const INTRO_EXIT_MS = parseFloat(motion.getPropertyValue("--intro-exit"));
-const SETTLE_MS = parseFloat(motion.getPropertyValue("--intro-settle"));
-let scene: RobotScene | null = null;
-let composition = 0;
-let introFrame = 0;
+
 let introTimer = 0;
 let introFinished = false;
 
 observeReveals(view.revealTargets, reducedMotion);
 startIntro();
-void mountScene();
+void mountHero();
+watchShowcase();
 
-/** Metin modeli beklemez; geç yüklenen sahne o anki kompozisyona katılır. */
+/**
+ * Açılış: önce yalnızca isim, sonra model.
+ *
+ * Model, isim ekranda dururken görünmez. İkisi aynı anda görünseydi dev
+ * tipografi modelin üstüne biner ve ne yazı ne de model düzgün okunurdu.
+ *
+ * Sıra sahneyi beklemez: model geç yüklense de metin zamanında gelir, sahne
+ * hazır olduğunda kendi yerine oturur.
+ */
 function startIntro(): void {
   if (reducedMotion || document.hidden || window.scrollY > 24 || window.location.hash) {
     finishIntro();
     return;
   }
+
   window.addEventListener("scroll", skipOnScroll, { passive: true });
   document.addEventListener("visibilitychange", skipWhenHidden);
+
   introTimer = window.setTimeout(() => {
     view.setPhase("exiting");
-    introTimer = window.setTimeout(() => {
-      view.setPhase("settled");
-      const start = performance.now();
-      const step = (now: number): void => {
-        const t = Math.min((now - start) / SETTLE_MS, 1);
-        // CSS --ease-scene ile aynı kübik çıkış eğrisi.
-        composition = 1 - Math.pow(1 - t, 3);
-        scene?.setComposition(composition);
-        if (t < 1) introFrame = requestAnimationFrame(step);
-        else finishIntro();
-      };
-      introFrame = requestAnimationFrame(step);
-    }, INTRO_EXIT_MS);
+    introTimer = window.setTimeout(finishIntro, INTRO_EXIT_MS);
   }, INTRO_HOLD_MS);
 }
 
+/** Kullanıcı kaydırmaya başladıysa açılışı beklemesin. */
 function skipOnScroll(): void {
   if (window.scrollY > 24) finishIntro();
 }
 
+/** Arka plana alınan sekmede zamanlayıcılar kısılır; açılış orada takılı kalmasın. */
 function skipWhenHidden(): void {
   if (document.hidden) finishIntro();
 }
@@ -65,51 +64,95 @@ function finishIntro(): void {
   if (introFinished) return;
   introFinished = true;
   clearTimeout(introTimer);
-  cancelAnimationFrame(introFrame);
   window.removeEventListener("scroll", skipOnScroll);
   document.removeEventListener("visibilitychange", skipWhenHidden);
   view.setPhase("settled");
-  composition = 1;
-  scene?.setComposition(1);
 }
 
-async function mountScene(): Promise<void> {
+/**
+ * Giriş sahnesi: tek kare çizilir ve öyle kalır.
+ *
+ * Bu bölümde model hareket etmez — ne kendi döner, ne kamera gezer, ne de
+ * sürüklenebilir. Bu yüzden çizim döngüsü hiç başlatılmaz; sahne kurulurken
+ * üretilen tek kare yeterlidir ve sayfa boyunca hiç iş yapmaz.
+ */
+async function mountHero(): Promise<void> {
   try {
-    const [{ createRobotScene }, { DemoDriver }] = await Promise.all([
-      import("../scene/robot-scene"),
-      import("../../../shared/demo-driver"),
-    ]);
-    scene = await createRobotScene(view.stageEl, {
-      offsetSubject: composition === 1,
+    const { createRobotScene } = await import("../scene/robot-scene");
+    await createRobotScene(view.heroStageEl, {
       autoOrbit: false,
+      interactive: false,
+      // Dar ekranda sahnenin kendi ızgara satırı var; modeli ayrıca yukarı
+      // itmek onu satırın üst kenarına yapıştırırdı.
+      compactLift: false,
     });
-    scene.setComposition(composition);
-    if (!reducedMotion) scene.setDriver(new DemoDriver());
-    scene.start();
-
-    // Azaltılmış harekette sabit model ve her zaman okunabilir metinler.
-    // Gösteri, metnin yeniden akışını yakalamak için ResizeObserver kullanır;
-    // desteklenmeyen tarayıcıda hiç başlatılmaz ve adımlar düz metin kalır.
-    if (!reducedMotion && "ResizeObserver" in window) {
-      startShowcase({
-        scene,
-        steps: view.stepEls,
-        markEl: view.markEl,
-        markLabelEl: view.markLabelEl,
-        stageEl: view.stageEl,
-      });
-    }
   } catch (error) {
-    console.error("3B sahne yüklenemedi:", error);
-    view.stageEl.querySelector("canvas")?.remove();
-    view.stageEl.appendChild(
-      el(
-        "div",
-        { class: "stage-fallback" },
-        el("p", { class: "eyebrow" }, "3B görünüm kullanılamıyor"),
-        el("p", {}, "Sayfanın geri kalanı etkilenmez."),
-      ),
-    );
+    console.error("Giriş sahnesi yüklenemedi:", error);
+    showStageFallback(view.heroStageEl);
     finishIntro();
   }
+}
+
+/**
+ * Gösteri sahnesi yaklaşınca kurulur.
+ *
+ * İki sahne iki ayrı WebGL bağlamı demek. Gösteri hiç görülmeyecekse — ziyaretçi
+ * giriş ekranından ayrılmadan çıkarsa — ikinci bağlamı hiç açmamak, özellikle
+ * telefonda anlamlı bir kazanç. Yüklemeye bölüm ekrana girmeden başlanır ki
+ * ziyaretçi oraya vardığında sahne hazır olsun.
+ */
+function watchShowcase(): void {
+  if (reducedMotion || !("ResizeObserver" in window) || !("IntersectionObserver" in window)) {
+    return;
+  }
+
+  const observer = new IntersectionObserver(
+    (entries) => {
+      if (!entries.some((entry) => entry.isIntersecting)) return;
+      observer.disconnect();
+      void mountShowcase();
+    },
+    { rootMargin: "120% 0px" },
+  );
+
+  observer.observe(view.showcaseEl);
+}
+
+async function mountShowcase(): Promise<void> {
+  let scene: RobotScene;
+  try {
+    const { createRobotScene } = await import("../scene/robot-scene");
+    scene = await createRobotScene(view.showcaseStageEl, {
+      autoOrbit: false,
+      interactive: false,
+      // Gösteri kendi kutusundadır; dar ekranda modeli yukarı itmeye gerek yok.
+      compactLift: false,
+    });
+    scene.start();
+  } catch (error) {
+    console.error("Gösteri sahnesi yüklenemedi:", error);
+    showStageFallback(view.showcaseStageEl);
+    return;
+  }
+
+  startShowcase({
+    scene,
+    steps: view.stepEls,
+    markEl: view.markEl,
+    markLabelEl: view.markLabelEl,
+    stageEl: view.showcaseStageEl,
+  });
+}
+
+/** Sahne kurulamazsa sayfanın geri kalanı çalışmaya devam eder. */
+function showStageFallback(container: HTMLElement): void {
+  container.querySelector("canvas")?.remove();
+  container.appendChild(
+    el(
+      "div",
+      { class: "stage-fallback" },
+      el("p", { class: "eyebrow" }, "3B görünüm kullanılamıyor"),
+      el("p", {}, "Sayfanın geri kalanı etkilenmez."),
+    ),
+  );
 }

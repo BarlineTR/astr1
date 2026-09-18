@@ -1,5 +1,6 @@
 import * as THREE from "three";
 import { GLTFLoader } from "three/examples/jsm/loaders/GLTFLoader.js";
+import type { GLTF } from "three/examples/jsm/loaders/GLTFLoader.js";
 
 /**
  * Sahnedeki robot modelinin, sahnenin geri kalanına gösterdiği yüz.
@@ -50,8 +51,26 @@ export const HERO_MODEL: ScanModelConfig = {
  * Üçgenler ağırlık merkezlerinin yüksekliğine göre iki indeks kümesine ayrılır.
  * Köşe tamponları paylaşılır — kopyalanan tek şey indeks dizisidir.
  */
+/**
+ * Çözümlenmiş dosyanın paylaşılan önbelleği.
+ *
+ * Sayfada iki sahne var — giriş ve özellik gösterisi — ve ikisi de aynı modeli
+ * kullanıyor. Önbellek olmasaydı 2,7 MB'lık dosya iki kez indirilip iki kez
+ * çözümlenirdi; çözümleme, 95 bin üçgenlik bir taramada ana iş parçacığını
+ * gözle görülür süre meşgul eder.
+ *
+ * Paylaşılan tek şey çözümleme sonucudur. Her sahne kendi geometrisini kopyalar,
+ * çünkü kubbe ayrımı ve dünya dönüşümü sahneye özgüdür.
+ */
+let parsed: Promise<GLTF> | null = null;
+
+function loadOnce(url: string): Promise<GLTF> {
+  parsed ??= new GLTFLoader().loadAsync(url);
+  return parsed;
+}
+
 export async function loadScanRobot(config: ScanModelConfig): Promise<RobotModel> {
-  const gltf = await new GLTFLoader().loadAsync(config.url);
+  const gltf = await loadOnce(config.url);
 
   const source = findFirstMesh(gltf.scene);
   if (!source) throw new Error("Model içinde mesh bulunamadı");
@@ -224,9 +243,13 @@ function normalizeMaterial(input: THREE.Material | THREE.Material[]): THREE.Mesh
   return material;
 }
 
+/**
+ * Malzemeyi bırakır, dokularını bırakmaz.
+ *
+ * Dokular çözümleme önbelleğinden gelir ve iki sahne tarafından paylaşılır;
+ * biri kapanırken onları bırakırsa diğerinin modeli dokusuz kalır. Dokular
+ * sayfa ömrü boyunca yaşar — iki küçük doku için bu, yanlış görüntüden iyidir.
+ */
 function disposeMaterial(material: THREE.MeshStandardMaterial): void {
-  material.map?.dispose();
-  material.normalMap?.dispose();
-  material.aoMap?.dispose();
   material.dispose();
 }

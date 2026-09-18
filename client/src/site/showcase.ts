@@ -85,7 +85,17 @@ export function startShowcase(options: {
    */
   function readingTop(): number {
     const header = document.querySelector(".site-header");
-    return header ? header.getBoundingClientRect().bottom : 0;
+    const top = header ? header.getBoundingClientRect().bottom : 0;
+
+    if (!compact.matches) return top;
+
+    /*
+     * Telefonda sahne ekranın üstüne sabitlenir ve metin onun altından akar.
+     * Okuma alanı da orada başlar: sahnenin arkasına girmiş bir yazı, başlık
+     * şeridinin altında olsa bile okunmuyordur.
+     */
+    const stage = document.querySelector(".showcase__sticky");
+    return stage ? Math.max(top, stage.getBoundingClientRect().bottom) : top;
   }
 
   interface Placement {

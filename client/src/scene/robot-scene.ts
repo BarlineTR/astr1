@@ -41,13 +41,6 @@ export interface RobotScene {
   project(point: THREE.Vector3): { x: number; y: number; inFront: boolean };
   /** Her çizilen kareden sonra çağrılır. İşaretlerin konumu buradan güncellenir. */
   onFrame(listener: (() => void) | null): void;
-  /**
-   * Modelin çerçevedeki yatay yerini ayarlar: 0 ortalı, 1 tamamen sağda.
-   *
-   * Açılış animasyonu bunu 0'dan 1'e sürer — model ortada büyük başlar, sonra
-   * sağa kayar ve solda metne yer açar.
-   */
-  setComposition(amount: number): void;
   /** Sürücü yokken sahneyi doğrudan sürmek için — konsol bunu kullanır. */
   apply(state: SceneState): void;
   start(): void;
@@ -67,6 +60,15 @@ export interface RobotSceneOptions {
    * başına durur; orada kaydırma modeli sebepsiz yere kenara iter.
    */
   offsetSubject?: boolean;
+  /**
+   * Dar ekranda model yukarı kaldırılsın mı.
+   *
+   * Giriş bölümünde sahne bütün ekranı kaplar ve metin altta durur; orada model
+   * yukarı kalkmazsa yazının tam arkasına düşer. Özellik gösterisinde ise sahne
+   * kendi kutusundadır ve altındaki metinle çakışmaz — orada kaldırmak modeli
+   * sebepsiz yere kutunun üst kenarına yapıştırır.
+   */
+  compactLift?: boolean;
 }
 
 export async function createRobotScene(
@@ -76,7 +78,8 @@ export async function createRobotScene(
   const reducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
   const autoOrbit = (options.autoOrbit ?? true) && !reducedMotion;
   const interactive = options.interactive ?? true;
-  let compositionAmount = options.offsetSubject === false ? 0 : 1;
+  const offsetSubject = options.offsetSubject !== false;
+  const compactLift = options.compactLift ?? true;
 
   /**
    * Dokunmatik cihazlarda döndürme kapalıdır.
@@ -190,15 +193,20 @@ export async function createRobotScene(
    * altında durur.
    */
   function applyComposition(width: number, height: number): void {
-    if (compositionAmount <= 0.001) {
+    if (!offsetSubject) {
       camera.clearViewOffset();
       return;
     }
 
     if (!compactLayout.matches) {
       // Geniş ekran: metin solda, model sağa kayar.
-      const shift = width * 0.17 * compositionAmount;
+      const shift = width * 0.17;
       camera.setViewOffset(width, height, -shift, 0, width, height);
+      return;
+    }
+
+    if (!compactLift) {
+      camera.clearViewOffset();
       return;
     }
 
@@ -210,7 +218,7 @@ export async function createRobotScene(
      * okunmaz olurdu. Pozitif `y`, izdüşüm penceresini aşağı kaydırır; bu da
      * özneyi ekranda yukarı taşır.
      */
-    const lift = height * 0.26 * compositionAmount;
+    const lift = height * 0.26;
     camera.setViewOffset(width, height, 0, lift, width, height);
   }
 
@@ -375,14 +383,6 @@ export async function createRobotScene(
     },
     onFrame(listener) {
       frameListener = listener;
-    },
-    setComposition(amount) {
-      compositionAmount = Math.min(1, Math.max(0, amount));
-      const { clientWidth, clientHeight } = container;
-      if (clientWidth === 0 || clientHeight === 0) return;
-      applyComposition(clientWidth, clientHeight);
-      camera.updateProjectionMatrix();
-      if (!running) renderer.render(scene, camera);
     },
     apply,
     start() {

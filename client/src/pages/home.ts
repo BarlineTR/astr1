@@ -5,14 +5,18 @@ import { footer, header } from "../site/chrome";
 /**
  * Açılışın üç evresi.
  *
- * `exiting` ayrı bir evre, çünkü isim ile metnin geçişleri aynı anda başlayınca
- * üst üste biniyordu: "ASTRO" daha silinmeden başlık soldan giriyordu. Şimdi
- * isim önce tamamen çekiliyor, metin ondan sonra geliyor.
+ * `exiting` ayrı bir evre, çünkü isim ile sahnenin geçişleri aynı anda başlarsa
+ * üst üste binerler: "ASTRO" daha silinmeden model arkasında belirir. Sıra
+ * şudur — yalnızca isim, isim çekilir, sonra model ve metin gelir.
  */
 export type IntroPhase = "intro" | "exiting" | "settled";
 
 export interface HomeView {
-  stageEl: HTMLElement;
+  /** Giriş bölümünün kendi sahnesi. Sabit durur, hareket etmez. */
+  heroStageEl: HTMLElement;
+  /** Özellik gösterisinin kendi sahnesi. Adımlara göre hareket eder. */
+  showcaseEl: HTMLElement;
+  showcaseStageEl: HTMLElement;
   markEl: HTMLElement;
   markLabelEl: HTMLElement;
   stepEls: HTMLElement[];
@@ -23,13 +27,18 @@ export interface HomeView {
 /**
  * Ana sayfa.
  *
- * Sayfanın ilk bölümü tek bir "film"dir: 3B sahne yapışkan olarak ekranda sabit
- * durur, metin ekranları onun üzerinden akar. Önce giriş, sonra özelliklerin
- * model üzerinde tek tek gösterildiği adımlar. Tek bir tuval kullanılır —
- * ikinci bir sahne, modeli ve dokularını ikinci kez ekran kartına yüklerdi.
+ * Giriş ve özellik gösterisi birbirinden bağımsız iki bölümdür ve her birinin
+ * kendi 3B sahnesi vardır.
+ *
+ * Tek bir yapışkan tuval paylaşıldığında iki sorun çıkıyordu: giriş metni ve
+ * rakam şeridi yukarı kayarken sabit duran modelin ortasından geçiyor, ve
+ * girişin sakin duruşu ile gösterinin kamera hareketi aynı sahneyi çekiştiriyordu.
+ * Ayrı bölümler bunu yapısal olarak çözer — giriş akışta kayar, gösteri kendi
+ * içinde yapışır.
  */
 export function renderHome(root: HTMLElement): HomeView {
-  const stageEl = el("div", { class: "film__stage", id: "stage" });
+  const heroStageEl = el("div", { class: "hero__stage" });
+  const showcaseStageEl = el("div", { class: "showcase__stage" });
 
   const markLabelEl = el("span", { class: "mark__label" });
   const markEl = el(
@@ -52,67 +61,74 @@ export function renderHome(root: HTMLElement): HomeView {
     el("p", { class: "intro__tail" }, INTRO.tail),
   );
 
-  const heroScreen = el(
-    "section",
-    { class: "screen screen--hero" },
+  const heroCopy = el(
+    "div",
+    { class: "page hero__inner" },
+    el("p", { class: "eyebrow" }, HERO.eyebrow),
+    el("h1", { class: "hero__title" }, HERO.title),
+    el("p", { class: "hero__lead" }, HERO.lead),
     el(
       "div",
-      { class: "page hero__inner" },
-      el("p", { class: "eyebrow" }, HERO.eyebrow),
-      el("h1", { class: "hero__title" }, HERO.title),
-      el("p", { class: "hero__lead" }, HERO.lead),
-      el(
-        "div",
-        { class: "hero__actions" },
-        el("a", { class: "btn btn--primary", href: "#ozellikler" }, "Özellikler"),
-        el("a", { class: "btn", href: "/hakkimizda" }, "Hakkımızda"),
-      ),
+      { class: "hero__actions" },
+      el("a", { class: "btn btn--primary", href: "#ozellikler" }, "Özellikler"),
+      el("a", { class: "btn", href: "/hakkimizda" }, "Hakkımızda"),
     ),
+  );
+
+  const heroEl = el(
+    "section",
+    { class: "hero is-intro" },
+    heroStageEl,
+    intro,
+    heroCopy,
     figures(),
   );
 
   const stepEls = SHOWCASE.map((step, index) =>
     el(
       "li",
-      { class: "screen step", id: index === 0 ? "ozellikler" : step.id },
+      { class: "step", id: index === 0 ? "ozellikler" : step.id },
       el(
         "div",
         { class: "page step__inner" },
-        el("p", { class: "step__index mono" }, `${String(index + 1).padStart(2, "0")} / ${String(SHOWCASE.length).padStart(2, "0")}`),
+        el(
+          "p",
+          { class: "step__index mono" },
+          `${String(index + 1).padStart(2, "0")} / ${String(SHOWCASE.length).padStart(2, "0")}`,
+        ),
         el("h2", { class: "step__title" }, step.title),
         el("p", { class: "step__body" }, step.body),
       ),
     ),
   );
 
-  const film = el(
-    "div",
-    { class: "film is-intro" },
-    el("div", { class: "film__sticky" }, stageEl, markEl, intro),
-    el(
-      "div",
-      { class: "film__screens" },
-      heroScreen,
-      el("ol", { class: "film__steps" }, ...stepEls),
-    ),
+  const showcaseEl = el(
+    "section",
+    { class: "showcase" },
+    el("div", { class: "showcase__sticky" }, showcaseStageEl, markEl),
+    el("ol", { class: "showcase__steps" }, ...stepEls),
   );
 
   const moreSection = more();
   const closingSection = closing();
 
-  root.append(header("ana"), film, moreSection, closingSection, footer());
-  heroScreen.inert = true;
+  root.append(header("ana"), heroEl, showcaseEl, moreSection, closingSection, footer());
+  heroCopy.inert = true;
 
   return {
-    stageEl,
+    heroStageEl,
+    showcaseEl,
+    showcaseStageEl,
     markEl,
     markLabelEl,
     stepEls,
     setPhase(phase) {
-      heroScreen.inert = phase !== "settled";
-      film.classList.toggle("is-intro", phase === "intro");
-      film.classList.toggle("is-exiting", phase === "exiting");
-      film.classList.toggle("is-settled", phase === "settled");
+      // Giriş sürerken metin odaklanabilir olmamalı: görünmeyen bir bağlantıya
+      // sekme ile ulaşmak, ekranda hiçbir şey olmadan odağı kaybettirir.
+      heroCopy.inert = phase !== "settled";
+      heroEl.classList.toggle("is-intro", phase === "intro");
+      heroEl.classList.toggle("is-exiting", phase === "exiting");
+      heroEl.classList.toggle("is-settled", phase === "settled");
     },
     revealTargets: [
       ...moreSection.querySelectorAll<HTMLElement>(".feature"),
@@ -148,11 +164,7 @@ function more(): HTMLElement {
     el(
       "div",
       { class: "page" },
-      el(
-        "div",
-        { class: "section__head" },
-        el("h2", {}, "Diğer yetenekler"),
-      ),
+      el("div", { class: "section__head" }, el("h2", {}, "Diğer yetenekler")),
       el(
         "div",
         { class: "features" },
