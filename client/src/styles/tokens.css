@@ -68,6 +68,9 @@
   --dur-fast: 160ms;
   --dur:      320ms;
   --dur-slow: 720ms;
+  --ease-scene: cubic-bezier(0.33333, 1, 0.66667, 1);
+  --intro-exit: 500ms;
+  --intro-settle: 800ms;
 }
 
 @media (prefers-reduced-motion: reduce) {

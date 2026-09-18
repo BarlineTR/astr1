@@ -13,10 +13,10 @@ export function renderAbout(root: HTMLElement): HTMLElement[] {
   const blocks = ABOUT.sections.map((section) =>
     el(
       "section",
-      { class: "section reveal", id: section.id },
+      { class: "section", id: section.id },
       el(
         "div",
-        { class: "page prose" },
+        { class: "page prose reveal" },
         el(
           "div",
           { class: "section__head" },
@@ -37,10 +37,10 @@ export function renderAbout(root: HTMLElement): HTMLElement[] {
 
   const contact = el(
     "section",
-    { class: "section section--closing reveal", id: "iletisim" },
+    { class: "section section--closing", id: "iletisim" },
     el(
       "div",
-      { class: "page closing" },
+      { class: "page closing reveal" },
       el(
         "div",
         {},
@@ -55,23 +55,24 @@ export function renderAbout(root: HTMLElement): HTMLElement[] {
     ),
   );
 
+  const intro = el(
+    "section",
+    { class: "section section--flush" },
+    el(
+      "div",
+      { class: "page" },
+      el("p", { class: "eyebrow reveal" }, "Kurumsal"),
+      el("h1", { class: "page-title reveal", style: "--reveal-delay: 80ms" }, "Hakkımızda"),
+      el("p", { class: "section__lead page-lead reveal", style: "--reveal-delay: 160ms" }, ABOUT.lead),
+    ),
+  );
+  const main = el("main", { class: "about" }, intro, ...blocks, contact);
+
   root.append(
     header("hakkimizda"),
-    el(
-      "section",
-      { class: "section section--flush" },
-      el(
-        "div",
-        { class: "page" },
-        el("p", { class: "eyebrow" }, "Kurumsal"),
-        el("h1", { class: "page-title" }, "Hakkımızda"),
-        el("p", { class: "section__lead page-lead" }, ABOUT.lead),
-      ),
-    ),
-    ...blocks,
-    contact,
+    main,
     footer(),
   );
 
-  return [...blocks, contact];
+  return [...main.querySelectorAll<HTMLElement>(".reveal")];
 }

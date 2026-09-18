@@ -97,7 +97,7 @@ export async function createRobotScene(
    * hiç metin yokken sağa itiliyordu. Eşik artık CSS'teki 60rem kırılma
    * noktasının aynısı.
    */
-  const wideLayout = window.matchMedia("(min-width: 60rem)");
+  const compactLayout = window.matchMedia("(max-width: 60rem)");
 
   const renderer = new THREE.WebGLRenderer({
     antialias: true,
@@ -162,6 +162,9 @@ export async function createRobotScene(
 
   let driver: SceneDriver | null = null;
   let focusTarget: FocusTarget | null = null;
+  let returningToOverview = false;
+  const overviewPoint = controls.target.clone();
+  const overviewDirection = camera.position.clone().sub(overviewPoint).normalize();
   let frameListener: (() => void) | null = null;
   let running = false;
   let frame = 0;
@@ -192,7 +195,7 @@ export async function createRobotScene(
       return;
     }
 
-    if (wideLayout.matches) {
+    if (!compactLayout.matches) {
       // Geniş ekran: metin solda, model sağa kayar.
       const shift = width * 0.17 * compositionAmount;
       camera.setViewOffset(width, height, -shift, 0, width, height);
@@ -220,15 +223,18 @@ export async function createRobotScene(
    * büyüğü seçilir; yön OrbitControls'ün getirdiği yerde kalır, yalnızca
    * uzunluk değişir.
    */
-  function frameSubject(aspect: number): void {
+  function overviewDistance(aspect: number): number {
     const halfFov = THREE.MathUtils.degToRad(camera.fov) / 2;
     // Çarpanlar modelin çerçeveyi ne kadar dolduracağını belirler. 0.85 ve 3.2,
     // giriş bölümünün geniş çerçevesinde modeli rakam şeridinin üstünde tutan,
     // konsolun dar panelinde ise taşırmayan değerler.
     const forHeight = (robot.height * 0.85) / Math.tan(halfFov);
     const forWidth = (robot.radius * 3.2) / (Math.tan(halfFov) * Math.max(aspect, 0.4));
-    const distance = Math.max(forHeight, forWidth);
+    return Math.max(forHeight, forWidth);
+  }
 
+  function frameSubject(aspect: number): void {
+    const distance = overviewDistance(aspect);
     const direction = camera.position.clone().sub(controls.target).normalize();
     camera.position.copy(controls.target).addScaledVector(direction, distance);
     controls.update();
@@ -241,7 +247,8 @@ export async function createRobotScene(
     camera.aspect = clientWidth / clientHeight;
     applyComposition(clientWidth, clientHeight);
     camera.updateProjectionMatrix();
-    frameSubject(camera.aspect);
+    if (returningToOverview && focusTarget) focusTarget.distance = overviewDistance(camera.aspect);
+    else if (!focusTarget) frameSubject(camera.aspect);
 
     // Yeni ölçüyle hemen bir kare çiz. Çizim döngüsüne bırakılırsa, sekme arka
     // plandayken `requestAnimationFrame` durduğu için tuval eski çerçeveleme ile
@@ -272,8 +279,12 @@ export async function createRobotScene(
     if (!visible) return;
 
     if (driver) apply(driver.update(dt));
-    if (focusTarget) approachFocus(focusTarget, dt);
-    controls.update();
+    if (focusTarget) {
+      approachFocus(focusTarget, dt);
+      camera.lookAt(controls.target);
+    } else {
+      controls.update(dt);
+    }
     renderer.render(scene, camera);
     frameListener?.();
   }
@@ -286,21 +297,34 @@ export async function createRobotScene(
    * animasyon farklı sürerdi.
    */
   function approachFocus(target: FocusTarget, dt: number): void {
-    const rate = 1 - Math.exp(-dt * 3.2);
+    const rate = reducedMotion ? 1 : 1 - Math.exp(-dt * 5);
 
     controls.target.lerp(target.point, rate);
 
     const azimuth = THREE.MathUtils.degToRad(target.azimuthDeg);
     const polar = THREE.MathUtils.degToRad(target.polarDeg);
+    // Portrede masaüstü yakın planı kafayı kadrajın dışına taşıyordu.
+    // Yatay görüş alanında modelin genişliğine de yer bırak.
+    const forWidth = (robot.radius * 1.5) /
+      (Math.tan(THREE.MathUtils.degToRad(camera.fov) / 2) * Math.max(camera.aspect, 0.4));
     const desired = new THREE.Vector3(
       Math.sin(polar) * Math.sin(azimuth),
       Math.cos(polar),
       Math.sin(polar) * Math.cos(azimuth),
     )
-      .multiplyScalar(target.distance)
+      .multiplyScalar(Math.max(target.distance, forWidth))
       .add(target.point);
 
     camera.position.lerp(desired, rate);
+    if (returningToOverview && camera.position.distanceTo(desired) < robot.height * 0.001 &&
+        controls.target.distanceTo(target.point) < robot.height * 0.001) {
+      camera.position.copy(desired);
+      controls.target.copy(target.point);
+      focusTarget = null;
+      returningToOverview = false;
+      controls.autoRotate = autoOrbit;
+      controls.enabled = interactive && !coarsePointer;
+    }
   }
 
   apply(IDLE_STATE);
@@ -323,12 +347,23 @@ export async function createRobotScene(
       driver = next;
     },
     focus(target) {
+      if (target === null) {
+        if (!focusTarget || returningToOverview) return;
+        target = {
+          point: overviewPoint,
+          azimuthDeg: THREE.MathUtils.radToDeg(Math.atan2(overviewDirection.x, overviewDirection.z)),
+          polarDeg: THREE.MathUtils.radToDeg(Math.acos(overviewDirection.y)),
+          distance: overviewDistance(camera.aspect),
+        };
+        returningToOverview = true;
+      } else {
+        returningToOverview = false;
+      }
       focusTarget = target;
       // Odaktayken serbest yörünge ve kullanıcı sürüklemesi kapanır: ikisi de
       // kameranın konumunu yazar ve odakla çekişirdi.
-      controls.autoRotate = autoOrbit && target === null;
-      controls.enabled = interactive && !coarsePointer && target === null;
-      if (target === null) frameSubject(camera.aspect);
+      controls.autoRotate = false;
+      controls.enabled = false;
     },
     project(point) {
       const projected = point.clone().project(camera);

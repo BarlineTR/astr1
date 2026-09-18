@@ -185,10 +185,9 @@
 /* ═══════════════════════════  Özellik adımları  ═══════════════════════════ */
 
 .step__inner {
-  max-width: 34rem;
   transition:
-    opacity 600ms var(--ease),
-    transform 600ms var(--ease);
+    opacity 360ms var(--ease-scene),
+    transform 480ms var(--ease-scene);
 }
 
 /*
@@ -196,7 +195,7 @@
  * koyar. Koşulsuz gizlenseydi ve denetleyici hiç başlamasaydı (sahne yüklenemedi,
  * gözlemci desteklenmiyor) bütün özellik metinleri görünmez kalırdı.
  */
-.film__steps.is-driven .step__inner { opacity: 0; transform: translateY(1.5rem); }
+.film__steps.is-driven .step__inner { opacity: 0; transform: translateY(0.75rem); }
 .film__steps.is-driven .step.is-active .step__inner { opacity: 1; transform: none; }
 
 .step__index { font-size: var(--t-micro); letter-spacing: 0.16em; color: var(--accent); }
@@ -248,7 +247,6 @@
   background: var(--accent-sunken);
   box-shadow: 0 0 0 4px rgba(200, 161, 90, 0.12);
   flex: none;
-  animation: mark-pulse 2.4s var(--ease) infinite;
 }
 
 .mark__stem { width: 2.25rem; height: 1px; background: var(--rule-accent); flex: none; }
@@ -260,11 +258,6 @@
   text-transform: uppercase;
   color: var(--accent-bright);
   white-space: nowrap;
-}
-
-@keyframes mark-pulse {
-  0%, 100% { box-shadow: 0 0 0 4px rgba(200, 161, 90, 0.12); }
-  50%      { box-shadow: 0 0 0 9px rgba(200, 161, 90, 0.04); }
 }
 
 /* ═══════════════════════════  Açılış animasyonu  ═══════════════════════════ */
@@ -293,15 +286,15 @@
     transparent 78%
   );
   transition:
-    opacity 700ms var(--ease),
-    transform 700ms var(--ease);
+    opacity var(--intro-exit) var(--ease-scene),
+    transform var(--intro-exit) var(--ease-scene);
 }
 
 .intro__line {
   display: grid;
   justify-items: center;
   gap: 0.5rem;
-  animation: intro-rise 1100ms var(--ease) both;
+  animation: intro-rise 900ms var(--ease-scene) both;
 }
 
 .intro__kicker {
@@ -327,37 +320,37 @@
   letter-spacing: 0.22em;
   text-transform: uppercase;
   color: var(--ink-faint);
-  animation: intro-rise 1100ms var(--ease) 180ms both;
+  animation: intro-rise 900ms var(--ease-scene) 140ms both;
 }
 
 @keyframes intro-rise {
-  from { opacity: 0; transform: translateY(1.5rem); }
+  from { opacity: 0; transform: translateY(0.75rem); }
   to   { opacity: 1; transform: none; }
 }
 
 .film.is-exiting .intro,
 .film.is-settled .intro {
   opacity: 0;
-  transform: translateY(-1.75rem) scale(0.97);
+  transform: translateY(-0.5rem);
 }
 
 .hero__inner,
 .figures {
   transition:
-    opacity 1000ms var(--ease),
-    transform 1000ms var(--ease);
+    opacity var(--intro-settle) var(--ease-scene),
+    transform var(--intro-settle) var(--ease-scene);
 }
 
 .film.is-intro .hero__inner,
-.film.is-exiting .hero__inner { opacity: 0; transform: translateX(-2.5rem); }
+.film.is-exiting .hero__inner { opacity: 0; transform: translateY(0.875rem); }
 
 .film.is-intro .figures,
-.film.is-exiting .figures { opacity: 0; transform: translateY(1.25rem); }
+.film.is-exiting .figures { opacity: 0; transform: translateY(0.5rem); }
 
 .film.is-settled .hero__inner,
 .film.is-settled .figures { opacity: 1; transform: none; }
 
-.film.is-settled .figures { transition-delay: 220ms; }
+.film.is-settled .figures { transition-delay: 100ms; }
 
 /* Giriş sürerken adımların perdesi görünmemeli. */
 .film.is-intro .screen::before,
@@ -367,17 +360,20 @@
 
 .reveal {
   opacity: 0;
-  transform: translateY(1.5rem);
+  transform: translateY(0.75rem);
   transition:
-    opacity 700ms var(--ease) var(--reveal-delay, 0ms),
-    transform 700ms var(--ease) var(--reveal-delay, 0ms);
+    opacity 360ms var(--ease-scene) var(--reveal-delay, 0ms),
+    transform 480ms var(--ease-scene) var(--reveal-delay, 0ms);
 }
 
 .reveal.is-visible { opacity: 1; transform: none; }
 
 @media (prefers-reduced-motion: reduce) {
-  .intro__line, .intro__tail, .mark__ring { animation: none; }
-  .reveal, .step__inner { opacity: 1; transform: none; }
+  .intro__line, .intro__tail { animation: none; }
+  .intro, .hero__inner, .figures, .step__inner, .mark, .reveal {
+    transition: none;
+  }
+  .reveal, .film__steps.is-driven .step__inner { opacity: 1; transform: none; }
 }
 
 /* ═══════════════════════════  Sayfa başlığı ve metin  ═══════════════════════════ */
@@ -392,6 +388,14 @@
 
 .section--flush { padding-top: var(--s-6); border-top: none; }
 .page-lead { font-size: var(--t-lead); max-width: 44ch; }
+
+.about { text-align: center; }
+.about .page { max-width: 48rem; }
+.about .page-lead,
+.about .prose__p,
+.about .prose__list,
+.about .section__lead { margin-inline: auto; }
+.about .closing { flex-direction: column; align-items: center; }
 
 .prose__p {
   max-width: var(--measure);
@@ -498,7 +502,13 @@
 @media (max-width: 60rem) {
   .screen { align-items: flex-end; padding-bottom: var(--s-5); }
 
-  .screen::before {
+  /* Perde sahneyle sabit kalır; her metin ekranıyla yukarı kaymaz. */
+  .screen::before { display: none; }
+  .film__sticky::after {
+    content: "";
+    position: absolute;
+    inset: 0;
+    pointer-events: none;
     background: linear-gradient(
       to bottom,
       transparent 0%,
@@ -515,6 +525,7 @@
 
   .step__title { font-size: clamp(1.75rem, 7vw, 2.5rem); }
   .step__body { font-size: var(--t-body); max-width: none; }
+  .film__steps.is-driven .step.is-seen .step__inner { opacity: 1; transform: none; }
 
   .figures__inner { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: var(--s-2) var(--s-3); }
   .figures__value { font-size: 1.125rem; }

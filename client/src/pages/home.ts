@@ -101,6 +101,7 @@ export function renderHome(root: HTMLElement): HomeView {
   const closingSection = closing();
 
   root.append(header("ana"), film, moreSection, closingSection, footer());
+  heroScreen.inert = true;
 
   return {
     stageEl,
@@ -108,6 +109,7 @@ export function renderHome(root: HTMLElement): HomeView {
     markLabelEl,
     stepEls,
     setPhase(phase) {
+      heroScreen.inert = phase !== "settled";
       film.classList.toggle("is-intro", phase === "intro");
       film.classList.toggle("is-exiting", phase === "exiting");
       film.classList.toggle("is-settled", phase === "settled");
