@@ -30,20 +30,82 @@ export const FIGURES = [
   { label: "Etkileşim mesafesi", value: "0,4 – 2,5 m" },
 ] as const;
 
-/** Ana sayfadaki özellikler. Başlık düzeyinde; ayrıntı yok. */
-export const FEATURES = [
+/**
+ * Model üzerinde tek tek gösterilen özellikler.
+ *
+ * Her adımın modelde bir çapası ve kendi kamera açısı vardır. Çapa, modelin
+ * ölçülerine oranla tanımlanır (yükseklik ve yarıçapın katı olarak); böylece
+ * model değiştiğinde noktalar mutlak metre değerleriyle yerinden oynamaz.
+ *
+ * Sırayı belirleyen şey aşağıdan yukarı ya da yukarıdan aşağı bir tur değil,
+ * anlatının kendisi: önce robotun neyi algıladığı, sonra nasıl karar verdiği,
+ * en sonda nasıl hareket ettiği.
+ */
+export const SHOWCASE = [
   {
+    id: "gorme",
+    label: "Kamera",
+    title: "Görme",
+    body:
+      "Derinlik kamerası kafanın önündedir ve kafayla birlikte döner. Yüz tespiti " +
+      "kameranın kendi işlemcisinde çalışır; ana bilgisayara yalnızca sonuç ulaşır.",
+    anchor: { y: 0.82, z: 0.62, x: 0.08 },
+    camera: { azimuthDeg: 20, polarDeg: 78, distanceScale: 1.55 },
+  },
+  {
+    id: "duyma",
+    label: "Mikrofon dizisi",
+    title: "Duyma",
+    body:
+      "Dört mikrofon dairesel bir dizi oluşturur. Sesin geliş yönü mikrofon " +
+      "kartının kendi işlemcisinde hesaplanır ve kafanın o anki açısıyla birleştirilir.",
+    anchor: { y: 0.99, z: 0.0, x: 0.0 },
+    camera: { azimuthDeg: -26, polarDeg: 60, distanceScale: 1.5 },
+  },
+  {
+    id: "bakis",
     title: "Sosyal bakış",
+    label: "Kafa ekseni",
     body:
-      "Konuşan kişiye döner, görüş alanındaki yüzü takip eder. Kime bakacağına " +
-      "görüntü ve sesi birlikte değerlendirerek karar verir.",
+      "Kafa tek eksende döner ve nereye bakacağına görüntü ile sesi birlikte " +
+      "değerlendirerek karar verir. Yüz görünürken yön yalnızca görüntüden gelir.",
+    anchor: { y: 0.72, z: 0.5, x: 0.0 },
+    camera: { azimuthDeg: 0, polarDeg: 84, distanceScale: 1.95 },
   },
   {
-    title: "Yüz ve ses tanıma",
+    id: "karar",
+    label: "İşlem birimi",
+    title: "Karar",
     body:
-      "Tanıtılan kişileri yüzünden ve sesinden tanır, ikisini aynı kimlikte " +
-      "birleştirir. Tanıma işlemi cihaz üzerinde çalışır.",
+      "Tanıma modelleri cihaz üzerinde çalışır. Kimi gördüğü ve kimin konuştuğu " +
+      "aynı kimlikte birleşir; bunun için ağ bağlantısı gerekmez.",
+    anchor: { y: 0.5, z: 0.62, x: 0.1 },
+    camera: { azimuthDeg: 32, polarDeg: 84, distanceScale: 1.85 },
   },
+  {
+    id: "cevre",
+    label: "Tarayıcı",
+    title: "Çevre algısı",
+    body:
+      "Lazer tarayıcı ve derinlik verisi birlikte çevrenin haritasını çıkarır. " +
+      "Kişilerin uzaklığı kadrajdaki konumundan değil gerçek ölçümden gelir.",
+    anchor: { y: 0.26, z: 0.7, x: -0.1 },
+    camera: { azimuthDeg: -22, polarDeg: 80, distanceScale: 1.95 },
+  },
+  {
+    id: "hareket",
+    label: "Tahrik tabanı",
+    title: "Hareket",
+    body:
+      "Diferansiyel tahrikli taban konum değiştirir. Hareket sınırları ve hız " +
+      "rampası donanım katmanında zorlanır; bağlantı koparsa motorlar durur.",
+    anchor: { y: 0.1, z: 0.6, x: 0.0 },
+    camera: { azimuthDeg: 16, polarDeg: 88, distanceScale: 2.05 },
+  },
+] as const;
+
+/** Model üzerinde yeri olmayan, listede kalan özellikler. */
+export const FEATURES = [
   {
     title: "Sesli diyalog",
     body:
@@ -51,16 +113,10 @@ export const FEATURES = [
       "motorlarla çalışmaya devam eder.",
   },
   {
-    title: "Çevre algısı",
+    title: "Yüz ve ses tanıma",
     body:
-      "Derinlik kamerası ve lazer tarayıcı ile çevresini üç boyutlu algılar; " +
-      "kişilerin uzaklığını ölçer.",
-  },
-  {
-    title: "Hareketli taban",
-    body:
-      "Diferansiyel tahrikli taban ile konum değiştirir. Tekerlek geri beslemesi " +
-      "ve eylemsizlik ölçümü ile konumunu izler.",
+      "Tanıtılan kişileri yüzünden ve sesinden tanır, ikisini aynı kimlikte " +
+      "birleştirir. Tanıma işlemi cihaz üzerinde çalışır.",
   },
   {
     title: "Güvenlik",

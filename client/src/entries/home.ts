@@ -5,6 +5,7 @@ import "../styles/layout.css";
 import { el } from "../dom";
 import { renderHome } from "../pages/home";
 import { observeReveals } from "../site/reveal";
+import { startShowcase } from "../site/showcase";
 
 const root = document.querySelector<HTMLElement>("#app");
 if (!root) throw new Error("#app bulunamadı");
@@ -25,8 +26,12 @@ void mountScene();
  * Hareket azaltma tercihinde animasyon hiç oynatılmaz: sayfa doğrudan yerleşmiş
  * halinde açılır.
  */
-const INTRO_HOLD_MS = 1500;
-const SETTLE_MS = 1100;
+/** İsmin ekranda durduğu süre. */
+const INTRO_HOLD_MS = 1400;
+/** İsmin silinme süresi. CSS'teki `.intro` geçişiyle aynı olmalı. */
+const INTRO_EXIT_MS = 700;
+/** Metnin ve modelin yerleşme süresi. */
+const SETTLE_MS = 1000;
 
 async function mountScene(): Promise<void> {
   if (reducedMotion) view.setPhase("settled");
@@ -43,6 +48,16 @@ async function mountScene(): Promise<void> {
     });
     scene.setDriver(new DemoDriver());
     scene.start();
+
+    // Özellik anlatısı sahneye bağlıdır: sahne yoksa adımlar düz metin olarak
+    // okunmaya devam eder, yalnızca kamera ve işaret çalışmaz.
+    startShowcase({
+      scene,
+      steps: view.stepEls,
+      markEl: view.markEl,
+      markLabelEl: view.markLabelEl,
+      stageEl: view.stageEl,
+    });
   } catch (error) {
     console.error("3B sahne yüklenemedi:", error);
     view.stageEl.appendChild(
@@ -57,10 +72,15 @@ async function mountScene(): Promise<void> {
 
   if (reducedMotion) return;
 
-  // Sahne yüklenemese bile metin gelmeli: bekleme her durumda işler.
+  // Sahne yüklenemese bile metin gelmeli: beklemeler her durumda işler.
   window.setTimeout(() => {
-    view.setPhase("settled");
-    if (scene) slideSubject(scene);
+    view.setPhase("exiting");
+
+    // Metin ve model, isim tamamen silindikten sonra hareket eder.
+    window.setTimeout(() => {
+      view.setPhase("settled");
+      if (scene) slideSubject(scene);
+    }, INTRO_EXIT_MS);
   }, INTRO_HOLD_MS);
 }
 

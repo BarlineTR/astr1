@@ -10,8 +10,37 @@ import { IDLE_STATE, type SceneDriver, type SceneState } from "../../../shared/s
 const ACCENT = 0xc8a15a;
 const ACCENT_ACTIVE = 0xe0bd7c;
 
+/** Modelin bir noktasına yaklaşmayı tarif eder. */
+export interface FocusTarget {
+  /** Bakılacak nokta — modelin kökü esas alınır (metre). */
+  point: THREE.Vector3;
+  /** Yatay açı: 0 tam önden, pozitif sağa doğru (derece). */
+  azimuthDeg: number;
+  /** Dikey açı: 90 tam yandan, küçülünce yukarıdan (derece). */
+  polarDeg: number;
+  /** Noktaya uzaklık (metre). */
+  distance: number;
+}
+
+/** Sahnenin, üstüne işaret koymak isteyen katmana verdiği ölçüler. */
+export interface RobotMetrics {
+  height: number;
+  radius: number;
+  headAxisHeight: number;
+}
+
 export interface RobotScene {
+  readonly metrics: RobotMetrics;
   setDriver(driver: SceneDriver | null): void;
+  /**
+   * Kamerayı bir noktaya yumuşakça taşır. `null` verilince varsayılan
+   * çerçevelemeye ve yörüngeye döner.
+   */
+  focus(target: FocusTarget | null): void;
+  /** Bir dünya noktasının tuval üzerindeki yerini verir (CSS pikseli). */
+  project(point: THREE.Vector3): { x: number; y: number; inFront: boolean };
+  /** Her çizilen kareden sonra çağrılır. İşaretlerin konumu buradan güncellenir. */
+  onFrame(listener: (() => void) | null): void;
   /**
    * Modelin çerçevedeki yatay yerini ayarlar: 0 ortalı, 1 tamamen sağda.
    *
@@ -132,6 +161,8 @@ export async function createRobotScene(
   controls.update();
 
   let driver: SceneDriver | null = null;
+  let focusTarget: FocusTarget | null = null;
+  let frameListener: (() => void) | null = null;
   let running = false;
   let frame = 0;
   let lastTime = 0;
@@ -156,12 +187,28 @@ export async function createRobotScene(
    * altında durur.
    */
   function applyComposition(width: number, height: number): void {
-    if (compositionAmount <= 0.001 || !wideLayout.matches) {
+    if (compositionAmount <= 0.001) {
       camera.clearViewOffset();
       return;
     }
-    const shift = width * 0.17 * compositionAmount;
-    camera.setViewOffset(width, height, -shift, 0, width, height);
+
+    if (wideLayout.matches) {
+      // Geniş ekran: metin solda, model sağa kayar.
+      const shift = width * 0.17 * compositionAmount;
+      camera.setViewOffset(width, height, -shift, 0, width, height);
+      return;
+    }
+
+    /*
+     * Dar ekran: metin altta, model yukarı kalkar.
+     *
+     * Kaydırma yatayda değil dikeyde yapılır, çünkü yerleşim de öyle bölünür.
+     * Model dikeyde ortada kalsaydı metnin tam arkasına düşer ve ikisi birden
+     * okunmaz olurdu. Pozitif `y`, izdüşüm penceresini aşağı kaydırır; bu da
+     * özneyi ekranda yukarı taşır.
+     */
+    const lift = height * 0.26 * compositionAmount;
+    camera.setViewOffset(width, height, 0, lift, width, height);
   }
 
   /**
@@ -225,8 +272,35 @@ export async function createRobotScene(
     if (!visible) return;
 
     if (driver) apply(driver.update(dt));
+    if (focusTarget) approachFocus(focusTarget, dt);
     controls.update();
     renderer.render(scene, camera);
+    frameListener?.();
+  }
+
+  /**
+   * Kamerayı hedefe kare kare yaklaştırır.
+   *
+   * Yaklaşma oranı `1 - e^(-k·dt)` ile hesaplanır; sabit bir oran kullanılsaydı
+   * hareketin hızı kare hızına bağlı olurdu ve 60 Hz ile 120 Hz ekranlarda
+   * animasyon farklı sürerdi.
+   */
+  function approachFocus(target: FocusTarget, dt: number): void {
+    const rate = 1 - Math.exp(-dt * 3.2);
+
+    controls.target.lerp(target.point, rate);
+
+    const azimuth = THREE.MathUtils.degToRad(target.azimuthDeg);
+    const polar = THREE.MathUtils.degToRad(target.polarDeg);
+    const desired = new THREE.Vector3(
+      Math.sin(polar) * Math.sin(azimuth),
+      Math.cos(polar),
+      Math.sin(polar) * Math.cos(azimuth),
+    )
+      .multiplyScalar(target.distance)
+      .add(target.point);
+
+    camera.position.lerp(desired, rate);
   }
 
   apply(IDLE_STATE);
@@ -240,8 +314,32 @@ export async function createRobotScene(
   renderer.render(scene, camera);
 
   return {
+    metrics: {
+      height: robot.height,
+      radius: robot.radius,
+      headAxisHeight: robot.headAxisHeight,
+    },
     setDriver(next) {
       driver = next;
+    },
+    focus(target) {
+      focusTarget = target;
+      // Odaktayken serbest yörünge ve kullanıcı sürüklemesi kapanır: ikisi de
+      // kameranın konumunu yazar ve odakla çekişirdi.
+      controls.autoRotate = autoOrbit && target === null;
+      controls.enabled = interactive && !coarsePointer && target === null;
+      if (target === null) frameSubject(camera.aspect);
+    },
+    project(point) {
+      const projected = point.clone().project(camera);
+      return {
+        x: (projected.x * 0.5 + 0.5) * container.clientWidth,
+        y: (-projected.y * 0.5 + 0.5) * container.clientHeight,
+        inFront: projected.z < 1,
+      };
+    },
+    onFrame(listener) {
+      frameListener = listener;
     },
     setComposition(amount) {
       compositionAmount = Math.min(1, Math.max(0, amount));
