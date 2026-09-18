@@ -1,0 +1,134 @@
+*, *::before, *::after { box-sizing: border-box; }
+
+html {
+  background: var(--bg);
+  color-scheme: dark;
+  -webkit-text-size-adjust: 100%;
+}
+
+body {
+  margin: 0;
+  font-family: var(--font-ui);
+  font-size: var(--t-body);
+  line-height: 1.6;
+  color: var(--ink);
+  background: var(--bg);
+  font-feature-settings: "kern", "liga";
+  -webkit-font-smoothing: antialiased;
+}
+
+h1, h2, h3 {
+  font-family: var(--font-display);
+  font-weight: 400;
+  line-height: 1.12;
+  letter-spacing: -0.012em;
+  margin: 0;
+  text-wrap: balance;
+}
+
+h1 { font-size: var(--t-h1); }
+h2 { font-size: var(--t-h2); }
+h3 { font-size: var(--t-h3); }
+
+p { margin: 0; text-wrap: pretty; }
+
+a {
+  color: inherit;
+  text-decoration-color: var(--rule-strong);
+  text-underline-offset: 0.25em;
+  transition: text-decoration-color var(--dur-fast) var(--ease);
+}
+a:hover { text-decoration-color: var(--accent); }
+
+:focus-visible {
+  outline: 1px solid var(--accent);
+  outline-offset: 3px;
+}
+
+/* ─────────────────────────────  Yerleşim  ───────────────────────────── */
+
+.page {
+  width: min(100% - var(--gutter) * 2, var(--page));
+  margin-inline: auto;
+}
+
+.section {
+  padding-block: var(--s-7);
+  border-top: 1px solid var(--rule);
+}
+
+.section--flush { border-top: none; }
+
+/*
+ * Bölüm başlığı: solda mono numara, sağda serif başlık ve giriş paragrafı.
+ * Numaralandırma, sayfayı bir broşür değil bir belge gibi okutan şeydir.
+ */
+.section__head { margin-bottom: var(--s-4); }
+
+.section__lead {
+  margin-top: var(--s-2);
+  max-width: var(--measure);
+  color: var(--ink-muted);
+  font-size: var(--t-lead);
+  line-height: 1.55;
+}
+
+@media (max-width: 40rem) {
+  .section { padding-block: var(--s-6); }
+}
+
+/* ─────────────────────────────  Ortak parçalar  ───────────────────────────── */
+
+.eyebrow {
+  font-family: var(--font-mono);
+  font-size: var(--t-micro);
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: var(--ink-faint);
+}
+
+.mono { font-family: var(--font-mono); font-variant-numeric: tabular-nums; }
+
+.rule { height: 1px; background: var(--rule); border: 0; margin: 0; }
+
+
+/* Düğme: dolgu yok, çizgi var. */
+.btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.6em;
+  font-family: var(--font-ui);
+  font-size: var(--t-small);
+  letter-spacing: 0.02em;
+  color: var(--ink);
+  background: transparent;
+  border: 1px solid var(--rule-strong);
+  padding: 0.7rem 1.25rem;
+  cursor: pointer;
+  text-decoration: none;
+  transition: border-color var(--dur-fast) var(--ease),
+              background var(--dur-fast) var(--ease),
+              color var(--dur-fast) var(--ease);
+}
+
+.btn:hover { border-color: var(--accent); color: var(--accent-bright); }
+
+.btn--quiet { border-color: transparent; color: var(--ink-muted); padding-inline: 0.75rem; }
+.btn--quiet:hover { border-color: var(--rule-strong); color: var(--ink); }
+
+.btn--alarm { border-color: rgba(180, 86, 76, 0.5); color: #d98b82; }
+.btn--alarm:hover { border-color: var(--alarm); background: rgba(180, 86, 76, 0.12); color: #e8a49b; }
+.btn--alarm.is-engaged { background: var(--alarm); border-color: var(--alarm); color: #120708; }
+
+.btn--primary {
+  border-color: var(--rule-accent);
+  background: var(--accent-sunken);
+  color: var(--accent-bright);
+}
+.btn--primary:hover { border-color: var(--accent); background: rgba(200, 161, 90, 0.16); }
+
+.visually-hidden {
+  position: absolute; width: 1px; height: 1px;
+  padding: 0; margin: -1px; overflow: hidden;
+  clip-path: inset(50%); white-space: nowrap;
+}

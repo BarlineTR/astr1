@@ -1,0 +1,79 @@
+/*
+ * ASTRO — görsel belirteçler.
+ *
+ * Kısıt: bu bir teknik belge estetiğidir, bir ürün açılış sayfası değil.
+ * Renk azdır ve iş görür; gradyan, parıltı ve cam efekti yoktur. Vurgu rengi
+ * yalnızca üç işe ayrılmıştır: bölüm numarası, etkin durum, ölçülmüş değer.
+ */
+
+:root {
+  /* — Zemin katmanları — */
+  --bg:            #0a0a0b;
+  --bg-raised:     #0f0f11;
+  --bg-sunken:     #070708;
+  --surface:       #131316;
+  --surface-hover: #191a1d;
+
+  /* — Çizgiler. Kenarlık değil, cetvel. — */
+  --rule:          rgba(255, 255, 255, 0.07);
+  --rule-strong:   rgba(255, 255, 255, 0.14);
+  --rule-accent:   rgba(200, 161, 90, 0.32);
+
+  /* — Metin — */
+  --ink:           #e9e7e2;
+  --ink-muted:     #9a978f;
+  --ink-faint:     #6a6862;
+
+  /* — Vurgu: pirinç. Tek renk, üç iş. — */
+  --accent:        #c8a15a;
+  --accent-bright: #e0bd7c;
+  --accent-sunken: rgba(200, 161, 90, 0.10);
+
+  /* — Durum. Yalnızca konsolda kullanılır. — */
+  --ok:            #6f9c6a;
+  --warn:          #c9903f;
+  --alarm:         #b4564c;
+
+  /* — Tipografi — */
+  --font-display: "Source Serif 4", "Georgia", "Times New Roman", serif;
+  --font-ui:      "Inter", system-ui, -apple-system, "Segoe UI", sans-serif;
+  --font-mono:    "IBM Plex Mono", ui-monospace, "SF Mono", Menlo, monospace;
+
+  /* Ölçek: 1.25 oranlı, gövde 16px. */
+  --t-micro: 0.6875rem;  /* 11px — etiket, kaynak */
+  --t-small: 0.8125rem;  /* 13px */
+  --t-body:  1rem;
+  --t-lead:  1.1875rem;  /* 19px */
+  --t-h3:    1.5rem;
+  --t-h2:    2.25rem;
+  --t-h1:    clamp(2.5rem, 5.5vw, 4.25rem);
+
+  /* — Ritim. 8px taban. — */
+  --s-1: 0.5rem;
+  --s-2: 1rem;
+  --s-3: 1.5rem;
+  --s-4: 2rem;
+  --s-5: 3rem;
+  --s-6: 4.5rem;
+  --s-7: 7rem;
+  --s-8: 10rem;
+
+  /* — Ölçü — */
+  --measure: 62ch;
+  --page:    76rem;
+  --gutter:  clamp(1.25rem, 4vw, 3.5rem);
+
+  /* — Hareket. Yavaş ve az. — */
+  --ease: cubic-bezier(0.22, 0.61, 0.36, 1);
+  --dur-fast: 160ms;
+  --dur:      320ms;
+  --dur-slow: 720ms;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  :root {
+    --dur-fast: 1ms;
+    --dur: 1ms;
+    --dur-slow: 1ms;
+  }
+}

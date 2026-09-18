@@ -1,0 +1,490 @@
+/* ─────────────────────────────  Başlık şeridi  ───────────────────────────── */
+
+.site-header {
+  position: sticky;
+  top: 0;
+  z-index: 20;
+  background: color-mix(in srgb, var(--bg) 88%, transparent);
+  backdrop-filter: blur(8px);
+  border-bottom: 1px solid var(--rule);
+}
+
+.site-header__inner {
+  display: flex;
+  align-items: center;
+  gap: var(--s-4);
+  min-height: 4.25rem;
+}
+
+.site-header__mark {
+  font-family: var(--font-display);
+  font-size: 1.25rem;
+  letter-spacing: 0.05em;
+  text-decoration: none;
+  white-space: nowrap;
+}
+
+.site-header__mark span {
+  font-family: var(--font-mono);
+  font-size: var(--t-micro);
+  color: var(--accent);
+  margin-left: 0.4em;
+  vertical-align: 0.35em;
+}
+
+.site-nav {
+  display: flex;
+  gap: var(--s-3);
+  margin-left: auto;
+  font-size: var(--t-small);
+  color: var(--ink-muted);
+}
+
+.site-nav a {
+  text-decoration: none;
+  padding-block: 0.25rem;
+  border-bottom: 1px solid transparent;
+}
+
+.site-nav a:hover { color: var(--ink); }
+
+.site-nav a.is-current {
+  color: var(--ink);
+  border-bottom-color: var(--accent);
+}
+
+@media (max-width: 48rem) {
+  .site-header__inner { gap: var(--s-2); min-height: 3.75rem; }
+  .site-nav { gap: var(--s-2); font-size: var(--t-micro); }
+  .btn--quiet { display: none; }
+}
+
+/* ─────────────────────────────  Giriş  ───────────────────────────── */
+
+.hero {
+  position: relative;
+  /* Açılış tam ekran olmalı. `svh`, mobil tarayıcı çubuğu gizlenip açıldıkça
+     yüksekliğin zıplamasını önler; `vh` desteklemeyen tarayıcılar için yedek. */
+  min-height: 100vh;
+  min-height: 100svh;
+  display: flex;
+  align-items: center;
+  overflow: hidden;
+}
+
+.hero__stage { position: absolute; inset: 0; z-index: 0; }
+
+.hero::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+  pointer-events: none;
+  background: linear-gradient(
+    100deg,
+    var(--bg) 0%,
+    color-mix(in srgb, var(--bg) 84%, transparent) 36%,
+    transparent 64%
+  );
+}
+
+.hero__inner {
+  position: relative;
+  z-index: 2;
+  pointer-events: none;
+  padding-block: var(--s-7) var(--s-8);
+}
+
+.hero__inner > * { pointer-events: auto; }
+
+.hero__title { margin-top: var(--s-2); max-width: 17ch; }
+
+.hero__lead {
+  margin-top: var(--s-3);
+  max-width: 48ch;
+  color: var(--ink-muted);
+  font-size: var(--t-lead);
+  line-height: 1.55;
+}
+
+.hero__actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--s-2);
+  margin-top: var(--s-4);
+}
+
+/* Rakam şeridi: girişin alt kenarına oturur, sayfayı ikiye böler. */
+.figures {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  z-index: 3;
+  border-top: 1px solid var(--rule);
+  background: color-mix(in srgb, var(--bg) 78%, transparent);
+  backdrop-filter: blur(6px);
+}
+
+.figures__inner {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 0 var(--s-3);
+  /* `.page` yatay ortalamayı auto kenar boşluğuyla yapar; kısayol `margin: 0`
+     onu ezip şeridi sayfa ızgarasından kopartıyordu. */
+  margin: 0 auto;
+  padding-block: var(--s-3);
+}
+
+.figures__label {
+  font-family: var(--font-mono);
+  font-size: var(--t-micro);
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--ink-faint);
+}
+
+.figures__value {
+  margin: 0.3rem 0 0;
+  font-size: 1.5rem;
+  color: var(--ink);
+}
+
+/*
+ * Dar ekran: model tam ekranı kaplar, metin altta perdenin üstünde durur.
+ *
+ * Masaüstündeki sol-sağ ayrımı burada işlemez — metin için yatayda yer yok.
+ * Bunun yerine sahne arka plana alınır ve dikey bir perde ile metnin okunurluğu
+ * korunur. Model de zaten bu en-boy oranında ortalanır (kamera kaydırması
+ * yalnızca geniş çerçevede uygulanır), yani kompozisyon kendiliğinden oturur.
+ */
+@media (max-width: 60rem) {
+  /*
+   * Sahne kendi satırında durur, metin onun altında düz zemine oturur.
+   *
+   * Önceki denemede tuval bütün girişi kaplıyor ve metin modelin üstüne
+   * biniyordu: model yarı yarıya gizleniyor, paragraf da onun üstünde zor
+   * okunuyordu. Dar ekranda yatayda yer olmadığı için ayrım dikey yapılır.
+   */
+  .hero {
+    display: grid;
+    grid-template-rows: minmax(14rem, 1fr) auto auto;
+  }
+
+  .hero__stage { position: relative; grid-row: 1; }
+
+  /* Sahnenin alt kenarı zemine karışsın; metnin arkası tamamen temiz kalsın. */
+  .hero::after { display: none; }
+
+  .hero__stage::after {
+    content: "";
+    position: absolute;
+    inset: auto 0 0 0;
+    height: 28%;
+    background: linear-gradient(to bottom, transparent, var(--bg));
+    pointer-events: none;
+  }
+
+  .hero__inner {
+    grid-row: 2;
+    padding-block: var(--s-3) var(--s-4);
+  }
+
+  .hero__title { max-width: none; font-size: clamp(2.25rem, 9vw, 3.25rem); }
+  .hero__lead { font-size: var(--t-body); max-width: none; }
+  .hero__actions { margin-top: var(--s-3); }
+
+  /* Rakamlar artık girişin üstüne binmez, akışta devam eder. */
+  .figures {
+    position: static;
+    grid-row: 3;
+    backdrop-filter: none;
+    background: var(--bg);
+  }
+
+  /*
+   * Açılış yazısı sahnenin alanında ortalanır, sayfanın tamamında değil.
+   * Mutlak konumlandırma `.hero`'nun tamamına göre çalıştığı için burada
+   * yazı, sahneyle aynı ızgara hücresine yerleştirilip üstüne bindirilir.
+   */
+  .intro {
+    position: relative;
+    grid-row: 1;
+    grid-column: 1;
+    inset: auto;
+  }
+
+  .hero__stage { grid-column: 1; }
+
+  .figures__inner {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: var(--s-3);
+  }
+
+  .figures__value { font-size: 1.25rem; }
+
+  .intro__name { font-size: clamp(3rem, 18vw, 6rem); }
+}
+
+/* Çok dar ekran: gezinme bağlantıları şeritten çıkar, alt bilgide zaten var. */
+@media (max-width: 30rem) {
+  .site-nav { display: none; }
+  .btn--console { padding: 0.7rem 1.1rem; font-size: var(--t-small); }
+  .figures__inner { gap: var(--s-2) var(--s-3); }
+  .feature { padding: var(--s-3) var(--s-2); }
+}
+
+/* ─────────────────────────────  Sayfa başlığı  ───────────────────────────── */
+
+.page-title {
+  font-family: var(--font-display);
+  font-size: clamp(2.25rem, 4.5vw, 3.25rem);
+  font-weight: 400;
+  line-height: 1.12;
+  margin: var(--s-2) 0 0;
+}
+
+.section--flush { padding-top: var(--s-6); border-top: none; }
+
+.placeholder {
+  margin-top: var(--s-2);
+  max-width: var(--measure);
+  color: var(--ink-faint);
+  font-size: var(--t-small);
+  font-style: italic;
+}
+
+/* ─────────────────────────────  Özellikler  ───────────────────────────── */
+
+.features {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(17rem, 1fr));
+  gap: 1px;
+  background: var(--rule);
+  border: 1px solid var(--rule);
+}
+
+.feature {
+  background: var(--bg);
+  padding: var(--s-4) var(--s-3);
+}
+
+.feature__title {
+  font-size: 1.1875rem;
+  letter-spacing: -0.005em;
+}
+
+.feature__body {
+  margin-top: var(--s-2);
+  color: var(--ink-muted);
+  font-size: var(--t-small);
+  line-height: 1.7;
+}
+
+/* ─────────────────────────────  Kapanış  ───────────────────────────── */
+
+.section--closing { padding-block: var(--s-6); }
+
+.closing {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: var(--s-4);
+}
+
+.closing .section__lead { margin-top: var(--s-2); }
+
+/* ─────────────────────────────  Alt bilgi  ───────────────────────────── */
+
+.site-footer {
+  border-top: 1px solid var(--rule);
+  padding-block: var(--s-4);
+  color: var(--ink-faint);
+  font-size: var(--t-small);
+}
+
+.site-footer__inner {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--s-2) var(--s-4);
+  justify-content: space-between;
+}
+
+.site-footer__nav { display: flex; flex-wrap: wrap; gap: var(--s-3); }
+.site-footer__nav a { text-decoration: none; }
+.site-footer__nav a:hover { color: var(--ink); }
+
+/* ─────────────────────────────  Sahne yedeği  ───────────────────────────── */
+
+.stage-fallback {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-content: center;
+  gap: var(--s-1);
+  text-align: center;
+  padding: var(--s-4);
+  color: var(--ink-faint);
+  font-size: var(--t-small);
+}
+
+/* ═══════════════════════════  Açılış animasyonu  ═══════════════════════════ */
+
+/*
+ * Giriş iki evrelidir. Önce yalnızca isim ekranı doldurur; sonra isim çekilir,
+ * model sağa kayar ve metin soldan gelir. Modelin kayması JavaScript'te
+ * (kameranın izdüşüm kaydırması) yapılır; buradaki geçişlerin süresi ve eğrisi
+ * onunla eşleşir, yoksa iki hareket birbirinden kopuk görünür.
+ */
+
+.intro {
+  position: absolute;
+  inset: 0;
+  z-index: 4;
+  display: grid;
+  place-content: center;
+  text-align: center;
+  padding-inline: var(--gutter);
+  pointer-events: none;
+  /* Modelin üstünde duran dev tipografinin okunabilmesi için arkasına perde.
+     Kenarlara doğru tamamen saydam: model kaybolmaz, yalnızca metnin arkası
+     koyulaşır. */
+  background: radial-gradient(
+    ellipse 70% 52% at 50% 50%,
+    color-mix(in srgb, var(--bg) 82%, transparent) 0%,
+    color-mix(in srgb, var(--bg) 55%, transparent) 45%,
+    transparent 78%
+  );
+  transition:
+    opacity 900ms var(--ease),
+    transform 900ms var(--ease);
+}
+
+/* Dikey yığın: üstte küçük "karşınızda", altında isim, en altta tanım. */
+.intro__line {
+  display: grid;
+  justify-items: center;
+  gap: 0.5rem;
+  animation: intro-rise 1100ms var(--ease) both;
+}
+
+.intro__kicker {
+  font-family: var(--font-mono);
+  font-size: var(--t-micro);
+  letter-spacing: 0.34em;
+  text-transform: uppercase;
+  color: var(--ink-muted);
+}
+
+.intro__name {
+  font-family: var(--font-display);
+  font-size: clamp(3.75rem, 15vw, 11rem);
+  line-height: 0.92;
+  letter-spacing: -0.02em;
+  color: var(--ink);
+}
+
+.intro__tail {
+  margin-top: var(--s-3);
+  font-family: var(--font-mono);
+  font-size: var(--t-micro);
+  letter-spacing: 0.22em;
+  text-transform: uppercase;
+  color: var(--ink-faint);
+  animation: intro-rise 1100ms var(--ease) 180ms both;
+}
+
+@keyframes intro-rise {
+  from { opacity: 0; transform: translateY(1.5rem); }
+  to   { opacity: 1; transform: none; }
+}
+
+.hero.is-settled .intro {
+  opacity: 0;
+  transform: translateY(-1.75rem) scale(0.97);
+}
+
+/* Yerleşme evresinde gelen parçalar. */
+.hero__inner,
+.figures {
+  transition:
+    opacity 1100ms var(--ease),
+    transform 1100ms var(--ease);
+}
+
+.hero.is-intro .hero__inner { opacity: 0; transform: translateX(-2.5rem); }
+.hero.is-intro .figures { opacity: 0; transform: translateY(1.25rem); }
+
+.hero.is-settled .hero__inner,
+.hero.is-settled .figures { opacity: 1; transform: none; }
+
+.hero.is-settled .figures { transition-delay: 220ms; }
+
+/* ═══════════════════════════  Kaydırma belirmeleri  ═══════════════════════════ */
+
+.reveal {
+  opacity: 0;
+  transform: translateY(1.5rem);
+  transition:
+    opacity 700ms var(--ease) var(--reveal-delay, 0ms),
+    transform 700ms var(--ease) var(--reveal-delay, 0ms);
+}
+
+.reveal.is-visible { opacity: 1; transform: none; }
+
+@media (prefers-reduced-motion: reduce) {
+  .intro__line, .intro__tail { animation: none; }
+  .reveal { opacity: 1; transform: none; }
+}
+
+/* ═══════════════════════════  Özellik numarası  ═══════════════════════════ */
+
+.feature__index {
+  display: block;
+  font-size: var(--t-micro);
+  letter-spacing: 0.14em;
+  color: var(--accent);
+  margin-bottom: var(--s-1);
+}
+
+/* ═══════════════════════════  Konsol düğmesi  ═══════════════════════════ */
+
+.btn--console {
+  padding: 0.8rem 1.4rem;
+  font-size: var(--t-body);
+  border-color: var(--rule-accent);
+  color: var(--accent-bright);
+  background: var(--accent-sunken);
+}
+
+.btn--console:hover { border-color: var(--accent); background: rgba(200, 161, 90, 0.18); }
+.btn--console.is-current { border-color: var(--accent); background: rgba(200, 161, 90, 0.2); }
+
+/* ═══════════════════════════  Düz metin bölümleri  ═══════════════════════════ */
+
+.page-lead { font-size: var(--t-lead); max-width: 44ch; }
+
+.prose__p {
+  max-width: var(--measure);
+  color: var(--ink-muted);
+  line-height: 1.75;
+  margin-top: var(--s-2);
+}
+
+.prose__p:first-of-type { margin-top: 0; }
+
+.prose__list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  max-width: var(--measure);
+  border-top: 1px solid var(--rule);
+}
+
+.prose__list li {
+  padding: 0.85rem 0;
+  border-bottom: 1px solid var(--rule);
+  color: var(--ink-muted);
+  font-size: var(--t-small);
+}

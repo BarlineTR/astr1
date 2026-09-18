@@ -1,0 +1,126 @@
+/* ─────────────────────────────  Konsol  ───────────────────────────── */
+
+.console__head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--s-3);
+}
+
+/* Veri kaynağı rozeti. Simülasyon her zaman görünür olmalıdır. */
+.badge {
+  font-family: var(--font-mono);
+  font-size: var(--t-micro);
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  padding: 0.35rem 0.75rem;
+  border: 1px solid var(--rule-strong);
+  color: var(--ink-muted);
+  white-space: nowrap;
+}
+
+.badge--live { border-color: rgba(111, 156, 106, 0.55); color: var(--ok); }
+.badge--mock { border-color: var(--rule-accent); color: var(--accent); background: var(--accent-sunken); }
+
+.console__notice {
+  margin-top: var(--s-3);
+  max-width: var(--measure);
+  color: var(--ink-muted);
+  font-size: var(--t-small);
+  border-left: 1px solid var(--rule-accent);
+  padding-left: var(--s-2);
+}
+
+/*
+ * İki sütun: solda sahne, sağda okumalar. Sahne üç satır boyunca uzanır, böylece
+ * yanındaki paneller boş hücre bırakmadan dizilir. DOM sırası — sahne, durum,
+ * kafa açısı, ses yönü, komut — ızgarayı kendiliğinden doldurur.
+ */
+.console__grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1.45fr) minmax(0, 1fr);
+  gap: 1px;
+  margin-top: var(--s-4);
+  background: var(--rule);
+  border: 1px solid var(--rule);
+}
+
+.panel { background: var(--bg); padding: var(--s-3); min-width: 0; }
+
+.panel--stage {
+  grid-row: span 3;
+  padding: 0;
+  position: relative;
+  min-height: 26rem;
+}
+
+.panel--wide { grid-column: 1 / -1; }
+
+.console__stage { position: absolute; inset: 0; }
+
+.panel__title {
+  font-family: var(--font-mono);
+  font-size: var(--t-micro);
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--ink-faint);
+  margin-bottom: var(--s-2);
+}
+
+@media (max-width: 60rem) {
+  .console__grid { grid-template-columns: minmax(0, 1fr); }
+  .panel--stage { grid-row: auto; min-height: 20rem; }
+  .panel--wide { grid-column: auto; }
+}
+
+/* ─────────────────────────────  Sayısal okumalar  ───────────────────────────── */
+
+.readouts { margin: 0; display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 0.5rem var(--s-2); }
+
+.readouts__label { color: var(--ink-faint); font-size: var(--t-small); }
+
+.readouts__value {
+  margin: 0;
+  text-align: right;
+  font-size: var(--t-small);
+  color: var(--ink);
+}
+
+/* ─────────────────────────────  Göstergeler  ───────────────────────────── */
+
+.gauge, .compass { width: 100%; height: auto; display: block; }
+
+.gauge__arc { fill: none; stroke: var(--rule-strong); stroke-width: 1.5; }
+
+.gauge__needle { stroke-linecap: round; }
+.gauge__needle--desired { stroke: var(--ink-faint); stroke-width: 1.5; stroke-dasharray: 4 3; }
+.gauge__needle--actual { stroke: var(--accent); stroke-width: 2.5; }
+
+.compass__ring { fill: none; stroke: var(--rule-strong); stroke-width: 1.5; }
+.compass__front { stroke: var(--ink-faint); stroke-width: 2; }
+.compass__marker { fill: var(--accent); }
+
+/* ─────────────────────────────  Komut  ───────────────────────────── */
+
+.controls { display: flex; flex-wrap: wrap; align-items: center; gap: var(--s-3); }
+
+.controls__slider { display: flex; align-items: center; gap: var(--s-2); flex: 1 1 18rem; min-width: 0; }
+
+.slider {
+  flex: 1;
+  min-width: 0;
+  accent-color: var(--accent);
+  background: transparent;
+}
+
+.slider__value { min-width: 4ch; text-align: right; color: var(--ink); font-size: var(--t-small); }
+
+.controls__buttons { display: flex; gap: var(--s-2); flex-wrap: wrap; }
+
+.controls__note {
+  margin-top: var(--s-2);
+  color: var(--ink-faint);
+  font-size: var(--t-micro);
+  line-height: 1.6;
+}
