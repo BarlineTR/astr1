@@ -70,22 +70,31 @@ function finishIntro(): void {
 }
 
 /**
- * Giriş sahnesi: tek kare çizilir ve öyle kalır.
+ * Giriş sahnesi: modelin kendi anlatısını oynattığı canlı sahne.
  *
- * Bu bölümde model hareket etmez — ne kendi döner, ne kamera gezer, ne de
- * sürüklenebilir. Bu yüzden çizim döngüsü hiç başlatılmaz; sahne kurulurken
- * üretilen tek kare yeterlidir ve sayfa boyunca hiç iş yapmaz.
+ * Model burada hareket eder — yavaşça döner ve senaryo sürücüsü kafayı sesin
+ * geldiği yöne çevirir. Sabit olan şey hareket değil, sahnenin sayfadaki yeri:
+ * bölüm akışta durduğu için kaydırınca metin modelin üstünden geçmez, ikisi
+ * birlikte yukarı kayar.
+ *
+ * Bölüm ekrandan çıkınca çizim durur — sahnenin kendi görünürlük gözlemcisi
+ * bunu hallediyor, sayfanın geri kalanı boyunca boşuna kare üretilmez.
  */
 async function mountHero(): Promise<void> {
   try {
-    const { createRobotScene } = await import("../scene/robot-scene");
-    await createRobotScene(view.heroStageEl, {
-      autoOrbit: false,
-      interactive: false,
+    const [{ createRobotScene }, { DemoDriver }] = await Promise.all([
+      import("../scene/robot-scene"),
+      import("../../../shared/demo-driver"),
+    ]);
+
+    const scene = await createRobotScene(view.heroStageEl, {
       // Dar ekranda sahnenin kendi ızgara satırı var; modeli ayrıca yukarı
       // itmek onu satırın üst kenarına yapıştırırdı.
       compactLift: false,
     });
+
+    scene.setDriver(new DemoDriver());
+    scene.start();
   } catch (error) {
     console.error("Giriş sahnesi yüklenemedi:", error);
     showStageFallback(view.heroStageEl);
