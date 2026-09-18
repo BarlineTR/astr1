@@ -183,6 +183,7 @@ try:
     from astro_ai.repetition_guard import RepetitionGuard
     from astro_ai.action_manager import ActionManager, SoundDirection, ActionResult
     from astro_ai.robot_led import RobotLED
+    from astro_ai.brain.paralinguistics_engine import ParalinguisticsEngine
 except ImportError:
     from conversation_session import ConversationSession, normalize_turkish_speech_input
     from memory_manager import MemoryManager
@@ -208,6 +209,11 @@ except ImportError:
         from robot_led import RobotLED
     except ImportError:
         RobotLED = None  # type: ignore
+    try:
+        from brain.paralinguistics_engine import ParalinguisticsEngine
+    except ImportError:
+        ParalinguisticsEngine = None  # type: ignore
+
 
 
 try:
@@ -791,6 +797,7 @@ class AstroRealtimeNode(Node):
         # Modular Cognitive Subsystems
         self.memory = MemoryManager()
         self.persona_engine = PersonaEngine(self.persona_name)
+        self.paralinguistics_engine = ParalinguisticsEngine() if ParalinguisticsEngine else None
         self.state_machine = StateMachine(RobotState.DEEP_IDLE)
         self._session_turns_buffer: List[Dict[str, Any]] = []
         self.session = ConversationSession(
@@ -6566,6 +6573,8 @@ class AstroRealtimeNode(Node):
         if not text:
             return b""
         clean_text = clean_tts_text(text)
+        if getattr(self, "paralinguistics_engine", None):
+            clean_text = self.paralinguistics_engine.format_tts_with_pauses(clean_text)
         if not clean_text:
             return b""
 
@@ -7045,6 +7054,8 @@ class AstroRealtimeNode(Node):
             return b"", "none", 0.0, False
         safe_text = ResponseSafetyGate.validate_response(text, persona=self.persona_name)
         clean_text = clean_tts_text(safe_text)
+        if getattr(self, "paralinguistics_engine", None):
+            clean_text = self.paralinguistics_engine.format_tts_with_pauses(clean_text)
         if not clean_text:
             return b"", "none", 0.0, False
 

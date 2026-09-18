@@ -9,6 +9,10 @@ from astro_ai.brain.initiative_engine import InitiativeEngine
 from astro_ai.brain.intent_engine import IntentEngine
 from astro_ai.brain.metacognitive_engine import MetacognitiveEngine
 from astro_ai.brain.outcome_resolver import OutcomeResolver
+from astro_ai.brain.paralinguistics_engine import (
+    ParalinguisticsCategory,
+    ParalinguisticsEngine,
+)
 from astro_ai.brain.prediction_engine import PredictionEngine
 from astro_ai.brain.prediction_factory import ActionExpectationFactory
 from astro_ai.brain.relationship_manager import RelationshipManager
@@ -27,6 +31,8 @@ __all__ = [
     "DialoguePolicyEngine",
     "MetacognitiveEngine",
     "OutcomeResolver",
+    "ParalinguisticsCategory",
+    "ParalinguisticsEngine",
     "PredictionEngine",
     "SocialBrain",
     "SelfModel",
@@ -39,3 +45,4 @@ __all__ = [
     "InitiativeEngine",
     "ResponsePlanner",
 ]
+
