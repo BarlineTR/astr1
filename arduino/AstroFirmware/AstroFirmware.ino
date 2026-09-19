@@ -49,8 +49,8 @@ static constexpr float KP = 0.6f, KI = 0.2f, KD = 0.0f; // 50 Hz PID için örne
 static constexpr int PWM_MAX = 255;
 static constexpr float PID_INTEGRAL_LIMIT = 50.0f; // ✅ FIX: Daha dar anti-windup limit
 
-// Kalibre Edildi: 45 tick / 30 derece = 1.5000 tick/derece (540 tick / 360 derece)
-static constexpr float HEAD_TICKS_PER_DEG = 1.5000f;
+// Canonical Head Encoder Resolution: Namiki 22CL-3501PG 80:1 (0.288 ticks/deg, ~3.47 deg/tick)
+static constexpr float HEAD_TICKS_PER_DEG = 0.288f;
 
 
 
@@ -62,11 +62,11 @@ static constexpr float HEAD_MAX_DEG =  180.0f;
 
 
 // Kafa motoru PWM limitleri ve statik sürtünme eşiği
-static constexpr int HEAD_PWM_LIMIT = 160;
-static constexpr int HEAD_PWM_MIN = 70;
+static constexpr int HEAD_PWM_LIMIT = 200;
+static constexpr int HEAD_PWM_MIN = 105;
 
-static constexpr float HEAD_KP = 4.0f, HEAD_KD = 0.05f;
-static constexpr int32_t HEAD_DEADBAND_TICKS = 1;  // 1 tick ~= 0.78 derece
+static constexpr float HEAD_KP = 12.0f, HEAD_KD = 0.40f;
+static constexpr int32_t HEAD_DEADBAND_TICKS = 1;  // 1 tick ~= 3.47 derece
 static constexpr uint32_t HEAD_STALL_MS = 1500;    // PWM'e rağmen tick değişmiyorsa kes (1.5s güvenli süre)
 
 

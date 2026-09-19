@@ -30,8 +30,8 @@ static constexpr float KP = 0.6f, KI = 0.2f, KD = 0.0f; // 50 Hz PID için örne
 static constexpr int PWM_MAX = 255;
 static constexpr float PID_INTEGRAL_LIMIT = 50.0f; // ✅ FIX: Daha dar anti-windup limit
 
-// Canonical Head Encoder Resolution: 440 ticks / 170.0 deg = 2.5882 ticks/deg (0.3864 deg/tick)
-static constexpr float HEAD_TICKS_PER_DEG = 2.5882f;
+// Canonical Head Encoder Resolution: Namiki 22CL-3501PG 80:1 (0.288 ticks/deg, ~3.47 deg/tick)
+static constexpr float HEAD_TICKS_PER_DEG = 0.288f;
 
 
 
@@ -64,31 +64,16 @@ static constexpr int32_t HEAD_TICKS_PER_REV =
 static constexpr int HEAD_PWM_LIMIT = 200;
 static constexpr int HEAD_PWM_MIN = 105;
 
-// Kafa konum PID'i.
-//
-// HEAD_KD 0.05 iken sonmleme yok sayilirdi: 20 deg/s (~52 tick/s) hizda D terimi
-// 2.6 PWM ediyordu, yani 200'luk olcekte gorunmez. Sonumsuz bir PID, asagidaki
-// surtunme ileri beslemesiyle birlesince limit cevrimi uretir.
-//
-// Ama enkoder turevi kuantize: iki cevrim arasindaki tek bir tick 50 Hz'de zaten
-// 50 tick/s okunur. Ham turevi buyuk bir kazancla carpmak, sonumleme yerine gurultu
-// enjekte eder. Bu yuzden turev once suzuluyor (HEAD_D_FILTER), sonra kazanca giriyor.
-static constexpr float HEAD_KP = 5.0f, HEAD_KD = 0.60f;
+// Kafa konum PID'i (Namiki 22CL coreless motor için ayarlandı).
+static constexpr float HEAD_KP = 12.0f, HEAD_KD = 0.40f;
 
 // Turev alcak geciren katsayisi (0..1). Kucuk = daha puruzsuz, daha gecikmeli.
 static constexpr float HEAD_D_FILTER = 0.25f;
 
 // PWM egim siniri: cikisin bir kontrol cevriminde degisebilecegi en buyuk miktar.
-// Olu bant kenarinda ileri besleme 0'dan 105'e basamak yapiyordu; 200'luk olcekte
-// bu, yarim skalalik bir darbe. 25 ile 105'e dort cevrimde (80 ms) ulasilir: darbe
-// yerine rampa, ama motor yine de kopma esigini gecmekte gecikmez.
 static constexpr int HEAD_PWM_SLEW = 25;
-// Dişli boşluğu 0.85 derece olarak ölçüldü (docs/final_validation_report.md) ve bir
-// tick 0.386 derece. Deadband boşluktan küçük olursa kontrolcü, mekanizmanın
-// kapatamayacağı bir hatayı kovalar: motor döner, çıkış takip etmez, hata durur,
-// tekrar döner — kafanın yüzü tutmaya çalışırken yaptığı sağ-sol salınım buydu.
-// 3 tick = 1.159 derece, boşluğu aşan ilk değer; sosyal mesafede görünmez.
-static constexpr int32_t HEAD_DEADBAND_TICKS = 3;  // 3 tick ~= 1.159 derece (boşluk 0.85)
+// Namiki 22CL: 1 tick ~= 3.47 derece. Deadband = 1 tick (titreşimsiz kararlı duruş).
+static constexpr int32_t HEAD_DEADBAND_TICKS = 1;  // 1 tick ~= 3.47 derece
 static constexpr uint32_t HEAD_STALL_MS = 1500;    // PWM'e rağmen tick değişmiyorsa kes (1.5s güvenli süre)
 
 

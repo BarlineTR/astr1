@@ -262,7 +262,7 @@ class SerialBridge(Node):
         self.declare_parameter("wheel_radius_right", 0.06)
         self.declare_parameter("wheel_separation", 0.26)
         self.declare_parameter("head_angle_scale", 1.0)
-        self.declare_parameter("head_ticks_per_deg", 2.5882)
+        self.declare_parameter("head_ticks_per_deg", 0.288)
         self.declare_parameter("head_zero_offset_ticks", 0.0)
         self.declare_parameter("head_sign", 1.0)
 
@@ -283,7 +283,7 @@ class SerialBridge(Node):
         self.wheel_radius_r = float(self.get_parameter("wheel_radius_right").value)
         self.wheel_separation = float(self.get_parameter("wheel_separation").value)
         self.head_angle_scale = float(self.get_parameter("head_angle_scale").value)
-        self.head_ticks_per_deg = float(self.get_parameter("head_ticks_per_deg").value or 2.5882)
+        self.head_ticks_per_deg = float(self.get_parameter("head_ticks_per_deg").value or 0.288)
         self.head_zero_offset_ticks = float(self.get_parameter("head_zero_offset_ticks").value or 0.0)
         self.head_sign = float(self.get_parameter("head_sign").value or 1.0)
 
@@ -1001,6 +1001,14 @@ class SerialBridge(Node):
                 self.get_logger().debug(f"[HEARTBEAT ACK] sequence={ack_seq} latency_ms={lat_ms:.1f}")
 
     def destroy_node(self):
+        # Graceful Head Park: Center head to 0.0 before disconnecting
+        try:
+            if self.ser and self.ser.is_open and self.arduino_alive:
+                pkt = self.build_packet(MSG_HEAD_CMD, struct.pack("<f", 0.0))
+                self.ser.write(pkt)
+                time.sleep(0.4)
+        except Exception:
+            pass
         self._mark_disconnected()
         if hasattr(super(), "destroy_node"):
             super().destroy_node()
