@@ -38,7 +38,7 @@ class LocalOfflineTTSEngine(BaseTTSEngine):
         self._state = self.STATE_STARTING
         self._piper_bin = shutil.which("piper") or self._find_piper_binary()
         self._espeak_bin = shutil.which("espeak-ng") or shutil.which("espeak")
-        self._piper_model = piper_model_path or os.getenv("TTS_PIPER_MODEL", "")
+        self._piper_model = piper_model_path or self._find_piper_model() or os.getenv("TTS_PIPER_MODEL", "")
         self._mode = self._detect_best_engine()
         self._state = self.STATE_READY
         self._safe_log("info", f"🔊 [LocalOfflineTTS] Hazır (Motor: {self._mode.upper()}, Dil: {self.language}, Durum: {self._state})")
@@ -66,6 +66,7 @@ class LocalOfflineTTSEngine(BaseTTSEngine):
 
     def _find_piper_binary(self) -> Optional[str]:
         candidates = [
+            os.path.expanduser("~/.local/bin/piper"),
             os.path.expanduser("~/.astro/bin/piper"),
             "/usr/local/bin/piper",
             "/usr/bin/piper",
@@ -73,6 +74,20 @@ class LocalOfflineTTSEngine(BaseTTSEngine):
         ]
         for c in candidates:
             if os.path.exists(c) and os.access(c, os.X_OK):
+                return c
+        return None
+
+    def _find_piper_model(self) -> Optional[str]:
+        env_m = os.getenv("TTS_PIPER_MODEL", "")
+        candidates = [
+            env_m,
+            os.path.expanduser("~/models/piper/tr_TR/tr_TR-dfki-medium.onnx"),
+            os.path.expanduser("~/.astro/models/piper/tr_TR/tr_TR-dfki-medium.onnx"),
+            "/home/okistech/models/piper/tr_TR/tr_TR-dfki-medium.onnx",
+            os.path.expanduser("~/models/piper/tr_TR-dfki-medium.onnx"),
+        ]
+        for c in candidates:
+            if c and os.path.isfile(c):
                 return c
         return None
 
