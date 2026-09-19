@@ -65,8 +65,9 @@ class PersonObjectAssociator:
                 if (t - obj.last_observed_ts) > 3.0:
                     continue  # Skip stale objects
 
-                obj_dist = obj.distance_m if obj.distance_m > 0.0 else person_dist
-                rel_dist = abs(person_dist - obj_dist)
+                has_metric_depth = (obj.distance_m > 0.0)
+                obj_dist = obj.distance_m if has_metric_depth else person_dist
+                rel_dist = abs(person_dist - obj_dist) if has_metric_depth else 0.50
 
                 relation = InteractionType.NONE
                 rel_conf = 0.0
@@ -82,16 +83,22 @@ class PersonObjectAssociator:
 
                     oxmin, oymin, oxmax, oymax = obj.bbox
                     ocx, ocy = obj.center
+                    if ocx == 0.0 and ocy == 0.0 and any(obj.bbox):
+                        ocx = (oxmin + oxmax) / 2.0
+                        ocy = (oymin + oymax) / 2.0
 
-                    # Check if object overlaps with mouth / chin region (for drinking/eating)
-                    mouth_ymin = fy + int(fh * 0.5)
-                    mouth_ymax = fy + int(fh * 1.3)
-                    mouth_xmin = fx - int(fw * 0.2)
-                    mouth_xmax = fx + int(fw * 1.2)
+                    # Check if object center is actually in mouth / chin region (for drinking/eating)
+                    mouth_ymin = fy + int(fh * 0.4)
+                    mouth_ymax = fy + int(fh * 1.35)
+                    mouth_xmin = fx - int(fw * 0.3)
+                    mouth_xmax = fx + int(fw * 1.3)
 
+                    # Strict mouth overlap: object center must be in mouth zone and not a huge desk bbox
+                    obj_height = oymax - oymin
                     is_near_mouth = (
-                        oxmin < mouth_xmax and oxmax > mouth_xmin and
-                        oymin < mouth_ymax and oymax > mouth_ymin
+                        mouth_xmin <= ocx <= mouth_xmax and
+                        mouth_ymin <= ocy <= mouth_ymax and
+                        obj_height <= int(fh * 2.2)
                     )
 
                     is_in_torso = (
@@ -99,12 +106,19 @@ class PersonObjectAssociator:
                         oymin < torso_ymax and oymax > torso_ymin
                     )
 
-                    if is_near_mouth and obj.class_name in ("cup", "bottle", "wine glass", "fork", "spoon", "sandwich", "apple"):
+                    # Metric depth check: if depth is known, must be within 0.45m of person
+                    depth_valid_for_holding = (not has_metric_depth) or (rel_dist <= 0.45)
+
+                    if is_near_mouth and depth_valid_for_holding and obj.class_name in ("cup", "bottle", "wine glass", "fork", "spoon", "sandwich", "apple"):
                         relation = InteractionType.HOLDING
                         rel_conf = 0.90
-                    elif is_in_torso and obj.class_name in ("cell phone", "book", "cup", "bottle"):
+                    elif is_in_torso and depth_valid_for_holding and obj.class_name in ("cell phone", "book"):
                         relation = InteractionType.HOLDING
                         rel_conf = 0.85
+                    elif is_in_torso and obj.class_name in ("cup", "bottle", "wine glass"):
+                        # Resting on desk in front of torso: NEAR, not drinking
+                        relation = InteractionType.NEAR
+                        rel_conf = 0.75
                     elif is_in_torso and obj.class_name in ("laptop", "keyboard"):
                         relation = InteractionType.IN_FRONT_OF
                         rel_conf = 0.88
@@ -112,14 +126,17 @@ class PersonObjectAssociator:
                         relation = InteractionType.NEAR
                         rel_conf = max(0.40, 1.0 - (rel_dist / self.proximity_threshold_m))
 
-                # 2. Metric 3D Proximity Fallback
-                elif rel_dist <= self.proximity_threshold_m:
+                # 2. Metric 3D Proximity Fallback (when 2D face_bbox is absent)
+                elif has_metric_depth and rel_dist <= self.proximity_threshold_m:
                     if obj.class_name in ("laptop", "keyboard") and obj_dist < person_dist:
                         relation = InteractionType.IN_FRONT_OF
                         rel_conf = 0.80
-                    elif obj.class_name in ("cell phone", "cup", "book", "bottle") and rel_dist < 0.40:
+                    elif obj.class_name in ("cell phone", "book") and rel_dist < 0.35:
                         relation = InteractionType.HOLDING
                         rel_conf = 0.75
+                    elif obj.class_name in ("cup", "bottle") and rel_dist < 0.25:
+                        relation = InteractionType.HOLDING
+                        rel_conf = 0.70
                     else:
                         relation = InteractionType.NEAR
                         rel_conf = max(0.40, 1.0 - (rel_dist / self.proximity_threshold_m))

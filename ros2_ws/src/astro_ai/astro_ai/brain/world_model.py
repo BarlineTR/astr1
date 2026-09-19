@@ -79,11 +79,24 @@ class WorldModel:
             # If any incoming person is an identified known user, purge placeholder anonymous records
             for p in people_list:
                 if getattr(p, "is_known", False) and str(p.person_id).lower() not in ("misafir", "guest"):
-                    for anon_id in ["misafir", "guest", "audio_speaker_1"]:
-                        if anon_id in self._people and anon_id != p.person_id:
-                            # Inherit trajectory history if target didn't have one
-                            if not getattr(p, "trajectory_history", None):
-                                p.trajectory_history = getattr(self._people[anon_id], "trajectory_history", [])
+                    stale_anon_ids = []
+                    for existing_id, existing_p in list(self._people.items()):
+                        if existing_id == p.person_id:
+                            continue
+                        is_anon = (
+                            existing_id in ("misafir", "guest", "audio_speaker_1")
+                            or existing_id.lower().startswith("person_misafir")
+                            or existing_id.lower().startswith("person_guest")
+                            or (existing_id.lower().startswith("person_") and not getattr(existing_p, "is_known", False))
+                        )
+                        if is_anon:
+                            az_diff = abs(getattr(p, "azimuth_deg", 0.0) - getattr(existing_p, "azimuth_deg", 0.0))
+                            if az_diff < 40.0 or len(self._people) <= 2:
+                                stale_anon_ids.append(existing_id)
+                    for anon_id in stale_anon_ids:
+                        if not getattr(p, "trajectory_history", None):
+                            p.trajectory_history = getattr(self._people[anon_id], "trajectory_history", [])
+                        if anon_id in self._people:
                             del self._people[anon_id]
 
             for p in people_list:

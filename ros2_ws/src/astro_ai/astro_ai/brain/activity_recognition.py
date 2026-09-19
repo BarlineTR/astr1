@@ -145,7 +145,7 @@ class TemporalActivityEngine:
         # I. Posture cues (Sitting vs Standing)
         dist = getattr(person, "distance_m", 1.5) or 1.5
         if "walking_motion" not in cues and dist <= 2.2:
-            # Strictly grounded: Sitting requires explicit posture cue, spatial chair/couch interaction, or face_bbox geometry
+            # Grounded: Sitting requires posture cue, spatial chair/couch, face_bbox geometry, or stationary proximity
             if motion_features and motion_features.get("posture") == "sitting":
                 cues.add("posture_sitting")
             elif motion_features and motion_features.get("posture") == "standing":
@@ -156,12 +156,16 @@ class TemporalActivityEngine:
             elif getattr(person, "face_bbox", None):
                 fb = person.face_bbox
                 if isinstance(fb, (list, tuple)) and len(fb) == 4 and any(fb):
-                    # In standard desk-mounted setups, seated user's face is centered/lower
-                    cy = (fb[1] + fb[3]) / 2.0 if fb[3] > fb[1] else (fb[1] + fb[3] / 2.0)
-                    if cy >= 180 or dist <= 1.4:
+                    # Face center Y: fb is typically (x, y, w, h)
+                    # If fb[3] > 80 and fb[1] < fb[3] and fb[3] > 300: could be (x1, y1, x2, y2)
+                    # Standard (x, y, w, h) center:
+                    cy = fb[1] + (fb[3] / 2.0)
+                    if cy >= 140 or dist <= 1.8:
                         cues.add("posture_sitting")
                     else:
                         cues.add("posture_standing")
+            elif dist <= 1.8:
+                cues.add("posture_sitting")
 
         # Record observation
         history.append(ActivityObservation(timestamp=t, cues=cues))

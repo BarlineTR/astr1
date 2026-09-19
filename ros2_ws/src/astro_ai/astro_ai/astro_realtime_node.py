@@ -3921,6 +3921,18 @@ class AstroRealtimeNode(Node):
         if t in ("dur", "dursana", "hareket etme", "dur artık", "dön", "sağına dön", "sesime dön", "bana dön"):
             return False, ""
 
+        # Compound query filter: If the user is also asking who they are ("ben kim", "ben kimim", etc.)
+        # or asking a multi-part conversational query, do NOT intercept with a single-purpose activity reply.
+        # Let GPT-4o-mini answer both identity and activity naturally!
+        compound_patterns = [
+            r"\bben\s+kim(?:im)?\b",
+            r"\bkimim\s+ben\b",
+            r"\badım\s+ne\b",
+            r"\bbeni\s+tanıyor\s+musun\b",
+        ]
+        if any(re.search(cp, t) for cp in compound_patterns):
+            return False, ""
+
         patterns = [
             r"\b(?:ben\s+)?(?:(?:şu\s*an(?:da)?|şuan)\s+)?ne\s+yap(?:ıyor(?:dur)?|ıyorum|ıyoruz|ıyorsun|maktayım|tığımı)\b",
             r"\b(?:ben\s+)?ne\s+yap(?:ıyor(?:dur)?|ıyorum|ıyoruz|ıyorsun|maktayım|tığımı)(?:\s+(?:şu\s*an(?:da)?|şuan))?\b",
@@ -3949,20 +3961,27 @@ class AstroRealtimeNode(Node):
         elif not vis_person_det:
             return True, "Şu an seni kameramda göremiyorum."
 
-        # Read active interlocutor from WorldModel
+        # Read active interlocutor from WorldModel:
+        # Prioritize person directly in front of camera (azimuth < 40 deg, is_present)
         wm = getattr(self.social_brain, "world_model", None) if getattr(self, "social_brain", None) else None
         interlocutor = None
-        if wm and hasattr(wm, "get_active_speaker"):
-            interlocutor = wm.get_active_speaker()
-        if interlocutor is None and wm and hasattr(wm, "_people"):
+        if wm and hasattr(wm, "_people"):
             with getattr(wm, "_lock", threading.Lock()):
-                present = [p for p in wm._people.values() if getattr(p, "is_present", False)]
-                if present:
-                    interlocutor = present[0]
+                front_tracked = [
+                    p for p in wm._people.values()
+                    if getattr(p, "is_present", False) and abs(getattr(p, "azimuth_deg", 90.0)) < 40.0
+                ]
+                if front_tracked:
+                    interlocutor = front_tracked[0]
+                else:
+                    present = [p for p in wm._people.values() if getattr(p, "is_present", False)]
+                    if present:
+                        interlocutor = present[0]
+
+        if interlocutor is None and wm and hasattr(wm, "get_active_speaker"):
+            interlocutor = wm.get_active_speaker()
 
         # Multi-modal Identity Isolation Safeguard:
-        # If speaker is verified (e.g. Baran) but camera sees a different person (e.g. Misafir),
-        # do NOT attribute Misafir's activity to the speaker!
         speaker_name = getattr(self, "_active_person_name", "") or ""
         if interlocutor and speaker_name and speaker_name.lower() != "misafir":
             int_name = getattr(interlocutor, "name", "") or ""
@@ -4218,12 +4237,6 @@ class AstroRealtimeNode(Node):
         # Natural, fluent adult/playful integration of verified interlocutor name
         if fact_clean == "Durdum.":
             return f"Durdum {valid_name}."
-
-        if fact_clean.startswith("Sesine döndüm,"):
-            return fact_clean.replace("Sesine döndüm,", f"Sesine döndüm {valid_name},", 1)
-
-        if fact_clean.startswith("Sesinin yönünü tam kestiremedim"):
-            return fact_clean.replace("Sesinin yönünü tam kestiremedim", f"Sesinin yönünü tam kestiremedim {valid_name},", 1)
 
         if fact_clean.startswith("Evet,"):
             return fact_clean.replace("Evet,", f"Evet {valid_name},", 1)
@@ -7704,6 +7717,13 @@ class AstroRealtimeNode(Node):
                 v_tgt_id_val = vis_ground.get("visual_target_id", "none")
                 v_tgt_dist_val = vis_ground.get("visual_target_distance")
                 act_state_val = "UNKNOWN"
+                if getattr(self, "social_brain", None) and hasattr(self.social_brain, "world_model"):
+                    wm_cur = self.social_brain.world_model
+                    with getattr(wm_cur, "_lock", threading.Lock()):
+                        for p_cand in wm_cur._people.values():
+                            if getattr(p_cand, "is_present", False) and getattr(p_cand, "current_activity", "UNKNOWN") != "UNKNOWN":
+                                act_state_val = p_cand.current_activity
+                                break
                 id_conf_val = 0.0
                 rec_p = getattr(self, "_recognized_person", {})
                 if isinstance(rec_p, dict) and rec_p.get("confidence") is not None:
@@ -7909,7 +7929,7 @@ class AstroRealtimeNode(Node):
                 is_det_dialogue, det_dialogue_reply, det_dialogue_type = self.dialogue_state_manager.process_user_turn(
                     user_text, intent_name=str(getattr(turn_intent, "value", turn_intent)) if turn_intent else None
                 )
-                if is_det_dialogue and det_dialogue_reply:
+                if is_det_dialogue and det_dialogue_reply and det_dialogue_type != "clarification":
                     reply_text = self._format_deterministic_response(
                         fact_text=det_dialogue_reply,
                         spk_name=spk_name,
@@ -8338,10 +8358,12 @@ class AstroRealtimeNode(Node):
                         generation_id=self._fallback_generation_id
                     )
 
-                if act_res and act_res.success:
-                    fact_reply = "Sesine döndüm, seni dinliyorum."
+                if spk_name and spk_name.lower() == "baran":
+                    fact_reply = "Dinliyorum seni abi."
+                elif spk_known and spk_name:
+                    fact_reply = f"Dinliyorum seni {spk_name}."
                 else:
-                    fact_reply = "Sesinin yönünü tam kestiremedim ama buradayım, seni dinliyorum."
+                    fact_reply = "Buradayım, dinliyorum."
 
                 reply_text = self._format_deterministic_response(
                     fact_text=fact_reply,
