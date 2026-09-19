@@ -12,6 +12,7 @@ namespace Proto {
     HEARTBEAT        = 0x01,  // host->mcu
     WHEEL_CMD        = 0x02,  // host->mcu: float32 left_rpm, right_rpm
     HEAD_CMD         = 0x03,  // host->mcu: float32 angle_deg
+    HEAD_SET_ZERO    = 0x04,  // host->mcu: tare current head position to 0.0
     IMU_DATA         = 0x10,  // mcu->host: 6x float32 (ax,ay,az,gx,gy,gz), uint32 micros
     ENCODER_TICKS    = 0x11,  // mcu->host: int32 L, int32 R, uint32 dt_us
     DIAGNOSTICS      = 0x12,  // mcu->host: uint16 vbat_mV, int16 mcu_temp_cX100, uint32 flags

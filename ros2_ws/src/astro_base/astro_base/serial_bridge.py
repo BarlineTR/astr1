@@ -22,7 +22,7 @@ try:
     from diagnostic_msgs.msg import DiagnosticArray, DiagnosticStatus, KeyValue
     from geometry_msgs.msg import Twist
     from sensor_msgs.msg import Imu, JointState
-    from std_msgs.msg import Float32
+    from std_msgs.msg import Float32, Empty
     from astro_base.msg import HeadCmd, WheelCmd
     try:
         from astro_base.msg import HeadState
@@ -140,6 +140,7 @@ SOF2 = 0x55
 MSG_HEARTBEAT = 0x01
 MSG_WHEEL_CMD = 0x02
 MSG_HEAD_CMD = 0x03
+MSG_HEAD_SET_ZERO = 0x04
 MSG_IMU_DATA = 0x10
 MSG_ENCODER_TICKS = 0x11
 MSG_DIAGNOSTICS = 0x12
@@ -324,6 +325,9 @@ class SerialBridge(Node):
         )
         self.sub_head_pos = self.create_subscription(
             Float32, "/head/cmd_pos", self.on_head_pos_cmd, 10
+        )
+        self.sub_head_set_zero = self.create_subscription(
+            Empty, "/head/set_zero", self.on_head_set_zero, 10
         )
 
 
@@ -654,6 +658,20 @@ class SerialBridge(Node):
         cmd = HeadCmd()
         cmd.angle_deg = float(msg.data)
         self.on_head_cmd(cmd)
+
+    def on_head_set_zero(self, msg: Empty):
+        if self.ser is None or not self.ser.is_open or not self.arduino_alive:
+            self.get_logger().warn("⚠️ [HEAD ZERO SET] Arduino bağlı değil, sıfırlanamadı!")
+            return
+        pkt = self.build_packet(MSG_HEAD_SET_ZERO, b"")
+        try:
+            with self.tx_lock:
+                self.ser.write(pkt)
+            self.head_pos = 0.0
+            self._last_sent_angle = 0.0
+            self.get_logger().info("🎯 [HEAD ZERO SET] Kafa konumu Arduino ve ROS'ta 0.0° olarak sabitlendi!")
+        except serial.SerialException as exc:
+            self.get_logger().error(f"HeadSetZero write failed: {exc}")
 
     def on_head_cmd(self, msg: HeadCmd):
         if self.ser is None or not self.ser.is_open or not self.arduino_alive:

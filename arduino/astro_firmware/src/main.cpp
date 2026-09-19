@@ -505,6 +505,20 @@ void processPacket(uint8_t msg_id, const uint8_t* pl, uint8_t len) {
       Serial2.print(F("[HEAD CMD] angle="));
       Serial2.println(angle_deg);
     } break;
+    case Proto::HEAD_SET_ZERO: {
+      noInterrupts();
+      g_head_ticks = 0;
+      interrupts();
+      g_head_target_ticks = 0;
+      g_head_profile_pos = 0.0f;
+      g_head_err_prev = 0;
+      g_head_stall_ref = 0;
+      g_head_stall_ms = millis();
+      g_diag_flags &= ~FLAG_HEAD_STALL;
+      setHeadPWM(0);
+      g_last_heartbeat_ms = millis();
+      Serial2.println(F("[HEAD ZERO SET] tare=0.0"));
+    } break;
   }
 }
 
