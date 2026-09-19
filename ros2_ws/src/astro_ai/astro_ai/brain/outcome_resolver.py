@@ -96,4 +96,32 @@ class OutcomeResolver:
                         )
                     )
 
+            # 5. Gaze: Target tracking convergence
+            elif p.action_id == "track_gaze" and "gaze_error_deg" in p.expected_state:
+                target_id = p.target_person_id
+                target_p = world_model._people.get(target_id) if target_id else None
+                if target_p and (getattr(target_p, "has_vision", False) or getattr(target_p, "is_present", False)):
+                    gaze_err = abs(float(getattr(target_p, "azimuth_deg", 0.0) or 0.0))
+                    # Converged within visual tolerance (15° FOV) or visually grounded
+                    if gaze_err <= 15.0 or (perception_data and perception_data.get("person_detected")):
+                        outcomes.append(
+                            ActualOutcome(
+                                outcome_id=f"out_gaze_{int(ts * 1000)}",
+                                expectation_id=p.prediction_id,
+                                actual_state={"gaze_error_deg": 0.0},
+                                timestamp=ts,
+                                source="gaze_tracker_convergence",
+                            )
+                        )
+                elif perception_data and perception_data.get("person_detected"):
+                    outcomes.append(
+                        ActualOutcome(
+                            outcome_id=f"out_gaze_{int(ts * 1000)}",
+                            expectation_id=p.prediction_id,
+                            actual_state={"gaze_error_deg": 0.0},
+                            timestamp=ts,
+                            source="gaze_tracker_visual_presence",
+                        )
+                    )
+
         return outcomes

@@ -1227,12 +1227,33 @@ class AstroRealtimeNode(Node):
                     p_conf = float(ident.get("biometric_confidence", 0.85))
                     p_fam = 0.80
                 else:
-                    p_name = "Misafir"
-                    p_id = "misafir"
-                    is_known = False
-                    p_formal = "Misafir"
-                    p_conf = 0.20
-                    p_fam = 0.20
+                    # Multi-Modal Audio-Visual Identity Fusion:
+                    # If speaker was verified (e.g. Baran via voice biometric) and only 1 face is in view,
+                    # fuse visual face with the verified speaker identity rather than creating a stranger ("Misafir").
+                    spk_name = getattr(self, "_active_person_name", "") or ""
+                    spk_ver = bool(
+                        getattr(self, "current_speaker_verified", False)
+                        or getattr(self, "_current_speaker_verified", False)
+                        or (hasattr(self, "audio_stream_manager") and getattr(self.audio_stream_manager, "is_verified", False))
+                    )
+                    if spk_ver and spk_name and spk_name.lower() != "misafir":
+                        p_name = spk_name
+                        p_id = spk_name.lower()
+                        is_known = True
+                        p_formal = spk_name
+                        p_conf = 0.90
+                        p_fam = 0.85
+                        wm_clean = getattr(getattr(self, "social_brain", None), "world_model", None)
+                        if wm_clean and hasattr(wm_clean, "_people") and "misafir" in wm_clean._people:
+                            with getattr(wm_clean, "_lock", threading.Lock()):
+                                wm_clean._people.pop("misafir", None)
+                    else:
+                        p_name = "Misafir"
+                        p_id = "misafir"
+                        is_known = False
+                        p_formal = "Misafir"
+                        p_conf = 0.20
+                        p_fam = 0.20
 
                 vad_speaking = bool(getattr(self, "_user_speaking_active", False))
                 has_vad = bool(vad_speaking or getattr(self, "_vad_active", False))
@@ -1278,18 +1299,19 @@ class AstroRealtimeNode(Node):
                 )
                 active_p.append(person_entity)
 
-                # Continuous activity evaluation with fresh spatial objects
-                if wm and hasattr(self, "_person_object_associator") and self._person_object_associator:
-                    fresh_objs = wm.get_spatial_objects(max_age_s=3.0)
-                    if fresh_objs:
-                        self._person_object_associator.associate(active_p, fresh_objs)
-                        if hasattr(self, "_temporal_activity_engine") and self._temporal_activity_engine:
-                            p_objs = [o for o in fresh_objs if getattr(o, "associated_person_id", None) == p_id]
-                            act, act_conf, ev = self._temporal_activity_engine.evaluate(person_entity, p_objs)
-                            wm.update_person_activity(p_id, act.value, act_conf, ev)
-                            person_entity.current_activity = act.value
-                            person_entity.activity_confidence = act_conf
-                            person_entity.activity_evidence = ev
+                # Continuous activity evaluation with fresh spatial objects or visual posture
+                if wm and hasattr(self, "_temporal_activity_engine") and self._temporal_activity_engine:
+                    fresh_objs = []
+                    if hasattr(self, "_person_object_associator") and self._person_object_associator:
+                        fresh_objs = wm.get_spatial_objects(max_age_s=3.0) or []
+                        if fresh_objs:
+                            self._person_object_associator.associate(active_p, fresh_objs)
+                    p_objs = [o for o in fresh_objs if getattr(o, "associated_person_id", None) == p_id] if fresh_objs else []
+                    act, act_conf, ev = self._temporal_activity_engine.evaluate(person_entity, p_objs)
+                    wm.update_person_activity(p_id, act.value, act_conf, ev)
+                    person_entity.current_activity = act.value
+                    person_entity.activity_confidence = act_conf
+                    person_entity.activity_evidence = ev
 
             self.cognitive_loop.step({
                 "people": active_p,
@@ -8506,7 +8528,7 @@ class AstroRealtimeNode(Node):
                         self.openai_api_key,
                         target_model,
                         messages,
-                        max_tokens=80,
+                        max_tokens=55,
                         temperature=0.65,
                         timeout=5.0,
                     ):
