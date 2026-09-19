@@ -2122,8 +2122,32 @@ class AstroRealtimeNode(Node):
                     has_lidar=bool(spatial_info.get("has_target")),
                 )
 
+                p_id_str = str(identity.get("user_id", name_val.lower()))
+                wm = getattr(self.social_brain, "world_model", None)
+                existing_p = None
+                if wm and hasattr(wm, "_people"):
+                    with getattr(wm, "_lock", threading.Lock()):
+                        existing_p = wm._people.get(p_id_str)
+                        if existing_p is None:
+                            front_cands = [
+                                p for p in wm._people.values()
+                                if getattr(p, "is_present", False)
+                                and abs(getattr(p, "azimuth_deg", 90.0)) < 45.0
+                                and getattr(p, "current_activity", "UNKNOWN") != "UNKNOWN"
+                            ]
+                            if front_cands:
+                                existing_p = front_cands[0]
+
+                existing_act = getattr(existing_p, "current_activity", "UNKNOWN") if existing_p else "UNKNOWN"
+                existing_act_conf = float(getattr(existing_p, "activity_confidence", 0.0)) if existing_p else 0.0
+                existing_act_ev = list(getattr(existing_p, "activity_evidence", [])) if existing_p else []
+                existing_act_objs = list(getattr(existing_p, "interacting_objects", [])) if existing_p else []
+                existing_fb = getattr(existing_p, "face_bbox", None) if existing_p else None
+                existing_col = getattr(existing_p, "dominant_clothing_color", "") if existing_p else ""
+                existing_acc = list(getattr(existing_p, "visual_accessories", [])) if existing_p else []
+
                 person = UnifiedPersonState(
-                    person_id=str(identity.get("user_id", name_val.lower())),
+                    person_id=p_id_str,
                     name=name_val,
                     formal_title=identity.get("formal_title", name_val),
                     is_known=is_known,
@@ -2138,6 +2162,13 @@ class AstroRealtimeNode(Node):
                     in_optical_cone=epistemic.in_camera_cone,
                     can_claim_vision=epistemic.can_claim_vision,
                     epistemic_status=epistemic.status.value,
+                    current_activity=existing_act,
+                    activity_confidence=existing_act_conf,
+                    activity_evidence=existing_act_ev,
+                    interacting_objects=existing_act_objs,
+                    face_bbox=existing_fb,
+                    dominant_clothing_color=existing_col,
+                    visual_accessories=existing_acc,
                 )
                 self.social_brain.world_model.update_people([person])
                 last_txt = getattr(self, "_last_user_transcript", "") or ""
@@ -3960,14 +3991,41 @@ class AstroRealtimeNode(Node):
         elif not vis_person_det:
             return True, "Şu an seni kameramda göremiyorum."
 
-        # Read active interlocutor from WorldModel:
+        # Read active interlocutor and activity from WorldModel:
         wm = getattr(self.social_brain, "world_model", None) if getattr(self, "social_brain", None) else None
         interlocutor = None
+        activity = "UNKNOWN"
+        activity_conf = 0.0
+
         if wm and hasattr(wm, "_people"):
             with getattr(wm, "_lock", threading.Lock()):
                 speaker_name = getattr(self, "_active_person_name", "") or ""
-                # 1. Match verified active speaker by name if known and present
+
+                # Step 1: People physically in front of camera (optical cone, abs(azimuth) < 45 deg, is_present)
+                front_tracked = [
+                    p for p in wm._people.values()
+                    if getattr(p, "is_present", False) and abs(getattr(p, "azimuth_deg", 90.0)) < 45.0
+                ]
+
+                # Step 2: If there's someone in front of camera matching speaker name with vision / active activity:
                 if speaker_name and speaker_name.lower() != "misafir":
+                    front_name_matches = [
+                        p for p in front_tracked
+                        if getattr(p, "name", "").lower() == speaker_name.lower()
+                    ]
+                    if front_name_matches:
+                        interlocutor = front_name_matches[0]
+
+                # Step 3: If no named match in front, check if any front-tracked person has active visual activity
+                if interlocutor is None and front_tracked:
+                    front_active = [p for p in front_tracked if getattr(p, "current_activity", "UNKNOWN") != "UNKNOWN"]
+                    if front_active:
+                        interlocutor = front_active[0]
+                    else:
+                        interlocutor = front_tracked[0]
+
+                # Step 4: Fallback to speaker by name anywhere if present
+                if interlocutor is None and speaker_name and speaker_name.lower() != "misafir":
                     name_matches = [
                         p for p in wm._people.values()
                         if getattr(p, "is_present", False) and getattr(p, "name", "").lower() == speaker_name.lower()
@@ -3975,34 +4033,51 @@ class AstroRealtimeNode(Node):
                     if name_matches:
                         interlocutor = name_matches[0]
 
-                # 2. Prioritize person directly in front of camera (azimuth < 40 deg, is_present)
+                # Step 5: Fallback to any present person with active activity
                 if interlocutor is None:
-                    front_tracked = [
+                    active_any = [
                         p for p in wm._people.values()
-                        if getattr(p, "is_present", False) and abs(getattr(p, "azimuth_deg", 90.0)) < 40.0
+                        if getattr(p, "is_present", False) and getattr(p, "current_activity", "UNKNOWN") != "UNKNOWN"
                     ]
-                    if front_tracked:
-                        interlocutor = front_tracked[0]
-                    else:
-                        present = [p for p in wm._people.values() if getattr(p, "is_present", False)]
-                        if present:
-                            interlocutor = present[0]
+                    if active_any:
+                        interlocutor = active_any[0]
+                    elif hasattr(wm, "get_active_speaker"):
+                        interlocutor = wm.get_active_speaker()
 
-        if interlocutor is None and wm and hasattr(wm, "get_active_speaker"):
-            interlocutor = wm.get_active_speaker()
+                if interlocutor:
+                    activity = getattr(interlocutor, "current_activity", "UNKNOWN")
+                    activity_conf = float(getattr(interlocutor, "activity_confidence", 0.0))
+
+                # Step 6: If interlocutor still has UNKNOWN activity, search if ANY present person in front has recognized activity
+                if activity == "UNKNOWN" and front_tracked:
+                    for p in front_tracked:
+                        p_act = getattr(p, "current_activity", "UNKNOWN")
+                        if p_act != "UNKNOWN":
+                            activity = p_act
+                            activity_conf = float(getattr(p, "activity_confidence", 0.75))
+                            break
+
+                # Step 7: Posture inference for stationary person in front of camera at desk distance
+                if activity == "UNKNOWN" and (interlocutor or front_tracked):
+                    target_p = interlocutor or (front_tracked[0] if front_tracked else None)
+                    if target_p:
+                        d = float(getattr(target_p, "distance_m", 1.0) or 1.0)
+                        az = abs(float(getattr(target_p, "azimuth_deg", 0.0) or 0.0))
+                        if 0.3 <= d <= 2.2 and az <= 45.0:
+                            activity = "SITTING"
+                            activity_conf = 0.70
 
         # Multi-modal Identity Isolation Safeguard:
+        # Only trigger if the person in front is a KNOWN DIFFERENT person (e.g. Mert, Oktay), NEVER "Misafir"!
         speaker_name = getattr(self, "_active_person_name", "") or ""
         if interlocutor and speaker_name and speaker_name.lower() != "misafir":
             int_name = getattr(interlocutor, "name", "") or ""
-            if int_name and int_name.lower() != speaker_name.lower():
+            is_known_int = getattr(interlocutor, "is_known", False)
+            if is_known_int and int_name and int_name.lower() not in ("misafir", "unknown", "") and int_name.lower() != speaker_name.lower():
                 return True, f"Şu an kameramda karşımda {int_name} duruyor, senin ne yaptığını doğrudan göremiyorum."
 
         # Read grounded human activity
-        activity = getattr(interlocutor, "current_activity", "UNKNOWN") if interlocutor else "UNKNOWN"
-        activity_conf = float(getattr(interlocutor, "activity_confidence", 0.0)) if interlocutor else 0.0
-
-        if (activity_conf >= 0.50 or (activity == "SITTING" and activity_conf > 0.0)) and activity != "UNKNOWN":
+        if (activity_conf >= 0.40 or (activity in ("SITTING", "USING_COMPUTER") and activity_conf > 0.0)) and activity != "UNKNOWN":
             act_enum = getattr(HumanActivity, activity, None) if HumanActivity else None
             desc = ACTIVITY_DESCRIPTIONS_TR.get(act_enum) if act_enum else None
             if desc:

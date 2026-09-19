@@ -259,6 +259,95 @@ class TestHumanizedDialogueAndActivity(unittest.TestCase):
         except UnboundLocalError as e:
             self.fail(f"Raised UnboundLocalError during streaming turn execution: {e}")
 
+    def test_09_activity_query_prioritizes_front_visual_entity_and_using_computer(self):
+        """When speaker Baran has DOA 134° (reflected sound) with UNKNOWN activity,
+        but a front-tracked person ('misafir' / camera face at 0.7m, 0°) is USING_COMPUTER,
+        _is_activity_query must resolve 'Bilgisayarında çalıştığını görüyorum.'"""
+        self.node._get_current_visual_grounding = lambda: {
+            "visual_state": "VERIFIED",
+            "visual_camera_available": True,
+            "visual_person_detected": True,
+            "visual_distance": 0.7,
+        }
+
+        # Speaker entity created at sound DOA reflection
+        spk_baran = UnifiedPersonState(
+            person_id="baran",
+            name="Baran",
+            is_known=True,
+            distance_m=1.2,
+            azimuth_deg=134.0,
+            has_vision=False,
+            has_audio=True,
+            is_present=True,
+            current_activity="UNKNOWN",
+            activity_confidence=0.0,
+        )
+
+        # Front visually-tracked person actively using computer
+        vis_guest = UnifiedPersonState(
+            person_id="misafir",
+            name="Misafir",
+            is_known=False,
+            distance_m=0.7,
+            azimuth_deg=0.0,
+            has_vision=True,
+            can_claim_vision=True,
+            is_present=True,
+            face_bbox=(200, 160, 140, 140),
+            current_activity="USING_COMPUTER",
+            activity_confidence=0.85,
+        )
+
+        self.node.social_brain.world_model._people = {
+            "baran": spk_baran,
+            "misafir": vis_guest,
+        }
+        self.node._active_person_name = "Baran"
+
+        is_act, reply = self.node._is_activity_query("Astro ben ne yapıyorum şu anda?")
+        self.assertTrue(is_act)
+        self.assertEqual(reply, "Bilgisayarında çalıştığını görüyorum.")
+        self.assertNotIn("ayırt edemiyorum", reply.lower())
+
+    def test_10_world_model_transfers_activity_when_purging_stale_anon(self):
+        """When verified person appears, activity & visual metadata from anonymous entity is transferred."""
+        wm = self.node.social_brain.world_model
+        # Existing visual tracking labeled as anonymous guest
+        anon = UnifiedPersonState(
+            person_id="misafir",
+            name="Misafir",
+            is_known=False,
+            distance_m=0.8,
+            azimuth_deg=5.0,
+            is_present=True,
+            current_activity="USING_COMPUTER",
+            activity_confidence=0.90,
+            face_bbox=(180, 150, 130, 130),
+            dominant_clothing_color="mavi",
+        )
+        wm._people = {"misafir": anon}
+
+        # Incoming verified Baran with UNKNOWN activity
+        baran = UnifiedPersonState(
+            person_id="baran",
+            name="Baran",
+            is_known=True,
+            distance_m=0.8,
+            azimuth_deg=5.0,
+            is_present=True,
+            current_activity="UNKNOWN",
+        )
+        wm.update_people([baran], now=100.0)
+
+        self.assertIn("baran", wm._people)
+        self.assertNotIn("misafir", wm._people)
+        saved_baran = wm._people["baran"]
+        self.assertEqual(saved_baran.current_activity, "USING_COMPUTER")
+        self.assertEqual(saved_baran.activity_confidence, 0.90)
+        self.assertEqual(saved_baran.dominant_clothing_color, "mavi")
+        self.assertEqual(saved_baran.face_bbox, (180, 150, 130, 130))
+
 
 if __name__ == "__main__":
     unittest.main()

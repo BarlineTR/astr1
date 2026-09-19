@@ -94,8 +94,22 @@ class WorldModel:
                             if az_diff < 40.0 or len(self._people) <= 2:
                                 stale_anon_ids.append(existing_id)
                     for anon_id in stale_anon_ids:
+                        anon_p = self._people[anon_id]
                         if not getattr(p, "trajectory_history", None):
-                            p.trajectory_history = getattr(self._people[anon_id], "trajectory_history", [])
+                            p.trajectory_history = getattr(anon_p, "trajectory_history", [])
+                        # Transfer activity and visual attributes if incoming entity has defaults/unknown
+                        if getattr(p, "current_activity", "UNKNOWN") == "UNKNOWN" and getattr(anon_p, "current_activity", "UNKNOWN") != "UNKNOWN":
+                            p.current_activity = anon_p.current_activity
+                            p.activity_confidence = getattr(anon_p, "activity_confidence", 0.75)
+                            p.last_activity_ts = getattr(anon_p, "last_activity_ts", t_now)
+                            p.activity_evidence = list(getattr(anon_p, "activity_evidence", []))
+                            p.interacting_objects = list(getattr(anon_p, "interacting_objects", []))
+                        if not getattr(p, "face_bbox", None) and getattr(anon_p, "face_bbox", None):
+                            p.face_bbox = anon_p.face_bbox
+                        if not getattr(p, "dominant_clothing_color", None) and getattr(anon_p, "dominant_clothing_color", None):
+                            p.dominant_clothing_color = anon_p.dominant_clothing_color
+                        if not getattr(p, "visual_accessories", None) and getattr(anon_p, "visual_accessories", None):
+                            p.visual_accessories = list(getattr(anon_p, "visual_accessories", []))
                         if anon_id in self._people:
                             del self._people[anon_id]
 
@@ -129,7 +143,7 @@ class WorldModel:
                     # Preserve activity and visual attributes if incoming entity has defaults/unknown
                     incoming_act = getattr(p, "current_activity", None)
                     if (not incoming_act or incoming_act == "UNKNOWN") and getattr(prev, "current_activity", None) and prev.current_activity != "UNKNOWN":
-                        if (t_now - getattr(prev, "last_activity_ts", 0.0)) <= 10.0:
+                        if (t_now - getattr(prev, "last_activity_ts", 0.0)) <= 30.0:
                             p.current_activity = prev.current_activity
                             p.activity_confidence = prev.activity_confidence
                             p.last_activity_ts = prev.last_activity_ts
@@ -138,6 +152,8 @@ class WorldModel:
 
                     if not getattr(p, "dominant_clothing_color", None) and getattr(prev, "dominant_clothing_color", None):
                         p.dominant_clothing_color = prev.dominant_clothing_color
+                    if not getattr(p, "face_bbox", None) and getattr(prev, "face_bbox", None):
+                        p.face_bbox = prev.face_bbox
                     if not getattr(p, "visual_accessories", None) and getattr(prev, "visual_accessories", None):
                         p.visual_accessories = list(prev.visual_accessories)
                     prev_age = getattr(prev, "estimated_age_group", None)
