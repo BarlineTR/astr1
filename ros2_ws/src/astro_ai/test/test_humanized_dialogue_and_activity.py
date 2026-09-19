@@ -232,7 +232,35 @@ class TestHumanizedDialogueAndActivity(unittest.TestCase):
         self.assertIn("otur", reply.lower())
         self.assertNotIn("ayırt edemiyorum", reply.lower())
 
+    def test_08_openai_streaming_tts_clause_timing_variables_assigned(self):
+        """Verify OpenAI 4o streaming synthesis does not raise UnboundLocalError on t_tts_request_started."""
+        self.node.use_4o = True
+        self.node.openai_api_key = "sk-mock-streaming-test"
+
+        mock_tokens = ["Merhaba ", "Baran, ", "bugün ", "sana ", "nasıl ", "yardımcı ", "olabilirim?"]
+        self.node.provider_registry.stream_openai_completion = MagicMock(return_value=iter(mock_tokens))
+
+        # Mock tts_router synthesize to return valid PCM
+        mock_pcm = b"\x00\x00" * 2400
+        mock_res = MagicMock()
+        mock_res.pcm = mock_pcm
+        mock_res.duration_ms = 100.0
+        mock_res.infer_ms = 50.0
+        mock_res.queue_wait_ms = 10.0
+        mock_res.actual_provider = "edge_tts"
+        mock_res.source_name = "edge_tts_cloud"
+        mock_res.model_name = "tr_tr_ahmet"
+        self.node.tts_router.synthesize = MagicMock(return_value=mock_res)
+        self.node._play_pcm_chunks = MagicMock()
+
+        # Calling _process_fallback_turn with direct_text must complete cleanly without UnboundLocalError
+        try:
+            self.node._process_fallback_turn(direct_text="Merhaba Astro")
+        except UnboundLocalError as e:
+            self.fail(f"Raised UnboundLocalError during streaming turn execution: {e}")
+
 
 if __name__ == "__main__":
     unittest.main()
+
 

@@ -7060,7 +7060,10 @@ class AstroRealtimeNode(Node):
             _log_gate_decision(False, "duplicate_generation")
             return False, "duplicate_generation"
 
-        # 8. Authorization consumed check (Single TTS per turn guarantee)
+        is_streaming_clause = (caller_reason == "streaming_clause")
+        is_streaming_final = (caller_reason == "streaming_final_clause")
+
+        # 8. Authorization consumed check (Single logical turn speech authorization)
         if auth.consumed:
             self.get_logger().warning(f"🛑 REJECT_DUPLICATE_SPEECH_AUTH: generation_id={generation_id} user_turn_id={user_turn_id}")
             _log_gate_decision(False, "authorization_consumed")
@@ -7071,19 +7074,24 @@ class AstroRealtimeNode(Node):
             _log_gate_decision(False, "no_user_turn")
             return False, "no_user_turn"
 
-        # 10. LLM inference completion check (unless deterministic policy)
-        if not is_deterministic:
+        # 10. LLM inference completion check (unless deterministic policy or active clause streaming)
+        if not is_deterministic and not is_streaming_clause:
             if not (is_llm_completed or auth.llm_inference_completed):
                 _log_gate_decision(False, "llm_not_completed")
                 return False, "llm_not_completed"
 
-        # 11. Final response text check
-        if not is_final_response or not response_text or not str(response_text).strip():
+        # 11. Response text check (intermediate streaming clauses don't require is_final_response)
+        if not response_text or not str(response_text).strip():
+            _log_gate_decision(False, "empty_response_text")
+            return False, "empty_response_text"
+
+        if not is_streaming_clause and not is_final_response:
             _log_gate_decision(False, "no_final_response")
             return False, "no_final_response"
 
-        # All hard gate checks passed! Consume authorization immediately.
-        auth.consumed = True
+        # All hard gate checks passed! Consume authorization on final response/clause.
+        if is_final_response or is_streaming_final:
+            auth.consumed = True
         _log_gate_decision(True, caller_reason)
         return True, "authorized"
 
@@ -7253,6 +7261,11 @@ class AstroRealtimeNode(Node):
         self._barge_in_latched = False  # Reset single logical barge-in debounce for new turn
         t_turn_start = time.monotonic()
         t_stt_finished = t_turn_start
+        t_tts_request_started = 0.0
+        t_tts_first_audio = 0.0
+        t_playback_started = 0.0
+        tts_ttfa_ms = 0.0
+        end_to_end_first_audio_ms = 0.0
         chosen_model = "none"
         chosen_provider = "none"
         response_origin = "none"
@@ -8541,6 +8554,7 @@ class AstroRealtimeNode(Node):
             total_enqueued_chunks = 0
             streamed_clauses_count = 0
             first_audio_played = False
+            t_tts_request_started = 0.0
 
             # Timing variables for latency trace telemetry (Problem 3)
             prompt_build_ms = 0.0
@@ -8594,7 +8608,7 @@ class AstroRealtimeNode(Node):
                                         llm_inference_completed=False,
                                         response_final=False,
                                     )
-                                if t_tts_request_started == 0.0:
+                                if t_tts_request_started <= 0.0:
                                     t_tts_request_started = time.monotonic()
                                 pcm_cl, s_ms, g_ms, q_ms = _synthesize_turn_clause(
                                     cl_txt,
@@ -8605,11 +8619,12 @@ class AstroRealtimeNode(Node):
                                 )
                                 total_synth_ms += s_ms
                                 if pcm_cl:
+                                    total_audio_bytes += len(pcm_cl)
                                     if not first_audio_played:
                                         first_audio_played = True
                                         t_playback_started = time.monotonic()
-                                        tts_ttfa_ms = (t_playback_started - t_tts_request_started) * 1000.0
-                                        end_to_end_first_audio_ms = (t_playback_started - t_stt_finished) * 1000.0
+                                        tts_ttfa_ms = (t_playback_started - t_tts_request_started) * 1000.0 if t_tts_request_started > 0 else 0.0
+                                        end_to_end_first_audio_ms = (t_playback_started - t_stt_finished) * 1000.0 if t_stt_finished > 0 else 0.0
                                     _handle_and_play_clause_audio(pcm_cl, is_final_clause=False)
                                     streamed_clauses_count += 1
 
@@ -8639,6 +8654,7 @@ class AstroRealtimeNode(Node):
                                 )
                                 total_synth_ms += s_ms
                                 if pcm_cl:
+                                    total_audio_bytes += len(pcm_cl)
                                     _handle_and_play_clause_audio(pcm_cl, is_final_clause=True)
                                     streamed_clauses_count += 1
 
