@@ -221,7 +221,7 @@ def generate_launch_description():
         condition=IfCondition(LaunchConfiguration("enable_audio")),
         parameters=[{
             "input_channels": LaunchConfiguration("audio_input_channels"),
-            "enable_hid_doa": False,
+            "enable_hid_doa": True,
         }],
     )
 

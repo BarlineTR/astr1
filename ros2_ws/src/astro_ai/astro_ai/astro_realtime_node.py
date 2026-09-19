@@ -1316,7 +1316,7 @@ class AstroRealtimeNode(Node):
             self.cognitive_loop.step({
                 "people": active_p,
                 "person_detected": bool(getattr(self, "_recognized_person", None) is not None),
-                "vad": bool(getattr(self, "_user_speaking_active", False)),
+                "vad": bool(getattr(self, "_user_speaking_active", False) or getattr(self, "_vad_active", False)),
                 "doa_deg": float(getattr(self, "_speaker_angle", 0.0) or 0.0),
                 "tts_speaking": bool(getattr(self, "_is_playback_active", False)),
                 "robot_state": {

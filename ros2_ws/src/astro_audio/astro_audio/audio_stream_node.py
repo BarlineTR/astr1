@@ -878,6 +878,13 @@ class AudioStreamNode(Node):
                     )
 
                 azimuth_deg, conf, valid = self._doa_estimator.estimate_from_multichannel_pcm(mics)
+                if valid and (self._respeaker is None or self._hid_status != "ok") and not is_active_playback:
+                    doa_msg = Float32()
+                    doa_msg.data = float(azimuth_deg)
+                    self.pub_doa.publish(doa_msg)
+                    hid_conf_msg = Float32()
+                    hid_conf_msg.data = float(conf)
+                    self.pub_doa_confidence.publish(hid_conf_msg)
 
             # Software Echo Mute & Self-Voice Suppression (Zero Self-Hearing):
             if is_active_playback:
