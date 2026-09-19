@@ -139,6 +139,100 @@ class TestHumanizedDialogueAndActivity(unittest.TestCase):
         self.assertIn("baran", wm._people)
         self.assertNotIn("person_misafir_0", wm._people)
 
+    def test_06_on_faces_payload_handling_and_world_model_update(self):
+        """Verify _on_faces parses incoming vision payload without NameError and updates WorldModel."""
+        import json
+        try:
+            from std_msgs.msg import String
+        except ImportError:
+            class String:
+                def __init__(self, data=""):
+                    self.data = data
+
+        faces_payload = [
+            {
+                "person_id": "baran",
+                "name": "Baran",
+                "recognized_name": "Baran",
+                "recognized_title": "Baran",
+                "is_known": True,
+                "confidence": 0.88,
+                "distance_m": 0.95,
+                "camera_azimuth_deg": -1.5,
+                "looking_at_robot": True,
+                "x": 200,
+                "y": 160,
+                "width": 140,
+                "height": 140,
+                "emotion": "neutral",
+                "dominant_clothing_color_tr": "siyah",
+            }
+        ]
+        msg = String(data=json.dumps(faces_payload))
+
+        # Calling _on_faces must NOT throw NameError or any unhandled exception
+        self.node._on_faces(msg)
+
+        wm = self.node.social_brain.world_model
+        person = wm.get_person("baran")
+        self.assertIsNotNone(person, "Baran should be registered in WorldModel by _on_faces")
+        self.assertEqual(person.name, "Baran")
+        self.assertAlmostEqual(person.distance_m, 0.95, places=2)
+        self.assertAlmostEqual(person.azimuth_deg, -1.5, places=1)
+        self.assertTrue(person.is_looking_at_robot)
+
+    def test_07_activity_query_resolves_sitting_from_vision(self):
+        """User asking 'Ne yapıyorum?' when seated in front of robot gets 'Oturduğunu görüyorum'."""
+        import json
+        try:
+            from std_msgs.msg import String
+        except ImportError:
+            class String:
+                def __init__(self, data=""):
+                    self.data = data
+
+        self.node._get_current_visual_grounding = lambda: {
+            "visual_state": "VERIFIED",
+            "visual_camera_available": True,
+            "visual_person_detected": True,
+            "visual_distance": 0.95,
+        }
+
+        # Simulate camera feed detecting seated Baran
+        faces_payload = [
+            {
+                "person_id": "baran",
+                "name": "Baran",
+                "recognized_name": "Baran",
+                "is_known": True,
+                "confidence": 0.9,
+                "distance_m": 0.95,
+                "camera_azimuth_deg": 0.0,
+                "looking_at_robot": True,
+                "x": 200,
+                "y": 160,
+                "width": 140,
+                "height": 140,
+            }
+        ]
+        msg = String(data=json.dumps(faces_payload))
+        self.node._on_faces(msg)
+
+        # Set speaker verification state to Baran
+        self.node._active_person_name = "Baran"
+
+        # Force activity engine evaluation / activity set
+        person = self.node.social_brain.world_model.get_person("baran")
+        self.assertIsNotNone(person)
+        person.current_activity = "SITTING"
+        person.activity_confidence = 0.8
+
+        is_act, reply = self.node._is_activity_query("Ne yapıyorum şu an?")
+        self.assertTrue(is_act)
+        self.assertIn("otur", reply.lower())
+        self.assertNotIn("ayırt edemiyorum", reply.lower())
+
 
 if __name__ == "__main__":
     unittest.main()
+

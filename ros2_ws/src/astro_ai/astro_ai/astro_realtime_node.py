@@ -990,9 +990,8 @@ class AstroRealtimeNode(Node):
         )
 
         # Local Offline Backup TTS Engine (Zero internet local resilience fallback)
-        # When use_realtime=False (local mode), espeak/local_offline_tts is strictly excluded from TTSRouter
         self.local_offline_tts: Optional[LocalOfflineTTSEngine] = None
-        if LocalOfflineTTSEngine and self.use_realtime:
+        if LocalOfflineTTSEngine:
             try:
                 self.local_offline_tts = LocalOfflineTTSEngine(
                     language=os.getenv("TTS_LANGUAGE", "tr"),
@@ -1022,7 +1021,7 @@ class AstroRealtimeNode(Node):
 
         self.tts_router = TTSRouter(
             local_xtts=self.local_xtts,
-            local_offline_tts=self.local_offline_tts if self.use_realtime else None,
+            local_offline_tts=self.local_offline_tts,
             edge_tts_synth_func=self._synthesize_edge_tts_pcm24k,
             edge_tts_enabled=self.edge_tts_enabled,
             logger=self._safe_log,
@@ -3962,21 +3961,32 @@ class AstroRealtimeNode(Node):
             return True, "Şu an seni kameramda göremiyorum."
 
         # Read active interlocutor from WorldModel:
-        # Prioritize person directly in front of camera (azimuth < 40 deg, is_present)
         wm = getattr(self.social_brain, "world_model", None) if getattr(self, "social_brain", None) else None
         interlocutor = None
         if wm and hasattr(wm, "_people"):
             with getattr(wm, "_lock", threading.Lock()):
-                front_tracked = [
-                    p for p in wm._people.values()
-                    if getattr(p, "is_present", False) and abs(getattr(p, "azimuth_deg", 90.0)) < 40.0
-                ]
-                if front_tracked:
-                    interlocutor = front_tracked[0]
-                else:
-                    present = [p for p in wm._people.values() if getattr(p, "is_present", False)]
-                    if present:
-                        interlocutor = present[0]
+                speaker_name = getattr(self, "_active_person_name", "") or ""
+                # 1. Match verified active speaker by name if known and present
+                if speaker_name and speaker_name.lower() != "misafir":
+                    name_matches = [
+                        p for p in wm._people.values()
+                        if getattr(p, "is_present", False) and getattr(p, "name", "").lower() == speaker_name.lower()
+                    ]
+                    if name_matches:
+                        interlocutor = name_matches[0]
+
+                # 2. Prioritize person directly in front of camera (azimuth < 40 deg, is_present)
+                if interlocutor is None:
+                    front_tracked = [
+                        p for p in wm._people.values()
+                        if getattr(p, "is_present", False) and abs(getattr(p, "azimuth_deg", 90.0)) < 40.0
+                    ]
+                    if front_tracked:
+                        interlocutor = front_tracked[0]
+                    else:
+                        present = [p for p in wm._people.values() if getattr(p, "is_present", False)]
+                        if present:
+                            interlocutor = present[0]
 
         if interlocutor is None and wm and hasattr(wm, "get_active_speaker"):
             interlocutor = wm.get_active_speaker()
@@ -3992,7 +4002,7 @@ class AstroRealtimeNode(Node):
         activity = getattr(interlocutor, "current_activity", "UNKNOWN") if interlocutor else "UNKNOWN"
         activity_conf = float(getattr(interlocutor, "activity_confidence", 0.0)) if interlocutor else 0.0
 
-        if activity_conf >= 0.55 and activity != "UNKNOWN":
+        if (activity_conf >= 0.50 or (activity == "SITTING" and activity_conf > 0.0)) and activity != "UNKNOWN":
             act_enum = getattr(HumanActivity, activity, None) if HumanActivity else None
             desc = ACTIVITY_DESCRIPTIONS_TR.get(act_enum) if act_enum else None
             if desc:
@@ -8529,6 +8539,8 @@ class AstroRealtimeNode(Node):
 
             total_audio_bytes = 0
             total_enqueued_chunks = 0
+            streamed_clauses_count = 0
+            first_audio_played = False
 
             # Timing variables for latency trace telemetry (Problem 3)
             prompt_build_ms = 0.0
@@ -8566,6 +8578,41 @@ class AstroRealtimeNode(Node):
 
                         full_reply_parts.append(token)
 
+                        # Clause-Level Streaming: Synthesize and play clauses incrementally
+                        if chunker and not self._barge_in_latched and self._fallback_generation_id == current_gen_id:
+                            ready_clauses = chunker.feed(token)
+                            for cl_txt in ready_clauses:
+                                if self._barge_in_latched or self._fallback_generation_id != current_gen_id:
+                                    break
+                                if not getattr(self, "_speech_authorization", None):
+                                    self._speech_authorization = SpeechAuthorization(
+                                        user_turn_id=u_turn_id,
+                                        generation_id=self._fallback_generation_id,
+                                        explicit_user_turn=True,
+                                        should_speak=True,
+                                        response_origin="openai_chat",
+                                        llm_inference_completed=False,
+                                        response_final=False,
+                                    )
+                                if t_tts_request_started == 0.0:
+                                    t_tts_request_started = time.monotonic()
+                                pcm_cl, s_ms, g_ms, q_ms = _synthesize_turn_clause(
+                                    cl_txt,
+                                    is_final_response=False,
+                                    is_deterministic=False,
+                                    is_llm_completed=False,
+                                    caller_reason="streaming_clause",
+                                )
+                                total_synth_ms += s_ms
+                                if pcm_cl:
+                                    if not first_audio_played:
+                                        first_audio_played = True
+                                        t_playback_started = time.monotonic()
+                                        tts_ttfa_ms = (t_playback_started - t_tts_request_started) * 1000.0
+                                        end_to_end_first_audio_ms = (t_playback_started - t_stt_finished) * 1000.0
+                                    _handle_and_play_clause_audio(pcm_cl, is_final_clause=False)
+                                    streamed_clauses_count += 1
+
                     if full_reply_parts:
                         chosen_model = target_model
                         chosen_provider = "openai"
@@ -8575,8 +8622,28 @@ class AstroRealtimeNode(Node):
                         llm_inference_duration_ms = llm_latency_ms
                         total_llm_ms = llm_latency_ms
                         self.provider_registry.record_success("openai", target_model, llm_latency_ms)
+
+                        # Flush remaining clause from chunker if any
+                        if chunker and streamed_clauses_count > 0 and not self._barge_in_latched and self._fallback_generation_id == current_gen_id:
+                            rem_cl = chunker.flush()
+                            if rem_cl:
+                                if self._speech_authorization:
+                                    self._speech_authorization.llm_inference_completed = True
+                                    self._speech_authorization.response_final = True
+                                pcm_cl, s_ms, g_ms, q_ms = _synthesize_turn_clause(
+                                    rem_cl,
+                                    is_final_response=True,
+                                    is_deterministic=False,
+                                    is_llm_completed=True,
+                                    caller_reason="streaming_final_clause",
+                                )
+                                total_synth_ms += s_ms
+                                if pcm_cl:
+                                    _handle_and_play_clause_audio(pcm_cl, is_final_clause=True)
+                                    streamed_clauses_count += 1
+
                         self.get_logger().info(
-                            f"🤖 [OpenAI 4o-mini Inference Success] model={target_model} | latency_ms={llm_latency_ms:.1f} | tokens={len(full_reply_parts)}"
+                            f"🤖 [OpenAI 4o-mini Inference Success] model={target_model} | latency_ms={llm_latency_ms:.1f} | tokens={len(full_reply_parts)} | streamed_clauses={streamed_clauses_count}"
                         )
                         attempts.append({
                             "provider": "openai",
@@ -9071,8 +9138,8 @@ class AstroRealtimeNode(Node):
                 if len(self._recent_robot_phrases) > 10:
                     self._recent_robot_phrases = self._recent_robot_phrases[-10:]
 
-            # Synthesize ONE single unified TTS generation for this logical turn
-            if full_reply_str and not self._barge_in_latched and self._fallback_generation_id == current_gen_id:
+            # Synthesize ONE single unified TTS generation for this logical turn (only if not streamed)
+            if full_reply_str and streamed_clauses_count == 0 and not self._barge_in_latched and self._fallback_generation_id == current_gen_id:
                 self._speech_authorization = SpeechAuthorization(
                     user_turn_id=u_turn_id,
                     generation_id=self._fallback_generation_id,
@@ -9655,6 +9722,13 @@ class AstroRealtimeNode(Node):
                 dom_color_conf = float(f.get("clothing_color_confidence", 0.0))
                 access_list = f.get("accessories", [])
                 fb_box = (int(f.get("x", 0)), int(f.get("y", 0)), int(f.get("width", 0)), int(f.get("height", 0)))
+                dist = float(f.get("distance_m") or f.get("distance") or getattr(self, "_user_distance", 1.5) or 1.5)
+                yaw = float(f.get("camera_azimuth_deg") or f.get("yaw_deg") or f.get("azimuth_deg") or getattr(self, "_speaker_angle", 0.0) or 0.0)
+                looking = bool(
+                    f.get("looking_at_robot") if f.get("looking_at_robot") is not None
+                    else (f.get("is_looking_at_robot") if f.get("is_looking_at_robot") is not None
+                    else getattr(self, "_looking_at_robot", False))
+                )
 
                 if UnifiedPersonState:
                     raw_attrs = {
