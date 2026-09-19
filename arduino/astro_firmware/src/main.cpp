@@ -170,19 +170,10 @@ void rightEncA() {
   bool b = digitalRead(R_ENC_B);
   g_right_ticks += b ? -1 : +1;
 }
-volatile int8_t g_head_last_dir = 1;
-
 void headEncA() {
-  if (g_head_pwm > 0) {
-    g_head_last_dir = 1;
-    g_head_ticks++;
-  } else if (g_head_pwm < 0) {
-    g_head_last_dir = -1;
-    g_head_ticks--;
-  } else {
-    // Frenleme/atalet aninda son hareket yonunde sayarak faz terslenmesi ve kaymayi onle
-    g_head_ticks += g_head_last_dir;
-  }
+  // Quadrature yön tespiti (Pin 21 HEAD_ENC_B)
+  bool b = digitalRead(HEAD_ENC_B);
+  g_head_ticks += b ? -1 : +1;
 }
 
 
