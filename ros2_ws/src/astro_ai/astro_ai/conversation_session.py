@@ -88,8 +88,8 @@ class ConversationSession:
 
     def __init__(
         self,
-        base_timeout_s: float = 16.0,
-        gaze_extension_s: float = 8.0,
+        base_timeout_s: float = 7.0,
+        gaze_extension_s: float = 4.0,
         on_session_start: Optional[Callable[[], None]] = None,
         on_session_end: Optional[Callable[[], None]] = None,
     ):

@@ -801,7 +801,8 @@ class AstroRealtimeNode(Node):
         self.state_machine = StateMachine(RobotState.DEEP_IDLE)
         self._session_turns_buffer: List[Dict[str, Any]] = []
         self.session = ConversationSession(
-            base_timeout_s=16.0,
+            base_timeout_s=7.0,
+            gaze_extension_s=4.0,
             on_session_end=self._on_conversation_session_ended,
         )
         self.action_manager = ActionManager(logger=self.get_logger(), node=self) if ActionManager else None
@@ -1394,6 +1395,17 @@ class AstroRealtimeNode(Node):
         if not is_isolated_test and not getattr(self, "openai_api_key", None):
             return False
         return True
+
+    def _can_use_llm(self) -> bool:
+        """Returns True if any conversational LLM service is available."""
+        if getattr(self, "use_4o", False) and getattr(self, "openai_api_key", None):
+            return True
+        if getattr(self, "groq_api_key", None):
+            return True
+        pr = getattr(self, "provider_registry", None)
+        if pr and hasattr(pr, "has_available_provider") and pr.has_available_provider():
+            return True
+        return False
 
     def _trigger_openai_hard_lockout(self, reason: str, ws=None) -> None:
         """Atomically locks out OpenAI for the entire process lifetime across all surfaces."""
@@ -2195,11 +2207,51 @@ class AstroRealtimeNode(Node):
             except Exception as _sb_err:
                 self.get_logger().debug(f"SocialBrain dialogue turn notice: {_sb_err}")
 
+        # Rich Grounded Visual & Physical Perception Block for Multimodal Reasoning
+        multimodal_perception_str = ""
+        try:
+            vis_state = self._get_current_visual_grounding() if callable(getattr(self, "_get_current_visual_grounding", None)) else {}
+            v_state = vis_state.get("visual_state", "UNKNOWN")
+            v_cam_avail = bool(vis_state.get("visual_camera_available", False))
+            v_person = bool(vis_state.get("visual_person_detected", False))
+            head_yaw = float(getattr(self, "_current_head_yaw", 0.0))
+
+            # Fetch fresh objects detected around robot
+            detected_objs_str = "Yok"
+            if getattr(self, "social_brain", None) and hasattr(self.social_brain, "world_model"):
+                wm = self.social_brain.world_model
+                if hasattr(wm, "get_spatial_objects"):
+                    s_objs = wm.get_spatial_objects(max_age_s=5.0, min_confidence=0.40)
+                    if s_objs:
+                        detected_objs_str = ", ".join(f"{getattr(o, 'label', 'nesne')} ({getattr(o, 'distance_m', 0.0):.1f}m)" for o in s_objs[:5])
+
+            p_activity = existing_act if 'existing_act' in locals() and existing_act else "UNKNOWN"
+            p_desc = ""
+            if p_activity != "UNKNOWN" and HumanActivity:
+                act_enum = getattr(HumanActivity, p_activity, None)
+                p_desc = ACTIVITY_DESCRIPTIONS_TR.get(act_enum, p_activity) if act_enum else p_activity
+
+            multimodal_perception_str = (
+                f"\n\n[GÖRSEL VE MEKÂNSAL FARKINDALIK BİLGİSİ (MULTIMODAL PERCEPTION)]:\n"
+                f"- Kamera Durumu: {'AKTİF' if v_cam_avail else 'KAPALI/BAĞLI DEĞİL'}, Görüntü Tazeliği: {v_state}\n"
+                f"- Kafa Açısı (Head Yaw): {head_yaw:+.1f}° (0° tam karşı/merkez, eksi değerler sağ, artı değerler sol)\n"
+                f"- Doğrudan Kamera Görüş Açısında İnsan Var mı: {'EVET' if v_person else 'HAYIR'}\n"
+                f"- Algılanan Kullanıcı Aktivitesi: {p_activity} ({p_desc or 'belirsiz'})\n"
+                f"- Çevredeki Nesneler: {detected_objs_str}\n"
+                f"ÖNEMLİ ALGI TALİMATI:\n"
+                f"1. Kullanıcı sana 'ne yapıyorum?', 'beni görüyor musun?', 'neredeyim?' gibi sorular sorduğunda yukarıdaki sensör durumunu doğal, esprili ve insansı bir şekilde harmanla.\n"
+                f"2. Asla kalıplaşmış, robotik hata mesajları ('Şu an görüntüm güncel olmadığı için...', 'Kameram aktif değil...', 'Ayırt edemiyorum...') verme.\n"
+                f"3. Eğer kullanıcı görüş açından çıkmışsa veya başka bir yöndeyse (örneğin radar/ses açısı ile kafa açısı uyuşmuyorsa), bunu samimice belirt (örneğin 'Gördüğüm kadarıyla masadan kalkıp sağıma geçmişsin ama tam ne yaptığına bakmak için başımı çevirmem gerek').\n"
+                f"4. Karşında oturuyor veya bilgisayar başındaysa bunu doğal bir dille söyle ('Gördüğüm kadarıyla bilgisayarının başında oturuyorsun').\n"
+            )
+        except Exception as _m_err:
+            self.get_logger().debug(f"multimodal_perception_str construction notice: {_m_err}")
+
         if not getattr(self, "persona_engine", None):
-            return f"Astro Default Instructions {bio_status}{spatial_rule}{social_context_str}"
+            return f"Astro Default Instructions {bio_status}{spatial_rule}{social_context_str}{multimodal_perception_str}"
         mem_ctx = self.memory.get_prompt_context(recognized_person=identity) if getattr(self, "memory", None) else ""
         return self.persona_engine.build_system_prompt(
-            memory_context=mem_ctx + bio_status + memory_rule + realtime_speech_rule + spatial_rule + social_context_str,
+            memory_context=mem_ctx + bio_status + memory_rule + realtime_speech_rule + spatial_rule + social_context_str + multimodal_perception_str,
             recognized_person=identity
         )
 
@@ -3937,7 +3989,7 @@ class AstroRealtimeNode(Node):
         else:
             return ", ".join(phrases[:-1]) + f" ve {phrases[-1]}"
 
-    def _is_activity_query(self, text: str) -> Tuple[bool, str]:
+    def _is_activity_query(self, text: str, prefer_llm: Optional[bool] = None) -> Tuple[bool, str]:
         """Detects explicit queries about user's current activity (e.g. 'ne yapıyorum', 'ben ne yapıyordur şu anda').
 
         Returns (is_activity_query, deterministic_reply_text).
@@ -3951,14 +4003,18 @@ class AstroRealtimeNode(Node):
         if t in ("dur", "dursana", "hareket etme", "dur artık", "dön", "sağına dön", "sesime dön", "bana dön"):
             return False, ""
 
-        # Compound query filter: If the user is also asking who they are ("ben kim", "ben kimim", etc.)
-        # or asking a multi-part conversational query, do NOT intercept with a single-purpose activity reply.
-        # Let GPT-4o-mini answer both identity and activity naturally!
+        # Compound / contextual query filter: If the user is asking identity ("ben kim") OR mentioning contextual changes
+        # ("konumu değiştirdim", "kalktım", "yerimi değiştirdim", "peki", "artık", etc.),
+        # do NOT intercept with a single-purpose static activity reply.
+        # Let LLM reason over the rich multimodal perception context!
         compound_patterns = [
             r"\bben\s+kim(?:im)?\b",
             r"\bkimim\s+ben\b",
             r"\badım\s+ne\b",
             r"\bbeni\s+tanıyor\s+musun\b",
+            r"\bkonum\b", r"\byerim\b", r"\byerimi\b", r"\bkalkt\b", r"\bayakta\b",
+            r"\bhareket\b", r"\bpeki\b", r"\bbaşka\b", r"\bfarklı\b", r"\bdeğiş\b",
+            r"\bşimdi\s+de\b", r"\bpeki\s+şimdi\b", r"\bartık\b", r"\boyna\b"
         ]
         if any(re.search(cp, t) for cp in compound_patterns):
             return False, ""
@@ -3978,11 +4034,18 @@ class AstroRealtimeNode(Node):
         if not is_match:
             return False, ""
 
+        has_llm = prefer_llm if prefer_llm is not None else self._can_use_llm()
+
         # Grounded response from real-time perception state
         vis_state = self._get_current_visual_grounding()
         v_state = vis_state.get("visual_state", "UNKNOWN")
         vis_cam_avail = vis_state.get("visual_camera_available", False)
         vis_person_det = vis_state.get("visual_person_detected", False)
+
+        # If LLM is available and camera is stale/unknown/no person in optical cone,
+        # let LLM reason contextually instead of regurgitating robotic error templates!
+        if has_llm and (not vis_cam_avail or v_state in ("STALE", "UNKNOWN") or not vis_person_det):
+            return False, ""
 
         if not vis_cam_avail or v_state == "UNKNOWN":
             return True, "Kameram şu anda aktif olmadığı için ne yaptığını göremiyorum."
@@ -4083,10 +4146,12 @@ class AstroRealtimeNode(Node):
             if desc:
                 return True, desc
 
-        # Truthful Unknown Fallback
+        # Truthful Unknown Fallback: If LLM is available, let LLM formulate a conversational response
+        if has_llm:
+            return False, ""
         return True, "Seni görüyorum ama şu an tam olarak ne yaptığını ayırt edemiyorum."
 
-    def _is_visual_state_query(self, text: str) -> Tuple[bool, str]:
+    def _is_visual_state_query(self, text: str, prefer_llm: Optional[bool] = None) -> Tuple[bool, str]:
         """Detects visual capability and perception queries (e.g. 'beni görüyor musun', 'kameranda neler görüyorsun').
 
         Returns (is_visual_state_query, deterministic_reply_text).
@@ -4095,6 +4160,15 @@ class AstroRealtimeNode(Node):
         if not text or not str(text).strip():
             return False, ""
         t = text.lower().strip()
+
+        # Contextual / state change filter: If user introduces movement or location change, pass to LLM
+        contextual_markers = [
+            r"\bkonum\b", r"\byerim\b", r"\byerimi\b", r"\bkalkt\b", r"\bayakta\b",
+            r"\bhareket\b", r"\bpeki\b", r"\bbaşka\b", r"\bfarklı\b", r"\bdeğiş\b",
+            r"\bşimdi\s+de\b", r"\bpeki\s+şimdi\b", r"\bartık\b"
+        ]
+        if any(re.search(cm, t) for cm in contextual_markers):
+            return False, ""
 
         patterns = [
             r"\b(?:beni\s+)?(?:kameran(?:dan)?\s+)?gör(?:üyor|ebiliyor)\s+musun(?:\s+beni)?\b",
@@ -4120,11 +4194,17 @@ class AstroRealtimeNode(Node):
         if not is_match:
             return False, ""
 
+        has_llm = prefer_llm if prefer_llm is not None else self._can_use_llm()
+
         vis_state = self._get_current_visual_grounding()
         v_state = vis_state.get("visual_state", "UNKNOWN")
         vis_cam_avail = vis_state.get("visual_camera_available", False)
         vis_person_det = vis_state.get("visual_person_detected", False)
         vis_dist = vis_state.get("visual_distance")
+
+        # If LLM is available and camera is stale or offline, pass to LLM
+        if has_llm and (not vis_cam_avail or v_state in ("STALE", "UNKNOWN")):
+            return False, ""
 
         if not vis_cam_avail or v_state == "UNKNOWN":
             return True, "Seni şu an doğrulayamıyorum, kameram aktif değil."
@@ -6429,13 +6509,23 @@ class AstroRealtimeNode(Node):
             rejected = True
             reject_reason = "known_phantom"
 
-        # 1. Playback active or room echo cooldown with high self-voice correlation
-        elif (is_playback_active or is_echo_cooldown) and self_voice_score >= 0.45:
+        # 1. Playback active or room echo cooldown with self-voice correlation
+        elif (is_playback_active or is_echo_cooldown) and self_voice_score >= 0.20:
             rejected = True
             reject_reason = "self_voice"
 
-        # 2. Playback is active and input does not exceed barge-in energy
-        elif is_playback_active and total_rms < self.barge_in_min_rms:
+        # 2. General self-voice echo loop prevention (repeating recent robot words)
+        elif self_voice_score >= 0.50 and not is_wake_cand:
+            rejected = True
+            reject_reason = "self_voice"
+
+        # 3. Echo cooldown leak: quiet or low VAD audio during post-playback window
+        elif is_echo_cooldown and not is_wake_cand and (total_rms < 1200.0 or vad_confidence < 0.60):
+            rejected = True
+            reject_reason = "echo_cooldown_leak"
+
+        # 4. Playback is active: reject non-barge-in audio unconditionally
+        elif is_playback_active and not has_strong_evidence:
             rejected = True
             reject_reason = "self_voice"
 
@@ -8160,7 +8250,8 @@ class AstroRealtimeNode(Node):
                     return
 
             # Instant Activity Query (Sub-250ms Direct Execution, 0ms LLM)
-            is_activity, act_reply = self._is_activity_query(user_text)
+            can_use_llm = self._can_use_llm()
+            is_activity, act_reply = self._is_activity_query(user_text, prefer_llm=can_use_llm)
             if is_activity:
                 reply_text = self._format_deterministic_response(
                     fact_text=act_reply,
@@ -8227,7 +8318,7 @@ class AstroRealtimeNode(Node):
                     return
 
             # Instant Visual State Query (Sub-250ms Direct Execution, 0ms LLM)
-            is_vis, vis_reply = self._is_visual_state_query(user_text)
+            is_vis, vis_reply = self._is_visual_state_query(user_text, prefer_llm=can_use_llm)
             if is_vis:
                 reply_text = self._format_deterministic_response(
                     fact_text=vis_reply,
@@ -9410,7 +9501,8 @@ class AstroRealtimeNode(Node):
                     local_rms = float(np.sqrt(np.mean(arr.astype(np.float32) ** 2)))
                     peak_val = int(np.max(np.abs(arr)))
                     # Maintain speech audio buffer for speaker recognition while robot is not speaking
-                    if not self._is_playback_active and raw_16k:
+                    is_cooldown_now = (now - getattr(self, "_playback_end_time", 0.0)) < getattr(self, "echo_mute_cooldown_s", 0.65)
+                    if not self._is_playback_active and not is_cooldown_now and raw_16k:
                         with self._lock:
                             self._user_speech_audio_buffer.append(raw_16k)
                             if len(self._user_speech_audio_buffer) > 250:
@@ -9426,6 +9518,17 @@ class AstroRealtimeNode(Node):
         # SLEEP / DEEP_IDLE MODE: Dedicated Low-CPU Wake Detector
         # ====================================================================
         if self._is_sleeping or self.state_machine.is_deep_idle():
+            is_cooldown_now = (now - getattr(self, "_playback_end_time", 0.0)) < getattr(self, "echo_mute_cooldown_s", 0.65)
+            if self._is_playback_active or is_cooldown_now:
+                with self._lock:
+                    if self._wake_listening or self._wake_audio_buffer:
+                        self._wake_listening = False
+                        self._wake_audio_buffer.clear()
+                    if self._fallback_speaking or self._fallback_audio_buffer:
+                        self._fallback_speaking = False
+                        self._fallback_audio_buffer.clear()
+                return
+
             if raw_16k:
                 wake_min_rms = float(os.getenv("WAKE_MIN_RMS", "120.0"))
                 wake_min_peak = int(os.getenv("WAKE_MIN_PEAK", "350"))
@@ -9467,6 +9570,10 @@ class AstroRealtimeNode(Node):
             # 1. Acoustic Protection Window: Strictly suppress self-voice feedback during initial burst (e.g. 350ms)
             if playback_start > 0.0 and ((now - playback_start) * 1000.0 < prot_ms):
                 self._barge_in_consecutive_frames = 0
+                with self._lock:
+                    if self._fallback_speaking or self._fallback_audio_buffer:
+                        self._fallback_speaking = False
+                        self._fallback_audio_buffer.clear()
                 return
 
             # Target barge-in threshold: Requires intentional voice exceeding loudspeaker playback level
@@ -9509,6 +9616,10 @@ class AstroRealtimeNode(Node):
                     f"reason=self_voice"
                 )
                 self._barge_in_consecutive_frames = 0
+                with self._lock:
+                    if self._fallback_speaking or self._fallback_audio_buffer:
+                        self._fallback_speaking = False
+                        self._fallback_audio_buffer.clear()
                 return
 
             # 3. Energy threshold check
@@ -9562,6 +9673,10 @@ class AstroRealtimeNode(Node):
                         f"decision=false\n"
                         f"reason={reason}"
                     )
+                with self._lock:
+                    if self._fallback_speaking or self._fallback_audio_buffer:
+                        self._fallback_speaking = False
+                        self._fallback_audio_buffer.clear()
                 return
 
             # 5. Barge-In Latch
@@ -9634,13 +9749,23 @@ class AstroRealtimeNode(Node):
         else:
             self._consecutive_loud_frames = max(0, self._consecutive_loud_frames - 1)
 
-        if self._consecutive_loud_frames >= 5 and (now - getattr(self, "_node_start_time", 0.0)) > 4.0:
-            if self._is_sleeping:
-                self._wake_up()
+        # Acoustic presence tracking (pure metric; never wake robot on noise alone to prevent self-wake)
+        # Wake-up is strictly reserved for intentional wake phrases in _process_wake_utterance.
 
         # --- 0-Cost Fallback Mode / OpenAI Chat Mode (STT + LLM + Edge-TTS) ---
         is_ws_connected = (self._is_connected or self.realtime_connection_state == "CONNECTED")
         if self._fallback_mode or getattr(self, "use_4o", False) or not self._can_use_openai("realtime") or not is_ws_connected or self._ws is None:
+            # HARDWARE PLAYBACK LEAKAGE GUARD:
+            # If robot is actively speaking or in post-playback acoustic echo cooldown,
+            # strictly purge and reject buffering audio frames into fallback buffer.
+            is_echo_cooldown = (now - getattr(self, "_playback_end_time", 0.0)) < getattr(self, "echo_mute_cooldown_s", 0.65)
+            if self._is_playback_active or is_echo_cooldown:
+                with self._lock:
+                    if self._fallback_speaking or self._fallback_audio_buffer:
+                        self._fallback_speaking = False
+                        self._fallback_audio_buffer.clear()
+                return
+
             if raw_16k:
                 try:
                     speech_start_condition = (local_rms > max(380.0, self._ambient_rms * 1.40) and peak_val > 900)
