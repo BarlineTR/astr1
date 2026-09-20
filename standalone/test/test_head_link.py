@@ -29,6 +29,7 @@ from astro_base.gaze.head_controller import (
 
 from head_link import (
     HEARTBEAT_INTERVAL_S,
+    TICKS_PER_DEG,
     HeadLink,
     encode_head_cmd,
     encode_heartbeat,
@@ -48,7 +49,7 @@ class TestParsingWhatTheFirmwareSends(unittest.TestCase):
 
         self.assertEqual(
             [(mid, head_degrees_from_encoder_payload(pl)) for mid, pl in parse_packets(stream)],
-            [(MSG_ENCODER_TICKS, 100.07)],
+            [(MSG_ENCODER_TICKS, round(259 / TICKS_PER_DEG, 2))],
         )
 
     def test_several_packets_in_one_read_are_all_returned(self):
@@ -135,7 +136,7 @@ class TestHeadLink(unittest.TestCase):
 
         link.poll()
 
-        self.assertAlmostEqual(link.measured_angle_deg, 100.07, places=2)
+        self.assertAlmostEqual(link.measured_angle_deg, round(259 / TICKS_PER_DEG, 2), places=2)
         self.assertTrue(link.has_feedback)
 
     def test_a_link_that_has_heard_nothing_admits_it(self):

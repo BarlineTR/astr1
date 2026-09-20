@@ -108,11 +108,16 @@ def main(argv=None, hid=None) -> int:
                         help="Bindirilmiş görüntüyü videoya kaydet. Yol verilmezse "
                              "astro_<tarih>.mp4 kullanılır. Ekransız çalışırken "
                              "(--no-window) neyin takip edildiğini sonradan izlemek için.")
+    parser.add_argument("--open-loop", action="store_true",
+                        help="Enkoder geri beslemesini devre dışı bırak, kafa açısını "
+                             "hareket modelinden açık çevrim tahmin et (titremeyi ve osilasyonu engeller)")
     opts = parser.parse_args(argv)
 
     head = HeadLink(port=open_port(opts.serial) if opts.serial else None)
     if opts.fixed_head:
         print("🔌 Sabit kamera/mikrofon teşhisi — kafa referansı 0°, encoder ölçümü yok")
+    elif opts.open_loop:
+        print("🔌 Açık çevrim modu aktif — motor sürülecek, kafa açısı komuttan tahmin edilecek")
     else:
         print("🔌 Arduino bağlı" if head.connected
               else "🔌 Arduino yok — açık çevrim, kafa açısı tahmin edilecek")
@@ -181,6 +186,9 @@ def main(argv=None, hid=None) -> int:
     frames, fps, last_fps_at, last_fps_frames = 0, 0.0, started, 0
     last_audio_log_yaw: Optional[float] = None
     last_visual_target_id: Optional[str] = None
+    motor_yaw: float = 0.0
+    encoder_stall_start: Optional[float] = None
+    encoder_fault_warned: bool = False
 
     consecutive_camera_fails = 0
     try:
@@ -217,8 +225,33 @@ def main(argv=None, hid=None) -> int:
 
             # Masadaki sensörler komutla dönmez. Bu modda bilinen sabit
             # referansı ortak beyne veririz; encoder varmış gibi raporlamayız.
-            head_reference = (0.0 if opts.fixed_head else
-                              head.measured_angle_deg if head.has_feedback else None)
+            if opts.fixed_head:
+                head_reference = 0.0
+                head_feedback_active = False
+            elif opts.open_loop:
+                head_reference = None
+                head_feedback_active = False
+            elif head.has_feedback:
+                head_reference = head.measured_angle_deg
+                head_feedback_active = True
+                # Enkoder donanım/kablo arıza koruması: Motor komutu verildiği halde (> 10°)
+                # enkoder 2 saniye boyunca 0.0°'de takılı kalırsa, sağa-sola osilasyonu (titremeyi)
+                # engellemek için otomatik açık çevrim tahmin moduna geç.
+                if abs(motor_yaw) >= 10.0 and abs(head.measured_angle_deg) < 0.5:
+                    if encoder_stall_start is None:
+                        encoder_stall_start = now
+                    elif now - encoder_stall_start > 2.0:
+                        if not encoder_fault_warned:
+                            print("\n⚠️  [ENKODER UYARISI] Kafa motoru dönüyor ancak enkoderden yanıt (0 tick) gelmiyor.")
+                            print("💡 Sağa-sola titremeyi (osilasyon) önlemek için açık çevrim (open-loop) tahmin moduna geçildi.\n")
+                            encoder_fault_warned = True
+                        head_reference = None
+                        head_feedback_active = False
+                else:
+                    encoder_stall_start = None
+            else:
+                head_reference = None
+                head_feedback_active = False
 
             # GazeTracker.step() çağrısına DOA beslenmez (doa_deg=None).
             # Böylece eski continuous tracker DOA açılarının (-21.2, -36.9, -59.4 vb.)
@@ -297,7 +330,7 @@ def main(argv=None, hid=None) -> int:
                 fps=fps,
                 detections=len(detections),
                 doa_deg=localizer.last_raw_doa if localizer.is_tracking() else None,
-                head_feedback=head.has_feedback,
+                head_feedback=head_feedback_active,
                 speech=audio.latest_speech(now) if audio.available else None,
                 fixed_head=opts.fixed_head,
             )
@@ -306,7 +339,7 @@ def main(argv=None, hid=None) -> int:
             # İki kez çizmek, zaten takılan makinede kare başına maliyeti ikiye katlar.
             if recorder is not None or not opts.no_window:
                 overlaid = draw_overlay(frame, detections, result, fps,
-                                        audio.available, head.has_feedback, opts.fixed_head)
+                                        audio.available, head_feedback_active, opts.fixed_head)
                 if recorder is not None:
                     recorder.add(overlaid, now)
                 if not opts.no_window:
