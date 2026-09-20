@@ -111,6 +111,9 @@ def main(argv=None, hid=None) -> int:
     parser.add_argument("--open-loop", action="store_true",
                         help="Enkoder geri beslemesini devre dışı bırak, kafa açısını "
                              "hareket modelinden açık çevrim tahmin et (titremeyi ve osilasyonu engeller)")
+    parser.add_argument("--vision-only", action="store_true",
+                        help="Yalnızca görsel (yüz) takibi yap; mikrofon/ses takibini "
+                             "tamamen devre dışı bırak (arka plan gürültüsünde savrulmayı önler)")
     opts = parser.parse_args(argv)
 
     head = HeadLink(port=open_port(opts.serial) if opts.serial else None)
@@ -218,7 +221,8 @@ def main(argv=None, hid=None) -> int:
 
             # ReSpeaker XVF3000 DSP (VOICEACTIVITY + DOAANGLE) localizer update:
             # Audio target üretiminde AudioSource kullanılmaz; tek ve authoritative kaynak ReSpeakerAudioLocalizer'dır.
-            localizer.read_and_update(now=now)
+            if not opts.vision_only:
+                localizer.read_and_update(now=now)
 
             if voice_loop is not None:
                 voice_loop.pump(now)
@@ -282,6 +286,14 @@ def main(argv=None, hid=None) -> int:
                 )
             )
 
+            current_speech = audio.latest_speech(now) if audio.available else None
+            # Ses hedefinin kabul edilmesi için: ya aktif takip devam ediyordur ya da konuşma tespit edilmiştir
+            audio_tracking_allowed = (
+                not opts.vision_only
+                and localizer.is_tracking(now)
+                and (result.owner == PrioritySource.ACTIVE_SPEAKER or (current_speech is not None and current_speech.is_speech))
+            )
+
             if vision_active:
                 localizer.on_vision_active()
                 target_yaw = result.target_yaw_deg
@@ -293,7 +305,7 @@ def main(argv=None, hid=None) -> int:
                     result.owner = PrioritySource.VISUAL_TRACKING
                     if not result.target_id:
                         result.target_id = last_visual_target_id
-            elif localizer.is_tracking(now):
+            elif audio_tracking_allowed:
                 last_visual_target_id = None
                 target_yaw = localizer.target_yaw_deg
                 motor_yaw = target_yaw
