@@ -109,6 +109,7 @@ class GazeTracker:
         self.audio_filter = AudioFilterCore()
         self.fusion = AudioVisualFusionCore(spatial_memory=self.spatial_memory)
         self.target_manager = TargetManagerCore()
+        self.target_manager.acquisition_threshold = 0.55
         self.fsm = SocialGazeFSM(
             min_limit_deg=self.calib.head.min_angle_deg,
             max_limit_deg=self.calib.head.max_angle_deg,

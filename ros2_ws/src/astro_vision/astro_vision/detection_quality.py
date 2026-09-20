@@ -125,7 +125,7 @@ class YuNetFaceDetector:
     stage-weight mapping is needed.
     """
 
-    def __init__(self, model_path, score_threshold: float = 0.7, nms_threshold: float = 0.3):
+    def __init__(self, model_path, score_threshold: float = 0.55, nms_threshold: float = 0.3):
         import cv2
 
         self._detector = cv2.FaceDetectorYN.create(

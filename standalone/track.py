@@ -190,6 +190,8 @@ def main(argv=None, hid=None) -> int:
     last_audio_log_yaw: Optional[float] = None
     last_visual_target_id: Optional[str] = None
     motor_yaw: float = 0.0
+    estimated_head_yaw: float = 0.0
+    last_yaw_update_time: float = started
     encoder_stall_start: Optional[float] = None
     encoder_fault_warned: bool = False
 
@@ -227,13 +229,25 @@ def main(argv=None, hid=None) -> int:
             if voice_loop is not None:
                 voice_loop.pump(now)
 
+            # Açık çevrim kafa açısı simülasyonu: Kafa hedefe doğru ~75 deg/s hızla döner.
+            # Böylece sesle dönüldüğünde (+60°) veya görsel takiple dönüldüğünde robot
+            # kafanın o açıda olduğunu bilir ve yüzü gördüğünde 0°'ye geri kaçmaz!
+            dt_yaw = max(0.001, min(0.1, now - last_yaw_update_time))
+            last_yaw_update_time = now
+            diff_yaw = motor_yaw - estimated_head_yaw
+            max_step_deg = 75.0 * dt_yaw
+            if abs(diff_yaw) <= max_step_deg:
+                estimated_head_yaw = motor_yaw
+            else:
+                estimated_head_yaw += max_step_deg if diff_yaw > 0 else -max_step_deg
+
             # Masadaki sensörler komutla dönmez. Bu modda bilinen sabit
             # referansı ortak beyne veririz; encoder varmış gibi raporlamayız.
             if opts.fixed_head:
                 head_reference = 0.0
                 head_feedback_active = False
             elif opts.open_loop:
-                head_reference = None
+                head_reference = estimated_head_yaw
                 head_feedback_active = False
             elif head.has_feedback:
                 head_reference = head.measured_angle_deg
@@ -249,12 +263,12 @@ def main(argv=None, hid=None) -> int:
                             print("\n⚠️  [ENKODER UYARISI] Kafa motoru dönüyor ancak enkoderden yanıt (0 tick) gelmiyor.")
                             print("💡 Sağa-sola titremeyi (osilasyon) önlemek için açık çevrim (open-loop) tahmin moduna geçildi.\n")
                             encoder_fault_warned = True
-                        head_reference = None
+                        head_reference = estimated_head_yaw
                         head_feedback_active = False
                 else:
                     encoder_stall_start = None
             else:
-                head_reference = None
+                head_reference = estimated_head_yaw
                 head_feedback_active = False
 
             # GazeTracker.step() çağrısına DOA beslenmez (doa_deg=None).
