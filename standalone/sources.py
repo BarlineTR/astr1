@@ -245,9 +245,14 @@ class CameraSource:
 
         if self.queue is not None:
             try:
-                in_frame = self.queue.tryGet() if hasattr(self.queue, "tryGet") else self.queue.get()
-                if in_frame is not None:
-                    return True, in_frame.getCvFrame()
+                # Wait up to 500ms for next frame so momentary empty queue doesn't abort
+                t_end = time.monotonic() + 0.5
+                while time.monotonic() < t_end:
+                    in_frame = self.queue.tryGet() if hasattr(self.queue, "tryGet") else self.queue.get()
+                    if in_frame is not None:
+                        return True, in_frame.getCvFrame()
+                    time.sleep(0.002)
+                return False, None
             except Exception:
                 return False, None
 

@@ -33,8 +33,8 @@ from astro_base.gaze.head_controller import (  # noqa: E402
 # The firmware's watchdog is 500 ms; leave most of that as margin.
 HEARTBEAT_INTERVAL_S = 0.2
 
-# 440 ticks over 170 degrees, verified in calibration_params.yaml.
-TICKS_PER_DEG = 2.5882
+# Namiki 22CL-3501PG 80:1 kalibrasyonu: 0.288 ticks/deg
+TICKS_PER_DEG = 0.288
 
 Packet = Tuple[int, bytes]
 
