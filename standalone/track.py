@@ -297,6 +297,7 @@ def main(argv=None, hid=None) -> int:
                     GazeStateEnum.HOLDING_ATTENTION,
                     GazeStateEnum.ORIENTING,
                     GazeStateEnum.ACQUIRING,
+                    GazeStateEnum.TARGET_LOST,
                 )
             )
 
@@ -305,7 +306,6 @@ def main(argv=None, hid=None) -> int:
             audio_tracking_allowed = (
                 not opts.vision_only
                 and localizer.is_tracking(now)
-                and (result.owner == PrioritySource.ACTIVE_SPEAKER or (current_speech is not None and current_speech.is_speech))
             )
 
             if vision_active:
@@ -334,13 +334,18 @@ def main(argv=None, hid=None) -> int:
                     last_audio_log_yaw = motor_yaw
             else:
                 last_visual_target_id = None
-                target_yaw = 0.0
-                motor_yaw = 0.0
-                result.target_yaw_deg = 0.0
-                result.owner = PrioritySource.IDLE
-                result.gaze_state = GazeStateEnum.IDLE
-                result.target_id = None
                 last_audio_log_yaw = None
+                # FSM kendi grace state'lerini yönetsin (TARGET_LOST → RECOVERING → IDLE).
+                # Biz sadece FSM IDLE veya RECOVERING dediğinde 0°'ye dönüyoruz.
+                if result.gaze_state in (GazeStateEnum.RECOVERING, GazeStateEnum.IDLE):
+                    target_yaw = result.target_yaw_deg  # FSM RECOVERING'de 0.0 döndürür
+                    motor_yaw = target_yaw
+                    result.owner = PrioritySource.IDLE
+                    result.target_id = None
+                else:
+                    # TARGET_LOST vb: son pozisyonu koru, FSM kararını bekle
+                    target_yaw = motor_yaw
+                    result.target_yaw_deg = motor_yaw
 
             head.send_angle(motor_yaw)
             head.tick(now)
