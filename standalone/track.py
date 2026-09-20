@@ -182,6 +182,7 @@ def main(argv=None, hid=None) -> int:
     last_audio_log_yaw: Optional[float] = None
     last_visual_target_id: Optional[str] = None
 
+    consecutive_camera_fails = 0
     try:
         while True:
             now = time.monotonic()
@@ -189,9 +190,14 @@ def main(argv=None, hid=None) -> int:
                 break
 
             ok, frame = camera.read()
-            if not ok:
-                print("⚠️  Kameradan kare gelmiyor")
-                break
+            if not ok or frame is None:
+                consecutive_camera_fails += 1
+                if consecutive_camera_fails > 15:
+                    print("⚠️  Kameradan kare gelmiyor")
+                    break
+                time.sleep(0.05)
+                continue
+            consecutive_camera_fails = 0
 
             detections = camera.detect(frame)
             head.poll()
