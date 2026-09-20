@@ -245,13 +245,15 @@ class CameraSource:
 
         if self.queue is not None:
             try:
-                # Wait up to 500ms for next frame so momentary empty queue doesn't abort
-                t_end = time.monotonic() + 0.5
+                # OAK-D sensor boot and auto-exposure takes 2-3 seconds for first frame
+                timeout_s = 5.0 if getattr(self, "_first_frame", True) else 2.0
+                t_end = time.monotonic() + timeout_s
                 while time.monotonic() < t_end:
                     in_frame = self.queue.tryGet() if hasattr(self.queue, "tryGet") else self.queue.get()
                     if in_frame is not None:
+                        self._first_frame = False
                         return True, in_frame.getCvFrame()
-                    time.sleep(0.002)
+                    time.sleep(0.005)
                 return False, None
             except Exception:
                 return False, None
