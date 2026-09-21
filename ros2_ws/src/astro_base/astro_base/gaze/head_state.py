@@ -59,7 +59,7 @@ class HeadState:
 
 
 class HeadStateManager:
-    """Manages head position authority, encoder freshness, and software estimation."""
+    """Manages head position authority, encoder freshness, stuck-at-zero detection, and software estimation."""
 
     def __init__(
         self,
@@ -68,28 +68,36 @@ class HeadStateManager:
         software_max_vel_deg_s: float = 75.0,
         min_limit_deg: float = -90.0,
         max_limit_deg: float = 90.0,
+        stuck_timeout_s: float = 0.50,
     ):
         self.ticks_per_deg = ticks_per_deg
         self.stale_timeout_s = stale_timeout_s
         self.software_max_vel_deg_s = software_max_vel_deg_s
         self.min_limit_deg = min_limit_deg
         self.max_limit_deg = max_limit_deg
+        self.stuck_timeout_s = stuck_timeout_s
 
         # Authority & telemetry state
         self.position_source: PositionSource = PositionSource.UNKNOWN
         self.encoder_available: bool = False
         self.encoder_stale: bool = True
+        self.encoder_responsive: bool = False  # True only if real tick dynamics / changes seen
+        self.encoder_stuck: bool = False       # True if commanded to move but ticks remain stuck
 
         # Physical encoder state
         self.actual_yaw_deg: Optional[float] = None
         self.last_known_encoder_deg: Optional[float] = None
         self.last_valid_encoder_time: float = 0.0
         self.encoder_ticks: int = 0
+        self._initial_ticks: Optional[int] = None
+        self._last_ticks_value: Optional[int] = None
+        self._last_ticks_change_time: float = 0.0
 
         # Software estimation state
         self.estimated_yaw_deg: Optional[float] = None
         self.last_accepted_target_deg: Optional[float] = None
         self.last_estimate_update_time: float = 0.0
+        self.last_command_time: float = 0.0
 
         # Dynamics
         self.velocity_deg_s: float = 0.0
@@ -106,11 +114,60 @@ class HeadStateManager:
         head_ticks: int,
         timestamp: Optional[float] = None,
         dt_s: Optional[float] = None,
+        wheel_ticks_l: int = 0,
+        wheel_ticks_r: int = 0,
     ) -> None:
-        """Called when authoritative encoder ticks arrive from hardware."""
+        """Called when encoder ticks packet arrives from hardware.
+
+        CRITICAL RULE: Receiving an encoder packet does NOT mean the encoder
+        measurement is valid! Continuously receiving head_ticks=0 is NEVER
+        automatically accepted as 0.0° real position.
+        """
         now = time.monotonic() if timestamp is None else float(timestamp)
-        self.encoder_ticks = int(head_ticks)
-        deg = round(float(head_ticks / self.ticks_per_deg), 2)
+        ticks = int(head_ticks)
+        self.encoder_ticks = ticks
+
+        # Baseline ticks initialization
+        if self._initial_ticks is None:
+            self._initial_ticks = ticks
+            self._last_ticks_value = ticks
+            self._last_ticks_change_time = now
+            # If initial ticks is already non-zero, it indicates previous tick activity
+            if ticks != 0:
+                self.encoder_responsive = True
+
+        # Detect dynamic tick change from last seen
+        if ticks != self._last_ticks_value:
+            self._last_ticks_value = ticks
+            self._last_ticks_change_time = now
+            self.encoder_responsive = True
+            self.encoder_stuck = False
+
+        # Check for stuck-at-zero / unresponsive condition:
+        # If a movement command was accepted and enough time elapsed,
+        # but ticks have not changed from baseline or stay frozen at 0:
+        is_command_moving = False
+        if self.last_accepted_target_deg is not None:
+            current_pos = self.estimated_yaw_deg if self.estimated_yaw_deg is not None else 0.0
+            if abs(self.last_accepted_target_deg) > 2.0 or abs(self.last_accepted_target_deg - current_pos) > 2.0:
+                is_command_moving = True
+
+        if is_command_moving and (now - self.last_command_time > self.stuck_timeout_s) and not self.encoder_responsive:
+            self.encoder_stuck = True
+
+        # If encoder is not responsive or stuck, DO NOT accept as ENCODER authority
+        if not self.encoder_responsive or self.encoder_stuck:
+            self.encoder_available = False
+            self.encoder_stale = True
+            self.actual_yaw_deg = None
+            if self.last_accepted_target_deg is not None or self.estimated_yaw_deg is not None:
+                self.position_source = PositionSource.ESTIMATED
+            else:
+                self.position_source = PositionSource.UNKNOWN
+            return
+
+        # When encoder is responsive and verified:
+        deg = round(float(ticks / self.ticks_per_deg), 2)
 
         # Calculate physical velocity if previous measurement exists
         if self.actual_yaw_deg is not None and self.last_valid_encoder_time > 0.0:
@@ -135,6 +192,7 @@ class HeadStateManager:
         now = time.monotonic() if timestamp is None else float(timestamp)
         clamped_target = max(self.min_limit_deg, min(self.max_limit_deg, float(target_yaw_deg)))
         self.last_accepted_target_deg = clamped_target
+        self.last_command_time = now
 
         if self.position_source == PositionSource.UNKNOWN:
             # First accepted command initializes software estimation
@@ -180,8 +238,23 @@ class HeadStateManager:
         """Evaluates current state, applies stale timeout, and returns a HeadState snapshot."""
         now = time.monotonic() if timestamp is None else float(timestamp)
 
-        # 1. Evaluate encoder freshness
-        if self.encoder_available:
+        # 1. Check for stuck-at-zero / unresponsive condition during active command
+        is_command_moving = False
+        if self.last_accepted_target_deg is not None:
+            current_pos = self.estimated_yaw_deg if self.estimated_yaw_deg is not None else 0.0
+            if abs(self.last_accepted_target_deg) > 2.0 or abs(self.last_accepted_target_deg - current_pos) > 2.0:
+                is_command_moving = True
+
+        if is_command_moving and (now - self.last_command_time > self.stuck_timeout_s) and not self.encoder_responsive:
+            self.encoder_stuck = True
+            self.encoder_available = False
+            self.encoder_stale = True
+            if self.position_source == PositionSource.ENCODER:
+                self.position_source = PositionSource.ESTIMATED
+            self.actual_yaw_deg = None
+
+        # 2. Evaluate encoder freshness for previously responsive encoder
+        if self.encoder_available and self.encoder_responsive:
             if (now - self.last_valid_encoder_time) > self.stale_timeout_s:
                 self.encoder_stale = True
                 if self.position_source == PositionSource.ENCODER:
@@ -193,11 +266,11 @@ class HeadStateManager:
                         self.estimated_yaw_deg = self.last_known_encoder_deg
                     self.last_estimate_update_time = now
 
-        # 2. Advance software estimate if in ESTIMATED state
+        # 3. Advance software estimate if in ESTIMATED state
         if self.position_source == PositionSource.ESTIMATED:
             self._update_estimate_step(now)
 
-        # 3. Determine moving / at_target indicators
+        # 4. Determine moving / at_target indicators
         target_pos = self.last_accepted_target_deg if self.last_accepted_target_deg is not None else 0.0
         is_moving = abs(self.velocity_deg_s) > 1.0
 
@@ -207,13 +280,13 @@ class HeadStateManager:
         else:
             at_target = False
 
-        # 4. Construct HeadState
-        # Invariant: position_deg is ONLY physical encoder angle; NaN if absent/stale
+        # 5. Construct HeadState
+        # Invariant: position_deg is ONLY physical encoder angle; NaN if absent/stale/unresponsive
         pos_deg = float(self.actual_yaw_deg) if (self.position_source == PositionSource.ENCODER and self.actual_yaw_deg is not None) else float("nan")
 
         return HeadState(
             position_source=self.position_source,
-            encoder_available=self.encoder_available,
+            encoder_available=self.encoder_available and self.encoder_responsive,
             encoder_stale=self.encoder_stale,
             actual_yaw_deg=self.actual_yaw_deg,
             estimated_yaw_deg=self.estimated_yaw_deg,
@@ -224,7 +297,7 @@ class HeadStateManager:
             at_target=at_target,
             enabled=self.enabled,
             watchdog_healthy=self.watchdog_healthy,
-            encoder_valid=(self.position_source == PositionSource.ENCODER and not self.encoder_stale),
+            encoder_valid=(self.position_source == PositionSource.ENCODER and not self.encoder_stale and self.encoder_responsive),
             fault_code=self.fault_code,
             timestamp=now,
         )

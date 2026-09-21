@@ -795,8 +795,10 @@ class SerialBridge(Node):
                     int(head_ticks * self.head_sign - self.head_zero_offset_ticks),
                     timestamp=now_mono,
                     dt_s=dt_s,
+                    wheel_ticks_l=left_ticks,
+                    wheel_ticks_r=right_ticks,
                 )
-                self.head_encoder_valid = True
+                self.head_encoder_valid = (self.head_state_mgr.position_source == PositionSource.ENCODER)
                 self._encoder_fault_logged = False
         else:
             self.head_encoder_valid = False

@@ -220,6 +220,88 @@ class TestHeadEncoderFallback(unittest.TestCase):
         self.assertEqual(cmd.priority_source, PrioritySource.DIRECT_DIALOGUE_INTENT)
         self.assertAlmostEqual(cmd.target_yaw_deg, 15.0, places=1)
 
+    # -------------------------------------------------------------------------
+    # Test I: Continuous zero ticks at startup never produces fake actual_yaw
+    # -------------------------------------------------------------------------
+    def test_i_continuous_zero_ticks_never_produces_fake_actual_yaw(self):
+        """0 tick alone must NEVER be blindly accepted as physical 0.0° position."""
+        t = 1.0
+        for _ in range(10):
+            self.mgr.on_encoder_feedback(head_ticks=0, timestamp=t)
+            t += 0.02
+        state = self.mgr.evaluate(timestamp=t)
+
+        self.assertEqual(state.position_source, PositionSource.UNKNOWN)
+        self.assertIsNone(state.actual_yaw_deg)
+        self.assertIsNone(state.estimated_yaw_deg)
+        self.assertTrue(math.isnan(state.position_deg))
+        self.assertFalse(state.has_encoder_authority)
+        self.assertFalse(state.encoder_available)
+
+    # -------------------------------------------------------------------------
+    # Test J: Stuck-at-zero with active command transitions to ESTIMATED
+    # -------------------------------------------------------------------------
+    def test_j_stuck_at_zero_with_command_transitions_to_estimated(self):
+        """When commanded to move and head_ticks stays 0, position_source must be ESTIMATED with actual_yaw_deg=None."""
+        t = 1.0
+        # Command head to 30.0 deg
+        self.mgr.on_command_accepted(target_yaw_deg=30.0, timestamp=t)
+
+        # head_ticks continues to arrive as 0 for > 0.5s
+        for _ in range(35):
+            t += 0.02
+            self.mgr.on_encoder_feedback(head_ticks=0, timestamp=t)
+
+        state = self.mgr.evaluate(timestamp=t)
+        self.assertEqual(state.position_source, PositionSource.ESTIMATED)
+        self.assertIsNone(state.actual_yaw_deg)
+        self.assertTrue(math.isnan(state.position_deg))
+        self.assertIsNotNone(state.estimated_yaw_deg)
+        self.assertAlmostEqual(state.estimated_yaw_deg, 30.0, places=1)
+        self.assertFalse(state.encoder_available)
+        self.assertTrue(state.encoder_stale)
+        self.assertFalse(state.has_encoder_authority)
+
+    # -------------------------------------------------------------------------
+    # Test K: Dynamic tick change activates encoder authority
+    # -------------------------------------------------------------------------
+    def test_k_dynamic_ticks_change_activates_encoder_authority(self):
+        """When head_ticks actually changes dynamically, encoder responsiveness is confirmed."""
+        t = 1.0
+        self.mgr.on_encoder_feedback(head_ticks=0, timestamp=t)
+        self.assertFalse(self.mgr.encoder_responsive)
+
+        # Ticks actually change (e.g. motor turned or head moved by hand)
+        t += 0.05
+        self.mgr.on_encoder_feedback(head_ticks=25, timestamp=t)
+        self.assertTrue(self.mgr.encoder_responsive)
+
+        state = self.mgr.evaluate(timestamp=t)
+        self.assertEqual(state.position_source, PositionSource.ENCODER)
+        self.assertIsNotNone(state.actual_yaw_deg)
+        self.assertAlmostEqual(state.actual_yaw_deg, round(25 / 2.5882, 2), places=2)
+        self.assertTrue(state.has_encoder_authority)
+
+    # -------------------------------------------------------------------------
+    # Test L: Wheel ticks active while head_ticks=0 confirms stuck encoder
+    # -------------------------------------------------------------------------
+    def test_l_wheel_ticks_active_while_head_ticks_zero_confirms_stuck(self):
+        """When wheel encoders are streaming deltas but head_ticks is 0, head encoder is stuck."""
+        t = 1.0
+        self.mgr.on_command_accepted(target_yaw_deg=-45.0, timestamp=t)
+
+        # Wheels are rolling, head commanded, but head_ticks remains 0
+        for _ in range(30):
+            t += 0.02
+            self.mgr.on_encoder_feedback(head_ticks=0, timestamp=t, wheel_ticks_l=10, wheel_ticks_r=10)
+
+        state = self.mgr.evaluate(timestamp=t)
+        self.assertEqual(state.position_source, PositionSource.ESTIMATED)
+        self.assertIsNone(state.actual_yaw_deg)
+        self.assertTrue(math.isnan(state.position_deg))
+        self.assertFalse(state.encoder_available)
+
 
 if __name__ == "__main__":
     unittest.main()
+

@@ -191,7 +191,12 @@ class HeadLink:
             for msg_id, payload in packets:
                 if msg_id == MSG_ENCODER_TICKS and len(payload) >= 16:
                     _dl, _dr, head_ticks, _dt = struct.unpack("<iiiI", payload[:16])
-                    self.state_mgr.on_encoder_feedback(head_ticks, timestamp=now)
+                    self.state_mgr.on_encoder_feedback(
+                        head_ticks,
+                        timestamp=now,
+                        wheel_ticks_l=_dl,
+                        wheel_ticks_r=_dr,
+                    )
 
         # Periodic evaluation to handle stale encoder
         hstate = self.state_mgr.evaluate(timestamp=now)
