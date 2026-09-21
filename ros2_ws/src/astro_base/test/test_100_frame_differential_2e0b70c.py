@@ -33,7 +33,7 @@ class Test100FrameDifferential2e0b70c(unittest.TestCase):
 
     def test_100_frame_differential_parity(self):
         standalone_tracker = StandaloneGazeTracker()
-        ros_node = StandaloneGazeRosNode()
+        ros_node = StandaloneGazeRosNode(use_camera_source=False, enable_audio=False)
 
         # Generate 100 synthetic test frames
         frames_spec = []
