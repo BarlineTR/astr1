@@ -46,6 +46,7 @@ class ReSpeakerAudioLocalizer:
     # Evidence: visual tracking found user at -70.2° when DOA read 148;
     # +-60° puts both 45° and 70°-80° speakers squarely inside the camera FOV (69°).
     SECTOR_CONFIRM_COUNT = 2   # consecutive readings to switch sector while tracking
+    SECTOR_HYSTERESIS_DEG = 3.0  # Schmitt-trigger hysteresis margin to prevent boundary chatter
 
     # ── Legacy calibration (kept for backward-compat tests) ────────
     CALIBRATION_POINTS = (
@@ -131,8 +132,8 @@ class ReSpeakerAudioLocalizer:
         return cls.VALID_DOA_MIN <= raw <= cls.VALID_DOA_MAX
 
     @classmethod
-    def doa_to_sector(cls, doa_deg: float) -> Optional[str]:
-        """Maps a raw DOA reading to a coarse sector.
+    def doa_to_sector(cls, doa_deg: float, current_sector: Optional[str] = None) -> Optional[str]:
+        """Maps a raw DOA reading to a coarse sector with Schmitt-trigger hysteresis.
 
         Returns:
             "LEFT", "CENTER", or "RIGHT" for valid DOA in front hemisphere.
@@ -141,9 +142,24 @@ class ReSpeakerAudioLocalizer:
         raw = float(doa_deg) % 360.0
         if not cls.is_valid_doa(raw):
             return None
-        if raw < cls.SECTOR_LEFT_MAX:
+
+        h = cls.SECTOR_HYSTERESIS_DEG
+        if current_sector == "LEFT":
+            left_max = cls.SECTOR_LEFT_MAX + h      # 58.0°
+            right_min = cls.SECTOR_RIGHT_MIN
+        elif current_sector == "RIGHT":
+            left_max = cls.SECTOR_LEFT_MAX
+            right_min = cls.SECTOR_RIGHT_MIN - h    # 97.0°
+        elif current_sector == "CENTER":
+            left_max = cls.SECTOR_LEFT_MAX - h      # 52.0°
+            right_min = cls.SECTOR_RIGHT_MIN + h    # 103.0°
+        else:
+            left_max = cls.SECTOR_LEFT_MAX          # 55.0°
+            right_min = cls.SECTOR_RIGHT_MIN        # 100.0°
+
+        if raw < left_max:
             return "LEFT"
-        elif raw >= cls.SECTOR_RIGHT_MIN:
+        elif raw >= right_min:
             return "RIGHT"
         else:
             return "CENTER"
@@ -274,7 +290,7 @@ class ReSpeakerAudioLocalizer:
             self._last_voice_activity_time = timestamp
             was_tracking = self._tracking_active
 
-            sector = self.doa_to_sector(doa_raw)
+            sector = self.doa_to_sector(doa_raw, current_sector=self._confirmed_sector)
             if sector is not None:
                 if not was_tracking or self._confirmed_sector is None:
                     if self.confirm_from_idle:

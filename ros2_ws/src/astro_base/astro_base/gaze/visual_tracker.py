@@ -40,7 +40,9 @@ class KalmanTrack3D:
         self.P = np.diag([0.2, 0.2, 0.3, 1.0, 1.0, 1.0]).astype(np.float64)
 
         self.last_update_time = timestamp
+        self.last_predict_time = timestamp
         self.last_seen_time = timestamp
+        self.last_seen_body_azimuth_deg = float(math.degrees(math.atan2(y0, x0)))
         self.age_frames = 1
         self.hit_count = 1
         self.missed_frames = 0
@@ -56,9 +58,13 @@ class KalmanTrack3D:
         self.body_yaw_source: str = getattr(obs, "body_yaw_source", "UNKNOWN")
         self.is_detector_scored: bool = getattr(obs, "is_detector_scored", True)
 
-    def predict(self, dt: float) -> Tuple[float, float, float]:
+    def predict(self, dt: float, timestamp: Optional[float] = None) -> Tuple[float, float, float]:
         """Kalman Prediction Step."""
         dt = max(0.001, min(0.5, dt))
+        if timestamp is not None:
+            self.last_predict_time = float(timestamp)
+        elif hasattr(self, "last_predict_time"):
+            self.last_predict_time += dt
 
         # State transition F = [[I3, dt*I3], [03, I3]]
         F = np.eye(6, dtype=np.float64)
@@ -131,7 +137,9 @@ class KalmanTrack3D:
             self.x[k] = max(-max_vel, min(max_vel, float(self.x[k])))
 
         self.last_update_time = timestamp
+        self.last_predict_time = timestamp
         self.last_seen_time = timestamp
+        self.last_seen_body_azimuth_deg = float(math.degrees(math.atan2(self.x[1], self.x[0])))
         self.hit_count += 1
         self.missed_frames = 0
 
@@ -181,7 +189,10 @@ class KalmanTrack3D:
         vx, vy, vz = float(self.x[3]), float(self.x[4]), float(self.x[5])
 
         dist_m = float(math.sqrt(x ** 2 + y ** 2 + z ** 2))
-        azimuth_deg = float(math.degrees(math.atan2(y, x)))
+        if self.state == TrackingState.COASTING and hasattr(self, "last_seen_body_azimuth_deg"):
+            azimuth_deg = self.last_seen_body_azimuth_deg
+        else:
+            azimuth_deg = float(math.degrees(math.atan2(y, x)))
         elevation_deg = float(math.degrees(math.atan2(z, math.hypot(x, y)))) if dist_m > 0.1 else 0.0
 
         return VisualTargetTrack(
@@ -248,8 +259,9 @@ class VisualTrackerCore:
 
         # 1. Prediction step for all existing tracks
         for track in self.tracks.values():
-            dt = timestamp - track.last_update_time
-            track.predict(dt)
+            prev_t = getattr(track, "last_predict_time", track.last_update_time)
+            dt = timestamp - prev_t
+            track.predict(dt, timestamp=timestamp)
             track.age_frames += 1
 
         # Transform observations to 3D base coordinates with explicit source

@@ -65,7 +65,7 @@ class HeadStateManager:
         self,
         ticks_per_deg: float = 2.5882,
         stale_timeout_s: float = 0.50,
-        software_max_vel_deg_s: float = 75.0,
+        software_max_vel_deg_s: float = 20.0,
         min_limit_deg: float = -90.0,
         max_limit_deg: float = 90.0,
         stuck_timeout_s: float = 0.50,

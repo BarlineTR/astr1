@@ -44,6 +44,7 @@ from astro_base.gaze.head_state import HeadStateManager, PositionSource
 from astro_base.gaze.motion_planner import MotionPlannerCore
 from astro_base.gaze.sensor_fusion import AudioVisualFusionCore
 from astro_base.gaze.target_manager import TargetManagerCore
+from astro_base.gaze.respeaker_localizer import ReSpeakerAudioLocalizer
 from astro_base.gaze.gaze_tracker import Detection, GazeResult, GazeTracker
 from astro_base.gaze.types import (
     AttentionDecision,
@@ -682,6 +683,161 @@ class TestGazeVisualTrackingE2E(unittest.TestCase):
     test_scenario_h_encoder_unknown_body_wheel_command_zero = test_extra_encoder_unknown_body_wheel_command_zero
     test_scenario_i_graceful_target_loss_settlement = test_scenario_8_graceful_target_loss_settlement
     test_scenario_j_standalone_vs_ros_pipeline_equivalence = test_scenario_10_standalone_vs_ros_pipeline_equivalence
+
+    # -------------------------------------------------------------------------
+    # Mandatory Regression Tests (Regression Suite)
+    # -------------------------------------------------------------------------
+    def test_regression_1_15_consecutive_face_loss_frames_holds_target(self):
+        """15 consecutive face-loss frames -> target yaw stays within +-5 deg of last confirmed heading."""
+        tracker = GazeTracker(calibration=self.calib)
+        t = 1000.0
+        # 5 frames of solid detection at x=147 (bearing ~ +14°)
+        det = Detection(x=147, y=200, w=80, h=80, confidence=0.88)
+        last_confirmed_yaw = None
+        for i in range(5):
+            res = tracker.step(faces=[det], frame_size=(640, 480), doa_deg=None, measured_head_deg=None, timestamp=t)
+            t += 0.033
+            last_confirmed_yaw = res.target_yaw_deg
+
+        self.assertIsNotNone(last_confirmed_yaw)
+        self.assertGreater(last_confirmed_yaw, 5.0)
+
+        # 15 consecutive face-loss frames (approx 500 ms)
+        for i in range(15):
+            res = tracker.step(faces=[], frame_size=(640, 480), doa_deg=None, measured_head_deg=None, timestamp=t)
+            t += 0.033
+            # During coasting/dwell, target must stay within +-5 deg of last confirmed heading, no runaway or sign flip!
+            self.assertLessEqual(
+                abs(res.target_yaw_deg - last_confirmed_yaw),
+                5.0,
+                f"Frame {i+1}/15 face loss drifted: {res.target_yaw_deg} vs confirmed {last_confirmed_yaw}",
+            )
+
+    def test_regression_2_150ms_face_dropout_preserves_track_id(self):
+        """150 ms face dropout (5 frames) -> track ID preserved (person_1), zero TARGET_SWITCH."""
+        tracker = GazeTracker(calibration=self.calib)
+        t = 1000.0
+        det = Detection(x=200, y=200, w=80, h=80, confidence=0.90)
+        # Establish track
+        res = None
+        for _ in range(5):
+            res = tracker.step(faces=[det], frame_size=(640, 480), doa_deg=None, measured_head_deg=None, timestamp=t)
+            t += 0.033
+
+        self.assertEqual(res.target_id, "person_1")
+
+        # 5 frames (approx 165ms) of dropout
+        for _ in range(5):
+            tracker.step(faces=[], frame_size=(640, 480), doa_deg=None, measured_head_deg=None, timestamp=t)
+            t += 0.033
+
+        # Face reappears near same position
+        det_reappear = Detection(x=205, y=200, w=80, h=80, confidence=0.88)
+        res_after = tracker.step(faces=[det_reappear], frame_size=(640, 480), doa_deg=None, measured_head_deg=None, timestamp=t)
+
+        self.assertEqual(res_after.target_id, "person_1", "Track ID must be preserved as person_1 after 150ms dropout")
+
+    def test_regression_3_high_velocity_dropout_no_target_jump(self):
+        """High initial velocity (vy = 1.0 m/s) during face dropout -> gaze target does not jump or flip signs."""
+        # 1. Positive heading test
+        tracker = GazeTracker(calibration=self.calib)
+        t = 1000.0
+        xs_pos = [220, 200, 180, 160]
+        res = None
+        for x in xs_pos:
+            det = Detection(x=x, y=200, w=80, h=80, confidence=0.90)
+            res = tracker.step(faces=[det], frame_size=(640, 480), doa_deg=None, measured_head_deg=None, timestamp=t)
+            t += 0.033
+
+        confirmed_yaw_pos = res.target_yaw_deg
+        self.assertGreater(confirmed_yaw_pos, 0.0)
+        # Dropout for 10 frames
+        for i in range(10):
+            res_drop = tracker.step(faces=[], frame_size=(640, 480), doa_deg=None, measured_head_deg=None, timestamp=t)
+            t += 0.033
+            self.assertGreaterEqual(res_drop.target_yaw_deg, 0.0, "Positive target yaw must not flip signs during dropout")
+            self.assertLessEqual(abs(res_drop.target_yaw_deg - confirmed_yaw_pos), 5.0, "Gaze target must stay within +-5 deg of confirmed heading")
+
+        # 2. Negative heading test
+        tracker_neg = GazeTracker(calibration=self.calib)
+        t = 2000.0
+        xs_neg = [420, 440, 460, 480]
+        for x in xs_neg:
+            det = Detection(x=x, y=200, w=80, h=80, confidence=0.90)
+            res = tracker_neg.step(faces=[det], frame_size=(640, 480), doa_deg=None, measured_head_deg=None, timestamp=t)
+            t += 0.033
+
+        confirmed_yaw_neg = res.target_yaw_deg
+        self.assertLess(confirmed_yaw_neg, 0.0)
+        for i in range(10):
+            res_drop = tracker_neg.step(faces=[], frame_size=(640, 480), doa_deg=None, measured_head_deg=None, timestamp=t)
+            t += 0.033
+            self.assertLessEqual(res_drop.target_yaw_deg, 0.0, "Negative target yaw must not flip signs during dropout")
+            self.assertLessEqual(abs(res_drop.target_yaw_deg - confirmed_yaw_neg), 5.0, "Gaze target must stay within +-5 deg of confirmed heading")
+
+    def test_regression_4_face_reacquisition_after_dropout_smoothly_resumes(self):
+        """Face reacquisition after dropout smoothly resumes visual tracking."""
+        tracker = GazeTracker(calibration=self.calib)
+        t = 1000.0
+        det = Detection(x=150, y=200, w=80, h=80, confidence=0.90)
+        for _ in range(5):
+            tracker.step(faces=[det], frame_size=(640, 480), doa_deg=None, measured_head_deg=None, timestamp=t)
+            t += 0.033
+
+        # Dropout for 8 frames
+        for _ in range(8):
+            tracker.step(faces=[], frame_size=(640, 480), doa_deg=None, measured_head_deg=None, timestamp=t)
+            t += 0.033
+
+        # Reacquisition
+        res_reacquired = None
+        for _ in range(3):
+            res_reacquired = tracker.step(faces=[det], frame_size=(640, 480), doa_deg=None, measured_head_deg=None, timestamp=t)
+            t += 0.033
+
+        self.assertEqual(res_reacquired.owner, PrioritySource.VISUAL_TRACKING)
+        self.assertEqual(res_reacquired.target_id, "person_1")
+        self.assertAlmostEqual(res_reacquired.target_yaw_deg, 14.0, delta=3.0)
+
+    def test_regression_5_respeaker_sector_hysteresis_55deg_oscillation(self):
+        """54.5-55.5 deg DOA oscillation -> no LEFT/CENTER chatter."""
+        localizer = ReSpeakerAudioLocalizer()
+        t = 100.0
+        # 1. Establish confirmed LEFT sector with DOA = 40°
+        yaw = localizer.update(doa_raw=40.0, voice_activity=True, timestamp=t)
+        t += 0.05
+        self.assertEqual(localizer.confirmed_sector, "LEFT")
+        self.assertEqual(yaw, 60.0)
+
+        # 2. Oscillate across the nominal 55° boundary: 54.5°, 55.5°, 54.8°, 55.3°...
+        oscillations = [54.5, 55.5, 54.8, 55.3, 54.6, 55.4, 54.7, 55.2]
+        for doa in oscillations:
+            yaw = localizer.update(doa_raw=doa, voice_activity=True, timestamp=t)
+            t += 0.05
+            self.assertEqual(
+                localizer.confirmed_sector,
+                "LEFT",
+                f"Sector chattered to {localizer.confirmed_sector} at DOA {doa}° while in LEFT!",
+            )
+            self.assertEqual(yaw, 60.0)
+
+        # 3. Test from CENTER sector
+        localizer.reset()
+        yaw = localizer.update(doa_raw=70.0, voice_activity=True, timestamp=t)
+        t += 0.05
+        self.assertEqual(localizer.confirmed_sector, "CENTER")
+        self.assertEqual(yaw, 0.0)
+
+        # Oscillate across 55° boundary: 55.2, 54.8, 55.4, 54.6...
+        for doa in [55.2, 54.8, 55.4, 54.6, 55.1, 54.9]:
+            yaw = localizer.update(doa_raw=doa, voice_activity=True, timestamp=t)
+            t += 0.05
+            self.assertEqual(
+                localizer.confirmed_sector,
+                "CENTER",
+                f"Sector chattered to {localizer.confirmed_sector} at DOA {doa}° while in CENTER!",
+            )
+            self.assertEqual(yaw, 0.0)
 
 
 if __name__ == "__main__":

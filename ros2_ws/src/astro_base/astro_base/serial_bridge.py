@@ -310,7 +310,7 @@ class SerialBridge(Node):
         self.head_state_mgr = HeadStateManager(
             ticks_per_deg=self.head_ticks_per_deg,
             stale_timeout_s=0.50,
-            software_max_vel_deg_s=75.0,
+            software_max_vel_deg_s=20.0,
         )
 
         qos_best_effort = QoSProfile(

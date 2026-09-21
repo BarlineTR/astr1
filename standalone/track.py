@@ -244,13 +244,13 @@ def main(argv=None, hid=None) -> int:
             if voice_loop is not None:
                 voice_loop.pump(now)
 
-            # Açık çevrim kafa açısı simülasyonu: Kafa hedefe doğru ~75 deg/s hızla döner.
+            # Açık çevrim kafa açısı simülasyonu: Kafa hedefe doğru ~20 deg/s hızla döner (firmware HEAD_MAX_VEL_DEG_S = 20.0 ile uyumlu).
             # Böylece sesle dönüldüğünde (+60°) veya görsel takiple dönüldüğünde robot
             # kafanın o açıda olduğunu bilir ve yüzü gördüğünde 0°'ye geri kaçmaz!
             dt_yaw = max(0.001, min(0.1, now - last_yaw_update_time))
             last_yaw_update_time = now
             diff_yaw = motor_yaw - estimated_head_yaw
-            max_step_deg = 75.0 * dt_yaw
+            max_step_deg = 20.0 * dt_yaw
             if abs(diff_yaw) <= max_step_deg:
                 estimated_head_yaw = motor_yaw
             else:
@@ -392,7 +392,7 @@ def main(argv=None, hid=None) -> int:
     finally:
         elapsed = max(time.monotonic() - started, 1e-6)
         print("\n" + status.summary(elapsed, frames))
-        if tracker.head_feedback_missing:
+        if tracker.head_feedback_missing and not opts.fixed_head:
             print("⚠️  Encoder hiç konuşmadı: kafa açısı komuttan tahmin edildi. "
                   "Gerçek açı sapabilir; --serial ile bağlayıp doğrulayın.")
         if recorder is not None:

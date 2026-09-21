@@ -124,7 +124,7 @@ class HeadLink:
         self.state_mgr = HeadStateManager(
             ticks_per_deg=ticks_per_deg,
             stale_timeout_s=0.50,
-            software_max_vel_deg_s=75.0,
+            software_max_vel_deg_s=20.0,
         )
         self.measured_angle_deg: float = float("nan")
         # Distinguished from "measured 0.0" on purpose: assuming zero while the head
