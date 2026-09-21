@@ -588,8 +588,8 @@ class SocialGazeNode(Node):
             is_speech_fresh = self.is_speech_verified and ((t - self._latest_vad_time) <= 0.5)
             speech = SpeechEstimate(is_speech=True, confidence=self._latest_doa_confidence) if is_speech_fresh else None
             doa_fresh = self._latest_doa_deg is not None and ((t - self._latest_doa_time) <= 0.5)
-            doa_val = self._latest_doa_deg if (speech is not None and speech.is_speech and doa_fresh) else None
-            measured_head = None if self.head_feedback_missing() else self.actual_head_yaw_deg
+            measured_head = self.actual_head_yaw_deg if self._head_position_source == "ENCODER" else None
+            estimated_head = self.estimated_head_yaw_deg if self._head_position_source != "ENCODER" else None
 
             self.golden_gaze_result = self.runtime.step(
                 faces=det_objs,
@@ -599,6 +599,7 @@ class SocialGazeNode(Node):
                 measured_head_deg=measured_head,
                 timestamp=self.capture_stamp,
                 is_robot_speaking=self.is_robot_speaking,
+                estimated_head_deg=estimated_head,
             )
             self.golden_step_stamp = time.monotonic()
             res = self.golden_gaze_result

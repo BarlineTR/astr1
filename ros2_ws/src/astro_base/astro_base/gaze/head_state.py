@@ -195,13 +195,14 @@ class HeadStateManager:
         self.last_command_time = now
 
         if self.position_source == PositionSource.UNKNOWN:
-            # First accepted command initializes software estimation
+            # First accepted command initializes software estimation from 0.0 reference
             self.position_source = PositionSource.ESTIMATED
-            self.estimated_yaw_deg = clamped_target
+            self.estimated_yaw_deg = 0.0
             self.last_estimate_update_time = now
+            self._update_estimate_step(now)
         elif self.position_source == PositionSource.ESTIMATED:
             if self.estimated_yaw_deg is None:
-                self.estimated_yaw_deg = clamped_target
+                self.estimated_yaw_deg = 0.0
             self._update_estimate_step(now)
         elif self.position_source == PositionSource.ENCODER:
             # Physical encoder is running; command is noted for target_position_deg

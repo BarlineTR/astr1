@@ -16,9 +16,24 @@ Validates the Behavior Contract (A, B, C, D, E, F) and 10 E2E scenarios:
 """
 
 import math
+import os
+import sys
 import time
 import unittest
 from typing import List, Optional
+
+pkg_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if pkg_dir not in sys.path:
+    sys.path.insert(0, pkg_dir)
+
+repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../.."))
+astro_ai_dir = os.path.join(repo_root, "ros2_ws", "src", "astro_ai")
+if astro_ai_dir not in sys.path:
+    sys.path.insert(0, astro_ai_dir)
+
+standalone_dir = os.path.join(repo_root, "standalone")
+if standalone_dir not in sys.path:
+    sys.path.insert(0, standalone_dir)
 
 from astro_base.gaze.attention_arbiter import AttentionArbiterCore
 from astro_base.gaze.coordinate_frames import CalibrationConfig, CoordinateTransformer
@@ -29,7 +44,7 @@ from astro_base.gaze.head_state import HeadStateManager, PositionSource
 from astro_base.gaze.motion_planner import MotionPlannerCore
 from astro_base.gaze.sensor_fusion import AudioVisualFusionCore
 from astro_base.gaze.target_manager import TargetManagerCore
-from astro_base.gaze.gaze_tracker import Detection, GazeResult
+from astro_base.gaze.gaze_tracker import Detection, GazeResult, GazeTracker
 from astro_base.gaze.types import (
     AttentionDecision,
     FilteredAudioState,
@@ -72,6 +87,123 @@ class TestGazeVisualTrackingE2E(unittest.TestCase):
         self.arbiter = AttentionArbiterCore(min_limit_deg=-75.0, max_limit_deg=75.0)
         self.fsm = SocialGazeFSM(min_limit_deg=-75.0, max_limit_deg=75.0)
         self.planner = MotionPlannerCore(min_limit_deg=-75.0, max_limit_deg=75.0)
+
+    # -------------------------------------------------------------------------
+    # Behavior Contract Scenarios A through D: Transformation Chain Tests
+    # -------------------------------------------------------------------------
+    def test_scenario_a_bearing_pos15_estimated_0(self):
+        """Test A: Camera bearing +15°, estimated_head 0° -> target ≈ +15° (Real chain)."""
+        tracker = GazeTracker(calibration=self.calib)
+        det = Detection(x=147, y=200, w=80, h=80, confidence=0.88)
+        now = 1000.0
+        result = tracker.step(
+            faces=[det],
+            frame_size=(640, 480),
+            doa_deg=None,
+            measured_head_deg=None,
+            timestamp=now,
+            estimated_head_deg=0.0,
+        )
+        self.assertAlmostEqual(result.target_yaw_deg, 15.0, delta=1.5)
+        self.assertEqual(result.owner, PrioritySource.VISUAL_TRACKING)
+
+    def test_scenario_b_bearing_neg30_estimated_0(self):
+        """Test B: Camera bearing -30°, estimated_head 0° -> target ≈ -26°..-30° (Real chain with parallax)."""
+        tracker = GazeTracker(calibration=self.calib)
+        det = Detection(x=547, y=200, w=80, h=80, confidence=0.88)
+        now = 1000.0
+        result = tracker.step(
+            faces=[det],
+            frame_size=(640, 480),
+            doa_deg=None,
+            measured_head_deg=None,
+            timestamp=now,
+            estimated_head_deg=0.0,
+        )
+        self.assertAlmostEqual(result.target_yaw_deg, -26.2, delta=2.0)
+        self.assertEqual(result.owner, PrioritySource.VISUAL_TRACKING)
+
+    def test_scenario_c_bearing_0_estimated_pos30(self):
+        """Test C: Camera bearing 0°, estimated_head +30° -> target ≈ +30° (Real chain)."""
+        tracker = GazeTracker(calibration=self.calib)
+        det = Detection(x=280, y=200, w=80, h=80, confidence=0.88)
+        now = 1000.0
+        result = tracker.step(
+            faces=[det],
+            frame_size=(640, 480),
+            doa_deg=None,
+            measured_head_deg=None,
+            timestamp=now,
+            estimated_head_deg=30.0,
+        )
+        self.assertAlmostEqual(result.target_yaw_deg, 30.0, delta=1.5)
+        self.assertEqual(result.owner, PrioritySource.VISUAL_TRACKING)
+
+    def test_scenario_d_bearing_0_estimated_neg30(self):
+        """Test D: Camera bearing 0°, estimated_head -30° -> target ≈ -30° (Real chain)."""
+        tracker = GazeTracker(calibration=self.calib)
+        det = Detection(x=280, y=200, w=80, h=80, confidence=0.88)
+        now = 1000.0
+        result = tracker.step(
+            faces=[det],
+            frame_size=(640, 480),
+            doa_deg=None,
+            measured_head_deg=None,
+            timestamp=now,
+            estimated_head_deg=-30.0,
+        )
+        self.assertAlmostEqual(result.target_yaw_deg, -30.0, delta=1.5)
+        self.assertEqual(result.owner, PrioritySource.VISUAL_TRACKING)
+
+    # -------------------------------------------------------------------------
+    # Behavior Contract Scenarios E and F: Trajectory & Anomaly Tests
+    # -------------------------------------------------------------------------
+    def test_scenario_e_normal_tracking_ramp(self):
+        """Test E: Ramp +15° -> +16° -> +18° -> +20° tracks smoothly without overshoot."""
+        tracker = GazeTracker(calibration=self.calib)
+        head = HeadStateManager()
+        now = 1000.0
+        world_angles = [15.0, 15.0, 15.0, 15.0, 15.0, 16.0, 17.0, 18.0, 19.0, 20.0]
+        for i, world_yaw in enumerate(world_angles):
+            t = now + i * 0.04
+            hstate = head.evaluate(timestamp=t)
+            h_yaw = hstate.estimated_yaw_deg or 0.0
+            cam_bearing = world_yaw - h_yaw
+            norm_u = -cam_bearing / 36.0
+            u = 320.0 + norm_u * 320.0
+            det = Detection(x=int(round(u - 40)), y=200, w=80, h=80, confidence=0.88)
+            result = tracker.step(
+                faces=[det],
+                frame_size=(640, 480),
+                doa_deg=None,
+                measured_head_deg=None,
+                timestamp=t,
+                estimated_head_deg=hstate.estimated_yaw_deg,
+            )
+            head.on_command_accepted(result.target_yaw_deg, timestamp=t)
+            self.assertLess(abs(result.target_yaw_deg), 35.0)
+            self.assertGreater(result.target_yaw_deg, 5.0)
+
+    def test_scenario_f_single_frame_anomaly_rejection(self):
+        """Test F: Single-frame anomaly (+15° -> sudden >30° jump) is rejected/coasted."""
+        tracker = GazeTracker(calibration=self.calib)
+        now = 1000.0
+        # Frame 1: +15°
+        u_15 = 320.0 - (15.0 / 36.0) * 320.0
+        det1 = Detection(x=int(round(u_15 - 40)), y=200, w=80, h=80, confidence=0.90)
+        res1 = tracker.step(faces=[det1], frame_size=(640, 480), doa_deg=None, measured_head_deg=None, timestamp=now, estimated_head_deg=0.0)
+
+        # Frame 2: +15° (confirms track)
+        res2 = tracker.step(faces=[det1], frame_size=(640, 480), doa_deg=None, measured_head_deg=None, timestamp=now + 0.04, estimated_head_deg=0.0)
+        self.assertAlmostEqual(res2.target_yaw_deg, 15.0, delta=2.0)
+
+        # Frame 3: Anomalous jump in observation (-30° bearing vs +15° track -> 45° jump)
+        u_neg30 = 320.0 + (30.0 / 36.0) * 320.0
+        det_anomaly = Detection(x=int(round(u_neg30 - 40)), y=200, w=80, h=80, confidence=0.90)
+        res3 = tracker.step(faces=[det_anomaly], frame_size=(640, 480), doa_deg=None, measured_head_deg=None, timestamp=now + 0.08, estimated_head_deg=0.0)
+
+        # Must NOT jump to -30° or ±75°; must coast near +15°!
+        self.assertAlmostEqual(res3.target_yaw_deg, 15.0, delta=4.0)
 
     # -------------------------------------------------------------------------
     # Scenario 1: Audio-to-Visual Lock Handoff
@@ -416,6 +548,12 @@ class TestGazeVisualTrackingE2E(unittest.TestCase):
                 action = behavior_intent_to_action_intent(intent)
                 if action and action.action_type == "move_robot":
                     self.fail(f"Body wheel command was generated at angle {angle}° with UNKNOWN encoder!")
+
+    # Aliases for Behavior Contract Scenarios G, H, I, J
+    test_scenario_g_visual_primacy_over_audio = test_scenario_2_visual_primacy_over_audio_noise
+    test_scenario_h_encoder_unknown_body_wheel_command_zero = test_extra_encoder_unknown_body_wheel_command_zero
+    test_scenario_i_graceful_target_loss_settlement = test_scenario_8_graceful_target_loss_settlement
+    test_scenario_j_standalone_vs_ros_pipeline_equivalence = test_scenario_10_standalone_vs_ros_pipeline_equivalence
 
 
 if __name__ == "__main__":

@@ -190,6 +190,7 @@ class GazeRuntimeCore:
         measured_head_deg: Optional[float] = None,
         timestamp: Optional[float] = None,
         is_robot_speaking: bool = False,
+        estimated_head_deg: Optional[float] = None,
     ) -> GazeResult:
         """Executes exactly ONE authoritative tracker step for ONE camera frame.
 
@@ -202,12 +203,15 @@ class GazeRuntimeCore:
         if measured_head_deg is not None:
             self.update_head_feedback(measured_head_deg, timestamp=timestamp)
             measured_head = float(measured_head_deg)
+            est_head = None
         elif self.has_head_feedback:
             aligned_pos, aligned_vel = self.get_head_position_at(timestamp)
             measured_head = aligned_pos
             self.tracker.head_velocity_deg_s = aligned_vel
+            est_head = None
         else:
             measured_head = None
+            est_head = estimated_head_deg if estimated_head_deg is not None else self.estimated_head_yaw_deg
 
         result = self.tracker.step(
             faces=faces,
@@ -217,6 +221,7 @@ class GazeRuntimeCore:
             measured_head_deg=measured_head,
             timestamp=timestamp,
             is_robot_speaking=is_robot_speaking,
+            estimated_head_deg=est_head,
         )
 
         self.last_result = result

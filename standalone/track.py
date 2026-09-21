@@ -258,20 +258,25 @@ def main(argv=None, hid=None) -> int:
 
             # Head position authority: ENCODER vs ESTIMATED vs UNKNOWN
             if opts.fixed_head:
-                head_reference = 0.0
+                meas_head = None
+                est_head = 0.0
                 head_feedback_active = False
             elif opts.open_loop:
-                head_reference = head.estimated_yaw_deg if head.estimated_yaw_deg is not None else estimated_head_yaw
+                meas_head = None
+                est_head = head.estimated_yaw_deg if head.estimated_yaw_deg is not None else estimated_head_yaw
                 head_feedback_active = False
             elif head.position_source == PositionSource.ENCODER and head.actual_yaw_deg is not None:
-                head_reference = head.actual_yaw_deg
+                meas_head = head.actual_yaw_deg
+                est_head = None
                 head_feedback_active = True
             elif head.position_source == PositionSource.ESTIMATED and head.estimated_yaw_deg is not None:
-                head_reference = head.estimated_yaw_deg
+                meas_head = None
+                est_head = head.estimated_yaw_deg
                 head_feedback_active = False
             else:
-                # UNKNOWN: position is not known; do NOT assume 0.0
-                head_reference = None
+                # UNKNOWN: position is not known; do NOT assume 0.0 as measured
+                meas_head = None
+                est_head = estimated_head_yaw
                 head_feedback_active = False
 
             # GazeTracker.step() çağrısına DOA beslenmez (doa_deg=None).
@@ -282,9 +287,10 @@ def main(argv=None, hid=None) -> int:
                 frame_size=(frame.shape[1], frame.shape[0]),
                 doa_deg=None,
                 speech=None,
-                measured_head_deg=head_reference,
+                measured_head_deg=meas_head,
                 timestamp=now,
                 is_robot_speaking=voice_loop.is_speaking_at(now) if voice_loop else False,
+                estimated_head_deg=est_head,
             )
 
             # Audio target'ın tek ve authoritative kaynağı ReSpeakerAudioLocalizer'dır.

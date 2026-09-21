@@ -138,6 +138,7 @@ class GazeTracker:
         timestamp: float,
         speech=None,
         is_robot_speaking: bool = False,
+        estimated_head_deg: Optional[float] = None,
     ) -> GazeResult:
         """Runs one cycle: perception, fusion, arbitration, motion.
 
@@ -164,23 +165,32 @@ class GazeTracker:
             self.head_angle_deg = new_angle
             self.head_feedback_missing = False
             self._last_head_time = timestamp
+            actual_head = self.head_angle_deg
+            estimated_head = None
         else:
             self.head_feedback_missing = True
+            actual_head = None
+            if estimated_head_deg is not None:
+                self.head_angle_deg = float(estimated_head_deg)
+                estimated_head = self.head_angle_deg
+            else:
+                estimated_head = self.head_angle_deg
 
         if doa_deg is not None and speech is not None and speech.is_speech:
             self._ingest_audio(doa_deg, timestamp, float(speech.confidence),
                                is_robot_speaking)
 
-        self._ingest_vision(faces, frame_size, timestamp)
+        self._ingest_vision(faces, frame_size, timestamp, actual_head=actual_head, estimated_head=estimated_head)
 
         fused = self.fusion.fuse(self._latest_audio, self._latest_tracks, timestamp)
         target_state = self.target_manager.update(fused, timestamp)
 
         command = self.fsm.update(
             target_state=target_state,
-            actual_head_yaw_deg=self.head_angle_deg,
+            actual_head_yaw_deg=actual_head,
             timestamp=timestamp,
             actual_head_vel_deg_s=self.head_velocity_deg_s,
+            estimated_head_yaw_deg=estimated_head,
         )
 
         if command.gaze_state == GazeStateEnum.IDLE:
@@ -194,10 +204,10 @@ class GazeTracker:
         # and lie to the state machine about having arrived.
         trajectory = self.planner.plan_step(
             gaze_cmd=command,
-            actual_pos_deg=None if self.head_feedback_missing else self.head_angle_deg,
+            actual_pos_deg=actual_head,
             timestamp=timestamp,
         )
-        if self.head_feedback_missing:
+        if self.head_feedback_missing and estimated_head_deg is None:
             self.head_angle_deg = float(trajectory.position_deg)
             self.head_velocity_deg_s = float(trajectory.velocity_deg_s)
             self._last_head_time = timestamp
@@ -236,12 +246,15 @@ class GazeTracker:
         )
 
     def _ingest_vision(
-        self, faces: Sequence[Detection], frame_size: Tuple[int, int], timestamp: float
+        self,
+        faces: Sequence[Detection],
+        frame_size: Tuple[int, int],
+        timestamp: float,
+        actual_head: Optional[float] = None,
+        estimated_head: Optional[float] = None,
     ) -> None:
         width, height = frame_size
         observations = []
-        actual_head = None if self.head_feedback_missing else self.head_angle_deg
-        estimated_head = self.head_angle_deg if self.head_feedback_missing else None
         for face in faces:
             is_scored = face.confidence is not None
             conf = face.confidence if is_scored else UNSCORED_CONFIDENCE

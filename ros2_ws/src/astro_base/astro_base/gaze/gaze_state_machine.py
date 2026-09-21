@@ -331,8 +331,9 @@ class SocialGazeFSM:
             )
 
             if self.state == GazeStateEnum.ORIENTING:
-                # Saccade in progress: update target if shifted by more than deadband
-                if abs(angular_diff_deg(target_yaw, self.target_yaw_deg)) >= self.deadband_deg:
+                # Saccade in progress: update target if shifted significantly (>= 8.0°) in open-loop, or >= deadband with encoder
+                shift_threshold = self.deadband_deg if actual_head_yaw_deg is not None else 8.0
+                if abs(angular_diff_deg(target_yaw, self.target_yaw_deg)) >= shift_threshold:
                     self.target_yaw_deg = target_yaw
 
                 # Complete orientation when arrived or timeout

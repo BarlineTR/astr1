@@ -11,7 +11,7 @@ import math
 from typing import Dict, List, Optional, Tuple
 import numpy as np
 
-from astro_base.gaze.angle_math import wrap_deg
+from astro_base.gaze.angle_math import angular_diff_deg, wrap_deg
 from astro_base.gaze.coordinate_frames import CoordinateTransformer
 from astro_base.gaze.types import TrackingState, VisualObservation, VisualTargetTrack
 
@@ -80,10 +80,27 @@ class KalmanTrack3D:
             Q[i + 3, i] = q_cov
 
         self.P = F @ self.P @ F.T + Q
+        # Damp velocity over time to eliminate unconstrained runaway
+        for k in range(3, 6):
+            self.x[k] *= 0.85
+            if abs(self.x[k]) < 0.02:
+                self.x[k] = 0.0
         return float(self.x[0]), float(self.x[1]), float(self.x[2])
 
     def update(self, obs_pos_3d: Tuple[float, float, float], obs: VisualObservation, timestamp: float) -> None:
         """Kalman Measurement Update Step."""
+        # Single-frame anomaly rejection (Rule F):
+        # A person cannot teleport > 30° in a single 40ms frame. If a confirmed track experiences
+        # an anomalous angular jump, reject the measurement and coast instead of corrupting the track.
+        if self.hit_count >= 2:
+            ox, oy = obs_pos_3d[0], obs_pos_3d[1]
+            tx, ty = self.x[0], self.x[1]
+            obs_bearing = math.degrees(math.atan2(oy, ox))
+            track_bearing = math.degrees(math.atan2(ty, tx))
+            if abs(angular_diff_deg(obs_bearing, track_bearing)) > 30.0:
+                self.mark_missed(timestamp, coast_timeout_s=2.0)
+                return
+
         z_meas = np.array(obs_pos_3d, dtype=np.float64)
         H = np.zeros((3, 6), dtype=np.float64)
         H[0, 0] = 1.0
@@ -106,6 +123,11 @@ class KalmanTrack3D:
         # Covariance update: P = (I - K H) P
         I = np.eye(6, dtype=np.float64)
         self.P = (I - K @ H) @ self.P
+
+        # Bound maximum physical velocity
+        max_vel = 1.2
+        for k in range(3, 6):
+            self.x[k] = max(-max_vel, min(max_vel, float(self.x[k])))
 
         self.last_update_time = timestamp
         self.last_seen_time = timestamp
