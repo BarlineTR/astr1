@@ -75,6 +75,7 @@ class AttentionArbiterCore:
                 reason=safety_intent.reason,
                 timestamp=timestamp,
                 is_preemption=True,
+                desired_body_yaw_deg=safety_intent.target_yaw_deg,
             )
             self.last_decision = decision
             return decision
@@ -136,6 +137,7 @@ class AttentionArbiterCore:
                     timestamp=timestamp,
                     is_preemption=True,
                     preempted_target_id=preempted_tid,
+                    desired_body_yaw_deg=chosen_yaw,
                 )
                 self.last_decision = decision
                 return decision
@@ -153,6 +155,7 @@ class AttentionArbiterCore:
                     reason=dialogue_intent.reason,
                     timestamp=timestamp,
                     is_preemption=False,
+                    desired_body_yaw_deg=dialogue_intent.target_yaw_deg,
                 )
                 self.last_decision = decision
                 return decision
@@ -177,6 +180,7 @@ class AttentionArbiterCore:
                 reason=f"GESTURE_{gesture_intent.gesture_name}",
                 timestamp=timestamp,
                 is_preemption=False,
+                desired_body_yaw_deg=target_yaw,
             )
             self.last_decision = decision
             return decision
@@ -201,6 +205,7 @@ class AttentionArbiterCore:
                 reason=reason,
                 timestamp=timestamp,
                 is_preemption=False,
+                desired_body_yaw_deg=active_target.body_azimuth_deg,
             )
             self.last_decision = decision
             return decision
@@ -216,6 +221,7 @@ class AttentionArbiterCore:
             reason="NO_ACTIVE_TARGET",
             timestamp=timestamp,
             is_preemption=False,
+            desired_body_yaw_deg=0.0,
         )
         self.last_decision = decision
         return decision

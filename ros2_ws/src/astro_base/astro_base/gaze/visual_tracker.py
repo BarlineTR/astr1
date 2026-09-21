@@ -52,6 +52,7 @@ class KalmanTrack3D:
         self.person_name = obs.person_name
         self.is_known = obs.is_known
         self.eye_contact = obs.eye_contact
+        self.last_camera_bearing_deg: float = getattr(obs, "camera_azimuth_deg", 0.0)
         self.body_yaw_source: str = getattr(obs, "body_yaw_source", "UNKNOWN")
         self.is_detector_scored: bool = getattr(obs, "is_detector_scored", True)
 
@@ -155,6 +156,7 @@ class KalmanTrack3D:
             self.person_name = obs.person_name
             self.is_known = True
         self.eye_contact = obs.eye_contact
+        self.last_camera_bearing_deg = getattr(obs, "camera_azimuth_deg", self.last_camera_bearing_deg)
         self.body_yaw_source = getattr(obs, "body_yaw_source", self.body_yaw_source)
         self.is_detector_scored = getattr(obs, "is_detector_scored", self.is_detector_scored)
 
@@ -199,6 +201,7 @@ class KalmanTrack3D:
             person_name=self.person_name,
             is_known=self.is_known,
             eye_contact=self.eye_contact,
+            camera_bearing_deg=round(self.last_camera_bearing_deg, 1),
         )
 
 
@@ -228,6 +231,7 @@ class VisualTrackerCore:
         timestamp: float,
         actual_head_yaw_deg: Optional[float] = None,
         estimated_head_yaw_deg: Optional[float] = None,
+        fixation_baseline_yaw_deg: Optional[float] = None,
     ) -> List[VisualTargetTrack]:
         """Updates all active tracks with the latest list of VisualObservations.
 
@@ -255,6 +259,7 @@ class VisualTrackerCore:
             base_pt, pt_source = self.transformer.camera_point_to_body_frame(
                 pos_3d_cam=o.pos_3d_camera,
                 actual_head_yaw_deg=actual_head_yaw_deg,
+                fixation_baseline_yaw_deg=fixation_baseline_yaw_deg,
                 estimated_head_yaw_deg=estimated_head_yaw_deg,
                 return_source=True,
             )

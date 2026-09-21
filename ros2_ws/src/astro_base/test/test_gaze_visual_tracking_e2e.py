@@ -124,8 +124,9 @@ class TestGazeVisualTrackingE2E(unittest.TestCase):
         self.assertEqual(result.owner, PrioritySource.VISUAL_TRACKING)
 
     def test_scenario_c_bearing_0_estimated_pos30(self):
-        """Test C: Camera bearing 0°, estimated_head +30° -> target ≈ +30° (Real chain)."""
+        """Test C: Camera bearing 0°, fixation_baseline +30° -> target ≈ +30° (Real chain)."""
         tracker = GazeTracker(calibration=self.calib)
+        tracker.fsm.fixation_baseline_yaw_deg = 30.0
         det = Detection(x=280, y=200, w=80, h=80, confidence=0.88)
         now = 1000.0
         result = tracker.step(
@@ -140,8 +141,9 @@ class TestGazeVisualTrackingE2E(unittest.TestCase):
         self.assertEqual(result.owner, PrioritySource.VISUAL_TRACKING)
 
     def test_scenario_d_bearing_0_estimated_neg30(self):
-        """Test D: Camera bearing 0°, estimated_head -30° -> target ≈ -30° (Real chain)."""
+        """Test D: Camera bearing 0°, fixation_baseline -30° -> target ≈ -30° (Real chain)."""
         tracker = GazeTracker(calibration=self.calib)
+        tracker.fsm.fixation_baseline_yaw_deg = -30.0
         det = Detection(x=280, y=200, w=80, h=80, confidence=0.88)
         now = 1000.0
         result = tracker.step(
@@ -154,6 +156,132 @@ class TestGazeVisualTrackingE2E(unittest.TestCase):
         )
         self.assertAlmostEqual(result.target_yaw_deg, -30.0, delta=1.5)
         self.assertEqual(result.owner, PrioritySource.VISUAL_TRACKING)
+
+    def test_decoupling_proof_constant_phi_cam_varying_estimated_yaw(self):
+        """Decoupling Proof: With constant phi_cam = -35°, varying estimated_head_yaw wildly does NOT alter target_yaw."""
+        tracker = GazeTracker(calibration=self.calib)
+        tracker.fsm.fixation_baseline_yaw_deg = 60.0
+        # phi_cam = -35.0 deg -> u in image
+        norm_u = -(-35.0) / 36.0
+        u = 320.0 + norm_u * 320.0
+        det = Detection(x=int(round(u - 40)), y=200, w=80, h=80, confidence=0.88)
+
+        now = 1000.0
+        estimates = [60.0, 50.0, 40.0, 30.0, 20.0, 0.0, -20.0, 55.0]
+        initial_target = None
+        for i, est_yaw in enumerate(estimates):
+            t = now + i * 0.04
+            result = tracker.step(
+                faces=[det],
+                frame_size=(640, 480),
+                doa_deg=None,
+                measured_head_deg=None,
+                timestamp=t,
+                estimated_head_deg=est_yaw,
+            )
+            if initial_target is None:
+                initial_target = result.target_yaw_deg
+                # Baseline = 60°, pinhole bearing ≈ -29.8° -> target ≈ 30.2°
+                self.assertAlmostEqual(initial_target, 30.2, delta=1.5)
+            # Decoupling proof: target must stay strictly locked regardless of estimated_head_deg
+            self.assertAlmostEqual(
+                result.target_yaw_deg, initial_target, delta=0.5,
+                msg=f"Target changed with estimated_head_deg={est_yaw}°: {result.target_yaw_deg} vs {initial_target}",
+            )
+
+    def test_motor_stall_immunity_constant_phi_cam(self):
+        """Scenario 3: Motor stall with constant phi_cam = -35° holds target at +30.2° for 50+ cycles without drift."""
+        tracker = GazeTracker(calibration=self.calib)
+        tracker.fsm.fixation_baseline_yaw_deg = 60.0
+        norm_u = -(-35.0) / 36.0
+        u = 320.0 + norm_u * 320.0
+        det = Detection(x=int(round(u - 40)), y=200, w=80, h=80, confidence=0.88)
+
+        now = 1000.0
+        targets = []
+        for i in range(60):  # 60 cycles = 2.4 seconds
+            t = now + i * 0.04
+            sim_est = max(25.0, 60.0 - i * 1.5)
+            result = tracker.step(
+                faces=[det],
+                frame_size=(640, 480),
+                doa_deg=None,
+                measured_head_deg=None,
+                timestamp=t,
+                estimated_head_deg=sim_est,
+            )
+            targets.append(result.target_yaw_deg)
+
+        # In every single frame across 60 cycles, target must remain near initial target (~30.2°)
+        # It must NEVER drift to -10°, -58°, or ±75°!
+        expected_tgt = targets[0]
+        for i, tgt in enumerate(targets):
+            self.assertAlmostEqual(
+                tgt, expected_tgt, delta=1.0,
+                msg=f"Cycle {i}: target drifted to {tgt}° (expected ~{expected_tgt}°)",
+            )
+
+    def test_optical_evidence_arrival_and_baseline_promotion(self):
+        """In UNKNOWN mode, baseline is ONLY promoted when optical evidence (|phi_cam| <= 3.0°) is held for >= 3 frames."""
+        tracker = GazeTracker(calibration=self.calib)
+        tracker.fsm.fixation_baseline_yaw_deg = 0.0
+        now = 1000.0
+
+        # Frame 1 & 2: Target appears off-center
+        norm_u = -(25.0) / 36.0
+        u = 320.0 + norm_u * 320.0
+        det_offcenter = Detection(x=int(round(u - 40)), y=200, w=80, h=80, confidence=0.88)
+        res1 = tracker.step(faces=[det_offcenter], frame_size=(640, 480), doa_deg=None, measured_head_deg=None, timestamp=now)
+        res2 = tracker.step(faces=[det_offcenter], frame_size=(640, 480), doa_deg=None, measured_head_deg=None, timestamp=now + 0.04)
+
+        expected_yaw = res2.target_yaw_deg
+        self.assertAlmostEqual(expected_yaw, 22.3, delta=2.0)
+        # Saccade is locked, baseline is still 0.0
+        self.assertEqual(tracker.fsm.fixation_baseline_yaw_deg, 0.0)
+
+        # Now simulate head physically arriving: face is centered in camera (phi_cam = 0°)
+        det_centered = Detection(x=280, y=200, w=80, h=80, confidence=0.88)  # u=320, phi_cam=0°
+        # Frame 3 (optical center count = 1): baseline still 0.0
+        tracker.step(faces=[det_centered], frame_size=(640, 480), doa_deg=None, measured_head_deg=None, timestamp=now + 0.08)
+        self.assertEqual(tracker.fsm.fixation_baseline_yaw_deg, 0.0)
+
+        # Frame 4 (optical center count = 2): baseline still 0.0
+        tracker.step(faces=[det_centered], frame_size=(640, 480), doa_deg=None, measured_head_deg=None, timestamp=now + 0.12)
+        self.assertEqual(tracker.fsm.fixation_baseline_yaw_deg, 0.0)
+
+        # Frame 5 (optical center count = 3): arrival confirmed -> baseline promoted!
+        res5 = tracker.step(faces=[det_centered], frame_size=(640, 480), doa_deg=None, measured_head_deg=None, timestamp=now + 0.16)
+        self.assertAlmostEqual(tracker.fsm.fixation_baseline_yaw_deg, expected_yaw, delta=2.0)
+        self.assertEqual(res5.gaze_state, GazeStateEnum.HOLDING_ATTENTION)
+
+    def test_unknown_to_encoder_handoff_zero_jump(self):
+        """Handoff from UNKNOWN to ENCODER mode: zero discontinuous jump in target yaw."""
+        tracker = GazeTracker(calibration=self.calib)
+        tracker.fsm.fixation_baseline_yaw_deg = 25.0
+        now = 1000.0
+
+        # Person centered at baseline +25.0° in open-loop
+        det_centered = Detection(x=280, y=200, w=80, h=80, confidence=0.88)
+        res_unknown = tracker.step(
+            faces=[det_centered],
+            frame_size=(640, 480),
+            doa_deg=None,
+            measured_head_deg=None,
+            timestamp=now,
+        )
+
+        # Encoder comes online reporting 25.0°
+        res_encoder = tracker.step(
+            faces=[det_centered],
+            frame_size=(640, 480),
+            doa_deg=None,
+            measured_head_deg=25.0,
+            timestamp=now + 0.04,
+        )
+
+        # Target yaw should have virtually zero jump (|delta| <= 1.0°)
+        jump = abs(res_encoder.target_yaw_deg - res_unknown.target_yaw_deg)
+        self.assertLessEqual(jump, 1.0)
 
     # -------------------------------------------------------------------------
     # Behavior Contract Scenarios E and F: Trajectory & Anomaly Tests
@@ -270,26 +398,26 @@ class TestGazeVisualTrackingE2E(unittest.TestCase):
     # Scenario 3: No Return-to-Zero Bounce
     # -------------------------------------------------------------------------
     def test_scenario_3_no_return_to_zero_bounce(self):
-        """When head is at +30° and person is centered (cam_az=0°), target_yaw stays at +30°."""
+        """When head is at baseline +30° and person is centered (cam_az=0°), target_yaw stays at +30°."""
         now = 300.0
-        # Head is turned to +30° (open-loop estimate)
-        estimated_head = 30.0
+        # Head fixation baseline is at +30° (open-loop baseline)
+        baseline = 30.0
 
         # Person is centered in camera (x=270, w=100 -> center_u=320 -> cam_azimuth = 0.0°)
         obs = self.perception.process_detection(
             x=270, y=190, w=100, h=100, depth_m=1.5,
             timestamp=now,
             actual_head_yaw_deg=None,
-            estimated_head_yaw_deg=estimated_head,
+            fixation_baseline_yaw_deg=baseline,
             frame_width=640, frame_height=480,
             confidence=0.88,
         )
-        self.assertEqual(obs.body_yaw_source, "ESTIMATED")
+        self.assertEqual(obs.body_yaw_source, "UNKNOWN")
         self.assertAlmostEqual(obs.body_azimuth_deg, 30.0, places=0)
 
-        tracks = self.tracker.update([obs], now, estimated_head_yaw_deg=estimated_head)
+        tracks = self.tracker.update([obs], now, fixation_baseline_yaw_deg=baseline)
         self.assertAlmostEqual(tracks[0].body_azimuth_deg, 30.0, places=0)
-        self.assertEqual(tracks[0].body_yaw_source, "ESTIMATED")
+        self.assertEqual(tracks[0].body_yaw_source, "UNKNOWN")
 
         fused = self.fusion.fuse(audio_state=None, visual_tracks=tracks, timestamp=now)
         t_state = self.target_mgr.update(fused, now)
@@ -434,23 +562,23 @@ class TestGazeVisualTrackingE2E(unittest.TestCase):
         # Initialize with target at +40°
         obs = self.perception.process_detection(
             x=320, y=240, w=80, h=80, depth_m=1.5,
-            timestamp=now, estimated_head_yaw_deg=40.0, confidence=0.85,
+            timestamp=now, actual_head_yaw_deg=40.0, confidence=0.85,
         )
-        tracks = self.tracker.update([obs], now, estimated_head_yaw_deg=40.0)
+        tracks = self.tracker.update([obs], now, actual_head_yaw_deg=40.0)
         t_state = self.target_mgr.update(self.fusion.fuse(None, tracks, now), now)
         cmd = self.fsm.update(t_state, actual_head_yaw_deg=40.0, timestamp=now)
         self.assertEqual(cmd.gaze_state, GazeStateEnum.TRACKING)
 
         # 1. 0.1s with no detection: Target is NOT dropped, it enters COASTING mode
         now += 0.1
-        tracks_coasting = self.tracker.update([], now, estimated_head_yaw_deg=40.0)
+        tracks_coasting = self.tracker.update([], now, actual_head_yaw_deg=40.0)
         t_state_coasting = self.target_mgr.update(self.fusion.fuse(None, tracks_coasting, now), now)
         self.assertIsNotNone(t_state_coasting.active_target)
         self.assertEqual(t_state_coasting.active_target.tracking_state, TrackingState.COASTING)
 
         # 2. After coasting timeout (2.5s > 2.0s): Track expires, TargetManager drops active target
         now += 2.5
-        tracks_lost = self.tracker.update([], now, estimated_head_yaw_deg=40.0)
+        tracks_lost = self.tracker.update([], now, actual_head_yaw_deg=40.0)
         t_state_lost = self.target_mgr.update(self.fusion.fuse(None, tracks_lost, now), now)
         self.assertIsNone(t_state_lost.active_target)
 
@@ -479,7 +607,7 @@ class TestGazeVisualTrackingE2E(unittest.TestCase):
     # Scenario 9: Encoder Decoupling with Software Estimate
     # -------------------------------------------------------------------------
     def test_scenario_9_encoder_decoupling_with_software_estimate(self):
-        """When encoder is absent, actual_yaw_deg is None and source is ESTIMATED."""
+        """When encoder is absent, actual_yaw_deg is None and optical transform source is UNKNOWN."""
         state_mgr = HeadStateManager(ticks_per_deg=1.5)
         # Accept motor command to +35.0°
         state_mgr.on_command_accepted(35.0, timestamp=700.0)
@@ -489,14 +617,14 @@ class TestGazeVisualTrackingE2E(unittest.TestCase):
         self.assertIsNone(hstate.actual_yaw_deg)
         self.assertIsNotNone(hstate.estimated_yaw_deg)
 
-        # Verify perception correctly labels source as ESTIMATED
+        # Verify perception correctly labels optical transform source as UNKNOWN (decoupled from software simulation)
         obs = self.perception.process_detection(
             x=320, y=240, w=80, h=80, depth_m=1.5,
             timestamp=700.1,
             actual_head_yaw_deg=hstate.actual_yaw_deg,
             estimated_head_yaw_deg=hstate.estimated_yaw_deg,
         )
-        self.assertEqual(obs.body_yaw_source, "ESTIMATED")
+        self.assertEqual(obs.body_yaw_source, "UNKNOWN")
 
     # -------------------------------------------------------------------------
     # Scenario 10: Standalone vs ROS Pipeline Equivalence

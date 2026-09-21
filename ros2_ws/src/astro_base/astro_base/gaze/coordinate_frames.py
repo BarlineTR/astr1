@@ -156,10 +156,11 @@ class CoordinateTransformer:
     def audio_head_bearing_to_body_yaw(
         self,
         head_relative_bearing_deg: float,
-        actual_head_yaw_deg: float
+        actual_head_yaw_deg: Optional[float] = None
     ) -> float:
         """Transforms head-relative acoustic bearing into absolute robot body yaw frame."""
-        return wrap_deg(actual_head_yaw_deg + head_relative_bearing_deg)
+        head_yaw = float(actual_head_yaw_deg) if actual_head_yaw_deg is not None else 0.0
+        return wrap_deg(head_yaw + head_relative_bearing_deg)
 
     def raw_audio_to_body_yaw(
         self,
@@ -202,6 +203,7 @@ class CoordinateTransformer:
         self,
         cam_azimuth_deg: float,
         actual_head_yaw_deg: Optional[float] = None,
+        fixation_baseline_yaw_deg: Optional[float] = None,
         estimated_head_yaw_deg: Optional[float] = None,
         return_source: bool = False,
     ):
@@ -210,18 +212,17 @@ class CoordinateTransformer:
         Returns:
             body_yaw_deg (float) if return_source is False.
             (body_yaw_deg, source) if return_source is True.
-            source is 'ENCODER', 'ESTIMATED', or 'UNKNOWN'.
-            Invariant: If actual_head_yaw_deg is None, physical reality is NOT assumed.
-            0.0 is NEVER assumed as physical truth.
+            source is 'ENCODER' or 'UNKNOWN'.
+            Invariant: estimated_head_yaw is NEVER used as a physical optical transform reference.
+            In open-loop (actual_head_yaw_deg is None), fixation_baseline_yaw_deg (static committed pose)
+            is used to prevent integrator drift and runaway.
         """
         if actual_head_yaw_deg is not None and not math.isnan(actual_head_yaw_deg):
             yaw = wrap_deg(float(actual_head_yaw_deg) + cam_azimuth_deg)
             source = "ENCODER"
-        elif estimated_head_yaw_deg is not None and not math.isnan(estimated_head_yaw_deg):
-            yaw = wrap_deg(float(estimated_head_yaw_deg) + cam_azimuth_deg)
-            source = "ESTIMATED"
         else:
-            yaw = wrap_deg(cam_azimuth_deg)
+            base_yaw = float(fixation_baseline_yaw_deg) if fixation_baseline_yaw_deg is not None and not math.isnan(fixation_baseline_yaw_deg) else 0.0
+            yaw = wrap_deg(base_yaw + cam_azimuth_deg)
             source = "UNKNOWN"
 
         if return_source:
@@ -232,6 +233,7 @@ class CoordinateTransformer:
         self,
         pos_3d_cam: Tuple[float, float, float],
         actual_head_yaw_deg: Optional[float] = None,
+        fixation_baseline_yaw_deg: Optional[float] = None,
         estimated_head_yaw_deg: Optional[float] = None,
         return_source: bool = False,
     ):
@@ -240,15 +242,14 @@ class CoordinateTransformer:
         Returns:
             (x_base, y_base, z_base) if return_source is False.
             ((x_base, y_base, z_base), source) if return_source is True.
+            Invariant: In open loop, uses static fixation_baseline_yaw_deg, completely decoupled
+            from estimated_head_yaw.
         """
         if actual_head_yaw_deg is not None and not math.isnan(actual_head_yaw_deg):
             theta = float(actual_head_yaw_deg)
             source = "ENCODER"
-        elif estimated_head_yaw_deg is not None and not math.isnan(estimated_head_yaw_deg):
-            theta = float(estimated_head_yaw_deg)
-            source = "ESTIMATED"
         else:
-            theta = 0.0
+            theta = float(fixation_baseline_yaw_deg) if fixation_baseline_yaw_deg is not None and not math.isnan(fixation_baseline_yaw_deg) else 0.0
             source = "UNKNOWN"
 
         x_opt, y_opt, z_opt = pos_3d_cam

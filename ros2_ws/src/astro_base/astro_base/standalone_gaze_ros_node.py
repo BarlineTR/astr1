@@ -1102,6 +1102,7 @@ class StandaloneGazeRosNode(Node):
                 GazeStateEnum.HOLDING_ATTENTION,
                 GazeStateEnum.ORIENTING,
                 GazeStateEnum.ACQUIRING,
+                GazeStateEnum.TARGET_LOST,
             )
         )
 
@@ -1221,15 +1222,18 @@ class StandaloneGazeRosNode(Node):
 
         doa_str = f"{doa_deg:+.1f}°" if doa_deg is not None else "NONE"
         owner_str = res.owner.value if hasattr(res.owner, "value") else str(res.owner)
+        aligned_head_str = f"{aligned_head:+.1f}°" if aligned_head is not None else "NONE"
+        actual_head_str = f"{actual_head:+.1f}°" if actual_head is not None else "NONE"
+        fb_deg_str = f"{fb_deg:+.1f}°" if fb_deg is not None else "NONE"
         sync_line = (
             f"visual_bearing={face_bearing_str} "
             f"audio_doa={doa_str} "
             f"owner={owner_str} "
             f"command_yaw={target_yaw:+.1f}° "
-            f"aligned_head={aligned_head:+.1f}° "
-            f"actual_head={actual_head:+.1f}° "
+            f"aligned_head={aligned_head_str} "
+            f"actual_head={actual_head_str} "
             f"temporal_skew_ms={temporal_skew_ms:.1f}ms "
-            f"head_feedback_deg={fb_deg:+.1f}° "
+            f"head_feedback_deg={fb_deg_str} "
             f"head_feedback_age_ms={fb_age:.1f}ms "
             f"head_feedback_source={fb_src}"
         )

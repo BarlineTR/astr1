@@ -145,6 +145,7 @@ class AudioVisualFusionCore:
                         body_yaw_source=getattr(vt, "body_yaw_source", "UNKNOWN"),
                         audio_confidence=round(audio_state.confidence, 2),
                         visual_confidence=round(vt.confidence, 2),
+                        camera_bearing_deg=getattr(vt, "camera_bearing_deg", 0.0),
                     )
                 )
             else:
@@ -166,6 +167,7 @@ class AudioVisualFusionCore:
                         body_yaw_source=getattr(vt, "body_yaw_source", "UNKNOWN"),
                         audio_confidence=0.0,
                         visual_confidence=round(vt.confidence, 2),
+                        camera_bearing_deg=getattr(vt, "camera_bearing_deg", 0.0),
                     )
                 )
 

@@ -110,7 +110,7 @@ class Test100FrameDifferential2e0b70c(unittest.TestCase):
 
             # 2. ROS Node Execution (Using direct frame step API)
             # Deliver head encoder feedback
-            ros_node._on_head_state(type("HState", (), {"position_deg": actual_head_sim, "velocity_deg_s": 0.0})())
+            ros_node._on_head_state(type("HState", (), {"position_deg": actual_head_sim, "velocity_deg_s": 0.0, "timestamp": t_stamp})())
             # Step frame directly into standalone ROS node
             ros_node.step_frame(detections=standalone_dets, frame_size=(640, 480), timestamp=t_stamp)
             ros_target_yaw = float(ros_node.last_published_yaw)

@@ -174,6 +174,7 @@ class VisualTargetTrack:
     person_name: Optional[str] = None
     is_known: bool = False
     eye_contact: bool = False
+    camera_bearing_deg: float = 0.0
 
 
 # =============================================================================
@@ -198,6 +199,7 @@ class FusedTarget:
     body_yaw_source: str = "UNKNOWN"      # "ENCODER", "ESTIMATED", or "UNKNOWN"
     audio_confidence: float = 0.0
     visual_confidence: float = 0.0
+    camera_bearing_deg: float = 0.0
 
 
 @dataclass
@@ -281,6 +283,7 @@ class AttentionDecision:
     timestamp: float
     is_preemption: bool = False
     preempted_target_id: Optional[str] = None
+    desired_body_yaw_deg: float = 0.0
 
 
 @dataclass
@@ -294,6 +297,7 @@ class GazeTarget:
     gaze_state: GazeStateEnum = GazeStateEnum.IDLE
     timestamp: float = 0.0
     reason: str = "DEFAULT"
+    desired_body_yaw_deg: float = 0.0
 
 
 @dataclass
@@ -306,6 +310,7 @@ class GazeCommand:
     active_target_id: Optional[str] = None
     confidence: float = 0.0
     timestamp: float = 0.0
+    desired_body_yaw_deg: float = 0.0
 
 
 @dataclass

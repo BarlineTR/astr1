@@ -116,6 +116,11 @@ class SocialGazeFSM:
         self.hold_exit_reason: str = "NONE"
         self.last_transition_reason: str = "INIT"
 
+        # Open-loop fixation baseline & optical evidence tracking
+        self.fixation_baseline_yaw_deg: float = 0.0
+        self._optical_centered_count: int = 0
+        self._saccade_locked: bool = False
+
         # Intents state storage
         self._safety_intent: SafetyGazeIntent = SafetyGazeIntent()
         self._explicit_intent: Optional[ExplicitGazeIntent] = None
@@ -232,9 +237,32 @@ class SocialGazeFSM:
         safety_intent: Optional[SafetyGazeIntent] = None,
     ) -> GazeCommand:
         """Evaluates sensory inputs, invokes AttentionArbiter, and executes social gaze policy."""
-        # Resolve best available head orientation for tracking and settling error calculation
-        effective_head_yaw = actual_head_yaw_deg if actual_head_yaw_deg is not None else estimated_head_yaw_deg
-        head_ref_yaw = effective_head_yaw if effective_head_yaw is not None else self.target_yaw_deg
+        # Invariant: Closed-loop rebase when authoritative encoder is present
+        if actual_head_yaw_deg is not None:
+            self.fixation_baseline_yaw_deg = actual_head_yaw_deg
+
+        # Optical evidence evaluation (centered within +-3.0 deg for >= 3 frames)
+        has_vision = (
+            target_state.active_target is not None
+            and target_state.active_target.modality in (Modality.FUSED, Modality.VISION)
+        )
+        if has_vision and target_state.active_target is not None:
+            optical_bearing = getattr(target_state.active_target, "camera_bearing_deg", None)
+            if optical_bearing is not None:
+                optical_err = abs(optical_bearing)
+            else:
+                optical_err = abs(angular_diff_deg(target_state.active_target.body_azimuth_deg, self.fixation_baseline_yaw_deg))
+
+            if optical_err <= 3.0:
+                self._optical_centered_count += 1
+            else:
+                self._optical_centered_count = 0
+        else:
+            self._optical_centered_count = 0
+
+        # Invariant: head_ref_yaw uses encoder if present, otherwise static fixation baseline.
+        # estimated_head_yaw is completely excluded from reference pose.
+        head_ref_yaw = actual_head_yaw_deg if actual_head_yaw_deg is not None else self.fixation_baseline_yaw_deg
 
         # 1. Update active intent stores if passed explicitly
         if explicit_intent is not None:
@@ -251,9 +279,9 @@ class SocialGazeFSM:
             elapsed_step = timestamp - self._gesture_step_start_time
             step_target = self._gesture_steps[self._gesture_step_idx]
             head_settled = (
-                abs(angular_diff_deg(effective_head_yaw if effective_head_yaw is not None else step_target, step_target)) <= self.position_tolerance_deg
+                abs(angular_diff_deg(head_ref_yaw, step_target)) <= self.position_tolerance_deg
                 and abs(actual_head_vel_deg_s) <= self.velocity_tolerance_deg_s
-            ) if effective_head_yaw is not None else False
+            ) if actual_head_yaw_deg is not None else False
 
             if elapsed_step >= self._gesture_step_duration_s or head_settled:
                 self._gesture_step_idx += 1
@@ -279,33 +307,32 @@ class SocialGazeFSM:
             dialogue_intent=self._dialogue_intent,
             gesture_intent=self._gesture_intent,
             safety_intent=self._safety_intent,
-            actual_head_yaw_deg=effective_head_yaw if effective_head_yaw is not None else 0.0,
+            actual_head_yaw_deg=head_ref_yaw,
             timestamp=timestamp,
         )
         self.last_decision = decision
         self.active_priority = decision.owner
         self.active_target_id = decision.target_id
 
-        # 4. Check physical settling detection
-        if effective_head_yaw is not None:
-            pos_err = abs(angular_diff_deg(effective_head_yaw, self.target_yaw_deg))
+        # 4. Physical settling detection
+        # Invariant: estimated_head_yaw is NEVER used as physical proof of arrival!
+        if actual_head_yaw_deg is not None:
+            pos_err = abs(angular_diff_deg(actual_head_yaw_deg, self.target_yaw_deg))
             pos_ok = (pos_err <= self.position_tolerance_deg)
-        else:
-            pos_err = 0.0
-            pos_ok = False
-        vel_ok = (abs(actual_head_vel_deg_s) <= self.velocity_tolerance_deg_s)
-
-        if pos_ok and vel_ok:
-            self._settling_persistence_count += 1
+            vel_ok = (abs(actual_head_vel_deg_s) <= self.velocity_tolerance_deg_s)
+            if pos_ok and vel_ok:
+                self._settling_persistence_count += 1
+            else:
+                self._settling_persistence_count = 0
+            self.at_target = (self._settling_persistence_count >= self.settling_persistence_required)
         else:
             self._settling_persistence_count = 0
-
-        self.at_target = (self._settling_persistence_count >= self.settling_persistence_required)
+            self.at_target = (self._optical_centered_count >= 3)
 
         # 5. Gaze Policy Lifecycle & Invariant Transitions
         if decision.owner == PrioritySource.EMERGENCY_STOP:
             self.target_yaw_deg = 0.0
-            head_yaw_check = effective_head_yaw if effective_head_yaw is not None else 0.0
+            head_yaw_check = actual_head_yaw_deg if actual_head_yaw_deg is not None else 0.0
             if abs(head_yaw_check) > 1.5:
                 self._transition_to(GazeStateEnum.RECOVERING, timestamp, reason="EMERGENCY_STOP_RECOVERY")
             else:
@@ -325,26 +352,40 @@ class SocialGazeFSM:
             self._reorient_attempted = False
             target_yaw = decision.target_yaw_deg
             err_deg = abs(angular_diff_deg(target_yaw, head_ref_yaw))
-            has_vision = (
-                target_state.active_target is not None
-                and target_state.active_target.modality in (Modality.FUSED, Modality.VISION)
-            )
 
             if self.state == GazeStateEnum.ORIENTING:
-                # Saccade in progress: update target if shifted significantly (>= 8.0°) in open-loop, or >= deadband with encoder
-                shift_threshold = self.deadband_deg if actual_head_yaw_deg is not None else 8.0
-                if abs(angular_diff_deg(target_yaw, self.target_yaw_deg)) >= shift_threshold:
-                    self.target_yaw_deg = target_yaw
+                if actual_head_yaw_deg is not None:
+                    # Closed-loop: update target if shifted significantly (>= deadband)
+                    if abs(angular_diff_deg(target_yaw, self.target_yaw_deg)) >= self.deadband_deg:
+                        self.target_yaw_deg = target_yaw
 
-                # Complete orientation when arrived or timeout
-                if self.at_target or (timestamp - self._state_entry_time) >= 2.5:
-                    if has_vision or decision.owner == PrioritySource.VISUAL_TRACKING:
-                        if self.at_target:
-                            self._transition_to(GazeStateEnum.HOLDING_ATTENTION, timestamp, reason="ORIENTING_ARRIVED_HOLD")
+                    # Complete orientation when arrived or timeout
+                    if self.at_target or (timestamp - self._state_entry_time) >= 2.5:
+                        if has_vision or decision.owner == PrioritySource.VISUAL_TRACKING:
+                            if self.at_target:
+                                self._transition_to(GazeStateEnum.HOLDING_ATTENTION, timestamp, reason="ORIENTING_ARRIVED_HOLD")
+                            else:
+                                self._transition_to(GazeStateEnum.TRACKING, timestamp, reason="ORIENTING_ARRIVED_TRACKING")
                         else:
-                            self._transition_to(GazeStateEnum.TRACKING, timestamp, reason="ORIENTING_ARRIVED_TRACKING")
-                    else:
-                        self._transition_to(GazeStateEnum.ACQUIRING, timestamp, reason="ORIENTING_COMPLETE_ACQUIRING")
+                            self._transition_to(GazeStateEnum.ACQUIRING, timestamp, reason="ORIENTING_COMPLETE_ACQUIRING")
+                else:
+                    # Open-loop (UNKNOWN position source):
+                    # Saccade command is strictly LOCKED during transit; intermediate camera frames do NOT alter target_yaw.
+                    # Arrival is confirmed ONLY by stable optical evidence (centered for >= 3 frames).
+                    if self._optical_centered_count >= 3:
+                        # Arrival confirmed by optical evidence -> promote fixation baseline!
+                        self.fixation_baseline_yaw_deg = self.target_yaw_deg
+                        if has_vision or decision.owner == PrioritySource.VISUAL_TRACKING:
+                            self._transition_to(GazeStateEnum.HOLDING_ATTENTION, timestamp, reason="ORIENTING_OPTICAL_CENTERED_HOLD")
+                        else:
+                            self._transition_to(GazeStateEnum.ACQUIRING, timestamp, reason="ORIENTING_OPTICAL_CENTERED_ACQUIRING")
+                    elif (timestamp - self._state_entry_time) >= 2.5:
+                        # Saccade timed out WITHOUT optical evidence (e.g. motor stall, target moved)
+                        # Invariant: NEVER promote fixation baseline on timeout!
+                        if has_vision or decision.owner == PrioritySource.VISUAL_TRACKING:
+                            self._transition_to(GazeStateEnum.TRACKING, timestamp, reason="ORIENTING_TIMEOUT_UNCONFIRMED_TRACK")
+                        else:
+                            self._transition_to(GazeStateEnum.ACQUIRING, timestamp, reason="ORIENTING_TIMEOUT_NO_OPTICAL")
 
             elif self.state == GazeStateEnum.ACQUIRING:
                 # Active target updated while acquiring (e.g. vision lock or speaker switch)
@@ -352,7 +393,9 @@ class SocialGazeFSM:
                     self.target_yaw_deg = target_yaw
 
                 if has_vision or decision.owner == PrioritySource.VISUAL_TRACKING:
-                    if self.at_target or err_deg <= self.position_tolerance_deg:
+                    if self.at_target or (actual_head_yaw_deg is None and self._optical_centered_count >= 3) or err_deg <= self.position_tolerance_deg:
+                        if actual_head_yaw_deg is None and self._optical_centered_count >= 3:
+                            self.fixation_baseline_yaw_deg = self.target_yaw_deg
                         self._transition_to(GazeStateEnum.HOLDING_ATTENTION, timestamp, reason="ACQUIRE_VISION_HOLD")
                     else:
                         self._transition_to(GazeStateEnum.TRACKING, timestamp, reason="ACQUIRE_VISION_TRACK")
@@ -360,10 +403,12 @@ class SocialGazeFSM:
                     self._transition_to(GazeStateEnum.ORIENTING, timestamp, reason="ACQUIRE_AUDIO_STEP_SACCADE")
 
             elif self.state == GazeStateEnum.HOLDING_ATTENTION:
-                # Stable Social Attention Commitment (Failure 9 & 10):
+                # Stable Social Attention Commitment:
                 # Continuously follow target setpoint smoothly if moved by more than deadband
                 if abs(angular_diff_deg(target_yaw, self.target_yaw_deg)) >= self.deadband_deg:
                     self.target_yaw_deg = target_yaw
+                    if actual_head_yaw_deg is None and self._optical_centered_count >= 3:
+                        self.fixation_baseline_yaw_deg = self.target_yaw_deg
 
                 # Only leave HOLDING_ATTENTION if target ID switched with significant spatial jump (> 12.0°) or large step jump (> 15.0°)
                 target_id_changed = (
@@ -384,9 +429,13 @@ class SocialGazeFSM:
                 # Smooth Visual Pursuit
                 if abs(angular_diff_deg(target_yaw, self.target_yaw_deg)) >= self.deadband_deg:
                     self.target_yaw_deg = target_yaw
+                    if actual_head_yaw_deg is None and self._optical_centered_count >= 3:
+                        self.fixation_baseline_yaw_deg = self.target_yaw_deg
 
                 # Settle into committed HOLDING_ATTENTION once arrived and velocity settled
-                if self.at_target or (err_deg <= self.position_tolerance_deg and abs(actual_head_vel_deg_s) <= self.velocity_tolerance_deg_s):
+                if self.at_target or (actual_head_yaw_deg is None and self._optical_centered_count >= 3) or (actual_head_yaw_deg is not None and err_deg <= self.position_tolerance_deg and abs(actual_head_vel_deg_s) <= self.velocity_tolerance_deg_s):
+                    if actual_head_yaw_deg is None and self._optical_centered_count >= 3:
+                        self.fixation_baseline_yaw_deg = self.target_yaw_deg
                     self._transition_to(GazeStateEnum.HOLDING_ATTENTION, timestamp, reason="PURSUIT_ARRIVED_HOLD")
                 elif err_deg > 25.0:
                     self._transition_to(GazeStateEnum.ORIENTING, timestamp, reason="LARGE_TARGET_STEP")
@@ -474,7 +523,7 @@ class SocialGazeFSM:
                     # Register Negative Evidence: This head yaw has no face -> mark as Reverb Zone!
                     if self.spatial_memory is not None:
                         self.spatial_memory.register_negative_acoustic_evidence(
-                            bearing_deg=effective_head_yaw if effective_head_yaw is not None else 0.0,
+                            bearing_deg=head_ref_yaw,
                             timestamp=timestamp,
                             reason="NO_FACE_IN_ACQUIRE"
                         )
@@ -513,7 +562,7 @@ class SocialGazeFSM:
                 self.target_yaw_deg = 0.0
                 time_in_recovering = timestamp - self._state_entry_time
                 settled_at_center = (
-                    abs(effective_head_yaw if effective_head_yaw is not None else 0.0) <= max(self.position_tolerance_deg, 2.5)
+                    abs(actual_head_yaw_deg if actual_head_yaw_deg is not None else 0.0) <= max(self.position_tolerance_deg, 2.5)
                     and abs(actual_head_vel_deg_s) <= self.velocity_tolerance_deg_s
                 )
                 if settled_at_center or time_in_recovering >= self.recovery_timeout_s:
@@ -535,11 +584,12 @@ class SocialGazeFSM:
                         self._last_idle_saccade_time = timestamp
 
         return GazeCommand(
-            target_yaw_deg=self.target_yaw_deg,
-            target_pitch_deg=self.target_pitch_deg,
+            target_yaw_deg=clamp_deg(self.target_yaw_deg, self.min_limit_deg, self.max_limit_deg),
+            target_pitch_deg=clamp_deg(self.target_pitch_deg, -25.0, 25.0),
             priority_source=self.active_priority,
             gaze_state=self.state,
             active_target_id=self.active_target_id,
             confidence=round(decision.confidence, 2),
             timestamp=timestamp,
+            desired_body_yaw_deg=getattr(decision, "desired_body_yaw_deg", self.target_yaw_deg),
         )

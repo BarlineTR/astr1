@@ -75,6 +75,7 @@ class VisualPerceptionCore:
         is_known: bool = False,
         cam_azimuth_deg: Optional[float] = None,
         is_detector_scored: bool = True,
+        fixation_baseline_yaw_deg: Optional[float] = None,
     ) -> VisualObservation:
         """Processes a single bounding box detection into a rich VisualObservation."""
         center_u = x + (w / 2.0)
@@ -107,6 +108,7 @@ class VisualPerceptionCore:
         body_yaw, body_yaw_source = self.transformer.camera_bearing_to_body_yaw(
             cam_azimuth_deg=cam_azimuth,
             actual_head_yaw_deg=actual_head_yaw_deg,
+            fixation_baseline_yaw_deg=fixation_baseline_yaw_deg,
             estimated_head_yaw_deg=estimated_head_yaw_deg,
             return_source=True,
         )

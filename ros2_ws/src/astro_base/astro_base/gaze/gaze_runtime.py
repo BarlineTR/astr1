@@ -82,8 +82,9 @@ class GazeRuntimeCore:
         self.last_feedback_time = t
         self.head_feedback_source = str(source)
         self._encoder_history.append((t, float(angle_deg), float(velocity_deg_s)))
-        self.tracker.head_angle_deg = float(angle_deg)
-        self.tracker.head_velocity_deg_s = float(velocity_deg_s)
+        if getattr(self.tracker, "_last_head_time", None) is None:
+            self.tracker.head_angle_deg = float(angle_deg)
+            self.tracker.head_velocity_deg_s = float(velocity_deg_s)
         self.tracker.head_feedback_missing = False
 
     def update_estimated_feedback(

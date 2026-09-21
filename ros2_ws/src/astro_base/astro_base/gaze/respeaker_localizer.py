@@ -449,7 +449,10 @@ class ReSpeakerAudioLocalizer:
 
         if self._cached_vad is None:
             if not self._vad_warning_emitted or (now - self._last_vad_warning_time > 5.0):
-                print("⚠️  ReSpeaker Hardware VAD okunamıyor (donanım yok veya yanıt vermiyor) — ses takibi devre dışı")
+                try:
+                    print("⚠️  ReSpeaker Hardware VAD okunamıyor (donanım yok veya yanıt vermiyor) — ses takibi devre dışı")
+                except UnicodeEncodeError:
+                    print("[WARN] ReSpeaker Hardware VAD okunamiyor (donanim yok veya yanit vermiyor) - ses takibi devre disi")
                 self._vad_warning_emitted = True
                 self._last_vad_warning_time = now
             self.reset()

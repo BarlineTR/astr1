@@ -64,6 +64,7 @@ class GazeResult:
     head_feedback_deg: float = 0.0
     head_feedback_age_ms: float = 0.0
     head_feedback_source: str = "NONE"
+    desired_body_yaw_deg: float = 0.0
 
 
 # A detection whose publisher reports no confidence: over the target manager's 0.40
@@ -180,7 +181,14 @@ class GazeTracker:
             self._ingest_audio(doa_deg, timestamp, float(speech.confidence),
                                is_robot_speaking)
 
-        self._ingest_vision(faces, frame_size, timestamp, actual_head=actual_head, estimated_head=estimated_head)
+        self._ingest_vision(
+            faces,
+            frame_size,
+            timestamp,
+            actual_head=actual_head,
+            estimated_head=estimated_head,
+            fixation_baseline=self.fsm.fixation_baseline_yaw_deg,
+        )
 
         fused = self.fusion.fuse(self._latest_audio, self._latest_tracks, timestamp)
         target_state = self.target_manager.update(fused, timestamp)
@@ -221,6 +229,7 @@ class GazeTracker:
             confidence=float(command.confidence),
             head_angle_deg=self.head_angle_deg,
             face_bearings_deg=tuple(t.body_azimuth_deg for t in self._latest_tracks),
+            desired_body_yaw_deg=getattr(command, "desired_body_yaw_deg", clamped_target_yaw),
         )
 
     def _ingest_audio(self, doa_deg: float, timestamp: float, confidence: float,
@@ -252,6 +261,7 @@ class GazeTracker:
         timestamp: float,
         actual_head: Optional[float] = None,
         estimated_head: Optional[float] = None,
+        fixation_baseline: Optional[float] = None,
     ) -> None:
         width, height = frame_size
         observations = []
@@ -264,6 +274,7 @@ class GazeTracker:
                     depth_m=self._estimate_distance(face.w, width),
                     timestamp=timestamp,
                     actual_head_yaw_deg=actual_head,
+                    fixation_baseline_yaw_deg=fixation_baseline,
                     estimated_head_yaw_deg=estimated_head,
                     frame_width=width, frame_height=height,
                     confidence=conf,
@@ -274,6 +285,7 @@ class GazeTracker:
             observations=observations,
             timestamp=timestamp,
             actual_head_yaw_deg=actual_head,
+            fixation_baseline_yaw_deg=fixation_baseline,
             estimated_head_yaw_deg=estimated_head,
         )
 

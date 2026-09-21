@@ -588,6 +588,7 @@ class SocialGazeNode(Node):
             is_speech_fresh = self.is_speech_verified and ((t - self._latest_vad_time) <= 0.5)
             speech = SpeechEstimate(is_speech=True, confidence=self._latest_doa_confidence) if is_speech_fresh else None
             doa_fresh = self._latest_doa_deg is not None and ((t - self._latest_doa_time) <= 0.5)
+            doa_val = float(self._latest_doa_deg) if doa_fresh else None
             measured_head = self.actual_head_yaw_deg if self._head_position_source == "ENCODER" else None
             estimated_head = self.estimated_head_yaw_deg if self._head_position_source != "ENCODER" else None
 
