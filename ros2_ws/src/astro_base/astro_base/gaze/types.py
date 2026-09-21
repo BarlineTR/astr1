@@ -139,7 +139,9 @@ class VisualMeasurement:
     camera_azimuth_deg: float = 0.0       # Angle relative to optical axis [-36°..+36°]
     camera_elevation_deg: float = 0.0
     body_azimuth_deg: float = 0.0         # Transformed to robot base coordinate frame
+    body_yaw_source: str = "UNKNOWN"      # "ENCODER", "ESTIMATED", or "UNKNOWN"
     confidence: float = 0.0               # Detection confidence [0.0..1.0]
+    is_detector_scored: bool = True       # False if assigned default/unscored prior
     eyes_visible: bool = False            # True if facial landmarks / eyes confirmed
     eye_contact: bool = False             # True if looking directly at robot
     head_yaw_deg: float = 0.0             # User's estimated head pose yaw
@@ -165,6 +167,7 @@ class VisualTargetTrack:
     confidence: float
     tracking_state: TrackingState
     last_seen_time: float
+    body_yaw_source: str = "UNKNOWN"      # "ENCODER", "ESTIMATED", or "UNKNOWN"
     age_frames: int = 1
     missed_frames: int = 0
     emotion: str = "neutral"
@@ -192,6 +195,7 @@ class FusedTarget:
     is_known: bool
     timestamp: float
     tracking_state: TrackingState
+    body_yaw_source: str = "UNKNOWN"      # "ENCODER", "ESTIMATED", or "UNKNOWN"
     audio_confidence: float = 0.0
     visual_confidence: float = 0.0
 

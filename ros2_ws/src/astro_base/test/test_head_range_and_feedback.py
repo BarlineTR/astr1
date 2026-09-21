@@ -124,7 +124,8 @@ class TestOpenLoopHeadEstimate(unittest.TestCase):
 
         self._drive(node, 40.0)
 
-        self.assertGreater(node.actual_head_yaw_deg, 20.0)
+        self.assertIsNone(node.actual_head_yaw_deg)
+        self.assertGreater(node.estimated_head_yaw_deg, 20.0)
 
     def test_a_real_encoder_reading_still_wins(self):
         node = SocialGazeNode()
@@ -139,7 +140,8 @@ class TestOpenLoopHeadEstimate(unittest.TestCase):
 
         self._drive(node, 400.0)
 
-        self.assertLessEqual(node.actual_head_yaw_deg, node.calib.head.max_angle_deg)
+        self.assertIsNone(node.actual_head_yaw_deg)
+        self.assertLessEqual(node.estimated_head_yaw_deg, node.calib.head.max_angle_deg)
 
     def test_the_planner_is_not_resynced_against_a_position_nobody_measured(self):
         """plan_step snaps its state to actual_pos_deg past 25 degrees of error; fed a

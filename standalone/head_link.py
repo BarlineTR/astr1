@@ -41,7 +41,8 @@ Packet = Tuple[int, bytes]
 
 def encode_head_cmd(angle_deg: float) -> bytes:
     """A HEAD_CMD packet. The firmware also treats it as a heartbeat."""
-    return build_packet(MSG_HEAD_CMD, struct.pack("<f", float(angle_deg)))
+    clamped = max(-75.0, min(75.0, float(angle_deg)))
+    return build_packet(MSG_HEAD_CMD, struct.pack("<f", clamped))
 
 
 def encode_heartbeat(seq: int) -> bytes:

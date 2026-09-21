@@ -63,7 +63,8 @@ class VisualPerceptionCore:
         h: int,
         depth_m: float,
         timestamp: float,
-        actual_head_yaw_deg: float = 0.0,
+        actual_head_yaw_deg: Optional[float] = None,
+        estimated_head_yaw_deg: Optional[float] = None,
         frame_width: int = 640,
         frame_height: int = 480,
         confidence: float = 0.80,
@@ -73,6 +74,7 @@ class VisualPerceptionCore:
         person_name: Optional[str] = None,
         is_known: bool = False,
         cam_azimuth_deg: Optional[float] = None,
+        is_detector_scored: bool = True,
     ) -> VisualObservation:
         """Processes a single bounding box detection into a rich VisualObservation."""
         center_u = x + (w / 2.0)
@@ -101,8 +103,13 @@ class VisualPerceptionCore:
             norm_u = (center_u - (frame_width / 2.0)) / (frame_width / 2.0)
             norm_v = (center_v - (frame_height / 2.0)) / (frame_height / 2.0)
 
-        # 3. Transform to robot base body frame
-        body_yaw = self.transformer.camera_bearing_to_body_yaw(cam_azimuth, actual_head_yaw_deg)
+        # 3. Transform to robot base body frame with explicit source attribution
+        body_yaw, body_yaw_source = self.transformer.camera_bearing_to_body_yaw(
+            cam_azimuth_deg=cam_azimuth,
+            actual_head_yaw_deg=actual_head_yaw_deg,
+            estimated_head_yaw_deg=estimated_head_yaw_deg,
+            return_source=True,
+        )
 
         # 4. Direct eye contact verification
         in_social_zone = (self.social_zone_min_dist_m <= depth_m <= self.social_zone_max_dist_m)
@@ -128,7 +135,9 @@ class VisualPerceptionCore:
             camera_azimuth_deg=round(float(cam_azimuth), 1),
             camera_elevation_deg=round(float(cam_elevation), 1),
             body_azimuth_deg=round(float(body_yaw), 1),
+            body_yaw_source=body_yaw_source,
             confidence=round(float(confidence), 2),
+            is_detector_scored=is_detector_scored,
             eyes_visible=eyes_visible,
             eye_contact=direct_eye_contact,
             head_yaw_deg=round(float(head_yaw_deg), 1),

@@ -358,13 +358,36 @@ class BehaviorEngine:
                 )
 
             # (c) Head Yaw Alignment / Centering
-            if abs(p_yaw) > 45.0 and not self._is_approaching and not self._is_retreating:
+            # ALIGN_BODY_TO_TARGET can ONLY be triggered if:
+            # 1. Target angle is verified in true body frame (head encoder is valid and known, NOT unknown/estimated)
+            # 2. Head target is mechanically unreachable (abs(p_yaw) > 75.0)
+            # 3. Visual target is stable (is_present, high visual confidence or eye contact, not stale)
+            # 4. Not an audio-only or stale target
+            is_encoder_verified = (
+                getattr(focused_person, "body_yaw_source", None) == "ENCODER"
+                or getattr(self_state, "head_position_source", None) == "ENCODER"
+                or getattr(self_state, "is_head_encoder_valid", False)
+            )
+            is_mechanically_unreachable = abs(p_yaw) > 75.0
+            is_visual_stable = (
+                focused_person.is_present
+                and (focused_person.visual_confidence >= 0.40 or getattr(focused_person, "is_looking_at_robot", False))
+                and not getattr(focused_person, "is_audio_only", False)
+            )
+
+            if (
+                is_encoder_verified
+                and is_mechanically_unreachable
+                and is_visual_stable
+                and not self._is_approaching
+                and not self._is_retreating
+            ):
                 candidates.append(
                     BehavioralIntent(
                         behavior_type=BehaviorType.ALIGN_BODY_TO_TARGET,
                         priority=BehaviorPriority.INTERACTION_INITIATION + 0.05,
                         target_id=focused_person.person_id,
-                        reason=f"head_yaw_limit_align_body: yaw={p_yaw:.1f}deg",
+                        reason=f"head_yaw_limit_align_body: yaw={p_yaw:.1f}deg > 75deg (encoder_verified)",
                         parameters={"target_yaw_deg": p_yaw},
                         timeout_s=1.5,
                         created_at=now,

@@ -36,7 +36,7 @@ class GazeRuntimeCore:
         self.calib = calibration or _load_calibration(calibration_path)
         self.tracker = GazeTracker(calibration=self.calib)
         self.position_source: PositionSource = PositionSource.UNKNOWN
-        self.actual_head_yaw_deg: float = 0.0
+        self.actual_head_yaw_deg: Optional[float] = None
         self.estimated_head_yaw_deg: Optional[float] = None
         self.actual_head_vel_deg_s: float = 0.0
         self.has_head_feedback: bool = False
@@ -53,15 +53,15 @@ class GazeRuntimeCore:
         return not self.has_head_feedback
 
     @property
-    def head_angle_deg(self) -> float:
+    def head_angle_deg(self) -> Optional[float]:
         if self.position_source == PositionSource.ENCODER:
             return self.actual_head_yaw_deg
         if self.estimated_head_yaw_deg is not None:
             return self.estimated_head_yaw_deg
-        return 0.0
+        return None
 
     @property
-    def head_feedback_deg(self) -> float:
+    def head_feedback_deg(self) -> Optional[float]:
         return self.actual_head_yaw_deg
 
     def update_head_feedback(
@@ -120,6 +120,7 @@ class GazeRuntimeCore:
         self.position_source = PositionSource.UNKNOWN
         self.is_position_known = False
         self.has_head_feedback = False
+        self.actual_head_yaw_deg = None
         self.estimated_head_yaw_deg = None
         self.head_feedback_source = str(source)
         self.tracker.head_feedback_missing = True
@@ -219,7 +220,7 @@ class GazeRuntimeCore:
         )
 
         self.last_result = result
-        self.last_target_yaw_deg = float(result.target_yaw_deg)
+        self.last_target_yaw_deg = max(-75.0, min(75.0, float(result.target_yaw_deg)))
         self.cycle_count += 1
         return result
 

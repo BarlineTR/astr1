@@ -47,11 +47,13 @@ class KalmanTrack3D:
         self.state = TrackingState.DETECTED
 
         # Visual metadata
-        self.confidence = obs.confidence
+        self.confidence = float(obs.confidence)
         self.emotion = obs.emotion
         self.person_name = obs.person_name
         self.is_known = obs.is_known
         self.eye_contact = obs.eye_contact
+        self.body_yaw_source: str = getattr(obs, "body_yaw_source", "UNKNOWN")
+        self.is_detector_scored: bool = getattr(obs, "is_detector_scored", True)
 
     def predict(self, dt: float) -> Tuple[float, float, float]:
         """Kalman Prediction Step."""
@@ -115,12 +117,24 @@ class KalmanTrack3D:
             self.state = TrackingState.TRACKING
 
         # Update metadata
-        self.confidence = 0.7 * self.confidence + 0.3 * obs.confidence
+        obs_conf = float(obs.confidence)
+        if getattr(obs, "is_detector_scored", True):
+            self.confidence = 0.7 * self.confidence + 0.3 * obs_conf
+        else:
+            # Unscored detection: baseline prior on frame 1; once temporally confirmed,
+            # track confirmation establishes high tracking confidence.
+            if self.state == TrackingState.TRACKING and self.hit_count >= 2:
+                self.confidence = max(0.78, min(1.0, 0.7 * self.confidence + 0.3 * 0.85))
+            else:
+                self.confidence = min(0.65, obs_conf)
+
         self.emotion = obs.emotion
         if obs.is_known:
             self.person_name = obs.person_name
             self.is_known = True
         self.eye_contact = obs.eye_contact
+        self.body_yaw_source = getattr(obs, "body_yaw_source", self.body_yaw_source)
+        self.is_detector_scored = getattr(obs, "is_detector_scored", self.is_detector_scored)
 
     def mark_missed(self, timestamp: float, coast_timeout_s: float = 2.0) -> None:
         """Marks track as unobserved in current frame; promotes to COASTING or LOST."""
@@ -156,6 +170,7 @@ class KalmanTrack3D:
             confidence=round(self.confidence, 2),
             tracking_state=self.state,
             last_seen_time=self.last_seen_time,
+            body_yaw_source=self.body_yaw_source,
             age_frames=self.age_frames,
             missed_frames=self.missed_frames,
             emotion=self.emotion,
@@ -189,7 +204,8 @@ class VisualTrackerCore:
         self,
         observations: List[VisualObservation],
         timestamp: float,
-        actual_head_yaw_deg: float = 0.0,
+        actual_head_yaw_deg: Optional[float] = None,
+        estimated_head_yaw_deg: Optional[float] = None,
     ) -> List[VisualTargetTrack]:
         """Updates all active tracks with the latest list of VisualObservations.
 
@@ -210,13 +226,18 @@ class VisualTrackerCore:
             track.predict(dt)
             track.age_frames += 1
 
-        # Transform observations to 3D base coordinates
+        # Transform observations to 3D base coordinates with explicit source
         obs_base_coords: List[Tuple[float, float, float]] = []
+        obs_sources: List[str] = []
         for o in valid_obs:
-            base_pt = self.transformer.camera_point_to_body_frame(
-                o.pos_3d_camera, actual_head_yaw_deg
+            base_pt, pt_source = self.transformer.camera_point_to_body_frame(
+                pos_3d_cam=o.pos_3d_camera,
+                actual_head_yaw_deg=actual_head_yaw_deg,
+                estimated_head_yaw_deg=estimated_head_yaw_deg,
+                return_source=True,
             )
             obs_base_coords.append(base_pt)
+            obs_sources.append(pt_source)
 
         # 2. Bipartite Matching (Greedy Association)
         track_ids = list(self.tracks.keys())
@@ -248,6 +269,7 @@ class VisualTrackerCore:
                 self.tracks[track_ids[t_idx]].update(
                     obs_base_coords[o_idx], valid_obs[o_idx], timestamp
                 )
+                self.tracks[track_ids[t_idx]].body_yaw_source = obs_sources[o_idx]
 
                 # Set row and column to infinity
                 cost_matrix[t_idx, :] = float("inf")
@@ -269,6 +291,7 @@ class VisualTrackerCore:
                     timestamp=timestamp,
                     obs=valid_obs[j],
                 )
+                new_track.body_yaw_source = obs_sources[j]
                 self.tracks[new_id] = new_track
 
         # 5. Purge expired LOST tracks

@@ -212,6 +212,8 @@ class SocialGazeFSM:
                 self.hold_exit_reason = reason or "STATE_EXIT"
             if new_state == GazeStateEnum.HOLDING_ATTENTION:
                 self.hold_enter_reason = reason or "STATE_ENTER"
+            if new_state in (GazeStateEnum.RECOVERING, GazeStateEnum.IDLE):
+                self.target_yaw_deg = 0.0
             self.last_transition_reason = reason
             self.state = new_state
             self._state_entry_time = timestamp
@@ -220,15 +222,20 @@ class SocialGazeFSM:
     def update(
         self,
         target_state: TargetState,
-        actual_head_yaw_deg: float,
+        actual_head_yaw_deg: Optional[float],
         timestamp: float,
         actual_head_vel_deg_s: float = 0.0,
+        estimated_head_yaw_deg: Optional[float] = None,
         explicit_intent: Optional[ExplicitGazeIntent] = None,
         dialogue_intent: Optional[DialogueGazeIntent] = None,
         gesture_intent: Optional[GestureGazeIntent] = None,
         safety_intent: Optional[SafetyGazeIntent] = None,
     ) -> GazeCommand:
         """Evaluates sensory inputs, invokes AttentionArbiter, and executes social gaze policy."""
+        # Resolve best available head orientation for tracking and settling error calculation
+        effective_head_yaw = actual_head_yaw_deg if actual_head_yaw_deg is not None else estimated_head_yaw_deg
+        head_ref_yaw = effective_head_yaw if effective_head_yaw is not None else self.target_yaw_deg
+
         # 1. Update active intent stores if passed explicitly
         if explicit_intent is not None:
             self._explicit_intent = explicit_intent
@@ -244,9 +251,9 @@ class SocialGazeFSM:
             elapsed_step = timestamp - self._gesture_step_start_time
             step_target = self._gesture_steps[self._gesture_step_idx]
             head_settled = (
-                abs(angular_diff_deg(actual_head_yaw_deg, step_target)) <= self.position_tolerance_deg
+                abs(angular_diff_deg(effective_head_yaw if effective_head_yaw is not None else step_target, step_target)) <= self.position_tolerance_deg
                 and abs(actual_head_vel_deg_s) <= self.velocity_tolerance_deg_s
-            )
+            ) if effective_head_yaw is not None else False
 
             if elapsed_step >= self._gesture_step_duration_s or head_settled:
                 self._gesture_step_idx += 1
@@ -272,7 +279,7 @@ class SocialGazeFSM:
             dialogue_intent=self._dialogue_intent,
             gesture_intent=self._gesture_intent,
             safety_intent=self._safety_intent,
-            actual_head_yaw_deg=actual_head_yaw_deg,
+            actual_head_yaw_deg=effective_head_yaw if effective_head_yaw is not None else 0.0,
             timestamp=timestamp,
         )
         self.last_decision = decision
@@ -280,8 +287,12 @@ class SocialGazeFSM:
         self.active_target_id = decision.target_id
 
         # 4. Check physical settling detection
-        pos_err = abs(angular_diff_deg(actual_head_yaw_deg, self.target_yaw_deg))
-        pos_ok = (pos_err <= self.position_tolerance_deg)
+        if effective_head_yaw is not None:
+            pos_err = abs(angular_diff_deg(effective_head_yaw, self.target_yaw_deg))
+            pos_ok = (pos_err <= self.position_tolerance_deg)
+        else:
+            pos_err = 0.0
+            pos_ok = False
         vel_ok = (abs(actual_head_vel_deg_s) <= self.velocity_tolerance_deg_s)
 
         if pos_ok and vel_ok:
@@ -294,7 +305,8 @@ class SocialGazeFSM:
         # 5. Gaze Policy Lifecycle & Invariant Transitions
         if decision.owner == PrioritySource.EMERGENCY_STOP:
             self.target_yaw_deg = 0.0
-            if abs(actual_head_yaw_deg) > 1.5:
+            head_yaw_check = effective_head_yaw if effective_head_yaw is not None else 0.0
+            if abs(head_yaw_check) > 1.5:
                 self._transition_to(GazeStateEnum.RECOVERING, timestamp, reason="EMERGENCY_STOP_RECOVERY")
             else:
                 self.active_target_id = None
@@ -303,7 +315,7 @@ class SocialGazeFSM:
         elif decision.is_preemption:
             # Explicit user command immediately preempts active attention without turn-taking dwell
             self.target_yaw_deg = decision.target_yaw_deg
-            err_to_target = abs(angular_diff_deg(self.target_yaw_deg, actual_head_yaw_deg))
+            err_to_target = abs(angular_diff_deg(self.target_yaw_deg, head_ref_yaw))
             if err_to_target > 8.0 and not self.at_target:
                 self._transition_to(GazeStateEnum.ORIENTING, timestamp, reason=f"PREEMPTION_SACCADE_{decision.reason}")
             else:
@@ -312,7 +324,7 @@ class SocialGazeFSM:
         elif decision.owner in (PrioritySource.ACTIVE_SPEAKER, PrioritySource.VISUAL_TRACKING):
             self._reorient_attempted = False
             target_yaw = decision.target_yaw_deg
-            err_deg = abs(angular_diff_deg(target_yaw, actual_head_yaw_deg))
+            err_deg = abs(angular_diff_deg(target_yaw, head_ref_yaw))
             has_vision = (
                 target_state.active_target is not None
                 and target_state.active_target.modality in (Modality.FUSED, Modality.VISION)
@@ -443,7 +455,7 @@ class SocialGazeFSM:
 
         elif decision.owner in (PrioritySource.DIRECT_DIALOGUE_INTENT, PrioritySource.GESTURE_INTENT):
             self.target_yaw_deg = decision.target_yaw_deg
-            err_deg = abs(angular_diff_deg(self.target_yaw_deg, actual_head_yaw_deg))
+            err_deg = abs(angular_diff_deg(self.target_yaw_deg, head_ref_yaw))
             if err_deg > 12.0 and not self.at_target:
                 self._transition_to(GazeStateEnum.ORIENTING, timestamp, reason="INTENT_SACCADE")
             else:
@@ -461,13 +473,13 @@ class SocialGazeFSM:
                     # Register Negative Evidence: This head yaw has no face -> mark as Reverb Zone!
                     if self.spatial_memory is not None:
                         self.spatial_memory.register_negative_acoustic_evidence(
-                            bearing_deg=actual_head_yaw_deg,
+                            bearing_deg=effective_head_yaw if effective_head_yaw is not None else 0.0,
                             timestamp=timestamp,
                             reason="NO_FACE_IN_ACQUIRE"
                         )
                     # Conscious check: Do we know where a real human is in the room?
                     known_person_yaw = self.spatial_memory.get_most_likely_person_location(timestamp, max_age_s=15.0) if self.spatial_memory else None
-                    if not self._reorient_attempted and known_person_yaw is not None and abs(angular_diff_deg(known_person_yaw, actual_head_yaw_deg)) > 15.0:
+                    if not self._reorient_attempted and known_person_yaw is not None and abs(angular_diff_deg(known_person_yaw, head_ref_yaw)) > 15.0:
                         self.target_yaw_deg = known_person_yaw
                         self._reorient_attempted = True
                         self._transition_to(GazeStateEnum.ORIENTING, timestamp, reason="REORIENT_TO_KNOWN_HUMAN")
@@ -488,7 +500,7 @@ class SocialGazeFSM:
                 time_lost = timestamp - self._state_entry_time
                 if time_lost >= self.target_lost_timeout_s:
                     known_person_yaw = self.spatial_memory.get_most_likely_person_location(timestamp, max_age_s=15.0) if self.spatial_memory else None
-                    if not self._reorient_attempted and known_person_yaw is not None and abs(angular_diff_deg(known_person_yaw, actual_head_yaw_deg)) > 15.0:
+                    if not self._reorient_attempted and known_person_yaw is not None and abs(angular_diff_deg(known_person_yaw, head_ref_yaw)) > 15.0:
                         self.target_yaw_deg = known_person_yaw
                         self._reorient_attempted = True
                         self._transition_to(GazeStateEnum.ORIENTING, timestamp, reason="LOST_REORIENT_TO_KNOWN_HUMAN")
@@ -500,7 +512,7 @@ class SocialGazeFSM:
                 self.target_yaw_deg = 0.0
                 time_in_recovering = timestamp - self._state_entry_time
                 settled_at_center = (
-                    abs(actual_head_yaw_deg) <= max(self.position_tolerance_deg, 2.5)
+                    abs(effective_head_yaw if effective_head_yaw is not None else 0.0) <= max(self.position_tolerance_deg, 2.5)
                     and abs(actual_head_vel_deg_s) <= self.velocity_tolerance_deg_s
                 )
                 if settled_at_center or time_in_recovering >= self.recovery_timeout_s:

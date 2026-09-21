@@ -161,10 +161,18 @@ class AttentionArbiterCore:
         # Priority 4: GESTURE_INTENT (Social gesture sequence)
         # =========================================================================
         if gesture_intent is not None and gesture_intent.valid:
+            active_target = target_state.active_target
+            has_active_visual = (active_target is not None and active_target.confidence >= self.min_visual_confidence)
+            # Metacognitive gestures (nod, tilt, etc.) must NOT usurp yaw tracking and pull away from person
+            if has_active_visual and gesture_intent.gesture_name in ("tilt", "nod", "puzzled_tilt", "attentive_nod", "expressive"):
+                target_yaw = active_target.body_azimuth_deg
+            else:
+                target_yaw = gesture_intent.target_yaw_deg
+
             decision = AttentionDecision(
                 owner=PrioritySource.GESTURE_INTENT,
-                target_id=None,
-                target_yaw_deg=clamp_deg(gesture_intent.target_yaw_deg, self.min_limit_deg, self.max_limit_deg),
+                target_id=active_target.target_id if has_active_visual else None,
+                target_yaw_deg=clamp_deg(target_yaw, self.min_limit_deg, self.max_limit_deg),
                 confidence=gesture_intent.confidence,
                 reason=f"GESTURE_{gesture_intent.gesture_name}",
                 timestamp=timestamp,

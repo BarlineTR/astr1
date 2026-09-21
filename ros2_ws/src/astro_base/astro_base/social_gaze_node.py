@@ -201,10 +201,13 @@ class SocialGazeNode(Node):
             min_confidence=0.50,
             direct_gaze_max_yaw_deg=22.0,
         )
+        self.declare_parameter("coasting_timeout_s", 2.0)
+        self.coast_timeout_s = float(self.get_parameter("coasting_timeout_s").value)
+
         self.visual_tracker = VisualTrackerCore(
             transformer=self.transformer,
             gating_distance_m=0.85,
-            coasting_timeout_s=0.70,
+            coasting_timeout_s=self.coast_timeout_s,
         )
         self.fusion = AudioVisualFusionCore(
             spatial_gate_deg=float(self.get_parameter("spatial_gate_deg").value),
@@ -246,13 +249,11 @@ class SocialGazeNode(Node):
         # -------------------------------------------------------------------------
         self.latest_audio_state: Optional[FilteredAudioState] = None
         self.latest_visual_tracks: List[VisualTargetTrack] = []
-        self.actual_head_yaw_deg: float = 0.0
+        self.actual_head_yaw_deg: Optional[float] = None
+        self.estimated_head_yaw_deg: Optional[float] = None
         self.actual_head_vel_deg_s: float = 0.0
-        self.raw_encoder_deg: float = 0.0
-        # Her kerteriz `body_azimuth = actual_head_yaw + kamera_acisi` ile hesaplanir.
-        # Encoder hic konusmazsa bu deger 0'da kalir, kafa fiziksel olarak donse bile:
-        # 20 derece donup kisiyi tam ortaya alan kafa, kisiyi 0 derecede sanip komutu
-        # merkeze geri cekiyor ve orada bekliyor. Sessizce olmasin diye izliyoruz.
+        self.raw_encoder_deg: Optional[float] = None
+        self._head_position_source: str = "UNKNOWN"
         self._head_feedback_seen: bool = False
         self._head_state_received: bool = False
         self.diagnostic_joint_yaw_deg: float = 0.0
@@ -405,6 +406,9 @@ class SocialGazeNode(Node):
             est_yaw = float(getattr(msg, "estimated_yaw_deg", float("nan")))
             self._head_position_source = "ESTIMATED"
             self._head_state_received = True
+            self.actual_head_yaw_deg = None
+            self.raw_encoder_deg = None
+            self._head_feedback_seen = False
             if not math.isnan(est_yaw):
                 self.estimated_head_yaw_deg = est_yaw
                 self.runtime.update_estimated_feedback(est_yaw, vel_val, timestamp=t, source="/head/state:estimated")
@@ -412,6 +416,10 @@ class SocialGazeNode(Node):
             # Position completely unknown — do NOT assume 0.0
             self._head_position_source = "UNKNOWN"
             self._head_state_received = True
+            self.actual_head_yaw_deg = None
+            self.estimated_head_yaw_deg = None
+            self.raw_encoder_deg = None
+            self._head_feedback_seen = False
             self.runtime.mark_head_feedback_unknown(timestamp=t, source="/head/state:unknown")
         else:
             # Backward compatibility for legacy HeadState message without position_source
@@ -444,6 +452,7 @@ class SocialGazeNode(Node):
                     self.raw_encoder_deg = float(deg_pos)
                     self.actual_head_yaw_deg = float(deg_pos)
                     self._head_feedback_seen = True
+                    self._head_position_source = "ENCODER"
                     self.actual_head_vel_deg_s = vel_val
                     self.runtime.update_head_feedback(deg_pos, vel_val, timestamp=t, source="/joint_states")
 
@@ -710,6 +719,7 @@ class SocialGazeNode(Node):
                     depth_m=depth_val,
                     timestamp=t,
                     actual_head_yaw_deg=self.actual_head_yaw_deg,
+                    estimated_head_yaw_deg=self.estimated_head_yaw_deg,
                     frame_width=frame_w_val,
                     frame_height=frame_h_val,
                     confidence=float(d.get("confidence", UNSCORED_DETECTION_CONFIDENCE)),
@@ -719,6 +729,7 @@ class SocialGazeNode(Node):
                     person_name=recog_name,
                     is_known=is_known_val,
                     cam_azimuth_deg=cam_az_val,
+                    is_detector_scored=(d.get("confidence") is not None),
                 )
                 obs_list.append(obs)
 
@@ -726,6 +737,7 @@ class SocialGazeNode(Node):
                 observations=obs_list,
                 timestamp=t,
                 actual_head_yaw_deg=self.actual_head_yaw_deg,
+                estimated_head_yaw_deg=self.estimated_head_yaw_deg,
             )
 
             last_assocs = getattr(self.visual_tracker, "last_associations", {})
@@ -884,12 +896,12 @@ class SocialGazeNode(Node):
     # =========================================================================
 
     def head_feedback_missing(self) -> bool:
-        """Encoderdan hic konum gelmediyse True.
-
-        Bu durumda tum kerterizler kafa 0 derecedeymis gibi hesaplanir ve hedef
-        merkeze cokerek takip sessizce olur.
-        """
-        return not self._head_feedback_seen
+        """Returns True if physical encoder feedback is missing, stale, or unverified."""
+        return not (
+            self._head_feedback_seen
+            and self._head_position_source == "ENCODER"
+            and self.actual_head_yaw_deg is not None
+        )
 
     def _control_cycle(self) -> None:
         t = time.monotonic()
@@ -961,6 +973,7 @@ class SocialGazeNode(Node):
             actual_head_yaw_deg=self.actual_head_yaw_deg,
             timestamp=t,
             actual_head_vel_deg_s=self.actual_head_vel_deg_s,
+            estimated_head_yaw_deg=self.estimated_head_yaw_deg,
         )
 
         # 2. Attention decision telemetry snapshot after update
@@ -1144,7 +1157,7 @@ class SocialGazeNode(Node):
                 target_source = "NONE"
                 gaze_cmd = replace(
                     gaze_cmd,
-                    target_yaw_deg=float(self.actual_head_yaw_deg),
+                    target_yaw_deg=0.0,
                     priority_source=PrioritySource.IDLE,
                 )
                 cmd_reason = "AUDIO_REACQ_EPISODE_EXHAUSTED_HOLD_STATIONARY"
@@ -1158,10 +1171,10 @@ class SocialGazeNode(Node):
             target_source = "NONE"
             gaze_cmd = replace(
                 gaze_cmd,
-                target_yaw_deg=float(self.actual_head_yaw_deg),
+                target_yaw_deg=0.0,
                 priority_source=PrioritySource.IDLE,
             )
-            cmd_reason = f"STATIONARY_HOLD_HEAD_AT_{self.actual_head_yaw_deg:+.1f}DEG"
+            cmd_reason = "STATIONARY_HOLD_HEAD_AT_CENTER"
 
         # CRITICAL ACCEPTANCE INVARIANT GUARDS
         if command_source in ("VISUAL_COAST", "VISUAL"):
@@ -1171,11 +1184,11 @@ class SocialGazeNode(Node):
                 target_source = "NONE"
                 gaze_cmd = replace(
                     gaze_cmd,
-                    target_yaw_deg=float(self.actual_head_yaw_deg),
+                    target_yaw_deg=0.0,
                     priority_source=PrioritySource.IDLE,
                 )
                 if not cmd_reason.startswith("STATIONARY") and not cmd_reason.startswith("IDLE"):
-                    cmd_reason = f"IDLE_STATIONARY_HOLD_HEAD_AT_{self.actual_head_yaw_deg:+.1f}DEG"
+                    cmd_reason = "IDLE_STATIONARY_HOLD_HEAD_AT_CENTER"
 
         if command_source == "VISUAL":
             target_source = "CAMERA"
@@ -1264,9 +1277,9 @@ class SocialGazeNode(Node):
         sample = {
             "timestamp": round(t, 3),
             "golden_target": round(golden_target_yaw, 2),
-            "actual_head": round(self.actual_head_yaw_deg, 2),
+            "actual_head": round(self.actual_head_yaw_deg, 2) if self.actual_head_yaw_deg is not None else None,
             "visual_bearing": round(vis_bearing, 2) if vis_bearing is not None else None,
-            "motor_error": round(abs(authoritative_target_yaw - self.actual_head_yaw_deg), 2),
+            "motor_error": round(abs(authoritative_target_yaw - self.actual_head_yaw_deg), 2) if self.actual_head_yaw_deg is not None else None,
         }
         self.recent_parity_samples.append(sample)
 
@@ -1274,10 +1287,11 @@ class SocialGazeNode(Node):
         vision_age_ms = round(max(0.0, (t - self.latest_detection_time) * 1000.0), 1) if self.latest_detection_time > 0.0 else 99999.0
         if (t - self._last_parity_report_time) >= 5.0:
             self._last_parity_report_time = t
+            actual_head_str = f"{self.actual_head_yaw_deg:+.1f}°" if self.actual_head_yaw_deg is not None else "UNKNOWN"
             self.get_logger().info(
                 f"📊 [RUNTIME PARITY 5s] golden_yaw={golden_target_yaw:+.1f}° "
                 f"legacy_yaw={legacy_target_yaw:+.1f}° divergence={self.golden_divergence_deg:.2f}° "
-                f"actual_head={self.actual_head_yaw_deg:+.1f}° vision_age={vision_age_ms:.1f}ms "
+                f"actual_head={actual_head_str} vision_age={vision_age_ms:.1f}ms "
                 f"samples_recorded={len(self.recent_parity_samples)}"
             )
 
@@ -1291,11 +1305,14 @@ class SocialGazeNode(Node):
         )
 
         if self.head_feedback_missing():
-            self.actual_head_yaw_deg = float(traj_point.position_deg)
+            # Invariant: NEVER write estimated software integration into actual_head_yaw_deg!
+            self.estimated_head_yaw_deg = float(traj_point.position_deg)
+            self.actual_head_yaw_deg = None
             self.actual_head_vel_deg_s = float(traj_point.velocity_deg_s)
 
         # 5. Actuator Command Publishing (Disabled by default: standalone_gaze_ros_node is sole actuator authority)
-        target_goal_deg = float(authoritative_target_yaw)
+        # Strictly clamped to [-75.0, +75.0]
+        target_goal_deg = max(-75.0, min(75.0, float(authoritative_target_yaw)))
         if self.enable_actuator_output:
             if self.pub_head_command is not None:
                 hcmd = HeadCmd()
@@ -1327,7 +1344,7 @@ class SocialGazeNode(Node):
         # 8. Separate Error Metrics Calculation (Failure 7)
         face_bearing_deg = self.latest_visual_tracks[0].body_azimuth_deg if self.latest_visual_tracks else None
         face_to_desired_error_deg = round(float(face_bearing_deg - gaze_cmd.target_yaw_deg), 2) if face_bearing_deg is not None else 0.0
-        desired_to_actual_error_deg = round(float(gaze_cmd.target_yaw_deg - self.actual_head_yaw_deg), 2)
+        desired_to_actual_error_deg = round(float(gaze_cmd.target_yaw_deg - self.actual_head_yaw_deg), 2) if self.actual_head_yaw_deg is not None else 0.0
         actuator_state_val = "MOVING" if (abs(self.actual_head_vel_deg_s) > 2.0 or abs(desired_to_actual_error_deg) > 2.0) else "SETTLED"
 
         audio_age_s = round(float(t - self.latest_audio_state.timestamp), 2) if self.latest_audio_state else 999.0
@@ -1414,7 +1431,7 @@ class SocialGazeNode(Node):
             "target_confidence": round(gaze_cmd.confidence, 2),
             "desired_yaw_deg": round(gaze_cmd.target_yaw_deg, 2),
             "planned_yaw_deg": round(traj_point.position_deg, 2),
-            "actual_yaw_deg": round(self.actual_head_yaw_deg, 2),
+            "actual_yaw_deg": round(self.actual_head_yaw_deg, 2) if self.actual_head_yaw_deg is not None else None,
             "face_to_desired_error_deg": face_to_desired_error_deg,
             "desired_to_actual_error_deg": desired_to_actual_error_deg,
             "target_identity_correctness": target_identity_correctness,

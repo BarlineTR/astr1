@@ -142,6 +142,7 @@ class AudioVisualFusionCore:
                         is_known=vt.is_known,
                         timestamp=timestamp,
                         tracking_state=vt.tracking_state,
+                        body_yaw_source=getattr(vt, "body_yaw_source", "UNKNOWN"),
                         audio_confidence=round(audio_state.confidence, 2),
                         visual_confidence=round(vt.confidence, 2),
                     )
@@ -162,6 +163,7 @@ class AudioVisualFusionCore:
                         is_known=vt.is_known,
                         timestamp=timestamp,
                         tracking_state=vt.tracking_state,
+                        body_yaw_source=getattr(vt, "body_yaw_source", "UNKNOWN"),
                         audio_confidence=0.0,
                         visual_confidence=round(vt.confidence, 2),
                     )
@@ -190,6 +192,7 @@ class AudioVisualFusionCore:
                 is_known=False,
                 timestamp=timestamp,
                 tracking_state=TrackingState.TRACKING,
+                body_yaw_source="ESTIMATED",
                 audio_confidence=round(audio_state.confidence, 2),
                 visual_confidence=0.0,
             )

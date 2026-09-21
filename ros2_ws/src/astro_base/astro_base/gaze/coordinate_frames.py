@@ -20,8 +20,6 @@ from astro_base.gaze.angle_math import clamp_deg, wrap_deg
 class HeadCalibration:
     """Head mechanical joint calibration parameters."""
     zero_offset_deg: float = 0.0
-    # 440 tick / 170 derece: boyun ±85 dönüyor. Kalibrasyon dosyası okunmadığında
-    # da bundan daha çekingen olmamalı, yoksa kafa erişebileceği kişide duruyor.
     min_angle_deg: float = -85.0
     max_angle_deg: float = 85.0
     ticks_per_deg: float = 1.5000
@@ -203,40 +201,63 @@ class CoordinateTransformer:
     def camera_bearing_to_body_yaw(
         self,
         cam_azimuth_deg: float,
-        actual_head_yaw_deg: float
-    ) -> float:
-        """Transforms camera-relative azimuth into absolute robot body yaw."""
-        return wrap_deg(actual_head_yaw_deg + cam_azimuth_deg)
+        actual_head_yaw_deg: Optional[float] = None,
+        estimated_head_yaw_deg: Optional[float] = None,
+        return_source: bool = False,
+    ):
+        """Transforms camera-relative azimuth into robot body yaw.
+
+        Returns:
+            body_yaw_deg (float) if return_source is False.
+            (body_yaw_deg, source) if return_source is True.
+            source is 'ENCODER', 'ESTIMATED', or 'UNKNOWN'.
+            Invariant: If actual_head_yaw_deg is None, physical reality is NOT assumed.
+            0.0 is NEVER assumed as physical truth.
+        """
+        if actual_head_yaw_deg is not None and not math.isnan(actual_head_yaw_deg):
+            yaw = wrap_deg(float(actual_head_yaw_deg) + cam_azimuth_deg)
+            source = "ENCODER"
+        elif estimated_head_yaw_deg is not None and not math.isnan(estimated_head_yaw_deg):
+            yaw = wrap_deg(float(estimated_head_yaw_deg) + cam_azimuth_deg)
+            source = "ESTIMATED"
+        else:
+            yaw = wrap_deg(cam_azimuth_deg)
+            source = "UNKNOWN"
+
+        if return_source:
+            return yaw, source
+        return yaw
 
     def camera_point_to_body_frame(
         self,
         pos_3d_cam: Tuple[float, float, float],
-        actual_head_yaw_deg: float
-    ) -> Tuple[float, float, float]:
+        actual_head_yaw_deg: Optional[float] = None,
+        estimated_head_yaw_deg: Optional[float] = None,
+        return_source: bool = False,
+    ):
         """Transforms 3D optical camera coordinates (x_opt, y_opt, z_opt) to robot base frame (x, y, z).
 
-        Optical frame (REP-103):
-          x_opt: Right
-          y_opt: Down
-          z_opt: Forward
-
-        Head frame:
-          x_head = z_opt + 0.06 (camera forward offset)
-          y_head = -x_opt (left is +Y)
-          z_head = -y_opt + 0.02 (up is +Z)
-
-        Base frame (rotated by actual_head_yaw_deg about Z):
-          x_base = x_head * cos(theta) - y_head * sin(theta)
-          y_base = x_head * sin(theta) + y_head * cos(theta)
-          z_base = z_head + 0.21 (head height)
+        Returns:
+            (x_base, y_base, z_base) if return_source is False.
+            ((x_base, y_base, z_base), source) if return_source is True.
         """
+        if actual_head_yaw_deg is not None and not math.isnan(actual_head_yaw_deg):
+            theta = float(actual_head_yaw_deg)
+            source = "ENCODER"
+        elif estimated_head_yaw_deg is not None and not math.isnan(estimated_head_yaw_deg):
+            theta = float(estimated_head_yaw_deg)
+            source = "ESTIMATED"
+        else:
+            theta = 0.0
+            source = "UNKNOWN"
+
         x_opt, y_opt, z_opt = pos_3d_cam
 
         x_head = z_opt + 0.06
         y_head = -x_opt
         z_head = -y_opt + 0.02
 
-        theta_rad = math.radians(actual_head_yaw_deg)
+        theta_rad = math.radians(theta)
         cos_t = math.cos(theta_rad)
         sin_t = math.sin(theta_rad)
 
@@ -244,4 +265,7 @@ class CoordinateTransformer:
         y_base = x_head * sin_t + y_head * cos_t
         z_base = z_head + 0.21
 
-        return float(x_base), float(y_base), float(z_base)
+        pt = (float(x_base), float(y_base), float(z_base))
+        if return_source:
+            return pt, source
+        return pt

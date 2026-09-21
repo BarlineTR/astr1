@@ -134,8 +134,15 @@ class TargetManagerCore:
 
         # 2. Candidate Selection & Turn-Taking Arbitration
         if self.active_target is None:
-            # No active target: Select best candidate meeting acquisition threshold (≥0.75)
-            best_candidate = next((t for t in self.candidate_targets if t.confidence >= self.acquisition_threshold), None)
+            # Select best candidate meeting acquisition threshold (>=0.75)
+            best_candidate = next(
+                (
+                    t for t in self.candidate_targets
+                    if t.modality in (Modality.VISION, Modality.FUSED)
+                    and t.confidence >= self.acquisition_threshold
+                ),
+                None,
+            )
 
             # Nothing seen clearly enough. Fall back to sound rather than staying put:
             # candidate_targets is already ordered Fused > Vision > Audio, so this only

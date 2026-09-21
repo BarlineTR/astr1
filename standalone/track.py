@@ -72,11 +72,20 @@ def draw_overlay(frame, detections, result, fps: float, audio_ok: bool, head_ok:
     return frame
 
 
+def _camera_arg(val: str):
+    if str(val).lower() in ("oak_d", "oakd", "depthai", "auto"):
+        return 0
+    try:
+        return int(val)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"Geçersiz kamera indeksi: {val}")
+
+
 def main(argv=None, hid=None) -> int:
     parser = argparse.ArgumentParser(description="ROS'suz ASTRO yüz/ses takibi")
-    parser.add_argument("--camera", type=int, default=0, help="Kamera indeksi")
+    parser.add_argument("--camera", type=_camera_arg, default=0, help="Kamera indeksi veya 'oak_d'")
     head_mode = parser.add_mutually_exclusive_group()
-    head_mode.add_argument("--serial", default=None, help="Arduino portu, örn. /dev/ttyACM0")
+    head_mode.add_argument("--serial", "--device", dest="serial", default=None, help="Arduino portu, örn. /dev/astro_arduino veya /dev/ttyACM0")
     head_mode.add_argument("--fixed-head", action="store_true",
                            help="Sabit dizüstü kamera/mikrofon teşhisi: kafa referansı "
                                 "0° kalır; motor bağlantısıyla birlikte kullanılmaz")
@@ -336,7 +345,8 @@ def main(argv=None, hid=None) -> int:
                     target_yaw = motor_yaw
                     result.target_yaw_deg = motor_yaw
 
-            head.send_angle(motor_yaw)
+            clamped_motor_yaw = max(-75.0, min(75.0, float(motor_yaw)))
+            head.send_angle(clamped_motor_yaw)
             head.tick(now)
 
             frames += 1

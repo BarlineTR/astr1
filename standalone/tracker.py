@@ -202,8 +202,9 @@ class GazeTracker:
             self.head_velocity_deg_s = float(trajectory.velocity_deg_s)
             self._last_head_time = timestamp
 
+        clamped_target_yaw = max(-75.0, min(75.0, float(command.target_yaw_deg)))
         return GazeResult(
-            target_yaw_deg=float(command.target_yaw_deg),
+            target_yaw_deg=clamped_target_yaw,
             gaze_state=command.gaze_state,
             owner=command.priority_source,
             target_id=command.active_target_id,
@@ -239,21 +240,28 @@ class GazeTracker:
     ) -> None:
         width, height = frame_size
         observations = []
+        actual_head = None if self.head_feedback_missing else self.head_angle_deg
+        estimated_head = self.head_angle_deg if self.head_feedback_missing else None
         for face in faces:
+            is_scored = face.confidence is not None
+            conf = face.confidence if is_scored else UNSCORED_CONFIDENCE
             observations.append(
                 self.visual_perception.process_detection(
                     x=face.x, y=face.y, w=face.w, h=face.h,
                     depth_m=self._estimate_distance(face.w, width),
                     timestamp=timestamp,
-                    actual_head_yaw_deg=self.head_angle_deg,
+                    actual_head_yaw_deg=actual_head,
+                    estimated_head_yaw_deg=estimated_head,
                     frame_width=width, frame_height=height,
-                    confidence=face.confidence if face.confidence else UNSCORED_CONFIDENCE,
+                    confidence=conf,
+                    is_detector_scored=is_scored,
                 )
             )
         self._latest_tracks = self.visual_tracker.update(
             observations=observations,
             timestamp=timestamp,
-            actual_head_yaw_deg=self.head_angle_deg,
+            actual_head_yaw_deg=actual_head,
+            estimated_head_yaw_deg=estimated_head,
         )
 
     @staticmethod
