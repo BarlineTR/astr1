@@ -21,6 +21,7 @@ from astro_base.gaze.gaze_tracker import (
     GazeTracker,
     _load_calibration,
 )
+from astro_base.gaze.head_state import PositionSource
 
 
 class GazeRuntimeCore:
@@ -34,9 +35,12 @@ class GazeRuntimeCore:
     ):
         self.calib = calibration or _load_calibration(calibration_path)
         self.tracker = GazeTracker(calibration=self.calib)
+        self.position_source: PositionSource = PositionSource.UNKNOWN
         self.actual_head_yaw_deg: float = 0.0
+        self.estimated_head_yaw_deg: Optional[float] = None
         self.actual_head_vel_deg_s: float = 0.0
         self.has_head_feedback: bool = False
+        self.is_position_known: bool = False
         self.last_feedback_time: float = 0.0
         self.head_feedback_source: str = "NONE"
         self._encoder_history: deque = deque(maxlen=200)
@@ -50,7 +54,11 @@ class GazeRuntimeCore:
 
     @property
     def head_angle_deg(self) -> float:
-        return self.actual_head_yaw_deg
+        if self.position_source == PositionSource.ENCODER:
+            return self.actual_head_yaw_deg
+        if self.estimated_head_yaw_deg is not None:
+            return self.estimated_head_yaw_deg
+        return 0.0
 
     @property
     def head_feedback_deg(self) -> float:
@@ -65,15 +73,56 @@ class GazeRuntimeCore:
     ) -> None:
         """Updates real encoder position and velocity from authoritative hardware feedback."""
         t = time.monotonic() if timestamp is None else float(timestamp)
+        self.position_source = PositionSource.ENCODER
         self.actual_head_yaw_deg = float(angle_deg)
+        self.estimated_head_yaw_deg = float(angle_deg)
         self.actual_head_vel_deg_s = float(velocity_deg_s)
         self.has_head_feedback = True
+        self.is_position_known = True
         self.last_feedback_time = t
         self.head_feedback_source = str(source)
         self._encoder_history.append((t, float(angle_deg), float(velocity_deg_s)))
         self.tracker.head_angle_deg = float(angle_deg)
         self.tracker.head_velocity_deg_s = float(velocity_deg_s)
         self.tracker.head_feedback_missing = False
+
+    def update_estimated_feedback(
+        self,
+        estimated_deg: float,
+        velocity_deg_s: float = 0.0,
+        timestamp: Optional[float] = None,
+        source: str = "/head/state:estimated",
+    ) -> None:
+        """Updates software-estimated head position when hardware encoder is absent or stale.
+
+        Invariant: actual_head_yaw_deg is NOT updated with estimated values.
+        """
+        t = time.monotonic() if timestamp is None else float(timestamp)
+        self.position_source = PositionSource.ESTIMATED
+        self.estimated_head_yaw_deg = float(estimated_deg)
+        self.is_position_known = True
+        self.has_head_feedback = False
+        self.last_feedback_time = t
+        self.head_feedback_source = str(source)
+        # Tracker uses estimated angle for perception transformations (body_yaw = head_angle + cam_azimuth)
+        # but head_feedback_missing remains True so motion planner knows physical encoder is absent.
+        self.tracker.head_angle_deg = float(estimated_deg)
+        self.tracker.head_velocity_deg_s = float(velocity_deg_s)
+        self.tracker.head_feedback_missing = True
+
+    def mark_head_feedback_unknown(
+        self,
+        timestamp: Optional[float] = None,
+        source: str = "UNKNOWN",
+    ) -> None:
+        """Marks head position as completely unknown. Invariant: 0.0 is NOT assumed."""
+        t = time.monotonic() if timestamp is None else float(timestamp)
+        self.position_source = PositionSource.UNKNOWN
+        self.is_position_known = False
+        self.has_head_feedback = False
+        self.estimated_head_yaw_deg = None
+        self.head_feedback_source = str(source)
+        self.tracker.head_feedback_missing = True
 
     def get_head_position_at(self, timestamp: float, max_window_s: float = 2.0) -> Tuple[float, float]:
         """Interpolates head (yaw_deg, velocity_deg_s) at a given historical timestamp.

@@ -109,18 +109,46 @@ def open_port(device: str, baud: int = 115200, timeout: float = 0.0):
         return None
 
 
+from astro_base.gaze.head_state import HeadStateManager, PositionSource
+
+
 class HeadLink:
     """Sends angles to the head and reads back where it actually is."""
 
-    def __init__(self, port=None):
+    def __init__(self, port=None, ticks_per_deg: float = TICKS_PER_DEG):
         self.port = port
         self._rx = bytearray()
         self._seq = 0
         self._last_beat: Optional[float] = None
-        self.measured_angle_deg: float = 0.0
+        self.state_mgr = HeadStateManager(
+            ticks_per_deg=ticks_per_deg,
+            stale_timeout_s=0.50,
+            software_max_vel_deg_s=75.0,
+        )
+        self.measured_angle_deg: float = float("nan")
         # Distinguished from "measured 0.0" on purpose: assuming zero while the head
         # is elsewhere is what makes every bearing collapse to centre.
         self.has_feedback: bool = False
+
+    @property
+    def position_source(self) -> PositionSource:
+        return self.state_mgr.position_source
+
+    @property
+    def encoder_available(self) -> bool:
+        return self.state_mgr.encoder_available
+
+    @property
+    def encoder_stale(self) -> bool:
+        return self.state_mgr.encoder_stale
+
+    @property
+    def actual_yaw_deg(self) -> Optional[float]:
+        return self.state_mgr.actual_yaw_deg
+
+    @property
+    def estimated_yaw_deg(self) -> Optional[float]:
+        return self.state_mgr.estimated_yaw_deg
 
     @property
     def connected(self) -> bool:
@@ -128,9 +156,15 @@ class HeadLink:
 
     def send_angle(self, angle_deg: float) -> None:
         if self.port is None:
+            self.state_mgr.on_command_rejected(angle_deg, "No port connected")
             return
-        self.port.write(encode_head_cmd(angle_deg))
-        self._last_beat = time.monotonic()
+        now = time.monotonic()
+        try:
+            self.port.write(encode_head_cmd(angle_deg))
+            self.state_mgr.on_command_accepted(angle_deg, now)
+            self._last_beat = now
+        except Exception as exc:
+            self.state_mgr.on_command_rejected(angle_deg, str(exc))
 
     def tick(self, now: Optional[float] = None) -> None:
         """Keeps the firmware watchdog fed between commands."""
@@ -144,20 +178,25 @@ class HeadLink:
         self._last_beat = now
 
     def poll(self) -> None:
-        """Drains the port and keeps the most recent encoder angle."""
-        if self.port is None:
-            return
-        waiting = getattr(self.port, "in_waiting", 0)
-        if waiting:
-            self._rx.extend(self.port.read(waiting))
+        """Drains the port, updates encoder feedback, and evaluates fallback state."""
+        now = time.monotonic()
+        if self.port is not None:
+            waiting = getattr(self.port, "in_waiting", 0)
+            if waiting:
+                self._rx.extend(self.port.read(waiting))
 
-        packets, remainder = parse_packets(bytes(self._rx), return_remainder=True)
-        self._rx = bytearray(remainder)
+            packets, remainder = parse_packets(bytes(self._rx), return_remainder=True)
+            self._rx = bytearray(remainder)
 
-        for msg_id, payload in packets:
-            if msg_id == MSG_ENCODER_TICKS and len(payload) >= 16:
-                self.measured_angle_deg = head_degrees_from_encoder_payload(payload)
-                self.has_feedback = True
+            for msg_id, payload in packets:
+                if msg_id == MSG_ENCODER_TICKS and len(payload) >= 16:
+                    _dl, _dr, head_ticks, _dt = struct.unpack("<iiiI", payload[:16])
+                    self.state_mgr.on_encoder_feedback(head_ticks, timestamp=now)
+
+        # Periodic evaluation to handle stale encoder
+        hstate = self.state_mgr.evaluate(timestamp=now)
+        self.has_feedback = (hstate.position_source == PositionSource.ENCODER)
+        self.measured_angle_deg = hstate.actual_yaw_deg if hstate.actual_yaw_deg is not None else float("nan")
 
     def close(self) -> None:
         if self.port is not None:

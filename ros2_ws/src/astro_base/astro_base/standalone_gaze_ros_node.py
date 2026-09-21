@@ -542,17 +542,37 @@ class StandaloneGazeRosNode(Node):
                 t = raw_t
         else:
             t = time.monotonic()
-        if hasattr(msg, "position_deg") and not math.isnan(msg.position_deg):
-            vel = float(getattr(msg, "velocity_deg_s", 0.0))
-            if math.isnan(vel):
-                vel = 0.0
-            pos = float(msg.position_deg)
-            self.raw_encoder_deg = pos
-            self.latest_head_state_pos_deg = pos
-            self.latest_head_state_target_pos_deg = float(getattr(msg, "target_position_deg", 0.0))
-            self.runtime.update_head_feedback(pos, vel, timestamp=t, source="/head/state")
-            self._head_feedback_seen = True
+        pos_source = getattr(msg, "position_source", None)
+        vel = float(getattr(msg, "velocity_deg_s", 0.0))
+        if math.isnan(vel):
+            vel = 0.0
+        self.latest_head_state_target_pos_deg = float(getattr(msg, "target_position_deg", 0.0))
+
+        if pos_source == "ENCODER":
+            actual_yaw = float(getattr(msg, "actual_yaw_deg", msg.position_deg))
+            if not math.isnan(actual_yaw):
+                self.raw_encoder_deg = actual_yaw
+                self.latest_head_state_pos_deg = actual_yaw
+                self.runtime.update_head_feedback(actual_yaw, vel, timestamp=t, source="/head/state")
+                self._head_feedback_seen = True
+                self._head_state_received = True
+        elif pos_source == "ESTIMATED":
+            est_yaw = float(getattr(msg, "estimated_yaw_deg", float("nan")))
             self._head_state_received = True
+            if not math.isnan(est_yaw):
+                self.latest_head_state_pos_deg = est_yaw
+                self.runtime.update_estimated_feedback(est_yaw, vel, timestamp=t, source="/head/state:estimated")
+        elif pos_source == "UNKNOWN":
+            self._head_state_received = True
+            self.runtime.mark_head_feedback_unknown(timestamp=t, source="/head/state:unknown")
+        else:
+            if hasattr(msg, "position_deg") and not math.isnan(msg.position_deg):
+                pos = float(msg.position_deg)
+                self.raw_encoder_deg = pos
+                self.latest_head_state_pos_deg = pos
+                self.runtime.update_head_feedback(pos, vel, timestamp=t, source="/head/state")
+                self._head_feedback_seen = True
+                self._head_state_received = True
 
     def _on_joint_states(self, msg: JointState) -> None:
         """Diagnostic reader for head_yaw_joint actual position and velocity.

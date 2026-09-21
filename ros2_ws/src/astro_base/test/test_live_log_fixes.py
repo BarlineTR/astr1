@@ -224,6 +224,8 @@ class TestLiveLogFixes(unittest.TestCase):
         """
         bridge = SerialBridge()
         bridge._last_sent_angle = 15.0
+        bridge.head_ticks_per_deg = 2.5882
+        bridge.head_state_mgr.ticks_per_deg = 2.5882
 
         # Normal ticks: e.g. 50 ticks with ticks_per_deg=2.5882 -> ~19.3° (valid)
         bridge.publish_joint_states(left_ticks=0, right_ticks=0, dt_us=20000, head_ticks=50)

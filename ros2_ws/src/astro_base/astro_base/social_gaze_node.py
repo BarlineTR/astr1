@@ -383,18 +383,46 @@ class SocialGazeNode(Node):
     # =========================================================================
 
     def _on_head_state(self, msg) -> None:
-        """Authoritative reader for real encoder position and velocity from HeadState message."""
+        """Authoritative reader for head position from HeadState message with fallback support."""
         t = time.monotonic()
         self.head_feedback_stamp = t
-        if hasattr(msg, "position_deg") and not math.isnan(msg.position_deg):
-            pos = float(msg.position_deg)
-            self.raw_encoder_deg = pos
-            self.actual_head_yaw_deg = pos
-            self._head_feedback_seen = True
+        vel_val = float(msg.velocity_deg_s) if hasattr(msg, "velocity_deg_s") and not math.isnan(msg.velocity_deg_s) else 0.0
+        self.actual_head_vel_deg_s = vel_val
+
+        pos_source = getattr(msg, "position_source", None)
+        if pos_source == "ENCODER":
+            # Physical encoder authority
+            actual_yaw = float(getattr(msg, "actual_yaw_deg", msg.position_deg))
+            if not math.isnan(actual_yaw):
+                self.raw_encoder_deg = actual_yaw
+                self.actual_head_yaw_deg = actual_yaw
+                self._head_feedback_seen = True
+                self._head_state_received = True
+                self._head_position_source = "ENCODER"
+                self.runtime.update_head_feedback(actual_yaw, vel_val, timestamp=t, source="/head/state")
+        elif pos_source == "ESTIMATED":
+            # Software estimate only — NEVER write to actual_head_yaw_deg or raw_encoder_deg
+            est_yaw = float(getattr(msg, "estimated_yaw_deg", float("nan")))
+            self._head_position_source = "ESTIMATED"
             self._head_state_received = True
-            vel_val = float(msg.velocity_deg_s) if hasattr(msg, "velocity_deg_s") and not math.isnan(msg.velocity_deg_s) else 0.0
-            self.actual_head_vel_deg_s = vel_val
-            self.runtime.update_head_feedback(pos, vel_val, timestamp=t, source="/head/state")
+            if not math.isnan(est_yaw):
+                self.estimated_head_yaw_deg = est_yaw
+                self.runtime.update_estimated_feedback(est_yaw, vel_val, timestamp=t, source="/head/state:estimated")
+        elif pos_source == "UNKNOWN":
+            # Position completely unknown — do NOT assume 0.0
+            self._head_position_source = "UNKNOWN"
+            self._head_state_received = True
+            self.runtime.mark_head_feedback_unknown(timestamp=t, source="/head/state:unknown")
+        else:
+            # Backward compatibility for legacy HeadState message without position_source
+            if hasattr(msg, "position_deg") and not math.isnan(msg.position_deg):
+                pos = float(msg.position_deg)
+                self.raw_encoder_deg = pos
+                self.actual_head_yaw_deg = pos
+                self._head_feedback_seen = True
+                self._head_state_received = True
+                self._head_position_source = "ENCODER"
+                self.runtime.update_head_feedback(pos, vel_val, timestamp=t, source="/head/state")
 
     def _on_joint_states(self, msg: JointState) -> None:
         """Diagnostic reader for head_yaw_joint actual position and velocity.
@@ -826,7 +854,11 @@ class SocialGazeNode(Node):
         self.fsm.set_safety_lock(msg.data)
         self.golden_tracker.fsm.set_safety_lock(msg.data)
         if msg.data:
-            self.authoritative_target_yaw = float(self.actual_head_yaw_deg)
+            # Rule 7 & 12.G: Emergency stop must NOT trust fallback position!
+            if getattr(self, "_head_position_source", "UNKNOWN") == "ENCODER":
+                self.authoritative_target_yaw = float(self.actual_head_yaw_deg)
+            else:
+                self.authoritative_target_yaw = 0.0
             self.authoritative_command_source = "EMERGENCY_STOP"
 
     def _on_sleep_mode(self, msg: Bool) -> None:

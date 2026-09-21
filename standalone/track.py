@@ -35,6 +35,7 @@ from head_link import HeadLink, open_port  # noqa: E402
 from recorder import OverlayRecorder, default_path  # noqa: E402
 from sources import AudioSource, CameraSource  # noqa: E402
 from astro_base.gaze.types import GazeStateEnum, PrioritySource  # noqa: E402
+from astro_base.gaze.head_state import PositionSource  # noqa: E402
 from stereo_doa import DEFAULT_MIC_SPACING_M  # noqa: E402
 from statuslog import StatusLog  # noqa: E402
 from tracker import GazeTracker  # noqa: E402
@@ -241,34 +242,22 @@ def main(argv=None, hid=None) -> int:
             else:
                 estimated_head_yaw += max_step_deg if diff_yaw > 0 else -max_step_deg
 
-            # Masadaki sensörler komutla dönmez. Bu modda bilinen sabit
-            # referansı ortak beyne veririz; encoder varmış gibi raporlamayız.
+            # Head position authority: ENCODER vs ESTIMATED vs UNKNOWN
             if opts.fixed_head:
                 head_reference = 0.0
                 head_feedback_active = False
             elif opts.open_loop:
-                head_reference = estimated_head_yaw
+                head_reference = head.estimated_yaw_deg if head.estimated_yaw_deg is not None else estimated_head_yaw
                 head_feedback_active = False
-            elif head.has_feedback:
-                head_reference = head.measured_angle_deg
+            elif head.position_source == PositionSource.ENCODER and head.actual_yaw_deg is not None:
+                head_reference = head.actual_yaw_deg
                 head_feedback_active = True
-                # Enkoder donanım/kablo arıza koruması: Motor komutu verildiği halde (> 10°)
-                # enkoder 2 saniye boyunca 0.0°'de takılı kalırsa, sağa-sola osilasyonu (titremeyi)
-                # engellemek için otomatik açık çevrim tahmin moduna geç.
-                if abs(motor_yaw) >= 10.0 and abs(head.measured_angle_deg) < 0.5:
-                    if encoder_stall_start is None:
-                        encoder_stall_start = now
-                    elif now - encoder_stall_start > 2.0:
-                        if not encoder_fault_warned:
-                            print("\n⚠️  [ENKODER UYARISI] Kafa motoru dönüyor ancak enkoderden yanıt (0 tick) gelmiyor.")
-                            print("💡 Sağa-sola titremeyi (osilasyon) önlemek için açık çevrim (open-loop) tahmin moduna geçildi.\n")
-                            encoder_fault_warned = True
-                        head_reference = estimated_head_yaw
-                        head_feedback_active = False
-                else:
-                    encoder_stall_start = None
+            elif head.position_source == PositionSource.ESTIMATED and head.estimated_yaw_deg is not None:
+                head_reference = head.estimated_yaw_deg
+                head_feedback_active = False
             else:
-                head_reference = estimated_head_yaw
+                # UNKNOWN: position is not known; do NOT assume 0.0
+                head_reference = None
                 head_feedback_active = False
 
             # GazeTracker.step() çağrısına DOA beslenmez (doa_deg=None).

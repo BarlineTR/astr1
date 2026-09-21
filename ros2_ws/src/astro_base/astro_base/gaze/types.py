@@ -13,6 +13,8 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import List, Optional, Tuple
 
+from astro_base.gaze.head_state import HeadState, PositionSource
+
 
 class Modality(str, Enum):
     """Sensing modality originating target observations."""

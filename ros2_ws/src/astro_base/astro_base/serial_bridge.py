@@ -28,6 +28,7 @@ try:
         from astro_base.msg import HeadState
     except ImportError:
         HeadState = None
+    from astro_base.gaze.head_state import HeadStateManager, PositionSource
 
 except ImportError:
     class _MockRclpy:
@@ -131,7 +132,26 @@ except ImportError:
     class Float32:
         def __init__(self, data=0.0):
             self.data = float(data)
-    HeadState = None
+    class Empty:
+        pass
+    class HeadState:
+        def __init__(self):
+            self.header = _MockHeader()
+            self.position_deg = float("nan")
+            self.velocity_deg_s = 0.0
+            self.target_position_deg = 0.0
+            self.moving = False
+            self.at_target = False
+            self.enabled = True
+            self.watchdog_healthy = True
+            self.encoder_valid = False
+            self.fault_code = 0
+            self.position_source = "UNKNOWN"
+            self.encoder_available = False
+            self.encoder_stale = True
+            self.actual_yaw_deg = float("nan")
+            self.estimated_yaw_deg = float("nan")
+    from astro_base.gaze.head_state import HeadStateManager, PositionSource
 
 
 SOF1 = 0xAA
@@ -287,6 +307,11 @@ class SerialBridge(Node):
         self.head_ticks_per_deg = float(self.get_parameter("head_ticks_per_deg").value or 0.288)
         self.head_zero_offset_ticks = float(self.get_parameter("head_zero_offset_ticks").value or 0.0)
         self.head_sign = float(self.get_parameter("head_sign").value or 1.0)
+        self.head_state_mgr = HeadStateManager(
+            ticks_per_deg=self.head_ticks_per_deg,
+            stale_timeout_s=0.50,
+            software_max_vel_deg_s=75.0,
+        )
 
         qos_best_effort = QoSProfile(
             depth=10, reliability=ReliabilityPolicy.BEST_EFFORT
@@ -700,6 +725,7 @@ class SerialBridge(Node):
 
                 if (angle_changed and min_interval_ok) or refresh_due:
                     self.ser.write(pkt)
+                    self.head_state_mgr.on_command_accepted(msg.angle_deg, now)
                     self._last_sent_angle = msg.angle_deg
                     self._last_sent_angle_time = now
                     if angle_changed:
@@ -707,6 +733,7 @@ class SerialBridge(Node):
                     else:
                         self.get_logger().debug(f"🔄 [HEAD SETPOINT REFRESH] angle_deg={msg.angle_deg:.1f} actual={current_head:.1f}°")
         except serial.SerialException as exc:
+            self.head_state_mgr.on_command_rejected(msg.angle_deg, str(exc))
             self.get_logger().error(f"HeadCmd write failed: {exc}")
             self._mark_disconnected()
 
@@ -749,44 +776,43 @@ class SerialBridge(Node):
         right_vel = d_right / dt_s if dt_s > 0 else 0.0
 
         HEAD_ENCODER_MAX_DEG = 80.0
+        now_mono = time.monotonic()
         if head_ticks is not None:
             # Canonical formula: position_deg = (sign * (head_ticks - zero_offset_ticks)) / ticks_per_head_degree
             raw_pos = (self.head_sign * (float(head_ticks) - self.head_zero_offset_ticks)) / self.head_ticks_per_deg
             if abs(raw_pos) > HEAD_ENCODER_MAX_DEG:
-                # Encoder value exceeds mechanical limits — reject and use open-loop fallback
-                self.head_pos = float(getattr(self, "_last_sent_angle", 0.0))
+                # Encoder value exceeds mechanical limits — reject
                 self.head_encoder_valid = False
+                self.head_pos = float(getattr(self, "_last_sent_angle", 0.0))
                 if not getattr(self, '_encoder_fault_logged', False):
                     self.get_logger().warn(
                         f"⚠️ [ENCODER FAULT] head_pos={raw_pos:+.1f}° exceeds "
-                        f"±{HEAD_ENCODER_MAX_DEG}° limit. Using command echo. "
-                        f"head_ticks={head_ticks}"
+                        f"±{HEAD_ENCODER_MAX_DEG}° limit. head_ticks={head_ticks}"
                     )
                     self._encoder_fault_logged = True
             else:
-                self.head_pos = raw_pos
+                self.head_state_mgr.on_encoder_feedback(
+                    int(head_ticks * self.head_sign - self.head_zero_offset_ticks),
+                    timestamp=now_mono,
+                    dt_s=dt_s,
+                )
                 self.head_encoder_valid = True
                 self._encoder_fault_logged = False
         else:
-            self.head_pos = float(getattr(self, "_last_sent_angle", 0.0))
             self.head_encoder_valid = False
+            self.head_pos = float(getattr(self, "_last_sent_angle", 0.0))
 
-        if not hasattr(self, "_last_head_pos_time"):
-            self._last_head_pos_time = time.monotonic()
-            self._last_head_pos = self.head_pos
-            self.head_vel = 0.0
-        else:
-            now_mono = time.monotonic()
-            dt_head = now_mono - self._last_head_pos_time
-            if dt_head >= 0.020:
-                raw_vel = (self.head_pos - self._last_head_pos) / dt_head
-                self.head_vel = 0.85 * self.head_vel + 0.15 * raw_vel
-                self._last_head_pos_time = now_mono
-                self._last_head_pos = self.head_pos
+        # Evaluate through HeadStateManager
+        hstate = self.head_state_mgr.evaluate(timestamp=now_mono)
+        if self.head_encoder_valid and hstate.actual_yaw_deg is not None:
+            self.head_pos = hstate.actual_yaw_deg
+        elif not hasattr(self, "head_pos") or self.head_pos is None:
+            self.head_pos = float(getattr(self, "_last_sent_angle", 0.0))
+        self.head_vel = hstate.velocity_deg_s
 
         target_pos = float(getattr(self, "_last_sent_angle", 0.0))
-        is_moving = abs(self.head_vel) > 1.0
-        at_target = abs(self.head_pos - target_pos) <= 2.0 and not is_moving
+        is_moving = hstate.moving
+        at_target = hstate.at_target
 
         js = JointState()
         js.header.stamp = now.to_msg()
@@ -800,14 +826,20 @@ class SerialBridge(Node):
             hs = HeadState()
             hs.header.stamp = now.to_msg()
             hs.header.frame_id = "head_link"
-            hs.position_deg = float(self.head_pos)
-            hs.velocity_deg_s = float(self.head_vel)
+            hs.position_source = hstate.position_source.value
+            hs.encoder_available = hstate.encoder_available
+            hs.encoder_stale = hstate.encoder_stale
+            hs.actual_yaw_deg = float(hstate.actual_yaw_deg) if hstate.actual_yaw_deg is not None else float("nan")
+            hs.estimated_yaw_deg = float(hstate.estimated_yaw_deg) if hstate.estimated_yaw_deg is not None else float("nan")
+            # Invariant: position_deg is ONLY physical encoder angle; NaN if absent/stale
+            hs.position_deg = float(hstate.position_deg)
+            hs.velocity_deg_s = float(hstate.velocity_deg_s)
             hs.target_position_deg = target_pos
             hs.moving = is_moving
             hs.at_target = at_target
             hs.enabled = bool(getattr(self, "arduino_alive", False))
             hs.watchdog_healthy = bool(getattr(self, "arduino_alive", False))
-            hs.encoder_valid = bool(self.head_encoder_valid)
+            hs.encoder_valid = bool(hstate.encoder_valid)
             hs.fault_code = 0
             self.pub_head_state.publish(hs)
 
