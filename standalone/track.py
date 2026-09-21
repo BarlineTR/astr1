@@ -19,6 +19,7 @@ tahmin etmeden okumak için:
 
 import argparse
 import math
+import os
 import sys
 import time
 from pathlib import Path
@@ -125,6 +126,10 @@ def main(argv=None, hid=None) -> int:
                         help="Yalnızca görsel (yüz) takibi yap; mikrofon/ses takibini "
                              "tamamen devre dışı bırak (arka plan gürültüsünde savrulmayı önler)")
     opts = parser.parse_args(argv)
+
+    if not opts.no_window and not os.environ.get("DISPLAY"):
+        print("ℹ️  DISPLAY bulunamadı (SSH/headless ortam) — pencere açılmayacak (--no-window devrede).")
+        opts.no_window = True
 
     head = HeadLink(port=open_port(opts.serial) if opts.serial else None)
     if opts.fixed_head:
