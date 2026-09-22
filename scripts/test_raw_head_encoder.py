@@ -20,8 +20,13 @@ except ImportError:
 SOF1 = 0xAA
 SOF2 = 0x55
 MSG_HEARTBEAT = 0x01
-MSG_ENCODER_TICKS = 0x02
-MSG_HEAD_CMD = 0x10
+MSG_WHEEL_CMD = 0x02
+MSG_HEAD_CMD = 0x03
+MSG_HEAD_SET_ZERO = 0x04
+MSG_IMU_DATA = 0x10
+MSG_ENCODER_TICKS = 0x11
+MSG_DIAGNOSTICS = 0x12
+MSG_HEARTBEAT_ACK = 0x13
 
 TICKS_PER_DEG = 0.288
 
@@ -106,7 +111,7 @@ def main():
     last_reported_ticks = None
 
     print("\n" + "=" * 65)
-    print("🚀 LISTENING FOR ENCODER TICKS FROM ARDUINO...")
+    print(">>> LISTENING FOR ENCODER TICKS FROM ARDUINO...")
     print("   Please move the robot head gently by hand or observe motor.")
     print("=" * 65 + "\n")
 
@@ -150,10 +155,10 @@ def main():
                         # Print on change or periodically
                         if last_reported_ticks is None or head_ticks != last_reported_ticks or packet_count % 20 == 0:
                             last_reported_ticks = head_ticks
-                            status = "🟢 ACTIVE" if head_ticks != 0 else "⚪ ZERO"
+                            status = "[ACTIVE]" if head_ticks != 0 else "[ZERO  ]"
                             print(
-                                f"[{status}] Pkt #{packet_count:04d} | "
-                                f"Head Ticks: {head_ticks:+6d} (delta: {delta:+5d}, ~{angle_deg:+.1f}°) | "
+                                f"{status} Pkt #{packet_count:04d} | "
+                                f"Head Ticks: {head_ticks:+6d} (delta: {delta:+5d}, ~{angle_deg:+.1f} deg) | "
                                 f"Wheels: [L:{wheel_l:+5d}, R:{wheel_r:+5d}]"
                             )
 
@@ -167,13 +172,13 @@ def main():
         ser.close()
 
     print("\n" + "=" * 65)
-    print("📊 TEST SUMMARY:")
+    print("--- TEST SUMMARY ---")
     print(f"   Total ENCODER_TICKS packets received: {packet_count}")
     print(f"   Non-zero head ticks count: {non_zero_ticks_seen}")
     if non_zero_ticks_seen > 0:
-        print(f"   🎉 SUCCESS! Encoder pulses detected: last ticks = {last_reported_ticks}")
+        print(f"   >>> SUCCESS: Encoder pulses detected! Last ticks = {last_reported_ticks}")
     else:
-        print("   ⚠️  All received packets reported 0 head ticks.")
+        print("   >>> NOTICE: All received packets reported 0 head ticks.")
     print("=" * 65)
 
 
