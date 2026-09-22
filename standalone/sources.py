@@ -167,6 +167,12 @@ class CameraSource:
                 cam.setFps(30.0)
                 if hasattr(cam, "setPreviewSize"):
                     cam.setPreviewSize(width, height)
+                if hasattr(cam, "initialControl"):
+                    try:
+                        # IMX214 AF voice coil shakes under head movement; lock to hyperfocal distance (~1.5m to inf)
+                        cam.initialControl.setManualFocus(130)
+                    except Exception:
+                        pass
 
                 # Robust XLinkOut node creation
                 xout_cls = None

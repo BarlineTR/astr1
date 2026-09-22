@@ -1225,6 +1225,7 @@ class StandaloneGazeRosNode(Node):
         aligned_head_str = f"{aligned_head:+.1f}°" if aligned_head is not None else "NONE"
         actual_head_str = f"{actual_head:+.1f}°" if actual_head is not None else "NONE"
         fb_deg_str = f"{fb_deg:+.1f}°" if fb_deg is not None else "NONE"
+        raw_enc_str = f"{raw_enc:+.1f}°" if raw_enc is not None else "NONE"
         sync_line = (
             f"visual_bearing={face_bearing_str} "
             f"audio_doa={doa_str} "
@@ -1258,9 +1259,9 @@ class StandaloneGazeRosNode(Node):
             f"frame_id={self.frame_index}\n"
             f"target_id={primary_target_id}\n"
             f"command_yaw={target_yaw:+.1f}°\n"
-            f"aligned_head={aligned_head:+.1f}°\n"
-            f"actual_head={actual_head:+.1f}°\n"
-            f"raw_encoder={raw_enc:+.1f}°\n"
+            f"aligned_head={aligned_head_str}\n"
+            f"actual_head={actual_head_str}\n"
+            f"raw_encoder={raw_enc_str}\n"
             f"FEEDBACK_SYNC: {sync_line}\n"
             f"source={getattr(res, 'command_source', 'VISUAL')}"
         )
@@ -1275,10 +1276,13 @@ class StandaloneGazeRosNode(Node):
             bbox_cx = frame_w / 2.0
             raw_bearing = 0.0
 
-        diag_err = target_yaw - aligned_head
+        aligned_h_val = float(aligned_head) if aligned_head is not None else 0.0
+        actual_h_val = float(actual_head) if actual_head is not None else 0.0
+        diag_err = target_yaw - aligned_h_val
         self._diag_raw_bearings.append(raw_bearing)
         self._diag_target_yaws.append(target_yaw)
-        self._diag_measured_heads.append(aligned_head)
+        if aligned_head is not None:
+            self._diag_measured_heads.append(aligned_h_val)
 
         std_raw = float(np.std(self._diag_raw_bearings)) if len(self._diag_raw_bearings) > 1 else 0.0
         std_tgt = float(np.std(self._diag_target_yaws)) if len(self._diag_target_yaws) > 1 else 0.0
@@ -1286,15 +1290,15 @@ class StandaloneGazeRosNode(Node):
 
         center_diag_line = (
             f"CENTER_DIAG: bbox_cx={bbox_cx:.1f} frame_cx={frame_w / 2.0:.1f} "
-            f"raw_bearing={raw_bearing:+.2f}° measured_head={aligned_head:+.2f}° "
+            f"raw_bearing={raw_bearing:+.2f}° measured_head={aligned_h_val:+.2f}° "
             f"target_yaw={target_yaw:+.2f}° error={diag_err:+.2f}° "
             f"sigma_raw={std_raw:.2f} sigma_tgt={std_tgt:.2f} sigma_head={std_head:.2f}"
         )
 
         # Structured Instrumentation for Forensic Isolation
         sign_vis = 0 if abs(raw_bearing) < 1e-3 else (1 if raw_bearing > 0 else -1)
-        sign_tgt = 0 if abs(target_yaw - aligned_head) < 1e-3 else (1 if (target_yaw - aligned_head) > 0 else -1)
-        sign_pub = 0 if abs(self.last_published_yaw - aligned_head) < 1e-3 else (1 if (self.last_published_yaw - aligned_head) > 0 else -1)
+        sign_tgt = 0 if abs(target_yaw - aligned_h_val) < 1e-3 else (1 if (target_yaw - aligned_h_val) > 0 else -1)
+        sign_pub = 0 if abs(self.last_published_yaw - aligned_h_val) < 1e-3 else (1 if (self.last_published_yaw - aligned_h_val) > 0 else -1)
 
         instrumentation_log = (
             f"RAW:\n"
@@ -1305,8 +1309,8 @@ class StandaloneGazeRosNode(Node):
             f"visual_bearing_deg={raw_bearing:+.2f}\n"
             f"\n"
             f"FEEDBACK:\n"
-            f"aligned_head_deg={aligned_head:+.2f}\n"
-            f"measured_head_deg={actual_head:+.2f}\n"
+            f"aligned_head_deg={aligned_h_val:+.2f}\n"
+            f"measured_head_deg={actual_h_val:+.2f}\n"
             f"temporal_skew_ms={temporal_skew_ms:.1f}\n"
             f"head_feedback_timestamp={self.runtime.last_feedback_time:.3f}\n"
             f"head_feedback_age_ms={fb_age:.1f}\n"
@@ -1396,7 +1400,7 @@ class StandaloneGazeRosNode(Node):
 
         if target_changed or owner_changed or cmd_jump or large_error or rate_limited_heartbeat:
             self.get_logger().info(
-                f"[VISUAL] target={primary_target_id} bearing={face_bearing_str} command={target_yaw:+.1f}° actual={aligned_head:+.1f}°"
+                f"[VISUAL] target={primary_target_id} bearing={face_bearing_str} command={target_yaw:+.1f}° actual={aligned_head_str}"
             )
             self._last_logged_visual_time = arrival_ts
             self._last_logged_command_yaw = target_yaw

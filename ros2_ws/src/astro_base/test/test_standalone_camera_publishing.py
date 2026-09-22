@@ -191,3 +191,16 @@ class TestStandaloneCameraPublishing:
         assert res_resumed.owner == PrioritySource.VISUAL_TRACKING
         assert abs(node.last_published_yaw) < 15.0
 
+    def test_step_frame_without_head_feedback_does_not_crash_telemetry_formatter(self):
+        """When node starts and no head feedback has arrived yet (aligned_head is None),
+        step_frame must format logs cleanly without NoneType.__format__ errors."""
+        from tracker import Detection
+        node = StandaloneGazeRosNode(use_camera_source=False, enable_audio=False)
+        assert node.runtime.actual_head_yaw_deg is None
+        # Stepping with and without detections must not raise any exceptions
+        det = Detection(x=300, y=200, w=80, h=80, confidence=0.88)
+        res1 = node.step_frame([det], (640, 480))
+        assert res1 is not None
+        res2 = node.step_frame([], (640, 480))
+        assert res2 is not None
+
