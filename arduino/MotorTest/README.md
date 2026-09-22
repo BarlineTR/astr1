@@ -27,8 +27,8 @@
 #define L_ENC_B     3
 #define R_ENC_A    18
 #define R_ENC_B    19
-#define HEAD_ENC_A 20
-#define HEAD_ENC_B 21
+#define HEAD_ENC_A 21
+#define HEAD_ENC_B 20
 
 // =======================
 // AYARLAR VE HIZ TAVANLARI

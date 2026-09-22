@@ -156,7 +156,7 @@ void rightEncA() {
   g_right_ticks += b ? -1 : +1;
 }
 void headEncA() {
-  // Quadrature yön tespiti (Pin 21 HEAD_ENC_B) - Namiki ters polarite düzeltildi
+  // Quadrature yön tespiti (Pin 20 HEAD_ENC_B) - Namiki ters polarite düzeltildi
   bool b = digitalRead(HEAD_ENC_B);
   g_head_ticks += b ? +1 : -1;
 }

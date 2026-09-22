@@ -43,8 +43,8 @@
 #define L_ENC_B     3   // INT1 (kesme baglanmiyor, sadece yon okunuyor)
 #define R_ENC_A    18   // INT5  (eski Serial1 TX1)
 #define R_ENC_B    19   // INT4  (eski Serial1 RX1)
-#define HEAD_ENC_A 20   // INT3  (eski I2C SDA)
-#define HEAD_ENC_B 21   // INT2  (eski I2C SCL)
+#define HEAD_ENC_A 21   // INT2  (eski I2C SCL)
+#define HEAD_ENC_B 20   // INT3  (eski I2C SDA)
 
 // ─────────────────────────────────────────────────────────────
 //  Durum LED'i
