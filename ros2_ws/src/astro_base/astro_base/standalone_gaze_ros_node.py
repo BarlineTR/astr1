@@ -23,18 +23,29 @@ from typing import Any, List, Optional, Sequence, Tuple
 import numpy as np
 
 try:
+    from sensor_msgs.msg import JointState, Image
+    from std_msgs.msg import Bool, Float32, String, Header
+except ImportError:
+    class _MockMsg:
+        def __init__(self, data=None, **kwargs):
+            self.data = data
+            for key, val in kwargs.items():
+                setattr(self, key, val)
+
+    Bool = Float32 = String = JointState = Image = Header = _MockMsg
+
+try:
+    from astro_base.msg import GazeStatus, HeadCmd, HeadState
+except ImportError:
+    try:
+        from astro_interfaces.msg import GazeStatus, HeadCmd, HeadState
+    except ImportError:
+        HeadState = HeadCmd = GazeStatus = None
+
+try:
     import rclpy
     from rclpy.node import Node
     from rclpy.qos import QoSProfile, ReliabilityPolicy, qos_profile_sensor_data
-    from sensor_msgs.msg import JointState, Image
-    from std_msgs.msg import Bool, Float32, String, Header
-    try:
-        from astro_base.msg import GazeStatus, HeadCmd, HeadState
-    except ImportError:
-        try:
-            from astro_interfaces.msg import GazeStatus, HeadCmd, HeadState
-        except ImportError:
-            HeadState = HeadCmd = GazeStatus = None
 except ImportError:
     class _MockRclpy:
         @staticmethod
@@ -990,8 +1001,8 @@ class StandaloneGazeRosNode(Node):
                 hdr.stamp = self.get_clock().now().to_msg()
                 hdr.frame_id = "camera_link"
                 self.pub_camera_image.publish(bgr_to_imgmsg(frame, hdr))
-            except Exception:
-                pass
+            except Exception as pub_err:
+                self.get_logger().debug(f"Camera frame publish error: {pub_err}")
         if self.camera is not None:
             detections = self.camera.detect(frame)
         else:

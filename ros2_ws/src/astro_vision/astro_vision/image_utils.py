@@ -40,8 +40,20 @@ def bgr_to_imgmsg(frame: np.ndarray, header=None) -> Image:
     if not hasattr(msg, "header") or msg.header is None:
         msg.header = Header()
 
-    if isinstance(header, Header) or header is not None:
+    if isinstance(header, Header):
         msg.header = header
+    elif header is not None:
+        try:
+            msg.header = header
+        except (AssertionError, TypeError):
+            if hasattr(msg, "header") and msg.header is not None:
+                if hasattr(header, "frame_id") and hasattr(msg.header, "frame_id"):
+                    msg.header.frame_id = str(header.frame_id)
+                if hasattr(header, "stamp") and header.stamp is not None and hasattr(msg.header, "stamp"):
+                    try:
+                        msg.header.stamp = header.stamp
+                    except (AssertionError, TypeError):
+                        pass
     elif hasattr(header, "sec") and hasattr(header, "nanosec"):
         msg.header.stamp = header
         msg.header.frame_id = "oak_rgb_camera_optical_frame"
