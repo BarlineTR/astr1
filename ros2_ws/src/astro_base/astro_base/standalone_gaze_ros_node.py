@@ -330,6 +330,8 @@ class StandaloneGazeRosNode(Node):
         self.cycle_id: int = 0
         self.frame_index: int = 0
         self.last_published_yaw: float = 0.0
+        self._estimated_head_yaw: float = 0.0
+        self._last_yaw_update_time: float = time.monotonic()
         self.latest_result: Optional[GazeResult] = None
         self._head_feedback_seen: bool = False
         self._head_state_received: bool = False
@@ -577,8 +579,8 @@ class StandaloneGazeRosNode(Node):
     def _on_joint_states(self, msg: JointState) -> None:
         """Diagnostic reader for head_yaw_joint actual position and velocity.
 
-        /head/state is the sole authoritative source. When /head/state is active,
-        /joint_states is strictly diagnostic and will not overwrite authoritative feedback.
+        /head/state is the sole authoritative source. /joint_states is strictly diagnostic
+        and will not overwrite authoritative feedback.
         """
         if hasattr(msg, "name") and "head_yaw_joint" in msg.name:
             idx = msg.name.index("head_yaw_joint")
@@ -589,11 +591,6 @@ class StandaloneGazeRosNode(Node):
                 deg_pos = math.degrees(pos_rad)
                 self.diagnostic_joint_yaw_deg = float(deg_pos)
                 self.diagnostic_joint_vel_deg_s = float(vel_deg)
-                if not self._head_state_received:
-                    t = time.monotonic()
-                    self.raw_encoder_deg = float(deg_pos)
-                    self.runtime.update_head_feedback(deg_pos, vel_deg, timestamp=t, source="/joint_states")
-                    self._head_feedback_seen = True
 
     def _on_emergency_stop(self, msg: Bool) -> None:
         self.runtime.tracker.fsm.set_safety_lock(bool(msg.data))
@@ -1081,6 +1078,23 @@ class StandaloneGazeRosNode(Node):
         elif robot_is_speaking:
             self.localizer.reset()
 
+        # Open-loop head motion model: 20 deg/s slew rate (matches standalone/track.py 1:1 and firmware HEAD_MAX_VEL_DEG_S)
+        dt_yaw = max(0.001, min(0.1, arrival_ts - getattr(self, "_last_yaw_update_time", arrival_ts)))
+        self._last_yaw_update_time = arrival_ts
+        diff_yaw = self.last_published_yaw - getattr(self, "_estimated_head_yaw", 0.0)
+        max_step_deg = 20.0 * dt_yaw
+        if abs(diff_yaw) <= max_step_deg:
+            self._estimated_head_yaw = self.last_published_yaw
+        else:
+            self._estimated_head_yaw = getattr(self, "_estimated_head_yaw", 0.0) + (max_step_deg if diff_yaw > 0 else -max_step_deg)
+
+        if self.runtime.has_head_feedback and self.runtime.actual_head_yaw_deg is not None:
+            est_head = None
+        elif getattr(self.runtime, "estimated_head_yaw_deg", None) is not None:
+            est_head = self.runtime.estimated_head_yaw_deg
+        else:
+            est_head = self._estimated_head_yaw
+
         t_step_start = time.monotonic()
         # GazeTracker.step() call strictly receives doa_deg=None and speech=None.
         # This completely eliminates continuous Kalman DOA angle leakage.
@@ -1091,6 +1105,7 @@ class StandaloneGazeRosNode(Node):
             speech=None,
             timestamp=capture_ts,
             is_robot_speaking=robot_is_speaking,
+            estimated_head_deg=est_head,
         )
         t_step_end = time.monotonic()
 
@@ -1161,13 +1176,18 @@ class StandaloneGazeRosNode(Node):
                     self._last_audio_log_yaw = motor_yaw
             else:
                 self._last_visual_target_id = None
-                target_yaw = 0.0
-                motor_yaw = 0.0
-                res.target_yaw_deg = 0.0
-                res.owner = PrioritySource.IDLE
-                res.gaze_state = GazeStateEnum.IDLE
-                res.target_id = None
                 self._last_audio_log_yaw = None
+                # Let FSM manage grace states (TARGET_LOST -> RECOVERING -> IDLE) matching track.py 1:1
+                if res.gaze_state in (GazeStateEnum.RECOVERING, GazeStateEnum.IDLE):
+                    target_yaw = float(res.target_yaw_deg)
+                    motor_yaw = target_yaw
+                    res.owner = PrioritySource.IDLE
+                    res.target_id = None
+                else:
+                    # TARGET_LOST etc: retain last published yaw, await FSM decision
+                    target_yaw = float(self.last_published_yaw)
+                    motor_yaw = target_yaw
+                    res.target_yaw_deg = motor_yaw
 
         social_offset = self._current_social_offset(arrival_ts)
         if social_offset != 0.0:

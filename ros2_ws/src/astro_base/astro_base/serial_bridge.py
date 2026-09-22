@@ -808,6 +808,8 @@ class SerialBridge(Node):
         hstate = self.head_state_mgr.evaluate(timestamp=now_mono)
         if self.head_encoder_valid and hstate.actual_yaw_deg is not None:
             self.head_pos = hstate.actual_yaw_deg
+        elif hstate.estimated_yaw_deg is not None and not math.isnan(hstate.estimated_yaw_deg):
+            self.head_pos = float(hstate.estimated_yaw_deg)
         elif not hasattr(self, "head_pos") or self.head_pos is None:
             self.head_pos = float(getattr(self, "_last_sent_angle", 0.0))
         self.head_vel = hstate.velocity_deg_s
