@@ -800,9 +800,11 @@ class AstroRealtimeNode(Node):
         self.paralinguistics_engine = ParalinguisticsEngine() if ParalinguisticsEngine else None
         self.state_machine = StateMachine(RobotState.DEEP_IDLE)
         self._session_turns_buffer: List[Dict[str, Any]] = []
+        conv_timeout = float(os.getenv("CONVERSATION_TIMEOUT", "14.0"))
+        gaze_ext = float(os.getenv("GAZE_EXTENSION_S", "5.0"))
         self.session = ConversationSession(
-            base_timeout_s=7.0,
-            gaze_extension_s=4.0,
+            base_timeout_s=conv_timeout,
+            gaze_extension_s=gaze_ext,
             on_session_end=self._on_conversation_session_ended,
         )
         self.action_manager = ActionManager(logger=self.get_logger(), node=self) if ActionManager else None
@@ -6401,6 +6403,8 @@ class AstroRealtimeNode(Node):
         elif was_active and not self._is_playback_active:
             self._playback_end_time = time.monotonic()
             self._last_interaction_time = time.monotonic()
+            if self.session:
+                self.session.record_robot_speech()
             self._clear_playback_reference()
             if not self._is_processing_fallback:
                 self._is_responding = False
@@ -7338,7 +7342,7 @@ class AstroRealtimeNode(Node):
         streamed asynchronously into audio_stream_node's queue without freezing
         the token generator thread.
         """
-        if not pcm_data:
+        if not pcm_data and not is_final_clause:
             return
         if not getattr(self, "_current_turn_explicit_user_turn", False):
             self.get_logger().warning("🛑 [Playback Blocked]: No explicit user turn.")
@@ -7352,35 +7356,36 @@ class AstroRealtimeNode(Node):
         self.state_machine.transition_to(RobotState.SPEAKING)
         chunk_size = 960  # 480 samples @ 24kHz int16 = 20ms
         effective_gen_id = generation_id or self._fallback_generation_id
-        pcm_dur_s = (len(pcm_data) / 2) / 24000.0
+        pcm_dur_s = (len(pcm_data) / 2) / 24000.0 if pcm_data else 0.0
         try:
-            for i in range(0, len(pcm_data), chunk_size):
-                if self._barge_in_latched:
-                    break
-                chunk = pcm_data[i : i + chunk_size]
-                if chunk:
-                    try:
-                        chunk_16k = resample_24k_to_16k(chunk) if len(chunk) != 320 else chunk
-                        self._update_playback_reference(chunk_16k)
-                    except Exception:
-                        pass
-                    b64_str = base64.b64encode(chunk).decode("ascii")
-                    msg_dict = {
-                        "generation_id": effective_gen_id,
-                        "tts_provider": tts_provider,
-                        "tts_model": tts_model,
-                        "tts_source": tts_source,
-                        "playback_source": tts_source,
-                        "is_done": False,
-                        "data": b64_str,
-                    }
-                    out_msg = String()
-                    out_msg.data = json.dumps(msg_dict)
-                    self.pub_output_pcm.publish(out_msg)
-                    if blocking_pace:
-                        time.sleep(0.018)
-                    else:
-                        time.sleep(0.001)
+            if pcm_data:
+                for i in range(0, len(pcm_data), chunk_size):
+                    if self._barge_in_latched:
+                        break
+                    chunk = pcm_data[i : i + chunk_size]
+                    if chunk:
+                        try:
+                            chunk_16k = resample_24k_to_16k(chunk) if len(chunk) != 320 else chunk
+                            self._update_playback_reference(chunk_16k)
+                        except Exception:
+                            pass
+                        b64_str = base64.b64encode(chunk).decode("ascii")
+                        msg_dict = {
+                            "generation_id": effective_gen_id,
+                            "tts_provider": tts_provider,
+                            "tts_model": tts_model,
+                            "tts_source": tts_source,
+                            "playback_source": tts_source,
+                            "is_done": False,
+                            "data": b64_str,
+                        }
+                        out_msg = String()
+                        out_msg.data = json.dumps(msg_dict)
+                        self.pub_output_pcm.publish(out_msg)
+                        if blocking_pace:
+                            time.sleep(0.018)
+                        else:
+                            time.sleep(0.001)
 
             # Send end sentinel if not interrupted by barge-in, only on final clause
             if is_final_clause and not self._barge_in_latched:
@@ -7399,7 +7404,7 @@ class AstroRealtimeNode(Node):
 
                 # Drain synchronization: wait for physical DAC playback completion up to calculated duration
                 t_drain_start = time.monotonic()
-                drain_timeout = max(0.2, pcm_dur_s * 0.5)
+                drain_timeout = max(0.2, pcm_dur_s * 0.5) if pcm_dur_s > 0 else 0.2
                 while self._is_playback_active and (time.monotonic() - t_drain_start < drain_timeout):
                     if self._barge_in_latched:
                         break
@@ -7408,6 +7413,8 @@ class AstroRealtimeNode(Node):
             if is_final_clause:
                 self._is_playback_active = False
                 self._playback_end_time = time.monotonic()
+                if self.session:
+                    self.session.record_robot_speech()
                 if self.state_machine.current_state == RobotState.SPEAKING:
                     self.state_machine.transition_to(RobotState.LISTENING)
 
@@ -7783,10 +7790,10 @@ class AstroRealtimeNode(Node):
                 return route_res.pcm, route_res.duration_ms, route_res.infer_ms, route_res.queue_wait_ms
 
             def _handle_and_play_clause_audio(pcm_audio: bytes, is_final_clause: bool = True):
-                if not pcm_audio:
+                if not pcm_audio and not is_final_clause:
                     return
                 # Debug WAV & verification log on first real XTTS synthesis
-                if active_engine == "xtts_gpu" and not getattr(self, "_first_xtts_debug_wav_written", False):
+                if pcm_audio and active_engine == "xtts_gpu" and not getattr(self, "_first_xtts_debug_wav_written", False):
                     self._first_xtts_debug_wav_written = True
                     try:
                         import wave, hashlib, tempfile
@@ -8807,6 +8814,7 @@ class AstroRealtimeNode(Node):
                         # Flush remaining clause from chunker if any
                         if chunker and streamed_clauses_count > 0 and not self._barge_in_latched and self._fallback_generation_id == current_gen_id:
                             rem_cl = chunker.flush()
+                            final_handled = False
                             if rem_cl:
                                 if self._speech_authorization:
                                     self._speech_authorization.llm_inference_completed = True
@@ -8823,6 +8831,12 @@ class AstroRealtimeNode(Node):
                                     total_audio_bytes += len(pcm_cl)
                                     _handle_and_play_clause_audio(pcm_cl, is_final_clause=True)
                                     streamed_clauses_count += 1
+                                    final_handled = True
+                            if not final_handled:
+                                if self._speech_authorization:
+                                    self._speech_authorization.llm_inference_completed = True
+                                    self._speech_authorization.response_final = True
+                                _handle_and_play_clause_audio(b"", is_final_clause=True)
 
                         self.get_logger().info(
                             f"🤖 [OpenAI 4o-mini Inference Success] model={target_model} | latency_ms={llm_latency_ms:.1f} | tokens={len(full_reply_parts)} | streamed_clauses={streamed_clauses_count}"
@@ -8835,6 +8849,11 @@ class AstroRealtimeNode(Node):
                         })
                 except Exception as oe:
                     self.get_logger().warn(f"⚠️ [OpenAI Chat {target_model} Failed]: {oe}")
+                    if streamed_clauses_count > 0 and not self._barge_in_latched and self._fallback_generation_id == current_gen_id:
+                        try:
+                            _handle_and_play_clause_audio(b"", is_final_clause=True)
+                        except Exception:
+                            pass
                     attempts.append({
                         "provider": "openai",
                         "model": target_model,
@@ -9768,7 +9787,7 @@ class AstroRealtimeNode(Node):
 
             if raw_16k:
                 try:
-                    speech_start_condition = (local_rms > max(380.0, self._ambient_rms * 1.40) and peak_val > 900)
+                    speech_start_condition = (local_rms > max(280.0, self._ambient_rms * 1.25) and peak_val > 650)
                     buf_to_proc = None
                     with self._lock:
                         if speech_start_condition:

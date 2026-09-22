@@ -37,12 +37,12 @@ class TestSelfTalkAndPerceptionGuard(unittest.TestCase):
             self.node = AstroRealtimeNode()
 
     def test_01_conversation_session_timeouts(self):
-        """Default timeouts must be 7.0s base and 4.0s gaze."""
+        """Default timeouts must be 14.0s base and 5.0s gaze."""
         session = ConversationSession()
-        self.assertEqual(session.base_timeout_s, 7.0)
-        self.assertEqual(session.gaze_extension_s, 4.0)
-        self.assertEqual(self.node.session.base_timeout_s, 7.0)
-        self.assertEqual(self.node.session.gaze_extension_s, 4.0)
+        self.assertEqual(session.base_timeout_s, 14.0)
+        self.assertEqual(session.gaze_extension_s, 5.0)
+        self.assertEqual(self.node.session.base_timeout_s, 14.0)
+        self.assertEqual(self.node.session.gaze_extension_s, 5.0)
 
     def test_02_playback_and_echo_cooldown_drops_fallback_buffer(self):
         """Microphone PCM during active playback or cooldown must NOT accumulate in fallback buffer."""
