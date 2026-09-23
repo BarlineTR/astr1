@@ -294,8 +294,13 @@ class BehaviorEngine:
 
             # (a) Proxemics Retreat (person stepped too close)
             # Hysteresis: trigger at < 0.7m, stop at >= 1.0m
+            # HRI Guard: Do not roll backward if user is seated (e.g. at desk/table) or mobile retreat disabled
+            p_activity = str(getattr(focused_person, "current_activity", "") or "").upper()
+            is_seated = "SITTING" in p_activity or "SEATED" in p_activity
+            can_retreat = getattr(self, "enable_mobile_retreat", True) and not is_seated
+
             if self._is_retreating:
-                if p_dist < 1.00:
+                if p_dist < 1.00 and can_retreat:
                     candidates.append(
                         BehavioralIntent(
                             behavior_type=BehaviorType.MAINTAIN_SOCIAL_DISTANCE,
@@ -309,7 +314,7 @@ class BehaviorEngine:
                     )
                 else:
                     self._is_retreating = False
-            elif p_dist < 0.70:
+            elif p_dist < 0.70 and can_retreat:
                 self._is_retreating = True
                 candidates.append(
                     BehavioralIntent(

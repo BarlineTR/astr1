@@ -377,10 +377,11 @@ class ActionManager:
 
     def execute_turn_to_sound(
         self,
+        azimuth_deg: Optional[float] = None,
         generation_id: Optional[int] = None,
         action_id: Optional[str] = None,
     ) -> ActionResult:
-        """Executes physical orientation towards the validated acoustic sound source.
+        """Executes physical orientation towards the validated acoustic sound source or specified target yaw.
 
         If DOA is unavailable or invalid, strictly produces NO_DIRECTION without moving motors.
         """
@@ -438,11 +439,21 @@ class ActionManager:
                 return res
 
             # 1. DOA / Multimodal User Direction Resolution
-            azimuth = None
-            confidence = 0.0
+            if azimuth_deg is not None:
+                az_val = float(azimuth_deg)
+                if abs(az_val) > 180.0:
+                    az_val = circular_doa_to_yaw(az_val)
+                azimuth = az_val
+                confidence = 0.90
+            else:
+                azimuth = None
+                confidence = 0.0
 
-            # Prefer recent speech consensus (within 6.0s) that is not a rear wall bounce (>130°)
-            speech_doa = [y for ts, y, cur_rms in self._doa_history if (now - ts) <= 6.0 and abs(y) <= 130.0 and cur_rms >= 150.0]
+            # Prefer recent speech consensus (within 6.0s) that is not a rear wall bounce (>130°) and not uncalibrated 0.0°
+            speech_doa = [
+                y for ts, y, cur_rms in self._doa_history
+                if (now - ts) <= 6.0 and abs(y) <= 130.0 and cur_rms >= 150.0 and (abs(y) >= 0.5 or cur_rms >= 450.0)
+            ]
             if speech_doa:
                 sin_s = sum(math.sin(math.radians(y)) for y in speech_doa)
                 cos_s = sum(math.cos(math.radians(y)) for y in speech_doa)
@@ -453,7 +464,10 @@ class ActionManager:
                 confidence = sound_dir.confidence
             else:
                 # Secondary fallback: speech within 10.0s
-                recent_doa = [y for ts, y, cur_rms in self._doa_history if (now - ts) <= 10.0 and abs(y) <= 130.0 and cur_rms >= 120.0]
+                recent_doa = [
+                    y for ts, y, cur_rms in self._doa_history
+                    if (now - ts) <= 10.0 and abs(y) <= 130.0 and cur_rms >= 120.0 and (abs(y) >= 0.5 or cur_rms >= 450.0)
+                ]
                 if recent_doa:
                     sin_s = sum(math.sin(math.radians(y)) for y in recent_doa)
                     cos_s = sum(math.cos(math.radians(y)) for y in recent_doa)
@@ -461,7 +475,7 @@ class ActionManager:
                     confidence = 0.60
                 elif self._node and getattr(self._node, "_speaker_angle", None) is not None:
                     spk_angle = float(self._node._speaker_angle)
-                    if abs(circular_doa_to_yaw(spk_angle)) <= 130.0:
+                    if abs(circular_doa_to_yaw(spk_angle)) <= 130.0 and abs(spk_angle) >= 0.5:
                         azimuth = float(circular_doa_to_yaw(spk_angle))
                         confidence = 0.55
                 elif self._node and getattr(self._node, "_vision_person_detected", False):
@@ -497,7 +511,10 @@ class ActionManager:
 
             if azimuth is None:
                 # 3. Broader temporal history fallback (up to 15.0s with verified acoustic speech energy)
-                broader_doa = [y for ts, y, cur_rms in self._doa_history if (now - ts) <= 15.0 and abs(y) <= 130.0 and cur_rms >= 120.0]
+                broader_doa = [
+                    y for ts, y, cur_rms in self._doa_history
+                    if (now - ts) <= 15.0 and abs(y) <= 130.0 and cur_rms >= 120.0 and (abs(y) >= 0.5 or cur_rms >= 450.0)
+                ]
                 if broader_doa:
                     sin_s = sum(math.sin(math.radians(y)) for y in broader_doa)
                     cos_s = sum(math.cos(math.radians(y)) for y in broader_doa)
@@ -505,15 +522,15 @@ class ActionManager:
                     confidence = 0.45
                     self._logger.info(f"👂 [ActionManager] Genişletilmiş zaman tamponundan ses yönü kurtarıldı -> {azimuth:.1f}°")
                 else:
-                    self._logger.warning("⚠️ [ActionManager] turn_to_sound: UNRESOLVED_CURRENT_SPEAKER_POSITION (DOA yok veya zayıf)")
+                    self._logger.warning("⚠️ [ActionManager] turn_to_sound: NO_DIRECTION (DOA yok veya zayıf)")
                     res = ActionResult(
                         success=False,
                         action="turn_to_sound",
                         action_id=act_id,
                         generation_id=generation_id,
-                        error_code="UNRESOLVED_CURRENT_SPEAKER_POSITION",
-                        error="Sesin yönü belirlenemedi (UNRESOLVED_CURRENT_SPEAKER_POSITION).",
-                        reason="UNRESOLVED_CURRENT_SPEAKER_POSITION",
+                        error_code="NO_DIRECTION",
+                        error="Sesin yönü belirlenemedi (NO_DIRECTION).",
+                        reason="NO_DIRECTION",
                         message="Sesin hangi yönden geldiği tespit edilemediği için robot hareket ettirilmedi.",
                         hardware_ack=False,
                     )
@@ -600,6 +617,8 @@ class ActionManager:
             )
             self._recent_actions.append(res)
             return res
+
+    turn_to_sound = execute_turn_to_sound
 
     def execute_move(
         self,
@@ -912,7 +931,9 @@ class ActionManager:
         elif act_type in ("turn_head", "turn_to_sound", "track_gaze"):
             target_yaw = params.get("target_yaw_deg", params.get("azimuth_deg"))
             target_yaw_val = float(target_yaw) if target_yaw is not None else None
-            return self.turn_to_sound(
+            if target_yaw_val is not None and abs(target_yaw_val) > 180.0:
+                target_yaw_val = circular_doa_to_yaw(target_yaw_val)
+            return self.execute_turn_to_sound(
                 azimuth_deg=target_yaw_val,
                 action_id=act_id,
             )

@@ -158,24 +158,33 @@ class HeadStateManager:
             self.encoder_responsive = True
             self.encoder_stuck = False
 
-        # Check for stuck-at-zero / unresponsive condition:
-        # If a movement command was accepted and enough time elapsed,
-        # but ticks have not changed from baseline or stay frozen at 0:
+        # Check for stuck / unresponsive condition:
+        # If a movement command was accepted and enough time elapsed (> stuck_timeout_s),
+        # but ticks have not changed (frozen at zero or stuck at non-zero baseline):
         is_command_moving = False
         if self.last_accepted_target_deg is not None:
-            current_pos = self.estimated_yaw_deg if self.estimated_yaw_deg is not None else 0.0
-            if abs(self.last_accepted_target_deg) > 2.0 or abs(self.last_accepted_target_deg - current_pos) > 2.0:
+            current_pos = self.actual_yaw_deg if self.actual_yaw_deg is not None else (
+                self.estimated_yaw_deg if self.estimated_yaw_deg is not None else 0.0
+            )
+            if abs(self.last_accepted_target_deg - current_pos) > 2.0:
                 is_command_moving = True
 
-        if is_command_moving and (now - self.last_command_time > self.stuck_timeout_s) and not self.encoder_responsive:
-            self.encoder_stuck = True
+        if is_command_moving and (now - self.last_command_time > self.stuck_timeout_s):
+            if (not self.encoder_responsive) or (now - self._last_ticks_change_time > self.stuck_timeout_s):
+                self.encoder_stuck = True
+                self.encoder_responsive = False
 
         # If encoder is not responsive or stuck, DO NOT accept as ENCODER authority
         if not self.encoder_responsive or self.encoder_stuck:
             self.encoder_available = False
             self.encoder_stale = True
             self.actual_yaw_deg = None
-            if self.last_accepted_target_deg is not None or self.estimated_yaw_deg is not None:
+            if self.position_source == PositionSource.ENCODER:
+                self.position_source = PositionSource.VIRTUAL_ENCODER
+                if self.estimated_yaw_deg is None and self.last_known_encoder_deg is not None:
+                    self.estimated_yaw_deg = self.last_known_encoder_deg
+                self.last_estimate_update_time = now
+            elif self.last_accepted_target_deg is not None or self.estimated_yaw_deg is not None:
                 self.position_source = PositionSource.VIRTUAL_ENCODER
             else:
                 self.position_source = PositionSource.UNKNOWN
@@ -263,23 +272,29 @@ class HeadStateManager:
         """Evaluates current state, applies stale timeout, and returns a HeadState snapshot."""
         now = time.monotonic() if timestamp is None else float(timestamp)
 
-        # 1. Check for stuck-at-zero / unresponsive condition during active command
+        # 1. Check for stuck / unresponsive condition during active command
         is_command_moving = False
         if self.last_accepted_target_deg is not None:
-            current_pos = self.estimated_yaw_deg if self.estimated_yaw_deg is not None else 0.0
-            if abs(self.last_accepted_target_deg) > 2.0 or abs(self.last_accepted_target_deg - current_pos) > 2.0:
+            current_pos = self.actual_yaw_deg if self.actual_yaw_deg is not None else (
+                self.estimated_yaw_deg if self.estimated_yaw_deg is not None else 0.0
+            )
+            if abs(self.last_accepted_target_deg - current_pos) > 2.0:
                 is_command_moving = True
 
-        if is_command_moving and (now - self.last_command_time > self.stuck_timeout_s) and not self.encoder_responsive:
-            self.encoder_stuck = True
-            self.encoder_available = False
-            self.encoder_stale = True
-            if self.position_source == PositionSource.ENCODER:
-                self.position_source = PositionSource.VIRTUAL_ENCODER
-                if self.estimated_yaw_deg is None and self.last_known_encoder_deg is not None:
-                    self.estimated_yaw_deg = self.last_known_encoder_deg
-                self.last_estimate_update_time = now
-            self.actual_yaw_deg = None
+        if is_command_moving and (now - self.last_command_time > self.stuck_timeout_s):
+            if (not self.encoder_responsive) or (now - self._last_ticks_change_time > self.stuck_timeout_s):
+                self.encoder_stuck = True
+                self.encoder_responsive = False
+                self.encoder_available = False
+                self.encoder_stale = True
+                if self.position_source == PositionSource.ENCODER:
+                    self.position_source = PositionSource.VIRTUAL_ENCODER
+                    if self.estimated_yaw_deg is None and self.last_known_encoder_deg is not None:
+                        self.estimated_yaw_deg = self.last_known_encoder_deg
+                    elif self.estimated_yaw_deg is None:
+                        self.estimated_yaw_deg = 0.0
+                    self.last_estimate_update_time = now
+                self.actual_yaw_deg = None
 
         # 2. Evaluate encoder freshness for previously responsive encoder
         if self.encoder_available and self.encoder_responsive:

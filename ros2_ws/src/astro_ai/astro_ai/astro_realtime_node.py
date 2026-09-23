@@ -181,7 +181,7 @@ try:
     from astro_ai.provider_registry import ProviderRegistry, ProviderError, ErrorClass
     from astro_ai.local_gemma_client import LocalGemmaClient, LocalGemmaError, estimate_tokens, bound_messages_to_context
     from astro_ai.repetition_guard import RepetitionGuard
-    from astro_ai.action_manager import ActionManager, SoundDirection, ActionResult
+    from astro_ai.action_manager import ActionManager, SoundDirection, ActionResult, circular_doa_to_yaw
     from astro_ai.robot_led import RobotLED
     from astro_ai.brain.paralinguistics_engine import ParalinguisticsEngine
 except ImportError:
@@ -202,9 +202,9 @@ except ImportError:
         bound_messages_to_context = lambda m, max_tokens=450: m  # type: ignore
     from repetition_guard import RepetitionGuard
     try:
-        from action_manager import ActionManager, SoundDirection, ActionResult
+        from action_manager import ActionManager, SoundDirection, ActionResult, circular_doa_to_yaw
     except ImportError:
-        ActionManager = SoundDirection = ActionResult = None  # type: ignore
+        ActionManager = SoundDirection = ActionResult = circular_doa_to_yaw = None  # type: ignore
     try:
         from robot_led import RobotLED
     except ImportError:
@@ -10199,11 +10199,19 @@ class AstroRealtimeNode(Node):
         self._last_vision_distance_time = time.monotonic()
 
     def _on_doa(self, msg: Float32):
-        self._speaker_angle = float(msg.data)
+        raw_val = float(msg.data)
+        # ReSpeaker DOA is circular 0°..359°. Normalize strictly to signed body yaw frame (-180°..+180°)
+        # to ensure cognitive world model and behavior parameters stay strictly in body frame.
+        if circular_doa_to_yaw is not None:
+            norm_yaw = circular_doa_to_yaw(raw_val)
+        else:
+            raw_c = raw_val % 360.0
+            norm_yaw = -(raw_c if raw_c <= 180.0 else raw_c - 360.0)
+        self._speaker_angle = float(norm_yaw)
         self._last_doa_time = time.monotonic()
         if getattr(self, "action_manager", None):
             self.action_manager.update_audio_state(
-                raw_doa_deg=float(msg.data),
+                raw_doa_deg=raw_val,
                 rms_level=getattr(self, "_latest_mic_rms", None),
                 vad_active=getattr(self, "_vad_active", False),
                 is_speaking=self._is_responding,

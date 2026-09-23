@@ -305,7 +305,42 @@ class TestHeadEncoderFallback(unittest.TestCase):
         self.assertTrue(math.isnan(state.position_deg))
         self.assertFalse(state.encoder_available)
 
+    # -------------------------------------------------------------------------
+    # Test M: Stuck at non-zero baseline with command transitions to ESTIMATED
+    # -------------------------------------------------------------------------
+    def test_m_stuck_at_nonzero_with_command_transitions_to_estimated(self):
+        """When hardware starts at non-zero ticks (e.g. 9 ticks ~ 3.5 deg) and commanded to move,
+        if ticks remain completely frozen at 9 for > stuck_timeout_s, failover to ESTIMATED must occur."""
+        t = 1.0
+        # Startup packet with 9 ticks arrives
+        self.mgr.on_encoder_feedback(head_ticks=9, timestamp=t)
+        state_init = self.mgr.evaluate(timestamp=t)
+        self.assertEqual(state_init.position_source, PositionSource.ENCODER)
+        self.assertAlmostEqual(state_init.actual_yaw_deg, round(9 / 2.5882, 2), places=1)
+
+        # Movement command is accepted: move head to 25.0 deg
+        t += 0.1
+        self.mgr.on_command_accepted(target_yaw_deg=25.0, timestamp=t)
+
+        # Arduino hardware encoder is disconnected/frozen: ticks stay strictly at 9 for 35 iterations (>0.7s)
+        for _ in range(35):
+            t += 0.02
+            self.mgr.on_encoder_feedback(head_ticks=9, timestamp=t)
+
+        state_stuck = self.mgr.evaluate(timestamp=t)
+        # Must detect that encoder is stuck and failover to ESTIMATED / VIRTUAL_ENCODER!
+        self.assertEqual(state_stuck.position_source, PositionSource.ESTIMATED)
+        self.assertIsNone(state_stuck.actual_yaw_deg)
+        self.assertTrue(math.isnan(state_stuck.position_deg))
+        self.assertFalse(state_stuck.encoder_available)
+        self.assertTrue(state_stuck.encoder_stale)
+        self.assertFalse(state_stuck.has_encoder_authority)
+        # Software estimate must be moving towards 25.0 deg
+        self.assertIsNotNone(state_stuck.estimated_yaw_deg)
+        self.assertGreater(state_stuck.estimated_yaw_deg, round(9 / 2.5882, 2))
+
 
 if __name__ == "__main__":
     unittest.main()
+
 

@@ -157,6 +157,28 @@ class TestPhase7BehavioralIntelligence:
         assert act_intent.parameters.get("direction") == "backward"
 
     # -------------------------------------------------------------------------
+    # Test 3b: Seated user proximity -> Suppresses physical retreat (HRI safety)
+    # -------------------------------------------------------------------------
+    def test_03b_seated_user_proximity_suppresses_base_retreat(
+        self, behavior_engine: BehaviorEngine, world_model: WorldModel, self_state: SelfState
+    ):
+        now = time.time()
+        self_state.focused_person_id = "p_baran"
+        p = UnifiedPersonState(
+            person_id="p_baran",
+            name="Baran",
+            distance_m=0.35,  # Close proximity (<0.70m)
+            azimuth_deg=0.0,
+            is_present=True,
+            current_activity="SITTING",  # Human is seated in conversational interaction
+        )
+        world_model.update_people([p], now=now)
+
+        intent = behavior_engine.step(world_model, self_state, now=now)
+        # Seated conversational human must NOT cause robot base retreat!
+        assert intent is None or intent.behavior_type != BehaviorType.MAINTAIN_SOCIAL_DISTANCE
+
+    # -------------------------------------------------------------------------
     # Test 4: Continuous user speech -> ATTENTIVE_LISTENING (nod)
     # -------------------------------------------------------------------------
     def test_04_active_speech_triggers_attentive_listening(

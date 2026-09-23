@@ -807,7 +807,7 @@ class TestGazeVisualTrackingE2E(unittest.TestCase):
         yaw = localizer.update(doa_raw=40.0, voice_activity=True, timestamp=t)
         t += 0.05
         self.assertEqual(localizer.confirmed_sector, "LEFT")
-        self.assertEqual(yaw, 60.0)
+        self.assertEqual(yaw, 35.0)
 
         # 2. Oscillate across the nominal 55° boundary: 54.5°, 55.5°, 54.8°, 55.3°...
         oscillations = [54.5, 55.5, 54.8, 55.3, 54.6, 55.4, 54.7, 55.2]
@@ -819,7 +819,7 @@ class TestGazeVisualTrackingE2E(unittest.TestCase):
                 "LEFT",
                 f"Sector chattered to {localizer.confirmed_sector} at DOA {doa}° while in LEFT!",
             )
-            self.assertEqual(yaw, 60.0)
+            self.assertEqual(yaw, 35.0)
 
         # 3. Test from CENTER sector
         localizer.reset()

@@ -705,10 +705,18 @@ class StandaloneGazeRosNode(Node):
             return
 
         # If actively tracking a person visually, protect gaze and reject override
+        now_m = time.monotonic()
         if hasattr(self, "latest_result") and self.latest_result:
-            if self.latest_result.owner == PrioritySource.VISUAL_TRACKING or self.latest_result.gaze_state in (
-                GazeStateEnum.TRACKING,
-                GazeStateEnum.HOLDING_ATTENTION,
+            if (
+                self.latest_result.owner == PrioritySource.VISUAL_TRACKING
+                or self.latest_result.gaze_state in (
+                    GazeStateEnum.TRACKING,
+                    GazeStateEnum.HOLDING_ATTENTION,
+                    GazeStateEnum.ORIENTING,
+                    GazeStateEnum.ACQUIRING,
+                    GazeStateEnum.TARGET_LOST,
+                )
+                or (now_m - getattr(self, "_last_visual_active_time", 0.0)) < 1.0
             ):
                 self.get_logger().info(
                     f"🛡️ [HEAD TARGET OVERRIDE IGNORED] Active visual tracking locked on face ({self.latest_result.gaze_state}). Target {target:+.1f}° rejected."
@@ -1175,8 +1183,9 @@ class StandaloneGazeRosNode(Node):
             # Check for active audio reacquisition
             is_speaking_device = bool(self._playback_active or self._robot_speaking)
             in_reverb_guard = now_m < getattr(self, "_post_speech_guard_until", 0.0)
+            in_visual_coasting = (now_m - getattr(self, "_last_visual_active_time", 0.0)) < 1.0
 
-            if not is_speaking_device and not in_reverb_guard and self.localizer.is_tracking(now_m):
+            if not is_speaking_device and not in_reverb_guard and not in_visual_coasting and self.localizer.is_tracking(now_m):
                 self._last_visual_target_id = None
                 target_yaw = float(self.localizer.target_yaw_deg)
                 motor_yaw = target_yaw
@@ -1200,7 +1209,7 @@ class StandaloneGazeRosNode(Node):
                     res.owner = PrioritySource.IDLE
                     res.target_id = None
                 else:
-                    # TARGET_LOST etc: retain last published yaw, await FSM decision
+                    # TARGET_LOST or visual coasting: retain last published yaw, await FSM decision
                     target_yaw = float(self.last_published_yaw)
                     motor_yaw = target_yaw
                     res.target_yaw_deg = motor_yaw
