@@ -250,7 +250,7 @@ class StandaloneGazeRosNode(Node):
         self.declare_parameter("camera_publish_fps", 15.0)
         self.declare_parameter("enable_audio", True)
         self.declare_parameter("audio_source_mode", "hardware")
-        self.declare_parameter("audio_hold_grace", 5.0)
+        self.declare_parameter("audio_hold_grace", 1.5)
         self.declare_parameter("audio_deadband", 5.0)
         self.declare_parameter("audio_doa_profile", "respeaker_sectors")
         self.declare_parameter("audio_confirm_from_idle", False)
@@ -703,11 +703,23 @@ class StandaloneGazeRosNode(Node):
             target = float(raw_val)
         except (ValueError, TypeError):
             return
+
+        # If actively tracking a person visually, protect gaze and reject override
+        if hasattr(self, "latest_result") and self.latest_result:
+            if self.latest_result.owner == PrioritySource.VISUAL_TRACKING or self.latest_result.gaze_state in (
+                GazeStateEnum.TRACKING,
+                GazeStateEnum.HOLDING_ATTENTION,
+            ):
+                self.get_logger().info(
+                    f"🛡️ [HEAD TARGET OVERRIDE IGNORED] Active visual tracking locked on face ({self.latest_result.gaze_state}). Target {target:+.1f}° rejected."
+                )
+                return
+
         clamped = max(-80.0, min(80.0, target))
         self._manual_target_yaw = clamped
-        self._manual_target_deadline = time.monotonic() + 4.0
+        self._manual_target_deadline = time.monotonic() + 1.5
         self.get_logger().info(
-            f"🎯 [HEAD TARGET OVERRIDE] /head/target_yaw received: {clamped:+.1f}° (latched 4.0s)"
+            f"🎯 [HEAD TARGET OVERRIDE] /head/target_yaw received: {clamped:+.1f}° (latched 1.5s)"
         )
 
     def _on_social_offset_yaw(self, msg) -> None:
@@ -1124,14 +1136,9 @@ class StandaloneGazeRosNode(Node):
         )
 
         now_m = arrival_ts
-        if now_m < getattr(self, "_manual_target_deadline", 0.0):
-            target_yaw = float(self._manual_target_yaw)
-            motor_yaw = target_yaw
-            res.target_yaw_deg = target_yaw
-            res.owner = PrioritySource.ACTIVE_SPEAKER
-            res.gaze_state = GazeStateEnum.ORIENTING
-            res.target_id = "target_override"
-        elif vision_active:
+        if vision_active:
+            # Active visual tracking takes absolute priority over acoustic/manual overrides
+            self._manual_target_deadline = 0.0
             self.localizer.on_vision_active()
             target_yaw = float(res.target_yaw_deg)
 
@@ -1157,6 +1164,13 @@ class StandaloneGazeRosNode(Node):
                 res.owner = PrioritySource.VISUAL_TRACKING
                 if not res.target_id:
                     res.target_id = self._last_visual_target_id
+        elif now_m < getattr(self, "_manual_target_deadline", 0.0):
+            target_yaw = float(self._manual_target_yaw)
+            motor_yaw = target_yaw
+            res.target_yaw_deg = target_yaw
+            res.owner = PrioritySource.ACTIVE_SPEAKER
+            res.gaze_state = GazeStateEnum.ORIENTING
+            res.target_id = "target_override"
         else:
             # Check for active audio reacquisition
             is_speaking_device = bool(self._playback_active or self._robot_speaking)

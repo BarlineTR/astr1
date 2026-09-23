@@ -155,7 +155,7 @@ def generate_launch_description():
         ),
         DeclareLaunchArgument(
             "audio_hold_grace",
-            default_value="5.0",
+            default_value="1.5",
             description="Grace period in seconds to hold speaker heading before returning to center",
         ),
         DeclareLaunchArgument(

@@ -38,13 +38,10 @@ class ReSpeakerAudioLocalizer:
     SECTOR_RIGHT_MIN = 100.0   # DOA >= 100° = RIGHT
     #                            55°..100° = CENTER
 
-    SECTOR_TARGETS = {"LEFT": 60.0, "CENTER": 0.0, "RIGHT": -60.0}
-    # NOTE: LEFT/RIGHT targets are SWAPPED from the original calibration labels.
-    # Live testing proved calibration labels were from user's perspective (facing robot):
-    #   DOA ~32  ("LEFT" in calib)  = robot's physical RIGHT  → motor +60°
-    #   DOA ~148 ("RIGHT" in calib) = robot's physical LEFT   → motor -60°
-    # Evidence: visual tracking found user at -70.2° when DOA read 148;
-    # +-60° puts both 45° and 70°-80° speakers squarely inside the camera FOV (69°).
+    SECTOR_TARGETS = {"LEFT": 35.0, "CENTER": 0.0, "RIGHT": -35.0}
+    # NOTE: Sector targets are tuned to ±35° so the camera HFOV (69°, ±34.5°)
+    # retains overlap with the center and lets visual tracking lock on smoothly
+    # without throwing the camera completely blind when acoustic echo hits.
     SECTOR_CONFIRM_COUNT = 2   # consecutive readings to switch sector while tracking
     SECTOR_HYSTERESIS_DEG = 3.0  # Schmitt-trigger hysteresis margin to prevent boundary chatter
 
@@ -60,7 +57,7 @@ class ReSpeakerAudioLocalizer:
     def __init__(
         self,
         hid=None,
-        hold_timeout_s: float = 5.0,
+        hold_timeout_s: float = 1.5,
         deadband_deg: float = 5.0,
         outlier_threshold_deg: float = 30.0,
         filter_window_size: int = 5,

@@ -401,6 +401,42 @@ class ActionManager:
 
             sound_dir = self.get_sound_direction()
 
+            # 0. Visual Primacy Guard: If robot is already visually tracking/seeing a person in front,
+            # do not allow acoustic echo or stale DOA to wrench the head away!
+            person_in_front = False
+            if self._node:
+                if getattr(self._node, "_vision_person_detected", False):
+                    person_in_front = True
+                elif (now - getattr(self._node, "_last_vision_faces_time", 0.0)) < 2.5:
+                    person_in_front = True
+                elif getattr(self._node, "_gaze_active_target", "NONE") not in ("NONE", "") and (now - getattr(self._node, "_last_tracked_gaze_time", 0.0)) < 2.5:
+                    person_in_front = True
+                elif hasattr(self._node, "social_brain") and hasattr(self._node.social_brain, "world_model"):
+                    try:
+                        tracked = getattr(self._node.social_brain.world_model, "tracked_people", {})
+                        if tracked:
+                            person_in_front = True
+                    except Exception:
+                        pass
+
+            if person_in_front:
+                self._logger.info("🛡️ [ActionManager] Kullanıcı zaten görsel olarak takip ediliyor / karşıda. turn_to_sound akustik geçersiz kılındı.")
+                if self._pub_head_gesture:
+                    msg = String()
+                    msg.data = "nod"
+                    self._pub_head_gesture.publish(msg)
+                res = ActionResult(
+                    success=True,
+                    action="turn_to_sound",
+                    action_id=act_id,
+                    generation_id=generation_id,
+                    azimuth_deg=0.0,
+                    hardware_ack=True,
+                    message="Kullanıcı zaten görsel olarak takip ediliyor.",
+                )
+                self._recent_actions.append(res)
+                return res
+
             # 1. DOA / Multimodal User Direction Resolution
             azimuth = None
             confidence = 0.0
