@@ -23,9 +23,17 @@ from typing import Optional
 
 class PositionSource(str, Enum):
     """Authority source for head position."""
-    ENCODER = "ENCODER"        # Physical hardware encoder feedback
-    ESTIMATED = "ESTIMATED"    # Software trajectory/command-based estimation
-    UNKNOWN = "UNKNOWN"        # Position is completely unknown (not assumed to be 0.0)
+    ENCODER = "ENCODER"                  # Physical hardware encoder feedback
+    VIRTUAL_ENCODER = "VIRTUAL_ENCODER"  # Software trajectory/command-based estimation
+    UNKNOWN = "UNKNOWN"                  # Position is completely unknown (not assumed to be 0.0)
+
+    @classmethod
+    def _missing_(cls, value):
+        if isinstance(value, str) and value.upper() == "ESTIMATED":
+            return cls.VIRTUAL_ENCODER
+        return super()._missing_(value)
+
+PositionSource.ESTIMATED = PositionSource.VIRTUAL_ENCODER
 
 
 @dataclass
@@ -36,6 +44,7 @@ class HeadState:
     encoder_stale: bool = True
     actual_yaw_deg: Optional[float] = None
     estimated_yaw_deg: Optional[float] = None
+    canonical_yaw_deg: Optional[float] = None  # Sole centrally resolved canonical yaw
     position_deg: float = float("nan")       # Physical encoder angle only (NaN if absent/stale)
     velocity_deg_s: float = 0.0
     target_position_deg: float = 0.0
@@ -50,12 +59,17 @@ class HeadState:
     @property
     def has_valid_position(self) -> bool:
         """True if any valid position (physical or estimated) is known."""
-        return self.position_source in (PositionSource.ENCODER, PositionSource.ESTIMATED)
+        return self.position_source in (PositionSource.ENCODER, PositionSource.VIRTUAL_ENCODER)
 
     @property
     def has_encoder_authority(self) -> bool:
         """True if physical encoder feedback is actively valid and fresh."""
         return self.position_source == PositionSource.ENCODER and self.actual_yaw_deg is not None
+
+    @property
+    def is_virtual(self) -> bool:
+        """True if operating in virtual encoder mode."""
+        return self.position_source == PositionSource.VIRTUAL_ENCODER
 
 
 class HeadStateManager:
@@ -135,6 +149,7 @@ class HeadStateManager:
             # If initial ticks is already non-zero, it indicates previous tick activity
             if ticks != 0:
                 self.encoder_responsive = True
+                self.encoder_stuck = False
 
         # Detect dynamic tick change from last seen
         if ticks != self._last_ticks_value:
@@ -161,13 +176,19 @@ class HeadStateManager:
             self.encoder_stale = True
             self.actual_yaw_deg = None
             if self.last_accepted_target_deg is not None or self.estimated_yaw_deg is not None:
-                self.position_source = PositionSource.ESTIMATED
+                self.position_source = PositionSource.VIRTUAL_ENCODER
             else:
                 self.position_source = PositionSource.UNKNOWN
             return
 
         # When encoder is responsive and verified:
         deg = round(float(ticks / self.ticks_per_deg), 2)
+        if abs(deg) > max(abs(self.min_limit_deg), abs(self.max_limit_deg)):
+            self.encoder_available = False
+            self.encoder_stale = True
+            self.actual_yaw_deg = None
+            self.position_source = PositionSource.VIRTUAL_ENCODER
+            return
 
         # Calculate physical velocity if previous measurement exists
         if self.actual_yaw_deg is not None and self.last_valid_encoder_time > 0.0:
@@ -176,6 +197,10 @@ class HeadStateManager:
                 raw_vel = (deg - self.actual_yaw_deg) / effective_dt
                 self.velocity_deg_s = round(0.85 * self.velocity_deg_s + 0.15 * raw_vel, 2)
 
+        # VIRTUAL_ENCODER -> ENCODER transition with zero-jump rebase:
+        # Physical reality becomes authoritative. Software estimate is rebased to physical deg.
+        # Commanded target (last_accepted_target_deg) is preserved; first encoder sample is NOT
+        # silently reinterpreted as a new target frame.
         self.actual_yaw_deg = deg
         self.last_known_encoder_deg = deg
         self.last_valid_encoder_time = now
@@ -183,7 +208,6 @@ class HeadStateManager:
         self.encoder_stale = False
         self.position_source = PositionSource.ENCODER
 
-        # Encoder authority overwrites software estimate
         self.estimated_yaw_deg = deg
         self.last_estimate_update_time = now
 
@@ -196,11 +220,11 @@ class HeadStateManager:
 
         if self.position_source == PositionSource.UNKNOWN:
             # First accepted command initializes software estimation from 0.0 reference
-            self.position_source = PositionSource.ESTIMATED
+            self.position_source = PositionSource.VIRTUAL_ENCODER
             self.estimated_yaw_deg = 0.0
             self.last_estimate_update_time = now
             self._update_estimate_step(now)
-        elif self.position_source == PositionSource.ESTIMATED:
+        elif self.position_source == PositionSource.VIRTUAL_ENCODER:
             if self.estimated_yaw_deg is None:
                 self.estimated_yaw_deg = 0.0
             self._update_estimate_step(now)
@@ -251,7 +275,10 @@ class HeadStateManager:
             self.encoder_available = False
             self.encoder_stale = True
             if self.position_source == PositionSource.ENCODER:
-                self.position_source = PositionSource.ESTIMATED
+                self.position_source = PositionSource.VIRTUAL_ENCODER
+                if self.estimated_yaw_deg is None and self.last_known_encoder_deg is not None:
+                    self.estimated_yaw_deg = self.last_known_encoder_deg
+                self.last_estimate_update_time = now
             self.actual_yaw_deg = None
 
         # 2. Evaluate encoder freshness for previously responsive encoder
@@ -259,16 +286,18 @@ class HeadStateManager:
             if (now - self.last_valid_encoder_time) > self.stale_timeout_s:
                 self.encoder_stale = True
                 if self.position_source == PositionSource.ENCODER:
-                    # Transition from ENCODER to ESTIMATED
-                    self.position_source = PositionSource.ESTIMATED
-                    # Invariant: actual_yaw_deg is cleared because encoder is stale
+                    # ENCODER -> VIRTUAL_ENCODER transition with zero-jump rebase:
+                    # Seed virtual estimate with last known physical encoder angle so motion begins seamlessly
+                    self.position_source = PositionSource.VIRTUAL_ENCODER
                     self.actual_yaw_deg = None
-                    if self.estimated_yaw_deg is None and self.last_known_encoder_deg is not None:
+                    if self.last_known_encoder_deg is not None:
                         self.estimated_yaw_deg = self.last_known_encoder_deg
+                    elif self.estimated_yaw_deg is None:
+                        self.estimated_yaw_deg = 0.0
                     self.last_estimate_update_time = now
 
-        # 3. Advance software estimate if in ESTIMATED state
-        if self.position_source == PositionSource.ESTIMATED:
+        # 3. Advance software estimate if in VIRTUAL_ENCODER state
+        if self.position_source == PositionSource.VIRTUAL_ENCODER:
             self._update_estimate_step(now)
 
         # 4. Determine moving / at_target indicators
@@ -281,7 +310,15 @@ class HeadStateManager:
         else:
             at_target = False
 
-        # 5. Construct HeadState
+        # 5. Centrally resolve sole canonical yaw
+        if self.position_source == PositionSource.ENCODER and self.actual_yaw_deg is not None:
+            canonical_yaw = float(self.actual_yaw_deg)
+        elif self.position_source == PositionSource.VIRTUAL_ENCODER and self.estimated_yaw_deg is not None:
+            canonical_yaw = float(self.estimated_yaw_deg)
+        else:
+            canonical_yaw = None
+
+        # 6. Construct HeadState
         # Invariant: position_deg is ONLY physical encoder angle; NaN if absent/stale/unresponsive
         pos_deg = float(self.actual_yaw_deg) if (self.position_source == PositionSource.ENCODER and self.actual_yaw_deg is not None) else float("nan")
 
@@ -291,6 +328,7 @@ class HeadStateManager:
             encoder_stale=self.encoder_stale,
             actual_yaw_deg=self.actual_yaw_deg,
             estimated_yaw_deg=self.estimated_yaw_deg,
+            canonical_yaw_deg=canonical_yaw,
             position_deg=pos_deg,
             velocity_deg_s=float(self.velocity_deg_s),
             target_position_deg=float(target_pos),

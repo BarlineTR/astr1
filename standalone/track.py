@@ -205,8 +205,6 @@ def main(argv=None, hid=None) -> int:
     last_audio_log_yaw: Optional[float] = None
     last_visual_target_id: Optional[str] = None
     motor_yaw: float = 0.0
-    estimated_head_yaw: float = 0.0
-    last_yaw_update_time: float = started
     encoder_stall_start: Optional[float] = None
     encoder_fault_warned: bool = False
 
@@ -244,39 +242,28 @@ def main(argv=None, hid=None) -> int:
             if voice_loop is not None:
                 voice_loop.pump(now)
 
-            # Açık çevrim kafa açısı simülasyonu: Kafa hedefe doğru ~20 deg/s hızla döner (firmware HEAD_MAX_VEL_DEG_S = 20.0 ile uyumlu).
-            # Böylece sesle dönüldüğünde (+60°) veya görsel takiple dönüldüğünde robot
-            # kafanın o açıda olduğunu bilir ve yüzü gördüğünde 0°'ye geri kaçmaz!
-            dt_yaw = max(0.001, min(0.1, now - last_yaw_update_time))
-            last_yaw_update_time = now
-            diff_yaw = motor_yaw - estimated_head_yaw
-            max_step_deg = 20.0 * dt_yaw
-            if abs(diff_yaw) <= max_step_deg:
-                estimated_head_yaw = motor_yaw
-            else:
-                estimated_head_yaw += max_step_deg if diff_yaw > 0 else -max_step_deg
-
-            # Head position authority: ENCODER vs ESTIMATED vs UNKNOWN
+            # Head position authority resolved centrally by HeadStateManager (single owner of virtual yaw)
+            hstate = head.state_mgr.evaluate(timestamp=now)
             if opts.fixed_head:
                 meas_head = None
                 est_head = 0.0
                 head_feedback_active = False
             elif opts.open_loop:
                 meas_head = None
-                est_head = head.estimated_yaw_deg if head.estimated_yaw_deg is not None else estimated_head_yaw
+                est_head = hstate.estimated_yaw_deg if hstate.estimated_yaw_deg is not None else 0.0
                 head_feedback_active = False
-            elif head.position_source == PositionSource.ENCODER and head.actual_yaw_deg is not None:
-                meas_head = head.actual_yaw_deg
+            elif hstate.position_source == PositionSource.ENCODER and hstate.actual_yaw_deg is not None:
+                meas_head = hstate.actual_yaw_deg
                 est_head = None
                 head_feedback_active = True
-            elif head.position_source == PositionSource.ESTIMATED and head.estimated_yaw_deg is not None:
+            elif hstate.position_source in (PositionSource.VIRTUAL_ENCODER, PositionSource.ESTIMATED) and hstate.estimated_yaw_deg is not None:
                 meas_head = None
-                est_head = head.estimated_yaw_deg
+                est_head = hstate.estimated_yaw_deg
                 head_feedback_active = False
             else:
                 # UNKNOWN: position is not known; do NOT assume 0.0 as measured
                 meas_head = None
-                est_head = estimated_head_yaw
+                est_head = hstate.estimated_yaw_deg
                 head_feedback_active = False
 
             # GazeTracker.step() çağrısına DOA beslenmez (doa_deg=None).

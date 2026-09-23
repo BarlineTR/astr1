@@ -333,6 +333,9 @@ class SerialBridge(Node):
             )
         else:
             self.pub_head_state = None
+        self.pub_head_yaw = self.create_publisher(
+            Float32, "/head/yaw_deg", 10
+        )
 
         self.sub_wheel = self.create_subscription(
             WheelCmd, "/wheel_cmds", self.on_wheel_cmd, 10
@@ -783,6 +786,11 @@ class SerialBridge(Node):
             if abs(raw_pos) > HEAD_ENCODER_MAX_DEG:
                 # Encoder value exceeds mechanical limits — reject
                 self.head_encoder_valid = False
+                self.head_state_mgr.encoder_available = False
+                self.head_state_mgr.encoder_stale = True
+                self.head_state_mgr.actual_yaw_deg = None
+                self.head_state_mgr.position_source = PositionSource.VIRTUAL_ENCODER
+                self.head_state_mgr.estimated_yaw_deg = float(getattr(self, "_last_sent_angle", 0.0))
                 self.head_pos = float(getattr(self, "_last_sent_angle", 0.0))
                 if not getattr(self, '_encoder_fault_logged', False):
                     self.get_logger().warn(
@@ -804,12 +812,10 @@ class SerialBridge(Node):
             self.head_encoder_valid = False
             self.head_pos = float(getattr(self, "_last_sent_angle", 0.0))
 
-        # Evaluate through HeadStateManager
+        # Evaluate centrally through HeadStateManager
         hstate = self.head_state_mgr.evaluate(timestamp=now_mono)
-        if self.head_encoder_valid and hstate.actual_yaw_deg is not None:
-            self.head_pos = hstate.actual_yaw_deg
-        elif hstate.estimated_yaw_deg is not None and not math.isnan(hstate.estimated_yaw_deg):
-            self.head_pos = float(hstate.estimated_yaw_deg)
+        if hstate.canonical_yaw_deg is not None:
+            self.head_pos = float(hstate.canonical_yaw_deg)
         elif not hasattr(self, "head_pos") or self.head_pos is None:
             self.head_pos = float(getattr(self, "_last_sent_angle", 0.0))
         self.head_vel = hstate.velocity_deg_s
@@ -826,6 +832,9 @@ class SerialBridge(Node):
         js.effort = [0.0, 0.0, 0.0]
         self.pub_js.publish(js)
 
+        if hasattr(self, "pub_head_yaw") and self.pub_head_yaw is not None:
+            self.pub_head_yaw.publish(Float32(data=float(self.head_pos)))
+
         if self.pub_head_state is not None:
             hs = HeadState()
             hs.header.stamp = now.to_msg()
@@ -835,6 +844,8 @@ class SerialBridge(Node):
             hs.encoder_stale = hstate.encoder_stale
             hs.actual_yaw_deg = float(hstate.actual_yaw_deg) if hstate.actual_yaw_deg is not None else float("nan")
             hs.estimated_yaw_deg = float(hstate.estimated_yaw_deg) if hstate.estimated_yaw_deg is not None else float("nan")
+            if hasattr(hs, "canonical_yaw_deg"):
+                hs.canonical_yaw_deg = float(hstate.canonical_yaw_deg) if hstate.canonical_yaw_deg is not None else float("nan")
             # Invariant: position_deg is ONLY physical encoder angle; NaN if absent/stale
             hs.position_deg = float(hstate.position_deg)
             hs.velocity_deg_s = float(hstate.velocity_deg_s)

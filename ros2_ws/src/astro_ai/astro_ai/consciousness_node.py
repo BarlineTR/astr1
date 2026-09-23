@@ -34,9 +34,17 @@ try:
     )
     from sensor_msgs.msg import LaserScan
     from std_msgs.msg import Bool, Float32, String
+    try:
+        from astro_base.msg import HeadState
+    except ImportError:
+        try:
+            from astro_interfaces.msg import HeadState
+        except ImportError:
+            HeadState = None
 except ImportError:
     rclpy = None
     qos_profile_sensor_data = 10
+    HeadState = None
 
     class _MockPublisher:
         def __init__(self, topic=""):
@@ -196,7 +204,10 @@ class ConsciousnessNode(Node):
         self.create_subscription(Bool, "/tts/speaking", self._on_tts_speaking_msg, 10)
         self.create_subscription(String, "/speech/text", self._on_speech_text_msg, 10)
         self.create_subscription(LaserScan, "/scan", self._on_scan_msg, qos_profile_sensor_data)
-        self.create_subscription(Float32, "/head/state", self._on_head_state_msg, qos_profile_sensor_data)
+        if HeadState is not None:
+            self.create_subscription(HeadState, "/head/state", self._on_head_state_msg, qos_profile_sensor_data)
+        else:
+            self.create_subscription(Float32, "/head/state", self._on_head_state_msg, qos_profile_sensor_data)
         self.create_subscription(String, "/gaze/active_target", self._on_active_target_msg, 10)
 
     # -------------------------------------------------------------------------
@@ -365,7 +376,14 @@ class ConsciousnessNode(Node):
         self.loop.event_detector.notify_sensor_active("lidar", now)
 
     def _on_head_state_msg(self, msg: Any) -> None:
-        yaw = float(getattr(msg, "data", 0.0))
+        if hasattr(msg, "canonical_yaw_deg") and not math.isnan(msg.canonical_yaw_deg):
+            yaw = float(msg.canonical_yaw_deg)
+        elif hasattr(msg, "actual_yaw_deg") and not math.isnan(msg.actual_yaw_deg):
+            yaw = float(msg.actual_yaw_deg)
+        elif hasattr(msg, "estimated_yaw_deg") and not math.isnan(msg.estimated_yaw_deg):
+            yaw = float(msg.estimated_yaw_deg)
+        else:
+            yaw = float(getattr(msg, "data", 0.0))
         now = time.time()
         with self._lock:
             self._sensor_cache["head_yaw_deg"] = yaw

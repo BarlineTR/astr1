@@ -93,7 +93,8 @@ class TestHeadEncoderFallback(unittest.TestCase):
         t0 = 10.0
         # No encoder feedback given
         self.mgr.on_command_accepted(target_yaw_deg=30.0, timestamp=t0)
-        state = self.mgr.evaluate(timestamp=t0)
+        # Advance time to allow software slew rate (20 deg/s) to reach target
+        state = self.mgr.evaluate(timestamp=t0 + 2.0)
 
         self.assertEqual(state.position_source, PositionSource.ESTIMATED)
         self.assertFalse(state.encoder_available)
@@ -141,7 +142,10 @@ class TestHeadEncoderFallback(unittest.TestCase):
         t = 10.0
         # 1. Start with accepted command -> ESTIMATED
         self.mgr.on_command_accepted(target_yaw_deg=40.0, timestamp=t)
-        state_est = self.mgr.evaluate(timestamp=t)
+        # Advance time in discrete steps to allow software slew rate (20 deg/s) to reach target
+        for _ in range(25):
+            t += 0.1
+            state_est = self.mgr.evaluate(timestamp=t)
         self.assertEqual(state_est.position_source, PositionSource.ESTIMATED)
         self.assertAlmostEqual(state_est.estimated_yaw_deg, 40.0, places=1)
 

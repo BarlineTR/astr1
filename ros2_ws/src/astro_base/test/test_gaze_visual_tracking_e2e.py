@@ -839,6 +839,104 @@ class TestGazeVisualTrackingE2E(unittest.TestCase):
             )
             self.assertEqual(yaw, 0.0)
 
+    def test_regression_e2e_encoder_unavailable_fixed_pixel_no_runaway(self):
+        """Regression test: Encoder unavailable (VIRTUAL_ENCODER), target remains at fixed camera bearing.
+
+        End-to-end chain:
+        camera detection -> camera bearing -> canonical head yaw -> target yaw -> head command -> virtual head update -> next camera frame.
+
+        Even though head commands are accepted and virtual yaw advances from 0° towards target,
+        repeated frames at a fixed camera bearing (e.g. +15°) MUST NOT cause target yaw to drift or
+        run away to limits (+-75°) because camera bearing must never feedback into virtual yaw.
+        """
+        head_mgr = HeadStateManager(ticks_per_deg=2.5882, software_max_vel_deg_s=20.0)
+        tracker = GazeTracker(calibration=self.calib)
+
+        t = 1000.0
+        # Detection at fixed pixel: x=147 (yields approx +15° bearing on 640x480)
+        det = Detection(x=147, y=200, w=80, h=80, confidence=0.88)
+
+        initial_target_yaw = None
+
+        for frame_idx in range(50):
+            # 1. Centrally evaluate HeadStateManager
+            hstate = head_mgr.evaluate(timestamp=t)
+            if frame_idx > 0:
+                self.assertEqual(hstate.position_source, PositionSource.VIRTUAL_ENCODER)
+            self.assertIsNone(hstate.actual_yaw_deg)
+            self.assertTrue(math.isnan(hstate.position_deg))
+
+            canonical_yaw = hstate.canonical_yaw_deg
+
+            # 2. Step GazeTracker with canonical estimated head yaw
+            res = tracker.step(
+                faces=[det],
+                frame_size=(640, 480),
+                doa_deg=None,
+                measured_head_deg=None,
+                timestamp=t,
+                estimated_head_deg=canonical_yaw,
+            )
+
+            if initial_target_yaw is None:
+                initial_target_yaw = res.target_yaw_deg
+                self.assertAlmostEqual(initial_target_yaw, 15.0, delta=2.5)
+
+            # 3. Simulate command dispatch & acceptance by HeadStateManager
+            head_mgr.on_command_accepted(res.target_yaw_deg, timestamp=t)
+
+            # 4. Invariant: target_yaw must remain stable around initial_target_yaw (~15°)
+            # It must NEVER drift or run away to +-75°
+            self.assertAlmostEqual(
+                res.target_yaw_deg,
+                initial_target_yaw,
+                delta=3.0,
+                msg=f"Frame {frame_idx}: target_yaw drifted to {res.target_yaw_deg}°! (virtual yaw={canonical_yaw}°)",
+            )
+            self.assertLess(abs(res.target_yaw_deg), 30.0)
+
+            t += 0.05  # 20 Hz frame rate
+
+    def test_head_state_zero_jump_rebase_encoder_virtual_transitions(self):
+        """Zero-jump rebase test between ENCODER and VIRTUAL_ENCODER authority modes."""
+        head_mgr = HeadStateManager(ticks_per_deg=1.0, stale_timeout_s=0.50, software_max_vel_deg_s=20.0)
+        t = 100.0
+
+        # 1. Physical encoder active at 25.0° (25 ticks with 1 tick/deg)
+        head_mgr.on_encoder_feedback(head_ticks=10, timestamp=t)
+        t += 0.05
+        head_mgr.on_encoder_feedback(head_ticks=25, timestamp=t)
+        hstate = head_mgr.evaluate(timestamp=t)
+        self.assertEqual(hstate.position_source, PositionSource.ENCODER)
+        self.assertEqual(hstate.actual_yaw_deg, 25.0)
+        self.assertEqual(hstate.canonical_yaw_deg, 25.0)
+
+        # 2. Encoder dies (times out past stale_timeout_s = 0.50s)
+        t += 0.60
+        hstate = head_mgr.evaluate(timestamp=t)
+        self.assertEqual(hstate.position_source, PositionSource.VIRTUAL_ENCODER)
+        self.assertIsNone(hstate.actual_yaw_deg)
+        # Invariant: Zero-jump rebase seeds virtual estimate with last known physical encoder angle
+        self.assertEqual(hstate.estimated_yaw_deg, 25.0)
+        self.assertEqual(hstate.canonical_yaw_deg, 25.0)
+
+        # 3. In virtual mode, command to 45.0°
+        head_mgr.on_command_accepted(45.0, timestamp=t)
+        t += 0.50  # at 20 deg/s, advances by 10.0° to 35.0°
+        hstate = head_mgr.evaluate(timestamp=t)
+        self.assertEqual(hstate.position_source, PositionSource.VIRTUAL_ENCODER)
+        self.assertAlmostEqual(hstate.canonical_yaw_deg, 35.0, delta=0.5)
+
+        # 4. Encoder comes back online at 36.0°
+        t += 0.05
+        head_mgr.on_encoder_feedback(head_ticks=36, timestamp=t)
+        hstate = head_mgr.evaluate(timestamp=t)
+        self.assertEqual(hstate.position_source, PositionSource.ENCODER)
+        self.assertEqual(hstate.actual_yaw_deg, 36.0)
+        self.assertEqual(hstate.canonical_yaw_deg, 36.0)
+        # Invariant: Commanded target is NOT overwritten by the encoder sample
+        self.assertEqual(hstate.target_position_deg, 45.0)
+
 
 if __name__ == "__main__":
     unittest.main()

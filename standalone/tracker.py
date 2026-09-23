@@ -205,20 +205,12 @@ class GazeTracker:
             self.audio_filter.reset()
             self._latest_audio = None
 
-        # With no encoder, assume the head went where it was told rather than that it
-        # sits at zero: assuming zero makes a person centred after a turn compute back
-        # to zero, which drives the head to centre and parks it. The planner's
-        # rate-limited integration is the model; the raw command would settle instantly
-        # and lie to the state machine about having arrived.
+        # Trajectory generation for actuators; internal motion planner state is not head position belief
         trajectory = self.planner.plan_step(
             gaze_cmd=command,
             actual_pos_deg=actual_head,
             timestamp=timestamp,
         )
-        if self.head_feedback_missing and estimated_head_deg is None:
-            self.head_angle_deg = float(trajectory.position_deg)
-            self.head_velocity_deg_s = float(trajectory.velocity_deg_s)
-            self._last_head_time = timestamp
 
         clamped_target_yaw = max(-75.0, min(75.0, float(command.target_yaw_deg)))
         return GazeResult(

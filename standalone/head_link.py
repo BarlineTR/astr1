@@ -152,6 +152,10 @@ class HeadLink:
         return self.state_mgr.estimated_yaw_deg
 
     @property
+    def canonical_yaw_deg(self) -> Optional[float]:
+        return self.state_mgr.evaluate().canonical_yaw_deg
+
+    @property
     def connected(self) -> bool:
         return self.port is not None
 

@@ -341,8 +341,6 @@ class StandaloneGazeRosNode(Node):
         self.cycle_id: int = 0
         self.frame_index: int = 0
         self.last_published_yaw: float = 0.0
-        self._estimated_head_yaw: float = 0.0
-        self._last_yaw_update_time: float = time.monotonic()
         self.latest_result: Optional[GazeResult] = None
         self._head_feedback_seen: bool = False
         self._head_state_received: bool = False
@@ -569,12 +567,14 @@ class StandaloneGazeRosNode(Node):
                 self.runtime.update_head_feedback(actual_yaw, vel, timestamp=t, source="/head/state")
                 self._head_feedback_seen = True
                 self._head_state_received = True
-        elif pos_source == "ESTIMATED":
-            est_yaw = float(getattr(msg, "estimated_yaw_deg", float("nan")))
+        elif pos_source in ("VIRTUAL_ENCODER", "ESTIMATED"):
+            est_yaw = float(getattr(msg, "canonical_yaw_deg", getattr(msg, "estimated_yaw_deg", float("nan"))))
+            if math.isnan(est_yaw):
+                est_yaw = float(getattr(msg, "estimated_yaw_deg", float("nan")))
             self._head_state_received = True
             if not math.isnan(est_yaw):
                 self.latest_head_state_pos_deg = est_yaw
-                self.runtime.update_estimated_feedback(est_yaw, vel, timestamp=t, source="/head/state:estimated")
+                self.runtime.update_estimated_feedback(est_yaw, vel, timestamp=t, source="/head/state:virtual")
         elif pos_source == "UNKNOWN":
             self._head_state_received = True
             self.runtime.mark_head_feedback_unknown(timestamp=t, source="/head/state:unknown")
@@ -1089,22 +1089,13 @@ class StandaloneGazeRosNode(Node):
         elif robot_is_speaking:
             self.localizer.reset()
 
-        # Open-loop head motion model: 20 deg/s slew rate (matches standalone/track.py 1:1 and firmware HEAD_MAX_VEL_DEG_S)
-        dt_yaw = max(0.001, min(0.1, arrival_ts - getattr(self, "_last_yaw_update_time", arrival_ts)))
-        self._last_yaw_update_time = arrival_ts
-        diff_yaw = self.last_published_yaw - getattr(self, "_estimated_head_yaw", 0.0)
-        max_step_deg = 20.0 * dt_yaw
-        if abs(diff_yaw) <= max_step_deg:
-            self._estimated_head_yaw = self.last_published_yaw
-        else:
-            self._estimated_head_yaw = getattr(self, "_estimated_head_yaw", 0.0) + (max_step_deg if diff_yaw > 0 else -max_step_deg)
-
+        # Head position authority resolved centrally by HeadStateManager / GazeRuntime
         if self.runtime.has_head_feedback and self.runtime.actual_head_yaw_deg is not None:
             est_head = None
         elif getattr(self.runtime, "estimated_head_yaw_deg", None) is not None:
             est_head = self.runtime.estimated_head_yaw_deg
         else:
-            est_head = self._estimated_head_yaw
+            est_head = 0.0
 
         t_step_start = time.monotonic()
         # GazeTracker.step() call strictly receives doa_deg=None and speech=None.
