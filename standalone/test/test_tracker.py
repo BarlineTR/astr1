@@ -105,11 +105,15 @@ class TestTheHeadEstimateWithoutAnEncoder(unittest.TestCase):
 
     def test_the_estimate_follows_the_command_instead_of_sitting_at_zero(self):
         tracker = GazeTracker()
-        for i in range(400):
-            tracker.step(faces=[_face_at(0.05)], frame_size=FRAME, doa_deg=None,
-                         measured_head_deg=None, timestamp=100.0 + i * 0.02)
+        res = None
+        for i in range(100):
+            res = tracker.step(faces=[_face_at(0.05)], frame_size=FRAME, doa_deg=None,
+                               measured_head_deg=None, timestamp=100.0 + i * 0.02)
 
-        self.assertGreater(tracker.head_angle_deg, 5.0)
+        self.assertIsNone(tracker.head_angle_deg)
+        self.assertEqual(res.position_source, "UNKNOWN")
+        self.assertTrue(res.is_relative_correction)
+
 
     def test_a_real_reading_takes_over_from_the_estimate(self):
         tracker = GazeTracker()

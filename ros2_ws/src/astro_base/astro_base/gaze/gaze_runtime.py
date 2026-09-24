@@ -105,9 +105,7 @@ class GazeRuntimeCore:
         self.has_head_feedback = False
         self.last_feedback_time = t
         self.head_feedback_source = str(source)
-        # Tracker uses estimated angle for perception transformations (body_yaw = head_angle + cam_azimuth)
-        # but head_feedback_missing remains True so motion planner knows physical encoder is absent.
-        self.tracker.head_angle_deg = float(estimated_deg)
+        # Invariant: Tracker does NOT inject software estimate into physical perception transforms.
         self.tracker.head_velocity_deg_s = float(velocity_deg_s)
         self.tracker.head_feedback_missing = True
 
@@ -125,6 +123,7 @@ class GazeRuntimeCore:
         self.estimated_head_yaw_deg = None
         self.head_feedback_source = str(source)
         self.tracker.head_feedback_missing = True
+        self.tracker.head_angle_deg = None
 
     def get_head_position_at(self, timestamp: float, max_window_s: float = 2.0) -> Tuple[float, float]:
         """Interpolates head (yaw_deg, velocity_deg_s) at a given historical timestamp.

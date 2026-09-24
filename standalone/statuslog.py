@@ -108,10 +108,11 @@ class StatusLog:
         state, owner, target = key
 
         wanted = float(result.target_yaw_deg)
-        actual = float(result.head_angle_deg)
+        actual = float(result.head_angle_deg) if result.head_angle_deg is not None else None
         # Hata, komut ile ölçülen açı arasındaki fark: buyuk ve inatci ise sorun
         # aktuatorde ya da seri hatta, algilamada degil.
-        error = wanted - actual
+        error = (wanted - actual) if actual is not None else None
+
 
         marker = ">" if changed else " "
         pose_label = "sabit" if fixed_head else "gercek" if head_feedback else "tahmin"

@@ -213,16 +213,20 @@ class CoordinateTransformer:
             body_yaw_deg (float) if return_source is False.
             (body_yaw_deg, source) if return_source is True.
             source is 'ENCODER' or 'UNKNOWN'.
-            Invariant: estimated_head_yaw is NEVER used as a physical optical transform reference.
-            In open-loop (actual_head_yaw_deg is None), fixation_baseline_yaw_deg (static committed pose)
-            is used to prevent integrator drift and runaway.
+
+        INVARIANTS:
+        1. When actual_head_yaw_deg is valid (ENCODER authority), physical body yaw is:
+           wrap_deg(actual_head_yaw_deg + cam_azimuth_deg).
+        2. When actual_head_yaw_deg is None (UNKNOWN mode), physical head position is unknown.
+           cam_azimuth_deg represents a relative optical angle from boresight (0.0).
+           estimated_head_yaw_deg and virtual targets are NEVER accumulated into this transform.
         """
         if actual_head_yaw_deg is not None and not math.isnan(actual_head_yaw_deg):
             yaw = wrap_deg(float(actual_head_yaw_deg) + cam_azimuth_deg)
             source = "ENCODER"
         else:
-            base_yaw = float(fixation_baseline_yaw_deg) if fixation_baseline_yaw_deg is not None and not math.isnan(fixation_baseline_yaw_deg) else 0.0
-            yaw = wrap_deg(base_yaw + cam_azimuth_deg)
+            # Optical reference only (boresight = 0.0), not physical head angle
+            yaw = wrap_deg(cam_azimuth_deg)
             source = "UNKNOWN"
 
         if return_source:
@@ -242,14 +246,17 @@ class CoordinateTransformer:
         Returns:
             (x_base, y_base, z_base) if return_source is False.
             ((x_base, y_base, z_base), source) if return_source is True.
-            Invariant: In open loop, uses static fixation_baseline_yaw_deg, completely decoupled
-            from estimated_head_yaw.
+
+        INVARIANTS:
+        When actual_head_yaw_deg is None, theta is fixed at 0.0 (optical reference only,
+        not physical head angle), completely decoupled from software estimates.
         """
         if actual_head_yaw_deg is not None and not math.isnan(actual_head_yaw_deg):
             theta = float(actual_head_yaw_deg)
             source = "ENCODER"
         else:
-            theta = float(fixation_baseline_yaw_deg) if fixation_baseline_yaw_deg is not None and not math.isnan(fixation_baseline_yaw_deg) else 0.0
+            # Optical reference only (boresight = 0.0), not physical head angle
+            theta = 0.0
             source = "UNKNOWN"
 
         x_opt, y_opt, z_opt = pos_3d_cam

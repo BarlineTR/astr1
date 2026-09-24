@@ -54,7 +54,7 @@ class GazeResult:
     owner: PrioritySource
     target_id: Optional[str]
     confidence: float
-    head_angle_deg: float
+    head_angle_deg: Optional[float] = None
     face_bearings_deg: Tuple[float, ...] = ()
     command_source: str = "VISUAL"
     target_source: str = "CAMERA"
@@ -65,6 +65,11 @@ class GazeResult:
     head_feedback_age_ms: float = 0.0
     head_feedback_source: str = "NONE"
     desired_body_yaw_deg: float = 0.0
+    relative_head_correction_deg: Optional[float] = None
+    is_relative_correction: bool = False
+    actual_head_yaw_deg: Optional[float] = None
+    position_source: str = "UNKNOWN"
+
 
 
 # A detection whose publisher reports no confidence: over the target manager's 0.40
@@ -123,7 +128,7 @@ class GazeTracker:
             max_limit_deg=self.calib.head.max_angle_deg,
         )
 
-        self.head_angle_deg: float = 0.0
+        self.head_angle_deg: Optional[float] = None
         self.head_velocity_deg_s: float = 0.0
         self.head_feedback_missing: bool = True
         self._last_head_time: Optional[float] = None
@@ -160,22 +165,21 @@ class GazeTracker:
             new_angle = float(measured_head_deg)
             if self._last_head_time is not None and timestamp > self._last_head_time:
                 dt = timestamp - self._last_head_time
-                self.head_velocity_deg_s = (new_angle - self.head_angle_deg) / dt
+                prev_angle = self.head_angle_deg if self.head_angle_deg is not None else new_angle
+                self.head_velocity_deg_s = (new_angle - prev_angle) / dt
             else:
                 self.head_velocity_deg_s = 0.0
             self.head_angle_deg = new_angle
             self.head_feedback_missing = False
             self._last_head_time = timestamp
             actual_head = self.head_angle_deg
-            estimated_head = None
+            pos_source = "ENCODER"
         else:
             self.head_feedback_missing = True
+            self.head_velocity_deg_s = 0.0
             actual_head = None
-            if estimated_head_deg is not None:
-                self.head_angle_deg = float(estimated_head_deg)
-                estimated_head = self.head_angle_deg
-            else:
-                estimated_head = self.head_angle_deg
+            self.head_angle_deg = None
+            pos_source = "UNKNOWN"
 
         if doa_deg is not None and speech is not None and speech.is_speech:
             self._ingest_audio(doa_deg, timestamp, float(speech.confidence),
@@ -186,8 +190,8 @@ class GazeTracker:
             frame_size,
             timestamp,
             actual_head=actual_head,
-            estimated_head=estimated_head,
-            fixation_baseline=self.fsm.fixation_baseline_yaw_deg,
+            estimated_head=None,
+            fixation_baseline=0.0,
         )
 
         fused = self.fusion.fuse(self._latest_audio, self._latest_tracks, timestamp)
@@ -198,7 +202,7 @@ class GazeTracker:
             actual_head_yaw_deg=actual_head,
             timestamp=timestamp,
             actual_head_vel_deg_s=self.head_velocity_deg_s,
-            estimated_head_yaw_deg=estimated_head,
+            estimated_head_yaw_deg=None,
         )
 
         if command.gaze_state == GazeStateEnum.IDLE:
@@ -221,8 +225,13 @@ class GazeTracker:
             confidence=float(command.confidence),
             head_angle_deg=self.head_angle_deg,
             face_bearings_deg=tuple(t.body_azimuth_deg for t in self._latest_tracks),
-            desired_body_yaw_deg=getattr(command, "desired_body_yaw_deg", clamped_target_yaw),
+            desired_body_yaw_deg=getattr(command, "desired_body_yaw_deg", 0.0 if actual_head is None else clamped_target_yaw),
+            relative_head_correction_deg=command.relative_head_correction_deg,
+            is_relative_correction=command.is_relative_correction,
+            actual_head_yaw_deg=actual_head,
+            position_source=pos_source,
         )
+
 
     def _ingest_audio(self, doa_deg: float, timestamp: float, confidence: float,
                       is_robot_speaking: bool = False) -> None:

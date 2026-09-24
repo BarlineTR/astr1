@@ -21,6 +21,59 @@ from dataclasses import dataclass
 from typing import Optional
 
 
+class UnknownModeActuatorAdapter:
+    """Adapts visual tracking relative corrections for the firmware's absolute actuator API.
+
+    FIRMWARE ACTUATOR CONTRACT:
+    The Arduino firmware's HEAD_CMD (0x03) accepts an absolute angle setpoint in degrees
+    relative to its boot reference zero:
+        e(t) = target_deg * ticks_per_deg - current_ticks
+    
+    When ENCODER is available (has_encoder=True):
+        The tracking pipeline computes an absolute spatial target in robot body coordinates:
+            target_yaw_deg = actual_head_yaw_deg + camera_bearing_deg
+        The adapter outputs this absolute target directly (clamped to safety limits).
+
+    When ENCODER is UNKNOWN (has_encoder=False):
+        The physical head pose is unknown (actual_head_yaw_deg = None, position_source = UNKNOWN).
+        The camera bearing represents a relative head correction (relative_head_correction_deg).
+        In open-loop operation without encoder feedback, the firmware's error proportional to
+        relative_head_correction_deg acts as a direct visual servoing proportional drive:
+            actuator_command_deg = relative_head_correction_deg
+        The adapter converts this relative visual correction into the actuator setpoint WITHOUT
+        accumulating open-loop integrator state, preventing virtual feedback runaway.
+    """
+
+    def __init__(self, min_limit_deg: float = -75.0, max_limit_deg: float = 75.0):
+        self.min_limit_deg = min_limit_deg
+        self.max_limit_deg = max_limit_deg
+
+    def adapt(
+        self,
+        target_yaw_deg: float,
+        relative_head_correction_deg: Optional[float] = None,
+        is_relative_correction: bool = False,
+        has_encoder: bool = False,
+    ) -> float:
+        """Translates high-level tracking targets to clamped actuator command for send_angle().
+
+        Parameters:
+            target_yaw_deg: High-level target angle (absolute or nominal).
+            relative_head_correction_deg: Visual relative correction from camera optical bearing.
+            is_relative_correction: Flag indicating if the mode is relative visual correction.
+            has_encoder: True if authoritative physical encoder feedback is valid.
+
+        Returns:
+            Clamped actuator command in degrees for send_angle().
+        """
+        if not has_encoder and is_relative_correction and relative_head_correction_deg is not None:
+            cmd = float(relative_head_correction_deg)
+        else:
+            cmd = float(target_yaw_deg)
+        return max(self.min_limit_deg, min(self.max_limit_deg, cmd))
+
+
+
 class PositionSource(str, Enum):
     """Authority source for head position."""
     ENCODER = "ENCODER"                  # Physical hardware encoder feedback

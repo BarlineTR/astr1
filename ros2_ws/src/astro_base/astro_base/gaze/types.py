@@ -311,6 +311,9 @@ class GazeCommand:
     confidence: float = 0.0
     timestamp: float = 0.0
     desired_body_yaw_deg: float = 0.0
+    relative_head_correction_deg: Optional[float] = None
+    is_relative_correction: bool = False
+
 
 
 @dataclass

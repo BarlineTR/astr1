@@ -39,8 +39,8 @@ from astro_base.gaze.attention_arbiter import AttentionArbiterCore
 from astro_base.gaze.coordinate_frames import CalibrationConfig, CoordinateTransformer
 from astro_base.gaze.gaze_runtime import GazeRuntimeCore
 from astro_base.gaze.gaze_state_machine import SocialGazeFSM
-from astro_base.gaze.head_controller import HeadControllerCore
-from astro_base.gaze.head_state import HeadStateManager, PositionSource
+from astro_base.gaze.head_state import HeadStateManager, PositionSource, UnknownModeActuatorAdapter
+
 from astro_base.gaze.motion_planner import MotionPlannerCore
 from astro_base.gaze.sensor_fusion import AudioVisualFusionCore
 from astro_base.gaze.target_manager import TargetManagerCore
@@ -125,9 +125,8 @@ class TestGazeVisualTrackingE2E(unittest.TestCase):
         self.assertEqual(result.owner, PrioritySource.VISUAL_TRACKING)
 
     def test_scenario_c_bearing_0_estimated_pos30(self):
-        """Test C: Camera bearing 0°, fixation_baseline +30° -> target ≈ +30° (Real chain)."""
+        """Test C: Camera bearing 0° with UNKNOWN encoder yields relative correction ≈ 0.0°."""
         tracker = GazeTracker(calibration=self.calib)
-        tracker.fsm.fixation_baseline_yaw_deg = 30.0
         det = Detection(x=280, y=200, w=80, h=80, confidence=0.88)
         now = 1000.0
         result = tracker.step(
@@ -138,25 +137,28 @@ class TestGazeVisualTrackingE2E(unittest.TestCase):
             timestamp=now,
             estimated_head_deg=30.0,
         )
-        self.assertAlmostEqual(result.target_yaw_deg, 30.0, delta=1.5)
+        self.assertAlmostEqual(result.target_yaw_deg, 0.0, delta=1.5)
+        self.assertTrue(result.is_relative_correction)
+        self.assertEqual(result.position_source, "UNKNOWN")
         self.assertEqual(result.owner, PrioritySource.VISUAL_TRACKING)
 
     def test_scenario_d_bearing_0_estimated_neg30(self):
-        """Test D: Camera bearing 0°, fixation_baseline -30° -> target ≈ -30° (Real chain)."""
+        """Test D: Camera bearing 0° with real encoder at -30° yields absolute target ≈ -30°."""
         tracker = GazeTracker(calibration=self.calib)
-        tracker.fsm.fixation_baseline_yaw_deg = -30.0
         det = Detection(x=280, y=200, w=80, h=80, confidence=0.88)
         now = 1000.0
         result = tracker.step(
             faces=[det],
             frame_size=(640, 480),
             doa_deg=None,
-            measured_head_deg=None,
+            measured_head_deg=-30.0,
             timestamp=now,
-            estimated_head_deg=-30.0,
         )
         self.assertAlmostEqual(result.target_yaw_deg, -30.0, delta=1.5)
+        self.assertFalse(result.is_relative_correction)
+        self.assertEqual(result.position_source, "ENCODER")
         self.assertEqual(result.owner, PrioritySource.VISUAL_TRACKING)
+
 
     def test_decoupling_proof_constant_phi_cam_varying_estimated_yaw(self):
         """Decoupling Proof: With constant phi_cam = -35°, varying estimated_head_yaw wildly does NOT alter target_yaw."""
@@ -182,8 +184,9 @@ class TestGazeVisualTrackingE2E(unittest.TestCase):
             )
             if initial_target is None:
                 initial_target = result.target_yaw_deg
-                # Baseline = 60°, pinhole bearing ≈ -29.8° -> target ≈ 30.2°
-                self.assertAlmostEqual(initial_target, 30.2, delta=1.5)
+                # Optical bearing ≈ -29.8°
+                self.assertAlmostEqual(initial_target, -29.8, delta=1.5)
+
             # Decoupling proof: target must stay strictly locked regardless of estimated_head_deg
             self.assertAlmostEqual(
                 result.target_yaw_deg, initial_target, delta=0.5,
@@ -250,18 +253,19 @@ class TestGazeVisualTrackingE2E(unittest.TestCase):
         tracker.step(faces=[det_centered], frame_size=(640, 480), doa_deg=None, measured_head_deg=None, timestamp=now + 0.12)
         self.assertEqual(tracker.fsm.fixation_baseline_yaw_deg, 0.0)
 
-        # Frame 5 (optical center count = 3): arrival confirmed -> baseline promoted!
+        # Frame 5 (optical center count = 3): arrival confirmed -> gaze state transitions to HOLDING_ATTENTION
         res5 = tracker.step(faces=[det_centered], frame_size=(640, 480), doa_deg=None, measured_head_deg=None, timestamp=now + 0.16)
-        self.assertAlmostEqual(tracker.fsm.fixation_baseline_yaw_deg, expected_yaw, delta=2.0)
+        # Invariant: baseline is optical reference (0.0), never polluted with virtual targets
+        self.assertEqual(tracker.fsm.fixation_baseline_yaw_deg, 0.0)
         self.assertEqual(res5.gaze_state, GazeStateEnum.HOLDING_ATTENTION)
 
     def test_unknown_to_encoder_handoff_zero_jump(self):
-        """Handoff from UNKNOWN to ENCODER mode: zero discontinuous jump in target yaw."""
+        """Handoff from UNKNOWN to ENCODER mode: adapter maps relative correction to actuator command seamlessly."""
         tracker = GazeTracker(calibration=self.calib)
-        tracker.fsm.fixation_baseline_yaw_deg = 25.0
+        adapter = UnknownModeActuatorAdapter()
         now = 1000.0
 
-        # Person centered at baseline +25.0° in open-loop
+        # Person centered in open-loop
         det_centered = Detection(x=280, y=200, w=80, h=80, confidence=0.88)
         res_unknown = tracker.step(
             faces=[det_centered],
@@ -270,19 +274,32 @@ class TestGazeVisualTrackingE2E(unittest.TestCase):
             measured_head_deg=None,
             timestamp=now,
         )
+        cmd_unknown = adapter.adapt(
+            target_yaw_deg=res_unknown.target_yaw_deg,
+            relative_head_correction_deg=res_unknown.relative_head_correction_deg,
+            is_relative_correction=res_unknown.is_relative_correction,
+            has_encoder=False,
+        )
+        self.assertAlmostEqual(cmd_unknown, 0.0, delta=1.0)
 
-        # Encoder comes online reporting 25.0°
+        # Encoder comes online reporting 0.0°
         res_encoder = tracker.step(
             faces=[det_centered],
             frame_size=(640, 480),
             doa_deg=None,
-            measured_head_deg=25.0,
+            measured_head_deg=0.0,
             timestamp=now + 0.04,
         )
-
-        # Target yaw should have virtually zero jump (|delta| <= 1.0°)
-        jump = abs(res_encoder.target_yaw_deg - res_unknown.target_yaw_deg)
+        cmd_encoder = adapter.adapt(
+            target_yaw_deg=res_encoder.target_yaw_deg,
+            relative_head_correction_deg=res_encoder.relative_head_correction_deg,
+            is_relative_correction=res_encoder.is_relative_correction,
+            has_encoder=True,
+        )
+        # Actuator command should have virtually zero jump (|delta| <= 1.0°)
+        jump = abs(cmd_encoder - cmd_unknown)
         self.assertLessEqual(jump, 1.0)
+
 
     # -------------------------------------------------------------------------
     # Behavior Contract Scenarios E and F: Trajectory & Anomaly Tests
@@ -399,34 +416,34 @@ class TestGazeVisualTrackingE2E(unittest.TestCase):
     # Scenario 3: No Return-to-Zero Bounce
     # -------------------------------------------------------------------------
     def test_scenario_3_no_return_to_zero_bounce(self):
-        """When head is at baseline +30° and person is centered (cam_az=0°), target_yaw stays at +30°."""
+        """When encoder is at +30° and person is centered (cam_az=0°), target_yaw stays at +30°."""
         now = 300.0
-        # Head fixation baseline is at +30° (open-loop baseline)
-        baseline = 30.0
+        # Encoder is at +30°
+        encoder_head = 30.0
 
         # Person is centered in camera (x=270, w=100 -> center_u=320 -> cam_azimuth = 0.0°)
         obs = self.perception.process_detection(
             x=270, y=190, w=100, h=100, depth_m=1.5,
             timestamp=now,
-            actual_head_yaw_deg=None,
-            fixation_baseline_yaw_deg=baseline,
+            actual_head_yaw_deg=encoder_head,
             frame_width=640, frame_height=480,
             confidence=0.88,
         )
-        self.assertEqual(obs.body_yaw_source, "UNKNOWN")
+        self.assertEqual(obs.body_yaw_source, "ENCODER")
         self.assertAlmostEqual(obs.body_azimuth_deg, 30.0, places=0)
 
-        tracks = self.tracker.update([obs], now, fixation_baseline_yaw_deg=baseline)
+        tracks = self.tracker.update([obs], now, actual_head_yaw_deg=encoder_head)
         self.assertAlmostEqual(tracks[0].body_azimuth_deg, 30.0, places=0)
-        self.assertEqual(tracks[0].body_yaw_source, "UNKNOWN")
+        self.assertEqual(tracks[0].body_yaw_source, "ENCODER")
 
         fused = self.fusion.fuse(audio_state=None, visual_tracks=tracks, timestamp=now)
         t_state = self.target_mgr.update(fused, now)
-        decision = self.arbiter.arbitrate(t_state, timestamp=now)
+        decision = self.arbiter.arbitrate(t_state, actual_head_yaw_deg=encoder_head, timestamp=now)
 
         # The target yaw must stay around +30.0°, NOT bounce back to 0.0°!
         self.assertAlmostEqual(decision.target_yaw_deg, 30.0, places=0)
         self.assertNotAlmostEqual(decision.target_yaw_deg, 0.0, places=1)
+
 
     # -------------------------------------------------------------------------
     # Scenario 4: Single-Frame Dropout Immunity

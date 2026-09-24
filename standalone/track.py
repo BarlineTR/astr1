@@ -36,7 +36,7 @@ from head_link import HeadLink, open_port  # noqa: E402
 from recorder import OverlayRecorder, default_path  # noqa: E402
 from sources import AudioSource, CameraSource  # noqa: E402
 from astro_base.gaze.types import GazeStateEnum, PrioritySource  # noqa: E402
-from astro_base.gaze.head_state import PositionSource  # noqa: E402
+from astro_base.gaze.head_state import PositionSource, UnknownModeActuatorAdapter  # noqa: E402
 from stereo_doa import DEFAULT_MIC_SPACING_M  # noqa: E402
 from statuslog import StatusLog  # noqa: E402
 from tracker import GazeTracker  # noqa: E402
@@ -61,12 +61,14 @@ def draw_overlay(frame, detections, result, fps: float, audio_ok: bool, head_ok:
     band = 60
     cv2.rectangle(frame, (0, height - band), (width, height), (0, 0, 0), -1)
     pose_label = "sabit" if fixed_head else "gercek" if head_ok else "tahmin"
+    pose_val_str = f"{result.head_angle_deg:+.1f}" if (result.head_angle_deg is not None and not math.isnan(result.head_angle_deg)) else "None"
     lines = (
         f"{result.gaze_state.value}  owner={result.owner.value}  "
         f"hedef={result.target_id or '-'}  conf={result.confidence:.2f}",
-        f"istenen {result.target_yaw_deg:+.1f}  ->  {pose_label} {result.head_angle_deg:+.1f}"
+        f"istenen {result.target_yaw_deg:+.1f}  ->  {pose_label} {pose_val_str}"
         f"   [{fps:.0f} fps  ses:{'V' if audio_ok else 'X'}  kafa:{'V' if head_ok else 'X'}]",
     )
+
     for i, text in enumerate(lines):
         cv2.putText(frame, text, (8, height - band + 24 + i * 26),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.52, TEXT_COLOUR, 1, cv2.LINE_AA)
@@ -205,6 +207,7 @@ def main(argv=None, hid=None) -> int:
     last_audio_log_yaw: Optional[float] = None
     last_visual_target_id: Optional[str] = None
     motor_yaw: float = 0.0
+    actuator_adapter = UnknownModeActuatorAdapter(min_limit_deg=-75.0, max_limit_deg=75.0)
     encoder_stall_start: Optional[float] = None
     encoder_fault_warned: bool = False
 
@@ -246,25 +249,22 @@ def main(argv=None, hid=None) -> int:
             hstate = head.state_mgr.evaluate(timestamp=now)
             if opts.fixed_head:
                 meas_head = None
-                est_head = 0.0
+                est_head = None
                 head_feedback_active = False
             elif opts.open_loop:
                 meas_head = None
-                est_head = hstate.estimated_yaw_deg if hstate.estimated_yaw_deg is not None else 0.0
+                est_head = None
                 head_feedback_active = False
             elif hstate.position_source == PositionSource.ENCODER and hstate.actual_yaw_deg is not None:
                 meas_head = hstate.actual_yaw_deg
                 est_head = None
                 head_feedback_active = True
-            elif hstate.position_source in (PositionSource.VIRTUAL_ENCODER, PositionSource.ESTIMATED) and hstate.estimated_yaw_deg is not None:
-                meas_head = None
-                est_head = hstate.estimated_yaw_deg
-                head_feedback_active = False
             else:
-                # UNKNOWN: position is not known; do NOT assume 0.0 as measured
+                # UNKNOWN: position is not known; do NOT assume 0.0 as measured, and do NOT inject estimate
                 meas_head = None
-                est_head = hstate.estimated_yaw_deg
+                est_head = None
                 head_feedback_active = False
+
 
             # GazeTracker.step() çağrısına DOA beslenmez (doa_deg=None).
             # Böylece eski continuous tracker DOA açılarının (-21.2, -36.9, -59.4 vb.)
@@ -307,7 +307,13 @@ def main(argv=None, hid=None) -> int:
             if vision_active:
                 localizer.on_vision_active()
                 target_yaw = result.target_yaw_deg
-                motor_yaw = target_yaw
+                has_enc = (hstate.position_source == PositionSource.ENCODER and hstate.actual_yaw_deg is not None)
+                motor_yaw = actuator_adapter.adapt(
+                    target_yaw_deg=target_yaw,
+                    relative_head_correction_deg=getattr(result, "relative_head_correction_deg", None),
+                    is_relative_correction=getattr(result, "is_relative_correction", False),
+                    has_encoder=has_enc,
+                )
                 last_audio_log_yaw = None
                 if result.target_id:
                     last_visual_target_id = result.target_id
