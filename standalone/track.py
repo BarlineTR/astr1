@@ -347,6 +347,42 @@ def main(argv=None, hid=None) -> int:
             head.send_angle(clamped_motor_yaw)
             head.tick(now)
 
+            if vision_active:
+                cam_bearing = None
+                if detections:
+                    cx = float(detections[0].x + (detections[0].w / 2.0))
+                    cy = float(detections[0].y + (detections[0].h / 2.0))
+                    cam_az, _ = tracker.transformer.camera_pixel_to_optical_angles(
+                        cx, cy, frame.shape[1], frame.shape[0]
+                    )
+                    cam_bearing = round(float(cam_az), 2)
+                elif getattr(tracker, "_latest_tracks", None) and len(tracker._latest_tracks) > 0:
+                    cam_bearing = round(float(tracker._latest_tracks[0].camera_bearing_deg), 2)
+
+                if hstate.position_source == PositionSource.ENCODER and hstate.actual_yaw_deg is not None:
+                    pos_src = "ENCODER"
+                    enc_actual = round(float(hstate.actual_yaw_deg), 2)
+                else:
+                    pos_src = "UNKNOWN"
+                    enc_actual = None
+
+                canon_yaw = (
+                    round(float(hstate.canonical_yaw_deg), 2)
+                    if hstate.canonical_yaw_deg is not None
+                    else None
+                )
+
+                print(
+                    f"[VISUAL_TELEMETRY] "
+                    f"target_id={result.target_id} "
+                    f"camera_bearing_deg={cam_bearing} "
+                    f"canonical_head_yaw_deg={canon_yaw} "
+                    f"target_yaw_deg={round(float(target_yaw), 2)} "
+                    f"serial_command_deg={round(float(clamped_motor_yaw), 2)} "
+                    f"position_source={pos_src} "
+                    f"encoder_actual_deg={enc_actual}"
+                )
+
             frames += 1
             if now - last_fps_at >= 1.0:
                 fps = (frames - last_fps_frames) / (now - last_fps_at)
