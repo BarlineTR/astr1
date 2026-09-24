@@ -18,7 +18,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional, Sequence, Tuple
 
-import core_path  # noqa: F401
 from astro_base.gaze.audio_filter import AudioFilterCore  # noqa: E402
 from astro_base.gaze.audio_perception import AudioPerceptionCore  # noqa: E402
 from astro_base.gaze.coordinate_frames import (  # noqa: E402

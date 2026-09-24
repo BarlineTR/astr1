@@ -25,7 +25,7 @@ from astro_audio.speech_detector import MIN_BLOCK_S, SpeechDetector  # noqa: E40
 from stereo_doa import DEFAULT_MIC_SPACING_M, StereoDOA  # noqa: E402
 from astro_vision.detection_quality import create_face_detector  # noqa: E402
 
-from tracker import Detection  # noqa: E402
+from astro_base.gaze.tracker import Detection  # noqa: E402
 
 SAMPLE_RATE = 16000
 BLOCK_SAMPLES = 1024

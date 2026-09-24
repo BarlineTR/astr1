@@ -12,7 +12,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import track
-from tracker import Detection
+from astro_base.gaze.tracker import Detection
 
 
 class _SabitKamera:
@@ -360,7 +360,7 @@ def test_valid_workspace_saturation():
 # 11. eski continuous tracker target_yaw değerleri asla dışarı sızmıyor
 def test_continuous_tracker_angles_never_leak():
     from track import ReSpeakerAudioLocalizer
-    from tracker import GazeTracker, PrioritySource
+    from astro_base.gaze.tracker import GazeTracker, PrioritySource
 
     tracker = GazeTracker()
     loc = ReSpeakerAudioLocalizer()
@@ -384,7 +384,7 @@ def test_continuous_tracker_angles_never_leak():
 # 12. audio target tek authoritative kaynak
 def test_audio_target_sole_authoritative_source():
     from track import ReSpeakerAudioLocalizer
-    from tracker import GazeResult, PrioritySource, GazeStateEnum, Detection
+    from astro_base.gaze.tracker import GazeResult, PrioritySource, GazeStateEnum, Detection
 
     loc = ReSpeakerAudioLocalizer(hold_timeout_s=1.2)
 

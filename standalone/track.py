@@ -39,7 +39,7 @@ from astro_base.gaze.types import GazeStateEnum, PrioritySource  # noqa: E402
 from astro_base.gaze.head_state import PositionSource  # noqa: E402
 from stereo_doa import DEFAULT_MIC_SPACING_M  # noqa: E402
 from statuslog import StatusLog  # noqa: E402
-from tracker import GazeTracker  # noqa: E402
+from astro_base.gaze.tracker import GazeTracker  # noqa: E402
 
 BOX_COLOUR = (0, 215, 255)
 TEXT_COLOUR = (0, 255, 120)
