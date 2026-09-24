@@ -315,6 +315,7 @@ def main(argv=None, hid=None) -> int:
                 and last_visual_detection_time is not None
                 and (now - last_visual_detection_time) < VISUAL_COAST_TIMEOUT_S
                 and result.gaze_state not in (GazeStateEnum.TARGET_LOST, GazeStateEnum.RECOVERING, GazeStateEnum.IDLE)
+                and getattr(result, "relative_head_correction_deg", None) is not None
             )
 
             if vision_active and (len(detections) > 0 or is_coasting):

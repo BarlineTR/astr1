@@ -132,11 +132,11 @@ class TestHeadLink(unittest.TestCase):
         self.assertIn(MSG_HEAD_CMD, msg_ids)
 
     def test_the_encoder_reading_becomes_the_measured_angle(self):
-        link = HeadLink(port=_FakePort(_encoder_packet(259)))
+        link = HeadLink(port=_FakePort(_encoder_packet(120)))
 
         link.poll()
 
-        self.assertAlmostEqual(link.measured_angle_deg, round(259 / TICKS_PER_DEG, 2), places=2)
+        self.assertAlmostEqual(link.measured_angle_deg, round(120 / TICKS_PER_DEG, 2), places=2)
         self.assertTrue(link.has_feedback)
 
     def test_a_link_that_has_heard_nothing_admits_it(self):

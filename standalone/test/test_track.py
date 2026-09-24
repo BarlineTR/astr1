@@ -153,11 +153,11 @@ def test_sector_first_detection_immediate():
     from track import ReSpeakerAudioLocalizer
     loc = ReSpeakerAudioLocalizer()
 
-    # DOA 32 → LEFT sector → target +60 (robot's physical right)
+    # DOA 32 → LEFT sector → target +35 (robot's physical right)
     loc.update(doa_raw=32.0, voice_activity=True, timestamp=1.0)
     assert loc.is_tracking()
     assert loc.confirmed_sector == "LEFT"
-    assert loc.target_yaw_deg == 60.0
+    assert loc.target_yaw_deg == loc.SECTOR_TARGETS["LEFT"]
 
 
 def test_sector_center_first_detection():
@@ -165,7 +165,7 @@ def test_sector_center_first_detection():
     loc = ReSpeakerAudioLocalizer()
     loc.update(doa_raw=78.0, voice_activity=True, timestamp=1.0)
     assert loc.confirmed_sector == "CENTER"
-    assert loc.target_yaw_deg == 0.0
+    assert loc.target_yaw_deg == loc.SECTOR_TARGETS["CENTER"]
 
 
 def test_sector_right_first_detection():
@@ -173,7 +173,7 @@ def test_sector_right_first_detection():
     loc = ReSpeakerAudioLocalizer()
     loc.update(doa_raw=142.0, voice_activity=True, timestamp=1.0)
     assert loc.confirmed_sector == "RIGHT"
-    assert loc.target_yaw_deg == -60.0
+    assert loc.target_yaw_deg == loc.SECTOR_TARGETS["RIGHT"]
 
 
 def test_sector_same_sector_no_jitter():
@@ -181,12 +181,12 @@ def test_sector_same_sector_no_jitter():
     from track import ReSpeakerAudioLocalizer
     loc = ReSpeakerAudioLocalizer()
     loc.update(doa_raw=32.0, voice_activity=True, timestamp=1.0)
-    assert loc.target_yaw_deg == 60.0
+    assert loc.target_yaw_deg == loc.SECTOR_TARGETS["LEFT"]
 
     # Different DOA values but same LEFT sector
     for i, doa in enumerate([25.0, 40.0, 35.0, 50.0, 30.0]):
         loc.update(doa_raw=doa, voice_activity=True, timestamp=1.1 + i * 0.05)
-        assert loc.target_yaw_deg == 60.0
+        assert loc.target_yaw_deg == loc.SECTOR_TARGETS["LEFT"]
         assert loc.confirmed_sector == "LEFT"
 
 
@@ -202,12 +202,12 @@ def test_sector_switch_requires_confirmation():
     # Single reading in RIGHT while tracking LEFT → does NOT switch (needs 2)
     loc.update(doa_raw=142.0, voice_activity=True, timestamp=1.1)
     assert loc.confirmed_sector == "LEFT"
-    assert loc.target_yaw_deg == 60.0
+    assert loc.target_yaw_deg == loc.SECTOR_TARGETS["LEFT"]
 
     # Second reading in RIGHT → NOW it switches (count = 2)
     loc.update(doa_raw=142.0, voice_activity=True, timestamp=1.2)
     assert loc.confirmed_sector == "RIGHT"
-    assert loc.target_yaw_deg == -60.0
+    assert loc.target_yaw_deg == loc.SECTOR_TARGETS["RIGHT"]
 
 
 def test_sector_switch_interrupted_resets_count():
@@ -239,9 +239,9 @@ def test_sector_motor_yaw_matches_target():
     """motor_yaw_deg always equals target_yaw_deg."""
     from track import ReSpeakerAudioLocalizer
     for doa, expected_sector, expected_target in [
-        (32.0, "LEFT", 60.0),
-        (78.0, "CENTER", 0.0),
-        (142.0, "RIGHT", -60.0),
+        (32.0, "LEFT", ReSpeakerAudioLocalizer.SECTOR_TARGETS["LEFT"]),
+        (78.0, "CENTER", ReSpeakerAudioLocalizer.SECTOR_TARGETS["CENTER"]),
+        (142.0, "RIGHT", ReSpeakerAudioLocalizer.SECTOR_TARGETS["RIGHT"]),
     ]:
         loc = ReSpeakerAudioLocalizer()
         loc.update(doa_raw=doa, voice_activity=True, timestamp=1.0)
@@ -269,15 +269,15 @@ def test_front_jitter_stays_in_center():
 def test_voice_activity_false_produces_no_new_target():
     from track import ReSpeakerAudioLocalizer
     loc = ReSpeakerAudioLocalizer(hold_timeout_s=1.2)
-    # Speech active at DOA 32 -> LEFT sector -> target +60.0 (robot's physical right)
+    # Speech active at DOA 32 -> LEFT sector -> target +35.0 (robot's physical right)
     loc.update(doa_raw=32.0, voice_activity=True, timestamp=1.0)
     assert loc.is_tracking() is True
-    assert loc.target_yaw_deg == 60.0
+    assert loc.target_yaw_deg == loc.SECTOR_TARGETS["LEFT"]
 
     # Speech inactive, new DOA 149 arrives -> target MUST NOT change
     loc.update(doa_raw=149.0, voice_activity=False, timestamp=1.5)
     assert loc.is_tracking() is True  # still holding within 1.2s timeout
-    assert loc.target_yaw_deg == 60.0
+    assert loc.target_yaw_deg == loc.SECTOR_TARGETS["LEFT"]
 
 
 # 9. VOICEACTIVITY tekrar true olduğunda DOA tracking devam ediyor
@@ -285,7 +285,7 @@ def test_tracking_resumes_when_voice_activity_returns():
     from track import ReSpeakerAudioLocalizer
     loc = ReSpeakerAudioLocalizer(hold_timeout_s=1.2)
     loc.update(doa_raw=32.0, voice_activity=True, timestamp=1.0)
-    assert loc.target_yaw_deg == 60.0
+    assert loc.target_yaw_deg == loc.SECTOR_TARGETS["LEFT"]
 
     # Hold timeout expires (1.5s > 1.2s)
     loc.update(doa_raw=None, voice_activity=False, timestamp=2.5)
@@ -295,7 +295,7 @@ def test_tracking_resumes_when_voice_activity_returns():
     # Speech resumes at same sector (LEFT, DOA 40) → immediate resume
     loc.update(doa_raw=40.0, voice_activity=True, timestamp=3.0)
     assert loc.is_tracking() is True
-    assert loc.target_yaw_deg == 60.0
+    assert loc.target_yaw_deg == loc.SECTOR_TARGETS["LEFT"]
     assert loc.confirmed_sector == "LEFT"
 
     # Speech resumes at DIFFERENT sector (RIGHT, DOA 142) while idle → immediate resume
@@ -304,7 +304,7 @@ def test_tracking_resumes_when_voice_activity_returns():
     assert loc.target_yaw_deg == 0.0
 
     loc.update(doa_raw=142.0, voice_activity=True, timestamp=5.1)
-    assert loc.target_yaw_deg == -60.0  # idle -> accepts immediately!
+    assert loc.target_yaw_deg == loc.SECTOR_TARGETS["RIGHT"]  # idle -> accepts immediately!
     assert loc.confirmed_sector == "RIGHT"
 
 
@@ -332,15 +332,15 @@ def test_invalid_doa_retains_valid_target_then_times_out():
     from track import ReSpeakerAudioLocalizer
     loc = ReSpeakerAudioLocalizer(hold_timeout_s=1.2)
 
-    # 1. Geçerli konuşma DOA 142 -> RIGHT sector -> hedef -60°
+    # 1. Geçerli konuşma DOA 142 -> RIGHT sector
     loc.update(doa_raw=142.0, voice_activity=True, timestamp=1.0)
     assert loc.is_tracking() is True
-    assert loc.target_yaw_deg == -60.0
+    assert loc.target_yaw_deg == loc.SECTOR_TARGETS["RIGHT"]
 
-    # 2. Arka/invalid DOA geldiğinde mevcut hedef -60° korunur
+    # 2. Arka/invalid DOA geldiğinde mevcut hedef korunur
     loc.update(doa_raw=300.0, voice_activity=True, timestamp=1.5)
     assert loc.is_tracking() is True
-    assert loc.target_yaw_deg == -60.0
+    assert loc.target_yaw_deg == loc.SECTOR_TARGETS["RIGHT"]
 
     # 3. Timeout dolduğunda hedef 0°'ye döner
     loc.update(doa_raw=300.0, voice_activity=True, timestamp=2.5)
@@ -378,7 +378,7 @@ def test_continuous_tracker_angles_never_leak():
 
     # Audio target comes exclusively from ReSpeakerAudioLocalizer (sector-based)
     loc.update(doa_raw=32.0, voice_activity=True, timestamp=10.0)
-    assert loc.target_yaw_deg == 60.0
+    assert loc.target_yaw_deg == loc.SECTOR_TARGETS["LEFT"]
 
 
 # 12. audio target tek authoritative kaynak
@@ -392,7 +392,7 @@ def test_audio_target_sole_authoritative_source():
     loc.update(doa_raw=32.0, voice_activity=True, timestamp=1.0)
     assert loc.is_tracking() is True
     target_yaw = loc.target_yaw_deg
-    assert target_yaw == 60.0
+    assert target_yaw == loc.SECTOR_TARGETS["LEFT"]
 
     # Step 2: Vision detected -> localizer drops audio tracking
     det = Detection(x=300, y=200, w=80, h=80, confidence=0.95)
@@ -453,8 +453,8 @@ def test_deadband_suppresses_small_changes():
 
 def test_mock_hid_voice_activity_and_doa_mapping():
     """Mock HID sector-based mapping:
-    - voice_activity() -> True, doa_angle() -> 142 => RIGHT sector, target -60
-    - voice_activity() -> True, doa_angle() -> 32  => LEFT sector, target +60
+    - voice_activity() -> True, doa_angle() -> 142 => RIGHT sector, target -35
+    - voice_activity() -> True, doa_angle() -> 32  => LEFT sector, target +35
     - voice_activity() -> False, doa_angle() -> 149 => target NOT changed
     """
     from track import ReSpeakerAudioLocalizer
@@ -462,12 +462,12 @@ def test_mock_hid_voice_activity_and_doa_mapping():
     mock_hid = MagicMock(spec=["voice_activity", "doa_angle"])
     localizer = ReSpeakerAudioLocalizer(hid=mock_hid, hold_timeout_s=1.2)
 
-    # 1. voice_activity() -> True, doa_angle() -> 142 => RIGHT sector, -60
+    # 1. voice_activity() -> True, doa_angle() -> 142 => RIGHT sector
     mock_hid.voice_activity.return_value = True
     mock_hid.doa_angle.return_value = 142.0
     target_1 = localizer.read_and_update(now=1.0)
     assert localizer.is_tracking() is True
-    assert target_1 == pytest.approx(-60.0, abs=1.0)
+    assert target_1 == pytest.approx(localizer.SECTOR_TARGETS["RIGHT"], abs=1.0)
     assert localizer.confirmed_sector == "RIGHT"
 
     # 2. voice_activity() -> True, doa_angle() -> 32 => LEFT sector
@@ -477,14 +477,14 @@ def test_mock_hid_voice_activity_and_doa_mapping():
     localizer.read_and_update(now=1.1)
     target_2 = localizer.read_and_update(now=1.2)
     assert localizer.is_tracking() is True
-    assert target_2 == pytest.approx(60.0, abs=1.0)
+    assert target_2 == pytest.approx(localizer.SECTOR_TARGETS["LEFT"], abs=1.0)
     assert localizer.confirmed_sector == "LEFT"
 
-    # 3. voice_activity() -> False => target stays at +60
+    # 3. voice_activity() -> False => target stays at LEFT
     mock_hid.voice_activity.return_value = False
     mock_hid.doa_angle.return_value = 149.0
     target_3 = localizer.read_and_update(now=1.5)
-    assert target_3 == pytest.approx(60.0, abs=1.0)
+    assert target_3 == pytest.approx(localizer.SECTOR_TARGETS["LEFT"], abs=1.0)
 
 
 def test_mock_hid_speech_detected_compatibility():
@@ -497,7 +497,7 @@ def test_mock_hid_speech_detected_compatibility():
 
     target = localizer.read_and_update(now=1.0)
     assert localizer.is_tracking() is True
-    assert target == pytest.approx(-60.0, abs=1.0)
+    assert target == pytest.approx(localizer.SECTOR_TARGETS["RIGHT"], abs=1.0)
 
 
 def test_hardware_vad_unreadable_disables_tracking():
@@ -579,32 +579,33 @@ def test_track_main_sends_sector_target_and_logs():
 
     assert mock_head.send_angle.called
     sent_angles = [call[0][0] for call in mock_head.send_angle.call_args_list]
-    assert any(pytest.approx(60.0, abs=1.0) == a for a in sent_angles)
-    assert "AUDIO sector=LEFT DOA=32 target=+60.0" in cikti.getvalue()
+    target_left = 35.0
+    assert any(pytest.approx(target_left, abs=1.0) == a for a in sent_angles)
+    assert f"AUDIO sector=LEFT DOA=32 target=+{target_left:.1f}" in cikti.getvalue()
 
 
 # ── DOA noise resilience ──────────────────────────────────────────
 
 def test_doa_noise_does_not_cause_opposite_turn():
     """The original bug: DOA ~148 with user in front caused +83° RIGHT turn.
-    With sectors, DOA 148 maps to RIGHT (-60° = robot's physical left), and noise can't cause
+    With sectors, DOA 148 maps to RIGHT (-35° = robot's physical left), and noise can't cause
     the old 80°+ wrong-direction turns.
     """
     from track import ReSpeakerAudioLocalizer
     loc = ReSpeakerAudioLocalizer()
 
-    # DOA 148 → RIGHT sector → target -60 (robot's physical left)
+    # DOA 148 → RIGHT sector → target -35 (robot's physical left)
     loc.update(doa_raw=148.0, voice_activity=True, timestamp=1.0)
-    assert loc.target_yaw_deg == -60.0
+    assert loc.target_yaw_deg == loc.SECTOR_TARGETS["RIGHT"]
     assert loc.confirmed_sector == "RIGHT"
 
     # DOA 32 → would be LEFT, but needs 3 consecutive confirmations
     loc.update(doa_raw=32.0, voice_activity=True, timestamp=1.1)
-    assert loc.target_yaw_deg == -60.0  # still RIGHT
+    assert loc.target_yaw_deg == loc.SECTOR_TARGETS["RIGHT"]  # still RIGHT
 
     # DOA bounces back to RIGHT → resets pending
     loc.update(doa_raw=140.0, voice_activity=True, timestamp=1.2)
-    assert loc.target_yaw_deg == -60.0  # still RIGHT
+    assert loc.target_yaw_deg == loc.SECTOR_TARGETS["RIGHT"]  # still RIGHT
 
 
 # ── Visual Tracking Coasting & Resilience ─────────────────────────
@@ -635,7 +636,7 @@ def test_visual_tracking_coasts_through_face_dropout_in_main():
 
     mock_hid = MagicMock(spec=["voice_activity", "doa_angle"])
     mock_hid.voice_activity.return_value = True
-    mock_hid.doa_angle.return_value = 149.0  # RIGHT sector -> -60.0
+    mock_hid.doa_angle.return_value = 149.0  # RIGHT sector -> -35.0
 
     mock_head = MagicMock()
     mock_head.has_feedback = False
@@ -653,9 +654,9 @@ def test_visual_tracking_coasts_through_face_dropout_in_main():
 
     sent_angles = [call[0][0] for call in mock_head.send_angle.call_args_list]
     assert len(sent_angles) == 12
-    # Yüz kaybolduğunda (kare 6..12) motor 0.0'a fırlamamalı ve audio (-60°) araya girmemeli
+    # Yüz kaybolduğunda (kare 6..12) motor 0.0'a fırlamamalı ve audio (-35°) araya girmemeli
     for angle in sent_angles[5:]:
         assert angle != 0.0, f"Açı sıfıra fırladı: {angle}"
-        assert angle != -60.0, f"Ses görsel takibi böldü: {angle}"
-        assert pytest.approx(-13.3, abs=1.0) == angle
+        assert angle != -35.0, f"Ses görsel takibi böldü: {angle}"
+        assert pytest.approx(-14.6, abs=1.0) == angle
 
