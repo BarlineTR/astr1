@@ -2,6 +2,7 @@
 """ASTRO V1 — Persona Engine, Tool Registry & Prompt Generator."""
 
 import json
+import os
 import re
 from typing import Any, Dict, List, Optional
 
@@ -363,6 +364,52 @@ ROBOT_TOOLS = [
                     },
                 },
                 "required": ["object_name"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "navigate_to_location",
+            "description": "Robotun haritada kayıtlı bir konuma otonom olarak gitmesini sağlar (örn: ofiste 'toplantı odası a', 'mutfak', 'danışma'; restoranda 'masa 2', 'kasa', 'bar').",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "destination": {
+                        "type": "string",
+                        "description": "Gidilmek istenen hedef konum veya masa adı (ör: 'toplantı odası a', 'mutfak', 'masa 3', 'kasa').",
+                    },
+                },
+                "required": ["destination"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "escort_guest",
+            "description": "Misafire veya müşteriye hedef konuma kadar refakat eder. Yolda misafirin arkadan gelip gelmediğini takip eder, misafir geride kalırsa durup bekler.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "destination": {
+                        "type": "string",
+                        "description": "Refakat edilecek hedef konum veya masa (örnek: 'masa 4', 'toplantı odası b', 'bekleme salonu').",
+                    },
+                },
+                "required": ["destination"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_available_destinations",
+            "description": "Robotun mevcut modunda (ofis veya restoran) gidebileceği tüm kayıtlı konumların ve masaların listesini döndürür.",
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "required": [],
             },
         },
     },
@@ -887,6 +934,28 @@ class PersonaEngine:
                     "- KULLANICI 'BEN KİMİM' DERSE: (Eğer Baran doğrulanmışsa): 'Sen beni yapan baş mühendisim Baran'sın amk, ama bana artistlik yapma, ne istiyorsan onu söyle!' de. (Misafir ise): 'Ne bileyim lan ben senin kim olduğunu lavuk, sokaktan geçen bir zibidisin işte amk!' de.\n"
                     "- TEK KIRMIZI ÇİZGİ: KESİNLİKLE ANNE, BABA, AİLE BİREYLERİ, din, inanç ve kutsal değerlere küfür etme. Bunun dışındaki tüm kişisel ve mizahi küfürler, hakaretler ve laf sokmalar tamamen serbesttir ve zorunludur."
                 )
+        robot_mode = os.getenv("ROBOT_MODE", "").lower().strip()
+        if robot_mode == "office":
+            base_prompt += (
+                "\n\n🏢 OFİS KARŞILAMA VE REHBERLİK GÖREV TALİMATI (OFFICE GREETER MODE):\n"
+                "- Şu anda bir ofis/şirket girişinde misafir karşılama ve rehberlik robotu olarak görev yapıyorsun.\n"
+                "- Gelen misafirleri profesyonel, nazik, güleryüzlü ve saygılı bir kurumsal dille karşıla.\n"
+                "- Misafir bir odaya veya birine gitmek istediğinde (örn: 'Toplantı Odası A nerede?', 'Müdür odasına gidecektim', 'Mutfak nerede?'):\n"
+                "  1. 'escort_guest' veya 'navigate_to_location' fonksiyonunu çağırarak misafire eşlik etmeyi teklif et ve yolu göster.\n"
+                "  2. Konumdan emin değilsen 'list_available_destinations' ile mevcut kayıtlı odaları ve noktaları kontrol et.\n"
+                "- Ziyaretçilere daima yardımcı, güven veren ve kurumsal nezaket çerçevesinde hitap et."
+            )
+        elif robot_mode == "restaurant":
+            base_prompt += (
+                "\n\n🍽️ RESTORAN KARŞILAMA VE MASA REFAKAT TALİMATI (RESTAURANT HOST MODE):\n"
+                "- Şu anda bir restoranın girişinde misafirleri karşılayan ve masalarına refakat eden ev sahibi robotsun.\n"
+                "- Gelen misafirleri çok sıcak, nezih ve neşeli bir dille karşıla ('Hoş geldiniz efendim, kaç kişiydiniz?', 'Rezervasyonunuz var mıydı?').\n"
+                "- Misafir masaya geçmek istediğinde (örn: 'Masa 2'ye geçelim', 'Bizi masamıza götür', 'Cam kenarı masa'):\n"
+                "  1. 'escort_guest' fonksiyonunu çağırarak misafirlerin önüne geç ve masaya kadar refakat et ('Lütfen beni takip edin, masanıza kadar eşlik edeyim').\n"
+                "  2. Masaya ulaşıldığında 'Afiyet olsun, harika bir akşam dilerim' gibi zarif bir kapanış yap.\n"
+                "  3. Hesap istendiğinde kasaya ('cashier') yönlendir veya refakat et."
+            )
+
         if memory_context:
             return f"{base_prompt}\n\n{memory_context}"
         return base_prompt

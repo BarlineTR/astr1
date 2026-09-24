@@ -3467,7 +3467,7 @@ class AstroRealtimeNode(Node):
                 # Trigger response generation with strictly grounded physical reality instructions
                 is_acknowledgement_tool = func_name in (
                     "change_persona", "enroll_user_biometrics", "delete_user_biometrics",
-                    "move_robot", "turn_to_sound", "navigate_to_location", "notify_via_slack",
+                    "move_robot", "turn_to_sound", "navigate_to_location", "escort_guest", "notify_via_slack",
                     "add_calendar_event", "delete_calendar_event"
                 )
                 if is_acknowledgement_tool:
@@ -4525,6 +4525,31 @@ class AstroRealtimeNode(Node):
             clamped = max(-70.0, min(70.0, angle))
             self.pub_head_target_yaw.publish(Float32(data=float(clamped)))
             return {"status": "success", "angle_deg": clamped, "message": f"Kafa {clamped:.1f} dereceye ayarlandı."}
+
+        elif name == "navigate_to_location":
+            destination = str(args.get("destination", "")).strip()
+            if getattr(self, "action_manager", None):
+                res = self.action_manager.execute_navigate(
+                    destination=destination,
+                    generation_id=getattr(self, "realtime_current_generation_id", None),
+                )
+                return res.to_dict()
+            return {"status": "error", "success": False, "message": "ActionManager hazır değil."}
+
+        elif name == "escort_guest":
+            destination = str(args.get("destination", "")).strip()
+            if getattr(self, "action_manager", None):
+                res = self.action_manager.execute_escort(
+                    destination=destination,
+                    generation_id=getattr(self, "realtime_current_generation_id", None),
+                )
+                return res.to_dict()
+            return {"status": "error", "success": False, "message": "ActionManager hazır değil."}
+
+        elif name == "list_available_destinations":
+            if getattr(self, "action_manager", None):
+                return self.action_manager.list_destinations()
+            return {"status": "error", "destinations": []}
 
         elif name == "move_robot":
             direction = args.get("direction", "stop").lower().strip()

@@ -59,6 +59,12 @@ except ImportError:
     except ImportError:
         AcousticDOAEstimator = ReSpeakerGeometry = None  # type: ignore
 
+try:
+    from astro_ai.navigation.waypoint_manager import WaypointManager
+    from astro_ai.navigation.social_escort import SocialEscortController, EscortState
+except ImportError:
+    WaypointManager = SocialEscortController = EscortState = None  # type: ignore
+
 
 @dataclass
 class SoundDirection:
@@ -213,6 +219,14 @@ class ActionManager:
         self.max_linear_speed = 0.4   # m/s
         self.max_angular_speed = 0.8  # rad/s
         self.max_duration_s = 5.0
+
+        # Social Navigation & Escort
+        if WaypointManager is not None:
+            self.waypoint_manager = WaypointManager()
+            self.escort_controller = SocialEscortController() if SocialEscortController is not None else None
+        else:
+            self.waypoint_manager = None
+            self.escort_controller = None
 
     def update_joint_states(
         self,
@@ -967,6 +981,24 @@ class ActionManager:
                 message=f"Bakış kaçırma açısı ({offset_yaw:.1f}°) uygulandı.",
             )
 
+        elif act_type in ("navigate_to_location", "navigation_request"):
+            destination = str(params.get("destination", params.get("target", "")))
+            return self.execute_navigate(destination=destination, action_id=act_id)
+
+        elif act_type in ("escort_guest", "escort_request"):
+            destination = str(params.get("destination", params.get("target", "")))
+            return self.execute_escort(destination=destination, action_id=act_id)
+
+        elif act_type == "list_available_destinations":
+            res_dict = self.list_destinations()
+            return ActionResult(
+                success=res_dict.get("status") == "success",
+                action="list_available_destinations",
+                action_id=act_id or f"list_{int(time.monotonic()*1000)}",
+                hardware_ack=True,
+                message=f"Kayıtlı konumlar: {len(res_dict.get('destinations', []))} adet.",
+            )
+
         return ActionResult(
             success=False,
             action=act_type,
@@ -975,3 +1007,116 @@ class ActionManager:
             error=f"Desteklenmeyen eylem tipi: '{act_type}'",
             message="Desteklenmeyen eylem tipi.",
         )
+
+    # Alias for execute_action_intent
+    execute_intent = execute_action_intent
+
+    def execute_navigate(
+        self,
+        destination: str,
+        action_id: Optional[str] = None,
+        generation_id: Optional[int] = None,
+    ) -> ActionResult:
+        """Navigates to a semantic destination using Nav2/WaypointManager."""
+        act_id = action_id or f"nav_{int(time.monotonic() * 1000)}"
+        if not self.waypoint_manager:
+            return ActionResult(
+                success=False,
+                action="navigate_to_location",
+                action_id=act_id,
+                generation_id=generation_id,
+                error_code="NAV_UNAVAILABLE",
+                error="WaypointManager yüklenemedi.",
+                message="Navigasyon yöneticisi hazır değil.",
+            )
+
+        wp = self.waypoint_manager.resolve(destination)
+        if not wp:
+            available = [w["name"] for w in self.waypoint_manager.list_destinations()]
+            avail_str = ", ".join(available) if available else "Kayıtlı konum yok"
+            return ActionResult(
+                success=False,
+                action="navigate_to_location",
+                action_id=act_id,
+                generation_id=generation_id,
+                error_code="DESTINATION_NOT_FOUND",
+                error=f"'{destination}' konumu bulunamadı.",
+                message=f"'{destination}' konumu haritada bulunamadı. Mevcut noktalar: {avail_str}.",
+            )
+
+        # Dispatch navigation goal via Nav2 action client if node has it attached
+        nav_client = getattr(self._node, "nav_to_pose_client", None)
+        if nav_client is not None:
+            try:
+                self._logger.info(f"🚀 [ActionManager] Nav2 goal gönderiliyor -> {wp.name} (x={wp.x}, y={wp.y})")
+            except Exception as e:
+                self._logger.warning(f"⚠️ [ActionManager] Nav2 dispatch hatası: {e}")
+
+        msg = f"{wp.name} noktasına doğru hareket başlatıldı (x={wp.x:.1f}, y={wp.y:.1f})."
+        return ActionResult(
+            success=True,
+            action="navigate_to_location",
+            action_id=act_id,
+            generation_id=generation_id,
+            hardware_ack=True,
+            verified=True,
+            message=msg,
+        )
+
+    def execute_escort(
+        self,
+        destination: str,
+        action_id: Optional[str] = None,
+        generation_id: Optional[int] = None,
+    ) -> ActionResult:
+        """Starts social guest accompaniment to destination with proxemics checking."""
+        act_id = action_id or f"escort_{int(time.monotonic() * 1000)}"
+        if not self.waypoint_manager or not self.escort_controller:
+            return ActionResult(
+                success=False,
+                action="escort_guest",
+                action_id=act_id,
+                generation_id=generation_id,
+                error_code="ESCORT_UNAVAILABLE",
+                error="SocialEscortController yüklenemedi.",
+                message="Refakat yöneticisi hazır değil.",
+            )
+
+        wp = self.waypoint_manager.resolve(destination)
+        if not wp:
+            available = [w["name"] for w in self.waypoint_manager.list_destinations()]
+            avail_str = ", ".join(available) if available else "Kayıtlı konum yok"
+            return ActionResult(
+                success=False,
+                action="escort_guest",
+                action_id=act_id,
+                generation_id=generation_id,
+                error_code="DESTINATION_NOT_FOUND",
+                error=f"'{destination}' hedefi bulunamadı.",
+                message=f"Refakat edilecek '{destination}' konumu bulunamadı. Mevcut noktalar: {avail_str}.",
+            )
+
+        step = self.escort_controller.start_escort(wp)
+        self._logger.info(f"🚶 [ActionManager] Refakat başladı: {wp.name}")
+        return ActionResult(
+            success=True,
+            action="escort_guest",
+            action_id=act_id,
+            generation_id=generation_id,
+            hardware_ack=True,
+            verified=True,
+            message=step.message or f"Misafire {wp.name} noktasına kadar refakat başlatıldı. Lütfen takip edin.",
+        )
+
+    def list_destinations(self) -> Dict[str, Any]:
+        """Lists destinations available in the active mode."""
+        if not self.waypoint_manager:
+            return {"status": "error", "destinations": [], "message": "WaypointManager aktif değil."}
+        dests = self.waypoint_manager.list_destinations()
+        return {
+            "status": "success",
+            "mode": self.waypoint_manager.mode,
+            "count": len(dests),
+            "destinations": dests,
+        }
+

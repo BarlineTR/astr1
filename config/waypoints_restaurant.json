@@ -1,0 +1,79 @@
+{
+  "mode": "restaurant",
+  "description": "ASTRO Restoran Karşılama ve Masa Refakat Noktaları",
+  "default_home": "entrance",
+  "waypoints": {
+    "entrance": {
+      "name": "Restoran Girişi",
+      "aliases": ["giris", "kapi", "karsilama", "entrance"],
+      "x": 0.0,
+      "y": 0.0,
+      "yaw_deg": 0.0,
+      "description": "Misafir karşılama ve bekleme noktası.",
+      "arrival_message": "Giriş karşılama noktasına döndüm. Yeni misafirleri bekliyorum."
+    },
+    "table_1": {
+      "name": "Masa 1",
+      "aliases": ["masa 1", "birinci masa", "1 numarali masa", "table 1"],
+      "x": 2.5,
+      "y": 1.5,
+      "yaw_deg": 45.0,
+      "description": "2 kişilik cam kenarı masa.",
+      "arrival_message": "Masa 1'e ulaştık. Buyrun lütfen, afiyet olsun!"
+    },
+    "table_2": {
+      "name": "Masa 2",
+      "aliases": ["masa 2", "ikinci masa", "2 numarali masa", "table 2"],
+      "x": 2.5,
+      "y": -1.5,
+      "yaw_deg": -45.0,
+      "description": "4 kişilik aile masası.",
+      "arrival_message": "Masa 2'ye geldik. Buyrun lütfen, keyifli bir yemek dilerim!"
+    },
+    "table_3": {
+      "name": "Masa 3",
+      "aliases": ["masa 3", "ucuncu masa", "3 numarali masa", "table 3"],
+      "x": 5.0,
+      "y": 1.5,
+      "yaw_deg": 45.0,
+      "description": "6 kişilik geniş grup masası.",
+      "arrival_message": "Masa 3'e geldik. Masanız hazır, şimdiden afiyet olsun!"
+    },
+    "table_4": {
+      "name": "Masa 4",
+      "aliases": ["masa 4", "dorduncu masa", "4 numarali masa", "table 4"],
+      "x": 5.0,
+      "y": -1.5,
+      "yaw_deg": -45.0,
+      "description": "2 kişilik bahçe manzaralı masa.",
+      "arrival_message": "Masa 4'e ulaştık. Buyrun lütfen, harika bir akşam dilerim!"
+    },
+    "bar": {
+      "name": "Bar / İçecek Alanı",
+      "aliases": ["bar", "icecek bolumu", "kokteyl bari"],
+      "x": 3.5,
+      "y": 3.0,
+      "yaw_deg": 90.0,
+      "description": "İçecek ve bar tezgahı.",
+      "arrival_message": "Bar alanına geldik. İçecek servisi için barmenimiz size yardımcı olacaktır."
+    },
+    "cashier": {
+      "name": "Kasa / Ödeme Noktası",
+      "aliases": ["kasa", "odeme noktasi", "hesap"],
+      "x": 1.0,
+      "y": -2.0,
+      "yaw_deg": -90.0,
+      "description": "Hesap ödeme ve ayrılış noktası.",
+      "arrival_message": "Kasaya ulaştık. Bizi tercih ettiğiniz için teşekkür ederiz, yine bekleriz!"
+    },
+    "kitchen": {
+      "name": "Mutfak Servis Çıkışı",
+      "aliases": ["mutfak", "servis", "yemek cikisi"],
+      "x": 6.0,
+      "y": 0.0,
+      "yaw_deg": 180.0,
+      "description": "Personel ve servis mutfağı.",
+      "arrival_message": "Mutfak servis noktasına ulaştım."
+    }
+  }
+}

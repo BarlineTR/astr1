@@ -1,0 +1,70 @@
+{
+  "mode": "office",
+  "description": "ASTRO Ofis Karşılama ve Rehberlik Noktaları",
+  "default_home": "reception",
+  "waypoints": {
+    "reception": {
+      "name": "Danışma / Karşılama",
+      "aliases": ["danisma", "reception", "giris", "karsilama"],
+      "x": 0.0,
+      "y": 0.0,
+      "yaw_deg": 0.0,
+      "description": "Ana giriş ve misafir karşılama masası.",
+      "arrival_message": "Danışma alanındayız. Size nasıl yardımcı olabilirim?"
+    },
+    "meeting_room_a": {
+      "name": "Toplantı Odası A",
+      "aliases": ["toplanti odasi a", "toplanti a", "buyuk toplanti odasi"],
+      "x": 4.5,
+      "y": 2.0,
+      "yaw_deg": 90.0,
+      "description": "Büyük konferans ve sunum odası.",
+      "arrival_message": "Toplantı Odası A'ya ulaştık. Buyrun lütfen, iyi toplantılar dilerim."
+    },
+    "meeting_room_b": {
+      "name": "Toplantı Odası B",
+      "aliases": ["toplanti odasi b", "toplanti b", "kucuk toplanti odasi"],
+      "x": 4.5,
+      "y": -2.0,
+      "yaw_deg": -90.0,
+      "description": "Küçük toplantı ve görüşme odası.",
+      "arrival_message": "Toplantı Odası B'ye geldik. Buyrun, verimli bir görüşme dilerim."
+    },
+    "kitchen": {
+      "name": "Mutfak / Dinlenme Alanı",
+      "aliases": ["mutfak", "cay ocagi", "kahve alani", "dinlenme alani"],
+      "x": 2.0,
+      "y": 3.5,
+      "yaw_deg": 180.0,
+      "description": "Çay, kahve ve mola alanı.",
+      "arrival_message": "Mutfak ve kahve alanına geldik. Afiyet olsun!"
+    },
+    "waiting_lounge": {
+      "name": "Bekleme Salonu",
+      "aliases": ["bekleme salonu", "bekleme alani", "lobi", "lounge"],
+      "x": 1.5,
+      "y": -1.5,
+      "yaw_deg": 0.0,
+      "description": "Misafir koltukları ve dinlenme köşesi.",
+      "arrival_message": "Bekleme salonundayız. Lütfen rahatınıza bakın, ev sahibinize haber veriyorum."
+    },
+    "manager_office": {
+      "name": "Yönetici Ofisi",
+      "aliases": ["yonetici ofisi", "mudur odasi", "baskan odasi"],
+      "x": 6.0,
+      "y": 0.0,
+      "yaw_deg": 0.0,
+      "description": "Genel Müdür ve Yönetici Odası.",
+      "arrival_message": "Yönetici ofisinin kapısındayız. Buyrun lütfen."
+    },
+    "charging_dock": {
+      "name": "Şarj İstasyonu",
+      "aliases": ["sarj istasyonu", "sarj noktasi", "yuva", "dock"],
+      "x": -0.5,
+      "y": 0.0,
+      "yaw_deg": 180.0,
+      "description": "Robot otomatik şarj istasyonu.",
+      "arrival_message": "Şarj istasyonuna döndüm. Bekleme moduna geçiyorum."
+    }
+  }
+}
