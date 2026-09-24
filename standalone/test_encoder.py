@@ -24,8 +24,8 @@ MSG_ENCODER_TICKS = 0x02
 MSG_HEARTBEAT = 0x01
 MSG_HEAD_CMD = 0x03
 
-# Namiki 22CL-3501PG 80:1 kalibrasyonu
-TICKS_PER_DEG = 0.288
+# Canonical Head Encoder Resolution: 440 ticks / 170.0 deg = 2.5882 ticks/deg
+TICKS_PER_DEG = 2.5882
 
 def crc8(data: bytes) -> int:
     crc = 0x00

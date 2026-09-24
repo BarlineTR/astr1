@@ -283,7 +283,7 @@ class SerialBridge(Node):
         self.declare_parameter("wheel_radius_right", 0.06)
         self.declare_parameter("wheel_separation", 0.26)
         self.declare_parameter("head_angle_scale", 1.0)
-        self.declare_parameter("head_ticks_per_deg", 0.288)
+        self.declare_parameter("head_ticks_per_deg", 2.5882)
         self.declare_parameter("head_zero_offset_ticks", 0.0)
         self.declare_parameter("head_sign", 1.0)
 
@@ -304,7 +304,7 @@ class SerialBridge(Node):
         self.wheel_radius_r = float(self.get_parameter("wheel_radius_right").value)
         self.wheel_separation = float(self.get_parameter("wheel_separation").value)
         self.head_angle_scale = float(self.get_parameter("head_angle_scale").value)
-        self.head_ticks_per_deg = float(self.get_parameter("head_ticks_per_deg").value or 0.288)
+        self.head_ticks_per_deg = float(self.get_parameter("head_ticks_per_deg").value or 2.5882)
         self.head_zero_offset_ticks = float(self.get_parameter("head_zero_offset_ticks").value or 0.0)
         self.head_sign = float(self.get_parameter("head_sign").value or 1.0)
         self.head_state_mgr = HeadStateManager(

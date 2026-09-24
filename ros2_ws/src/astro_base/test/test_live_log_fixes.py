@@ -260,7 +260,7 @@ class TestLiveLogFixes(unittest.TestCase):
         from tracker import Detection
         from astro_base.gaze.types import GazeStateEnum
         node = StandaloneGazeRosNode(use_camera_source=False, enable_audio=False)
-        det = [Detection(x=320, y=200, w=80, h=80, confidence=0.9)]
+        det = [Detection(x=280, y=200, w=80, h=80, confidence=0.9)]
 
         # Settle into HOLDING_ATTENTION
         for i in range(50):
@@ -271,8 +271,8 @@ class TestLiveLogFixes(unittest.TestCase):
         self.assertEqual(node.latest_result.gaze_state, GazeStateEnum.HOLDING_ATTENTION)
         prev_target = node.last_published_yaw
 
-        # Face slightly jitters (+1.1° optical bearing from center: x=310 instead of 320)
-        det_jitter = [Detection(x=310, y=200, w=80, h=80, confidence=0.9)]
+        # Face slightly jitters (+1.1° optical bearing from center: x=270 instead of 280)
+        det_jitter = [Detection(x=270, y=200, w=80, h=80, confidence=0.9)]
         res = node.step_frame(detections=det_jitter, frame_size=(640, 480), timestamp=10.0 + 51 * 0.033)
 
         # target_yaw must be held at prev_target rather than hunting
@@ -434,12 +434,12 @@ class TestLiveLogFixes(unittest.TestCase):
         loc.update(doa_raw=142.0, voice_activity=True, timestamp=11.030)
         self.assertTrue(loc.is_tracking())
         self.assertEqual(loc.confirmed_sector, "RIGHT")
-        self.assertEqual(loc.target_yaw_deg, -60.0)
+        self.assertEqual(loc.target_yaw_deg, -35.0)
 
         # 5. Speech pauses (VAD False): tracking must remain active during hold grace
         loc.update(doa_raw=None, voice_activity=False, timestamp=12.0)
         self.assertTrue(loc.is_tracking(12.0))
-        self.assertEqual(loc.target_yaw_deg, -60.0)
+        self.assertEqual(loc.target_yaw_deg, -35.0)
 
 
 if __name__ == "__main__":

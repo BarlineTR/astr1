@@ -30,8 +30,8 @@ static constexpr float KP = 0.6f, KI = 0.2f, KD = 0.0f; // 50 Hz PID için örne
 static constexpr int PWM_MAX = 255;
 static constexpr float PID_INTEGRAL_LIMIT = 50.0f; // ✅ FIX: Daha dar anti-windup limit
 
-// Canonical Head Encoder Resolution: Namiki 22CL-3501PG 80:1 (0.288 ticks/deg, ~3.47 deg/tick)
-static constexpr float HEAD_TICKS_PER_DEG = 0.288f;
+// Canonical Head Encoder Resolution: 440 ticks / 170.0 deg = 2.5882 ticks/deg (0.3864 deg/tick)
+static constexpr float HEAD_TICKS_PER_DEG = 2.5882f;
 
 
 
@@ -71,9 +71,9 @@ static constexpr float HEAD_KP = 12.0f, HEAD_KD = 0.40f;
 static constexpr float HEAD_D_FILTER = 0.25f;
 
 // PWM egim siniri: cikisin bir kontrol cevriminde degisebilecegi en buyuk miktar.
-static constexpr int HEAD_PWM_SLEW = 25;
-// Namiki 22CL: 1 tick ~= 3.47 derece. Deadband = 1 tick (titreşimsiz kararlı duruş).
-static constexpr int32_t HEAD_DEADBAND_TICKS = 1;  // 1 tick ~= 3.47 derece
+// Dişli boşluğu 0.85 derece olarak ölçüldü (docs/final_validation_report.md) ve bir
+// tick 0.386 derece. 3 tick = 1.159 derece, boşluğu aşan ilk değer; sosyal mesafede görünmez.
+static constexpr int32_t HEAD_DEADBAND_TICKS = 3;  // 3 tick ~= 1.159 derece (boşluk 0.85)
 static constexpr uint32_t HEAD_STALL_MS = 1500;    // PWM'e rağmen tick değişmiyorsa kes (1.5s güvenli süre)
 
 

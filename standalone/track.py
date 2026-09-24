@@ -207,7 +207,6 @@ def main(argv=None, hid=None) -> int:
     last_audio_log_yaw: Optional[float] = None
     last_visual_target_id: Optional[str] = None
     last_visual_detection_time: Optional[float] = None
-    last_visual_motor_yaw: float = 0.0
     VISUAL_COAST_TIMEOUT_S: float = 0.30
     motor_yaw: float = 0.0
     actuator_adapter = UnknownModeActuatorAdapter(min_limit_deg=-75.0, max_limit_deg=75.0)
@@ -329,10 +328,6 @@ def main(argv=None, hid=None) -> int:
                     is_relative_correction=getattr(result, "is_relative_correction", False),
                     has_encoder=has_enc,
                 )
-                if len(detections) > 0:
-                    last_visual_motor_yaw = motor_yaw
-                elif is_coasting and not has_enc:
-                    motor_yaw = last_visual_motor_yaw
                 last_audio_log_yaw = None
                 if result.target_id:
                     last_visual_target_id = result.target_id
