@@ -71,6 +71,7 @@ static constexpr float HEAD_KP = 12.0f, HEAD_KD = 0.40f;
 static constexpr float HEAD_D_FILTER = 0.25f;
 
 // PWM egim siniri: cikisin bir kontrol cevriminde degisebilecegi en buyuk miktar.
+static constexpr int HEAD_PWM_SLEW = 25;
 // Dişli boşluğu 0.85 derece olarak ölçüldü (docs/final_validation_report.md) ve bir
 // tick 0.386 derece. 3 tick = 1.159 derece, boşluğu aşan ilk değer; sosyal mesafede görünmez.
 static constexpr int32_t HEAD_DEADBAND_TICKS = 3;  // 3 tick ~= 1.159 derece (boşluk 0.85)
