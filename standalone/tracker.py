@@ -225,7 +225,7 @@ class GazeTracker:
             confidence=float(command.confidence),
             head_angle_deg=self.head_angle_deg,
             face_bearings_deg=tuple(t.body_azimuth_deg for t in self._latest_tracks),
-            desired_body_yaw_deg=getattr(command, "desired_body_yaw_deg", 0.0 if actual_head is None else clamped_target_yaw),
+            desired_body_yaw_deg=0.0 if actual_head is None else getattr(command, "desired_body_yaw_deg", clamped_target_yaw),
             relative_head_correction_deg=command.relative_head_correction_deg,
             is_relative_correction=command.is_relative_correction,
             actual_head_yaw_deg=actual_head,

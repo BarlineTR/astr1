@@ -583,12 +583,15 @@ class SocialGazeFSM:
         if actual_head_yaw_deg is None:
             # ENCODER is UNKNOWN:
             # camera bearing is treated directly as visual relative error/correction
-            if decision.owner == PrioritySource.VISUAL_TRACKING and target_state.active_target is not None:
-                opt_bearing = getattr(target_state.active_target, "camera_bearing_deg", None)
-                if opt_bearing is None:
-                    opt_bearing = target_state.active_target.body_azimuth_deg
-                rel_correction = float(opt_bearing)
-                is_rel = True
+            if decision.owner == PrioritySource.VISUAL_TRACKING and self.state != GazeStateEnum.TARGET_LOST:
+                if target_state.active_target is not None:
+                    opt_bearing = getattr(target_state.active_target, "camera_bearing_deg", None)
+                    if opt_bearing is None:
+                        opt_bearing = target_state.active_target.body_azimuth_deg
+                    rel_correction = float(opt_bearing)
+                    is_rel = True
+            if self.state in (GazeStateEnum.TARGET_LOST, GazeStateEnum.RECOVERING, GazeStateEnum.IDLE):
+                self.target_yaw_deg = 0.0
             desired_body_yaw = 0.0  # Body alignment disabled when head orientation is unknown
         else:
             desired_body_yaw = getattr(decision, "desired_body_yaw_deg", self.target_yaw_deg)

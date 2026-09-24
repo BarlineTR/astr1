@@ -206,6 +206,9 @@ def main(argv=None, hid=None) -> int:
     frames, fps, last_fps_at, last_fps_frames = 0, 0.0, started, 0
     last_audio_log_yaw: Optional[float] = None
     last_visual_target_id: Optional[str] = None
+    last_visual_detection_time: Optional[float] = None
+    last_visual_motor_yaw: float = 0.0
+    VISUAL_COAST_TIMEOUT_S: float = 0.30
     motor_yaw: float = 0.0
     actuator_adapter = UnknownModeActuatorAdapter(min_limit_deg=-75.0, max_limit_deg=75.0)
     encoder_stall_start: Optional[float] = None
@@ -286,6 +289,10 @@ def main(argv=None, hid=None) -> int:
             # GazeTracker'ın hedefi koruma (HOLDING_ATTENTION, TARGET_LOST, TRACKING, ORIENTING)
             # ve setpoint açısını tutma mekanizması korunur; kafa hemen 0°'ye fırlatılmaz
             # ve ses dikkati dağıtamaz.
+            has_enc = (hstate.position_source == PositionSource.ENCODER and hstate.actual_yaw_deg is not None)
+
+            # Vision active check:
+            # When encoder is UNKNOWN, TARGET_LOST must not hold vision_active with a stale setpoint.
             vision_active = (
                 result.owner == PrioritySource.VISUAL_TRACKING
                 or result.gaze_state in (
@@ -293,7 +300,6 @@ def main(argv=None, hid=None) -> int:
                     GazeStateEnum.HOLDING_ATTENTION,
                     GazeStateEnum.ORIENTING,
                     GazeStateEnum.ACQUIRING,
-                    GazeStateEnum.TARGET_LOST,
                 )
             )
 
@@ -304,16 +310,29 @@ def main(argv=None, hid=None) -> int:
                 and localizer.is_tracking(now)
             )
 
-            if vision_active:
-                localizer.on_vision_active()
+            # Visual coasting check: allow coasting up to 0.3s for momentary detection dropout
+            is_coasting = (
+                not has_enc
+                and last_visual_detection_time is not None
+                and (now - last_visual_detection_time) < VISUAL_COAST_TIMEOUT_S
+                and result.gaze_state not in (GazeStateEnum.TARGET_LOST, GazeStateEnum.RECOVERING, GazeStateEnum.IDLE)
+            )
+
+            if vision_active and (len(detections) > 0 or is_coasting):
+                if len(detections) > 0:
+                    last_visual_detection_time = now
+                    localizer.on_vision_active()
                 target_yaw = result.target_yaw_deg
-                has_enc = (hstate.position_source == PositionSource.ENCODER and hstate.actual_yaw_deg is not None)
                 motor_yaw = actuator_adapter.adapt(
                     target_yaw_deg=target_yaw,
                     relative_head_correction_deg=getattr(result, "relative_head_correction_deg", None),
                     is_relative_correction=getattr(result, "is_relative_correction", False),
                     has_encoder=has_enc,
                 )
+                if len(detections) > 0:
+                    last_visual_motor_yaw = motor_yaw
+                elif is_coasting and not has_enc:
+                    motor_yaw = last_visual_motor_yaw
                 last_audio_log_yaw = None
                 if result.target_id:
                     last_visual_target_id = result.target_id
@@ -323,6 +342,7 @@ def main(argv=None, hid=None) -> int:
                         result.target_id = last_visual_target_id
             elif audio_tracking_allowed:
                 last_visual_target_id = None
+                last_visual_detection_time = None
                 target_yaw = localizer.target_yaw_deg
                 motor_yaw = target_yaw
                 result.target_yaw_deg = target_yaw
@@ -336,16 +356,18 @@ def main(argv=None, hid=None) -> int:
                     last_audio_log_yaw = motor_yaw
             else:
                 last_visual_target_id = None
+                last_visual_detection_time = None
                 last_audio_log_yaw = None
-                # FSM kendi grace state'lerini yönetsin (TARGET_LOST → RECOVERING → IDLE).
-                # Biz sadece FSM IDLE veya RECOVERING dediğinde 0°'ye dönüyoruz.
-                if result.gaze_state in (GazeStateEnum.RECOVERING, GazeStateEnum.IDLE):
-                    target_yaw = result.target_yaw_deg  # FSM RECOVERING'de 0.0 döndürür
-                    motor_yaw = target_yaw
-                    result.owner = PrioritySource.IDLE
-                    result.target_id = None
+                # FSM grace states (TARGET_LOST → RECOVERING → IDLE).
+                # In UNKNOWN mode or lost target, safely terminate visual actuator command to 0.0.
+                if not has_enc or result.gaze_state in (GazeStateEnum.RECOVERING, GazeStateEnum.IDLE, GazeStateEnum.TARGET_LOST):
+                    target_yaw = 0.0
+                    motor_yaw = 0.0
+                    if result.gaze_state in (GazeStateEnum.RECOVERING, GazeStateEnum.IDLE):
+                        result.owner = PrioritySource.IDLE
+                        result.target_id = None
+                    result.target_yaw_deg = 0.0
                 else:
-                    # TARGET_LOST vb: son pozisyonu koru, FSM kararını bekle
                     target_yaw = motor_yaw
                     result.target_yaw_deg = motor_yaw
 
@@ -391,7 +413,7 @@ def main(argv=None, hid=None) -> int:
                 target_owner = result.owner.name if hasattr(result.owner, "name") else str(result.owner)
                 body_yaw_cmd = (
                     round(float(result.desired_body_yaw_deg), 2)
-                    if getattr(result, "desired_body_yaw_deg", None) is not None
+                    if (getattr(result, "desired_body_yaw_deg", None) is not None and has_enc)
                     else 0.0
                 )
 

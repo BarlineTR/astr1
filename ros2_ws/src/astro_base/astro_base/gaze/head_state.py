@@ -66,8 +66,16 @@ class UnknownModeActuatorAdapter:
         Returns:
             Clamped actuator command in degrees for send_angle().
         """
-        if not has_encoder and is_relative_correction and relative_head_correction_deg is not None:
-            cmd = float(relative_head_correction_deg)
+        if not has_encoder:
+            if is_relative_correction:
+                if relative_head_correction_deg is not None:
+                    cmd = float(relative_head_correction_deg)
+                else:
+                    # In UNKNOWN mode when visual measurement is absent (e.g. TARGET_LOST),
+                    # do NOT hold stale targets. Safely command 0.0 (stop/boresight).
+                    cmd = 0.0
+            else:
+                cmd = float(target_yaw_deg)
         else:
             cmd = float(target_yaw_deg)
         return max(self.min_limit_deg, min(self.max_limit_deg, cmd))
@@ -199,17 +207,23 @@ class HeadStateManager:
             self._initial_ticks = ticks
             self._last_ticks_value = ticks
             self._last_ticks_change_time = now
-            # If initial ticks is already non-zero, it indicates previous tick activity
-            if ticks != 0:
+            # Strict verification: A stationary single tick (0, 1, -1) at boot is noise/floating pin.
+            # Never assume encoder is responsive when abs(ticks) <= 1!
+            if abs(ticks) > 1:
                 self.encoder_responsive = True
+                self.encoder_stuck = False
+            else:
+                self.encoder_responsive = False
                 self.encoder_stuck = False
 
         # Detect dynamic tick change from last seen
         if ticks != self._last_ticks_value:
             self._last_ticks_value = ticks
             self._last_ticks_change_time = now
-            self.encoder_responsive = True
-            self.encoder_stuck = False
+            # Dynamic movement verification: must move outside the single-tick deadband from baseline
+            if abs(ticks) > 1 and abs(ticks - (self._initial_ticks or 0)) > 1:
+                self.encoder_responsive = True
+                self.encoder_stuck = False
 
         # Check for stuck / unresponsive condition:
         # If a movement command was accepted and enough time elapsed (> stuck_timeout_s),
@@ -232,12 +246,7 @@ class HeadStateManager:
             self.encoder_available = False
             self.encoder_stale = True
             self.actual_yaw_deg = None
-            if self.position_source == PositionSource.ENCODER:
-                self.position_source = PositionSource.VIRTUAL_ENCODER
-                if self.estimated_yaw_deg is None and self.last_known_encoder_deg is not None:
-                    self.estimated_yaw_deg = self.last_known_encoder_deg
-                self.last_estimate_update_time = now
-            elif self.last_accepted_target_deg is not None or self.estimated_yaw_deg is not None:
+            if self.last_accepted_target_deg is not None or self.estimated_yaw_deg is not None:
                 self.position_source = PositionSource.VIRTUAL_ENCODER
             else:
                 self.position_source = PositionSource.UNKNOWN

@@ -206,8 +206,9 @@ class TestHeadEncoderFallback(unittest.TestCase):
         self.assertEqual(runtime.position_source, PositionSource.ESTIMATED)
         self.assertTrue(runtime.is_position_known)
         self.assertFalse(runtime.has_head_feedback)
-        # Tracker uses estimated angle for spatial transforms
-        self.assertAlmostEqual(runtime.tracker.head_angle_deg, 25.0, places=1)
+        # Invariant: physical head angle is None; software estimate holds 25.0
+        self.assertIsNone(runtime.tracker.head_angle_deg)
+        self.assertAlmostEqual(runtime.estimated_head_yaw_deg, 25.0, places=1)
 
         # Set dialogue intent (e.g., looking at user during conversation)
         runtime.tracker.fsm.set_dialogue_target(yaw_deg=15.0, duration_s=2.0, timestamp=t)

@@ -20,7 +20,7 @@ from typing import List
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import core_path  # noqa: F401
-from astro_base.gaze.head_state import PositionSource, UnknownModeActuatorAdapter
+from astro_base.gaze.head_state import HeadStateManager, PositionSource, UnknownModeActuatorAdapter
 from astro_base.gaze.respeaker_localizer import ReSpeakerAudioLocalizer
 from astro_base.gaze.types import GazeStateEnum, PrioritySource
 from tracker import Detection, GazeResult, GazeTracker
@@ -310,6 +310,47 @@ class TestRelativeCorrectionInvariants(unittest.TestCase):
         self.assertEqual(res.position_source, "UNKNOWN")
         self.assertTrue(tracker.head_feedback_missing)
 
+    def test_scenario_9_single_tick_noise_rejected_as_unknown(self):
+        """Scenario 9: Single-tick noise rejection (stuck at 0 or 1).
+        With ticks_per_deg=0.288, 1 tick produces 3.47 deg.
+        Verify that raw ticks=1 at boot or noise does NOT claim ENCODER authority!
+        """
+        mgr = HeadStateManager(ticks_per_deg=0.288, stale_timeout_s=0.50)
+        # Packet with 1 tick arrives
+        mgr.on_encoder_feedback(head_ticks=1, timestamp=10.0)
+        state = mgr.evaluate(timestamp=10.0)
+
+        self.assertEqual(state.position_source, PositionSource.UNKNOWN)
+        self.assertIsNone(state.actual_yaw_deg)
+        self.assertFalse(state.encoder_available)
+        self.assertFalse(state.has_encoder_authority)
+
+    def test_scenario_10_target_lost_safely_terminates_unknown_actuator_command(self):
+        """Scenario 10: TARGET_LOST command termination.
+        When visual target is lost in UNKNOWN mode, relative_head_correction_deg is None.
+        UnknownModeActuatorAdapter must output 0.0, NOT hold a stale setpoint (e.g. 11.1 deg).
+        """
+        adapter = UnknownModeActuatorAdapter(min_limit_deg=-75.0, max_limit_deg=75.0)
+
+        # Active visual tracking with 11.1 deg correction
+        cmd_active = adapter.adapt(
+            target_yaw_deg=11.1,
+            relative_head_correction_deg=11.1,
+            is_relative_correction=True,
+            has_encoder=False,
+        )
+        self.assertEqual(cmd_active, 11.1)
+
+        # Target lost: relative_head_correction_deg is None
+        cmd_lost = adapter.adapt(
+            target_yaw_deg=11.1,  # stale target from previous frame
+            relative_head_correction_deg=None,
+            is_relative_correction=True,
+            has_encoder=False,
+        )
+        self.assertEqual(cmd_lost, 0.0)  # Must be safely terminated to 0.0!
+
 
 if __name__ == "__main__":
     unittest.main()
+
