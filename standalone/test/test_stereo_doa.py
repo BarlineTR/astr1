@@ -20,7 +20,7 @@ import core_path  # noqa: F401
 from astro_audio.speech_detector import SpeechVerdict  # noqa: E402
 from astro_base.gaze.types import PrioritySource  # noqa: E402
 from sources import AudioSource  # noqa: E402
-from astro_base.gaze.tracker import Detection, GazeTracker  # noqa: E402
+from tracker import Detection, GazeTracker  # noqa: E402
 from stereo_doa import (  # noqa: E402
     DEFAULT_MIC_SPACING_M,
     SPEED_OF_SOUND_MPS,

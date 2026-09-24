@@ -20,7 +20,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import core_path  # noqa: F401
 from astro_base.gaze.types import GazeStateEnum, PrioritySource  # noqa: E402
 
-from astro_base.gaze.tracker import Detection, GazeTracker  # noqa: E402
+from tracker import Detection, GazeTracker  # noqa: E402
 
 
 FRAME = (640, 480)
