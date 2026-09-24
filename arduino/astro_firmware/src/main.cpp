@@ -156,10 +156,22 @@ void rightEncA() {
   g_right_ticks += b ? -1 : +1;
 }
 void headEncA() {
-  // Quadrature yön tespiti (Pin 20 HEAD_ENC_B) - Namiki ters polarite düzeltildi
+  // Quadrature yön tespiti (Pin 20/23 HEAD_ENC_B) - Namiki ters polarite düzeltildi
   bool b = digitalRead(HEAD_ENC_B);
   g_head_ticks += b ? +1 : -1;
 }
+
+// Donanımsal kesme desteği olmayan pinler (ör. Pin 22) için Timer1 5 kHz CTC ISR
+ISR(TIMER1_COMPA_vect) {
+  static uint8_t s_last_a = HIGH;
+  uint8_t a = digitalRead(HEAD_ENC_A);
+  if (s_last_a == LOW && a == HIGH) {
+    bool b = digitalRead(HEAD_ENC_B);
+    g_head_ticks += b ? +1 : -1;
+  }
+  s_last_a = a;
+}
+
 
 
 
@@ -215,7 +227,21 @@ void setupIO() {
 
   attachInterrupt(digitalPinToInterrupt(L_ENC_A),    leftEncA,  RISING);
   attachInterrupt(digitalPinToInterrupt(R_ENC_A),    rightEncA, RISING);
-  attachInterrupt(digitalPinToInterrupt(HEAD_ENC_A), headEncA,  RISING);
+  int head_int = digitalPinToInterrupt(HEAD_ENC_A);
+  if (head_int != NOT_AN_INTERRUPT) {
+    attachInterrupt(head_int, headEncA, RISING);
+  } else {
+    // Pin 22 gibi kesme donanımı olmayan pinler için Timer1 CTC 5 kHz örnekleyici
+    noInterrupts();
+    TCCR1A = 0;
+    TCCR1B = 0;
+    TCNT1  = 0;
+    OCR1A  = 399; // 16 MHz / 8 / 400 = 5000 Hz (200 µs)
+    TCCR1B |= (1 << WGM12);  // CTC modu
+    TCCR1B |= (1 << CS11);   // Prescaler 8
+    TIMSK1 |= (1 << OCIE1A); // Timer1 Compare A Match kesmesi aktif
+    interrupts();
+  }
 
   // ✅ FIX: PWM frekansını artır -> 8-bit phase-correct, prescaler 1:
   //   16 MHz / (1 * 510) = 31.37 kHz. millis()/micros() Timer0'da, etkilenmez.
