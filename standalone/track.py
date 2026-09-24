@@ -377,16 +377,37 @@ def main(argv=None, hid=None) -> int:
                     if hstate.canonical_yaw_deg is not None
                     else None
                 )
+                rel_corr = (
+                    round(float(result.relative_head_correction_deg), 2)
+                    if getattr(result, "relative_head_correction_deg", None) is not None
+                    else None
+                )
+                est_yaw = (
+                    round(float(hstate.estimated_yaw_deg), 2)
+                    if hstate.estimated_yaw_deg is not None
+                    else None
+                )
+                gaze_st = result.gaze_state.name if hasattr(result.gaze_state, "name") else str(result.gaze_state)
+                target_owner = result.owner.name if hasattr(result.owner, "name") else str(result.owner)
+                body_yaw_cmd = (
+                    round(float(result.desired_body_yaw_deg), 2)
+                    if getattr(result, "desired_body_yaw_deg", None) is not None
+                    else 0.0
+                )
 
                 print(
                     f"[VISUAL_TELEMETRY] "
                     f"target_id={result.target_id} "
                     f"camera_bearing_deg={cam_bearing} "
-                    f"canonical_head_yaw_deg={canon_yaw} "
+                    f"relative_head_correction_deg={rel_corr} "
                     f"target_yaw_deg={round(float(target_yaw), 2)} "
                     f"serial_command_deg={round(float(clamped_motor_yaw), 2)} "
                     f"position_source={pos_src} "
-                    f"encoder_actual_deg={enc_actual}"
+                    f"actual_head_yaw_deg={enc_actual} "
+                    f"estimated_head_yaw_deg={est_yaw} "
+                    f"gaze_state={gaze_st} "
+                    f"visual_target_owner={target_owner} "
+                    f"body_yaw_command={body_yaw_cmd}"
                 )
 
             frames += 1
