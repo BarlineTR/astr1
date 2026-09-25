@@ -925,6 +925,15 @@ class StandaloneGazeRosNode(Node):
                             "title": meta.get("title", ""),
                             "formal_title": meta.get("formal_title", name)
                         }
+                        last_logged = getattr(self, "_last_logged_recog_name", None)
+                        last_time = getattr(self, "_last_logged_recog_time", 0.0)
+                        now_log = time.monotonic()
+                        if last_logged != name or (now_log - last_time) >= 4.0:
+                            self._last_logged_recog_name = name
+                            self._last_logged_recog_time = now_log
+                            conf_pct = int((conf or 0.85) * 100)
+                            formal = meta.get("formal_title", name)
+                            self.get_logger().info(f"👤 [YÜZ TANINDI]: {name} ({formal}) — Güven: %{conf_pct}")
                     else:
                         payload = {
                             "name": "Misafir",

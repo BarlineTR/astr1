@@ -10541,6 +10541,14 @@ class AstroRealtimeNode(Node):
                     self._active_person_name = name
                     self._person_hold_until = now + 45.0  # Hold identity for 45 seconds
 
+                    last_logged_name = getattr(self, "_last_logged_person_identity", None)
+                    last_logged_time = getattr(self, "_last_logged_person_time", 0.0)
+                    if last_logged_name != name or (now - last_logged_time) >= 5.0:
+                        self._last_logged_person_identity = name
+                        self._last_logged_person_time = now
+                        conf_pct = int(data.get("confidence", 0.85) * 100)
+                        self.get_logger().info(f"🧠 [Bilişsel Kimlik / Yüz Doğrulandı]: {name} ({formal_title}) — Güven: %{conf_pct}")
+
                     # Event-driven vision trigger for new person
                     if getattr(self, "_last_seen_person", "") != name:
                         self._last_seen_person = name
