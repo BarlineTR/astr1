@@ -16,7 +16,7 @@ from astro_audio.edge_tts_engine import EdgeTTSEngine
 
 def test_edge_tts_synthesis():
     print("\n--- 1. Edge-TTS Sentez Testi ---")
-    engine = EdgeTTSEngine(voice="tr-TR-AhmetNeural")
+    engine = EdgeTTSEngine(voice="tr-TR-AhmetNeural", logger=lambda lvl, msg: print(f"    [{lvl}] {msg}"))
     test_cases = [
         "Ne robotu lan zibidi,",
         "ne var söyle !",
