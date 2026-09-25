@@ -6,9 +6,23 @@ and proactive pre-meeting reminder detection.
 
 import json
 import os
+import re
 import time
+import urllib.parse
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
+
+try:
+    from dotenv import find_dotenv, load_dotenv
+    _env_path = find_dotenv(usecwd=True)
+    if _env_path:
+        load_dotenv(dotenv_path=_env_path)
+    else:
+        _repo_env = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..", "..", ".env"))
+        if os.path.exists(_repo_env):
+            load_dotenv(dotenv_path=_repo_env)
+except Exception:
+    pass
 
 
 class CalendarService:
@@ -25,6 +39,16 @@ class CalendarService:
         self.google_ical_url = os.environ.get("GOOGLE_CALENDAR_ICAL_URL", "")
         self.google_access_token = os.environ.get("GOOGLE_CALENDAR_ACCESS_TOKEN", os.environ.get("GOOGLE_ACCESS_TOKEN", ""))
         self._reminded_event_ids = set()
+        self._ical_cache: List[Dict[str, Any]] = []
+        self._ical_cache_time: float = 0.0
+
+        # Auto-derive calendar ID from secret iCal URL if not explicitly configured
+        if (not self.google_calendar_id or self.google_calendar_id == "primary") and self.google_ical_url:
+            m = re.search(r"/calendar/ical/([^/]+)/", self.google_ical_url)
+            if m:
+                extracted = urllib.parse.unquote(m.group(1))
+                if extracted and ("@" in extracted or "." in extracted):
+                    self.google_calendar_id = extracted
 
         self._ensure_storage_initialized()
 
@@ -90,15 +114,23 @@ class CalendarService:
             except Exception:
                 pass
 
-    def _load_local_events(self) -> List[Dict[str, Any]]:
+    def _load_local_data(self) -> Dict[str, Any]:
         if not os.path.exists(self.storage_path):
-            return []
+            return {"events": [], "deleted_event_ids": []}
         try:
             with open(self.storage_path, "r", encoding="utf-8") as f:
                 data = json.load(f)
-                return data.get("events", [])
+                if isinstance(data, list):
+                    return {"events": data, "deleted_event_ids": []}
+                return data
         except Exception:
-            return []
+            return {"events": [], "deleted_event_ids": []}
+
+    def _load_local_events(self) -> List[Dict[str, Any]]:
+        return self._load_local_data().get("events", [])
+
+    def _load_deleted_ids(self) -> set:
+        return set(self._load_local_data().get("deleted_event_ids", []))
 
     def _fetch_google_rest_events(self) -> List[Dict[str, Any]]:
         """Fetches upcoming events via Google Calendar v3 REST API (if key and calendar ID provided)."""
@@ -136,20 +168,43 @@ class CalendarService:
         except Exception:
             return []
 
-    def _fetch_google_ical_events(self) -> List[Dict[str, Any]]:
+    def _fetch_google_ical_events(self, force_refresh: bool = False) -> List[Dict[str, Any]]:
         """Fetches upcoming events via Google Calendar Secret iCal Feed URL (Zero API Key needed!)."""
         if not self.google_ical_url:
             return []
+
+        # Return cached events if fresh (< 60s)
+        if not force_refresh and self._ical_cache and (time.time() - self._ical_cache_time < 60.0):
+            return self._ical_cache
+
         import urllib.request
         try:
             req = urllib.request.Request(self.google_ical_url, headers={"User-Agent": "AstroV1-OfficeBot"})
-            with urllib.request.urlopen(req, timeout=3.5) as resp:
+            with urllib.request.urlopen(req, timeout=4.0) as resp:
                 content = resp.read().decode("utf-8", errors="ignore")
+
+            # RFC 5545 Line Unfolding: lines starting with space/tab are continuations
+            unfolded_lines = []
+            for raw_line in content.splitlines():
+                if raw_line.startswith((" ", "\t")) and unfolded_lines:
+                    unfolded_lines[-1] += raw_line[1:]
+                else:
+                    unfolded_lines.append(raw_line)
+
+            def _unescape_ical(text: str) -> str:
+                return (
+                    text.replace("\\n", "\n")
+                    .replace("\\N", "\n")
+                    .replace("\\,", ",")
+                    .replace("\\;", ";")
+                    .replace("\\\\", "\\")
+                    .strip()
+                )
 
             events = []
             cur_event = None
-            for line in content.splitlines():
-                line = line.strip()
+            for raw_unfolded in unfolded_lines:
+                line = raw_unfolded.strip()
                 if line == "BEGIN:VEVENT":
                     cur_event = {}
                 elif line == "END:VEVENT" and cur_event is not None:
@@ -158,37 +213,55 @@ class CalendarService:
                     cur_event = None
                 elif cur_event is not None:
                     if line.startswith("SUMMARY:"):
-                        cur_event["title"] = line[8:]
+                        cur_event["title"] = _unescape_ical(line[8:])
                     elif line.startswith("LOCATION:"):
-                        cur_event["location"] = line[9:]
+                        cur_event["location"] = _unescape_ical(line[9:])
+                    elif line.startswith("DESCRIPTION:"):
+                        cur_event["description"] = _unescape_ical(line[12:])
+                    elif line.startswith("UID:"):
+                        cur_event["id"] = line[4:].strip()
                     elif line.startswith("DTSTART"):
-                        val = line.split(":")[-1].replace("Z", "")
+                        val_raw = line.split(":")[-1].strip()
+                        is_utc = val_raw.endswith("Z")
+                        val = val_raw.replace("Z", "")
                         try:
                             if len(val) == 8 and val.isdigit():
                                 dt = datetime.strptime(val, "%Y%m%d")
                                 cur_event["start_time"] = dt.strftime("%Y-%m-%d 09:00")
                             else:
                                 dt = datetime.strptime(val[:15], "%Y%m%dT%H%M%S")
+                                if is_utc:
+                                    # Convert UTC to local system time (e.g. Europe/Istanbul UTC+3)
+                                    dt = dt.replace(tzinfo=timezone.utc).astimezone().replace(tzinfo=None)
                                 cur_event["start_time"] = dt.strftime("%Y-%m-%d %H:%M")
-                            cur_event["duration_minutes"] = 45
+                            if "duration_minutes" not in cur_event:
+                                cur_event["duration_minutes"] = 45
                             cur_event["organizer"] = "Google Takvim"
-                            cur_event["id"] = f"ical_{val[:15]}_{abs(hash(cur_event.get('title', '')))}"
+                            if "id" not in cur_event:
+                                cur_event["id"] = f"ical_{val[:15]}_{abs(hash(cur_event.get('title', '')))}"
                         except Exception:
                             pass
                     elif line.startswith("DTEND"):
-                        val = line.split(":")[-1].replace("Z", "")
+                        val_raw = line.split(":")[-1].strip()
+                        is_utc = val_raw.endswith("Z")
+                        val = val_raw.replace("Z", "")
                         try:
                             if len(val) >= 15 and "start_time" in cur_event:
                                 dt_end = datetime.strptime(val[:15], "%Y%m%dT%H%M%S")
+                                if is_utc:
+                                    dt_end = dt_end.replace(tzinfo=timezone.utc).astimezone().replace(tzinfo=None)
                                 dt_start = datetime.strptime(cur_event["start_time"], "%Y-%m-%d %H:%M")
                                 dur = int((dt_end - dt_start).total_seconds() / 60.0)
                                 if dur > 0:
                                     cur_event["duration_minutes"] = dur
                         except Exception:
                             pass
+
+            self._ical_cache = events
+            self._ical_cache_time = time.time()
             return events
         except Exception:
-            return []
+            return self._ical_cache or []
 
     def _google_rest_headers(self) -> Dict[str, str]:
         headers = {"User-Agent": "AstroV1-OfficeBot", "Content-Type": "application/json"}
@@ -287,13 +360,17 @@ class CalendarService:
 
         # 2. Collect from local JSON storage
         local_events = self._load_local_events()
+        deleted_ids = self._load_deleted_ids()
 
         # Merge with deduplication (by event id or title+start_time)
         all_events = []
         seen_keys = set()
 
         for ev in (google_events + local_events):
+            ev_id = str(ev.get("id", ""))
             t_key = f"{ev.get('title')}_{ev.get('start_time')}"
+            if (ev_id and ev_id in deleted_ids) or (t_key in deleted_ids):
+                continue
             if t_key not in seen_keys:
                 seen_keys.add(t_key)
                 all_events.append(ev)
@@ -310,7 +387,11 @@ class CalendarService:
                 else:
                     st = datetime.strptime(st_str, "%Y-%m-%d %H:%M")
 
-                if now - timedelta(minutes=15) <= st <= cutoff:
+                dur = ev.get("duration_minutes", 30)
+                end = st + timedelta(minutes=dur)
+
+                # Include if currently in-progress (st <= now <= end) or starting within window
+                if (st <= now <= end) or (now <= st <= cutoff) or (now - timedelta(minutes=15) <= st <= cutoff):
                     ev_copy = dict(ev)
                     ev_copy["dt_start"] = st
                     upcoming.append(ev_copy)
@@ -456,7 +537,8 @@ class CalendarService:
     ) -> Dict[str, Any]:
         """Adds an event to local storage and syncs to Google Calendar if configured."""
         org = organizer or os.environ.get("ASTRO_OWNER_NAME", "Kullanıcı")
-        events = self._load_local_events()
+        data = self._load_local_data()
+        events = data.get("events", [])
         new_event = {
             "id": f"evt_{int(time.time())}",
             "title": title,
@@ -476,9 +558,10 @@ class CalendarService:
             pass
 
         events.append(new_event)
+        data["events"] = events
         try:
             with open(self.storage_path, "w", encoding="utf-8") as f:
-                json.dump({"events": events}, f, ensure_ascii=False, indent=2)
+                json.dump(data, f, ensure_ascii=False, indent=2)
             return {"status": "success", "event": new_event}
         except Exception as e:
             return {"status": "error", "message": str(e)}
@@ -489,17 +572,27 @@ class CalendarService:
         if not q_low:
             return {"status": "error", "message": "Silinecek etkinlik adı belirtilmedi."}
 
-        events = self._load_local_events()
+        data = self._load_local_data()
+        events = data.get("events", [])
+        deleted_ids = set(data.get("deleted_event_ids", []))
         to_keep = []
         deleted = []
 
         for ev in events:
             title = ev.get("title", "").lower()
             ev_id = str(ev.get("id", "")).lower()
-            if q_low in title or q_low in ev_id or (len(q_low) > 3 and any(w in title for w in q_low.split())):
+            if q_low in title or q_low in ev_id or (len(q_low) > 3 and all(w in title for w in q_low.split())):
                 deleted.append(ev)
             else:
                 to_keep.append(ev)
+
+        # If not found in local events, also search in Google iCal events
+        if not deleted:
+            for ical_ev in self._fetch_google_ical_events():
+                title = ical_ev.get("title", "").lower()
+                ev_id = str(ical_ev.get("id", "")).lower()
+                if q_low in title or q_low in ev_id or (len(q_low) > 3 and all(w in title for w in q_low.split())):
+                    deleted.append(ical_ev)
 
         if not deleted:
             return {
@@ -507,8 +600,14 @@ class CalendarService:
                 "message": f"'{query}' ile eşleşen bir etkinlik bulunamadı."
             }
 
-        # Attempt Google Calendar REST delete for deleted events
+        # Track deleted IDs to mask from iCal in future queries
         for dev in deleted:
+            if dev.get("id"):
+                deleted_ids.add(str(dev["id"]))
+            if dev.get("title") and dev.get("start_time"):
+                deleted_ids.add(f"{dev.get('title')}_{dev.get('start_time')}")
+
+            # Attempt Google Calendar REST delete for deleted events
             gid = dev.get("google_id") or (dev.get("id") if not str(dev.get("id", "")).startswith("evt_") else None)
             if gid:
                 try:
@@ -518,7 +617,7 @@ class CalendarService:
 
         try:
             with open(self.storage_path, "w", encoding="utf-8") as f:
-                json.dump({"events": to_keep}, f, ensure_ascii=False, indent=2)
+                json.dump({"events": to_keep, "deleted_event_ids": list(deleted_ids)}, f, ensure_ascii=False, indent=2)
             del_title = deleted[0].get("title", query)
             return {
                 "status": "success",
@@ -543,17 +642,34 @@ class CalendarService:
         if not q_low:
             return {"status": "error", "message": "Güncellenecek etkinlik adı belirtilmedi."}
 
-        events = self._load_local_events()
+        data = self._load_local_data()
+        events = data.get("events", [])
+        deleted_ids = set(data.get("deleted_event_ids", []))
         target_event = None
         target_idx = -1
 
         for idx, ev in enumerate(events):
             title = ev.get("title", "").lower()
             ev_id = str(ev.get("id", "")).lower()
-            if q_low in title or q_low in ev_id or (len(q_low) > 3 and any(w in title for w in q_low.split())):
+            if q_low in title or q_low in ev_id or (len(q_low) > 3 and all(w in title for w in q_low.split())):
                 target_event = ev
                 target_idx = idx
                 break
+
+        # If not in local events, check if it exists in iCal events
+        if not target_event:
+            for ical_ev in self._fetch_google_ical_events():
+                title = ical_ev.get("title", "").lower()
+                ev_id = str(ical_ev.get("id", "")).lower()
+                if q_low in title or q_low in ev_id or (len(q_low) > 3 and all(w in title for w in q_low.split())):
+                    target_event = dict(ical_ev)
+                    if ical_ev.get("id"):
+                        deleted_ids.add(str(ical_ev["id"]))
+                    if ical_ev.get("title") and ical_ev.get("start_time"):
+                        deleted_ids.add(f"{ical_ev.get('title')}_{ical_ev.get('start_time')}")
+                    events.append(target_event)
+                    target_idx = len(events) - 1
+                    break
 
         if not target_event:
             return {"status": "not_found", "message": f"'{query}' ile eşleşen bir etkinlik bulunamadı."}
@@ -584,7 +700,7 @@ class CalendarService:
 
         try:
             with open(self.storage_path, "w", encoding="utf-8") as f:
-                json.dump({"events": events}, f, ensure_ascii=False, indent=2)
+                json.dump({"events": events, "deleted_event_ids": list(deleted_ids)}, f, ensure_ascii=False, indent=2)
         except Exception as e:
             return {"status": "error", "message": f"Yerel depolama güncellenemedi: {e}"}
 

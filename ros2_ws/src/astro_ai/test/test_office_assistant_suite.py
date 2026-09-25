@@ -277,7 +277,71 @@ class TestAstroRealtimeNodeOfficeTools(unittest.TestCase):
         self.assertGreaterEqual(len(tts_messages), 1)
         self.assertIn("çay içeceğim", tts_messages[0])
 
+    def test_13_google_calendar_ical_integration(self):
+        cal = self.node.calendar_service
+        cal.google_ical_url = (
+            "https://calendar.google.com/calendar/ical/"
+            "7953b2fc68f9a7f3efb93736c65c67c4c2bb91b66f05eb9287bec4a31f9783d0%40group.calendar.google.com/"
+            "private-6e5454dd9d2f21dbff4c43ad7cc4633d/basic.ics"
+        )
+        # Verify calendar ID derivation
+        import re, urllib.parse
+        m = re.search(r"/calendar/ical/([^/]+)/", cal.google_ical_url)
+        self.assertIsNotNone(m)
+        self.assertEqual(
+            urllib.parse.unquote(m.group(1)),
+            "7953b2fc68f9a7f3efb93736c65c67c4c2bb91b66f05eb9287bec4a31f9783d0@group.calendar.google.com"
+        )
+
+        sample_ics = (
+            "BEGIN:VCALENDAR\r\n"
+            "PRODID:-//Google Inc//Google Calendar 70.9054//EN\r\n"
+            "VERSION:2.0\r\n"
+            "X-WR-CALNAME:ast1\r\n"
+            "BEGIN:VEVENT\r\n"
+            "UID:sample_gcal_001@google.com\r\n"
+            "SUMMARY:Astro Ekip\r\n"
+            "  Senkronizasyonu\r\n"
+            "DESCRIPTION:Proje detaylari ve\r\n"
+            "  yol haritasi\r\n"
+            "LOCATION:Ar-Ge Odasi\r\n"
+            "DTSTART:20260925T110000Z\r\n"
+            "DTEND:20260925T120000Z\r\n"
+            "END:VEVENT\r\n"
+            "END:VCALENDAR"
+        )
+
+        with patch("urllib.request.urlopen") as mock_urlopen:
+            mock_resp = MagicMock()
+            mock_resp.read.return_value = sample_ics.encode("utf-8")
+            mock_urlopen.return_value.__enter__.return_value = mock_resp
+
+            # 1. Fetch and parse with force_refresh
+            events = cal._fetch_google_ical_events(force_refresh=True)
+            self.assertEqual(len(events), 1)
+            ev = events[0]
+            self.assertEqual(ev["title"], "Astro Ekip Senkronizasyonu")
+            self.assertEqual(ev["location"], "Ar-Ge Odasi")
+            self.assertEqual(ev["id"], "sample_gcal_001@google.com")
+            self.assertEqual(ev["duration_minutes"], 60)
+
+            # 2. Test cache: second call does not invoke urlopen
+            mock_urlopen.reset_mock()
+            cached_events = cal._fetch_google_ical_events(force_refresh=False)
+            self.assertEqual(len(cached_events), 1)
+            mock_urlopen.assert_not_called()
+
+            # 3. Test deleting an iCal event masks it locally
+            del_res = cal.delete_event("Astro Ekip")
+            self.assertEqual(del_res["status"], "success")
+            self.assertIn("Astro Ekip Senkronizasyonu", del_res["deleted_title"])
+
+            # 4. Verify it is now masked from upcoming events
+            upcoming = cal.get_upcoming_events(hours=48)
+            self.assertFalse(any(e.get("id") == "sample_gcal_001@google.com" for e in upcoming))
+
 
 if __name__ == "__main__":
     unittest.main()
+
 
