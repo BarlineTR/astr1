@@ -135,6 +135,26 @@ def _resolve_standalone_dir() -> str:
     return str(Path(__file__).resolve().parents[5] / "standalone")
 
 
+def _resolve_known_faces_dir() -> Optional[str]:
+    """Finds the authoritative directory containing known face reference images."""
+    env_dir = os.getenv("ASTRO_KNOWN_FACES_DIR")
+    if env_dir and os.path.exists(env_dir):
+        return env_dir
+    cur = Path(__file__).resolve().parent
+    while cur.parent != cur:
+        cand = cur / "ros2_ws" / "src" / "astro_vision" / "data" / "known_faces"
+        if cand.exists() and len(os.listdir(cand)) > 0:
+            return str(cand)
+        cand2 = cur / "src" / "astro_vision" / "data" / "known_faces"
+        if cand2.exists() and len(os.listdir(cand2)) > 0:
+            return str(cand2)
+        cur = cur.parent
+    desk = Path.home() / "Desktop" / "astr1" / "ros2_ws" / "src" / "astro_vision" / "data" / "known_faces"
+    if desk.exists() and len(os.listdir(desk)) > 0:
+        return str(desk)
+    return None
+
+
 _STANDALONE_DIR = _resolve_standalone_dir()
 if _STANDALONE_DIR not in sys.path:
     sys.path.insert(0, _STANDALONE_DIR)
@@ -473,10 +493,15 @@ class StandaloneGazeRosNode(Node):
         self.face_recognizer = None
         if FaceRecognizer is not None:
             try:
-                self.face_recognizer = FaceRecognizer()
-                self.get_logger().info("👤 [FaceRecognizer] SFace yerel yüz tanıma motoru yüklendi.")
+                resolved_faces_dir = _resolve_known_faces_dir()
+                self.face_recognizer = FaceRecognizer(data_dir=resolved_faces_dir)
+                num_profiles = len(getattr(self.face_recognizer, "_known_embeddings", {}))
+                if num_profiles > 0:
+                    self.get_logger().info(f"👤 [FaceRecognizer] SFace yerel yüz tanıma motoru yüklendi ({num_profiles} profil hazır, dizin={self.face_recognizer.data_dir}).")
+                else:
+                    self.get_logger().warn(f"⚠️ [FaceRecognizer] SFace yüklendi ancak bilinen yüz galerisi BOŞ! Aranan dizin: {self.face_recognizer.data_dir}")
             except Exception as fr_err:
-                self.get_logger().debug(f"FaceRecognizer skipped: {fr_err}")
+                self.get_logger().error(f"❌ [FaceRecognizer] Başlatılamadı: {fr_err}")
 
         # Object Detection Publisher (Local YOLO COCO-80 via ObjectDetectorEngine)
         self.object_engine = None
@@ -904,8 +929,8 @@ class StandaloneGazeRosNode(Node):
         try:
             best_det = max(detections, key=lambda d: d.w * d.h)
             h, w = frame.shape[:2]
-            margin_x = int(best_det.w * 0.15)
-            margin_y = int(best_det.h * 0.15)
+            margin_x = int(best_det.w * 0.35)
+            margin_y = int(best_det.h * 0.35)
             x1 = max(0, best_det.x - margin_x)
             y1 = max(0, best_det.y - margin_y)
             x2 = min(w, best_det.x + best_det.w + margin_x)
@@ -917,6 +942,7 @@ class StandaloneGazeRosNode(Node):
             def _worker(roi):
                 try:
                     name, conf, meta = self.face_recognizer.recognize_face(roi)
+                    now_log = time.monotonic()
                     if name:
                         payload = {
                             "name": name,
@@ -927,14 +953,20 @@ class StandaloneGazeRosNode(Node):
                         }
                         last_logged = getattr(self, "_last_logged_recog_name", None)
                         last_time = getattr(self, "_last_logged_recog_time", 0.0)
-                        now_log = time.monotonic()
-                        if last_logged != name or (now_log - last_time) >= 4.0:
+                        if last_logged != name or (now_log - last_time) >= 3.0:
                             self._last_logged_recog_name = name
                             self._last_logged_recog_time = now_log
                             conf_pct = int((conf or 0.85) * 100)
                             formal = meta.get("formal_title", name)
                             self.get_logger().info(f"👤 [YÜZ TANINDI]: {name} ({formal}) — Güven: %{conf_pct}")
                     else:
+                        cand = meta.get("candidate", "Bilinmeyen") if isinstance(meta, dict) else "Bilinmeyen"
+                        last_unrec_time = getattr(self, "_last_unrec_log_time", 0.0)
+                        if (now_log - last_unrec_time) >= 3.0:
+                            self._last_unrec_log_time = now_log
+                            score_pct = int((conf or 0.0) * 100)
+                            thresh_pct = int(getattr(self.face_recognizer, "threshold", 0.38) * 100)
+                            self.get_logger().info(f"🔍 [YÜZ ANALİZİ]: Tanınamadı (Misafir) — En yakın aday: '{cand}' skor: %{score_pct} (Eşik: %{thresh_pct})")
                         payload = {
                             "name": "Misafir",
                             "confidence": float(conf) if conf is not None else 0.0,

@@ -36,8 +36,8 @@ except ImportError:  # paket kaynaktan çalıştırılıyorsa
         class FaceEngineUnavailable(RuntimeError):
             pass
 
-# OpenCV SFace için belgelenen eşik: kosinüs >= 0.363 aynı kişi.
-FACE_MATCH_THRESHOLD = float(os.getenv("FACE_MATCH_THRESHOLD", "0.45"))
+# OpenCV SFace için belgelenen eşik: kosinüs >= 0.363 aynı kişi (mobil ekran / ışık toleransı için 0.38 idealdir).
+FACE_MATCH_THRESHOLD = float(os.getenv("FACE_MATCH_THRESHOLD", "0.38"))
 
 _ENGINE = None
 _ENGINE_TRIED = False
@@ -60,20 +60,50 @@ class FaceRecognizer:
     """Manages facial feature embeddings, known gallery indexing, and matching."""
     EMBEDDING_DIM: int = 128  # OpenCV SFace standard embedding dimension
 
-    def __init__(self, data_dir: Optional[str] = None):
+    def __init__(self, data_dir: Optional[str] = None, threshold: float = FACE_MATCH_THRESHOLD):
+        from pathlib import Path
+        self.threshold = threshold
         if data_dir is None:
-            # Check default workspace paths
-            candidates = [
-                os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "data", "known_faces")),
-                os.path.abspath("./data/known_faces")
-            ]
-            self.data_dir = candidates[0]
+            # Check environment, ament package share, source tree, and standard robot paths
+            candidates = []
+            env_dir = os.getenv("ASTRO_KNOWN_FACES_DIR")
+            if env_dir:
+                candidates.append(os.path.abspath(env_dir))
+
+            try:
+                from ament_index_python.packages import get_package_share_directory
+                share_dir = get_package_share_directory("astro_vision")
+                candidates.append(os.path.join(share_dir, "data", "known_faces"))
+            except Exception:
+                pass
+
+            this_p = Path(__file__).resolve()
+            candidates.append(str(this_p.parent.parent / "data" / "known_faces"))
+            candidates.append(str(this_p.parent / "data" / "known_faces"))
+
+            # Install space climbing back to source tree
+            try:
+                candidates.append(str(this_p.parents[3] / "src" / "astro_vision" / "data" / "known_faces"))
+                candidates.append(str(this_p.parents[4] / "src" / "astro_vision" / "data" / "known_faces"))
+                candidates.append(str(this_p.parents[5] / "ros2_ws" / "src" / "astro_vision" / "data" / "known_faces"))
+            except IndexError:
+                pass
+
+            # Standard robot and workspace paths
+            candidates.append(str(Path.home() / "Desktop" / "astr1" / "ros2_ws" / "src" / "astro_vision" / "data" / "known_faces"))
+            candidates.append(str(Path.home() / ".astro" / "known_faces"))
+            candidates.append(os.path.abspath("./ros2_ws/src/astro_vision/data/known_faces"))
+            candidates.append(os.path.abspath("./data/known_faces"))
+
+            self.data_dir = None
             for c in candidates:
-                if os.path.exists(c):
-                    self.data_dir = c
+                if c and os.path.exists(c) and len(os.listdir(c)) > 0:
+                    self.data_dir = os.path.abspath(c)
                     break
+            if self.data_dir is None:
+                self.data_dir = os.path.abspath(candidates[0] if candidates else "./data/known_faces")
         else:
-            self.data_dir = data_dir
+            self.data_dir = os.path.abspath(data_dir)
 
         os.makedirs(self.data_dir, exist_ok=True)
         self._lock = threading.RLock()
@@ -86,14 +116,37 @@ class FaceRecognizer:
         self.reload_gallery()
 
     def _init_default_profiles(self):
-        """Initializes metadata templates for Bitlis & Turkey officials."""
+        """Initializes metadata templates for Bitlis & Turkey officials and cabinet members."""
         defaults = {
-            "Erol Karaömeroğlu": {"title": "Bitlis Valisi", "formal_title": "Sayın Valim", "category": "governor"},
+            # Protokol ve Yaratıcı
+            "Recep Tayyip Erdoğan": {"title": "Cumhurbaşkanı", "formal_title": "Sayın Cumhurbaşkanım", "category": "head_of_state"},
+            "Cevdet Yılmaz": {"title": "Cumhurbaşkanı Yardımcısı", "formal_title": "Sayın Cumhurbaşkanı Yardımcım", "category": "executive"},
+            "Baran": {"title": "Baş Mühendis & Yaratıcı", "formal_title": "Baran Bey", "category": "creator"},
+            "Selçuk Bayraktar": {"title": "Baykar Yönetim Kurulu Başkanı", "formal_title": "Sayın Bayraktar", "category": "industry"},
+            # Kabine Üyeleri
+            "Hakan Fidan": {"title": "Dışişleri Bakanı", "formal_title": "Sayın Bakanım", "category": "minister"},
+            "Ali Yerlikaya": {"title": "İçişleri Bakanı", "formal_title": "Sayın Bakanım", "category": "minister"},
+            "Mehmet Şimşek": {"title": "Hazine ve Maliye Bakanı", "formal_title": "Sayın Bakanım", "category": "minister"},
+            "Yaşar Güler": {"title": "Milli Savunma Bakanı", "formal_title": "Sayın Bakanım", "category": "minister"},
+            "Yılmaz Tunç": {"title": "Adalet Bakanı", "formal_title": "Sayın Bakanım", "category": "minister"},
+            "Mehmet Fatih Kacır": {"title": "Sanayi ve Teknoloji Bakanı", "formal_title": "Sayın Bakanım", "category": "minister"},
+            "Alparslan Bayraktar": {"title": "Enerji ve Tabii Kaynaklar Bakanı", "formal_title": "Sayın Bakanım", "category": "minister"},
+            "Murat Kurum": {"title": "Çevre, Şehircilik ve İklim Değişikliği Bakanı", "formal_title": "Sayın Bakanım", "category": "minister"},
+            "Yusuf Tekin": {"title": "Milli Eğitim Bakanı", "formal_title": "Sayın Bakanım", "category": "minister"},
+            "Abdulkadir Uraloğlu": {"title": "Ulaştırma ve Altyapı Bakanı", "formal_title": "Sayın Bakanım", "category": "minister"},
+            "İbrahim Yumaklı": {"title": "Tarım ve Orman Bakanı", "formal_title": "Sayın Bakanım", "category": "minister"},
+            "Kemal Memişoğlu": {"title": "Sağlık Bakanı", "formal_title": "Sayın Bakanım", "category": "minister"},
+            "Mahinur Özdemir Göktaş": {"title": "Aile ve Sosyal Hizmetler Bakanı", "formal_title": "Sayın Bakanım", "category": "minister"},
+            "Ömer Bolat": {"title": "Ticaret Bakanı", "formal_title": "Sayın Bakanım", "category": "minister"},
+            "Osman Aşkın Bak": {"title": "Gençlik ve Spor Bakanı", "formal_title": "Sayın Bakanım", "category": "minister"},
+            "Vedat Işıkhan": {"title": "Çalışma ve Sosyal Güvenlik Bakanı", "formal_title": "Sayın Bakanım", "category": "minister"},
+            "Mehmet Nuri Ersoy": {"title": "Kültür ve Turizm Bakanı", "formal_title": "Sayın Bakanım", "category": "minister"},
+            # Bitlis ve Bölge Mülki İdare
+            "Erol Karaömeroğlu": {"title": "Bitlis Eski Valisi", "formal_title": "Sayın Valim", "category": "governor"},
+            "Ahmet Karakaya": {"title": "Bitlis Valisi", "formal_title": "Sayın Valim", "category": "governor"},
             "Nesrullah Tanğlay": {"title": "Bitlis Belediye Başkanı", "formal_title": "Sayın Başkanım", "category": "mayor"},
             "Batuhan Bingöl": {"title": "Ahlat Kaymakamı", "formal_title": "Sayın Kaymakamım", "category": "district_governor"},
             "Yavuz Gülmez": {"title": "Ahlat Belediye Başkanı", "formal_title": "Sayın Başkanım", "category": "mayor"},
-            "Recep Tayyip Erdoğan": {"title": "Cumhurbaşkanı", "formal_title": "Sayın Cumhurbaşkanım", "category": "head_of_state"},
-            "Baran": {"title": "Baş Mühendis & Yaratıcı", "formal_title": "Baran Bey", "category": "creator"}
         }
         for name, meta in defaults.items():
             norm = self._normalize_name(name)
@@ -130,13 +183,8 @@ class FaceRecognizer:
                 largest = max(faces, key=lambda f: float(f[2]) * float(f[3]))
                 feature = engine.embed(face_bgr, largest)
             else:
-                h, w = face_bgr.shape[:2]
-                if h <= 250 and w <= 250:
-                    aligned = cv2.resize(face_bgr, (112, 112))
-                    feature = engine.feature(aligned)
-                else:
-                    # Full frame with no face detected
-                    return None
+                aligned = cv2.resize(face_bgr, (112, 112))
+                feature = engine.feature(aligned)
         except Exception:
             return None
 
@@ -173,11 +221,11 @@ class FaceRecognizer:
             # 2. Load from data_dir image files
             if os.path.exists(self.data_dir):
                 indexed_count = 0
-                for entry in os.listdir(self.data_dir):
+                for entry in sorted(os.listdir(self.data_dir)):
                     entry_path = os.path.join(self.data_dir, entry)
                     if os.path.isdir(entry_path):
                         person_norm = self._normalize_name(entry)
-                        for f in os.listdir(entry_path):
+                        for f in sorted(os.listdir(entry_path)):
                             if f.lower().endswith((".jpg", ".jpeg", ".png", ".bmp")):
                                 img_p = os.path.join(entry_path, f)
                                 if cv2 is not None:
@@ -197,6 +245,9 @@ class FaceRecognizer:
                                 if emb is not None:
                                     self._known_embeddings.setdefault(person_norm, []).append(emb)
                                     indexed_count += 1
+
+            total_embs = sum(len(v) for v in self._known_embeddings.values())
+            _LOG.info("👤 [FaceRecognizer] Galeri hazır: %d kişi, %d şablon yüklendi (data_dir=%s)", len(self._known_embeddings), total_embs, self.data_dir)
 
     def enroll_face(self, name: str, face_bgr: np.ndarray, title: Optional[str] = None) -> bool:
         """Dynamically learns and saves a new face to disk and memory."""
@@ -238,14 +289,19 @@ class FaceRecognizer:
                     _LOG.debug("enroll_face: yok sayılan hata (%s)", _exc)
             return True
 
-    def recognize_face(self, face_bgr: np.ndarray, threshold: float = FACE_MATCH_THRESHOLD) -> Tuple[Optional[str], float, Dict[str, Any]]:
+    def recognize_face(self, face_bgr: np.ndarray, threshold: Optional[float] = None) -> Tuple[Optional[str], float, Dict[str, Any]]:
         """Matches a face ROI against the known gallery. Returns (name, confidence, metadata)."""
-        # 1. First try FaceEngine directly (loads ~/.astro/faces/faces.json)
+        eff_thresh = float(threshold if threshold is not None else self.threshold)
+        emb = self.extract_embedding(face_bgr)
+        if emb is None:
+            return None, 0.0, {}
+
+        # 1. First try FaceEngine directly if it has registered people
         engine = _get_engine()
-        if engine is not None:
+        if engine is not None and getattr(engine, "people", None):
             try:
-                matched_name, sim = engine.identify(face_bgr)
-                if matched_name is not None and sim >= threshold:
+                matched_name, sim = engine.identify(emb)
+                if matched_name is not None and sim >= eff_thresh:
                     norm = self._normalize_name(matched_name)
                     meta = self._person_metadata.get(norm, {
                         "name": matched_name,
@@ -253,16 +309,10 @@ class FaceRecognizer:
                         "formal_title": matched_name
                     })
                     return meta["name"], round(float(sim), 2), meta
-                elif sim is not None and sim > 0:
-                    return None, round(float(sim), 2), {}
             except Exception as _exc:
                 _LOG.debug("recognize_face: yok sayılan hata (%s)", _exc)
 
-        # 2. Fallback to in-memory matching
-        emb = self.extract_embedding(face_bgr)
-        if emb is None:
-            return None, 0.0, {}
-
+        # 2. Fallback to in-memory matching against known_faces
         with self._lock:
             if not self._known_embeddings:
                 return None, 0.0, {}
@@ -277,8 +327,7 @@ class FaceRecognizer:
                         highest_sim = sim
                         best_match = person_norm
 
-
-            if best_match is not None and highest_sim >= threshold:
+            if best_match is not None and highest_sim >= eff_thresh:
                 meta = self._person_metadata.get(best_match, {
                     "name": best_match.replace("_", " ").title(),
                     "title": "Tanınan Kişi",
@@ -286,5 +335,6 @@ class FaceRecognizer:
                 })
                 return meta["name"], round(highest_sim, 2), meta
 
-            return None, max(0.0, round(highest_sim, 2)), {}
+            cand_name = best_match.replace("_", " ").title() if best_match else "Bilinmeyen"
+            return None, max(0.0, round(highest_sim, 2)), {"candidate": cand_name}
 

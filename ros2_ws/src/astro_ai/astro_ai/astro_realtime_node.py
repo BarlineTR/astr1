@@ -611,6 +611,19 @@ def is_known_phantom_pattern(text: str) -> bool:
     }
     if t in phantom_exacts:
         return True
+
+    phantom_substrings = (
+        "sesime dön yüzüme bak durdum merkez",
+        "sesime don yuzume bak durdum merkez",
+        "sesime dön yüzüme bak",
+        "sesime don yuzume bak",
+        "yüzüme bak durdum merkez",
+        "yuzume bak durdum merkez",
+        "durdum merkez",
+    )
+    if any(ps in t for ps in phantom_substrings):
+        return True
+
     # Repetitive single word loop e.g. "türen, türen, türen" or "evet, evet, evet"
     words = t.split()
     if len(words) >= 2 and len(set(words)) == 1 and words[0] in ("türen", "turen", "evet", "hayır", "ha", "he", "diz", "dizi", "altyazı", "hahaha"):
@@ -6978,9 +6991,9 @@ class AstroRealtimeNode(Node):
 
         # 3. Weak speech duration, low VAD confidence, or ambient noise floor
         elif (
-            (vad_confidence < 0.15 or speech_ms < 50 or total_rms < max(75.0, self._ambient_rms * 1.05))
+            (vad_confidence < 0.30 or speech_ms < 80 or total_rms < max(190.0, self._ambient_rms * 1.15))
             if is_wake_cand
-            else (vad_confidence < 0.20 or speech_ms < 100 or total_rms < max(130.0, self._ambient_rms * 1.15))
+            else (vad_confidence < 0.22 or speech_ms < 100 or total_rms < max(130.0, self._ambient_rms * 1.15))
         ):
             rejected = True
             reject_reason = "no_speech"
@@ -7000,6 +7013,11 @@ class AstroRealtimeNode(Node):
 
         # 6. Low quality speech / Repetitive Whisper hallucination gate (e.g. 'Türen, türen...', 'Hahaha')
         elif not is_wake_cand and vad_confidence < 0.35 and speech_ms < 220 and total_rms < 380.0:
+            rejected = True
+            reject_reason = "low_confidence"
+
+        # 6b. Long hallucination on background noise (e.g. prompt hallucinations on faint ambient noise)
+        elif len(words) >= 3 and vad_confidence < 0.35 and total_rms < 280.0:
             rejected = True
             reject_reason = "low_confidence"
 
@@ -7188,7 +7206,7 @@ class AstroRealtimeNode(Node):
         if not self.groq_api_key:
             return None
         try:
-            prompt_text = "Astro, hey Astro, sesime dön, bana bak, bana dön, yüzüme bak, dur, durdum, merkez, Baran, Oktay, robot."
+            prompt_text = "Astro robot."
             boundary = "----WebKitFormBoundary" + os.urandom(16).hex()
             body = bytearray()
             body.extend(f"--{boundary}\r\n".encode())
@@ -8206,11 +8224,23 @@ class AstroRealtimeNode(Node):
 
             if not spk_name:
                 identity = self._get_active_biometric_identity()
-                if identity.get("is_known") and identity.get("name", "").lower() != "misafir":
-                    spk_name = identity.get("name")
-                    spk_score = identity.get("confidence", 0.85)
-                    spk_source = identity.get("source", "memory_hold")
+                bio_id = identity.get("biometric_identity", "unknown")
+                bio_status = identity.get("biometric_status", "unknown")
+                # Only adopt speaker name if biometrically verified or from an ongoing dialogue hold.
+                # Do NOT adopt persistent_memory owner as live active speaker in the room.
+                if identity.get("is_known") and bio_id not in ("unknown", "ambiguous_conflict", None, "") and bio_status in ("verified", "probable"):
+                    spk_name = bio_id
+                    spk_score = identity.get("biometric_confidence", 0.85)
+                    spk_source = identity.get("biometric_source", "sensor_biometrics")
                     spk_known = True
+                elif identity.get("has_active_hold") and identity.get("active_hold_speaker"):
+                    spk_name = identity.get("active_hold_speaker")
+                    spk_score = 0.80
+                    spk_source = "session_hold"
+                    spk_known = True
+                else:
+                    spk_name = None
+                    spk_known = False
 
             active_speaker_dict = {
                 "name": spk_name or "Misafir",

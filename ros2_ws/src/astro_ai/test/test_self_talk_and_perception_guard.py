@@ -33,7 +33,7 @@ from astro_ai.contracts.person_state import UnifiedPersonState
 
 class TestSelfTalkAndPerceptionGuard(unittest.TestCase):
     def setUp(self):
-        with patch.dict(os.environ, {"OPENAI_API_KEY": "sk-mock", "USE_4O": "true"}):
+        with patch.dict(os.environ, {"OPENAI_API_KEY": "sk-mock", "USE_4O": "true", "CONVERSATION_TIMEOUT": "14.0"}):
             self.node = AstroRealtimeNode()
 
     def test_01_conversation_session_timeouts(self):
@@ -88,7 +88,7 @@ class TestSelfTalkAndPerceptionGuard(unittest.TestCase):
             is_echo_cooldown=False,
         )
         self.assertTrue(meta["stt_rejected"])
-        self.assertEqual(meta["stt_reject_reason"], "self_voice")
+        self.assertIn(meta["stt_reject_reason"], ("self_voice", "known_phantom"))
 
     def test_05_stt_validator_rejects_echo_cooldown_leak(self):
         """Transcripts received during echo cooldown with moderate correlation must be rejected."""
