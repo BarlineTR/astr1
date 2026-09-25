@@ -104,6 +104,13 @@ def run_hardware_grounding_test():
 
     # 3. Step Consciousness & Spatial Fusion
     print("\n🧠 [3/5] Stepping Consciousness & Cognitive Loop Architecture...")
+    try:
+        import rclpy
+        if not rclpy.ok():
+            rclpy.init()
+    except Exception:
+        pass
+
     from astro_ai.consciousness_node import ConsciousnessNode
     from astro_ai.contracts.consciousness_types import CognitiveEventType
 
