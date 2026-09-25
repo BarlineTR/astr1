@@ -53,66 +53,64 @@ class CalendarService:
         self._ensure_storage_initialized()
 
     def _ensure_storage_initialized(self):
-        """Seeds default office events if storage file is missing, empty, or all events are in the past."""
-        needs_seed = False
+        """Initializes storage file. Never injects unsolicited mock events into user calendar; purges any legacy demo seeds."""
         if not os.path.exists(self.storage_path) or os.path.getsize(self.storage_path) == 0:
-            needs_seed = True
-        else:
-            try:
-                events = self._load_local_events()
-                if not events:
-                    needs_seed = True
-                else:
-                    # If all events are older than 7 days, refresh seed events
-                    has_recent = False
-                    now = datetime.now()
-                    for ev in events:
-                        st_str = ev.get("start_time", "")
-                        try:
-                            if "T" in st_str:
-                                st = datetime.fromisoformat(st_str.replace("Z", "+00:00")).replace(tzinfo=None)
-                            else:
-                                st = datetime.strptime(st_str, "%Y-%m-%d %H:%M")
-                            if abs((now - st).total_seconds()) < 7 * 86400:
-                                has_recent = True
-                                break
-                        except Exception:
-                            pass
-                    if not has_recent:
-                        needs_seed = True
-            except Exception:
-                needs_seed = True
-
-        if needs_seed:
-            now = datetime.now()
-            default_owner = os.environ.get("ASTRO_OWNER_NAME", "Kullanıcı")
-            seed_events = [
-                {
-                    "id": "evt_sprint_review",
-                    "title": "Haftalık Sprint Değerlendirmesi",
-                    "start_time": (now + timedelta(minutes=10)).strftime("%Y-%m-%d %H:%M"),
-                    "duration_minutes": 45,
-                    "location": "Toplantı Odası A",
-                    "organizer": default_owner,
-                    "attendees": list(dict.fromkeys([default_owner, "Baran", "Selin", "Ahmet"])),
-                    "description": "Yeni robotik ve arayüz geliştirmelerinin değerlendirilmesi."
-                },
-                {
-                    "id": "evt_arch_sync",
-                    "title": "Astro Sistem Mimarisi İncelemesi",
-                    "start_time": (now + timedelta(hours=3)).strftime("%Y-%m-%d %H:%M"),
-                    "duration_minutes": 60,
-                    "location": "Lobi / Ar-Ge Alanı",
-                    "organizer": default_owner,
-                    "attendees": list(dict.fromkeys([default_owner, "Baran", "Yapay Zeka Ekibi"])),
-                    "description": "ROS2 ve LLM gerçek zamanlı gecikme optimizasyonları."
-                }
-            ]
             try:
                 with open(self.storage_path, "w", encoding="utf-8") as f:
-                    json.dump({"events": seed_events}, f, ensure_ascii=False, indent=2)
+                    json.dump({"events": [], "deleted_event_ids": []}, f, ensure_ascii=False, indent=2)
             except Exception:
                 pass
+            return
+
+        # Purge any legacy mock seed events from existing storage
+        try:
+            data = self._load_local_data()
+            events = data.get("events", [])
+            cleaned = [
+                ev for ev in events
+                if str(ev.get("id", "")) not in ("evt_sprint_review", "evt_arch_sync")
+                and ev.get("title") not in ("Haftalık Sprint Değerlendirmesi", "Astro Sistem Mimarisi İncelemesi")
+            ]
+            if len(cleaned) != len(events):
+                data["events"] = cleaned
+                with open(self.storage_path, "w", encoding="utf-8") as f:
+                    json.dump(data, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
+
+    def seed_demo_events(self):
+        """Explicitly seeds demo events when requested by automated test suites or sandbox demos."""
+        now = datetime.now()
+        default_owner = os.environ.get("ASTRO_OWNER_NAME", "Kullanıcı")
+        seed_events = [
+            {
+                "id": "evt_sprint_review",
+                "title": "Haftalık Sprint Değerlendirmesi",
+                "start_time": (now + timedelta(minutes=10)).strftime("%Y-%m-%d %H:%M"),
+                "duration_minutes": 45,
+                "location": "Toplantı Odası A",
+                "organizer": default_owner,
+                "attendees": list(dict.fromkeys([default_owner, "Baran", "Selin", "Ahmet"])),
+                "description": "Yeni robotik ve arayüz geliştirmelerinin değerlendirilmesi."
+            },
+            {
+                "id": "evt_arch_sync",
+                "title": "Astro Sistem Mimarisi İncelemesi",
+                "start_time": (now + timedelta(hours=3)).strftime("%Y-%m-%d %H:%M"),
+                "duration_minutes": 60,
+                "location": "Lobi / Ar-Ge Alanı",
+                "organizer": default_owner,
+                "attendees": list(dict.fromkeys([default_owner, "Baran", "Yapay Zeka Ekibi"])),
+                "description": "ROS2 ve LLM gerçek zamanlı gecikme optimizasyonları."
+            }
+        ]
+        data = self._load_local_data()
+        data["events"] = seed_events
+        try:
+            with open(self.storage_path, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
 
     def _load_local_data(self) -> Dict[str, Any]:
         if not os.path.exists(self.storage_path):

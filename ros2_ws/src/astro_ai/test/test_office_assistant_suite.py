@@ -42,6 +42,7 @@ class TestOfficeCalendarAndSlack(unittest.TestCase):
         self.test_dir = tempfile.mkdtemp()
         self.cal_file = os.path.join(self.test_dir, "test_calendar.json")
         self.calendar = CalendarService(storage_path=self.cal_file)
+        self.calendar.seed_demo_events()
         self.slack = SlackService()
 
     def test_01_calendar_summary_and_employee_meeting_status(self):
@@ -102,6 +103,7 @@ class TestOfficeConcierge(unittest.TestCase):
         self.test_dir = tempfile.mkdtemp()
         self.cal_file = os.path.join(self.test_dir, "test_calendar.json")
         self.calendar = CalendarService(storage_path=self.cal_file)
+        self.calendar.seed_demo_events()
         self.slack = SlackService()
         self.concierge = OfficeConciergeManager(
             calendar_service=self.calendar,
@@ -170,6 +172,7 @@ class TestAstroRealtimeNodeOfficeTools(unittest.TestCase):
         temp_dir = tempfile.mkdtemp()
         self.temp_cal = os.path.join(temp_dir, "test_node_cal.json")
         self.node.calendar_service = CalendarService(storage_path=self.temp_cal)
+        self.node.calendar_service.seed_demo_events()
 
     def test_06_realtime_tools_check_calendar_events(self):
         res = self.node._execute_realtime_tool("check_calendar_events", {"query": "bugün"})
@@ -339,6 +342,22 @@ class TestAstroRealtimeNodeOfficeTools(unittest.TestCase):
             # 4. Verify it is now masked from upcoming events
             upcoming = cal.get_upcoming_events(hours=48)
             self.assertFalse(any(e.get("id") == "sample_gcal_001@google.com" for e in upcoming))
+
+    def test_14_clean_empty_calendar_by_default(self):
+        # Verify that without seed_demo_events, calendar starts completely empty
+        import tempfile
+        tmp_dir = tempfile.mkdtemp()
+        fresh_cal_path = os.path.join(tmp_dir, "empty_cal.json")
+        clean_cal = CalendarService(storage_path=fresh_cal_path)
+
+        events = clean_cal.get_upcoming_events(hours=24)
+        self.assertEqual(len(events), 0)
+
+        summary = clean_cal.get_today_summary()
+        self.assertIn("bulunmuyor", summary)
+
+        reminders = clean_cal.check_meeting_reminders(lead_minutes=10)
+        self.assertEqual(len(reminders), 0)
 
 
 if __name__ == "__main__":

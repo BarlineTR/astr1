@@ -6926,6 +6926,11 @@ class AstroRealtimeNode(Node):
         rejected = False
         reject_reason = "none"
 
+        # Watchdog: auto-clear stuck _is_responding if robot is not actually playing audio or generating
+        if getattr(self, "_is_responding", False) and not is_playback_active and not getattr(self, "_is_processing_fallback", False):
+            if getattr(self, "active_response_state", "") not in ("IN_PROGRESS", "GENERATING", "SPEAKING"):
+                self._is_responding = False
+
         # Check if audio has strong acoustic evidence of real human speech articulation
         is_busy_speaking = bool(is_playback_active or getattr(self, "_is_responding", False))
 
@@ -8008,19 +8013,21 @@ class AstroRealtimeNode(Node):
                 norm_wake_check = re.sub(r"[^\w\s]", "", validated_text.lower()).strip()
                 wake_tokens = ("astro", "hey astro", "selam astro", "hey", "selam", "uyan", "uyan astro", "astro uyan")
                 if norm_wake_check in wake_tokens:
-                    self._wake_up()
-                    self._is_sleeping = False
-                    if self.session:
-                        self.session.activate_session(reason="wake_word")
-                    self.state_machine.transition_to(RobotState.LISTENING)
-                    if self.robot_led:
-                        self.robot_led.set_state(LEDState.LISTENING)
-                    self._provide_attentive_listening_cue()
-                    self.get_logger().info(
-                        f"⚡ [Active Wake-Only]: \"{validated_text}\" -> Woke to LISTENING (wake_only=True, turn_created=False, 0 LLM / 0 TTS, non-verbal nod+LED active)."
-                    )
-                    self._is_processing_fallback = False
-                    self._is_responding = False
+                    try:
+                        self._wake_up()
+                        self._is_sleeping = False
+                        if self.session:
+                            self.session.activate_session(reason="wake_word")
+                        self.state_machine.transition_to(RobotState.LISTENING)
+                        if self.robot_led:
+                            self.robot_led.set_state(LEDState.LISTENING)
+                        self._provide_attentive_listening_cue()
+                        self.get_logger().info(
+                            f"⚡ [Active Wake-Only]: \"{validated_text}\" -> Woke to LISTENING (wake_only=True, turn_created=False, 0 LLM / 0 TTS, non-verbal nod+LED active)."
+                        )
+                    finally:
+                        self._is_processing_fallback = False
+                        self._is_responding = False
                     return
 
                 # Check if user said "Hey Astro, <command>" or "Astro, <command>"
@@ -10953,6 +10960,22 @@ class AstroRealtimeNode(Node):
                     self.get_logger().info("👂 [Attentive Listening] Kullanıcı dinleniyor — Onay baş hareketi (nod) üretildi.")
         except Exception as exc:
             self.get_logger().debug(f"_social_attentive_listener_tick error: {exc}")
+
+    def _provide_attentive_listening_cue(self):
+        """Emits subtle non-verbal listening cues (head nod, attentive LED) on wake detection."""
+        try:
+            if getattr(self, "robot_led", None):
+                self.robot_led.set_state(LEDState.LISTENING)
+            nod_msg = String()
+            nod_msg.data = "nod"
+            if getattr(self, "pub_head_gesture", None):
+                self.pub_head_gesture.publish(nod_msg)
+            if getattr(self, "pub_gesture", None):
+                self.pub_gesture.publish(nod_msg)
+            self._last_attentive_nod_time = time.monotonic()
+        except Exception as exc:
+            self.get_logger().debug(f"_provide_attentive_listening_cue error: {exc}")
+
 
     def resolve_identities(self) -> Dict[str, Any]:
         """Separates and resolves:
