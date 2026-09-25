@@ -773,13 +773,13 @@ class AudioStreamNode(Node):
             if self._capture_channels >= 4 and len(raw_arr) >= (HW_BLOCK_SIZE * self._capture_channels):
                 multi_ch = raw_arr.reshape(-1, self._capture_channels).T  # Shape: (channels, frames)
                 # On 6-channel ReSpeaker:
-                # ch0 is the XMOS DSP beamformed output, which heavily attenuates voice when off-axis.
-                # ch1 is the true physical Front Microphone (Mic 0, 0 deg).
-                # Default to ch1 (or AUDIO_SPEECH_CHANNEL override) for loud, unattenuated speech recognition.
+                # Channel 0 is the XMOS DSP hardware processed audio (AEC + Beamformed + Noise Suppressed).
+                # Channels 1..4 are physical raw microphones (Mic 0, 1, 2, 3) used exclusively for DOA / GCC-PHAT.
+                # Channel 0 is the primary authoritative speech input for STT and OpenAI Realtime.
                 if self._capture_channels >= 6:
-                    speech_ch = int(os.getenv("AUDIO_SPEECH_CHANNEL", "1"))
+                    speech_ch = int(os.getenv("AUDIO_SPEECH_CHANNEL", "0"))
                     if speech_ch >= multi_ch.shape[0]:
-                        speech_ch = 1
+                        speech_ch = 0
                 else:
                     speech_ch = int(os.getenv("AUDIO_SPEECH_CHANNEL", "0"))
                     if speech_ch >= multi_ch.shape[0]:
@@ -886,37 +886,17 @@ class AudioStreamNode(Node):
                     hid_conf_msg.data = float(conf)
                     self.pub_doa_confidence.publish(hid_conf_msg)
 
-            # Software Echo Mute & Self-Voice Suppression (Zero Self-Hearing):
+            # Hardware AEC Barge-In & Energy Gate (ReSpeaker DSP handles AEC on Channel 0):
             if is_active_playback:
+                # Ignore brief DAC startup click transient (<= 60ms)
                 burst_start = getattr(self, "_burst_start_time", 0.0)
-                if self._playback_burst_active and burst_start > 0.0 and ((now - burst_start) * 1000.0 < self.barge_in_protection_ms):
+                if self._playback_burst_active and burst_start > 0.0 and ((now - burst_start) * 1000.0 < 60.0):
                     return
 
-                # Target barge-in threshold during active playback: Requires intentional voice exceeding loudspeaker playback level
-                playback_barge_rms = float(getattr(self, "barge_in_playback_min_rms", 4500.0))
-                playback_barge_peak = int(getattr(self, "barge_in_playback_min_peak", 14000))
-                adaptive_barge_in_rms = max(playback_barge_rms, self._ambient_rms * self.barge_in_noise_mult)
-
-                # Channel correlation check: If all mic channels are highly correlated (internal speaker echo), suppress
-                if multi_ch is not None and multi_ch.shape[0] >= 5:
-                    def _corr(a: np.ndarray, b: np.ndarray) -> float:
-                        af = a.astype(np.float32) - float(np.mean(a))
-                        bf = b.astype(np.float32) - float(np.mean(b))
-                        d = float(np.sqrt(np.sum(af ** 2) * np.sum(bf ** 2)))
-                        return float(np.sum(af * bf) / d) if d > 1e-6 else 0.0
-
-                    c12 = _corr(multi_ch[1], multi_ch[2])
-                    c13 = _corr(multi_ch[1], multi_ch[3])
-                    c14 = _corr(multi_ch[1], multi_ch[4])
-                    if min(c12, c13, c14) >= 0.90:
-                        return
-                    if multi_ch.shape[0] >= 6:
-                        ch5_rms = float(np.sqrt(np.mean(multi_ch[5].astype(np.float32) ** 2)))
-                        if ch5_rms > 100.0 and _corr(multi_ch[speech_ch], multi_ch[5]) >= 0.70:
-                            return
-
-                # 2. Distinguish loud speech energy during active playback
-                is_genuine_barge_in = (rms >= adaptive_barge_in_rms and peak >= playback_barge_peak)
+                # With ReSpeaker Hardware AEC on Channel 0, robot playback is cancelled in DSP.
+                # User voice during playback only needs genuine speech energy above ambient floor.
+                barge_rms_thresh = max(250.0, self._ambient_rms * 1.3)
+                is_genuine_barge_in = (rms >= barge_rms_thresh and peak >= 600)
                 if not is_genuine_barge_in:
                     return
 

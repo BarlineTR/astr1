@@ -301,10 +301,7 @@ class SpeechRecognitionNode(Node):
                 self._is_speaking = False
                 return
 
-            # While robot is speaking, do NOT record speaker audio into buffer!
-            if self._tts_speaking:
-                return
-
+            # Buffer incoming audio continuously (ReSpeaker hardware AEC removes speaker output)
             data = list(msg.data)
             self._ring_buffer.extend(data)
             if len(self._ring_buffer) > 6400:
@@ -329,17 +326,8 @@ class SpeechRecognitionNode(Node):
             if self._is_realtime_primary_active():
                 return
 
-            # Ignore VAD while robot is actively speaking to prevent echolalia
-            if self._tts_speaking:
-                return
-
             if msg.data:
                 now = time.monotonic()
-
-                # Post-TTS echo suppression (0.60s room reverberation cooldown)
-                if self._last_tts_end_time is not None and (now - self._last_tts_end_time) < 0.60:
-                    return
-
                 if not self._is_speaking:
                     self._buffer = list(self._ring_buffer)
                     self._is_speaking = True
@@ -355,9 +343,6 @@ class SpeechRecognitionNode(Node):
 
         audio_data = None
         with self._lock:
-            if self._tts_speaking:
-                return
-
             if self._is_speaking and self._last_speech_time is not None:
                 elapsed = time.monotonic() - self._last_speech_time
                 if elapsed > self._silence_timeout_s:

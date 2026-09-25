@@ -10272,12 +10272,12 @@ class AstroRealtimeNode(Node):
         if is_active_playback:
             self._last_interaction_time = now
 
-        # Zero Self-Hearing Protection & Multi-Signal Persistent Barge-In
+        # ReSpeaker Hardware AEC Barge-In & State Tracking (Hardware AEC on Channel 0)
         if is_active_playback:
             playback_start = getattr(self, "_playback_start_monotonic", 0.0)
-            prot_ms = float(getattr(self, "barge_in_protection_ms", 350.0))
+            prot_ms = 60.0  # Ignore brief DAC startup click transient (<= 60ms)
 
-            # 1. Acoustic Protection Window: Strictly suppress self-voice feedback during initial burst (e.g. 350ms)
+            # 1. Acoustic Protection Window: Ignore brief DAC power-on click
             if playback_start > 0.0 and ((now - playback_start) * 1000.0 < prot_ms):
                 self._barge_in_consecutive_frames = 0
                 with self._lock:
@@ -10286,53 +10286,13 @@ class AstroRealtimeNode(Node):
                         self._fallback_audio_buffer.clear()
                 return
 
-            # Target barge-in threshold: Requires intentional voice exceeding loudspeaker playback level
-            barge_min_rms = float(getattr(self, "barge_in_playback_min_rms", getattr(self, "barge_in_min_rms", 1400.0)))
-            barge_noise_mult = float(getattr(self, "barge_in_noise_mult", 3.0))
-            barge_min_peak = int(getattr(self, "barge_in_playback_min_peak", getattr(self, "barge_in_min_peak", 2500)))
+            # Target barge-in threshold: With ReSpeaker Hardware AEC on Channel 0,
+            # natural user voice easily exceeds ambient noise floor.
             ambient_val = float(getattr(self, "_ambient_rms", 120.0))
+            target_barge_in_rms = max(280.0, ambient_val * 1.3)
+            target_barge_in_peak = 600
 
-            target_barge_in_rms = max(barge_min_rms, ambient_val * barge_noise_mult)
-            target_barge_in_peak = barge_min_peak
-
-            # Self-voice rejection score check: if voice recognizer is active, check self-voice score
-            self_voice_score = 0.0
-            if getattr(self, "voice_recognizer", None) and hasattr(self.voice_recognizer, "score_self_voice"):
-                try:
-                    self_voice_score = self.voice_recognizer.score_self_voice(raw_16k)
-                except Exception:
-                    self_voice_score = 0.0
-            if self_voice_score < 0.70 and hasattr(self, "_playback_ref_pcm") and self._playback_ref_pcm:
-                try:
-                    ref_score = compute_pcm_self_voice_score(raw_16k, self._playback_ref_pcm)
-                    self_voice_score = max(self_voice_score, ref_score)
-                except Exception:
-                    pass
-
-            # 2. Self-Voice Rejection Check
-            if self_voice_score >= 0.70:
-                self.get_logger().debug(
-                    f"[BARGE-IN DECISION]\n"
-                    f"playback_active=true\n"
-                    f"vad_confidence={1.0 if getattr(self, '_vad_active', False) else 0.0:.2f}\n"
-                    f"speech_duration_ms=0\n"
-                    f"speech_continuity_ms=0\n"
-                    f"rms={local_rms:.0f}\n"
-                    f"peak={peak_val}\n"
-                    f"self_voice_score={self_voice_score:.2f}\n"
-                    f"transient_noise=false\n"
-                    f"speech_confirmed=false\n"
-                    f"decision=false\n"
-                    f"reason=self_voice"
-                )
-                self._barge_in_consecutive_frames = 0
-                with self._lock:
-                    if self._fallback_speaking or self._fallback_audio_buffer:
-                        self._fallback_speaking = False
-                        self._fallback_audio_buffer.clear()
-                return
-
-            # 3. Energy threshold check
+            # 2. Energy threshold check
             is_loud = (local_rms >= target_barge_in_rms and peak_val >= target_barge_in_peak)
             if is_loud:
                 self._barge_in_consecutive_frames += 1
@@ -10342,30 +10302,12 @@ class AstroRealtimeNode(Node):
             speech_duration_ms = self._barge_in_consecutive_frames * 20
             speech_continuity_ms = speech_duration_ms
             
-            # Barge-in minimum speech duration is provider-dependent.
-            # Edge-TTS: self_voice_score=0.00 (suppressor trained only on OpenAI Realtime voice, not Edge-TTS audio),
-            # so minimum confirmation window must be wider to avoid false cuts from ambient echo.
-            # OpenAI Realtime: server manages barge-in natively; client-side can stay at base threshold.
-            try:
-                is_edge_tts_active = getattr(self, "_fallback_mode", False) or not self._can_use_openai("realtime")
-            except Exception:
-                is_edge_tts_active = False
-
-            if is_edge_tts_active:
-                # In Edge-TTS mode without hardware AEC subtraction, require substantial human speech
-                # (>=400ms continuity in production, 120ms under pytest) to avoid microphone loudspeaker feedback false cuts.
-                effective_min_speech_ms = 120.0 if self._under_pytest() else 400.0
-                target_barge_in_rms = max(target_barge_in_rms * 1.5, 3000.0)
-                target_barge_in_peak = max(target_barge_in_peak, 8000)
-            else:
-                base_min_speech_ms = float(getattr(self, "barge_in_min_speech_ms", 60.0))
-                effective_min_speech_ms = max(base_min_speech_ms, getattr(self, "barge_in_min_consecutive_frames", 3) * 20.0)
-
-            min_speech_ms = effective_min_speech_ms
+            # With hardware AEC active on Channel 0, 60ms human voice continuity confirms barge-in
+            min_speech_ms = 60.0
             if speech_duration_ms < min_speech_ms:
                 if local_rms >= target_barge_in_rms and peak_val >= target_barge_in_peak:
                     is_vad_active = getattr(self, "_vad_active", False)
-                    is_human_candidate = is_vad_active and (self_voice_score < 0.60)
+                    is_human_candidate = is_vad_active
                     # Transient noise is an isolated impulse (<40ms) when VAD does not detect human voice
                     is_transient = (speech_duration_ms < 40) and not is_human_candidate
                     reason = "transient_noise" if is_transient else "insufficient_speech_duration"
