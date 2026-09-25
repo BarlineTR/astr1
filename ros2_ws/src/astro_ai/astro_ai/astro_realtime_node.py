@@ -1226,8 +1226,18 @@ class AstroRealtimeNode(Node):
         if not getattr(self, "cognitive_loop", None):
             return
         try:
+            now_mono = time.monotonic()
+            last_face_time = getattr(self, "_last_vision_faces_time", 0.0)
+            has_fresh_visual_face = (now_mono - last_face_time) <= 1.5
+
+            if not has_fresh_visual_face:
+                with self._lock:
+                    self._recognized_person = None
+                    self._user_distance = 0.0
+                    self._looking_at_robot = False
+
             active_p = []
-            if getattr(self, "_recognized_person", None) and UnifiedPersonState:
+            if has_fresh_visual_face and getattr(self, "_recognized_person", None) and UnifiedPersonState:
                 ident = self.resolve_identities() if callable(getattr(self, "resolve_identities", None)) else {}
                 bio_status = ident.get("biometric_status", "unknown")
                 is_conflict = bio_status == "ambiguous"
@@ -4090,8 +4100,8 @@ class AstroRealtimeNode(Node):
         vis_cam_avail = vis_state.get("visual_camera_available", False)
         vis_person_det = vis_state.get("visual_person_detected", False)
 
-        # If LLM is available and camera is stale/unknown/no person in optical cone,
-        # let LLM reason contextually instead of regurgitating robotic error templates!
+        # If LLM is available and camera has no visual person in optical cone,
+        # let LLM formulate dynamic social response with strict negative visual grounding
         if has_llm and (not vis_cam_avail or v_state in ("STALE", "UNKNOWN") or not vis_person_det):
             return False, ""
 
@@ -4100,7 +4110,7 @@ class AstroRealtimeNode(Node):
         elif v_state == "STALE":
             return True, "Şu an görüntüm güncel olmadığı için ne yaptığını göremiyorum."
         elif not vis_person_det:
-            return True, "Şu an seni kameramda göremiyorum."
+            return True, "Şu an kameramın görüş açısında değilsin, ne yaptığını göremiyorum."
 
         # Read active interlocutor and activity from WorldModel:
         wm = getattr(self.social_brain, "world_model", None) if getattr(self, "social_brain", None) else None
@@ -4168,15 +4178,6 @@ class AstroRealtimeNode(Node):
                             activity_conf = float(getattr(p, "activity_confidence", 0.75))
                             break
 
-                # Step 7: Posture inference for stationary person in front of camera at desk distance
-                if activity == "UNKNOWN" and (interlocutor or front_tracked):
-                    target_p = interlocutor or (front_tracked[0] if front_tracked else None)
-                    if target_p:
-                        d = float(getattr(target_p, "distance_m", 1.0) or 1.0)
-                        az = abs(float(getattr(target_p, "azimuth_deg", 0.0) or 0.0))
-                        if 0.3 <= d <= 2.2 and az <= 45.0:
-                            activity = "SITTING"
-                            activity_conf = 0.70
 
         # Multi-modal Identity Isolation Safeguard:
         # Only trigger if the person in front is a KNOWN DIFFERENT person (e.g. Mert, Oktay), NEVER "Misafir"!
@@ -10175,6 +10176,14 @@ class AstroRealtimeNode(Node):
                 return
             faces_data = json.loads(raw)
             if not isinstance(faces_data, list) or len(faces_data) == 0:
+                with self._lock:
+                    self._recognized_person = None
+                    self._user_distance = 0.0
+                    self._looking_at_robot = False
+                if getattr(self, "social_brain", None) and hasattr(self.social_brain, "world_model"):
+                    self.social_brain.world_model.update_people([], now=time.time())
+                    if hasattr(self.social_brain, "attention_manager"):
+                        self.social_brain.attention_manager.select_focus_target([])
                 return
 
             candidates: List[Any] = []

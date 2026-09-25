@@ -29,7 +29,8 @@ class ResponsePlanner:
         # 2. Intent-Driven Strategy
         if context.user_intent == IntentType.GREETING:
             if context.relationship_role == RelationshipRole.CREATOR:
-                strategies.append("Geliştiricin Baran'ı samimi, sadık ve neşeyle selamla")
+                greeting_target = context.person_name or "Geliştiricini"
+                strategies.append(f"{greeting_target}'ı samimi, sadık ve neşeyle selamla")
                 tone = "playful_and_enthusiastic"
             elif context.relationship_role == RelationshipRole.FRIEND:
                 strategies.append(f"{context.person_name}'i eski bir dost gibi sıcak selamla")

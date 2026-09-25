@@ -162,15 +162,14 @@ class PersistentProfile:
         # _check_reminders timer'ı da aynı kilitte bloke olunca ai_brain_node'un
         # tüm callback grubu donuyor ve robot kalıcı olarak sağırlaşıyordu.
         self._lock = threading.RLock()
+        owner_env = os.getenv("ASTRO_OWNER_NAME", "").strip()
         self.data: Dict[str, Any] = {
             "robot_name": "Astro",
-            "owner_name": "Baran",
+            "owner_name": owner_env,
             "current_persona": "playful",
             "user_style_notes": "Samimi ve doğal Türkçe konuşur",
             "verified_facts": [
-                "Senin adın Astro, sen akıllı, bağımsız ve interaktif bir sosyal robot asistansın.",
-                "Robotun geliştiricisinin ve üreticisinin adı Baran.",
-                "Robotik ve yazılımla ilgileniyor."
+                "Senin adın Astro, sen akıllı, bağımsız ve interaktif bir sosyal robot asistansın."
             ],
             "learned_objects": {},
             "environmental_observations": [],

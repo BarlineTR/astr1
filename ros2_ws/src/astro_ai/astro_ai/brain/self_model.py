@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import os
 import time
 from typing import Any, Dict, List, Optional, Set
 
@@ -37,7 +38,7 @@ class SelfModel:
     """Represents Astro's self-awareness, identity, capabilities, physical limits, and dynamic self-state."""
 
     name: str = "Astro"
-    creator: str = "Baran"
+    creator: str = field(default_factory=lambda: os.getenv("ASTRO_OWNER_NAME", "Astro Ekibi"))
     location: str = "Bitlis / Ahlat"
     version: str = "ASTRO V1 (Cognitive Embodied Social Robot)"
 

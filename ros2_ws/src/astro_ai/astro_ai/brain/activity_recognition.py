@@ -156,16 +156,11 @@ class TemporalActivityEngine:
             elif getattr(person, "face_bbox", None):
                 fb = person.face_bbox
                 if isinstance(fb, (list, tuple)) and len(fb) == 4 and any(fb):
-                    # Face center Y: fb is typically (x, y, w, h)
-                    # If fb[3] > 80 and fb[1] < fb[3] and fb[3] > 300: could be (x1, y1, x2, y2)
-                    # Standard (x, y, w, h) center:
                     cy = fb[1] + (fb[3] / 2.0)
-                    if cy >= 140 or dist <= 1.8:
+                    if cy >= 180:
                         cues.add("posture_sitting")
                     else:
                         cues.add("posture_standing")
-            elif dist <= 1.8:
-                cues.add("posture_sitting")
 
         # Record observation
         history.append(ActivityObservation(timestamp=t, cues=cues))

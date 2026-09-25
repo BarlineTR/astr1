@@ -269,8 +269,11 @@ class CognitiveLoop:
                     fp = self.world_model._people[curr_focus]
                     if not fp.has_vision and fp.has_audio:
                         active_perception["focused_person_acoustic_only"] = True
-                    if not fp.is_present and getattr(fp, "occlusion_duration_s", 0.0) >= 0:
+                    if not fp.is_present:
                         active_perception["focused_person_occluded"] = True
+                        present_p = [p for p in self.world_model._people.values() if p.is_present]
+                        self.self_state.focused_person_id = present_p[0].person_id if present_p else None
+                        curr_focus = self.self_state.focused_person_id
                 else:
                     active_perception["focus_orphan"] = True
                     if self.world_model._active_speaker:
@@ -486,7 +489,7 @@ class CognitiveLoop:
                 degraded_capabilities=sorted(list(self.self_state.degraded_capabilities)),
                 identity={
                     "name": "Astro",
-                    "creator": "Baran",
+                    "creator": getattr(self.self_state, "creator", None) or os.getenv("ASTRO_OWNER_NAME", "Astro Ekibi"),
                     "location": "Bitlis / Ahlat",
                     "version": "ASTRO V1 (Cognitive Embodied Social Robot)",
                 },
@@ -738,6 +741,8 @@ class CognitiveLoop:
         # 2. World Model / Dünya Modeli
         people_detail_list = []
         for p in (result.world_snapshot.people or []):
+            if not getattr(p, "is_present", True):
+                continue
             st = p.tracking_state.value if hasattr(p.tracking_state, "value") else str(p.tracking_state)
             act_str = f", {p.current_activity}" if getattr(p, "current_activity", None) and p.current_activity != "UNKNOWN" else ""
             p_desc = f"{p.person_id}({st}, {p.distance_m:.1f}m, {p.azimuth_deg:.0f}°{act_str})"

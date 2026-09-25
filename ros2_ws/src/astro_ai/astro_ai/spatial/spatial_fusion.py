@@ -5,6 +5,7 @@ into authoritative UnifiedPersonState instances.
 """
 
 import math
+import os
 import threading
 import time
 from typing import Any, Dict, List, Optional
@@ -170,7 +171,7 @@ class SpatialFusionEngine:
                         person_id=person_id,
                         name=name,
                         formal_title=formal_title,
-                        role=RelationshipRole.CREATOR if name.lower() == "baran" else (RelationshipRole.FRIEND if is_known else RelationshipRole.UNKNOWN),
+                        role=RelationshipRole.CREATOR if (os.getenv("ASTRO_OWNER_NAME", "").lower() and name.lower() == os.getenv("ASTRO_OWNER_NAME", "").lower()) else (RelationshipRole.FRIEND if is_known else RelationshipRole.UNKNOWN),
                         is_known=is_known,
                         identity_confidence=max(conf, 0.70 if is_known else 0.30),
                         distance_m=round(fused_dist, 2),
@@ -234,8 +235,8 @@ class SpatialFusionEngine:
                         person_id=a_pid,
                         name=spk_name,
                         formal_title=spk_name,
-                        role=RelationshipRole.CREATOR if spk_name.lower() == "baran" else RelationshipRole.UNKNOWN,
-                        is_known=(spk_name.lower() == "baran"),
+                        role=RelationshipRole.CREATOR if (os.getenv("ASTRO_OWNER_NAME", "").lower() and spk_name.lower() == os.getenv("ASTRO_OWNER_NAME", "").lower()) else RelationshipRole.UNKNOWN,
+                        is_known=(bool(os.getenv("ASTRO_OWNER_NAME", "")) and spk_name.lower() == os.getenv("ASTRO_OWNER_NAME", "").lower()),
                         identity_confidence=0.40 if self._latest_speaker_data else 0.20,
                         distance_m=round(a_dist, 2),
                         azimuth_deg=round(self._latest_audio_doa, 1),
@@ -343,8 +344,8 @@ class SpatialFusionEngine:
                         person_id=a_pid,
                         name=spk_name,
                         formal_title=spk_name,
-                        role=RelationshipRole.CREATOR if spk_name.lower() == "baran" else RelationshipRole.UNKNOWN,
-                        is_known=(spk_name.lower() == "baran"),
+                        role=RelationshipRole.CREATOR if (os.getenv("ASTRO_OWNER_NAME", "").lower() and spk_name.lower() == os.getenv("ASTRO_OWNER_NAME", "").lower()) else RelationshipRole.UNKNOWN,
+                        is_known=(bool(os.getenv("ASTRO_OWNER_NAME", "")) and spk_name.lower() == os.getenv("ASTRO_OWNER_NAME", "").lower()),
                         identity_confidence=0.40 if self._latest_speaker_data else 0.20,
                         distance_m=2.5,
                         azimuth_deg=round(self._latest_audio_doa, 1),
@@ -392,8 +393,8 @@ class SpatialFusionEngine:
                     person_id=a_pid,
                     name=spk_name,
                     formal_title=spk_name,
-                    role=RelationshipRole.CREATOR if spk_name.lower() == "baran" else RelationshipRole.UNKNOWN,
-                    is_known=(spk_name.lower() == "baran"),
+                    role=RelationshipRole.CREATOR if (os.getenv("ASTRO_OWNER_NAME", "").lower() and spk_name.lower() == os.getenv("ASTRO_OWNER_NAME", "").lower()) else RelationshipRole.UNKNOWN,
+                    is_known=(bool(os.getenv("ASTRO_OWNER_NAME", "")) and spk_name.lower() == os.getenv("ASTRO_OWNER_NAME", "").lower()),
                     identity_confidence=0.40 if self._latest_speaker_data else 0.20,
                     distance_m=2.5,
                     azimuth_deg=round(self._latest_audio_doa, 1),

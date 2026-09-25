@@ -296,6 +296,66 @@ class TestZeroSelfTalkAndVisionRoast(unittest.TestCase):
         synth_text = self.node.tts_router.synthesize.call_args[0][0]
         self.assertIn("telefon", synth_text.lower())
 
+    def test_11_camera_looking_at_empty_space_clears_world_model_and_focus(self):
+        """11. Boş Duvar / Görsel Yokluk: Kamera boş alana bakarken bilinçte hayalet kişi tutulamaz (focus=None, kişiler=[])."""
+        # Pre-seed a recognized person
+        self.node._recognized_person = {"name": "Baran", "user_id": "baran", "is_known": True}
+        self.node._active_person_name = "Baran"
+        self.node._user_distance = 0.3
+        self.node._speaker_angle = -34.0
+        self.node._looking_at_robot = True
+        self.node._last_vision_faces_time = time.monotonic() - 5.0  # 5 seconds ago!
+
+        # Camera sends empty faces array (looking at empty space)
+        empty_msg = String()
+        empty_msg.data = "[]"
+        self.node._on_faces(empty_msg)
+
+        # 1. State must immediately reset
+        self.assertIsNone(self.node._recognized_person)
+        self.assertEqual(self.node._user_distance, 0.0)
+        self.assertFalse(self.node._looking_at_robot)
+
+        # 2. Run cognitive cycle tick
+        self.node._cognitive_cycle_tick()
+
+        # 3. World model must have 0 present people and focus must NOT be on ghost
+        wm = getattr(getattr(self.node, "social_brain", None), "world_model", None)
+        if wm:
+            present_people = [p for p in wm._people.values() if getattr(p, "is_present", False)]
+            self.assertEqual(len(present_people), 0)
+        if getattr(self.node, "cognitive_loop", None):
+            self.assertIsNone(self.node.cognitive_loop.self_state.focused_person_id)
+
+    def test_12_no_visual_person_activity_query_never_hallucinates_computer_or_sitting(self):
+        """12. Sıfır Ezber: Kamera görmediği halde 'bilgisayarda oturuyorsun' tahmini yapamaz, dürüst cevap verir."""
+        now = time.monotonic()
+        self.node._oak_connection_state = "CONNECTED"
+        self.node._oak_last_frame_time = now
+        self.node._last_vision_faces_time = 0.0  # Camera sees NO person
+        self.node._user_distance = 0.0
+        self.node._looking_at_robot = False
+        self.node._recognized_person = None
+
+        # Even if mock memory has developer facts
+        if hasattr(self.node, "memory") and hasattr(self.node.memory, "profile"):
+            self.node.memory.profile.get_known_person = MagicMock(return_value={
+                "name": "Baran",
+                "learned_facts": ["robotik ve yazılımla ilgileniyor", "bilgisayar başında çalışır"]
+            })
+
+        mock_stream = MagicMock()
+        mock_stream.return_value = ["Şu an seni ", "kameramda göremiyorum."]
+        with patch.object(self.node.local_gemma_client, "stream", mock_stream):
+            self.node._process_fallback_turn(direct_text="Ben şu an ne yapıyorum?")
+
+        self.node.tts_router.synthesize.assert_called_once()
+        synth_text = self.node.tts_router.synthesize.call_args[0][0].lower()
+        # Must NOT guess computer or sitting!
+        self.assertNotIn("bilgisayar", synth_text)
+        self.assertNotIn("oturuyorsun", synth_text)
+        self.assertIn("göremiyorum", synth_text)
+
 
 if __name__ == "__main__":
     unittest.main()

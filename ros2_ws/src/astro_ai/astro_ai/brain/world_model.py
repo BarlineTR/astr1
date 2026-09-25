@@ -175,7 +175,7 @@ class WorldModel:
             for pid, p in list(self._people.items()):
                 if pid not in current_ids:
                     dt = t_now - p.last_seen_ts
-                    if dt > 5.0:
+                    if dt > 2.5:
                         del self._people[pid]
                     else:
                         p.is_present = False
