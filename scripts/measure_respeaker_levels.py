@@ -14,23 +14,28 @@ DEV = "plughw:CARD=ArrayUAC10,DEV=0"
 
 def record_audio(duration_s=2.0, out_wav="/tmp/measure_6ch.wav"):
     frames = int(RATE * duration_s)
+    total_bytes = frames * CHANNELS * 2
     cmd = [
         "arecord",
         "-D", DEV,
-        "-f", "S16_LE",
-        "-r", str(RATE),
         "-c", str(CHANNELS),
-        "-d", str(int(duration_s + 0.5)),
-        out_wav
+        "-r", str(RATE),
+        "-f", "S16_LE",
+        "-t", "raw",
+        "-q",
     ]
-    subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    if not os.path.exists(out_wav):
-        return None
-    with wave.open(out_wav, "rb") as wf:
-        n_f = wf.getnframes()
-        data = wf.readframes(n_f)
-        arr = np.frombuffer(data, dtype=np.int16).reshape(-1, CHANNELS)
+    try:
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        raw_data = proc.stdout.read(total_bytes)
+        proc.terminate()
+        proc.wait(timeout=0.5)
+        if len(raw_data) < total_bytes:
+            return None
+        arr = np.frombuffer(raw_data, dtype=np.int16).reshape(-1, CHANNELS)
         return arr
+    except Exception as e:
+        print(f"Record error: {e}")
+        return None
 
 def measure_levels():
     print("=== 1. SESSİZLİK / ARKA PLAN ÖLÇÜMÜ (1.5s) ===")
