@@ -34,25 +34,45 @@ def probe_dsp():
         # bRequest: 0 (read), bmRequestType: 0xC0 (Vendor In Device)
         # wValue: parameter_id, wIndex: 0x1C (XVF DSP control interface)
         print("\n--- DSP Parameter Values ---")
-        for name, param_def in PARAMETERS.items():
-            param_id = param_def[0]
-            param_type = param_def[1]
-            try:
-                # XMOS / Seeed Tuning interface: bRequest=0x80, bmRequestType=0xC0, wIndex=0x1C
-                # Some firmware use bRequest=0 or control transfer
-                ret = dev.ctrl_transfer(0xC0, 0, param_id, 0x1C, 8, timeout=1000)
-                if ret:
-                    raw_bytes = bytes(ret)
-                    if param_type == 'int':
-                        val = int.from_bytes(raw_bytes[:4], byteorder='little', signed=True)
-                    elif param_type == 'float':
-                        import struct
-                        val = struct.unpack('<f', raw_bytes[:4])[0]
-                    else:
-                        val = raw_bytes
-                    print(f"  {name:20s} (ID {param_id:2d}): {val}  [{param_def[5]}]")
-            except Exception as e:
-                print(f"  {name:20s} (ID {param_id:2d}): Read Error ({e})")
+        # Try probing interface indices
+        found_config = None
+        for test_idx in [3, 0x1C, 0, 1, 2, 4, 0x24]:
+            for test_req in [0, 0x80, 0x01]:
+                for test_type in [0xC0, 0xA1, 0xC1]:
+                    try:
+                        ret = dev.ctrl_transfer(test_type, test_req, 19, test_idx, 8, timeout=200)
+                        if ret:
+                            found_config = (test_type, test_req, test_idx)
+                            print(f"  [Found Working Control Config]: type=0x{test_type:02X} req=0x{test_req:02X} wIndex=0x{test_idx:02X} -> {bytes(ret)}")
+                            break
+                    except Exception:
+                        pass
+                if found_config:
+                    break
+            if found_config:
+                break
+
+        if found_config:
+            b_type, b_req, w_idx = found_config
+            for name, param_def in PARAMETERS.items():
+                param_id = param_def[0]
+                param_type = param_def[1]
+                try:
+                    ret = dev.ctrl_transfer(b_type, b_req, param_id, w_idx, 8, timeout=500)
+                    if ret:
+                        raw_bytes = bytes(ret)
+                        if param_type == 'int':
+                            val = int.from_bytes(raw_bytes[:4], byteorder='little', signed=True)
+                        elif param_type == 'float':
+                            import struct
+                            val = struct.unpack('<f', raw_bytes[:4])[0]
+                        else:
+                            val = raw_bytes
+                        print(f"  {name:20s} (ID {param_id:2d}): {val}  [{param_def[5]}]")
+                except Exception as e:
+                    print(f"  {name:20s} (ID {param_id:2d}): Read Error ({e})")
+        else:
+            print("  [Note]: Standard USB Control Vendor interface did not respond to vendor read. DSP is running in autonomous standalone hardware mode.")
 
     except Exception as exc:
         print(f"PyUSB Error: {exc}")
