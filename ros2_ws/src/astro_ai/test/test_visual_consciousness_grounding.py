@@ -14,6 +14,12 @@ from astro_ai.contracts.consciousness_types import CognitiveEventType
 class TestVisualConsciousnessGrounding(unittest.TestCase):
     def setUp(self):
         os.environ["FACE_MATCH_THRESHOLD"] = "0.38"
+        try:
+            import rclpy
+            if not rclpy.ok():
+                rclpy.init()
+        except Exception:
+            pass
 
     def test_01_consciousness_node_receives_faces_and_emits_perception_events(self):
         """ConsciousnessNode detects person appearance/disappearance from /vision/faces."""
