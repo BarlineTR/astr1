@@ -128,6 +128,30 @@ class TestSelfTalkAndPerceptionGuard(unittest.TestCase):
         self.assertIn("Kafa Açısı", prompt)
         self.assertIn("ÖNEMLİ ALGI TALİMATI", prompt)
 
+    def test_09_common_greeting_ne_haber_not_rejected_as_self_voice(self):
+        """'Ne haber?' must NOT be rejected as self_voice when robot had spoken a sentence with 'ne' while idle."""
+        self.node._recent_robot_phrases = ["Ben ne yapabilirim senin için?"]
+        pcm = (np.ones(16000, dtype=np.int16) * 500).tobytes()
+        transcript, meta = self.node._validate_stt_transcript(
+            transcript="Ne haber?",
+            raw_pcm=pcm,
+            is_playback_active=False,
+            is_echo_cooldown=False,
+        )
+        self.assertFalse(meta["stt_rejected"], f"Expected 'Ne haber?' to be accepted, but got: {meta}")
+
+    def test_10_single_word_napiyorsun_accepted(self):
+        """Single word 'Napıyorsun?' must pass without being dropped by single-word thresholds."""
+        # Realistic user speech: RMS ~300, 200ms duration
+        pcm = (np.ones(3200, dtype=np.int16) * 350).tobytes()
+        transcript, meta = self.node._validate_stt_transcript(
+            transcript="Napıyorsun?",
+            raw_pcm=pcm,
+            is_playback_active=False,
+            is_echo_cooldown=False,
+        )
+        self.assertFalse(meta["stt_rejected"], f"Expected 'Napıyorsun?' to be accepted, but got: {meta}")
+
 
 if __name__ == "__main__":
     unittest.main()

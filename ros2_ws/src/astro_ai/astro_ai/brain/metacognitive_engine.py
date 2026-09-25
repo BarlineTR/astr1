@@ -497,7 +497,8 @@ class MetacognitiveEngine:
 
             elif self._consecutive_failures >= self.repeated_failure_threshold:
                 need_reassessment = True
-                reassess_reason = f"repeated_prediction_failures:{self._consecutive_failures}"
+                failure_snapshot = self._consecutive_failures
+                reassess_reason = f"repeated_prediction_failures:{failure_snapshot}"
                 triggered, dec = self.trigger_reassessment(reassess_reason, now=ts)
                 if triggered:
                     decision = dec
@@ -509,6 +510,9 @@ class MetacognitiveEngine:
                         target_strategy_id=self._active_strategy_id,
                         timestamp=ts,
                     )
+                # Reset consecutive failure counter once reassessment/review is emitted
+                # to avoid continuous decision thrashing on every 100ms cycle
+                self._consecutive_failures = 0
 
             elif info_sufficiency in (InformationSufficiency.INSUFFICIENT, InformationSufficiency.STALE):
                 acoustic_cand = perc.get("acoustic_attention_candidate")

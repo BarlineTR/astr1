@@ -124,4 +124,16 @@ class OutcomeResolver:
                         )
                     )
 
+            # 6. Gesture & gaze aversion internal execution confirmation
+            elif p.action_id.startswith("gesture_") or p.action_id in ("gesture", "gaze_aversion"):
+                outcomes.append(
+                    ActualOutcome(
+                        outcome_id=f"out_gest_{int(ts * 1000)}",
+                        expectation_id=p.prediction_id,
+                        actual_state=dict(p.expected_state),
+                        timestamp=ts,
+                        source="internal_motor_gesture_feedback",
+                    )
+                )
+
         return outcomes

@@ -499,7 +499,10 @@ def discover_groq_models(api_key: str) -> list[str]:
 VALID_SHORT_UTTERANCES = {
     "hey", "lan", "dur", "ne", "tamam", "merhaba", "evet", "hayır",
     "astro", "selam", "alo", "sus", "günaydın", "iyi geceler", "naber",
-    "efendim", "anladım", "peki", "dinliyorum", "burada", "buradayım"
+    "efendim", "anladım", "peki", "dinliyorum", "burada", "buradayım",
+    "napıyorsun", "nasılsın", "iyiyim", "iyidir", "harika", "süper",
+    "anlaştık", "aynen", "tabii", "tamamdır", "olur", "yok", "hoşçakal",
+    "görüşürüz", "merhabalar"
 }
 
 SUSPECT_PHRASES = [
@@ -509,6 +512,12 @@ SUSPECT_PHRASES = [
     "beğenmeyi unutmayın", "hoşça kalın", "hoşçakalın", "bay bay", "m.k.", "sponsor",
     "videoyu beğenmeyi", "subtitle", "transcription by", "hı hı", "cık", "çık", "ııı", "eee", "hmm"
 ]
+
+COMMON_TURKISH_STOPWORDS = {
+    "ne", "ve", "bir", "bu", "o", "de", "da", "mi", "mı", "mu", "mü",
+    "var", "yok", "için", "ile", "çok", "ben", "sen", "biz", "siz", "ki",
+    "ama", "fakat", "ya", "hem", "ise"
+}
 
 
 def compute_self_voice_score(transcript: str, recent_robot_phrases: List[str]) -> float:
@@ -530,13 +539,19 @@ def compute_self_voice_score(transcript: str, recent_robot_phrases: List[str]) -
         p_words = set(p_clean.split())
         if not p_words:
             continue
-        # Exact substring match
-        if t_clean in p_clean or p_clean in t_clean:
+        # Exact sentence match or long multi-word substring match
+        if t_clean == p_clean or (len(t_words) >= 3 and (t_clean in p_clean or p_clean in t_clean)):
             score = 0.95
         else:
-            # Word overlap (Jaccard / containment)
-            intersection = t_words.intersection(p_words)
-            score = len(intersection) / float(len(t_words))
+            # Meaningful word overlap excluding conversational particles/stopwords
+            meaningful_t = t_words - COMMON_TURKISH_STOPWORDS
+            if meaningful_t:
+                meaningful_p = p_words - COMMON_TURKISH_STOPWORDS
+                intersection = meaningful_t.intersection(meaningful_p)
+                score = len(intersection) / float(len(meaningful_t))
+            else:
+                intersection = t_words.intersection(p_words)
+                score = (len(intersection) / float(len(t_words))) * 0.4
         if score > max_score:
             max_score = score
     return min(1.0, max_score)
@@ -6543,8 +6558,13 @@ class AstroRealtimeNode(Node):
             rejected = True
             reject_reason = "self_voice"
 
-        # 2. General self-voice echo loop prevention (repeating recent robot words)
-        elif self_voice_score >= 0.50 and not is_wake_cand:
+        # 2. General self-voice echo loop prevention (verbatim repetition of long robot phrases)
+        elif (
+            not is_wake_cand
+            and not is_short_utterance
+            and len(words) >= 3
+            and self_voice_score >= 0.85
+        ):
             rejected = True
             reject_reason = "self_voice"
 
@@ -6576,7 +6596,7 @@ class AstroRealtimeNode(Node):
         elif len(words) == 1:
             if (is_short_utterance or is_wake_cand) and speech_ms >= 50 and total_rms >= max(75.0, self._ambient_rms * 1.05) and not is_playback_active:
                 rejected = False
-            elif not is_short_utterance and not is_wake_cand and (speech_ms < 140 or total_rms < 380.0 or vad_confidence < 0.30):
+            elif not is_short_utterance and not is_wake_cand and (speech_ms < 100 or total_rms < max(180.0, self._ambient_rms * 1.2) or vad_confidence < 0.25):
                 rejected = True
                 reject_reason = "low_confidence"
 

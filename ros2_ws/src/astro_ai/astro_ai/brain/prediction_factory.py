@@ -138,33 +138,9 @@ class ActionExpectationFactory:
                 status=PredictionStatus.PENDING,
             )
 
-        elif atype == "gesture":
-            gname = str(params.get("gesture_name", "nod"))
-            pred_id = f"pred_gesture_{action_intent.intent_id}"
-            return Prediction(
-                prediction_id=pred_id,
-                action_id=f"gesture_{gname}",
-                expected_state={"gesture_status": "COMPLETED"},
-                expected_by=ts + 1.5,
-                confidence_weight=0.6,
-                source="gesture",
-                created_at=ts,
-                status=PredictionStatus.PENDING,
-            )
-
-        elif atype == "gaze_aversion":
-            offset = float(params.get("offset_yaw_deg", 3.0))
-            pred_id = f"pred_avert_{action_intent.intent_id}"
-            return Prediction(
-                prediction_id=pred_id,
-                action_id="gaze_aversion",
-                expected_state={"gaze_offset_deg": round(offset, 1)},
-                expected_by=ts + 1.5,
-                confidence_weight=0.5,
-                source="gaze_aversion",
-                created_at=ts,
-                status=PredictionStatus.PENDING,
-            )
+        elif atype in ("gesture", "gaze_aversion"):
+            # Internal expressive motor behaviors do not yield external environmental predictions
+            return None
 
         return None
 
