@@ -146,7 +146,7 @@ def run_hardware_grounding_test():
     has_person = cog_node._sensor_cache["person_detected"]
     print(f"✅ Consciousness Person Detected State: {has_person}")
     print(f"✅ SelfState Operational State: {cog_node.self_state.operational_state}")
-    print(f"✅ Affective State Valence/Arousal: {cog_node.affective_state.valence:.2f} / {cog_node.affective_state.arousal:.2f}")
+    print(f"✅ Affective State Arousal/Social: {cog_node.affective_state.arousal:.2f} / {cog_node.affective_state.social_engagement:.2f}")
 
     # 4. Astro Realtime Multimodal Grounding
     print("\n🌐 [4/5] Testing AstroRealtimeNode Multimodal Grounding & Prompts...")
