@@ -104,7 +104,11 @@ class EdgeTTSEngine:
             self._safe_log("warn", f"⚠️ [Edge-TTS SYNTHESIS FAILED] generation_id={generation_id} reason=network_unavailable (fast_skip)")
             return None
 
-        clean_text = text.strip()
+        clean_text = re.sub(r"\s+([.,!?:;])", r"\1", text.strip())
+        clean_text = re.sub(r"[^\w\s.,!?:;\-\'\"çğıöşüÇĞİÖŞÜ]", "", clean_text).strip()
+        if not clean_text or not any(c.isalnum() for c in clean_text):
+            return None
+
         v = voice or self.voice
         r = rate or self.rate
         t_limit = timeout or self.timeout_s

@@ -6849,7 +6849,7 @@ class AstroRealtimeNode(Node):
             if self.session:
                 self.session.record_robot_speech()
             self._clear_playback_reference()
-            if not self._is_processing_fallback:
+            if not getattr(self, "_is_processing_fallback", False):
                 self._is_responding = False
             self._flush_audio_buffers("playback_ended")
             # Clear OpenAI input audio buffer so trailing room reverberation doesn't trigger VAD
@@ -6858,7 +6858,8 @@ class AstroRealtimeNode(Node):
                     asyncio.run_coroutine_threadsafe(self._ws.send(json.dumps({"type": "input_audio_buffer.clear"})), self._loop)
                 except Exception as _exc:
                     self.get_logger().debug(f"_on_playback_active: yok sayılan hata ({_exc})")
-            self.get_logger().info("👂 [Astro Dinliyor]: Mikrofon aktif, sizi dinliyor...")
+            if not getattr(self, "_is_processing_fallback", False):
+                self.get_logger().info("👂 [Astro Dinliyor]: Mikrofon aktif, sizi dinliyor...")
 
     def _validate_stt_transcript(
         self,
@@ -7253,6 +7254,13 @@ class AstroRealtimeNode(Node):
         if not clean_text:
             return b""
 
+        # Fix spacing before punctuation that causes Edge-TTS WebSocket drops
+        clean_text = re.sub(r"\s+([.,!?:;])", r"\1", clean_text).strip()
+        # Clean non-speakable symbols while retaining Turkish characters and punctuation
+        clean_text = re.sub(r"[^\w\s.,!?:;\-\'\"çğıöşüÇĞİÖŞÜ]", "", clean_text).strip()
+        if not clean_text or not any(c.isalnum() for c in clean_text):
+            return b""
+
         p = self.persona_name.lower()
         default_voice = "tr-TR-EmelNeural" if p in ("flirt", "emotional") else "tr-TR-AhmetNeural"
         voice = os.getenv("EDGE_TTS_VOICE", default_voice).strip() or default_voice
@@ -7261,42 +7269,51 @@ class AstroRealtimeNode(Node):
         pitch = os.getenv("EDGE_TTS_PITCH", "+0Hz").strip() or "+0Hz"
         volume = os.getenv("EDGE_TTS_VOLUME", "+0%").strip() or "+0%"
 
-        try:
-            import edge_tts
-            loop = asyncio.new_event_loop()
-            async def _get_mp3():
-                communicate = edge_tts.Communicate(clean_text, voice, rate=rate, pitch=pitch, volume=volume)
-                buf = bytearray()
-                async for chunk in communicate.stream():
-                    if chunk["type"] == "audio":
-                        buf.extend(chunk["data"])
-                return bytes(buf)
-            mp3_data = loop.run_until_complete(_get_mp3())
-            loop.close()
-
-
-            if mp3_data:
+        for attempt in range(2):
+            try:
+                import edge_tts
+                loop = asyncio.new_event_loop()
+                async def _get_mp3():
+                    communicate = edge_tts.Communicate(clean_text, voice, rate=rate, pitch=pitch, volume=volume)
+                    buf = bytearray()
+                    async for chunk in communicate.stream():
+                        if chunk["type"] == "audio":
+                            buf.extend(chunk["data"])
+                    return bytes(buf)
                 try:
-                    ff_proc = subprocess.Popen(
-                        ["ffmpeg", "-y", "-i", "pipe:0", "-f", "s16le", "-acodec", "pcm_s16le", "-ac", "1", "-ar", "24000", "pipe:1"],
-                        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
-                    )
-                    pcm_data, _ = ff_proc.communicate(input=mp3_data, timeout=8.0)
-                    if pcm_data:
-                        return pcm_data
-                except Exception:
-                    pass
+                    mp3_data = loop.run_until_complete(asyncio.wait_for(_get_mp3(), timeout=4.5))
+                finally:
+                    try:
+                        loop.run_until_complete(loop.shutdown_asyncgens())
+                    except Exception:
+                        pass
+                    loop.close()
 
-                try:
-                    import io
-                    from pydub import AudioSegment
-                    seg = AudioSegment.from_file(io.BytesIO(mp3_data), format="mp3")
-                    seg = seg.set_frame_rate(24000).set_channels(1).set_sample_width(2)
-                    return seg.raw_data
-                except Exception:
-                    pass
-        except Exception as e:
-            self.get_logger().warn(f"⚠️ [Edge-TTS Hatası]: {e}")
+                if mp3_data:
+                    try:
+                        ff_proc = subprocess.Popen(
+                            ["ffmpeg", "-y", "-i", "pipe:0", "-f", "s16le", "-acodec", "pcm_s16le", "-ac", "1", "-ar", "24000", "pipe:1"],
+                            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
+                        )
+                        pcm_data, _ = ff_proc.communicate(input=mp3_data, timeout=5.0)
+                        if pcm_data and len(pcm_data) > 100:
+                            return pcm_data
+                    except Exception:
+                        pass
+
+                    try:
+                        import io
+                        from pydub import AudioSegment
+                        seg = AudioSegment.from_file(io.BytesIO(mp3_data), format="mp3")
+                        seg = seg.set_frame_rate(24000).set_channels(1).set_sample_width(2)
+                        return seg.raw_data
+                    except Exception:
+                        pass
+            except Exception as e:
+                if attempt == 0:
+                    time.sleep(0.1)
+                    continue
+                self.get_logger().warn(f"⚠️ [Edge-TTS Hatası]: {e}")
         return b""
 
     def _discover_providers_background(self):
@@ -8311,6 +8328,11 @@ class AstroRealtimeNode(Node):
                 clean_text = response_length_gate(clause_text, user_query=user_text, max_words=35, max_sentences=2)
                 if not clean_text:
                     return None, 0.0, 0.0, 0.0
+
+                with self._lock:
+                    self._recent_robot_phrases.append(clean_text.lower())
+                    if len(self._recent_robot_phrases) > 10:
+                        self._recent_robot_phrases = self._recent_robot_phrases[-10:]
 
                 nonlocal active_engine, tts_source_name, tts_model_name
 
@@ -10183,8 +10205,14 @@ class AstroRealtimeNode(Node):
                     local_rms = float(np.sqrt(np.mean(arr.astype(np.float32) ** 2)))
                     peak_val = int(np.max(np.abs(arr)))
                     # Maintain speech audio buffer for speaker recognition while robot is not speaking
-                    is_cooldown_now = (now - getattr(self, "_playback_end_time", 0.0)) < getattr(self, "echo_mute_cooldown_s", 0.65)
-                    if not self._is_playback_active and not is_cooldown_now and raw_16k:
+                    is_cooldown_now = (now - getattr(self, "_playback_end_time", 0.0)) < float(getattr(self, "echo_mute_cooldown_s", 1.2))
+                    is_busy_collecting = bool(
+                        self._is_playback_active
+                        or getattr(self, "_is_responding", False)
+                        or getattr(self, "_is_processing_fallback", False)
+                        or is_cooldown_now
+                    )
+                    if not is_busy_collecting and raw_16k:
                         with self._lock:
                             self._user_speech_audio_buffer.append(raw_16k)
                             if len(self._user_speech_audio_buffer) > 250:
@@ -10441,9 +10469,14 @@ class AstroRealtimeNode(Node):
             # If robot is actively speaking, actively preparing response (TTS synthesis/LLM),
             # or in post-playback acoustic echo cooldown,
             # strictly purge and reject buffering audio frames into fallback buffer.
-            echo_cooldown_limit = float(getattr(self, "echo_mute_cooldown_s", 0.85))
+            echo_cooldown_limit = float(getattr(self, "echo_mute_cooldown_s", 1.2))
             is_echo_cooldown = (now - getattr(self, "_playback_end_time", 0.0)) < echo_cooldown_limit
-            is_robot_busy = bool(self._is_playback_active or getattr(self, "_is_responding", False) or is_echo_cooldown)
+            is_robot_busy = bool(
+                self._is_playback_active
+                or getattr(self, "_is_responding", False)
+                or getattr(self, "_is_processing_fallback", False)
+                or is_echo_cooldown
+            )
             if is_robot_busy:
                 with self._lock:
                     if self._fallback_speaking or self._fallback_audio_buffer:
