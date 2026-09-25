@@ -147,6 +147,7 @@ from astro_base.gaze.gaze_tracker import Detection, GazeResult, UNSCORED_CONFIDE
 from astro_base.gaze.types import GazeStateEnum, PrioritySource
 from astro_base.gaze.respeaker_localizer import ReSpeakerAudioLocalizer
 from astro_base.gaze.respeaker_sectors import ReSpeakerEyeSectors
+from astro_base.gaze.head_state import PositionSource, UnknownModeActuatorAdapter
 
 try:
     from astro_audio.respeaker_usb import ReSpeakerHID
@@ -336,6 +337,7 @@ class StandaloneGazeRosNode(Node):
             calibration_path=calib_path,
             coast_timeout_s=coast_timeout,
         )
+        self.actuator_adapter = UnknownModeActuatorAdapter(min_limit_deg=-75.0, max_limit_deg=75.0)
 
         # Feedback & Telemetry State
         self.cycle_id: int = 0
@@ -704,30 +706,17 @@ class StandaloneGazeRosNode(Node):
         except (ValueError, TypeError):
             return
 
-        # If actively tracking a person visually, protect gaze and reject override
-        now_m = time.monotonic()
-        if hasattr(self, "latest_result") and self.latest_result:
-            if (
-                self.latest_result.owner == PrioritySource.VISUAL_TRACKING
-                or self.latest_result.gaze_state in (
-                    GazeStateEnum.TRACKING,
-                    GazeStateEnum.HOLDING_ATTENTION,
-                    GazeStateEnum.ORIENTING,
-                    GazeStateEnum.ACQUIRING,
-                    GazeStateEnum.TARGET_LOST,
-                )
-                or (now_m - getattr(self, "_last_visual_active_time", 0.0)) < 1.0
-            ):
-                self.get_logger().info(
-                    f"🛡️ [HEAD TARGET OVERRIDE IGNORED] Active visual tracking locked on face ({self.latest_result.gaze_state}). Target {target:+.1f}° rejected."
-                )
-                return
-
         clamped = max(-80.0, min(80.0, target))
         self._manual_target_yaw = clamped
-        self._manual_target_deadline = time.monotonic() + 1.5
+        now_m = time.monotonic()
+        self._manual_target_deadline_monotonic = now_m + 4.0
+        ref_time = getattr(self, "_last_step_arrival_ts", None)
+        if ref_time is not None and abs(ref_time - now_m) > 1000.0:
+            self._manual_target_deadline = ref_time + 4.0
+        else:
+            self._manual_target_deadline = now_m + 4.0
         self.get_logger().info(
-            f"🎯 [HEAD TARGET OVERRIDE] /head/target_yaw received: {clamped:+.1f}° (latched 1.5s)"
+            f"🎯 [HEAD TARGET OVERRIDE] /head/target_yaw received: {clamped:+.1f}° (latched 4.0s)"
         )
 
     def _on_social_offset_yaw(self, msg) -> None:
@@ -1144,9 +1133,15 @@ class StandaloneGazeRosNode(Node):
         )
 
         now_m = arrival_ts
-        if vision_active:
-            # Active visual tracking takes absolute priority over acoustic/manual overrides
-            self._manual_target_deadline = 0.0
+        self._last_step_arrival_ts = arrival_ts
+        if now_m < getattr(self, "_manual_target_deadline", 0.0):
+            target_yaw = float(self._manual_target_yaw)
+            motor_yaw = target_yaw
+            res.target_yaw_deg = target_yaw
+            res.owner = PrioritySource.ACTIVE_SPEAKER
+            res.gaze_state = GazeStateEnum.ORIENTING
+            res.target_id = "target_override"
+        elif vision_active:
             self.localizer.on_vision_active()
             target_yaw = float(res.target_yaw_deg)
 
@@ -1162,7 +1157,13 @@ class StandaloneGazeRosNode(Node):
                     if hasattr(self, "last_published_yaw") and self.last_published_yaw != 0.0:
                         target_yaw = self.last_published_yaw
 
-            motor_yaw = target_yaw
+            has_enc = bool(self.runtime.has_head_feedback and self.runtime.actual_head_yaw_deg is not None)
+            motor_yaw = self.actuator_adapter.adapt(
+                target_yaw_deg=target_yaw,
+                relative_head_correction_deg=getattr(res, "relative_head_correction_deg", None),
+                is_relative_correction=getattr(res, "is_relative_correction", False),
+                has_encoder=has_enc,
+            )
             self._last_audio_log_yaw = None
             self._last_visual_active_time = now_m
             self._last_visual_yaw = target_yaw
@@ -1172,13 +1173,6 @@ class StandaloneGazeRosNode(Node):
                 res.owner = PrioritySource.VISUAL_TRACKING
                 if not res.target_id:
                     res.target_id = self._last_visual_target_id
-        elif now_m < getattr(self, "_manual_target_deadline", 0.0):
-            target_yaw = float(self._manual_target_yaw)
-            motor_yaw = target_yaw
-            res.target_yaw_deg = target_yaw
-            res.owner = PrioritySource.ACTIVE_SPEAKER
-            res.gaze_state = GazeStateEnum.ORIENTING
-            res.target_id = "target_override"
         else:
             # Check for active audio reacquisition
             is_speaking_device = bool(self._playback_active or self._robot_speaking)
@@ -1303,7 +1297,7 @@ class StandaloneGazeRosNode(Node):
             f"cycle_id={self.cycle_id}\n"
             f"frame_id={self.frame_index}\n"
             f"target_id={primary_target_id}\n"
-            f"command_yaw={target_yaw:+.1f}°\n"
+            f"command_yaw={motor_yaw:+.1f}°\n"
             f"aligned_head={aligned_head_str}\n"
             f"actual_head={actual_head_str}\n"
             f"raw_encoder={raw_enc_str}\n"
@@ -1467,7 +1461,11 @@ class StandaloneGazeRosNode(Node):
         If running headless without camera, updates audio localizer.
         """
         now_m = time.monotonic()
-        if now_m < getattr(self, "_manual_target_deadline", 0.0):
+        manual_active = (
+            now_m < getattr(self, "_manual_target_deadline", 0.0)
+            or now_m < getattr(self, "_manual_target_deadline_monotonic", 0.0)
+        )
+        if manual_active:
             target_yaw = float(self._manual_target_yaw)
         elif self.camera is None or not getattr(self.camera, "available", False):
             # Headless or camera-less mode: localizer can be stepped if camera loop isn't driving

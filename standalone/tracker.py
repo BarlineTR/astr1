@@ -122,6 +122,8 @@ class GazeTracker:
             min_limit_deg=self.calib.head.min_angle_deg,
             max_limit_deg=self.calib.head.max_angle_deg,
             spatial_memory=self.spatial_memory,
+            acquisition_threshold=0.55,
+            target_lost_timeout_s=2.5,
         )
         self.planner = MotionPlannerCore(
             min_limit_deg=self.calib.head.min_angle_deg,

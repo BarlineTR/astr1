@@ -1017,7 +1017,7 @@ class AstroRealtimeNode(Node):
 
         # Local Offline Backup TTS Engine (Zero internet local resilience fallback)
         self.local_offline_tts: Optional[LocalOfflineTTSEngine] = None
-        if LocalOfflineTTSEngine:
+        if LocalOfflineTTSEngine and self.use_realtime:
             try:
                 self.local_offline_tts = LocalOfflineTTSEngine(
                     language=os.getenv("TTS_LANGUAGE", "tr"),
