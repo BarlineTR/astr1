@@ -164,7 +164,12 @@ class TestOfficeConcierge(unittest.TestCase):
 class TestAstroRealtimeNodeOfficeTools(unittest.TestCase):
     @patch.dict(os.environ, {"ASTRO_TEST_MODE": "1", "OPENAI_API_KEY": "sk-mock-key"})
     def setUp(self):
+        import tempfile
         self.node = AstroRealtimeNode()
+        # Test isolation: use a temporary calendar file with fresh seed events
+        temp_dir = tempfile.mkdtemp()
+        self.temp_cal = os.path.join(temp_dir, "test_node_cal.json")
+        self.node.calendar_service = CalendarService(storage_path=self.temp_cal)
 
     def test_06_realtime_tools_check_calendar_events(self):
         res = self.node._execute_realtime_tool("check_calendar_events", {"query": "bugün"})
@@ -222,6 +227,55 @@ class TestAstroRealtimeNodeOfficeTools(unittest.TestCase):
         })
         self.assertEqual(res_del["status"], "success")
         self.assertIn("kaldırıldı", res_del["message"])
+
+    def test_11_realtime_tools_update_calendar_event(self):
+        # Add an initial event
+        self.node.calendar_service.add_event_smart(
+            title="Sistem Planlama",
+            date_str="bugün",
+            time_str="11:00",
+            location="Oda 1"
+        )
+        # Update event via tool call
+        res_upd = self.node._execute_realtime_tool("update_calendar_event", {
+            "query": "Sistem Planlama",
+            "new_time": "16:00",
+            "new_location": "Büyük Konferans Salonu"
+        })
+        self.assertEqual(res_upd["status"], "success")
+        self.assertIn("güncellendi", res_upd["message"])
+        self.assertEqual(res_upd["event"]["location"], "Büyük Konferans Salonu")
+        self.assertIn("16:00", res_upd["event"]["start_time"])
+
+    def test_12_reminder_lifecycle_and_due_alert(self):
+        # 1. Set reminder via tool (clear any previous in-memory reminders for test isolation)
+        self.node._reminders.clear()
+        res_rem = self.node._execute_realtime_tool("set_reminder", {
+            "minutes": 5.0,
+            "topic": "çay içeceğim"
+        })
+        self.assertEqual(res_rem["status"], "success")
+        self.assertEqual(res_rem["minutes"], 5.0)
+        self.assertEqual(res_rem["topic"], "çay içeceğim")
+        self.assertEqual(len(self.node._reminders), 1)
+
+        # 2. Check persistence in memory profile
+        persisted = self.node.memory.profile.get_active_reminders()
+        self.assertGreaterEqual(len(persisted), 1)
+        self.assertTrue(any("çay içeceğim" in r.get("reminder_text", "") for r in persisted))
+
+        # 3. Simulate due time arrived
+        self.node._reminders[0]["due_time"] = time.monotonic() - 1.0
+
+        # 4. Trigger _check_reminders and verify speech output is invoked (not blocked by proactive_speech_enabled)
+        tts_messages = []
+        self.node.pub_tts = MagicMock()
+        self.node.pub_tts.publish = lambda msg: tts_messages.append(msg.data)
+        
+        self.node._check_reminders()
+        self.assertEqual(len(self.node._reminders), 0)
+        self.assertGreaterEqual(len(tts_messages), 1)
+        self.assertIn("çay içeceğim", tts_messages[0])
 
 
 if __name__ == "__main__":

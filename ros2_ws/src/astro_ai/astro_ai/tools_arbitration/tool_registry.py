@@ -11,6 +11,7 @@ class ToolCategory(str, Enum):
     ENVIRONMENT = "Environment"
     ROBOT = "Robot"
     UTILITY = "Utility"
+    OFFICE = "Office"
 
 
 class ToolRegistry:
@@ -146,6 +147,76 @@ class ToolRegistry:
                         "duration": {"type": "number", "description": "Kaç saniye hareket edeceği"}
                     },
                     "required": ["direction"]
+                }
+            }
+        },
+        # Office & Calendar
+        {
+            "category": ToolCategory.OFFICE,
+            "type": "function",
+            "function": {
+                "name": "check_calendar_events",
+                "description": "Kullanıcının bugünkü veya belirli bir zaman aralığındaki takvim programını ve toplantılarını sorgular.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string", "description": "Zaman aralığı veya konu (örn: bugün, bu hafta)"},
+                        "days": {"type": "number", "description": "Kaç günlük takvimin sorgulanacağı"}
+                    },
+                    "required": []
+                }
+            }
+        },
+        {
+            "category": ToolCategory.OFFICE,
+            "type": "function",
+            "function": {
+                "name": "add_calendar_event",
+                "description": "Takvime yeni bir toplantı veya etkinlik ekler.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "title": {"type": "string", "description": "Toplantı başlığı"},
+                        "date": {"type": "string", "description": "Tarih veya gün (örn: yarın, salı)"},
+                        "time": {"type": "string", "description": "Saat (örn: 14:00)"},
+                        "duration_minutes": {"type": "number", "description": "Süre (dakika)"},
+                        "location": {"type": "string", "description": "Konum veya oda"}
+                    },
+                    "required": ["title"]
+                }
+            }
+        },
+        {
+            "category": ToolCategory.OFFICE,
+            "type": "function",
+            "function": {
+                "name": "update_calendar_event",
+                "description": "Takvimdeki mevcut bir toplantının saatini, gününü veya yerini günceller.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string", "description": "Güncellenecek toplantının adı"},
+                        "new_date": {"type": "string", "description": "Yeni tarih veya gün"},
+                        "new_time": {"type": "string", "description": "Yeni saat"},
+                        "new_location": {"type": "string", "description": "Yeni konum"},
+                        "new_title": {"type": "string", "description": "Yeni başlık"}
+                    },
+                    "required": ["query"]
+                }
+            }
+        },
+        {
+            "category": ToolCategory.OFFICE,
+            "type": "function",
+            "function": {
+                "name": "delete_calendar_event",
+                "description": "Takvimdeki bir toplantıyı veya randevuyu siler.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string", "description": "İptal edilecek toplantı adı"}
+                    },
+                    "required": ["query"]
                 }
             }
         },

@@ -1193,8 +1193,24 @@ class AstroRealtimeNode(Node):
         self._consecutive_loud_frames = 0
         self.create_timer(1.0, self._check_sleep_mode)
 
-        # Reminders storage
+        # Reminders storage with persistent profile recovery
         self._reminders: List[Dict[str, Any]] = []
+        try:
+            persisted = self.memory.profile.get_active_reminders()
+            now_wall = time.time()
+            now_mono = time.monotonic()
+            for pr in persisted:
+                target_wall = pr.get("target_time", 0.0)
+                if target_wall > now_wall:
+                    delta_s = target_wall - now_wall
+                    self._reminders.append({
+                        "due_time": now_mono + delta_s,
+                        "topic": pr.get("reminder_text", "hatırlatma"),
+                        "minutes": delta_s / 60.0,
+                        "wall_target": target_wall
+                    })
+        except Exception:
+            pass
         self.create_timer(1.0, self._check_reminders)
 
         # Long-Term Episodic Session Lifecycle & Summarizer Timer
@@ -2305,11 +2321,26 @@ class AstroRealtimeNode(Node):
         except Exception as _m_err:
             self.get_logger().debug(f"multimodal_perception_str construction notice: {_m_err}")
 
+        office_calendar_rule = (
+            "\n\n[OFİS ASİSTANLIĞI, TAKVİM VE HATIRLATMA KURALLARI]:\n"
+            "- Sen kibar, çevik ve son derece profesyonel bir sosyal robotsun.\n"
+            "- Kullanıcı takvimini sorduğunda ('bugün neyim var?', 'bu hafta hangi toplantılar var?', 'programıma bak'):\n"
+            "  * KESİNLİKLE 'check_calendar_events' fonksiyonunu çağır.\n"
+            "  * Kullanıcıya 'Hemen takvimini kontrol ediyorum...' havasında profesyonel, net ve canlı bir özet sun.\n"
+            "- Kullanıcı toplantı veya etkinlik eklemek ('yarın saat 15:00'e toplantı ekle'), silmek ('toplantıyı iptal et') veya güncellemek ('saatini 16:00 yap') istediğinde:\n"
+            "  * İlgili fonksiyonu çağır ('add_calendar_event', 'delete_calendar_event', 'update_calendar_event').\n"
+            "  * Tamamlandığında tek bir güven veren, net cümleyle onayla (Örn: 'Toplantınızı takvime ekledim.', 'Toplantı saat 16:00 olarak güncellendi.').\n"
+            "- Kullanıcı hatırlatma veya alarm istediğinde ('5 dakika sonra çay içeceğim bana hatırlat'):\n"
+            "  * KESİNLİKLE 'set_reminder' fonksiyonunu çağır (minutes ve topic parametreleriyle).\n"
+            "  * 'Tamamdır, 5 dakika sonra çay içeceğini sana hatırlatacağım' diyerek net ve pozitif onay ver.\n"
+            "- ASLA 'takvime erişimim yok', 'aracım yok', 'yapamam' deme.\n"
+        )
+
         if not getattr(self, "persona_engine", None):
-            return f"Astro Default Instructions {bio_status}{spatial_rule}{social_context_str}{multimodal_perception_str}"
+            return f"Astro Default Instructions {bio_status}{spatial_rule}{social_context_str}{multimodal_perception_str}{office_calendar_rule}"
         mem_ctx = self.memory.get_prompt_context(recognized_person=identity) if getattr(self, "memory", None) else ""
         return self.persona_engine.build_system_prompt(
-            memory_context=mem_ctx + bio_status + memory_rule + realtime_speech_rule + spatial_rule + social_context_str + multimodal_perception_str,
+            memory_context=mem_ctx + bio_status + memory_rule + realtime_speech_rule + spatial_rule + social_context_str + multimodal_perception_str + office_calendar_rule,
             recognized_person=identity
         )
 
@@ -2646,6 +2677,23 @@ class AstroRealtimeNode(Node):
                             "type": "object",
                             "properties": {
                                 "query": {"type": "string", "description": "İptal edilmek istenen toplantının adı veya anahtar kelimesi (örn: 'diş randevusu', 'tasarım toplantısı')"}
+                            },
+                            "required": ["query"]
+                        }
+                    },
+                    {
+                        "type": "function",
+                        "name": "update_calendar_event",
+                        "description": "Kullanıcı takvimdeki mevcut bir toplantının, randevunun veya etkinliğin saatini, gününü, yerini, süresini veya başlığını değiştirmek, ertelemek ya da güncellemek istediğinde KESİNLİKLE çağrılır (Örn: 'Ahmet ile olan toplantının saatini 16:00 yap', 'diş randevumu yarına ertele', 'toplantı yerini Lobi olarak değiştir').",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "query": {"type": "string", "description": "Güncellenecek toplantının mevcut adı veya anahtar kelimesi (örn: 'Ahmet ile toplantı', 'diş randevusu')"},
+                                "new_date": {"type": "string", "description": "Yeni gün veya tarih (örn: 'yarın', 'cuma', '2026-09-28')"},
+                                "new_time": {"type": "string", "description": "Yeni saat (örn: '16:00', '14:30')"},
+                                "new_location": {"type": "string", "description": "Yeni konum veya oda (örn: 'Toplantı Odası B', 'Lobi')"},
+                                "new_title": {"type": "string", "description": "Yeni başlık veya konu"},
+                                "new_duration_minutes": {"type": "number", "description": "Yeni süre (dakika)"}
                             },
                             "required": ["query"]
                         }
@@ -3524,9 +3572,37 @@ class AstroRealtimeNode(Node):
                 is_acknowledgement_tool = func_name in (
                     "change_persona", "enroll_user_biometrics", "delete_user_biometrics",
                     "move_robot", "turn_to_sound", "navigate_to_location", "escort_guest", "notify_via_slack",
-                    "add_calendar_event", "delete_calendar_event"
+                    "add_calendar_event", "delete_calendar_event", "update_calendar_event", "set_reminder"
                 )
-                if is_acknowledgement_tool:
+                if func_name == "set_reminder":
+                    min_val = tool_result.get("minutes", 1.0)
+                    min_str = f"{min_val:.0f}" if isinstance(min_val, (int, float)) and min_val == int(min_val) else f"{min_val}"
+                    top_val = tool_result.get("topic", "hatırlatma")
+                    tool_instructions = (
+                        f"HATIRLATICI ONAY KURALI: {min_str} dakika sonraya '{top_val}' hatırlatması başarıyla kuruldu! "
+                        f"Kullanıcıya güven veren, sıcak ve net tek bir kısa cümleyle (örn: 'Tamamdır, {min_str} dakika sonra çay içeceğini sana hatırlatacağım') teyit ver. "
+                        f"Uzun tirat atma, tek nefeste bitir."
+                    )
+                elif func_name == "update_calendar_event":
+                    msg = tool_result.get("message", "Etkinlik güncellendi.")
+                    tool_instructions = (
+                        f"TAKVİM GÜNCELLEME ONAY KURALI: {msg} "
+                        f"Kullanıcıya tek bir net ve profesyonel cümleyle (örn: 'Toplantıyı saat 16:00 olarak güncelledim.') teyit ver."
+                    )
+                elif func_name == "add_calendar_event":
+                    title_ev = tool_result.get("title", "Toplantı")
+                    st_ev = tool_result.get("start_time", "")
+                    tool_instructions = (
+                        f"TAKVİM EKLEME ONAY KURALI: '{title_ev}' ({st_ev}) başarıyla takvime eklendi! "
+                        f"Kullanıcıya tek bir net ve profesyonel cümleyle (örn: 'Toplantınızı takvime ekledim.') teyit ver."
+                    )
+                elif func_name == "delete_calendar_event":
+                    msg = tool_result.get("message", "Etkinlik kaldırıldı.")
+                    tool_instructions = (
+                        f"TAKVİM İPTAL ONAY KURALI: {msg} "
+                        f"Kullanıcıya tek bir net ve profesyonel cümleyle iptali doğrula."
+                    )
+                elif is_acknowledgement_tool:
                     tool_instructions = (
                         "FİZİKSEL VE EYLEM CEVAP KURALI: Az önce çalıştırılan fonksiyonun (tool) çıktısını kesin ve mutlak gerçeklik kabul et. "
                         "Eğer çıktı başarı (success=true) içeriyorsa eylemin yapıldığını TEK BİR KISA CÜMLE (maksimum 3-8 kelime) ile doğrula! "
@@ -3538,7 +3614,7 @@ class AstroRealtimeNode(Node):
                     sched_text = tool_result.get("schedule", "") if isinstance(tool_result, dict) else str(tool_result)
                     tool_instructions = (
                         f"OFİS TAKVİMİ CEVAP KURALI: Takvimdeki etkinlikler şunlardır: '{sched_text}'. "
-                        f"Bu etkinlikleri kullanıcıya doğrudan, samimi, net ve canlı bir Türkçe ile aktar. "
+                        f"Kullanıcıya son derece profesyonel, samimi, net ve canlı bir Türkçe ile 'Hemen takvimini kontrol ettim...' havasında doğrudan aktar. "
                         f"Uydurma toplantı veya saat ekleme."
                     )
                 elif func_name == "inspect_camera_view":
@@ -3806,6 +3882,100 @@ class AstroRealtimeNode(Node):
                 return True, "Ankara"
             return True, "Ahlat"
         return False, ""
+
+    def _is_reminder_query(self, text: str) -> Tuple[bool, float, str]:
+        text_l = text.lower()
+        reminder_triggers = ["hatırlat", "alarm kur", "zamanlayıcı kur", "haber ver", "uyar", "bana söyle", "hatırlatıcı"]
+        if not any(w in text_l for w in reminder_triggers):
+            return False, 0.0, ""
+
+        num_map = {
+            "yarım": 0.5, "yarim": 0.5, "buçuk": 0.5, "çeyrek": 0.25, "ceyrek": 0.25,
+            "bir": 1.0, "1": 1.0, "iki": 2.0, "2": 2.0, "üç": 3.0, "uc": 3.0, "3": 3.0,
+            "dört": 4.0, "dort": 4.0, "4": 4.0, "beş": 5.0, "bes": 5.0, "5": 5.0,
+            "altı": 6.0, "alti": 6.0, "6": 6.0, "yedi": 7.0, "7": 7.0, "sekiz": 8.0, "8": 8.0,
+            "dokuz": 9.0, "9": 9.0, "on": 10.0, "10": 10.0, "on beş": 15.0, "15": 15.0,
+            "yirmi": 20.0, "20": 20.0, "yirmi beş": 25.0, "25": 25.0,
+            "otuz": 30.0, "30": 30.0, "kırk": 40.0, "kirk": 40.0, "40": 40.0,
+            "elli": 50.0, "50": 50.0, "altmış": 60.0, "altmis": 60.0, "60": 60.0
+        }
+
+        mins = 1.0
+        time_pattern = r'(\d+|yarım|yarim|çeyrek|ceyrek|on\s+beş|on\s+iki|bir|iki|üç|uc|dört|dort|beş|bes|altı|alti|yedi|sekiz|dokuz|on|yirmi|otuz|kırk|elli|altmış)\s*(dakika|dk|saniye|sn|saat|hour|min|sec)'
+        m = re.search(time_pattern, text_l)
+
+        if m:
+            val_str = m.group(1).strip()
+            unit_str = m.group(2).strip()
+            val = float(num_map.get(val_str, float(val_str) if val_str.isdigit() else 1.0))
+
+            if any(u in unit_str for u in ["saniye", "sn", "sec"]):
+                mins = val / 60.0
+            elif any(u in unit_str for u in ["saat", "hour"]):
+                mins = val * 60.0
+            else:
+                mins = val
+        else:
+            if "saniye sonra" in text_l:
+                mins = 0.5
+            elif "saat sonra" in text_l:
+                mins = 60.0
+            elif "dakika sonra" in text_l:
+                mins = 1.0
+            else:
+                mins = 5.0
+
+        clean = re.sub(r'(?i)\b(iyiyim|ben de iyiyim|harikayım|süperim|ben|de|teşekkür\s*ederim|teşekkürler|sağ\s*ol|sağol|merhaba|selam|günaydın|lütfen|bana|hey\s*astro|astro)\b', '', text)
+        clean = re.sub(r'(?i)\b(\d+|yarım|yarim|çeyrek|ceyrek|on\s+beş|on\s+iki|bir|iki|üç|uc|dört|dort|beş|bes|altı|alti|yedi|sekiz|dokuz|on|yirmi|otuz|kırk|elli|altmış)\s*(dakika|dk|saniye|sn|saat)\s*(sonra)?\b', '', clean)
+        clean = re.sub(r'(?i)\b(dakika|saniye|saat)\s*sonra\b', '', clean)
+        clean = re.sub(r'(?i)\b(hatırlatabilir\s*misin|hatırlatır\s*mısın|hatırlatırsa[nm]|hatırlat|alarm\s*kur|zamanlayıcı\s*kur|haber\s*ver|uyar|söyler\s*misin|kurar\s*mısın)\b', '', clean)
+        clean = re.sub(r'(?i)\b(içeceğim|içecegim|içmem\s*lazım|yapacağım|yapmam\s*gerek|gideceğim|alacağım|kapatacağım|edeceğim|edecegim|olacağım)\b', '', clean)
+        clean = re.sub(r'[^\w\s]', '', clean).strip()
+        clean = " ".join(clean.split())
+
+        if not clean or len(clean) < 3:
+            if "çay" in text_l:
+                topic = "çay içme"
+            elif "kahve" in text_l:
+                topic = "kahve içme"
+            elif "su" in text_l:
+                topic = "su içme"
+            elif "ilaç" in text_l:
+                topic = "ilaç alma"
+            elif "yemek" in text_l or "fırın" in text_l:
+                topic = "yemek"
+            elif "toplantı" in text_l:
+                topic = "toplantı"
+            else:
+                topic = "hatırlatma"
+        else:
+            topic = clean
+
+        return True, mins, topic
+
+    def _is_calendar_query(self, text: str) -> Tuple[bool, str, int]:
+        text_l = text.lower()
+        cal_triggers = [
+            "takvim", "toplantım var mı", "toplantım nedir", "toplantılarım",
+            "neyim var", "programım", "etkinliklerim", "ajandam",
+            "randevum var mı", "randevularım", "sonraki toplantı"
+        ]
+        if not any(w in text_l for w in cal_triggers):
+            return False, "", 0
+
+        query = "bugün"
+        days = 1
+        if "hafta" in text_l:
+            query = "bu hafta"
+            days = 7
+        elif "yarın" in text_l or "yarin" in text_l:
+            query = "yarın"
+            days = 2
+        elif "ay" in text_l:
+            query = "bu ay"
+            days = 30
+
+        return True, query, days
 
     # Yerel modda kendini tanıtma cümlesini yakalama ve kalıcı profile kaydetme
     _NAME_TOKEN = r"[A-ZÇĞİÖŞÜ][a-zçğıöşü]{1,}"
@@ -4587,10 +4757,28 @@ class AstroRealtimeNode(Node):
 
         elif name == "set_reminder":
             mins = float(args.get("minutes", 1.0))
-            topic = args.get("topic", "hatırlatma")
-            due_time = time.monotonic() + (mins * 60.0)
-            self._reminders.append({"due_time": due_time, "topic": topic, "minutes": mins})
-            return {"status": "success", "message": f"{mins} dakika sonra '{topic}' hatırlatması kuruldu."}
+            topic = str(args.get("topic", "hatırlatma")).strip()
+            now_mono = time.monotonic()
+            due_time = now_mono + (mins * 60.0)
+            wall_target = time.time() + (mins * 60.0)
+            self._reminders.append({"due_time": due_time, "topic": topic, "minutes": mins, "wall_target": wall_target})
+            try:
+                identity = self._get_active_biometric_identity()
+                user_name = identity.get("name") if identity.get("is_known") else (self.memory.profile.data.get("owner_name") or "Kullanıcı")
+                self.memory.profile.add_active_reminder(wall_target, topic, user_name)
+            except Exception as _r_err:
+                self.get_logger().debug(f"Reminder persistence notice: {_r_err}")
+
+            if getattr(self, "action_manager", None):
+                self.action_manager.execute_gesture("nod")
+
+            min_str = f"{mins:.0f}" if mins.is_integer() else f"{mins}"
+            return {
+                "status": "success",
+                "minutes": mins,
+                "topic": topic,
+                "message": f"{min_str} dakika sonra '{topic}' hatırlatması kuruldu."
+            }
 
         elif name == "save_user_memory":
             key = args.get("key", "")
@@ -4845,6 +5033,25 @@ class AstroRealtimeNode(Node):
             query = str(args.get("query", "")).strip()
             if getattr(self, "calendar_service", None):
                 res = self.calendar_service.delete_event(query)
+                return res
+            return {"status": "error", "message": "Takvim servisi aktif değil."}
+
+        elif name == "update_calendar_event":
+            query = str(args.get("query", "")).strip()
+            new_date = args.get("new_date")
+            new_time = args.get("new_time")
+            new_location = args.get("new_location")
+            new_title = args.get("new_title")
+            new_duration = args.get("new_duration_minutes")
+            if getattr(self, "calendar_service", None):
+                res = self.calendar_service.update_event_smart(
+                    query=query,
+                    new_date=new_date,
+                    new_time=new_time,
+                    new_location=new_location,
+                    new_title=new_title,
+                    new_duration=int(new_duration) if new_duration is not None else None
+                )
                 return res
             return {"status": "error", "message": "Takvim servisi aktif değil."}
 
@@ -6372,18 +6579,55 @@ class AstroRealtimeNode(Node):
         for r in due:
             topic = r["topic"]
             self.get_logger().info(f"⏰ [Realtime Alarm]: '{topic}' zamanı geldi!")
-            # Trigger proactive realtime message (only if proactive speech is explicitly enabled)
-            if getattr(self, "proactive_speech_enabled", False) and self._ws and self._loop and self._is_connected:
+
+            # Physical gesture & emotion
+            if getattr(self, "action_manager", None):
+                self.action_manager.execute_gesture("nod")
+            if hasattr(self, "pub_emotion"):
+                emo = String()
+                emo.data = "playful"
+                self.pub_emotion.publish(emo)
+
+            # Spoken reminder: Always speak out (user-contract, never gated by proactive_speech_enabled)
+            if self._ws and self._loop and self._is_connected:
                 alarm_event = {
                     "type": "conversation.item.create",
                     "item": {
                         "type": "message",
                         "role": "user",
-                        "content": [{"type": "input_text", "text": f"[Sistem Hatırlatması]: Kullanıcıya '{topic}' vaktinin geldiğini neşeyle hatırlat."}]
+                        "content": [
+                            {
+                                "type": "input_text",
+                                "text": (
+                                    f"[Sistem Hatırlatması]: Kullanıcının önceden kurduğu hatırlatma vakti geldi! "
+                                    f"Konu: '{topic}'. Kullanıcıya sıcak, neşeli ve profesyonel bir sosyal robot gibi doğrudan seslenerek "
+                                    f"'{topic}' vaktinin geldiğini hatırlat (Örn: 'Vakit geldi, çay içme zamanı!')."
+                                )
+                            }
+                        ]
                     }
                 }
-                asyncio.run_coroutine_threadsafe(self._ws.send(json.dumps(alarm_event)), self._loop)
-                asyncio.run_coroutine_threadsafe(self._ws.send(json.dumps({"type": "response.create"})), self._loop)
+                try:
+                    asyncio.run_coroutine_threadsafe(self._ws.send(json.dumps(alarm_event)), self._loop)
+                    asyncio.run_coroutine_threadsafe(self._ws.send(json.dumps({"type": "response.create"})), self._loop)
+                except Exception as _e_ws:
+                    self.get_logger().error(f"Alarm WS send error: {_e_ws}")
+            else:
+                # Fallback TTS / Offline audio
+                reminder_speech = f"Hatırlatmamı istemiştin: {topic} zamanı geldi!"
+                self.get_logger().info(f"🔊 [Fallback TTS Alarm]: {reminder_speech}")
+                if hasattr(self, "pub_tts"):
+                    tts_m = String()
+                    tts_m.data = reminder_speech
+                    self.pub_tts.publish(tts_m)
+                elif callable(getattr(self, "_speak_offline", None)):
+                    self._speak_offline(reminder_speech)
+
+            # Clean from persistent memory profile
+            try:
+                self.memory.profile.get_and_pop_due_reminders(now=time.time())
+            except Exception:
+                pass
 
         # Check pre-meeting proactive reminders (10 minutes before meeting)
         if getattr(self, "calendar_service", None):
@@ -6414,6 +6658,14 @@ class AstroRealtimeNode(Node):
                         asyncio.run_coroutine_threadsafe(self._ws.send(json.dumps({"type": "response.create"})), self._loop)
                     except Exception:
                         pass
+                else:
+                    meet_msg = f"{m_min} dakika sonra {m_title} toplantınız başlıyor."
+                    if hasattr(self, "pub_tts"):
+                        tts_m = String()
+                        tts_m.data = meet_msg
+                        self.pub_tts.publish(tts_m)
+                    elif callable(getattr(self, "_speak_offline", None)):
+                        self._speak_offline(meet_msg)
 
     def _check_session_lifecycle(self):
         """Periodically checks if the active session ended and summarizes it into long-term profile."""
@@ -8477,6 +8729,134 @@ class AstroRealtimeNode(Node):
                     t_playback_started = time.monotonic()
                     end_to_end_first_audio_ms = (t_playback_started - t_stt_finished) * 1000.0
                     self.get_logger().info(f"🤖 [Astro (Canlı Hava Durumu)]: \"{reply_text}\"")
+                    self.memory.episodic.add_message("assistant", reply_text)
+                    self.session.record_robot_speech()
+                    if getattr(self, "dialogue_state_manager", None):
+                        self.dialogue_state_manager.record_assistant_turn(reply_text)
+                    _record_turn_telemetry(
+                        reply_text,
+                        origin="deterministic_policy",
+                        played=True,
+                        dur_synth_ms=total_synth_ms,
+                        gpu_ms=total_gpu_ms,
+                        t_stt_finished_ts=t_stt_finished,
+                        t_intent_resolved_ts=t_intent_resolved,
+                        t_response_ready_ts=t_response_ready,
+                        t_tts_request_started_ts=t_tts_request_started,
+                        t_tts_first_audio_ts=t_tts_first_audio,
+                        t_playback_started_ts=t_playback_started,
+                        intent_resolution_ms_val=intent_resolution_ms,
+                        response_generation_ms_val=response_generation_ms,
+                        tts_ttfa_ms_val=tts_ttfa_ms,
+                        end_to_end_first_audio_ms_val=end_to_end_first_audio_ms,
+                    )
+                    _handle_and_play_clause_audio(pcm, is_final_clause=True)
+                    return
+
+            # Instant Reminder Query (Sub-250ms Direct Execution)
+            is_reminder, r_mins, r_topic = self._is_reminder_query(user_text)
+            if is_reminder:
+                self._execute_realtime_tool("set_reminder", {"minutes": r_mins, "topic": r_topic})
+                r_min_str = f"{r_mins:.0f}" if r_mins == int(r_mins) else f"{r_mins}"
+                reply_text = f"Tamamdır, {r_min_str} dakika sonra sana {r_topic} hatırlatması yapacağım."
+                t_response_ready = time.monotonic()
+                response_generation_ms = (t_response_ready - t_intent_resolved) * 1000.0
+
+                with self._lock:
+                    self._recent_robot_phrases.append(reply_text.lower())
+                    if len(self._recent_robot_phrases) > 10:
+                        self._recent_robot_phrases = self._recent_robot_phrases[-10:]
+
+                self._speech_authorization = SpeechAuthorization(
+                    user_turn_id=u_turn_id,
+                    generation_id=self._fallback_generation_id,
+                    explicit_user_turn=True,
+                    should_speak=True,
+                    response_origin="deterministic_policy",
+                    llm_inference_completed=True,
+                    response_final=True,
+                )
+                t_tts_request_started = time.monotonic()
+                pcm, s_ms, g_ms, q_ms = _synthesize_turn_clause(
+                    reply_text,
+                    is_final_response=True,
+                    is_deterministic=True,
+                    is_llm_completed=True,
+                    caller_reason="deterministic_policy",
+                )
+                t_tts_first_audio = time.monotonic()
+                tts_ttfa_ms = (t_tts_first_audio - t_tts_request_started) * 1000.0
+                total_synth_ms += s_ms
+                total_gpu_ms += g_ms
+                total_queue_wait_ms += q_ms
+                if pcm:
+                    t_playback_started = time.monotonic()
+                    end_to_end_first_audio_ms = (t_playback_started - t_stt_finished) * 1000.0
+                    self.get_logger().info(f"🤖 [Astro (Hatırlatıcı Kuruldu)]: \"{reply_text}\"")
+                    self.memory.episodic.add_message("assistant", reply_text)
+                    self.session.record_robot_speech()
+                    if getattr(self, "dialogue_state_manager", None):
+                        self.dialogue_state_manager.record_assistant_turn(reply_text)
+                    _record_turn_telemetry(
+                        reply_text,
+                        origin="deterministic_policy",
+                        played=True,
+                        dur_synth_ms=total_synth_ms,
+                        gpu_ms=total_gpu_ms,
+                        t_stt_finished_ts=t_stt_finished,
+                        t_intent_resolved_ts=t_intent_resolved,
+                        t_response_ready_ts=t_response_ready,
+                        t_tts_request_started_ts=t_tts_request_started,
+                        t_tts_first_audio_ts=t_tts_first_audio,
+                        t_playback_started_ts=t_playback_started,
+                        intent_resolution_ms_val=intent_resolution_ms,
+                        response_generation_ms_val=response_generation_ms,
+                        tts_ttfa_ms_val=tts_ttfa_ms,
+                        end_to_end_first_audio_ms_val=end_to_end_first_audio_ms,
+                    )
+                    _handle_and_play_clause_audio(pcm, is_final_clause=True)
+                    return
+
+            # Instant Calendar Query (Sub-250ms Direct Execution)
+            is_cal, cal_q, cal_d = self._is_calendar_query(user_text)
+            if is_cal:
+                cal_res = self._execute_realtime_tool("check_calendar_events", {"query": cal_q, "days": cal_d})
+                sched = cal_res.get("schedule", "Takvimde etkinlik bulunmuyor.")
+                reply_text = f"Hemen takvimini kontrol ettim:\n{sched}"
+                t_response_ready = time.monotonic()
+                response_generation_ms = (t_response_ready - t_intent_resolved) * 1000.0
+
+                with self._lock:
+                    self._recent_robot_phrases.append(reply_text.lower())
+                    if len(self._recent_robot_phrases) > 10:
+                        self._recent_robot_phrases = self._recent_robot_phrases[-10:]
+
+                self._speech_authorization = SpeechAuthorization(
+                    user_turn_id=u_turn_id,
+                    generation_id=self._fallback_generation_id,
+                    explicit_user_turn=True,
+                    should_speak=True,
+                    response_origin="deterministic_policy",
+                    llm_inference_completed=True,
+                    response_final=True,
+                )
+                t_tts_request_started = time.monotonic()
+                pcm, s_ms, g_ms, q_ms = _synthesize_turn_clause(
+                    reply_text,
+                    is_final_response=True,
+                    is_deterministic=True,
+                    is_llm_completed=True,
+                    caller_reason="deterministic_policy",
+                )
+                t_tts_first_audio = time.monotonic()
+                tts_ttfa_ms = (t_tts_first_audio - t_tts_request_started) * 1000.0
+                total_synth_ms += s_ms
+                total_gpu_ms += g_ms
+                total_queue_wait_ms += q_ms
+                if pcm:
+                    t_playback_started = time.monotonic()
+                    end_to_end_first_audio_ms = (t_playback_started - t_stt_finished) * 1000.0
+                    self.get_logger().info(f"🤖 [Astro (Takvim Özeti)]: \"{reply_text}\"")
                     self.memory.episodic.add_message("assistant", reply_text)
                     self.session.record_robot_speech()
                     if getattr(self, "dialogue_state_manager", None):

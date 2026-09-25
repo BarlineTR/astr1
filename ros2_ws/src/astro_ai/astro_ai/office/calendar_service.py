@@ -21,17 +21,47 @@ class CalendarService:
             self.storage_path = os.path.join(astro_dir, "office_calendar.json")
 
         self.google_api_key = os.environ.get("GOOGLE_CALENDAR_API_KEY", "")
-        self.google_calendar_id = os.environ.get("GOOGLE_CALENDAR_ID", "")
+        self.google_calendar_id = os.environ.get("GOOGLE_CALENDAR_ID", "") or "primary"
         self.google_ical_url = os.environ.get("GOOGLE_CALENDAR_ICAL_URL", "")
+        self.google_access_token = os.environ.get("GOOGLE_CALENDAR_ACCESS_TOKEN", os.environ.get("GOOGLE_ACCESS_TOKEN", ""))
         self._reminded_event_ids = set()
 
         self._ensure_storage_initialized()
 
     def _ensure_storage_initialized(self):
-        """Seeds default office events if storage file is missing or empty."""
+        """Seeds default office events if storage file is missing, empty, or all events are in the past."""
+        needs_seed = False
         if not os.path.exists(self.storage_path) or os.path.getsize(self.storage_path) == 0:
+            needs_seed = True
+        else:
+            try:
+                events = self._load_local_events()
+                if not events:
+                    needs_seed = True
+                else:
+                    # If all events are older than 7 days, refresh seed events
+                    has_recent = False
+                    now = datetime.now()
+                    for ev in events:
+                        st_str = ev.get("start_time", "")
+                        try:
+                            if "T" in st_str:
+                                st = datetime.fromisoformat(st_str.replace("Z", "+00:00")).replace(tzinfo=None)
+                            else:
+                                st = datetime.strptime(st_str, "%Y-%m-%d %H:%M")
+                            if abs((now - st).total_seconds()) < 7 * 86400:
+                                has_recent = True
+                                break
+                        except Exception:
+                            pass
+                    if not has_recent:
+                        needs_seed = True
+            except Exception:
+                needs_seed = True
+
+        if needs_seed:
             now = datetime.now()
-            # Seed 2 realistic events for today
+            default_owner = os.environ.get("ASTRO_OWNER_NAME", "Kullanıcı")
             seed_events = [
                 {
                     "id": "evt_sprint_review",
@@ -39,8 +69,8 @@ class CalendarService:
                     "start_time": (now + timedelta(minutes=10)).strftime("%Y-%m-%d %H:%M"),
                     "duration_minutes": 45,
                     "location": "Toplantı Odası A",
-                    "organizer": "Baran",
-                    "attendees": ["Baran", "Selin", "Ahmet"],
+                    "organizer": default_owner,
+                    "attendees": list(dict.fromkeys([default_owner, "Baran", "Selin", "Ahmet"])),
                     "description": "Yeni robotik ve arayüz geliştirmelerinin değerlendirilmesi."
                 },
                 {
@@ -49,8 +79,8 @@ class CalendarService:
                     "start_time": (now + timedelta(hours=3)).strftime("%Y-%m-%d %H:%M"),
                     "duration_minutes": 60,
                     "location": "Lobi / Ar-Ge Alanı",
-                    "organizer": "Baran",
-                    "attendees": ["Baran", "Yapay Zeka Ekibi"],
+                    "organizer": default_owner,
+                    "attendees": list(dict.fromkeys([default_owner, "Baran", "Yapay Zeka Ekibi"])),
                     "description": "ROS2 ve LLM gerçek zamanlı gecikme optimizasyonları."
                 }
             ]
@@ -159,6 +189,96 @@ class CalendarService:
             return events
         except Exception:
             return []
+
+    def _google_rest_headers(self) -> Dict[str, str]:
+        headers = {"User-Agent": "AstroV1-OfficeBot", "Content-Type": "application/json"}
+        if self.google_access_token:
+            headers["Authorization"] = f"Bearer {self.google_access_token}"
+        return headers
+
+    def _google_rest_insert_event(self, event_data: Dict[str, Any]) -> Optional[str]:
+        """Creates event on Google Calendar via v3 REST API if access token and calendar ID are set."""
+        if not self.google_access_token or not self.google_calendar_id:
+            return None
+        import urllib.request
+        import urllib.parse
+        cal_id = urllib.parse.quote(self.google_calendar_id)
+        url = f"https://www.googleapis.com/calendar/v3/calendars/{cal_id}/events"
+
+        st_str = event_data.get("start_time", "")
+        dur = event_data.get("duration_minutes", 30)
+        try:
+            if "T" in st_str:
+                st_dt = datetime.fromisoformat(st_str.replace("Z", "+00:00")).replace(tzinfo=None)
+            else:
+                st_dt = datetime.strptime(st_str, "%Y-%m-%d %H:%M")
+            end_dt = st_dt + timedelta(minutes=dur)
+            st_iso = st_dt.isoformat()
+            end_iso = end_dt.isoformat()
+        except Exception:
+            return None
+
+        body = {
+            "summary": event_data.get("title", "Toplantı"),
+            "location": event_data.get("location", "Ofis"),
+            "description": event_data.get("description", "Astro Sosyal Robot tarafından oluşturuldu."),
+            "start": {"dateTime": f"{st_iso}+03:00" if "+" not in st_iso else st_iso},
+            "end": {"dateTime": f"{end_iso}+03:00" if "+" not in end_iso else end_iso},
+        }
+
+        try:
+            req = urllib.request.Request(
+                url,
+                data=json.dumps(body).encode("utf-8"),
+                headers=self._google_rest_headers(),
+                method="POST"
+            )
+            with urllib.request.urlopen(req, timeout=3.5) as resp:
+                res_data = json.loads(resp.read().decode("utf-8"))
+                return res_data.get("id")
+        except Exception:
+            return None
+
+    def _google_rest_patch_event(self, google_event_id: str, patch_data: Dict[str, Any]) -> bool:
+        """Updates event on Google Calendar via v3 REST API."""
+        if not self.google_access_token or not self.google_calendar_id or not google_event_id:
+            return False
+        import urllib.request
+        import urllib.parse
+        cal_id = urllib.parse.quote(self.google_calendar_id)
+        ev_id = urllib.parse.quote(google_event_id)
+        url = f"https://www.googleapis.com/calendar/v3/calendars/{cal_id}/events/{ev_id}"
+        try:
+            req = urllib.request.Request(
+                url,
+                data=json.dumps(patch_data).encode("utf-8"),
+                headers=self._google_rest_headers(),
+                method="PATCH"
+            )
+            with urllib.request.urlopen(req, timeout=3.5) as resp:
+                return resp.status in (200, 204)
+        except Exception:
+            return False
+
+    def _google_rest_delete_event(self, google_event_id: str) -> bool:
+        """Deletes event from Google Calendar via v3 REST API."""
+        if not self.google_access_token or not self.google_calendar_id or not google_event_id:
+            return False
+        import urllib.request
+        import urllib.parse
+        cal_id = urllib.parse.quote(self.google_calendar_id)
+        ev_id = urllib.parse.quote(google_event_id)
+        url = f"https://www.googleapis.com/calendar/v3/calendars/{cal_id}/events/{ev_id}"
+        try:
+            req = urllib.request.Request(
+                url,
+                headers=self._google_rest_headers(),
+                method="DELETE"
+            )
+            with urllib.request.urlopen(req, timeout=3.5) as resp:
+                return resp.status in (200, 204)
+        except Exception:
+            return False
 
     def get_upcoming_events(self, hours: float = 12.0) -> List[Dict[str, Any]]:
         """Returns sorted upcoming events merged across Google Calendar (REST or iCal) and local storage."""
@@ -331,10 +451,11 @@ class CalendarService:
         start_time_str: str,
         duration_minutes: int = 30,
         location: str = "Ofis",
-        organizer: str = "Baran",
+        organizer: Optional[str] = None,
         attendees: Optional[List[str]] = None
     ) -> Dict[str, Any]:
-        """Adds an event to local storage."""
+        """Adds an event to local storage and syncs to Google Calendar if configured."""
+        org = organizer or os.environ.get("ASTRO_OWNER_NAME", "Kullanıcı")
         events = self._load_local_events()
         new_event = {
             "id": f"evt_{int(time.time())}",
@@ -342,9 +463,18 @@ class CalendarService:
             "start_time": start_time_str,
             "duration_minutes": duration_minutes,
             "location": location,
-            "organizer": organizer,
-            "attendees": attendees or [organizer]
+            "organizer": org,
+            "attendees": attendees or [org]
         }
+
+        # Attempt Google Calendar REST insert
+        try:
+            google_id = self._google_rest_insert_event(new_event)
+            if google_id:
+                new_event["google_id"] = google_id
+        except Exception:
+            pass
+
         events.append(new_event)
         try:
             with open(self.storage_path, "w", encoding="utf-8") as f:
@@ -354,7 +484,7 @@ class CalendarService:
             return {"status": "error", "message": str(e)}
 
     def delete_event(self, query: str) -> Dict[str, Any]:
-        """Deletes an event matching the query title or keyword from local storage."""
+        """Deletes an event matching the query title or keyword from local storage and Google Calendar."""
         q_low = query.lower().strip()
         if not q_low:
             return {"status": "error", "message": "Silinecek etkinlik adı belirtilmedi."}
@@ -377,6 +507,15 @@ class CalendarService:
                 "message": f"'{query}' ile eşleşen bir etkinlik bulunamadı."
             }
 
+        # Attempt Google Calendar REST delete for deleted events
+        for dev in deleted:
+            gid = dev.get("google_id") or (dev.get("id") if not str(dev.get("id", "")).startswith("evt_") else None)
+            if gid:
+                try:
+                    self._google_rest_delete_event(gid)
+                except Exception:
+                    pass
+
         try:
             with open(self.storage_path, "w", encoding="utf-8") as f:
                 json.dump({"events": to_keep}, f, ensure_ascii=False, indent=2)
@@ -390,6 +529,176 @@ class CalendarService:
         except Exception as e:
             return {"status": "error", "message": str(e)}
 
+    def update_event(
+        self,
+        query: str,
+        new_title: Optional[str] = None,
+        new_start_time: Optional[str] = None,
+        new_duration_minutes: Optional[int] = None,
+        new_location: Optional[str] = None,
+        new_description: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Updates fields of an existing event matching the query in local storage and Google Calendar."""
+        q_low = query.lower().strip()
+        if not q_low:
+            return {"status": "error", "message": "Güncellenecek etkinlik adı belirtilmedi."}
+
+        events = self._load_local_events()
+        target_event = None
+        target_idx = -1
+
+        for idx, ev in enumerate(events):
+            title = ev.get("title", "").lower()
+            ev_id = str(ev.get("id", "")).lower()
+            if q_low in title or q_low in ev_id or (len(q_low) > 3 and any(w in title for w in q_low.split())):
+                target_event = ev
+                target_idx = idx
+                break
+
+        if not target_event:
+            return {"status": "not_found", "message": f"'{query}' ile eşleşen bir etkinlik bulunamadı."}
+
+        old_title = target_event.get("title", query)
+        changes = []
+
+        if new_title and new_title.strip():
+            target_event["title"] = new_title.strip()
+            changes.append(f"başlık: '{target_event['title']}'")
+
+        if new_start_time and new_start_time.strip():
+            target_event["start_time"] = new_start_time.strip()
+            changes.append(f"zaman: {target_event['start_time']}")
+
+        if new_duration_minutes is not None and int(new_duration_minutes) > 0:
+            target_event["duration_minutes"] = int(new_duration_minutes)
+            changes.append(f"süre: {target_event['duration_minutes']} dk")
+
+        if new_location and new_location.strip():
+            target_event["location"] = new_location.strip()
+            changes.append(f"konum: {target_event['location']}")
+
+        if new_description is not None:
+            target_event["description"] = new_description
+
+        events[target_idx] = target_event
+
+        try:
+            with open(self.storage_path, "w", encoding="utf-8") as f:
+                json.dump({"events": events}, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            return {"status": "error", "message": f"Yerel depolama güncellenemedi: {e}"}
+
+        # Google Calendar REST Patch sync
+        gid = target_event.get("google_id") or (target_event.get("id") if not str(target_event.get("id", "")).startswith("evt_") else None)
+        if gid:
+            patch_payload = {}
+            if new_title:
+                patch_payload["summary"] = new_title
+            if new_location:
+                patch_payload["location"] = new_location
+            if new_start_time:
+                try:
+                    st_dt = datetime.strptime(new_start_time, "%Y-%m-%d %H:%M")
+                    dur = target_event.get("duration_minutes", 30)
+                    end_dt = st_dt + timedelta(minutes=dur)
+                    patch_payload["start"] = {"dateTime": f"{st_dt.isoformat()}+03:00"}
+                    patch_payload["end"] = {"dateTime": f"{end_dt.isoformat()}+03:00"}
+                except Exception:
+                    pass
+            if patch_payload:
+                try:
+                    self._google_rest_patch_event(gid, patch_payload)
+                except Exception:
+                    pass
+
+        change_str = ", ".join(changes) if changes else "bilgiler güncellendi"
+        return {
+            "status": "success",
+            "event": target_event,
+            "old_title": old_title,
+            "changes": changes,
+            "message": f"'{old_title}' etkinliği başarıyla güncellendi ({change_str})."
+        }
+
+    def update_event_smart(
+        self,
+        query: str,
+        new_date: Optional[str] = None,
+        new_time: Optional[str] = None,
+        new_location: Optional[str] = None,
+        new_title: Optional[str] = None,
+        new_duration: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """Smart event updater that parses relative Turkish date/time words and updates event."""
+        new_start_time = None
+        if new_date or new_time:
+            events = self._load_local_events()
+            q_low = query.lower().strip()
+            cur_dt = datetime.now()
+            for ev in events:
+                if q_low in ev.get("title", "").lower() or q_low in str(ev.get("id", "")).lower():
+                    try:
+                        st_str = ev.get("start_time", "")
+                        if "T" in st_str:
+                            cur_dt = datetime.fromisoformat(st_str.replace("Z", "+00:00")).replace(tzinfo=None)
+                        else:
+                            cur_dt = datetime.strptime(st_str, "%Y-%m-%d %H:%M")
+                    except Exception:
+                        pass
+                    break
+
+            target_date = cur_dt
+            now = datetime.now()
+            if new_date:
+                d_low = new_date.lower().strip()
+                tr_weekdays = {
+                    "pazartesi": 0, "salı": 1, "sali": 1, "çarşamba": 2, "carsamba": 2,
+                    "perşembe": 3, "persembe": 3, "cuma": 4, "cumartesi": 5, "pazar": 6
+                }
+                if "bugün" in d_low or "bugun" in d_low:
+                    target_date = now
+                elif "yarın" in d_low or "yarin" in d_low:
+                    target_date = now + timedelta(days=1)
+                elif "öbür gün" in d_low or "obur gun" in d_low:
+                    target_date = now + timedelta(days=2)
+                elif any(w in d_low for w in tr_weekdays):
+                    for w_name, w_idx in tr_weekdays.items():
+                        if w_name in d_low:
+                            cur_w = now.weekday()
+                            days_ahead = (w_idx - cur_w) % 7
+                            if days_ahead == 0 or "gelecek" in d_low or "önümüzdeki" in d_low or "onumuzdeki" in d_low:
+                                days_ahead += 7
+                            target_date = now + timedelta(days=days_ahead)
+                            break
+                elif len(d_low) == 10 and "-" in d_low:
+                    try:
+                        target_date = datetime.strptime(d_low, "%Y-%m-%d")
+                    except Exception:
+                        pass
+
+            hour = target_date.hour
+            minute = target_date.minute
+            if new_time:
+                clean_time = new_time.replace(".", ":").strip()
+                if ":" not in clean_time and clean_time.isdigit():
+                    clean_time = f"{int(clean_time):02d}:00"
+                try:
+                    t_parts = [int(p) for p in clean_time.split(":")[:2]]
+                    hour = t_parts[0]
+                    minute = t_parts[1]
+                except Exception:
+                    pass
+
+            new_start_time = target_date.replace(hour=hour, minute=minute, second=0, microsecond=0).strftime("%Y-%m-%d %H:%M")
+
+        return self.update_event(
+            query=query,
+            new_title=new_title,
+            new_start_time=new_start_time,
+            new_duration_minutes=new_duration,
+            new_location=new_location
+        )
+
     def add_event_smart(
         self,
         title: str,
@@ -397,10 +706,11 @@ class CalendarService:
         time_str: str = "10:00",
         duration_minutes: int = 45,
         location: str = "Ofis",
-        organizer: str = "Baran",
+        organizer: Optional[str] = None,
         attendees: Optional[List[str]] = None
     ) -> Dict[str, Any]:
         """Smart event creator that parses relative Turkish date words and saves event."""
+        org = organizer or os.environ.get("ASTRO_OWNER_NAME", "Kullanıcı")
         now = datetime.now()
         target_date = now
 
@@ -446,6 +756,6 @@ class CalendarService:
             start_time_str=start_time_str,
             duration_minutes=duration_minutes,
             location=location,
-            organizer=organizer,
+            organizer=org,
             attendees=attendees
         )
