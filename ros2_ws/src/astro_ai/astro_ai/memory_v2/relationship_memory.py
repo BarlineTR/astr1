@@ -40,9 +40,11 @@ class RelationshipMemory:
 
         # Create new profile
         pid = f"rel_{norm.replace(' ', '_')}"
-        role = RelationshipRole.CREATOR if norm == "baran" else RelationshipRole.NEW_USER
-        fam = 1.0 if norm == "baran" else 0.10
-        trust = 1.0 if norm == "baran" else 0.50
+        owner_name = os.getenv("ASTRO_OWNER_NAME", "baran").lower().strip()
+        is_owner = (norm == owner_name)
+        role = RelationshipRole.CREATOR if is_owner else RelationshipRole.NEW_USER
+        fam = 1.0 if is_owner else 0.10
+        trust = 1.0 if is_owner else 0.50
 
         self.storage.execute_write(
             """

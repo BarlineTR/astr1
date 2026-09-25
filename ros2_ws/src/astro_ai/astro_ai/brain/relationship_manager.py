@@ -23,7 +23,7 @@ class RelationshipManager:
         count = prof["interaction_count"]
 
         # Determine appropriate tone and formality
-        if person_name.lower() == "baran":
+        if role == RelationshipRole.CREATOR or person_name.lower() in ("baran", os.getenv("ASTRO_OWNER_NAME", "").lower()):
             suggested_tone = "playful_and_loyal_partner"
             formality_level = "informal_best_friend"
         elif role == RelationshipRole.FRIEND or fam >= 0.70:
@@ -59,13 +59,14 @@ class RelationshipManager:
         prof = self.memory.get_or_create_profile(person_name)
         new_count = prof["interaction_count"] + 1
 
+        is_creator = (prof.get("role") == RelationshipRole.CREATOR or prof["name"].lower() in ("baran", os.getenv("ASTRO_OWNER_NAME", "").lower()))
         # Familiarity increases asymptotically with each turn
-        new_fam = min(0.98, prof["familiarity"] + 0.03) if prof["name"].lower() != "baran" else 1.0
+        new_fam = min(0.98, prof["familiarity"] + 0.03) if not is_creator else 1.0
 
         # Trust adjusts according to emotional valence / cooperative interaction
         # Positive sentiment (valence > 0.2) builds trust; hostile sentiment degrades it
         trust_delta = 0.02 if valence > 0.2 else (-0.03 if valence < -0.4 else 0.005)
-        new_trust = max(0.1, min(1.0, prof["trust"] + trust_delta)) if prof["name"].lower() != "baran" else 1.0
+        new_trust = max(0.1, min(1.0, prof["trust"] + trust_delta)) if not is_creator else 1.0
 
         # Role progression
         role = prof["role"]

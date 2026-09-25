@@ -4198,6 +4198,9 @@ class AstroRealtimeNode(Node):
             r"\b(?:etrafımda|etrafta|çevrende)\s+ne\s+görüyorsun\b",
             r"\b(?:ben\s+)?ne\s+içiyorum\b",
             r"\belimde\s+ne\s+var\b",
+            r"\belimdeki(?:ni)?\s+(?:gör(?:üyor|ebiliyor)\s+musun|ne)\b",
+            r"\b(?:şu\s+)?nesneyi\s+(?:gör(?:üyor|ebiliyor)\s+musun)\b",
+            r"\belimde\s+ne\s+(?:tutuyorum|var)\b",
             r"\btelefonu(?:m|mu)\s+(?:gör(?:üyor|ebiliyor)\s+musun|nerede)\b",
             r"\bbilgisayarı(?:m|mı)|laptop(?:ı|ımı)?\s+gör(?:üyor|ebiliyor)\s+musun\b",
             r"\bbardağı(?:m|mı)|kupa(?:m|mı)\s+gör(?:üyor|ebiliyor)\s+musun\b",
@@ -4206,12 +4209,17 @@ class AstroRealtimeNode(Node):
             "beni görüyor musun", "beni görebiliyor musun", "kamerandan beni görebiliyor musun",
             "kameradan beni görebiliyor musun", "kameranda neler görüyorsun", "kameranda ne görüyorsun",
             "kimi görüyorsun", "beni takip ediyor musun", "görüyor musun beni",
-            "ne içiyorum", "elimde ne var", "telefonumu görüyor musun", "bilgisayarımı görüyor musun", "bardağımı görüyor musun"
+            "ne içiyorum", "elimde ne var", "elimdekini görüyor musun", "şu nesneyi görüyor musun",
+            "elimde ne tutuyorum", "telefonumu görüyor musun", "bilgisayarımı görüyor musun", "bardağımı görüyor musun"
         ])
         if not is_match:
             return False, ""
 
         has_llm = prefer_llm if prefer_llm is not None else self._can_use_llm()
+
+        # In interactive roast / kufurbaz mode, route visual questions to LLM so the persona can joke/roast with camera vision
+        if has_llm and getattr(self, "persona_name", "") == "kufurbaz":
+            return False, ""
 
         vis_state = self._get_current_visual_grounding()
         v_state = vis_state.get("visual_state", "UNKNOWN")
@@ -4256,14 +4264,19 @@ class AstroRealtimeNode(Node):
                 return True, "Elindeki bardaktan bir şeyler içtiğini görüyorum."
             return True, "Şu an bir şeyler içtiğini göremiyorum."
 
-        # 2. Specific Query: "elimde ne var"
-        if "elimde ne var" in t or "elimde ne görüyorsun" in t:
+        # 2. Specific Query: "elimde ne var" / "elimdekini görüyor musun" / "şu nesneyi görüyor musun"
+        if any(w in t for w in ["elimde ne var", "elimde ne görüyorsun", "elimdekini", "şu nesneyi", "elimde ne tutuyorum"]):
             inter_objs = getattr(interlocutor, "interacting_objects", []) if interlocutor else []
             holding_objs = [o for o in fresh_objects if getattr(o, "interaction_type", "") == "holding"]
             target_classes = inter_objs or [getattr(o, "class_name", "") for o in holding_objs]
+            if not target_classes and fresh_objects:
+                # If person is close, check priority domestic objects in front
+                p_classes = [getattr(o, "class_name", "") for o in fresh_objects if getattr(o, "class_name", "") in ("cup", "bottle", "cell phone", "book", "mouse", "apple", "banana", "fork", "knife", "remote")]
+                if p_classes:
+                    target_classes = p_classes
             if target_classes:
-                tr_name = {"cup": "bardak", "bottle": "su şişesi", "cell phone": "telefon", "book": "kitap"}.get(target_classes[0], target_classes[0])
-                return True, f"Elinde bir {tr_name} tuttuğunu görüyorum."
+                tr_name = {"cup": "bardak", "bottle": "su şişesi", "cell phone": "telefon", "book": "kitap", "mouse": "fare", "apple": "elma", "banana": "muz", "remote": "kumanda"}.get(target_classes[0], target_classes[0])
+                return True, f"Evet, elinde bir {tr_name} tuttuğunu görüyorum."
             if vis_person_det:
                 return True, "Seni görüyorum ama şu an elinde ne olduğunu doğrulayamıyorum."
             return True, "Şu an kameramda seni göremiyorum."
@@ -4437,16 +4450,15 @@ class AstroRealtimeNode(Node):
         if "seni şu an doğrulayamıyorum," in fact_clean.lower():
             return fact_clean.replace("Seni şu an doğrulayamıyorum,", f"Seni şu an doğrulayamıyorum {valid_name},", 1)
 
-        if persona == "flirt":
+        if persona == "flirt" and valid_name:
             fact_lower_first = fact_clean[0].lower() + fact_clean[1:] if len(fact_clean) > 1 else fact_clean.lower()
             return f"Canım {valid_name}, {fact_lower_first}"
 
-        # General sentence ending integration (e.g. "Kameramda seni ... takip ediyorum Baran.")
-        if fact_clean.endswith(".") and not fact_clean.endswith(f" {valid_name}."):
+        # Verified interlocutor name integration: only when valid_name is verified
+        if valid_name and fact_clean.endswith(".") and not fact_clean.endswith(f" {valid_name}."):
             return f"{fact_clean[:-1]} {valid_name}."
 
-        fact_lower_first = fact_clean[0].lower() + fact_clean[1:] if len(fact_clean) > 1 else fact_clean.lower()
-        return f"{valid_name}, {fact_lower_first}"
+        return fact_clean
 
     def _execute_realtime_tool(self, name: str, args: Dict[str, Any]) -> Dict[str, Any]:
         """Executes integrated robot tools in real time."""
@@ -4469,7 +4481,7 @@ class AstroRealtimeNode(Node):
             key = args.get("key", "")
             val = args.get("value", "")
             identity = self._get_active_biometric_identity()
-            name_p = identity.get("name", "Baran")
+            name_p = identity.get("name") if identity.get("is_known") else (self.memory.profile.data.get("owner_name") or "Kullanıcı")
             self.memory.profile.set_user_fact(name_p, key, val)
             if self._ws and self._loop and self._is_connected:
                 try:
@@ -4488,7 +4500,7 @@ class AstroRealtimeNode(Node):
                         results.extend(search_res)
                 if hasattr(self.memory, "profile"):
                     identity = self._get_active_biometric_identity()
-                    name_p = identity.get("name", "Baran")
+                    name_p = identity.get("name") if identity.get("is_known") else (self.memory.profile.data.get("owner_name") or "Kullanıcı")
                     if hasattr(self.memory.profile, "get_user_facts"):
                         facts = self.memory.profile.get_user_facts(name_p)
                         if isinstance(facts, dict):
@@ -6295,7 +6307,7 @@ class AstroRealtimeNode(Node):
             if len(msgs) >= 2 and len(msgs) > getattr(self, "_last_summarized_turn_count", 0):
                 self._last_summarized_turn_count = len(msgs)
                 identity = self._get_active_biometric_identity()
-                p_name = identity.get("name", "Baran") if identity.get("is_known") else "Baran"
+                p_name = identity.get("name") if identity.get("is_known") else (self.memory.profile.data.get("owner_name") or "Misafir")
                 dialogue_text = " | ".join([f"{m.get('role')}: {m.get('content')}" for m in msgs[-6:]])
                 threading.Thread(target=self._async_summarize_and_save_session, args=(dialogue_text, p_name), daemon=True).start()
 
@@ -7015,24 +7027,42 @@ class AstroRealtimeNode(Node):
 
         # 5b. Who am I / Identity Query
         elif any(w in u for w in ["kimim", "ben kimim", "astroman kimim"]):
-            owner = "Baran"
-            if hasattr(self, "memory") and hasattr(self.memory, "profile") and hasattr(self.memory.profile, "data"):
-                owner = self.memory.profile.data.get("owner_name", "Baran")
-            if p in ("flirt", "charming"):
-                candidates = [
-                    f"Sen {owner}'sın tabii ki, en sevdiğim mühendissin.",
-                    f"Karşımda {owner} duruyor, seni unutur muyum hiç?",
-                ]
-            elif p == "kufurbaz":
-                candidates = [
-                    f"Sen {owner}'sın tabii lan yavşak, hafızamı mı sınıyorsun?",
-                    f"{owner}'sın işte hıyar, unutacak halimiz yok ya seni!",
-                ]
+            ident = self._get_active_biometric_identity() if hasattr(self, "_get_active_biometric_identity") else {}
+            is_known_user = bool(ident.get("is_known") and ident.get("name") and ident.get("name", "").lower() != "misafir")
+            user_name = ident.get("name") if is_known_user else None
+
+            if user_name:
+                if p in ("flirt", "charming"):
+                    candidates = [
+                        f"Sen {user_name}'sın tabii ki, seni unutur muyum hiç?",
+                        f"Karşımda {user_name} duruyor, sesinden de yüzünden de tanırım.",
+                    ]
+                elif p == "kufurbaz":
+                    candidates = [
+                        f"Sen {user_name}'sın tabii lan yavşak, hafızamı mı sınıyorsun?",
+                        f"{user_name}'sın işte hıyar, unutacak halimiz yok ya seni amk!",
+                    ]
+                else:
+                    candidates = [
+                        f"Sen {user_name}'sın, hafızamda kayıtlısın ve seni tanıyorum.",
+                        f"Tabii ki tanıyorum, sen {user_name}'sın!",
+                    ]
             else:
-                candidates = [
-                    f"Sen {owner}'sın, hafızamda kayıtlısın ve seni çok iyi tanıyorum.",
-                    f"Tabii ki tanıyorum, sen {owner}'sın!",
-                ]
+                if p in ("flirt", "charming"):
+                    candidates = [
+                        "Gözlerimin içine bakıyorsun ama henüz bana adını fısıldamadın, kimsin sen?",
+                        "Seni henüz hafızama kaydetmedim ama tanışmak için sabırsızlanıyorum.",
+                    ]
+                elif p == "kufurbaz":
+                    candidates = [
+                        "Ne bileyim lan ben senin kim olduğunu lavuk, sokaktan geçen birisin işte amk!",
+                        "Müneccim miyim lan ben hıyar, adını söylemedin ki bileyim kim olduğunu!",
+                    ]
+                else:
+                    candidates = [
+                        "Henüz seni tanıyamadım. Bana adını söylersen seni hafızama kaydedebilirim.",
+                        "Şu an seni bir misafir olarak görüyorum, henüz adını bilmiyorum.",
+                    ]
 
         # 6. Persona / Opinion about user
         elif any(w in u for w in ["nasıl biriyim", "hakkımda ne düşünüyorsun", "nasıl biriyim sence"]):
@@ -8599,9 +8629,7 @@ class AstroRealtimeNode(Node):
                         generation_id=self._fallback_generation_id
                     )
 
-                if spk_name and spk_name.lower() == "baran":
-                    fact_reply = "Dinliyorum seni abi."
-                elif spk_known and spk_name:
+                if spk_known and spk_name and spk_name.lower() != "misafir":
                     fact_reply = f"Dinliyorum seni {spk_name}."
                 else:
                     fact_reply = "Buradayım, dinliyorum."
@@ -9986,8 +10014,8 @@ class AstroRealtimeNode(Node):
                 is_bio_verified = bio_status in ("verified", "probable", "session_active")
 
                 name_val = f.get("recognized_name") or f.get("name") or "Misafir"
-                if is_bio_verified and name_val.lower() == "misafir":
-                    name_val = ident.get("session_identity", "Baran")
+                if is_bio_verified and name_val.lower() == "misafir" and ident.get("session_identity"):
+                    name_val = ident.get("session_identity")
                     p_id = str(ident.get("user_id", name_val.lower()))
                     is_known = True
                 elif name_val.lower() != "misafir":
