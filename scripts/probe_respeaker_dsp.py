@@ -76,6 +76,13 @@ def probe_dsp():
 
     except Exception as exc:
         print(f"PyUSB Error: {exc}")
+    finally:
+        try:
+            if 'dev' in locals() and dev is not None:
+                import usb.util
+                usb.util.dispose_resources(dev)
+        except Exception:
+            pass
 
 def probe_channels():
     print("\n=== 2. ALSA 6-CHANNEL CAPTURE PROBE ===")
