@@ -16,10 +16,20 @@ def test_sd_capture():
                 respeaker_idx = i
 
     print(f"\nTarget ReSpeaker index: {respeaker_idx}")
-    target_idx = respeaker_idx if respeaker_idx is not None else sd.default.device[0]
-    dev_info = sd.query_devices(target_idx)
-    max_in = dev_info['max_input_channels']
-    print(f"Opening device [{target_idx}] '{dev_info['name']}' with {max_in} channels @ 16000Hz...")
+    for target in ['pulse', 'default', 29, 33, respeaker_idx]:
+        try:
+            print(f"\nTrying device '{target}'...")
+            dev_info = sd.query_devices(target)
+            print(f"Device name: {dev_info['name']}, max_in: {dev_info['max_input_channels']}")
+            rec = sd.rec(int(1.5 * 16000), samplerate=16000, channels=1, dtype='int16', device=target)
+            sd.wait()
+            rec_f = rec.flatten().astype(np.float32)
+            rms = np.sqrt(np.mean(rec_f**2))
+            peak = np.max(np.abs(rec_f))
+            print(f"✅ SUCCESS with device '{target}': RMS={rms:.1f} | Peak={peak:.0f}")
+            break
+        except Exception as e:
+            print(f"❌ Failed with device '{target}': {e}")
 
     # Record 2 seconds
     dur = 2.0
