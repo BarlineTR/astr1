@@ -7885,7 +7885,7 @@ class AstroRealtimeNode(Node):
             return
 
         self._is_processing_fallback = True
-        self._is_responding = True
+        self._is_responding = False
         self._fallback_generation_id += 1
         current_gen_id = self._fallback_generation_id
         u_turn_id = f"turn_{self._fallback_generation_id}"
@@ -8007,6 +8007,8 @@ class AstroRealtimeNode(Node):
 
                 # If rejected, immediately abort turn without LLM, memory, or TTS invocation
                 if not validated_text:
+                    self._is_processing_fallback = False
+                    self._is_responding = False
                     return
 
                 # Check for pure wake word in active/sleep mode (e.g. "Astro.", "Hey Astro", "Uyan")
@@ -8134,6 +8136,7 @@ class AstroRealtimeNode(Node):
                 self.get_logger().info(f"🗣️ [Siz (0-Maliyet)]: \"{user_text}\"")
                 self.memory.episodic.add_message("user", user_text)
                 self.state_machine.transition_to(RobotState.THINKING)
+                self._is_responding = True
 
             # 4. Run Voiceprint Recognition (Acoustic Speaker Identification with Temporal Smoothing)
 
