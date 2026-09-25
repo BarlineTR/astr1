@@ -182,9 +182,13 @@ class FaceRecognizer:
             if len(faces) > 0:
                 largest = max(faces, key=lambda f: float(f[2]) * float(f[3]))
                 feature = engine.embed(face_bgr, largest)
-            else:
+            elif face_bgr.shape[0] < 350 and face_bgr.shape[1] < 350 and (0.6 < face_bgr.shape[1] / max(1, face_bgr.shape[0]) < 1.6):
+                # Pre-cropped face ROI from an upstream detector where landmarks weren't found
                 aligned = cv2.resize(face_bgr, (112, 112))
                 feature = engine.feature(aligned)
+            else:
+                # Full scene / empty frame without a detected face -> strictly NOT A FACE
+                return None
         except Exception:
             return None
 

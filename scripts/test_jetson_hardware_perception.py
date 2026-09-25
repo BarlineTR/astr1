@@ -93,14 +93,9 @@ def run_hardware_grounding_test():
             score_pct = int((conf or 0.0) * 100)
             print(f"🔍 [YÜZ ANALİZİ]: Tanınamadı (Misafir) — En yakın aday: '{cand}' skor: %{score_pct}")
     else:
-        # If no face detector ran on full frame, try recognize_face directly on frame
-        name, conf, meta = recognizer.recognize_face(frame)
-        if name:
-            recognized_name = name
-            recognized_conf = float(conf)
-            recognized_formal = meta.get("formal_title", name)
-            is_known = True
-            print(f"🎯 [DOĞRUDAN YÜZ TANINDI]: {name} ({recognized_formal}) — Güven: %{int(recognized_conf * 100)}")
+        print("ℹ️ No face detected in camera field of view (Robot is viewing an empty area/wall).")
+        recognized_name = "Misafir"
+        is_known = False
 
     # 3. Step Consciousness & Spatial Fusion
     print("\n🧠 [3/5] Stepping Consciousness & Cognitive Loop Architecture...")
@@ -119,7 +114,7 @@ def run_hardware_grounding_test():
 
     # Build faces payload matching ROS 2 /vision/faces topic
     faces_payload = []
-    if detections or is_known:
+    if detections and is_known:
         faces_payload.append({
             "name": recognized_name,
             "recognized_name": recognized_name,
@@ -129,10 +124,10 @@ def run_hardware_grounding_test():
             "confidence": recognized_conf if recognized_conf > 0 else 0.85,
             "looking_at_robot": True,
             "distance_m": 1.2,
-            "x": 200,
-            "y": 100,
-            "width": 240,
-            "height": 280,
+            "x": int(best_det.x),
+            "y": int(best_det.y),
+            "width": int(best_det.w),
+            "height": int(best_det.h),
         })
 
     class MockMsg:

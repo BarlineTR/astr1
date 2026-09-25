@@ -11132,11 +11132,6 @@ class AstroRealtimeNode(Node):
             user_source = "session_hold"
             bio_status = "session_active"
             is_known = True
-        elif owner_name and owner_name.lower() != "misafir":
-            user_name = owner_name
-            user_source = "persistent_memory"
-            bio_status = "unknown"
-            is_known = True
         else:
             user_name = "Misafir"
             user_source = "guest_fallback"
