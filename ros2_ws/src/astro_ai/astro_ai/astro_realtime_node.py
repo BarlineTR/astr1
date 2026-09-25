@@ -20,6 +20,7 @@ import io
 import json
 import math
 import os
+import random
 import re
 import subprocess
 import sys
@@ -182,7 +183,7 @@ try:
     from astro_ai.local_gemma_client import LocalGemmaClient, LocalGemmaError, estimate_tokens, bound_messages_to_context
     from astro_ai.repetition_guard import RepetitionGuard
     from astro_ai.action_manager import ActionManager, SoundDirection, ActionResult, circular_doa_to_yaw
-    from astro_ai.robot_led import RobotLED
+    from astro_ai.robot_led import RobotLED, LEDState
     from astro_ai.brain.paralinguistics_engine import ParalinguisticsEngine
 except ImportError:
     from conversation_session import ConversationSession, normalize_turkish_speech_input
@@ -206,9 +207,16 @@ except ImportError:
     except ImportError:
         ActionManager = SoundDirection = ActionResult = circular_doa_to_yaw = None  # type: ignore
     try:
-        from robot_led import RobotLED
+        from robot_led import RobotLED, LEDState
     except ImportError:
         RobotLED = None  # type: ignore
+        class LEDState:  # type: ignore
+            IDLE = "idle"
+            LISTENING = "listening"
+            THINKING = "thinking"
+            SPEAKING = "speaking"
+            ERROR = "error"
+            OFF = "off"
     try:
         from brain.paralinguistics_engine import ParalinguisticsEngine
     except ImportError:
@@ -1063,6 +1071,14 @@ class AstroRealtimeNode(Node):
         self._temporal_activity_engine = TemporalActivityEngine() if TemporalActivityEngine else None
         self._last_detected_objects: List[Any] = []
         self._last_detected_objects_time: float = 0.0
+        self._last_held_object_cache: Dict[str, Any] = {
+            "class_name": None,
+            "tr_name": None,
+            "confidence": 0.0,
+            "distance_m": 0.0,
+            "timestamp": 0.0,
+            "person_id": None,
+        }
 
         # Autonomous Idle Learning (Cognitive Memory Reflection only, 0 camera calls)
         self._enable_idle_learning = os.environ.get("ENABLE_IDLE_LEARNING", "true").lower() == "true"
@@ -1422,6 +1438,12 @@ class AstroRealtimeNode(Node):
         pr = getattr(self, "provider_registry", None)
         if pr and hasattr(pr, "has_available_provider") and pr.has_available_provider():
             return True
+        if getattr(self, "local_gemma_client", None) and hasattr(self.local_gemma_client, "is_available"):
+            try:
+                if self.local_gemma_client.is_available():
+                    return True
+            except Exception:
+                pass
         return False
 
     def _trigger_openai_hard_lockout(self, reason: str, ws=None) -> None:
@@ -2242,6 +2264,13 @@ class AstroRealtimeNode(Node):
                     if s_objs:
                         detected_objs_str = ", ".join(f"{getattr(o, 'label', 'nesne')} ({getattr(o, 'distance_m', 0.0):.1f}m)" for o in s_objs[:5])
 
+            # Fetch held object from RAM cache
+            held_info = "Yok"
+            cached = getattr(self, "_last_held_object_cache", {}) or {}
+            c_age = time.monotonic() - cached.get("timestamp", 0.0) if cached else 999.0
+            if c_age <= 5.0 and cached.get("tr_name"):
+                held_info = f"{cached.get('tr_name')}"
+
             p_activity = existing_act if 'existing_act' in locals() and existing_act else "UNKNOWN"
             p_desc = ""
             if p_activity != "UNKNOWN" and HumanActivity:
@@ -2254,12 +2283,14 @@ class AstroRealtimeNode(Node):
                 f"- Kafa Açısı (Head Yaw): {head_yaw:+.1f}° (0° tam karşı/merkez, eksi değerler sağ, artı değerler sol)\n"
                 f"- Doğrudan Kamera Görüş Açısında İnsan Var mı: {'EVET' if v_person else 'HAYIR'}\n"
                 f"- Algılanan Kullanıcı Aktivitesi: {p_activity} ({p_desc or 'belirsiz'})\n"
+                f"- Elde Tutulan / Uzatılan Nesne: {held_info}\n"
                 f"- Çevredeki Nesneler: {detected_objs_str}\n"
                 f"ÖNEMLİ ALGI TALİMATI:\n"
                 f"1. Kullanıcı sana 'ne yapıyorum?', 'beni görüyor musun?', 'neredeyim?' gibi sorular sorduğunda yukarıdaki sensör durumunu doğal, esprili ve insansı bir şekilde harmanla.\n"
                 f"2. Asla kalıplaşmış, robotik hata mesajları ('Şu an görüntüm güncel olmadığı için...', 'Kameram aktif değil...', 'Ayırt edemiyorum...') verme.\n"
-                f"3. Eğer kullanıcı görüş açından çıkmışsa veya başka bir yöndeyse (örneğin radar/ses açısı ile kafa açısı uyuşmuyorsa), bunu samimice belirt (örneğin 'Gördüğüm kadarıyla masadan kalkıp sağıma geçmişsin ama tam ne yaptığına bakmak için başımı çevirmem gerek').\n"
+                f"3. Eğer kullanıcı görüş açından çıkmışsa veya başka bir yöndeyse, bunu samimice belirt.\n"
                 f"4. Karşında oturuyor veya bilgisayar başındaysa bunu doğal bir dille söyle ('Gördüğüm kadarıyla bilgisayarının başında oturuyorsun').\n"
+                f"5. Kullanıcı elinde bir nesne tutuyorsa veya 'elimdekini görüyor musun' derse, elindeki nesneyi ({held_info}) bildiğini söyle. Küfürbaz veya Witty moddaysan kullanıcının 'sana girsin' tarzı şakalarına asla düşme; 'Görüyorum elindeki {held_info}ı, sana girsin şakası mı yapacaksın lan yemezler!' gibi anında kontra yap ve dalganı geç!\n"
             )
         except Exception as _m_err:
             self.get_logger().debug(f"multimodal_perception_str construction notice: {_m_err}")
@@ -4217,33 +4248,19 @@ class AstroRealtimeNode(Node):
 
         has_llm = prefer_llm if prefer_llm is not None else self._can_use_llm()
 
-        # In interactive roast / kufurbaz mode, route visual questions to LLM so the persona can joke/roast with camera vision
-        if has_llm and getattr(self, "persona_name", "") == "kufurbaz":
-            return False, ""
-
         vis_state = self._get_current_visual_grounding()
         v_state = vis_state.get("visual_state", "UNKNOWN")
         vis_cam_avail = vis_state.get("visual_camera_available", False)
         vis_person_det = vis_state.get("visual_person_detected", False)
         vis_dist = vis_state.get("visual_distance")
 
-        # If LLM is available and camera is stale or offline, pass to LLM
-        if has_llm and (not vis_cam_avail or v_state in ("STALE", "UNKNOWN")):
-            return False, ""
-
-        if not vis_cam_avail or v_state == "UNKNOWN":
-            return True, "Seni şu an doğrulayamıyorum, kameram aktif değil."
-
-        if v_state == "STALE":
-            return True, "Şu an görüntüm güncel değil, seni doğrulayamıyorum."
-
-        # Fetch fresh objects from WorldModel
+        # Fetch fresh objects from WorldModel and local cache
+        now_m = time.monotonic()
         wm = getattr(self.social_brain, "world_model", None) if getattr(self, "social_brain", None) else None
         fresh_objects: List[Any] = []
         if wm and hasattr(wm, "get_spatial_objects"):
             fresh_objects = wm.get_spatial_objects(max_age_s=3.0, min_confidence=0.45)
         if not fresh_objects and hasattr(self, "_last_detected_objects"):
-            now_m = time.monotonic()
             if (now_m - getattr(self, "_last_detected_objects_time", 0.0)) <= 3.0:
                 fresh_objects = [o for o in self._last_detected_objects if getattr(o, "confidence", 1.0) >= 0.45]
 
@@ -4254,6 +4271,103 @@ class AstroRealtimeNode(Node):
                 present = [p for p in wm._people.values() if getattr(p, "is_present", False)]
                 if present:
                     interlocutor = present[0]
+
+        # =====================================================================
+        # FAST-PATH HELD OBJECT QUERY (Sub-500ms Embodied AI & Witty Roasting)
+        # =====================================================================
+        is_held_query = any(w in t for w in [
+            "elimde ne var", "elimde ne görüyorsun", "elimdekini", "şu nesneyi",
+            "elimde ne tutuyorum", "elimdeki ne", "elimdeki nesne", "elimi görüyor musun",
+            "bunu görüyor musun", "elimdekini görüyor musun", "şu nesneyi görüyor musun"
+        ])
+        if is_held_query:
+            if not vis_cam_avail or v_state == "UNKNOWN":
+                return True, "Seni şu an doğrulayamıyorum, kameram aktif değil."
+            if v_state == "STALE":
+                return True, "Şu an görüntüm güncel değil, seni doğrulayamıyorum."
+
+            tr_map = {
+                "cup": "bardak", "bottle": "şişe", "cell phone": "telefon",
+                "book": "kitap", "remote": "kumanda", "mouse": "fare",
+                "apple": "elma", "banana": "muz", "fork": "çatal",
+                "spoon": "kaşık", "knife": "bıçak", "sandwich": "sandviç",
+                "keys": "anahtar", "pen": "kalem", "scissors": "makas",
+            }
+            acc_map = {
+                "bardak": "bardağı", "şişe": "şişeyi", "su şişesi": "su şişesini",
+                "telefon": "telefonu", "kitap": "kitabı", "kumanda": "kumandayı",
+                "fare": "fareyi", "elma": "elmayı", "muz": "muzu",
+                "anahtar": "anahtarı", "kalem": "kalemi", "çatal": "çatalı",
+                "kaşık": "kaşığı", "bıçak": "bıçağı", "sandviç": "sandviçi",
+                "nesne": "nesneyi", "zıkkım": "zıkkımı",
+            }
+
+            # 1. Check RAM cache (<10ms)
+            cached = getattr(self, "_last_held_object_cache", {}) or {}
+            c_age = now_m - cached.get("timestamp", 0.0)
+            cached_tr = cached.get("tr_name") if (c_age <= 4.0 and cached.get("confidence", 0.0) >= 0.40) else None
+
+            # 2. Check fresh objects and interlocutor
+            inter_objs = getattr(interlocutor, "holding_objects", []) or getattr(interlocutor, "interacting_objects", []) if interlocutor else []
+            holding_objs = [o for o in fresh_objects if getattr(o, "interaction_type", "") == "holding"]
+            target_classes = inter_objs or [getattr(o, "class_name", "") for o in holding_objs]
+            if not target_classes and fresh_objects:
+                p_classes = [getattr(o, "class_name", "") for o in fresh_objects if getattr(o, "class_name", "") in tr_map]
+                if p_classes:
+                    target_classes = p_classes
+
+            detected_tr = cached_tr or (tr_map.get(target_classes[0].lower(), target_classes[0]) if target_classes else None)
+            detected_acc = acc_map.get(detected_tr.lower(), (detected_tr + "ı") if detected_tr else "nesneyi") if detected_tr else "nesneyi"
+
+            p_mode = getattr(self, "persona_name", "playful").lower()
+
+            if p_mode in ("kufurbaz", "witty", "roast"):
+                if detected_tr:
+                    roast_replies = [
+                        f"Görüyorum elindeki {detected_acc}... Hayırdır, 'sana girsin' şakası mı yapacaksın lan? O numaraları yemezler, dikkat et kendine girmesin!",
+                        f"Görüyorum elindeki {detected_acc}... Aklınca 'sana girsin' deyip makara yapacaksın değil mi? Çek şunu gözümün önünden, yemezler!",
+                        f"Görüyorum lan, elinde {detected_tr} tutuyorsun. 'Sana girsin' falan demeye kalkışırsan fena bozarım, haberin olsun!",
+                        f"Görüyorum elindeki {detected_acc}... Aklınca 'sana girsin' falan deyip güleceksin değil mi? Boş yapma, o şaka sana döner!",
+                    ]
+                    return True, random.choice(roast_replies)
+                elif vis_person_det:
+                    roast_unclear = [
+                        "Kameram sana bakıyor ama elinde ne tuttuğunu tam seçemiyorum lan, biraz yaklaştır bakalım.",
+                        "Gözümün içine sokuyorsun ama netleşmedi, ne o elindeki zıkkım? Biraz daha kaldır da göreyim.",
+                    ]
+                    return True, random.choice(roast_unclear)
+                else:
+                    return True, "Şu an kameramda seni göremiyorum lan, nereye saklandın?"
+
+            elif p_mode == "formal":
+                if detected_tr:
+                    return True, f"Evet efendim, elinizde bir {detected_tr} tuttuğunuzu görüyorum."
+                elif vis_person_det:
+                    return True, "Sizi görüyorum fakat elinizdeki nesneyi şu an net olarak seçemiyorum efendim."
+                else:
+                    return True, "Şu an kameramda sizi göremiyorum efendim."
+
+            else:  # playful, friendly, default
+                if detected_tr:
+                    return True, f"Evet, elinde bir {detected_tr} tuttuğunu görüyorum."
+                elif vis_person_det:
+                    return True, "Seni görüyorum ama şu an elinde ne olduğunu doğrulayamıyorum."
+                else:
+                    return True, "Şu an kameramda seni göremiyorum."
+
+        # In interactive roast / kufurbaz mode, route other open-ended visual questions to LLM
+        if has_llm and getattr(self, "persona_name", "") == "kufurbaz":
+            return False, ""
+
+        # If LLM is available and camera is stale or offline, pass to LLM
+        if has_llm and (not vis_cam_avail or v_state in ("STALE", "UNKNOWN")):
+            return False, ""
+
+        if not vis_cam_avail or v_state == "UNKNOWN":
+            return True, "Seni şu an doğrulayamıyorum, kameram aktif değil."
+
+        if v_state == "STALE":
+            return True, "Şu an görüntüm güncel değil, seni doğrulayamıyorum."
 
         # 1. Specific Query: "ne içiyorum"
         if "içiyorum" in t or "ne iciyorum" in t:
@@ -5707,40 +5821,51 @@ class AstroRealtimeNode(Node):
         valid_cmd, cmd_reason = is_valid_user_command(extracted_cmd)
 
         if is_only_wake_word or not valid_cmd:
-            # Pure Wake Phrase, Wake + Phantom, or Wake + Catalog/Repetitive Hallucination:
-            # Wakes robot up, flushes buffers, transitions to LISTENING, and gives verbal acknowledgment.
+            # Pure Wake Phrase: Transitions cleanly to LISTENING with attentive LED and head nod
             self._wake_up()
-            p = getattr(self, "persona_name", "playful").lower()
-            if p in ("flirt", "charming"):
-                wake_replies = ["Buradayım, seni dinliyorum.", "Selam, söyle bakalım.", "Gözüm kulağım sende, dinliyorum.", "Seni dinliyorum, anlat bakalım."]
-            elif p in ("kufurbaz", "witty"):
-                wake_replies = ["Söyle bakalım!", "Buradayım, dinliyorum.", "He söyle bakalım?", "Dinliyorum, ne var ne yok?"]
-            elif p == "formal":
-                wake_replies = ["Buyrun efendim, sizi dinliyorum.", "Evet efendim, buradayım."]
-            elif p == "playful":
-                wake_replies = ["Buradayım! Ne yapıyoruz?", "Söyle bakalım!", "Seni dinliyorum!"]
-            elif p == "sarcastic":
-                wake_replies = ["Yine ne oldu?", "Dinliyorum, anlat bakalım."]
-            elif p == "angry":
-                wake_replies = ["Ne var yine?!", "Söyle hemen!"]
-            else:
-                wake_replies = ["Efendim?", "Dinliyorum?", "Buradayım!"]
+            self._is_sleeping = False
+            if self.session:
+                self.session.activate_session(reason="wake_word")
+            self.state_machine.transition_to(RobotState.LISTENING)
+            if self.robot_led:
+                self.robot_led.set_state(LEDState.LISTENING)
+            self._provide_attentive_listening_cue()
 
-            import random
-            reply = random.choice(wake_replies)
-            self.get_logger().info(f"🤖 [Astro Wake Cevabı]: \"{reply}\"")
-            if self._can_use_openai("realtime") and self._ws and self._loop and self._is_connected:
-                self._dispatch_turn(int(time.time() * 1000) % 100000, reply)
+            verbal_ack_enabled = os.getenv("WAKE_VERBAL_ACK", "false").lower() == "true"
+            tts_did_start = False
+
+            if verbal_ack_enabled:
+                p = getattr(self, "persona_name", "playful").lower()
+                if p in ("flirt", "charming"):
+                    wake_replies = ["Buradayım, seni dinliyorum.", "Selam, söyle bakalım.", "Gözüm kulağım sende, dinliyorum."]
+                elif p in ("kufurbaz", "witty"):
+                    wake_replies = ["Söyle bakalım!", "Buradayım, dinliyorum.", "He söyle bakalım?"]
+                elif p == "formal":
+                    wake_replies = ["Buyrun efendim, sizi dinliyorum.", "Evet efendim, buradayım."]
+                else:
+                    wake_replies = ["Buradayım!", "Seni dinliyorum!"]
+
+                import random
+                reply = random.choice(wake_replies)
+                self.get_logger().info(f"🤖 [Astro Wake Cevabı]: \"{reply}\"")
+                if self._can_use_openai("realtime") and self._ws and self._loop and self._is_connected:
+                    self._dispatch_turn(int(time.time() * 1000) % 100000, reply)
+                    tts_did_start = True
+                else:
+                    fb_msg = String()
+                    fb_msg.data = json.dumps({
+                        "text": reply,
+                        "engine": "edge-tts",
+                        "generation_id": int(time.time() * 1000) % 100000,
+                        "fallback_reason": "wake_ack",
+                    })
+                    if hasattr(self, "pub_tts_say") and self.pub_tts_say:
+                        self.pub_tts_say.publish(fb_msg)
+                        tts_did_start = True
             else:
-                fb_msg = String()
-                fb_msg.data = json.dumps({
-                    "text": reply,
-                    "engine": "edge-tts",
-                    "generation_id": int(time.time() * 1000) % 100000,
-                    "fallback_reason": "wake_ack",
-                })
-                if hasattr(self, "pub_tts_say") and self.pub_tts_say:
-                    self.pub_tts_say.publish(fb_msg)
+                self.get_logger().info(
+                    f"✨ [Attentive Non-Verbal Wake]: \"{transcript}\" -> LISTENING mode activated with LED & head nod (verbal chatter suppressed)."
+                )
 
             self.get_logger().info(
                 f"⚡ [Wake Telemetry]: wake_detector_active=True | wake_candidate=\"{transcript}\" | "
@@ -5748,7 +5873,7 @@ class AstroRealtimeNode(Node):
                 f"stt_started=True | stt_finished=True | transcript=\"{transcript}\" | "
                 f"extracted_command=\"{extracted_cmd}\" | command_invalid={not valid_cmd} | "
                 f"command_reject_reason={cmd_reason if not valid_cmd else 'none'} | "
-                f"wake_only=True | wake_rejected=False | conversation_turn_created=True | llm_started=False | tts_started=True"
+                f"wake_only=True | wake_rejected=False | conversation_turn_created=True | llm_started=False | tts_started={tts_did_start}"
             )
         else:
             # Wake + Attached Genuine Command (e.g. "Hey Astro hava nasıl?"): Strip wake phrase and forward command
@@ -6549,8 +6674,11 @@ class AstroRealtimeNode(Node):
         reject_reason = "none"
 
         # Check if audio has strong acoustic evidence of real human speech articulation
+        is_busy_speaking = bool(is_playback_active or getattr(self, "_is_responding", False))
+
+        # Check if audio has strong acoustic evidence of real human speech articulation
         has_strong_evidence = (
-            not is_playback_active
+            not is_busy_speaking
             and not is_echo_cooldown
             and speech_ms >= 550
             and audio_ms >= 700
@@ -6565,8 +6693,8 @@ class AstroRealtimeNode(Node):
             rejected = True
             reject_reason = "known_phantom"
 
-        # 1. Playback active or room echo cooldown with self-voice correlation
-        elif (is_playback_active or is_echo_cooldown) and self_voice_score >= 0.20:
+        # 1. Playback active, responding, or room echo cooldown with self-voice correlation
+        elif (is_busy_speaking or is_echo_cooldown) and self_voice_score >= 0.20:
             rejected = True
             reject_reason = "self_voice"
 
@@ -6585,8 +6713,8 @@ class AstroRealtimeNode(Node):
             rejected = True
             reject_reason = "echo_cooldown_leak"
 
-        # 4. Playback is active: reject non-barge-in audio unconditionally
-        elif is_playback_active and not has_strong_evidence:
+        # 4. Playback or response generation is active: reject non-barge-in audio unconditionally
+        elif is_busy_speaking and not has_strong_evidence:
             rejected = True
             reject_reason = "self_voice"
 
@@ -7632,8 +7760,11 @@ class AstroRealtimeNode(Node):
                     if self.session:
                         self.session.activate_session(reason="wake_word")
                     self.state_machine.transition_to(RobotState.LISTENING)
+                    if self.robot_led:
+                        self.robot_led.set_state(LEDState.LISTENING)
+                    self._provide_attentive_listening_cue()
                     self.get_logger().info(
-                        f"⚡ [Active Wake-Only]: \"{validated_text}\" -> Woke to LISTENING (wake_only=True, turn_created=False, 0 LLM / 0 TTS)."
+                        f"⚡ [Active Wake-Only]: \"{validated_text}\" -> Woke to LISTENING (wake_only=True, turn_created=False, 0 LLM / 0 TTS, non-verbal nod+LED active)."
                     )
                     self._is_processing_fallback = False
                     self._is_responding = False
@@ -7650,6 +7781,44 @@ class AstroRealtimeNode(Node):
                 elif norm_wake_check.startswith("selam astro "):
                     validated_text = validated_text[len("selam astro"):].lstrip(" ,.")
                     has_wake = True
+
+                # =====================================================================
+                # VISUAL PRESENCE HARD GATE (Zero Ghost Speech / Boş Odaya Konuşmama Garantisi)
+                # =====================================================================
+                # If no direct wake word was spoken, user MUST be visually present in OAK-D Lite camera.
+                # If camera sees 0 people and no wake phrase was spoken, drop immediately!
+                vis_state = self._get_current_visual_grounding()
+                vis_person_det = bool(vis_state.get("visual_person_detected", False))
+                wm = getattr(self.social_brain, "world_model", None) if getattr(self, "social_brain", None) else None
+                has_wm_people = False
+                if wm and hasattr(wm, "_people"):
+                    with getattr(wm, "_lock", threading.Lock()):
+                        has_wm_people = any(getattr(p, "is_present", False) for p in wm._people.values())
+                has_visual_presence = vis_person_det or has_wm_people
+
+                if not has_wake and not has_visual_presence:
+                    self.get_logger().info(
+                        f"🛑 [Visual Presence Gate Dropped]: \"{raw_transcript}\" -> OAK-D kamerasında insan yok ve uyanma kelimesi söylenmedi (drop/ignore, 0 LLM / 0 TTS)."
+                    )
+                    self.emit_response_trace(
+                        generation_id=self._fallback_generation_id,
+                        user_turn_id=f"turn_{self._fallback_generation_id}",
+                        user_audio=f"{len(raw_pcm)}B",
+                        stt=f"groq_whisper: '{raw_transcript}'",
+                        user_turn_created=False,
+                        social_intent="none",
+                        should_speak=False,
+                        llm_provider="none",
+                        llm_inference="none",
+                        response_text="",
+                        tts="none",
+                        playback="none",
+                        response_origin="none",
+                        termination_reason="NO_VISUAL_PRESENCE",
+                    )
+                    self._is_processing_fallback = False
+                    self._is_responding = False
+                    return
 
                 # Determine explicit user turn:
                 # Must have validated wake phrase + command/query OR be in an already active conversation session!
@@ -9847,11 +10016,14 @@ class AstroRealtimeNode(Node):
         # --- 0-Cost Fallback Mode / OpenAI Chat Mode (STT + LLM + Edge-TTS) ---
         is_ws_connected = (self._is_connected or self.realtime_connection_state == "CONNECTED")
         if self._fallback_mode or getattr(self, "use_4o", False) or not self._can_use_openai("realtime") or not is_ws_connected or self._ws is None:
-            # HARDWARE PLAYBACK LEAKAGE GUARD:
-            # If robot is actively speaking or in post-playback acoustic echo cooldown,
+            # HARDWARE PLAYBACK LEAKAGE & ECHO GATE (Self-Voice Killer):
+            # If robot is actively speaking, actively preparing response (TTS synthesis/LLM),
+            # or in post-playback acoustic echo cooldown,
             # strictly purge and reject buffering audio frames into fallback buffer.
-            is_echo_cooldown = (now - getattr(self, "_playback_end_time", 0.0)) < getattr(self, "echo_mute_cooldown_s", 0.65)
-            if self._is_playback_active or is_echo_cooldown:
+            echo_cooldown_limit = float(getattr(self, "echo_mute_cooldown_s", 0.85))
+            is_echo_cooldown = (now - getattr(self, "_playback_end_time", 0.0)) < echo_cooldown_limit
+            is_robot_busy = bool(self._is_playback_active or getattr(self, "_is_responding", False) or is_echo_cooldown)
+            if is_robot_busy:
                 with self._lock:
                     if self._fallback_speaking or self._fallback_audio_buffer:
                         self._fallback_speaking = False
@@ -10077,6 +10249,26 @@ class AstroRealtimeNode(Node):
                 fresh_objs = wm.get_spatial_objects(max_age_s=3.0)
                 if hasattr(self, "_person_object_associator") and self._person_object_associator and fresh_objs:
                     self._person_object_associator.associate(candidates, fresh_objs)
+                    holding_res = [o for o in fresh_objs if getattr(o, "interaction_type", "") == "holding"]
+                    if holding_res:
+                        best_h = max(holding_res, key=lambda o: getattr(o, "confidence", 0.0))
+                        cname = getattr(best_h, "class_name", "")
+                        tr_map = {
+                            "cup": "bardak", "bottle": "şişe", "cell phone": "telefon",
+                            "book": "kitap", "remote": "kumanda", "mouse": "fare",
+                            "apple": "elma", "banana": "muz", "fork": "çatal",
+                            "spoon": "kaşık", "knife": "bıçak", "sandwich": "sandviç",
+                            "keys": "anahtar", "pen": "kalem", "scissors": "makas",
+                        }
+                        with self._lock:
+                            self._last_held_object_cache = {
+                                "class_name": cname,
+                                "tr_name": tr_map.get(cname.lower(), cname),
+                                "confidence": float(getattr(best_h, "confidence", 0.85)),
+                                "distance_m": float(getattr(best_h, "distance_m", 0.0)),
+                                "timestamp": time.monotonic(),
+                                "person_id": getattr(best_h, "associated_person_id", None),
+                            }
 
                 if hasattr(self, "_temporal_activity_engine") and self._temporal_activity_engine:
                     for c_person in candidates:
@@ -10164,9 +10356,37 @@ class AstroRealtimeNode(Node):
                                 act, act_conf, ev = self._temporal_activity_engine.evaluate(p, p_objs)
                                 wm.update_person_activity(p.person_id, act.value, act_conf, ev)
 
+            # Fast in-memory cache update for held object (<10ms access)
+            holding_objs = [o for o in spatial_objects if getattr(o, "interaction_type", "") == "holding"]
+            if not holding_objs:
+                holding_objs = [
+                    o for o in spatial_objects
+                    if getattr(o, "class_name", "") in (
+                        "cup", "bottle", "cell phone", "book", "apple", "banana", "remote", "mouse", "keys", "fork", "knife", "spoon"
+                    ) and getattr(o, "distance_m", 0.0) <= 1.8
+                ]
+
             with self._lock:
                 self._last_detected_objects = spatial_objects
                 self._last_detected_objects_time = time.monotonic()
+                if holding_objs:
+                    best_h = max(holding_objs, key=lambda o: getattr(o, "confidence", 0.0))
+                    cname = getattr(best_h, "class_name", "")
+                    tr_map = {
+                        "cup": "bardak", "bottle": "şişe", "cell phone": "telefon",
+                        "book": "kitap", "remote": "kumanda", "mouse": "fare",
+                        "apple": "elma", "banana": "muz", "fork": "çatal",
+                        "spoon": "kaşık", "knife": "bıçak", "sandwich": "sandviç",
+                        "keys": "anahtar", "pen": "kalem", "scissors": "makas",
+                    }
+                    self._last_held_object_cache = {
+                        "class_name": cname,
+                        "tr_name": tr_map.get(cname.lower(), cname),
+                        "confidence": float(getattr(best_h, "confidence", 0.85)),
+                        "distance_m": float(getattr(best_h, "distance_m", 0.0)),
+                        "timestamp": time.monotonic(),
+                        "person_id": getattr(best_h, "associated_person_id", None),
+                    }
         except Exception as _exc:
             self.get_logger().debug(f"_on_detected_objects: {_exc}")
 

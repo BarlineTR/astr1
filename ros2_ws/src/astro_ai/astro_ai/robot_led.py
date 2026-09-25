@@ -23,6 +23,16 @@ from typing import Any, Dict, List, Optional
 _LOG = logging.getLogger("RobotLED")
 
 
+class LEDState:
+    """Standard LED Ring visual states."""
+    IDLE = "idle"
+    LISTENING = "listening"
+    THINKING = "thinking"
+    SPEAKING = "speaking"
+    ERROR = "error"
+    OFF = "off"
+
+
 class NativeReSpeakerUsbRing:
     """Direct hardware driver for Seeed ReSpeaker USB 4-Mic Array (XMOS XVF3000).
 

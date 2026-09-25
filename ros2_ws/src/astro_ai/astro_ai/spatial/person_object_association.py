@@ -101,17 +101,31 @@ class PersonObjectAssociator:
                         obj_height <= int(fh * 2.2)
                     )
 
-                    is_in_torso = (
-                        oxmin < torso_xmax and oxmax > torso_xmin and
-                        oymin < torso_ymax and oymax > torso_ymin
+                    # Hand & Extended Arm Reach Zone (Holding objects in front or toward camera)
+                    arm_xmin = fx - int(fw * 2.2)
+                    arm_xmax = fx + int(fw * 3.2)
+                    arm_ymin = fy + int(fh * 0.4)
+                    arm_ymax = fy + int(fh * 4.2)
+                    is_in_hand_reach = (
+                        arm_xmin <= ocx <= arm_xmax and
+                        arm_ymin <= ocy <= arm_ymax
                     )
 
-                    # Metric depth check: if depth is known, must be within 0.45m of person
-                    depth_valid_for_holding = (not has_metric_depth) or (rel_dist <= 0.45)
+                    # Metric depth check: if depth is known, must be within 0.70m of person and in front
+                    depth_valid_for_holding = (not has_metric_depth) or (rel_dist <= 0.70 and obj_dist <= person_dist + 0.25)
+
+                    handheld_items = (
+                        "cup", "bottle", "wine glass", "fork", "spoon", "knife",
+                        "sandwich", "apple", "banana", "cell phone", "book", "remote",
+                        "mouse", "scissors", "toothbrush", "pen", "keys"
+                    )
 
                     if is_near_mouth and depth_valid_for_holding and obj.class_name in ("cup", "bottle", "wine glass", "fork", "spoon", "sandwich", "apple"):
                         relation = InteractionType.HOLDING
-                        rel_conf = 0.90
+                        rel_conf = 0.92
+                    elif is_in_hand_reach and depth_valid_for_holding and obj.class_name in handheld_items:
+                        relation = InteractionType.HOLDING
+                        rel_conf = 0.88
                     elif is_in_torso and depth_valid_for_holding and obj.class_name in ("cell phone", "book"):
                         relation = InteractionType.HOLDING
                         rel_conf = 0.85
@@ -131,12 +145,12 @@ class PersonObjectAssociator:
                     if obj.class_name in ("laptop", "keyboard") and obj_dist < person_dist:
                         relation = InteractionType.IN_FRONT_OF
                         rel_conf = 0.80
-                    elif obj.class_name in ("cell phone", "book") and rel_dist < 0.35:
+                    elif obj.class_name in ("cell phone", "book") and rel_dist < 0.45:
                         relation = InteractionType.HOLDING
-                        rel_conf = 0.75
-                    elif obj.class_name in ("cup", "bottle") and rel_dist < 0.25:
+                        rel_conf = 0.80
+                    elif obj.class_name in ("cup", "bottle", "remote", "banana", "apple") and rel_dist < 0.45 and obj_dist <= person_dist + 0.15:
                         relation = InteractionType.HOLDING
-                        rel_conf = 0.70
+                        rel_conf = 0.78
                     else:
                         relation = InteractionType.NEAR
                         rel_conf = max(0.40, 1.0 - (rel_dist / self.proximity_threshold_m))
@@ -160,5 +174,10 @@ class PersonObjectAssociator:
 
             # Update person's interacting objects list
             setattr(person, "interacting_objects", list(set(interacting_classes)))
+            holding_classes = [
+                r.class_name for r in results
+                if r.person_id == person.person_id and r.relation == InteractionType.HOLDING
+            ]
+            setattr(person, "holding_objects", list(set(holding_classes)))
 
         return results

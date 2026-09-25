@@ -51,7 +51,19 @@ class InteractionGate:
         """Computes authoritative InteractionGateDecision."""
         addressed = self.is_directly_addressed(user_text)
 
-        # Rule 0: Explicit direct address or validated user turn ALWAYS forces ENGAGED
+        # Rule 0: No person present and not directly addressed -> BYPASS immediately (Zero Ghost Speech)
+        if person is None and not addressed:
+            return InteractionGateDecision(
+                mode=InteractionGateMode.BYPASS,
+                attention_state=attention_state,
+                identity_certainty=identity_certainty,
+                should_respond_verbally=False,
+                should_track_with_gaze=False,
+                reason="NO_TARGET",
+                gating_prompt_instruction="ETKİLEŞİM KAPISI [BYPASS]: Görüş alanında kimse yok ve doğrudan hitap edilmedi. Sessiz kal.",
+            )
+
+        # Rule 0.5: Explicit direct address or validated user turn with present person ALWAYS forces ENGAGED
         if addressed or explicit_user_turn:
             return InteractionGateDecision(
                 mode=InteractionGateMode.ENGAGED,
