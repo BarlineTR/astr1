@@ -27,14 +27,16 @@ def record_audio(duration_s=2.0, out_wav="/tmp/measure_6ch.wav"):
     try:
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         raw_data = proc.stdout.read(total_bytes)
+        err_msg = proc.stderr.read().decode('utf-8', errors='replace') if proc.stderr else ''
         proc.terminate()
         proc.wait(timeout=0.5)
         if len(raw_data) < total_bytes:
+            print(f"Record failed: got {len(raw_data)} bytes (expected {total_bytes}), stderr: {err_msg}")
             return None
         arr = np.frombuffer(raw_data, dtype=np.int16).reshape(-1, CHANNELS)
         return arr
     except Exception as e:
-        print(f"Record error: {e}")
+        print(f"Record exception: {e}")
         return None
 
 def measure_levels():
