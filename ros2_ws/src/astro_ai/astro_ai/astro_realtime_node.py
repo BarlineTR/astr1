@@ -10562,7 +10562,8 @@ class AstroRealtimeNode(Node):
             with self._lock:
                 self._recognized_person = data
                 self._last_vision_faces_time = now
-                if data.get("is_known") and data.get("confidence", 0.0) >= 0.45:
+                match_thresh = float(os.getenv("FACE_MATCH_THRESHOLD", "0.38"))
+                if data.get("is_known") and data.get("confidence", 0.0) >= match_thresh:
                     if self._is_sleeping:
                         self._wake_up()
                     name = data.get("name", "")
@@ -11190,8 +11191,10 @@ class AstroRealtimeNode(Node):
         mock_cam = os.getenv("ASTRO_MOCK_CAMERA_AVAILABLE", "0").strip().lower() in ("1", "true", "yes")
         oak_state = getattr(self, "_oak_connection_state", "DISCONNECTED")
         last_f = getattr(self, "_oak_last_frame_time", 0.0)
+        last_info = getattr(self, "_oak_last_camera_info_time", 0.0)
         last_face = getattr(self, "_last_vision_faces_time", 0.0)
-        ref_t = last_face if last_face > 0.0 else last_f
+        # Visual frame freshness: prioritize live camera frame stream (last_f), then camera_info, then face detection
+        ref_t = last_f if last_f > 0.0 else (last_info if last_info > 0.0 else last_face)
         visual_age_ms = int((now - ref_t) * 1000.0) if ref_t > 0.0 else -1
 
         cam_fresh = False
@@ -11201,7 +11204,7 @@ class AstroRealtimeNode(Node):
                 visual_age_ms = 10
         else:
             has_recent_frame = (last_f > 0.0 and (now - last_f) < 4.0)
-            has_recent_info = (getattr(self, "_oak_last_camera_info_time", 0.0) > 0.0 and (now - getattr(self, "_oak_last_camera_info_time", 0.0)) < 4.0)
+            has_recent_info = (last_info > 0.0 and (now - last_info) < 4.0)
             has_frame_obj = getattr(self, "_latest_camera_frame", None) is not None
             cam_fresh = bool(oak_state == "CONNECTED" or has_recent_frame or has_recent_info or has_frame_obj)
 

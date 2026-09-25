@@ -202,6 +202,8 @@ class ConsciousnessNode(Node):
         self.create_subscription(Bool, "/audio/vad", self._on_audio_vad_msg, qos_profile_sensor_data)
         self.create_subscription(Float32, "/audio/doa", self._on_audio_doa_msg, qos_profile_sensor_data)
         self.create_subscription(Bool, "/tts/speaking", self._on_tts_speaking_msg, 10)
+        self.create_subscription(Bool, "/robot/is_speaking", self._on_tts_speaking_msg, 10)
+        self.create_subscription(Bool, "/audio/playback_active", self._on_tts_speaking_msg, 10)
         self.create_subscription(String, "/speech/text", self._on_speech_text_msg, 10)
         self.create_subscription(LaserScan, "/scan", self._on_scan_msg, qos_profile_sensor_data)
         if HeadState is not None:
@@ -225,8 +227,11 @@ class ConsciousnessNode(Node):
         except Exception:
             pass
 
+        has_faces = len(face_data) > 0
         with self._lock:
+            prev = self._sensor_cache["person_detected"]
             self._sensor_cache["faces_json"] = raw_txt
+            self._sensor_cache["person_detected"] = has_faces
             self._sensor_cache["last_sensor_update_ts"] = now
             self.spatial_fusion.update_vision_perception(
                 faces=face_data,
@@ -234,6 +239,22 @@ class ConsciousnessNode(Node):
             )
 
         self.loop.event_detector.notify_sensor_active("camera", now)
+
+        # Emit perception events on state transitions if not already triggered by /vision/person_detected
+        if has_faces and not prev:
+            self.get_logger().info("👁️ [Bilinç: Görme Algısı] Kamera görüş alanında kişi algılandı")
+            self.event_bus.create_and_publish(
+                event_type=CognitiveEventType.PERSON_APPEARED,
+                source="vision",
+                data={"timestamp": now},
+            )
+        elif not has_faces and prev:
+            self.get_logger().info("👁️ [Bilinç: Görme Algısı] Kişi kamera görüş alanından ayrıldı")
+            self.event_bus.create_and_publish(
+                event_type=CognitiveEventType.PERSON_DISAPPEARED,
+                source="vision",
+                data={"timestamp": now},
+            )
 
     def _on_recognized_person_msg(self, msg: Any) -> None:
         val = str(getattr(msg, "data", "")).strip()

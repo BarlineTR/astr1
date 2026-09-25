@@ -183,6 +183,11 @@ def generate_launch_description():
             default_value="false",
             description="Invert RPLIDAR scan (flips left/right for upside down or mirrored mount)",
         ),
+        DeclareLaunchArgument(
+            "enable_consciousness",
+            default_value="true",
+            description="Enable cognitive consciousness loop node (10Hz CognitiveLoop, spatial fusion & introspection)",
+        ),
     ]
 
     serial_bridge_node = Node(
@@ -236,6 +241,18 @@ def generate_launch_description():
         }],
     )
 
+    consciousness_node = Node(
+        package="astro_ai",
+        executable="consciousness_node",
+        name="consciousness_node",
+        output="screen",
+        condition=IfCondition(LaunchConfiguration("enable_consciousness")),
+        parameters=[{
+            "cognitive_loop_hz": 10.0,
+            "enable_telemetry": True,
+        }],
+    )
+
     lidar_launch_entity = None
     try:
         try:
@@ -276,6 +293,7 @@ def generate_launch_description():
             standalone_gaze_node,
             audio_stream_node,
             astro_realtime_node,
+            consciousness_node,
         ]
         + extra_entities
     )

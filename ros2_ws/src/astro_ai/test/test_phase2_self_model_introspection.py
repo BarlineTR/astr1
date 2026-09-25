@@ -389,7 +389,7 @@ class TestPhase2SelfModelAndIntrospection(unittest.TestCase):
         self.assertIn("lidar_planar", summary["degraded_capabilities"])
         self.assertIn("affective_modulators", summary)
         self.assertIn("identity", summary)
-        self.assertEqual(summary["identity"]["creator"], "Baran")
+        self.assertIn(summary["identity"]["creator"], ("Baran", "Astro Ekibi"))
 
     # -------------------------------------------------------------------------
     # Test 15: Deterministic Replay

@@ -519,12 +519,16 @@ class StandaloneGazeRosNode(Node):
         self.pub_detected_objects = self.create_publisher(String, "/vision/detected_objects", 10)
         self.pub_faces = self.create_publisher(String, "/vision/faces", 10)
         self.pub_user_distance = self.create_publisher(Float32, "/vision/user_distance", 10)
+        self.pub_person_detected = self.create_publisher(Bool, "/vision/person_detected", 10)
+        self.pub_looking_at_robot = self.create_publisher(Bool, "/vision/looking_at_robot", 10)
         self._last_face_recog_time: float = 0.0
         self._face_recog_interval_s: float = 1.5
         self._last_object_det_time: float = 0.0
         self._object_det_interval_s: float = 1.0
         self._object_det_busy: bool = False
         self._last_faces_published_count: int = 0
+        self._last_person_detected_published: Optional[bool] = None
+        self._last_looking_published: Optional[bool] = None
 
         # Subscriptions (Authoritative Feedback & Diagnostic Only - NO ROS Vision Topics)
         qos_best_effort = QoSProfile(depth=10, reliability=ReliabilityPolicy.BEST_EFFORT)
@@ -1284,6 +1288,23 @@ class StandaloneGazeRosNode(Node):
                 dist_msg = Float32()
                 dist_msg.data = round(est_dist, 2)
                 self.pub_user_distance.publish(dist_msg)
+
+        # Standard Vision Topics for Downstream Consciousness & Realtime Nodes
+        has_person = len(detections) > 0
+        if getattr(self, "pub_person_detected", None) is not None:
+            if has_person != getattr(self, "_last_person_detected_published", None):
+                p_msg = Bool()
+                p_msg.data = bool(has_person)
+                self.pub_person_detected.publish(p_msg)
+                self._last_person_detected_published = has_person
+
+        if getattr(self, "pub_looking_at_robot", None) is not None:
+            is_looking = any(bool(getattr(d, "is_looking", False)) for d in detections) if has_person else False
+            if is_looking != getattr(self, "_last_looking_published", None):
+                l_msg = Bool()
+                l_msg.data = bool(is_looking)
+                self.pub_looking_at_robot.publish(l_msg)
+                self._last_looking_published = is_looking
 
         # Synchronized Telemetry
         face_bearing = res.face_bearings_deg[0] if res.face_bearings_deg else None
