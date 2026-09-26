@@ -7794,7 +7794,7 @@ class AstroRealtimeNode(Node):
         _log_gate_decision(True, caller_reason)
         return True, "authorized"
 
-    def _synthesize_speech_pcm(self, text: str) -> Tuple[bytes, str, float, bool]:
+    def _synthesize_speech_pcm(self, text: str, generation_id: Optional[int] = None) -> Tuple[bytes, str, float, bool]:
         """Synthesizes speech to int16 PCM using:
         1. ElevenLabs Flash v2.5 (Primary Remote TTS ~75ms)
         2. Local Coqui XTTS on CUDA GPU (Local / Offline Fallback)
@@ -7802,6 +7802,10 @@ class AstroRealtimeNode(Node):
         
         Returns: (pcm_bytes, active_engine_name, infer_ms, is_ready)
         """
+        gen_id = generation_id if generation_id is not None else self._fallback_generation_id
+        if gen_id in getattr(self, "_cancelled_generation_ids", set()):
+            self.get_logger().info(f"🛑 [_synthesize_speech_pcm Blocked]: generation_id={gen_id} is cancelled.")
+            return b"", "cancelled", 0.0, False
         if not text:
             return b"", "none", 0.0, False
         safe_text = ResponseSafetyGate.validate_response(text, persona=self.persona_name)
@@ -10409,18 +10413,16 @@ class AstroRealtimeNode(Node):
 
             # Minimum speech duration requirement:
             # - If test or node explicitly configured barge_in_min_consecutive_frames: honor configured frame count
-            # - If loud user voice (RMS >= 1200 or peak >= 3500): 60ms (3 frames)
-            # - If VAD is active and self_voice_score < 0.20: 80ms (4 frames)
-            # - If VAD is not active (vad_confidence=0.0): 140ms (7 frames) to prevent 60ms speaker echo false-cuts
+            # - If VAD is active and self_voice_score < 0.20: 60ms (3 frames) if loud, else 80ms (4 frames)
+            # - If VAD is not active (vad_confidence=0.0): physical speaker echo can reach high RMS!
+            #   Must NEVER confirm human speech in 60ms when VAD=0. Requires sustained persistence (>=200ms).
             min_frames_cfg = getattr(self, "barge_in_min_consecutive_frames", None)
             if min_frames_cfg is not None:
                 min_speech_ms = float(min_frames_cfg * 20)
-            elif local_rms >= 1200.0 or peak_val >= 3500:
-                min_speech_ms = 60.0
             elif is_vad_active and self_voice_score < 0.20:
-                min_speech_ms = 80.0
+                min_speech_ms = 60.0 if (local_rms >= 1200.0 or peak_val >= 3500) else 80.0
             else:
-                min_speech_ms = 140.0
+                min_speech_ms = 200.0
 
             if speech_duration_ms < min_speech_ms or (not is_vad_active and local_rms < target_barge_in_rms):
                 if is_loud:
