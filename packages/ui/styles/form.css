@@ -298,3 +298,8 @@
 }
 .eslestirme__not { margin: 0; font-size: var(--t-small); color: var(--ink-muted); }
 .eslestirme__sonraki { margin: 0; color: var(--ink-muted); }
+
+/* Silme gibi geri alınamayan işlemler kendi kutusunda ve alarm çizgisiyle. */
+.pano__bolum--tehlikeli { border-top-color: var(--alarm); }
+.pano__bolum--tehlikeli .pano__bolum-baslik { color: var(--alarm); }
+.pano__bolum--tehlikeli code { color: var(--accent); }

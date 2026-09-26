@@ -21,11 +21,15 @@
     "db:up": "docker compose -f docker/compose.yaml up -d",
     "db:down": "docker compose -f docker/compose.yaml down",
     "db:generate": "npm run --workspace=@astro/site db:generate",
-    "db:migrate": "npm run --workspace=@astro/site db:migrate"
+    "db:migrate": "npm run --workspace=@astro/site db:migrate",
+    "robot:sahte": "node tools/sahte-robot.mjs",
+    "build:gateway": "npm run build --workspace=@astro/gateway"
   },
   "devDependencies": {
     "@playwright/test": "^1.63.0",
+    "@types/ws": "^8.18.1",
     "typescript": "^5.6.3",
-    "vitest": "^4.1.11"
+    "vitest": "^4.1.11",
+    "ws": "^8.22.0"
   }
 }

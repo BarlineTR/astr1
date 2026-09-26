@@ -6,13 +6,14 @@ dallarında durur.
 
 ```
 apps/
-├── site/        Next.js 16 — pazarlama, SEO, oturum, ödeme (ileride), panel
+├── site/        Next.js 16 — pazarlama, SEO, oturum, panel, eşleştirme API'si
 └── gateway/     Fastify — robot ↔ tarayıcı köprüsü (kalıcı WebSocket)
 packages/
-├── protocol/    telemetri ve komut sözleşmesi (zod) + JSON Schema üretimi
+├── protocol/    telemetri, komut ve tel sözleşmesi (zod) + JSON Schema üretimi
 └── ui/          görsel belirteçler ve stiller
+tools/           sahte-robot.mjs — portu robot olmadan denemek için referans ajan
 docker/          imajlar ve yerel yığın
-docs/            tasarım belgesi, uygulama planı, risk kaydı
+docs/            tasarım belgesi, uygulama planı, risk kaydı, bağlantı portu
 ```
 
 ## Çalıştırma
@@ -23,7 +24,8 @@ cp apps/site/.env.example apps/site/.env.local
 npm run db:up                 # Postgres (Docker, 5433)
 npm run db:migrate            # şemayı uygula
 npm run dev:site              # http://localhost:3000
-npm run dev:gateway           # http://localhost:8420  (isteğe bağlı)
+npm run build:gateway         # ağ geçidi paketlenir
+bash scripts/gecit.sh         # http://localhost:8420
 ```
 
 Ortam dosyası **`apps/site/.env.local`** içinde durur, kökte değil: Next ortam
@@ -54,7 +56,9 @@ veritabanına ihtiyaç duyar.
 | `/iletisim` | İletişim ve teklif formu |
 | `/giris`, `/kayit` | Kimlik |
 | `/panel` | Cihazlar, hesap — **giriş arkasında** |
-| `/panel/cihaz/[id]` | Gerçek kontrol konsolu — giriş + cihaz yetkisi arkasında |
+| `/panel/cihaz/ekle` | Robot ekleme ve eşleştirme kodu |
+| `/panel/cihaz/[id]` | Gerçek kontrol konsolu, cihaz yönetimi — giriş + cihaz yetkisi arkasında |
+| `/panel/abonelik`, `/panel/faturalar` | Plan ve ödeme (ödeme sağlayıcısı henüz bağlı değil) |
 | `/kvkk`, `/gizlilik`, `/cerez`, `/kosullar`, `/mesafeli-satis`, `/iade` | Hukuki (taslak) |
 
 ## Bu kod tabanında bilinmesi gerekenler
@@ -74,6 +78,12 @@ veritabanına ihtiyaç duyar.
 - **Ağ geçidi paketlenerek dağıtılır.** `tsc` göreli importları uzantısız
   bırakıyor ve Node ESM onları çözemiyor; ayrıca sözleşme paketi kaynak TS
   olarak yayımlanıyor. esbuild ikisini birlikte çözüyor.
+- **Robot dışa doğru bağlanır.** Müşteri ağında port açılmaz. Ağ geçidi
+  durumsuz bir röle; cihaz kayıtları sitenin veritabanında ve bağlantı
+  kurulurken bir kez sorulur. Ayrıntı: `docs/BAGLANTI.md`.
+- **Hareket komutları robot bağlı değilken ya da gecikme 800 ms'yi aştığında
+  gönderilmez; acil durdurma bu kısıttan muaftır.** Durdurmayı geciktirmek,
+  geciken bir hareket komutundan çok daha kötü.
 - **Yer tutucular görünür.** Kurum bilgileri, fiyatlar ve hukuki metinler taslak
   ve sayfalar bunu kendileri söylüyor. Bkz. `docs/RISKLER.md`.
 
@@ -81,6 +91,7 @@ veritabanına ihtiyaç duyar.
 
 - `docs/superpowers/specs/2026-09-26-kurumsal-web-sitesi-design.md` — tasarım ve kararlar
 - `docs/superpowers/plans/2026-09-26-faz-0-1-2-kurumsal-site.md` — uygulama planı
+- `docs/BAGLANTI.md` — robot bağlantı portu: sözleşme, eşleştirme, yetki, sınırlar
 - `docs/RISKLER.md` — yayın öncesi kapatılması gereken maddeler
 
 ## Dağıtım

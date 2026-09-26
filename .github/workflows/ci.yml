@@ -42,6 +42,10 @@ jobs:
       - name: Tip denetimi
         run: npm run typecheck
 
+      - name: Ağ geçidi derlemesi
+        # Tümleşik test gerçek süreci ayağa kaldırıyor; dist olmadan koşamaz.
+        run: npm run build --workspace=@astro/gateway
+
       - name: Birim testleri
         run: npm test
 

@@ -1,9 +1,8 @@
-import { and, eq } from "drizzle-orm";
 import { notFound } from "next/navigation";
 
-import { db } from "@/db";
-import { deviceGrants, devices } from "@/db/schema";
+import { CihazYonetimi } from "@/components/CihazYonetimi";
 import { Konsol } from "@/components/Konsol";
+import { cihazErisimi, komutVerebilir } from "@/db/sorgular/cihaz";
 import { oturumGerekli } from "@/lib/oturum";
 import { sayfaMetadata } from "@/lib/seo";
 
@@ -14,40 +13,42 @@ export const metadata = sayfaMetadata({
   dizinleme: false,
 });
 
+const DURUM_ADI: Record<string, string> = {
+  kayitli: "kayıtlı",
+  "eslestirme-bekliyor": "eşleştirme bekliyor",
+  cevrimdisi: "çevrimdışı",
+  cevrimici: "çevrimiçi",
+};
+
 export default async function CihazSayfasi({ params }: PageProps<"/panel/cihaz/[id]">) {
   const { id } = await params;
   const oturum = await oturumGerekli(`/panel/cihaz/${id}`);
 
-  /*
-   * Erişim iki yoldan gelebilir: cihazın sahibi olmak ya da kendisine yetki
-   * verilmiş olmak. İkisi de yoksa 404 dönülür, 403 değil — 403 o kimlikte bir
-   * cihazın gerçekten var olduğunu söyler ve kimlikleri tarayarak envanter
-   * çıkarmaya izin verir.
-   */
-  const [cihaz] = await db
-    .select()
-    .from(devices)
-    .where(and(eq(devices.id, id), eq(devices.ownerUserId, oturum.user.id)))
-    .limit(1);
+  const erisim = await cihazErisimi(id, oturum.user.id);
+  // 403 değil 404: 403 o kimlikte bir cihazın var olduğunu söyler.
+  if (!erisim) notFound();
 
-  const [yetki] = cihaz
-    ? [null]
-    : await db
-        .select()
-        .from(deviceGrants)
-        .where(and(eq(deviceGrants.deviceId, id), eq(deviceGrants.userId, oturum.user.id)))
-        .limit(1);
-
-  if (!cihaz && !yetki) notFound();
+  const { cihaz, yetki } = erisim;
+  const kodGecerli = Boolean(
+    cihaz.pairingCodeHash && cihaz.pairingExpiresAt && cihaz.pairingExpiresAt > new Date(),
+  );
 
   return (
     <>
-      <div className="pano__baslik">
-        <h1>{cihaz?.name ?? "Cihaz"}</h1>
-        <p className="pano__lead mono">{cihaz?.serial ?? id}</p>
+      <div className="pano__baslik pano__baslik--eylemli">
+        <div>
+          <h1>{cihaz.name}</h1>
+          <p className="pano__lead cihaz-basligi__seri mono">{cihaz.serial}</p>
+        </div>
+        <span className="cihaz__durum">{DURUM_ADI[cihaz.status] ?? cihaz.status}</span>
       </div>
 
-      <Konsol mod="canli" />
+      <Konsol mod="canli" cihazId={cihaz.id} komutVerebilir={komutVerebilir(yetki)} />
+
+      {/* Yönetim yalnızca sahibe görünür: operatör cihazı kullanır, bağlamaz. */}
+      {yetki === "sahip" && (
+        <CihazYonetimi cihazId={cihaz.id} seri={cihaz.serial} kodGecerliMi={kodGecerli} />
+      )}
     </>
   );
 }

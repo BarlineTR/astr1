@@ -124,3 +124,68 @@
   font-size: var(--t-micro);
   line-height: 1.6;
 }
+
+/* ──────────────────────────  Bağlantı şeridi  ──────────────────────────── */
+
+.baglanti {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--s-2) var(--s-3);
+  padding: var(--s-2) 0 var(--s-3);
+  border-bottom: 1px solid var(--rule);
+  margin-bottom: var(--s-3);
+}
+
+.baglanti__olcu { font-size: var(--t-small); color: var(--ink-faint); }
+.baglanti__olcu strong { color: var(--ink-muted); font-weight: 400; }
+
+/* Eşik aşıldığında hareket komutları kapanıyor; nedeni görünür olmalı. */
+.baglanti__olcu.is-uyari { color: var(--warn); }
+.baglanti__olcu.is-uyari strong { color: var(--warn); }
+
+.baglanti__ayrinti { font-size: var(--t-small); color: var(--alarm); }
+
+.badge--alarm {
+  border-color: rgba(180, 86, 76, 0.55);
+  color: var(--alarm);
+}
+
+/* ──────────────────────────  Çerçeve günlüğü  ──────────────────────────── */
+
+/*
+ * Giden ve gelen çerçeveler. Telemetri buraya yazılmıyor — saniyede onlarca
+ * gelip günlüğü kullanılamaz hale getiriyordu; onların yeri durum tablosu.
+ */
+.gunluk {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  max-height: 16rem;
+  overflow-y: auto;
+  font-size: var(--t-small);
+}
+.gunluk__bos { color: var(--ink-faint); font-size: var(--t-small); margin: 0; }
+
+.gunluk__satir {
+  display: grid;
+  grid-template-columns: auto auto minmax(6rem, auto) 1fr;
+  gap: var(--s-2);
+  padding: 0.35rem 0;
+  border-bottom: 1px solid var(--rule);
+  align-items: baseline;
+}
+.gunluk__saat { color: var(--ink-faint); font-size: var(--t-micro); }
+.gunluk__yon { color: var(--ink-faint); }
+.gunluk__satir--giden .gunluk__yon { color: var(--accent); }
+.gunluk__tur { color: var(--ink-muted); font-size: var(--t-micro); }
+.gunluk__ozet { color: var(--ink); }
+
+.controls__onay {
+  margin: var(--s-2) 0 0;
+  font-size: var(--t-small);
+  color: var(--ink-muted);
+}
+
+/* Kapalı denetim: neden kapalı olduğu altındaki notta yazıyor. */
+.slider:disabled { opacity: 0.4; cursor: not-allowed; }

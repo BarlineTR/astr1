@@ -6,7 +6,8 @@
   "exports": {
     ".": "./src/index.ts",
     "./schema": "./src/schema.ts",
-    "./json-schema": "./src/json-schema.ts"
+    "./json-schema": "./src/json-schema.ts",
+    "./wire": "./src/wire.ts"
   },
   "types": "./src/index.ts",
   "dependencies": {

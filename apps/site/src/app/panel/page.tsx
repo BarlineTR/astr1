@@ -1,8 +1,6 @@
-import { eq } from "drizzle-orm";
 import Link from "next/link";
 
-import { db } from "@/db";
-import { devices } from "@/db/schema";
+import { kullanicininCihazlari } from "@/db/sorgular/cihaz";
 import { oturumGerekli } from "@/lib/oturum";
 import { sayfaMetadata } from "@/lib/seo";
 
@@ -24,10 +22,7 @@ const DURUM_ADI: Record<string, string> = {
 export default async function PanelAnaSayfa() {
   const oturum = await oturumGerekli();
 
-  const cihazlar = await db
-    .select()
-    .from(devices)
-    .where(eq(devices.ownerUserId, oturum.user.id));
+  const cihazlar = await kullanicininCihazlari(oturum.user.id);
 
   return (
     <>
