@@ -10227,6 +10227,7 @@ class AstroRealtimeNode(Node):
 
         now = time.monotonic()
         self_voice_score: float = 0.0
+        barge_in_after_ms: int = 0
 
         # Try parsing JSON wrapped frame, raw base64 PCM string, or direct bytes
         raw_16k: bytes = b""
@@ -10274,144 +10275,144 @@ class AstroRealtimeNode(Node):
         if local_rms < 380.0:
             self._ambient_rms = 0.96 * self._ambient_rms + 0.04 * local_rms
 
-            # ====================================================================
-            # SLEEP / DEEP_IDLE MODE: Dedicated Low-CPU Wake Detector
-            # ====================================================================
-            if self._is_sleeping or self.state_machine.is_deep_idle():
-                is_cooldown_now = (now - getattr(self, "_playback_end_time", 0.0)) < getattr(self, "echo_mute_cooldown_s", 0.65)
-                if self._is_playback_active or is_cooldown_now:
-                    with self._lock:
-                        if self._wake_listening or self._wake_audio_buffer:
-                            self._wake_listening = False
-                            self._wake_audio_buffer.clear()
-                        if self._fallback_speaking or self._fallback_audio_buffer:
-                            self._fallback_speaking = False
-                            self._fallback_audio_buffer.clear()
-                    return
-
-                if raw_16k:
-                    wake_min_rms = float(os.getenv("WAKE_MIN_RMS", "120.0"))
-                    wake_min_peak = int(os.getenv("WAKE_MIN_PEAK", "350"))
-                    is_speech_energy = (local_rms > max(wake_min_rms, self._ambient_rms * 1.20) and peak_val > wake_min_peak)
-                    if is_speech_energy:
-                        self._wake_last_voice_time = now
-                        if not self._wake_listening:
-                            self._wake_listening = True
-                            with self._lock:
-                                # 18 pre-roll frames (360ms) ensures full initial syllable (e.g. "Hey") is preserved
-                                pre_frames = list(self._user_speech_audio_buffer[-18:]) if len(self._user_speech_audio_buffer) >= 18 else list(self._user_speech_audio_buffer)
-                            self._wake_audio_buffer = list(pre_frames) + [raw_16k]
-                        else:
-                            self._wake_audio_buffer.append(raw_16k)
-                            max_wake_s = float(os.getenv("WAKE_MAX_UTTERANCE_S", "12.0"))
-                            if (len(self._wake_audio_buffer) * 0.020) >= max_wake_s:
-                                self._flush_wake_buffer(reason="max_utterance")
-                    elif self._wake_listening:
-                        self._wake_audio_buffer.append(raw_16k)
-                        # Silence pause (0.50s after speech ends) triggers wake verification
-                        if (now - self._wake_last_voice_time) > 0.50:
-                            self._flush_wake_buffer(reason="silence")
+        # ====================================================================
+        # SLEEP / DEEP_IDLE MODE: Dedicated Low-CPU Wake Detector
+        # ====================================================================
+        if self._is_sleeping or self.state_machine.is_deep_idle():
+            is_cooldown_now = (now - getattr(self, "_playback_end_time", 0.0)) < getattr(self, "echo_mute_cooldown_s", 0.65)
+            if self._is_playback_active or is_cooldown_now:
+                with self._lock:
+                    if self._wake_listening or self._wake_audio_buffer:
+                        self._wake_listening = False
+                        self._wake_audio_buffer.clear()
+                    if self._fallback_speaking or self._fallback_audio_buffer:
+                        self._fallback_speaking = False
+                        self._fallback_audio_buffer.clear()
                 return
 
-            # ====================================================================
-            # ACTIVE MODE: Interaction timestamp & State Tracking
-            # ====================================================================
-            # Playback & Echo Cooldown State Determination
-            # P0-7: Barge-in is only evaluated during active audio playback
-            is_active_playback = bool(self._is_playback_active)
-            if is_active_playback:
-                self._last_interaction_time = now
+            if raw_16k:
+                wake_min_rms = float(os.getenv("WAKE_MIN_RMS", "120.0"))
+                wake_min_peak = int(os.getenv("WAKE_MIN_PEAK", "350"))
+                is_speech_energy = (local_rms > max(wake_min_rms, self._ambient_rms * 1.20) and peak_val > wake_min_peak)
+                if is_speech_energy:
+                    self._wake_last_voice_time = now
+                    if not self._wake_listening:
+                        self._wake_listening = True
+                        with self._lock:
+                            # 18 pre-roll frames (360ms) ensures full initial syllable (e.g. "Hey") is preserved
+                            pre_frames = list(self._user_speech_audio_buffer[-18:]) if len(self._user_speech_audio_buffer) >= 18 else list(self._user_speech_audio_buffer)
+                        self._wake_audio_buffer = list(pre_frames) + [raw_16k]
+                    else:
+                        self._wake_audio_buffer.append(raw_16k)
+                        max_wake_s = float(os.getenv("WAKE_MAX_UTTERANCE_S", "12.0"))
+                        if (len(self._wake_audio_buffer) * 0.020) >= max_wake_s:
+                            self._flush_wake_buffer(reason="max_utterance")
+                elif self._wake_listening:
+                    self._wake_audio_buffer.append(raw_16k)
+                    # Silence pause (0.50s after speech ends) triggers wake verification
+                    if (now - self._wake_last_voice_time) > 0.50:
+                        self._flush_wake_buffer(reason="silence")
+            return
 
-            # ReSpeaker Hardware AEC Barge-In & State Tracking (Hardware AEC on Channel 0)
-            if is_active_playback:
-                playback_start = getattr(self, "_playback_start_monotonic", 0.0)
-                prot_ms = 60.0  # Ignore brief DAC startup click transient (<= 60ms)
+        # ====================================================================
+        # ACTIVE MODE: Interaction timestamp & State Tracking
+        # ====================================================================
+        # Playback & Echo Cooldown State Determination
+        # P0-7: Barge-in is only evaluated during active audio playback
+        is_active_playback = bool(self._is_playback_active)
+        if is_active_playback:
+            self._last_interaction_time = now
 
-                # 1. Acoustic Protection Window: Ignore brief DAC power-on click
-                if playback_start > 0.0 and ((now - playback_start) * 1000.0 < prot_ms):
-                    self._barge_in_consecutive_frames = 0
-                    with self._lock:
-                        if self._fallback_speaking or self._fallback_audio_buffer:
-                            self._fallback_speaking = False
-                            self._fallback_audio_buffer.clear()
-                    return
+        # ReSpeaker Hardware AEC Barge-In & State Tracking (Hardware AEC on Channel 0)
+        if is_active_playback:
+            playback_start = getattr(self, "_playback_start_monotonic", 0.0)
+            prot_ms = 60.0  # Ignore brief DAC startup click transient (<= 60ms)
 
-                # Target barge-in threshold: With ReSpeaker Hardware AEC on Channel 0,
-                # natural user voice easily exceeds ambient noise floor.
-                ambient_val = float(getattr(self, "_ambient_rms", 120.0))
-                target_barge_in_rms = max(280.0, ambient_val * 1.3)
-                target_barge_in_peak = 600
-
-                # Compute self-voice score against current playback reference
-                self_voice_score = 0.0
-                if getattr(self, "_playback_ref_pcm", None) and raw_16k:
-                    try:
-                        self_voice_score = compute_pcm_self_voice_score(raw_16k, self._playback_ref_pcm)
-                    except Exception:
-                        self_voice_score = 0.0
-
-                # 2. Energy threshold check
-                is_loud = (local_rms >= target_barge_in_rms and peak_val >= target_barge_in_peak)
-                if is_loud:
-                    self._barge_in_consecutive_frames += 1
-                else:
-                    self._barge_in_consecutive_frames = max(0, self._barge_in_consecutive_frames - 1)
-
-                speech_duration_ms = self._barge_in_consecutive_frames * 20
-                speech_continuity_ms = speech_duration_ms
-                
-                # With hardware AEC active on Channel 0, 60ms human voice continuity confirms barge-in
-                min_speech_ms = 60.0
-                if speech_duration_ms < min_speech_ms:
-                    if local_rms >= target_barge_in_rms and peak_val >= target_barge_in_peak:
-                        is_vad_active = getattr(self, "_vad_active", False)
-                        is_human_candidate = is_vad_active
-                        # Transient noise is an isolated impulse (<40ms) when VAD does not detect human voice
-                        is_transient = (speech_duration_ms < 40) and not is_human_candidate
-                        reason = "transient_noise" if is_transient else "insufficient_speech_duration"
-                        self.get_logger().debug(
-                            f"[BARGE-IN DECISION]\n"
-                            f"playback_active=true\n"
-                            f"vad_confidence={1.0 if getattr(self, '_vad_active', False) else 0.0:.2f}\n"
-                            f"speech_duration_ms={speech_duration_ms}\n"
-                            f"speech_continuity_ms={speech_continuity_ms}\n"
-                            f"rms={local_rms:.0f}\n"
-                            f"peak={peak_val}\n"
-                            f"self_voice_score={self_voice_score:.2f}\n"
-                            f"transient_noise={'true' if is_transient else 'false'}\n"
-                            f"speech_confirmed=false\n"
-                            f"decision=false\n"
-                            f"reason={reason}"
-                        )
-                    with self._lock:
-                        if self._fallback_speaking or self._fallback_audio_buffer:
-                            self._fallback_speaking = False
-                            self._fallback_audio_buffer.clear()
-                    return
-
-                # 5. Barge-In Latch
-                if self._barge_in_latched:
-                    return
-                self._barge_in_latched = True
+            # 1. Acoustic Protection Window: Ignore brief DAC power-on click
+            if playback_start > 0.0 and ((now - playback_start) * 1000.0 < prot_ms):
                 self._barge_in_consecutive_frames = 0
-                self._is_playback_active = False
-                self._is_responding = False
-                barge_in_after_ms = int((now - playback_start) * 1000.0) if playback_start > 0.0 else int(self.barge_in_protection_ms + 100)
+                with self._lock:
+                    if self._fallback_speaking or self._fallback_audio_buffer:
+                        self._fallback_speaking = False
+                        self._fallback_audio_buffer.clear()
+                return
 
-                self.get_logger().info(
-                    f"[BARGE-IN DECISION]\n"
-                    f"playback_active=true\n"
-                    f"vad_confidence={1.0 if getattr(self, '_vad_active', False) else 0.0:.2f}\n"
-                    f"speech_duration_ms={speech_duration_ms}\n"
-                    f"speech_continuity_ms={speech_continuity_ms}\n"
-                    f"rms={local_rms:.0f}\n"
-                    f"peak={peak_val}\n"
-                    f"self_voice_score={self_voice_score:.2f}\n"
-                    f"transient_noise=false\n"
-                    f"speech_confirmed=true\n"
-                    f"decision=true\n"
-                    f"reason=human_speech_confirmed"
-                )
+            # Target barge-in threshold: With ReSpeaker Hardware AEC on Channel 0,
+            # natural user voice easily exceeds ambient noise floor.
+            ambient_val = float(getattr(self, "_ambient_rms", 120.0))
+            target_barge_in_rms = max(280.0, ambient_val * 1.3)
+            target_barge_in_peak = 600
+
+            # Compute self-voice score against current playback reference
+            self_voice_score = 0.0
+            if getattr(self, "_playback_ref_pcm", None) and raw_16k:
+                try:
+                    self_voice_score = compute_pcm_self_voice_score(raw_16k, self._playback_ref_pcm)
+                except Exception:
+                    self_voice_score = 0.0
+
+            # 2. Energy threshold check
+            is_loud = (local_rms >= target_barge_in_rms and peak_val >= target_barge_in_peak)
+            if is_loud:
+                self._barge_in_consecutive_frames += 1
+            else:
+                self._barge_in_consecutive_frames = max(0, self._barge_in_consecutive_frames - 1)
+
+            speech_duration_ms = self._barge_in_consecutive_frames * 20
+            speech_continuity_ms = speech_duration_ms
+            
+            # With hardware AEC active on Channel 0, 60ms human voice continuity confirms barge-in
+            min_speech_ms = 60.0
+            if speech_duration_ms < min_speech_ms:
+                if local_rms >= target_barge_in_rms and peak_val >= target_barge_in_peak:
+                    is_vad_active = getattr(self, "_vad_active", False)
+                    is_human_candidate = is_vad_active
+                    # Transient noise is an isolated impulse (<40ms) when VAD does not detect human voice
+                    is_transient = (speech_duration_ms < 40) and not is_human_candidate
+                    reason = "transient_noise" if is_transient else "insufficient_speech_duration"
+                    self.get_logger().debug(
+                        f"[BARGE-IN DECISION]\n"
+                        f"playback_active=true\n"
+                        f"vad_confidence={1.0 if getattr(self, '_vad_active', False) else 0.0:.2f}\n"
+                        f"speech_duration_ms={speech_duration_ms}\n"
+                        f"speech_continuity_ms={speech_continuity_ms}\n"
+                        f"rms={local_rms:.0f}\n"
+                        f"peak={peak_val}\n"
+                        f"self_voice_score={self_voice_score:.2f}\n"
+                        f"transient_noise={'true' if is_transient else 'false'}\n"
+                        f"speech_confirmed=false\n"
+                        f"decision=false\n"
+                        f"reason={reason}"
+                    )
+                with self._lock:
+                    if self._fallback_speaking or self._fallback_audio_buffer:
+                        self._fallback_speaking = False
+                        self._fallback_audio_buffer.clear()
+                return
+
+            # 5. Barge-In Latch
+            if self._barge_in_latched:
+                return
+            self._barge_in_latched = True
+            self._barge_in_consecutive_frames = 0
+            self._is_playback_active = False
+            self._is_responding = False
+            barge_in_after_ms = int((now - playback_start) * 1000.0) if playback_start > 0.0 else int(self.barge_in_protection_ms + 100)
+
+            self.get_logger().info(
+                f"[BARGE-IN DECISION]\n"
+                f"playback_active=true\n"
+                f"vad_confidence={1.0 if getattr(self, '_vad_active', False) else 0.0:.2f}\n"
+                f"speech_duration_ms={speech_duration_ms}\n"
+                f"speech_continuity_ms={speech_continuity_ms}\n"
+                f"rms={local_rms:.0f}\n"
+                f"peak={peak_val}\n"
+                f"self_voice_score={self_voice_score:.2f}\n"
+                f"transient_noise=false\n"
+                f"speech_confirmed=true\n"
+                f"decision=true\n"
+                f"reason=human_speech_confirmed"
+            )
 
             # 6. Actuate Cancellation: Cancel ongoing audio and speech pipeline
             if getattr(self, "_fallback_mode", False) or not self._can_use_openai("realtime"):
