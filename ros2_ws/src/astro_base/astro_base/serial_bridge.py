@@ -987,6 +987,8 @@ class SerialBridge(Node):
                 self._mark_disconnected()
                 time.sleep(0.5)
             except Exception as exc:
+                if not rclpy.ok():
+                    break
                 self.get_logger().error(f"[SERIAL RX THREAD EXCEPTION] Unexpected error: {exc}")
                 time.sleep(0.5)
 
@@ -1097,7 +1099,7 @@ def main():
     node = SerialBridge()
     try:
         rclpy.spin(node)
-    except KeyboardInterrupt as _exc:
+    except (KeyboardInterrupt, getattr(rclpy.executors, "ExternalShutdownException", KeyboardInterrupt)) as _exc:
         _LOG.debug("main: yok sayılan hata (%s)", _exc)
     finally:
         node.destroy_node()
