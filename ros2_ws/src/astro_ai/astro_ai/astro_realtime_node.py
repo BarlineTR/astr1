@@ -8373,7 +8373,9 @@ class AstroRealtimeNode(Node):
                 if not clause_text or not str(clause_text).strip():
                     return None, 0.0, 0.0, 0.0
 
+                # Pre-TTS cancellation check
                 if self._barge_in_latched or self._fallback_generation_id != current_gen_id or current_gen_id in getattr(self, "_cancelled_generation_ids", set()):
+                    self.get_logger().info(f"🛑 [TTS Request Dropped]: generation_id={current_gen_id} cancelled before TTS request. Skipping.")
                     return None, 0.0, 0.0, 0.0
 
                 allowed, reason = self.authorize_speech(
@@ -8386,6 +8388,11 @@ class AstroRealtimeNode(Node):
                     caller_reason=caller_reason,
                 )
                 if not allowed:
+                    return None, 0.0, 0.0, 0.0
+
+                # Post-authorization cancellation check
+                if self._barge_in_latched or self._fallback_generation_id != current_gen_id or current_gen_id in getattr(self, "_cancelled_generation_ids", set()):
+                    self.get_logger().info(f"🛑 [TTS Request Dropped]: generation_id={current_gen_id} cancelled after auth. Skipping.")
                     return None, 0.0, 0.0, 0.0
 
                 clean_text = response_length_gate(clause_text, user_query=user_text, max_words=35, max_sentences=2)
@@ -8406,6 +8413,12 @@ class AstroRealtimeNode(Node):
                     language=os.getenv("TTS_LANGUAGE", "tr"),
                     realtime_fallback_reason=fb_reason,
                 )
+
+                # Post-TTS immediate cancellation check
+                if self._barge_in_latched or self._fallback_generation_id != current_gen_id or current_gen_id in getattr(self, "_cancelled_generation_ids", set()):
+                    self.get_logger().info(f"🛑 [TTS Result Discarded]: generation_id={current_gen_id} was cancelled during TTS synthesis. Discarding audio.")
+                    return None, 0.0, 0.0, 0.0
+
                 active_engine = route_res.actual_provider
                 tts_source_name = route_res.source_name
                 tts_model_name = route_res.model_name
@@ -8415,6 +8428,7 @@ class AstroRealtimeNode(Node):
                 if not pcm_audio and not is_final_clause:
                     return
                 if self._barge_in_latched or self._fallback_generation_id != current_gen_id or current_gen_id in getattr(self, "_cancelled_generation_ids", set()):
+                    self.get_logger().info(f"🛑 [Playback Skipped]: generation_id={current_gen_id} is cancelled. 0 PCM enqueued.")
                     return
                 # Debug WAV & verification log on first real XTTS synthesis
                 if pcm_audio and active_engine == "xtts_gpu" and not getattr(self, "_first_xtts_debug_wav_written", False):
@@ -10380,23 +10394,27 @@ class AstroRealtimeNode(Node):
                 except Exception:
                     self_voice_score = 0.0
 
+            curr_gen_id = getattr(self, "_fallback_generation_id", 0)
+            is_vad_active = bool(getattr(self, "_vad_active", False) or getattr(self, "_user_speaking_active", False))
+            vad_confidence = float(getattr(self, "_vad_confidence", 1.0 if is_vad_active else 0.0))
+
             # 2. Self-Voice Filter (Acoustic Echo Suppression)
             # If incoming audio correlates with what Astro is playing through the speaker, it is robot self-voice!
             if self_voice_score >= 0.28:
                 self._barge_in_consecutive_frames = max(0, self._barge_in_consecutive_frames - 2)
-                self.get_logger().debug(
+                self.get_logger().info(
                     f"[BARGE-IN DECISION]\n"
                     f"playback_active=true\n"
-                    f"vad_confidence={1.0 if (getattr(self, '_vad_active', False) or getattr(self, '_user_speaking_active', False)) else 0.0:.2f}\n"
+                    f"vad_confidence={vad_confidence:.2f}\n"
                     f"speech_duration_ms={self._barge_in_consecutive_frames * 20}\n"
                     f"speech_continuity_ms={self._barge_in_consecutive_frames * 20}\n"
                     f"rms={local_rms:.0f}\n"
                     f"peak={peak_val}\n"
                     f"self_voice_score={self_voice_score:.2f}\n"
-                    f"transient_noise=false\n"
                     f"speech_confirmed=false\n"
                     f"decision=false\n"
-                    f"reason=self_voice_suppressed"
+                    f"reason=self_voice_suppressed\n"
+                    f"generation_id={curr_gen_id}"
                 )
                 with self._lock:
                     if getattr(self, "_fallback_speaking", False) or getattr(self, "_fallback_audio_buffer", None):
@@ -10420,30 +10438,28 @@ class AstroRealtimeNode(Node):
 
             speech_duration_ms = self._barge_in_consecutive_frames * 20
             speech_continuity_ms = speech_duration_ms
-            is_vad_active = bool(getattr(self, "_vad_active", False) or getattr(self, "_user_speaking_active", False))
-            min_frames_cfg = getattr(self, "barge_in_min_consecutive_frames", None)
-            is_speech_candidate = bool(is_vad_active or (local_rms >= 5000.0) or (min_frames_cfg is not None))
 
-            # 4. Active VAD & Duration Requirement during Playback:
-            # During active audio playback, physical speaker output echoes back into the microphone.
-            # Loud acoustic energy without active VAD confirmation MUST NEVER trigger barge-in!
-            if not is_speech_candidate:
+            # 4. Strict Barge-In Decision Invariant:
+            # During playback, acoustic echo enters the mic.
+            # INVARIANT: If vad_confidence <= 0.05 or not is_vad_active:
+            # High RMS/peak alone NEVER constitutes human speech.
+            # MUST strictly enforce speech_confirmed=false and decision=false.
+            if not is_vad_active or vad_confidence <= 0.05:
+                self._barge_in_consecutive_frames = 0
                 if is_loud:
-                    is_transient = (speech_duration_ms < 60)
-                    reason = "transient_noise" if is_transient else "vad_inactive_during_playback"
-                    self.get_logger().debug(
+                    self.get_logger().info(
                         f"[BARGE-IN DECISION]\n"
                         f"playback_active=true\n"
-                        f"vad_confidence=0.00\n"
-                        f"speech_duration_ms={speech_duration_ms}\n"
-                        f"speech_continuity_ms={speech_continuity_ms}\n"
+                        f"vad_confidence={vad_confidence:.2f}\n"
+                        f"speech_duration_ms=0\n"
+                        f"speech_continuity_ms=0\n"
                         f"rms={local_rms:.0f}\n"
                         f"peak={peak_val}\n"
                         f"self_voice_score={self_voice_score:.2f}\n"
-                        f"transient_noise={'true' if is_transient else 'false'}\n"
                         f"speech_confirmed=false\n"
                         f"decision=false\n"
-                        f"reason={reason}"
+                        f"reason=vad_inactive_during_playback\n"
+                        f"generation_id={curr_gen_id}"
                     )
                 with self._lock:
                     if getattr(self, "_fallback_speaking", False) or getattr(self, "_fallback_audio_buffer", None):
@@ -10452,7 +10468,8 @@ class AstroRealtimeNode(Node):
                             self._fallback_audio_buffer.clear()
                 return
 
-            # When speech candidate is valid, determine required speech duration
+            # When VAD is active, determine required speech duration
+            min_frames_cfg = getattr(self, "barge_in_min_consecutive_frames", None)
             if min_frames_cfg is not None:
                 min_speech_ms = float(min_frames_cfg * 20)
             elif self_voice_score < 0.20:
@@ -10462,21 +10479,19 @@ class AstroRealtimeNode(Node):
 
             if speech_duration_ms < min_speech_ms:
                 if is_loud:
-                    is_transient = (speech_duration_ms < 60) and not is_vad_active
-                    reason = "transient_noise" if is_transient else "insufficient_speech_duration"
-                    self.get_logger().debug(
+                    self.get_logger().info(
                         f"[BARGE-IN DECISION]\n"
                         f"playback_active=true\n"
-                        f"vad_confidence={1.0 if is_vad_active else 0.0:.2f}\n"
+                        f"vad_confidence={vad_confidence:.2f}\n"
                         f"speech_duration_ms={speech_duration_ms}\n"
                         f"speech_continuity_ms={speech_continuity_ms}\n"
                         f"rms={local_rms:.0f}\n"
                         f"peak={peak_val}\n"
                         f"self_voice_score={self_voice_score:.2f}\n"
-                        f"transient_noise={'true' if is_transient else 'false'}\n"
                         f"speech_confirmed=false\n"
                         f"decision=false\n"
-                        f"reason={reason}"
+                        f"reason=insufficient_speech_duration\n"
+                        f"generation_id={curr_gen_id}"
                     )
                 with self._lock:
                     if getattr(self, "_fallback_speaking", False) or getattr(self, "_fallback_audio_buffer", None):
@@ -10497,16 +10512,16 @@ class AstroRealtimeNode(Node):
             self.get_logger().info(
                 f"[BARGE-IN DECISION]\n"
                 f"playback_active=true\n"
-                f"vad_confidence={1.0 if is_vad_active else 0.0:.2f}\n"
+                f"vad_confidence={vad_confidence:.2f}\n"
                 f"speech_duration_ms={speech_duration_ms}\n"
                 f"speech_continuity_ms={speech_continuity_ms}\n"
                 f"rms={local_rms:.0f}\n"
                 f"peak={peak_val}\n"
                 f"self_voice_score={self_voice_score:.2f}\n"
-                f"transient_noise=false\n"
                 f"speech_confirmed=true\n"
                 f"decision=true\n"
-                f"reason=human_speech_confirmed"
+                f"reason=human_speech_confirmed\n"
+                f"generation_id={curr_gen_id}"
             )
 
             # 6. Actuate Cancellation: Cancel ongoing audio and speech pipeline
@@ -10515,18 +10530,23 @@ class AstroRealtimeNode(Node):
                 self._speech_authorization.invalidated = True
                 self._speech_authorization = None
 
-            cancelled_gen = getattr(self, "_fallback_generation_id", 0)
+            cancelled_gens = set()
+            for attr in ("_fallback_generation_id", "active_generation_id", "realtime_current_generation_id", "_current_generation_id"):
+                gid = getattr(self, attr, None)
+                if gid is not None and isinstance(gid, int):
+                    cancelled_gens.add(gid)
             if not hasattr(self, "_cancelled_generation_ids"):
                 self._cancelled_generation_ids = set()
-            self._cancelled_generation_ids.add(cancelled_gen)
-            if getattr(self, "tts_router", None) and hasattr(self.tts_router, "cancel"):
-                self.tts_router.cancel(cancelled_gen)
-            if getattr(self, "elevenlabs_engine", None) and hasattr(self.elevenlabs_engine, "cancel"):
-                self.elevenlabs_engine.cancel(cancelled_gen)
-            if getattr(self, "local_xtts", None) and hasattr(self.local_xtts, "cancel"):
-                self.local_xtts.cancel(cancelled_gen)
-            if getattr(self, "local_offline_tts", None) and hasattr(self.local_offline_tts, "cancel"):
-                self.local_offline_tts.cancel(cancelled_gen)
+            self._cancelled_generation_ids.update(cancelled_gens)
+            for gid in cancelled_gens:
+                if getattr(self, "tts_router", None) and hasattr(self.tts_router, "cancel"):
+                    self.tts_router.cancel(gid)
+                if getattr(self, "elevenlabs_engine", None) and hasattr(self.elevenlabs_engine, "cancel"):
+                    self.elevenlabs_engine.cancel(gid)
+                if getattr(self, "local_xtts", None) and hasattr(self.local_xtts, "cancel"):
+                    self.local_xtts.cancel(gid)
+                if getattr(self, "local_offline_tts", None) and hasattr(self.local_offline_tts, "cancel"):
+                    self.local_offline_tts.cancel(gid)
 
             can_use_realtime = False
             if hasattr(self, "_can_use_openai") and callable(self._can_use_openai):

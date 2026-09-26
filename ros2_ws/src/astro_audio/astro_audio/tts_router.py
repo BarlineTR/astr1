@@ -150,6 +150,25 @@ class TTSRouter:
         except Exception:
             pass
 
+    def _cancelled_result(self, generation_id: int) -> TTSRouteResult:
+        self._safe_log("info", f"🛑 [TTSRouter Cancelled]: generation_id={generation_id} is cancelled, returning 0 PCM.")
+        return TTSRouteResult(
+            pcm=None,
+            selected_provider="cancelled",
+            actual_provider="cancelled",
+            model_name="cancelled",
+            source_name="cancelled",
+            tts_state="cancelled",
+            tts_ready=False,
+            tts_healthy=False,
+            fallback_reason="generation_cancelled",
+            fallback_chain=["cancelled"],
+            duration_ms=0.0,
+            ttfa_ms=0.0,
+            infer_ms=0.0,
+            queue_wait_ms=0.0,
+        )
+
     def synthesize(
         self,
         text: str,
@@ -159,20 +178,7 @@ class TTSRouter:
     ) -> TTSRouteResult:
         """Synthesizes speech through the strict Realtime Fallback -> Edge-TTS -> Local Offline -> Emergency WAV chain."""
         if generation_id in self._cancelled_generation_ids:
-            self._safe_log("info", f"🛑 [TTSRouter Cancelled]: generation_id={generation_id} is cancelled, skipping synthesis.")
-            return TTSRouteResult(
-                pcm=None,
-                selected_provider="cancelled",
-                actual_provider="cancelled",
-                model_name="cancelled",
-                source_name="cancelled",
-                tts_state="cancelled",
-                tts_ready=False,
-                tts_healthy=False,
-                fallback_reason="generation_cancelled",
-                fallback_chain=["cancelled"],
-                duration_ms=0.0,
-            )
+            return self._cancelled_result(generation_id)
         if not text or not text.strip():
             return TTSRouteResult(
                 pcm=None,
@@ -381,6 +387,9 @@ class TTSRouter:
             tot_ms = (time.perf_counter() - t_start) * 1000.0
 
             if pcm and len(pcm) > 10:
+                if generation_id in self._cancelled_generation_ids:
+                    self._safe_log("info", f"🛑 [EDGE-TTS DISCARDED] generation_id={generation_id} was cancelled during synthesis.")
+                    return self._cancelled_result(generation_id)
                 fallback_chain.append("edge_tts")
                 self._safe_log(
                     "info",
@@ -420,6 +429,9 @@ class TTSRouter:
         else:
             fallback_chain.append("edge_tts(disabled)")
 
+        if generation_id in self._cancelled_generation_ids:
+            return self._cancelled_result(generation_id)
+
         # -------------------------------------------------------------
         # STEP 2: Local Offline TTS (Emergency Last Resort)
         # -------------------------------------------------------------
@@ -439,6 +451,9 @@ class TTSRouter:
                 tot_ms = (time.perf_counter() - t_start) * 1000.0
 
                 if pcm and len(pcm) > 10:
+                    if generation_id in self._cancelled_generation_ids:
+                        self._safe_log("info", f"🛑 [LOCAL-OFFLINE-TTS DISCARDED] generation_id={generation_id} was cancelled during synthesis.")
+                        return self._cancelled_result(generation_id)
                     fallback_chain.append("local_offline_tts")
                     self._safe_log(
                         "info",
@@ -467,6 +482,9 @@ class TTSRouter:
             except Exception as e:
                 fallback_chain.append(f"local_offline_tts(error:{e})")
                 self._safe_log("error", f"❌ [Local Offline TTS Error]: {e}")
+
+        if generation_id in self._cancelled_generation_ids:
+            return self._cancelled_result(generation_id)
 
         # -------------------------------------------------------------
         # STEP 3: Pre-Generated Emergency Audio Fallback (Zero-Silence Contract)
