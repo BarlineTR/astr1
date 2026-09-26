@@ -15,25 +15,25 @@ export default async function PanelDuzeni({ children }: { children: React.ReactN
   const oturum = await oturumGerekli();
 
   return (
-    <div className="panel">
-      <header className="panel__ust">
-        <div className="page panel__ust-ic">
+    <div className="pano">
+      <header className="pano__ust">
+        <div className="page pano__ust-ic">
           <Link className="site-header__mark" href="/">
             {SITE.name}
             <span>{SITE.version}</span>
           </Link>
 
-          <nav className="panel__nav" aria-label="Panel">
+          <nav className="pano__nav" aria-label="Panel">
             <Link href="/panel">Cihazlar</Link>
             <Link href="/panel/hesap">Hesap</Link>
           </nav>
 
-          <span className="panel__kullanici mono">{oturum.user.email}</span>
+          <span className="pano__kullanici mono">{oturum.user.email}</span>
           <CikisDugmesi className="btn btn--quiet" />
         </div>
       </header>
 
-      <main className="page panel__govde">{children}</main>
+      <main className="page pano__govde">{children}</main>
     </div>
   );
 }

@@ -22,9 +22,9 @@ export default async function PanelAnaSayfa() {
 
   return (
     <>
-      <div className="panel__baslik">
+      <div className="pano__baslik">
         <h1>Cihazlar</h1>
-        <p className="panel__lead">
+        <p className="pano__lead">
           Hesabınıza bağlı robotlar ve anlık durumları.
         </p>
       </div>

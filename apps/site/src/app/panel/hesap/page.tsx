@@ -19,9 +19,9 @@ export default async function HesapSayfasi() {
 
   return (
     <>
-      <div className="panel__baslik">
+      <div className="pano__baslik">
         <h1>Hesap</h1>
-        <p className="panel__lead">Hesap bilgileriniz ve yetki seviyeniz.</p>
+        <p className="pano__lead">Hesap bilgileriniz ve yetki seviyeniz.</p>
       </div>
 
       <dl className="kunye">
