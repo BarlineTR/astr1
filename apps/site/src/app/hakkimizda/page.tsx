@@ -1,12 +1,14 @@
 import { ABOUT } from "@/data/icerik";
 import { SayfaKabuk } from "@/components/SayfaKabuk";
+import { sayfaMetadata } from "@/lib/seo";
 
-export const metadata = {
-  title: "Hakkımızda",
-  description:
+export const metadata = sayfaMetadata({
+  baslik: "Hakkımızda",
+  aciklama:
     "İnsanla makine arasındaki etkileşimi ekrana dokunmaktan çıkarıp doğal olana " +
     "yaklaştırmaya çalışıyoruz.",
-};
+  yol: "/hakkimizda",
+});
 
 export default function HakkimizdaSayfasi() {
   return (

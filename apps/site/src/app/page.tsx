@@ -6,6 +6,16 @@ import { Gosteri } from "@/components/Gosteri";
 import { HeroBolum } from "@/components/HeroBolum";
 import { SiteFooter } from "@/components/SiteFooter";
 import { SiteHeader } from "@/components/SiteHeader";
+import { JsonLd } from "@/components/JsonLd";
+import { organizationJsonLd, productJsonLd, sayfaMetadata } from "@/lib/seo";
+
+export const metadata = sayfaMetadata({
+  baslik: "ASTRO — sosyal robot platformu",
+  aciklama:
+    "Çevresindeki insanları gören, duyan ve kiminle ilgileneceğine kendi karar " +
+    "veren robot platformu. Karşılama, bilgilendirme ve etkileşim için.",
+  yol: "/",
+});
 
 /**
  * Ana sayfa.
@@ -21,6 +31,8 @@ import { SiteHeader } from "@/components/SiteHeader";
 export default function AnaSayfa() {
   return (
     <>
+      <JsonLd data={organizationJsonLd()} />
+      <JsonLd data={productJsonLd()} />
       <SiteHeader current="ana" />
 
       <main>

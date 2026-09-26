@@ -3,16 +3,27 @@ import Link from "next/link";
 import { FEATURES, SHOWCASE } from "@/data/icerik";
 import { SayfaKabuk } from "@/components/SayfaKabuk";
 import { TeknikTablo } from "@/components/TeknikTablo";
+import { sayfaMetadata, breadcrumbJsonLd, productJsonLd } from "@/lib/seo";
+import { JsonLd } from "@/components/JsonLd";
 
-export const metadata = {
-  title: "Platform",
-  description:
+export const metadata = sayfaMetadata({
+  baslik: "Platform",
+  aciklama:
     "ASTRO V1: konuşana ve görünen kişiye dönen sosyal robot platformu. " +
     "Yetenekler, ölçülmüş çalışma sınırları ve teknik veriler.",
-};
+  yol: "/platform",
+});
 
 export default function PlatformSayfasi() {
   return (
+    <>
+      <JsonLd data={productJsonLd()} />
+      <JsonLd
+        data={breadcrumbJsonLd([
+          { ad: "Ana sayfa", yol: "/" },
+          { ad: "Platform", yol: "/platform" },
+        ])}
+      />
     <SayfaKabuk
       current="platform"
       ustBaslik="ASTRO V1"
@@ -89,5 +100,6 @@ export default function PlatformSayfasi() {
         </div>
       </section>
     </SayfaKabuk>
+    </>
   );
 }

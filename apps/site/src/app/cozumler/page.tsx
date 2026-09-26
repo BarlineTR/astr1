@@ -2,12 +2,14 @@ import Link from "next/link";
 
 import { COZUMLER } from "@/data/cozumler";
 import { SayfaKabuk } from "@/components/SayfaKabuk";
+import { sayfaMetadata } from "@/lib/seo";
 
-export const metadata = {
-  title: "Çözümler",
-  description:
+export const metadata = sayfaMetadata({
+  baslik: "Çözümler",
+  aciklama:
     "Karşılama, bilgilendirme ve eğitim senaryolarında ASTRO sosyal robot platformu.",
-};
+  yol: "/cozumler",
+});
 
 export default function CozumlerSayfasi() {
   return (

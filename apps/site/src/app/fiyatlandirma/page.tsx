@@ -3,11 +3,13 @@ import Link from "next/link";
 import { DESTEK_PAKETLERI, GELISTIRME_FIYATI, PLANLAR, type Kalem } from "@/data/fiyatlar";
 import { kurusBicimle } from "@/lib/para";
 import { SayfaKabuk } from "@/components/SayfaKabuk";
+import { sayfaMetadata } from "@/lib/seo";
 
-export const metadata = {
-  title: "Fiyatlandırma",
-  description: "Uzaktan erişim planları ve destek paketleri.",
-};
+export const metadata = sayfaMetadata({
+  baslik: "Fiyatlandırma",
+  aciklama: "Uzaktan erişim planları ve destek paketleri.",
+  yol: "/fiyatlandirma",
+});
 
 export default function FiyatlandirmaSayfasi() {
   return (

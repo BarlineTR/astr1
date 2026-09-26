@@ -1,11 +1,13 @@
 import { SayfaKabuk } from "@/components/SayfaKabuk";
 import { TeknikTablo } from "@/components/TeknikTablo";
+import { sayfaMetadata } from "@/lib/seo";
 
-export const metadata = {
-  title: "Teknoloji",
-  description:
+export const metadata = sayfaMetadata({
+  baslik: "Teknoloji",
+  aciklama:
     "Algı, sosyal bakış ve güvenlik katmanları — her iddianın ölçüm kaynağıyla birlikte.",
-};
+  yol: "/teknoloji",
+});
 
 /**
  * Teknoloji sayfası.

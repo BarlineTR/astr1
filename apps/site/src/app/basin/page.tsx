@@ -1,11 +1,13 @@
 import { BASIN } from "@/data/kurumsal";
 import { KURUM } from "@/data/kurum";
 import { SayfaKabuk } from "@/components/SayfaKabuk";
+import { sayfaMetadata } from "@/lib/seo";
 
-export const metadata = {
-  title: "Basın",
-  description: "Marka varlıkları ve kurumsal künye bilgileri.",
-};
+export const metadata = sayfaMetadata({
+  baslik: "Basın",
+  aciklama: "Marka varlıkları ve kurumsal künye bilgileri.",
+  yol: "/basin",
+});
 
 export default function BasinSayfasi() {
   return (

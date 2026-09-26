@@ -1,10 +1,12 @@
 import { YONETIM } from "@/data/kurumsal";
 import { SayfaKabuk } from "@/components/SayfaKabuk";
+import { sayfaMetadata } from "@/lib/seo";
 
-export const metadata = {
-  title: "Yönetim",
-  description: "ASTRO'yu geliştiren ekip.",
-};
+export const metadata = sayfaMetadata({
+  baslik: "Yönetim",
+  aciklama: "ASTRO'yu geliştiren ekip.",
+  yol: "/hakkimizda/yonetim",
+});
 
 export default function YonetimSayfasi() {
   return (
