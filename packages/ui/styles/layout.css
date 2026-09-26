@@ -32,14 +32,34 @@
   vertical-align: 0.35em;
 }
 
+/*
+ * Gezinme, geniş ekranda şerit; dar ekranda açılır menü.
+ *
+ * <details> kullanılıyor çünkü menünün JavaScript'e ihtiyacı olmamalı: sayfanın
+ * metni betik olmadan okunabiliyorsa gezinme de çalışmalı. Geniş ekranda düğme
+ * gizlenir ve liste açık/kapalı durumdan bağımsız olarak gösterilir.
+ */
+/*
+ * Onay kutusu ekranda görünmez ama odaklanabilir kalır: klavyeyle sekme ile
+ * ulaşılır, boşlukla açılır. Tamamen gizlemek (display:none) onu odak
+ * sırasından da düşürürdü.
+ */
+.site-menu__toggle {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  opacity: 0;
+  pointer-events: none;
+}
+.site-menu__button { display: none; }
+
 .site-nav {
   display: flex;
-  gap: var(--s-3);
   margin-left: auto;
+  gap: var(--s-3);
   font-size: var(--t-small);
   color: var(--ink-muted);
 }
-
 .site-nav a {
   text-decoration: none;
   padding-block: 0.25rem;
@@ -48,6 +68,9 @@
 
 .site-nav a:hover { color: var(--ink); }
 .site-nav a.is-current { color: var(--ink); border-bottom-color: var(--accent); }
+
+/* Şeritte ayrı bir düğmesi olan bağlantı, geniş ekranda menüde tekrarlanmaz. */
+.site-nav__only-compact { display: none; }
 
 .btn--console {
   padding: 0.8rem 1.4rem;
@@ -507,16 +530,59 @@
   font-size: var(--t-small);
 }
 
+/*
+ * Alt bilgi artık tek satır değil, sütunlu bir kurumsal alt bilgi.
+ *
+ * Önceki kural flex + space-between idi: tek satırda telif ile gezinmeyi
+ * karşılıklı koyuyordu. Sütun ızgarası onun içine konduğunda flex tarafından
+ * büzülüp dar bir şeride sıkışıyordu.
+ */
 .site-footer__inner {
   display: flex;
-  flex-wrap: wrap;
-  gap: var(--s-2) var(--s-4);
-  justify-content: space-between;
+  flex-direction: column;
 }
 
-.site-footer__nav { display: flex; flex-wrap: wrap; gap: var(--s-3); }
-.site-footer__nav a { text-decoration: none; }
-.site-footer__nav a:hover { color: var(--ink); }
+.site-footer__grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(9rem, 1fr));
+  gap: var(--s-4) var(--s-3);
+  padding-bottom: var(--s-4);
+}
+.site-footer__col { display: flex; flex-direction: column; gap: var(--s-1); align-items: start; }
+.site-footer__col a { text-decoration: none; }
+.site-footer__col a:hover { color: var(--ink); }
+
+.site-footer__head {
+  margin: 0 0 var(--s-1);
+  font-family: var(--font-mono);
+  font-size: var(--t-micro);
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--ink-faint);
+}
+
+.site-footer__base {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--s-2);
+  padding-top: var(--s-3);
+  border-top: 1px solid var(--rule);
+}
+.site-footer__base p { margin: 0; }
+
+/*
+ * Yer tutucu kurum bilgisi uyarısı.
+ *
+ * Uyarı rengiyle, çünkü fark edilmesi gerekiyor: yer tutucu bilgiyle yayına
+ * çıkmak sessizce mümkün olmamalı.
+ */
+.site-footer__uyari {
+  color: var(--warn);
+  font-family: var(--font-mono);
+  font-size: var(--t-micro);
+}
 
 .stage-fallback {
   position: absolute;
@@ -637,7 +703,58 @@
 }
 
 @media (max-width: 30rem) {
-  .site-nav { display: none; }
+
   .btn--console { padding: 0.7rem 1.1rem; font-size: var(--t-small); }
   .feature { padding: var(--s-3) var(--s-2); }
+}
+
+/* ═══════════════════════  Dar ekranda açılır menü  ═══════════════════════ */
+
+@media (max-width: 48rem) {
+  .site-menu__button {
+    display: inline-block;
+    margin-left: auto;
+    list-style: none;
+    cursor: pointer;
+    padding: 0.55rem 0.9rem;
+    border: 1px solid var(--rule-strong);
+    color: var(--ink);
+    font-family: var(--font-mono);
+    font-size: var(--t-micro);
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    user-select: none;
+  }
+  .site-menu__toggle:checked ~ .site-menu__button {
+    border-color: var(--rule-accent);
+    color: var(--accent-bright);
+  }
+  /* Onay kutusu görünmez olduğu için odak halkasını etiket taşır. */
+  .site-menu__toggle:focus-visible ~ .site-menu__button {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+  }
+
+  /*
+   * Açık menü şeridin altına düşer ve akışı itmez: içerik menü açılınca
+   * aşağı kaymamalı, yoksa ziyaretçi okuduğu yeri kaybediyor.
+   */
+  .site-nav {
+    position: absolute;
+    left: 0;
+    right: 0;
+    top: 100%;
+    z-index: 20;
+    flex-direction: column;
+    gap: 0;
+    padding: var(--s-2) var(--gutter) var(--s-3);
+    background: var(--bg-raised);
+    border-block: 1px solid var(--rule);
+    font-size: var(--t-body);
+  }
+  .site-menu__toggle:not(:checked) ~ .site-nav { display: none; }
+  .site-nav a { padding-block: var(--s-2); border-bottom: 1px solid var(--rule); }
+  .site-nav a:last-child { border-bottom: 0; }
+
+  .site-nav__only-compact { display: block; }
 }

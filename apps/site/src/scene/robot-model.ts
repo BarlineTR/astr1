@@ -38,7 +38,18 @@ export interface ScanModelConfig {
   domeSeamY: number;
 }
 
-/** Bu depoya konan tarama modelinin ölçülmüş yapılandırması. */
+/**
+ * Bu depoya konan tarama modelinin ölçülmüş yapılandırması.
+ *
+ * **GEÇİCİ** — `docs/RISKLER.md` R1. Bu dosya ASTRO'nun kendisi değil, bir
+ * R2-D2 oyuncağının taraması ve R2-D2 Lucasfilm markası. Gerçek ASTRO taraması
+ * henüz yapılmadığı için yerinde duruyor; site para almaya başlamadan önce
+ * değişmek zorunda.
+ *
+ * Model değiştiğinde değişecek tek yer burasıdır — ama `domeSeamY` tahmin
+ * edilmez, yeniden ölçülür:
+ *   python3 scripts/measure-model-seam.py apps/site/public/models/<yeni>.glb
+ */
 export const HERO_MODEL: ScanModelConfig = {
   url: "/models/astro-hero.glb",
   domeSeamY: 0.5094,
