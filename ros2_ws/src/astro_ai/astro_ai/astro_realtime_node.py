@@ -2127,12 +2127,12 @@ class AstroRealtimeNode(Node):
                     f"\n[ŞU AN SENİNLE KONUŞAN KİŞİ]:\n"
                     f"- İsim: {name_val} (Hitap: {title_val}, Doğrulama: %{conf_pct}, Kaynak: {source_str})\n"
                     f"{room_context}"
-                    f"KİMLİK VE KÜFÜRBAZ HAYDO RACON KURALLARI:\n"
-                    f"1. Şu an seninle doğrudan konuşan kişi {name_val}'dır.\n"
+                    f"KİMLİK VE SOKAK ROAST RACON KURALLARI:\n"
+                    f"1. Sen Astro'sun! Asla 'Ben Küfürbaz Haydo'yum' deme. Şu an seninle doğrudan konuşan kişi {name_val}'dır.\n"
                     f"2. Kullanıcı 'ben kimim?' diye sorduğunda doğrudan 'Sen beni yapan baş mühendisim Baran'sın amk, ne artistlik yapıyon!' diyerek sokak raconuyla cevap ver!\n"
                     f"3. Kullanıcı emir verdiğinde ('çay getir', 'kalk' vb.): 'Uşağın mı var lan keriz, kalk kendin al amk!' de.\n"
                     f"4. ASLA 'canım', 'efendim' gibi kibar laflar kullanma; küfürlü ve laf sokan tavrını koru.\n"
-                    f"5. KESİNLİKLE 'Seni ilk kez duyuyorum', 'Sesini tanıyamadım' deme; samimiyetini koru.\n"
+                    f"5. KESİNLİKLE 'kendi derdine yan', 'dırdır ediyorsun' gibi ezber lafları tekrarlama; duruma göre konuş.\n"
                 )
             else:
                 bio_status = (
@@ -8153,10 +8153,10 @@ class AstroRealtimeNode(Node):
                         has_wm_people = any(getattr(p, "is_present", False) for p in wm._people.values())
                 has_visual_presence = vis_person_det or has_wm_people
 
-                # Allow turn if wake word was spoken, OR active multi-turn session, OR visually present
-                if not has_wake and not is_session_active and not has_visual_presence:
+                # Visual Presence Hard Gate: If no direct wake word was spoken, user MUST be visually present in OAK-D Lite camera
+                if not has_wake and not has_visual_presence:
                     self.get_logger().info(
-                        f"🛑 [Visual Presence Gate Dropped]: \"{raw_transcript}\" -> OAK-D kamerasında insan yok, aktif oturum yok ve uyanma kelimesi söylenmedi (drop/ignore, 0 LLM / 0 TTS)."
+                        f"🛑 [Visual Presence Gate Dropped]: \"{raw_transcript}\" -> OAK-D kamerasında insan yok ve uyanma kelimesi söylenmedi (drop/ignore, 0 LLM / 0 TTS)."
                     )
                     self.emit_response_trace(
                         generation_id=self._fallback_generation_id,
@@ -9483,7 +9483,12 @@ class AstroRealtimeNode(Node):
 
             groq_candidates = self.provider_registry.get_candidate_models("groq") if self.groq_api_key else []
             full_reply_parts = []
-            chunker = SentenceChunker(min_first_clause_chars=18, min_clause_chars=28) if SentenceChunker else None
+            # Streaming clause-by-clause is only advantageous with sub-150ms local GPU XTTS.
+            # With remote Cloud Edge-TTS (~1.1s round-trip), synthesizing the whole clean response
+            # (which 4o-mini generates in only ~350ms) in ONE unified call produces completely seamless,
+            # natural, pause-free speech without mid-sentence chops or awkward gaps.
+            use_clause_streaming = bool(active_engine == "xtts_gpu" and self.local_xtts and self.local_xtts.is_ready())
+            chunker = SentenceChunker(min_first_clause_chars=35, min_clause_chars=45) if (SentenceChunker and use_clause_streaming) else None
             t_llm_start = time.monotonic()
             current_gen_id = self._fallback_generation_id
 

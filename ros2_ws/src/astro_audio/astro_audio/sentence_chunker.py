@@ -115,16 +115,9 @@ class SentenceChunker:
                 # Valid sentence terminal
                 return i + 1
 
-        # Priority 2: Clause Enders (, : ;) after min_len characters with trailing space
-        for i in range(min_len, len(text)):
-            char = text[i]
-            if char in {",", ":", ";"}:
-                if i + 1 < len(text) and text[i + 1].isspace():
-                    return i + 1
-
-        # Priority 3: Soft split if buffer is excessively long (> 75 chars) on whitespace
-        if len(text) > 75:
-            last_space = text[:75].rfind(" ")
+        # Priority 2: Soft split only if buffer is excessively long (> 90 chars) on whitespace
+        if len(text) > 90:
+            last_space = text[:90].rfind(" ")
             if last_space > min_len:
                 return last_space + 1
 
