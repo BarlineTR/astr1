@@ -158,6 +158,9 @@ class ConsciousnessNode(Node):
             "last_sensor_update_ts": time.time(),
         }
 
+        self._last_face_seen_ts: float = 0.0
+        self._cached_face_data: List[Dict[str, Any]] = []
+
         # Telemetry & Timing
         self._last_telemetry_ts = 0.0
         self._telemetry_interval_s = 0.5  # 2 Hz telemetry
@@ -230,25 +233,42 @@ class ConsciousnessNode(Node):
         has_faces = len(face_data) > 0
         with self._lock:
             prev = self._sensor_cache["person_detected"]
-            self._sensor_cache["faces_json"] = raw_txt
-            self._sensor_cache["person_detected"] = has_faces
+            if has_faces:
+                self._last_face_seen_ts = now
+                self._cached_face_data = face_data
+                self._sensor_cache["faces_json"] = raw_txt
+                self._sensor_cache["person_detected"] = True
+                active_faces = face_data
+            else:
+                # 3.0s temporal coasting window before declaring person gone
+                time_since_face = now - getattr(self, "_last_face_seen_ts", 0.0)
+                if time_since_face < 3.0 and self._cached_face_data:
+                    self._sensor_cache["person_detected"] = True
+                    active_faces = self._cached_face_data
+                else:
+                    self._sensor_cache["faces_json"] = "[]"
+                    self._sensor_cache["person_detected"] = False
+                    self._cached_face_data = []
+                    active_faces = []
+
             self._sensor_cache["last_sensor_update_ts"] = now
             self.spatial_fusion.update_vision_perception(
-                faces=face_data,
+                faces=active_faces,
                 looking_at_robot=self._sensor_cache.get("looking_at_robot", False),
             )
+            curr = self._sensor_cache["person_detected"]
 
         self.loop.event_detector.notify_sensor_active("camera", now)
 
-        # Emit perception events on state transitions if not already triggered by /vision/person_detected
-        if has_faces and not prev:
+        # Emit perception events on state transitions
+        if curr and not prev:
             self.get_logger().info("👁️ [Bilinç: Görme Algısı] Kamera görüş alanında kişi algılandı")
             self.event_bus.create_and_publish(
                 event_type=CognitiveEventType.PERSON_APPEARED,
                 source="vision",
                 data={"timestamp": now},
             )
-        elif not has_faces and prev:
+        elif not curr and prev:
             self.get_logger().info("👁️ [Bilinç: Görme Algısı] Kişi kamera görüş alanından ayrıldı")
             self.event_bus.create_and_publish(
                 event_type=CognitiveEventType.PERSON_DISAPPEARED,
@@ -270,23 +290,28 @@ class ConsciousnessNode(Node):
 
     def _on_person_detected_msg(self, msg: Any) -> None:
         val = bool(getattr(msg, "data", False))
-        prev = self._sensor_cache["person_detected"]
         now = time.time()
         with self._lock:
-            self._sensor_cache["person_detected"] = val
+            prev = self._sensor_cache["person_detected"]
+            if val:
+                self._last_face_seen_ts = now
+                self._sensor_cache["person_detected"] = True
+            elif (now - getattr(self, "_last_face_seen_ts", 0.0)) >= 3.0:
+                self._sensor_cache["person_detected"] = False
             self._sensor_cache["last_sensor_update_ts"] = now
+            curr = self._sensor_cache["person_detected"]
 
         self.loop.event_detector.notify_sensor_active("camera", now)
 
         # Emit perception events on state transitions
-        if val and not prev:
+        if curr and not prev:
             self.get_logger().info("👁️ [Bilinç: Görme Algısı] Kamera görüş alanında kişi algılandı")
             self.event_bus.create_and_publish(
                 event_type=CognitiveEventType.PERSON_APPEARED,
                 source="vision",
                 data={"timestamp": now},
             )
-        elif not val and prev:
+        elif not curr and prev:
             self.get_logger().info("👁️ [Bilinç: Görme Algısı] Kişi kamera görüş alanından ayrıldı")
             self.event_bus.create_and_publish(
                 event_type=CognitiveEventType.PERSON_DISAPPEARED,

@@ -529,6 +529,10 @@ class StandaloneGazeRosNode(Node):
         self._last_faces_published_count: int = 0
         self._last_person_detected_published: Optional[bool] = None
         self._last_looking_published: Optional[bool] = None
+        self._last_face_payload: Optional[Dict[str, Any]] = None
+        self._last_face_payload_time: float = 0.0
+        self._no_detections_since: float = 0.0
+        self._last_faces_stream_time: float = 0.0
 
         # Subscriptions (Authoritative Feedback & Diagnostic Only - NO ROS Vision Topics)
         qos_best_effort = QoSProfile(depth=10, reliability=ReliabilityPolicy.BEST_EFFORT)
@@ -888,12 +892,53 @@ class StandaloneGazeRosNode(Node):
                 detections = self.camera.detect(frame)
                 self._maybe_recognize_face(frame, detections)
                 self._maybe_detect_objects(frame)
-                if not detections and getattr(self, "_last_faces_published_count", 0) > 0:
-                    if getattr(self, "pub_faces", None):
-                        f_msg = String()
-                        f_msg.data = "[]"
-                        self.pub_faces.publish(f_msg)
-                    self._last_faces_published_count = 0
+                now_frame = time.monotonic()
+                if detections:
+                    self._no_detections_since = 0.0
+                    if (now_frame - getattr(self, "_last_faces_stream_time", 0.0)) >= 0.10:  # 10 Hz steady face stream
+                        self._last_faces_stream_time = now_frame
+                        if getattr(self, "pub_faces", None):
+                            best_det = max(detections, key=lambda d: d.w * d.h)
+                            cached = getattr(self, "_last_face_payload", None)
+                            cached_time = getattr(self, "_last_face_payload_time", 0.0)
+                            if cached and (now_frame - cached_time) < 45.0:
+                                name_val = cached.get("name", "Misafir")
+                                formal_val = cached.get("formal_title", name_val)
+                                is_known_val = cached.get("is_known", False)
+                                conf_val = cached.get("confidence", 0.85)
+                            else:
+                                name_val = "Misafir"
+                                formal_val = "Misafir"
+                                is_known_val = False
+                                conf_val = 0.0
+
+                            faces_list = [{
+                                "name": name_val,
+                                "recognized_name": name_val,
+                                "recognized_title": formal_val,
+                                "person_id": name_val.lower(),
+                                "is_known": is_known_val,
+                                "confidence": conf_val,
+                                "x": int(best_det.x),
+                                "y": int(best_det.y),
+                                "width": int(best_det.w),
+                                "height": int(best_det.h),
+                                "distance_m": float(getattr(self, "_last_estimated_dist", 1.5) or 1.5),
+                                "looking_at_robot": bool(getattr(best_det, "is_looking", False)),
+                            }]
+                            f_msg = String()
+                            f_msg.data = json.dumps(faces_list)
+                            self.pub_faces.publish(f_msg)
+                            self._last_faces_published_count = len(faces_list)
+                else:
+                    if self._no_detections_since == 0.0:
+                        self._no_detections_since = now_frame
+                    elif (now_frame - self._no_detections_since) >= 2.5 and getattr(self, "_last_faces_published_count", 0) > 0:
+                        if getattr(self, "pub_faces", None):
+                            f_msg = String()
+                            f_msg.data = "[]"
+                            self.pub_faces.publish(f_msg)
+                        self._last_faces_published_count = 0
                 t_detect_done = time.monotonic()
                 frame_h, frame_w = frame.shape[:2]
 
@@ -978,6 +1023,8 @@ class StandaloneGazeRosNode(Node):
                             "title": "Misafir",
                             "formal_title": "Misafir"
                         }
+                    self._last_face_payload = payload
+                    self._last_face_payload_time = time.monotonic()
                     msg = String()
                     msg.data = json.dumps(payload)
                     if getattr(self, "pub_recognized_person", None):

@@ -1151,7 +1151,7 @@ class AstroRealtimeNode(Node):
         self._last_vision_distance_time: float = 0.0
         self._last_vision_looking_time: float = 0.0
         self._last_vision_faces_time: float = 0.0
-        self.visual_evidence_ttl_s: float = float(os.getenv("VISUAL_EVIDENCE_TTL_S", "2.5"))
+        self.visual_evidence_ttl_s: float = float(os.getenv("VISUAL_EVIDENCE_TTL_S", "15.0"))
         # Single output owner for /head_command is social_gaze_node
         self.pub_telemetry = self.create_publisher(String, "/astro/telemetry", 10)
         self.pub_diagnostics = self.create_publisher(DiagnosticArray, "/diagnostics", 10)
@@ -1278,9 +1278,10 @@ class AstroRealtimeNode(Node):
         try:
             now_mono = time.monotonic()
             last_face_time = getattr(self, "_last_vision_faces_time", 0.0)
-            has_fresh_visual_face = (now_mono - last_face_time) <= 1.5
+            has_direct_person = getattr(self, "_recognized_person", None) is not None
+            has_fresh_visual_face = (last_face_time == 0.0 and has_direct_person) or ((now_mono - last_face_time) <= 4.0)
 
-            if not has_fresh_visual_face:
+            if not has_fresh_visual_face and last_face_time > 0.0 and (now_mono - last_face_time) > 4.0:
                 with self._lock:
                     self._recognized_person = None
                     self._user_distance = 0.0
@@ -2062,19 +2063,22 @@ class AstroRealtimeNode(Node):
     def is_visual_evidence_fresh(self, now: Optional[float] = None) -> bool:
         """Checks whether recent OAK-D visual face or distance evidence is fresh within visual_evidence_ttl_s."""
         t = now if now is not None else time.monotonic()
-        ttl = getattr(self, "visual_evidence_ttl_s", 2.5)
+        ttl = getattr(self, "visual_evidence_ttl_s", 15.0)
         last_d = getattr(self, "_last_vision_distance_time", 0.0)
         last_l = getattr(self, "_last_vision_looking_time", 0.0)
         last_f = getattr(self, "_last_vision_faces_time", 0.0)
         dist_fresh = bool(last_d > 0.0 and (t - last_d) <= ttl and getattr(self, "_user_distance", 0.0) > 0.1)
         look_fresh = bool(last_l > 0.0 and (t - last_l) <= ttl and getattr(self, "_looking_at_robot", False))
         faces_fresh = bool(last_f > 0.0 and (t - last_f) <= ttl)
+        has_direct_evidence = bool(getattr(self, "_recognized_person", None) is not None or getattr(self, "_user_distance", 0.0) > 0.1)
+        if last_f == 0.0 and last_d == 0.0 and last_l == 0.0 and has_direct_evidence:
+            return True
         return dist_fresh or look_fresh or faces_fresh
 
     def get_fresh_visual_distance(self, now: Optional[float] = None) -> float:
         """Returns visual distance if fresh within visual_evidence_ttl_s, else 0.0."""
         t = now if now is not None else time.monotonic()
-        ttl = getattr(self, "visual_evidence_ttl_s", 2.5)
+        ttl = getattr(self, "visual_evidence_ttl_s", 15.0)
         last_d = getattr(self, "_last_vision_distance_time", 0.0)
         if last_d > 0.0 and (t - last_d) <= ttl:
             return float(getattr(self, "_user_distance", 0.0))
@@ -2083,7 +2087,7 @@ class AstroRealtimeNode(Node):
     def get_fresh_looking_at_robot(self, now: Optional[float] = None) -> bool:
         """Returns gaze looking state if fresh within visual_evidence_ttl_s, else False."""
         t = now if now is not None else time.monotonic()
-        ttl = getattr(self, "visual_evidence_ttl_s", 2.5)
+        ttl = getattr(self, "visual_evidence_ttl_s", 15.0)
         last_l = getattr(self, "_last_vision_looking_time", 0.0)
         if last_l > 0.0 and (t - last_l) <= ttl:
             return bool(getattr(self, "_looking_at_robot", False))
@@ -8315,6 +8319,16 @@ class AstroRealtimeNode(Node):
                     spk_score = 0.80
                     spk_source = "session_hold"
                     spk_known = True
+                elif identity.get("is_known") and identity.get("name") and str(identity.get("name")).lower() != "misafir":
+                    spk_name = identity.get("name")
+                    spk_score = float(identity.get("confidence", 0.85))
+                    spk_source = str(identity.get("identity_source", "session_identity"))
+                    spk_known = True
+                elif getattr(self, "_active_person_name", None) and (time.monotonic() < getattr(self, "_person_hold_until", 0.0)) and self._active_person_name.lower() != "misafir":
+                    spk_name = self._active_person_name
+                    spk_score = 0.85
+                    spk_source = "active_person_hold"
+                    spk_known = True
                 else:
                     spk_name = None
                     spk_known = False
@@ -10782,15 +10796,19 @@ class AstroRealtimeNode(Node):
             if not raw:
                 return
             faces_data = json.loads(raw)
+            now_mono = time.monotonic()
             if not isinstance(faces_data, list) or len(faces_data) == 0:
-                with self._lock:
-                    self._recognized_person = None
-                    self._user_distance = 0.0
-                    self._looking_at_robot = False
-                if getattr(self, "social_brain", None) and hasattr(self.social_brain, "world_model"):
-                    self.social_brain.world_model.update_people([], now=time.time())
-                    if hasattr(self.social_brain, "attention_manager"):
-                        self.social_brain.attention_manager.select_focus_target([])
+                # 4.0s temporal coasting window before wiping face presence
+                last_seen = getattr(self, "_last_vision_faces_time", 0.0)
+                if (now_mono - last_seen) > 4.0:
+                    with self._lock:
+                        self._recognized_person = None
+                        self._user_distance = 0.0
+                        self._looking_at_robot = False
+                    if getattr(self, "social_brain", None) and hasattr(self.social_brain, "world_model"):
+                        self.social_brain.world_model.update_people([], now=time.time())
+                        if hasattr(self.social_brain, "attention_manager"):
+                            self.social_brain.attention_manager.select_focus_target([])
                 return
 
             candidates: List[Any] = []
@@ -10901,6 +10919,14 @@ class AstroRealtimeNode(Node):
                             if chosen.is_known and chosen.name.lower() != "misafir":
                                 self._active_person_name = chosen.name
                                 self._person_hold_until = now_mono + 30.0
+                                if not self._recognized_person or self._recognized_person.get("name") != chosen.name:
+                                    self._recognized_person = {
+                                        "name": chosen.name,
+                                        "is_known": True,
+                                        "title": getattr(chosen, "formal_title", chosen.name),
+                                        "formal_title": getattr(chosen, "formal_title", chosen.name),
+                                        "confidence": chosen.identity_confidence,
+                                    }
                             self._user_distance = chosen.distance_m
                             self._looking_at_robot = chosen.is_looking_at_robot
                             self._last_vision_faces_time = now_mono
@@ -11375,8 +11401,10 @@ class AstroRealtimeNode(Node):
         last_f = getattr(self, "_oak_last_frame_time", 0.0)
         last_info = getattr(self, "_oak_last_camera_info_time", 0.0)
         last_face = getattr(self, "_last_vision_faces_time", 0.0)
-        # Visual frame freshness: prioritize live camera frame stream (last_f), then camera_info, then face detection
-        ref_t = last_f if last_f > 0.0 else (last_info if last_info > 0.0 else last_face)
+        last_dist = getattr(self, "_last_vision_distance_time", 0.0)
+        last_look = getattr(self, "_last_vision_looking_time", 0.0)
+        # Visual frame freshness: compute ref_t from the freshest visual evidence stream
+        ref_t = max(last_f, last_info, last_face, last_dist, last_look)
         visual_age_ms = int((now - ref_t) * 1000.0) if ref_t > 0.0 else -1
 
         cam_fresh = False
@@ -11385,14 +11413,17 @@ class AstroRealtimeNode(Node):
             if visual_age_ms < 0:
                 visual_age_ms = 10
         else:
-            has_recent_frame = (last_f > 0.0 and (now - last_f) < 4.0)
-            has_recent_info = (last_info > 0.0 and (now - last_info) < 4.0)
+            has_recent_frame = (last_f > 0.0 and (now - last_f) < 15.0)
+            has_recent_info = (last_info > 0.0 and (now - last_info) < 15.0)
+            has_recent_face = (last_face > 0.0 and (now - last_face) < 15.0)
+            has_recent_dist = (last_dist > 0.0 and (now - last_dist) < 15.0)
+            has_recent_look = (last_look > 0.0 and (now - last_look) < 15.0)
             has_frame_obj = getattr(self, "_latest_camera_frame", None) is not None
-            cam_fresh = bool(oak_state == "CONNECTED" or has_recent_frame or has_recent_info or has_frame_obj)
+            cam_fresh = bool(oak_state == "CONNECTED" or has_recent_frame or has_recent_info or has_recent_face or has_recent_dist or has_recent_look or has_frame_obj)
 
         if not cam_fresh or ref_t <= 0.0:
             visual_state = "UNKNOWN"
-        elif visual_age_ms > 4000:
+        elif visual_age_ms > 15000:
             visual_state = "STALE"
         else:
             visual_state = "FRESH"
@@ -11445,7 +11476,7 @@ class AstroRealtimeNode(Node):
                 pass
 
         # Fallback to direct vision topic state if fresh
-        if not person_detected and (self.is_visual_evidence_fresh(now=now) or (last_face > 0.0 and (now - last_face) < 4.0)):
+        if not person_detected and (self.is_visual_evidence_fresh(now=now) or (last_face > 0.0 and (now - last_face) < 15.0)):
             person_detected = True
             v_dist = self.get_fresh_visual_distance(now=now) or getattr(self, "_user_distance", 0.0)
             if v_dist > 0.1:
@@ -11454,6 +11485,11 @@ class AstroRealtimeNode(Node):
             rec_p = getattr(self, "_recognized_person", {})
             if isinstance(rec_p, dict) and rec_p.get("name") and rec_p.get("name", "").lower() != "misafir":
                 target_name = rec_p.get("name")
+            if not target_name:
+                held_name = getattr(self, "_active_person_name", "")
+                held_until = getattr(self, "_person_hold_until", 0.0)
+                if held_name and held_name.lower() != "misafir" and now < held_until:
+                    target_name = held_name
             if target_id == "none":
                 target_id = "person_1"
 
