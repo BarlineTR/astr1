@@ -1,3 +1,11 @@
+# Yerel geliştirme ve tek VPS'e taşıma yığını.
+#
+# Geliştirmede yalnızca `db` gerekiyor:
+#   docker compose -f docker/compose.yaml up -d db
+#
+# Tam yığını denemek için (tasarım belgesi D4'teki taşıma yolu):
+#   docker compose -f docker/compose.yaml --profile tam up --build
+
 services:
   db:
     image: postgres:16-alpine
@@ -13,6 +21,28 @@ services:
       test: ["CMD-SHELL", "pg_isready -U astro"]
       interval: 5s
       retries: 10
+
+  site:
+    profiles: ["tam"]
+    build:
+      context: ..
+      dockerfile: docker/site.Dockerfile
+    environment:
+      DATABASE_URL: postgres://astro:astro@db:5432/astro
+      BETTER_AUTH_SECRET: ${BETTER_AUTH_SECRET:?BETTER_AUTH_SECRET verilmeli}
+      BETTER_AUTH_URL: ${SITE_URL:-http://localhost:3000}
+      NEXT_PUBLIC_SITE_URL: ${SITE_URL:-http://localhost:3000}
+    ports: ["3000:3000"]
+    depends_on:
+      db:
+        condition: service_healthy
+
+  gateway:
+    profiles: ["tam"]
+    build:
+      context: ..
+      dockerfile: docker/gateway.Dockerfile
+    ports: ["8420:8420"]
 
 volumes:
   astro-db:

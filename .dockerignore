@@ -1,0 +1,14 @@
+node_modules
+**/node_modules
+.next
+**/.next
+dist
+**/dist
+.git
+.tsbuild
+**/.tsbuild
+test-results
+playwright-report
+.env
+.env.local
+.vercel

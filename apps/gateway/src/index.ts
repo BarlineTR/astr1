@@ -1,8 +1,3 @@
-import { existsSync } from "node:fs";
-import { fileURLToPath } from "node:url";
-import { dirname, join, parse } from "node:path";
-
-import fastifyStatic from "@fastify/static";
 import fastifyWebsocket from "@fastify/websocket";
 import Fastify from "fastify";
 
@@ -12,34 +7,6 @@ import type { ServerMessage } from "@astro/protocol";
 import { parseCommand } from "./command";
 import { MockSource } from "./telemetry/mock";
 import type { TelemetrySource } from "./telemetry/source";
-
-/**
- * İstemcinin derlenmiş çıktısını bulur.
- *
- * Sabit bir göreli yol yazılamaz: `tsx` ile kaynaktan koşarken bu dosya
- * `server/src` içindedir, derlendikten sonra `server/dist/server/src` içinde.
- * Yukarı doğru yürüyüp `client/dist`i aramak iki durumda da çalışır ve
- * bulunamadığında sessizce boş sayfa yerine anlaşılır bir hata verir.
- */
-function findClientDist(): string {
-  const override = process.env.CLIENT_DIST;
-  if (override) return override;
-
-  let current = dirname(fileURLToPath(import.meta.url));
-  const { root } = parse(current);
-  while (true) {
-    const candidate = join(current, "client/dist");
-    if (existsSync(candidate)) return candidate;
-    if (current === root) break;
-    current = dirname(current);
-  }
-  throw new Error(
-    "client/dist bulunamadı. Önce `npm run build --workspace=client` çalıştırın " +
-      "ya da CLIENT_DIST ortam değişkenini verin.",
-  );
-}
-
-const CLIENT_DIST = findClientDist();
 
 const PORT = Number(process.env.PORT ?? 8420);
 const HOST = process.env.HOST ?? "0.0.0.0";
@@ -56,21 +23,8 @@ const source: TelemetrySource = new MockSource();
 const app = Fastify({ logger: { level: process.env.LOG_LEVEL ?? "info" } });
 
 await app.register(fastifyWebsocket);
-await app.register(fastifyStatic, { root: CLIENT_DIST });
 
 app.get("/saglik", async () => ({ ok: true, kaynak: "mock" }));
-
-/**
- * Temiz adresler. Vercel bunu `cleanUrls` ile kendisi yapar; yerel sunucunun
- * aynı adresleri vermesi, iki ortamda farklı bağlantılar denemek zorunda
- * kalmamak için gerekli.
- */
-for (const [route, file] of [
-  ["/hakkimizda", "hakkimizda.html"],
-  ["/konsol", "konsol.html"],
-] as const) {
-  app.get(route, (_request, reply) => reply.sendFile(file));
-}
 
 app.get("/ws", { websocket: true }, (socket) => {
   const hello: ServerMessage = {

@@ -1,0 +1,65 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  dogrula:
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: astro
+          POSTGRES_PASSWORD: astro
+          POSTGRES_DB: astro
+        ports: ["5433:5432"]
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      DATABASE_URL: postgres://astro:astro@localhost:5433/astro
+      BETTER_AUTH_SECRET: ci-testleri-icin-sabit-sir-degeri-degistirmeyin
+      BETTER_AUTH_URL: http://localhost:3000
+      NEXT_PUBLIC_SITE_URL: http://localhost:3000
+      NEXT_TELEMETRY_DISABLED: "1"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20.20.2"
+          cache: npm
+
+      - run: npm ci
+
+      - name: Tip denetimi
+        run: npm run typecheck
+
+      - name: Birim testleri
+        run: npm test
+
+      - name: Veritabanı göçleri
+        run: npm run db:migrate
+
+      - name: Tarayıcı kurulumu
+        run: npx playwright install --with-deps chromium
+
+      - name: Uçtan uca testler
+        run: npm run e2e
+
+      - name: Test çıktıları
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-raporu
+          path: |
+            playwright-report/
+            test-results/
+          retention-days: 7

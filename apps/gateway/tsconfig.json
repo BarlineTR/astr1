@@ -3,10 +3,11 @@
   "compilerOptions": {
     "lib": ["ES2022"],
     "types": ["node"],
-    "outDir": "dist",
-    "rootDir": "src",
     "composite": true,
-    "declaration": true
+    "declaration": true,
+    "emitDeclarationOnly": true,
+    "declarationDir": ".tsbuild",
+    "rootDir": "src"
   },
   "include": ["src"]
 }
