@@ -1,7 +1,36 @@
-import { YakindaSayfa } from "@/components/YakindaSayfa";
+import Link from "next/link";
 
-export const metadata = { title: "Çözümler" };
+import { COZUMLER } from "@/data/cozumler";
+import { SayfaKabuk } from "@/components/SayfaKabuk";
 
-export default function Sayfa() {
-  return <YakindaSayfa current="cozumler" baslik="Çözümler" aciklama="Karşılama, bilgilendirme ve etkileşim senaryoları." />;
+export const metadata = {
+  title: "Çözümler",
+  description:
+    "Karşılama, bilgilendirme ve eğitim senaryolarında ASTRO sosyal robot platformu.",
+};
+
+export default function CozumlerSayfasi() {
+  return (
+    <SayfaKabuk
+      current="cozumler"
+      ustBaslik="Kullanım alanları"
+      baslik="Çözümler"
+      lead="Platformun hangi ortamda ne işe yaradığı — senaryoyla birlikte."
+    >
+      <section className="section">
+        <div className="page">
+          <div className="features">
+            {COZUMLER.map((c) => (
+              <article className="feature" key={c.slug}>
+                <h2 className="feature__title">
+                  <Link href={`/cozumler/${c.slug}`}>{c.ad}</Link>
+                </h2>
+                <p className="feature__body">{c.ozet}</p>
+              </article>
+            ))}
+          </div>
+        </div>
+      </section>
+    </SayfaKabuk>
+  );
 }

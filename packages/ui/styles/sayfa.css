@@ -1,0 +1,207 @@
+/*
+ * İç sayfalar.
+ *
+ * Ana sayfanın kendi yerleşimi `layout.css` içinde; burası kurumsal iç
+ * sayfaların ortak parçaları. Ayrı dosya, çünkü layout.css zaten 700 satır ve
+ * iki farklı işi bir arada tutmak ikisini de okunmaz yapıyor.
+ *
+ * Yeni renk, yeni yazı tipi, yeni gölge yok: her değer tokens.css'teki bir
+ * belirteçten okunur.
+ */
+
+/* ───────────────────────────  Sayfa girişi  ─────────────────────────── */
+
+.sayfa-giris {
+  padding-block: var(--s-6) var(--s-5);
+  border-bottom: 1px solid var(--rule);
+}
+
+.sayfa-giris__baslik {
+  font-family: var(--font-display);
+  font-size: var(--t-h1);
+  font-weight: 400;
+  line-height: 1.05;
+  letter-spacing: -0.01em;
+  margin: var(--s-2) 0 0;
+}
+
+.sayfa-giris__lead {
+  max-width: var(--measure);
+  margin: var(--s-3) 0 0;
+  font-size: var(--t-lead);
+  color: var(--ink-muted);
+}
+
+/* ──────────────────────────────  Listeler  ────────────────────────────── */
+
+.liste {
+  max-width: var(--measure);
+  margin: var(--s-2) 0 0;
+  padding: 0;
+  list-style: none;
+  color: var(--ink-muted);
+}
+.liste > li {
+  position: relative;
+  padding: var(--s-2) 0 var(--s-2) var(--s-3);
+  border-bottom: 1px solid var(--rule);
+}
+.liste > li::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  top: calc(var(--s-2) + 0.6em);
+  width: 0.5rem;
+  height: 1px;
+  background: var(--rule-accent);
+}
+
+/* Numaralı liste: sıra anlamlıysa numara da görünür olmalı. */
+.liste--numarali {
+  counter-reset: adim;
+}
+.liste--numarali > li {
+  counter-increment: adim;
+  padding-left: var(--s-4);
+}
+.liste--numarali > li::before {
+  content: counter(adim, decimal-leading-zero);
+  top: var(--s-2);
+  width: auto;
+  height: auto;
+  background: none;
+  font-family: var(--font-mono);
+  font-size: var(--t-micro);
+  color: var(--accent);
+}
+
+/* ────────────────────────────  Teknik tablo  ──────────────────────────── */
+
+/*
+ * Gerçek tablo, ızgarayla çizilmiş kutu yığını değil: ekran okuyucular ve
+ * üretken arama araçları satır/sütun ilişkisini böyle okuyor.
+ */
+.teknik-tablo {
+  width: 100%;
+  margin-top: var(--s-3);
+  border-collapse: collapse;
+  font-size: var(--t-small);
+  text-align: left;
+}
+.teknik-tablo caption {
+  padding-bottom: var(--s-2);
+  font-family: var(--font-mono);
+  font-size: var(--t-micro);
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--ink-faint);
+  text-align: left;
+}
+.teknik-tablo th,
+.teknik-tablo td {
+  padding: var(--s-2) var(--s-2) var(--s-2) 0;
+  border-bottom: 1px solid var(--rule);
+  vertical-align: baseline;
+  font-weight: 400;
+}
+.teknik-tablo thead th {
+  border-bottom-color: var(--rule-strong);
+  font-family: var(--font-mono);
+  font-size: var(--t-micro);
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--ink-faint);
+}
+.teknik-tablo tbody th { color: var(--ink); width: 34%; }
+.teknik-tablo td.mono { color: var(--accent); white-space: nowrap; width: 18%; }
+.teknik-tablo tbody td:last-child { color: var(--ink-muted); }
+
+@media (max-width: 48rem) {
+  /* Dar ekranda üç sütun sıkışıyor; kaynak sütunu satır altına düşer. */
+  .teknik-tablo,
+  .teknik-tablo tbody,
+  .teknik-tablo tr { display: block; }
+  .teknik-tablo thead { display: none; }
+  .teknik-tablo tr { padding-block: var(--s-2); border-bottom: 1px solid var(--rule); }
+  .teknik-tablo th,
+  .teknik-tablo td { display: block; width: auto; border: 0; padding: 0; white-space: normal; }
+  .teknik-tablo td.mono { font-size: var(--t-h3); padding-block: 0.25rem; }
+}
+
+/* ────────────────────────────  Ölçüm notu  ──────────────────────────── */
+
+/*
+ * "Bu sayı nereden geldi" notu. Vurgu rengi burada üçüncü işinde:
+ * ölçülmüş değer.
+ */
+.olcum-notu {
+  max-width: var(--measure);
+  margin-top: var(--s-3);
+  padding-left: var(--s-3);
+  border-left: 1px solid var(--rule-accent);
+  font-size: var(--t-small);
+  color: var(--ink-muted);
+}
+.olcum-notu .eyebrow { display: block; margin-bottom: 0.35rem; }
+
+/* ────────────────────────────  Uyarı şeridi  ──────────────────────────── */
+
+.uyari-serit {
+  margin-top: var(--s-4);
+  padding: var(--s-2) var(--s-3);
+  border: 1px solid var(--warn);
+  color: var(--warn);
+  font-family: var(--font-mono);
+  font-size: var(--t-small);
+}
+
+/* ────────────────────────────  Fiyat kartları  ────────────────────────── */
+
+.fiyat-izgara {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(16rem, 1fr));
+  gap: var(--s-2);
+  margin-top: var(--s-3);
+}
+
+.fiyat-karti {
+  display: flex;
+  flex-direction: column;
+  gap: var(--s-1);
+  padding: var(--s-3);
+  background: var(--surface);
+  border: 1px solid var(--rule);
+}
+.fiyat-karti__ad {
+  margin: 0;
+  font-family: var(--font-display);
+  font-size: var(--t-h3);
+  font-weight: 400;
+}
+.fiyat-karti__tutar {
+  margin: 0;
+  font-size: var(--t-h2);
+  color: var(--accent);
+  line-height: 1.1;
+}
+.fiyat-karti__periyot { font-size: var(--t-small); color: var(--ink-faint); }
+.fiyat-karti__aciklama { margin: 0; color: var(--ink-muted); font-size: var(--t-small); }
+.fiyat-karti .liste { margin-top: var(--s-2); font-size: var(--t-small); }
+.fiyat-karti .liste > li:last-child { border-bottom: 0; }
+
+/* ──────────────────────────────  Künye  ──────────────────────────────── */
+
+.kunye {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(14rem, 1fr));
+  gap: var(--s-3);
+  margin-top: var(--s-3);
+}
+.kunye dt {
+  font-family: var(--font-mono);
+  font-size: var(--t-micro);
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--ink-faint);
+}
+.kunye dd { margin: 0.35rem 0 0; color: var(--ink); }
