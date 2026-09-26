@@ -205,3 +205,15 @@
   color: var(--ink-faint);
 }
 .kunye dd { margin: 0.35rem 0 0; color: var(--ink); }
+
+/* ─────────────────────────────  Hukuki metin  ─────────────────────────── */
+
+.hukuki { max-width: var(--measure); }
+.hukuki h2 {
+  margin: var(--s-5) 0 var(--s-2);
+  font-family: var(--font-display);
+  font-size: var(--t-h3);
+  font-weight: 400;
+}
+.hukuki__no { color: var(--accent); font-size: var(--t-small); }
+.hukuki p { color: var(--ink-muted); margin: 0 0 var(--s-2); }

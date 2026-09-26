@@ -76,7 +76,7 @@ export function SiteFooter() {
             olmasın: bayrak kalkana kadar bu uyarı her sayfanın altında durur.
           */}
           {KURUM.YER_TUTUCU && (
-            <p className="site-footer__uyari" role="status">
+            <p className="site-footer__uyari">
               Bu sayfadaki kurum bilgileri yer tutucudur — yayına hazır değildir.
             </p>
           )}

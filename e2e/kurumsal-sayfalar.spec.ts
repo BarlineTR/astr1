@@ -43,7 +43,7 @@ test("fiyatlandırma sayfası geliştirme fiyatı olduğunu söyler", async ({ p
   await page.goto("/fiyatlandirma");
 
   // Uydurma tutarla yayına çıkmak fark edilmeden mümkün olmasın.
-  await expect(page.getByRole("status").first()).toContainText("geliştirme aşaması");
+  await expect(page.getByText("geliştirme aşaması")).toBeVisible();
   await expect(page.getByText("₺").first()).toBeVisible();
 });
 

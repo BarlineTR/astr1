@@ -25,7 +25,7 @@ export default function FiyatlandirmaSayfasi() {
       */}
       {GELISTIRME_FIYATI && (
         <section className="page">
-          <p className="uyari-serit" role="status">
+          <p className="uyari-serit">
             Bu sayfadaki tutarlar geliştirme aşaması değerleridir; gerçek fiyat listesi
             değildir.
           </p>

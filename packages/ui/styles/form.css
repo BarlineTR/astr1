@@ -200,3 +200,33 @@
   border: 1px solid currentColor;
 }
 .rozet--uyari { color: var(--warn); }
+
+/* ────────────────────────────  İletişim sayfası  ──────────────────────── */
+
+.iletisim-izgara {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(20rem, 1fr));
+  gap: var(--s-6) var(--s-5);
+}
+.iletisim-izgara h2 {
+  margin: 0;
+  font-family: var(--font-display);
+  font-size: var(--t-h3);
+  font-weight: 400;
+}
+
+.form__alan-hata { color: var(--alarm); font-size: var(--t-micro); }
+.form__istege-bagli { color: var(--ink-faint); text-transform: none; letter-spacing: 0; }
+
+/*
+ * Tuzak alan ekranda yok ama DOM'da var.
+ * display:none kullanılmıyor: bazı botlar gizli alanları atlamak için tam olarak
+ * ona bakıyor. Ekran dışına taşımak hem kullanıcıdan hem de o kontrolden kaçırır.
+ */
+.tuzak {
+  position: absolute;
+  left: -9999px;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+}

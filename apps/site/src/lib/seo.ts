@@ -45,6 +45,8 @@ export const SAYFALAR: readonly SayfaKaydi[] = [
   { yol: "/gizlilik", ad: "Gizlilik politikası", sitemap: true, oncelik: 0.2, degisim: "yearly" },
   { yol: "/cerez", ad: "Çerez politikası", sitemap: true, oncelik: 0.2, degisim: "yearly" },
   { yol: "/kosullar", ad: "Kullanım koşulları", sitemap: true, oncelik: 0.2, degisim: "yearly" },
+  { yol: "/mesafeli-satis", ad: "Mesafeli satış sözleşmesi", sitemap: true, oncelik: 0.2, degisim: "yearly" },
+  { yol: "/iade", ad: "Teslimat ve iade koşulları", sitemap: true, oncelik: 0.2, degisim: "yearly" },
 
   // Giriş arkasındakiler: listede var ama sitemap dışı.
   { yol: "/panel", ad: "Panel", sitemap: false, oncelik: 0, degisim: "daily" },
