@@ -7278,8 +7278,12 @@ class AstroRealtimeNode(Node):
             self.get_logger().debug(f"Groq Whisper transcription notice: {e}")
             return None
 
-    def _synthesize_edge_tts_pcm24k(self, text: str) -> bytes:
+    def _synthesize_edge_tts_pcm24k(self, text: str, generation_id: Optional[int] = None) -> bytes:
         """Synthesizes Turkish speech via Python edge-tts and converts to 24kHz int16 mono raw PCM for playback."""
+        gen_id = generation_id if generation_id is not None else self._fallback_generation_id
+        if gen_id in getattr(self, "_cancelled_generation_ids", set()):
+            self.get_logger().info(f"🛑 [Edge-TTS Cancelled]: generation_id={gen_id} is cancelled, skipping synthesis.")
+            return b""
         if not text:
             return b""
         clean_text = clean_tts_text(text)
