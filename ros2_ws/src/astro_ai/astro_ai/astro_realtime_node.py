@@ -1152,6 +1152,7 @@ class AstroRealtimeNode(Node):
         self._last_vision_looking_time: float = 0.0
         self._last_vision_faces_time: float = 0.0
         self.visual_evidence_ttl_s: float = float(os.getenv("VISUAL_EVIDENCE_TTL_S", "15.0"))
+        self.face_evidence_ttl_s: float = float(os.getenv("FACE_EVIDENCE_TTL_S", "2.5"))
         # Single output owner for /head_command is social_gaze_node
         self.pub_telemetry = self.create_publisher(String, "/astro/telemetry", 10)
         self.pub_diagnostics = self.create_publisher(DiagnosticArray, "/diagnostics", 10)
@@ -11534,8 +11535,13 @@ class AstroRealtimeNode(Node):
             held_name = getattr(self, "_active_person_name", "")
             hold_until = getattr(self, "_person_hold_until", 0.0)
 
-        # Visual freshness check: face evidence expires if older than visual_evidence_ttl_s
-        is_face_fresh = self.is_visual_evidence_fresh(now=now) if hasattr(self, "is_visual_evidence_fresh") else True
+        # Visual freshness check: face evidence expires if older than face_evidence_ttl_s (2.5s)
+        last_f = getattr(self, "_last_vision_faces_time", 0.0)
+        face_ttl = getattr(self, "face_evidence_ttl_s", 2.5)
+        if last_f > 0.0:
+            is_face_fresh = bool((now - last_f) <= face_ttl)
+        else:
+            is_face_fresh = self.is_visual_evidence_fresh(now=now) if hasattr(self, "is_visual_evidence_fresh") else bool(face)
 
         # Extract multimodal candidate evidence
         f_name = None
@@ -11626,6 +11632,11 @@ class AstroRealtimeNode(Node):
             user_name = held_name
             user_source = "session_hold"
             bio_status = "session_active"
+            is_known = True
+        elif owner_name and owner_name.lower() != "misafir":
+            user_name = owner_name
+            user_source = "persistent_memory"
+            bio_status = "unknown"
             is_known = True
         else:
             user_name = "Misafir"
