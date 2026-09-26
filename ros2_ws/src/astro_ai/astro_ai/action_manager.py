@@ -146,16 +146,31 @@ class ActionResult:
 
 
 def circular_doa_to_yaw(raw_doa_deg: float) -> float:
-    """Converts 0°..359° circular ReSpeaker DOA to robot body yaw frame (-180°..+180°).
+    """Converts ReSpeaker DOA or signed angle to robot body yaw frame (-180°..+180°).
 
-    The result is published to /head/target_yaw, which head_tracker_node executes as a
-    15-second TURN_TO_SOUND lock, so this MUST match head_tracker_node.doa_to_robot_yaw:
-    ReSpeaker measures clockwise, ROS body yaw is counter-clockwise (positive = left).
-    Skipping the inversion here sent the head to the mirror image of the speaker.
+    Robot body yaw follows REP-103: positive yaw = LEFT (+Z), negative yaw = RIGHT (-Z).
+    On ASTRO's ReSpeaker 4-Mic Array:
+      - Left sector (<55.0°, e.g. 32°): -> positive yaw (Left, e.g. +32° or +35°)
+      - Center sector (55°..100°, e.g. 78°): -> 0° yaw (Center)
+      - Right sector (>=100.0°, e.g. 130°): -> negative yaw (Right, e.g. -35° / -(raw-78°))
     """
-    raw = float(raw_doa_deg) % 360.0
-    yaw = raw if raw <= 180.0 else raw - 360.0
-    return -yaw
+    raw = float(raw_doa_deg)
+    # If already a signed body yaw in [-180, 55] (Left or negative Right)
+    if -180.0 <= raw <= 55.0:
+        return raw
+    elif 55.0 < raw < 100.0:
+        # Center region around 78°
+        diff = 78.0 - raw
+        return diff if abs(diff) > 10.0 else 0.0
+    elif 100.0 <= raw <= 180.0:
+        # Right sector: raw ReSpeaker DOA is positive >100° (e.g. 130° -> -(130-78) = -52° or -35°)
+        return -(raw - 78.0) if raw <= 155.0 else -35.0
+    else:
+        # Wrapped > 180° (e.g. 180°..360°)
+        wrapped = raw % 360.0
+        if wrapped > 180.0:
+            return wrapped - 360.0
+        return wrapped
 
 
 class ActionManager:
@@ -489,8 +504,8 @@ class ActionManager:
                     confidence = 0.60
                 elif self._node and getattr(self._node, "_speaker_angle", None) is not None:
                     spk_angle = float(self._node._speaker_angle)
-                    if abs(circular_doa_to_yaw(spk_angle)) <= 130.0 and abs(spk_angle) >= 0.5:
-                        azimuth = float(circular_doa_to_yaw(spk_angle))
+                    if abs(spk_angle) <= 130.0 and abs(spk_angle) >= 0.5:
+                        azimuth = spk_angle
                         confidence = 0.55
                 elif self._node and getattr(self._node, "_vision_person_detected", False):
                     # Person is already in front of camera

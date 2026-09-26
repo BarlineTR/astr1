@@ -238,6 +238,7 @@ def generate_launch_description():
         condition=IfCondition(LaunchConfiguration("enable_voice")),
         parameters=[{
             "use_realtime": LaunchConfiguration("use_realtime"),
+            "enable_cognitive_loop": False,
         }],
     )
 

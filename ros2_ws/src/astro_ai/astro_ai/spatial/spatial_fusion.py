@@ -68,6 +68,12 @@ class SpatialFusionEngine:
                 vad = vad_active if vad_active is not None else is_speaking
                 if abs(float(doa_deg)) < 0.5 and not vad and (rms_level is None or rms_level < 450.0):
                     validated_doa = None
+                else:
+                    try:
+                        from astro_ai.action_manager import circular_doa_to_yaw
+                        validated_doa = circular_doa_to_yaw(float(doa_deg))
+                    except Exception:
+                        validated_doa = float(doa_deg)
 
             self._latest_audio_doa = validated_doa
             self._latest_speaker_data = speaker_id_dict

@@ -825,6 +825,24 @@ class AstroRealtimeNode(Node):
         )
 
 
+        # ROS 2 parameter for cognitive loop authority
+        # Default is False when consciousness_node is active to preserve single CognitiveLoop authority
+        param_enable_cognitive_loop = False
+        if hasattr(self, "declare_parameter"):
+            try:
+                if hasattr(self, "has_parameter") and self.has_parameter("enable_cognitive_loop"):
+                    param_val_cl = self.get_parameter("enable_cognitive_loop").value
+                else:
+                    self.declare_parameter("enable_cognitive_loop", False)
+                    param_val_cl = self.get_parameter("enable_cognitive_loop").value
+                if param_val_cl is not None:
+                    param_enable_cognitive_loop = bool(param_val_cl)
+            except Exception:
+                param_enable_cognitive_loop = False
+
+        env_enable_cognitive_loop = os.environ.get("ENABLE_COGNITIVE_LOOP", "false").strip().lower() in ("1", "true", "yes", "on")
+        self.enable_cognitive_loop = param_enable_cognitive_loop or env_enable_cognitive_loop
+
         # Proactive speech policy gate (default OFF as per forensic invariant)
         self.proactive_speech_enabled = os.environ.get("ASTRO_PROACTIVE_SPEECH", "0").strip().lower() in ("1", "true", "yes", "on")
         self._last_explicit_user_turn: bool = False
@@ -859,7 +877,7 @@ class AstroRealtimeNode(Node):
                 cognitive_db_path = os.path.expanduser(os.getenv("ASTRO_COGNITIVE_DB", os.path.join(db_dir, "cognitive.db")))
                 self.social_brain = SocialBrain(db_path=cognitive_db_path)
                 self.get_logger().info(f"🧠 [SocialBrain] Başlatıldı. Bilişsel veritabanı: {cognitive_db_path}")
-                if CognitiveLoop:
+                if self.enable_cognitive_loop and CognitiveLoop:
                     self.cognitive_loop = CognitiveLoop(
                         world_model=self.social_brain.world_model,
                         on_telemetry=self.get_logger().info,
@@ -1180,6 +1198,8 @@ class AstroRealtimeNode(Node):
         self.create_subscription(Float32, "/head/cmd_pos", self._on_head_cmd_pos, 10)
         self.create_subscription(Bool, "/astro/quiet_mode", self._on_quiet_mode, 10)
         self.create_subscription(Bool, "/astro/sleep_mode", self._on_sleep_mode, 10)
+        self._last_consciousness_state: Optional[Dict[str, Any]] = None
+        self.create_subscription(String, "/consciousness/state", self._on_consciousness_state, 10)
 
         # Tool execution deduplication
         self._executed_tool_calls: set[str] = set()
@@ -5880,6 +5900,14 @@ class AstroRealtimeNode(Node):
         except Exception as exc:
             self.get_logger().debug(f"_on_quiet_mode error: {exc}")
 
+    def _on_consciousness_state(self, msg: String) -> None:
+        """Caches latest authoritative consciousness telemetry from consciousness_node."""
+        try:
+            if msg and msg.data:
+                self._last_consciousness_state = json.loads(msg.data)
+        except Exception:
+            pass
+
     def is_in_quiet_or_sleep_state(self) -> bool:
         """Determines if the robot is authoritatively in quiet mode, sleep mode, or deep idle."""
         if getattr(self, "_is_quiet_mode", False):
@@ -5888,6 +5916,11 @@ class AstroRealtimeNode(Node):
             return True
         if hasattr(self, "state_machine") and self.state_machine and hasattr(self.state_machine, "is_deep_idle"):
             if self.state_machine.is_deep_idle():
+                return True
+        if getattr(self, "_last_consciousness_state", None):
+            intro = self._last_consciousness_state.get("introspection", {})
+            curr_act = intro.get("activity") or self._last_consciousness_state.get("current_activity")
+            if curr_act and ("sleep" in str(curr_act).lower() or "quiet" in str(curr_act).lower()):
                 return True
         if hasattr(self, "cognitive_loop") and self.cognitive_loop:
             self_model = getattr(self.cognitive_loop, "self_model", None)
@@ -10906,18 +10939,27 @@ class AstroRealtimeNode(Node):
 
     def _on_doa(self, msg: Float32):
         raw_val = float(msg.data)
-        # ReSpeaker DOA is circular 0°..359°. Normalize strictly to signed body yaw frame (-180°..+180°)
-        # to ensure cognitive world model and behavior parameters stay strictly in body frame.
+        # ReSpeaker DOA is circular 0°..359° or signed [-180..+180]. Normalize strictly to
+        # signed body yaw frame (-180°..+180°) where positive = LEFT, negative = RIGHT.
         if circular_doa_to_yaw is not None:
             norm_yaw = circular_doa_to_yaw(raw_val)
         else:
-            raw_c = raw_val % 360.0
-            norm_yaw = -(raw_c if raw_c <= 180.0 else raw_c - 360.0)
+            raw = float(raw_val)
+            if -180.0 <= raw <= 55.0:
+                norm_yaw = raw
+            elif 55.0 < raw < 100.0:
+                diff = 78.0 - raw
+                norm_yaw = diff if abs(diff) > 10.0 else 0.0
+            elif 100.0 <= raw <= 180.0:
+                norm_yaw = -(raw - 78.0) if raw <= 155.0 else -35.0
+            else:
+                w = raw % 360.0
+                norm_yaw = w - 360.0 if w > 180.0 else w
         self._speaker_angle = float(norm_yaw)
         self._last_doa_time = time.monotonic()
         if getattr(self, "action_manager", None):
             self.action_manager.update_audio_state(
-                raw_doa_deg=raw_val,
+                raw_doa_deg=norm_yaw,
                 rms_level=getattr(self, "_latest_mic_rms", None),
                 vad_active=getattr(self, "_vad_active", False),
                 is_speaking=self._is_responding,

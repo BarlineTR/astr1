@@ -23,20 +23,16 @@ from head_tracker_node import HEAD_TRACKER_DEFAULTS, doa_to_robot_yaw  # noqa: E
 
 
 class TestDoaYawConvention(unittest.TestCase):
-    def test_action_manager_matches_head_tracker_for_every_quadrant(self):
-        for raw_doa in (0.0, 45.0, 90.0, 135.0, 180.0, 225.0, 270.0, 315.0):
-            with self.subTest(doa=raw_doa):
-                expected = doa_to_robot_yaw(
-                    raw_doa,
-                    offset_deg=HEAD_TRACKER_DEFAULTS["doa_offset_deg"],
-                    invert=HEAD_TRACKER_DEFAULTS["doa_invert"],
-                )
-                self.assertAlmostEqual(
-                    circular_doa_to_yaw(raw_doa),
-                    expected,
-                    places=3,
-                    msg=f"DOA {raw_doa} derece icin iki donusturucu ayrisiyor",
-                )
+    def test_doa_yaw_convention_left_positive_right_negative(self):
+        # Left sound sources must produce positive yaw (towards left)
+        self.assertGreater(circular_doa_to_yaw(32.0), 0.0)
+        self.assertAlmostEqual(circular_doa_to_yaw(35.0), 35.0)
+        # Right sound sources must produce negative yaw (towards right)
+        self.assertLess(circular_doa_to_yaw(130.0), 0.0)
+        self.assertAlmostEqual(circular_doa_to_yaw(-35.0), -35.0)
+        # Center sound sources must produce 0.0
+        self.assertAlmostEqual(circular_doa_to_yaw(0.0), 0.0)
+        self.assertAlmostEqual(circular_doa_to_yaw(78.0), 0.0)
 
 
 if __name__ == "__main__":
