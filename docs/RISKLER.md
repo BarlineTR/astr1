@@ -8,6 +8,7 @@ koşul sağlanmadan o faz yayına alınmaz.
 **Durum:** açık
 **Çıkış koşulu:** Faz 3 (ödeme) yayına çıkmadan önce kapatılmalı
 **Dosya:** `apps/site/public/models/astro-hero.glb`
+**Kod:** `apps/site/src/scene/robot-model.ts` → `HERO_MODEL`
 
 `astro-hero.glb` ASTRO'nun kendisi değil, bir R2-D2 oyuncağının fotogrametri
 taramasıdır. R2-D2 Lucasfilm'in tescilli markasıdır. Tanıtım amaçlı bir geliştirme
@@ -16,7 +17,7 @@ sitede durması değildir.**
 
 Gerçek ASTRO taraması henüz yapılmadığı için model geliştirme boyunca yerinde kalıyor
 (tasarım belgesi D12). Tarama geldiğinde değiştirilecek yer tek dosyadır:
-`apps/site/src/scene/model-source.ts`.
+`apps/site/src/scene/robot-model.ts` içindeki `HERO_MODEL` sabiti.
 
 Model değişirse kubbe dikiş yüksekliği yeniden ölçülmelidir — tek parça taranmış bir
 modelde kubbe ayrı bir nesne değildir ve `robot-model.ts` üçgenleri ölçülmüş bir
@@ -39,7 +40,7 @@ sayfada yer tutucu olduğu açıkça yazıyor. **Hukukçu onayından geçmeden p
 
 **Durum:** açık
 **Çıkış koşulu:** Faz 3 (ödeme) yayına çıkmadan önce kapatılmalı
-**Dosya:** `apps/site/src/data/kurum.ts`
+**Dosya:** `apps/site/src/data/kurum.ts` (ayrıca `kurumsal.ts` — yönetim ve basın listeleri boş)
 
 Ticari unvan, vergi numarası, adres, telefon ve ETBİS kaydı gerçek değil. iyzico
 başvurusu ve hukuki sayfalar bunlar olmadan tamamlanamaz. Bütün yer tutucular tek
@@ -53,3 +54,18 @@ modülde ve `YER_TUTUCU` sabitiyle işaretli.
 Destek paketi tutarları ve abonelik planları geliştirme için uydurulmuş değerlerdir,
 kodda `GELISTIRME_FIYATI` ile işaretlidir. Gerçek fiyat listesi gelmeden ödeme akışı
 yayına alınmaz.
+
+---
+
+## Durum özeti (2026-09-26)
+
+| Risk | Durum | Neyi engelliyor |
+|---|---|---|
+| R1 — model marka riski | açık | Ödeme fazının yayına çıkması |
+| R2 — hukuki metinler taslak | açık | Ödeme fazının yayına çıkması |
+| R3 — kurum bilgileri yer tutucu | açık | iyzico başvurusu, hukuki sayfalar |
+| R4 — fiyatlar uydurma | açık | Ödeme akışının yayına çıkması |
+
+Dördü de **kod tarafında hazır**: değişecek yerler tek modüllerde toplandı ve
+sayfalar yer tutucu olduklarını kendileri söylüyor. Gerçek bilgi geldiğinde
+yapılacak iş, bu dosyaları doldurup bayrakları kapatmaktan ibaret.

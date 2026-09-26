@@ -1,72 +1,95 @@
-# ASTRO web
+# ASTRO — kurumsal web sitesi
 
-Üç sayfalık tanıtım sitesi ve kontrol konsolu.
+ASTRO sosyal robot platformunun tanıtım sitesi, kullanıcı paneli ve robot ağ
+geçidi. Bu dal **yalnızca** web sitesini içerir; ROS kodu `main` ve `feat/*`
+dallarında durur.
 
 ```
-web/
-├── shared/      # telemetri sözleşmesi, sınırlar, senaryo sürücüsü (iki taraf da kullanır)
-├── client/      # Vite + TypeScript + Three.js — üç sayfa
-└── server/      # Fastify — statik servis + /ws telemetri (yalnızca yerel)
+apps/
+├── site/        Next.js 16 — pazarlama, SEO, oturum, ödeme (ileride), panel
+└── gateway/     Fastify — robot ↔ tarayıcı köprüsü (kalıcı WebSocket)
+packages/
+├── protocol/    telemetri ve komut sözleşmesi (zod) + JSON Schema üretimi
+└── ui/          görsel belirteçler ve stiller
+docker/          imajlar ve yerel yığın
+docs/            tasarım belgesi, uygulama planı, risk kaydı
 ```
+
+## Çalıştırma
+
+```bash
+npm install
+cp apps/site/.env.example apps/site/.env.local
+npm run db:up                 # Postgres (Docker, 5433)
+npm run db:migrate            # şemayı uygula
+npm run dev:site              # http://localhost:3000
+npm run dev:gateway           # http://localhost:8420  (isteğe bağlı)
+```
+
+Ortam dosyası **`apps/site/.env.local`** içinde durur, kökte değil: Next ortam
+dosyalarını uygulama dizininden okur.
+
+## Doğrulama
+
+```bash
+npm run typecheck             # tsc -b + Next projesi
+npm test                      # vitest — birim testleri
+npm run e2e                   # Playwright — üretim çıktısına karşı
+```
+
+`npm run e2e` kendi sunucusunu ayağa kaldırır (`build` + `start`) ve
+veritabanına ihtiyaç duyar.
 
 ## Sayfalar
 
 | Adres | İçerik |
 |---|---|
-| `/` | Tanıtım: 3B sahne, özellikler, çalışma sınırları |
-| `/hakkimizda` | Kurumsal sayfa — şimdilik yalnızca başlık iskeleti |
-| `/konsol` | Kontrol konsolu: canlı durum, kafa açısı, ses yönü, komut |
+| `/` | Giriş sahnesi, kaydırma anlatısı, yetenekler |
+| `/platform` | Ürün, ölçülmüş teknik veriler |
+| `/platform/demo` | Konsol demosu — tarayıcı içi senaryo, robota bağlanmaz |
+| `/cozumler`, `/cozumler/[sektor]` | Karşılama, bilgilendirme, eğitim |
+| `/teknoloji` | Algı, sosyal bakış, güvenlik — ölçüm kaynaklarıyla |
+| `/fiyatlandirma` | Planlar ve destek paketleri (geliştirme fiyatları) |
+| `/hakkimizda`, `/hakkimizda/yonetim`, `/basin` | Kurumsal |
+| `/iletisim` | İletişim ve teklif formu |
+| `/giris`, `/kayit` | Kimlik |
+| `/panel` | Cihazlar, hesap — **giriş arkasında** |
+| `/panel/cihaz/[id]` | Gerçek kontrol konsolu — giriş + cihaz yetkisi arkasında |
+| `/kvkk`, `/gizlilik`, `/cerez`, `/kosullar`, `/mesafeli-satis`, `/iade` | Hukuki (taslak) |
 
-## Geliştirme
+## Bu kod tabanında bilinmesi gerekenler
 
-```bash
-npm install
-npm run dev                      # istemci, http://localhost:5173
-npm run dev:server               # telemetri sunucusu, http://localhost:8420
-```
+- **İçerik sunucuda üretilir.** Ham HTML yanıtında `h1` ve gövde metni bulunmak
+  zorunda; `e2e/ssr-icerik.spec.ts` bunu JavaScript **kapalıyken** ölçer.
+  Taşımadan önceki hata tam olarak buydu ve JS açıkken hiç görünmüyordu.
+- **Sözleşme iki girişli.** `@astro/protocol` sabitler ve tipler (çalışma zamanı
+  bedeli yok), `@astro/protocol/schema` zod şemaları. Tarayıcı ikincisini almaz:
+  tek giriş olduğunda zod her ziyaretçiye 28,5 KB (gz) olarak iniyordu.
+- **Kopya içerik modüllerinde durur** (`apps/site/src/data/`). Bileşenin içine
+  düz metin yazılmaz — İngilizce sürümün yolu böyle açık kalıyor.
+- **CSS sınıf adları `showcase.ts` ile eşleşmek zorunda.** Kaydırma anlatısı
+  çerçeveden bağımsız bir modül ve sınıf adlarıyla çalışıyor.
+- **`.panel` konsol kartlarının**, `.pano` panel kabuğunun. İkisi aynı adı
+  kullandığında kabuğun `display:flex` kuralı konsol ızgarasını bozuyor.
+- **Ağ geçidi paketlenerek dağıtılır.** `tsc` göreli importları uzantısız
+  bırakıyor ve Node ESM onları çözemiyor; ayrıca sözleşme paketi kaynak TS
+  olarak yayımlanıyor. esbuild ikisini birlikte çözüyor.
+- **Yer tutucular görünür.** Kurum bilgileri, fiyatlar ve hukuki metinler taslak
+  ve sayfalar bunu kendileri söylüyor. Bkz. `docs/RISKLER.md`.
 
-İstemci tek başına da çalışır: sunucu bulunamazsa konsol, senaryoyu tarayıcıda
-koşturur ve bunu `SİMÜLASYON` rozetiyle açıkça belirtir.
+## Belgeler
 
-## Yerel ağda yayın
+- `docs/superpowers/specs/2026-09-26-kurumsal-web-sitesi-design.md` — tasarım ve kararlar
+- `docs/superpowers/plans/2026-09-26-faz-0-1-2-kurumsal-site.md` — uygulama planı
+- `docs/RISKLER.md` — yayın öncesi kapatılması gereken maddeler
 
-```bash
-npm run build
-npm start                        # Fastify, dist'i ve /ws'yi servis eder
-```
+## Dağıtım
 
-## Vercel
+Vercel: `vercel.json` hazır, kök dizin bu dal. Ağ geçidi Vercel'de yaşayamaz
+(kalıcı WebSocket) ve ayrı bir sunucuda koşar.
 
-Statik dağıtım. `vercel.json` hazır; Vercel projesinde **Root Directory = `web`**
-seçilmelidir.
-
-```bash
-npx vercel            # önizleme dağıtımı
-npx vercel --prod     # yayın
-```
-
-Vercel sunucusuz olduğu için kalıcı WebSocket kurulamaz: orada konsol her zaman
-tarayıcı içi senaryoyla çalışır, gerçek robota bağlanmaz. Robota bağlanan sürüm
-yerel ağdaki Fastify sunucusudur.
-
-## Telemetri sözleşmesi
-
-`shared/protocol.ts` tek anlaşmadır ve alanları gerçek ROS topic'lerinden
-türetilmiştir. Faz 2'de yazılacak `astro_web` ROS köprüsü bu sözleşmeye uyar;
-`server/src/index.ts` içinde değişecek tek satır `new MockSource()` yerine
-`new BridgeSource()` olur.
-
-## Giriş sahnesindeki model
-
-`client/public/models/astro-hero.glb` **geçici bir yer tutucudur** — ASTRO'nun
-kendisi değil, bir R2-D2 oyuncağının fotogrametri taramasıdır ve R2-D2 Lucasfilm
-markasıdır. Kalıcı ve herkese açık bir tanıtım için değiştirilmelidir.
-
-Model tek parça tarandığı için kubbe ayrı bir nesne değildir; `robot-model.ts`
-üçgenleri ölçülmüş bir yükseklikte ikiye ayırır. Model değişirse dikiş yüksekliği
-yeniden ölçülmelidir:
+Tek VPS'e taşıma yolu da çalışır durumda tutulur:
 
 ```bash
-python3 scripts/measure-model-seam.py client/public/models/astro-hero.glb
-python3 scripts/optimize-model.py <ham.glb> client/public/models/astro-hero.glb
+docker compose -f docker/compose.yaml --profile tam up --build
 ```
