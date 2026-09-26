@@ -1,6 +1,6 @@
 import * as THREE from "three";
 
-import { SHOWCASE } from "../data/content";
+import { SHOWCASE } from "../data/icerik";
 import type { FocusTarget, RobotScene } from "../scene/robot-scene";
 
 /**

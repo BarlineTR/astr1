@@ -9,15 +9,18 @@
     "client"
   ],
   "scripts": {
-    "dev": "npm run dev --workspace=client",
-    "build": "npm run build --workspace=client && npm run build --workspace=@astro/gateway",
-    "start": "npm run start --workspace=@astro/gateway",
+    "build": "npm run build:site && npm run build --workspace=@astro/gateway",
     "test": "vitest run",
-    "typecheck": "tsc -b --pretty false",
+    "typecheck": "tsc -b --pretty false && tsc -p apps/site/tsconfig.json --pretty false",
     "dev:gateway": "npm run dev --workspace=@astro/gateway",
-    "start:gateway": "npm run start --workspace=@astro/gateway"
+    "start:gateway": "npm run start --workspace=@astro/gateway",
+    "dev:site": "npm run dev --workspace=@astro/site",
+    "build:site": "npm run build --workspace=@astro/site",
+    "start:site": "npm run start --workspace=@astro/site",
+    "e2e": "playwright test"
   },
   "devDependencies": {
+    "@playwright/test": "^1.63.0",
     "typescript": "^5.6.3",
     "vitest": "^4.1.11"
   }

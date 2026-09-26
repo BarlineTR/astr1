@@ -1,5 +1,11 @@
 /** Sitenin metin içeriği. Teknik ayrıntı burada değil, depoda durur. */
 
+import {
+  AUDIO_REACHABLE_DEG,
+  CAMERA_HFOV_DEG,
+  HEAD_YAW_LIMIT_DEG,
+} from "@astro/protocol";
+
 export const SITE = {
   name: "ASTRO",
   version: "V1",
@@ -22,11 +28,17 @@ export const HERO = {
     "gerektiren ortamlar için geliştirildi.",
 } as const;
 
-/** Girişin altındaki rakam şeridi: aracın çalışma sınırları. */
+/**
+ * Girişin altındaki rakam şeridi: aracın çalışma sınırları.
+ *
+ * Değerler `@astro/protocol` sabitlerinden okunur, elle yazılmaz. Kalibrasyon
+ * değişip sabit güncellendiğinde site kendiliğinden doğru kalır; iki yerde
+ * tutulan bir ölçüm kaçınılmaz olarak ayrışıyordu.
+ */
 export const FIGURES = [
-  { label: "Kafa dönüş aralığı", value: "±85°" },
-  { label: "Kamera görüş açısı", value: "72°" },
-  { label: "Ulaşılabilir ses açısı", value: "121°" },
+  { label: "Kafa dönüş aralığı", value: `±${HEAD_YAW_LIMIT_DEG}°` },
+  { label: "Kamera görüş açısı", value: `${CAMERA_HFOV_DEG}°` },
+  { label: "Ulaşılabilir ses açısı", value: `${AUDIO_REACHABLE_DEG}°` },
   { label: "Etkileşim mesafesi", value: "0,4 – 2,5 m" },
 ] as const;
 

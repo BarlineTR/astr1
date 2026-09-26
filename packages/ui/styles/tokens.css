@@ -35,9 +35,14 @@
   --alarm:         #b4564c;
 
   /* — Tipografi — */
-  --font-display: "Source Serif 4", "Georgia", "Times New Roman", serif;
-  --font-ui:      "Inter", system-ui, -apple-system, "Segoe UI", sans-serif;
-  --font-mono:    "IBM Plex Mono", ui-monospace, "SF Mono", Menlo, monospace;
+  /*
+   * Aileler next/font tarafından üretilen değişkenlerden gelir; isimleri elle
+   * yazmak, alt küme veya ağırlık değiştiğinde sessizce yedek yazı tipine
+   * düşmek demekti. Yedek zincirleri yerinde duruyor.
+   */
+  --font-display: var(--font-display-loaded), "Georgia", "Times New Roman", serif;
+  --font-ui:      var(--font-ui-loaded), system-ui, -apple-system, "Segoe UI", sans-serif;
+  --font-mono:    var(--font-mono-loaded), ui-monospace, "SF Mono", Menlo, monospace;
 
   /* Ölçek: 1.25 oranlı, gövde 16px. */
   --t-micro: 0.6875rem;  /* 11px — etiket, kaynak */

@@ -5,9 +5,6 @@
       "path": "./packages/protocol"
     },
     {
-      "path": "./client"
-    },
-    {
       "path": "./apps/gateway"
     },
     {
