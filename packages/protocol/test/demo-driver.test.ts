@@ -1,13 +1,13 @@
 import { describe, expect, it } from "vitest";
 
-import { AUDIO_CHAT_CONE_DEG, AUDIO_REACHABLE_DEG, HEAD_YAW_LIMIT_DEG } from "./limits";
+import { AUDIO_CHAT_CONE_DEG, AUDIO_REACHABLE_DEG, HEAD_YAW_LIMIT_DEG } from "../src/limits";
 import {
   DemoDriver,
   IDLE_BEFORE_FIRST_EVENT_S,
   IDLE_SWAY_DEG,
   PERSISTENCE_S,
   type DemoEvent,
-} from "./demo-driver";
+} from "../src/demo-driver";
 
 const STEP = 1 / 60;
 

@@ -1,11 +1,11 @@
 import * as THREE from "three";
 import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
 
-import { CAMERA_HFOV_DEG, CAMERA_VFOV_DEG, AUDIO_REACHABLE_DEG } from "../../../shared/limits";
+import { CAMERA_HFOV_DEG, CAMERA_VFOV_DEG, AUDIO_REACHABLE_DEG } from "@astro/protocol";
 import { createBearingRing } from "./bearing-ring";
 import { createFovFrustum } from "./fov-frustum";
 import { HERO_MODEL, loadScanRobot, type RobotModel } from "./robot-model";
-import { IDLE_STATE, type SceneDriver, type SceneState } from "../../../shared/scene-state";
+import { IDLE_STATE, type SceneDriver, type SceneState } from "@astro/protocol";
 
 const ACCENT = 0xc8a15a;
 const ACCENT_ACTIVE = 0xe0bd7c;

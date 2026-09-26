@@ -1,0 +1,11 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "lib": ["ES2022"],
+    "composite": true,
+    "declaration": true,
+    "declarationDir": ".tsbuild",
+    "emitDeclarationOnly": true
+  },
+  "include": ["src", "test"]
+}

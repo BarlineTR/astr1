@@ -1,6 +1,6 @@
-import { DemoDriver } from "../../../shared/demo-driver";
-import { HEAD_YAW_LIMIT_DEG } from "../../../shared/limits";
-import type { Command, ServerMessage, Telemetry } from "../../../shared/protocol";
+import { DemoDriver } from "@astro/protocol";
+import { HEAD_YAW_LIMIT_DEG } from "@astro/protocol";
+import type { Command, ServerMessage, Telemetry } from "@astro/protocol";
 
 /**
  * Konsolun telemetri kaynağı.

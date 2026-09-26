@@ -1,4 +1,4 @@
-import type { Command, Telemetry } from "../../../shared/protocol";
+import type { Command, Telemetry } from "@astro/protocol";
 
 /**
  * Telemetri kaynağı.

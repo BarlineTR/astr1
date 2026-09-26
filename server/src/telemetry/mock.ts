@@ -1,6 +1,6 @@
-import { DemoDriver } from "../../../shared/demo-driver";
-import { HEAD_YAW_LIMIT_DEG } from "../../../shared/limits";
-import type { Command, Telemetry } from "../../../shared/protocol";
+import { DemoDriver } from "@astro/protocol";
+import { HEAD_YAW_LIMIT_DEG } from "@astro/protocol";
+import type { Command, Telemetry } from "@astro/protocol";
 import type { TelemetrySource } from "./source";
 
 /**

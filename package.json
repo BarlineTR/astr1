@@ -3,7 +3,12 @@
   "private": true,
   "version": "0.1.0",
   "type": "module",
-  "workspaces": ["server", "client"],
+  "workspaces": [
+    "apps/*",
+    "packages/*",
+    "client",
+    "server"
+  ],
   "scripts": {
     "dev": "npm run dev --workspace=client",
     "dev:server": "npm run dev --workspace=server",
@@ -14,6 +19,6 @@
   },
   "devDependencies": {
     "typescript": "^5.6.3",
-    "vitest": "^2.1.8"
+    "vitest": "^4.1.11"
   }
 }

@@ -1,10 +1,22 @@
 {
   "extends": "../tsconfig.base.json",
   "compilerOptions": {
-    "lib": ["ES2022", "DOM", "DOM.Iterable"],
-    "types": ["vite/client"],
-    "noEmit": true,
-    "allowImportingTsExtensions": true
+    "lib": [
+      "ES2022",
+      "DOM",
+      "DOM.Iterable"
+    ],
+    "types": [
+      "vite/client"
+    ],
+    "allowImportingTsExtensions": true,
+    "composite": true,
+    "declaration": true,
+    "emitDeclarationOnly": true,
+    "declarationDir": ".tsbuild"
   },
-  "include": ["src", "vite.config.ts", "../shared"]
+  "include": [
+    "src",
+    "vite.config.ts"
+  ]
 }

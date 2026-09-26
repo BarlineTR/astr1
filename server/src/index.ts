@@ -6,8 +6,8 @@ import fastifyStatic from "@fastify/static";
 import fastifyWebsocket from "@fastify/websocket";
 import Fastify from "fastify";
 
-import { HEAD_YAW_LIMIT_DEG } from "../../shared/limits";
-import type { Command, ServerMessage } from "../../shared/protocol";
+import { HEAD_YAW_LIMIT_DEG, PROTOCOL_VERSION } from "@astro/protocol";
+import type { Command, ServerMessage } from "@astro/protocol";
 import { MockSource } from "./telemetry/mock";
 import type { TelemetrySource } from "./telemetry/source";
 
@@ -43,11 +43,11 @@ const PORT = Number(process.env.PORT ?? 8420);
 const HOST = process.env.HOST ?? "0.0.0.0";
 
 /**
- * Faz 1: telemetri sentetiktir.
+ * Şimdilik telemetri sentetiktir.
  *
- * Faz 2'de burası `new BridgeSource(...)` olacak ve `astro_web` ROS düğümüne
+ * Faz 4'te burası `new BridgeSource(...)` olacak ve `astro_web` ROS düğümüne
  * bağlanacak. Sunucunun geri kalanında değişen tek şey bu satırdır — sözleşme
- * `shared/protocol.ts` içinde sabittir.
+ * `@astro/protocol` içinde sabittir.
  */
 const source: TelemetrySource = new MockSource();
 
@@ -73,6 +73,9 @@ for (const [route, file] of [
 app.get("/ws", { websocket: true }, (socket) => {
   const hello: ServerMessage = {
     kind: "hello",
+    // Ana sürüm uyuşmazsa karşı taraf bağlantıyı reddeder; sessizce yanlış
+    // alan okumaktan iyidir.
+    v: PROTOCOL_VERSION,
     source: "mock",
     limits: { headYawDeg: HEAD_YAW_LIMIT_DEG },
   };

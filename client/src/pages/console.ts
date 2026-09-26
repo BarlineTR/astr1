@@ -1,6 +1,6 @@
 import { CONSOLE_INTRO } from "../data/content";
-import { HEAD_YAW_LIMIT_DEG } from "../../../shared/limits";
-import type { Command, Telemetry } from "../../../shared/protocol";
+import { HEAD_YAW_LIMIT_DEG } from "@astro/protocol";
+import type { Command, Telemetry } from "@astro/protocol";
 import { el } from "../dom";
 import { footer, header } from "../site/chrome";
 

@@ -84,7 +84,7 @@ async function mountHero(): Promise<void> {
   try {
     const [{ createRobotScene }, { DemoDriver }] = await Promise.all([
       import("../scene/robot-scene"),
-      import("../../../shared/demo-driver"),
+      import("@astro/protocol"),
     ]);
 
     const scene = await createRobotScene(view.heroStageEl, {
