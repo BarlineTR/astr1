@@ -10414,15 +10414,35 @@ class AstroRealtimeNode(Node):
             # Minimum speech duration requirement:
             # - If test or node explicitly configured barge_in_min_consecutive_frames: honor configured frame count
             # - If VAD is active and self_voice_score < 0.20: 60ms (3 frames) if loud, else 80ms (4 frames)
-            # - If VAD is not active (vad_confidence=0.0): physical speaker echo can reach high RMS!
-            #   Must NEVER confirm human speech in 60ms when VAD=0. Requires sustained persistence (>=200ms).
+            # - If VAD is inactive (vad_confidence=0.0): physical speaker echo can reach high RMS!
+            #   Must NEVER confirm human speech without VAD during active playback.
             min_frames_cfg = getattr(self, "barge_in_min_consecutive_frames", None)
             if min_frames_cfg is not None:
                 min_speech_ms = float(min_frames_cfg * 20)
             elif is_vad_active and self_voice_score < 0.20:
                 min_speech_ms = 60.0 if (local_rms >= 1200.0 or peak_val >= 3500) else 80.0
             else:
-                min_speech_ms = 200.0
+                # No VAD evidence during playback -> strictly suppress barge-in
+                if is_loud:
+                    self.get_logger().debug(
+                        f"[BARGE-IN DECISION]\n"
+                        f"playback_active=true\n"
+                        f"vad_confidence=0.00\n"
+                        f"speech_duration_ms={speech_duration_ms}\n"
+                        f"speech_continuity_ms={speech_continuity_ms}\n"
+                        f"rms={local_rms:.0f}\n"
+                        f"peak={peak_val}\n"
+                        f"self_voice_score={self_voice_score:.2f}\n"
+                        f"transient_noise=false\n"
+                        f"speech_confirmed=false\n"
+                        f"decision=false\n"
+                        f"reason=vad_inactive_during_playback"
+                    )
+                with self._lock:
+                    if self._fallback_speaking or self._fallback_audio_buffer:
+                        self._fallback_speaking = False
+                        self._fallback_audio_buffer.clear()
+                return
 
             if speech_duration_ms < min_speech_ms or (not is_vad_active and local_rms < target_barge_in_rms):
                 if is_loud:
