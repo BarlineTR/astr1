@@ -1,0 +1,18 @@
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: astro
+      POSTGRES_PASSWORD: astro
+      POSTGRES_DB: astro
+    # 5433, çünkü geliştirme makinesinde 5432'de başka bir Postgres olabilir ve
+    # sessizce yanlış veritabanına bağlanmak, bağlanamamaktan çok daha kötü.
+    ports: ["5433:5432"]
+    volumes: ["astro-db:/var/lib/postgresql/data"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U astro"]
+      interval: 5s
+      retries: 10
+
+volumes:
+  astro-db:

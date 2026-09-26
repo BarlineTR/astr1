@@ -17,7 +17,11 @@
     "dev:site": "npm run dev --workspace=@astro/site",
     "build:site": "npm run build --workspace=@astro/site",
     "start:site": "npm run start --workspace=@astro/site",
-    "e2e": "playwright test"
+    "e2e": "playwright test",
+    "db:up": "docker compose -f docker/compose.yaml up -d",
+    "db:down": "docker compose -f docker/compose.yaml down",
+    "db:generate": "npm run --workspace=@astro/site db:generate",
+    "db:migrate": "npm run --workspace=@astro/site db:migrate"
   },
   "devDependencies": {
     "@playwright/test": "^1.63.0",

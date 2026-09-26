@@ -6,19 +6,25 @@
   "scripts": {
     "dev": "NEXT_TELEMETRY_DISABLED=1 next dev",
     "build": "NEXT_TELEMETRY_DISABLED=1 next build",
-    "start": "NEXT_TELEMETRY_DISABLED=1 next start"
+    "start": "NEXT_TELEMETRY_DISABLED=1 next start",
+    "db:generate": "drizzle-kit generate",
+    "db:migrate": "drizzle-kit migrate"
   },
   "dependencies": {
     "@astro/protocol": "*",
     "@astro/ui": "*",
+    "drizzle-orm": "^0.45.3",
     "next": "16.3.6",
+    "pg": "^8.23.0",
     "react": "19.3.0",
     "react-dom": "19.3.0",
     "three": "^0.170.0"
   },
   "devDependencies": {
+    "@types/pg": "^8.23.1",
     "@types/react": "^19.0.0",
     "@types/react-dom": "^19.0.0",
-    "@types/three": "^0.170.0"
+    "@types/three": "^0.170.0",
+    "drizzle-kit": "^0.31.11"
   }
 }
