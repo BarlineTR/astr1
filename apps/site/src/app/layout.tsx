@@ -4,6 +4,7 @@ import "@astro/ui/styles/tokens.css";
 import "@astro/ui/styles/base.css";
 import "@astro/ui/styles/layout.css";
 import "@astro/ui/styles/sayfa.css";
+import "@astro/ui/styles/form.css";
 
 import { KURUM } from "@/data/kurum";
 

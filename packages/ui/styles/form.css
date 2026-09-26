@@ -1,0 +1,194 @@
+/*
+ * Formlar, kimlik sayfaları ve panel.
+ *
+ * Yeni renk ya da yazı tipi yok: her değer tokens.css'teki bir belirteçten.
+ */
+
+/* ──────────────────────────────  Formlar  ────────────────────────────── */
+
+.form {
+  display: flex;
+  flex-direction: column;
+  gap: var(--s-3);
+  margin-top: var(--s-4);
+}
+
+.form__alan {
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+}
+.form__alan > span,
+.form__alan > label {
+  font-family: var(--font-mono);
+  font-size: var(--t-micro);
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--ink-faint);
+}
+
+.form input[type="text"],
+.form input[type="email"],
+.form input[type="tel"],
+.form input[type="password"],
+.form select,
+.form textarea {
+  width: 100%;
+  padding: 0.8rem 0.9rem;
+  background: var(--bg-sunken);
+  border: 1px solid var(--rule-strong);
+  color: var(--ink);
+  font-family: inherit;
+  font-size: var(--t-body);
+}
+.form input:focus-visible,
+.form select:focus-visible,
+.form textarea:focus-visible {
+  outline: none;
+  border-color: var(--accent);
+}
+.form textarea { min-height: 9rem; resize: vertical; }
+
+.form__ipucu { color: var(--ink-faint); font-size: var(--t-micro); }
+
+/* Onay kutusu ile metni aynı hizada; metin uzun olduğu için üstten hizalanır. */
+.form__onay {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: var(--s-2);
+  align-items: start;
+  font-size: var(--t-small);
+  color: var(--ink-muted);
+}
+.form__onay input { margin-top: 0.2rem; accent-color: var(--accent); }
+.form__onay a { color: var(--ink); }
+
+/*
+ * Hata kutusu. Alarm rengi yalnızca burada ve konsolda kullanılır; dikkat
+ * çekmesi gereken tek yer bu.
+ */
+.form__hata {
+  margin: 0;
+  padding: var(--s-2) var(--s-3);
+  border: 1px solid var(--alarm);
+  color: var(--alarm);
+  font-size: var(--t-small);
+}
+
+.form__basari {
+  margin: 0;
+  padding: var(--s-2) var(--s-3);
+  border: 1px solid var(--ok);
+  color: var(--ok);
+  font-size: var(--t-small);
+}
+
+/* ───────────────────────────  Kimlik sayfaları  ─────────────────────── */
+
+/*
+ * Giriş ve kayıtta şerit ve alt bilgi yok: tek bir iş var ve gezinme dikkat
+ * dağıtıyor.
+ */
+.kimlik {
+  min-height: 100dvh;
+  display: grid;
+  place-items: center;
+  padding: var(--s-5) var(--gutter);
+}
+.kimlik__kutu {
+  width: 100%;
+  max-width: 26rem;
+}
+.kimlik__mark { display: inline-flex; margin-bottom: var(--s-5); }
+.kimlik__baslik {
+  margin: 0;
+  font-family: var(--font-display);
+  font-size: var(--t-h2);
+  font-weight: 400;
+}
+.kimlik__lead { margin: var(--s-1) 0 0; color: var(--ink-muted); }
+.kimlik__alt {
+  margin-top: var(--s-4);
+  padding-top: var(--s-3);
+  border-top: 1px solid var(--rule);
+  font-size: var(--t-small);
+  color: var(--ink-faint);
+}
+.kimlik__alt a { color: var(--ink); }
+
+/* ────────────────────────────────  Panel  ────────────────────────────── */
+
+.panel { min-height: 100dvh; display: flex; flex-direction: column; }
+
+.panel__ust {
+  border-bottom: 1px solid var(--rule);
+  background: var(--bg-raised);
+}
+.panel__ust-ic {
+  display: flex;
+  align-items: center;
+  gap: var(--s-3);
+  padding-block: var(--s-2);
+}
+.panel__nav { display: flex; gap: var(--s-3); margin-left: var(--s-3); font-size: var(--t-small); }
+.panel__nav a { text-decoration: none; color: var(--ink-muted); }
+.panel__nav a:hover { color: var(--ink); }
+.panel__kullanici {
+  margin-left: auto;
+  font-size: var(--t-micro);
+  color: var(--ink-faint);
+}
+
+.panel__govde { padding-block: var(--s-5); flex: 1; }
+.panel__baslik { margin-bottom: var(--s-4); }
+.panel__baslik h1 {
+  margin: 0;
+  font-family: var(--font-display);
+  font-size: var(--t-h2);
+  font-weight: 400;
+}
+.panel__lead { margin: var(--s-1) 0 0; color: var(--ink-muted); }
+
+@media (max-width: 48rem) {
+  .panel__kullanici { display: none; }
+  .panel__ust-ic { flex-wrap: wrap; }
+}
+
+/* ─────────────────────────────  Boş durum  ───────────────────────────── */
+
+/*
+ * Boş liste yerine ne olduğunu anlatan bir kutu: boşluk, kullanıcıya bir şeyin
+ * bozuk olduğunu düşündürüyor.
+ */
+.bos-durum {
+  padding: var(--s-4);
+  border: 1px dashed var(--rule-strong);
+  color: var(--ink-muted);
+  max-width: var(--measure);
+}
+.bos-durum p { margin: var(--s-1) 0 0; }
+.bos-durum a { color: var(--ink); }
+.bos-durum__not { font-size: var(--t-small); color: var(--ink-faint); }
+
+/* ──────────────────────────────  Cihazlar  ───────────────────────────── */
+
+.cihaz-listesi { list-style: none; margin: 0; padding: 0; }
+.cihaz {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--s-3);
+  padding: var(--s-3) 0;
+  border-bottom: 1px solid var(--rule);
+}
+.cihaz__ad { margin: 0; font-size: var(--t-h3); font-weight: 400; }
+.cihaz__seri { margin: 0.2rem 0 0; font-size: var(--t-micro); color: var(--ink-faint); }
+.cihaz__durum { font-family: var(--font-mono); font-size: var(--t-micro); color: var(--accent); }
+
+.rozet {
+  font-family: var(--font-mono);
+  font-size: var(--t-micro);
+  padding: 0.1rem 0.4rem;
+  border: 1px solid currentColor;
+}
+.rozet--uyari { color: var(--warn); }
