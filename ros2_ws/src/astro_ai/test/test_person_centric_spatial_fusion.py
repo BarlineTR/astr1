@@ -50,6 +50,7 @@ class DummyNode:
         self._speaker_tentative_name = None
         self._speaker_tentative_count = 0
         self._speaker_tentative_last_time = 0.0
+        self._last_active_track_id = None
         self.logger_messages = []
 
     def get_logger(self):
@@ -63,6 +64,10 @@ class DummyNode:
             def debug(outer, msg):
                 self.logger_messages.append(("DEBUG", msg))
         return Logger()
+
+    def _log_fusion_result(self, res):
+        # No-op stub for tests; actual node will log via get_logger()
+        pass
 
 
 # Import the actual method by creating a test harness that binds resolve_active_speaker_and_track
@@ -186,35 +191,41 @@ def test_scenario_d_two_people_oktay_speaks():
 
 
 def test_scenario_e_depth_separation():
-    """Two people at 0°: foreground user at 0.9m, background person at 3.0m."""
-    p_close = UnifiedPersonState(
-        person_id="person_close",
-        name="Misafir",
-        is_known=False,
-        distance_m=0.9,
-        azimuth_deg=0.0,
+    """Baran at 1.0m / +20°, Oktay at 2.5m / +21°, DOA +21°, Oktay speaks.
+    Oktay must be selected; Baran must NOT be selected just because he is closer!
+    """
+    p_baran = UnifiedPersonState(
+        person_id="person_baran",
+        name="Baran",
+        is_known=True,
+        identity_confidence=0.90,
+        distance_m=1.0,
+        azimuth_deg=20.0,
         is_looking_at_robot=True,
         is_present=True,
     )
-    p_far = UnifiedPersonState(
-        person_id="person_far",
-        name="Misafir",
-        is_known=False,
-        distance_m=3.0,
-        azimuth_deg=0.0,
-        is_looking_at_robot=False,
+    p_oktay = UnifiedPersonState(
+        person_id="person_oktay",
+        name="Oktay",
+        is_known=True,
+        identity_confidence=0.88,
+        distance_m=2.5,
+        azimuth_deg=21.0,
+        is_looking_at_robot=True,
         is_present=True,
     )
     mock_vr = MagicMock()
-    mock_vr.identify_speaker.return_value = ("Oktay", 0.75)
+    mock_vr.identify_speaker.return_value = ("Oktay", 0.78)
 
     now = time.monotonic()
-    node = DummyNode([p_close, p_far], voice_recognizer=mock_vr, speaker_angle=0.0, last_doa_time=now)
+    node = DummyNode([p_baran, p_oktay], voice_recognizer=mock_vr, speaker_angle=21.0, last_doa_time=now)
     res = run_fusion(node, raw_pcm=b"\x00\x00" * 1600)
 
-    # Matched track should be the foreground person at 0.9m, not the person at 3.0m
-    assert res["matched_track"].person_id == "person_close"
+    # Oktay matches DOA (+21°) and voice ("Oktay"). Baran (1.0m/+20°) must NOT be chosen just for being closer!
+    assert res["matched_track"].person_id == "person_oktay"
     assert res["name"] == "Oktay"
+    assert res["is_known"] is True
+    assert res["conflict"] is False
 
 
 def test_scenario_f_cross_modal_conflict():

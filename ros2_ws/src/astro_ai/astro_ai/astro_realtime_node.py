@@ -11208,10 +11208,12 @@ class AstroRealtimeNode(Node):
 
         matched_track = None
         spatial_reason = "no_physical_tracks"
+        best_s_spatial = 0.0
+        best_s_depth = 0.0
+        best_s_temporal = 0.0
 
         if wm_people:
             if doa_fresh and spk_angle is not None:
-                # Calculate physical spatial association scores
                 scored_candidates = []
                 for p in wm_people:
                     az = float(getattr(p, "azimuth_deg", 0.0))
@@ -11223,17 +11225,41 @@ class AstroRealtimeNode(Node):
 
                     # Spatial angular gate: must be within 28 degrees of DOA
                     if delta_theta <= 28.0:
-                        # Angle consistency score
-                        s_angle = math.exp(-(delta_theta ** 2) / (2.0 * (10.0 ** 2)))
-                        # StereoDepth / 3D spatial consistency (closer in social zone preferred)
-                        s_depth = 1.0 / (1.0 + max(0.0, dist - 0.8))
-                        # Gaze consistency
-                        s_gaze = 1.0 if is_looking else 0.6
-                        # Combined physical score
-                        s_physical = s_angle * (0.6 * s_depth + 0.4 * s_gaze)
+                        # 1. Angular consistency (Gaussian with sigma = 6.0 deg)
+                        s_angle = math.exp(-(delta_theta ** 2) / (2.0 * (6.0 ** 2)))
+
+                        # 2. Depth plausibility & 3D spatial consistency (Plausible interactive envelope: 0.6m - 3.5m)
+                        if 0.6 <= dist <= 3.2:
+                            s_depth = 1.0
+                        elif dist > 3.2:
+                            s_depth = math.exp(-((dist - 3.2) ** 2) / (2.0 * (1.2 ** 2)))
+                        else:
+                            s_depth = math.exp(-((0.6 - dist) ** 2) / (2.0 * (0.2 ** 2)))
+
+                        # 3. Gaze consistency
+                        s_gaze = 1.0 if is_looking else 0.7
+
+                        # 4. Track continuity (temporal hysteresis)
+                        last_track_id = getattr(self, "_last_active_track_id", None)
+                        s_continuity = 0.15 if (last_track_id and getattr(p, "person_id", "") == last_track_id) else 0.0
+
+                        # 5. Identity alignment prior (Stage A voice candidate vs physical track face)
+                        s_identity_prior = 0.0
+                        p_name = getattr(p, "name", "")
+                        p_is_known = bool(getattr(p, "is_known", False))
+                        if v_name and p_is_known and p_name:
+                            if p_name.lower() == v_name.lower():
+                                s_identity_prior = 0.40  # Track identity matches acoustic voice candidate
+                            else:
+                                s_identity_prior = -0.40  # Track identity directly conflicts with acoustic voice candidate
+
+                        # Combined physical spatial score
+                        s_physical = (0.50 * s_angle + 0.30 * s_depth + 0.20 * s_gaze) + s_continuity + s_identity_prior
                         scored_candidates.append({
                             "person": p,
                             "score": s_physical,
+                            "s_depth": s_depth,
+                            "s_temporal": s_continuity,
                             "delta_theta": delta_theta,
                             "distance_m": dist,
                         })
@@ -11247,14 +11273,19 @@ class AstroRealtimeNode(Node):
                         score_diff = top1["score"] - top2["score"]
                         dist_diff = abs(top1["distance_m"] - top2["distance_m"])
                         if score_diff < 0.12 and dist_diff < 0.4:
-                            # Spatially ambiguous between tracks
                             matched_track = None
                             spatial_reason = "spatially_ambiguous_tracks"
                         else:
                             matched_track = top1["person"]
+                            best_s_spatial = top1["score"]
+                            best_s_depth = top1["s_depth"]
+                            best_s_temporal = top1["s_temporal"]
                             spatial_reason = f"matched_doa_and_depth (score={top1['score']:.2f})"
                     else:
                         matched_track = scored_candidates[0]["person"]
+                        best_s_spatial = scored_candidates[0]["score"]
+                        best_s_depth = scored_candidates[0]["s_depth"]
+                        best_s_temporal = scored_candidates[0]["s_temporal"]
                         spatial_reason = f"matched_doa_and_depth (score={scored_candidates[0]['score']:.2f})"
                 else:
                     matched_track = None
@@ -11263,6 +11294,8 @@ class AstroRealtimeNode(Node):
                 # No fresh DOA: if only 1 person present in front of robot, associate with that person
                 if len(wm_people) == 1:
                     matched_track = wm_people[0]
+                    best_s_spatial = 1.0
+                    best_s_depth = 1.0
                     spatial_reason = "single_present_person_no_doa"
                 else:
                     matched_track = None
@@ -11285,7 +11318,7 @@ class AstroRealtimeNode(Node):
             self.get_logger().warn(
                 f"⚠️ [IDENTITY CONFLICT]: Face candidate '{face_name}' (%{int(face_conf*100)}) != Voice candidate '{v_name}' (%{int(v_score*100)}). Setting AMBIGUOUS."
             )
-            return {
+            res = {
                 "name": "Misafir",
                 "speaker_name": None,
                 "confidence": 0.0,
@@ -11294,7 +11327,23 @@ class AstroRealtimeNode(Node):
                 "matched_track": matched_track,
                 "conflict": True,
                 "spatial_reason": spatial_reason,
+                "track_id": getattr(matched_track, "person_id", None) if matched_track else None,
+                "depth_m": float(getattr(matched_track, "distance_m", 0.0)) if matched_track else None,
+                "bearing_deg": float(getattr(matched_track, "azimuth_deg", 0.0)) if matched_track else None,
+                "DOA": spk_angle,
+                "face_identity": face_name,
+                "face_confidence": face_conf,
+                "voice_identity": v_name,
+                "voice_confidence": v_score,
+                "multimodal_identity": "AMBIGUOUS / CONFLICT",
+                "active_speaker": "Misafir",
+                "identity_certainty": "AMBIGUOUS",
+                "spatial_score": round(best_s_spatial, 2),
+                "depth_score": round(best_s_depth, 2),
+                "temporal_score": round(best_s_temporal, 2),
             }
+            self._log_fusion_result(res)
+            return res
 
         # Case 1: Voice recognized and confirmed/smoothed
         if v_name and v_status in ("confirmed", "smoothed"):
@@ -11308,6 +11357,8 @@ class AstroRealtimeNode(Node):
                 }
                 self._active_person_name = v_name
                 self._person_hold_until = now_mono + 45.0
+                if matched_track:
+                    self._last_active_track_id = getattr(matched_track, "person_id", None)
 
             # If matched track was anonymous or misafir, bind the voice identity to the physical track
             if matched_track and not getattr(matched_track, "is_known", False):
@@ -11317,7 +11368,7 @@ class AstroRealtimeNode(Node):
                 if getattr(self, "social_brain", None) and hasattr(self.social_brain, "world_model"):
                     self.social_brain.world_model.update_people([matched_track])
 
-            return {
+            res = {
                 "name": v_name,
                 "speaker_name": v_name,
                 "confidence": v_score,
@@ -11326,7 +11377,23 @@ class AstroRealtimeNode(Node):
                 "matched_track": matched_track,
                 "conflict": False,
                 "spatial_reason": spatial_reason,
+                "track_id": getattr(matched_track, "person_id", None) if matched_track else None,
+                "depth_m": float(getattr(matched_track, "distance_m", 0.0)) if matched_track else None,
+                "bearing_deg": float(getattr(matched_track, "azimuth_deg", 0.0)) if matched_track else None,
+                "DOA": spk_angle,
+                "face_identity": face_name,
+                "face_confidence": face_conf,
+                "voice_identity": v_name,
+                "voice_confidence": v_score,
+                "multimodal_identity": v_name,
+                "active_speaker": v_name,
+                "identity_certainty": "KNOWN" if (face_name and face_name.lower() == v_name.lower()) else "PROBABLE",
+                "spatial_score": round(best_s_spatial, 2),
+                "depth_score": round(best_s_depth, 2),
+                "temporal_score": round(best_s_temporal, 2),
             }
+            self._log_fusion_result(res)
+            return res
 
         # Case 2: Voice is UNKNOWN, but a known face is in view
         # INVARIANT: An unknown voice must NEVER be attributed to a known face!
@@ -11334,7 +11401,7 @@ class AstroRealtimeNode(Node):
             self.get_logger().info(
                 f"👤 [Unknown Voice with Known Face]: Face '{face_name}' visible at track, but acoustic voice not verified -> Treating as Guest/Misafir."
             )
-            return {
+            res = {
                 "name": "Misafir",
                 "speaker_name": None,
                 "confidence": 0.0,
@@ -11343,7 +11410,23 @@ class AstroRealtimeNode(Node):
                 "matched_track": matched_track,
                 "conflict": False,
                 "spatial_reason": spatial_reason,
+                "track_id": getattr(matched_track, "person_id", None) if matched_track else None,
+                "depth_m": float(getattr(matched_track, "distance_m", 0.0)) if matched_track else None,
+                "bearing_deg": float(getattr(matched_track, "azimuth_deg", 0.0)) if matched_track else None,
+                "DOA": spk_angle,
+                "face_identity": face_name,
+                "face_confidence": face_conf,
+                "voice_identity": None,
+                "voice_confidence": v_score,
+                "multimodal_identity": "Misafir (Guest)",
+                "active_speaker": "Misafir",
+                "identity_certainty": "UNKNOWN",
+                "spatial_score": round(best_s_spatial, 2),
+                "depth_score": round(best_s_depth, 2),
+                "temporal_score": round(best_s_temporal, 2),
             }
+            self._log_fusion_result(res)
+            return res
 
         # Case 3: Active dialogue continuation hold (only if no conflict and track matches or no other people)
         held_name = getattr(self, "_active_person_name", "")
@@ -11352,7 +11435,7 @@ class AstroRealtimeNode(Node):
             if matched_track and getattr(matched_track, "name", "").lower() != held_name.lower() and getattr(matched_track, "is_known", False):
                 self._person_hold_until = 0.0
             else:
-                return {
+                res = {
                     "name": held_name,
                     "speaker_name": held_name,
                     "confidence": 0.80,
@@ -11361,10 +11444,26 @@ class AstroRealtimeNode(Node):
                     "matched_track": matched_track,
                     "conflict": False,
                     "spatial_reason": "active_hold",
+                    "track_id": getattr(matched_track, "person_id", None) if matched_track else None,
+                    "depth_m": float(getattr(matched_track, "distance_m", 0.0)) if matched_track else None,
+                    "bearing_deg": float(getattr(matched_track, "azimuth_deg", 0.0)) if matched_track else None,
+                    "DOA": spk_angle,
+                    "face_identity": face_name,
+                    "face_confidence": face_conf,
+                    "voice_identity": held_name,
+                    "voice_confidence": 0.80,
+                    "multimodal_identity": held_name,
+                    "active_speaker": held_name,
+                    "identity_certainty": "PROBABLE",
+                    "spatial_score": round(best_s_spatial, 2),
+                    "depth_score": round(best_s_depth, 2),
+                    "temporal_score": 0.15,
                 }
+                self._log_fusion_result(res)
+                return res
 
         # Case 4: Default Guest / Unidentified
-        return {
+        res = {
             "name": "Misafir",
             "speaker_name": None,
             "confidence": 0.0,
@@ -11373,7 +11472,47 @@ class AstroRealtimeNode(Node):
             "matched_track": matched_track,
             "conflict": False,
             "spatial_reason": spatial_reason,
+            "track_id": getattr(matched_track, "person_id", None) if matched_track else None,
+            "depth_m": float(getattr(matched_track, "distance_m", 0.0)) if matched_track else None,
+            "bearing_deg": float(getattr(matched_track, "azimuth_deg", 0.0)) if matched_track else None,
+            "DOA": spk_angle,
+            "face_identity": face_name,
+            "face_confidence": face_conf,
+            "voice_identity": None,
+            "voice_confidence": v_score,
+            "multimodal_identity": "Misafir",
+            "active_speaker": "Misafir",
+            "identity_certainty": "UNKNOWN",
+            "spatial_score": round(best_s_spatial, 2),
+            "depth_score": round(best_s_depth, 2),
+            "temporal_score": round(best_s_temporal, 2),
         }
+        self._log_fusion_result(res)
+        return res
+
+    def _log_fusion_result(self, res: Dict[str, Any]) -> None:
+        """Emits structured forensic log of the active speaker fusion decision."""
+        try:
+            self.get_logger().info(
+                f"🎯 [ACTIVE SPEAKER FUSION]\n"
+                f"  track_id: {res.get('track_id')}\n"
+                f"  depth_m: {res.get('depth_m')}\n"
+                f"  bearing_deg: {res.get('bearing_deg')}\n"
+                f"  DOA: {res.get('DOA')}\n"
+                f"  face_identity: {res.get('face_identity')}\n"
+                f"  face_confidence: {res.get('face_confidence')}\n"
+                f"  voice_identity: {res.get('voice_identity')}\n"
+                f"  voice_confidence: {res.get('voice_confidence')}\n"
+                f"  multimodal_identity: {res.get('multimodal_identity')}\n"
+                f"  active_speaker: {res.get('active_speaker')}\n"
+                f"  identity_certainty: {res.get('identity_certainty')}\n"
+                f"  spatial_score: {res.get('spatial_score')}\n"
+                f"  depth_score: {res.get('depth_score')}\n"
+                f"  temporal_score: {res.get('temporal_score')}\n"
+                f"  reason: {res.get('spatial_reason')}"
+            )
+        except Exception:
+            pass
 
     def resolve_identities(self) -> Dict[str, Any]:
         """Separates and resolves:
