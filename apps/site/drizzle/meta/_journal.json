@@ -15,6 +15,13 @@
       "when": 1790431956165,
       "tag": "0001_steady_fenris",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1790436352081,
+      "tag": "0002_cynical_warlock",
+      "breakpoints": true
     }
   ]
 }

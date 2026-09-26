@@ -1,6 +1,8 @@
 import Link from "next/link";
 
 import { DESTEK_PAKETLERI, GELISTIRME_FIYATI, PLANLAR } from "@/data/fiyatlar";
+import { odemeCanliMi, odemeSaglayici } from "@/lib/odeme";
+import { SatinAlDugmesi } from "@/components/SatinAlDugmesi";
 import { kurusBicimle } from "@/lib/para";
 import { oturumGerekli } from "@/lib/oturum";
 import { sayfaMetadata } from "@/lib/seo";
@@ -14,6 +16,9 @@ export const metadata = sayfaMetadata({
 
 export default async function AbonelikSayfasi() {
   await oturumGerekli("/panel/abonelik");
+
+  const saglayici = odemeSaglayici();
+  const canli = odemeCanliMi();
 
   /*
    * Aktif abonelik henüz tutulmuyor: abonelik kaydı ancak bir ödeme
@@ -68,29 +73,31 @@ export default async function AbonelikSayfasi() {
                   ))}
                 </ul>
               )}
-              {/*
-                Düğme sessizce kırık değil: neden çalışmadığı yazıyor.
-                Çalışmayan bir "Satın al" düğmesi, olmayan bir düğmeden kötü.
-              */}
-              <button className="btn" type="button" disabled>
-                Planı seçin
-              </button>
-              <p className="pano__not">Ödeme altyapısı bağlanınca etkinleşecek.</p>
+              <SatinAlDugmesi slug={plan.slug} etiket="Planı seçin" />
             </article>
           ))}
         </div>
       </section>
 
       <section className="pano__bolum">
-        <h2 className="pano__bolum-baslik">Ödeme yöntemi</h2>
-        <div className="bos-durum">
-          <p className="eyebrow">Kayıtlı ödeme yöntemi yok</p>
-          <p>
-            Ödeme altyapısı (iyzico) henüz bağlanmadı. Bağlandığında kart
-            bilgileriniz bizde değil, ödeme sağlayıcısında saklanacak; burada
-            yalnızca kartın son dört hanesi görünecek.
+        <h2 className="pano__bolum-baslik">Ödeme</h2>
+        {canli ? (
+          <p className="pano__lead">
+            Ödemeler iyzico üzerinden alınıyor. Kart bilgileriniz bizim
+            sunucumuza hiç uğramıyor; ödeme iyzico&apos;nun kendi sayfasında
+            tamamlanıyor ve 3D Secure orada yürüyor.
           </p>
-        </div>
+        ) : (
+          /*
+            Sessizce sahte sağlayıcıya düşmek, paranın hiç tahsil edilmediğini
+            fark etmeden yayına çıkmak demek olurdu.
+          */
+          <p className="uyari-serit">
+            Gerçek ödeme sağlayıcısı bağlı değil (şu an: <strong>{saglayici.id}</strong>).
+            Bu ortamda para hareket etmez. iyzico anahtarları tanımlandığında
+            akış kendiliğinden gerçek sağlayıcıya geçer.
+          </p>
+        )}
       </section>
 
       <section className="pano__bolum">
@@ -105,10 +112,7 @@ export default async function AbonelikSayfasi() {
               <h3 className="fiyat-karti__ad">{paket.ad}</h3>
               <p className="fiyat-karti__tutar mono">{kurusBicimle(paket.fiyatKurus)}</p>
               <p className="fiyat-karti__aciklama">{paket.aciklama}</p>
-              <button className="btn" type="button" disabled>
-                Destek olun
-              </button>
-              <p className="pano__not">Ödeme altyapısı bağlanınca etkinleşecek.</p>
+              <SatinAlDugmesi slug={paket.slug} etiket="Destek olun" />
             </article>
           ))}
         </div>

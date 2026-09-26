@@ -57,6 +57,19 @@ yayına alınmaz.
 
 ---
 
+## R5 — Ödeme sağlayıcısı bağlı değil
+
+**Durum:** açık
+**Çıkış koşulu:** gerçek tahsilat öncesi
+**Dosya:** `apps/site/.env.local` → `IYZICO_API_KEY`, `IYZICO_SECRET_KEY`
+
+Anahtarlar tanımlı değilken sahte sağlayıcı kullanılıyor: bütün sipariş akışı
+çalışıyor ama para hareket etmiyor. Panel hangi sağlayıcının bağlı olduğunu
+yazıyor, yani bu durumla yayına çıkmak fark edilmeden mümkün değil.
+
+Sandbox anahtarı almak dakikalar sürer (`docs/ODEME.md`). **Canlı** hesap tüzel
+kişilik ister ve R3 kapanmadan açılamaz.
+
 ## Durum özeti (2026-09-26)
 
 | Risk | Durum | Neyi engelliyor |
@@ -65,6 +78,7 @@ yayına alınmaz.
 | R2 — hukuki metinler taslak | açık | Ödeme fazının yayına çıkması |
 | R3 — kurum bilgileri yer tutucu | açık | iyzico başvurusu, hukuki sayfalar |
 | R4 — fiyatlar uydurma | açık | Ödeme akışının yayına çıkması |
+| R5 — iyzico anahtarı yok | açık | Gerçek tahsilat |
 
 Dördü de **kod tarafında hazır**: değişecek yerler tek modüllerde toplandı ve
 sayfalar yer tutucu olduklarını kendileri söylüyor. Gerçek bilgi geldiğinde

@@ -18,6 +18,15 @@ const config: NextConfig = {
   transpilePackages: ["@astro/protocol", "@astro/ui"],
 
   typedRoutes: true,
+
+  /*
+   * iyzipay paketlenmez, çalışma anında require edilir.
+   *
+   * SDK kaynak sınıflarını `fs.readdirSync(__dirname + "/resources")` ile
+   * dinamik yüklüyor; paketleyici bunu çözemiyor ve derleme "Can't resolve
+   * .../resources/ <dynamic>" ile düşüyor.
+   */
+  serverExternalPackages: ["iyzipay"],
 };
 
 export default config;

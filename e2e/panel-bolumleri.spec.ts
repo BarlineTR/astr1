@@ -80,8 +80,16 @@ test("abonelik sayfası planları ve eksik olanı açıkça gösteriyor", async 
   await expect(page.getByText("Gözlem")).toBeVisible();
   await expect(page.getByText("Operasyon")).toBeVisible();
 
-  // Ödeme adımı neden çalışmadığını söylüyor; sessizce kırık düğme yok.
-  await expect(page.getByText(/ödeme altyapısı/i).first()).toBeVisible();
+  // Satın alma düğmeleri artık gerçek akışa bağlı.
+  await expect(page.getByRole("button", { name: "Planı seçin" }).first()).toBeEnabled();
+  await expect(page.getByRole("button", { name: "Destek olun" }).first()).toBeEnabled();
+
+  /*
+   * Sessizce sahte sağlayıcıya düşmek, paranın hiç tahsil edilmediğini fark
+   * etmeden yayına çıkmak demek olurdu: hangi sağlayıcının bağlı olduğu
+   * sayfada yazıyor.
+   */
+  await expect(page.getByText(/ödeme sağlayıcısı bağlı değil|iyzico üzerinden/i)).toBeVisible();
 });
 
 test("faturalar sayfası boş durumu anlatıyor", async ({ page }) => {

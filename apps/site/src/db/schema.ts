@@ -244,3 +244,109 @@ export const auditEvents = pgTable(
     index("audit_created_idx").on(t.createdAt),
   ],
 );
+
+/* ──────────────────────────────  Ödeme  ──────────────────────────────── */
+
+/**
+ * Siparişler.
+ *
+ * Ürünler tabloda değil kodda (`data/fiyatlar.ts`): sabit ve kısa bir liste,
+ * tablo olsaydı kimsenin kullanmayacağı bir yönetim ekranı gerekirdi. Ama
+ * kalem adı ve fiyatı siparişe **kopyalanır** — fiyat sonradan değişince eski
+ * siparişin tutarı değişmemeli.
+ *
+ * Durum yalnızca sağlayıcıdan gelen sonuçla ilerler, tarayıcının döndüğü
+ * sayfayla değil: kullanıcı ödeme sonrası sekmeyi kapatsa da sipariş tamamlanır.
+ */
+export const orders = pgTable(
+  "orders",
+  {
+    id: text("id").primaryKey(),
+    userId: text("user_id").references(() => users.id, { onDelete: "set null" }),
+    email: text("email").notNull(),
+    /** "destek" | "abonelik" */
+    kind: text("kind").notNull(),
+    /** "bekliyor" | "odendi" | "basarisiz" | "iade" */
+    status: text("status").notNull().default("bekliyor"),
+    totalMinor: integer("total_minor").notNull(),
+    currency: text("currency").notNull().default("TRY"),
+    provider: text("provider").notNull(),
+    /** Sağlayıcının oturum kimliği (iyzico'da checkout form token'ı). */
+    providerRef: text("provider_ref"),
+    /** İstek/yanıt eşlemesi için; sağlayıcıya gönderilir ve aynen geri gelir. */
+    conversationId: text("conversation_id").notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+    paidAt: timestamp("paid_at", { withTimezone: true }),
+  },
+  (t) => [
+    index("orders_user_idx").on(t.userId),
+    index("orders_status_idx").on(t.status),
+    uniqueIndex("orders_conversation_uniq").on(t.conversationId),
+  ],
+);
+
+export const orderItems = pgTable(
+  "order_items",
+  {
+    id: text("id").primaryKey(),
+    orderId: text("order_id")
+      .notNull()
+      .references(() => orders.id, { onDelete: "cascade" }),
+    productSlug: text("product_slug").notNull(),
+    /** Satın alma anındaki ad ve fiyat; sonradan değişse de sipariş sabit kalır. */
+    name: text("name").notNull(),
+    unitPriceMinor: integer("unit_price_minor").notNull(),
+    quantity: integer("quantity").notNull().default(1),
+  },
+  (t) => [index("order_items_order_idx").on(t.orderId)],
+);
+
+/**
+ * Gerçekleşen ödemeler.
+ *
+ * `providerPaymentId` tekil: sonucu iki kez almak (geri dönüş + kullanıcının
+ * sayfayı yenilemesi) ikinci bir ödeme kaydı yaratmamalı. Tekillik veritabanında
+ * zorlanıyor, kodda "önce bak sonra yaz" ile değil — iki istek aynı anda
+ * geldiğinde o kontrol ikisini de geçiriyordu.
+ */
+export const payments = pgTable(
+  "payments",
+  {
+    id: text("id").primaryKey(),
+    orderId: text("order_id")
+      .notNull()
+      .references(() => orders.id, { onDelete: "cascade" }),
+    provider: text("provider").notNull(),
+    providerPaymentId: text("provider_payment_id").notNull().unique(),
+    /** "basarili" | "basarisiz" */
+    status: text("status").notNull(),
+    amountMinor: integer("amount_minor").notNull(),
+    currency: text("currency").notNull().default("TRY"),
+    cardFamily: text("card_family"),
+    cardLastFour: text("card_last_four"),
+    /** Sağlayıcının ham yanıtı; hata ayıklama ve uyuşmazlık için. */
+    raw: jsonb("raw"),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [index("payments_order_idx").on(t.orderId)],
+);
+
+/**
+ * Sağlayıcıdan gelen bildirimler.
+ *
+ * `providerEventId` tekil ve idempotensi buradan geliyor: aynı bildirim iki kez
+ * gelirse ikincisi hiçbir şey yapmaz. Sağlayıcılar bildirimi en az bir kez
+ * göndermeyi garanti eder, tam bir kez değil.
+ */
+export const webhookEvents = pgTable(
+  "webhook_events",
+  {
+    id: text("id").primaryKey(),
+    provider: text("provider").notNull(),
+    providerEventId: text("provider_event_id").notNull().unique(),
+    receivedAt: timestamp("received_at", { withTimezone: true }).notNull().defaultNow(),
+    processedAt: timestamp("processed_at", { withTimezone: true }),
+    raw: jsonb("raw"),
+  },
+  (t) => [index("webhook_provider_idx").on(t.provider)],
+);

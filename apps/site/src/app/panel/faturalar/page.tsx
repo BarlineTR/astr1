@@ -1,4 +1,9 @@
+import { desc, eq } from "drizzle-orm";
+
+import { db } from "@/db";
+import { orders } from "@/db/schema";
 import { KURUM } from "@/data/kurum";
+import { kurusBicimle } from "@/lib/para";
 import { oturumGerekli } from "@/lib/oturum";
 import { sayfaMetadata } from "@/lib/seo";
 
@@ -9,33 +14,63 @@ export const metadata = sayfaMetadata({
   dizinleme: false,
 });
 
+const DURUM_ADI: Record<string, string> = {
+  odendi: "ödendi",
+  bekliyor: "bekliyor",
+  basarisiz: "başarısız",
+  iade: "iade edildi",
+};
+
 export default async function FaturalarSayfasi() {
   const oturum = await oturumGerekli("/panel/faturalar");
 
-  /*
-   * Fatura kaydı ödemeyle birlikte oluşur; ödeme sağlayıcısı bağlanmadan
-   * fatura da yok. Sahte bir liste göstermektense boş durum anlatıyor.
-   */
-  const faturalar: ReadonlyArray<{ id: string }> = [];
+  const siparisler = await db
+    .select()
+    .from(orders)
+    .where(eq(orders.userId, oturum.user.id))
+    .orderBy(desc(orders.createdAt));
 
   return (
     <>
       <div className="pano__baslik">
         <h1>Faturalar</h1>
-        <p className="pano__lead">Ödeme geçmişiniz ve indirilebilir faturalarınız.</p>
+        <p className="pano__lead">Ödeme geçmişiniz ve siparişleriniz.</p>
       </div>
 
-      {faturalar.length === 0 && (
+      {siparisler.length === 0 ? (
         <div className="bos-durum">
           <p className="eyebrow">Henüz fatura yok</p>
           <p>
-            İlk ödemeniz gerçekleştiğinde faturalarınız burada listelenir ve PDF
-            olarak indirilebilir.
+            İlk ödemeniz gerçekleştiğinde siparişleriniz burada listelenir.
           </p>
           <p className="bos-durum__not">
             Faturalar <strong>{oturum.user.email}</strong> adresine de gönderilir.
           </p>
         </div>
+      ) : (
+        <table className="teknik-tablo">
+          <caption>Siparişleriniz</caption>
+          <thead>
+            <tr>
+              <th scope="col">Tarih</th>
+              <th scope="col">Sipariş</th>
+              <th scope="col">Tutar</th>
+              <th scope="col">Durum</th>
+            </tr>
+          </thead>
+          <tbody>
+            {siparisler.map((s) => (
+              <tr key={s.id}>
+                <th scope="row">
+                  {s.createdAt.toLocaleDateString("tr-TR")}
+                </th>
+                <td className="mono">{s.id.slice(0, 8)}…</td>
+                <td className="mono">{kurusBicimle(s.totalMinor)}</td>
+                <td>{DURUM_ADI[s.status] ?? s.status}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
       )}
 
       <section className="pano__bolum">
@@ -56,8 +91,8 @@ export default async function FaturalarSayfasi() {
         </dl>
         <p className="pano__not">
           Kurumsal fatura için vergi bilgilerinizi{" "}
-          <a href={`mailto:${KURUM.eposta}`}>bize iletin</a>; fatura alanları ödeme
-          altyapısıyla birlikte düzenlenebilir hale gelecek.
+          <a href={`mailto:${KURUM.eposta}`}>bize iletin</a>. Resmî fatura
+          düzenlemesi, kurum bilgileri tamamlandığında devreye alınacak.
         </p>
       </section>
     </>

@@ -58,7 +58,8 @@ veritabanına ihtiyaç duyar.
 | `/panel` | Cihazlar, hesap — **giriş arkasında** |
 | `/panel/cihaz/ekle` | Robot ekleme ve eşleştirme kodu |
 | `/panel/cihaz/[id]` | Gerçek kontrol konsolu, cihaz yönetimi — giriş + cihaz yetkisi arkasında |
-| `/panel/abonelik`, `/panel/faturalar` | Plan ve ödeme (ödeme sağlayıcısı henüz bağlı değil) |
+| `/panel/abonelik`, `/panel/faturalar` | Plan satın alma, destek paketleri, sipariş geçmişi |
+| `/odeme/sonuc/[siparisId]` | Ödeme sonucu |
 | `/kvkk`, `/gizlilik`, `/cerez`, `/kosullar`, `/mesafeli-satis`, `/iade` | Hukuki (taslak) |
 
 ## Bu kod tabanında bilinmesi gerekenler
@@ -84,6 +85,9 @@ veritabanına ihtiyaç duyar.
 - **Hareket komutları robot bağlı değilken ya da gecikme 800 ms'yi aştığında
   gönderilmez; acil durdurma bu kısıttan muaftır.** Durdurmayı geciktirmek,
   geciken bir hareket komutundan çok daha kötü.
+- **Ödeme fiyatı istemciden almaz.** Forma yalnızca ürün slug'ı konur; tutar
+  sunucudaki listeden okunur. Sonuç işleme idempotenttir ve tekillik
+  veritabanında zorlanır. Ayrıntı: `docs/ODEME.md`.
 - **Yer tutucular görünür.** Kurum bilgileri, fiyatlar ve hukuki metinler taslak
   ve sayfalar bunu kendileri söylüyor. Bkz. `docs/RISKLER.md`.
 
@@ -92,6 +96,7 @@ veritabanına ihtiyaç duyar.
 - `docs/superpowers/specs/2026-09-26-kurumsal-web-sitesi-design.md` — tasarım ve kararlar
 - `docs/superpowers/plans/2026-09-26-faz-0-1-2-kurumsal-site.md` — uygulama planı
 - `docs/BAGLANTI.md` — robot bağlantı portu: sözleşme, eşleştirme, yetki, sınırlar
+- `docs/ODEME.md` — ödeme altyapısı: akış, kararlar, iyzico'yu bağlamak
 - `docs/RISKLER.md` — yayın öncesi kapatılması gereken maddeler
 
 ## Dağıtım
