@@ -565,21 +565,21 @@ def compute_self_voice_score(transcript: str, recent_robot_phrases: List[str]) -
     return min(1.0, max_score)
 
 
-def compute_pcm_self_voice_score(mic_pcm: bytes, ref_pcm: bytes, max_lag_samples: int = 4800) -> float:
+def compute_pcm_self_voice_score(mic_pcm: bytes, ref_pcm: bytes, max_lag_samples: int = 24000) -> float:
     """Computes acoustic correlation (0.0 to 1.0) between incoming mic frame and playback buffer."""
-    if not mic_pcm or not ref_pcm:
+    if not mic_pcm or not ref_pcm or len(mic_pcm) < 160 or len(ref_pcm) < 160:
         return 0.0
     try:
         mic = np.frombuffer(mic_pcm, dtype=np.int16).astype(np.float32)
         ref = np.frombuffer(ref_pcm, dtype=np.int16).astype(np.float32)
         if len(mic) == 0 or len(ref) == 0:
             return 0.0
-        mic_c = mic - np.mean(mic)
-        mic_n = float(np.linalg.norm(mic_c))
-        if mic_n < 1e-4:
-            return 0.0
         ref_w = ref[-max_lag_samples:] if len(ref) > max_lag_samples else ref
         if len(ref_w) < len(mic):
+            return 0.0
+        mic_c = mic - np.mean(mic)
+        mic_n = float(np.linalg.norm(mic_c))
+        if mic_n < 1e-3:
             return 0.0
         ref_c = ref_w - np.mean(ref_w)
         corr = np.correlate(ref_c, mic_c, mode='valid')
@@ -993,6 +993,7 @@ class AstroRealtimeNode(Node):
         self._fallback_audio_buffer: List[bytes] = []
         self._is_processing_fallback = False
         self._fallback_generation_id = 0
+        self._cancelled_generation_ids: Set[int] = set()
         self._current_user_turn_id: Optional[str] = None
         self._speech_authorization: Optional[SpeechAuthorization] = None
 
@@ -6842,9 +6843,9 @@ class AstroRealtimeNode(Node):
         ref_lock = getattr(self, "_playback_ref_lock", None)
         if ref_lock:
             with ref_lock:
-                self._playback_ref_pcm = (getattr(self, "_playback_ref_pcm", b"") + pcm_16k)[-48000:]
+                self._playback_ref_pcm = (getattr(self, "_playback_ref_pcm", b"") + pcm_16k)[-64000:]
         else:
-            self._playback_ref_pcm = (getattr(self, "_playback_ref_pcm", b"") + pcm_16k)[-48000:]
+            self._playback_ref_pcm = (getattr(self, "_playback_ref_pcm", b"") + pcm_16k)[-64000:]
 
     def _clear_playback_reference(self):
         """Clears playback reference buffer when playback stops or turn completes."""
@@ -7041,7 +7042,7 @@ class AstroRealtimeNode(Node):
         elif len(words) == 1:
             if (is_short_utterance or is_wake_cand) and speech_ms >= 50 and total_rms >= max(75.0, self._ambient_rms * 1.05) and not is_playback_active:
                 rejected = False
-            elif not is_short_utterance and not is_wake_cand and (speech_ms < 100 or total_rms < max(180.0, self._ambient_rms * 1.2) or vad_confidence < 0.25):
+            elif not is_short_utterance and not is_wake_cand and (speech_ms < 150 or total_rms < max(180.0, self._ambient_rms * 1.2) or vad_confidence < 0.25):
                 rejected = True
                 reject_reason = "low_confidence"
 
@@ -7873,6 +7874,10 @@ class AstroRealtimeNode(Node):
         """
         if not pcm_data and not is_final_clause:
             return
+        effective_gen_id = generation_id or self._fallback_generation_id
+        if self._barge_in_latched or (generation_id and self._fallback_generation_id != generation_id) or (effective_gen_id in getattr(self, "_cancelled_generation_ids", set())):
+            self.get_logger().debug(f"🛑 [Playback Blocked]: Barge-in or stale/cancelled generation_id={effective_gen_id}")
+            return
         if not getattr(self, "_current_turn_explicit_user_turn", False):
             self.get_logger().warning("🛑 [Playback Blocked]: No explicit user turn.")
             return
@@ -7884,12 +7889,11 @@ class AstroRealtimeNode(Node):
         self._playback_start_monotonic = time.monotonic()
         self.state_machine.transition_to(RobotState.SPEAKING)
         chunk_size = 960  # 480 samples @ 24kHz int16 = 20ms
-        effective_gen_id = generation_id or self._fallback_generation_id
         pcm_dur_s = (len(pcm_data) / 2) / 24000.0 if pcm_data else 0.0
         try:
             if pcm_data:
                 for i in range(0, len(pcm_data), chunk_size):
-                    if self._barge_in_latched:
+                    if self._barge_in_latched or (generation_id and self._fallback_generation_id != generation_id) or (effective_gen_id in getattr(self, "_cancelled_generation_ids", set())):
                         break
                     chunk = pcm_data[i : i + chunk_size]
                     if chunk:
@@ -7917,7 +7921,7 @@ class AstroRealtimeNode(Node):
                             time.sleep(0.001)
 
             # Send end sentinel if not interrupted by barge-in, only on final clause
-            if is_final_clause and not self._barge_in_latched:
+            if is_final_clause and not self._barge_in_latched and (not generation_id or self._fallback_generation_id == generation_id) and (effective_gen_id not in getattr(self, "_cancelled_generation_ids", set())):
                 end_dict = {
                     "generation_id": effective_gen_id,
                     "tts_provider": tts_provider,
@@ -7935,7 +7939,7 @@ class AstroRealtimeNode(Node):
                 t_drain_start = time.monotonic()
                 drain_timeout = max(1.0, pcm_dur_s + 1.5) if pcm_dur_s > 0 else 1.0
                 while self._is_playback_active and (time.monotonic() - t_drain_start < drain_timeout):
-                    if self._barge_in_latched:
+                    if self._barge_in_latched or (generation_id and self._fallback_generation_id != generation_id) or (effective_gen_id in getattr(self, "_cancelled_generation_ids", set())):
                         break
                     time.sleep(0.02)
         finally:
@@ -8361,9 +8365,12 @@ class AstroRealtimeNode(Node):
                 if not clause_text or not str(clause_text).strip():
                     return None, 0.0, 0.0, 0.0
 
+                if self._barge_in_latched or self._fallback_generation_id != current_gen_id or current_gen_id in getattr(self, "_cancelled_generation_ids", set()):
+                    return None, 0.0, 0.0, 0.0
+
                 allowed, reason = self.authorize_speech(
                     user_turn_id=u_turn_id,
-                    generation_id=self._fallback_generation_id,
+                    generation_id=current_gen_id,
                     response_text=clause_text,
                     is_final_response=is_final_response,
                     is_deterministic=is_deterministic,
@@ -8387,7 +8394,7 @@ class AstroRealtimeNode(Node):
                 fb_reason = "realtime_unavailable" if self.use_realtime else "local_mode_configured"
                 route_res = self.tts_router.synthesize(
                     clean_text,
-                    generation_id=self._fallback_generation_id,
+                    generation_id=current_gen_id,
                     language=os.getenv("TTS_LANGUAGE", "tr"),
                     realtime_fallback_reason=fb_reason,
                 )
@@ -8399,13 +8406,15 @@ class AstroRealtimeNode(Node):
             def _handle_and_play_clause_audio(pcm_audio: bytes, is_final_clause: bool = True):
                 if not pcm_audio and not is_final_clause:
                     return
+                if self._barge_in_latched or self._fallback_generation_id != current_gen_id or current_gen_id in getattr(self, "_cancelled_generation_ids", set()):
+                    return
                 # Debug WAV & verification log on first real XTTS synthesis
                 if pcm_audio and active_engine == "xtts_gpu" and not getattr(self, "_first_xtts_debug_wav_written", False):
                     self._first_xtts_debug_wav_written = True
                     try:
                         import wave, hashlib, tempfile
                         wav_dir = "/tmp" if os.path.exists("/tmp") else tempfile.gettempdir()
-                        wav_path = os.path.join(wav_dir, f"astro_xtts_{self._fallback_generation_id}.wav")
+                        wav_path = os.path.join(wav_dir, f"astro_xtts_{current_gen_id}.wav")
                         with wave.open(wav_path, "wb") as wf:
                             wf.setnchannels(1)
                             wf.setsampwidth(2)
@@ -8416,7 +8425,7 @@ class AstroRealtimeNode(Node):
                         telem = self.local_xtts.get_telemetry() if self.local_xtts else {}
                         self.get_logger().info(
                             f"🎵 [XTTS OUTPUT VERIFIED]\n"
-                            f"  generation_id={self._fallback_generation_id}\n"
+                            f"  generation_id={current_gen_id}\n"
                             f"  provider=xtts_gpu\n"
                             f"  model=xtts_finetuned\n"
                             f"  checkpoint={telem.get('xtts_model_path', 'default')}\n"
@@ -8432,7 +8441,7 @@ class AstroRealtimeNode(Node):
 
                 self._play_pcm_chunks(
                     pcm_audio,
-                    generation_id=self._fallback_generation_id,
+                    generation_id=current_gen_id,
                     tts_provider=active_engine,
                     tts_model=tts_model_name,
                     tts_source=tts_source_name,
@@ -9486,7 +9495,7 @@ class AstroRealtimeNode(Node):
                         temperature=0.65,
                         timeout=5.0,
                     ):
-                        if self._barge_in_latched or self._fallback_generation_id != current_gen_id:
+                        if self._barge_in_latched or self._fallback_generation_id != current_gen_id or current_gen_id in getattr(self, "_cancelled_generation_ids", set()):
                             self.get_logger().info("🛑 [OpenAI 4o-mini Interrupted] Barge-in detected during streaming.")
                             break
 
@@ -9499,15 +9508,15 @@ class AstroRealtimeNode(Node):
                         full_reply_parts.append(token)
 
                         # Clause-Level Streaming: Synthesize and play clauses incrementally
-                        if chunker and not self._barge_in_latched and self._fallback_generation_id == current_gen_id:
+                        if chunker and not self._barge_in_latched and self._fallback_generation_id == current_gen_id and current_gen_id not in getattr(self, "_cancelled_generation_ids", set()):
                             ready_clauses = chunker.feed(token)
                             for cl_txt in ready_clauses:
-                                if self._barge_in_latched or self._fallback_generation_id != current_gen_id:
+                                if self._barge_in_latched or self._fallback_generation_id != current_gen_id or current_gen_id in getattr(self, "_cancelled_generation_ids", set()):
                                     break
                                 if not getattr(self, "_speech_authorization", None):
                                     self._speech_authorization = SpeechAuthorization(
                                         user_turn_id=u_turn_id,
-                                        generation_id=self._fallback_generation_id,
+                                        generation_id=current_gen_id,
                                         explicit_user_turn=True,
                                         should_speak=True,
                                         response_origin="openai_chat",
@@ -9545,7 +9554,7 @@ class AstroRealtimeNode(Node):
                         self.provider_registry.record_success("openai", target_model, llm_latency_ms)
 
                         # Flush remaining clause from chunker if any
-                        if chunker and streamed_clauses_count > 0 and not self._barge_in_latched and self._fallback_generation_id == current_gen_id:
+                        if chunker and streamed_clauses_count > 0 and not self._barge_in_latched and self._fallback_generation_id == current_gen_id and current_gen_id not in getattr(self, "_cancelled_generation_ids", set()):
                             rem_cl = chunker.flush()
                             final_handled = False
                             if rem_cl:
@@ -9582,7 +9591,7 @@ class AstroRealtimeNode(Node):
                         })
                 except Exception as oe:
                     self.get_logger().warn(f"⚠️ [OpenAI Chat {target_model} Failed]: {oe}")
-                    if streamed_clauses_count > 0 and not self._barge_in_latched and self._fallback_generation_id == current_gen_id:
+                    if streamed_clauses_count > 0 and not self._barge_in_latched and self._fallback_generation_id == current_gen_id and current_gen_id not in getattr(self, "_cancelled_generation_ids", set()):
                         try:
                             _handle_and_play_clause_audio(b"", is_final_clause=True)
                         except Exception:
@@ -9926,6 +9935,10 @@ class AstroRealtimeNode(Node):
                             temperature=0.65,
                             timeout=5.0,
                         ):
+                            if self._barge_in_latched or self._fallback_generation_id != current_gen_id or current_gen_id in getattr(self, "_cancelled_generation_ids", set()):
+                                self.get_logger().info("🛑 [Groq Interrupted] Barge-in detected during streaming.")
+                                break
+
                             if not first_token_seen:
                                 llm_ttft_ms = (time.monotonic() - t_model_start) * 1000.0
                                 first_token_seen = True
@@ -10073,10 +10086,10 @@ class AstroRealtimeNode(Node):
                     self._recent_robot_phrases = self._recent_robot_phrases[-10:]
 
             # Synthesize ONE single unified TTS generation for this logical turn (only if not streamed)
-            if full_reply_str and streamed_clauses_count == 0 and not self._barge_in_latched and self._fallback_generation_id == current_gen_id:
+            if full_reply_str and streamed_clauses_count == 0 and not self._barge_in_latched and self._fallback_generation_id == current_gen_id and current_gen_id not in getattr(self, "_cancelled_generation_ids", set()):
                 self._speech_authorization = SpeechAuthorization(
                     user_turn_id=u_turn_id,
-                    generation_id=self._fallback_generation_id,
+                    generation_id=current_gen_id,
                     explicit_user_turn=True,
                     should_speak=True,
                     response_origin=response_origin,
@@ -10326,7 +10339,7 @@ class AstroRealtimeNode(Node):
         # ReSpeaker Hardware AEC Barge-In & State Tracking (Hardware AEC on Channel 0)
         if is_active_playback:
             playback_start = getattr(self, "_playback_start_monotonic", 0.0)
-            prot_ms = 60.0  # Ignore brief DAC startup click transient (<= 60ms)
+            prot_ms = 120.0  # Ignore brief DAC startup click transient and initial buffer window (<= 120ms)
 
             # 1. Acoustic Protection Window: Ignore brief DAC power-on click
             if playback_start > 0.0 and ((now - playback_start) * 1000.0 < prot_ms):
@@ -10337,21 +10350,53 @@ class AstroRealtimeNode(Node):
                         self._fallback_audio_buffer.clear()
                 return
 
-            # Target barge-in threshold: With ReSpeaker Hardware AEC on Channel 0,
-            # natural user voice easily exceeds ambient noise floor.
-            ambient_val = float(getattr(self, "_ambient_rms", 120.0))
-            target_barge_in_rms = max(280.0, ambient_val * 1.3)
-            target_barge_in_peak = 600
-
-            # Compute self-voice score against current playback reference
+            # Compute self-voice score against current playback reference under lock
             self_voice_score = 0.0
-            if getattr(self, "_playback_ref_pcm", None) and raw_16k:
+            ref_lock = getattr(self, "_playback_ref_lock", None)
+            ref_pcm_bytes = b""
+            if ref_lock:
+                with ref_lock:
+                    ref_pcm_bytes = self._playback_ref_pcm
+            else:
+                ref_pcm_bytes = getattr(self, "_playback_ref_pcm", b"")
+
+            if ref_pcm_bytes and raw_16k:
                 try:
-                    self_voice_score = compute_pcm_self_voice_score(raw_16k, self._playback_ref_pcm)
+                    self_voice_score = compute_pcm_self_voice_score(raw_16k, ref_pcm_bytes)
                 except Exception:
                     self_voice_score = 0.0
 
-            # 2. Energy threshold check
+            # 2. Self-Voice Filter (Acoustic Echo Suppression)
+            # If incoming audio correlates with what Astro is playing through the speaker, it is robot self-voice!
+            if self_voice_score >= 0.28:
+                self._barge_in_consecutive_frames = max(0, self._barge_in_consecutive_frames - 2)
+                self.get_logger().debug(
+                    f"[BARGE-IN DECISION]\n"
+                    f"playback_active=true\n"
+                    f"vad_confidence={1.0 if (getattr(self, '_vad_active', False) or getattr(self, '_user_speaking_active', False)) else 0.0:.2f}\n"
+                    f"speech_duration_ms={self._barge_in_consecutive_frames * 20}\n"
+                    f"speech_continuity_ms={self._barge_in_consecutive_frames * 20}\n"
+                    f"rms={local_rms:.0f}\n"
+                    f"peak={peak_val}\n"
+                    f"self_voice_score={self_voice_score:.2f}\n"
+                    f"transient_noise=false\n"
+                    f"speech_confirmed=false\n"
+                    f"decision=false\n"
+                    f"reason=self_voice_suppressed"
+                )
+                with self._lock:
+                    if self._fallback_speaking or self._fallback_audio_buffer:
+                        self._fallback_speaking = False
+                        self._fallback_audio_buffer.clear()
+                return
+
+            # Target barge-in threshold: With ReSpeaker Hardware AEC on Channel 0,
+            # natural user voice easily exceeds ambient noise floor.
+            ambient_val = float(getattr(self, "_ambient_rms", 120.0))
+            target_barge_in_rms = max(300.0, ambient_val * 1.35)
+            target_barge_in_peak = 650
+
+            # 3. Energy threshold check
             is_loud = (local_rms >= target_barge_in_rms and peak_val >= target_barge_in_peak)
             if is_loud:
                 self._barge_in_consecutive_frames += 1
@@ -10360,20 +10405,31 @@ class AstroRealtimeNode(Node):
 
             speech_duration_ms = self._barge_in_consecutive_frames * 20
             speech_continuity_ms = speech_duration_ms
-            
-            # With hardware AEC active on Channel 0, 60ms human voice continuity confirms barge-in
-            min_speech_ms = 60.0
-            if speech_duration_ms < min_speech_ms:
-                if local_rms >= target_barge_in_rms and peak_val >= target_barge_in_peak:
-                    is_vad_active = getattr(self, "_vad_active", False)
-                    is_human_candidate = is_vad_active
-                    # Transient noise is an isolated impulse (<40ms) when VAD does not detect human voice
-                    is_transient = (speech_duration_ms < 40) and not is_human_candidate
+            is_vad_active = bool(getattr(self, "_vad_active", False) or getattr(self, "_user_speaking_active", False))
+
+            # Minimum speech duration requirement:
+            # - If test or node explicitly configured barge_in_min_consecutive_frames: honor configured frame count
+            # - If loud user voice (RMS >= 1200 or peak >= 3500): 60ms (3 frames)
+            # - If VAD is active and self_voice_score < 0.20: 80ms (4 frames)
+            # - If VAD is not active (vad_confidence=0.0): 140ms (7 frames) to prevent 60ms speaker echo false-cuts
+            min_frames_cfg = getattr(self, "barge_in_min_consecutive_frames", None)
+            if min_frames_cfg is not None:
+                min_speech_ms = float(min_frames_cfg * 20)
+            elif local_rms >= 1200.0 or peak_val >= 3500:
+                min_speech_ms = 60.0
+            elif is_vad_active and self_voice_score < 0.20:
+                min_speech_ms = 80.0
+            else:
+                min_speech_ms = 140.0
+
+            if speech_duration_ms < min_speech_ms or (not is_vad_active and local_rms < target_barge_in_rms):
+                if is_loud:
+                    is_transient = (speech_duration_ms < 60) and not is_vad_active
                     reason = "transient_noise" if is_transient else "insufficient_speech_duration"
                     self.get_logger().debug(
                         f"[BARGE-IN DECISION]\n"
                         f"playback_active=true\n"
-                        f"vad_confidence={1.0 if getattr(self, '_vad_active', False) else 0.0:.2f}\n"
+                        f"vad_confidence={1.0 if is_vad_active else 0.0:.2f}\n"
                         f"speech_duration_ms={speech_duration_ms}\n"
                         f"speech_continuity_ms={speech_continuity_ms}\n"
                         f"rms={local_rms:.0f}\n"
@@ -10402,7 +10458,7 @@ class AstroRealtimeNode(Node):
             self.get_logger().info(
                 f"[BARGE-IN DECISION]\n"
                 f"playback_active=true\n"
-                f"vad_confidence={1.0 if getattr(self, '_vad_active', False) else 0.0:.2f}\n"
+                f"vad_confidence={1.0 if is_vad_active else 0.0:.2f}\n"
                 f"speech_duration_ms={speech_duration_ms}\n"
                 f"speech_continuity_ms={speech_continuity_ms}\n"
                 f"rms={local_rms:.0f}\n"
@@ -10415,17 +10471,29 @@ class AstroRealtimeNode(Node):
             )
 
             # 6. Actuate Cancellation: Cancel ongoing audio and speech pipeline
+            # Atomically invalidate speech authorization
+            if getattr(self, "_speech_authorization", None):
+                self._speech_authorization.invalidated = True
+                self._speech_authorization = None
+
+            cancelled_gen = self._fallback_generation_id
+            if not hasattr(self, "_cancelled_generation_ids"):
+                self._cancelled_generation_ids = set()
+            self._cancelled_generation_ids.add(cancelled_gen)
+
             if getattr(self, "_fallback_mode", False) or not self._can_use_openai("realtime"):
                 self._fallback_speaking = True
                 self._fallback_speech_start = now
                 self._last_speech_time = now
-                self._fallback_generation_id += 1
+                if getattr(self, "tts_router", None) and hasattr(self.tts_router, "cancel"):
+                    self.tts_router.cancel(cancelled_gen)
                 if self.elevenlabs_engine:
-                    self.elevenlabs_engine.cancel(self._fallback_generation_id)
+                    self.elevenlabs_engine.cancel(cancelled_gen)
                 if self.local_xtts:
-                    self.local_xtts.cancel(self._fallback_generation_id)
+                    self.local_xtts.cancel(cancelled_gen)
                 if self.local_offline_tts:
-                    self.local_offline_tts.cancel(self._fallback_generation_id)
+                    self.local_offline_tts.cancel(cancelled_gen)
+                self._fallback_generation_id += 1
                 with self._lock:
                     self._fallback_audio_buffer = [raw_16k]
             else:

@@ -950,6 +950,10 @@ class AudioStreamNode(Node):
             is_first = bool(payload.get("is_first", False))
             gen_id = payload.get("generation_id", 0)
 
+            # Drop incoming chunks immediately if generation was cancelled
+            if hasattr(self, "_cancelled_gen_ids") and gen_id in self._cancelled_gen_ids:
+                return
+
             raw_16k = b""
             if b64_pcm:
                 raw_24k = base64.b64decode(b64_pcm.encode("ascii"))
@@ -981,22 +985,29 @@ class AudioStreamNode(Node):
             if not msg.data:
                 return
 
-            # P0-7: Barge-in is only valid if playback has actually started and played bytes > 0
-            if not self._playback_burst_active or self._total_played_bytes == 0:
-                return
-
             now_mono = time.monotonic()
             barge_in_after_ms = int((now_mono - self._burst_start_time) * 1000.0) if self._burst_start_time > 0 else 0
-            if self._burst_start_time > 0 and barge_in_after_ms < int(self.barge_in_protection_ms):
-                self.get_logger().debug(f"🛡️ [Acoustic Gate] Interruption rejected: {barge_in_after_ms}ms < {self.barge_in_protection_ms}ms (self-voice echo)")
-                return
 
             discarded_bytes = 0
+            if not hasattr(self, "_cancelled_gen_ids"):
+                self._cancelled_gen_ids = set()
+
+            prov = getattr(self, "_active_provenance", {})
+            cancelled_gen = prov.get('generation_id', 0)
+            if cancelled_gen:
+                self._cancelled_gen_ids.add(cancelled_gen)
+
             with self._playback_lock:
                 while not self._play_queue.empty():
                     try:
                         c = self._play_queue.get_nowait()
-                        raw_len = len(c["pcm"]) if isinstance(c, dict) else len(c)
+                        if isinstance(c, dict):
+                            raw_len = len(c.get("pcm", b""))
+                            q_gen = c.get("generation_id", 0)
+                            if q_gen:
+                                self._cancelled_gen_ids.add(q_gen)
+                        else:
+                            raw_len = len(c)
                         discarded_bytes += raw_len
                     except queue.Empty:
                         break
@@ -1006,11 +1017,6 @@ class AudioStreamNode(Node):
             self._playback_burst_active = False
             self._last_playback_time = 0.0
             self._playback_drop_until = now_mono + 0.15
-            prov = getattr(self, "_active_provenance", {})
-            cancelled_gen = prov.get('generation_id', 0)
-            if not hasattr(self, "_cancelled_gen_ids"):
-                self._cancelled_gen_ids = set()
-            self._cancelled_gen_ids.add(cancelled_gen)
 
             gen_bytes = getattr(self, "_current_gen_played_bytes", self._total_played_bytes)
 
@@ -1186,8 +1192,8 @@ class AudioStreamNode(Node):
                             f"playback_duration_ms={int(burst_dur_ms)}"
                         )
                     active_gen_id = None
-                elif gen_started and (time.monotonic() - self._last_playback_time) > 2.0:
-                    # Stream timed out without is_done (e.g. dropped connection)
+                elif gen_started and (time.monotonic() - self._last_playback_time) > 6.0:
+                    # Stream timed out without is_done (e.g. dropped connection after 6 seconds of inactivity)
                     self._is_playing = False
                     self._playback_burst_active = False
                     gen_started = False

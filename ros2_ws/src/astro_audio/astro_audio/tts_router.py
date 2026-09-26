@@ -98,6 +98,7 @@ class TTSRouter:
 
         self.edge_timeout_s = float(os.getenv("TTS_EDGE_SYNTHESIS_TIMEOUT_S", os.getenv("EDGE_TTS_TIMEOUT_S", str(self.DEFAULT_EDGE_TTS_TIMEOUT_S))))
         self.playback_deadline_ms = float(os.getenv("TTS_PLAYBACK_START_DEADLINE_MS", str(self.DEFAULT_PLAYBACK_DEADLINE_MS)))
+        self._cancelled_generation_ids: set[int] = set()
 
         # One-time dormant XTTS notification
         if self.local_xtts:
@@ -116,6 +117,30 @@ class TTSRouter:
             f"Local Offline TTS (Emergency Fallback) -> Emergency WAV"
         )
 
+    def cancel(self, generation_id: int) -> None:
+        """Cancels all in-flight and pending synthesis operations for a given generation_id."""
+        self._cancelled_generation_ids.add(generation_id)
+        if self.local_xtts and hasattr(self.local_xtts, "cancel"):
+            try:
+                self.local_xtts.cancel(generation_id)
+            except Exception:
+                pass
+        if self.elevenlabs_engine and hasattr(self.elevenlabs_engine, "cancel"):
+            try:
+                self.elevenlabs_engine.cancel(generation_id)
+            except Exception:
+                pass
+        if self.openai_tts_engine and hasattr(self.openai_tts_engine, "cancel"):
+            try:
+                self.openai_tts_engine.cancel(generation_id)
+            except Exception:
+                pass
+        if self.local_offline_tts and hasattr(self.local_offline_tts, "cancel"):
+            try:
+                self.local_offline_tts.cancel(generation_id)
+            except Exception:
+                pass
+
     def _safe_log(self, lvl: str, msg: str):
         try:
             if self._log:
@@ -133,6 +158,21 @@ class TTSRouter:
         realtime_fallback_reason: Optional[str] = None,
     ) -> TTSRouteResult:
         """Synthesizes speech through the strict Realtime Fallback -> Edge-TTS -> Local Offline -> Emergency WAV chain."""
+        if generation_id in self._cancelled_generation_ids:
+            self._safe_log("info", f"🛑 [TTSRouter Cancelled]: generation_id={generation_id} is cancelled, skipping synthesis.")
+            return TTSRouteResult(
+                pcm=None,
+                selected_provider="cancelled",
+                actual_provider="cancelled",
+                model_name="cancelled",
+                source_name="cancelled",
+                tts_state="cancelled",
+                tts_ready=False,
+                tts_healthy=False,
+                fallback_reason="generation_cancelled",
+                fallback_chain=["cancelled"],
+                duration_ms=0.0,
+            )
         if not text or not text.strip():
             return TTSRouteResult(
                 pcm=None,
