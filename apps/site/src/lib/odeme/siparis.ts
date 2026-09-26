@@ -82,6 +82,7 @@ export async function siparisOlustur(
       ip: girdi.alici.ip,
     },
     geriDonusUrl: `${girdi.siteUrl}/api/odeme/geri-donus`,
+    periyot: girdi.tur === "abonelik" ? "ay" : "tek",
   });
 
   if (!baslat.ok || !baslat.odemeSayfasiUrl) {

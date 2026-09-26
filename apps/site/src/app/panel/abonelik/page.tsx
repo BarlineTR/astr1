@@ -2,6 +2,8 @@ import Link from "next/link";
 
 import { DESTEK_PAKETLERI, GELISTIRME_FIYATI, PLANLAR } from "@/data/fiyatlar";
 import { odemeCanliMi, odemeSaglayici } from "@/lib/odeme";
+import { aktifAbonelik } from "@/lib/odeme/abonelik";
+import { AbonelikDurumu } from "@/components/AbonelikDurumu";
 import { SatinAlDugmesi } from "@/components/SatinAlDugmesi";
 import { kurusBicimle } from "@/lib/para";
 import { oturumGerekli } from "@/lib/oturum";
@@ -15,17 +17,12 @@ export const metadata = sayfaMetadata({
 });
 
 export default async function AbonelikSayfasi() {
-  await oturumGerekli("/panel/abonelik");
+  const oturum = await oturumGerekli("/panel/abonelik");
 
   const saglayici = odemeSaglayici();
   const canli = odemeCanliMi();
-
-  /*
-   * Aktif abonelik henüz tutulmuyor: abonelik kaydı ancak bir ödeme
-   * gerçekleştiğinde oluşur ve ödeme sağlayıcısı bağlanmadan ödeme olmuyor.
-   * Boş bir `subscriptions` tablosu eklemek, doldurulmayacak bir şema demekti.
-   */
-  const aktifPlan = null;
+  const abonelik = await aktifAbonelik(oturum.user.id);
+  const plan = abonelik ? PLANLAR.find((p) => p.slug === abonelik.productSlug) : null;
 
   return (
     <>
@@ -38,7 +35,19 @@ export default async function AbonelikSayfasi() {
 
       <section className="pano__bolum">
         <h2 className="pano__bolum-baslik">Mevcut plan</h2>
-        {aktifPlan ? null : (
+        {abonelik ? (
+          <AbonelikDurumu
+            planAdi={plan?.ad ?? abonelik.productSlug}
+            fiyatKurus={abonelik.priceMinor}
+            durum={abonelik.status}
+            donemSonu={
+              abonelik.currentPeriodEnd
+                ? abonelik.currentPeriodEnd.toLocaleDateString("tr-TR")
+                : null
+            }
+            iptalEdildi={abonelik.cancelAt !== null}
+          />
+        ) : (
           <div className="bos-durum">
             <p className="eyebrow">Aktif planınız yok</p>
             <p>
@@ -58,22 +67,26 @@ export default async function AbonelikSayfasi() {
         )}
 
         <div className="fiyat-izgara">
-          {PLANLAR.map((plan) => (
-            <article className="fiyat-karti" key={plan.slug}>
-              <h3 className="fiyat-karti__ad">{plan.ad}</h3>
+          {PLANLAR.map((secenek) => (
+            <article className="fiyat-karti" key={secenek.slug}>
+              <h3 className="fiyat-karti__ad">{secenek.ad}</h3>
               <p className="fiyat-karti__tutar mono">
-                {kurusBicimle(plan.fiyatKurus)}
+                {kurusBicimle(secenek.fiyatKurus)}
                 <span className="fiyat-karti__periyot"> / ay</span>
               </p>
-              <p className="fiyat-karti__aciklama">{plan.aciklama}</p>
-              {plan.ozellikler && (
+              <p className="fiyat-karti__aciklama">{secenek.aciklama}</p>
+              {secenek.ozellikler && (
                 <ul className="liste">
-                  {plan.ozellikler.map((o) => (
+                  {secenek.ozellikler.map((o) => (
                     <li key={o}>{o}</li>
                   ))}
                 </ul>
               )}
-              <SatinAlDugmesi slug={plan.slug} etiket="Planı seçin" />
+              <SatinAlDugmesi
+                slug={secenek.slug}
+                etiket="Planı seçin"
+                kapali={abonelik !== null}
+              />
             </article>
           ))}
         </div>

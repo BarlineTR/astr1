@@ -1,57 +1,50 @@
 import { notFound } from "next/navigation";
 
 import { odemeSaglayici } from "@/lib/odeme";
-import type { SahteSaglayiciEk } from "@/lib/odeme/sahte";
+import type { SahteAbonelikEk } from "@/lib/odeme/sahte-abonelik";
 import { SahteOdemeFormu } from "@/components/SahteOdemeFormu";
 import { SayfaKabuk } from "@/components/SayfaKabuk";
 import { sayfaMetadata } from "@/lib/seo";
 
 export const metadata = sayfaMetadata({
-  baslik: "Ödeme (taklit)",
-  aciklama: "Geliştirme ortamı ödeme taklidi.",
-  yol: "/odeme/sahte",
+  baslik: "Abonelik ödemesi (taklit)",
+  aciklama: "Geliştirme ortamı abonelik taklidi.",
+  yol: "/odeme/sahte-abonelik",
   dizinleme: false,
 });
 
-/**
- * Sahte sağlayıcının ödeme sayfası taklidi.
- *
- * Yalnızca iyzico anahtarları yokken var olur: gerçek sağlayıcı seçiliyse bu
- * adres 404 döner. Bütün sipariş yaşam döngüsünün anahtar olmadan da uçtan uca
- * koşabilmesi için, ve gerçekte bu adım iyzico'nun kendi sayfasında geçiyor.
- */
-export default async function SahteOdemeSayfasi({
+export default async function SahteAbonelikSayfasi({
   params,
-}: PageProps<"/odeme/sahte/[token]">) {
+}: PageProps<"/odeme/sahte-abonelik/[token]">) {
   const { token } = await params;
   const saglayici = odemeSaglayici();
-
   if (saglayici.id !== "sahte") notFound();
 
-  const ek = saglayici as unknown as SahteSaglayiciEk;
-  const ozet = ek.sahteOturumOzeti(token);
+  const ek = saglayici as unknown as SahteAbonelikEk;
+  const ozet = ek.sahteAbonelikOzeti(token);
   if (!ozet) notFound();
 
   return (
     <SayfaKabuk
       current="fiyatlandirma"
       ustBaslik="Geliştirme ortamı"
-      baslik="Ödeme taklidi"
-      lead="Bu sayfa gerçek bir ödeme sayfası değil. iyzico anahtarları tanımlı olmadığı için sahte sağlayıcı kullanılıyor."
+      baslik="Abonelik ödemesi"
+      lead="Kart bilgileriniz saklanır ve her dönem otomatik çekim yapılır. Bu ekran bir taklittir."
     >
       <section className="section">
         <div className="page">
           <p className="uyari-serit">
             Bu ekran bir <strong>taklittir</strong>. Gerçek bir kart girilmez, para
             hareket etmez ve girdiğiniz hiçbir bilgi sunucuya gönderilmez. Gerçek
-            akışta bu adım iyzico&apos;nun kendi sayfasında geçer; kart bilgisi bizim
-            sunucumuza hiç uğramaz.
+            akışta kart iyzico tarafında saklanır ve tekrarlayan çekimi iyzico yürütür.
           </p>
           <SahteOdemeFormu
             token={token}
             tutarKurus={ozet.tutarKurus}
             kalemAdi={ozet.kalemAdi}
-            periyot={ozet.periyot}
+            periyot="ay"
+            kararUcu="/api/odeme/sahte-abonelik-karar"
+            geriDonusUcu="/api/odeme/abonelik-geri-donus"
           />
         </div>
       </section>

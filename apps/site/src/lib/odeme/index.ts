@@ -1,8 +1,20 @@
-import { iyzicoSaglayici } from "./iyzico";
-import { sahteSaglayici } from "./sahte";
-import type { OdemeSaglayici } from "./saglayici";
+import Iyzipay from "iyzipay";
 
-export type { OdemeSaglayici, OdemeBaslatGirdi, OdemeSonucu, SepetKalemi } from "./saglayici";
+import { iyzicoSaglayici } from "./iyzico";
+import { iyzicoAbonelik } from "./iyzico-abonelik";
+import { sahteSaglayici } from "./sahte";
+import { sahteAbonelik } from "./sahte-abonelik";
+import type { AbonelikSaglayici, OdemeSaglayici } from "./saglayici";
+
+export type {
+  AbonelikSaglayici,
+  AbonelikSonucu,
+  OdemeSaglayici,
+  OdemeBaslatGirdi,
+  OdemeSonucu,
+  SepetKalemi,
+} from "./saglayici";
+export { abonelikDestekliyorMu } from "./saglayici";
 
 /**
  * Yapılandırmaya göre sağlayıcı seçer.
@@ -24,10 +36,19 @@ function olustur(): OdemeSaglayici {
   const siteUrl = process.env.NEXT_PUBLIC_SITE_URL ?? "http://localhost:3000";
 
   if (apiKey && secretKey) {
-    return iyzicoSaglayici({ apiKey, secretKey, uri });
+    /*
+     * Abonelik yüzeyi aynı istemciyi paylaşıyor ama ayrı bir modülde: iyzico'da
+     * abonelik ayrı bir ürün ve hesapta ayrıca etkinleştirilmesi gerekiyor.
+     * Tek seferlik ödeme çalışırken aboneliğin çalışmaması olağan bir durum.
+     */
+    const istemci = new Iyzipay({ apiKey, secretKey, uri });
+    return Object.assign(
+      iyzicoSaglayici({ apiKey, secretKey, uri }),
+      iyzicoAbonelik(istemci),
+    );
   }
 
-  return sahteSaglayici(siteUrl);
+  return Object.assign(sahteSaglayici(siteUrl), sahteAbonelik(siteUrl));
 }
 
 export function odemeSaglayici(): OdemeSaglayici {

@@ -90,11 +90,47 @@ Canlıya geçerken `IYZICO_URI` `https://api.iyzipay.com` olur. **Canlı hesap
 tüzel kişilik ister** — kurum bilgileri (`docs/RISKLER.md` R3) tamamlanmadan
 canlı başvuru yapılamaz.
 
+## Tekrarlayan tahsilat
+
+Aylık planlar tek seferlik ödemeden **tamamen ayrı** bir yol izler:
+`/v2/subscription/checkoutform/initialize`. Kartı iyzico saklar, yenileme
+tarihinde o çeker ve bize bildirir. Biz yalnızca aynasını tutuyoruz — kendi
+zamanlayıcımızla çekim denemek, sağlayıcının durumuyla ayrışan ikinci bir
+gerçek üretirdi.
+
+**Plan iyzico tarafında yaşar.** Ürün ve fiyat planı iyzico panelinden
+oluşturulur ve bir `pricingPlanReferenceCode` verir; tutar ve yenileme sıklığı
+orada tanımlıdır. `data/fiyatlar.ts` içindeki tutar **gösterim** amaçlıdır;
+tahsil edilen tutarı iyzico'daki plan belirler. İkisinin ayrışmaması eşlemeyi
+kuran kişinin sorumluluğudur — kod bunu doğrulayamaz, çünkü plan tutarını ancak
+iyzico bilir.
+
+Eşleme ortam değişkeniyle: `IYZICO_PLAN_GOZLEM`, `IYZICO_PLAN_OPERASYON`.
+Tanımlı değilse aylık plan satın alınamaz ve **neden** satın alınamadığı
+kullanıcıya yazılır.
+
+### İptal
+
+İptal erişimi anında kesmez: ödenmiş dönemin sonuna kadar sürer, yoksa kullanan
+kişi parasını ödediği süreyi kaybeder. Bu yüzden durum `aktif` kalır ve yalnızca
+`cancelAt` işaretlenir; dönem sonunda durumu sağlayıcı `iptal`e çevirir ve biz
+onu aynalarız.
+
+İptal edilmiş ama dönemi süren abonelikle yeni plan seçilemez: aynı ay için iki
+kez ödeme demek olurdu.
+
+### Tek abonelik kuralı
+
+Bir kullanıcının aynı anda yalnızca bir canlı aboneliği olabilir. İkincisi iki
+kez tahsilat demek; plan değiştirme ayrı bir iş (iyzico'nun `upgrade` ucu) ve
+henüz yapılmadı.
+
 ## Henüz yapılmayanlar
 
-- **Tekrarlayan tahsilat.** Abonelik planı şu an tek seferlik ödeme olarak
-  alınıyor. iyzico'nun Abonelik API'si ayrı bir ürün ve hesapta ayrıca
-  etkinleştirilmesi gerekiyor.
+- **Plan değiştirme (upgrade/downgrade).** iyzico'nun `upgrade` ucu var, henüz
+  bağlanmadı.
+- **Kart güncelleme.** Yenileme başarısız olduğunda kullanıcının kartını
+  değiştirebilmesi gerekiyor (`/v2/subscription/card-update/...`).
 - **Webhook.** Geri dönüş yeterli çalışıyor; webhook ikinci bir güvence olarak
   eklenecek. `webhook_events` tablosu ve idempotensi anahtarı hazır.
 - **İade.** `OdemeSaglayici` arayüzüne eklenecek.

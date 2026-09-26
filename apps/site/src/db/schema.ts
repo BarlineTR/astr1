@@ -350,3 +350,44 @@ export const webhookEvents = pgTable(
   },
   (t) => [index("webhook_provider_idx").on(t.provider)],
 );
+
+/**
+ * Abonelikler.
+ *
+ * Tekrarlayan tahsilatı sağlayıcı yürütüyor: kartı o saklıyor, yenileme
+ * tarihinde o çekiyor ve bize bildiriyor. Biz yalnızca aynasını tutuyoruz —
+ * kendi zamanlayıcımızla çekim denemek, sağlayıcının durumuyla ayrışan ikinci
+ * bir gerçek üretirdi.
+ *
+ * `providerRef` sağlayıcıdaki abonelik referansı; iptal ve durum sorgusu
+ * bununla yapılıyor.
+ */
+export const subscriptions = pgTable(
+  "subscriptions",
+  {
+    id: text("id").primaryKey(),
+    userId: text("user_id")
+      .notNull()
+      .references(() => users.id, { onDelete: "cascade" }),
+    productSlug: text("product_slug").notNull(),
+    provider: text("provider").notNull(),
+    providerRef: text("provider_ref"),
+    /** "bekliyor" | "aktif" | "odenmedi" | "iptal" | "bitti" */
+    status: text("status").notNull().default("bekliyor"),
+    priceMinor: integer("price_minor").notNull(),
+    currency: text("currency").notNull().default("TRY"),
+    /** Bir sonraki yenileme; sağlayıcının bildirdiği tarih. */
+    currentPeriodEnd: timestamp("current_period_end", { withTimezone: true }),
+    /**
+     * İptal istendiği an. Abonelik hemen bitmez: ödenmiş dönemin sonuna kadar
+     * sürer, yoksa kullanan kişi parasını ödediği süreyi kaybeder.
+     */
+    cancelAt: timestamp("cancel_at", { withTimezone: true }),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [
+    index("subscriptions_user_idx").on(t.userId),
+    index("subscriptions_status_idx").on(t.status),
+    uniqueIndex("subscriptions_provider_ref_uniq").on(t.providerRef),
+  ],
+);

@@ -71,6 +71,27 @@ declare module "iyzipay" {
       retrieve(istek: { locale: string; token: string }, geriCagir: GeriCagir): void;
     };
 
+    /** Abonelik: iyzico'da ayrı bir ürün, hesapta ayrıca etkinleştirilmeli. */
+    subscriptionCheckoutForm: {
+      initialize(
+        istek: {
+          locale: string;
+          conversationId: string;
+          callbackUrl: string;
+          pricingPlanReferenceCode: string;
+          subscriptionInitialStatus?: string;
+          customer: Record<string, unknown>;
+        },
+        geriCagir: GeriCagir,
+      ): void;
+      retrieve(istek: { checkoutFormToken: string }, geriCagir: GeriCagir): void;
+    };
+
+    subscription: {
+      retrieve(istek: { subscriptionReferenceCode: string }, geriCagir: GeriCagir): void;
+      cancel(istek: { subscriptionReferenceCode: string }, geriCagir: GeriCagir): void;
+    };
+
     static LOCALE: { TR: string; EN: string };
     static CURRENCY: { TRY: string; EUR: string; USD: string };
     static PAYMENT_GROUP: { PRODUCT: string; LISTING: string; SUBSCRIPTION: string };

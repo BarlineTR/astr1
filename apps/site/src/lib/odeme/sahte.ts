@@ -85,12 +85,30 @@ export function sahteSaglayici(siteUrl: string): OdemeSaglayici {
       sahteOturumVarMi(token: string): boolean {
         return oturumlar.has(token);
       },
+      sahteOturumOzeti(token: string) {
+        const oturum = oturumlar.get(token);
+        if (!oturum) return null;
+        const ilk = oturum.girdi.kalemler[0];
+        return {
+          tutarKurus: oturum.girdi.toplamKurus,
+          kalemAdi: ilk?.ad ?? "Sipariş",
+          periyot: oturum.girdi.periyot ?? "tek",
+        };
+      },
     } as Record<string, unknown>),
   } as OdemeSaglayici;
+}
+
+/** Taklit ekranın göstereceği özet. */
+export interface SahteOturumOzeti {
+  tutarKurus: number;
+  kalemAdi: string;
+  periyot: "tek" | "ay";
 }
 
 /** Sahte sağlayıcının ek yüzeyi. */
 export interface SahteSaglayiciEk {
   sahteKararVer(token: string, sonuc: "basarili" | "basarisiz"): boolean;
   sahteOturumVarMi(token: string): boolean;
+  sahteOturumOzeti(token: string): SahteOturumOzeti | null;
 }

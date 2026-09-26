@@ -1,18 +1,9 @@
-import { expect, type Page, test } from "@playwright/test";
+import { expect, test } from "@playwright/test";
 
-async function hesapAc(page: Page) {
-  const n = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-  await page.goto("/kayit");
-  await page.getByLabel("Ad soyad").fill("Ödeme Kullanıcı");
-  await page.getByLabel("E-posta").fill(`odeme-${n}@example.invalid`);
-  await page.getByLabel("Parola").fill("Gecici-Parola-123");
-  await page.getByLabel(/KVKK aydınlatma metnini okudum/).check();
-  await page.getByRole("button", { name: "Hesap oluştur" }).click();
-  await expect(page).toHaveURL(/\/panel/, { timeout: 15_000 });
-}
+import { hesapAc, odemeEkraniniGec } from "./yardimcilar/odeme";
 
 test("destek paketi satın alma uçtan uca çalışır", async ({ page }) => {
-  await hesapAc(page);
+  await hesapAc(page, "odeme");
   await page.goto("/panel/abonelik");
 
   // "Çay" paketi — ilk destek kartı.
@@ -22,7 +13,7 @@ test("destek paketi satın alma uçtan uca çalışır", async ({ page }) => {
   await expect(page).toHaveURL(/\/odeme\/sahte\//, { timeout: 20_000 });
   await expect(page.getByText("gerçek bir ödeme sayfası değil")).toBeVisible();
 
-  await page.getByRole("button", { name: "Ödemeyi onayla" }).click();
+  await odemeEkraniniGec(page, true);
 
   await expect(page).toHaveURL(/\/odeme\/sonuc\//, { timeout: 20_000 });
   await expect(page.getByRole("heading", { name: "Ödeme alındı" })).toBeVisible();
@@ -30,23 +21,23 @@ test("destek paketi satın alma uçtan uca çalışır", async ({ page }) => {
 });
 
 test("reddedilen ödeme siparişi başarısız işaretler", async ({ page }) => {
-  await hesapAc(page);
+  await hesapAc(page, "odeme");
   await page.goto("/panel/abonelik");
   await page.getByRole("button", { name: "Destek olun" }).first().click();
   await expect(page).toHaveURL(/\/odeme\/sahte\//, { timeout: 20_000 });
 
-  await page.getByRole("button", { name: "Ödemeyi reddet" }).click();
+  await odemeEkraniniGec(page, false);
 
   await expect(page).toHaveURL(/\/odeme\/sonuc\//, { timeout: 20_000 });
   await expect(page.getByRole("heading", { name: "Ödeme tamamlanamadı" })).toBeVisible();
 });
 
 test("ödenen sipariş faturalar listesinde görünür", async ({ page }) => {
-  await hesapAc(page);
+  await hesapAc(page, "odeme");
   await page.goto("/panel/abonelik");
   await page.getByRole("button", { name: "Destek olun" }).first().click();
   await expect(page).toHaveURL(/\/odeme\/sahte\//, { timeout: 20_000 });
-  await page.getByRole("button", { name: "Ödemeyi onayla" }).click();
+  await odemeEkraniniGec(page, true);
   await expect(page).toHaveURL(/\/odeme\/sonuc\//, { timeout: 20_000 });
 
   await page.goto("/panel/faturalar");
@@ -59,13 +50,13 @@ test("ödenen sipariş faturalar listesinde görünür", async ({ page }) => {
  * yenilemesi, ileride webhook. İkinci ödeme kaydı yaratmamalı.
  */
 test("aynı geri dönüş iki kez gelirse tek ödeme kaydı oluşur", async ({ page, request }) => {
-  await hesapAc(page);
+  await hesapAc(page, "odeme");
   await page.goto("/panel/abonelik");
   await page.getByRole("button", { name: "Destek olun" }).first().click();
   await expect(page).toHaveURL(/\/odeme\/sahte\//, { timeout: 20_000 });
 
   const token = new URL(page.url()).pathname.split("/").pop()!;
-  await page.getByRole("button", { name: "Ödemeyi onayla" }).click();
+  await odemeEkraniniGec(page, true);
   await expect(page).toHaveURL(/\/odeme\/sonuc\//, { timeout: 20_000 });
   const siparisUrl = page.url();
 

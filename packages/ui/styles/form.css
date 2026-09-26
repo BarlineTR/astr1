@@ -303,3 +303,83 @@
 .pano__bolum--tehlikeli { border-top-color: var(--alarm); }
 .pano__bolum--tehlikeli .pano__bolum-baslik { color: var(--alarm); }
 .pano__bolum--tehlikeli code { color: var(--accent); }
+
+/* ─────────────────────────  Taklit ödeme ekranı  ──────────────────────── */
+
+/*
+ * Gerçek akışta bu adım sağlayıcının kendi sayfasında geçiyor. Bu ekran
+ * yalnızca anahtar yokken görünür ve ödeme adımının nasıl duracağını gösterir.
+ * Bilerek başka bir şirketin markası kullanılmıyor.
+ */
+.odeme-ekrani {
+  max-width: 28rem;
+  margin-top: var(--s-4);
+  border: 1px solid var(--rule-strong);
+  background: var(--surface);
+}
+
+.odeme-ekrani__ozet {
+  padding: var(--s-3);
+  border-bottom: 1px solid var(--rule);
+  background: var(--bg-sunken);
+}
+.odeme-ekrani__tutar {
+  margin: var(--s-1) 0 0;
+  font-size: var(--t-h2);
+  color: var(--accent);
+  line-height: 1.1;
+}
+.odeme-ekrani__kalem { margin: var(--s-1) 0 0; color: var(--ink-muted); font-size: var(--t-small); }
+.odeme-ekrani__periyot { color: var(--ink-faint); }
+
+.odeme-ekrani__form { padding: var(--s-3); margin-top: 0; }
+
+.odeme-ekrani__kart-alani { position: relative; }
+/* Kart ailesi rozeti alanın içinde sağda; girişin üstüne binmemesi için padding. */
+.odeme-ekrani__kart-alani input { padding-right: 7rem; }
+.odeme-ekrani__aile {
+  position: absolute;
+  right: 0.75rem;
+  top: 50%;
+  transform: translateY(-50%);
+  font-family: var(--font-mono);
+  font-size: var(--t-micro);
+  color: var(--ink-faint);
+}
+
+.odeme-ekrani__ikili {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: var(--s-2);
+}
+
+.odeme-ekrani__3d {
+  margin: 0;
+  padding: var(--s-2) var(--s-3);
+  border-left: 1px solid var(--rule-accent);
+  color: var(--ink-muted);
+  font-size: var(--t-small);
+}
+.odeme-ekrani__3d strong { color: var(--ink); }
+
+.odeme-ekrani__vazgec { align-self: start; }
+.odeme-ekrani__bekleme { padding: var(--s-5) var(--s-3); color: var(--ink-muted); text-align: center; }
+
+/* ────────────────────────────  Abonelik kartı  ────────────────────────── */
+
+.abonelik-karti {
+  display: flex;
+  flex-direction: column;
+  gap: var(--s-2);
+  padding: var(--s-3);
+  border: 1px solid var(--rule-accent);
+  background: var(--surface);
+  max-width: 32rem;
+}
+.abonelik-karti__ust {
+  display: flex;
+  align-items: start;
+  justify-content: space-between;
+  gap: var(--s-3);
+}
+.abonelik-karti .pano__not { margin: 0; }
