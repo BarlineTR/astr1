@@ -45,10 +45,17 @@ dönüştürmek. Site altı işi yapacak:
 
 ### 2.2 Atılacak olanlar
 
-- **`astro-hero.glb`**: `web/README.md`'nin kendi yazdığı gibi bir R2-D2 oyuncağının
-  fotogrametri taraması. R2-D2 Lucasfilm markasıdır. Para toplayan bir sitede
-  kullanılamaz — kaldırılacak.
 - **İstemcide çizilen sayfa gövdesi**: SEO hedefiyle bağdaşmaz.
+
+### 2.3 Kabul edilmiş risk: giriş sahnesindeki model
+
+`client/public/models/astro-hero.glb` bir R2-D2 oyuncağının fotogrametri taramasıdır
+ve R2-D2 Lucasfilm markasıdır (`web/README.md` bunu zaten yazıyor). Gerçek ASTRO
+taraması henüz yapılmadığı için model **geliştirme boyunca yerinde kalır** (D12).
+
+Bu bilinçli bir risktir, gözden kaçmış bir şey değil: site herkese açık yayına
+çıkmadan ve para almaya başlamadan önce model değiştirilmelidir. `docs/RISKLER.md`
+dosyası bu maddeyi taşır ve Faz 3'ün (ödeme) çıkış koşuludur.
 
 ## 3. Doğrulanmış kısıtlar
 
@@ -108,7 +115,7 @@ veri**dir. Açık rıza akışı, saklama süresi ve veri envanteri Faz 4b'nin p
 | D9 | ORM: Drizzle | SQL'e yakın, Neon serverless ile de düz Postgres ile de aynı çalışır — D4'teki taşınabilirlik kararının devamı |
 | D10 | Kimlik: better-auth 1.7.6 | Kendi Postgres'imizde oturum, rol ve oturum iptali; sağlayıcıya bağlı değil |
 | D11 | İngilizce şimdilik yok, yolu kapanmıyor | Bütün kopya içerik modüllerinde durur; `[locale]` yönlendirmesi sonradan eklenir, bileşenler değişmez |
-| D12 | Model: yordamsal yer tutucu | R2-D2 taraması kalkar. Yerine kodla üretilen soyut gövde gelir: dosya yok, lisans riski yok, 2,7 MB indirme yok. Gerçek ASTRO taraması geldiğinde tek dosya değişir |
+| D12 | **Mevcut `astro-hero.glb` kalır** (2026-09-26'da revize edildi) | Gerçek ASTRO taraması henüz yapılmadı; yer tutucu olmadan giriş sahnesi boşalır. Marka riski kabul edilmiş ve kayda geçmiştir (§2.3), yayına çıkmadan önce değiştirilmesi `docs/RISKLER.md`'de takip edilir. Sahne yükleme yolu tek dosyada kalır ki tarama gelince değişiklik tek satır olsun |
 
 ## 5. Mimari
 
@@ -333,7 +340,7 @@ Kırık `npm run typecheck` Faz 0'da onarılır: kökte proje referanslı `tscon
 | Faz | İçerik | Kabul ölçütü |
 |---|---|---|
 | **0** | Dal ayrımı, monorepo iskeleti, `typecheck` onarımı, CI | `site/main`'de ROS dosyası yok; typecheck, test, build üçü de yeşil |
-| **1** | Next.js 16'ya taşıma, kurumsal sayfa mimarisi, SSR SEO, yordamsal model, konsolun `/panel`e taşınması | Ham HTML'de içerik var; sitemap ve robots üretiliyor; R2-D2 dosyası çalışan ağaçta ve dağıtılan çıktıda yok (git geçmişinde kalır; istenirse ayrı bir geçmiş temizliği işi) |
+| **1** | Next.js 16'ya taşıma, kurumsal sayfa mimarisi, SSR SEO, konsolun `/panel`e taşınması | Ham HTML'de `h1` ve gövde metni var; sitemap ve robots üretiliyor; 16 birim testi hâlâ geçiyor |
 | **2** | better-auth + Postgres, roller, giriş/kayıt, iletişim + RFQ formu, e-posta, KVKK onay kaydı, denetim kaydı, panel iskeleti | `/panel` anonim erişimi reddediyor; gerçek konsol yalnızca girişten sonra görünüyor |
 | **3a** | `PaymentProvider` + iyzico, destek paketi | Sanal ortamda uçtan uca ödeme; webhook idempotent |
 | **3b** | Abonelik planları, panel erişiminin ödemeye bağlanması | Plan bitince erişim kapanıyor |
@@ -357,17 +364,26 @@ Kırık `npm run typecheck` Faz 0'da onarılır: kökte proje referanslı `tscon
 
 ## 16. Açık sorular
 
+**2026-09-26 tarihinde cevaplananlar:**
+
+- **Kurum bilgileri** (§16.2): Faz 1–2 yer tutucu değerlerle yürür. Yer tutucular tek
+  bir modülde (`apps/site/src/data/kurum.ts`) toplanır ve her biri açıkça
+  `YER_TUTUCU` olarak işaretlenir; gerçek bilgi geldiğinde tek dosya değişir.
+- **Gerçek ASTRO modeli** (§16.4): tarama yapılmadı, mevcut model kalır (D12, §2.3).
+- **Fiyatlandırma** (§16.6): geliştirme aşaması için uydurma tutarlar kullanılır ve
+  `GELISTIRME_FIYATI` olarak işaretlenir; gerçek fiyat gelmeden Faz 3 yayına çıkmaz.
+
+**Hâlâ açık:**
+
 1. **"CEO ve SEO'ya uyarlanabilsin"** ifadesini şöyle okudum: SEO = arama motoru
    görünürlüğü (Bölüm 6), CEO = kurumsal/yönetim sunumu, yani yönetim ekibi sayfası
    ve basın kiti (`/hakkimizda/yonetim`, `/basin`). Farklı bir şey kastedildiyse
    Bölüm 6.1 değişir.
-2. **Kurum bilgileri**: ticari unvan, vergi numarası, adres, telefon, ETBİS. Hukuki
-   sayfalar ve iyzico başvurusu bunlar olmadan tamamlanamaz. Faz 1–2 bunlar yer
-   tutucuyken bitebilir, Faz 3 bitemez.
+2. **Kurum bilgilerinin gerçeği**: ticari unvan, vergi numarası, adres, telefon,
+   ETBİS. Yer tutucuyla Faz 1–2 biter; hukuki sayfalar ve iyzico başvurusu bunlar
+   gelmeden **tamamlanamaz** — Faz 3'ün giriş koşulu.
 3. **Yönetim ekibi ve referanslar**: isim, görsel, unvan, müşteri listesi. Bugünkü
    `ABOUT` metni bilerek doğrulanamaz iddia içermiyor; kurumsal sayfa bunları ister.
-4. **Gerçek ASTRO modeli**: taraması var mı? Yoksa yordamsal yer tutucu kalır (D12).
-5. **Alan adı ve e-posta**: SEO canonical, OG adresleri ve e-posta gönderimi için
+4. **Alan adı ve e-posta**: SEO canonical, OG adresleri ve e-posta gönderimi için
    (SPF/DKIM) gerekli.
-6. **Fiyatlandırma**: destek paketi tutarları ve abonelik planları Faz 3a'da gerekli,
-   Faz 1'de "yakında" olarak durabilir.
+
