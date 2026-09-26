@@ -91,7 +91,9 @@ class WorldModel:
                         )
                         if is_anon:
                             az_diff = abs(getattr(p, "azimuth_deg", 0.0) - getattr(existing_p, "azimuth_deg", 0.0))
-                            if az_diff < 40.0 or len(self._people) <= 2:
+                            dist_diff = abs(getattr(p, "distance_m", 0.0) - getattr(existing_p, "distance_m", 0.0))
+                            # Only purge if it truly represents the same physical person (close in azimuth and distance)
+                            if az_diff < 15.0 and dist_diff < 0.6:
                                 stale_anon_ids.append(existing_id)
                     for anon_id in stale_anon_ids:
                         anon_p = self._people[anon_id]

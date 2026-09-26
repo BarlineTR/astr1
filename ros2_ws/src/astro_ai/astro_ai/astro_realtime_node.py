@@ -8237,109 +8237,14 @@ class AstroRealtimeNode(Node):
                 self.state_machine.transition_to(RobotState.THINKING)
                 self._is_responding = True
 
-            # 4. Run Voiceprint Recognition (Acoustic Speaker Identification with Temporal Smoothing)
+            # 4. Run Person-Centric Multi-Modal Identity & Active Speaker Fusion
+            active_speaker_dict = self.resolve_active_speaker_and_track(raw_pcm=raw_pcm if not direct_text else None)
 
-            spk_name = None
-            spk_score = 0.0
-            spk_source = "unidentified"
-            spk_known = False
+            spk_name = active_speaker_dict.get("speaker_name")
+            spk_score = float(active_speaker_dict.get("confidence", 0.0))
+            spk_source = str(active_speaker_dict.get("source", "unidentified"))
+            spk_known = bool(active_speaker_dict.get("is_known", False))
 
-            if not direct_text and self.voice_recognizer and raw_pcm:
-                try:
-                    audio_i16 = np.frombuffer(raw_pcm, dtype=np.int16)
-                    identified_name, score = self.voice_recognizer.identify_speaker(audio_i16, sample_rate=16000)
-                    now_s = time.monotonic()
-
-                    if identified_name and identified_name.lower() != "misafir":
-                        # Temporal smoothing:
-                        # 1. High confidence (>= 0.65): Confirmed immediately
-                        if score >= 0.65:
-                            spk_name = identified_name
-                            spk_score = score
-                            spk_source = "voice_recognition"
-                            spk_known = True
-                            self._speaker_tentative_name = identified_name
-                            self._speaker_tentative_count = 2
-                            self._speaker_tentative_last_time = now_s
-                            with self._lock:
-                                self._recognized_speaker = {
-                                    "name": identified_name,
-                                    "score": score,
-                                    "is_known": True,
-                                    "confidence": score,
-                                    "source": "voice_recognition",
-                                }
-                                self._active_person_name = identified_name
-                                self._person_hold_until = now_s + 45.0
-                        # 2. Tentative confidence (0.45 <= score < 0.65): Requires 2 observations within 15s
-                        elif score >= 0.45:
-                            if getattr(self, "_speaker_tentative_name", None) == identified_name and (now_s - getattr(self, "_speaker_tentative_last_time", 0.0)) < 15.0:
-                                self._speaker_tentative_count += 1
-                            else:
-                                self._speaker_tentative_name = identified_name
-                                self._speaker_tentative_count = 1
-                            self._speaker_tentative_last_time = now_s
-
-                            if self._speaker_tentative_count >= 2:
-                                spk_name = identified_name
-                                spk_score = score
-                                spk_source = "voice_recognition_smoothed"
-                                spk_known = True
-                                with self._lock:
-                                    self._recognized_speaker = {
-                                        "name": identified_name,
-                                        "score": score,
-                                        "is_known": True,
-                                        "confidence": score,
-                                        "source": "voice_recognition_smoothed",
-                                    }
-                                    self._active_person_name = identified_name
-                                    self._person_hold_until = now_s + 45.0
-                            else:
-                                self.get_logger().info(f"👤 [Tentative Speaker] candidate={identified_name} score={score:.2f} obs={self._speaker_tentative_count}/2 (waiting confirmation)")
-                        else:
-                            # score < 0.45: Unidentified, discard without overwriting context
-                            self.get_logger().debug(f"👤 [Low Confidence Speaker] candidate={identified_name} score={score:.2f} < 0.45 (ignored)")
-                except Exception as ex:
-                    self.get_logger().debug(f"Voiceprint recognition error: {ex}")
-
-            if not spk_name:
-                identity = self._get_active_biometric_identity()
-                bio_id = identity.get("biometric_identity", "unknown")
-                bio_status = identity.get("biometric_status", "unknown")
-                # Only adopt speaker name if biometrically verified or from an ongoing dialogue hold.
-                # Do NOT adopt persistent_memory owner as live active speaker in the room.
-                if identity.get("is_known") and bio_id not in ("unknown", "ambiguous_conflict", None, "") and bio_status in ("verified", "probable"):
-                    spk_name = bio_id
-                    spk_score = identity.get("biometric_confidence", 0.85)
-                    spk_source = identity.get("biometric_source", "sensor_biometrics")
-                    spk_known = True
-                elif identity.get("has_active_hold") and identity.get("active_hold_speaker"):
-                    spk_name = identity.get("active_hold_speaker")
-                    spk_score = 0.80
-                    spk_source = "session_hold"
-                    spk_known = True
-                elif identity.get("is_known") and identity.get("name") and str(identity.get("name")).lower() != "misafir":
-                    spk_name = identity.get("name")
-                    spk_score = float(identity.get("confidence", 0.85))
-                    spk_source = str(identity.get("identity_source", "session_identity"))
-                    spk_known = True
-                elif getattr(self, "_active_person_name", None) and (time.monotonic() < getattr(self, "_person_hold_until", 0.0)) and self._active_person_name.lower() != "misafir":
-                    spk_name = self._active_person_name
-                    spk_score = 0.85
-                    spk_source = "active_person_hold"
-                    spk_known = True
-                else:
-                    spk_name = None
-                    spk_known = False
-
-            active_speaker_dict = {
-                "name": spk_name or "Misafir",
-                "speaker_name": spk_name,
-                "confidence": spk_score,
-                "is_known": spk_known,
-                "source": spk_source,
-            }
             speaker_display = spk_name if spk_name else "null"
             self.get_logger().info(f"👤 [Speaker Context] speaker={speaker_display} confidence={spk_score:.2f} source={spk_source}")
 
@@ -10820,16 +10725,12 @@ class AstroRealtimeNode(Node):
                 is_bio_verified = bio_status in ("verified", "probable", "session_active")
 
                 name_val = f.get("recognized_name") or f.get("name") or "Misafir"
-                if is_bio_verified and name_val.lower() == "misafir" and ident.get("session_identity"):
-                    name_val = ident.get("session_identity")
-                    p_id = str(ident.get("user_id", name_val.lower()))
-                    is_known = True
-                elif name_val.lower() != "misafir":
-                    p_id = str(f.get("person_id") or name_val.lower())
-                    is_known = True
+                is_known = bool(f.get("is_known", False)) and name_val.lower() != "misafir"
+                if is_known:
+                    p_id = str(f.get("person_id") or f"person_{name_val.lower()}")
                 else:
-                    p_id = str(f.get("person_id") or f"person_{name_val.lower()}_{idx}")
-                    is_known = bool(f.get("is_known", False))
+                    name_val = "Misafir"
+                    p_id = str(f.get("person_id") or f"person_guest_{idx + 1}")
                 age_grp = f.get("age_group", "UNKNOWN")
                 age_conf = float(f.get("age_confidence", 0.0))
                 dom_color = f.get("dominant_clothing_color_tr") or f.get("dominant_clothing_color", "")
@@ -11231,6 +11132,248 @@ class AstroRealtimeNode(Node):
         except Exception as exc:
             self.get_logger().debug(f"_provide_attentive_listening_cue error: {exc}")
 
+
+    def resolve_active_speaker_and_track(self, raw_pcm: Optional[bytes] = None) -> Dict[str, Any]:
+        """Person-Centric Multi-Modal Identity and Active Speaker Fusion.
+
+        Two-stage resolution:
+        Stage A: Voice Recognition ("Whose voice is this?")
+          - Identify speaker acoustic embedding via WeSpeaker ResNet-34 ONNX.
+          - Apply temporal smoothing and confidence thresholds.
+        Stage B: Physical Person Track Association ("Which physical track is speaking?")
+          - Candidate tracks from WorldModel.
+          - DOA + camera azimuth bearing matching.
+          - StereoDepth / 3D spatial consistency.
+          - Looking at robot / gaze bonus.
+          - Spatial ambiguity rejection.
+        Stage C: Multimodal Fusion & Conflict Detection
+          - Evaluate identity certainty via AttentionManager.
+          - Detect cross-modal conflict (e.g. face=Baran, voice=Oktay -> AMBIGUOUS/CONFLICT).
+          - Unknown voice + known face -> Unknown/Guest (never force face identity onto unknown voice).
+        """
+        now_mono = time.monotonic()
+
+        # -------------------------------------------------------------
+        # STAGE A: Voice Recognition
+        # -------------------------------------------------------------
+        v_name = None
+        v_score = 0.0
+        v_status = "unidentified"
+
+        if getattr(self, "voice_recognizer", None) and raw_pcm:
+            try:
+                audio_i16 = np.frombuffer(raw_pcm, dtype=np.int16)
+                identified_name, score = self.voice_recognizer.identify_speaker(audio_i16, sample_rate=16000)
+                if identified_name and identified_name.lower() != "misafir":
+                    if score >= 0.65:
+                        v_name = identified_name
+                        v_score = float(score)
+                        v_status = "confirmed"
+                        self._speaker_tentative_name = identified_name
+                        self._speaker_tentative_count = 2
+                        self._speaker_tentative_last_time = now_mono
+                    elif score >= 0.45:
+                        if getattr(self, "_speaker_tentative_name", None) == identified_name and (now_mono - getattr(self, "_speaker_tentative_last_time", 0.0)) < 15.0:
+                            self._speaker_tentative_count += 1
+                        else:
+                            self._speaker_tentative_name = identified_name
+                            self._speaker_tentative_count = 1
+                        self._speaker_tentative_last_time = now_mono
+
+                        if self._speaker_tentative_count >= 2:
+                            v_name = identified_name
+                            v_score = float(score)
+                            v_status = "smoothed"
+                        else:
+                            v_status = "tentative"
+                            self.get_logger().info(f"👤 [Tentative Speaker] candidate={identified_name} score={score:.2f} obs={self._speaker_tentative_count}/2")
+                    else:
+                        v_status = "low_confidence"
+            except Exception as ex:
+                self.get_logger().debug(f"Stage A voice recognition notice: {ex}")
+
+        # -------------------------------------------------------------
+        # STAGE B: Physical Person Track Association via DOA + StereoDepth
+        # -------------------------------------------------------------
+        spk_angle = getattr(self, "_speaker_angle", None)
+        last_doa = getattr(self, "_last_doa_time", 0.0)
+        doa_fresh = (spk_angle is not None and (now_mono - last_doa < 4.0))
+
+        # Retrieve tracked physical persons from WorldModel
+        wm_people = []
+        if getattr(self, "social_brain", None) and hasattr(self.social_brain, "world_model"):
+            wm = self.social_brain.world_model
+            with getattr(wm, "_lock", threading.Lock()):
+                wm_people = [p for p in wm._people.values() if getattr(p, "is_present", False)]
+
+        matched_track = None
+        spatial_reason = "no_physical_tracks"
+
+        if wm_people:
+            if doa_fresh and spk_angle is not None:
+                # Calculate physical spatial association scores
+                scored_candidates = []
+                for p in wm_people:
+                    az = float(getattr(p, "azimuth_deg", 0.0))
+                    dist = float(getattr(p, "distance_m", 1.5))
+                    is_looking = bool(getattr(p, "is_looking_at_robot", False))
+
+                    # Angular difference in signed yaw frame
+                    delta_theta = abs((az - spk_angle + 180.0) % 360.0 - 180.0)
+
+                    # Spatial angular gate: must be within 28 degrees of DOA
+                    if delta_theta <= 28.0:
+                        # Angle consistency score
+                        s_angle = math.exp(-(delta_theta ** 2) / (2.0 * (10.0 ** 2)))
+                        # StereoDepth / 3D spatial consistency (closer in social zone preferred)
+                        s_depth = 1.0 / (1.0 + max(0.0, dist - 0.8))
+                        # Gaze consistency
+                        s_gaze = 1.0 if is_looking else 0.6
+                        # Combined physical score
+                        s_physical = s_angle * (0.6 * s_depth + 0.4 * s_gaze)
+                        scored_candidates.append({
+                            "person": p,
+                            "score": s_physical,
+                            "delta_theta": delta_theta,
+                            "distance_m": dist,
+                        })
+
+                if scored_candidates:
+                    scored_candidates.sort(key=lambda c: c["score"], reverse=True)
+                    # Check spatial ambiguity between top two candidates
+                    if len(scored_candidates) >= 2:
+                        top1 = scored_candidates[0]
+                        top2 = scored_candidates[1]
+                        score_diff = top1["score"] - top2["score"]
+                        dist_diff = abs(top1["distance_m"] - top2["distance_m"])
+                        if score_diff < 0.12 and dist_diff < 0.4:
+                            # Spatially ambiguous between tracks
+                            matched_track = None
+                            spatial_reason = "spatially_ambiguous_tracks"
+                        else:
+                            matched_track = top1["person"]
+                            spatial_reason = f"matched_doa_and_depth (score={top1['score']:.2f})"
+                    else:
+                        matched_track = scored_candidates[0]["person"]
+                        spatial_reason = f"matched_doa_and_depth (score={scored_candidates[0]['score']:.2f})"
+                else:
+                    matched_track = None
+                    spatial_reason = "no_track_within_doa_gate"
+            else:
+                # No fresh DOA: if only 1 person present in front of robot, associate with that person
+                if len(wm_people) == 1:
+                    matched_track = wm_people[0]
+                    spatial_reason = "single_present_person_no_doa"
+                else:
+                    matched_track = None
+                    spatial_reason = "multi_person_without_doa"
+
+        # -------------------------------------------------------------
+        # STAGE C: Multimodal Fusion & Conflict Detection
+        # -------------------------------------------------------------
+        face_name = None
+        face_conf = 0.0
+        if matched_track and getattr(matched_track, "is_known", False):
+            raw_fn = getattr(matched_track, "name", "")
+            if raw_fn and raw_fn.lower() != "misafir":
+                face_name = raw_fn
+                face_conf = float(getattr(matched_track, "identity_confidence", 0.85))
+
+        # Check for cross-modal conflict:
+        # e.g., Face is Baran, Voice is Oktay (both confirmed with confidence >= 0.45)
+        if face_name and v_name and face_name.lower() != v_name.lower() and face_conf >= 0.45 and v_score >= 0.45:
+            self.get_logger().warn(
+                f"⚠️ [IDENTITY CONFLICT]: Face candidate '{face_name}' (%{int(face_conf*100)}) != Voice candidate '{v_name}' (%{int(v_score*100)}). Setting AMBIGUOUS."
+            )
+            return {
+                "name": "Misafir",
+                "speaker_name": None,
+                "confidence": 0.0,
+                "is_known": False,
+                "source": "cross_modal_conflict",
+                "matched_track": matched_track,
+                "conflict": True,
+                "spatial_reason": spatial_reason,
+            }
+
+        # Case 1: Voice recognized and confirmed/smoothed
+        if v_name and v_status in ("confirmed", "smoothed"):
+            with self._lock:
+                self._recognized_speaker = {
+                    "name": v_name,
+                    "score": v_score,
+                    "is_known": True,
+                    "confidence": v_score,
+                    "source": f"voice_{v_status}",
+                }
+                self._active_person_name = v_name
+                self._person_hold_until = now_mono + 45.0
+
+            # If matched track was anonymous or misafir, bind the voice identity to the physical track
+            if matched_track and not getattr(matched_track, "is_known", False):
+                matched_track.name = v_name
+                matched_track.is_known = True
+                matched_track.identity_confidence = v_score
+                if getattr(self, "social_brain", None) and hasattr(self.social_brain, "world_model"):
+                    self.social_brain.world_model.update_people([matched_track])
+
+            return {
+                "name": v_name,
+                "speaker_name": v_name,
+                "confidence": v_score,
+                "is_known": True,
+                "source": "voice_recognition" if not face_name else "fused_multimodal",
+                "matched_track": matched_track,
+                "conflict": False,
+                "spatial_reason": spatial_reason,
+            }
+
+        # Case 2: Voice is UNKNOWN, but a known face is in view
+        # INVARIANT: An unknown voice must NEVER be attributed to a known face!
+        if not v_name and face_name:
+            self.get_logger().info(
+                f"👤 [Unknown Voice with Known Face]: Face '{face_name}' visible at track, but acoustic voice not verified -> Treating as Guest/Misafir."
+            )
+            return {
+                "name": "Misafir",
+                "speaker_name": None,
+                "confidence": 0.0,
+                "is_known": False,
+                "source": "unrecognized_voice_guest",
+                "matched_track": matched_track,
+                "conflict": False,
+                "spatial_reason": spatial_reason,
+            }
+
+        # Case 3: Active dialogue continuation hold (only if no conflict and track matches or no other people)
+        held_name = getattr(self, "_active_person_name", "")
+        hold_until = getattr(self, "_person_hold_until", 0.0)
+        if held_name and held_name.lower() != "misafir" and now_mono < hold_until:
+            if matched_track and getattr(matched_track, "name", "").lower() != held_name.lower() and getattr(matched_track, "is_known", False):
+                self._person_hold_until = 0.0
+            else:
+                return {
+                    "name": held_name,
+                    "speaker_name": held_name,
+                    "confidence": 0.80,
+                    "is_known": True,
+                    "source": "dialogue_continuation_hold",
+                    "matched_track": matched_track,
+                    "conflict": False,
+                    "spatial_reason": "active_hold",
+                }
+
+        # Case 4: Default Guest / Unidentified
+        return {
+            "name": "Misafir",
+            "speaker_name": None,
+            "confidence": 0.0,
+            "is_known": False,
+            "source": "guest_unidentified",
+            "matched_track": matched_track,
+            "conflict": False,
+            "spatial_reason": spatial_reason,
+        }
 
     def resolve_identities(self) -> Dict[str, Any]:
         """Separates and resolves:

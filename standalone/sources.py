@@ -197,10 +197,49 @@ class CameraSource:
                 else:
                     cam.video.link(xout.input)
 
+                # StereoDepth Engine (Hardware Accelerated Stereo on OAK-D Lite)
+                has_depth = False
+                try:
+                    mono_cls = None
+                    for container in [getattr(dai, "node", None), getattr(dai, "nodes", None), dai]:
+                        if container is not None and hasattr(container, "MonoCamera"):
+                            mono_cls = getattr(container, "MonoCamera")
+                            break
+                    stereo_cls = None
+                    for container in [getattr(dai, "node", None), getattr(dai, "nodes", None), dai]:
+                        if container is not None and hasattr(container, "StereoDepth"):
+                            stereo_cls = getattr(container, "StereoDepth")
+                            break
+
+                    if mono_cls is not None and stereo_cls is not None:
+                        mono_l = self.pipeline.create(mono_cls) if hasattr(self.pipeline, "create") else mono_cls(self.pipeline)
+                        mono_r = self.pipeline.create(mono_cls) if hasattr(self.pipeline, "create") else mono_cls(self.pipeline)
+                        mono_l.setResolution(dai.MonoCameraProperties.SensorResolution.THE_400_P)
+                        mono_r.setResolution(dai.MonoCameraProperties.SensorResolution.THE_400_P)
+                        mono_l.setBoardSocket(dai.CameraBoardSocket.LEFT)
+                        mono_r.setBoardSocket(dai.CameraBoardSocket.RIGHT)
+
+                        stereo = self.pipeline.create(stereo_cls) if hasattr(self.pipeline, "create") else stereo_cls(self.pipeline)
+                        stereo.setLeftRightCheck(True)
+                        stereo.setSubpixel(True)
+                        stereo.setDepthAlign(dai.CameraBoardSocket.RGB)
+                        mono_l.out.link(stereo.left)
+                        mono_r.out.link(stereo.right)
+
+                        xout_d = self.pipeline.create(xout_cls) if hasattr(self.pipeline, "create") else xout_cls(self.pipeline)
+                        xout_d.setStreamName("depth")
+                        stereo.depth.link(xout_d.input)
+                        has_depth = True
+                except Exception as d_exc:
+                    # Non-fatal: OAK-D will continue in RGB-only mode with monocular depth fallback
+                    has_depth = False
+
                 self.device = dai.Device(self.pipeline)
                 self.queue = self.device.getOutputQueue(name="rgb", maxSize=2, blocking=False)
+                self.queue_depth = self.device.getOutputQueue(name="depth", maxSize=2, blocking=False) if has_depth else None
+                self._latest_depth_frame = None
                 self.available = True
-                self.backend = "OAK-D"
+                self.backend = "OAK-D-Spatial" if has_depth else "OAK-D"
 
             except Exception as exc:
                 self.error = str(exc)
@@ -267,6 +306,14 @@ class CameraSource:
                             cv_frame = in_frame.getCvFrame()
                             if cv_frame is not None and cv_frame.size > 0:
                                 self._first_frame = False
+                                # Poll corresponding depth frame if stereo depth is active
+                                if getattr(self, "queue_depth", None) is not None:
+                                    try:
+                                        in_d = self.queue_depth.tryGet()
+                                        if in_d is not None:
+                                            self._latest_depth_frame = in_d.getFrame()
+                                    except Exception:
+                                        pass
                                 return True, cv_frame
                         except Exception:
                             time.sleep(0.02)
@@ -278,6 +325,31 @@ class CameraSource:
                 return False, None
 
         return False, None
+
+    def get_roi_depth(self, x: int, y: int, w: int, h: int, frame_w: int = 640) -> float:
+        """Returns measured 3D median depth in meters from StereoDepth, or falls back to monocular estimation."""
+        depth_frame = getattr(self, "_latest_depth_frame", None)
+        if depth_frame is not None and getattr(depth_frame, "size", 0) > 0:
+            try:
+                fh, fw = depth_frame.shape[:2]
+                x1 = max(0, min(fw - 1, int(x + w * 0.25)))
+                x2 = max(x1 + 1, min(fw, int(x + w * 0.75)))
+                y1 = max(0, min(fh - 1, int(y + h * 0.25)))
+                y2 = max(y1 + 1, min(fh, int(y + h * 0.75)))
+                roi = depth_frame[y1:y2, x1:x2]
+                valid = roi[roi > 200]  # Minimum 20cm
+                if valid.size > 8:
+                    med_mm = float(np.median(valid))
+                    if 250.0 <= med_mm <= 8000.0:
+                        return round(med_mm / 1000.0, 2)
+            except Exception:
+                pass
+        # Fallback to monocular pinhole estimate:
+        box_w = float(w)
+        if box_w > 0:
+            focal_px = float(frame_w) * 0.8
+            return float(min(4.0, max(0.3, (0.16 * focal_px) / box_w)))
+        return 1.5
 
     def detect(self, frame) -> List[Detection]:
         return to_detections(self.detector.detect(frame))

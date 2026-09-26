@@ -531,6 +531,7 @@ class StandaloneGazeRosNode(Node):
         self._last_looking_published: Optional[bool] = None
         self._last_face_payload: Optional[Dict[str, Any]] = None
         self._last_face_payload_time: float = 0.0
+        self._tracked_face_identities: Dict[float, Dict[str, Any]] = {}
         self._no_detections_since: float = 0.0
         self._last_faces_stream_time: float = 0.0
 
@@ -898,34 +899,71 @@ class StandaloneGazeRosNode(Node):
                     if (now_frame - getattr(self, "_last_faces_stream_time", 0.0)) >= 0.10:  # 10 Hz steady face stream
                         self._last_faces_stream_time = now_frame
                         if getattr(self, "pub_faces", None):
-                            best_det = max(detections, key=lambda d: d.w * d.h)
-                            cached = getattr(self, "_last_face_payload", None)
-                            cached_time = getattr(self, "_last_face_payload_time", 0.0)
-                            if cached and (now_frame - cached_time) < 45.0:
-                                name_val = cached.get("name", "Misafir")
-                                formal_val = cached.get("formal_title", name_val)
-                                is_known_val = cached.get("is_known", False)
-                                conf_val = cached.get("confidence", 0.85)
-                            else:
-                                name_val = "Misafir"
-                                formal_val = "Misafir"
-                                is_known_val = False
-                                conf_val = 0.0
+                            faces_list = []
+                            now_id = time.monotonic()
+                            tracked_ids = getattr(self, "_tracked_face_identities", {})
+                            for idx, det in enumerate(detections):
+                                u_norm = float(det.x + det.w / 2.0) / max(1.0, float(frame_w))
+                                # Match with known identity if nearby in horizontal angle (within 0.22 normalized width)
+                                identity_match = None
+                                for cached_u, id_data in list(tracked_ids.items()):
+                                    if abs(u_norm - cached_u) < 0.22 and (now_id - id_data.get("timestamp", 0.0)) < 30.0:
+                                        identity_match = id_data
+                                        break
 
-                            faces_list = [{
-                                "name": name_val,
-                                "recognized_name": name_val,
-                                "recognized_title": formal_val,
-                                "person_id": name_val.lower(),
-                                "is_known": is_known_val,
-                                "confidence": conf_val,
-                                "x": int(best_det.x),
-                                "y": int(best_det.y),
-                                "width": int(best_det.w),
-                                "height": int(best_det.h),
-                                "distance_m": float(getattr(self, "_last_estimated_dist", 1.5) or 1.5),
-                                "looking_at_robot": bool(getattr(best_det, "is_looking", False)),
-                            }]
+                                if identity_match:
+                                    name_val = identity_match.get("name", "Misafir")
+                                    formal_val = identity_match.get("formal_title", name_val)
+                                    is_known_val = bool(identity_match.get("is_known", False))
+                                    conf_val = float(identity_match.get("confidence", 0.85))
+                                else:
+                                    # Fallback to single face payload if only 1 detection
+                                    cached = getattr(self, "_last_face_payload", None)
+                                    cached_time = getattr(self, "_last_face_payload_time", 0.0)
+                                    if len(detections) == 1 and cached and (now_frame - cached_time) < 45.0:
+                                        name_val = cached.get("name", "Misafir")
+                                        formal_val = cached.get("formal_title", name_val)
+                                        is_known_val = cached.get("is_known", False)
+                                        conf_val = cached.get("confidence", 0.85)
+                                    else:
+                                        name_val = "Misafir"
+                                        formal_val = "Misafir"
+                                        is_known_val = False
+                                        conf_val = 0.0
+
+                                # Calculate measured StereoDepth or monocular fallback
+                                if hasattr(self.camera, "get_roi_depth"):
+                                    d_m = self.camera.get_roi_depth(det.x, det.y, det.w, det.h, frame_w)
+                                else:
+                                    focal_px = float(frame_w) * 0.8
+                                    d_m = float(min(4.0, max(0.3, (0.16 * focal_px) / max(1.0, float(det.w)))))
+
+                                # Calculate optical bearing angles
+                                u_px = float(det.x + det.w / 2.0)
+                                v_px = float(det.y + det.h / 2.0)
+                                if hasattr(self.runtime.tracker, "transformer"):
+                                    cam_az, cam_el = self.runtime.tracker.transformer.camera_pixel_to_optical_angles(u_px, v_px, frame_w, frame_h)
+                                else:
+                                    cam_az = float(-(u_px - frame_w / 2.0) / (frame_w / 2.0) * 35.0)
+
+                                p_id = f"person_{name_val.lower()}" if (is_known_val and name_val.lower() != "misafir") else f"person_{idx + 1}"
+                                faces_list.append({
+                                    "track_id": f"person_{idx + 1}",
+                                    "name": name_val,
+                                    "recognized_name": name_val,
+                                    "recognized_title": formal_val,
+                                    "person_id": p_id,
+                                    "is_known": is_known_val,
+                                    "confidence": conf_val,
+                                    "x": int(det.x),
+                                    "y": int(det.y),
+                                    "width": int(det.w),
+                                    "height": int(det.h),
+                                    "distance_m": round(float(d_m), 2),
+                                    "head_yaw_deg": round(float(cam_az), 1),
+                                    "looking_at_robot": bool(getattr(det, "is_looking", False)),
+                                })
+
                             f_msg = String()
                             f_msg.data = json.dumps(faces_list)
                             self.pub_faces.publish(f_msg)
@@ -976,83 +1014,78 @@ class StandaloneGazeRosNode(Node):
         self._last_face_recog_time = now_m
 
         try:
-            best_det = max(detections, key=lambda d: d.w * d.h)
+            sorted_dets = sorted(detections, key=lambda d: d.w * d.h, reverse=True)[:2]
             h, w = frame.shape[:2]
-            margin_x = int(best_det.w * 0.35)
-            margin_y = int(best_det.h * 0.35)
-            x1 = max(0, best_det.x - margin_x)
-            y1 = max(0, best_det.y - margin_y)
-            x2 = min(w, best_det.x + best_det.w + margin_x)
-            y2 = min(h, best_det.y + best_det.h + margin_y)
-            if x2 <= x1 or y2 <= y1:
+            roi_items = []
+            for det in sorted_dets:
+                margin_x = int(det.w * 0.35)
+                margin_y = int(det.h * 0.35)
+                x1 = max(0, det.x - margin_x)
+                y1 = max(0, det.y - margin_y)
+                x2 = min(w, det.x + det.w + margin_x)
+                y2 = min(h, det.y + det.h + margin_y)
+                if x2 > x1 and y2 > y1:
+                    u_norm = float(det.x + det.w / 2.0) / max(1.0, float(w))
+                    roi_items.append((frame[y1:y2, x1:x2].copy(), u_norm, det))
+
+            if not roi_items:
                 return
-            face_roi = frame[y1:y2, x1:x2].copy()
 
-            def _worker(roi):
+            def _worker(items):
                 try:
-                    name, conf, meta = self.face_recognizer.recognize_face(roi)
-                    now_log = time.monotonic()
-                    if name:
-                        payload = {
-                            "name": name,
-                            "confidence": float(conf) if conf is not None else 0.85,
-                            "is_known": True,
-                            "title": meta.get("title", ""),
-                            "formal_title": meta.get("formal_title", name)
-                        }
-                        last_logged = getattr(self, "_last_logged_recog_name", None)
-                        last_time = getattr(self, "_last_logged_recog_time", 0.0)
-                        if last_logged != name or (now_log - last_time) >= 3.0:
-                            self._last_logged_recog_name = name
-                            self._last_logged_recog_time = now_log
-                            conf_pct = int((conf or 0.85) * 100)
-                            formal = meta.get("formal_title", name)
-                            self.get_logger().info(f"👤 [YÜZ TANINDI]: {name} ({formal}) — Güven: %{conf_pct}")
-                    else:
-                        cand = meta.get("candidate", "Bilinmeyen") if isinstance(meta, dict) else "Bilinmeyen"
-                        last_unrec_time = getattr(self, "_last_unrec_log_time", 0.0)
-                        if (now_log - last_unrec_time) >= 3.0:
-                            self._last_unrec_log_time = now_log
-                            score_pct = int((conf or 0.0) * 100)
-                            thresh_pct = int(getattr(self.face_recognizer, "threshold", 0.38) * 100)
-                            self.get_logger().info(f"🔍 [YÜZ ANALİZİ]: Tanınamadı (Misafir) — En yakın aday: '{cand}' skor: %{score_pct} (Eşik: %{thresh_pct})")
-                        payload = {
-                            "name": "Misafir",
-                            "confidence": float(conf) if conf is not None else 0.0,
-                            "is_known": False,
-                            "title": "Misafir",
-                            "formal_title": "Misafir"
-                        }
-                    self._last_face_payload = payload
-                    self._last_face_payload_time = time.monotonic()
-                    msg = String()
-                    msg.data = json.dumps(payload)
-                    if getattr(self, "pub_recognized_person", None):
-                        self.pub_recognized_person.publish(msg)
+                    for face_roi, u_norm, det in items:
+                        name, conf, meta = self.face_recognizer.recognize_face(face_roi)
+                        now_log = time.monotonic()
+                        if name:
+                            payload = {
+                                "name": name,
+                                "confidence": float(conf) if conf is not None else 0.85,
+                                "is_known": True,
+                                "title": meta.get("title", ""),
+                                "formal_title": meta.get("formal_title", name),
+                                "timestamp": now_log,
+                                "u_norm": u_norm
+                            }
+                            if hasattr(self, "_tracked_face_identities"):
+                                self._tracked_face_identities[round(u_norm, 2)] = payload
+                            last_logged = getattr(self, "_last_logged_recog_name", None)
+                            last_time = getattr(self, "_last_logged_recog_time", 0.0)
+                            if last_logged != name or (now_log - last_time) >= 3.0:
+                                self._last_logged_recog_name = name
+                                self._last_logged_recog_time = now_log
+                                conf_pct = int((conf or 0.85) * 100)
+                                formal = meta.get("formal_title", name)
+                                self.get_logger().info(f"👤 [YÜZ TANINDI]: {name} ({formal}) — Güven: %{conf_pct}")
+                        else:
+                            cand = meta.get("candidate", "Bilinmeyen") if isinstance(meta, dict) else "Bilinmeyen"
+                            last_unrec_time = getattr(self, "_last_unrec_log_time", 0.0)
+                            if (now_log - last_unrec_time) >= 4.0:
+                                self._last_unrec_log_time = now_log
+                                score_pct = int((conf or 0.0) * 100)
+                                thresh_pct = int(getattr(self.face_recognizer, "threshold", 0.38) * 100)
+                                self.get_logger().info(f"🔍 [YÜZ ANALİZİ]: Tanınamadı (Misafir) — En yakın aday: '{cand}' skor: %{score_pct} (Eşik: %{thresh_pct})")
+                            payload = {
+                                "name": "Misafir",
+                                "confidence": float(conf) if conf is not None else 0.0,
+                                "is_known": False,
+                                "title": "Misafir",
+                                "formal_title": "Misafir",
+                                "timestamp": now_log,
+                                "u_norm": u_norm
+                            }
+                            if hasattr(self, "_tracked_face_identities"):
+                                self._tracked_face_identities[round(u_norm, 2)] = payload
 
-                    if getattr(self, "pub_faces", None):
-                        faces_list = [{
-                            "name": payload["name"],
-                            "recognized_name": payload["name"],
-                            "recognized_title": payload.get("formal_title", payload["name"]),
-                            "person_id": payload.get("user_id", payload["name"].lower()),
-                            "is_known": payload["is_known"],
-                            "confidence": payload["confidence"],
-                            "x": int(best_det.x),
-                            "y": int(best_det.y),
-                            "width": int(best_det.w),
-                            "height": int(best_det.h),
-                            "distance_m": float(getattr(self, "_last_estimated_dist", 1.5) or 1.5),
-                            "looking_at_robot": bool(getattr(best_det, "is_looking", False)),
-                        }]
-                        f_msg = String()
-                        f_msg.data = json.dumps(faces_list)
-                        self.pub_faces.publish(f_msg)
-                        self._last_faces_published_count = len(faces_list)
+                        self._last_face_payload = payload
+                        self._last_face_payload_time = time.monotonic()
+                        msg = String()
+                        msg.data = json.dumps(payload)
+                        if getattr(self, "pub_recognized_person", None):
+                            self.pub_recognized_person.publish(msg)
                 except Exception as rec_err:
                     self.get_logger().debug(f"_maybe_recognize_face worker notice: {rec_err}")
 
-            threading.Thread(target=_worker, args=(face_roi,), daemon=True).start()
+            threading.Thread(target=_worker, args=(roi_items,), daemon=True).start()
         except Exception as exc:
             self.get_logger().debug(f"_maybe_recognize_face notice: {exc}")
 
