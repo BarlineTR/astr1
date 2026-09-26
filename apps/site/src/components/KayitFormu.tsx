@@ -1,90 +1,53 @@
 "use client";
 
-import { useRouter } from "next/navigation";
 import Link from "next/link";
-import { useState } from "react";
+import { useActionState } from "react";
 
-import { signUp } from "@/lib/auth-client";
-import { KVKK_METIN_SURUMU } from "@/data/hukuki";
+import { kayitOl, type KayitSonuc } from "@/app/kayit/actions";
 
+const BASLANGIC: KayitSonuc | null = null;
+
+/**
+ * Kayıt formu.
+ *
+ * Sunucu eylemiyle gönderilir: JavaScript kapalıyken de çalışır, onay kutusu
+ * sunucuda zorunludur ve hesap ile KVKK onayı aynı akışta yazılır.
+ */
 export function KayitFormu() {
-  const router = useRouter();
-  const [hata, setHata] = useState<string | null>(null);
-  const [gonderiliyor, setGonderiliyor] = useState(false);
-
-  async function gonder(olay: React.FormEvent<HTMLFormElement>) {
-    olay.preventDefault();
-    setHata(null);
-
-    const form = new FormData(olay.currentTarget);
-    const onay = form.get("kvkk") === "on";
-
-    /*
-     * Onay istemcide de sunucuda da zorunlu. Buradaki kontrol yalnızca hızlı
-     * geri bildirim; asıl engel sunucu tarafındaki onay kaydıdır.
-     */
-    if (!onay) {
-      setHata("Devam etmek için KVKK aydınlatma metnini onaylamanız gerekiyor.");
-      return;
-    }
-
-    const parola = String(form.get("parola") ?? "");
-    if (parola.length < 10) {
-      setHata("Parola en az 10 karakter olmalı.");
-      return;
-    }
-
-    setGonderiliyor(true);
-
-    const sonuc = await signUp.email({
-      name: String(form.get("ad") ?? ""),
-      email: String(form.get("eposta") ?? ""),
-      password: parola,
-    });
-
-    if (sonuc.error) {
-      setHata(
-        sonuc.error.status === 422
-          ? "Bu e-posta adresiyle bir hesap zaten var."
-          : "Hesap oluşturulamadı. Lütfen bilgileri kontrol edin.",
-      );
-      setGonderiliyor(false);
-      return;
-    }
-
-    // Onay kaydı sunucuya yazılır; hangi metin sürümüne verildiği ile birlikte.
-    await fetch("/api/onay", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ kind: "kvkk", textVersion: KVKK_METIN_SURUMU }),
-    });
-
-    router.push("/panel");
-    router.refresh();
-  }
+  const [durum, gonder, bekliyor] = useActionState(kayitOl, BASLANGIC);
+  const hata = (alan: string) => durum?.hatalar?.[alan];
 
   return (
-    <form className="form" onSubmit={gonder} noValidate>
-      {hata && (
+    <form className="form" action={gonder} noValidate>
+      {hata("genel") && (
         <p className="form__hata" role="alert">
-          {hata}
+          {hata("genel")}
         </p>
       )}
 
-      <label className="form__alan">
-        <span>Ad soyad</span>
-        <input type="text" name="ad" autoComplete="name" required />
-      </label>
+      <div className="form__alan">
+        <label htmlFor="ad">Ad soyad</label>
+        <input id="ad" type="text" name="ad" autoComplete="name" required />
+        {hata("ad") && (
+          <small className="form__alan-hata" role="alert">
+            {hata("ad")}
+          </small>
+        )}
+      </div>
 
-      <label className="form__alan">
-        <span>E-posta</span>
-        <input type="email" name="eposta" autoComplete="email" required />
-      </label>
+      <div className="form__alan">
+        <label htmlFor="eposta">E-posta</label>
+        <input id="eposta" type="email" name="eposta" autoComplete="email" required />
+        {hata("eposta") && (
+          <small className="form__alan-hata" role="alert">
+            {hata("eposta")}
+          </small>
+        )}
+      </div>
 
       {/*
         İpucu etiketin içinde değil: label'ın içindeki her metin erişilebilir
         ada katılıyor ve alan "Parola En az 10 karakter." diye okunuyordu.
-        aria-describedby doğru bağ.
       */}
       <div className="form__alan">
         <label htmlFor="parola">Parola</label>
@@ -100,18 +63,28 @@ export function KayitFormu() {
         <small className="form__ipucu" id="parola-ipucu">
           En az 10 karakter.
         </small>
+        {hata("parola") && (
+          <small className="form__alan-hata" role="alert">
+            {hata("parola")}
+          </small>
+        )}
       </div>
 
       <label className="form__onay">
-        <input type="checkbox" name="kvkk" />
+        <input type="checkbox" name="kvkkOnay" />
         <span>
           <Link href="/kvkk">KVKK aydınlatma metnini</Link> okudum, kişisel verilerimin
           işlenmesini kabul ediyorum.
         </span>
       </label>
+      {hata("kvkkOnay") && (
+        <p className="form__hata" role="alert">
+          {hata("kvkkOnay")}
+        </p>
+      )}
 
-      <button className="btn btn--primary" type="submit" disabled={gonderiliyor}>
-        {gonderiliyor ? "Hesap oluşturuluyor…" : "Hesap oluştur"}
+      <button className="btn btn--primary" type="submit" disabled={bekliyor}>
+        {bekliyor ? "Hesap oluşturuluyor…" : "Hesap oluştur"}
       </button>
     </form>
   );

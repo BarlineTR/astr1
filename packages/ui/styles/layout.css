@@ -51,6 +51,17 @@
   opacity: 0;
   pointer-events: none;
 }
+
+/*
+ * Sağdaki iki eylem bir arada: aralarındaki boşluk gezinmeyle aralarındaki
+ * boşluktan küçük, böylece "bunlar birlikte" okunuyor.
+ */
+.site-header__eylemler {
+  display: flex;
+  align-items: center;
+  gap: var(--s-2);
+  margin-left: var(--s-4);
+}
 .site-menu__button { display: none; }
 
 .site-nav {
@@ -711,6 +722,10 @@
 /* ═══════════════════════  Dar ekranda açılır menü  ═══════════════════════ */
 
 @media (max-width: 48rem) {
+  /* Dar ekranda sade eylem menüye iniyor; şeritte yalnızca Panel kalıyor. */
+  .site-header__eylemler { margin-left: 0; }
+  .site-header__eylemler .btn--quiet { display: none; }
+
   .site-menu__button {
     display: inline-block;
     margin-left: auto;

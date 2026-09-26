@@ -1,70 +1,51 @@
 "use client";
 
-import { useRouter, useSearchParams } from "next/navigation";
-import { useState } from "react";
+import { useSearchParams } from "next/navigation";
+import { useActionState } from "react";
 
-import { signIn } from "@/lib/auth-client";
-import { guvenliDonusYolu } from "@/lib/yetki";
+import { girisYap, type GirisSonuc } from "@/app/giris/actions";
 
+const BASLANGIC: GirisSonuc | null = null;
+
+/**
+ * Giriş formu.
+ *
+ * Sunucu eylemiyle gönderilir: JavaScript kapalıyken de çalışır. Girişten
+ * sonra dönülecek sayfa gizli alanda taşınır ve sunucuda `guvenliDonusYolu`
+ * ile süzülür — dış adres kabul edilmez.
+ */
 export function GirisFormu() {
-  const router = useRouter();
-  const aramaParams = useSearchParams();
-  const [hata, setHata] = useState<string | null>(null);
-  const [gonderiliyor, setGonderiliyor] = useState(false);
-
-  async function gonder(olay: React.FormEvent<HTMLFormElement>) {
-    olay.preventDefault();
-    setHata(null);
-    setGonderiliyor(true);
-
-    const form = new FormData(olay.currentTarget);
-    const sonuc = await signIn.email({
-      email: String(form.get("eposta") ?? ""),
-      password: String(form.get("parola") ?? ""),
-    });
-
-    if (sonuc.error) {
-      /*
-       * Sağlayıcının İngilizce mesajı gösterilmiyor ve hangi alanın yanlış
-       * olduğu da söylenmiyor: "e-posta bulunamadı" demek, hangi adreslerin
-       * kayıtlı olduğunu dışarıdan sınamaya izin verir.
-       */
-      setHata("E-posta veya parola hatalı.");
-      setGonderiliyor(false);
-      return;
-    }
-
-    /*
-     * typedRoutes derleme anında sabit adresleri doğruluyor; buradaki adres
-     * çalışma zamanında geliyor ve güvenliği guvenliDonusYolu sağlıyor
-     * (dış adres ve protokolsüz biçim reddediliyor). Tip bu yüzden daraltılıyor.
-     */
-    router.push(
-      guvenliDonusYolu(aramaParams.get("devam")) as Parameters<typeof router.push>[0],
-    );
-    router.refresh();
-  }
+  const [durum, gonder, bekliyor] = useActionState(girisYap, BASLANGIC);
+  const devam = useSearchParams().get("devam");
 
   return (
-    <form className="form" onSubmit={gonder} noValidate>
-      {hata && (
+    <form className="form" action={gonder} noValidate>
+      {durum?.hata && (
         <p className="form__hata" role="alert">
-          {hata}
+          {durum.hata}
         </p>
       )}
 
-      <label className="form__alan">
-        <span>E-posta</span>
-        <input type="email" name="eposta" autoComplete="email" required />
-      </label>
+      <input type="hidden" name="devam" value={devam ?? ""} />
 
-      <label className="form__alan">
-        <span>Parola</span>
-        <input type="password" name="parola" autoComplete="current-password" required />
-      </label>
+      <div className="form__alan">
+        <label htmlFor="eposta">E-posta</label>
+        <input id="eposta" type="email" name="eposta" autoComplete="email" required />
+      </div>
 
-      <button className="btn btn--primary" type="submit" disabled={gonderiliyor}>
-        {gonderiliyor ? "Giriş yapılıyor…" : "Giriş yap"}
+      <div className="form__alan">
+        <label htmlFor="parola">Parola</label>
+        <input
+          id="parola"
+          type="password"
+          name="parola"
+          autoComplete="current-password"
+          required
+        />
+      </div>
+
+      <button className="btn btn--primary" type="submit" disabled={bekliyor}>
+        {bekliyor ? "Giriş yapılıyor…" : "Giriş yap"}
       </button>
     </form>
   );

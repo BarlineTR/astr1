@@ -48,7 +48,8 @@ test("yanlış parola anlaşılır hata verir ve panele sokmaz", async ({ page }
   await page.getByLabel("Parola", { exact: true }).fill("yanlis-parola");
   await page.getByRole("button", { name: "Giriş yap" }).click();
 
-  await expect(page.getByRole("alert")).toBeVisible({ timeout: 15_000 });
+  // Next'in rota duyurucusu da role="alert" taşıyor; forma ait kutuya bakılıyor.
+  await expect(page.locator(".form__hata")).toBeVisible({ timeout: 15_000 });
   await expect(page).not.toHaveURL(/\/panel/);
 });
 

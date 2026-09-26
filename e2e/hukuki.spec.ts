@@ -10,7 +10,9 @@ for (const yol of SAYFALAR) {
     expect(yanit?.status()).toBe(200);
 
     // Onaysız bir metnin yayında olduğu gizlenmemeli.
-    await expect(page.getByRole("alert")).toContainText("hukukçu onayından geçmemiştir");
+    await expect(page.locator(".uyari-serit")).toContainText(
+      "hukukçu onayından geçmemiştir",
+    );
 
     // Onay kayıtları bu sürüme referans veriyor; görünmezse kullanıcı neyi
     // onayladığını sonradan bulamaz.

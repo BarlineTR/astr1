@@ -230,3 +230,71 @@
   height: 1px;
   overflow: hidden;
 }
+
+/* ───────────────────────────  Panel bölümleri  ───────────────────────── */
+
+.pano__dar { max-width: 30rem; }
+
+.pano__baslik--eylemli {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: start;
+  justify-content: space-between;
+  gap: var(--s-3);
+}
+
+.pano__bolum {
+  padding-top: var(--s-5);
+  margin-top: var(--s-5);
+  border-top: 1px solid var(--rule);
+}
+.pano__bolum:first-of-type { margin-top: 0; }
+
+.pano__bolum-baslik {
+  margin: 0 0 var(--s-3);
+  font-family: var(--font-mono);
+  font-size: var(--t-micro);
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--ink-faint);
+}
+
+.pano__not {
+  margin: var(--s-2) 0 0;
+  font-size: var(--t-small);
+  color: var(--ink-faint);
+}
+.pano__not a { color: var(--ink-muted); }
+
+.cihaz__ad a { text-decoration: none; }
+.cihaz__ad a:hover { color: var(--accent-bright); }
+
+/* Devre dışı düğme: tıklanamaz olduğu görünmeli, gizlenmemeli. */
+.btn[disabled] {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+/* ────────────────────────────  Eşleştirme  ───────────────────────────── */
+
+.eslestirme { max-width: 34rem; display: flex; flex-direction: column; gap: var(--s-3); }
+
+/*
+ * Kod bir kez görünüyor: ekranda kaçırılmayacak kadar büyük ve seçilebilir
+ * olmalı.
+ */
+.eslestirme__kutu {
+  padding: var(--s-3);
+  border: 1px solid var(--rule-accent);
+  background: var(--accent-sunken);
+}
+.eslestirme__kod {
+  margin: var(--s-2) 0;
+  font-size: var(--t-h2);
+  letter-spacing: 0.08em;
+  color: var(--accent-bright);
+  user-select: all;
+  word-break: break-all;
+}
+.eslestirme__not { margin: 0; font-size: var(--t-small); color: var(--ink-muted); }
+.eslestirme__sonraki { margin: 0; color: var(--ink-muted); }

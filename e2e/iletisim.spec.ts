@@ -24,7 +24,9 @@ test("KVKK onayı olmadan gönderilemez", async ({ page }) => {
   // Onay kutusu işaretlenmiyor.
   await page.getByRole("button", { name: "Gönderin" }).click();
 
-  await expect(page.getByRole("alert").first()).toContainText("KVKK", { timeout: 15_000 });
+  await expect(page.locator(".form__hata").first()).toContainText("KVKK", {
+    timeout: 15_000,
+  });
 });
 
 test("teklif talebinde kurum adı zorunlu", async ({ page }) => {
@@ -37,7 +39,7 @@ test("teklif talebinde kurum adı zorunlu", async ({ page }) => {
   await teklif.getByLabel(/KVKK aydınlatma metnini okudum/).check();
   await teklif.getByRole("button", { name: "Teklif isteyin" }).click();
 
-  await expect(teklif.getByRole("alert").first()).toContainText("kurum adı", {
+  await expect(teklif.locator(".form__alan-hata").first()).toContainText("kurum adı", {
     timeout: 15_000,
   });
 });

@@ -25,6 +25,8 @@ export default async function PanelDuzeni({ children }: { children: React.ReactN
 
           <nav className="pano__nav" aria-label="Panel">
             <Link href="/panel">Cihazlar</Link>
+            <Link href="/panel/abonelik">Abonelik</Link>
+            <Link href="/panel/faturalar">Faturalar</Link>
             <Link href="/panel/hesap">Hesap</Link>
           </nav>
 

@@ -2,16 +2,6 @@ import Link from "next/link";
 
 import { SITE } from "@/data/icerik";
 
-/**
- * Bağlantı adresi tipi, `Link`'in kendi tipinden türetilir.
- *
- * `typedRoutes` açık: var olmayan bir adrese bağlantı derleme anında reddedilir
- * ve kurumsal bir sitede ölü iç bağlantı olmaması buna değer. Tipi Next'in
- * ürettiği dosyadan import etmek yerine buradan türetiyoruz — o dosyanın yolu
- * Next'in iç meselesi ve sürümle değişebilir.
- */
-type Yol = React.ComponentProps<typeof Link>["href"];
-
 export type PageId =
   | "ana"
   | "platform"
@@ -22,23 +12,47 @@ export type PageId =
   | "iletisim"
   | "panel";
 
-/** Kurumsal ürün hiyerarşisi: platform → çözüm → teknoloji → fiyat. */
+/**
+ * Bağlantı adresi tipi, `Link`'in kendi tipinden türetilir.
+ *
+ * `typedRoutes` açık: var olmayan bir adrese bağlantı derleme anında reddedilir
+ * ve kurumsal bir sitede ölü iç bağlantı olmaması buna değer. Tipi Next'in
+ * ürettiği dosyadan import etmek yerine buradan türetiyoruz — o dosyanın yolu
+ * Next'in iç meselesi ve sürümle değişebilir.
+ */
+type Yol = React.ComponentProps<typeof Link>["href"];
+
+/**
+ * Gezinme: kurumsal ürün hiyerarşisi ve iletişim.
+ *
+ * İletişim buraya taşındı. Sağ tarafta eylem olarak durduğunda üç düğme yan
+ * yana geliyordu ve hiçbiri diğerinden ayırt edilemiyordu; oysa İletişim bir
+ * sayfa, Hesap ve Panel ise hesaba giden yollar.
+ */
 const NAV: ReadonlyArray<{ id: PageId; label: string; href: Yol }> = [
   { id: "platform", label: "Platform", href: "/platform" },
   { id: "cozumler", label: "Çözümler", href: "/cozumler" },
   { id: "teknoloji", label: "Teknoloji", href: "/teknoloji" },
   { id: "fiyatlandirma", label: "Fiyatlandırma", href: "/fiyatlandirma" },
   { id: "hakkimizda", label: "Hakkımızda", href: "/hakkimizda" },
+  { id: "iletisim", label: "İletişim", href: "/iletisim" },
 ];
 
-/** Panel gezinme bağlantısı değil, eylem. Şeritte çerçeveli ve bir tık büyük durur. */
-const PANEL: { id: PageId; label: string; href: Yol } = {
-  id: "panel",
-  label: "Panel",
-  href: "/panel",
-};
+/**
+ * Sağdaki iki eylem.
+ *
+ * Hesap ve Panel ayrı: biri hesabın kendisine (bilgiler, yetki), diğeri işin
+ * yapıldığı yere (cihazlar) gider. Tek bir "Panel" düğmesi ikisini de
+ * karşılıyormuş gibi duruyordu ama hesabına bakmak isteyen kullanıcı önce
+ * cihaz listesine düşüyordu.
+ *
+ * İkisi de her zaman görünür ve şerit statik kalır. Oturuma göre değişen bir
+ * başlık, bütün pazarlama sayfalarını dinamik hale getirir ve önbelleklenmesini
+ * engellerdi; giriş yapmamış ziyaretçiyi zaten middleware girişe yolluyor.
+ */
+const HESAP: { label: string; href: Yol } = { label: "Hesap", href: "/panel/hesap" };
+const PANEL: { label: string; href: Yol } = { label: "Panel", href: "/panel" };
 
-/** Bütün sayfaların paylaştığı başlık şeridi. Etkin sayfa işaretlenir. */
 export function SiteHeader({ current }: { current: PageId }) {
   return (
     <header className="site-header">
@@ -65,6 +79,7 @@ export function SiteHeader({ current }: { current: PageId }) {
         <label className="site-menu__button" htmlFor="site-menu-toggle">
           Menü
         </label>
+
         <nav className="site-nav" aria-label="Sayfalar">
           {NAV.map((item) => (
             <Link
@@ -76,25 +91,26 @@ export function SiteHeader({ current }: { current: PageId }) {
               {item.label}
             </Link>
           ))}
-          {/* Dar ekranda şeritten düşen bağlantı menüde kalır. */}
-          <Link className="site-nav__only-compact" href="/iletisim">
-            İletişim
+          {/* Dar ekranda sağdaki sade eylem menüye iner. */}
+          <Link className="site-nav__only-compact" href={HESAP.href}>
+            {HESAP.label}
           </Link>
         </nav>
 
-        <Link className="btn btn--quiet" href="/iletisim">
-          İletişim
-        </Link>
-
-        <Link
-          className={
-            current === PANEL.id ? "btn btn--console is-current" : "btn btn--console"
-          }
-          href={PANEL.href}
-          aria-current={current === PANEL.id ? "page" : undefined}
-        >
-          {PANEL.label}
-        </Link>
+        <div className="site-header__eylemler">
+          <Link className="btn btn--quiet" href={HESAP.href}>
+            {HESAP.label}
+          </Link>
+          <Link
+            className={
+              current === "panel" ? "btn btn--console is-current" : "btn btn--console"
+            }
+            href={PANEL.href}
+            aria-current={current === "panel" ? "page" : undefined}
+          >
+            {PANEL.label}
+          </Link>
+        </div>
       </div>
     </header>
   );

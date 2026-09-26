@@ -168,7 +168,18 @@ export const devices = pgTable(
     serial: text("serial").notNull().unique(),
     name: text("name").notNull(),
     ownerUserId: text("owner_user_id").references(() => users.id, { onDelete: "set null" }),
+    /** Robot ajanının uzun ömürlü jetonunun özeti. Eşleştirme tamamlanınca dolar. */
     tokenHash: text("token_hash"),
+    /**
+     * Tek kullanımlık eşleştirme kodunun özeti.
+     *
+     * Kod kullanıcıya **yalnızca bir kez** gösterilir ve veritabanında hiç
+     * saklanmaz: veritabanı sızsa bile kodlarla cihaz bağlanamaz. Robot ajanı
+     * kodu getirip uzun ömürlü jetonla değiştirecek (ağ geçidi fazı).
+     */
+    pairingCodeHash: text("pairing_code_hash"),
+    /** Kod süresi. Süresi geçmiş kod yeniden üretilebilir. */
+    pairingExpiresAt: timestamp("pairing_expires_at", { withTimezone: true }),
     firmwareVersion: text("firmware_version"),
     status: text("status").notNull().default("kayitli"),
     lastSeenAt: timestamp("last_seen_at", { withTimezone: true }),

@@ -8,6 +8,13 @@
       "when": 1790418837386,
       "tag": "0000_strong_revanche",
       "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "7",
+      "when": 1790431956165,
+      "tag": "0001_steady_fenris",
+      "breakpoints": true
     }
   ]
 }
