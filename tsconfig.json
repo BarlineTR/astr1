@@ -1,8 +1,17 @@
 {
   "files": [],
   "references": [
-    { "path": "./packages/protocol" },
-    { "path": "./client" },
-    { "path": "./server" }
+    {
+      "path": "./packages/protocol"
+    },
+    {
+      "path": "./client"
+    },
+    {
+      "path": "./apps/gateway"
+    },
+    {
+      "path": "./apps/gateway/tsconfig.test.json"
+    }
   ]
 }

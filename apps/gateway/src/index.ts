@@ -7,7 +7,9 @@ import fastifyWebsocket from "@fastify/websocket";
 import Fastify from "fastify";
 
 import { HEAD_YAW_LIMIT_DEG, PROTOCOL_VERSION } from "@astro/protocol";
-import type { Command, ServerMessage } from "@astro/protocol";
+import type { ServerMessage } from "@astro/protocol";
+
+import { parseCommand } from "./command";
 import { MockSource } from "./telemetry/mock";
 import type { TelemetrySource } from "./telemetry/source";
 
@@ -88,13 +90,15 @@ app.get("/ws", { websocket: true }, (socket) => {
   });
 
   socket.on("message", (raw: Buffer) => {
-    try {
-      // İstemciden gelen her şey şüphelidir; kaynak sınırları ayrıca zorlar.
-      source.send(JSON.parse(raw.toString()) as Command);
-    } catch {
-      const error: ServerMessage = { kind: "error", message: "Komut çözümlenemedi" };
+    // İstemciden gelen her şey şüphelidir: sözleşmeye uymayan komut robota
+    // hiç ulaşmaz. Kaynak sınırları ayrıca zorlar.
+    const sonuc = parseCommand(raw.toString());
+    if (!sonuc.ok) {
+      const error: ServerMessage = { kind: "error", message: sonuc.message };
       socket.send(JSON.stringify(error));
+      return;
     }
+    source.send(sonuc.command);
   });
 
   socket.on("close", unsubscribe);
