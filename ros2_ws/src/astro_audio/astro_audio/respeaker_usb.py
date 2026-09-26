@@ -54,6 +54,11 @@ class ReSpeakerHID:
             return struct.unpack_from("<i", data)[0]
         except Exception as exc:
             self.last_error = str(exc)
+            if "32" in str(exc) or "pipe" in str(exc).lower():
+                try:
+                    self.dev.reset()
+                except Exception:
+                    pass
             self.dev = None
             self._last_find_attempt = time.monotonic()
             return None

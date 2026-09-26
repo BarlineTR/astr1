@@ -87,6 +87,32 @@ CHUNK_MS = 20  # 20ms chunks = 320 samples @ 16kHz
 HW_BLOCK_SIZE = int(HW_SAMPLE_RATE * (CHUNK_MS / 1000.0))  # 320
 
 
+def reset_respeaker_usb(logger=None) -> bool:
+    """Attempts to un-stall ReSpeaker XMOS processor via USB bus reset."""
+    try:
+        import usb.core
+        dev = usb.core.find(idVendor=0x2886, idProduct=0x0018)
+        if dev is not None:
+            if logger:
+                logger.info("🔄 [USB RECOVERY] Resetting ReSpeaker USB device (2886:0018)...")
+            dev.reset()
+            time.sleep(0.6)
+            return True
+    except Exception as exc:
+        if logger:
+            logger.debug(f"[USB RECOVERY] pyusb reset failed: {exc}")
+    try:
+        res = subprocess.run(["usbreset", "2886:0018"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=2.0)
+        if res.returncode == 0:
+            if logger:
+                logger.info("🔄 [USB RECOVERY] usbreset 2886:0018 succeeded.")
+            time.sleep(0.6)
+            return True
+    except Exception:
+        pass
+    return False
+
+
 class ArecordStream:
     """Direct ALSA raw PCM capture via arecord subprocess.
 
@@ -117,7 +143,7 @@ class ArecordStream:
         self.active = False
         self.last_error: str = ""
 
-    def start(self):
+    def start(self, retry_on_stall: bool = True):
         self.stop()
         cmd = [
             "arecord",
@@ -156,9 +182,16 @@ class ArecordStream:
             except Exception:
                 pass
             self.last_error = f"arecord exited immediately with code {self._proc.returncode}: {stderr_msg}"
+            self._proc = None
+
+            if retry_on_stall and ("-32" in stderr_msg or "broken pipe" in stderr_msg.lower() or "set_params" in stderr_msg.lower()):
+                if self.logger:
+                    self.logger.warn(f"[AUDIO WARN] arecord encountered stall ({stderr_msg}). Attempting ReSpeaker USB reset...")
+                if reset_respeaker_usb(self.logger):
+                    return self.start(retry_on_stall=False)
+
             if self.logger:
                 self.logger.error(f"❌ [ARECORD ERROR] {self.last_error}")
-            self._proc = None
             return
 
         self._stop_event.clear()
@@ -445,11 +478,14 @@ class AudioStreamNode(Node):
             is_speech = self._respeaker.speech_detected()
             doa_angle = self._respeaker.doa_angle()
             status = "ok" if is_speech is not None and doa_angle is not None else self._respeaker.last_error or "Geçersiz USB DOA/VAD yanıtı"
+            now = time.monotonic()
             if status != self._hid_status:
-                self._hid_status = status
                 if status == "ok":
+                    self._hid_status = status
                     self.get_logger().info("ReSpeaker USB DOA/VAD okunuyor; /audio/doa ham montaj açısıdır.")
-                else:
+                elif (now - getattr(self, "_last_hid_warn_time", 0.0)) > 5.0:
+                    self._last_hid_warn_time = now
+                    self._hid_status = status
                     self.get_logger().warning(f"ReSpeaker DOA/VAD yok: {status}; USB bağlantısı ve udev izinlerini kontrol edin. Yeniden denenecek.")
 
             is_active_playback = self._acoustic_playback_active()
@@ -724,6 +760,34 @@ class AudioStreamNode(Node):
                 sd_err = "sounddevice library is not installed"
             elif self._in_dev_idx is None:
                 sd_err = "no valid sounddevice input device index"
+
+        # Try virtual ALSA plugins ("pulse", "default") via arecord as final resilience layer
+        for fallback_alsa in ("pulse", "default"):
+            if fallback_alsa == alsa_target:
+                continue
+            self.get_logger().info(f"Attempting fallback direct ALSA arecord on '{fallback_alsa}'...")
+            fallback_stream = ArecordStream(
+                alsa_device=fallback_alsa,
+                channels=1,
+                rate=HW_SAMPLE_RATE,
+                blocksize=HW_BLOCK_SIZE,
+                callback=self._input_callback,
+                logger=self.get_logger(),
+            )
+            fallback_stream.start()
+            if fallback_stream.active:
+                self._input_stream = fallback_stream
+                self._input_stream_alive = True
+                self._capture_channels = 1
+                self._mic_channel_indices = (0,)
+                self._in_device_name = f"ALSA ({fallback_alsa}) [arecord fallback]"
+                self.get_logger().info(
+                    f"🔊 [AUDIO READY]\n"
+                    f"  input_device={self._in_device_name}\n"
+                    f"  input_callback=alive\n"
+                    f"  audio_input_callback_alive=True"
+                )
+                return
 
         # If both direct ALSA arecord and sounddevice failed:
         self._input_stream_alive = False
@@ -1044,16 +1108,36 @@ class AudioStreamNode(Node):
             self._playback_worker_error = "sounddevice_library_missing"
             return
 
+        def _open_dac_stream(preferred_dev):
+            candidates = [preferred_dev]
+            if preferred_dev is not None:
+                candidates.append(None)
+            last_ex = None
+            for dev in candidates:
+                try:
+                    s = sd.RawOutputStream(
+                        samplerate=HW_SAMPLE_RATE,
+                        blocksize=0,
+                        device=dev,
+                        channels=CHANNELS,
+                        dtype=DTYPE,
+                    )
+                    s.start()
+                    dev_label = f"device={dev} ({self._out_device_name if dev is not None else 'system default'})"
+                    self.get_logger().info(f"🔊 [AUDIO PLAYBACK] DAC output stream opened ({dev_label})")
+                    return s
+                except Exception as ex:
+                    last_ex = ex
+                    if "-32" in str(ex) or "broken pipe" in str(ex).lower():
+                        reset_respeaker_usb(self.get_logger())
+                    self.get_logger().warn(f"[AUDIO WARN] Failed to open DAC stream on device={dev}: {ex}")
+            if last_ex:
+                raise last_ex
+            return None
+
         out_stream = None
         try:
-            out_stream = sd.RawOutputStream(
-                samplerate=HW_SAMPLE_RATE,
-                blocksize=0,
-                device=self._out_dev_idx,
-                channels=CHANNELS,
-                dtype=DTYPE,
-            )
-            out_stream.start()
+            out_stream = _open_dac_stream(self._out_dev_idx)
             self._output_stream = out_stream
             self._playback_worker_alive = True
             self._playback_worker_error = "none"
@@ -1064,7 +1148,6 @@ class AudioStreamNode(Node):
                 f"❌ [Realtime Audio] Çıkış akışı başlatılamadı ({self._out_device_name}): {e} | "
                 f"tts_playback_started=False | tts_playback_error={self._playback_worker_error}"
             )
-            return
 
         active_gen_id = None
         gen_started = False
@@ -1076,7 +1159,23 @@ class AudioStreamNode(Node):
         if not hasattr(self, "_cancelled_gen_ids"):
             self._cancelled_gen_ids = set()
 
+        last_dac_retry = 0.0
         while not self._stop_event.is_set():
+            if out_stream is None:
+                now_t = time.monotonic()
+                if now_t - last_dac_retry >= 2.0:
+                    last_dac_retry = now_t
+                    try:
+                        out_stream = _open_dac_stream(self._out_dev_idx)
+                        self._output_stream = out_stream
+                        self._playback_worker_alive = True
+                        self._playback_worker_error = "none"
+                    except Exception:
+                        pass
+                if out_stream is None:
+                    time.sleep(0.1)
+                    continue
+
             try:
                 item = self._play_queue.get(timeout=0.05)
                 if isinstance(item, dict):
@@ -1144,16 +1243,40 @@ class AudioStreamNode(Node):
 
                 if chunk and len(chunk) > 0:
                     t_w_start = time.perf_counter()
-                    with self._playback_lock:
-                        # İlk blocking write sürerken de robot konuşuyor.
-                        self._is_playing = True
-                        out_stream.write(chunk)
+                    write_ok = False
+                    try:
+                        with self._playback_lock:
+                            # İlk blocking write sürerken de robot konuşuyor.
+                            self._is_playing = True
+                            out_stream.write(chunk)
+                        write_ok = True
+                    except Exception as w_exc:
+                        self.get_logger().warn(f"[AUDIO WARN] DAC write error: {w_exc}. Reopening stream...")
+                        try:
+                            out_stream.stop()
+                            out_stream.close()
+                        except Exception:
+                            pass
+                        out_stream = None
+                        self._output_stream = None
+                        if "-32" in str(w_exc) or "broken pipe" in str(w_exc).lower():
+                            reset_respeaker_usb(self.get_logger())
+                        try:
+                            out_stream = _open_dac_stream(self._out_dev_idx)
+                            self._output_stream = out_stream
+                            if out_stream is not None:
+                                with self._playback_lock:
+                                    out_stream.write(chunk)
+                                write_ok = True
+                        except Exception as retry_exc:
+                            self.get_logger().error(f"❌ [AUDIO ERROR] DAC retry write failed: {retry_exc}")
                     t_w_end = time.perf_counter()
 
-                    self._last_playback_time = time.monotonic()
-                    gen_played_bytes += len(chunk)
-                    self._current_gen_played_bytes = gen_played_bytes
-                    self._total_played_bytes += len(chunk)
+                    if write_ok:
+                        self._last_playback_time = time.monotonic()
+                        gen_played_bytes += len(chunk)
+                        self._current_gen_played_bytes = gen_played_bytes
+                        self._total_played_bytes += len(chunk)
 
                 # If done signal received and queue is now empty, finish generation playback
                 if gen_done_seen and self._play_queue.empty():

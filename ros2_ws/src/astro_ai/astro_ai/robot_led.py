@@ -53,11 +53,16 @@ class NativeReSpeakerUsbRing:
         self._logger = logger or _LOG
         self._brightness = 25
         self._last_err_logged: float = 0.0
+        self._last_init_attempt: float = 0.0
         self._init_device()
 
     def _init_device(self) -> bool:
         if self._dev is not None:
             return True
+        now = time.monotonic()
+        if now - self._last_init_attempt < 2.5:
+            return False
+        self._last_init_attempt = now
         try:
             import usb.core
             dev = usb.core.find(idVendor=self.VID, idProduct=self.PID)
@@ -77,11 +82,13 @@ class NativeReSpeakerUsbRing:
 
     def _handle_usb_error(self, action: str, exc: Exception):
         now = time.monotonic()
-        if now - self._last_err_logged < 5.0:
+        exc_str = str(exc)
+        is_pipe_err = "32" in exc_str or "pipe" in exc_str.lower()
+        limit_s = 10.0 if is_pipe_err else 5.0
+        if now - self._last_err_logged < limit_s:
             return
         self._last_err_logged = now
 
-        exc_str = str(exc)
         if "Access denied" in exc_str or "13" in exc_str or "insufficient permissions" in exc_str.lower():
             self._logger.warning(
                 f"⚠️ [RobotLED] ReSpeaker USB erişim izni yok ({action}): {exc}\n"
@@ -89,6 +96,8 @@ class NativeReSpeakerUsbRing:
                 "  echo 'SUBSYSTEM==\"usb\", ATTR{idVendor}==\"2886\", MODE=\"0666\"' | sudo tee /etc/udev/rules.d/60-respeaker.rules\n"
                 "  sudo udevadm control --reload-rules && sudo udevadm trigger"
             )
+        elif is_pipe_err:
+            self._logger.warning(f"⚠️ [RobotLED] ReSpeaker USB endpoint stall/pipe uyarısı ({action}): {exc}. Otomatik USB reset denenecek.")
         else:
             self._logger.warning(f"⚠️ [RobotLED] ReSpeaker USB donanım uyarısı ({action}): {exc}")
 
@@ -105,6 +114,11 @@ class NativeReSpeakerUsbRing:
             return True
         except Exception as exc:
             self._handle_usb_error(f"write(cmd={cmd})", exc)
+            if "32" in str(exc) or "pipe" in str(exc).lower():
+                try:
+                    self._dev.reset()
+                except Exception:
+                    pass
             self._dev = None  # Re-enumerate on next attempt
             return False
 

@@ -386,14 +386,27 @@ class SerialBridge(Node):
         self.time_offset_ns = None
         self.first_imu_sync = True
 
-        self.is_self_testing = True
+        enable_wheel_test = False
+        try:
+            if hasattr(self, "declare_parameter"):
+                self.declare_parameter("enable_startup_self_test", False)
+                enable_wheel_test = bool(self.get_parameter("enable_startup_self_test").value)
+        except Exception:
+            pass
+        if not enable_wheel_test:
+            enable_wheel_test = os.getenv("ENABLE_STARTUP_WHEEL_TEST", "0").lower() in ("1", "true", "yes")
+
+        self.is_self_testing = enable_wheel_test
 
         self.connect_timer = self.create_timer(self.connect_retry_sec, self._try_connect)
         self.hb_timer = self.create_timer(0.1, self.send_heartbeat)
         
-        # Start startup wheel self-test in a background thread
-        self.self_test_thread = threading.Thread(target=self._run_startup_self_test, daemon=True)
-        self.self_test_thread.start()
+        # Start startup wheel self-test in a background thread only if enabled
+        if enable_wheel_test:
+            self.self_test_thread = threading.Thread(target=self._run_startup_self_test, daemon=True)
+            self.self_test_thread.start()
+        else:
+            self.self_test_thread = None
 
         self._try_connect()
 

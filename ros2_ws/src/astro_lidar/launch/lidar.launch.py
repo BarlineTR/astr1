@@ -8,20 +8,42 @@ from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 
 
+def _is_lidar_port(dev_path: str) -> bool:
+    try:
+        for l_path in ("/dev/astro_lidar", "/dev/rplidar"):
+            if os.path.exists(l_path) and os.path.realpath(dev_path) == os.path.realpath(l_path):
+                return True
+    except Exception:
+        pass
+    try:
+        import serial.tools.list_ports
+        for port_info in serial.tools.list_ports.comports():
+            if port_info.device == dev_path and getattr(port_info, "vid", None) == 0x10C4:
+                return True
+    except Exception:
+        pass
+    try:
+        bname = os.path.basename(dev_path)
+        for sys_v_path in (
+            f"/sys/class/tty/{bname}/device/../idVendor",
+            f"/sys/class/tty/{bname}/device/idVendor",
+        ):
+            if os.path.exists(sys_v_path):
+                with open(sys_v_path, "r") as f:
+                    if f.read().strip().lower() == "10c4":
+                        return True
+    except Exception:
+        pass
+    return False
+
+
 def _resolve_serial_port(primary: str):
-    for port in (
-        primary,
-        "/dev/ttyUSB1",
-        "/dev/ttyUSB0",
-        "/dev/ttyACM1",
-        "/dev/ttyACM0",
-    ):
-        if port and os.path.exists(port):
-            return port
-    for pattern in ("/dev/astro_*", "/dev/ttyUSB*", "/dev/ttyACM*"):
-        matches = sorted(glob.glob(pattern))
-        if matches:
-            return matches[0]
+    if primary and os.path.exists(primary) and (primary in ("/dev/astro_lidar", "/dev/rplidar") or _is_lidar_port(primary)):
+        return primary
+    for pattern in ("/dev/astro_lidar*", "/dev/rplidar*", "/dev/ttyUSB*", "/dev/ttyACM*"):
+        for p in sorted(glob.glob(pattern)):
+            if _is_lidar_port(p):
+                return p
     return None
 
 
