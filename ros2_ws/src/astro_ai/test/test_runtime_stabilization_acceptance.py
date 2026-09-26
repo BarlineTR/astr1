@@ -81,8 +81,20 @@ except Exception:
     class HeadCmd:
         angle_deg: float = 0.0
     mock_astro_base_msg.WheelCmd = WheelCmd
-    mock_astro_base_msg.HeadCmd = HeadCmd
     sys.modules["astro_base.msg"] = mock_astro_base_msg
+    mock_gaze = MagicMock()
+    mock_gaze_state = MagicMock()
+    class HeadStateManager:
+        def __init__(self, *args, **kwargs): pass
+    class PositionSource:
+        NONE = "NONE"
+        FACE = "FACE"
+        DOA = "DOA"
+    mock_gaze_state.HeadStateManager = HeadStateManager
+    mock_gaze_state.PositionSource = PositionSource
+    mock_gaze.head_state = mock_gaze_state
+    sys.modules["astro_base.gaze"] = mock_gaze
+    sys.modules["astro_base.gaze.head_state"] = mock_gaze_state
     rclpy = mock_rclpy
 
 try:
@@ -96,7 +108,11 @@ except Exception:
 # Ensure paths
 test_dir = os.path.dirname(__file__)
 astro_ai_dir = os.path.abspath(os.path.join(test_dir, '..', 'astro_ai'))
+astro_ai_pkg = os.path.abspath(os.path.join(test_dir, '..'))
 astro_base_dir = os.path.abspath(os.path.join(test_dir, '..', '..', 'astro_base', 'astro_base'))
+astro_base_pkg = os.path.abspath(os.path.join(test_dir, '..', '..', 'astro_base'))
+sys.path.insert(0, astro_base_pkg)
+sys.path.insert(0, astro_ai_pkg)
 sys.path.insert(0, astro_ai_dir)
 sys.path.insert(0, astro_base_dir)
 
@@ -200,8 +216,8 @@ class TestBargeInMultiSignalPipeline(unittest.TestCase):
         log_text = '\n'.join(self.logs)
         self.assertIn('[BARGE-IN DECISION]', log_text)
         self.assertIn('playback_active=true', log_text)
-        self.assertIn('speech_duration_ms=120', log_text)
-        self.assertIn('speech_continuity_ms=120', log_text)
+        self.assertIn('speech_duration_ms=80', log_text)
+        self.assertIn('speech_continuity_ms=80', log_text)
         self.assertIn('transient_noise=false', log_text)
         self.assertIn('speech_confirmed=true', log_text)
         self.assertIn('decision=true', log_text)

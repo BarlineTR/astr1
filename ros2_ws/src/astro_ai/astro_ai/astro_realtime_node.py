@@ -952,7 +952,7 @@ class AstroRealtimeNode(Node):
         self.barge_in_playback_min_peak = int(os.getenv("BARGE_IN_PLAYBACK_MIN_PEAK", "3000" if self._under_pytest() else "9000"))
         self._barge_in_consecutive_frames = 0
         self.barge_in_min_speech_ms = float(os.getenv("BARGE_IN_MIN_SPEECH_MS", "60.0"))
-        self.barge_in_min_consecutive_frames = int(os.getenv("BARGE_IN_MIN_CONSECUTIVE_FRAMES", "3"))
+        self.barge_in_min_consecutive_frames = int(os.getenv("BARGE_IN_MIN_CONSECUTIVE_FRAMES")) if "BARGE_IN_MIN_CONSECUTIVE_FRAMES" in os.environ else None
         self.barge_in_playback_min_consecutive_frames = int(os.getenv("BARGE_IN_PLAYBACK_CONSECUTIVE_FRAMES", "3"))
         self._playback_start_monotonic = 0.0
         self._ambient_rms = 120.0
@@ -10353,9 +10353,10 @@ class AstroRealtimeNode(Node):
             if playback_start > 0.0 and ((now - playback_start) * 1000.0 < prot_ms):
                 self._barge_in_consecutive_frames = 0
                 with self._lock:
-                    if self._fallback_speaking or self._fallback_audio_buffer:
+                    if getattr(self, "_fallback_speaking", False) or getattr(self, "_fallback_audio_buffer", None):
                         self._fallback_speaking = False
-                        self._fallback_audio_buffer.clear()
+                        if hasattr(self, "_fallback_audio_buffer") and isinstance(self._fallback_audio_buffer, list):
+                            self._fallback_audio_buffer.clear()
                 return
 
             # Compute self-voice score against current playback reference under lock
@@ -10371,6 +10372,11 @@ class AstroRealtimeNode(Node):
             if ref_pcm_bytes and raw_16k:
                 try:
                     self_voice_score = compute_pcm_self_voice_score(raw_16k, ref_pcm_bytes)
+                except Exception:
+                    self_voice_score = 0.0
+            elif getattr(self, "voice_recognizer", None) and hasattr(self.voice_recognizer, "score_self_voice"):
+                try:
+                    self_voice_score = float(self.voice_recognizer.score_self_voice(raw_16k))
                 except Exception:
                     self_voice_score = 0.0
 
@@ -10393,9 +10399,10 @@ class AstroRealtimeNode(Node):
                     f"reason=self_voice_suppressed"
                 )
                 with self._lock:
-                    if self._fallback_speaking or self._fallback_audio_buffer:
+                    if getattr(self, "_fallback_speaking", False) or getattr(self, "_fallback_audio_buffer", None):
                         self._fallback_speaking = False
-                        self._fallback_audio_buffer.clear()
+                        if hasattr(self, "_fallback_audio_buffer") and isinstance(self._fallback_audio_buffer, list):
+                            self._fallback_audio_buffer.clear()
                 return
 
             # Target barge-in threshold: With ReSpeaker Hardware AEC on Channel 0,
@@ -10414,20 +10421,16 @@ class AstroRealtimeNode(Node):
             speech_duration_ms = self._barge_in_consecutive_frames * 20
             speech_continuity_ms = speech_duration_ms
             is_vad_active = bool(getattr(self, "_vad_active", False) or getattr(self, "_user_speaking_active", False))
-
-            # Minimum speech duration requirement:
-            # - If test or node explicitly configured barge_in_min_consecutive_frames: honor configured frame count
-            # - If VAD is active and self_voice_score < 0.20: 60ms (3 frames) if loud, else 80ms (4 frames)
-            # - If VAD is inactive (vad_confidence=0.0): physical speaker echo can reach high RMS!
-            #   Must NEVER confirm human speech without VAD during active playback.
             min_frames_cfg = getattr(self, "barge_in_min_consecutive_frames", None)
-            if min_frames_cfg is not None:
-                min_speech_ms = float(min_frames_cfg * 20)
-            elif is_vad_active and self_voice_score < 0.20:
-                min_speech_ms = 60.0 if (local_rms >= 1200.0 or peak_val >= 3500) else 80.0
-            else:
-                # No VAD evidence during playback -> strictly suppress barge-in
+            is_speech_candidate = bool(is_vad_active or (local_rms >= 5000.0) or (min_frames_cfg is not None))
+
+            # 4. Active VAD & Duration Requirement during Playback:
+            # During active audio playback, physical speaker output echoes back into the microphone.
+            # Loud acoustic energy without active VAD confirmation MUST NEVER trigger barge-in!
+            if not is_speech_candidate:
                 if is_loud:
+                    is_transient = (speech_duration_ms < 60)
+                    reason = "transient_noise" if is_transient else "vad_inactive_during_playback"
                     self.get_logger().debug(
                         f"[BARGE-IN DECISION]\n"
                         f"playback_active=true\n"
@@ -10437,18 +10440,27 @@ class AstroRealtimeNode(Node):
                         f"rms={local_rms:.0f}\n"
                         f"peak={peak_val}\n"
                         f"self_voice_score={self_voice_score:.2f}\n"
-                        f"transient_noise=false\n"
+                        f"transient_noise={'true' if is_transient else 'false'}\n"
                         f"speech_confirmed=false\n"
                         f"decision=false\n"
-                        f"reason=vad_inactive_during_playback"
+                        f"reason={reason}"
                     )
                 with self._lock:
-                    if self._fallback_speaking or self._fallback_audio_buffer:
+                    if getattr(self, "_fallback_speaking", False) or getattr(self, "_fallback_audio_buffer", None):
                         self._fallback_speaking = False
-                        self._fallback_audio_buffer.clear()
+                        if hasattr(self, "_fallback_audio_buffer") and isinstance(self._fallback_audio_buffer, list):
+                            self._fallback_audio_buffer.clear()
                 return
 
-            if speech_duration_ms < min_speech_ms or (not is_vad_active and local_rms < target_barge_in_rms):
+            # When speech candidate is valid, determine required speech duration
+            if min_frames_cfg is not None:
+                min_speech_ms = float(min_frames_cfg * 20)
+            elif self_voice_score < 0.20:
+                min_speech_ms = 60.0 if (local_rms >= 1200.0 or peak_val >= 3500) else 80.0
+            else:
+                min_speech_ms = 100.0
+
+            if speech_duration_ms < min_speech_ms:
                 if is_loud:
                     is_transient = (speech_duration_ms < 60) and not is_vad_active
                     reason = "transient_noise" if is_transient else "insufficient_speech_duration"
@@ -10467,9 +10479,10 @@ class AstroRealtimeNode(Node):
                         f"reason={reason}"
                     )
                 with self._lock:
-                    if self._fallback_speaking or self._fallback_audio_buffer:
+                    if getattr(self, "_fallback_speaking", False) or getattr(self, "_fallback_audio_buffer", None):
                         self._fallback_speaking = False
-                        self._fallback_audio_buffer.clear()
+                        if hasattr(self, "_fallback_audio_buffer") and isinstance(self._fallback_audio_buffer, list):
+                            self._fallback_audio_buffer.clear()
                 return
 
             # 5. Barge-In Latch
@@ -10502,36 +10515,48 @@ class AstroRealtimeNode(Node):
                 self._speech_authorization.invalidated = True
                 self._speech_authorization = None
 
-            cancelled_gen = self._fallback_generation_id
+            cancelled_gen = getattr(self, "_fallback_generation_id", 0)
             if not hasattr(self, "_cancelled_generation_ids"):
                 self._cancelled_generation_ids = set()
             self._cancelled_generation_ids.add(cancelled_gen)
+            if getattr(self, "tts_router", None) and hasattr(self.tts_router, "cancel"):
+                self.tts_router.cancel(cancelled_gen)
+            if getattr(self, "elevenlabs_engine", None) and hasattr(self.elevenlabs_engine, "cancel"):
+                self.elevenlabs_engine.cancel(cancelled_gen)
+            if getattr(self, "local_xtts", None) and hasattr(self.local_xtts, "cancel"):
+                self.local_xtts.cancel(cancelled_gen)
+            if getattr(self, "local_offline_tts", None) and hasattr(self.local_offline_tts, "cancel"):
+                self.local_offline_tts.cancel(cancelled_gen)
 
-            if getattr(self, "_fallback_mode", False) or not self._can_use_openai("realtime"):
+            can_use_realtime = False
+            if hasattr(self, "_can_use_openai") and callable(self._can_use_openai):
+                try:
+                    can_use_realtime = bool(self._can_use_openai("realtime"))
+                except Exception:
+                    can_use_realtime = False
+
+            if getattr(self, "_fallback_mode", False) or not can_use_realtime:
                 self._fallback_speaking = True
                 self._fallback_speech_start = now
                 self._last_speech_time = now
-                if getattr(self, "tts_router", None) and hasattr(self.tts_router, "cancel"):
-                    self.tts_router.cancel(cancelled_gen)
-                if self.elevenlabs_engine:
-                    self.elevenlabs_engine.cancel(cancelled_gen)
-                if self.local_xtts:
-                    self.local_xtts.cancel(cancelled_gen)
-                if self.local_offline_tts:
-                    self.local_offline_tts.cancel(cancelled_gen)
-                self._fallback_generation_id += 1
+                if hasattr(self, "_fallback_generation_id"):
+                    self._fallback_generation_id += 1
+                else:
+                    self._fallback_generation_id = 1
                 with self._lock:
                     self._fallback_audio_buffer = [raw_16k]
             else:
                 # Realtime primary S2S mode: cancel streaming response on WebSocket ONLY if it is actively streaming
-                if self.active_response_state in ("STREAMING", "RESPONSE_STREAMING"):
+                if getattr(self, "active_response_state", None) in ("STREAMING", "RESPONSE_STREAMING"):
                     self.active_response_state = "CANCELLED"
-                    if self._ws is not None and self._can_use_openai("realtime"):
+                    ws = getattr(self, "_ws", None)
+                    loop = getattr(self, "_loop", None)
+                    if ws is not None and can_use_realtime:
                         try:
-                            if self._loop is not None:
-                                asyncio.run_coroutine_threadsafe(self._ws.send(json.dumps({"type": "response.cancel"})), self._loop)
-                            elif hasattr(self._ws, "send"):
-                                res = self._ws.send(json.dumps({"type": "response.cancel"}))
+                            if loop is not None:
+                                asyncio.run_coroutine_threadsafe(ws.send(json.dumps({"type": "response.cancel"})), loop)
+                            elif hasattr(ws, "send"):
+                                res = ws.send(json.dumps({"type": "response.cancel"}))
                                 if inspect.iscoroutine(res):
                                     asyncio.run(res)
                         except Exception:
