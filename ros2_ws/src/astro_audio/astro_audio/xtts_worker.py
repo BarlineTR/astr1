@@ -484,7 +484,7 @@ def main() -> int:
         try:
             req_cond_latent, req_spk_emb = get_or_extract_latents(req_spk_wav)
         except Exception as exc:
-            req_cond_latent, req_spk_emb = gpt_cond_latent, speaker_embedding
+            req_cond_latent, req_spk_emb = gpt_lat, spk_emb
 
         try:
             if not first_inference_done:
