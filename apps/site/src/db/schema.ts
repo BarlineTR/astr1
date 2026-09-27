@@ -391,3 +391,70 @@ export const subscriptions = pgTable(
     uniqueIndex("subscriptions_provider_ref_uniq").on(t.providerRef),
   ],
 );
+
+/* ─────────────  Kişi Tanımlama (Yüz Tanıma & VIP Listesi)  ───────────── */
+
+export const KISI_ROLLER = ["vip", "family", "staff", "guest", "blacklist"] as const;
+export type KisiRol = (typeof KISI_ROLLER)[number];
+
+export const people = pgTable(
+  "people",
+  {
+    id: text("id").primaryKey(),
+    ownerUserId: text("owner_user_id")
+      .notNull()
+      .references(() => users.id, { onDelete: "cascade" }),
+    deviceId: text("device_id").references(() => devices.id, { onDelete: "set null" }),
+    name: text("name").notNull(),
+    role: text("role").$type<KisiRol>().notNull().default("guest"),
+    notes: text("notes"),
+    photoBase64: text("photo_base64"),
+    faceVector: jsonb("face_vector"),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [index("people_owner_idx").on(t.ownerUserId), index("people_device_idx").on(t.deviceId)],
+);
+
+/* ──────────  Robot Ses, Kişilik ve Anomali Ayarları  ────────── */
+
+export const robotSettings = pgTable(
+  "robot_settings",
+  {
+    id: text("id").primaryKey(),
+    deviceId: text("device_id")
+      .notNull()
+      .unique()
+      .references(() => devices.id, { onDelete: "cascade" }),
+    voiceSpeed: integer("voice_speed").notNull().default(100),
+    voicePitch: integer("voice_pitch").notNull().default(100),
+    ttsVoice: text("tts_voice").notNull().default("tr_tr_male"),
+    llmPrompt: text("llm_prompt").notNull().default("Sen yardımsever ve cana yakın bir sosyal robotsun."),
+    greetingMessage: text("greeting_message").notNull().default("Merhaba, hoş geldiniz!"),
+    alertOnUnknown: boolean("alert_on_unknown").notNull().default(true),
+    alertEmail: text("alert_email"),
+    patrolActive: boolean("patrol_active").notNull().default(false),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [index("robot_settings_device_idx").on(t.deviceId)],
+);
+
+/* ──────────  LiDAR Harita Devriye Noktaları (Waypoints)  ────────── */
+
+export const patrolWaypoints = pgTable(
+  "patrol_waypoints",
+  {
+    id: text("id").primaryKey(),
+    deviceId: text("device_id")
+      .notNull()
+      .references(() => devices.id, { onDelete: "cascade" }),
+    name: text("name").notNull(),
+    x: integer("x").notNull(),
+    y: integer("y").notNull(),
+    yaw: integer("yaw").notNull().default(0),
+    visitIntervalMinutes: integer("visit_interval_minutes").default(30),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [index("waypoints_device_idx").on(t.deviceId)],
+);
+

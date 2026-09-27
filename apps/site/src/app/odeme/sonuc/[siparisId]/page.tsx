@@ -64,16 +64,42 @@ export default async function OdemeSonucSayfasi({
   return (
     <SayfaKabuk
       current="fiyatlandirma"
-      ustBaslik="Ödeme"
-      baslik={DURUM_BASLIK[siparis.status] ?? "Sipariş durumu"}
+      ustBaslik="Ödeme Sonucu"
+      baslik={basarili ? "Ödemeniz Başarıyla Alındı!" : (DURUM_BASLIK[siparis.status] ?? "Sipariş durumu")}
       lead={
         basarili
-          ? "Desteğiniz için teşekkür ederiz. Fatura bilgileriniz e-posta adresinize gönderilecek."
+          ? `Tebrikler! İşleminiz onaylandı. Detaylı sipariş ve fatura dökümü ${siparis.email} adresine gönderildi.`
           : "Ödeme tamamlanamadı. Kartınızdan çekim yapılmadıysa yeniden deneyebilirsiniz."
       }
     >
       <section className="section">
         <div className="page">
+          {basarili && (
+            <div
+              className="panel"
+              style={{
+                backgroundColor: "rgba(16, 185, 129, 0.08)",
+                border: "1px solid rgba(16, 185, 129, 0.3)",
+                padding: "1.5rem",
+                borderRadius: "8px",
+                marginBottom: "2rem",
+              }}
+            >
+              <h3 style={{ color: "#10b981", margin: "0 0 0.5rem" }}>✅ Aboneliğiniz Aktifleştirildi</h3>
+              <p style={{ margin: "0 0 1rem", fontSize: "0.95rem" }}>
+                Robot yönetim paneli yetkileriniz tanımlandı. Artık cihazlarınızı bağlayabilir, canlı telemetri ve LiDAR ortam krokisine erişebilirsiniz.
+              </p>
+              <div style={{ display: "flex", gap: "1rem" }}>
+                <Link className="btn btn--primary" href="/panel">
+                  Robot Paneline Geçin
+                </Link>
+                <Link className="btn btn--quiet" href="/panel/faturalar">
+                  Fatura Geçmişi
+                </Link>
+              </div>
+            </div>
+          )}
+
           <dl className="kunye">
             <div>
               <dt>Sipariş numarası</dt>
@@ -89,19 +115,21 @@ export default async function OdemeSonucSayfasi({
             </div>
           </dl>
 
-          <ul className="liste">
+          <ul className="liste" style={{ margin: "1.5rem 0" }}>
             {kalemler.map((k) => (
               <li key={k.id}>
-                {k.name} × {k.quantity} — {kurusBicimle(k.unitPriceMinor * k.quantity)}
+                <strong>{k.name}</strong> × {k.quantity} — {kurusBicimle(k.unitPriceMinor * k.quantity)}
               </li>
             ))}
           </ul>
 
-          <p>
-            <Link className="btn btn--primary" href="/panel/faturalar">
-              Faturalarıma git
-            </Link>
-          </p>
+          {!basarili && (
+            <p>
+              <Link className="btn btn--primary" href="/fiyatlandirma">
+                Yeniden Deneyin
+              </Link>
+            </p>
+          )}
         </div>
       </section>
     </SayfaKabuk>

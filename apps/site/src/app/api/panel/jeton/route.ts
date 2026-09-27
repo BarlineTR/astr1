@@ -35,9 +35,18 @@ export async function POST(istek: Request) {
     exp: Date.now() + PANEL_JETON_OMRU_MS,
   });
 
+  const hostBasligi = istek.headers.get("x-forwarded-host") || istek.headers.get("host") || "localhost:3000";
+  const hostname = hostBasligi.split(":")[0];
+  const proto = istek.headers.get("x-forwarded-proto") === "https" ? "wss" : "ws";
+
+  let gecitUrl = process.env.NEXT_PUBLIC_GECIT_URL;
+  if (!gecitUrl || gecitUrl.includes("localhost") || gecitUrl.includes("127.0.0.1")) {
+    gecitUrl = `${proto}://${hostname}:8420`;
+  }
+
   return NextResponse.json({
     ok: true,
     token,
-    gecitUrl: process.env.NEXT_PUBLIC_GECIT_URL ?? "ws://localhost:8420",
+    gecitUrl,
   });
 }

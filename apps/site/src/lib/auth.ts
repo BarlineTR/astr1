@@ -25,11 +25,10 @@ export const auth = betterAuth({
   emailAndPassword: {
     enabled: true,
     /*
-     * Doğrulama zorunlu değil: hesap açıldığı anda panele girebilmeli, yoksa
-     * ilk deneyim e-posta beklemekle geçiyor. Doğrulama e-postası yine gidiyor
-     * ve doğrulanmamış hesap ileride cihaz bağlayamayacak.
+     * Doğrulama zorunlu: hesap açıldığında kullanıcı e-posta doğrulaması
+     * yapmadan panele ve robot yönetim sistemine erişemez.
      */
-    requireEmailVerification: false,
+    requireEmailVerification: true,
     minPasswordLength: 10,
     sendResetPassword: async ({ user, url }) => {
       await epostaGonder({
@@ -70,9 +69,20 @@ export const auth = betterAuth({
     updateAge: 60 * 60 * 24,
   },
 
+  trustedOrigins: [
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+    "http://192.168.1.111:3000",
+    "http://100.95.192.117:3000",
+  ],
+
   advanced: {
-    /* Çerez üretimde yalnızca HTTPS üzerinden gider. */
-    useSecureCookies: process.env.NODE_ENV === "production",
+    /*
+     * Çerez güvenliği:
+     * Yerel ağ (192.168.x.x / localhost) HTTP üzerinden çalıştığından
+     * Secure çerez zorunluluğu yalnızca USE_SECURE_COOKIES=true (HTTPS) iken açılır.
+     */
+    useSecureCookies: process.env.USE_SECURE_COOKIES === "true",
   },
 
   /*

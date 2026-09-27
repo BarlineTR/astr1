@@ -1,8 +1,10 @@
 import Link from "next/link";
 
 import { kullanicininCihazlari } from "@/db/sorgular/cihaz";
+import { aktifAbonelik } from "@/lib/odeme/abonelik";
 import { oturumGerekli } from "@/lib/oturum";
 import { sayfaMetadata } from "@/lib/seo";
+import { AboneliksizKarsilama } from "@/components/AboneliksizKarsilama";
 
 export const metadata = sayfaMetadata({
   baslik: "Cihazlar",
@@ -21,6 +23,11 @@ const DURUM_ADI: Record<string, string> = {
 
 export default async function PanelAnaSayfa() {
   const oturum = await oturumGerekli();
+
+  const abonelik = await aktifAbonelik(oturum.user.id);
+  if (!abonelik) {
+    return <AboneliksizKarsilama />;
+  }
 
   const cihazlar = await kullanicininCihazlari(oturum.user.id);
 

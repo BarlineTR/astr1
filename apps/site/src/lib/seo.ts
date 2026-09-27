@@ -50,6 +50,10 @@ export const SAYFALAR: readonly SayfaKaydi[] = [
 
   // Giriş arkasındakiler: listede var ama sitemap dışı.
   { yol: "/panel", ad: "Panel", sitemap: false, oncelik: 0, degisim: "daily" },
+  { yol: "/panel/kisiler", ad: "Kişiler", sitemap: false, oncelik: 0, degisim: "daily" },
+  { yol: "/panel/harita", ad: "Harita & Devriye", sitemap: false, oncelik: 0, degisim: "daily" },
+  { yol: "/panel/ayarlar", ad: "Robot Ayarları", sitemap: false, oncelik: 0, degisim: "daily" },
+  { yol: "/dogrulama-bekleniyor", ad: "Doğrulama Bekleniyor", sitemap: false, oncelik: 0, degisim: "yearly" },
 ];
 
 /** Yolu mutlak adrese çevirir. */

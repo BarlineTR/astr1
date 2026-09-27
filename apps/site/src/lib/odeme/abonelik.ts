@@ -3,7 +3,7 @@ import { randomUUID } from "node:crypto";
 import { and, eq, inArray } from "drizzle-orm";
 
 import { db } from "@/db";
-import { subscriptions } from "@/db/schema";
+import { auditEvents, subscriptions, users } from "@/db/schema";
 import { PLANLAR } from "@/data/fiyatlar";
 
 import { abonelikDestekliyorMu, odemeSaglayici } from "./index";
@@ -219,3 +219,81 @@ export async function abonelikIptalEt(
 
   return { ok: true };
 }
+
+/**
+ * Veritabanı üzerinden doğrudan e-posta ile abonelik tanımlar / uzatır.
+ *
+ * Müşterinin veya yöneticinin tarayıcı arayüzünden manipülasyon yapmasını
+ * önlemek amacıyla doğrudan sunucu tarafında çalışır.
+ */
+export async function epostaIleAbonelikTanimla(girdi: {
+  eposta: string;
+  planSlug: string;
+  sureGun?: number;
+  yoneticiId?: string;
+}): Promise<{ ok: boolean; mesaj?: string; hata?: string }> {
+  const eposta = girdi.eposta.trim().toLowerCase();
+  const plan = PLANLAR.find((p) => p.slug === girdi.planSlug);
+  if (!plan) {
+    return { ok: false, hata: `Geçersiz plan: ${girdi.planSlug}` };
+  }
+
+  const [kullanici] = await db
+    .select()
+    .from(users)
+    .where(eq(users.email, eposta))
+    .limit(1);
+
+  if (!kullanici) {
+    return { ok: false, hata: `Bu e-posta adresine sahip kullanıcı bulunamadı: ${eposta}` };
+  }
+
+  const sureGun = girdi.sureGun ?? 30;
+  const bitisTarihi = new Date(Date.now() + sureGun * 24 * 60 * 60 * 1000);
+
+  const mevcut = await aktifAbonelik(kullanici.id);
+  let abonelikId: string;
+
+  if (mevcut) {
+    abonelikId = mevcut.id;
+    await db
+      .update(subscriptions)
+      .set({
+        productSlug: plan.slug,
+        status: "aktif",
+        provider: "admin_tanimli",
+        providerRef: `manual_${Date.now()}`,
+        priceMinor: plan.fiyatKurus,
+        currentPeriodEnd: bitisTarihi,
+        cancelAt: null,
+      })
+      .where(eq(subscriptions.id, mevcut.id));
+  } else {
+    abonelikId = randomUUID();
+    await db.insert(subscriptions).values({
+      id: abonelikId,
+      userId: kullanici.id,
+      productSlug: plan.slug,
+      provider: "admin_tanimli",
+      providerRef: `manual_${Date.now()}`,
+      status: "aktif",
+      priceMinor: plan.fiyatKurus,
+      currency: "TRY",
+      currentPeriodEnd: bitisTarihi,
+    });
+  }
+
+  await db.insert(auditEvents).values({
+    id: randomUUID(),
+    actorUserId: girdi.yoneticiId ?? null,
+    kind: "abonelik.admin_tanimlandi",
+    payload: { eposta, planSlug: plan.slug, sureGun, bitisTarihi: bitisTarihi.toISOString() },
+    result: "ok",
+  });
+
+  return {
+    ok: true,
+    mesaj: `${eposta} kullanıcısına ${plan.ad} planı ${sureGun} gün süreyle tanımlandı.`,
+  };
+}
+

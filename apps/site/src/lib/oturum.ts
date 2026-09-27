@@ -23,5 +23,10 @@ export async function oturumGerekli(istenenYol = "/panel") {
    * protokolsüz biçim reddediliyor). Tip bu yüzden daraltılıyor.
    */
   if (!oturum) redirect(donusYolu(istenenYol) as Parameters<typeof redirect>[0]);
+  if (!oturum.user.emailVerified) {
+    redirect(
+      `/dogrulama-bekleniyor?eposta=${encodeURIComponent(oturum.user.email)}` as Parameters<typeof redirect>[0],
+    );
+  }
   return oturum;
 }

@@ -13,7 +13,12 @@ import { donusYolu } from "@/lib/yetki";
  * önde, kesin olanı arkada.
  */
 export function middleware(istek: NextRequest) {
-  const cerez = getSessionCookie(istek);
+  const cerez =
+    getSessionCookie(istek) ||
+    istek.cookies.get("better-auth.session_token")?.value ||
+    istek.cookies.get("__Secure-better-auth.session_token")?.value ||
+    istek.cookies.get("better-auth.session_data")?.value;
+
   if (cerez) return NextResponse.next();
 
   const url = istek.nextUrl.clone();

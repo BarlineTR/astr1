@@ -51,18 +51,44 @@ export function SahteOdemeFormu({
   const [adim, setAdim] = useState<Adim>("kart");
   const [numara, setNumara] = useState("");
   const [adSoyad, setAdSoyad] = useState("");
+  const [musteriEposta, setMusteriEposta] = useState("");
+  const [musteriTelefon, setMusteriTelefon] = useState("");
+  const [musteriSifre, setMusteriSifre] = useState("");
   const [sonKullanma, setSonKullanma] = useState("");
   const [cvc, setCvc] = useState("");
   const [otp, setOtp] = useState("");
+  const [faturaTipi, setFaturaTipi] = useState<"bireysel" | "kurumsal" | "">("");
+  const [firmaAdi, setFirmaAdi] = useState("");
+  const [vergiNo, setVergiNo] = useState("");
+  const [tipKurus, setTipKurus] = useState<number>(0);
   const [hatalar, setHatalar] = useState<Record<string, string>>({});
   const [genelHata, setGenelHata] = useState<string | null>(null);
 
   const aile = kartAilesi(numara);
+  const toplamTutarKurus = tutarKurus + tipKurus;
 
   function kartiDogrula(): boolean {
     const yeni: Record<string, string> = {};
+
+    if (adSoyad.trim().length < 3) yeni.adSoyad = "Lütfen adınızı ve soyadınızı yazın.";
+    if (!musteriEposta.includes("@") || musteriEposta.trim().length < 5) {
+      yeni.musteriEposta = "Geçerli bir e-posta adresi yazın.";
+    }
+    if (musteriTelefon.replace(/\D/g, "").length < 10) {
+      yeni.musteriTelefon = "Geçerli bir telefon numarası girin (Örn: 05XX...).";
+    }
+    if (musteriSifre && musteriSifre.length < 8) {
+      yeni.musteriSifre = "Şifre en az 8 karakter olmalı.";
+    }
+
+    if (!faturaTipi) {
+      yeni.faturaTipi = "Lütfen müşteri / fatura tipini seçin (Zorunlu alan).";
+    } else if (faturaTipi === "kurumsal") {
+      if (firmaAdi.trim().length < 2) yeni.firmaAdi = "Firma unvanını girin.";
+      if (vergiNo.trim().length < 10) yeni.vergiNo = "Geçerli bir Vergi Kimlik Numarası (VKN/TCKN) girin.";
+    }
+
     if (!luhnGecerliMi(numara)) yeni.numara = "Kart numarası geçersiz.";
-    if (adSoyad.trim().length < 3) yeni.adSoyad = "Kart üzerindeki adı yazın.";
     if (!sonKullanmaGecerliMi(sonKullanma)) yeni.sonKullanma = "AA/YY biçiminde ve gelecekte olmalı.";
     if (!cvcGecerliMi(cvc)) yeni.cvc = "CVC 3 ya da 4 hane.";
     setHatalar(yeni);
@@ -97,10 +123,11 @@ export function SahteOdemeFormu({
     <div className="odeme-ekrani">
       <div className="odeme-ekrani__ozet">
         <p className="eyebrow">Ödenecek tutar</p>
-        <p className="odeme-ekrani__tutar mono">{kurusBicimle(tutarKurus)}</p>
+        <p className="odeme-ekrani__tutar mono">{kurusBicimle(toplamTutarKurus)}</p>
         <p className="odeme-ekrani__kalem">
           {kalemAdi}
           {periyot === "ay" && <span className="odeme-ekrani__periyot"> · aylık yenilenir</span>}
+          {tipKurus > 0 && <span> (+{kurusBicimle(tipKurus)} bahşiş/katkı)</span>}
         </p>
       </div>
 
@@ -114,6 +141,140 @@ export function SahteOdemeFormu({
           }}
           noValidate
         >
+          {/* Müşteri ve İletişim Bilgileri */}
+          <div className="form__alan">
+            <label htmlFor="ad-soyad">Ad Soyad *</label>
+            <input
+              id="ad-soyad"
+              value={adSoyad}
+              placeholder="Adınız ve Soyadınız"
+              onChange={(e) => setAdSoyad(e.target.value)}
+            />
+            {hatalar.adSoyad && (
+              <small className="form__alan-hata" role="alert">
+                {hatalar.adSoyad}
+              </small>
+            )}
+          </div>
+
+          <div className="odeme-ekrani__ikili">
+            <div className="form__alan">
+              <label htmlFor="musteri-eposta">E-posta Adresi *</label>
+              <input
+                id="musteri-eposta"
+                type="email"
+                value={musteriEposta}
+                placeholder="ornek@firma.com"
+                onChange={(e) => setMusteriEposta(e.target.value)}
+              />
+              {hatalar.musteriEposta && (
+                <small className="form__alan-hata" role="alert">
+                  {hatalar.musteriEposta}
+                </small>
+              )}
+            </div>
+
+            <div className="form__alan">
+              <label htmlFor="musteri-telefon">Telefon Numarası *</label>
+              <input
+                id="musteri-telefon"
+                type="tel"
+                value={musteriTelefon}
+                placeholder="05XX XXX XX XX"
+                onChange={(e) => setMusteriTelefon(e.target.value)}
+              />
+              {hatalar.musteriTelefon && (
+                <small className="form__alan-hata" role="alert">
+                  {hatalar.musteriTelefon}
+                </small>
+              )}
+            </div>
+          </div>
+
+          <div className="form__alan">
+            <label htmlFor="musteri-sifre">Hesap Parolası (Opsiyonel / Yeni Hesap Açılışı İçin)</label>
+            <input
+              id="musteri-sifre"
+              type="password"
+              value={musteriSifre}
+              placeholder="En az 8 karakterli parola"
+              onChange={(e) => setMusteriSifre(e.target.value)}
+            />
+            {hatalar.musteriSifre && (
+              <small className="form__alan-hata" role="alert">
+                {hatalar.musteriSifre}
+              </small>
+            )}
+          </div>
+
+          {/* Zorunlu Müşteri / Fatura Tipi */}
+          <div className="form__alan">
+            <label>
+              Müşteri & Fatura Tipi <span style={{ color: "var(--color-alarm, #ef4444)" }}>* (Zorunlu)</span>
+            </label>
+            <div style={{ display: "flex", gap: "1rem", marginTop: "0.25rem" }}>
+              <label style={{ display: "inline-flex", alignItems: "center", gap: "0.4rem", cursor: "pointer" }}>
+                <input
+                  type="radio"
+                  name="faturaTipi"
+                  value="bireysel"
+                  checked={faturaTipi === "bireysel"}
+                  onChange={() => setFaturaTipi("bireysel")}
+                />
+                Bireysel
+              </label>
+              <label style={{ display: "inline-flex", alignItems: "center", gap: "0.4rem", cursor: "pointer" }}>
+                <input
+                  type="radio"
+                  name="faturaTipi"
+                  value="kurumsal"
+                  checked={faturaTipi === "kurumsal"}
+                  onChange={() => setFaturaTipi("kurumsal")}
+                />
+                Kurumsal (Şirket)
+              </label>
+            </div>
+            {hatalar.faturaTipi && (
+              <small className="form__alan-hata" role="alert">
+                {hatalar.faturaTipi}
+              </small>
+            )}
+          </div>
+
+          {faturaTipi === "kurumsal" && (
+            <div className="odeme-ekrani__ikili">
+              <div className="form__alan">
+                <label htmlFor="firma-ad">Firma Unvanı</label>
+                <input
+                  id="firma-ad"
+                  value={firmaAdi}
+                  placeholder="Şirket Tam Adı A.Ş."
+                  onChange={(e) => setFirmaAdi(e.target.value)}
+                />
+                {hatalar.firmaAdi && (
+                  <small className="form__alan-hata" role="alert">
+                    {hatalar.firmaAdi}
+                  </small>
+                )}
+              </div>
+              <div className="form__alan">
+                <label htmlFor="vergi-no">Vergi Kimlik No (VKN)</label>
+                <input
+                  id="vergi-no"
+                  value={vergiNo}
+                  inputMode="numeric"
+                  placeholder="10 Haneli VKN"
+                  onChange={(e) => setVergiNo(e.target.value.replace(/\D/g, "").slice(0, 11))}
+                />
+                {hatalar.vergiNo && (
+                  <small className="form__alan-hata" role="alert">
+                    {hatalar.vergiNo}
+                  </small>
+                )}
+              </div>
+            </div>
+          )}
+
           <div className="form__alan">
             <label htmlFor="kart-numara">Kart numarası</label>
             <div className="odeme-ekrani__kart-alani">
@@ -188,8 +349,30 @@ export function SahteOdemeFormu({
             </div>
           </div>
 
+          {/* Proje Bahşişi / Destek Katkısı (Tip) */}
+          <div className="form__alan" style={{ borderTop: "1px dashed var(--color-border, #333)", paddingTop: "0.75rem" }}>
+            <label>Geliştiriciye Destek / Bahşiş (Tip)</label>
+            <div style={{ display: "flex", gap: "0.5rem", flexWrap: "wrap", marginTop: "0.25rem" }}>
+              {[
+                { etiket: "Katkısız", kurus: 0 },
+                { etiket: "+50 ₺ Çay", kurus: 5000 },
+                { etiket: "+150 ₺ Kahve", kurus: 15000 },
+                { etiket: "+500 ₺ Devre", kurus: 50000 },
+              ].map((secenek) => (
+                <button
+                  type="button"
+                  key={secenek.kurus}
+                  className={`btn btn--small ${tipKurus === secenek.kurus ? "btn--primary" : "btn--quiet"}`}
+                  onClick={() => setTipKurus(secenek.kurus)}
+                >
+                  {secenek.etiket}
+                </button>
+              ))}
+            </div>
+          </div>
+
           <button className="btn btn--primary" type="submit">
-            {kurusBicimle(tutarKurus)}
+            {kurusBicimle(toplamTutarKurus)}
             {periyot === "ay" ? " / ay abone ol" : " öde"}
           </button>
 

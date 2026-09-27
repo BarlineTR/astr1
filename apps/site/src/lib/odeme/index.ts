@@ -4,6 +4,7 @@ import { iyzicoSaglayici } from "./iyzico";
 import { iyzicoAbonelik } from "./iyzico-abonelik";
 import { sahteSaglayici } from "./sahte";
 import { sahteAbonelik } from "./sahte-abonelik";
+import { stripeSaglayici } from "./stripe";
 import type { AbonelikSaglayici, OdemeSaglayici } from "./saglayici";
 
 export type {
@@ -19,17 +20,25 @@ export { abonelikDestekliyorMu } from "./saglayici";
 /**
  * Yapılandırmaya göre sağlayıcı seçer.
  *
- * iyzico anahtarları varsa iyzico, yoksa sahte sağlayıcı. **Sessizce** sahteye
- * düşmüyor: seçilen sağlayıcı arayüzde ve günlükte görünüyor, çünkü yanlışlıkla
- * sahte sağlayıcıyla yayına çıkmak paranın hiç tahsil edilmemesi demek.
- *
- * Süreç boyunca tek örnek tutuluyor: sahte sağlayıcı oturumları bellekte ve her
- * çağrıda yeni örnek üretmek onları kaybettiriyordu. Next geliştirme kipinde
- * modülleri sıcak yeniden yüklediği için globalThis üzerinde saklanıyor.
+ * 1. Stripe anahtarı (STRIPE_SECRET_KEY) varsa -> Stripe
+ * 2. iyzico anahtarları (IYZICO_API_KEY & IYZICO_SECRET_KEY) varsa -> iyzico
+ * 3. Hiçbiri yoksa -> Sahte sağlayıcı (Test / Geliştirme)
  */
 const global_ = globalThis as unknown as { __astroOdeme?: OdemeSaglayici };
 
 function olustur(): OdemeSaglayici {
+  const stripeSecret = process.env.STRIPE_SECRET_KEY;
+  const stripePublishable = process.env.STRIPE_PUBLISHABLE_KEY || process.env.NEXT_PUBLIC_STRIPE_PUBLISHABLE_KEY;
+  const stripeWebhook = process.env.STRIPE_WEBHOOK_SECRET;
+
+  if (stripeSecret) {
+    return stripeSaglayici({
+      secretKey: stripeSecret,
+      publishableKey: stripePublishable,
+      webhookSecret: stripeWebhook,
+    });
+  }
+
   const apiKey = process.env.IYZICO_API_KEY;
   const secretKey = process.env.IYZICO_SECRET_KEY;
   const uri = process.env.IYZICO_URI ?? "https://sandbox-api.iyzipay.com";

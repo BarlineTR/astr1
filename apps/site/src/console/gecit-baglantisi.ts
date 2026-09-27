@@ -96,7 +96,14 @@ export function gecideBaglan(
     olaylar.durum("baglaniyor");
 
     try {
-      soket = new WebSocket(`${gecitUrl.replace(/\/$/, "")}/ws/panel`);
+      let wsUrl = gecitUrl.replace(/\/$/, "");
+      if (typeof window !== "undefined") {
+        const curHost = window.location.hostname;
+        if (curHost && curHost !== "localhost" && curHost !== "127.0.0.1") {
+          wsUrl = wsUrl.replace(/localhost|127\.0\.0\.1/, curHost);
+        }
+      }
+      soket = new WebSocket(`${wsUrl}/ws/panel`);
     } catch {
       olaylar.durum("hata", "Ağ geçidine bağlanılamadı.");
       return;

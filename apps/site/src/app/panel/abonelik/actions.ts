@@ -52,10 +52,26 @@ export async function satinAl(
       siteUrl: KURUM.siteUrl,
     });
 
-    if (!abonelik.ok || !abonelik.odemeSayfasiUrl) {
-      return { ok: false, hata: abonelik.hata ?? "Abonelik başlatılamadı." };
+    if (abonelik.ok && abonelik.odemeSayfasiUrl) {
+      redirect(abonelik.odemeSayfasiUrl as Parameters<typeof redirect>[0]);
     }
-    redirect(abonelik.odemeSayfasiUrl as Parameters<typeof redirect>[0]);
+
+    // Sağlayıcıda tekrarlayan abonelik API'si aktif değilse (örn. iyzico e-ticaret hesabı)
+    // kullanıcıyı mağdur etmeyip doğrudan 1 aylık periyot siparişi başlatıyoruz:
+    const sonuc = await siparisOlustur({
+      kullaniciId: oturum.user.id,
+      eposta: oturum.user.email,
+      tur: "abonelik",
+      kalemler: [{ slug: kalem.slug, ad: kalem.ad, birimKurus: kalem.fiyatKurus, adet: 1 }],
+      alici: { ad: ad ?? "Müşteri", soyad: kalan.join(" ") || "-", ip },
+      siteUrl: KURUM.siteUrl,
+    });
+
+    if (!sonuc.ok || !sonuc.odemeSayfasiUrl) {
+      return { ok: false, hata: sonuc.hata ?? "Ödeme başlatılamadı." };
+    }
+
+    redirect(sonuc.odemeSayfasiUrl as Parameters<typeof redirect>[0]);
   }
 
   const sonuc = await siparisOlustur({

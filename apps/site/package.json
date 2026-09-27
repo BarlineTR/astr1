@@ -4,9 +4,9 @@
   "version": "0.1.0",
   "type": "module",
   "scripts": {
-    "dev": "NEXT_TELEMETRY_DISABLED=1 next dev",
-    "build": "NEXT_TELEMETRY_DISABLED=1 next build",
-    "start": "NEXT_TELEMETRY_DISABLED=1 next start",
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
     "db:generate": "drizzle-kit generate",
     "db:migrate": "drizzle-kit migrate"
   },
@@ -21,6 +21,7 @@
     "react": "19.3.0",
     "react-dom": "19.3.0",
     "resend": "^6.30.0",
+    "stripe": "^22.6.2",
     "three": "^0.170.0"
   },
   "devDependencies": {

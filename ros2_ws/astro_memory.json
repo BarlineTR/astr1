@@ -1,0 +1,37 @@
+{
+  "robot_name": "Astro",
+  "owner_name": "Baran",
+  "current_persona": "playful",
+  "user_style_notes": "Samimi ve doğal Türkçe konuşur",
+  "verified_facts": [
+    "Senin adın Astro, sen akıllı, bağımsız ve interaktif bir sosyal robot asistansın."
+  ],
+  "learned_objects": [],
+  "environmental_observations": [
+    "Test high confidence."
+  ],
+  "last_interaction": null,
+  "user_facts": [],
+  "active_reminders": [
+    {
+      "target_time": 1790425951.9273236,
+      "reminder_text": "çay içeceğim",
+      "user_name": "Baran",
+      "created_at": 1790425651.9273236
+    }
+  ],
+  "known_people": {
+    "baran": {
+      "name": "Baran",
+      "title": "Baş Mühendis & Geliştirici",
+      "formal_title": "Baran Bey",
+      "notes": "Robotun yaratıcısı ve baş mühendisi.",
+      "learned_facts": [
+        "Robotik ve yazılımla ilgileniyor."
+      ],
+      "preferences": {},
+      "session_summaries": [],
+      "learned_at": 1790335217.604482
+    }
+  }
+}

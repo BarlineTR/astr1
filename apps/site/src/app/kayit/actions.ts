@@ -93,5 +93,7 @@ export async function kayitOl(
   });
 
   // redirect() NEXT_REDIRECT fırlatır; try/catch dışında olmalı.
-  redirect("/panel");
+  redirect(
+    `/dogrulama-bekleniyor?eposta=${encodeURIComponent(eposta)}` as Parameters<typeof redirect>[0],
+  );
 }
