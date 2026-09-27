@@ -28,11 +28,17 @@ import urllib.request
 
 try:
     import websockets
+    import websockets.exceptions
 except ImportError:
     sys.exit("❌ 'websockets' paketi bulunamadı. Lütfen yükleyin: pip install websockets")
 
 TOKEN_FILE = Path(os.path.expanduser("~/.astro/device_token.json"))
 PROTOCOL_VERSION = "1"
+
+# Reconnect ayarları
+RECONNECT_BASLANGIC_S = 2.0   # İlk bekleme süresi
+RECONNECT_MAKSIMUM_S  = 60.0  # Maksimum bekleme süresi
+RECONNECT_CARPAN      = 2.0   # Her denemede katlanır
 
 
 def jeton_yukle() -> dict:
@@ -83,7 +89,7 @@ class AstroRobotAjan:
         self.calisiyor = True
 
         # Robot anlık durum parametreleri
-        self.kabul_edildi = asyncio.Event()
+        self.kabul_edildi: asyncio.Event | None = None
         self.hedef_yaw = 0.0
         self.gercek_yaw = 0.0
         self.estop = False
@@ -91,29 +97,91 @@ class AstroRobotAjan:
         self.vad = False
         self.yuz_sayisi = 0
 
-    async def baglan(self):
+    def _durum_sifirla(self):
+        """Her yeni bağlantıda olay ve kalıcı olmayan durumu sıfırla."""
+        self.kabul_edildi = asyncio.Event()
+        self.ws = None
+
+    async def baglan_bir_kez(self) -> bool:
+        """
+        Tek bağlantı denemesi. Başarılı bağlantı kurulup normal kapanış
+        gerçekleşirse True (yeniden bağlan), kalıcı hata varsa False (çık) döner.
+        """
+        self._durum_sifirla()
         ws_url = f"{self.gecit_url}/ws/cihaz"
         print(f"🔌 Ağ geçidine bağlanılıyor: {ws_url} ...")
 
-        async with websockets.connect(ws_url) as ws:
-            self.ws = ws
-            print("🚀 Ağ geçidi bağlantısı kuruldu.")
+        try:
+            async with websockets.connect(ws_url) as ws:
+                self.ws = ws
+                print("🚀 Ağ geçidi bağlantısı kuruldu.")
 
-            # 1. cihaz.merhaba el sıkışması
-            merhaba = {
-                "kind": "cihaz.merhaba",
-                "v": PROTOCOL_VERSION,
-                "token": self.token,
-                "firmware": "astro-v1.0",
-            }
-            await ws.send(json.dumps(merhaba))
-            print("👋 'cihaz.merhaba' çerçevesi iletildi. Yetkilendirme bekleniyor...")
+                # cihaz.merhaba el sıkışması
+                merhaba = {
+                    "kind": "cihaz.merhaba",
+                    "v": PROTOCOL_VERSION,
+                    "token": self.token,
+                    "firmware": "astro-v1.0",
+                }
+                await ws.send(json.dumps(merhaba))
+                print("👋 'cihaz.merhaba' çerçevesi iletildi. Yetkilendirme bekleniyor...")
 
-            # Yanıt dinleyici ve Telemetri döngülerini eşzamanlı başlat
-            await asyncio.gather(
-                self.mesaj_dinle(),
-                self.telemetri_dongusu(),
-            )
+                await asyncio.gather(
+                    self.mesaj_dinle(),
+                    self.telemetri_dongusu(),
+                )
+
+            # WebSocket bağlantısı normal kapandı → yeniden bağlan
+            return True
+
+        except websockets.exceptions.ConnectionClosedError as e:
+            kod = e.code if hasattr(e, "code") else None
+            neden = e.reason if hasattr(e, "reason") else str(e)
+
+            if kod == 4000:
+                # Aynı cihaz başka bir bağlantıyla kayıt oldu.
+                # Bu genellikle servis yeniden başlatmasından kaynaklanır.
+                # Kısa bekleyip yeniden dene.
+                print(f"⚠️ Bağlantı kesildi (4000): {neden} — kısa süre sonra yeniden deneyeceğim.")
+                return True
+
+            if kod == 4001:
+                print(f"❌ Jeton geçersiz veya iptal edilmiş. Yeniden eşleştirme gerekebilir.")
+                return False  # Kalıcı hata — çık
+
+            if kod == 4003:
+                print(f"❌ Protokol sürüm uyuşmazlığı. Agent güncellemesi gerekiyor.")
+                return False  # Kalıcı hata — çık
+
+            print(f"⚠️ Ağ geçidi bağlantısı koptu (kod={kod}): {neden}")
+            return True  # Geçici hata — yeniden bağlan
+
+        except (ConnectionRefusedError, OSError) as e:
+            print(f"⚠️ Bağlantı kurulamadı: {e}")
+            return True  # Gateway geçici olarak kapalı — yeniden dene
+
+        except Exception as e:
+            print(f"⚠️ Beklenmedik hata: {e}")
+            return True
+
+    async def calistir(self):
+        """Yeniden bağlanma döngüsü — bağlantı kopunca exponential backoff ile tekrar dener."""
+        bekleme = RECONNECT_BASLANGIC_S
+        while self.calisiyor:
+            t_baslangic = time.time()
+            devam = await self.baglan_bir_kez()
+            if not devam:
+                print("🛑 Kalıcı hata nedeniyle ajan durduruluyor.")
+                break
+            if not self.calisiyor:
+                break
+            # Bağlantı uzun süre (>30sn) ayaktaysa backoff'u sıfırla
+            baglilik_suresi = time.time() - t_baslangic
+            if baglilik_suresi > 30:
+                bekleme = RECONNECT_BASLANGIC_S
+            print(f"🔄 {bekleme:.0f} saniye sonra yeniden bağlanılacak...")
+            await asyncio.sleep(bekleme)
+            bekleme = min(bekleme * RECONNECT_CARPAN, RECONNECT_MAKSIMUM_S)
 
     async def mesaj_dinle(self):
         try:
@@ -136,7 +204,7 @@ class AstroRobotAjan:
                 elif tur == "gecit.komut":
                     await self.komut_isle(mesaj)
         except websockets.exceptions.ConnectionClosed:
-            print("⚠️ Ağ geçidi bağlantısı koptu.")
+            pass  # baglan_bir_kez'deki except bloğu zaten yakalayacak
 
     async def komut_isle(self, mesaj: dict):
         komut_id = mesaj.get("komutId")
@@ -165,7 +233,6 @@ class AstroRobotAjan:
             kabul = False
             neden = f"Bilinmeyen komut: {komut_turu}"
 
-        # Onay çerçevesi gönder (cihaz.onay)
         if komut_id:
             onay = {
                 "kind": "cihaz.onay",
@@ -174,13 +241,16 @@ class AstroRobotAjan:
             }
             if neden:
                 onay["neden"] = neden
-            await self.ws.send(json.dumps(onay))
+            try:
+                await self.ws.send(json.dumps(onay))
+            except Exception:
+                pass
 
     async def telemetri_dongusu(self):
         """10 Hz (100 ms) aralıkla panele canlı robot telemetrisi basar."""
         await self.kabul_edildi.wait()
         while self.calisiyor:
-            # Gerçek açıyı yumuşak bir şekilde hedefe yaklaştır (simülasyon / servo rampası)
+            # Gerçek açıyı yumuşak bir şekilde hedefe yaklaştır
             fark = self.hedef_yaw - self.gercek_yaw
             if abs(fark) > 0.5 and not self.estop:
                 self.gercek_yaw += (1.0 if fark > 0 else -1.0) * min(abs(fark), 3.0)
@@ -261,8 +331,9 @@ def main():
     ajan = AstroRobotAjan(token=token, gecit_url=gecit_url, serial=args.serial)
 
     try:
-        asyncio.run(ajan.baglan())
+        asyncio.run(ajan.calistir())
     except KeyboardInterrupt:
+        ajan.calisiyor = False
         print("\n🛑 Robot ajanı durduruldu.")
 
 
