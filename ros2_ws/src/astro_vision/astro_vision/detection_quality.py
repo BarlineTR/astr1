@@ -79,8 +79,8 @@ class DetectionHold:
         self._held = 0
 
     def update(
-        self, faces: List[Tuple[int, int, int, int, float]]
-    ) -> List[Tuple[int, int, int, int, float]]:
+        self, faces: List[Tuple[Any, ...]]
+    ) -> List[Tuple[Any, ...]]:
         """Returns this frame's detections, or the previous ones while budget remains."""
         if faces:
             self._last = list(faces)
@@ -93,7 +93,12 @@ class DetectionHold:
 
         self._held += 1
         scale = self.decay ** self._held
-        return [(x, y, w, h, conf * scale) for (x, y, w, h, conf) in self._last]
+        res = []
+        for item in self._last:
+            x, y, w, h, conf = item[:5]
+            raw = item[5] if len(item) > 5 else None
+            res.append((x, y, w, h, conf * scale, raw))
+        return res
 
 
 class HaarFaceDetector:
@@ -108,7 +113,7 @@ class HaarFaceDetector:
         self.cascade = cascade
         self.detect_kwargs = detect_kwargs
 
-    def detect(self, frame) -> List[Tuple[int, int, int, int, float]]:
+    def detect(self, frame) -> List[Tuple[Any, ...]]:
         import cv2
 
         gray = frame if frame.ndim == 2 else cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
@@ -133,7 +138,7 @@ class YuNetFaceDetector:
         )
         self._input_size = None
 
-    def detect(self, frame) -> List[Tuple[int, int, int, int, float]]:
+    def detect(self, frame) -> List[Tuple[Any, ...]]:
         import cv2
 
         if frame.ndim == 2:
@@ -147,10 +152,10 @@ class YuNetFaceDetector:
         if detections is None:
             return []
 
-        faces: List[Tuple[int, int, int, int, float]] = []
+        faces: List[Tuple[Any, ...]] = []
         for row in detections:
             x, y, w, h = (int(round(v)) for v in row[:4])
-            faces.append((x, y, w, h, float(row[-1])))
+            faces.append((x, y, w, h, float(row[-1]), row))
         return faces
 
 

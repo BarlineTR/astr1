@@ -105,10 +105,17 @@ def _is_duplicate(a: np.ndarray, b: np.ndarray) -> bool:
 
 
 def to_detections(found) -> List[Detection]:
-    """Turns the detector's (x, y, w, h, confidence) tuples into Detections."""
+    """Turns the detector's (x, y, w, h, confidence, [raw_row]) tuples into Detections."""
     return [
-        Detection(x=int(x), y=int(y), w=int(w), h=int(h), confidence=float(conf))
-        for (x, y, w, h, conf) in found
+        Detection(
+            x=int(f[0]),
+            y=int(f[1]),
+            w=int(f[2]),
+            h=int(f[3]),
+            confidence=float(f[4]),
+            raw_row=f[5] if len(f) > 5 else None,
+        )
+        for f in found
     ]
 
 

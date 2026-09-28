@@ -1031,10 +1031,15 @@ class StandaloneGazeRosNode(Node):
             if not roi_items:
                 return
 
-            def _worker(items):
+            def _worker(items, full_img):
                 try:
                     for face_roi, u_norm, det in items:
-                        name, conf, meta = self.face_recognizer.recognize_face(face_roi)
+                        raw_r = getattr(det, "raw_row", None)
+                        name, conf, meta = self.face_recognizer.recognize_face(
+                            face_roi,
+                            full_frame=full_img,
+                            face_row=raw_r,
+                        )
                         now_log = time.monotonic()
                         if name:
                             payload = {
@@ -1085,7 +1090,7 @@ class StandaloneGazeRosNode(Node):
                 except Exception as rec_err:
                     self.get_logger().debug(f"_maybe_recognize_face worker notice: {rec_err}")
 
-            threading.Thread(target=_worker, args=(roi_items,), daemon=True).start()
+            threading.Thread(target=_worker, args=(roi_items, frame.copy()), daemon=True).start()
         except Exception as exc:
             self.get_logger().debug(f"_maybe_recognize_face notice: {exc}")
 

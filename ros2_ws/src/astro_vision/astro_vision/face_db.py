@@ -45,7 +45,7 @@ class FaceEngine:
         self,
         model_dir=None,
         db_path=None,
-        detect_threshold: float = 0.8,
+        detect_threshold: float = float(os.getenv("FACE_DETECT_THRESHOLD", "0.50")),
         cosine_threshold: float = DEFAULT_COSINE_THRESHOLD,
     ):
         self.model_dir = Path(os.path.expanduser(str(model_dir))) if model_dir else DEFAULT_MODEL_DIR
@@ -75,12 +75,14 @@ class FaceEngine:
     def detect(self, frame) -> np.ndarray:
         """Karedeki yüzleri döndürür (Nx15: kutu, 5 nokta, skor).
 
-        Çok büyük görsellerde (örn. 3000 px'lik portreler) YuNet yüzü hiç
-        bulamıyor; galeri fotoğraflarının 9/25'i bu yüzden kaçıyordu. Algılama
-        küçültülmüş kopyada yapılıp koordinatlar orijinale geri ölçeklenir —
-        hizalama (alignCrop) yine tam çözünürlüklü kareden yapılır.
+        Çok büyük görsellerde küçültülür; çok küçük kırpıntılarda ise YuNet'in
+        algılayabilmesi için 320px'e büyütülüp koordinatlar geri ölçeklenir.
+        Hizalama (alignCrop) her zaman tam çözünürlüklü kareden yapılır.
         """
         height, width = frame.shape[:2]
+        if height < 10 or width < 10:
+            return np.empty((0, 15), dtype=np.float32)
+
         scale = min(1.0, MAX_DETECT_SIDE / max(height, width))
 
         if scale < 1.0:
@@ -91,6 +93,16 @@ class FaceEngine:
                 return np.empty((0, 15), dtype=np.float32)
             faces = faces.copy()
             faces[:, :14] /= scale       # ilk 14 sütun koordinat, 15. skor
+            return faces
+        elif max(height, width) < 240:
+            scale_up = 320.0 / max(height, width)
+            scaled = cv2.resize(frame, (int(width * scale_up), int(height * scale_up)))
+            self._detector.setInputSize((scaled.shape[1], scaled.shape[0]))
+            _retval, faces = self._detector.detect(scaled)
+            if faces is None or len(faces) == 0:
+                return np.empty((0, 15), dtype=np.float32)
+            faces = faces.copy()
+            faces[:, :14] /= scale_up
             return faces
 
         self._detector.setInputSize((width, height))

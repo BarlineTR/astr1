@@ -44,6 +44,7 @@ class Detection:
     h: int
     confidence: float
     detector_source: Optional[str] = "vision_json"
+    raw_row: Optional[Any] = None
 
 
 @dataclass

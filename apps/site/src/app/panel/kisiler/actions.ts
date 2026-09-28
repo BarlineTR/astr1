@@ -160,11 +160,12 @@ export async function kisiKaldir(id: string) {
           if (fs.existsSync(fPath)) {
             const raw = fs.readFileSync(fPath, "utf-8");
             const data = JSON.parse(raw);
-            if (data && data.people) {
+            if (data && typeof data === "object") {
               let degisti = false;
-              for (const k of Object.keys(data.people)) {
-                if (k.toLowerCase() === hedef.name.toLowerCase() || sanitizeName(k) === cleanKey) {
-                  delete data.people[k];
+              const targetDict = data.people && typeof data.people === "object" ? data.people : data;
+              for (const k of Object.keys(targetDict)) {
+                if (k.toLowerCase() === hedef.name.toLowerCase() || sanitizeName(k) === cleanKey || k.toLowerCase() === cleanKey) {
+                  delete targetDict[k];
                   degisti = true;
                 }
               }
