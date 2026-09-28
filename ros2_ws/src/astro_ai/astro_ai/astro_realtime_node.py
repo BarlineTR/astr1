@@ -15,6 +15,8 @@ import logging
 _LOG = logging.getLogger(__name__)
 
 import base64
+import collections
+from collections import deque, Counter
 import inspect
 import io
 import json
