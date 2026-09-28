@@ -16,7 +16,7 @@ clean here and ragged under ROS, the fault is the plumbing.
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional, Sequence, Tuple
+from typing import Any, List, Optional, Sequence, Tuple
 
 import core_path  # noqa: F401
 from astro_base.gaze.audio_filter import AudioFilterCore  # noqa: E402
