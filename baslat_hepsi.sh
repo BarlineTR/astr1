@@ -21,7 +21,7 @@ echo "========================================================"
 echo "[1/4] Eski düğümler ve arka plan servisleri temizleniyor..."
 pkill -f "astro_web_agent"        2>/dev/null || true
 pkill -f "tsx.*index.ts"          2>/dev/null || true
-pkill -f "next dev"               2>/dev/null || true
+pkill -f "next"                   2>/dev/null || true
 pkill -f "astro_social_gaze"      2>/dev/null || true
 pkill -f "serial_bridge"          2>/dev/null || true
 pkill -f "standalone_gaze"        2>/dev/null || true
@@ -74,7 +74,7 @@ cleanup() {
     [ -n "$GW_PID" ] && kill "$GW_PID" 2>/dev/null || true
     pkill -f "astro_web_agent"   2>/dev/null || true
     pkill -f "tsx.*index.ts"     2>/dev/null || true
-    pkill -f "next dev"          2>/dev/null || true
+    pkill -f "next"              2>/dev/null || true
     pkill -f "serial_bridge"     2>/dev/null || true
     pkill -f "astro_realtime"    2>/dev/null || true
     pkill -f "audio_stream"      2>/dev/null || true
@@ -103,11 +103,10 @@ fi
 # 3b. Next.js Site
 echo "  [+] Next.js Web Paneli başlatılıyor (:3000)..."
 cd "$DIR/apps/site"
-nohup npx next dev -H 0.0.0.0 -p 3000 \
-    > "$DIR/site.log" 2>&1 &
+nohup node "$DIR/node_modules/next/dist/bin/next" dev -H 0.0.0.0 -p 3000 < /dev/null > "$DIR/site.log" 2>&1 &
 SITE_PID=$!
 cd "$DIR"
-sleep 10
+sleep 5
 if nc -z localhost 3000 2>/dev/null; then
     echo "      ✅ Panel hazır (http://192.168.1.111:3000)"
 else
