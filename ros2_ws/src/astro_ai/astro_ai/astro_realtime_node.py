@@ -6141,7 +6141,8 @@ class AstroRealtimeNode(Node):
         wake_keywords = (
             "hey astro", "astro", "selam astro", "merhaba astro",
             "ey astro", "hay astro", "alo astro", "hey", "selam",
-            "astrocum", "astrom", "astrocuğum", "astrocan"
+            "astrocum", "astrom", "astrocuğum", "astrocan",
+            "astro robot", "hey astro robot", "robot astro"
         )
         if t_clean in wake_keywords:
             is_wake_pattern = True
@@ -6164,7 +6165,7 @@ class AstroRealtimeNode(Node):
         wake_confidence = 0.95
         vad_confidence = round(min(1.0, total_rms / 600.0), 2)
 
-        is_only_wake_word = (len(extracted_cmd) < 2)
+        is_only_wake_word = (len(extracted_cmd) < 2) or (extracted_cmd.lower() in ("robot", "astro", "hey", "efendim"))
         valid_cmd, cmd_reason = is_valid_user_command(extracted_cmd)
 
         if is_only_wake_word or not valid_cmd:
@@ -6178,7 +6179,7 @@ class AstroRealtimeNode(Node):
                 self.robot_led.set_state(LEDState.LISTENING)
             self._provide_attentive_listening_cue()
 
-            verbal_ack_enabled = os.getenv("WAKE_VERBAL_ACK", "false").lower() == "true"
+            verbal_ack_enabled = os.getenv("WAKE_VERBAL_ACK", "true").lower() == "true"
             tts_did_start = False
 
             if verbal_ack_enabled:
@@ -7441,7 +7442,7 @@ class AstroRealtimeNode(Node):
         if not self.groq_api_key:
             return None
         try:
-            prompt_text = "Astro robot."
+            prompt_text = "Astro, nasılsın?"
             boundary = "----WebKitFormBoundary" + os.urandom(16).hex()
             body = bytearray()
             body.extend(f"--{boundary}\r\n".encode())
@@ -10522,7 +10523,7 @@ class AstroRealtimeNode(Node):
             # If incoming audio correlates with what Astro is playing through the speaker, it is robot self-voice!
             if self_voice_score >= 0.28:
                 self._barge_in_consecutive_frames = max(0, self._barge_in_consecutive_frames - 2)
-                self.get_logger().info(
+                self.get_logger().debug(
                     f"[BARGE-IN DECISION]\n"
                     f"playback_active=true\n"
                     f"vad_confidence={vad_confidence:.2f}\n"
@@ -10567,7 +10568,7 @@ class AstroRealtimeNode(Node):
             if not is_vad_active or vad_confidence <= 0.05:
                 self._barge_in_consecutive_frames = 0
                 if is_loud:
-                    self.get_logger().info(
+                    self.get_logger().debug(
                         f"[BARGE-IN DECISION]\n"
                         f"playback_active=true\n"
                         f"vad_confidence={vad_confidence:.2f}\n"
@@ -10599,7 +10600,7 @@ class AstroRealtimeNode(Node):
 
             if speech_duration_ms < min_speech_ms:
                 if is_loud:
-                    self.get_logger().info(
+                    self.get_logger().debug(
                         f"[BARGE-IN DECISION]\n"
                         f"playback_active=true\n"
                         f"vad_confidence={vad_confidence:.2f}\n"
