@@ -1088,7 +1088,7 @@ class StandaloneGazeRosNode(Node):
                         if getattr(self, "pub_recognized_person", None):
                             self.pub_recognized_person.publish(msg)
                 except Exception as rec_err:
-                    self.get_logger().debug(f"_maybe_recognize_face worker notice: {rec_err}")
+                    self.get_logger().error(f"❌ [_maybe_recognize_face worker notice]: {rec_err}")
 
             threading.Thread(target=_worker, args=(roi_items, frame.copy()), daemon=True).start()
         except Exception as exc:
