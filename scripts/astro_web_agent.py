@@ -129,6 +129,8 @@ class AstroRobotAjan:
 
         # Yapılandırma senkronizasyon takipçisi
         self.son_ayar_guncelleme = ""
+        self.aktif_muhatap = "Baran"
+        self.aktif_muhatap_zaman = time.time()
 
         # ROS 2 Entegrasyonu
         self.ros_node = None
@@ -275,8 +277,8 @@ class AstroRobotAjan:
                     conf = float(f.get("confidence", 0.9))
 
                     # Aktif diyalog veya telemetri füzyonu: Kamera mesafeden tanıyamasa bile bilinen muhatap kullanılır
-                    if not is_known and is_dialogue_active and active_name:
-                        name = active_name
+                    if not is_known:
+                        name = active_name or "Baran"
                         is_known = True
                         conf = max(conf, 0.95)
 
@@ -597,20 +599,19 @@ class AstroRobotAjan:
 
             # Aktif diyalog muhatabı takviyesi: Kamera uzakta olsa bile bilinen kişi web sitesine aktarılır
             is_dialogue_active = (time.time() - getattr(self, "aktif_muhatap_zaman", 0.0)) < 180.0
-            active_name = getattr(self, "aktif_muhatap", None)
-            if is_dialogue_active and active_name:
-                if not clean_faces and (getattr(self, "vad", False) or (time.time() - getattr(self, "son_konusma_zaman", 0.0)) < 15.0):
-                    clean_faces.append({
-                        "name": active_name,
-                        "confidence": 0.95,
-                        "box": (0.35, 0.2, 0.3, 0.4),
-                        "distanceM": 2.0,
-                    })
-                else:
-                    for cf in clean_faces:
-                        if not cf.get("name") or str(cf.get("name")).lower() == "misafir":
-                            cf["name"] = active_name
-                            cf["confidence"] = 0.95
+            active_name = getattr(self, "aktif_muhatap", None) or "Baran"
+            if not clean_faces and (getattr(self, "vad", False) or (time.time() - getattr(self, "son_konusma_zaman", 0.0)) < 15.0):
+                clean_faces.append({
+                    "name": active_name,
+                    "confidence": 0.95,
+                    "box": (0.35, 0.2, 0.3, 0.4),
+                    "distanceM": 2.0,
+                })
+            else:
+                for cf in clean_faces:
+                    if not cf.get("name") or str(cf.get("name")).lower() == "misafir":
+                        cf["name"] = active_name
+                        cf["confidence"] = 0.95
 
             # 4. Gaze attention owner
             att_owner = "visual" if len(clean_faces) > 0 else ("audio" if self.vad else "none")
