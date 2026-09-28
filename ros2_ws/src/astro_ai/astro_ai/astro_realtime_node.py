@@ -6163,8 +6163,8 @@ class AstroRealtimeNode(Node):
         self._wake_audio_buffer.clear()
         self._wake_listening = False
         self._wake_last_voice_time = 0.0
-        # Uyandırma kelimesi en az 18 frame (360ms) akustik konuşma gerektirir
-        if len(buf) < 18:
+        # Uyandırma kelimesi en az 10 frame (200ms) gerektirir
+        if len(buf) < 10:
             return
         if reason == "max_utterance":
             now_w = time.monotonic()
@@ -6180,34 +6180,19 @@ class AstroRealtimeNode(Node):
             raw_w = b"".join(buf)
             arr_w = np.frombuffer(raw_w, dtype=np.int16)
             w_rms = float(np.sqrt(np.mean(arr_w.astype(np.float32) ** 2))) if len(arr_w) > 0 else 0.0
-            if w_rms < max(180.0, getattr(self, "_ambient_rms", 120.0) * 1.25):
+            if w_rms < max(80.0, getattr(self, "_ambient_rms", 120.0) * 1.05):
                 return
         threading.Thread(target=self._process_wake_candidate, args=(buf,), daemon=True).start()
 
     def _process_wake_candidate(self, audio_chunks: List[bytes]):
         """Processes potential wake utterance during sleep with strict wake phrase gating, buffer flushing, and telemetry tracking."""
         raw_pcm = b"".join(audio_chunks)
-        # Sıkı süre sınırı: "Astro" veya "Hey Astro" telaffuzu en az 420ms sürer (300ms gürültü patlamaları elenir)
-        if len(raw_pcm) < 16000 * 2 * 0.42:
+        if len(raw_pcm) < 16000 * 2 * 0.20:
             return
 
         arr = np.frombuffer(raw_pcm, dtype=np.int16)
         total_rms = float(np.sqrt(np.mean(arr.astype(np.float32) ** 2))) if len(arr) > 0 else 0.0
         peak_val = int(np.max(np.abs(arr))) if len(arr) > 0 else 0
-
-        # Yerel Akustik Konuşma Filtresi (0 STT maliyeti; sessizlik/tıslama/klik kesin eleme)
-        chunk_sz = 320  # 20ms
-        tot_chunks = max(1, len(arr) // chunk_sz)
-        sp_thresh = max(220.0, getattr(self, "_ambient_rms", 120.0) * 1.20)
-        speech_chunks = sum(
-            1 for i in range(0, len(arr) - chunk_sz + 1, chunk_sz)
-            if np.sqrt(np.mean(arr[i : i + chunk_sz].astype(np.float32) ** 2)) > sp_thresh
-        )
-        local_speech_ms = int(speech_chunks * 20)
-        local_vad_conf = speech_chunks / float(tot_chunks)
-
-        if local_speech_ms < 400 or local_vad_conf < 0.55 or total_rms < max(280.0, getattr(self, "_ambient_rms", 120.0) * 1.25):
-            return
 
         import io
         import wave
@@ -7388,9 +7373,9 @@ class AstroRealtimeNode(Node):
 
         # 5. Weak speech duration, low VAD confidence, or ambient noise floor
         elif (
-            (vad_confidence < 0.60 or speech_ms < 420 or total_rms < max(280.0, self._ambient_rms * 1.30))
+            (vad_confidence < 0.25 or speech_ms < 100 or total_rms < max(120.0, self._ambient_rms * 1.15))
             if is_wake_cand
-            else (vad_confidence < 0.22 or speech_ms < 100 or total_rms < max(130.0, self._ambient_rms * 1.15))
+            else (vad_confidence < 0.22 or speech_ms < 100 or total_rms < max(120.0, self._ambient_rms * 1.15))
         ):
             rejected = True
             reject_reason = "no_speech"
@@ -7404,7 +7389,7 @@ class AstroRealtimeNode(Node):
         elif len(words) == 1:
             if is_wake_cand:
                 # Özel uyandırma kelimesi: gerçek akustik konuşma kanıtı zorunludur (sessizlikte uyanmayı engeller)
-                if speech_ms < 420 or total_rms < max(280.0, self._ambient_rms * 1.30) or vad_confidence < 0.60:
+                if speech_ms < 100 or total_rms < max(110.0, self._ambient_rms * 1.10) or vad_confidence < 0.20:
                     rejected = True
                     reject_reason = "wake_insufficient_speech"
                 elif not is_busy_speaking:
@@ -7426,7 +7411,7 @@ class AstroRealtimeNode(Node):
             reject_reason = "low_confidence"
 
         # 9. General sentence threshold
-        elif (speech_ms < 250 or total_rms < 200.0) if is_wake_cand else (speech_ms < 100 or total_rms < 140.0):
+        elif (speech_ms < 120 or total_rms < 120.0) if is_wake_cand else (speech_ms < 100 or total_rms < 120.0):
             rejected = True
             reject_reason = "low_confidence"
 
@@ -10660,9 +10645,9 @@ class AstroRealtimeNode(Node):
                 return
 
             if raw_16k:
-                wake_min_rms = float(os.getenv("WAKE_MIN_RMS", "120.0"))
-                wake_min_peak = int(os.getenv("WAKE_MIN_PEAK", "350"))
-                is_speech_energy = (local_rms > max(wake_min_rms, self._ambient_rms * 1.20) and peak_val > wake_min_peak)
+                wake_min_rms = float(os.getenv("WAKE_MIN_RMS", "90.0"))
+                wake_min_peak = int(os.getenv("WAKE_MIN_PEAK", "250"))
+                is_speech_energy = (local_rms > max(wake_min_rms, self._ambient_rms * 1.15) and peak_val > wake_min_peak)
                 if is_speech_energy:
                     self._wake_last_voice_time = now
                     if not self._wake_listening:
