@@ -3,6 +3,8 @@ import Link from "next/link";
 import { DESTEK_PAKETLERI, GELISTIRME_FIYATI, PLANLAR, type Kalem } from "@/data/fiyatlar";
 import { kurusBicimle } from "@/lib/para";
 import { SayfaKabuk } from "@/components/SayfaKabuk";
+import { SatinAlDugmesi } from "@/components/SatinAlDugmesi";
+import { oturumAl } from "@/lib/oturum";
 import { sayfaMetadata } from "@/lib/seo";
 
 export const metadata = sayfaMetadata({
@@ -11,7 +13,10 @@ export const metadata = sayfaMetadata({
   yol: "/fiyatlandirma",
 });
 
-export default function FiyatlandirmaSayfasi() {
+export default async function FiyatlandirmaSayfasi() {
+  const oturum = await oturumAl();
+  const oturumVar = !!oturum;
+
   return (
     <SayfaKabuk
       current="fiyatlandirma"
@@ -45,7 +50,7 @@ export default function FiyatlandirmaSayfasi() {
           </div>
           <div className="fiyat-izgara">
             {PLANLAR.map((p) => (
-              <FiyatKarti kalem={p} key={p.slug} />
+              <FiyatKarti kalem={p} oturumVar={oturumVar} key={p.slug} />
             ))}
           </div>
         </div>
@@ -64,7 +69,7 @@ export default function FiyatlandirmaSayfasi() {
           </div>
           <div className="fiyat-izgara">
             {DESTEK_PAKETLERI.map((p) => (
-              <FiyatKarti kalem={p} key={p.slug} />
+              <FiyatKarti kalem={p} oturumVar={oturumVar} key={p.slug} />
             ))}
           </div>
         </div>
@@ -88,7 +93,9 @@ export default function FiyatlandirmaSayfasi() {
   );
 }
 
-function FiyatKarti({ kalem }: { kalem: Kalem }) {
+function FiyatKarti({ kalem, oturumVar }: { kalem: Kalem; oturumVar: boolean }) {
+  const etiket = kalem.periyot === "ay" ? "Satın Al" : "Destek Ol";
+
   return (
     <article className="fiyat-karti">
       <h3 className="fiyat-karti__ad">{kalem.ad}</h3>
@@ -104,6 +111,14 @@ function FiyatKarti({ kalem }: { kalem: Kalem }) {
           ))}
         </ul>
       )}
+      <div style={{ marginTop: "auto", paddingTop: "1.25rem" }}>
+        <SatinAlDugmesi
+          slug={kalem.slug}
+          etiket={etiket}
+          periyot={kalem.periyot}
+          oturumVar={oturumVar}
+        />
+      </div>
     </article>
   );
 }
