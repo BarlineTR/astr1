@@ -46,6 +46,10 @@ export async function ayarlarKaydet(
   const greetingMessage = String(form.get("greetingMessage") ?? "");
   const alertOnUnknown = form.get("alertOnUnknown") === "on";
   const alertEmail = String(form.get("alertEmail") ?? "").trim() || null;
+  const speechOrientation = String(form.get("speechOrientation") ?? "autonomous");
+  const quietMode = form.get("quietMode") === "on";
+  const sleepMode = form.get("sleepMode") === "on";
+  const proactiveGreeting = form.get("proactiveGreeting") === "on";
 
   try {
     await robotAyarlariGuncelle(cihazId, {
@@ -57,6 +61,10 @@ export async function ayarlarKaydet(
       greetingMessage,
       alertOnUnknown,
       alertEmail,
+      speechOrientation,
+      quietMode,
+      sleepMode,
+      proactiveGreeting,
     });
 
     const settingsObj = {
@@ -67,6 +75,10 @@ export async function ayarlarKaydet(
       llmPrompt,
       greetingMessage,
       alertOnUnknown,
+      speechOrientation,
+      quietMode,
+      sleepMode,
+      proactiveGreeting,
       updatedAt: new Date().toISOString(),
     };
 

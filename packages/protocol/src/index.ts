@@ -22,6 +22,7 @@ export type {
   GazeTelemetry,
   HeadTelemetry,
   SafetyTelemetry,
+  SpeechTelemetry,
   ServerMessage,
   Telemetry,
   TelemetrySource,

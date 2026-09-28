@@ -32,6 +32,281 @@
       "preferences": {},
       "session_summaries": [],
       "learned_at": 1790335217.604482
+    },
+    "abdulkadir_uraloglu": {
+      "name": "Abdulkadir Uraloğlu",
+      "title": "Ulaştırma ve Altyapı Bakanı",
+      "formal_title": "Sayın Bakanım",
+      "role": "vip",
+      "notes": "Ulaştırma ve Altyapı Bakanı",
+      "learned_facts": [
+        "Ulaştırma ve Altyapı Bakanı"
+      ],
+      "learned_at": 1790596367.059
+    },
+    "ahmet_karakaya": {
+      "name": "Ahmet Karakaya",
+      "title": "Bitlis Valisi",
+      "formal_title": "Sayın Valim",
+      "role": "vip",
+      "notes": "Bitlis Valisi",
+      "learned_facts": [
+        "Bitlis Valisi"
+      ],
+      "learned_at": 1790596367.059
+    },
+    "ali_yerlikaya": {
+      "name": "Ali Yerlikaya",
+      "title": "İçişleri Bakanı",
+      "formal_title": "Sayın Bakanım",
+      "role": "vip",
+      "notes": "İçişleri Bakanı",
+      "learned_facts": [
+        "İçişleri Bakanı"
+      ],
+      "learned_at": 1790596367.059
+    },
+    "alparslan_bayraktar": {
+      "name": "Alparslan Bayraktar",
+      "title": "Enerji ve Tabii Kaynaklar Bakanı",
+      "formal_title": "Sayın Bakanım",
+      "role": "vip",
+      "notes": "Enerji ve Tabii Kaynaklar Bakanı",
+      "learned_facts": [
+        "Enerji ve Tabii Kaynaklar Bakanı"
+      ],
+      "learned_at": 1790596367.059
+    },
+    "batuhan_bingol": {
+      "name": "Batuhan Bingöl",
+      "title": "Ahlat Kaymakamı",
+      "formal_title": "Sayın Kaymakamım",
+      "role": "vip",
+      "notes": "Ahlat Kaymakamı",
+      "learned_facts": [
+        "Ahlat Kaymakamı"
+      ],
+      "learned_at": 1790596367.059
+    },
+    "cevdet_yilmaz": {
+      "name": "Cevdet Yılmaz",
+      "title": "Cumhurbaşkanı Yardımcısı",
+      "formal_title": "Sayın Cumhurbaşkanı Yardımcım",
+      "role": "vip",
+      "notes": "Cumhurbaşkanı Yardımcısı",
+      "learned_facts": [
+        "Cumhurbaşkanı Yardımcısı"
+      ],
+      "learned_at": 1790596367.059
+    },
+    "erol_karaomeroglu": {
+      "name": "Erol Karaömeroğlu",
+      "title": "Bitlis Eski Valisi",
+      "formal_title": "Sayın Valim",
+      "role": "vip",
+      "notes": "Bitlis Eski Valisi",
+      "learned_facts": [
+        "Bitlis Eski Valisi"
+      ],
+      "learned_at": 1790596367.059
+    },
+    "hakan_fidan": {
+      "name": "Hakan Fidan",
+      "title": "Dışişleri Bakanı",
+      "formal_title": "Sayın Bakanım",
+      "role": "vip",
+      "notes": "Dışişleri Bakanı",
+      "learned_facts": [
+        "Dışişleri Bakanı"
+      ],
+      "learned_at": 1790596367.059
+    },
+    "ibrahim_yumakli": {
+      "name": "İbrahim Yumaklı",
+      "title": "Tarım ve Orman Bakanı",
+      "formal_title": "Sayın Bakanım",
+      "role": "vip",
+      "notes": "Tarım ve Orman Bakanı",
+      "learned_facts": [
+        "Tarım ve Orman Bakanı"
+      ],
+      "learned_at": 1790596367.059
+    },
+    "kemal_memisoglu": {
+      "name": "Kemal Memişoğlu",
+      "title": "Sağlık Bakanı",
+      "formal_title": "Sayın Bakanım",
+      "role": "vip",
+      "notes": "Sağlık Bakanı",
+      "learned_facts": [
+        "Sağlık Bakanı"
+      ],
+      "learned_at": 1790596367.059
+    },
+    "mahinur_ozdemir_goktas": {
+      "name": "Mahinur Özdemir Göktaş",
+      "title": "Aile ve Sosyal Hizmetler Bakanı",
+      "formal_title": "Sayın Bakanım",
+      "role": "vip",
+      "notes": "Aile ve Sosyal Hizmetler Bakanı",
+      "learned_facts": [
+        "Aile ve Sosyal Hizmetler Bakanı"
+      ],
+      "learned_at": 1790596367.059
+    },
+    "mehmet_fatih_kacir": {
+      "name": "Mehmet Fatih Kacır",
+      "title": "Sanayi ve Teknoloji Bakanı",
+      "formal_title": "Sayın Bakanım",
+      "role": "vip",
+      "notes": "Sanayi ve Teknoloji Bakanı",
+      "learned_facts": [
+        "Sanayi ve Teknoloji Bakanı"
+      ],
+      "learned_at": 1790596367.059
+    },
+    "mehmet_nuri_ersoy": {
+      "name": "Mehmet Nuri Ersoy",
+      "title": "Kültür ve Turizm Bakanı",
+      "formal_title": "Sayın Bakanım",
+      "role": "vip",
+      "notes": "Kültür ve Turizm Bakanı",
+      "learned_facts": [
+        "Kültür ve Turizm Bakanı"
+      ],
+      "learned_at": 1790596367.059
+    },
+    "mehmet_simsek": {
+      "name": "Mehmet Şimşek",
+      "title": "Hazine ve Maliye Bakanı",
+      "formal_title": "Sayın Bakanım",
+      "role": "vip",
+      "notes": "Hazine ve Maliye Bakanı",
+      "learned_facts": [
+        "Hazine ve Maliye Bakanı"
+      ],
+      "learned_at": 1790596367.059
+    },
+    "murat_kurum": {
+      "name": "Murat Kurum",
+      "title": "Çevre, Şehircilik ve İklim Değişikliği Bakanı",
+      "formal_title": "Sayın Bakanım",
+      "role": "vip",
+      "notes": "Çevre, Şehircilik ve İklim Değişikliği Bakanı",
+      "learned_facts": [
+        "Çevre, Şehircilik ve İklim Değişikliği Bakanı"
+      ],
+      "learned_at": 1790596367.059
+    },
+    "nesrullah_tanglay": {
+      "name": "Nesrullah Tanğlay",
+      "title": "Bitlis Belediye Başkanı",
+      "formal_title": "Sayın Başkanım",
+      "role": "vip",
+      "notes": "Bitlis Belediye Başkanı",
+      "learned_facts": [
+        "Bitlis Belediye Başkanı"
+      ],
+      "learned_at": 1790596367.059
+    },
+    "omer_bolat": {
+      "name": "Ömer Bolat",
+      "title": "Ticaret Bakanı",
+      "formal_title": "Sayın Bakanım",
+      "role": "vip",
+      "notes": "Ticaret Bakanı",
+      "learned_facts": [
+        "Ticaret Bakanı"
+      ],
+      "learned_at": 1790596367.059
+    },
+    "osman_askin_bak": {
+      "name": "Osman Aşkın Bak",
+      "title": "Gençlik ve Spor Bakanı",
+      "formal_title": "Sayın Bakanım",
+      "role": "vip",
+      "notes": "Gençlik ve Spor Bakanı",
+      "learned_facts": [
+        "Gençlik ve Spor Bakanı"
+      ],
+      "learned_at": 1790596367.059
+    },
+    "recep_tayyip_erdogan": {
+      "name": "Recep Tayyip Erdoğan",
+      "title": "Cumhurbaşkanı",
+      "formal_title": "Sayın Cumhurbaşkanım",
+      "role": "vip",
+      "notes": "Cumhurbaşkanı",
+      "learned_facts": [
+        "Cumhurbaşkanı"
+      ],
+      "learned_at": 1790596367.059
+    },
+    "selcuk_bayraktar": {
+      "name": "Selçuk Bayraktar",
+      "title": "Baykar Yönetim Kurulu Başkanı",
+      "formal_title": "Sayın Bayraktar",
+      "role": "vip",
+      "notes": "Baykar Yönetim Kurulu Başkanı",
+      "learned_facts": [
+        "Baykar Yönetim Kurulu Başkanı"
+      ],
+      "learned_at": 1790596367.059
+    },
+    "vedat_isikhan": {
+      "name": "Vedat Işıkhan",
+      "title": "Çalışma ve Sosyal Güvenlik Bakanı",
+      "formal_title": "Sayın Bakanım",
+      "role": "vip",
+      "notes": "Çalışma ve Sosyal Güvenlik Bakanı",
+      "learned_facts": [
+        "Çalışma ve Sosyal Güvenlik Bakanı"
+      ],
+      "learned_at": 1790596367.059
+    },
+    "yasar_guler": {
+      "name": "Yaşar Güler",
+      "title": "Milli Savunma Bakanı",
+      "formal_title": "Sayın Bakanım",
+      "role": "vip",
+      "notes": "Milli Savunma Bakanı",
+      "learned_facts": [
+        "Milli Savunma Bakanı"
+      ],
+      "learned_at": 1790596367.059
+    },
+    "yavuz_gulmez": {
+      "name": "Yavuz Gülmez",
+      "title": "Ahlat Belediye Başkanı",
+      "formal_title": "Sayın Başkanım",
+      "role": "vip",
+      "notes": "Ahlat Belediye Başkanı",
+      "learned_facts": [
+        "Ahlat Belediye Başkanı"
+      ],
+      "learned_at": 1790596367.059
+    },
+    "yilmaz_tunc": {
+      "name": "Yılmaz Tunç",
+      "title": "Adalet Bakanı",
+      "formal_title": "Sayın Bakanım",
+      "role": "vip",
+      "notes": "Adalet Bakanı",
+      "learned_facts": [
+        "Adalet Bakanı"
+      ],
+      "learned_at": 1790596367.059
+    },
+    "yusuf_tekin": {
+      "name": "Yusuf Tekin",
+      "title": "Milli Eğitim Bakanı",
+      "formal_title": "Sayın Bakanım",
+      "role": "vip",
+      "notes": "Milli Eğitim Bakanı",
+      "learned_facts": [
+        "Milli Eğitim Bakanı"
+      ],
+      "learned_at": 1790596367.06
     }
   }
 }

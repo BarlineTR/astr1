@@ -5,6 +5,9 @@ import fs from "node:fs";
 import path from "node:path";
 import { kisiEkle, kisiSil } from "@/db/sorgular/kisiler";
 import { oturumGerekli } from "@/lib/oturum";
+import { db } from "@/db";
+import { people } from "@/db/schema";
+import { and, eq } from "drizzle-orm";
 import type { KisiRol } from "@/db/schema";
 
 export interface KisiKaydetSonuc {
@@ -101,6 +104,56 @@ export async function kisiKaydet(
 
 export async function kisiKaldir(id: string) {
   const oturum = await oturumGerekli("/panel/kisiler");
-  await kisiSil(id, oturum.user.id);
+
+  try {
+    // Kişiyi silmeden önce adını al
+    const [hedef] = await db
+      .select({ name: people.name })
+      .from(people)
+      .where(and(eq(people.id, id), eq(people.ownerUserId, oturum.user.id)))
+      .limit(1);
+
+    await kisiSil(id, oturum.user.id);
+
+    if (hedef?.name) {
+      const cleanKey = sanitizeName(hedef.name);
+
+      // 1. Dosya ve klasörleri sil
+      for (const dir of KNOWN_FACES_DIRS) {
+        try {
+          const personDir = path.join(dir, cleanKey);
+          if (fs.existsSync(personDir)) {
+            fs.rmSync(personDir, { recursive: true, force: true });
+          }
+          const flatFile = path.join(dir, `${cleanKey}.jpg`);
+          if (fs.existsSync(flatFile)) {
+            fs.unlinkSync(flatFile);
+          }
+        } catch {
+          // yoksay
+        }
+      }
+
+      // 2. astro_memory.json'dan sil
+      for (const memPath of MEMORY_FILE_PATHS) {
+        try {
+          if (fs.existsSync(memPath)) {
+            const raw = fs.readFileSync(memPath, "utf-8");
+            const mem = JSON.parse(raw);
+            if (mem.known_people && mem.known_people[cleanKey]) {
+              delete mem.known_people[cleanKey];
+              fs.writeFileSync(memPath, JSON.stringify(mem, null, 2), "utf-8");
+            }
+          }
+        } catch {
+          // yoksay
+        }
+      }
+    }
+  } catch (e) {
+    console.error("Kişi silme ek işlem hatası:", e);
+  }
+
   revalidatePath("/panel/kisiler");
 }
+

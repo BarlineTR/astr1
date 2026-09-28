@@ -122,6 +122,10 @@ class AstroRobotAjan:
         self.attention_owner = "none"
         self.visual_valid = False
         self.faces_list = []
+        self.son_konusma = ""
+        self.son_konusma_zaman = 0.0
+        self.robot_duygu = "neutral"
+        self.realtime_state = "idle"
 
         # Yapılandırma senkronizasyon takipçisi
         self.son_ayar_guncelleme = ""
@@ -148,6 +152,9 @@ class AstroRobotAjan:
             self.pub_head_cmd_pos = self.ros_node.create_publisher(RosFloat32, "/head/cmd_pos", 10)
             self.pub_safety_estop = self.ros_node.create_publisher(RosBool, "/safety/emergency_stop", 10)
             self.pub_config_update = self.ros_node.create_publisher(RosString, "/astro/config_update", 10)
+            self.pub_quiet_mode = self.ros_node.create_publisher(RosBool, "/astro/quiet_mode", 10)
+            self.pub_sleep_mode = self.ros_node.create_publisher(RosBool, "/astro/sleep_mode", 10)
+            self.pub_sys_sleep = self.ros_node.create_publisher(RosBool, "/system/sleep", 10)
             if RosHeadCmd is not None:
                 self.pub_head_cmd = self.ros_node.create_publisher(RosHeadCmd, "/head/command", 10)
             else:
@@ -163,11 +170,14 @@ class AstroRobotAjan:
             self.ros_node.create_subscription(RosString, "/vision/faces", self._on_vision_faces, 10)
             self.ros_node.create_subscription(RosString, "/gaze/state", self._on_gaze_state, 10)
             self.ros_node.create_subscription(RosBool, "/safety/emergency_stop", self._on_safety_estop, 10)
+            self.ros_node.create_subscription(RosString, "/speech/text", self._on_speech_text, 10)
+            self.ros_node.create_subscription(RosString, "/robot/emotion", self._on_robot_emotion, 10)
+            self.ros_node.create_subscription(RosString, "/realtime/state", self._on_realtime_state, 10)
 
             # ROS 2 executor'ını arka plan iş parçacığında çalıştır
             self._ros_thread = threading.Thread(target=self._ros_spin_loop, daemon=True)
             self._ros_thread.start()
-            print("🚀 ROS 2 Konuları başarıyla dinleniyor (/head/state, /audio/doa, /vision/faces...)")
+            print("🚀 ROS 2 Konuları dinleniyor (/head/state, /audio/doa, /vision/faces, /speech/text...)")
         except Exception as e:
             print(f"⚠️ ROS 2 başlatma hatası: {e}. Simülasyona devam ediliyor.")
 
@@ -278,6 +288,32 @@ class AstroRobotAjan:
     def _on_safety_estop(self, msg):
         try:
             self.estop = bool(msg.data)
+        except Exception:
+            pass
+
+    def _on_speech_text(self, msg):
+        try:
+            txt = (msg.data or "").strip()
+            if txt:
+                self.son_konusma = txt
+                self.son_konusma_zaman = time.time()
+                print(f"💬 [Sohbet / Transkript]: {txt}")
+        except Exception:
+            pass
+
+    def _on_robot_emotion(self, msg):
+        try:
+            emo = (msg.data or "").strip()
+            if emo:
+                self.robot_duygu = emo
+        except Exception:
+            pass
+
+    def _on_realtime_state(self, msg):
+        try:
+            st = (msg.data or "").strip()
+            if st:
+                self.realtime_state = st
         except Exception:
             pass
 
@@ -565,6 +601,12 @@ class AstroRobotAjan:
                         "eStop": bool(self.estop),
                         "watchdogOk": bool(self.watchdog_ok),
                     },
+                    "speech": {
+                        "lastTranscript": self.son_konusma if self.son_konusma else None,
+                        "lastSpeaker": "Baran" if any(f.get("name") == "Baran" for f in clean_faces) else None,
+                        "emotion": self.robot_duygu if self.robot_duygu else "neutral",
+                        "state": self.realtime_state if self.realtime_state else "idle",
+                    },
                 },
             }
 
@@ -621,8 +663,15 @@ class AstroRobotAjan:
             greeting = ayarlar.get("greetingMessage", "")
             speed = ayarlar.get("voiceSpeed", 100)
             pitch = ayarlar.get("voicePitch", 100)
+            speech_orientation = ayarlar.get("speechOrientation", "autonomous")
+            quiet_mode = bool(ayarlar.get("quietMode", False))
+            sleep_mode = bool(ayarlar.get("sleepMode", False))
+            proactive_greeting = bool(ayarlar.get("proactiveGreeting", True))
 
-            print(f"✨ [Web -> Robot Sync]: Yeni ayarlar robota aktarılıyor... (Kişilik: {persona}, Ses: {voice})")
+            print(
+                f"✨ [Web -> Robot Sync]: Yeni ayarlar robota aktarılıyor... "
+                f"(Kişilik: {persona}, Ses: {voice}, Yönelim: {speech_orientation})"
+            )
 
             # 1. ROS 2 düğümüne canlı bildirim yayınla
             if self.ros_node is not None and self.pub_config_update is not None:
@@ -635,9 +684,29 @@ class AstroRobotAjan:
                         "greeting": greeting,
                         "speed": speed,
                         "pitch": pitch,
+                        "speechOrientation": speech_orientation,
+                        "quietMode": quiet_mode,
+                        "sleepMode": sleep_mode,
+                        "proactiveGreeting": proactive_greeting,
                         "updatedAt": guncelleme_zamani,
                     })
                     self.pub_config_update.publish(cfg_msg)
+
+                    if hasattr(self, "pub_quiet_mode") and self.pub_quiet_mode is not None:
+                        q_msg = RosBool()
+                        q_msg.data = quiet_mode
+                        self.pub_quiet_mode.publish(q_msg)
+
+                    if hasattr(self, "pub_sleep_mode") and self.pub_sleep_mode is not None:
+                        s_msg = RosBool()
+                        s_msg.data = sleep_mode
+                        self.pub_sleep_mode.publish(s_msg)
+
+                    if hasattr(self, "pub_sys_sleep") and self.pub_sys_sleep is not None:
+                        s_msg2 = RosBool()
+                        s_msg2.data = sleep_mode
+                        self.pub_sys_sleep.publish(s_msg2)
+
                     print("   ✅ /astro/config_update konusuna canlı yapılandırma yayınlandı.")
                 except Exception as pub_err:
                     print(f"   ⚠️ ROS 2 config_update yayın hatası: {pub_err}")

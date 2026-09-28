@@ -78,6 +78,13 @@ export const safetyTelemetrySchema = z.object({
   watchdogOk: z.boolean(),
 });
 
+export const speechTelemetrySchema = z.object({
+  lastTranscript: z.string().nullable().optional(),
+  lastSpeaker: z.string().nullable().optional(),
+  emotion: z.string().nullable().optional(),
+  state: z.string().nullable().optional(),
+});
+
 export const telemetrySchema = z.object({
   /** Köprünün damgaladığı zaman (ms, epoch). Gecikme ölçümü buna dayanır. */
   t: z.number(),
@@ -89,6 +96,7 @@ export const telemetrySchema = z.object({
   audio: audioTelemetrySchema,
   faces: z.array(faceObservationSchema),
   safety: safetyTelemetrySchema,
+  speech: speechTelemetrySchema.optional(),
 });
 
 /**
@@ -129,6 +137,7 @@ export type GazeTelemetry = z.infer<typeof gazeTelemetrySchema>;
 export type AudioTelemetry = z.infer<typeof audioTelemetrySchema>;
 export type FaceObservation = z.infer<typeof faceObservationSchema>;
 export type SafetyTelemetry = z.infer<typeof safetyTelemetrySchema>;
+export type SpeechTelemetry = z.infer<typeof speechTelemetrySchema>;
 export type Telemetry = z.infer<typeof telemetrySchema>;
 export type Command = z.infer<typeof commandSchema>;
 export type ServerMessage = z.infer<typeof serverMessageSchema>;

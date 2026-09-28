@@ -13,6 +13,10 @@ interface Ayarlar {
   greetingMessage: string;
   alertOnUnknown: boolean;
   alertEmail: string | null;
+  speechOrientation?: string;
+  quietMode?: boolean;
+  sleepMode?: boolean;
+  proactiveGreeting?: boolean;
 }
 
 const PERSONA_PROMPTS: Record<string, string> = {
@@ -154,6 +158,61 @@ export function RobotAyarlariFormu({ ayarlar }: { ayarlar: Ayarlar }) {
             defaultValue={ayarlar.greetingMessage}
             placeholder="Örn: Selam, ne var ne yok?"
           />
+        </div>
+      </fieldset>
+
+      {/* Konuşma Yönelimi & Kafa Takibi */}
+      <fieldset className="panel" style={{ border: "1px solid var(--color-border, #333)", padding: "1.25rem", borderRadius: "8px", marginTop: "1rem" }}>
+        <legend style={{ padding: "0 0.5rem", fontWeight: "bold" }}>🎯 Konuşma Yönelimi & Kafa Takip Modu</legend>
+
+        <div className="form__alan" style={{ marginTop: "0.5rem" }}>
+          <label htmlFor="speechOrientation">Ses & Kafa Yönelim Stratejisi</label>
+          <select
+            id="speechOrientation"
+            name="speechOrientation"
+            defaultValue={ayarlar.speechOrientation ?? "autonomous"}
+          >
+            <option value="autonomous">🎯 Otonom Çok Modlu Yönelim (Ses DOA + Kamera Yüz Füzyonu — Önerilen)</option>
+            <option value="face_only">👁️ Yalnızca Görsel Yüz Takibi (Sese dönmez, kameradaki yüze odaklanır)</option>
+            <option value="sound_only">🎤 Yalnızca Ses Yönü / DOA Takibi (Mikrofon dizisinin tespit ettiği açıya yönelir)</option>
+            <option value="fixed">🛑 Sabit Kafa (Otonom takip devre dışı, yalnızca manuel kontrolde kalır)</option>
+          </select>
+          <small style={{ color: "var(--color-muted, #a1a1aa)", display: "block", marginTop: "0.25rem" }}>
+            Astro'nun konuşan kişiye veya çevredeki seslere göre kafasını nasıl çevireceğini belirler.
+          </small>
+        </div>
+
+        <div className="form__alan" style={{ marginTop: "0.75rem" }}>
+          <label style={{ display: "flex", alignItems: "center", gap: "0.5rem", cursor: "pointer" }}>
+            <input
+              type="checkbox"
+              name="proactiveGreeting"
+              defaultChecked={ayarlar.proactiveGreeting ?? true}
+            />
+            Biri odaya girdiğinde veya yaklaştığında proaktif olarak söze başla (Lobi / Karşılama)
+          </label>
+        </div>
+
+        <div className="form__alan" style={{ marginTop: "0.5rem" }}>
+          <label style={{ display: "flex", alignItems: "center", gap: "0.5rem", cursor: "pointer" }}>
+            <input
+              type="checkbox"
+              name="quietMode"
+              defaultChecked={ayarlar.quietMode ?? false}
+            />
+            Sessiz Dinleme Modu (Robot ses çıkarmaz, yalnızca dinler ve not alır)
+          </label>
+        </div>
+
+        <div className="form__alan" style={{ marginTop: "0.5rem" }}>
+          <label style={{ display: "flex", alignItems: "center", gap: "0.5rem", cursor: "pointer" }}>
+            <input
+              type="checkbox"
+              name="sleepMode"
+              defaultChecked={ayarlar.sleepMode ?? false}
+            />
+            Uyku / Bekleme Modu (Motorlar ve konuşma uykuya alınır)
+          </label>
         </div>
       </fieldset>
 

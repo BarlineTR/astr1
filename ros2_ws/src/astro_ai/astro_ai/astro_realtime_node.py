@@ -6326,13 +6326,40 @@ class AstroRealtimeNode(Node):
             if greeting:
                 self.greeting_phrase = str(greeting).strip()
 
+            # Speech orientation mode (autonomous | face_only | sound_only | fixed)
+            speech_orient = payload.get("speechOrientation")
+            if speech_orient:
+                self.speech_orientation_mode = str(speech_orient).strip().lower()
+                self.get_logger().info(f"🎯 [Konuşma Yönelimi Modu]: {self.speech_orientation_mode}")
+
+            # Proactive greeting
+            if "proactiveGreeting" in payload:
+                self.proactive_speech_enabled = bool(payload["proactiveGreeting"])
+                self.get_logger().info(f"👋 [Proaktif Selamlama]: {'AKTİF' if self.proactive_speech_enabled else 'PASİF'}")
+
+            # Quiet mode
+            if "quietMode" in payload:
+                q_val = bool(payload["quietMode"])
+                self._is_quiet_mode = q_val
+                self.get_logger().info(f"🤫 [Sessiz Mod]: {'AKTİF' if q_val else 'PASİF'}")
+
+            # Sleep mode
+            if "sleepMode" in payload:
+                s_val = bool(payload["sleepMode"])
+                if s_val and not getattr(self, "_is_sleeping", False):
+                    self._enter_sleep_mode()
+                elif not s_val and getattr(self, "_is_sleeping", False):
+                    self._wake_up()
+                self.get_logger().info(f"💤 [Uyku Modu]: {'UYKU' if s_val else 'UYANDI'}")
+
             # Force immediate session update to OpenAI Realtime WebSocket
             self._last_synced_identity = ""
             self._sync_perception_to_session()
 
             self.get_logger().info(
                 f"🎭 [Canlı Ayar Güncellendi]: Kişilik -> '{self.persona_name.upper()}', "
-                f"Ses -> [{self.realtime_voice}], Karşılama -> '{getattr(self, 'greeting_phrase', '')}'"
+                f"Ses -> [{self.realtime_voice}], Karşılama -> '{getattr(self, 'greeting_phrase', '')}', "
+                f"Yönelim -> '{getattr(self, 'speech_orientation_mode', 'autonomous')}'"
             )
         except Exception as e:
             self.get_logger().error(f"❌ /astro/config_update işleme hatası: {e}")

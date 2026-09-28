@@ -28,6 +28,10 @@ export async function robotAyarlariGetir(deviceId: string) {
       greetingMessage: "Selam, ne var ne yok?",
       alertOnUnknown: true,
       patrolActive: false,
+      speechOrientation: "autonomous",
+      quietMode: false,
+      sleepMode: false,
+      proactiveGreeting: true,
     })
     .returning();
 
@@ -50,6 +54,10 @@ export async function robotAyarlariGuncelle(
     alertOnUnknown?: boolean;
     alertEmail?: string | null;
     patrolActive?: boolean;
+    speechOrientation?: string;
+    quietMode?: boolean;
+    sleepMode?: boolean;
+    proactiveGreeting?: boolean;
   },
 ) {
   await db
@@ -60,3 +68,4 @@ export async function robotAyarlariGuncelle(
     })
     .where(eq(robotSettings.deviceId, deviceId));
 }
+

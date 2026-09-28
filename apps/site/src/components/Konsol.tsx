@@ -350,6 +350,34 @@ export function Konsol({
         )}
 
         {mod === "canli" && (
+          <div className="panel panel--wide" style={{ borderLeft: "4px solid var(--color-primary, #10b981)" }}>
+            <p className="panel__title">🎙️ Canlı Konuşma & Bilişsel Algı Durumu</p>
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(220px, 1fr))", gap: "1rem", marginTop: "0.5rem" }}>
+              <div style={{ background: "rgba(255, 255, 255, 0.03)", padding: "0.75rem", borderRadius: "6px" }}>
+                <span style={{ fontSize: "0.75rem", color: "var(--color-muted, #a1a1aa)", textTransform: "uppercase" }}>Son Duyulan / Konuşulan Cümle</span>
+                <p style={{ margin: "0.35rem 0 0", fontSize: "0.95rem", fontWeight: 500, color: "#fff" }}>
+                  {telemetri?.speech?.lastTranscript ? `“${telemetri.speech.lastTranscript}”` : "Henüz bir konuşma algılanmadı..."}
+                </p>
+              </div>
+              <div style={{ background: "rgba(255, 255, 255, 0.03)", padding: "0.75rem", borderRadius: "6px" }}>
+                <span style={{ fontSize: "0.75rem", color: "var(--color-muted, #a1a1aa)", textTransform: "uppercase" }}>Algılanan Kişi & Muhatap</span>
+                <p style={{ margin: "0.35rem 0 0", fontSize: "0.95rem", fontWeight: 500, color: "#38bdf8" }}>
+                  {telemetri?.faces && telemetri.faces.length > 0
+                    ? telemetri.faces.map(f => f.name || "Misafir").join(", ")
+                    : "Kamera önünde kimse yok"}
+                </p>
+              </div>
+              <div style={{ background: "rgba(255, 255, 255, 0.03)", padding: "0.75rem", borderRadius: "6px" }}>
+                <span style={{ fontSize: "0.75rem", color: "var(--color-muted, #a1a1aa)", textTransform: "uppercase" }}>Yapay Zeka Durumu & Duygu</span>
+                <p style={{ margin: "0.35rem 0 0", fontSize: "0.95rem", fontWeight: 500, color: "#fbbf24" }}>
+                  {telemetri?.speech?.emotion ? `Duygu: ${telemetri.speech.emotion}` : "Doğal / Dengeli"} · {telemetri?.audio?.vad ? "🗣️ Konuşuluyor" : "👂 Dinlemede"}
+                </p>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {mod === "canli" && (
           <div className="panel panel--wide">
             <p className="panel__title">Çerçeve günlüğü</p>
             <CerceveGunlugu kayitlar={kayitlar} />

@@ -27,16 +27,18 @@ export async function GET(request: Request) {
       .limit(1);
 
     // 3. Tanımlı kişileri getir
-    const kisiler = await db
-      .select({
-        id: people.id,
-        name: people.name,
-        role: people.role,
-        notes: people.notes,
-        hasPhoto: people.photoBase64,
-      })
-      .from(people)
-      .where(eq(people.ownerUserId, cihaz.ownerUserId));
+    const kisiler = cihaz.ownerUserId
+      ? await db
+          .select({
+            id: people.id,
+            name: people.name,
+            role: people.role,
+            notes: people.notes,
+            hasPhoto: people.photoBase64,
+          })
+          .from(people)
+          .where(eq(people.ownerUserId, cihaz.ownerUserId))
+      : [];
 
     // 4. Devriye noktalarını getir
     const noktalar = await db
@@ -61,6 +63,10 @@ export async function GET(request: Request) {
             greetingMessage: ayarlar.greetingMessage,
             alertOnUnknown: ayarlar.alertOnUnknown,
             patrolActive: ayarlar.patrolActive,
+            speechOrientation: ayarlar.speechOrientation,
+            quietMode: ayarlar.quietMode,
+            sleepMode: ayarlar.sleepMode,
+            proactiveGreeting: ayarlar.proactiveGreeting,
             updatedAt: ayarlar.updatedAt ? new Date(ayarlar.updatedAt).toISOString() : new Date().toISOString(),
           }
         : null,
