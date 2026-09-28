@@ -173,6 +173,7 @@ class AstroRobotAjan:
             self.ros_node.create_subscription(RosString, "/speech/text", self._on_speech_text, 10)
             self.ros_node.create_subscription(RosString, "/robot/emotion", self._on_robot_emotion, 10)
             self.ros_node.create_subscription(RosString, "/realtime/state", self._on_realtime_state, 10)
+            self.ros_node.create_subscription(RosString, "/astro/telemetry", self._on_astro_telemetry, 10)
 
             # ROS 2 executor'ını arka plan iş parçacığında çalıştır
             self._ros_thread = threading.Thread(target=self._ros_spin_loop, daemon=True)
@@ -238,6 +239,22 @@ class AstroRobotAjan:
         except Exception:
             pass
 
+    def _on_astro_telemetry(self, msg):
+        try:
+            d = json.loads(msg.data or "{}")
+            soc = d.get("social_state", {})
+            active_p = soc.get("active_person")
+            if active_p and str(active_p).strip() and str(active_p).lower() != "misafir":
+                self.aktif_muhatap = str(active_p).strip()
+                self.aktif_muhatap_zaman = time.time()
+                if getattr(self, "faces_list", None):
+                    for fc in self.faces_list:
+                        if not fc.get("name") or str(fc.get("name")).lower() == "misafir":
+                            fc["name"] = self.aktif_muhatap
+                            fc["confidence"] = 0.95
+        except Exception:
+            pass
+
     def _on_vision_faces(self, msg):
         try:
             raw = (msg.data or "").strip()
@@ -248,12 +265,21 @@ class AstroRobotAjan:
             faces = json.loads(raw)
             if isinstance(faces, list) and len(faces) > 0:
                 parsed = []
+                is_dialogue_active = (time.time() - getattr(self, "aktif_muhatap_zaman", 0.0)) < 180.0
+                active_name = getattr(self, "aktif_muhatap", None)
                 for f in faces:
                     if not isinstance(f, dict):
                         continue
                     name = f.get("recognized_name") or f.get("name")
                     is_known = bool(f.get("is_known", False)) and str(name).lower() != "misafir"
                     conf = float(f.get("confidence", 0.9))
+
+                    # Aktif diyalog veya telemetri füzyonu: Kamera mesafeden tanıyamasa bile bilinen muhatap kullanılır
+                    if not is_known and is_dialogue_active and active_name:
+                        name = active_name
+                        is_known = True
+                        conf = max(conf, 0.95)
+
                     # [x, y, w, h] normalize
                     box = [
                         float(f.get("x", 0.2)),
@@ -568,6 +594,23 @@ class AstroRobotAjan:
                         })
                     except Exception:
                         continue
+
+            # Aktif diyalog muhatabı takviyesi: Kamera uzakta olsa bile bilinen kişi web sitesine aktarılır
+            is_dialogue_active = (time.time() - getattr(self, "aktif_muhatap_zaman", 0.0)) < 180.0
+            active_name = getattr(self, "aktif_muhatap", None)
+            if is_dialogue_active and active_name:
+                if not clean_faces and (getattr(self, "vad", False) or (time.time() - getattr(self, "son_konusma_zaman", 0.0)) < 15.0):
+                    clean_faces.append({
+                        "name": active_name,
+                        "confidence": 0.95,
+                        "box": (0.35, 0.2, 0.3, 0.4),
+                        "distanceM": 2.0,
+                    })
+                else:
+                    for cf in clean_faces:
+                        if not cf.get("name") or str(cf.get("name")).lower() == "misafir":
+                            cf["name"] = active_name
+                            cf["confidence"] = 0.95
 
             # 4. Gaze attention owner
             att_owner = "visual" if len(clean_faces) > 0 else ("audio" if self.vad else "none")

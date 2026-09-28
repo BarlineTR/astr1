@@ -4076,11 +4076,46 @@ class AstroRealtimeNode(Node):
         if not name or not getattr(self, "memory", None) or not hasattr(self.memory, "profile"):
             return None
         try:
-            self.memory.profile.add_known_person(name, title="Tanışılan Kişi", formal_title=name)
+            formal_title = f"{name} Bey"
+            self.memory.profile.add_known_person(name, title=formal_title, formal_title=formal_title)
             self.memory.profile.set_user_fact(name, "Ad", name)
             self.memory.profile.remove_facts_containing("Konuştuğun kişinin adı")
             self.memory.profile.add_verified_fact(f"Konuştuğun kişinin adı {name}.")
             self._safe_log("info", f"🧠 [Yerel Hafıza] Kullanıcı adı kaydedildi: {name}")
+
+            # 1. Aktif kimliği hemen güncelle (180 saniye boyunca diyalog ve telemetri Baran kalsın)
+            now = time.monotonic()
+            with self._lock:
+                self._active_person_name = name
+                self._person_hold_until = now + 180.0
+                self._recognized_speaker = {
+                    "name": name,
+                    "title": formal_title,
+                    "formal_title": formal_title,
+                    "confidence": 0.95,
+                    "is_known": True,
+                    "source": "dialogue"
+                }
+                self._recognized_person = {
+                    "name": name,
+                    "title": formal_title,
+                    "formal_title": formal_title,
+                    "confidence": 0.95,
+                    "is_known": True,
+                    "source": "dialogue"
+                }
+                self._last_synced_identity = ""
+
+            # 2. Oturum ve algı durumunu senkronize et
+            self._sync_perception_to_session()
+
+            # 3. Yüz/ses biyometrisi ve PostgreSQL kaydını arka planda yap
+            threading.Thread(
+                target=self._enroll_user_biometrics,
+                args=(name, formal_title),
+                daemon=True
+            ).start()
+
             return name
         except Exception as exc:
             self._safe_log("warn", f"[Yerel Hafıza] Ad kaydedilemedi: {exc}")
