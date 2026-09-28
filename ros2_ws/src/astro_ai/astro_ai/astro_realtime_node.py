@@ -7164,7 +7164,7 @@ class AstroRealtimeNode(Node):
         # Check if audio has strong acoustic evidence of real human speech articulation
         is_busy_speaking = bool(is_playback_active or getattr(self, "_is_responding", False))
 
-        # Check if audio has strong acoustic evidence of real human speech articulation
+        # has_strong_evidence: requires silence (no playback) + strong acoustic signal
         has_strong_evidence = (
             not is_busy_speaking
             and not is_echo_cooldown
@@ -7175,9 +7175,20 @@ class AstroRealtimeNode(Node):
             and self_voice_score < 0.20
         )
 
+        # has_strong_evidence_acoustic: playback'ten bağımsız — güçlü RMS + düşük self_voice_score → barge-in izni
+        # Kullanıcı robot konuşurken yüksek sesle konuşursa duyulsun (wake word barge-in)
+        has_strong_evidence_acoustic = (
+            not is_echo_cooldown
+            and self_voice_score < 0.15
+            and speech_ms >= 400
+            and vad_confidence >= 0.45
+            and total_rms >= 800.0
+            and peak_val >= 3000
+        )
+
         # 0. Pure Known Phantom Hallucination Patterns (e.g. 'Altyazı M.K.', 'Abone ol', 'İzlediğiniz için teşekkürler', 'türen türen türen')
         is_phantom = is_known_phantom_pattern(norm_text)
-        if is_phantom and not is_short_utterance and not has_strong_evidence:
+        if is_phantom and not is_short_utterance and not has_strong_evidence and not has_strong_evidence_acoustic:
             rejected = True
             reject_reason = "known_phantom"
 
@@ -7196,8 +7207,8 @@ class AstroRealtimeNode(Node):
             rejected = True
             reject_reason = "echo_cooldown_leak"
 
-        # 4. Playback or response generation is active: reject non-barge-in audio unconditionally
-        elif is_busy_speaking and not has_strong_evidence:
+        # 4. Playback or response generation is active: reject UNLESS acoustic barge-in evidence is strong
+        elif is_busy_speaking and not has_strong_evidence and not has_strong_evidence_acoustic:
             rejected = True
             reject_reason = "self_voice"
 
