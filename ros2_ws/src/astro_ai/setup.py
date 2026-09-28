@@ -1,0 +1,32 @@
+import os
+from glob import glob
+from setuptools import find_packages, setup
+
+package_name = 'astro_ai'
+
+setup(
+    name=package_name,
+    version='1.0.0',
+    packages=find_packages(exclude=['test']),
+    data_files=[
+        ('share/ament_index/resource_index/packages',
+            ['resource/' + package_name]),
+        ('share/' + package_name, ['package.xml']),
+        (os.path.join('share', package_name, 'launch'), glob('launch/*.py')),
+    ],
+    install_requires=['setuptools', 'groq', 'numpy', 'opencv-python'],
+    zip_safe=True,
+    maintainer='Baran Eren',
+    maintainer_email='baran@example.com',
+    description='ASTRO V1 AI Brain for LLM interactions',
+    license='Apache-2.0',
+    entry_points={
+        'console_scripts': [
+            'ai_brain_node = astro_ai.ai_brain_node:main',
+            'astro_realtime_node = astro_ai.astro_realtime_node:main',
+            'profiler_node = astro_ai.profiler_node:main',
+            'consciousness_node = astro_ai.consciousness_node:main',
+        ],
+
+    },
+)

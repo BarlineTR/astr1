@@ -1,0 +1,1673 @@
+#!/usr/bin/env python3
+"""Thin ROS 2 Transport Wrapper for Standalone 2e0b70c Gaze Engine.
+
+Architecture:
+  ONE CAMERA FRAME -> ONE DETECTION -> ONE GAZE ENGINE STEP -> ONE HEAD TARGET
+
+Strict Invariants:
+1. Gaze decisions (face tracking, target selection, gaze angle, coasting,
+   reacquisition) are made SOLELY by the golden standalone runtime from 2e0b70c.
+2. ROS 2 provides only transport (camera input, encoder feedback, command dispatch).
+3. 50Hz keepalive timer only republishes last target yaw to feed the MCU watchdog;
+   it never steps the tracker or alters visual state.
+4. /head/state is the sole authoritative feedback source.
+"""
+
+import collections
+import json
+import math
+import os
+import sys
+import time
+from typing import Any, List, Optional, Sequence, Tuple
+import numpy as np
+
+try:
+    from sensor_msgs.msg import JointState, Image
+    from std_msgs.msg import Bool, Float32, String, Header
+except ImportError:
+    class _MockMsg:
+        def __init__(self, data=None, **kwargs):
+            self.data = data
+            for key, val in kwargs.items():
+                setattr(self, key, val)
+
+    Bool = Float32 = String = JointState = Image = Header = _MockMsg
+
+try:
+    from astro_base.msg import GazeStatus, HeadCmd, HeadState
+except ImportError:
+    try:
+        from astro_interfaces.msg import GazeStatus, HeadCmd, HeadState
+    except ImportError:
+        HeadState = HeadCmd = GazeStatus = None
+
+try:
+    import rclpy
+    from rclpy.node import Node
+    from rclpy.qos import QoSProfile, ReliabilityPolicy, qos_profile_sensor_data
+except ImportError:
+    class _MockRclpy:
+        @staticmethod
+        def ok(): return True
+        @staticmethod
+        def shutdown(): pass
+        @staticmethod
+        def init(*args, **kwargs): pass
+    rclpy = _MockRclpy()
+
+    class _MockParam:
+        def __init__(self, val): self.value = val
+        def get_parameter_value(self):
+            class _Val:
+                def __init__(self, v):
+                    self.string_value = str(v) if v is not None else ""
+                    self.double_value = float(v) if isinstance(v, (int, float)) else 0.0
+                    self.integer_value = int(v) if isinstance(v, (int, float)) else 0
+                    self.bool_value = bool(v)
+            return _Val(self.value)
+
+    class _MockPublisher:
+        def __init__(self, topic): self.topic = topic; self.last_msg = None; self.count = 0
+        def publish(self, msg): self.last_msg = msg; self.count += 1
+
+    class _MockClock:
+        def now(self):
+            class _Time:
+                def to_msg(self): return None
+            return _Time()
+
+    class Node:
+        def __init__(self, node_name="node", *args, **kwargs):
+            self._node_name = node_name
+            self._params = {}
+        def get_name(self): return self._node_name
+        def create_publisher(self, msg_type, topic, *args, **kwargs):
+            return _MockPublisher(topic)
+        def create_subscription(self, *args, **kwargs): return None
+        def create_timer(self, *args, **kwargs): return None
+        def get_clock(self): return _MockClock()
+        def get_logger(self):
+            import logging
+            return logging.getLogger(self._node_name)
+        def declare_parameter(self, name, value=None, *args, **kwargs):
+            self._params[name] = value
+            return _MockParam(value)
+        def get_parameter(self, name):
+            return _MockParam(self._params.get(name))
+        def destroy_node(self): pass
+
+    class QoSProfile:
+        def __init__(self, *args, **kwargs): pass
+
+    class ReliabilityPolicy:
+        BEST_EFFORT = 0
+        RELIABLE = 1
+
+    qos_profile_sensor_data = QoSProfile()
+
+    class _MockMsg:
+        def __init__(self, data=None, **kwargs):
+            self.data = data
+            for key, val in kwargs.items():
+                setattr(self, key, val)
+
+    Bool = Float32 = String = JointState = Image = Header = _MockMsg
+    GazeStatus = HeadCmd = HeadState = None
+
+if HeadCmd is None:
+    class HeadCmd:  # type: ignore
+        def __init__(self, angle_deg: float = 0.0, velocity_deg_s: float = 0.0):
+            self.angle_deg = float(angle_deg)
+            self.velocity_deg_s = float(velocity_deg_s)
+
+from pathlib import Path
+import threading
+
+
+def _resolve_standalone_dir() -> str:
+    cur = Path(__file__).resolve().parent
+    while cur.parent != cur:
+        cand = cur / "standalone"
+        if (cand / "tracker.py").exists():
+            return str(cand)
+        cur = cur.parent
+    return str(Path(__file__).resolve().parents[5] / "standalone")
+
+
+def _resolve_known_faces_dir() -> Optional[str]:
+    """Finds the authoritative directory containing known face reference images."""
+    env_dir = os.getenv("ASTRO_KNOWN_FACES_DIR")
+    if env_dir and os.path.exists(env_dir):
+        return env_dir
+    cur = Path(__file__).resolve().parent
+    while cur.parent != cur:
+        cand = cur / "ros2_ws" / "src" / "astro_vision" / "data" / "known_faces"
+        if cand.exists() and len(os.listdir(cand)) > 0:
+            return str(cand)
+        cand2 = cur / "src" / "astro_vision" / "data" / "known_faces"
+        if cand2.exists() and len(os.listdir(cand2)) > 0:
+            return str(cand2)
+        cur = cur.parent
+    desk = Path.home() / "Desktop" / "astr1" / "ros2_ws" / "src" / "astro_vision" / "data" / "known_faces"
+    if desk.exists() and len(os.listdir(desk)) > 0:
+        return str(desk)
+    return None
+
+
+_STANDALONE_DIR = _resolve_standalone_dir()
+if _STANDALONE_DIR not in sys.path:
+    sys.path.insert(0, _STANDALONE_DIR)
+
+from sources import CameraSource, AudioSource
+from stereo_doa import DEFAULT_MIC_SPACING_M
+from astro_base.gaze.angle_math import circular_distance_deg
+from astro_base.gaze.gaze_runtime import GazeRuntimeCore
+from astro_base.gaze.gaze_tracker import Detection, GazeResult, UNSCORED_CONFIDENCE
+from astro_base.gaze.types import GazeStateEnum, PrioritySource
+from astro_base.gaze.respeaker_localizer import ReSpeakerAudioLocalizer
+from astro_base.gaze.respeaker_sectors import ReSpeakerEyeSectors
+from astro_base.gaze.head_state import PositionSource, UnknownModeActuatorAdapter
+
+try:
+    from astro_audio.respeaker_usb import ReSpeakerHID
+except ImportError:
+    ReSpeakerHID = None
+
+try:
+    from astro_vision.image_utils import bgr_to_imgmsg
+except ImportError:
+    import array
+    def bgr_to_imgmsg(frame: np.ndarray, header=None) -> Any:
+        msg = Image()
+        if header is not None:
+            msg.header = header
+        msg.height, msg.width = frame.shape[:2]
+        msg.encoding = "bgr8"
+        msg.is_bigendian = 0
+        msg.step = int(frame.shape[1] * 3)
+        msg.data = array.array("B", frame.tobytes())
+        return msg
+
+try:
+    from astro_vision.face_recognizer import FaceRecognizer
+except ImportError:
+    try:
+        from face_recognizer import FaceRecognizer
+    except ImportError:
+        FaceRecognizer = None
+
+try:
+    from astro_vision.object_detector import ObjectDetectorEngine
+except ImportError:
+    try:
+        from object_detector import ObjectDetectorEngine
+    except ImportError:
+        ObjectDetectorEngine = None
+
+
+def _coerce_bool(val: Any) -> bool:
+    """Robustly coerces booleans, numbers, and string representations ('false', '0', etc.)."""
+    if isinstance(val, bool):
+        return val
+    if isinstance(val, (int, float)):
+        return bool(val)
+    if isinstance(val, str):
+        return val.strip().lower() in ("true", "1", "yes", "on")
+class StandaloneSpeechVerdict:
+    """Lightweight speech verdict container conforming to GazeTracker and SpeechDetector interface."""
+
+    def __init__(
+        self,
+        is_speech: bool = True,
+        confidence: float = 0.85,
+        harmonicity: float = 0.5,
+        modulation: float = 0.5,
+        rms: float = 500.0,
+        reason: str = "ros_topic",
+    ):
+        self.is_speech = bool(is_speech)
+        self.confidence = float(confidence)
+        self.harmonicity = float(harmonicity)
+        self.modulation = float(modulation)
+        self.rms = float(rms)
+        self.reason = str(reason)
+
+
+class StandaloneGazeRosNode(Node):
+    """Thin ROS 2 wrapper mapping CameraSource, AudioSource, and ROS topics to the golden 2e0b70c standalone gaze runtime.
+
+    Strict Invariants:
+    1. Gaze decisions (face tracking, target selection, gaze angle, coasting,
+       reacquisition) are made SOLELY by the golden standalone runtime from 2e0b70c.
+    2. CameraSource & AudioSource run directly inside the ROS process (no /vision/faces topic dependency).
+    3. Exactly ONE frame -> ONE detection -> ONE tracker step -> ONE head command.
+    4. Visual target has absolute priority over audio; audio reacquisition activates only when target_id == NONE.
+    5. 50Hz keepalive timer only republishes last target yaw to feed the MCU watchdog without stepping tracker.
+    6. /head/state is the sole authoritative feedback source.
+    """
+
+    def __init__(
+        self,
+        camera_device: Optional[int] = None,
+        use_camera_source: Optional[bool] = None,
+        enable_audio: Optional[bool] = None,
+        enable_voice: Optional[bool] = None,
+        verbose_diagnostics: Optional[bool] = None,
+        audio_source_mode: Optional[str] = None,
+        audio_doa_profile: Optional[str] = None,
+    ):
+        super().__init__("standalone_gaze_ros_node")
+
+        # Declare parameters
+        self.declare_parameter("camera_device", 0)
+        self.declare_parameter("use_camera_source", True)
+        self.declare_parameter("control_rate_hz", 50.0)
+        self.declare_parameter("coast_timeout_s", 1.0)
+        self.declare_parameter("calibration_path", "")
+        self.declare_parameter("camera_latency_s", 0.050)
+        self.declare_parameter("publish_camera_image", True)
+        self.declare_parameter("camera_image_topic", "/oak/rgb/image_raw")
+        self.declare_parameter("camera_publish_fps", 15.0)
+        self.declare_parameter("enable_audio", True)
+        self.declare_parameter("audio_source_mode", "hardware")
+        self.declare_parameter("audio_hold_grace", 1.5)
+        self.declare_parameter("audio_deadband", 5.0)
+        self.declare_parameter("audio_doa_profile", "respeaker_sectors")
+        self.declare_parameter("audio_confirm_from_idle", False)
+        self.declare_parameter("audio_sector_confirm_count", 2)
+        self.declare_parameter("audio_device", -1)
+        self.declare_parameter("mic_channels", "")
+        self.declare_parameter("mic_spacing", DEFAULT_MIC_SPACING_M)
+        self.declare_parameter("audio_freshness_s", 1.0)
+        self.declare_parameter("enable_voice", True)
+        self.declare_parameter("enable_edge_tts", True)
+        self.declare_parameter("verbose_diagnostics", False)
+
+        cam_dev = camera_device if camera_device is not None else int(self.get_parameter("camera_device").value)
+        use_cam = _coerce_bool(use_camera_source if use_camera_source is not None else self.get_parameter("use_camera_source").value)
+        control_rate = float(self.get_parameter("control_rate_hz").value)
+        coast_timeout = float(self.get_parameter("coast_timeout_s").value)
+        calib_path = str(self.get_parameter("calibration_path").value) or None
+        self.camera_latency_s = float(self.get_parameter("camera_latency_s").value)
+        self.publish_camera_image = _coerce_bool(self.get_parameter("publish_camera_image").value)
+        self.camera_image_topic = str(self.get_parameter("camera_image_topic").value)
+        self.camera_publish_fps = float(self.get_parameter("camera_publish_fps").value)
+        self._last_camera_pub_time: float = 0.0
+
+        use_audio = _coerce_bool(enable_audio if enable_audio is not None else self.get_parameter("enable_audio").value)
+        self.enable_audio = use_audio
+        audio_src_mode = str(
+            audio_source_mode
+            if audio_source_mode is not None
+            else self.get_parameter("audio_source_mode").value
+        ).strip().lower()
+        self.audio_source_mode = audio_src_mode
+        self.audio_hold_grace = float(self.get_parameter("audio_hold_grace").value)
+        self.audio_deadband = float(self.get_parameter("audio_deadband").value)
+        self.audio_doa_profile = str(audio_doa_profile or self.get_parameter("audio_doa_profile").value)
+        self.audio_confirm_from_idle = _coerce_bool(self.get_parameter("audio_confirm_from_idle").value)
+        self.audio_sector_confirm_count = int(self.get_parameter("audio_sector_confirm_count").value)
+        self._audio_sectors = ReSpeakerEyeSectors() if self.audio_doa_profile == "respeaker_eye_20260908" else None
+
+        self.respeaker_hid = None
+        if self.enable_audio and self.audio_source_mode in ("standalone", "hardware"):
+            if ReSpeakerHID is not None:
+                try:
+                    self.respeaker_hid = ReSpeakerHID()
+                except Exception as hid_exc:
+                    self.get_logger().warning(f"ReSpeakerHID başlatılamadı: {hid_exc}")
+
+        self.localizer = ReSpeakerAudioLocalizer(
+            hid=self.respeaker_hid,
+            hold_timeout_s=self.audio_hold_grace,
+            deadband_deg=self.audio_deadband,
+            confirm_from_idle=self.audio_confirm_from_idle,
+            sector_confirm_count=self.audio_sector_confirm_count,
+        )
+        self._last_visual_target_id: Optional[str] = None
+        self._last_audio_log_yaw: Optional[float] = None
+
+        audio_dev = int(self.get_parameter("audio_device").value)
+        audio_dev = None if audio_dev < 0 else audio_dev
+        mic_ch_str = str(self.get_parameter("mic_channels").value).strip()
+        mic_channels = [int(c.strip()) for c in mic_ch_str.split(",") if c.strip().isdigit()] if mic_ch_str else None
+        mic_spacing = float(self.get_parameter("mic_spacing").value)
+        self.audio_freshness_s = float(self.get_parameter("audio_freshness_s").value)
+        self.enable_voice = _coerce_bool(enable_voice if enable_voice is not None else self.get_parameter("enable_voice").value)
+        self.enable_edge_tts = _coerce_bool(self.get_parameter("enable_edge_tts").value)
+        self.verbose_diagnostics = _coerce_bool(
+            verbose_diagnostics
+            if verbose_diagnostics is not None
+            else self.get_parameter("verbose_diagnostics").value
+        )
+
+        # Rate-limiting and Event Transition State for INFO Logging
+        self._last_logged_visual_time: float = 0.0
+        self._last_logged_target_id: Optional[str] = None
+        self._last_logged_owner: Optional[Any] = None
+        self._last_logged_command_yaw: float = 0.0
+        self._speech_was_active: bool = False
+        self._last_logged_speech_time: float = 0.0
+        self._last_logged_doa: Optional[float] = None
+        self._last_logged_doa_time: float = 0.0
+
+        # The Golden Standalone Runtime Core (Immutable 2e0b70c baseline)
+        self.runtime = GazeRuntimeCore(
+            calibration_path=calib_path,
+            coast_timeout_s=coast_timeout,
+        )
+        self.actuator_adapter = UnknownModeActuatorAdapter(min_limit_deg=-75.0, max_limit_deg=75.0)
+
+        # Feedback & Telemetry State
+        self.cycle_id: int = 0
+        self.frame_index: int = 0
+        self.last_published_yaw: float = 0.0
+        self.latest_result: Optional[GazeResult] = None
+        self._head_feedback_seen: bool = False
+        self._head_state_received: bool = False
+        self.raw_encoder_deg: float = 0.0
+        self.diagnostic_joint_yaw_deg: float = 0.0
+        self.diagnostic_joint_vel_deg_s: float = 0.0
+        self._running: bool = True
+        self.camera: Optional[CameraSource] = None
+        self._cam_thread: Optional[threading.Thread] = None
+        self.audio: Optional[AudioSource] = None
+        self.voice_loop = None
+
+        # Thread-safe Audio Perception State from ROS topics
+        self._audio_lock = threading.Lock()
+        self._latest_doa_deg: Optional[float] = None
+        self._latest_doa_time: float = 0.0
+        self._latest_doa_conf: float = 0.85
+        self._latest_vad_active: bool = False
+        self._latest_vad_time: float = 0.0
+        self._playback_active: bool = False
+        self._robot_speaking: bool = False
+        self._manual_target_yaw: float = 0.0
+        self._manual_target_deadline: float = 0.0
+        self._social_yaw_offset: float = 0.0
+        self._social_offset_expiry: float = 0.0
+        self._gesture_sequence: List[Tuple[float, float]] = []
+        self._gesture_cooldown_until: float = 0.0
+        self._post_speech_guard_until: float = 0.0
+        self._last_visual_active_time: float = 0.0
+        self._last_visual_yaw: float = 0.0
+        self.visual_deadband_deg: float = 2.5
+
+        # Audio Integration: ROS topic bridge (default) vs standalone hardware mode
+        if use_audio:
+            if self.audio_source_mode in ("topics", "ros"):
+                self.sub_audio_doa = self.create_subscription(
+                    Float32, "/audio/doa", self._on_audio_doa, 10
+                )
+                self.sub_audio_conf = self.create_subscription(
+                    Float32, "/audio/doa_confidence", self._on_audio_doa_conf, 10
+                )
+                self.sub_audio_vad = self.create_subscription(
+                    Bool, "/audio/vad", self._on_audio_vad, 10
+                )
+                self.sub_playback_active = self.create_subscription(
+                    Bool, "/audio/playback_active", self._on_playback_active, 10
+                )
+                self.sub_robot_speaking = self.create_subscription(
+                    Bool, "/robot/is_speaking", self._on_robot_speaking, 10
+                )
+                self.get_logger().info(
+                    "🎤 Audio Bridge active via ROS topics (/audio/doa, /audio/doa_confidence, /audio/vad, /audio/playback_active)"
+                )
+                if self.enable_voice:
+                    self.get_logger().info(
+                        "🗣️ Voice & conversation handled by external node (astro_realtime_node)"
+                    )
+            elif self.audio_source_mode in ("standalone", "hardware"):
+                try:
+                    self.audio = AudioSource(
+                        device=audio_dev,
+                        mic_spacing_m=mic_spacing,
+                        mic_channels=mic_channels,
+                        max_age_s=self.audio_freshness_s,
+                    )
+                    self.audio.start()
+                    if self.audio.available:
+                        self.get_logger().info(
+                            f"🎤 AudioSource initialized ({self.audio.mode} mode, {self.audio.device_name} @{self.audio.sample_rate}Hz)"
+                        )
+                        if self.enable_voice:
+                            try:
+                                import voice as voice_module
+                                self.voice_loop = voice_module.build_default_loop(
+                                    self.audio, edge_tts_enabled=self.enable_edge_tts
+                                )
+                                if self.voice_loop is not None:
+                                    self.get_logger().info(f"🗣️ VoiceLoop active — wake word: '{self.voice_loop.wake_word}'")
+                                    if not getattr(self.voice_loop.tts, "edge_tts_enabled", False):
+                                        self.get_logger().info("[AUDIO] Edge-TTS unavailable")
+                                else:
+                                    err = str(voice_module.LAST_SETUP_ERROR or "")
+                                    if "key" in err.lower() or "openai" in err.lower() or "client" in err.lower():
+                                        self.get_logger().info("[AUDIO] OpenAI unavailable")
+                                    else:
+                                        self.get_logger().info(f"[AUDIO] VoiceLoop inactive: {err}")
+                                    if not self.enable_edge_tts:
+                                        self.get_logger().info("[AUDIO] Edge-TTS unavailable")
+                            except Exception as v_exc:
+                                self.get_logger().warning(f"🗣️ VoiceLoop setup skipped: {v_exc}")
+                                self.get_logger().info("[AUDIO] OpenAI unavailable")
+                    else:
+                        self.get_logger().warning(f"🎤 AudioSource unavailable ({self.audio.error}) — continuing in vision-only mode")
+                except Exception as a_exc:
+                    self.get_logger().warning(f"🎤 AudioSource setup error: {a_exc} — continuing in vision-only mode")
+
+        # 100-sample Diagnostic Ring Buffers for Center Isolation
+        self._diag_raw_bearings: collections.deque = collections.deque(maxlen=100)
+        self._diag_target_yaws: collections.deque = collections.deque(maxlen=100)
+        self._diag_measured_heads: collections.deque = collections.deque(maxlen=100)
+        self.latest_head_state_pos_deg: float = 0.0
+        self.latest_head_state_target_pos_deg: float = 0.0
+
+        # Actuator Publishers
+        if HeadCmd is not None:
+            self.pub_head_command = self.create_publisher(HeadCmd, "/head/command", 10)
+        else:
+            self.pub_head_command = None
+        self.pub_head_cmd_pos = self.create_publisher(Float32, "/head/cmd_pos", 10)
+
+        # Diagnostic Publishers
+        if GazeStatus is not None:
+            self.pub_gaze_state = self.create_publisher(GazeStatus, "/gaze/state", 10)
+        else:
+            self.pub_gaze_state = None
+        self.pub_active_target = self.create_publisher(String, "/gaze/active_target", 10)
+        self.pub_gaze_debug = self.create_publisher(String, "/gaze/debug", 10)
+
+        # Camera Image Publisher (makes camera frames available to vision tools and ai_brain_node)
+        if self.publish_camera_image:
+            self.pub_camera_image = self.create_publisher(
+                Image, self.camera_image_topic, qos_profile_sensor_data
+            )
+        else:
+            self.pub_camera_image = None
+
+        # Face Recognition Publisher (Local 0-Token OpenCV SFace)
+        self.face_recognizer = None
+        if FaceRecognizer is not None:
+            try:
+                resolved_faces_dir = _resolve_known_faces_dir()
+                self.face_recognizer = FaceRecognizer(data_dir=resolved_faces_dir)
+                num_profiles = len(getattr(self.face_recognizer, "_known_embeddings", {}))
+                if num_profiles > 0:
+                    self.get_logger().info(f"👤 [FaceRecognizer] SFace yerel yüz tanıma motoru yüklendi ({num_profiles} profil hazır, dizin={self.face_recognizer.data_dir}).")
+                else:
+                    self.get_logger().warn(f"⚠️ [FaceRecognizer] SFace yüklendi ancak bilinen yüz galerisi BOŞ! Aranan dizin: {self.face_recognizer.data_dir}")
+            except Exception as fr_err:
+                self.get_logger().error(f"❌ [FaceRecognizer] Başlatılamadı: {fr_err}")
+
+        # Object Detection Publisher (Local YOLO COCO-80 via ObjectDetectorEngine)
+        self.object_engine = None
+        if ObjectDetectorEngine is not None:
+            try:
+                self.object_engine = ObjectDetectorEngine()
+                if getattr(self.object_engine, "is_ready", False):
+                    self.get_logger().info("📦 [ObjectDetector] YOLO COCO-80 nesne algılama motoru yüklendi.")
+                else:
+                    self.get_logger().info(f"📦 [ObjectDetector] Durum: {getattr(self.object_engine, 'status', 'NOT_READY')}")
+            except Exception as oe_err:
+                self.get_logger().debug(f"ObjectDetectorEngine skipped: {oe_err}")
+
+        self.pub_recognized_person = self.create_publisher(String, "/vision/recognized_person", 10)
+        self.pub_detected_objects = self.create_publisher(String, "/vision/detected_objects", 10)
+        self.pub_faces = self.create_publisher(String, "/vision/faces", 10)
+        self.pub_user_distance = self.create_publisher(Float32, "/vision/user_distance", 10)
+        self.pub_person_detected = self.create_publisher(Bool, "/vision/person_detected", 10)
+        self.pub_looking_at_robot = self.create_publisher(Bool, "/vision/looking_at_robot", 10)
+        self._last_face_recog_time: float = 0.0
+        self._face_recog_interval_s: float = 1.5
+        self._last_object_det_time: float = 0.0
+        self._object_det_interval_s: float = 1.0
+        self._object_det_busy: bool = False
+        self._last_faces_published_count: int = 0
+        self._last_person_detected_published: Optional[bool] = None
+        self._last_looking_published: Optional[bool] = None
+        self._last_face_payload: Optional[Dict[str, Any]] = None
+        self._last_face_payload_time: float = 0.0
+        self._tracked_face_identities: Dict[float, Dict[str, Any]] = {}
+        self._no_detections_since: float = 0.0
+        self._last_faces_stream_time: float = 0.0
+
+        # Subscriptions (Authoritative Feedback & Diagnostic Only - NO ROS Vision Topics)
+        qos_best_effort = QoSProfile(depth=10, reliability=ReliabilityPolicy.BEST_EFFORT)
+        if HeadState is not None:
+            self.create_subscription(HeadState, "/head/state", self._on_head_state, 10)
+        self.create_subscription(JointState, "/joint_states", self._on_joint_states, qos_best_effort)
+        self.create_subscription(Bool, "/safety/emergency_stop", self._on_emergency_stop, 10)
+        self.create_subscription(Bool, "/system/sleep", self._on_sleep_mode, 10)
+        self.create_subscription(Float32, "/head/target_yaw", self._on_target_yaw, 10)
+        self.create_subscription(Float32, "/head/social_offset_yaw", self._on_social_offset_yaw, 10)
+        self.create_subscription(String, "/head/gesture", self._on_head_gesture, 10)
+
+        # Direct CameraSource Integration (Hardware pipeline)
+        if use_cam:
+            try:
+                self.camera = CameraSource(device=cam_dev)
+                if self.camera.available:
+                    self.get_logger().info(
+                        f"📷 CameraSource initialized ({self.camera.backend}) | detector: {self.camera.detector_name}"
+                    )
+                    self._cam_thread = threading.Thread(target=self._camera_worker_loop, daemon=True)
+                    self._cam_thread.start()
+                else:
+                    self.get_logger().info(
+                        f"📷 CameraSource device {cam_dev} not available ({self.camera.error or 'no camera'}) — headless test mode"
+                    )
+            except Exception as exc:
+                self.get_logger().warning(f"📷 Could not start CameraSource: {exc}")
+
+        # 50Hz Passive Motor Keepalive Timer (WATCHDOG FEED ONLY - NO TRACKER STEPS)
+        period_s = 1.0 / max(1.0, control_rate)
+        self.keepalive_timer = self.create_timer(period_s, self._passive_keepalive_cycle)
+
+        self.get_logger().info(
+            f"StandaloneGazeRosNode active — Sole visual authority: standalone 2e0b70c runtime (Keepalive: {control_rate:.1f}Hz, verbose_diagnostics: {self.verbose_diagnostics})"
+        )
+
+    # =========================================================================
+    # Hardware State Callbacks (Authoritative Feedback)
+    # =========================================================================
+
+    def _on_head_state(self, msg) -> None:
+        """Authoritative reader for encoder position from HeadState message."""
+        if hasattr(msg, "timestamp") and msg.timestamp is not None:
+            t = float(msg.timestamp)
+        elif hasattr(msg, "header") and hasattr(msg.header, "stamp") and getattr(msg.header.stamp, "sec", 0) > 0:
+            raw_t = float(msg.header.stamp.sec) + float(msg.header.stamp.nanosec) * 1e-9
+            # If header.stamp is UNIX epoch (> 1e8) while camera uses monotonic (< 1e8),
+            # fall back to time.monotonic() to prevent 50-year time domain divergence
+            if raw_t > 1e8 and time.monotonic() < 1e8:
+                t = time.monotonic()
+            else:
+                t = raw_t
+        else:
+            t = time.monotonic()
+        pos_source = getattr(msg, "position_source", None)
+        vel = float(getattr(msg, "velocity_deg_s", 0.0))
+        if math.isnan(vel):
+            vel = 0.0
+        self.latest_head_state_target_pos_deg = float(getattr(msg, "target_position_deg", 0.0))
+
+        if pos_source == "ENCODER":
+            actual_yaw = float(getattr(msg, "actual_yaw_deg", msg.position_deg))
+            if not math.isnan(actual_yaw):
+                self.raw_encoder_deg = actual_yaw
+                self.latest_head_state_pos_deg = actual_yaw
+                self.runtime.update_head_feedback(actual_yaw, vel, timestamp=t, source="/head/state")
+                self._head_feedback_seen = True
+                self._head_state_received = True
+        elif pos_source in ("VIRTUAL_ENCODER", "ESTIMATED"):
+            est_yaw = float(getattr(msg, "canonical_yaw_deg", getattr(msg, "estimated_yaw_deg", float("nan"))))
+            if math.isnan(est_yaw):
+                est_yaw = float(getattr(msg, "estimated_yaw_deg", float("nan")))
+            self._head_state_received = True
+            if not math.isnan(est_yaw):
+                self.latest_head_state_pos_deg = est_yaw
+                self.runtime.update_estimated_feedback(est_yaw, vel, timestamp=t, source="/head/state:virtual")
+        elif pos_source == "UNKNOWN":
+            self._head_state_received = True
+            self.runtime.mark_head_feedback_unknown(timestamp=t, source="/head/state:unknown")
+        else:
+            if hasattr(msg, "position_deg") and not math.isnan(msg.position_deg):
+                pos = float(msg.position_deg)
+                self.raw_encoder_deg = pos
+                self.latest_head_state_pos_deg = pos
+                self.runtime.update_head_feedback(pos, vel, timestamp=t, source="/head/state")
+                self._head_feedback_seen = True
+                self._head_state_received = True
+
+    def _on_joint_states(self, msg: JointState) -> None:
+        """Diagnostic reader for head_yaw_joint actual position and velocity.
+
+        /head/state is the sole authoritative source. /joint_states is strictly diagnostic
+        and will not overwrite authoritative feedback.
+        """
+        if hasattr(msg, "name") and "head_yaw_joint" in msg.name:
+            idx = msg.name.index("head_yaw_joint")
+            pos_rad = msg.position[idx]
+            if not math.isnan(pos_rad):
+                vel_rad = msg.velocity[idx] if len(msg.velocity) > idx else 0.0
+                vel_deg = math.degrees(vel_rad) if not math.isnan(vel_rad) else 0.0
+                deg_pos = math.degrees(pos_rad)
+                self.diagnostic_joint_yaw_deg = float(deg_pos)
+                self.diagnostic_joint_vel_deg_s = float(vel_deg)
+
+    def _on_emergency_stop(self, msg: Bool) -> None:
+        self.runtime.tracker.fsm.set_safety_lock(bool(msg.data))
+
+    def _on_sleep_mode(self, msg: Bool) -> None:
+        self.runtime.tracker.fsm.set_sleep_mode(bool(msg.data))
+
+    # =========================================================================
+    # Audio Topic Callbacks (Topic Bridge Mode)
+    # =========================================================================
+
+    def _on_audio_doa(self, msg: Float32) -> None:
+        """Receives DOA angle in degrees [0..359°] from /audio/doa."""
+        try:
+            val = float(msg.data)
+            now = time.monotonic()
+            with self._audio_lock:
+                self._latest_doa_deg = val
+                self._latest_doa_time = now
+                # Post-speech echo guard: ignore DOA during reverb window
+                if now < self._post_speech_guard_until:
+                    return
+                if self.audio_source_mode in ("topics", "ros"):
+                    is_speaking = bool(self._playback_active or self._robot_speaking)
+                    vad_val = bool(self._latest_vad_active and not is_speaking)
+                    self.localizer.update(doa_raw=val, voice_activity=vad_val, timestamp=now)
+        except Exception as e:
+            self.get_logger().debug(f"Error in _on_audio_doa: {e}")
+
+    def _on_audio_doa_conf(self, msg: Float32) -> None:
+        """Receives GCC-PHAT PSR confidence [0.0..1.0] from /audio/doa_confidence."""
+        try:
+            val = float(msg.data)
+            with self._audio_lock:
+                self._latest_doa_conf = max(0.0, min(1.0, val))
+        except Exception as e:
+            self.get_logger().debug(f"Error in _on_audio_doa_conf: {e}")
+
+    def _on_audio_vad(self, msg: Bool) -> None:
+        """Receives Voice Activity Detection status from /audio/vad."""
+        try:
+            val = bool(msg.data)
+            now = time.monotonic()
+            with self._audio_lock:
+                self._latest_vad_active = val
+                if val:
+                    self._latest_vad_time = now
+                elif self._audio_sectors is not None:
+                    self._audio_sectors.reset()
+                    self._latest_doa_deg = None
+                # Post-speech echo guard: ignore VAD during reverb window
+                if now < self._post_speech_guard_until:
+                    return
+                if self.audio_source_mode in ("topics", "ros"):
+                    is_speaking = bool(self._playback_active or self._robot_speaking)
+                    vad_val = bool(val and not is_speaking)
+                    self.localizer.update(doa_raw=self._latest_doa_deg, voice_activity=vad_val, timestamp=now)
+        except Exception as e:
+            self.get_logger().debug(f"Error in _on_audio_vad: {e}")
+
+    def _on_playback_active(self, msg: Bool) -> None:
+        """Receives DAC audio playback status from /audio/playback_active."""
+        try:
+            with self._audio_lock:
+                new_val = bool(msg.data)
+                was_active = self._playback_active
+                self._playback_active = new_val
+                if new_val:
+                    self.localizer.reset()
+                elif was_active and not new_val:
+                    # Playback just stopped — reset localizer and apply 1.5s post-speech guard
+                    # to prevent echo/reverb from triggering DOA swings
+                    self.localizer.reset()
+                    self._post_speech_guard_until = time.monotonic() + 1.5
+        except Exception as e:
+            self.get_logger().debug(f"Error in _on_playback_active: {e}")
+
+    def _on_robot_speaking(self, msg: Bool) -> None:
+        """Receives robot speaking status from /robot/is_speaking."""
+        try:
+            with self._audio_lock:
+                new_val = bool(msg.data)
+                was_speaking = self._robot_speaking
+                self._robot_speaking = new_val
+                if new_val:
+                    self.localizer.reset()
+                elif was_speaking and not new_val:
+                    # Robot speaking just finished — reset localizer and apply 1.5s post-speech guard
+                    # to prevent echo/reverb from triggering DOA swings
+                    self.localizer.reset()
+                    self._post_speech_guard_until = time.monotonic() + 1.5
+        except Exception as e:
+            self.get_logger().debug(f"Error in _on_robot_speaking: {e}")
+
+    def _on_target_yaw(self, msg) -> None:
+        """Handles explicit target yaw commands (e.g. from dialogue tools, turn_to_sound, manual commands)."""
+        raw_val = getattr(msg, "data", msg)
+        try:
+            target = float(raw_val)
+        except (ValueError, TypeError):
+            return
+
+        clamped = max(-80.0, min(80.0, target))
+        self._manual_target_yaw = clamped
+        now_m = time.monotonic()
+        self._manual_target_deadline_monotonic = now_m + 4.0
+        ref_time = getattr(self, "_last_step_arrival_ts", None)
+        if ref_time is not None and abs(ref_time - now_m) > 1000.0:
+            self._manual_target_deadline = ref_time + 4.0
+        else:
+            self._manual_target_deadline = now_m + 4.0
+        self.get_logger().info(
+            f"🎯 [HEAD TARGET OVERRIDE] /head/target_yaw received: {clamped:+.1f}° (latched 4.0s)"
+        )
+
+    def _on_social_offset_yaw(self, msg) -> None:
+        """Receives non-verbal social gaze aversion micro-offset (e.g. +3.0° during thinking)."""
+        raw_val = getattr(msg, "data", msg)
+        try:
+            val = float(raw_val)
+        except (ValueError, TypeError):
+            return
+        self._social_yaw_offset = max(-15.0, min(15.0, val))
+        self._social_offset_expiry = time.monotonic() + 3.0
+
+    def _on_head_gesture(self, msg) -> None:
+        """Executes non-verbal subtle head gestures (nod, shake, tilt) on top of active gaze."""
+        raw_val = getattr(msg, "data", msg)
+        if not raw_val:
+            return
+        g_name = str(raw_val).strip().lower()
+        now = time.monotonic()
+        if g_name in ("nod", "yes", "onayla"):
+            self._gesture_sequence = [
+                (2.5, now + 0.12),
+                (-2.0, now + 0.24),
+                (0.0, now + 0.36),
+            ]
+            self.get_logger().info("🎭 [Gesture] Dinleme onay baş sallaması (nod) uygulandı.")
+        elif g_name in ("shake", "no", "reddet"):
+            self._gesture_sequence = [
+                (5.0, now + 0.12),
+                (-5.0, now + 0.24),
+                (2.5, now + 0.36),
+                (0.0, now + 0.48),
+            ]
+            self.get_logger().info("🎭 [Gesture] Baş sallama (shake) uygulandı.")
+        elif g_name in ("tilt", "curious", "merak"):
+            self._gesture_sequence = [
+                (3.5, now + 0.20),
+                (0.0, now + 0.40),
+            ]
+            self.get_logger().info("🎭 [Gesture] Merak kafa eğme (tilt) uygulandı.")
+        elif g_name in ("center", "reset", "sifirla"):
+            self._gesture_sequence = []
+            self._social_yaw_offset = 0.0
+
+    def _current_social_offset(self, now: float) -> float:
+        """Computes current non-verbal head offset without disrupting gaze tracking.
+
+        Priority: gesture_sequence > gesture_cooldown > social_yaw_offset.
+        When a gesture (nod/shake/tilt) is executing, social_yaw_offset is
+        suppressed. After the gesture finishes, a 150ms cooldown prevents
+        immediate social_offset re-engagement from causing ±3° oscillation.
+        """
+        if self._gesture_sequence:
+            step_target, step_deadline = self._gesture_sequence[0]
+            if now < step_deadline:
+                return step_target
+            self._gesture_sequence.pop(0)
+            if self._gesture_sequence:
+                return self._gesture_sequence[0][0]
+            # Gesture just finished: apply cooldown to prevent immediate
+            # social_offset re-engagement from causing jitter
+            self._gesture_cooldown_until = now + 0.15
+            return 0.0
+        # Cooldown guard after gesture completion
+        if now < self._gesture_cooldown_until:
+            return 0.0
+        if self._social_yaw_offset != 0.0:
+            if now < self._social_offset_expiry:
+                return self._social_yaw_offset
+            self._social_yaw_offset = 0.0
+        return 0.0
+
+    def _sample_acoustic_state(
+        self, now: float
+    ) -> Tuple[Optional[float], Optional[Any], bool]:
+        """Samples acoustic state from ROS topics or standalone source with freshness check."""
+        if not self.enable_audio:
+            return None, None, False
+
+        in_reverb_guard = (now < getattr(self, "_post_speech_guard_until", 0.0))
+
+        # If direct AudioSource exists (standalone hardware mode)
+        if self.audio is not None and getattr(self.audio, "available", False):
+            if in_reverb_guard:
+                doa_deg = None
+                speech = None
+            else:
+                doa_deg = self.audio.latest_doa_deg(now)
+                speech = self.audio.latest_speech(now)
+            if self.voice_loop is not None:
+                self.voice_loop.pump(now)
+            is_speaking = self.voice_loop.is_speaking_at(now) if self.voice_loop else False
+            return doa_deg, speech, is_speaking
+
+        # Default ROS topic bridge
+        with self._audio_lock:
+            # Check DOA freshness
+            doa_deg = None
+            if self._latest_doa_deg is not None and not in_reverb_guard:
+                if (now - self._latest_doa_time) <= self.audio_freshness_s:
+                    doa_deg = self._latest_doa_deg
+                    if self._audio_sectors is not None:
+                        doa_deg = self._audio_sectors.update(doa_deg, now)
+
+            # Check VAD / speech freshness
+            speech = None
+            if self._latest_vad_active and not in_reverb_guard:
+                if (now - self._latest_vad_time) <= self.audio_freshness_s:
+                    speech = StandaloneSpeechVerdict(
+                        is_speech=True, confidence=self._latest_doa_conf
+                    )
+
+            is_speaking = bool(self._playback_active or self._robot_speaking)
+            return doa_deg, speech, is_speaking
+
+    # =========================================================================
+    # CameraSource Worker Loop
+    # =========================================================================
+
+    def _camera_worker_loop(self) -> None:
+        """Continuously reads from CameraSource, runs detector, and steps gaze runtime."""
+        while self._running and self.camera is not None and self.camera.available:
+            try:
+                ok, frame = self.camera.read()
+                if not ok or frame is None:
+                    time.sleep(0.01)
+                    continue
+
+                t_read_done = time.monotonic()
+                if self.pub_camera_image is not None and (t_read_done - self._last_camera_pub_time) >= (1.0 / max(1.0, self.camera_publish_fps)):
+                    self._last_camera_pub_time = t_read_done
+                    try:
+                        hdr = Header()
+                        hdr.stamp = self.get_clock().now().to_msg()
+                        hdr.frame_id = "camera_link"
+                        self.pub_camera_image.publish(bgr_to_imgmsg(frame, hdr))
+                    except Exception as pub_err:
+                        self.get_logger().debug(f"Camera frame publish error: {pub_err}")
+
+                detections = self.camera.detect(frame)
+                self._maybe_recognize_face(frame, detections)
+                self._maybe_detect_objects(frame)
+                now_frame = time.monotonic()
+                if detections:
+                    self._no_detections_since = 0.0
+                    if (now_frame - getattr(self, "_last_faces_stream_time", 0.0)) >= 0.10:  # 10 Hz steady face stream
+                        self._last_faces_stream_time = now_frame
+                        if getattr(self, "pub_faces", None):
+                            faces_list = []
+                            now_id = time.monotonic()
+                            tracked_ids = getattr(self, "_tracked_face_identities", {})
+                            for idx, det in enumerate(detections):
+                                u_norm = float(det.x + det.w / 2.0) / max(1.0, float(frame_w))
+                                # Match with known identity if nearby in horizontal angle (within 0.22 normalized width)
+                                identity_match = None
+                                for cached_u, id_data in list(tracked_ids.items()):
+                                    if abs(u_norm - cached_u) < 0.22 and (now_id - id_data.get("timestamp", 0.0)) < 30.0:
+                                        identity_match = id_data
+                                        break
+
+                                if identity_match:
+                                    name_val = identity_match.get("name", "Misafir")
+                                    formal_val = identity_match.get("formal_title", name_val)
+                                    is_known_val = bool(identity_match.get("is_known", False))
+                                    conf_val = float(identity_match.get("confidence", 0.85))
+                                else:
+                                    # Fallback to single face payload if only 1 detection
+                                    cached = getattr(self, "_last_face_payload", None)
+                                    cached_time = getattr(self, "_last_face_payload_time", 0.0)
+                                    if len(detections) == 1 and cached and (now_frame - cached_time) < 45.0:
+                                        name_val = cached.get("name", "Misafir")
+                                        formal_val = cached.get("formal_title", name_val)
+                                        is_known_val = cached.get("is_known", False)
+                                        conf_val = cached.get("confidence", 0.85)
+                                    else:
+                                        name_val = "Misafir"
+                                        formal_val = "Misafir"
+                                        is_known_val = False
+                                        conf_val = 0.0
+
+                                # Calculate measured StereoDepth or monocular fallback
+                                if hasattr(self.camera, "get_roi_depth"):
+                                    d_m = self.camera.get_roi_depth(det.x, det.y, det.w, det.h, frame_w)
+                                else:
+                                    focal_px = float(frame_w) * 0.8
+                                    d_m = float(min(4.0, max(0.3, (0.16 * focal_px) / max(1.0, float(det.w)))))
+
+                                # Calculate optical bearing angles
+                                u_px = float(det.x + det.w / 2.0)
+                                v_px = float(det.y + det.h / 2.0)
+                                if hasattr(self.runtime.tracker, "transformer"):
+                                    cam_az, cam_el = self.runtime.tracker.transformer.camera_pixel_to_optical_angles(u_px, v_px, frame_w, frame_h)
+                                else:
+                                    cam_az = float(-(u_px - frame_w / 2.0) / (frame_w / 2.0) * 35.0)
+
+                                p_id = f"person_{name_val.lower()}" if (is_known_val and name_val.lower() != "misafir") else f"person_{idx + 1}"
+                                faces_list.append({
+                                    "track_id": f"person_{idx + 1}",
+                                    "name": name_val,
+                                    "recognized_name": name_val,
+                                    "recognized_title": formal_val,
+                                    "person_id": p_id,
+                                    "is_known": is_known_val,
+                                    "confidence": conf_val,
+                                    "x": int(det.x),
+                                    "y": int(det.y),
+                                    "width": int(det.w),
+                                    "height": int(det.h),
+                                    "distance_m": round(float(d_m), 2),
+                                    "head_yaw_deg": round(float(cam_az), 1),
+                                    "looking_at_robot": bool(getattr(det, "is_looking", False)),
+                                })
+
+                            f_msg = String()
+                            f_msg.data = json.dumps(faces_list)
+                            self.pub_faces.publish(f_msg)
+                            self._last_faces_published_count = len(faces_list)
+                else:
+                    if self._no_detections_since == 0.0:
+                        self._no_detections_since = now_frame
+                    elif (now_frame - self._no_detections_since) >= 2.5 and getattr(self, "_last_faces_published_count", 0) > 0:
+                        if getattr(self, "pub_faces", None):
+                            f_msg = String()
+                            f_msg.data = "[]"
+                            self.pub_faces.publish(f_msg)
+                        self._last_faces_published_count = 0
+                t_detect_done = time.monotonic()
+                frame_h, frame_w = frame.shape[:2]
+
+                capture_ts = t_read_done - self.camera_latency_s
+                arrival_ts = t_detect_done
+
+                # Sample latest acoustic state
+                doa_deg, speech, is_speaking = self._sample_acoustic_state(arrival_ts)
+
+                self._step_frame_and_dispatch(
+                    detections=detections,
+                    frame_w=frame_w,
+                    frame_h=frame_h,
+                    capture_ts=capture_ts,
+                    arrival_ts=arrival_ts,
+                    doa_deg=doa_deg,
+                    speech=speech,
+                    is_robot_speaking=is_speaking,
+                )
+            except Exception as exc:
+                self.get_logger().error(f"Error in CameraSource worker loop: {exc}")
+                time.sleep(0.05)
+
+    # =========================================================================
+    # Frame-Synchronous Visual Processing API
+    # =========================================================================
+
+    def _maybe_recognize_face(self, frame: Optional[np.ndarray], detections: Sequence[Detection]) -> None:
+        """Asynchronously and non-blockingly identifies faces via local OpenCV SFace."""
+        if not getattr(self, "face_recognizer", None) or not detections or frame is None:
+            return
+        now_m = time.monotonic()
+        if (now_m - getattr(self, "_last_face_recog_time", 0.0)) < getattr(self, "_face_recog_interval_s", 1.5):
+            return
+        self._last_face_recog_time = now_m
+
+        try:
+            sorted_dets = sorted(detections, key=lambda d: d.w * d.h, reverse=True)[:2]
+            h, w = frame.shape[:2]
+            roi_items = []
+            for det in sorted_dets:
+                margin_x = int(det.w * 0.35)
+                margin_y = int(det.h * 0.35)
+                x1 = max(0, det.x - margin_x)
+                y1 = max(0, det.y - margin_y)
+                x2 = min(w, det.x + det.w + margin_x)
+                y2 = min(h, det.y + det.h + margin_y)
+                if x2 > x1 and y2 > y1:
+                    u_norm = float(det.x + det.w / 2.0) / max(1.0, float(w))
+                    roi_items.append((frame[y1:y2, x1:x2].copy(), u_norm, det))
+
+            if not roi_items:
+                return
+
+            def _worker(items):
+                try:
+                    for face_roi, u_norm, det in items:
+                        name, conf, meta = self.face_recognizer.recognize_face(face_roi)
+                        now_log = time.monotonic()
+                        if name:
+                            payload = {
+                                "name": name,
+                                "confidence": float(conf) if conf is not None else 0.85,
+                                "is_known": True,
+                                "title": meta.get("title", ""),
+                                "formal_title": meta.get("formal_title", name),
+                                "timestamp": now_log,
+                                "u_norm": u_norm
+                            }
+                            if hasattr(self, "_tracked_face_identities"):
+                                self._tracked_face_identities[round(u_norm, 2)] = payload
+                            last_logged = getattr(self, "_last_logged_recog_name", None)
+                            last_time = getattr(self, "_last_logged_recog_time", 0.0)
+                            if last_logged != name or (now_log - last_time) >= 3.0:
+                                self._last_logged_recog_name = name
+                                self._last_logged_recog_time = now_log
+                                conf_pct = int((conf or 0.85) * 100)
+                                formal = meta.get("formal_title", name)
+                                self.get_logger().info(f"👤 [YÜZ TANINDI]: {name} ({formal}) — Güven: %{conf_pct}")
+                        else:
+                            cand = meta.get("candidate", "Bilinmeyen") if isinstance(meta, dict) else "Bilinmeyen"
+                            last_unrec_time = getattr(self, "_last_unrec_log_time", 0.0)
+                            if (now_log - last_unrec_time) >= 4.0:
+                                self._last_unrec_log_time = now_log
+                                score_pct = int((conf or 0.0) * 100)
+                                thresh_pct = int(getattr(self.face_recognizer, "threshold", 0.38) * 100)
+                                self.get_logger().info(f"🔍 [YÜZ ANALİZİ]: Tanınamadı (Misafir) — En yakın aday: '{cand}' skor: %{score_pct} (Eşik: %{thresh_pct})")
+                            payload = {
+                                "name": "Misafir",
+                                "confidence": float(conf) if conf is not None else 0.0,
+                                "is_known": False,
+                                "title": "Misafir",
+                                "formal_title": "Misafir",
+                                "timestamp": now_log,
+                                "u_norm": u_norm
+                            }
+                            if hasattr(self, "_tracked_face_identities"):
+                                self._tracked_face_identities[round(u_norm, 2)] = payload
+
+                        self._last_face_payload = payload
+                        self._last_face_payload_time = time.monotonic()
+                        msg = String()
+                        msg.data = json.dumps(payload)
+                        if getattr(self, "pub_recognized_person", None):
+                            self.pub_recognized_person.publish(msg)
+                except Exception as rec_err:
+                    self.get_logger().debug(f"_maybe_recognize_face worker notice: {rec_err}")
+
+            threading.Thread(target=_worker, args=(roi_items,), daemon=True).start()
+        except Exception as exc:
+            self.get_logger().debug(f"_maybe_recognize_face notice: {exc}")
+
+    def _maybe_detect_objects(self, frame: Optional[np.ndarray]) -> None:
+        """Asynchronously runs YOLO COCO-80 object detection without blocking gaze tracking loop."""
+        if not getattr(self, "object_engine", None) or frame is None:
+            return
+        now_m = time.monotonic()
+        if (now_m - getattr(self, "_last_object_det_time", 0.0)) < getattr(self, "_object_det_interval_s", 1.0):
+            return
+        if getattr(self, "_object_det_busy", False):
+            return
+        self._last_object_det_time = now_m
+        self._object_det_busy = True
+
+        frame_copy = frame.copy()
+
+        def _worker(img):
+            try:
+                objs = self.object_engine.process_frame(img, now=time.time())
+                if getattr(self, "pub_detected_objects", None):
+                    payload = [o.to_dict() for o in objs]
+                    msg = String()
+                    msg.data = json.dumps(payload, ensure_ascii=False)
+                    self.pub_detected_objects.publish(msg)
+            except Exception as err:
+                self.get_logger().debug(f"_maybe_detect_objects worker notice: {err}")
+            finally:
+                self._object_det_busy = False
+
+        threading.Thread(target=_worker, args=(frame_copy,), daemon=True).start()
+
+    def step_camera_frame(
+        self,
+        frame,
+        timestamp: Optional[float] = None,
+        doa_deg: Optional[float] = None,
+        speech: Optional[Any] = None,
+        is_robot_speaking: Optional[bool] = None,
+    ) -> GazeResult:
+        """Runs detector on frame and steps tracker (1:1 with standalone/track.py)."""
+        t_start = time.monotonic()
+        if self.pub_camera_image is not None and (t_start - self._last_camera_pub_time) >= (1.0 / max(1.0, self.camera_publish_fps)):
+            self._last_camera_pub_time = t_start
+            try:
+                hdr = Header()
+                hdr.stamp = self.get_clock().now().to_msg()
+                hdr.frame_id = "camera_link"
+                self.pub_camera_image.publish(bgr_to_imgmsg(frame, hdr))
+            except Exception as pub_err:
+                self.get_logger().debug(f"Camera frame publish error: {pub_err}")
+        if self.camera is not None:
+            detections = self.camera.detect(frame)
+        else:
+            detections = []
+        self._maybe_recognize_face(frame, detections)
+        self._maybe_detect_objects(frame)
+        t_end = time.monotonic()
+        frame_h, frame_w = frame.shape[:2]
+        if timestamp is not None:
+            capture_ts = float(timestamp)
+            arrival_ts = float(timestamp)
+        else:
+            capture_ts = t_start - self.camera_latency_s
+            arrival_ts = t_end
+
+        s_doa, s_speech, s_speaking = self._sample_acoustic_state(arrival_ts)
+        if doa_deg is None:
+            doa_deg = s_doa
+        if speech is None:
+            speech = s_speech
+        if is_robot_speaking is None:
+            is_robot_speaking = s_speaking
+
+        return self._step_frame_and_dispatch(
+            detections=detections,
+            frame_w=frame_w,
+            frame_h=frame_h,
+            capture_ts=capture_ts,
+            arrival_ts=arrival_ts,
+            doa_deg=doa_deg,
+            speech=speech,
+            is_robot_speaking=bool(is_robot_speaking),
+        )
+
+    def step_frame(
+        self,
+        detections: Sequence[Detection],
+        frame_size: Tuple[int, int] = (640, 480),
+        timestamp: Optional[float] = None,
+        doa_deg: Optional[float] = None,
+        speech: Optional[Any] = None,
+        is_robot_speaking: bool = False,
+    ) -> GazeResult:
+        """Direct frame step for testing/replay without ROS topics."""
+        t = timestamp if timestamp is not None else time.monotonic()
+        return self._step_frame_and_dispatch(
+            detections=detections,
+            frame_w=frame_size[0],
+            frame_h=frame_size[1],
+            capture_ts=t,
+            arrival_ts=t,
+            doa_deg=doa_deg,
+            speech=speech,
+            is_robot_speaking=is_robot_speaking,
+        )
+
+    def _step_frame_and_dispatch(
+        self,
+        detections: Sequence[Detection],
+        frame_w: int,
+        frame_h: int,
+        capture_ts: float,
+        arrival_ts: float,
+        doa_deg: Optional[float] = None,
+        speech: Optional[Any] = None,
+        is_robot_speaking: bool = False,
+    ) -> GazeResult:
+        """Executes strictly ONE gaze engine step for ONE camera frame.
+
+        ONE FRAME -> ONE DETECTION -> ONE GAZE STEP -> ONE RESULT -> ONE HEAD TARGET
+        """
+        self.cycle_id += 1
+        self.frame_index += 1
+
+        robot_is_speaking = bool(is_robot_speaking or self._playback_active or self._robot_speaking)
+
+        if (self.enable_audio or doa_deg is not None) and not robot_is_speaking:
+            if self.audio_source_mode in ("standalone", "hardware") and doa_deg is None:
+                self.localizer.read_and_update(now=arrival_ts)
+            else:
+                if doa_deg is not None or speech is not None:
+                    vad = bool(speech and getattr(speech, "is_speech", False))
+                    self.localizer.update(doa_raw=doa_deg, voice_activity=vad, timestamp=arrival_ts)
+        elif robot_is_speaking:
+            self.localizer.reset()
+
+        # Head position authority resolved centrally by HeadStateManager / GazeRuntime
+        if self.runtime.has_head_feedback and self.runtime.actual_head_yaw_deg is not None:
+            est_head = None
+        elif getattr(self.runtime, "estimated_head_yaw_deg", None) is not None:
+            est_head = self.runtime.estimated_head_yaw_deg
+        else:
+            est_head = 0.0
+
+        t_step_start = time.monotonic()
+        # GazeTracker.step() call strictly receives doa_deg=None and speech=None.
+        # This completely eliminates continuous Kalman DOA angle leakage.
+        res = self.runtime.step(
+            faces=detections,
+            frame_size=(frame_w, frame_h),
+            doa_deg=None,
+            speech=None,
+            timestamp=capture_ts,
+            is_robot_speaking=robot_is_speaking,
+            estimated_head_deg=est_head,
+        )
+        t_step_end = time.monotonic()
+
+        # Authoritative 3-way arbitration matching standalone/track.py 1:1
+        vision_active = (
+            res.owner == PrioritySource.VISUAL_TRACKING
+            or res.gaze_state in (
+                GazeStateEnum.TRACKING,
+                GazeStateEnum.HOLDING_ATTENTION,
+                GazeStateEnum.ORIENTING,
+                GazeStateEnum.ACQUIRING,
+                GazeStateEnum.TARGET_LOST,
+            )
+        )
+
+        now_m = arrival_ts
+        self._last_step_arrival_ts = arrival_ts
+        if now_m < getattr(self, "_manual_target_deadline", 0.0):
+            target_yaw = float(self._manual_target_yaw)
+            motor_yaw = target_yaw
+            res.target_yaw_deg = target_yaw
+            res.owner = PrioritySource.ACTIVE_SPEAKER
+            res.gaze_state = GazeStateEnum.ORIENTING
+            res.target_id = "target_override"
+        elif vision_active:
+            self.localizer.on_vision_active()
+            target_yaw = float(res.target_yaw_deg)
+
+            # Center deadband filter: when holding attention and face is already within ±2.5° of center,
+            # freeze target_yaw to avoid motor hunting / oscillation when sitting in front.
+            if res.gaze_state == GazeStateEnum.HOLDING_ATTENTION and detections:
+                bbox_cx = float(detections[0].x + (detections[0].w / 2.0))
+                bbox_cy = float(detections[0].y + (detections[0].h / 2.0))
+                raw_bearing, _ = self.runtime.tracker.transformer.camera_pixel_to_optical_angles(
+                    bbox_cx, bbox_cy, frame_w, frame_h
+                )
+                if abs(raw_bearing) <= getattr(self, "visual_deadband_deg", 2.5):
+                    if hasattr(self, "last_published_yaw") and self.last_published_yaw != 0.0:
+                        target_yaw = self.last_published_yaw
+
+            has_enc = bool(self.runtime.has_head_feedback and self.runtime.actual_head_yaw_deg is not None)
+            motor_yaw = self.actuator_adapter.adapt(
+                target_yaw_deg=target_yaw,
+                relative_head_correction_deg=getattr(res, "relative_head_correction_deg", None),
+                is_relative_correction=getattr(res, "is_relative_correction", False),
+                has_encoder=has_enc,
+            )
+            self._last_audio_log_yaw = None
+            self._last_visual_active_time = now_m
+            self._last_visual_yaw = target_yaw
+            if res.target_id:
+                self._last_visual_target_id = res.target_id
+            if res.owner != PrioritySource.VISUAL_TRACKING:
+                res.owner = PrioritySource.VISUAL_TRACKING
+                if not res.target_id:
+                    res.target_id = self._last_visual_target_id
+        else:
+            # Check for active audio reacquisition
+            is_speaking_device = bool(self._playback_active or self._robot_speaking)
+            in_reverb_guard = now_m < getattr(self, "_post_speech_guard_until", 0.0)
+            in_visual_coasting = (now_m - getattr(self, "_last_visual_active_time", 0.0)) < 1.0
+
+            if not is_speaking_device and not in_reverb_guard and not in_visual_coasting and self.localizer.is_tracking(now_m):
+                self._last_visual_target_id = None
+                target_yaw = float(self.localizer.target_yaw_deg)
+                motor_yaw = target_yaw
+                res.target_yaw_deg = target_yaw
+                res.owner = PrioritySource.ACTIVE_SPEAKER
+                res.gaze_state = GazeStateEnum.ORIENTING
+                res.target_id = "audio_speaker_1"
+                if self._last_audio_log_yaw != motor_yaw:
+                    doa_val = self.localizer.last_raw_doa
+                    doa_str = f"{doa_val:.0f}" if doa_val is not None else "?"
+                    sector_str = self.localizer.confirmed_sector or "?"
+                    self.get_logger().info(f"AUDIO sector={sector_str} DOA={doa_str} target={target_yaw:+.1f}")
+                    self._last_audio_log_yaw = motor_yaw
+            else:
+                self._last_visual_target_id = None
+                self._last_audio_log_yaw = None
+                # Let FSM manage grace states (TARGET_LOST -> RECOVERING -> IDLE) matching track.py 1:1
+                if res.gaze_state in (GazeStateEnum.RECOVERING, GazeStateEnum.IDLE):
+                    target_yaw = float(res.target_yaw_deg)
+                    motor_yaw = target_yaw
+                    res.owner = PrioritySource.IDLE
+                    res.target_id = None
+                else:
+                    # TARGET_LOST or visual coasting: retain last published yaw, await FSM decision
+                    target_yaw = float(self.last_published_yaw)
+                    motor_yaw = target_yaw
+                    res.target_yaw_deg = motor_yaw
+
+        social_offset = self._current_social_offset(arrival_ts)
+        if social_offset != 0.0:
+            max_limit = getattr(self.localizer, "max_yaw_deg", 75.0)
+            effective_motor_yaw = float(max(-max_limit, min(max_limit, motor_yaw + social_offset)))
+        else:
+            effective_motor_yaw = motor_yaw
+
+        self.latest_result = res
+        self.last_published_yaw = effective_motor_yaw
+        self.runtime.last_target_yaw_deg = motor_yaw
+
+        # Direct Actuator Dispatch (ONE RESULT -> ONE AUTHORITATIVE TARGET)
+        if self.pub_head_command is not None:
+            hcmd = HeadCmd()
+            hcmd.angle_deg = effective_motor_yaw
+            self.pub_head_command.publish(hcmd)
+
+        cmd_pos = Float32()
+        cmd_pos.data = effective_motor_yaw
+        self.pub_head_cmd_pos.publish(cmd_pos)
+
+        if self.pub_active_target is not None:
+            tgt_msg = String()
+            tgt_msg.data = res.target_id or "NONE"
+            self.pub_active_target.publish(tgt_msg)
+
+        if detections and getattr(self, "pub_user_distance", None) is not None:
+            box_w = float(detections[0].w)
+            fw = float(frame_w) if frame_w > 0 else 640.0
+            if box_w > 0:
+                focal_px = fw * 0.8
+                est_dist = float(min(4.0, max(0.3, (0.16 * focal_px) / box_w)))
+                dist_msg = Float32()
+                dist_msg.data = round(est_dist, 2)
+                self.pub_user_distance.publish(dist_msg)
+
+        # Standard Vision Topics for Downstream Consciousness & Realtime Nodes
+        has_person = len(detections) > 0
+        if getattr(self, "pub_person_detected", None) is not None:
+            if has_person != getattr(self, "_last_person_detected_published", None):
+                p_msg = Bool()
+                p_msg.data = bool(has_person)
+                self.pub_person_detected.publish(p_msg)
+                self._last_person_detected_published = has_person
+
+        if getattr(self, "pub_looking_at_robot", None) is not None:
+            is_looking = any(bool(getattr(d, "is_looking", False)) for d in detections) if has_person else False
+            if is_looking != getattr(self, "_last_looking_published", None):
+                l_msg = Bool()
+                l_msg.data = bool(is_looking)
+                self.pub_looking_at_robot.publish(l_msg)
+                self._last_looking_published = is_looking
+
+        # Synchronized Telemetry
+        face_bearing = res.face_bearings_deg[0] if res.face_bearings_deg else None
+        face_bearing_str = f"{face_bearing:+.1f}°" if face_bearing is not None else "NONE"
+        primary_target_id = res.target_id or "NONE"
+        vision_age_ms = round(max(0.0, (arrival_ts - capture_ts) * 1000.0), 1)
+        bbox_str = f"[{detections[0].x},{detections[0].y},{detections[0].w},{detections[0].h}]" if detections else "NONE"
+        conf_str = f"{detections[0].confidence:.2f}" if detections else "0.00"
+
+        tracker_head = self.runtime.tracker.head_angle_deg
+        actual_head = self.runtime.actual_head_yaw_deg
+        aligned_head, aligned_vel = self.runtime.get_head_position_at(capture_ts)
+        temporal_skew_ms = max(0.0, (arrival_ts - capture_ts) * 1000.0)
+        raw_enc = getattr(self, "raw_encoder_deg", actual_head)
+        fb_deg, fb_age, fb_src = self.runtime.get_feedback_telemetry(now=arrival_ts)
+
+        doa_str = f"{doa_deg:+.1f}°" if doa_deg is not None else "NONE"
+        owner_str = res.owner.value if hasattr(res.owner, "value") else str(res.owner)
+        aligned_head_str = f"{aligned_head:+.1f}°" if aligned_head is not None else "NONE"
+        actual_head_str = f"{actual_head:+.1f}°" if actual_head is not None else "NONE"
+        fb_deg_str = f"{fb_deg:+.1f}°" if fb_deg is not None else "NONE"
+        raw_enc_str = f"{raw_enc:+.1f}°" if raw_enc is not None else "NONE"
+        sync_line = (
+            f"visual_bearing={face_bearing_str} "
+            f"audio_doa={doa_str} "
+            f"owner={owner_str} "
+            f"command_yaw={target_yaw:+.1f}° "
+            f"aligned_head={aligned_head_str} "
+            f"actual_head={actual_head_str} "
+            f"temporal_skew_ms={temporal_skew_ms:.1f}ms "
+            f"head_feedback_deg={fb_deg_str} "
+            f"head_feedback_age_ms={fb_age:.1f}ms "
+            f"head_feedback_source={fb_src}"
+        )
+
+        frame_log = (
+            f"FRAME\n"
+            f"cycle_id={self.cycle_id}\n"
+            f"frame_id={self.frame_index}\n"
+            f"capture_ts={capture_ts:.3f}\n"
+            f"arrival_ts={arrival_ts:.3f}\n"
+            f"step_ts={t_step_end:.3f}\n"
+            f"vision_age_ms={vision_age_ms:.1f}\n"
+            f"bbox={bbox_str}\n"
+            f"confidence={conf_str}\n"
+            f"visual_bearing={face_bearing_str}\n"
+            f"target_id={primary_target_id}"
+        )
+
+        cmd_log = (
+            f"COMMAND\n"
+            f"cycle_id={self.cycle_id}\n"
+            f"frame_id={self.frame_index}\n"
+            f"target_id={primary_target_id}\n"
+            f"command_yaw={motor_yaw:+.1f}°\n"
+            f"aligned_head={aligned_head_str}\n"
+            f"actual_head={actual_head_str}\n"
+            f"raw_encoder={raw_enc_str}\n"
+            f"FEEDBACK_SYNC: {sync_line}\n"
+            f"source={getattr(res, 'command_source', 'VISUAL')}"
+        )
+        # Center Forensic Diagnostic Telemetry
+        if detections:
+            bbox_cx = float(detections[0].x + (detections[0].w / 2.0))
+            bbox_cy = float(detections[0].y + (detections[0].h / 2.0))
+            raw_bearing, _ = self.runtime.tracker.transformer.camera_pixel_to_optical_angles(
+                bbox_cx, bbox_cy, frame_w, frame_h
+            )
+        else:
+            bbox_cx = frame_w / 2.0
+            raw_bearing = 0.0
+
+        aligned_h_val = float(aligned_head) if aligned_head is not None else 0.0
+        actual_h_val = float(actual_head) if actual_head is not None else 0.0
+        diag_err = target_yaw - aligned_h_val
+        self._diag_raw_bearings.append(raw_bearing)
+        self._diag_target_yaws.append(target_yaw)
+        if aligned_head is not None:
+            self._diag_measured_heads.append(aligned_h_val)
+
+        std_raw = float(np.std(self._diag_raw_bearings)) if len(self._diag_raw_bearings) > 1 else 0.0
+        std_tgt = float(np.std(self._diag_target_yaws)) if len(self._diag_target_yaws) > 1 else 0.0
+        std_head = float(np.std(self._diag_measured_heads)) if len(self._diag_measured_heads) > 1 else 0.0
+
+        center_diag_line = (
+            f"CENTER_DIAG: bbox_cx={bbox_cx:.1f} frame_cx={frame_w / 2.0:.1f} "
+            f"raw_bearing={raw_bearing:+.2f}° measured_head={aligned_h_val:+.2f}° "
+            f"target_yaw={target_yaw:+.2f}° error={diag_err:+.2f}° "
+            f"sigma_raw={std_raw:.2f} sigma_tgt={std_tgt:.2f} sigma_head={std_head:.2f}"
+        )
+
+        # Structured Instrumentation for Forensic Isolation
+        sign_vis = 0 if abs(raw_bearing) < 1e-3 else (1 if raw_bearing > 0 else -1)
+        sign_tgt = 0 if abs(target_yaw - aligned_h_val) < 1e-3 else (1 if (target_yaw - aligned_h_val) > 0 else -1)
+        sign_pub = 0 if abs(self.last_published_yaw - aligned_h_val) < 1e-3 else (1 if (self.last_published_yaw - aligned_h_val) > 0 else -1)
+
+        instrumentation_log = (
+            f"RAW:\n"
+            f"bbox_center_x={bbox_cx:.1f}\n"
+            f"frame_center_x={frame_w / 2.0:.1f}\n"
+            f"\n"
+            f"VISION:\n"
+            f"visual_bearing_deg={raw_bearing:+.2f}\n"
+            f"\n"
+            f"FEEDBACK:\n"
+            f"aligned_head_deg={aligned_h_val:+.2f}\n"
+            f"measured_head_deg={actual_h_val:+.2f}\n"
+            f"temporal_skew_ms={temporal_skew_ms:.1f}\n"
+            f"head_feedback_timestamp={self.runtime.last_feedback_time:.3f}\n"
+            f"head_feedback_age_ms={fb_age:.1f}\n"
+            f"head_feedback_source={fb_src}\n"
+            f"\n"
+            f"CONTROL:\n"
+            f"visual_error_deg={diag_err:+.2f}\n"
+            f"target_yaw_deg={target_yaw:+.2f}\n"
+            f"published_command_deg={target_yaw:+.2f}\n"
+            f"\n"
+            f"ACTUATOR:\n"
+            f"actual_head_deg={self.latest_head_state_pos_deg:+.2f}\n"
+            f"target_position_deg={self.latest_head_state_target_pos_deg:+.2f}\n"
+            f"\n"
+            f"SIGNS:\n"
+            f"sign(visual_bearing)={sign_vis:+d}\n"
+            f"sign(target_yaw - measured_head)={sign_tgt:+d}\n"
+            f"sign(published_command - measured_head)={sign_pub:+d}"
+        )
+
+        speech_conf = f"{speech.confidence:.2f}" if (speech and hasattr(speech, "confidence")) else "0.00"
+        audio_log = (
+            f"AUDIO:\n"
+            f"doa_deg={doa_str}\n"
+            f"speech_confidence={speech_conf}\n"
+            f"is_robot_speaking={is_robot_speaking}\n"
+            f"gaze_owner={owner_str}"
+        )
+
+        forensic_msg = f"\n{frame_log}\n{cmd_log}\n{center_diag_line}\n{instrumentation_log}\n\n{audio_log}"
+
+        # 1. Forensic Telemetry (Exposed ONLY at DEBUG level, or printed if verbose_diagnostics=True)
+        self.get_logger().debug(sync_line)
+        self.get_logger().debug(forensic_msg)
+        if self.verbose_diagnostics:
+            try:
+                print(forensic_msg)
+            except UnicodeEncodeError:
+                print(forensic_msg.encode("ascii", errors="replace").decode("ascii"))
+
+        # 2. Audio State Changes & Event Logging (Quiet, meaningful, non-spamming)
+        # A. Gaze owner transition
+        if res.owner != self._last_logged_owner:
+            if res.owner == PrioritySource.ACTIVE_SPEAKER:
+                self.get_logger().info("[AUDIO] owner=AUDIO_REACQUISITION")
+            elif res.owner == PrioritySource.VISUAL_TRACKING:
+                self.get_logger().info("[AUDIO] owner=VISUAL_TRACKING")
+            elif res.owner == PrioritySource.IDLE and self._last_logged_owner in (
+                PrioritySource.ACTIVE_SPEAKER,
+                PrioritySource.VISUAL_TRACKING,
+            ):
+                self.get_logger().info("[AUDIO] owner=IDLE")
+
+        # B. Speech onset
+        is_speech = bool(speech is not None and getattr(speech, "is_speech", False))
+        if is_speech:
+            conf_val = float(getattr(speech, "confidence", 0.0))
+            if not self._speech_was_active or (arrival_ts - self._last_logged_speech_time >= 2.0):
+                self.get_logger().info(f"[AUDIO] speech detected confidence={conf_val:.2f}")
+                self._last_logged_speech_time = arrival_ts
+            self._speech_was_active = True
+        else:
+            self._speech_was_active = False
+
+        # C. Meaningful DOA update (only on arrival, shift >= 5°, or >= 1.0s periodic)
+        if doa_deg is not None and is_speech:
+            if (
+                self._last_logged_doa is None
+                or abs(circular_distance_deg(doa_deg, self._last_logged_doa)) >= 5.0
+                or (arrival_ts - self._last_logged_doa_time >= 1.0)
+            ):
+                self.get_logger().info(f"[AUDIO] DOA={doa_deg:+.1f}°")
+                self._last_logged_doa = doa_deg
+                self._last_logged_doa_time = arrival_ts
+        elif doa_deg is None:
+            self._last_logged_doa = None
+
+        # 3. Visual Tracking State (Rate-limited to ~1Hz or on material change)
+        target_changed = primary_target_id != self._last_logged_target_id
+        owner_changed = res.owner != self._last_logged_owner
+        cmd_jump = abs(target_yaw - self._last_logged_command_yaw) >= 3.0
+        large_error = abs(diag_err) >= 15.0 and (arrival_ts - self._last_logged_visual_time >= 1.0)
+        rate_limited_heartbeat = (
+            (arrival_ts - self._last_logged_visual_time >= 1.0)
+            and (primary_target_id != "NONE" or res.owner != PrioritySource.IDLE)
+        )
+
+        if target_changed or owner_changed or cmd_jump or large_error or rate_limited_heartbeat:
+            self.get_logger().info(
+                f"[VISUAL] target={primary_target_id} bearing={face_bearing_str} command={target_yaw:+.1f}° actual={aligned_head_str}"
+            )
+            self._last_logged_visual_time = arrival_ts
+            self._last_logged_command_yaw = target_yaw
+
+        self._last_logged_target_id = primary_target_id
+        self._last_logged_owner = res.owner
+
+        return res
+
+    # =========================================================================
+    # Passive 50Hz Keepalive
+    # =========================================================================
+
+    def _passive_keepalive_cycle(self) -> None:
+        """Streams last authoritative target yaw to keep MCU watchdog fed.
+
+        DOES NOT step tracker.
+        DOES NOT update targets when camera is active.
+        If running headless without camera, updates audio localizer.
+        """
+        now_m = time.monotonic()
+        manual_active = (
+            now_m < getattr(self, "_manual_target_deadline", 0.0)
+            or now_m < getattr(self, "_manual_target_deadline_monotonic", 0.0)
+        )
+        if manual_active:
+            target_yaw = float(self._manual_target_yaw)
+        elif self.camera is None or not getattr(self.camera, "available", False):
+            # Headless or camera-less mode: localizer can be stepped if camera loop isn't driving
+            if self.enable_audio and self.audio_source_mode in ("standalone", "hardware"):
+                self.localizer.read_and_update(now=now_m)
+            if self.localizer.is_tracking(now_m):
+                target_yaw = float(self.localizer.target_yaw_deg)
+            else:
+                target_yaw = 0.0
+        else:
+            target_yaw = float(self.runtime.get_keepalive_yaw_deg())
+        social_offset = self._current_social_offset(now_m)
+        if social_offset != 0.0:
+            max_limit = getattr(self.localizer, "max_yaw_deg", 75.0)
+            effective_yaw = float(max(-max_limit, min(max_limit, target_yaw + social_offset)))
+        else:
+            effective_yaw = float(target_yaw)
+        cmd_pos = Float32()
+        cmd_pos.data = float(effective_yaw)
+        self.pub_head_cmd_pos.publish(cmd_pos)
+
+        if self.pub_head_command is not None:
+            hcmd = HeadCmd()
+            hcmd.angle_deg = float(effective_yaw)
+            self.pub_head_command.publish(hcmd)
+
+    def destroy_node(self) -> bool:
+        self._running = False
+        if self._cam_thread is not None and self._cam_thread.is_alive():
+            self._cam_thread.join(timeout=1.0)
+        if self.camera is not None:
+            try:
+                self.camera.close()
+            except Exception:
+                pass
+        if self.audio is not None:
+            try:
+                self.audio.close()
+            except Exception:
+                pass
+        if self.voice_loop is not None:
+            try:
+                self.voice_loop.stop()
+            except Exception:
+                pass
+        return super().destroy_node()
+
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = StandaloneGazeRosNode()
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.destroy_node()
+        if rclpy.ok():
+            rclpy.shutdown()
+
+
+if __name__ == "__main__":
+    main()

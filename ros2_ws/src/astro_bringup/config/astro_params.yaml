@@ -1,0 +1,106 @@
+serial_bridge:
+  ros__parameters:
+    port: "/dev/ttyCH341USB0"
+    baud: 115200
+    connect_retry_sec: 2.0
+    frame_id_imu: "imu_link"
+    ticks_per_rev_left: 2048.0
+    ticks_per_rev_right: 2048.0
+    wheel_radius_left: 0.06
+    wheel_radius_right: 0.06
+    head_angle_scale: 1.0  # Polarity fixed: ROS (+Left) -> Arduino (+Left)
+
+rplidar_node:
+  ros__parameters:
+    channel_type: "serial"
+    serial_port: "/dev/astro_lidar"
+    serial_baudrate: 115200
+    frame_id: "laser_frame"
+    inverted: false
+    angle_compensate: true
+    scan_mode: ""
+    scan_frequency: 10.0
+    auto_standby: false
+
+scan_filter_node:
+  ros__parameters:
+    range_min: 0.15
+    range_max: 12.0
+    filter_nan: true
+
+audio_capture_node:
+  ros__parameters:
+    device_name: "ReSpeaker"
+    device_index: -1
+    sample_rate: 16000
+    channels: 6
+    chunk_size: 1024
+    vad_threshold: 0.6
+
+speech_recognition_node:
+  ros__parameters:
+    model_path: "/opt/vosk/vosk-model-small-tr-0.3"
+    language: "tr"
+    partial_results: false
+    silence_timeout_s: 1.5
+
+tts_node:
+  ros__parameters:
+    language: "tr"
+    rate: 150
+    volume: 0.8
+
+/oak:
+  ros__parameters:
+    camera:
+      i_nn_type: "none"
+      i_enable_imu: false
+    i_pipeline_type: "RGBD"
+    rgb:
+      i_resolution: "1080P"
+      i_fps: 30.0
+      i_publish_topic: true
+    stereo:
+      i_enabled: true
+      i_depth_filter_size: 5
+      i_lr_check: true
+
+face_detector_node:
+  ros__parameters:
+    input_topic: "/oak/rgb/image_raw"
+    scale_factor: 1.1
+    min_neighbors: 5
+    min_size: 30
+
+head_tracker_node:
+  ros__parameters:
+    enabled: true
+    doa_offset_deg: 0.0
+    doa_invert: true                # true (ReSpeaker Clockwise -> ROS Body CCW ters çevirme)
+    max_yaw_deg: 75.0               # Bounded ±75° joint envelope
+    min_yaw_deg: -75.0              # Bounded ±75° joint envelope
+    deadband_deg: 3.0
+    min_dwell_time_s: 2.5
+    idle_return_timeout_s: 25.0
+    max_speed_deg_s: 75.0
+    min_rms_threshold: 400.0
+    head_motion_settle_s: 0.4
+    vision_fusion_enabled: true
+    vision_gain: 0.85
+    vision_timeout_s: 1.5
+
+social_gaze_node:
+  ros__parameters:
+    control_rate_hz: 50.0
+    max_velocity_deg_s: 75.0
+    max_acceleration_deg_s2: 180.0
+    max_jerk_deg_s3: 5400.0
+    gaze_deadband_deg: 2.5
+    min_attention_dwell_s: 2.50
+    turn_taking_min_dwell_s: 0.80
+    spatial_gate_deg: 25.0
+    idle_saccades_enabled: false
+    self_speech_suppression: true
+
+
+

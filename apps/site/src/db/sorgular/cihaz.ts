@@ -53,10 +53,28 @@ export function komutVerebilir(yetki: CihazYetkisi): boolean {
   return yetki === "sahip" || yetki === "operator";
 }
 
-/** Kullanıcının cihazları. İptal edilmişler listelenmez. */
+/** Kullanıcının cihazları (sahip olduğu veya yetkilendirildiği cihazlar). İptal edilmişler listelenmez. */
 export async function kullanicininCihazlari(kullaniciId: string) {
-  return db
-    .select()
+  const satirlar = await db
+    .select({ cihaz: devices })
     .from(devices)
-    .where(and(eq(devices.ownerUserId, kullaniciId), isNull(devices.revokedAt)));
+    .leftJoin(
+      deviceGrants,
+      and(eq(deviceGrants.deviceId, devices.id), eq(deviceGrants.userId, kullaniciId)),
+    )
+    .where(
+      and(
+        isNull(devices.revokedAt),
+        or(eq(devices.ownerUserId, kullaniciId), eq(deviceGrants.userId, kullaniciId)),
+      ),
+    );
+
+  // Tekil cihaz listesi döner
+  const cihazMap = new Map<string, typeof devices.$inferSelect>();
+  for (const s of satirlar) {
+    if (!cihazMap.has(s.cihaz.id)) {
+      cihazMap.set(s.cihaz.id, s.cihaz);
+    }
+  }
+  return Array.from(cihazMap.values());
 }
