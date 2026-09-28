@@ -6185,8 +6185,8 @@ class AstroRealtimeNode(Node):
     def _process_wake_candidate(self, audio_chunks: List[bytes]):
         """Processes potential wake utterance during sleep with strict wake phrase gating, buffer flushing, and telemetry tracking."""
         raw_pcm = b"".join(audio_chunks)
-        # Sıkı süre sınırı: "Astro" veya "Hey Astro" telaffuzu en az 380ms sürer
-        if len(raw_pcm) < 16000 * 2 * 0.38:
+        # Sıkı süre sınırı: "Astro" veya "Hey Astro" telaffuzu en az 420ms sürer (300ms gürültü patlamaları elenir)
+        if len(raw_pcm) < 16000 * 2 * 0.42:
             return
 
         arr = np.frombuffer(raw_pcm, dtype=np.int16)
@@ -6204,7 +6204,7 @@ class AstroRealtimeNode(Node):
         local_speech_ms = int(speech_chunks * 20)
         local_vad_conf = speech_chunks / float(tot_chunks)
 
-        if local_speech_ms < 280 or local_vad_conf < 0.35 or total_rms < max(240.0, getattr(self, "_ambient_rms", 120.0) * 1.20):
+        if local_speech_ms < 400 or local_vad_conf < 0.55 or total_rms < max(280.0, getattr(self, "_ambient_rms", 120.0) * 1.25):
             return
 
         import io
@@ -7386,7 +7386,7 @@ class AstroRealtimeNode(Node):
 
         # 5. Weak speech duration, low VAD confidence, or ambient noise floor
         elif (
-            (vad_confidence < 0.40 or speech_ms < 280 or total_rms < max(240.0, self._ambient_rms * 1.20))
+            (vad_confidence < 0.60 or speech_ms < 420 or total_rms < max(280.0, self._ambient_rms * 1.30))
             if is_wake_cand
             else (vad_confidence < 0.22 or speech_ms < 100 or total_rms < max(130.0, self._ambient_rms * 1.15))
         ):
@@ -7402,7 +7402,7 @@ class AstroRealtimeNode(Node):
         elif len(words) == 1:
             if is_wake_cand:
                 # Özel uyandırma kelimesi: gerçek akustik konuşma kanıtı zorunludur (sessizlikte uyanmayı engeller)
-                if speech_ms < 280 or total_rms < max(240.0, self._ambient_rms * 1.20) or vad_confidence < 0.38:
+                if speech_ms < 420 or total_rms < max(280.0, self._ambient_rms * 1.30) or vad_confidence < 0.60:
                     rejected = True
                     reject_reason = "wake_insufficient_speech"
                 elif not is_busy_speaking:
