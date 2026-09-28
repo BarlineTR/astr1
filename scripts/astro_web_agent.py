@@ -462,7 +462,82 @@ class AstroRobotAjan:
                 if abs(fark) > 0.5 and not self.estop:
                     self.gercek_yaw += (1.0 if fark > 0 else -1.0) * min(abs(fark), 3.0)
 
-            att_owner = "visual" if len(self.faces_list) > 0 else ("audio" if self.vad else "none")
+            # 1. Head angles sanitization
+            try:
+                dy = float(self.hedef_yaw)
+                if math.isnan(dy) or math.isinf(dy):
+                    dy = 0.0
+            except Exception:
+                dy = 0.0
+
+            try:
+                ay = float(self.gercek_yaw)
+                if math.isnan(ay) or math.isinf(ay):
+                    ay = 0.0
+            except Exception:
+                ay = 0.0
+
+            # 2. Audio DoA & VAD sanitization
+            doa_val = None
+            if self.vad:
+                try:
+                    d_flt = float(self.doa_deg)
+                    if not math.isnan(d_flt) and not math.isinf(d_flt):
+                        doa_val = round(d_flt, 1)
+                except Exception:
+                    doa_val = None
+
+            conf_val = 0.0
+            if self.vad:
+                try:
+                    c_flt = float(self.doa_confidence if self.doa_confidence is not None else 0.88)
+                    if not math.isnan(c_flt) and not math.isinf(c_flt):
+                        conf_val = max(0.0, min(1.0, round(c_flt, 2)))
+                except Exception:
+                    conf_val = 0.88
+
+            # 3. Faces list sanitization
+            clean_faces = []
+            if isinstance(self.faces_list, list):
+                for fc in self.faces_list:
+                    if not isinstance(fc, dict):
+                        continue
+                    try:
+                        f_name = fc.get("name")
+                        f_name_str = str(f_name) if f_name else None
+                        f_conf = float(fc.get("confidence", 0.9))
+                        if math.isnan(f_conf) or math.isinf(f_conf):
+                            f_conf = 0.9
+                        f_conf = max(0.0, min(1.0, round(f_conf, 2)))
+                        bx = fc.get("box", [0.2, 0.2, 0.3, 0.4])
+                        if not isinstance(bx, (list, tuple)) or len(bx) != 4:
+                            bx = [0.2, 0.2, 0.3, 0.4]
+                        clean_box = (
+                            max(0.0, min(1.0, float(bx[0]))),
+                            max(0.0, min(1.0, float(bx[1]))),
+                            max(0.0, min(1.0, float(bx[2]))),
+                            max(0.0, min(1.0, float(bx[3]))),
+                        )
+                        dist = fc.get("distanceM")
+                        dist_val = None
+                        if dist is not None:
+                            d_m = float(dist)
+                            if not math.isnan(d_m) and not math.isinf(d_m):
+                                dist_val = round(d_m, 2)
+                        clean_faces.append({
+                            "name": f_name_str,
+                            "confidence": f_conf,
+                            "box": clean_box,
+                            "distanceM": dist_val,
+                        })
+                    except Exception:
+                        continue
+
+            # 4. Gaze attention owner
+            att_owner = "visual" if len(clean_faces) > 0 else ("audio" if self.vad else "none")
+            gaze_st = str(self.gaze_state or "IDLE").strip()
+            if not gaze_st or gaze_st == "IDLE":
+                gaze_st = "TRACKING" if len(clean_faces) > 0 else "IDLE"
 
             telemetri = {
                 "kind": "cihaz.telemetri",
@@ -471,21 +546,21 @@ class AstroRobotAjan:
                     "source": "robot",
                     "connected": True,
                     "head": {
-                        "desiredYawDeg": round(float(self.hedef_yaw), 1),
-                        "actualYawDeg": round(float(self.gercek_yaw), 1),
+                        "desiredYawDeg": round(dy, 1),
+                        "actualYawDeg": round(ay, 1),
                         "encoderOk": bool(self.encoder_ok),
                     },
                     "audio": {
-                        "doaDeg": round(float(self.doa_deg), 1) if self.vad else None,
-                        "confidence": round(float(self.doa_confidence or (0.88 if self.vad else 0.0)), 2),
+                        "doaDeg": doa_val,
+                        "confidence": conf_val,
                         "vad": bool(self.vad),
                     },
                     "gaze": {
                         "attentionOwner": att_owner,
-                        "state": self.gaze_state if self.gaze_state != "IDLE" else ("TRACKING" if len(self.faces_list) > 0 else "IDLE"),
-                        "visualValid": bool(self.visual_valid),
+                        "state": gaze_st,
+                        "visualValid": len(clean_faces) > 0,
                     },
-                    "faces": self.faces_list,
+                    "faces": clean_faces,
                     "safety": {
                         "eStop": bool(self.estop),
                         "watchdogOk": bool(self.watchdog_ok),

@@ -69,11 +69,8 @@ app.get("/ws/cihaz", { websocket: true }, (socket) => {
 
     const cozulmus = cihazCerceveSchema.safeParse(govde);
     if (!cozulmus.success) {
-      /*
-       * Robot da istemci kadar şüpheli: jetonu ele geçirilmiş bir ajan bozuk
-       * telemetri basabilir ve panel onu gerçek sanardı.
-       */
-      hata("sozlesme-disi", "Çerçeve sözleşmeye uymuyor");
+      app.log.warn({ issues: cozulmus.error.issues }, "Çerçeve sözleşmeye uymuyor");
+      hata("sozlesme-disi", `Çerçeve sözleşmeye uymuyor: ${cozulmus.error.issues.map((i) => `${i.path.join(".")}: ${i.message}`).join(", ")}`);
       return;
     }
 
