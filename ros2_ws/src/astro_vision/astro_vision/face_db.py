@@ -140,7 +140,14 @@ class FaceEngine:
         except (json.JSONDecodeError, OSError):
             return
         for name, vectors in data.get("people", {}).items():
-            self.people[name] = [np.array(v, dtype=np.float32).reshape(1, -1) for v in vectors]
+            valid_vecs = []
+            for v in vectors:
+                arr = np.array(v, dtype=np.float32).flatten()
+                norm = float(np.linalg.norm(arr))
+                if norm > 1e-4:
+                    valid_vecs.append((arr / norm).reshape(1, -1))
+            if valid_vecs:
+                self.people[name] = valid_vecs
 
     def save(self):
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -156,7 +163,13 @@ class FaceEngine:
     def add_person(self, name: str, features: list[np.ndarray], replace: bool = False):
         if replace or name not in self.people:
             self.people[name] = []
-        self.people[name].extend(features)
+        normalized_features = []
+        for feat in features:
+            v = np.array(feat, dtype=np.float32).flatten()
+            norm = float(np.linalg.norm(v))
+            if norm > 1e-4:
+                normalized_features.append((v / norm).reshape(1, -1))
+        self.people[name].extend(normalized_features)
 
     def remove_person(self, name: str) -> bool:
         return self.people.pop(name, None) is not None

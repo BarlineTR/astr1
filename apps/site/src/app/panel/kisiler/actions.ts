@@ -149,6 +149,34 @@ export async function kisiKaldir(id: string) {
           // yoksay
         }
       }
+
+      // 3. ~/.astro/faces/faces.json'dan sil
+      const facesJsonPaths = [
+        path.resolve(process.env.HOME || "", ".astro/faces/faces.json"),
+        "/home/okistech/.astro/faces/faces.json",
+      ];
+      for (const fPath of facesJsonPaths) {
+        try {
+          if (fs.existsSync(fPath)) {
+            const raw = fs.readFileSync(fPath, "utf-8");
+            const data = JSON.parse(raw);
+            if (data && data.people) {
+              let degisti = false;
+              for (const k of Object.keys(data.people)) {
+                if (k.toLowerCase() === hedef.name.toLowerCase() || sanitizeName(k) === cleanKey) {
+                  delete data.people[k];
+                  degisti = true;
+                }
+              }
+              if (degisti) {
+                fs.writeFileSync(fPath, JSON.stringify(data, null, 2), "utf-8");
+              }
+            }
+          }
+        } catch {
+          // yoksay
+        }
+      }
     }
   } catch (e) {
     console.error("Kişi silme ek işlem hatası:", e);

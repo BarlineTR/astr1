@@ -36,8 +36,8 @@ except ImportError:  # paket kaynaktan çalıştırılıyorsa
         class FaceEngineUnavailable(RuntimeError):
             pass
 
-# OpenCV SFace için belgelenen eşik: kosinüs >= 0.363 aynı kişi (mobil ekran / ışık toleransı için 0.38 idealdir).
-FACE_MATCH_THRESHOLD = float(os.getenv("FACE_MATCH_THRESHOLD", "0.38"))
+# OpenCV SFace için belgelenen eşik: kosinüs >= 0.363 aynı kişi; sahada ve robotik ortamda güvenli eşik 0.45'tir.
+FACE_MATCH_THRESHOLD = float(os.getenv("FACE_MATCH_THRESHOLD", "0.45"))
 
 _ENGINE = None
 _ENGINE_TRIED = False
@@ -300,45 +300,60 @@ class FaceRecognizer:
         if emb is None:
             return None, 0.0, {}
 
-        # 1. First try FaceEngine directly if it has registered people
+        emb_flat = np.asarray(emb, dtype=np.float32).flatten()
+        emb_norm = float(np.linalg.norm(emb_flat))
+        if emb_norm < 1e-4:
+            return None, 0.0, {}
+        emb_flat = emb_flat / emb_norm
+
+        scores_by_person: Dict[str, float] = {}
+
+        # 1. Evaluate FaceEngine database if available
         engine = _get_engine()
         if engine is not None and getattr(engine, "people", None):
-            try:
-                matched_name, sim = engine.identify(emb)
-                if matched_name is not None and sim >= eff_thresh:
-                    norm = self._normalize_name(matched_name)
-                    meta = self._person_metadata.get(norm, {
-                        "name": matched_name,
-                        "title": "Tanınan Kişi",
-                        "formal_title": matched_name
-                    })
-                    return meta["name"], round(float(sim), 2), meta
-            except Exception as _exc:
-                _LOG.debug("recognize_face: yok sayılan hata (%s)", _exc)
+            for p_name, vectors in engine.people.items():
+                p_norm = self._normalize_name(p_name)
+                for vec in vectors:
+                    k_flat = np.asarray(vec, dtype=np.float32).flatten()
+                    k_norm = float(np.linalg.norm(k_flat))
+                    if k_norm > 1e-4:
+                        sim = float(np.dot(emb_flat, k_flat / k_norm))
+                        if sim > scores_by_person.get(p_norm, -1.0):
+                            scores_by_person[p_norm] = sim
 
-        # 2. Fallback to in-memory matching against known_faces
+        # 2. Evaluate in-memory gallery from disk
         with self._lock:
-            if not self._known_embeddings:
-                return None, 0.0, {}
-
-            best_match = None
-            highest_sim = -1.0
-
-            for person_norm, emb_list in self._known_embeddings.items():
+            for p_norm, emb_list in self._known_embeddings.items():
                 for known_emb in emb_list:
-                    sim = float(np.dot(emb.flatten(), np.asarray(known_emb).flatten()))
-                    if sim > highest_sim:
-                        highest_sim = sim
-                        best_match = person_norm
+                    k_flat = np.asarray(known_emb, dtype=np.float32).flatten()
+                    k_norm = float(np.linalg.norm(k_flat))
+                    if k_norm > 1e-4:
+                        sim = float(np.dot(emb_flat, k_flat / k_norm))
+                        if sim > scores_by_person.get(p_norm, -1.0):
+                            scores_by_person[p_norm] = sim
 
-            if best_match is not None and highest_sim >= eff_thresh:
-                meta = self._person_metadata.get(best_match, {
-                    "name": best_match.replace("_", " ").title(),
-                    "title": "Tanınan Kişi",
-                    "formal_title": best_match.replace("_", " ").title()
-                })
-                return meta["name"], round(highest_sim, 2), meta
+        if not scores_by_person:
+            return None, 0.0, {}
 
-            cand_name = best_match.replace("_", " ").title() if best_match else "Bilinmeyen"
-            return None, max(0.0, round(highest_sim, 2)), {"candidate": cand_name}
+        # Sort candidates by descending similarity
+        ranked = sorted(scores_by_person.items(), key=lambda kv: kv[1], reverse=True)
+        best_person, best_score = ranked[0]
+        second_score = ranked[1][1] if len(ranked) > 1 else -1.0
+
+        # Margin check: if top candidate is ambiguous with second candidate, avoid guessing
+        if best_score >= eff_thresh:
+            margin = best_score - second_score
+            if margin < 0.035 and best_score < 0.55 and second_score >= (eff_thresh - 0.05):
+                cand_name = best_person.replace("_", " ").title()
+                return None, round(best_score, 2), {"candidate": f"{cand_name} (belirsiz)", "ambiguous": True}
+
+            meta = self._person_metadata.get(best_person, {
+                "name": best_person.replace("_", " ").title(),
+                "title": "Tanınan Kişi",
+                "formal_title": best_person.replace("_", " ").title()
+            })
+            return meta["name"], round(best_score, 2), meta
+
+        cand_name = best_person.replace("_", " ").title()
+        return None, max(0.0, round(best_score, 2)), {"candidate": cand_name}
 

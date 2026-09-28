@@ -907,7 +907,7 @@ class StandaloneGazeRosNode(Node):
                                 # Match with known identity if nearby in horizontal angle (within 0.22 normalized width)
                                 identity_match = None
                                 for cached_u, id_data in list(tracked_ids.items()):
-                                    if abs(u_norm - cached_u) < 0.22 and (now_id - id_data.get("timestamp", 0.0)) < 30.0:
+                                    if abs(u_norm - cached_u) < 0.22 and (now_id - id_data.get("timestamp", 0.0)) < 5.0:
                                         identity_match = id_data
                                         break
 
@@ -917,10 +917,10 @@ class StandaloneGazeRosNode(Node):
                                     is_known_val = bool(identity_match.get("is_known", False))
                                     conf_val = float(identity_match.get("confidence", 0.85))
                                 else:
-                                    # Fallback to single face payload if only 1 detection
+                                    # Fallback to single face payload if only 1 detection (recent within 4.0s)
                                     cached = getattr(self, "_last_face_payload", None)
                                     cached_time = getattr(self, "_last_face_payload_time", 0.0)
-                                    if len(detections) == 1 and cached and (now_frame - cached_time) < 45.0:
+                                    if len(detections) == 1 and cached and (now_frame - cached_time) < 4.0:
                                         name_val = cached.get("name", "Misafir")
                                         formal_val = cached.get("formal_title", name_val)
                                         is_known_val = cached.get("is_known", False)
