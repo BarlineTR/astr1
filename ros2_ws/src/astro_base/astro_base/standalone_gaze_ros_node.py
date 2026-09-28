@@ -879,6 +879,7 @@ class StandaloneGazeRosNode(Node):
                     time.sleep(0.01)
                     continue
 
+                frame_h, frame_w = frame.shape[:2]
                 t_read_done = time.monotonic()
                 if self.pub_camera_image is not None and (t_read_done - self._last_camera_pub_time) >= (1.0 / max(1.0, self.camera_publish_fps)):
                     self._last_camera_pub_time = t_read_done
