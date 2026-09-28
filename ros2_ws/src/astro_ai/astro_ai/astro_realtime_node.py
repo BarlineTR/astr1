@@ -810,7 +810,7 @@ class AstroRealtimeNode(Node):
 
         self.connect_realtime = bool(self.use_realtime and connect_realtime and not is_test_mode)
         self.fake_transport = fake_transport
-        self.persona_name = os.environ.get("PERSONA", "playful").strip().lower()
+        self.persona_name = os.environ.get("PERSONA", "kufurbaz").strip().lower()
         self.realtime_voice = raw_voice if raw_voice in VALID_REALTIME_VOICES else PERSONA_DEFAULT_VOICES.get(self.persona_name, "echo")
 
         # Anahtarın nereden geldiğini başlangıçta söyle. "eksik" hatası alındığında
@@ -1202,6 +1202,8 @@ class AstroRealtimeNode(Node):
         self.create_subscription(Bool, "/astro/sleep_mode", self._on_sleep_mode, 10)
         self._last_consciousness_state: Optional[Dict[str, Any]] = None
         self.create_subscription(String, "/consciousness/state", self._on_consciousness_state, 10)
+        self.create_subscription(String, "/astro/config_update", self._on_config_update, 10)
+        self.create_subscription(String, "/astro/set_persona", self._on_set_persona_topic, 10)
 
         # Tool execution deduplication
         self._executed_tool_calls: set[str] = set()
@@ -2375,11 +2377,15 @@ class AstroRealtimeNode(Node):
             "- ASLA 'takvime erişimim yok', 'aracım yok', 'yapamam' deme.\n"
         )
 
+        mem_ctx = self.memory.get_prompt_context(recognized_person=identity) if getattr(self, "memory", None) else ""
+        context_str = mem_ctx + bio_status + memory_rule + realtime_speech_rule + spatial_rule + social_context_str + multimodal_perception_str + office_calendar_rule
+        custom_p = getattr(self, "_custom_system_prompt", None)
+        if custom_p and (self.persona_name == "custom" or len(custom_p.strip()) > 20):
+            return f"{custom_p.strip()}\n\n{context_str}"
         if not getattr(self, "persona_engine", None):
             return f"Astro Default Instructions {bio_status}{spatial_rule}{social_context_str}{multimodal_perception_str}{office_calendar_rule}"
-        mem_ctx = self.memory.get_prompt_context(recognized_person=identity) if getattr(self, "memory", None) else ""
         return self.persona_engine.build_system_prompt(
-            memory_context=mem_ctx + bio_status + memory_rule + realtime_speech_rule + spatial_rule + social_context_str + multimodal_perception_str + office_calendar_rule,
+            memory_context=context_str,
             recognized_person=identity
         )
 
@@ -6287,6 +6293,80 @@ class AstroRealtimeNode(Node):
             self._last_tracked_gaze_time = time.monotonic()
         except Exception:
             pass
+
+    def _on_set_persona_topic(self, msg: String):
+        """Sets active persona from topic /astro/set_persona."""
+        raw_p = (msg.data or "").strip().lower()
+        self._apply_persona_change(raw_p)
+
+    def _on_config_update(self, msg: String):
+        """Web panelinden gelen canlı ayar ve kişilik güncellemelerini uygular."""
+        try:
+            payload = json.loads(msg.data)
+            self.get_logger().info(f"⚙️ [Astro Realtime Node] /astro/config_update alındı: {payload}")
+
+            persona = payload.get("persona")
+            if persona:
+                self._apply_persona_change(persona)
+
+            # Custom prompt override
+            custom_prompt = payload.get("prompt") or payload.get("llmPrompt")
+            if custom_prompt:
+                self._custom_system_prompt = str(custom_prompt).strip()
+            elif persona and persona != "custom":
+                self._custom_system_prompt = None
+
+            # Voice
+            voice = payload.get("voice") or payload.get("ttsVoice")
+            if voice and voice in VALID_REALTIME_VOICES:
+                self.realtime_voice = voice
+
+            # Greeting
+            greeting = payload.get("greeting") or payload.get("greetingMessage")
+            if greeting:
+                self.greeting_phrase = str(greeting).strip()
+
+            # Force immediate session update to OpenAI Realtime WebSocket
+            self._last_synced_identity = ""
+            self._sync_perception_to_session()
+
+            self.get_logger().info(
+                f"🎭 [Canlı Ayar Güncellendi]: Kişilik -> '{self.persona_name.upper()}', "
+                f"Ses -> [{self.realtime_voice}], Karşılama -> '{getattr(self, 'greeting_phrase', '')}'"
+            )
+        except Exception as e:
+            self.get_logger().error(f"❌ /astro/config_update işleme hatası: {e}")
+
+    def _apply_persona_change(self, raw_p: str):
+        p_map = {
+            "küfürbaz": "kufurbaz", "kufurbaz": "kufurbaz", "haydo": "kufurbaz", "sokak": "kufurbaz",
+            "neseli": "playful", "neşeli": "playful", "playful": "playful", "oyuncu": "playful",
+            "witty": "witty", "espri": "witty", "zeki": "witty", "absurt": "witty", "absürt": "witty",
+            "flirt": "flirt", "flort": "flirt", "flört": "flirt", "capkin": "flirt", "çapkın": "flirt",
+            "formal": "formal", "resmi": "formal", "protokol": "formal",
+            "concierge": "concierge", "danisma": "concierge", "danışma": "concierge", "karsilama": "concierge", "karşılama": "concierge",
+            "custom": "custom", "ozel": "custom", "özel": "custom",
+            "sarkastik": "sarcastic", "sarcastic": "sarcastic", "alayci": "sarcastic", "alaycı": "sarcastic",
+            "sinirli": "angry", "angry": "angry", "asabi": "angry", "ofkeli": "angry", "öfkeli": "angry",
+            "duygusal": "emotional", "emotional": "emotional"
+        }
+        target = p_map.get(raw_p, raw_p)
+        if target in PERSONA_PROMPTS or target == "custom":
+            self.persona_name = target
+            if target in PERSONA_PROMPTS:
+                self.persona_engine.set_persona(target)
+            if hasattr(self, "memory") and hasattr(self.memory, "profile"):
+                self.memory.profile.set_persona(target)
+            raw_v = os.environ.get("OPENAI_REALTIME_VOICE", "").strip().lower()
+            if not raw_v or raw_v not in VALID_REALTIME_VOICES:
+                self.realtime_voice = PERSONA_DEFAULT_VOICES.get(target, "echo")
+
+            # Publish emotion for face screen
+            emo_msg = String()
+            emo_msg.data = target
+            self.pub_emotion.publish(emo_msg)
+            return True
+        return False
 
     def _evaluate_lidar_blindspot_approach(self):
         """Detects approaching entities in blind spots when IDLE, turning head curiously to look for face."""
@@ -11831,12 +11911,15 @@ class AstroRealtimeNode(Node):
         self._last_sync_time = now
 
         system_prompt = self._build_current_system_prompt()
+        session_payload = {
+            "type": "realtime",
+            "instructions": system_prompt,
+        }
+        if getattr(self, "realtime_voice", None):
+            session_payload["voice"] = self.realtime_voice
         update_event = {
             "type": "session.update",
-            "session": {
-                "type": "realtime",
-                "instructions": system_prompt
-            }
+            "session": session_payload,
         }
 
         try:

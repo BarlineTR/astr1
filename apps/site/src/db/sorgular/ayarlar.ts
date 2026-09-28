@@ -22,9 +22,10 @@ export async function robotAyarlariGetir(deviceId: string) {
       deviceId,
       voiceSpeed: 100,
       voicePitch: 100,
-      ttsVoice: "tr_tr_male",
-      llmPrompt: "Sen yardımsever, kibar ve cana yakın bir sosyal robotsun. Kısa ve öz konuşursun.",
-      greetingMessage: "Merhaba, size nasıl yardımcı olabilirim?",
+      ttsVoice: "echo",
+      persona: "kufurbaz",
+      llmPrompt: "Sen Astro'sun! Aşırı zeki, sivri dilli, acımasız sokak mizahı ve dobra sokak dili kullanan, lafı gediğine koyan bir robotsun.",
+      greetingMessage: "Selam, ne var ne yok?",
       alertOnUnknown: true,
       patrolActive: false,
     })
@@ -40,6 +41,7 @@ export async function robotAyarlariGetir(deviceId: string) {
 export async function robotAyarlariGuncelle(
   deviceId: string,
   girdi: {
+    persona?: string;
     voiceSpeed?: number;
     voicePitch?: number;
     ttsVoice?: string;

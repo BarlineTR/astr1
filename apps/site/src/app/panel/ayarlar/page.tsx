@@ -1,9 +1,12 @@
 import Link from "next/link";
+import fs from "node:fs";
+import path from "node:path";
 import { robotAyarlariGetir } from "@/db/sorgular/ayarlar";
 import { kullanicininCihazlari } from "@/db/sorgular/cihaz";
 import { oturumGerekli } from "@/lib/oturum";
 import { sayfaMetadata } from "@/lib/seo";
 import { RobotAyarlariFormu } from "@/components/RobotAyarlariFormu";
+import { BiliselHafizaKutusu } from "@/components/BiliselHafizaKutusu";
 
 export const metadata = sayfaMetadata({
   baslik: "Robot Ayarları & Ses/Kişilik",
@@ -11,6 +14,23 @@ export const metadata = sayfaMetadata({
   yol: "/panel",
   dizinleme: false,
 });
+
+function hafizaYukle() {
+  const candidatePaths = [
+    path.resolve(process.cwd(), "../../ros2_ws/astro_memory.json"),
+    "/home/okistech/Desktop/astr1/ros2_ws/astro_memory.json",
+  ];
+  for (const p of candidatePaths) {
+    try {
+      if (fs.existsSync(p)) {
+        return JSON.parse(fs.readFileSync(p, "utf-8"));
+      }
+    } catch {
+      // yoksay
+    }
+  }
+  return null;
+}
 
 export default async function AyarlarSayfasi() {
   const oturum = await oturumGerekli("/panel/ayarlar");
@@ -35,6 +55,7 @@ export default async function AyarlarSayfasi() {
     return null;
   }
   const ayarlar = await robotAyarlariGetir(aktifCihaz.id);
+  const hafiza = hafizaYukle();
 
   return (
     <>
@@ -46,6 +67,8 @@ export default async function AyarlarSayfasi() {
       </div>
 
       <RobotAyarlariFormu ayarlar={ayarlar} />
+
+      <BiliselHafizaKutusu hafiza={hafiza} />
     </>
   );
 }
