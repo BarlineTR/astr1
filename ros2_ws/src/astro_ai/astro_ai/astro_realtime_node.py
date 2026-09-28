@@ -11422,6 +11422,16 @@ class AstroRealtimeNode(Node):
                 face_name = raw_fn
                 face_conf = float(getattr(matched_track, "identity_confidence", 0.85))
 
+        # Fallback to recent direct visual face recognition if track wasn't resolved or was anonymous
+        if not face_name:
+            rec_p = getattr(self, "_recognized_person", None)
+            rec_time = getattr(self, "_last_vision_faces_time", 0.0)
+            if rec_p and (now_mono - rec_time) < 4.0 and rec_p.get("is_known"):
+                raw_fn = rec_p.get("name", "")
+                if raw_fn and raw_fn.lower() != "misafir":
+                    face_name = raw_fn
+                    face_conf = float(rec_p.get("confidence", 0.85))
+
         # Check for cross-modal conflict:
         # e.g., Face is Baran, Voice is Oktay (both confirmed with confidence >= 0.45)
         if face_name and v_name and face_name.lower() != v_name.lower() and face_conf >= 0.45 and v_score >= 0.45:
@@ -11505,18 +11515,35 @@ class AstroRealtimeNode(Node):
             self._log_fusion_result(res)
             return res
 
-        # Case 2: Voice is UNKNOWN, but a known face is in view
-        # INVARIANT: An unknown voice must NEVER be attributed to a known face!
-        if not v_name and face_name:
-            self.get_logger().info(
-                f"👤 [Unknown Voice with Known Face]: Face '{face_name}' visible at track, but acoustic voice not verified -> Treating as Guest/Misafir."
-            )
+        # Case 2: Voice is unverified/unknown, but a known face is visually confirmed at the track
+        if not v_name and face_name and face_conf >= 0.38:
+            with self._lock:
+                self._recognized_speaker = {
+                    "name": face_name,
+                    "score": face_conf,
+                    "is_known": True,
+                    "confidence": face_conf,
+                    "source": "visual_face_verified",
+                }
+                self._active_person_name = face_name
+                self._person_hold_until = now_mono + 45.0
+                if matched_track:
+                    self._last_active_track_id = getattr(matched_track, "person_id", None)
+
+            # Bind visual identity to the physical track
+            if matched_track and not getattr(matched_track, "is_known", False):
+                matched_track.name = face_name
+                matched_track.is_known = True
+                matched_track.identity_confidence = face_conf
+                if getattr(self, "social_brain", None) and hasattr(self.social_brain, "world_model"):
+                    self.social_brain.world_model.update_people([matched_track])
+
             res = {
-                "name": "Misafir",
-                "speaker_name": None,
-                "confidence": 0.0,
-                "is_known": False,
-                "source": "unrecognized_voice_guest",
+                "name": face_name,
+                "speaker_name": face_name,
+                "confidence": face_conf,
+                "is_known": True,
+                "source": "visual_face_recognition",
                 "matched_track": matched_track,
                 "conflict": False,
                 "spatial_reason": spatial_reason,
@@ -11528,9 +11555,9 @@ class AstroRealtimeNode(Node):
                 "face_confidence": face_conf,
                 "voice_identity": None,
                 "voice_confidence": v_score,
-                "multimodal_identity": "Misafir (Guest)",
-                "active_speaker": "Misafir",
-                "identity_certainty": "UNKNOWN",
+                "multimodal_identity": face_name,
+                "active_speaker": face_name,
+                "identity_certainty": "KNOWN" if face_conf >= 0.60 else "PROBABLE",
                 "spatial_score": round(best_s_spatial, 2),
                 "depth_score": round(best_s_depth, 2),
                 "temporal_score": round(best_s_temporal, 2),
