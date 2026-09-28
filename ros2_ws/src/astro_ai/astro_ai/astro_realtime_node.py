@@ -2157,12 +2157,14 @@ class AstroRealtimeNode(Node):
         else:
             bio_status = (
                 f"\n[ŞU AN KONUŞAN KİŞİ]:\n"
-                f"- Misafir / Tanımlanmamış Konuşmacı.\n"
+                f"- Misafir / Henüz Tanımlanmamış Konuşmacı.\n"
                 f"{room_context}"
-                f"DAVRANIŞ KURALLARI:\n"
-                f"1. Karşındaki kişinin kimliği henüz biyometrik olarak doğrulanmadı.\n"
-                f"2. Kullanıcının sorusuna veya konusuna doğrudan ve doğal cevap ver.\n"
-                f"3. Gerçekte işlem yapmadıysan 'kaydını yaptım', 'işleme aldım', 'kaydettim' gibi sahte iddialarda kesinlikle bulunma.\n"
+                f"TANIŞMA VE KAYIT KURALLARI:\n"
+                f"1. Karşındaki kişi henüz sistemde kayıtlı değil (Misafir).\n"
+                f"2. Kullanıcı 'Ben Baran', 'Benim adım Ahmet', 'Bana Can de' diyerek kendini tanıttığında DERHAL 'enroll_user_biometrics' fonksiyonunu çağır ve kişiyi kaydet!\n"
+                f"3. Kullanıcı 'beni tanıdın mı?', 'ben kimim?' diye sorduğunda henüz tanışmadığınızı söyle ve adını sor ('Henüz tanışamadık, isminiz nedir?').\n"
+                f"4. Sohbet başlarken veya uygun bir anda sıcak bir şekilde 'Merhaba! Henüz tanışmadık, isminiz nedir?' diye sorabilirsin.\n"
+                f"5. ASLA kullanıcının adını tahmin etme veya başka biriyle karıştırma; adını kullanıcı kendisi söyleyene kadar Misafir olarak davran.\n"
             )
 
         recent_sessions = []
@@ -5675,6 +5677,12 @@ class AstroRealtimeNode(Node):
         except Exception as me:
             self.get_logger().warn(f"Memory update notice: {me}")
 
+        # 3. Synchronize to Website PostgreSQL Database
+        try:
+            self._save_person_to_postgres(name, formal_title, frame)
+        except Exception as dbe:
+            self.get_logger().warn(f"Postgres sync notice: {dbe}")
+
         if voice_ok and face_ok:
             msg = f"{name} ({formal_title}) başarıyla hem sesinden hem de yüzünden Astro'nun hafızasına kaydedildi!"
         elif voice_ok:
@@ -5691,6 +5699,61 @@ class AstroRealtimeNode(Node):
             "face_enrolled": face_ok,
             "message": msg
         }
+
+    def _save_person_to_postgres(self, name: str, formal_title: str, frame: Optional[np.ndarray]) -> bool:
+        """Persists newly enrolled person to website PostgreSQL database."""
+        try:
+            import psycopg2
+            import base64
+            import uuid
+
+            photo_b64 = None
+            if frame is not None and getattr(frame, "size", 0) > 0 and cv2 is not None:
+                ret, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
+                if ret:
+                    photo_b64 = "data:image/jpeg;base64," + base64.b64encode(buf).decode("utf-8")
+
+            conn = psycopg2.connect("postgres://astro:astro@127.0.0.1:5432/astro", connect_timeout=3)
+            cur = conn.cursor()
+
+            cur.execute("SELECT id, owner_user_id FROM devices LIMIT 1;")
+            row = cur.fetchone()
+            dev_id = row[0] if row else "af2ffc9a-10c8-4ed2-875e-1ed10b0c1e99"
+            owner_id = row[1] if row else "jbyJfCjP95XEs009yt3fq12x5qoBXSjR"
+
+            cur.execute("SELECT id FROM people WHERE lower(name) = lower(%s) LIMIT 1;", (name,))
+            existing = cur.fetchone()
+
+            p_role = "vip" if name.lower() == "baran" else "guest"
+            notes = f"{formal_title} - Robot tarafından ses ve yüz tanıma ile otonom kaydedildi."
+
+            if existing:
+                if photo_b64:
+                    cur.execute(
+                        "UPDATE people SET role = %s, notes = %s, photo_base64 = %s, updated_at = NOW() WHERE id = %s;",
+                        (p_role, notes, photo_b64, existing[0])
+                    )
+                else:
+                    cur.execute(
+                        "UPDATE people SET role = %s, notes = %s, updated_at = NOW() WHERE id = %s;",
+                        (p_role, notes, existing[0])
+                    )
+            else:
+                p_id = f"p_{uuid.uuid4().hex[:16]}"
+                cur.execute(
+                    "INSERT INTO people (id, device_id, owner_user_id, name, role, notes, photo_base64, created_at, updated_at) "
+                    "VALUES (%s, %s, %s, %s, %s, %s, %s, NOW(), NOW());",
+                    (p_id, dev_id, owner_id, name, p_role, notes, photo_b64)
+                )
+
+            conn.commit()
+            cur.close()
+            conn.close()
+            self.get_logger().info(f"💾 [PostgreSQL Sync]: '{name}' web veritabanına ('people' tablosu) başarıyla kaydedildi!")
+            return True
+        except Exception as e:
+            self.get_logger().warn(f"PostgreSQL sync notice: {e}")
+            return False
 
 
     def _inspect_camera_view(self, focus: str = "") -> Dict[str, Any]:

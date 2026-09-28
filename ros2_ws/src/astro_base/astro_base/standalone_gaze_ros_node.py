@@ -1035,6 +1035,9 @@ class StandaloneGazeRosNode(Node):
             def _worker(items, full_img):
                 try:
                     for face_roi, u_norm, det in items:
+                        # Skip face recognition on very small blurry crops (<55px) or extreme edges until gaze centers
+                        if getattr(det, "w", 0) < 55 or getattr(det, "h", 0) < 55 or u_norm < 0.08 or u_norm > 0.92:
+                            continue
                         raw_r = getattr(det, "raw_row", None)
                         name, conf, meta = self.face_recognizer.recognize_face(
                             face_roi,
@@ -1043,6 +1046,18 @@ class StandaloneGazeRosNode(Node):
                         )
                         now_log = time.monotonic()
                         if name:
+                            # Continual multi-vector enrichment when high confidence
+                            if conf and conf >= 0.55:
+                                try:
+                                    norm_p = self.face_recognizer._normalize_name(name)
+                                    cur_embs = self.face_recognizer._known_embeddings.get(norm_p, [])
+                                    if len(cur_embs) < 6:
+                                        live_emb = self.face_recognizer.extract_embedding(face_roi, full_frame=full_img, face_row=raw_r)
+                                        if live_emb is not None:
+                                            self.face_recognizer._known_embeddings.setdefault(norm_p, []).append(live_emb)
+                                except Exception:
+                                    pass
+
                             payload = {
                                 "name": name,
                                 "confidence": float(conf) if conf is not None else 0.85,
