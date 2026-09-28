@@ -103,7 +103,7 @@ fi
 # 3b. Next.js Site
 echo "  [+] Next.js Web Paneli başlatılıyor (:3000)..."
 cd "$DIR/apps/site"
-nohup node_modules/.bin/next dev --hostname 0.0.0.0 \
+nohup npx next dev -H 0.0.0.0 -p 3000 \
     > "$DIR/site.log" 2>&1 &
 SITE_PID=$!
 cd "$DIR"
