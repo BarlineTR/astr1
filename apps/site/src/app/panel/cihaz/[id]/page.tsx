@@ -3,6 +3,7 @@ import { notFound } from "next/navigation";
 import { CihazYonetimi } from "@/components/CihazYonetimi";
 import { Konsol } from "@/components/Konsol";
 import { cihazErisimi, komutVerebilir } from "@/db/sorgular/cihaz";
+import { PANEL_JETON_OMRU_MS, panelJetonuImzala } from "@/lib/cihaz-jeton";
 import { oturumGerekli } from "@/lib/oturum";
 import { sayfaMetadata } from "@/lib/seo";
 
@@ -33,6 +34,14 @@ export default async function CihazSayfasi({ params }: PageProps<"/panel/cihaz/[
     cihaz.pairingCodeHash && cihaz.pairingExpiresAt && cihaz.pairingExpiresAt > new Date(),
   );
 
+  const baslangicJetonu = panelJetonuImzala({
+    cihazId: erisim.cihaz.id,
+    kullaniciId: oturum.user.id,
+    komutVerebilir: komutVerebilir(erisim.yetki),
+    exp: Date.now() + PANEL_JETON_OMRU_MS,
+  });
+  const gecitUrl = process.env.NEXT_PUBLIC_GECIT_URL ?? "ws://192.168.1.111:8420";
+
   return (
     <>
       <div className="pano__baslik pano__baslik--eylemli">
@@ -43,7 +52,13 @@ export default async function CihazSayfasi({ params }: PageProps<"/panel/cihaz/[
         <span className="cihaz__durum">{DURUM_ADI[cihaz.status] ?? cihaz.status}</span>
       </div>
 
-      <Konsol mod="canli" cihazId={cihaz.id} komutVerebilir={komutVerebilir(yetki)} />
+      <Konsol
+        mod="canli"
+        cihazId={cihaz.id}
+        komutVerebilir={komutVerebilir(yetki)}
+        baslangicJetonu={baslangicJetonu}
+        gecitUrl={gecitUrl}
+      />
 
       {/* Yönetim yalnızca sahibe görünür: operatör cihazı kullanır, bağlamaz. */}
       {yetki === "sahip" && (

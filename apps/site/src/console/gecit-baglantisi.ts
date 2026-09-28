@@ -53,6 +53,10 @@ export const GECIKME_ESIGI_MS = 800;
 export function gecideBaglan(
   cihazId: string,
   olaylar: GecitOlaylari,
+  secenekler?: {
+    baslangicJetonu?: string;
+    gecitUrl?: string;
+  },
 ): GecitBaglantisi {
   let soket: WebSocket | null = null;
   let kapatildi = false;
@@ -72,24 +76,28 @@ export function gecideBaglan(
   void (async () => {
     olaylar.durum("yetkileniyor");
 
-    let token: string;
-    let gecitUrl: string;
-    try {
-      const yanit = await fetch("/api/panel/jeton", {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ cihazId }),
-      });
-      if (!yanit.ok) {
-        olaylar.durum("hata", "Bu cihaz için yetki alınamadı.");
+    let token: string = secenekler?.baslangicJetonu ?? "";
+    let gecitUrl: string = secenekler?.gecitUrl ?? "";
+
+    if (!token || !gecitUrl) {
+      try {
+        const yanit = await fetch("/api/panel/jeton", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ cihazId }),
+          signal: AbortSignal.timeout(6000),
+        });
+        if (!yanit.ok) {
+          olaylar.durum("hata", "Bu cihaz için yetki alınamadı.");
+          return;
+        }
+        const govde = (await yanit.json()) as { token: string; gecitUrl: string };
+        token = govde.token;
+        gecitUrl = govde.gecitUrl;
+      } catch {
+        olaylar.durum("hata", "Yetki sunucusuna ulaşılamadı.");
         return;
       }
-      const govde = (await yanit.json()) as { token: string; gecitUrl: string };
-      token = govde.token;
-      gecitUrl = govde.gecitUrl;
-    } catch {
-      olaylar.durum("hata", "Yetki sunucusuna ulaşılamadı.");
-      return;
     }
 
     if (kapatildi) return;

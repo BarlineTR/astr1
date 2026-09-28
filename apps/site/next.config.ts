@@ -27,6 +27,8 @@ const config: NextConfig = {
    * .../resources/ <dynamic>" ile düşüyor.
    */
   serverExternalPackages: ["iyzipay"],
+
+  allowedDevOrigins: ["192.168.1.111", "192.168.1.111:3000", "localhost:3000"],
 };
 
 export default config;

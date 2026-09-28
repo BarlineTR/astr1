@@ -36,7 +36,7 @@ echo "[2/4] Ortam değişkenleri ve ROS 2 kütüphaneleri yükleniyor..."
 export GATEWAY_SHARED_SECRET=gelistirme-gecit-sirri-uretimde-degistirin
 export DATABASE_URL=postgres://astro:astro@localhost:5432/astro
 export BETTER_AUTH_SECRET=gelistirme-icin-sabit-deger-uretimde-degistirin
-export BETTER_AUTH_URL=http://localhost:3000
+export BETTER_AUTH_URL=http://192.168.1.111:3000
 export NEXT_PUBLIC_GECIT_URL=ws://192.168.1.111:8420
 export NEXT_PUBLIC_SITE_URL=http://192.168.1.111:3000
 export NEXT_TELEMETRY_DISABLED=1

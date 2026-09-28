@@ -6,6 +6,7 @@ import {
   PANEL_JETON_OMRU_MS,
   panelJetonuImzala,
 } from "@/lib/cihaz-jeton";
+import { auth } from "@/lib/auth";
 import { oturumAl } from "@/lib/oturum";
 
 const govdeSchema = z.object({ cihazId: z.string().min(1).max(64) });
@@ -18,7 +19,7 @@ const govdeSchema = z.object({ cihazId: z.string().min(1).max(64) });
  * bağlantı kurulumu için — kurulan bağlantı jeton dolunca kopmuyor.
  */
 export async function POST(istek: Request) {
-  const oturum = await oturumAl();
+  const oturum = (await auth.api.getSession({ headers: istek.headers })) ?? (await oturumAl());
   if (!oturum) return NextResponse.json({ ok: false }, { status: 401 });
 
   const cozulmus = govdeSchema.safeParse(await istek.json().catch(() => null));

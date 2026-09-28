@@ -41,10 +41,14 @@ export function Konsol({
   mod,
   cihazId,
   komutVerebilir: baslangicYetkisi = true,
+  baslangicJetonu,
+  gecitUrl: baslangicGecitUrl,
 }: {
   mod: "demo" | "canli";
   cihazId?: string;
   komutVerebilir?: boolean;
+  baslangicJetonu?: string;
+  gecitUrl?: string;
 }) {
   const stageRef = useRef<HTMLDivElement>(null);
   const uygulaRef = useRef<
@@ -143,28 +147,35 @@ export function Konsol({
 
     if (!cihazId) return;
 
-    const gecit = gecideBaglan(cihazId, {
-      durum: (d, a) => {
-        setDurum(d);
-        setAyrinti(a);
+    const gecit = gecideBaglan(
+      cihazId,
+      {
+        durum: (d, a) => {
+          setDurum(d);
+          setAyrinti(a);
+        },
+        telemetri: (t, g) => {
+          setTelemetri(t);
+          setGecikme(g);
+          setEStop(t.safety.eStop);
+          sahneyeUygula(t);
+        },
+        cihazDurumu: (bagli, gorulme, fw) => {
+          setRobotBagli(bagli);
+          setSonGorulme(gorulme);
+          setFirmware(fw);
+        },
+        onay: (_komutId, kabul, neden) => {
+          setSonOnay(kabul ? "Komut uygulandı." : `Komut reddedildi: ${neden ?? "—"}`);
+        },
+        cerceve: cerceveEkle,
+        yetki: setKomutVerebilir,
       },
-      telemetri: (t, g) => {
-        setTelemetri(t);
-        setGecikme(g);
-        setEStop(t.safety.eStop);
-        sahneyeUygula(t);
+      {
+        baslangicJetonu,
+        gecitUrl: baslangicGecitUrl,
       },
-      cihazDurumu: (bagli, gorulme, fw) => {
-        setRobotBagli(bagli);
-        setSonGorulme(gorulme);
-        setFirmware(fw);
-      },
-      onay: (_komutId, kabul, neden) => {
-        setSonOnay(kabul ? "Komut uygulandı." : `Komut reddedildi: ${neden ?? "—"}`);
-      },
-      cerceve: cerceveEkle,
-      yetki: setKomutVerebilir,
-    });
+    );
 
     gecitRef.current = gecit;
 
@@ -173,7 +184,7 @@ export function Konsol({
       gecit.kapat();
       gecitRef.current = null;
     };
-  }, [mod, cihazId, cerceveEkle, sahneyeUygula]);
+  }, [mod, cihazId, cerceveEkle, sahneyeUygula, baslangicJetonu, baslangicGecitUrl]);
 
   const gecikmeYuksek = gecikme !== null && gecikme > GECIKME_ESIGI_MS;
   /*
