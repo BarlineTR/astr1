@@ -6109,11 +6109,23 @@ class AstroRealtimeNode(Node):
         )
 
         self_score = stt_meta.get("self_voice_score", 0.0)
-        if not validated_text or is_pb or is_cd or self_score >= 0.35:
+        stt_rejected = stt_meta.get("stt_rejected", True)
+
+        # Barge-in wake: STT doğrulamasını geçtiyse (stt_rejected=False) ve self_voice_score çok düşükse
+        # playback_active bile olsa wake word'ü işle (kullanıcı robot konuşurken uyandırabilsin)
+        barge_in_wake_ok = (
+            not stt_rejected
+            and self_score < 0.15
+            and peak_val >= 3000
+            and total_rms >= 800.0
+        )
+
+        if not validated_text or self_score >= 0.35 or (not barge_in_wake_ok and (is_pb or is_cd)):
             reject_r = stt_meta.get("stt_reject_reason") or ("playback_active" if is_pb else "echo_cooldown" if is_cd else "self_voice")
             self.get_logger().info(
                 f"⚡ [Wake Telemetry]: wake_detector_active=True | wake_candidate=\"{transcript}\" | "
                 f"stt_rejected=True | stt_reject_reason={reject_r} | self_voice_score={self_score} | "
+                f"barge_in_wake_ok={barge_in_wake_ok} | "
                 f"wake_rejected=True | conversation_turn_created=False | llm_started=False | tts_started=False"
             )
             return
