@@ -8396,11 +8396,11 @@ class AstroRealtimeNode(Node):
                 local_vad_conf = round(min(1.0, speech_frames_cnt / float(tot_frames_cnt)), 2)
                 t_vad_end = time.monotonic()
 
-                # Discard immediately if audio has no genuine acoustic speech evidence (0 STT calls)
-                if local_speech_ms < 90 or pcm_rms < max(200.0, self._ambient_rms * 1.15) or local_vad_conf < 0.15:
+                # Discard immediately if audio has no genuine acoustic speech evidence (< 0.60 VAD gate -> 0 STT calls)
+                if local_speech_ms < 360 or pcm_rms < max(320.0, self._ambient_rms * 1.25) or local_vad_conf < 0.60:
                     self.no_speech_rejection_count += 1
-                    self.get_logger().debug(
-                        f"🔇 [VAD Gate Dropped Buffer (0 STT Calls)]: speech_ms={local_speech_ms} | rms={pcm_rms:.1f} | vad_conf={local_vad_conf:.2f}"
+                    self.get_logger().info(
+                        f"🔇 [VAD Gate Dropped Buffer (0 STT Calls)]: speech_ms={local_speech_ms} | rms={pcm_rms:.1f} | vad_conf={local_vad_conf:.2f} (< 0.60 gate)"
                     )
                     return
 
@@ -10587,6 +10587,8 @@ class AstroRealtimeNode(Node):
         raw_16k: bytes = b""
         local_rms: float = 0.0
         peak_val: int = 0
+        raw_mics_rms: Optional[float] = None
+        ch5_rms: Optional[float] = None
         try:
             if isinstance(msg, (bytes, bytearray)):
                 raw_bytes = bytes(msg)
@@ -10597,6 +10599,8 @@ class AstroRealtimeNode(Node):
                 if raw_str.startswith("{") and raw_str.endswith("}"):
                     data_dict = json.loads(raw_str)
                     b64_audio = data_dict.get("data", "")
+                    raw_mics_rms = data_dict.get("raw_mics_rms")
+                    ch5_rms = data_dict.get("ch5_rms")
                     raw_bytes = base64.b64decode(b64_audio.encode("ascii")) if b64_audio else b""
                 else:
                     raw_bytes = base64.b64decode(raw_str.encode("ascii"))
@@ -10715,7 +10719,14 @@ class AstroRealtimeNode(Node):
 
             curr_gen_id = getattr(self, "_fallback_generation_id", 0)
             is_vad_active = bool(getattr(self, "_vad_active", False) or getattr(self, "_user_speaking_active", False))
-            vad_confidence = float(getattr(self, "_vad_confidence", 1.0 if is_vad_active else 0.0))
+            ambient_val = float(getattr(self, "_ambient_rms", 120.0))
+            target_barge_in_rms = max(350.0, ambient_val * 1.35)
+            target_barge_in_peak = 750
+
+            # Acoustic voice presence evidence: high energy with low correlation to robot's own playback
+            is_acoustic_voice = (local_rms >= target_barge_in_rms and peak_val >= target_barge_in_peak and self_voice_score < 0.22)
+            effective_vad_active = is_vad_active or is_acoustic_voice
+            vad_confidence = float(getattr(self, "_vad_confidence", 1.0 if effective_vad_active else 0.0))
 
             # 2. Self-Voice Filter (Acoustic Echo Suppression)
             # If incoming audio correlates with what Astro is playing through the speaker, it is robot self-voice!
@@ -10742,12 +10753,6 @@ class AstroRealtimeNode(Node):
                             self._fallback_audio_buffer.clear()
                 return
 
-            # Target barge-in threshold: With ReSpeaker Hardware AEC on Channel 0,
-            # natural user voice easily exceeds ambient noise floor.
-            ambient_val = float(getattr(self, "_ambient_rms", 120.0))
-            target_barge_in_rms = max(300.0, ambient_val * 1.35)
-            target_barge_in_peak = 650
-
             # 3. Energy threshold check
             is_loud = (local_rms >= target_barge_in_rms and peak_val >= target_barge_in_peak)
             if is_loud:
@@ -10760,10 +10765,10 @@ class AstroRealtimeNode(Node):
 
             # 4. Strict Barge-In Decision Invariant:
             # During playback, acoustic echo enters the mic.
-            # INVARIANT: If vad_confidence <= 0.05 or not is_vad_active:
+            # INVARIANT: If effective_vad_active is False or vad_confidence <= 0.05:
             # High RMS/peak alone NEVER constitutes human speech.
             # MUST strictly enforce speech_confirmed=false and decision=false.
-            if not is_vad_active or vad_confidence <= 0.05:
+            if not effective_vad_active or vad_confidence <= 0.05:
                 self._barge_in_consecutive_frames = 0
                 if is_loud:
                     self.get_logger().debug(
@@ -10924,28 +10929,63 @@ class AstroRealtimeNode(Node):
         # --- 0-Cost Fallback Mode / OpenAI Chat Mode (STT + LLM + Edge-TTS) ---
         is_ws_connected = (self._is_connected or self.realtime_connection_state == "CONNECTED")
         if self._fallback_mode or getattr(self, "use_4o", False) or not self._can_use_openai("realtime") or not is_ws_connected or self._ws is None:
-            # HARDWARE PLAYBACK LEAKAGE & ECHO GATE (Self-Voice Killer):
-            # If robot is actively speaking, actively preparing response (TTS synthesis/LLM),
-            # or in post-playback acoustic echo cooldown,
-            # strictly purge and reject buffering audio frames into fallback buffer.
-            echo_cooldown_limit = float(getattr(self, "echo_mute_cooldown_s", 1.2))
+            # 1. Hardware playback state: Barge-in logic above manages playback cancellation.
+            # While audio is actively playing through the speaker, do not buffer speech unless barge-in latched.
+            if self._is_playback_active:
+                if not self._barge_in_latched:
+                    return
+
+            # 2. Residual echo cooldown: strictly ignore acoustic leakage in the measured 150ms tail.
+            echo_cooldown_limit = float(getattr(self, "echo_mute_cooldown_s", 0.150))
             is_echo_cooldown = (now - getattr(self, "_playback_end_time", 0.0)) < echo_cooldown_limit
-            is_robot_busy = bool(
-                self._is_playback_active
-                or getattr(self, "_is_responding", False)
-                or getattr(self, "_is_processing_fallback", False)
-                or is_echo_cooldown
-            )
-            if is_robot_busy:
-                with self._lock:
-                    if self._fallback_speaking or self._fallback_audio_buffer:
-                        self._fallback_speaking = False
-                        self._fallback_audio_buffer.clear()
+            if is_echo_cooldown and not self._barge_in_latched:
                 return
+
+            # 3. Thinking / Inference Cancellation (Cancel & Restart):
+            # If the robot is thinking (LLM inference in-flight) and user speaks intentionally,
+            # cancel previous inference atomically and restart a fresh turn.
+            is_thinking = bool(getattr(self, "_is_responding", False) or getattr(self, "_is_processing_fallback", False))
+            if is_thinking:
+                speech_interrupt_cond = (local_rms > max(450.0, self._ambient_rms * 1.5) and peak_val > 1200)
+                if speech_interrupt_cond:
+                    self.get_logger().info("⚡ [THINKING CANCEL & RESTART] Kullanıcı robot düşünürken konuştu; eski çıkarım iptal ediliyor.")
+                    old_gid = getattr(self, "_fallback_generation_id", 0)
+                    self._fallback_generation_id = old_gid + 1
+                    if not hasattr(self, "_cancelled_generation_ids"):
+                        self._cancelled_generation_ids = set()
+                    self._cancelled_generation_ids.add(old_gid)
+
+                    # Realtime WebSocket cancel if active streaming
+                    if getattr(self, "active_response_state", None) in ("STREAMING", "RESPONSE_STREAMING"):
+                        self.active_response_state = "CANCELLED"
+                        ws = getattr(self, "_ws", None)
+                        loop = getattr(self, "_loop", None)
+                        if ws is not None:
+                            try:
+                                if loop is not None:
+                                    asyncio.run_coroutine_threadsafe(ws.send(json.dumps({"type": "response.cancel"})), loop)
+                            except Exception:
+                                pass
+
+                    if getattr(self, "output_manager", None):
+                        self.output_manager.interrupt(self._fallback_generation_id)
+
+                    self._is_responding = False
+                    self._is_processing_fallback = False
+                    self._fallback_speaking = True
+                    self._fallback_speech_start = now
+                    self._last_speech_time = now
+                    with self._lock:
+                        self._fallback_audio_buffer = [raw_16k]
+                    return
+                else:
+                    return
 
             if raw_16k:
                 try:
-                    speech_start_condition = (local_rms > max(280.0, self._ambient_rms * 1.25) and peak_val > 650)
+                    # Speech start condition requires clear voice energy above ambient + raw mic confirmation (if multi-ch)
+                    has_raw_mic_speech = (raw_mics_rms is None) or (raw_mics_rms >= 180.0)
+                    speech_start_condition = (local_rms > max(340.0, self._ambient_rms * 1.35) and peak_val > 850 and has_raw_mic_speech)
                     buf_to_proc = None
                     with self._lock:
                         if speech_start_condition:
@@ -10962,7 +11002,8 @@ class AstroRealtimeNode(Node):
                             # Silence timeout (0.75s after speech ends)
                             if (now - self._last_speech_time) > 0.75:
                                 self._fallback_speaking = False
-                                if len(self._fallback_audio_buffer) >= 12 and not self._is_processing_fallback:
+                                # Enforce minimum 18 frames (360ms) of sustained audio to prevent short ambient clicks / "Astro." hallucinations
+                                if len(self._fallback_audio_buffer) >= 18 and not self._is_processing_fallback:
                                     buf_to_proc = list(self._fallback_audio_buffer)
                                     self._fallback_audio_buffer.clear()
                                 else:
@@ -10981,10 +11022,14 @@ class AstroRealtimeNode(Node):
                         total_chunks = max(1, len(arr_fb) // chunk_sz)
                         speech_ratio = loud_cnt / float(total_chunks)
 
-                        if fb_rms >= max(260.0, self._ambient_rms * 1.20) and loud_cnt >= 5 and speech_ratio >= 0.15:
+                        # Strict Pre-STT Gate: Require >= 18 loud frames and >= 0.60 VAD speech ratio
+                        if fb_rms >= max(320.0, self._ambient_rms * 1.25) and loud_cnt >= 18 and speech_ratio >= 0.60:
                             threading.Thread(target=self._process_fallback_turn, args=(buf_to_proc,), daemon=True).start()
                         else:
                             self.no_speech_rejection_count += 1
+                            self.get_logger().info(
+                                f"🔇 [Pre-STT Gate Rejected Noise]: fb_rms={fb_rms:.1f} | loud_cnt={loud_cnt} | speech_ratio={speech_ratio:.2f} (< 0.60)"
+                            )
                 except Exception as _exc:
                     self.get_logger().warning(f"[_on_input_pcm fallback error]: {_exc}")
             return
@@ -12054,15 +12099,11 @@ class AstroRealtimeNode(Node):
             user_source = "session_hold"
             bio_status = "session_active"
             is_known = True
-        elif owner_name and owner_name.lower() != "misafir":
-            user_name = owner_name
-            user_source = "persistent_memory"
-            bio_status = "unknown"
-            is_known = True
         else:
+            # Unidentified person: NEVER assume owner without biometric/session verification!
             user_name = "Misafir"
-            user_source = "guest_fallback"
-            bio_status = "unknown"
+            user_source = "guest_unidentified"
+            bio_status = "unverified"
             is_known = False
 
         certainty_val = cert.value if hasattr(cert, "value") else str(cert)

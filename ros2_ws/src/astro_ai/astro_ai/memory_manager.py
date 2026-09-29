@@ -202,7 +202,10 @@ class PersistentProfile:
     def _sanitize(self):
         # Guarantee core identity
         self.data["robot_name"] = "Astro"
-        self.data["owner_name"] = "Baran"
+        saved_owner = self.data.get("owner_name", "").strip()
+        env_owner = os.getenv("ASTRO_OWNER_NAME", "").strip()
+        if not saved_owner:
+            self.data["owner_name"] = env_owner or "Baran"
 
         # Filter unverified gossip from verified_facts
         clean_facts = []
@@ -212,10 +215,11 @@ class PersistentProfile:
                 continue
             clean_facts.append(fact)
 
+        owner_name = self.data.get("owner_name", "Baran")
         if not clean_facts:
             clean_facts = [
                 "Senin adın Astro, sen akıllı, bağımsız ve interaktif bir sosyal robot asistansın.",
-                "Robotun geliştiricisinin ve üreticisinin adı Baran."
+                f"Robotun geliştiricisinin ve üreticisinin adı {owner_name}."
             ]
         self.data["verified_facts"] = clean_facts
 

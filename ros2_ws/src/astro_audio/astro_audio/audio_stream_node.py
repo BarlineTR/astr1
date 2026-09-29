@@ -950,6 +950,17 @@ class AudioStreamNode(Node):
                     hid_conf_msg.data = float(conf)
                     self.pub_doa_confidence.publish(hid_conf_msg)
 
+            # Calculate raw mic RMS across physical channels 1..4 (bypasses XMOS AGC on Ch0)
+            raw_mics_rms = 0.0
+            ch5_rms = 0.0
+            if multi_ch is not None and multi_ch.shape[0] >= 5:
+                raw_mics = multi_ch[1:5].astype(np.float32)
+                raw_mics_rms = float(np.sqrt(np.mean(raw_mics ** 2)))
+                if multi_ch.shape[0] >= 6:
+                    ch5_rms = float(np.sqrt(np.mean(multi_ch[5].astype(np.float32) ** 2)))
+            else:
+                raw_mics_rms = rms
+
             # Hardware AEC Barge-In & Energy Gate (ReSpeaker DSP handles AEC on Channel 0):
             if is_active_playback:
                 # Ignore brief DAC startup click transient (<= 60ms)
@@ -958,9 +969,9 @@ class AudioStreamNode(Node):
                     return
 
                 # With ReSpeaker Hardware AEC on Channel 0, robot playback is cancelled in DSP.
-                # User voice during playback only needs genuine speech energy above ambient floor.
+                # User voice during playback requires genuine acoustic energy on raw mics and Ch0
                 barge_rms_thresh = max(250.0, self._ambient_rms * 1.3)
-                is_genuine_barge_in = (rms >= barge_rms_thresh and peak >= 600)
+                is_genuine_barge_in = (rms >= barge_rms_thresh and peak >= 600 and (raw_mics_rms >= 180.0 or multi_ch is None))
                 if not is_genuine_barge_in:
                     return
 
@@ -972,10 +983,17 @@ class AudioStreamNode(Node):
             # Resample 16kHz -> 24kHz for OpenAI Realtime API (Channel 0 / Front Speech)
             pcm_24k = resample_16k_to_24k(mono_raw_bytes)
 
-            # Encode to base64 and publish to ROS 2 topic
+            # Encode to base64 and wrap with acoustic telemetry
             b64_str = base64.b64encode(pcm_24k).decode("ascii")
             msg = String()
-            msg.data = b64_str
+            payload = {
+                "data": b64_str,
+                "ch0_rms": float(rms),
+                "raw_mics_rms": float(raw_mics_rms),
+                "ch5_rms": float(ch5_rms),
+                "peak": int(peak),
+            }
+            msg.data = json.dumps(payload)
             self.pub_input_pcm.publish(msg)
         except Exception as exc:
             self._callback_exception_count += 1
