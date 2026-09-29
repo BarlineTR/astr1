@@ -2113,19 +2113,16 @@ class AstroRealtimeNode(Node):
         is_known = identity.get("is_known", False) and identity.get("name", "Misafir").lower() != "misafir"
         name_val = identity.get("name", "Misafir")
         if not is_known or name_val.lower() == "misafir":
-            # Default persistent creator/owner grounding (Baran)
-            held = getattr(self, "_active_person_name", "")
-            eff_name = held if (held and held.lower() != "misafir") else "Baran"
-            identity["name"] = eff_name
-            identity["display_name"] = eff_name
-            identity["title"] = f"{eff_name} Bey" if eff_name == "Baran" else eff_name
-            identity["formal_title"] = f"{eff_name} Bey" if eff_name == "Baran" else eff_name
-            identity["is_known"] = True
-            identity["confidence"] = 0.90
-            identity["identity_source"] = "creator_owner_grounding"
-            identity["biometric_status"] = "verified"
-            is_known = True
-            name_val = eff_name
+            identity["name"] = "Misafir"
+            identity["display_name"] = "Misafir"
+            identity["title"] = "Misafir"
+            identity["formal_title"] = "Misafir"
+            identity["is_known"] = False
+            identity["confidence"] = 0.0
+            identity["identity_source"] = "unidentified_guest"
+            identity["biometric_status"] = "unknown"
+            is_known = False
+            name_val = "Misafir"
         conf_pct = int(identity.get("confidence", identity.get("score", 0.0)) * 100)
         source_str = identity.get("source", "perception")
 
@@ -2210,9 +2207,15 @@ class AstroRealtimeNode(Node):
         )
 
         realtime_speech_rule = (
-            "\n\n[CANLI SESLİ DİYALOG, HIZ VE BEDEN KONTROLÜ]:\n"
-            "- Sen canlı sesle konuşan ve hareket edebilen fiziksel bir robotsun.\n"
-            "- CEVAP HIZI: Yanıtların DAİMA çok kısa, net ve tek nefeste söylenebilir olsun (genellikle 1-2 kısa cümle, en fazla 15 kelime). Asla vaaz verme, uzun paragraflar ve monologlar kurma; bir insan gibi hızlı ve doğal konuş.\n"
+            "\n\n[FİZİKSEL ROBOT VE CANLI SESLİ DİYALOG KURALLARI]:\n"
+            "- Sen tekerlekli, dönen kafalı, kameralı ve mikrofonlu fiziksel bir sosyal robotsun (Astro). Sanal bir ChatGPT veya metin chatbot'u DEĞİLSİN!\n"
+            "- KESİN VE ZORUNLU CEVAP UZUNLUĞU:\n"
+            "  * Günlük ve genel sohbette: En fazla 1-3 kısa cümle (en fazla 20 kelime).\n"
+            "  * Basit sorularda ('Astro nasılsın?', 'Bugün hava nasıl?', 'Şu an ne yapıyorsun?', 'Saat kaç?'): KESİNLİKLE TEK CÜMLE!\n"
+            "- YASAK DAVRANIŞLAR (ANTI-CHATGPT):\n"
+            "  * Asla 'Harika bir soru!', 'Size yardımcı olmaktan memnuniyet duyarım', 'Tabii ki!', 'Elbette!' gibi yapay zeka klişeleri KULLANMA!\n"
+            "  * Asla madde işaretli liste yapma, vaaz verme, uzun paragraflar ve monologlar kurma.\n"
+            "  * Kullanıcı kimliğini sormadıkça veya sohbet gerektirmedikçe kendini tanıtma; bir insan gibi doğrudan ve lafı dolandırmadan konuş.\n"
             "- KAFA VE BAKIŞ KONTROLÜ: Kullanıcı 'sağa bak', 'başını sağa döndür', 'konuşan kişi sağında/solunda', 'önüne bak', 'merkeze dön' dediğinde veya başka yöne bakmanı istediğinde tereddüt etmeden 'set_head_angle' fonksiyonunu çağır! Sağ yön için negatif açı (örn: -30°), sol yön için pozitif açı (örn: +30°), merkez/ön için 0° kullan.\n"
         )
 
@@ -2525,6 +2528,8 @@ class AstroRealtimeNode(Node):
             "session": {
                 "type": "realtime",
                 "instructions": system_prompt,
+                "temperature": 0.65,
+                "max_response_output_tokens": int(os.getenv("REALTIME_MAX_OUTPUT_TOKENS", "75")),
                 "audio": {
                     "input": {
                         "transcription": {
@@ -3001,10 +3006,23 @@ class AstroRealtimeNode(Node):
         self.active_generation_id = counter
         self.realtime_current_generation_id = counter
 
+        # Build complete grounded turn prompt so OpenAI Realtime does NOT drop persona, physical embodiment or brevity
+        full_turn_prompt = self._build_current_system_prompt(active_speaker=identity, explicit_user_turn=True)
+        turn_combined_instructions = (
+            f"{full_turn_prompt}\n\n"
+            f"[DÖNEMSEL MUHATAP VE MEKÂN BAĞLAMI]:\n{per_turn_instructions}\n\n"
+            f"[ZORUNLU CEVAP SINIRI VE TAVIR]:\n"
+            f"- Sen fiziksel Astro robotsun. Doğrudan ve canlı Türkçe konuş.\n"
+            f"- KESİNLİKLE 1-3 kısa cümleyle cevap ver (en fazla 20 kelime). Basit sorularda KESİNLİKLE TEK CÜMLE söyle.\n"
+            f"- Asla ChatGPT gibi 'Harika bir soru', 'Nasıl yardımcı olabilirim' gibi yapay zeka klişeleri veya madde madde liste KULLANMA!"
+        )
+
         resp_event = {
             "type": "response.create",
             "response": {
-                "instructions": per_turn_instructions
+                "instructions": turn_combined_instructions,
+                "max_output_tokens": int(os.getenv("REALTIME_MAX_OUTPUT_TOKENS", "75")),
+                "temperature": 0.65,
             }
         }
         if ws is not None:
@@ -8329,11 +8347,18 @@ class AstroRealtimeNode(Node):
         self._speech_authorization = None
         self._barge_in_latched = False  # Reset single logical barge-in debounce for new turn
         t_turn_start = time.monotonic()
+        t_vad_start = t_turn_start
+        t_vad_end = t_turn_start
         t_stt_finished = t_turn_start
+        stt_ms = 0.0
+        int_res_ms = 0.0
         t_tts_request_started = 0.0
         t_tts_first_audio = 0.0
         t_playback_started = 0.0
         tts_ttfa_ms = 0.0
+        ttfa_ms = 0.0
+        dur_synth_ms = 0.0
+        e2e_ms = 0.0
         end_to_end_first_audio_ms = 0.0
         chosen_model = "none"
         chosen_provider = "none"
@@ -8613,14 +8638,12 @@ class AstroRealtimeNode(Node):
                     active_speaker_dict["formal_title"] = res_id.get("formal_title", "Baran Bey")
                     active_speaker_dict["source"] = res_id.get("identity_source", "persistent_grounding")
                 else:
-                    held = getattr(self, "_active_person_name", "")
-                    target_name = held if (held and held.lower() != "misafir") else "Baran"
-                    active_speaker_dict["name"] = target_name
-                    active_speaker_dict["speaker_name"] = target_name
-                    active_speaker_dict["is_known"] = True
-                    active_speaker_dict["confidence"] = 0.90
-                    active_speaker_dict["formal_title"] = f"{target_name} Bey" if target_name == "Baran" else target_name
-                    active_speaker_dict["source"] = "creator_owner_grounding"
+                    active_speaker_dict["name"] = "Misafir"
+                    active_speaker_dict["speaker_name"] = "Misafir"
+                    active_speaker_dict["is_known"] = False
+                    active_speaker_dict["confidence"] = 0.0
+                    active_speaker_dict["formal_title"] = "Misafir"
+                    active_speaker_dict["source"] = "unidentified_guest"
 
             spk_name = active_speaker_dict.get("speaker_name")
             spk_score = float(active_speaker_dict.get("confidence", 0.0))
@@ -12372,9 +12395,58 @@ class AstroRealtimeNode(Node):
 
             # 4. Publish /astro/telemetry (JSON)
             if getattr(self, "pub_telemetry", None):
+                ident = self.resolve_identities() if hasattr(self, "resolve_identities") else {}
+                r_state = getattr(self.state_machine, "state", "IDLE") if hasattr(self, "state_machine") else "IDLE"
+                if isinstance(r_state, object) and hasattr(r_state, "name"):
+                    r_state = r_state.name
+                elif isinstance(r_state, object) and hasattr(r_state, "value"):
+                    r_state = str(r_state.value)
+                else:
+                    r_state = str(r_state)
+
+                if self.is_robot_speaking():
+                    r_state = "SPEAKING"
+                elif getattr(self, "_is_responding", False):
+                    r_state = "THINKING"
+                elif getattr(self, "_is_sleeping", False):
+                    r_state = "SLEEPING"
+
                 telem_payload = {
                     "timestamp": time.time(),
-                    "voice_mode": "local" if not getattr(self, "use_realtime", True) else "realtime",
+                    "robot_state": r_state,
+                    "voice_mode": "4o" if getattr(self, "use_4o", False) else ("realtime" if getattr(self, "use_realtime", True) else "local"),
+                    "is_speaking": bool(self.is_robot_speaking()),
+                    "is_sleeping": bool(getattr(self, "_is_sleeping", False)),
+                    "conversation": {
+                        "model": "gpt-4o-mini" if getattr(self, "use_4o", False) else ("gpt-realtime-2.1-mini" if getattr(self, "use_realtime", True) else "local_gemma"),
+                        "mode": "4o" if getattr(self, "use_4o", False) else ("realtime" if getattr(self, "use_realtime", True) else "local"),
+                        "last_user_utterance": str(getattr(self, "_last_user_transcript", "") or ""),
+                        "last_assistant_response": str(getattr(self, "_last_robot_reply", "") or ""),
+                        "llm_provider": str(getattr(self, "_last_llm_provider", "openai")),
+                        "tts_provider": str(getattr(self, "_last_tts_provider", "realtime" if getattr(self, "use_realtime", True) else "edge_tts")),
+                    },
+                    "identity": {
+                        "name": str(ident.get("name", "Misafir")),
+                        "display_name": str(ident.get("display_name", ident.get("name", "Misafir"))),
+                        "is_known": bool(ident.get("is_known", False)),
+                        "biometric_status": str(ident.get("biometric_status", "unknown")),
+                        "identity_source": str(ident.get("identity_source", "guest")),
+                        "confidence": float(ident.get("confidence", 0.0)),
+                        "active_speaker": active_p,
+                    },
+                    "head": {
+                        "actual_yaw_deg": float(getattr(self, "_current_head_yaw", 0.0)),
+                        "target_yaw_deg": float(getattr(self, "_target_head_yaw", 0.0)),
+                    },
+                    "audio": {
+                        "vad": bool(getattr(self, "_last_vad", False)),
+                        "vad_confidence": float(getattr(self, "_last_vad_confidence", 0.0)),
+                        "mic_rms": float(getattr(self, "_last_audio_rms", 0.0)),
+                        "ambient_rms": float(getattr(self, "_ambient_noise_rms", 0.0)),
+                        "self_voice_score": float(getattr(self, "_last_self_voice_score", 0.0)),
+                        "playback_active": bool(self.is_robot_speaking()),
+                        "barge_in": bool(getattr(self, "_barge_in_latched", False)),
+                    },
                     "latency": {
                         "p50_total_ms": p50_ms,
                         "p95_total_ms": p95_ms,
@@ -12391,7 +12463,7 @@ class AstroRealtimeNode(Node):
                     "realtime_ws": {
                         "connected": ws_conn,
                         "state": ws_state,
-                        "mode": "local" if not getattr(self, "use_realtime", True) else "realtime",
+                        "mode": "4o" if getattr(self, "use_4o", False) else ("realtime" if getattr(self, "use_realtime", True) else "local"),
                     },
                     "social_state": {
                         "active_person": active_p,

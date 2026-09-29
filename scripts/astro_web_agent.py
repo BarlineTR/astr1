@@ -1,47 +1,62 @@
 #!/usr/bin/env python3
-"""ASTRO V1 — Resmi Robot Ağ Geçidi İstemcisi ve Web Köprüsü.
+"""ASTRO V1 — Resmi Robot Ağ Geçidi İstemcisi, Canlı Kamera ve Bilinç Telemetri Dashboard'u.
 
-Bu ajan, fiziksel robotunuzun (ROS 2 / Python / Arduino) web kontrol paneline
-bağlanmasını sağlar.
+Bu servis iki temel görevi birlikte yürütür:
+1. ASTRO BİLİNÇ VE TELEMETRİ DASHBOARD'U (Port 8080):
+   - OAK-D RGB / Yüz kamerasından gerçek zamanlı, ultra düşük gecikmeli MJPEG canlı video akışı.
+   - Kamera kopsa bile bağlantıyı düşürmeyen akıllı standby / reconnect fallback mekanizması.
+   - Görsel Takip (Visual Tracking): Yüz kutuları (bbox), tanınan isimler, güven skoru, kişi sayısı, mesafe.
+   - Biyometrik Kimlik (Identity): Verified/unverified, aktif konuşmacı, kimlik kaynağı, tanınma skoru.
+   - Robot Durumu: State machine (IDLE, LISTENING, THINKING, SPEAKING, TRACKING), kafa açıları (hedef vs gerçek).
+   - Ses / Konuşma Telemetrisi: Canlı RMS seviyesi, VAD durumu/güveni, barge-in durumu, self-voice skoru, DoA açısı.
+   - AI / Diyalog Durumu: Model (4o-mini / Realtime), son kullanıcı cümlesi, robot cevabı, gecikme metrikleri (TTFT, TTFA, E2E).
+   - Canlı Olay Akışı (Event Stream): Zaman damgalı olay kaydı (WAKE, RECOG, BARGE-IN, STATE).
 
-Mimari (docs/BAGLANTI.md):
-  Robot (bu ajan)  ──(dışa doğru WSS)──>  Ağ Geçidi (Fastify: 8420)  <──  Müşteri Paneli (Next.js: 3000)
-       │
-       ▼
-   ROS 2 Hub (rclpy)
-     ├── /head/state               (astro_base/msg/HeadState)
-     ├── /head/command, /head/cmd_pos (astro_base/msg/HeadCmd, std_msgs/msg/Float32)
-     ├── /audio/doa, /audio/vad    (std_msgs/msg/Float32, Bool)
-     ├── /vision/faces             (std_msgs/msg/String JSON)
-     ├── /safety/emergency_stop    (std_msgs/msg/Bool)
-     └── /astro/config_update      (std_msgs/msg/String JSON)
+2. RESMİ WEB KÖPRÜSÜ (Fastify Gateway: 8420 & Next.js: 3000):
+   - Fastify Ağ Geçidi ile WebSocket telemetri köprüsü kurar.
+   - Web panelinden gelen kafa hedef açısı, e-stop ve yapılandırma güncellemelerini ROS 2'ye iletir.
 """
 
 import argparse
 import asyncio
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import math
 import os
+from pathlib import Path
 import sys
 import threading
 import time
-from pathlib import Path
 import urllib.error
 import urllib.request
+from typing import Any, Dict, List, Optional
+
+try:
+    import cv2
+    import numpy as np
+    HAVE_CV2 = True
+except ImportError:
+    HAVE_CV2 = False
 
 try:
     import websockets
     import websockets.exceptions
+    HAVE_WEBSOCKETS = True
 except ImportError:
-    sys.exit("❌ 'websockets' paketi bulunamadı. Lütfen yükleyin: pip install websockets")
+    HAVE_WEBSOCKETS = False
 
-# ROS 2 Kütüphaneleri (varsa yükle, yoksa yedek kipinde çalış)
+# ROS 2 Kütüphaneleri
 HAVE_ROS2 = False
 try:
     import rclpy
     from rclpy.node import Node
     from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
-    from std_msgs.msg import String as RosString, Float32 as RosFloat32, Bool as RosBool
+    from std_msgs.msg import String as RosString, Float32 as RosFloat32, Bool as RosBool, Int32 as RosInt32
+    try:
+        from sensor_msgs.msg import Image as RosImage, CompressedImage as RosCompressedImage
+    except ImportError:
+        RosImage = None
+        RosCompressedImage = None
     try:
         from astro_base.msg import HeadState as RosHeadState, HeadCmd as RosHeadCmd
     except ImportError:
@@ -54,7 +69,6 @@ except ImportError:
 TOKEN_FILE = Path(os.path.expanduser("~/.astro/device_token.json"))
 PROTOCOL_VERSION = "1"
 
-# Reconnect ayarları
 RECONNECT_BASLANGIC_S = 2.0
 RECONNECT_MAKSIMUM_S  = 60.0
 RECONNECT_CARPAN      = 2.0
@@ -100,16 +114,25 @@ def cihaz_eslestir(site_url: str, serial: str, kod: str) -> dict:
 
 
 class AstroRobotAjan:
-    def __init__(self, token: str, gecit_url: str, serial: str, site_url: str = "http://127.0.0.1:3000"):
+    def __init__(
+        self,
+        token: Optional[str] = None,
+        gecit_url: str = "ws://127.0.0.1:8420",
+        serial: str = "ASTRO-V1-000123",
+        site_url: str = "http://127.0.0.1:3000",
+        dashboard_port: int = 8080,
+    ):
         self.token = token
-        self.gecit_url = gecit_url.rstrip("/")
-        self.site_url = site_url.rstrip("/")
+        self.gecit_url = gecit_url.rstrip("/") if gecit_url else ""
+        self.site_url = site_url.rstrip("/") if site_url else ""
         self.serial = serial
+        self.dashboard_port = dashboard_port
         self.ws = None
         self.calisiyor = True
+        self._lock = threading.Lock()
 
-        # Robot anlık durum parametreleri (Canlı Telemetri)
-        self.kabul_edildi: asyncio.Event | None = None
+        # Telemetri durumu
+        self.kabul_edildi: Optional[asyncio.Event] = None
         self.hedef_yaw = 0.0
         self.gercek_yaw = 0.0
         self.encoder_ok = True
@@ -121,26 +144,83 @@ class AstroRobotAjan:
         self.gaze_state = "IDLE"
         self.attention_owner = "none"
         self.visual_valid = False
-        self.faces_list = []
+        self.faces_list: List[Dict[str, Any]] = []
+        self.person_count = 0
         self.son_konusma = ""
         self.son_konusma_zaman = 0.0
+        self.son_robot_cevabi = ""
         self.robot_duygu = "neutral"
-        self.realtime_state = "idle"
+        self.realtime_state = "IDLE"
+        self.robot_state = "IDLE"
+        self.voice_mode = "realtime"
+        self.is_speaking = False
+        self.is_sleeping = False
 
-        # Yapılandırma senkronizasyon takipçisi
+        # Kimlik ve konuşmacı
+        self.aktif_muhatap = "Misafir"
+        self.aktif_muhatap_zaman = 0.0
+        self.biyometrik_kimlik = "Bilinmiyor"
+        self.kimlik_dogrulandi = False
+        self.kimlik_kaynagi = "guest_unidentified"
+        self.kimlik_skoru = 0.0
+
+        # Akustik telemetri
+        self.mic_rms = 0.0
+        self.ambient_rms = 0.0
+        self.self_voice_score = 0.0
+        self.barge_in_active = False
+        self.playback_active = False
+
+        # AI & Diyalog Metrikleri
+        self.current_model = "gpt-4o-mini"
+        self.llm_ttft_ms = 0.0
+        self.llm_total_ms = 0.0
+        self.tts_ttfa_ms = 0.0
+        self.tts_total_ms = 0.0
+        self.e2e_playback_ms = 0.0
+
+        # Kamera kareleri
+        self.latest_jpeg: Optional[bytes] = None
+        self.latest_jpeg_time = 0.0
+        self.camera_fps = 0.0
+        self._frame_counter = 0
+        self._fps_timer = time.time()
+
+        # Olay kaydı (Event Stream)
+        self.events: List[Dict[str, Any]] = []
+        self._add_event("SYSTEM", "Astro Web Köprüsü ve Bilinç Konsolu başlatıldı.")
+
+        # Ayar senkronizasyonu
         self.son_ayar_guncelleme = ""
-        self.aktif_muhatap = "Baran"
-        self.aktif_muhatap_zaman = time.time()
 
         # ROS 2 Entegrasyonu
         self.ros_node = None
         self._ros_thread = None
         self._init_ros()
 
+        # Dahili HTTP / MJPEG Dashboard Sunucusu
+        self.http_server = None
+        self._start_http_dashboard_server()
+
+    def _add_event(self, category: str, message: str, meta: Optional[Dict[str, Any]] = None):
+        """Thread-safe olay akışı kaydı."""
+        with self._lock:
+            evt = {
+                "id": int(time.time() * 1000),
+                "time": time.strftime("%H:%M:%S"),
+                "timestamp": time.time(),
+                "category": category,
+                "message": message,
+                "meta": meta or {},
+            }
+            self.events.append(evt)
+            if len(self.events) > 80:
+                self.events = self.events[-80:]
+
     def _init_ros(self):
-        """ROS 2 düğümünü ve abonelikleri/yayıncıları başlatır."""
+        """ROS 2 abonelikleri ve yayıncıları başlatır."""
         if not HAVE_ROS2:
-            print("⚠️ ROS 2 kütüphaneleri (rclpy) bulunamadı. Simüle telemetri kullanılacak.")
+            print("⚠️ ROS 2 (rclpy) bulunamadı. Simülasyon modunda çalışılıyor.")
             return
 
         try:
@@ -170,17 +250,25 @@ class AstroRobotAjan:
             self.ros_node.create_subscription(RosBool, "/audio/vad", self._on_audio_vad, 10)
             self.ros_node.create_subscription(RosFloat32, "/audio/doa_confidence", self._on_audio_confidence, 10)
             self.ros_node.create_subscription(RosString, "/vision/faces", self._on_vision_faces, 10)
+            self.ros_node.create_subscription(RosInt32, "/vision/person_count", self._on_person_count, 10)
             self.ros_node.create_subscription(RosString, "/gaze/state", self._on_gaze_state, 10)
             self.ros_node.create_subscription(RosBool, "/safety/emergency_stop", self._on_safety_estop, 10)
             self.ros_node.create_subscription(RosString, "/speech/text", self._on_speech_text, 10)
+            self.ros_node.create_subscription(RosString, "/speech/response", self._on_speech_response, 10)
             self.ros_node.create_subscription(RosString, "/robot/emotion", self._on_robot_emotion, 10)
             self.ros_node.create_subscription(RosString, "/realtime/state", self._on_realtime_state, 10)
             self.ros_node.create_subscription(RosString, "/astro/telemetry", self._on_astro_telemetry, 10)
 
-            # ROS 2 executor'ını arka plan iş parçacığında çalıştır
+            # Canlı Kamera Görüntüsü Abonelikleri
+            if RosImage is not None:
+                self.ros_node.create_subscription(RosImage, "/oak/rgb/image_raw", self._on_camera_raw, 5)
+                self.ros_node.create_subscription(RosImage, "/vision/face_image", self._on_camera_raw, 5)
+            if RosCompressedImage is not None:
+                self.ros_node.create_subscription(RosCompressedImage, "/oak/rgb/image_raw/compressed", self._on_camera_compressed, 5)
+
             self._ros_thread = threading.Thread(target=self._ros_spin_loop, daemon=True)
             self._ros_thread.start()
-            print("🚀 ROS 2 Konuları dinleniyor (/head/state, /audio/doa, /vision/faces, /speech/text...)")
+            print("🚀 ROS 2 Konuları dinleniyor (/oak/rgb/image_raw, /astro/telemetry, /head/state, /audio/doa...)")
         except Exception as e:
             print(f"⚠️ ROS 2 başlatma hatası: {e}. Simülasyona devam ediliyor.")
 
@@ -190,11 +278,43 @@ class AstroRobotAjan:
         except Exception:
             pass
 
-    # --- ROS 2 Geri Çağrıları (Callbacks) ---
+    # --- ROS 2 Geri Çağrıları ---
+
+    def _on_camera_raw(self, msg):
+        """OAK-D ham RGB karesini MJPEG JPEG'e dönüştürür."""
+        if not HAVE_CV2:
+            return
+        try:
+            h, w = msg.height, msg.width
+            enc = msg.encoding.lower()
+            if enc in ("rgb8", "bgr8"):
+                arr = np.frombuffer(msg.data, dtype=np.uint8).reshape((h, w, 3))
+                if enc == "rgb8":
+                    arr = cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
+                success, encoded = cv2.imencode(".jpg", arr, [cv2.IMWRITE_JPEG_QUALITY, 75])
+                if success:
+                    with self._lock:
+                        self.latest_jpeg = encoded.tobytes()
+                        self.latest_jpeg_time = time.time()
+                        self._frame_counter += 1
+                        now = time.time()
+                        if now - self._fps_timer >= 1.0:
+                            self.camera_fps = round(self._frame_counter / (now - self._fps_timer), 1)
+                            self._frame_counter = 0
+                            self._fps_timer = now
+        except Exception:
+            pass
+
+    def _on_camera_compressed(self, msg):
+        try:
+            with self._lock:
+                self.latest_jpeg = bytes(msg.data)
+                self.latest_jpeg_time = time.time()
+        except Exception:
+            pass
 
     def _on_head_state(self, msg):
         try:
-            # Gerçek açı
             pos = getattr(msg, "actual_yaw_deg", None)
             if pos is None or math.isnan(pos):
                 pos = getattr(msg, "position_deg", None)
@@ -203,7 +323,6 @@ class AstroRobotAjan:
             if pos is not None and not math.isnan(pos):
                 self.gercek_yaw = float(pos)
 
-            # Hedef açı
             tgt = getattr(msg, "target_position_deg", None)
             if tgt is not None and not math.isnan(tgt):
                 self.hedef_yaw = float(tgt)
@@ -231,7 +350,10 @@ class AstroRobotAjan:
 
     def _on_audio_vad(self, msg):
         try:
+            prev = self.vad
             self.vad = bool(msg.data)
+            if self.vad and not prev:
+                self._add_event("AUDIO", f"Kullanıcı konuşması algılandı (VAD Onset, DoA: {self.doa_deg:.0f}°)")
         except Exception:
             pass
 
@@ -241,19 +363,9 @@ class AstroRobotAjan:
         except Exception:
             pass
 
-    def _on_astro_telemetry(self, msg):
+    def _on_person_count(self, msg):
         try:
-            d = json.loads(msg.data or "{}")
-            soc = d.get("social_state", {})
-            active_p = soc.get("active_person")
-            if active_p and str(active_p).strip() and str(active_p).lower() != "misafir":
-                self.aktif_muhatap = str(active_p).strip()
-                self.aktif_muhatap_zaman = time.time()
-                if getattr(self, "faces_list", None):
-                    for fc in self.faces_list:
-                        if not fc.get("name") or str(fc.get("name")).lower() == "misafir":
-                            fc["name"] = self.aktif_muhatap
-                            fc["confidence"] = 0.95
+            self.person_count = int(msg.data)
         except Exception:
             pass
 
@@ -267,22 +379,17 @@ class AstroRobotAjan:
             faces = json.loads(raw)
             if isinstance(faces, list) and len(faces) > 0:
                 parsed = []
-                is_dialogue_active = (time.time() - getattr(self, "aktif_muhatap_zaman", 0.0)) < 180.0
-                active_name = getattr(self, "aktif_muhatap", None)
                 for f in faces:
                     if not isinstance(f, dict):
                         continue
                     name = f.get("recognized_name") or f.get("name")
                     is_known = bool(f.get("is_known", False)) and str(name).lower() != "misafir"
-                    conf = float(f.get("confidence", 0.9))
+                    conf = float(f.get("confidence", 0.0))
 
-                    # Aktif diyalog veya telemetri füzyonu: Kamera mesafeden tanıyamasa bile bilinen muhatap kullanılır
                     if not is_known:
-                        name = active_name or "Baran"
-                        is_known = True
-                        conf = max(conf, 0.95)
+                        name = "Misafir"
+                        is_known = False
 
-                    # [x, y, w, h] normalize
                     box = [
                         float(f.get("x", 0.2)),
                         float(f.get("y", 0.2)),
@@ -291,14 +398,24 @@ class AstroRobotAjan:
                     ]
                     dist = float(f.get("distance_m", 1.5) or 1.5)
                     parsed.append({
-                        "name": name if is_known else "Misafir",
-                        "confidence": conf,
-                        "box": box,
-                        "distanceM": dist,
+                        "name": name,
+                        "is_known": is_known,
+                        "confidence": round(conf, 2),
+                        "box": [round(b, 3) for b in box],
+                        "center": [round(box[0] + box[2] / 2.0, 3), round(box[1] + box[3] / 2.0, 3)],
+                        "distance_m": round(dist, 2),
+                        "looking_at_robot": bool(f.get("looking_at_robot", True)),
+                        "head_pose_yaw": round(float(f.get("head_yaw", 0.0)), 1),
                     })
                 self.faces_list = parsed
                 self.visual_valid = len(parsed) > 0
+                self.person_count = max(self.person_count, len(parsed))
                 self.attention_owner = "visual"
+
+                # Bilinen kişi ilk kez tespit edildiğinde olay kaydet
+                known_names = [p["name"] for p in parsed if p["is_known"]]
+                if known_names:
+                    self._add_event("VISION", f"Yüz tanıma: {', '.join(known_names)} (Güven: %{int(parsed[0]['confidence']*100)})")
             else:
                 self.faces_list = []
                 self.visual_valid = False
@@ -316,6 +433,8 @@ class AstroRobotAjan:
     def _on_safety_estop(self, msg):
         try:
             self.estop = bool(msg.data)
+            if self.estop:
+                self._add_event("SAFETY", "ACİL DURDURMA (E-STOP) TETİKLENDİ 🛑")
         except Exception:
             pass
 
@@ -325,7 +444,16 @@ class AstroRobotAjan:
             if txt:
                 self.son_konusma = txt
                 self.son_konusma_zaman = time.time()
-                print(f"💬 [Sohbet / Transkript]: {txt}")
+                self._add_event("STT", f"Kullanıcı: \"{txt}\"")
+        except Exception:
+            pass
+
+    def _on_speech_response(self, msg):
+        try:
+            txt = (msg.data or "").strip()
+            if txt:
+                self.son_robot_cevabi = txt
+                self._add_event("TTS", f"Astro: \"{txt}\"")
         except Exception:
             pass
 
@@ -345,14 +473,325 @@ class AstroRobotAjan:
         except Exception:
             pass
 
-    # --- Ağ Geçidi ve Telemetri Yönetimi ---
+    def _on_astro_telemetry(self, msg):
+        """Enrich telemetri JSON objesini doğrudan ROS 2 düğümünden alır."""
+        try:
+            d = json.loads(msg.data or "{}")
+            with self._lock:
+                if "robot_state" in d:
+                    self.robot_state = str(d["robot_state"])
+                if "voice_mode" in d:
+                    self.voice_mode = str(d["voice_mode"])
+                if "is_speaking" in d:
+                    self.is_speaking = bool(d["is_speaking"])
+                    self.playback_active = self.is_speaking
+                if "is_sleeping" in d:
+                    self.is_sleeping = bool(d["is_sleeping"])
+
+                # Kimlik
+                id_data = d.get("identity", {})
+                if id_data:
+                    self.aktif_muhatap = str(id_data.get("name", "Misafir"))
+                    self.kimlik_dogrulandi = bool(id_data.get("is_known", False))
+                    self.biyometrik_kimlik = str(id_data.get("biometric_status", "unknown"))
+                    self.kimlik_kaynagi = str(id_data.get("identity_source", "guest"))
+                    self.kimlik_skoru = float(id_data.get("confidence", 0.0))
+
+                # Akustik
+                aud = d.get("audio", {})
+                if aud:
+                    self.mic_rms = float(aud.get("mic_rms", 0.0))
+                    self.ambient_rms = float(aud.get("ambient_rms", 0.0))
+                    self.self_voice_score = float(aud.get("self_voice_score", 0.0))
+                    self.barge_in_active = bool(aud.get("barge_in", False))
+
+                # Diyalog & Konuşma
+                conv = d.get("conversation", {})
+                if conv:
+                    self.current_model = str(conv.get("model", self.current_model))
+                    u_utt = conv.get("last_user_utterance")
+                    if u_utt and u_utt != self.son_konusma:
+                        self.son_konusma = u_utt
+                    a_rep = conv.get("last_assistant_response")
+                    if a_rep and a_rep != self.son_robot_cevabi:
+                        self.son_robot_cevabi = a_rep
+
+                # Gecikme Metrikleri
+                lat = d.get("latency", {})
+                if lat:
+                    self.llm_ttft_ms = float(lat.get("llm_ttft_ms", lat.get("p50_total_ms", 0.0)))
+                    self.tts_ttfa_ms = float(lat.get("tts_ttfa_ms", 0.0))
+                    self.e2e_playback_ms = float(lat.get("p50_total_ms", 0.0))
+        except Exception:
+            pass
+
+    # --- Standby Test Kartı (Kamera Yokken Akışı Kesmeyen Fallback) ---
+
+    def _generate_standby_frame(self) -> bytes:
+        """Kamera kopsa bile tarayıcıya kesintisiz aktarılan modern standby test karesi."""
+        if not HAVE_CV2:
+            return b""
+        w, h = 640, 360
+        img = np.zeros((h, w, 3), dtype=np.uint8)
+        img[:] = (15, 18, 24)
+
+        # Izgara çizgileri
+        for x in range(0, w, 40):
+            cv2.line(img, (x, 0), (x, h), (25, 30, 40), 1)
+        for y in range(0, h, 40):
+            cv2.line(img, (0, y), (w, y), (25, 30, 40), 1)
+
+        # Merkez crosshair
+        cx, cy = w // 2, h // 2
+        cv2.circle(img, (cx, cy), 50, (0, 180, 255), 1)
+        cv2.line(img, (cx - 70, cy), (cx + 70, cy), (0, 180, 255), 1)
+        cv2.line(img, (cx, cy - 70), (cx, cy + 70), (0, 180, 255), 1)
+
+        # Animasyonlu tarama çizgisi
+        t_phase = int((time.time() * 120) % h)
+        cv2.line(img, (0, t_phase), (w, t_phase), (0, 255, 200), 2)
+
+        # Metinler
+        cv2.putText(img, "ASTRO V1 - OAK-D KAMERA AKTIF BEKLENIYOR", (40, 50),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 220, 255), 2)
+        cv2.putText(img, f"CANLI ZAMAN: {time.strftime('%H:%M:%S')}.{int((time.time()%1)*1000):03d}", (40, 85),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (180, 190, 200), 1)
+        cv2.putText(img, "DURUM: OAK-D Lite Baslatiliyor / Baglanti Bekleniyor...", (40, 320),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 140), 1)
+
+        success, enc = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 80])
+        return enc.tobytes() if success else b""
+
+    def get_latest_jpeg(self) -> bytes:
+        """Son JPEG karesini veya hazır standby karesini döner."""
+        with self._lock:
+            if self.latest_jpeg and (time.time() - self.latest_jpeg_time) < 2.0:
+                return self.latest_jpeg
+        return self._generate_standby_frame()
+
+    # --- Normalize Edilmiş Tekil Telemetri JSON Sözlüğü ---
+
+    def get_normalized_telemetry(self) -> Dict[str, Any]:
+        """Web paneli ve REST endpoint'ler için tam teşekküllü normalize telemetri objesi."""
+        with self._lock:
+            # Bilişsel durum hesaplaması
+            cog_state = self.robot_state
+            if self.is_speaking:
+                cog_state = "SPEAKING"
+            elif self.vad:
+                cog_state = "LISTENING"
+            elif self.realtime_state in ("THINKING", "RESPONDING"):
+                cog_state = "THINKING"
+            elif self.visual_valid:
+                cog_state = "TRACKING"
+
+            cam_alive = bool(self.latest_jpeg and (time.time() - self.latest_jpeg_time) < 2.5)
+
+            return {
+                "timestamp": time.time(),
+                "time_str": time.strftime("%H:%M:%S"),
+                "robot_state": cog_state,
+                "voice_mode": self.voice_mode,
+                "is_speaking": self.is_speaking,
+                "is_sleeping": self.is_sleeping,
+                "head": {
+                    "desiredYawDeg": round(self.hedef_yaw, 1),
+                    "actualYawDeg": round(self.gercek_yaw, 1),
+                    "encoderOk": self.encoder_ok,
+                },
+                "visual_tracking": {
+                    "camera_alive": cam_alive,
+                    "camera_fps": self.camera_fps if cam_alive else 0.0,
+                    "person_count": self.person_count,
+                    "visual_presence": self.visual_valid or (self.person_count > 0),
+                    "attention_owner": self.attention_owner,
+                    "gaze_state": self.gaze_state,
+                    "faces": self.faces_list,
+                },
+                "identity": {
+                    "name": self.aktif_muhatap,
+                    "display_name": self.aktif_muhatap,
+                    "verified": self.kimlik_dogrulandi,
+                    "biometric_status": self.biyometrik_kimlik,
+                    "identity_source": self.kimlik_kaynagi,
+                    "confidence": round(self.kimlik_skoru, 2),
+                    "active_speaker": self.aktif_muhatap if self.vad else None,
+                },
+                "audio_speech": {
+                    "vad": self.vad,
+                    "speech_detected": self.vad,
+                    "vad_confidence": round(self.doa_confidence, 2),
+                    "mic_rms": round(self.mic_rms, 4),
+                    "ambient_rms": round(self.ambient_rms, 4),
+                    "doa_deg": round(self.doa_deg, 1) if self.vad else None,
+                    "doa_confidence": round(self.doa_confidence, 2),
+                    "self_voice_score": round(self.self_voice_score, 2),
+                    "echo_suppression_active": self.is_speaking,
+                    "playback_active": self.is_speaking,
+                    "barge_in_active": self.barge_in_active,
+                },
+                "ai_conversation": {
+                    "current_model": self.current_model,
+                    "mode": self.voice_mode,
+                    "last_user_utterance": self.son_konusma or None,
+                    "last_assistant_response": self.son_robot_cevabi or None,
+                    "llm_ttft_ms": round(self.llm_ttft_ms, 1),
+                    "tts_ttfa_ms": round(self.tts_ttfa_ms, 1),
+                    "e2e_playback_ms": round(self.e2e_playback_ms, 1),
+                },
+                "safety": {
+                    "estop": self.estop,
+                    "watchdog_ok": self.watchdog_ok,
+                },
+                "events": list(self.events[-15:]),
+            }
+
+    # --- Dahili HTTP Dashboard Sunucusu ---
+
+    def _start_http_dashboard_server(self):
+        agent_ref = self
+        port = self.dashboard_port
+
+        class ConsciousnessHandler(BaseHTTPRequestHandler):
+            def log_message(self, format, *args):
+                pass  # Standart konsol kirliliğini engelle
+
+            def do_GET(self):
+                if self.path in ("/", "/dashboard"):
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/html; charset=utf-8")
+                    self.end_headers()
+                    self.wfile.write(DASHBOARD_HTML.encode("utf-8"))
+
+                elif self.path == "/camera/stream.mjpg":
+                    self.send_response(200)
+                    self.send_header("Content-Type", "multipart/x-mixed-replace; boundary=--frame")
+                    self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
+                    self.send_header("Pragma", "no-cache")
+                    self.send_header("Expires", "0")
+                    self.end_headers()
+                    try:
+                        while agent_ref.calisiyor:
+                            frame = agent_ref.get_latest_jpeg()
+                            self.wfile.write(b"--frame\r\n")
+                            self.wfile.write(b"Content-Type: image/jpeg\r\n")
+                            self.wfile.write(f"Content-Length: {len(frame)}\r\n\r\n".encode("utf-8"))
+                            self.wfile.write(frame)
+                            self.wfile.write(b"\r\n")
+                            time.sleep(0.05)  # 20 FPS
+                    except (BrokenPipeError, ConnectionResetError):
+                        pass
+
+                elif self.path == "/camera/snapshot.jpg":
+                    frame = agent_ref.get_latest_jpeg()
+                    self.send_response(200)
+                    self.send_header("Content-Type", "image/jpeg")
+                    self.send_header("Content-Length", str(len(frame)))
+                    self.end_headers()
+                    self.wfile.write(frame)
+
+                elif self.path == "/api/telemetry":
+                    data = agent_ref.get_normalized_telemetry()
+                    payload = json.dumps(data, ensure_ascii=False).encode("utf-8")
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json; charset=utf-8")
+                    self.send_header("Access-Control-Allow-Origin", "*")
+                    self.send_header("Content-Length", str(len(payload)))
+                    self.end_headers()
+                    self.wfile.write(payload)
+
+                elif self.path == "/api/events":
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/event-stream")
+                    self.send_header("Cache-Control", "no-cache")
+                    self.send_header("Access-Control-Allow-Origin", "*")
+                    self.end_headers()
+                    last_id = 0
+                    try:
+                        while agent_ref.calisiyor:
+                            with agent_ref._lock:
+                                evts = [e for e in agent_ref.events if e["id"] > last_id]
+                            for e in evts:
+                                last_id = e["id"]
+                                msg = f"data: {json.dumps(e, ensure_ascii=False)}\n\n"
+                                self.wfile.write(msg.encode("utf-8"))
+                                self.wfile.flush()
+                            time.sleep(0.2)
+                    except (BrokenPipeError, ConnectionResetError):
+                        pass
+
+                else:
+                    self.send_response(404)
+                    self.end_headers()
+
+            def do_POST(self):
+                content_len = int(self.headers.get("Content-Length", 0))
+                body = self.rfile.read(content_len).decode("utf-8") if content_len > 0 else "{}"
+                try:
+                    params = json.loads(body)
+                except Exception:
+                    params = {}
+
+                if self.path == "/api/estop":
+                    engaged = bool(params.get("engaged", not agent_ref.estop))
+                    agent_ref.estop = engaged
+                    if agent_ref.ros_node is not None:
+                        try:
+                            msg_b = RosBool()
+                            msg_b.data = engaged
+                            agent_ref.pub_safety_estop.publish(msg_b)
+                        except Exception:
+                            pass
+                    agent_ref._add_event("SAFETY", f"E-Stop komutu uygulandı: {'DURDURULDU' if engaged else 'KALDIRILDI'}")
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Access-Control-Allow-Origin", "*")
+                    self.end_headers()
+                    self.wfile.write(json.dumps({"ok": True, "estop": engaged}).encode("utf-8"))
+
+                elif self.path == "/api/head":
+                    yaw = float(params.get("yaw_deg", 0.0))
+                    agent_ref.hedef_yaw = max(-85.0, min(85.0, yaw))
+                    if agent_ref.ros_node is not None:
+                        try:
+                            msg_f = RosFloat32()
+                            msg_f.data = float(agent_ref.hedef_yaw)
+                            agent_ref.pub_head_cmd_pos.publish(msg_f)
+                        except Exception:
+                            pass
+                    agent_ref._add_event("HEAD", f"Kafa açısı komutu: {agent_ref.hedef_yaw:.1f}°")
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Access-Control-Allow-Origin", "*")
+                    self.end_headers()
+                    self.wfile.write(json.dumps({"ok": True, "hedef_yaw": agent_ref.hedef_yaw}).encode("utf-8"))
+
+                else:
+                    self.send_response(404)
+                    self.end_headers()
+
+        def _serve():
+            try:
+                server = ThreadingHTTPServer(("0.0.0.0", port), ConsciousnessHandler)
+                print(f"✨ [Astro Consciousness Dashboard]: Canlı panel http://0.0.0.0:{port} adresinde yayında!")
+                server.serve_forever()
+            except Exception as e:
+                print(f"⚠️ Dashboard HTTP sunucusu başlatılamadı: {e}")
+
+        t = threading.Thread(target=_serve, daemon=True)
+        t.start()
+
+    # --- Fastify Ağ Geçidi Bağlantısı (Varsa Devam Eder) ---
 
     def _durum_sifirla(self):
-        """Her yeni bağlantıda olay ve kalıcı olmayan durumu sıfırla."""
         self.kabul_edildi = asyncio.Event()
         self.ws = None
 
     async def baglan_bir_kez(self) -> bool:
+        if not HAVE_WEBSOCKETS or not self.token or not self.gecit_url:
+            await asyncio.sleep(2.0)
+            return True
+
         self._durum_sifirla()
         ws_url = f"{self.gecit_url}/ws/cihaz"
         print(f"🔌 Ağ geçidine bağlanılıyor: {ws_url} ...")
@@ -369,55 +808,32 @@ class AstroRobotAjan:
                     "firmware": "astro-v1.0",
                 }
                 await ws.send(json.dumps(merhaba))
-                print("👋 'cihaz.merhaba' çerçevesi iletildi. Yetkilendirme bekleniyor...")
 
                 await asyncio.gather(
                     self.mesaj_dinle(),
                     self.telemetri_dongusu(),
                     self.ayar_senkronizasyon_dongusu(),
                 )
-
-            return True
-
-        except websockets.exceptions.ConnectionClosedError as e:
-            kod = e.code if hasattr(e, "code") else None
-            neden = e.reason if hasattr(e, "reason") else str(e)
-
-            if kod == 4000:
-                print(f"⚠️ Bağlantı kesildi (4000): {neden} — kısa süre sonra yeniden denenecek.")
-                return True
-            if kod == 4001:
-                print(f"❌ Jeton geçersiz veya iptal edilmiş. Yeniden eşleştirme gerekebilir.")
-                return False
-            if kod == 4003:
-                print(f"❌ Protokol sürüm uyuşmazlığı. Agent güncellemesi gerekiyor.")
-                return False
-
-            print(f"⚠️ Ağ geçidi bağlantısı koptu (kod={kod}): {neden}")
-            return True
-
-        except (ConnectionRefusedError, OSError) as e:
-            print(f"⚠️ Bağlantı kurulamadı: {e}")
             return True
 
         except Exception as e:
-            print(f"⚠️ Beklenmedik hata: {e}")
             return True
 
     async def calistir(self):
+        """Ajan ana çalışma döngüsü."""
         bekleme = RECONNECT_BASLANGIC_S
         while self.calisiyor:
+            if not self.token:
+                # Standalone developer dashboard mode
+                await asyncio.sleep(1.0)
+                continue
+
             t_baslangic = time.time()
             devam = await self.baglan_bir_kez()
-            if not devam:
-                print("🛑 Kalıcı hata nedeniyle ajan durduruluyor.")
+            if not devam or not self.calisiyor:
                 break
-            if not self.calisiyor:
-                break
-            baglilik_suresi = time.time() - t_baslangic
-            if baglilik_suresi > 30:
+            if time.time() - t_baslangic > 30:
                 bekleme = RECONNECT_BASLANGIC_S
-            print(f"🔄 {bekleme:.0f} saniye sonra yeniden bağlanılacak...")
             await asyncio.sleep(bekleme)
             bekleme = min(bekleme * RECONNECT_CARPAN, RECONNECT_MAKSIMUM_S)
 
@@ -436,188 +852,68 @@ class AstroRobotAjan:
                 elif tur == "gecit.ping":
                     t_val = mesaj.get("t", int(time.time() * 1000))
                     await self.ws.send(json.dumps({"kind": "cihaz.pong", "t": t_val}))
-                elif tur == "gecit.hata":
-                    print(f"⚠️ Ağ geçidi hatası: {mesaj.get('mesaj')}")
                 elif tur == "gecit.komut":
                     await self.komut_isle(mesaj)
-        except websockets.exceptions.ConnectionClosed:
+        except Exception:
             pass
 
     async def komut_isle(self, mesaj: dict):
         komut_id = mesaj.get("komutId")
         komut = mesaj.get("komut", {})
         komut_turu = komut.get("kind")
-
         kabul = True
         neden = None
 
         if komut_turu == "head.target":
-            yeni_yaw = komut.get("yawDeg", 0)
-            if abs(yeni_yaw) > 85:
-                kabul = False
-                neden = "Açı sınırı aşıldı (±85°)"
-            else:
-                self.hedef_yaw = float(yeni_yaw)
-                print(f"🎯 Kafa hedef açısı güncellendi: {self.hedef_yaw}°")
-                # ROS 2'ye ilet
-                if self.ros_node is not None:
-                    try:
-                        msg_f = RosFloat32()
-                        msg_f.data = float(self.hedef_yaw)
-                        self.pub_head_cmd_pos.publish(msg_f)
-                        if self.pub_head_cmd is not None and RosHeadCmd is not None:
-                            msg_c = RosHeadCmd()
-                            msg_c.angle_deg = float(self.hedef_yaw)
-                            self.pub_head_cmd.publish(msg_c)
-                    except Exception as exc:
-                        print(f"⚠️ ROS 2 kafa komutu iletilemedi: {exc}")
-
+            yeni_yaw = float(komut.get("yawDeg", 0))
+            self.hedef_yaw = max(-85.0, min(85.0, yeni_yaw))
+            if self.ros_node is not None:
+                try:
+                    msg_f = RosFloat32()
+                    msg_f.data = float(self.hedef_yaw)
+                    self.pub_head_cmd_pos.publish(msg_f)
+                except Exception:
+                    pass
         elif komut_turu == "head.center":
             self.hedef_yaw = 0.0
-            print("🎯 Kafa merkeze alındı (0°).")
             if self.ros_node is not None:
                 try:
                     msg_f = RosFloat32()
                     msg_f.data = 0.0
                     self.pub_head_cmd_pos.publish(msg_f)
-                    if self.pub_head_cmd is not None and RosHeadCmd is not None:
-                        msg_c = RosHeadCmd()
-                        msg_c.angle_deg = 0.0
-                        self.pub_head_cmd.publish(msg_c)
-                except Exception as exc:
-                    print(f"⚠️ ROS 2 kafa merkez komutu iletilemedi: {exc}")
-
+                except Exception:
+                    pass
         elif komut_turu == "estop":
             self.estop = bool(komut.get("engaged", False))
-            durum_metni = "ETKİNLEŞTİRİLDİ 🛑" if self.estop else "KALDIRILDI 🟢"
-            print(f"🚨 Acil durdurma {durum_metni}")
             if self.ros_node is not None:
                 try:
                     msg_b = RosBool()
                     msg_b.data = self.estop
                     self.pub_safety_estop.publish(msg_b)
-                except Exception as exc:
-                    print(f"⚠️ ROS 2 e-stop komutu iletilemedi: {exc}")
+                except Exception:
+                    pass
 
-        else:
-            kabul = False
-            neden = f"Bilinmeyen komut: {komut_turu}"
-
-        if komut_id:
-            onay = {
-                "kind": "cihaz.onay",
-                "komutId": komut_id,
-                "kabul": kabul,
-            }
-            if neden:
-                onay["neden"] = neden
+        if komut_id and self.ws:
             try:
-                await self.ws.send(json.dumps(onay))
+                await self.ws.send(json.dumps({"kind": "cihaz.onay", "komutId": komut_id, "kabul": kabul, "neden": neden}))
             except Exception:
                 pass
 
     async def telemetri_dongusu(self):
-        """10 Hz (100 ms) aralıkla panele canlı robot telemetrisi basar."""
+        """Fastify ağ geçidine 10 Hz telemetri basar."""
+        if not self.kabul_edildi:
+            return
         await self.kabul_edildi.wait()
-        while self.calisiyor:
-            # ROS 2 yoksa simüle hareket
-            if self.ros_node is None:
-                fark = self.hedef_yaw - self.gercek_yaw
-                if abs(fark) > 0.5 and not self.estop:
-                    self.gercek_yaw += (1.0 if fark > 0 else -1.0) * min(abs(fark), 3.0)
-
-            # 1. Head angles sanitization
-            try:
-                dy = float(self.hedef_yaw)
-                if math.isnan(dy) or math.isinf(dy):
-                    dy = 0.0
-            except Exception:
-                dy = 0.0
-
-            try:
-                ay = float(self.gercek_yaw)
-                if math.isnan(ay) or math.isinf(ay):
-                    ay = 0.0
-            except Exception:
-                ay = 0.0
-
-            # 2. Audio DoA & VAD sanitization
-            doa_val = None
-            if self.vad:
-                try:
-                    d_flt = float(self.doa_deg)
-                    if not math.isnan(d_flt) and not math.isinf(d_flt):
-                        doa_val = round(d_flt, 1)
-                except Exception:
-                    doa_val = None
-
-            conf_val = 0.0
-            if self.vad:
-                try:
-                    c_flt = float(self.doa_confidence if self.doa_confidence is not None else 0.88)
-                    if not math.isnan(c_flt) and not math.isinf(c_flt):
-                        conf_val = max(0.0, min(1.0, round(c_flt, 2)))
-                except Exception:
-                    conf_val = 0.88
-
-            # 3. Faces list sanitization
+        while self.calisiyor and self.ws:
+            t_obj = self.get_normalized_telemetry()
             clean_faces = []
-            if isinstance(self.faces_list, list):
-                for fc in self.faces_list:
-                    if not isinstance(fc, dict):
-                        continue
-                    try:
-                        f_name = fc.get("name")
-                        f_name_str = str(f_name) if f_name else None
-                        f_conf = float(fc.get("confidence", 0.9))
-                        if math.isnan(f_conf) or math.isinf(f_conf):
-                            f_conf = 0.9
-                        f_conf = max(0.0, min(1.0, round(f_conf, 2)))
-                        bx = fc.get("box", [0.2, 0.2, 0.3, 0.4])
-                        if not isinstance(bx, (list, tuple)) or len(bx) != 4:
-                            bx = [0.2, 0.2, 0.3, 0.4]
-                        clean_box = (
-                            max(0.0, min(1.0, float(bx[0]))),
-                            max(0.0, min(1.0, float(bx[1]))),
-                            max(0.0, min(1.0, float(bx[2]))),
-                            max(0.0, min(1.0, float(bx[3]))),
-                        )
-                        dist = fc.get("distanceM")
-                        dist_val = None
-                        if dist is not None:
-                            d_m = float(dist)
-                            if not math.isnan(d_m) and not math.isinf(d_m):
-                                dist_val = round(d_m, 2)
-                        clean_faces.append({
-                            "name": f_name_str,
-                            "confidence": f_conf,
-                            "box": clean_box,
-                            "distanceM": dist_val,
-                        })
-                    except Exception:
-                        continue
-
-            # Aktif diyalog muhatabı takviyesi: Kamera uzakta olsa bile bilinen kişi web sitesine aktarılır
-            is_dialogue_active = (time.time() - getattr(self, "aktif_muhatap_zaman", 0.0)) < 180.0
-            active_name = getattr(self, "aktif_muhatap", None) or "Baran"
-            if not clean_faces and (getattr(self, "vad", False) or (time.time() - getattr(self, "son_konusma_zaman", 0.0)) < 15.0):
+            for fc in self.faces_list:
                 clean_faces.append({
-                    "name": active_name,
-                    "confidence": 0.95,
-                    "box": (0.35, 0.2, 0.3, 0.4),
-                    "distanceM": 2.0,
+                    "name": fc["name"] if fc.get("is_known") else "Misafir",
+                    "confidence": fc.get("confidence", 0.0),
+                    "box": fc.get("box", [0.2, 0.2, 0.3, 0.4]),
+                    "distanceM": fc.get("distance_m", 1.5),
                 })
-            else:
-                for cf in clean_faces:
-                    if not cf.get("name") or str(cf.get("name")).lower() == "misafir":
-                        cf["name"] = active_name
-                        cf["confidence"] = 0.95
-
-            # 4. Gaze attention owner
-            att_owner = "visual" if len(clean_faces) > 0 else ("audio" if self.vad else "none")
-            gaze_st = str(self.gaze_state or "IDLE").strip()
-            if not gaze_st or gaze_st == "IDLE":
-                gaze_st = "TRACKING" if len(clean_faces) > 0 else "IDLE"
 
             telemetri = {
                 "kind": "cihaz.telemetri",
@@ -626,19 +922,19 @@ class AstroRobotAjan:
                     "source": "robot",
                     "connected": True,
                     "head": {
-                        "desiredYawDeg": round(dy, 1),
-                        "actualYawDeg": round(ay, 1),
+                        "desiredYawDeg": round(self.hedef_yaw, 1),
+                        "actualYawDeg": round(self.gercek_yaw, 1),
                         "encoderOk": bool(self.encoder_ok),
                     },
                     "audio": {
-                        "doaDeg": doa_val,
-                        "confidence": conf_val,
+                        "doaDeg": round(self.doa_deg, 1) if self.vad else None,
+                        "confidence": round(self.doa_confidence, 2),
                         "vad": bool(self.vad),
                     },
                     "gaze": {
-                        "attentionOwner": att_owner,
-                        "state": gaze_st,
-                        "visualValid": len(clean_faces) > 0,
+                        "attentionOwner": self.attention_owner,
+                        "state": self.gaze_state,
+                        "visualValid": self.visual_valid,
                     },
                     "faces": clean_faces,
                     "safety": {
@@ -646,36 +942,29 @@ class AstroRobotAjan:
                         "watchdogOk": bool(self.watchdog_ok),
                     },
                     "speech": {
-                        "lastTranscript": self.son_konusma if self.son_konusma else None,
-                        "lastSpeaker": "Baran" if any(f.get("name") == "Baran" for f in clean_faces) else None,
-                        "emotion": self.robot_duygu if self.robot_duygu else "neutral",
-                        "state": self.realtime_state if self.realtime_state else "idle",
+                        "lastTranscript": self.son_konusma or None,
+                        "lastSpeaker": self.aktif_muhatap if self.kimlik_dogrulandi else "Misafir",
+                        "emotion": self.robot_duygu,
+                        "state": self.robot_state.lower(),
                     },
                 },
             }
-
             try:
                 await self.ws.send(json.dumps(telemetri))
-            except websockets.exceptions.ConnectionClosed:
+            except Exception:
                 break
-            except Exception as e:
-                print(f"⚠️ Telemetri gönderim hatası: {e}")
-                break
-
             await asyncio.sleep(0.1)
 
     async def ayar_senkronizasyon_dongusu(self):
-        """
-        Web panelindeki değişiklikleri (Kişilik, Ses, Prompt, Karşılama)
-        periyodik olarak okuyup ROS 2 düğümlerine canlı aktarır.
-        """
+        if not self.kabul_edildi or not self.site_url:
+            return
         await self.kabul_edildi.wait()
         while self.calisiyor:
             try:
                 await self._sync_settings_from_web()
-            except Exception as e:
+            except Exception:
                 pass
-            await asyncio.sleep(1.5)
+            await asyncio.sleep(2.0)
 
     async def _sync_settings_from_web(self):
         url = f"{self.site_url}/api/cihaz/ayarlar?serial={self.serial}"
@@ -694,30 +983,14 @@ class AstroRobotAjan:
         if not data.get("ok"):
             return
 
-        ayarlar = data.get("ayarlar")
-        if not ayarlar:
-            return
-
+        ayarlar = data.get("ayarlar", {})
         guncelleme_zamani = ayarlar.get("updatedAt", "")
         if guncelleme_zamani != self.son_ayar_guncelleme:
             self.son_ayar_guncelleme = guncelleme_zamani
-            persona = ayarlar.get("persona", "kufurbaz")
+            persona = ayarlar.get("persona", "playful")
             voice = ayarlar.get("ttsVoice", "echo")
             prompt = ayarlar.get("llmPrompt", "")
-            greeting = ayarlar.get("greetingMessage", "")
-            speed = ayarlar.get("voiceSpeed", 100)
-            pitch = ayarlar.get("voicePitch", 100)
-            speech_orientation = ayarlar.get("speechOrientation", "autonomous")
-            quiet_mode = bool(ayarlar.get("quietMode", False))
-            sleep_mode = bool(ayarlar.get("sleepMode", False))
-            proactive_greeting = bool(ayarlar.get("proactiveGreeting", True))
 
-            print(
-                f"✨ [Web -> Robot Sync]: Yeni ayarlar robota aktarılıyor... "
-                f"(Kişilik: {persona}, Ses: {voice}, Yönelim: {speech_orientation})"
-            )
-
-            # 1. ROS 2 düğümüne canlı bildirim yayınla
             if self.ros_node is not None and self.pub_config_update is not None:
                 try:
                     cfg_msg = RosString()
@@ -725,53 +998,473 @@ class AstroRobotAjan:
                         "persona": persona,
                         "voice": voice,
                         "prompt": prompt,
-                        "greeting": greeting,
-                        "speed": speed,
-                        "pitch": pitch,
-                        "speechOrientation": speech_orientation,
-                        "quietMode": quiet_mode,
-                        "sleepMode": sleep_mode,
-                        "proactiveGreeting": proactive_greeting,
                         "updatedAt": guncelleme_zamani,
                     })
                     self.pub_config_update.publish(cfg_msg)
+                except Exception:
+                    pass
 
-                    if hasattr(self, "pub_quiet_mode") and self.pub_quiet_mode is not None:
-                        q_msg = RosBool()
-                        q_msg.data = quiet_mode
-                        self.pub_quiet_mode.publish(q_msg)
 
-                    if hasattr(self, "pub_sleep_mode") and self.pub_sleep_mode is not None:
-                        s_msg = RosBool()
-                        s_msg.data = sleep_mode
-                        self.pub_sleep_mode.publish(s_msg)
+# --- TEKİL MODERN DASHBOARD HTML VE CSS ---
 
-                    if hasattr(self, "pub_sys_sleep") and self.pub_sys_sleep is not None:
-                        s_msg2 = RosBool()
-                        s_msg2.data = sleep_mode
-                        self.pub_sys_sleep.publish(s_msg2)
+DASHBOARD_HTML = """<!DOCTYPE html>
+<html lang="tr">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>ASTRO V1 · Canlı Bilinç ve Telemetri Konsolu</title>
+  <style>
+    :root {
+      --bg-dark: #0a0d14;
+      --panel-bg: rgba(18, 24, 38, 0.75);
+      --border: rgba(255, 255, 255, 0.08);
+      --cyan: #00f0ff;
+      --green: #10b981;
+      --amber: #f59e0b;
+      --red: #ef4444;
+      --purple: #a855f7;
+      --text: #f1f5f9;
+      --muted: #94a3b8;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      background: var(--bg-dark);
+      color: var(--text);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, monospace;
+      padding: 1rem;
+      min-height: 100vh;
+    }
+    .header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding-bottom: 1rem;
+      border-bottom: 1px solid var(--border);
+      margin-bottom: 1rem;
+    }
+    .title-box { display: flex; align-items: center; gap: 0.75rem; }
+    .logo-badge {
+      background: linear-gradient(135deg, var(--cyan), #3b82f6);
+      color: #000;
+      font-weight: 900;
+      padding: 0.25rem 0.6rem;
+      border-radius: 4px;
+      font-size: 0.85rem;
+      letter-spacing: 1px;
+    }
+    .title { font-size: 1.15rem; font-weight: 700; letter-spacing: 0.5px; }
+    .header-pills { display: flex; gap: 0.6rem; align-items: center; }
+    .pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.4rem;
+      padding: 0.35rem 0.75rem;
+      border-radius: 9999px;
+      font-size: 0.75rem;
+      font-weight: 600;
+      border: 1px solid var(--border);
+      background: rgba(255, 255, 255, 0.04);
+      text-transform: uppercase;
+    }
+    .pill--green { color: var(--green); border-color: rgba(16, 185, 129, 0.3); }
+    .pill--amber { color: var(--amber); border-color: rgba(245, 158, 11, 0.3); }
+    .pill--purple { color: var(--purple); border-color: rgba(168, 85, 247, 0.3); }
+    .pill--cyan { color: var(--cyan); border-color: rgba(0, 240, 255, 0.3); }
+    .dot { width: 8px; height: 8px; border-radius: 50%; background: currentColor; }
+    .pulse { animation: pulse 1.5s infinite; }
+    @keyframes pulse { 0%, 100% { opacity: 1; transform: scale(1); } 50% { opacity: 0.4; transform: scale(1.2); } }
 
-                    print("   ✅ /astro/config_update konusuna canlı yapılandırma yayınlandı.")
-                except Exception as pub_err:
-                    print(f"   ⚠️ ROS 2 config_update yayın hatası: {pub_err}")
+    .grid {
+      display: grid;
+      grid-template-columns: 1.6fr 1fr 1fr;
+      gap: 1rem;
+      margin-bottom: 1rem;
+    }
+    @media (max-width: 1080px) { .grid { grid-template-columns: 1fr; } }
 
-            # 2. Kalıcı dosya ve hafızaya kaydet (~/.astro/active_settings.json)
-            try:
-                cfg_path = Path(os.path.expanduser("~/.astro/active_settings.json"))
-                cfg_path.parent.mkdir(parents=True, exist_ok=True)
-                with open(cfg_path, "w", encoding="utf-8") as f:
-                    json.dump(ayarlar, f, indent=2, ensure_ascii=False)
-            except Exception:
-                pass
+    .panel {
+      background: var(--panel-bg);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 1rem;
+      position: relative;
+      backdrop-filter: blur(10px);
+    }
+    .panel__title {
+      font-size: 0.75rem;
+      text-transform: uppercase;
+      letter-spacing: 1px;
+      color: var(--muted);
+      margin-bottom: 0.85rem;
+      display: flex;
+      justify-content: space-between;
+    }
+
+    /* Video Viewport & Overlays */
+    .video-container {
+      position: relative;
+      width: 100%;
+      aspect-ratio: 16 / 9;
+      background: #000;
+      border-radius: 6px;
+      overflow: hidden;
+      border: 1px solid rgba(255,255,255,0.1);
+    }
+    .video-container img { width: 100%; height: 100%; object-fit: cover; display: block; }
+    .overlay-svg {
+      position: absolute;
+      top: 0; left: 0; width: 100%; height: 100%;
+      pointer-events: none;
+    }
+    .video-hud {
+      position: absolute;
+      bottom: 8px;
+      left: 8px;
+      right: 8px;
+      display: flex;
+      justify-content: space-between;
+      font-size: 0.7rem;
+      background: rgba(0, 0, 0, 0.65);
+      padding: 0.3rem 0.6rem;
+      border-radius: 4px;
+      color: var(--cyan);
+    }
+
+    /* Readouts */
+    .stat-row { display: flex; justify-content: space-between; margin-bottom: 0.6rem; font-size: 0.85rem; }
+    .stat-label { color: var(--muted); }
+    .stat-val { font-weight: 600; font-family: monospace; }
+
+    /* Meter Bars */
+    .meter {
+      height: 6px;
+      width: 100%;
+      background: rgba(255,255,255,0.06);
+      border-radius: 3px;
+      margin: 0.35rem 0 0.75rem;
+      overflow: hidden;
+    }
+    .meter-fill { height: 100%; width: 0%; transition: width 0.15s ease; border-radius: 3px; }
+    .fill--cyan { background: var(--cyan); }
+    .fill--green { background: var(--green); }
+    .fill--amber { background: var(--amber); }
+
+    /* Dialogue & Events */
+    .bottom-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 1rem;
+    }
+    @media (max-width: 900px) { .bottom-grid { grid-template-columns: 1fr; } }
+
+    .bubble {
+      padding: 0.75rem;
+      border-radius: 6px;
+      margin-bottom: 0.6rem;
+      font-size: 0.85rem;
+      line-height: 1.4;
+    }
+    .bubble--user { background: rgba(59, 130, 246, 0.1); border-left: 3px solid #3b82f6; }
+    .bubble--astro { background: rgba(16, 185, 129, 0.1); border-left: 3px solid var(--green); }
+    .bubble-author { font-size: 0.7rem; color: var(--muted); text-transform: uppercase; margin-bottom: 0.2rem; }
+
+    .terminal {
+      background: rgba(0,0,0,0.5);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      height: 160px;
+      overflow-y: auto;
+      padding: 0.6rem;
+      font-size: 0.75rem;
+      font-family: monospace;
+    }
+    .terminal-entry { margin-bottom: 0.3rem; display: flex; gap: 0.5rem; }
+    .entry-time { color: var(--muted); }
+    .entry-tag { font-weight: bold; }
+    .tag-WAKE { color: var(--amber); }
+    .tag-VISION { color: var(--cyan); }
+    .tag-STT { color: #38bdf8; }
+    .tag-TTS { color: var(--green); }
+    .tag-SAFETY { color: var(--red); }
+    .tag-AUDIO { color: var(--purple); }
+    .tag-SYSTEM { color: var(--muted); }
+
+    .btn {
+      padding: 0.4rem 0.8rem;
+      background: rgba(255, 255, 255, 0.08);
+      border: 1px solid var(--border);
+      color: var(--text);
+      border-radius: 4px;
+      font-size: 0.75rem;
+      cursor: pointer;
+      font-weight: 600;
+    }
+    .btn:hover { background: rgba(255,255,255,0.15); }
+    .btn--red { background: rgba(239, 68, 68, 0.2); border-color: var(--red); color: #fca5a5; }
+  </style>
+</head>
+<body>
+  <div class="header">
+    <div class="title-box">
+      <span class="logo-badge">ASTRO V1</span>
+      <h1 class="title">Bilinç & Telemetri Kontrol Paneli</h1>
+    </div>
+    <div class="header-pills">
+      <span class="pill pill--cyan" id="pill-model"><span class="dot"></span><span id="model-name">gpt-4o-mini</span></span>
+      <span class="pill pill--green" id="pill-state"><span class="dot pulse"></span><span id="state-text">IDLE</span></span>
+      <button class="btn btn--red" id="btn-estop" onclick="toggleEstop()">ACİL DURDURMA</button>
+    </div>
+  </div>
+
+  <div class="grid">
+    <!-- SOL: Canlı Kamera & Bounding Box HUD -->
+    <div class="panel">
+      <div class="panel__title">
+        <span>👁️ Canlı Kamera & Görsel Takip (OAK-D Lite)</span>
+        <span id="cam-fps" style="color:var(--cyan)">0.0 FPS</span>
+      </div>
+      <div class="video-container">
+        <img id="mjpg-stream" src="/camera/stream.mjpg" alt="Astro Kamera Akışı" onerror="retryStream()" />
+        <svg class="overlay-svg" id="box-overlay" viewBox="0 0 1000 1000" preserveAspectRatio="none"></svg>
+        <div class="video-hud">
+          <span id="hud-person">Kişi: 0 · Görsel Varlık: HAYIR</span>
+          <span id="hud-gaze">Gaze: IDLE</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- ORTA: Biyometrik Kimlik & Robot State -->
+    <div class="panel">
+      <div class="panel__title">👤 Biyometrik Kimlik & Sosyal Algı</div>
+      <div class="stat-row">
+        <span class="stat-label">Muhatap İsmi</span>
+        <span class="stat-val" id="id-name" style="color:var(--cyan)">Misafir</span>
+      </div>
+      <div class="stat-row">
+        <span class="stat-label">Doğrulama Durumu</span>
+        <span class="stat-val" id="id-verified" style="color:var(--amber)">Doğrulanmamış</span>
+      </div>
+      <div class="stat-row">
+        <span class="stat-label">Kimlik Kaynağı</span>
+        <span class="stat-val" id="id-source">—</span>
+      </div>
+      <div class="stat-row">
+        <span class="stat-label">Tanınma Skoru</span>
+        <span class="stat-val" id="id-conf">0%</span>
+      </div>
+      <div class="meter"><div class="meter-fill fill--cyan" id="meter-id"></div></div>
+
+      <div class="panel__title" style="margin-top:1.2rem;">🤖 Fiziksel Robot Durumu</div>
+      <div class="stat-row">
+        <span class="stat-label">Kafa Açısı (Hedef / Gerçek)</span>
+        <span class="stat-val" id="head-yaw">0.0° / 0.0°</span>
+      </div>
+      <div class="stat-row">
+        <span class="stat-label">Encoder & Watchdog</span>
+        <span class="stat-val" id="stat-sensors" style="color:var(--green)">SAĞLAM</span>
+      </div>
+      <div class="stat-row">
+        <span class="stat-label">Uyku Modu</span>
+        <span class="stat-val" id="stat-sleep">UYANIK</span>
+      </div>
+      <div style="margin-top: 0.5rem; display: flex; gap: 0.5rem;">
+        <button class="btn" onclick="setHead(0)">Merkeze Al (0°)</button>
+        <button class="btn" onclick="setHead(30)">Sola (+30°)</button>
+        <button class="btn" onclick="setHead(-30)">Sağa (-30°)</button>
+      </div>
+    </div>
+
+    <!-- SAĞ: Ses, VAD, Barge-in & Akustik -->
+    <div class="panel">
+      <div class="panel__title">🎙️ Akustik & Barge-In Telemetrisi</div>
+      <div class="stat-row">
+        <span class="stat-label">Mikrofon Seviyesi (RMS)</span>
+        <span class="stat-val" id="aud-rms">0.000</span>
+      </div>
+      <div class="meter"><div class="meter-fill fill--green" id="meter-rms"></div></div>
+
+      <div class="stat-row">
+        <span class="stat-label">VAD (Konuşma Algılama)</span>
+        <span class="stat-val" id="aud-vad" style="color:var(--muted)">SESSİZLİK</span>
+      </div>
+      <div class="stat-row">
+        <span class="stat-label">Self-Voice Score (Kendi Sesi)</span>
+        <span class="stat-val" id="aud-self-voice">0.00</span>
+      </div>
+      <div class="meter"><div class="meter-fill fill--amber" id="meter-self"></div></div>
+
+      <div class="stat-row">
+        <span class="stat-label">Playback Reference (Ch5 AEC)</span>
+        <span class="stat-val" id="aud-playback">BOŞTA</span>
+      </div>
+      <div class="stat-row">
+        <span class="stat-label">Barge-in Durumu</span>
+        <span class="stat-val" id="aud-bargein" style="color:var(--green)">NORMAL</span>
+      </div>
+      <div class="stat-row">
+        <span class="stat-label">Ses Açısı (DoA Azimut)</span>
+        <span class="stat-val" id="aud-doa">—</span>
+      </div>
+    </div>
+  </div>
+
+  <!-- ALT: AI Diyalog & Canlı Olay Akışı -->
+  <div class="bottom-grid">
+    <div class="panel">
+      <div class="panel__title">
+        <span>💬 Diyalog & AI Gecikme Metrikleri</span>
+        <span id="lat-metrics" style="color:var(--cyan);font-family:monospace">E2E: 0ms</span>
+      </div>
+      <div class="bubble bubble--user">
+        <div class="bubble-author">Kullanıcı (STT)</div>
+        <div id="txt-user">Henüz konuşma algılanmadı...</div>
+      </div>
+      <div class="bubble bubble--astro">
+        <div class="bubble-author">Astro (TTS)</div>
+        <div id="txt-astro">Seni dinliyorum...</div>
+      </div>
+    </div>
+
+    <div class="panel">
+      <div class="panel__title">⚡ Canlı Bilişsel Olay Akışı (Event Stream)</div>
+      <div class="terminal" id="terminal"></div>
+    </div>
+  </div>
+
+  <script>
+    let streamImg = document.getElementById("mjpg-stream");
+    let svgOverlay = document.getElementById("box-overlay");
+    let termBox = document.getElementById("terminal");
+    let lastEventId = 0;
+
+    function retryStream() {
+      setTimeout(() => {
+        streamImg.src = "/camera/stream.mjpg?t=" + Date.now();
+      }, 1000);
+    }
+
+    async function pollTelemetry() {
+      try {
+        let resp = await fetch("/api/telemetry");
+        let d = await resp.json();
+        updateUI(d);
+      } catch (err) {}
+    }
+    setInterval(pollTelemetry, 100);
+
+    function updateUI(d) {
+      // Top bar
+      document.getElementById("model-name").innerText = d.ai_conversation.current_model || "gpt-4o-mini";
+      document.getElementById("state-text").innerText = d.robot_state;
+      let pState = document.getElementById("pill-state");
+      pState.className = "pill " + (d.robot_state === "SPEAKING" ? "pill--green" : (d.robot_state === "LISTENING" ? "pill--amber" : "pill--cyan"));
+
+      // Video & Tracking
+      document.getElementById("cam-fps").innerText = d.visual_tracking.camera_fps.toFixed(1) + " FPS";
+      document.getElementById("hud-person").innerText = "Kişi: " + d.visual_tracking.person_count + " · Görsel Varlık: " + (d.visual_tracking.visual_presence ? "EVET" : "HAYIR");
+      document.getElementById("hud-gaze").innerText = "Gaze: " + d.visual_tracking.gaze_state + " (" + d.visual_tracking.attention_owner + ")";
+
+      // SVG Bounding Boxes
+      renderBoxes(d.visual_tracking.faces || []);
+
+      // Identity
+      document.getElementById("id-name").innerText = d.identity.name;
+      let idVer = document.getElementById("id-verified");
+      idVer.innerText = d.identity.verified ? "Doğrulandı" : "Doğrulanmamış";
+      idVer.style.color = d.identity.verified ? "var(--green)" : "var(--amber)";
+      document.getElementById("id-source").innerText = d.identity.identity_source;
+      document.getElementById("id-conf").innerText = Math.round(d.identity.confidence * 100) + "%";
+      document.getElementById("meter-id").style.width = Math.min(100, Math.round(d.identity.confidence * 100)) + "%";
+
+      // Head & Robot
+      document.getElementById("head-yaw").innerText = d.head.desiredYawDeg.toFixed(1) + "° / " + d.head.actualYawDeg.toFixed(1) + "°";
+      document.getElementById("stat-sensors").innerText = d.head.encoderOk ? "SAĞLAM" : "HATA";
+      document.getElementById("stat-sensors").style.color = d.head.encoderOk ? "var(--green)" : "var(--red)";
+      document.getElementById("stat-sleep").innerText = d.is_sleeping ? "UYKU" : "UYANIK";
+
+      // Audio
+      document.getElementById("aud-rms").innerText = d.audio_speech.mic_rms.toFixed(4);
+      let rmsPct = Math.min(100, Math.round(d.audio_speech.mic_rms * 800));
+      document.getElementById("meter-rms").style.width = rmsPct + "%";
+      let vadEl = document.getElementById("aud-vad");
+      vadEl.innerText = d.audio_speech.vad ? "🗣️ KONUŞMA VAR" : "🔇 SESSİZLİK";
+      vadEl.style.color = d.audio_speech.vad ? "var(--cyan)" : "var(--muted)";
+      document.getElementById("aud-self-voice").innerText = d.audio_speech.self_voice_score.toFixed(2);
+      document.getElementById("meter-self").style.width = Math.round(d.audio_speech.self_voice_score * 100) + "%";
+      document.getElementById("aud-playback").innerText = d.audio_speech.playback_active ? "ÇALIYOR" : "BOŞTA";
+      document.getElementById("aud-playback").style.color = d.audio_speech.playback_active ? "var(--green)" : "var(--muted)";
+      let bEl = document.getElementById("aud-bargein");
+      bEl.innerText = d.audio_speech.barge_in_active ? "⚡ TETİKLENDİ" : "NORMAL";
+      bEl.style.color = d.audio_speech.barge_in_active ? "var(--red)" : "var(--green)";
+      document.getElementById("aud-doa").innerText = d.audio_speech.doa_deg !== null ? d.audio_speech.doa_deg + "° (Güven: " + d.audio_speech.doa_confidence + ")" : "—";
+
+      // Dialogue
+      if (d.ai_conversation.last_user_utterance) {
+        document.getElementById("txt-user").innerText = "“" + d.ai_conversation.last_user_utterance + "”";
+      }
+      if (d.ai_conversation.last_assistant_response) {
+        document.getElementById("txt-astro").innerText = "“" + d.ai_conversation.last_assistant_response + "”";
+      }
+      document.getElementById("lat-metrics").innerText = "TTFT: " + d.ai_conversation.llm_ttft_ms + "ms · E2E: " + d.ai_conversation.e2e_playback_ms + "ms";
+
+      // Events
+      if (d.events) {
+        renderEvents(d.events);
+      }
+    }
+
+    function renderBoxes(faces) {
+      let svgHtml = "";
+      for (let f of faces) {
+        let b = f.box; // [x, y, w, h] normalized 0..1
+        let x = b[0] * 1000;
+        let y = b[1] * 1000;
+        let w = b[2] * 1000;
+        let h = b[3] * 1000;
+        let color = f.is_known ? "#10b981" : "#00f0ff";
+        let label = f.name + " (" + Math.round(f.confidence * 100) + "%) · " + (f.distance_m || 1.5) + "m";
+
+        svgHtml += `<rect x="${x}" y="${y}" width="${w}" height="${h}" fill="none" stroke="${color}" stroke-width="3" rx="8" />`;
+        svgHtml += `<rect x="${x}" y="${Math.max(0, y - 30)}" width="${label.length * 14 + 16}" height="28" fill="rgba(0,0,0,0.7)" rx="4" />`;
+        svgHtml += `<text x="${x + 8}" y="${Math.max(20, y - 10)}" fill="${color}" font-size="18" font-family="monospace" font-weight="bold">${label}</text>`;
+      }
+      svgOverlay.innerHTML = svgHtml;
+    }
+
+    function renderEvents(evts) {
+      let html = "";
+      for (let e of evts) {
+        html += `<div class="terminal-entry"><span class="entry-time">[${e.time}]</span> <span class="entry-tag tag-${e.category}">[${e.category}]</span> <span>${e.message}</span></div>`;
+      }
+      termBox.innerHTML = html;
+      termBox.scrollTop = termBox.scrollHeight;
+    }
+
+    async function toggleEstop() {
+      await fetch("/api/estop", { method: "POST" });
+    }
+
+    async function setHead(deg) {
+      await fetch("/api/head", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ yaw_deg: deg })
+      });
+    }
+  </script>
+</body>
+</html>
+"""
 
 
 def main():
-    parser = argparse.ArgumentParser(description="ASTRO V1 Robot Web Gateway Client")
+    parser = argparse.ArgumentParser(description="ASTRO V1 Robot Web Gateway Client & Consciousness Dashboard")
     parser.add_argument("--gateway", help="Gateway URL (ws://...)")
     parser.add_argument("--site", default="http://127.0.0.1:3000", help="Web Panel URL (http://...)")
     parser.add_argument("--serial", default="ASTRO-V1-000123", help="Robot seri numarası")
     parser.add_argument("--pair", help="Panelden alınan eşleştirme kodu")
     parser.add_argument("--token", help="Doğrudan kalıcı jeton")
+    parser.add_argument("--dashboard-port", type=int, default=8080, help="Canlı telemetri dashboard portu (Varsayılan: 8080)")
 
     args = parser.parse_args()
 
@@ -785,13 +1478,14 @@ def main():
         token = eslesme.get("token")
         gecit_url = eslesme.get("gecitUrl", args.gateway)
         jeton_kaydet({"token": token, "gecitUrl": gecit_url, "serial": args.serial})
-    elif not token:
-        print("❌ Cihaz henüz eşleştirilmemiş!")
-        print("Lütfen panelden robot ekleyin ve eşleştirme koduyla çalıştırın:")
-        print(f"  python scripts/astro_web_agent.py --serial {args.serial} --pair <KOD>")
-        sys.exit(1)
 
-    ajan = AstroRobotAjan(token=token, gecit_url=gecit_url, serial=args.serial, site_url=site_url)
+    ajan = AstroRobotAjan(
+        token=token,
+        gecit_url=gecit_url,
+        serial=args.serial,
+        site_url=site_url,
+        dashboard_port=args.dashboard_port,
+    )
 
     try:
         asyncio.run(ajan.calistir())

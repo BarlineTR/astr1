@@ -16,7 +16,14 @@ next-env.d.ts
 /playwright-report
 /blob-report
 
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+
 # Yerel ortam dosyaları
 .env
 .env.local
 .env.*.local
+
+
