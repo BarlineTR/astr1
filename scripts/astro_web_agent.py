@@ -152,7 +152,7 @@ class AstroRobotAjan:
         self.robot_duygu = "neutral"
         self.realtime_state = "IDLE"
         self.robot_state = "IDLE"
-        self.voice_mode = "realtime"
+        self.voice_mode = "4O"
         self.is_speaking = False
         self.is_sleeping = False
 
@@ -256,8 +256,9 @@ class AstroRobotAjan:
             self.ros_node.create_subscription(RosString, "/speech/text", self._on_speech_text, 10)
             self.ros_node.create_subscription(RosString, "/speech/response", self._on_speech_response, 10)
             self.ros_node.create_subscription(RosString, "/robot/emotion", self._on_robot_emotion, 10)
-            self.ros_node.create_subscription(RosString, "/realtime/state", self._on_realtime_state, 10)
             self.ros_node.create_subscription(RosString, "/astro/telemetry", self._on_astro_telemetry, 10)
+            self.ros_node.create_subscription(RosString, "/astro/turn_telemetry", self._on_turn_telemetry, 10)
+            self.ros_node.create_subscription(RosString, "/astro/dispatched_transcript", self._on_speech_text, 10)
 
             # Canlı Kamera Görüntüsü Abonelikleri
             if RosImage is not None:
@@ -525,41 +526,63 @@ class AstroRobotAjan:
         except Exception:
             pass
 
+    def _on_turn_telemetry(self, msg):
+        """Doğrudan Astro Realtime Node'dan gelen tam turn telemetrisini işler."""
+        try:
+            d = json.loads(msg.data or "{}")
+            with self._lock:
+                if d.get("llm_model"):
+                    self.current_model = str(d["llm_model"])
+                if d.get("actual_provider"):
+                    self.voice_mode = "4O"
+                if "first_token_ms" in d and float(d.get("first_token_ms") or 0.0) > 0:
+                    self.llm_ttft_ms = float(d["first_token_ms"])
+                elif "llm_duration_ms" in d and float(d.get("llm_duration_ms") or 0.0) > 0:
+                    self.llm_ttft_ms = float(d["llm_duration_ms"])
+                if "tts_ttfa_ms" in d and float(d.get("tts_ttfa_ms") or 0.0) > 0:
+                    self.tts_ttfa_ms = float(d["tts_ttfa_ms"])
+                if "end_to_end_first_audio_ms" in d and float(d.get("end_to_end_first_audio_ms") or 0.0) > 0:
+                    self.e2e_playback_ms = float(d["end_to_end_first_audio_ms"])
+                u_turn = d.get("user_turn_id", "")
+                self._add_event("AI", f"Turn Telemetrisi: {self.current_model} | E2E: {self.e2e_playback_ms:.0f}ms | TTFA: {self.tts_ttfa_ms:.0f}ms")
+        except Exception:
+            pass
+
     # --- Standby Test Kartı (Kamera Yokken Akışı Kesmeyen Fallback) ---
 
     def _generate_standby_frame(self) -> bytes:
-        """Kamera kopsa bile tarayıcıya kesintisiz aktarılan modern standby test karesi."""
+        """Kamera akışı olmadığında gösterilen kompakt, profesyonel CAMERA OFFLINE kartı."""
         if not HAVE_CV2:
             return b""
         w, h = 640, 360
         img = np.zeros((h, w, 3), dtype=np.uint8)
-        img[:] = (15, 18, 24)
+        img[:] = (13, 17, 23)  # Dark slate background #0d1117
 
-        # Izgara çizgileri
-        for x in range(0, w, 40):
-            cv2.line(img, (x, 0), (x, h), (25, 30, 40), 1)
-        for y in range(0, h, 40):
-            cv2.line(img, (0, y), (w, y), (25, 30, 40), 1)
+        # Compact center card box
+        card_w, card_h = 320, 130
+        x1 = (w - card_w) // 2
+        y1 = (h - card_h) // 2
+        x2 = x1 + card_w
+        y2 = y1 + card_h
+        cv2.rectangle(img, (x1, y1), (x2, y2), (28, 35, 48), -1)
+        cv2.rectangle(img, (x1, y1), (x2, y2), (48, 54, 66), 1)
 
-        # Merkez crosshair
-        cx, cy = w // 2, h // 2
-        cv2.circle(img, (cx, cy), 50, (0, 180, 255), 1)
-        cv2.line(img, (cx - 70, cy), (cx + 70, cy), (0, 180, 255), 1)
-        cv2.line(img, (cx, cy - 70), (cx, cy + 70), (0, 180, 255), 1)
+        # Status badge dot & text
+        dot_cx = x1 + 35
+        dot_cy = y1 + 45
+        cv2.circle(img, (dot_cx, dot_cy), 6, (60, 60, 240), -1)  # Red/amber offline dot
+        cv2.putText(img, "CAMERA OFFLINE", (dot_cx + 18, dot_cy + 6),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.65, (230, 237, 243), 2, cv2.LINE_AA)
 
-        # Animasyonlu tarama çizgisi
-        t_phase = int((time.time() * 120) % h)
-        cv2.line(img, (0, t_phase), (w, t_phase), (0, 255, 200), 2)
+        # Subtitle
+        cv2.putText(img, "OAK-D Lite  *  Awaiting RGB Stream", (x1 + 32, y1 + 82),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.42, (139, 148, 158), 1, cv2.LINE_AA)
 
-        # Metinler
-        cv2.putText(img, "ASTRO V1 - OAK-D KAMERA AKTIF BEKLENIYOR", (40, 50),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 220, 255), 2)
-        cv2.putText(img, f"CANLI ZAMAN: {time.strftime('%H:%M:%S')}.{int((time.time()%1)*1000):03d}", (40, 85),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (180, 190, 200), 1)
-        cv2.putText(img, "DURUM: OAK-D Lite Baslatiliyor / Baglanti Bekleniyor...", (40, 320),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 140), 1)
+        # Micro timestamp
+        cv2.putText(img, f"STANDBY {time.strftime('%H:%M:%S')}", (x1 + 32, y1 + 106),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.36, (80, 90, 105), 1, cv2.LINE_AA)
 
-        success, enc = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 80])
+        success, enc = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 85])
         return enc.tobytes() if success else b""
 
     def get_latest_jpeg(self) -> bytes:
@@ -1074,13 +1097,13 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     .pulse { animation: pulse 1.5s infinite; }
     @keyframes pulse { 0%, 100% { opacity: 1; transform: scale(1); } 50% { opacity: 0.4; transform: scale(1.2); } }
 
-    .grid {
+    .main-layout {
       display: grid;
-      grid-template-columns: 1.6fr 1fr 1fr;
-      gap: 1rem;
+      grid-template-columns: 1.25fr 1fr;
+      gap: 1.2rem;
       margin-bottom: 1rem;
     }
-    @media (max-width: 1080px) { .grid { grid-template-columns: 1fr; } }
+    @media (max-width: 1080px) { .main-layout { grid-template-columns: 1fr; } }
 
     .panel {
       background: var(--panel-bg);
@@ -1149,14 +1172,6 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     .fill--green { background: var(--green); }
     .fill--amber { background: var(--amber); }
 
-    /* Dialogue & Events */
-    .bottom-grid {
-      display: grid;
-      grid-template-columns: 1fr 1fr;
-      gap: 1rem;
-    }
-    @media (max-width: 900px) { .bottom-grid { grid-template-columns: 1fr; } }
-
     .bubble {
       padding: 0.75rem;
       border-radius: 6px;
@@ -1187,6 +1202,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     .tag-TTS { color: var(--green); }
     .tag-SAFETY { color: var(--red); }
     .tag-AUDIO { color: var(--purple); }
+    .tag-AI { color: #818cf8; }
     .tag-SYSTEM { color: var(--muted); }
 
     .btn {
@@ -1210,124 +1226,139 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       <h1 class="title">Bilinç & Telemetri Kontrol Paneli</h1>
     </div>
     <div class="header-pills">
-      <span class="pill pill--cyan" id="pill-model"><span class="dot"></span><span id="model-name">gpt-4o-mini</span></span>
+      <span class="pill pill--cyan" id="pill-mode"><span class="dot"></span><span>MODE: <strong id="mode-name">4O</strong></span></span>
+      <span class="pill pill--purple" id="pill-model"><span class="dot"></span><span id="model-name">gpt-4o-mini</span></span>
       <span class="pill pill--green" id="pill-state"><span class="dot pulse"></span><span id="state-text">IDLE</span></span>
       <button class="btn btn--red" id="btn-estop" onclick="toggleEstop()">ACİL DURDURMA</button>
     </div>
   </div>
 
-  <div class="grid">
-    <!-- SOL: Canlı Kamera & Bounding Box HUD -->
-    <div class="panel">
-      <div class="panel__title">
-        <span>👁️ Canlı Kamera & Görsel Takip (OAK-D Lite)</span>
-        <span id="cam-fps" style="color:var(--cyan)">0.0 FPS</span>
+  <div class="main-layout">
+    <!-- SOL SÜTUN: 16:9 Canlı Kamera & Diyalog Paneli -->
+    <div class="col-left">
+      <!-- 1. Canlı Kamera & Bounding Box HUD -->
+      <div class="panel">
+        <div class="panel__title">
+          <span>👁️ Canlı Kamera & Görsel Takip (OAK-D Lite)</span>
+          <span id="cam-fps" style="color:var(--cyan)">0.0 FPS</span>
+        </div>
+        <div class="video-container">
+          <img id="mjpg-stream" src="/camera/stream.mjpg" alt="Astro Kamera Akışı" onerror="retryStream()" />
+          <svg class="overlay-svg" id="box-overlay" viewBox="0 0 1000 1000" preserveAspectRatio="none"></svg>
+          <div class="video-hud">
+            <span id="hud-person">Kişi: 0 · Görsel Varlık: HAYIR</span>
+            <span id="hud-gaze">Gaze: IDLE</span>
+          </div>
+        </div>
       </div>
-      <div class="video-container">
-        <img id="mjpg-stream" src="/camera/stream.mjpg" alt="Astro Kamera Akışı" onerror="retryStream()" />
-        <svg class="overlay-svg" id="box-overlay" viewBox="0 0 1000 1000" preserveAspectRatio="none"></svg>
-        <div class="video-hud">
-          <span id="hud-person">Kişi: 0 · Görsel Varlık: HAYIR</span>
-          <span id="hud-gaze">Gaze: IDLE</span>
+
+      <!-- 2. Diyalog & Pipeline Gecikme Metrikleri -->
+      <div class="panel" style="margin-top: 1rem;">
+        <div class="panel__title">
+          <span>💬 Diyalog & End-to-End Pipeline Metrikleri</span>
+          <span id="lat-metrics" style="color:var(--cyan);font-family:monospace">E2E: 0ms</span>
+        </div>
+        <div class="bubble bubble--user">
+          <div class="bubble-author">Kullanıcı (STT)</div>
+          <div id="txt-user">Henüz konuşma algılanmadı...</div>
+        </div>
+        <div class="bubble bubble--astro">
+          <div class="bubble-author">Astro (TTS)</div>
+          <div id="txt-astro">Seni dinliyorum...</div>
+        </div>
+        <div style="background: rgba(0,0,0,0.3); padding: 0.5rem 0.75rem; border-radius: 4px; border: 1px solid var(--border); font-size: 0.75rem;">
+          <div style="display: flex; justify-content: space-between; font-family: monospace;">
+            <span>MODEL: <strong id="lat-model" style="color:var(--purple)">gpt-4o-mini</strong></span>
+            <span>TTFT: <strong id="lat-ttft">0ms</strong></span>
+            <span>TTFA: <strong id="lat-ttfa">0ms</strong></span>
+            <span>E2E: <strong id="lat-e2e" style="color:var(--cyan)">0ms</strong></span>
+          </div>
         </div>
       </div>
     </div>
 
-    <!-- ORTA: Biyometrik Kimlik & Robot State -->
-    <div class="panel">
-      <div class="panel__title">👤 Biyometrik Kimlik & Sosyal Algı</div>
-      <div class="stat-row">
-        <span class="stat-label">Muhatap İsmi</span>
-        <span class="stat-val" id="id-name" style="color:var(--cyan)">Misafir</span>
+    <!-- SAĞ SÜTUN: Bilişsel Kartlar & Event Stream -->
+    <div class="col-right">
+      <!-- 1. Biyometrik Kimlik & Oturum -->
+      <div class="panel">
+        <div class="panel__title">👤 Biyometrik Kimlik & Oturum</div>
+        <div class="stat-row">
+          <span class="stat-label">Muhatap İsmi</span>
+          <span class="stat-val" id="id-name" style="color:var(--cyan);font-weight:700;">Misafir</span>
+        </div>
+        <div class="stat-row">
+          <span class="stat-label">Doğrulama Durumu</span>
+          <span class="stat-val" id="id-verified" style="color:var(--amber)">Doğrulanmamış</span>
+        </div>
+        <div class="stat-row">
+          <span class="stat-label">Kimlik Kaynağı</span>
+          <span class="stat-val" id="id-source">—</span>
+        </div>
+        <div class="stat-row">
+          <span class="stat-label">Tanınma Skoru</span>
+          <span class="stat-val" id="id-conf">0%</span>
+        </div>
+        <div class="meter"><div class="meter-fill fill--cyan" id="meter-id"></div></div>
       </div>
-      <div class="stat-row">
-        <span class="stat-label">Doğrulama Durumu</span>
-        <span class="stat-val" id="id-verified" style="color:var(--amber)">Doğrulanmamış</span>
-      </div>
-      <div class="stat-row">
-        <span class="stat-label">Kimlik Kaynağı</span>
-        <span class="stat-val" id="id-source">—</span>
-      </div>
-      <div class="stat-row">
-        <span class="stat-label">Tanınma Skoru</span>
-        <span class="stat-val" id="id-conf">0%</span>
-      </div>
-      <div class="meter"><div class="meter-fill fill--cyan" id="meter-id"></div></div>
 
-      <div class="panel__title" style="margin-top:1.2rem;">🤖 Fiziksel Robot Durumu</div>
-      <div class="stat-row">
-        <span class="stat-label">Kafa Açısı (Hedef / Gerçek)</span>
-        <span class="stat-val" id="head-yaw">0.0° / 0.0°</span>
+      <!-- 2. Fiziksel Robot Durumu -->
+      <div class="panel" style="margin-top: 1rem;">
+        <div class="panel__title">🤖 Fiziksel Robot Durumu</div>
+        <div class="stat-row">
+          <span class="stat-label">Kafa Açısı (Hedef / Gerçek)</span>
+          <span class="stat-val" id="head-yaw">0.0° / 0.0°</span>
+        </div>
+        <div class="stat-row">
+          <span class="stat-label">Encoder & Watchdog</span>
+          <span class="stat-val" id="stat-sensors" style="color:var(--green)">SAĞLAM</span>
+        </div>
+        <div class="stat-row">
+          <span class="stat-label">Uyku Modu</span>
+          <span class="stat-val" id="stat-sleep">UYANIK</span>
+        </div>
+        <div style="margin-top: 0.5rem; display: flex; gap: 0.5rem;">
+          <button class="btn" onclick="setHead(0)">Merkez (0°)</button>
+          <button class="btn" onclick="setHead(30)">Sol (+30°)</button>
+          <button class="btn" onclick="setHead(-30)">Sağ (-30°)</button>
+        </div>
       </div>
-      <div class="stat-row">
-        <span class="stat-label">Encoder & Watchdog</span>
-        <span class="stat-val" id="stat-sensors" style="color:var(--green)">SAĞLAM</span>
-      </div>
-      <div class="stat-row">
-        <span class="stat-label">Uyku Modu</span>
-        <span class="stat-val" id="stat-sleep">UYANIK</span>
-      </div>
-      <div style="margin-top: 0.5rem; display: flex; gap: 0.5rem;">
-        <button class="btn" onclick="setHead(0)">Merkeze Al (0°)</button>
-        <button class="btn" onclick="setHead(30)">Sola (+30°)</button>
-        <button class="btn" onclick="setHead(-30)">Sağa (-30°)</button>
-      </div>
-    </div>
 
-    <!-- SAĞ: Ses, VAD, Barge-in & Akustik -->
-    <div class="panel">
-      <div class="panel__title">🎙️ Akustik & Barge-In Telemetrisi</div>
-      <div class="stat-row">
-        <span class="stat-label">Mikrofon Seviyesi (RMS)</span>
-        <span class="stat-val" id="aud-rms">0.000</span>
+      <!-- 3. Akustik & Barge-In Telemetrisi -->
+      <div class="panel" style="margin-top: 1rem;">
+        <div class="panel__title">🎙️ Akustik & Barge-In Telemetrisi</div>
+        <div class="stat-row">
+          <span class="stat-label">Mikrofon Seviyesi (RMS)</span>
+          <span class="stat-val" id="aud-rms">0.000</span>
+        </div>
+        <div class="meter"><div class="meter-fill fill--green" id="meter-rms"></div></div>
+        <div class="stat-row">
+          <span class="stat-label">VAD (Konuşma Algılama)</span>
+          <span class="stat-val" id="aud-vad" style="color:var(--muted)">SESSİZLİK</span>
+        </div>
+        <div class="stat-row">
+          <span class="stat-label">Playback Reference (Ch5 AEC)</span>
+          <span class="stat-val" id="aud-playback">BOŞTA</span>
+        </div>
+        <div class="stat-row">
+          <span class="stat-label">Self-Voice Score (Kendi Sesi)</span>
+          <span class="stat-val" id="aud-self-voice">0.00</span>
+        </div>
+        <div class="meter"><div class="meter-fill fill--amber" id="meter-self"></div></div>
+        <div class="stat-row">
+          <span class="stat-label">Barge-in Durumu</span>
+          <span class="stat-val" id="aud-bargein" style="color:var(--green)">NORMAL</span>
+        </div>
+        <div class="stat-row">
+          <span class="stat-label">Ses Açısı (DoA Azimut)</span>
+          <span class="stat-val" id="aud-doa">—</span>
+        </div>
       </div>
-      <div class="meter"><div class="meter-fill fill--green" id="meter-rms"></div></div>
 
-      <div class="stat-row">
-        <span class="stat-label">VAD (Konuşma Algılama)</span>
-        <span class="stat-val" id="aud-vad" style="color:var(--muted)">SESSİZLİK</span>
+      <!-- 4. Canlı Bilişsel Olay Akışı -->
+      <div class="panel" style="margin-top: 1rem;">
+        <div class="panel__title">⚡ Canlı Bilişsel Olay Akışı (Event Stream)</div>
+        <div class="terminal" id="terminal"></div>
       </div>
-      <div class="stat-row">
-        <span class="stat-label">Self-Voice Score (Kendi Sesi)</span>
-        <span class="stat-val" id="aud-self-voice">0.00</span>
-      </div>
-      <div class="meter"><div class="meter-fill fill--amber" id="meter-self"></div></div>
-
-      <div class="stat-row">
-        <span class="stat-label">Playback Reference (Ch5 AEC)</span>
-        <span class="stat-val" id="aud-playback">BOŞTA</span>
-      </div>
-      <div class="stat-row">
-        <span class="stat-label">Barge-in Durumu</span>
-        <span class="stat-val" id="aud-bargein" style="color:var(--green)">NORMAL</span>
-      </div>
-      <div class="stat-row">
-        <span class="stat-label">Ses Açısı (DoA Azimut)</span>
-        <span class="stat-val" id="aud-doa">—</span>
-      </div>
-    </div>
-  </div>
-
-  <!-- ALT: AI Diyalog & Canlı Olay Akışı -->
-  <div class="bottom-grid">
-    <div class="panel">
-      <div class="panel__title">
-        <span>💬 Diyalog & AI Gecikme Metrikleri</span>
-        <span id="lat-metrics" style="color:var(--cyan);font-family:monospace">E2E: 0ms</span>
-      </div>
-      <div class="bubble bubble--user">
-        <div class="bubble-author">Kullanıcı (STT)</div>
-        <div id="txt-user">Henüz konuşma algılanmadı...</div>
-      </div>
-      <div class="bubble bubble--astro">
-        <div class="bubble-author">Astro (TTS)</div>
-        <div id="txt-astro">Seni dinliyorum...</div>
-      </div>
-    </div>
-
-    <div class="panel">
-      <div class="panel__title">⚡ Canlı Bilişsel Olay Akışı (Event Stream)</div>
-      <div class="terminal" id="terminal"></div>
     </div>
   </div>
 
@@ -1354,6 +1385,9 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
     function updateUI(d) {
       // Top bar
+      if (document.getElementById("mode-name")) {
+        document.getElementById("mode-name").innerText = d.ai_conversation.mode || "4O";
+      }
       document.getElementById("model-name").innerText = d.ai_conversation.current_model || "gpt-4o-mini";
       document.getElementById("state-text").innerText = d.robot_state;
       let pState = document.getElementById("pill-state");
@@ -1370,7 +1404,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       // Identity
       document.getElementById("id-name").innerText = d.identity.name;
       let idVer = document.getElementById("id-verified");
-      idVer.innerText = d.identity.verified ? "Doğrulandı" : "Doğrulanmamış";
+      idVer.innerText = d.identity.verified ? "Doğrulandı" : "Doğrulanmamış (Misafir)";
       idVer.style.color = d.identity.verified ? "var(--green)" : "var(--amber)";
       document.getElementById("id-source").innerText = d.identity.identity_source;
       document.getElementById("id-conf").innerText = Math.round(d.identity.confidence * 100) + "%";
@@ -1394,7 +1428,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       document.getElementById("aud-playback").innerText = d.audio_speech.playback_active ? "ÇALIYOR" : "BOŞTA";
       document.getElementById("aud-playback").style.color = d.audio_speech.playback_active ? "var(--green)" : "var(--muted)";
       let bEl = document.getElementById("aud-bargein");
-      bEl.innerText = d.audio_speech.barge_in_active ? "⚡ TETİKLENDİ" : "NORMAL";
+      bEl.innerText = d.audio_speech.barge_in_active ? "⚡ PLAYBACK KESİLDİ (BARGE-IN)" : "NORMAL";
       bEl.style.color = d.audio_speech.barge_in_active ? "var(--red)" : "var(--green)";
       document.getElementById("aud-doa").innerText = d.audio_speech.doa_deg !== null ? d.audio_speech.doa_deg + "° (Güven: " + d.audio_speech.doa_confidence + ")" : "—";
 
@@ -1405,7 +1439,13 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       if (d.ai_conversation.last_assistant_response) {
         document.getElementById("txt-astro").innerText = "“" + d.ai_conversation.last_assistant_response + "”";
       }
-      document.getElementById("lat-metrics").innerText = "TTFT: " + d.ai_conversation.llm_ttft_ms + "ms · E2E: " + d.ai_conversation.e2e_playback_ms + "ms";
+      document.getElementById("lat-metrics").innerText = "E2E: " + Math.round(d.ai_conversation.e2e_playback_ms) + "ms";
+      if (document.getElementById("lat-model")) {
+        document.getElementById("lat-model").innerText = d.ai_conversation.current_model || "gpt-4o-mini";
+        document.getElementById("lat-ttft").innerText = Math.round(d.ai_conversation.llm_ttft_ms) + "ms";
+        document.getElementById("lat-ttfa").innerText = Math.round(d.ai_conversation.tts_ttfa_ms) + "ms";
+        document.getElementById("lat-e2e").innerText = Math.round(d.ai_conversation.e2e_playback_ms) + "ms";
+      }
 
       // Events
       if (d.events) {
