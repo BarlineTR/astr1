@@ -44,7 +44,10 @@ export function BaglantiSeridi({
 
   return (
     <div className="baglanti">
-      <span className={DURUM_SINIFI[durum]}>{DURUM_METNI[durum]}</span>
+      <span className={DURUM_SINIFI[durum]}>
+        {durum === "bagli" && <span className="badge__dot" />}
+        {DURUM_METNI[durum]}
+      </span>
 
       {gecikmeMs !== null && (
         <span className={yuksekGecikme ? "baglanti__olcu is-uyari" : "baglanti__olcu"}>

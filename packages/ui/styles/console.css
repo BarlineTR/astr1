@@ -18,9 +18,32 @@
   border: 1px solid var(--rule-strong);
   color: var(--ink-muted);
   white-space: nowrap;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.45rem;
+  border-radius: 4px;
 }
 
-.badge--live { border-color: rgba(111, 156, 106, 0.55); color: var(--ok); }
+.badge--live {
+  border-color: rgba(111, 156, 106, 0.55);
+  color: var(--ok);
+  background: rgba(111, 156, 106, 0.08);
+}
+
+.badge__dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background-color: currentColor;
+  box-shadow: 0 0 8px currentColor;
+  animation: livePulse 1.8s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+}
+
+@keyframes livePulse {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50% { opacity: 0.35; transform: scale(0.75); }
+}
+
 .badge--mock { border-color: var(--rule-accent); color: var(--accent); background: var(--accent-sunken); }
 
 .console__notice {
@@ -53,6 +76,94 @@
   padding: 0;
   position: relative;
   min-height: 26rem;
+  overflow: hidden;
+  transition: box-shadow 400ms ease, border-color 400ms ease;
+}
+
+/* ── Bilişsel Durum Işıması (Cognitive Halo & Glow) ── */
+.panel--stage.state--listening {
+  box-shadow: inset 0 0 45px rgba(200, 161, 90, 0.25), 0 0 30px rgba(200, 161, 90, 0.15);
+  border: 1px solid rgba(200, 161, 90, 0.5);
+}
+
+.panel--stage.state--thinking {
+  box-shadow: inset 0 0 50px rgba(168, 85, 247, 0.25), 0 0 30px rgba(168, 85, 247, 0.18);
+  border: 1px solid rgba(168, 85, 247, 0.5);
+}
+
+.panel--stage.state--speaking {
+  box-shadow: inset 0 0 50px rgba(56, 189, 248, 0.28), 0 0 30px rgba(56, 189, 248, 0.2);
+  border: 1px solid rgba(56, 189, 248, 0.55);
+}
+
+.panel--stage.state--orienting {
+  box-shadow: inset 0 0 40px rgba(16, 185, 129, 0.22), 0 0 25px rgba(16, 185, 129, 0.15);
+  border: 1px solid rgba(16, 185, 129, 0.45);
+}
+
+/* ── Sahne İçi Canlı HUD Katmanı ── */
+.console__hud-top {
+  position: absolute;
+  top: var(--s-2);
+  left: var(--s-2);
+  right: var(--s-2);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--s-2);
+  z-index: 10;
+  pointer-events: none;
+}
+
+.console__hud-bottom {
+  position: absolute;
+  bottom: var(--s-2);
+  left: var(--s-2);
+  right: var(--s-2);
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+  z-index: 10;
+  pointer-events: none;
+}
+
+.console__hud-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  padding: 0.3rem 0.65rem;
+  background: rgba(10, 10, 11, 0.82);
+  backdrop-filter: blur(8px);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 4px;
+  font-family: var(--font-mono);
+  font-size: var(--t-micro);
+  color: var(--ink);
+  letter-spacing: 0.05em;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.4);
+}
+
+.console__hud-subtitle {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.45rem 0.85rem;
+  background: rgba(10, 10, 11, 0.88);
+  backdrop-filter: blur(12px);
+  border: 1px solid var(--rule-accent);
+  border-radius: 6px;
+  font-size: var(--t-small);
+  color: var(--ink);
+  animation: hudSubtitleFade 250ms ease-out;
+}
+
+.console__hud-subtitle strong {
+  color: var(--accent-bright);
+}
+
+@keyframes hudSubtitleFade {
+  from { opacity: 0; transform: translateY(6px); }
+  to { opacity: 1; transform: translateY(0); }
 }
 
 .panel--wide { grid-column: 1 / -1; }

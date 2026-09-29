@@ -27,10 +27,18 @@ export const viewport: Viewport = {
   themeColor: "#0a0a0b",
 };
 
+import { Suspense } from "react";
+import { NavigationProgressBar } from "@/components/NavigationProgressBar";
+
 export default function RootLayout({ children }: { children: React.ReactNode }) {
   return (
     <html lang="tr" className={`${serif.variable} ${ui.variable} ${mono.variable}`}>
-      <body>{children}</body>
+      <body>
+        <Suspense fallback={null}>
+          <NavigationProgressBar />
+        </Suspense>
+        {children}
+      </body>
     </html>
   );
 }

@@ -1,6 +1,7 @@
 import Link from "next/link";
 
 import { CikisDugmesi } from "@/components/CikisDugmesi";
+import { PanoNav } from "@/components/PanoNav";
 import { SITE } from "@/data/icerik";
 import { oturumGerekli } from "@/lib/oturum";
 
@@ -23,15 +24,7 @@ export default async function PanelDuzeni({ children }: { children: React.ReactN
             <span>{SITE.version}</span>
           </Link>
 
-          <nav className="pano__nav" aria-label="Panel">
-            <Link href="/panel">Cihazlar</Link>
-            <Link href="/panel/kisiler">Kişiler</Link>
-            <Link href="/panel/harita">Harita & Devriye</Link>
-            <Link href="/panel/ayarlar">Ayarlar</Link>
-            <Link href="/panel/abonelik">Abonelik</Link>
-            <Link href="/panel/faturalar">Faturalar</Link>
-            <Link href="/panel/hesap">Hesap</Link>
-          </nav>
+          <PanoNav />
 
           <span className="pano__kullanici mono">{oturum.user.email}</span>
           <CikisDugmesi className="btn btn--quiet" />

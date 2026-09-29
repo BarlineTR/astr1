@@ -199,6 +199,25 @@ export function Konsol({
     demoGonderRef.current?.(k);
   };
 
+  const cognitiveState = (() => {
+    if (!telemetri) return "idle";
+    const speechState = telemetri.speech?.state?.toLowerCase();
+    if (speechState === "listening" || speechState === "thinking" || speechState === "speaking") {
+      return speechState;
+    }
+    if (telemetri.audio?.vad) return "listening";
+    if (telemetri.gaze?.state === "TRACKING" || telemetri.gaze?.attentionOwner === "visual") return "orienting";
+    return "idle";
+  })();
+
+  const durumRozetMetni = {
+    listening: "🎧 DİNLİYOR",
+    thinking: "🧠 DÜŞÜNÜYOR",
+    speaking: "🔊 KONUŞUYOR",
+    orienting: "🎯 ODAKLANIYOR",
+    idle: "💤 BOŞTA",
+  }[cognitiveState];
+
   return (
     <div className="konsol">
       {mod === "demo" ? (
@@ -224,9 +243,33 @@ export function Konsol({
       )}
 
       <div className="console__grid">
-        <div className="panel panel--stage">
+        <div className={`panel panel--stage state--${cognitiveState}`}>
           {/* Sahne mutlak konumlu ayrı bir katman; kart yalnızca çerçeve. */}
           <div className="console__stage" ref={stageRef} />
+
+          {/* Sahne üstü canlı HUD katmanı */}
+          <div className="console__hud-top">
+            <span className="console__hud-pill">
+              <span className="badge__dot" />
+              {durumRozetMetni}
+            </span>
+            {telemetri && (
+              <span className="console__hud-pill">
+                {telemetri.faces && telemetri.faces.length > 0
+                  ? `👤 ${telemetri.faces.map((f) => f.name || "Misafir").join(", ")}`
+                  : "👁️ Serbest Tarama"}
+              </span>
+            )}
+          </div>
+
+          {telemetri?.speech?.lastTranscript && (
+            <div className="console__hud-bottom">
+              <div className="console__hud-subtitle">
+                <strong>🎙️ {telemetri.speech.lastSpeaker || "Astro"}:</strong>
+                <span>“{telemetri.speech.lastTranscript}”</span>
+              </div>
+            </div>
+          )}
         </div>
 
         <div className="panel">

@@ -38,12 +38,49 @@ export function RobotAyarlariFormu({ ayarlar }: { ayarlar: Ayarlar }) {
   const [promptMetni, setPromptMetni] = useState(ayarlar.llmPrompt);
   const [hiz, setHiz] = useState(ayarlar.voiceSpeed);
   const [ton, setTon] = useState(ayarlar.voicePitch);
+  const [konusuyor, setKonusuyor] = useState(false);
 
   const handlePersonaChange = (yeni: string) => {
     setSeciliPersona(yeni);
     if (PERSONA_PROMPTS[yeni]) {
       setPromptMetni(PERSONA_PROMPTS[yeni]);
     }
+  };
+
+  const sesTestEt = () => {
+    if (typeof window === "undefined" || !("speechSynthesis" in window)) {
+      alert("Tarayıcınız Web Speech ses sentezini desteklemiyor.");
+      return;
+    }
+
+    if (konusuyor) {
+      window.speechSynthesis.cancel();
+      setKonusuyor(false);
+      return;
+    }
+
+    window.speechSynthesis.cancel();
+
+    const testCumlesi =
+      ayarlar.greetingMessage ||
+      "Merhaba! Ben Astro. Sistemlerimi yapılandırdığınız için teşekkür ederim.";
+    const utterance = new SpeechSynthesisUtterance(testCumlesi);
+
+    utterance.rate = Math.max(0.5, Math.min(2.0, hiz / 100));
+    utterance.pitch = Math.max(0.5, Math.min(2.0, ton / 100));
+    utterance.lang = "tr-TR";
+
+    const sesler = window.speechSynthesis.getVoices();
+    const trSes = sesler.find((v) => v.lang.startsWith("tr")) || sesler[0];
+    if (trSes) {
+      utterance.voice = trSes;
+    }
+
+    utterance.onstart = () => setKonusuyor(true);
+    utterance.onend = () => setKonusuyor(false);
+    utterance.onerror = () => setKonusuyor(false);
+
+    window.speechSynthesis.speak(utterance);
   };
 
   return (
@@ -158,6 +195,20 @@ export function RobotAyarlariFormu({ ayarlar }: { ayarlar: Ayarlar }) {
             defaultValue={ayarlar.greetingMessage}
             placeholder="Örn: Selam, ne var ne yok?"
           />
+        </div>
+
+        <div style={{ marginTop: "0.75rem", display: "flex", alignItems: "center", gap: "0.75rem" }}>
+          <button
+            type="button"
+            className="btn btn--secondary"
+            onClick={sesTestEt}
+            style={{ display: "inline-flex", alignItems: "center", gap: "0.5rem" }}
+          >
+            {konusuyor ? "⏹️ Sesi Durdur" : "🔊 Seçili Sesi ve Hızı Canlı Dinle"}
+          </button>
+          <small style={{ color: "var(--color-muted, #a1a1aa)" }}>
+            (Tarayıcınızın konuşma sentezleyicisi ile anlık hız & ton önizlemesi)
+          </small>
         </div>
       </fieldset>
 
