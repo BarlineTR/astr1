@@ -286,7 +286,7 @@ class GlobalProviderCircuitBreaker:
                 p_rec.state = ProviderState.EXHAUSTED
                 self._log(
                     "error",
-                    f"🚨 [OPENAI QUOTA EXHAUSTED]\n"
+                    f"🚨 [{parent_key.upper()} QUOTA EXHAUSTED]\n"
                     f"🚨 [PROVIDER CIRCUIT BREAKER]\n"
                     f"  provider={parent_key}\n"
                     f"  state=EXHAUSTED\n"

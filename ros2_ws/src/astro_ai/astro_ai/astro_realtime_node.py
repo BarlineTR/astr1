@@ -606,6 +606,7 @@ def is_known_phantom_pattern(text: str) -> bool:
         "altyazı", "altyazı mk", "altyazı m k", "altyazi", "altyazi mk", "altyazi m k",
         "abone ol", "kanala abone ol", "abone olun", "videoyu beğenmeyi unutmayın",
         "izlediğiniz için teşekkürler", "izlediginiz icin tesekkurler",
+        "izlediğiniz için teşekkür ederim", "izlediginiz icin tesekkur ederim",
         "izlediğiniz için teşekkür ederiz", "izlediginiz icin tesekkur ederiz",
         "diz", "dizi", "hahaha", "hahahaha", "hehehe", "hihihi",
         "türen türen türen", "türen", "turen", "turen turen turen",
@@ -615,6 +616,13 @@ def is_known_phantom_pattern(text: str) -> bool:
         return True
 
     phantom_substrings = (
+        "altyazı m",
+        "altyazi m",
+        "altyazı mk",
+        "altyazi mk",
+        "izlediğiniz için",
+        "izlediginiz icin",
+        "abone ol",
         "sesime dön yüzüme bak durdum merkez",
         "sesime don yuzume bak durdum merkez",
         "sesime dön yüzüme bak",
@@ -1171,6 +1179,7 @@ class AstroRealtimeNode(Node):
         self.pub_social_offset_yaw = self.create_publisher(Float32, "/head/social_offset_yaw", 10)
         self.pub_explicit_gaze = self.create_publisher(String, "/behavior/explicit_gaze", 10)
         self.pub_transcript = self.create_publisher(String, "/speech/text", 10)
+        self.pub_speech_response = self.create_publisher(String, "/speech/response", 10)
 
         # Non-verbal Attentive Social Body Language State
         self._user_speaking_active: bool = False
@@ -1209,6 +1218,7 @@ class AstroRealtimeNode(Node):
             pass
 
         # ROS 2 Subscribers
+        self.create_subscription(String, "/speech/text", self._on_speech_text_input, 10)
         self.create_subscription(String, "/tts/realtime_request", self._on_realtime_turn_request, 10)
         self.create_subscription(String, "/audio/realtime_input_pcm", self._on_input_pcm, 50)
         self.create_subscription(Bool, "/audio/playback_active", self._on_playback_active, 10)
@@ -1592,6 +1602,23 @@ class AstroRealtimeNode(Node):
             f"  active_websocket_closed=True"
         )
 
+    def _on_speech_text_input(self, msg: String):
+        """Processes direct speech text input via 4o/conversational fallback turn pipeline."""
+        if not msg or not getattr(msg, "data", None):
+            return
+        txt = msg.data.strip()
+        if not txt:
+            return
+        self._global_generation_counter += 1
+        gen_id = self._global_generation_counter
+        self.realtime_current_generation_id = gen_id
+        threading.Thread(
+            target=self._process_fallback_turn,
+            kwargs={"direct_text": txt},
+            daemon=True,
+            name=f"astro-text-turn-{gen_id}"
+        ).start()
+
     def _on_realtime_turn_request(self, msg: String):
         """Receives conversational turn request from ai_brain_node and manages single active response."""
         try:
@@ -1615,6 +1642,17 @@ class AstroRealtimeNode(Node):
 
             if gen_id == self._last_sent_generation_id:
                 self.get_logger().info(f"[REALTIME TURN DUPLICATE DROPPED]\ngeneration_id={gen_id}")
+                return
+
+            # When running in USE_4O=true mode, process turn through OpenAI 4o pipeline
+            if getattr(self, "use_4o", False):
+                self.realtime_current_generation_id = gen_id
+                threading.Thread(
+                    target=self._process_fallback_turn,
+                    kwargs={"direct_text": text},
+                    daemon=True,
+                    name=f"astro-4o-turn-{gen_id}"
+                ).start()
                 return
 
             if not self._can_use_openai("realtime") or not self._ws or not self._loop or not self._is_connected:
@@ -2162,7 +2200,7 @@ class AstroRealtimeNode(Node):
             f"display_name={identity.get('display_name', name_val)}\n"
             f"identity_source={identity.get('identity_source', source_str)}\n"
             f"biometric_status={identity.get('biometric_status', 'verified' if is_known else 'unknown')}\n"
-            f"memory_profile_loaded=true\n"
+            f"memory_profile_loaded={'true' if is_known else 'false'}\n"
             f"realtime_context_injected=true"
         )
 
@@ -2208,11 +2246,11 @@ class AstroRealtimeNode(Node):
                 f"- Misafir / Henüz Tanımlanmamış Konuşmacı.\n"
                 f"{room_context}"
                 f"TANIŞMA VE KAYIT KURALLARI:\n"
-                f"1. Karşındaki kişi henüz sistemde kayıtlı değil (Misafir).\n"
+                f"1. Karşındaki kişi henüz biyometrik olarak tam doğrulanmadı (Misafir).\n"
                 f"2. Kullanıcı 'Ben Baran', 'Benim adım Ahmet', 'Bana Can de' diyerek kendini tanıttığında DERHAL 'enroll_user_biometrics' fonksiyonunu çağır ve kişiyi kaydet!\n"
-                f"3. Kullanıcı 'beni tanıdın mı?', 'ben kimim?' diye sorduğunda henüz tanışmadığınızı söyle ve adını sor ('Henüz tanışamadık, isminiz nedir?').\n"
-                f"4. Sohbet başlarken veya uygun bir anda sıcak bir şekilde 'Merhaba! Henüz tanışmadık, isminiz nedir?' diye sorabilirsin.\n"
-                f"5. ASLA kullanıcının adını tahmin etme veya başka biriyle karıştırma; adını kullanıcı kendisi söyleyene kadar Misafir olarak davran.\n"
+                f"3. Kullanıcı 'beni tanıdın mı?', 'ben kimim?' diye sorduğunda: Eğer kayıtlı kişiler listesinde ('KAYITLI KİŞİLER') Baran varsa veya sesini Baran'a benzetiyorsan nazikçe 'Sesin Baran'a çok benziyor ama henüz tam doğrulayamadım, sen misin?' veya doğal bir tonla cevap ver. Asla ezbere ve mekanik bir 'Henüz tanışamadık, isminiz nedir?' kalıbına sıkışıp kalma.\n"
+                f"4. Sohbet başlarken veya uygun bir anda sıcak bir şekilde 'Merhaba! Nasıl yardımcı olabilirim?' diyebilirsin.\n"
+                f"5. ASLA kullanıcının adını rastgele tahmin etme; adını kullanıcı kendisi söyleyene kadar doğal ve kibar davran.\n"
             )
 
         recent_sessions = []
@@ -7377,7 +7415,7 @@ class AstroRealtimeNode(Node):
 
         # 0. Pure Known Phantom Hallucination Patterns (e.g. 'Altyazı M.K.', 'Abone ol', 'İzlediğiniz için teşekkürler', 'türen türen türen')
         is_phantom = is_known_phantom_pattern(norm_text)
-        if is_phantom and not is_short_utterance and not has_strong_evidence and not has_strong_evidence_acoustic:
+        if is_phantom:
             rejected = True
             reject_reason = "known_phantom"
 
@@ -7621,7 +7659,7 @@ class AstroRealtimeNode(Node):
         if not self.groq_api_key:
             return None
         try:
-            prompt_text = prompt if prompt is not None else ""
+            prompt_text = prompt if prompt is not None else "Merhaba Astro, nasılsın? İyi misin? Robot komutları, Türkçe diyalog."
             boundary = "----WebKitFormBoundary" + os.urandom(16).hex()
             body = bytearray()
             body.extend(f"--{boundary}\r\n".encode())
@@ -8429,9 +8467,9 @@ class AstroRealtimeNode(Node):
                 t_vad_end = time.monotonic()
 
                 is_session_active = bool(self.session and self.session.is_active())
-                min_speech_ms = 160 if is_session_active else 320
-                min_vad_conf = 0.30 if is_session_active else 0.50
-                min_pcm_rms = max(180.0, self._ambient_rms * 1.10) if is_session_active else max(300.0, self._ambient_rms * 1.25)
+                min_speech_ms = 220 if is_session_active else 320
+                min_vad_conf = 0.35 if is_session_active else 0.50
+                min_pcm_rms = max(220.0, self._ambient_rms * 1.15) if is_session_active else max(300.0, self._ambient_rms * 1.25)
 
                 # Discard immediately if audio has no genuine acoustic speech evidence (< 0.60 VAD gate -> 0 STT calls)
                 if local_speech_ms < min_speech_ms or pcm_rms < min_pcm_rms or local_vad_conf < min_vad_conf:
@@ -9864,6 +9902,14 @@ class AstroRealtimeNode(Node):
                     t_model_start = time.monotonic()
                     first_token_seen = False
 
+                    self.get_logger().info(
+                        f"👤 [4O IDENTITY CONTEXT] profile_id={active_speaker_dict.get('user_id', active_speaker_dict.get('name', 'misafir')).lower()} | "
+                        f"memory_name={active_speaker_dict.get('name', 'none')} | "
+                        f"biometric_identity={active_speaker_dict.get('multimodal_identity', active_speaker_dict.get('name', 'none'))} | "
+                        f"session_identity={active_speaker_dict.get('active_speaker', active_speaker_dict.get('name', 'none'))} | "
+                        f"confidence={active_speaker_dict.get('confidence', 0.0):.2f} | "
+                        f"source={active_speaker_dict.get('source', 'none')}"
+                    )
                     self.get_logger().info(f"🤖 [OpenAI 4o-mini Inference Start] model={target_model}")
                     for token in self.provider_registry.stream_openai_completion(
                         self.openai_api_key,
@@ -10298,8 +10344,8 @@ class AstroRealtimeNode(Node):
                     full_reply_parts = []
 
             # Attempt A: Streaming Groq LLMs (Fastest first, fallback on failure)
-            # STRICT POLICY: When use_realtime=false, cloud LLM fallback is COMPLETELY OFF (zero cloud leakage)
-            if not full_reply_parts and (self.use_realtime or getattr(self, "use_4o", False)) and self.groq_api_key and groq_candidates:
+            # STRICT POLICY: When use_4o=true or use_realtime=false, cloud LLM fallback is COMPLETELY OFF (zero cloud leakage)
+            if not full_reply_parts and not self._barge_in_latched and not getattr(self, "use_4o", False) and self.use_realtime and self.groq_api_key and groq_candidates:
                 for target_model in groq_candidates:
                     try:
                         t_model_start = time.monotonic()
@@ -10357,8 +10403,8 @@ class AstroRealtimeNode(Node):
                         continue
 
             # Attempt B: Google Gemini REST Fallback (if Groq produced no tokens)
-            # STRICT POLICY: When use_realtime=false, cloud LLM fallback is COMPLETELY OFF (zero cloud leakage)
-            if not full_reply_parts and self.use_realtime and self.gemini_api_key:
+            # STRICT POLICY: When use_4o=true or use_realtime=false, cloud LLM fallback is COMPLETELY OFF (zero cloud leakage)
+            if not full_reply_parts and not self._barge_in_latched and not getattr(self, "use_4o", False) and self.use_realtime and self.gemini_api_key:
                 gemini_candidates = self.provider_registry.get_candidate_models("gemini")
                 for g_mod in gemini_candidates:
                     try:
@@ -10501,6 +10547,17 @@ class AstroRealtimeNode(Node):
 
             if full_reply_str:
                 self.get_logger().info(f"🤖 [Astro ({chosen_provider}/{chosen_model})]: \"{full_reply_str}\"")
+                if hasattr(self, "pub_speech_response") and self.pub_speech_response:
+                    self.pub_speech_response.publish(String(data=full_reply_str))
+                if hasattr(self, "pub_tts_say") and self.pub_tts_say:
+                    fb_msg = String()
+                    fb_msg.data = json.dumps({
+                        "text": full_reply_str,
+                        "engine": active_engine,
+                        "generation_id": current_gen_id,
+                        "model": chosen_model,
+                    })
+                    self.pub_tts_say.publish(fb_msg)
                 self.memory.episodic.add_message("assistant", full_reply_str)
                 self.session.record_robot_speech()
                 if getattr(self, "dialogue_state_manager", None):
@@ -10998,55 +11055,21 @@ class AstroRealtimeNode(Node):
             if is_echo_cooldown and not self._barge_in_latched:
                 return
 
-            # 3. Thinking / Inference Cancellation (Cancel & Restart):
-            # If the robot is thinking (LLM inference in-flight) and user speaks intentionally,
-            # cancel previous inference atomically and restart a fresh turn.
-            is_thinking = bool(getattr(self, "_is_responding", False) or getattr(self, "_is_processing_fallback", False))
-            if is_thinking:
-                speech_interrupt_cond = (local_rms > max(450.0, self._ambient_rms * 1.5) and peak_val > 1200)
-                if speech_interrupt_cond:
-                    self.get_logger().info("⚡ [THINKING CANCEL & RESTART] Kullanıcı robot düşünürken konuştu; eski çıkarım iptal ediliyor.")
-                    old_gid = getattr(self, "_fallback_generation_id", 0)
-                    self._fallback_generation_id = old_gid + 1
-                    if not hasattr(self, "_cancelled_generation_ids"):
-                        self._cancelled_generation_ids = set()
-                    self._cancelled_generation_ids.add(old_gid)
-
-                    # Realtime WebSocket cancel if active streaming
-                    if getattr(self, "active_response_state", None) in ("STREAMING", "RESPONSE_STREAMING"):
-                        self.active_response_state = "CANCELLED"
-                        ws = getattr(self, "_ws", None)
-                        loop = getattr(self, "_loop", None)
-                        if ws is not None:
-                            try:
-                                if loop is not None:
-                                    asyncio.run_coroutine_threadsafe(ws.send(json.dumps({"type": "response.cancel"})), loop)
-                            except Exception:
-                                pass
-
-                    if getattr(self, "output_manager", None):
-                        self.output_manager.interrupt(self._fallback_generation_id)
-
-                    self._is_responding = False
-                    self._is_processing_fallback = False
-                    self._fallback_speaking = True
-                    self._fallback_speech_start = now
-                    self._last_speech_time = now
-                    with self._lock:
-                        self._fallback_audio_buffer = [raw_16k]
-                    return
-                else:
-                    return
+            # 3. Playback / Residual echo handled above.
+            # While robot is thinking (LLM / TTS), DO NOT cancel on raw 20ms audio frames!
+            # Raw audio frames are safely accumulated into the speech buffer below.
+            # Superseding an in-flight generation ONLY occurs if a full valid utterance completes
+            # and passes acoustic pre-STT density gates.
 
             if raw_16k:
                 try:
                     # Active session sensitivity vs idle wake detection
                     is_sess_active = bool(self.session and self.session.is_active())
                     if is_sess_active:
-                        has_raw_mic_speech = (raw_mics_rms is None) or (raw_mics_rms >= 120.0)
-                        speech_start_condition = (local_rms > max(180.0, self._ambient_rms * 1.15) and peak_val > 450 and has_raw_mic_speech)
+                        has_raw_mic_speech = (raw_mics_rms is None) or (raw_mics_rms >= 150.0)
+                        speech_start_condition = (local_rms > max(220.0, self._ambient_rms * 1.18) and peak_val > 550 and has_raw_mic_speech)
                         silence_timeout_s = 0.45
-                        min_frames_needed = 10
+                        min_frames_needed = 12
                     else:
                         has_raw_mic_speech = (raw_mics_rms is None) or (raw_mics_rms >= 180.0)
                         speech_start_condition = (local_rms > max(340.0, self._ambient_rms * 1.35) and peak_val > 850 and has_raw_mic_speech)
@@ -11069,7 +11092,7 @@ class AstroRealtimeNode(Node):
                             # Silence timeout after speech ends
                             if (now - self._last_speech_time) > silence_timeout_s:
                                 self._fallback_speaking = False
-                                if len(self._fallback_audio_buffer) >= min_frames_needed and not self._is_processing_fallback:
+                                if len(self._fallback_audio_buffer) >= min_frames_needed:
                                     buf_to_proc = list(self._fallback_audio_buffer)
                                     self._fallback_audio_buffer.clear()
                                 else:
@@ -11081,7 +11104,7 @@ class AstroRealtimeNode(Node):
                         arr_fb = np.frombuffer(raw_fb, dtype=np.int16)
                         fb_rms = float(np.sqrt(np.mean(arr_fb.astype(np.float32) ** 2))) if len(arr_fb) > 0 else 0.0
                         chunk_sz = 320  # 20ms
-                        loud_thresh = max(180.0, self._ambient_rms * 1.15) if is_sess_active else max(280.0, self._ambient_rms * 1.25)
+                        loud_thresh = max(220.0, self._ambient_rms * 1.18) if is_sess_active else max(280.0, self._ambient_rms * 1.25)
                         loud_cnt = sum(
                             1 for i in range(0, len(arr_fb) - chunk_sz + 1, chunk_sz)
                             if np.sqrt(np.mean(arr_fb[i : i + chunk_sz].astype(np.float32) ** 2)) > loud_thresh
@@ -11089,12 +11112,20 @@ class AstroRealtimeNode(Node):
                         total_chunks = max(1, len(arr_fb) // chunk_sz)
                         speech_ratio = loud_cnt / float(total_chunks)
 
-                        min_rms_req = max(180.0, self._ambient_rms * 1.10) if is_sess_active else max(300.0, self._ambient_rms * 1.25)
-                        min_loud_req = 8 if is_sess_active else 14
-                        min_ratio_req = 0.30 if is_sess_active else 0.50
+                        min_rms_req = max(220.0, self._ambient_rms * 1.15) if is_sess_active else max(300.0, self._ambient_rms * 1.25)
+                        min_loud_req = 10 if is_sess_active else 14
+                        min_ratio_req = 0.35 if is_sess_active else 0.50
 
                         # Pre-STT Gate
                         if fb_rms >= min_rms_req and loud_cnt >= min_loud_req and speech_ratio >= min_ratio_req:
+                            if self._is_processing_fallback or getattr(self, "_is_responding", False):
+                                old_gid = getattr(self, "_fallback_generation_id", 0)
+                                if not hasattr(self, "_cancelled_generation_ids"):
+                                    self._cancelled_generation_ids = set()
+                                self._cancelled_generation_ids.add(old_gid)
+                                self._is_processing_fallback = False
+                                self._is_responding = False
+                                self.get_logger().info(f"⚡ [SUPERSEDING IN-FLIGHT TURN]: Yeni ve geçerli kullanıcı konuşması tamamlandı; generation_id={old_gid} iptal ediliyor.")
                             threading.Thread(target=self._process_fallback_turn, args=(buf_to_proc,), daemon=True).start()
                         else:
                             self.no_speech_rejection_count += 1
@@ -11696,6 +11727,8 @@ class AstroRealtimeNode(Node):
                             v_score = float(score)
                             v_status = "smoothed"
                         else:
+                            v_name = identified_name
+                            v_score = float(score)
                             v_status = "tentative"
                             self.get_logger().info(f"👤 [Tentative Speaker] candidate={identified_name} score={score:.2f} obs={self._speaker_tentative_count}/2")
                     else:
@@ -11866,8 +11899,8 @@ class AstroRealtimeNode(Node):
             self._log_fusion_result(res)
             return res
 
-        # Case 1: Voice recognized and confirmed/smoothed
-        if v_name and v_status in ("confirmed", "smoothed"):
+        # Case 1: Voice recognized and confirmed/smoothed/tentative
+        if v_name and v_status in ("confirmed", "smoothed", "tentative"):
             with self._lock:
                 self._recognized_speaker = {
                     "name": v_name,
@@ -11877,7 +11910,7 @@ class AstroRealtimeNode(Node):
                     "source": f"voice_{v_status}",
                 }
                 self._active_person_name = v_name
-                self._person_hold_until = now_mono + 45.0
+                self._person_hold_until = now_mono + (45.0 if v_status != "tentative" else 25.0)
                 if matched_track:
                     self._last_active_track_id = getattr(matched_track, "person_id", None)
 
@@ -11908,7 +11941,7 @@ class AstroRealtimeNode(Node):
                 "voice_confidence": v_score,
                 "multimodal_identity": v_name,
                 "active_speaker": v_name,
-                "identity_certainty": "KNOWN" if (face_name and face_name.lower() == v_name.lower()) else "PROBABLE",
+                "identity_certainty": "KNOWN" if (face_name and face_name.lower() == v_name.lower()) else ("SMOOTHED" if v_status == "smoothed" else ("CONFIRMED" if v_status == "confirmed" else "TENTATIVE")),
                 "spatial_score": round(best_s_spatial, 2),
                 "depth_score": round(best_s_depth, 2),
                 "temporal_score": round(best_s_temporal, 2),

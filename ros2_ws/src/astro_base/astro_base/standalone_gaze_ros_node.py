@@ -1035,8 +1035,8 @@ class StandaloneGazeRosNode(Node):
             def _worker(items, full_img):
                 try:
                     for face_roi, u_norm, det in items:
-                        # Skip face recognition on very small blurry crops (<55px) or extreme edges until gaze centers
-                        if getattr(det, "w", 0) < 55 or getattr(det, "h", 0) < 55 or u_norm < 0.08 or u_norm > 0.92:
+                        # Skip face recognition on very small blurry crops (<20px) or extreme edges until gaze centers
+                        if getattr(det, "w", 0) < 20 or getattr(det, "h", 0) < 20 or u_norm < 0.08 or u_norm > 0.92:
                             continue
                         raw_r = getattr(det, "raw_row", None)
                         name, conf, meta = self.face_recognizer.recognize_face(
