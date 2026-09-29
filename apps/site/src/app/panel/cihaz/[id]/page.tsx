@@ -1,3 +1,4 @@
+import Link from "next/link";
 import { notFound } from "next/navigation";
 
 import { CihazYonetimi } from "@/components/CihazYonetimi";
@@ -49,7 +50,16 @@ export default async function CihazSayfasi({ params }: PageProps<"/panel/cihaz/[
           <h1>{cihaz.name}</h1>
           <p className="pano__lead cihaz-basligi__seri mono">{cihaz.serial}</p>
         </div>
-        <span className="cihaz__durum">{DURUM_ADI[cihaz.status] ?? cihaz.status}</span>
+        <div style={{ display: "flex", alignItems: "center", gap: "0.75rem" }}>
+          <Link
+            href={`/panel/cihaz/${cihaz.id}/kamera`}
+            className="btn btn--sm"
+            style={{ display: "inline-flex", alignItems: "center", gap: "0.4rem" }}
+          >
+            <span>📹</span> Canlı Kamera
+          </Link>
+          <span className="cihaz__durum">{DURUM_ADI[cihaz.status] ?? cihaz.status}</span>
+        </div>
       </div>
 
       <Konsol

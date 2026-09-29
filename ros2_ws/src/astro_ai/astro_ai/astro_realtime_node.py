@@ -6918,12 +6918,14 @@ class AstroRealtimeNode(Node):
             ans = None
 
             # 1. Try Groq (0 Token Cost)
+            # NOTE: If discover_groq_models returns empty (network block / 403), skip Groq entirely.
+            # Do NOT fall back to hardcoded model names — they may be invalid and cause blacklisting.
             if self.groq_api_key:
                 active_groq = discover_groq_models(self.groq_api_key)
                 text_models = [m for m in ["openai/gpt-oss-120b", "openai/gpt-oss-20b", "llama-3.3-70b-versatile", "llama-3.1-8b-instant"] if m in active_groq]
                 if not text_models and active_groq:
                     text_models = active_groq[:2]
-                for g_m in (text_models or ["llama-3.3-70b-versatile"]):
+                for g_m in text_models:  # Only iterate if discovery succeeded; skip if empty
                     try:
                         req_data = {
                             "model": g_m,
@@ -7106,15 +7108,11 @@ class AstroRealtimeNode(Node):
         summary = None
 
         # 1. Try Groq (0 Token Cost / Ultra-fast)
+        # NOTE: If discover_groq_models returns empty (network 403 block), skip Groq.
+        # Hardcoded fallback model names may be invalid and cause permanent blacklisting.
         if self.use_realtime and self.groq_api_key:
             active_groq = discover_groq_models(self.groq_api_key)
-            groq_candidates = active_groq if active_groq else [
-                "llama-3.3-70b-versatile",
-                "openai/gpt-oss-120b",
-                "llama-3.1-8b-instant",
-                "openai/gpt-oss-20b",
-                "qwen/qwen3.6-27b",
-            ]
+            groq_candidates = active_groq  # Empty list = skip Groq entirely
             for groq_model in groq_candidates:
                 try:
                     import urllib.request
@@ -10774,8 +10772,13 @@ class AstroRealtimeNode(Node):
             curr_gen_id = getattr(self, "_fallback_generation_id", 0)
             is_vad_active = bool(getattr(self, "_vad_active", False) or getattr(self, "_user_speaking_active", False))
             ambient_val = float(getattr(self, "_ambient_rms", 120.0))
-            target_barge_in_rms = max(350.0, ambient_val * 1.35)
-            target_barge_in_peak = 750
+            # During TTS playback, use higher configured thresholds to avoid false barge-in from
+            # background noise (TV subtitles, environmental sounds, etc.).
+            # barge_in_playback_min_rms default=4500, barge_in_playback_min_peak default=9000
+            _pb_min_rms = float(getattr(self, "barge_in_playback_min_rms", 4500.0))
+            _pb_min_peak = int(getattr(self, "barge_in_playback_min_peak", 9000))
+            target_barge_in_rms = max(_pb_min_rms, ambient_val * 1.8)
+            target_barge_in_peak = _pb_min_peak
 
             # Acoustic voice presence evidence: high energy with low correlation to robot's own playback
             is_acoustic_voice = (local_rms >= target_barge_in_rms and peak_val >= target_barge_in_peak and self_voice_score < 0.22)

@@ -1,5 +1,6 @@
 "use client";
 
+import Link from "next/link";
 import { useCallback, useEffect, useRef, useState } from "react";
 
 import { HEAD_YAW_LIMIT_DEG, type Command, type Telemetry } from "@astro/protocol";
@@ -70,7 +71,6 @@ export function Konsol({
   const [hedefAci, setHedefAci] = useState(0);
   const [eStop, setEStop] = useState(false);
   const [sonOnay, setSonOnay] = useState<string | null>(null);
-  const [gorunumModu, setGorunumModu] = useState<"3b" | "kamera">("3b");
 
   const cerceveEkle = useCallback((kayit: CerceveKaydi) => {
     setKayitlar((oncekiler) => [kayit, ...oncekiler].slice(0, GUNLUK_SINIRI));
@@ -244,21 +244,9 @@ export function Konsol({
       )}
 
       <div className="console__grid">
-        <div className={`panel panel--stage state--${cognitiveState}`} style={{ position: "relative", minHeight: "340px", overflow: "hidden" }}>
-          {gorunumModu === "3b" ? (
-            <div className="console__stage" ref={stageRef} />
-          ) : (
-            <div style={{ position: "absolute", inset: 0, background: "#000", display: "flex", alignItems: "center", justifyContent: "center" }}>
-              <img
-                src={typeof window !== "undefined" ? `http://${window.location.hostname}:8080/camera/stream.mjpg` : "/camera/stream.mjpg"}
-                alt="OAK-D Canlı Video"
-                style={{ width: "100%", height: "100%", objectFit: "cover" }}
-                onError={(e) => {
-                  (e.target as HTMLImageElement).src = "http://192.168.1.111:8080/camera/stream.mjpg";
-                }}
-              />
-            </div>
-          )}
+        <div className={`panel panel--stage state--${cognitiveState}`}>
+          {/* Sahne mutlak konumlu ayrı bir katman; kart yalnızca çerçeve. */}
+          <div className="console__stage" ref={stageRef} />
 
           {/* Sahne üstü canlı HUD katmanı */}
           <div className="console__hud-top">
@@ -273,24 +261,28 @@ export function Konsol({
                   : "👁️ Serbest Tarama"}
               </span>
             )}
-            <div style={{ marginLeft: "auto", display: "flex", gap: "0.25rem", pointerEvents: "auto" }}>
-              <button
-                type="button"
+            {cihazId && (
+              <Link
+                href={`/panel/cihaz/${cihazId}/kamera`}
                 className="btn btn--sm"
-                style={{ padding: "0.2rem 0.5rem", fontSize: "0.7rem", background: gorunumModu === "3b" ? "var(--color-primary, #10b981)" : "rgba(0,0,0,0.5)" }}
-                onClick={() => setGorunumModu("3b")}
+                style={{
+                  marginLeft: "auto",
+                  padding: "0.25rem 0.65rem",
+                  fontSize: "0.75rem",
+                  background: "rgba(10, 10, 11, 0.85)",
+                  border: "1px solid rgba(255, 255, 255, 0.15)",
+                  color: "#fff",
+                  textDecoration: "none",
+                  display: "inline-flex",
+                  alignItems: "center",
+                  gap: "0.35rem",
+                  pointerEvents: "auto",
+                  borderRadius: "4px",
+                }}
               >
-                3B Sahne
-              </button>
-              <button
-                type="button"
-                className="btn btn--sm"
-                style={{ padding: "0.2rem 0.5rem", fontSize: "0.7rem", background: gorunumModu === "kamera" ? "var(--color-primary, #10b981)" : "rgba(0,0,0,0.5)" }}
-                onClick={() => setGorunumModu("kamera")}
-              >
-                📹 Canlı Kamera
-              </button>
-            </div>
+                <span>📹</span> Canlı Kamera ↗
+              </Link>
+            )}
           </div>
 
           {telemetri?.speech?.lastTranscript && (

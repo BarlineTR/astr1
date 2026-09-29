@@ -50,7 +50,7 @@ HAVE_ROS2 = False
 try:
     import rclpy
     from rclpy.node import Node
-    from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
+    from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, qos_profile_sensor_data
     from std_msgs.msg import String as RosString, Float32 as RosFloat32, Bool as RosBool, Int32 as RosInt32
     try:
         from sensor_msgs.msg import Image as RosImage, CompressedImage as RosCompressedImage
@@ -260,12 +260,13 @@ class AstroRobotAjan:
             self.ros_node.create_subscription(RosString, "/astro/turn_telemetry", self._on_turn_telemetry, 10)
             self.ros_node.create_subscription(RosString, "/astro/dispatched_transcript", self._on_speech_text, 10)
 
-            # Canlı Kamera Görüntüsü Abonelikleri
+            # Canlı Kamera Görüntüsü Abonelikleri (Sensör verisi için BEST_EFFORT qos_profile_sensor_data)
+            cam_qos = qos_profile_sensor_data if 'qos_profile_sensor_data' in globals() else QoSProfile(depth=5, reliability=ReliabilityPolicy.BEST_EFFORT)
             if RosImage is not None:
-                self.ros_node.create_subscription(RosImage, "/oak/rgb/image_raw", self._on_camera_raw, 5)
-                self.ros_node.create_subscription(RosImage, "/vision/face_image", self._on_camera_raw, 5)
+                self.ros_node.create_subscription(RosImage, "/oak/rgb/image_raw", self._on_camera_raw, cam_qos)
+                self.ros_node.create_subscription(RosImage, "/vision/face_image", self._on_camera_raw, cam_qos)
             if RosCompressedImage is not None:
-                self.ros_node.create_subscription(RosCompressedImage, "/oak/rgb/image_raw/compressed", self._on_camera_compressed, 5)
+                self.ros_node.create_subscription(RosCompressedImage, "/oak/rgb/image_raw/compressed", self._on_camera_compressed, cam_qos)
 
             self._ros_thread = threading.Thread(target=self._ros_spin_loop, daemon=True)
             self._ros_thread.start()
@@ -678,6 +679,24 @@ class AstroRobotAjan:
         class ConsciousnessHandler(BaseHTTPRequestHandler):
             def log_message(self, format, *args):
                 pass  # Standart konsol kirliliğini engelle
+
+            def do_HEAD(self):
+                if self.path in ("/", "/dashboard"):
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/html; charset=utf-8")
+                    self.end_headers()
+                elif self.path in ("/camera/stream.mjpg", "/camera/snapshot.jpg"):
+                    self.send_response(200)
+                    self.send_header("Content-Type", "image/jpeg")
+                    self.end_headers()
+                elif self.path == "/api/telemetry":
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json; charset=utf-8")
+                    self.send_header("Access-Control-Allow-Origin", "*")
+                    self.end_headers()
+                else:
+                    self.send_response(404)
+                    self.end_headers()
 
             def do_GET(self):
                 if self.path in ("/", "/dashboard"):

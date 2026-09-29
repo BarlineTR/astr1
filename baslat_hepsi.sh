@@ -19,17 +19,18 @@ echo "========================================================"
 
 # --- 1. Eski Prosesleri Temizle ---
 echo "[1/4] Eski düğümler ve arka plan servisleri temizleniyor..."
-pkill -f "astro_web_agent"        2>/dev/null || true
-pkill -f "tsx.*index.ts"          2>/dev/null || true
-pkill -f "next"                   2>/dev/null || true
-pkill -f "astro_social_gaze"      2>/dev/null || true
-pkill -f "serial_bridge"          2>/dev/null || true
-pkill -f "standalone_gaze"        2>/dev/null || true
-pkill -f "consciousness"          2>/dev/null || true
-pkill -f "astro_realtime"         2>/dev/null || true
-pkill -f "audio_stream"           2>/dev/null || true
-pkill -f "scan_filter"            2>/dev/null || true
-sleep 2
+fuser -k 8080/tcp 8420/tcp 3000/tcp 2>/dev/null || true
+pkill -9 -f "astro_web_agent"        2>/dev/null || true
+pkill -9 -f "tsx.*index.ts"          2>/dev/null || true
+pkill -9 -f "next"                   2>/dev/null || true
+pkill -9 -f "astro_social_gaze"      2>/dev/null || true
+pkill -9 -f "serial_bridge"          2>/dev/null || true
+pkill -9 -f "standalone_gaze"        2>/dev/null || true
+pkill -9 -f "consciousness"          2>/dev/null || true
+pkill -9 -f "astro_realtime"         2>/dev/null || true
+pkill -9 -f "audio_stream"           2>/dev/null || true
+pkill -9 -f "scan_filter"            2>/dev/null || true
+sleep 1
 
 # --- 2. Ortam Değişkenleri & ROS2 Kaynakları ---
 echo "[2/4] Ortam değişkenleri ve ROS 2 kütüphaneleri yükleniyor..."
@@ -72,12 +73,13 @@ cleanup() {
     [ -n "$BRIDGE_PID" ] && kill "$BRIDGE_PID" 2>/dev/null || true
     [ -n "$SITE_PID" ] && kill "$SITE_PID" 2>/dev/null || true
     [ -n "$GW_PID" ] && kill "$GW_PID" 2>/dev/null || true
-    pkill -f "astro_web_agent"   2>/dev/null || true
-    pkill -f "tsx.*index.ts"     2>/dev/null || true
-    pkill -f "next"              2>/dev/null || true
-    pkill -f "serial_bridge"     2>/dev/null || true
-    pkill -f "astro_realtime"    2>/dev/null || true
-    pkill -f "audio_stream"      2>/dev/null || true
+    fuser -k 8080/tcp 8420/tcp 3000/tcp 2>/dev/null || true
+    pkill -9 -f "astro_web_agent"   2>/dev/null || true
+    pkill -9 -f "tsx.*index.ts"     2>/dev/null || true
+    pkill -9 -f "next"              2>/dev/null || true
+    pkill -9 -f "serial_bridge"     2>/dev/null || true
+    pkill -9 -f "astro_realtime"    2>/dev/null || true
+    pkill -9 -f "audio_stream"      2>/dev/null || true
     echo "✅ Tüm servisler güvenle durduruldu."
 }
 trap cleanup EXIT INT TERM

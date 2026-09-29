@@ -50,6 +50,9 @@ export interface GecitBaglantisi {
  */
 export const GECIKME_ESIGI_MS = 800;
 
+/** Yeniden bağlanma gecikmesi (ms). */
+const YENIDEN_BAGLANTI_GECIKME_MS = 5000;
+
 export function gecideBaglan(
   cihazId: string,
   olaylar: GecitOlaylari,
@@ -62,6 +65,7 @@ export function gecideBaglan(
   let kapatildi = false;
   let sonGecikme: number | null = null;
   let komutSayaci = 0;
+  let yenidenBaglanmaZamanlayici: ReturnType<typeof setTimeout> | null = null;
 
   const kaydet = (yon: CerceveKaydi["yon"], tur: string, ozet: string): void => {
     olaylar.cerceve({ yon, tur, ozet, t: Date.now() });
@@ -73,7 +77,8 @@ export function gecideBaglan(
     kaydet("giden", String(cerceve.kind), ozet);
   };
 
-  void (async () => {
+  const baglan = async (): Promise<void> => {
+    if (kapatildi) return;
     olaylar.durum("yetkileniyor");
 
     let token: string = secenekler?.baslangicJetonu ?? "";
@@ -89,6 +94,7 @@ export function gecideBaglan(
         });
         if (!yanit.ok) {
           olaylar.durum("hata", "Bu cihaz için yetki alınamadı.");
+          planlaYenidenBaglanma();
           return;
         }
         const govde = (await yanit.json()) as { token: string; gecitUrl: string };
@@ -96,6 +102,7 @@ export function gecideBaglan(
         gecitUrl = govde.gecitUrl;
       } catch {
         olaylar.durum("hata", "Yetki sunucusuna ulaşılamadı.");
+        planlaYenidenBaglanma();
         return;
       }
     }
@@ -114,6 +121,7 @@ export function gecideBaglan(
       soket = new WebSocket(`${wsUrl}/ws/panel`);
     } catch {
       olaylar.durum("hata", "Ağ geçidine bağlanılamadı.");
+      planlaYenidenBaglanma();
       return;
     }
 
@@ -182,13 +190,32 @@ export function gecideBaglan(
     });
 
     soket.addEventListener("close", () => {
-      if (!kapatildi) olaylar.durum("kopuk");
+      if (!kapatildi) {
+        olaylar.durum("kopuk");
+        planlaYenidenBaglanma();
+      }
     });
 
     soket.addEventListener("error", () => {
-      if (!kapatildi) olaylar.durum("hata", "Ağ geçidi bağlantısı koptu.");
+      if (!kapatildi) {
+        olaylar.durum("hata", "Ağ geçidi bağlantısı koptu.");
+        planlaYenidenBaglanma();
+      }
     });
-  })();
+  };
+
+  const planlaYenidenBaglanma = (): void => {
+    if (kapatildi) return;
+    if (yenidenBaglanmaZamanlayici !== null) return; // Zaten planlandı
+    yenidenBaglanmaZamanlayici = setTimeout(() => {
+      yenidenBaglanmaZamanlayici = null;
+      soket?.close();
+      soket = null;
+      void baglan();
+    }, YENIDEN_BAGLANTI_GECIKME_MS);
+  };
+
+  void baglan();
 
   return {
     komutGonder(komut) {
@@ -206,6 +233,10 @@ export function gecideBaglan(
     },
     kapat() {
       kapatildi = true;
+      if (yenidenBaglanmaZamanlayici !== null) {
+        clearTimeout(yenidenBaglanmaZamanlayici);
+        yenidenBaglanmaZamanlayici = null;
+      }
       soket?.close();
     },
     gecikme: () => sonGecikme,
