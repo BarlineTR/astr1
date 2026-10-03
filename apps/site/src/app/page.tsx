@@ -46,6 +46,9 @@ export default function AnaSayfa() {
               <Link className="btn btn--primary" href="/platform">
                 Platformu inceleyin
               </Link>
+              <Link className="btn" href="/durum">
+                Robot Durumu
+              </Link>
               <Link className="btn" href="/iletisim">
                 Teklif isteyin
               </Link>

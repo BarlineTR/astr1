@@ -4,6 +4,7 @@ import { SITE } from "@/data/icerik";
 
 export type PageId =
   | "ana"
+  | "durum"
   | "platform"
   | "cozumler"
   | "teknoloji"
@@ -30,6 +31,7 @@ type Yol = React.ComponentProps<typeof Link>["href"];
  * sayfa, Hesap ve Panel ise hesaba giden yollar.
  */
 const NAV: ReadonlyArray<{ id: PageId; label: string; href: Yol }> = [
+  { id: "durum", label: "Robot Durumu", href: "/durum" },
   { id: "platform", label: "Platform", href: "/platform" },
   { id: "cozumler", label: "Çözümler", href: "/cozumler" },
   { id: "teknoloji", label: "Teknoloji", href: "/teknoloji" },
