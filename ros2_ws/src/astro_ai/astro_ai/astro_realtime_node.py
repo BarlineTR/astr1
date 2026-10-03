@@ -1036,6 +1036,7 @@ class AstroRealtimeNode(Node):
         self._cancelled_generation_ids: Set[int] = set()
         self._current_user_turn_id: Optional[str] = None
         self._speech_authorization: Optional[SpeechAuthorization] = None
+        self._thinking_start_time: float = 0.0
 
         # Dedicated Wake Detector (Active in SLEEP / DEEP_IDLE with Ultra-low CPU)
         self._wake_audio_buffer: List[bytes] = []
@@ -6116,6 +6117,21 @@ class AstroRealtimeNode(Node):
     def _check_sleep_mode(self):
         """Transitions Astro into sleep mode after conversation inactivity (protected by active follow-up window)."""
         now = time.monotonic()
+
+        # THINKING State Self-Healing Watchdog:
+        # If the robot is in THINKING state for > 6.0 seconds without active playback or active fallback,
+        # recover automatically to LISTENING / DEEP_IDLE and reset LEDs.
+        if hasattr(self, "state_machine") and self.state_machine and self.state_machine.is_thinking():
+            t_think_start = getattr(self, "_thinking_start_time", 0.0)
+            if t_think_start > 0.0 and (now - t_think_start > 6.0):
+                if not getattr(self, "_is_playback_active", False) and not getattr(self, "_is_processing_fallback", False):
+                    self.get_logger().warning(
+                        f"⏱️ [Thinking Watchdog Timeout]: Robot {now - t_think_start:.1f}s boyunca THINKING durumunda takıldı. Otomatik LISTENING durumuna döndürülüyor."
+                    )
+                    target_state = RobotState.DEEP_IDLE if (getattr(self, "_is_sleeping", False) or self.state_machine.is_deep_idle()) else RobotState.LISTENING
+                    self.state_machine.transition_to(target_state)
+                    self._is_responding = False
+
         in_follow_up = now < getattr(self, "_follow_up_listening_deadline", 0.0)
         is_busy = (
             self._is_responding
@@ -8184,8 +8200,12 @@ class AstroRealtimeNode(Node):
 
         # 3. User turn existence check
         if not user_turn_id or not curr_turn_id:
-            _log_gate_decision(False, "no_user_turn")
-            return False, "no_user_turn"
+            if user_turn_id and not curr_turn_id and generation_id == getattr(self, "_fallback_generation_id", None):
+                curr_turn_id = user_turn_id
+                self._current_user_turn_id = user_turn_id
+            else:
+                _log_gate_decision(False, "no_user_turn")
+                return False, "no_user_turn"
 
         # 4. Stale turn check
         if user_turn_id != curr_turn_id:
@@ -8204,8 +8224,20 @@ class AstroRealtimeNode(Node):
 
         # 7. Authorization object check
         if auth is None or getattr(auth, "invalidated", False):
-            _log_gate_decision(False, "no_user_turn")
-            return False, "no_user_turn"
+            if explicit_turn and user_turn_id and generation_id == getattr(self, "_fallback_generation_id", None):
+                auth = SpeechAuthorization(
+                    user_turn_id=user_turn_id,
+                    generation_id=generation_id,
+                    explicit_user_turn=True,
+                    should_speak=True,
+                    response_origin=getattr(self, "_current_response_origin", "user_turn_response"),
+                    llm_inference_completed=is_llm_completed,
+                    response_final=is_final_response,
+                )
+                self._speech_authorization = auth
+            else:
+                _log_gate_decision(False, "no_user_turn")
+                return False, "no_user_turn"
 
         if auth.user_turn_id != user_turn_id:
             _log_gate_decision(False, "stale_turn")
@@ -8540,6 +8572,7 @@ class AstroRealtimeNode(Node):
                     self._wake_up()
                     self._is_sleeping = False
                 self.state_machine.transition_to(RobotState.THINKING)
+                self._thinking_start_time = time.monotonic()
                 self.get_logger().info(f"🗣️ [Siz (Yedek Zeka)]: \"{user_text}\"")
                 self.memory.episodic.add_message("user", user_text)
                 raw_pcm = b""
@@ -8769,6 +8802,7 @@ class AstroRealtimeNode(Node):
                 self.get_logger().info(f"🗣️ [Siz (0-Maliyet)]: \"{user_text}\"")
                 self.memory.episodic.add_message("user", user_text)
                 self.state_machine.transition_to(RobotState.THINKING)
+                self._thinking_start_time = time.monotonic()
                 self._is_responding = True
 
             # 4. Run Person-Centric Multi-Modal Identity & Active Speaker Fusion
@@ -10002,6 +10036,15 @@ class AstroRealtimeNode(Node):
             if not full_reply_parts and getattr(self, "use_4o", False) and self.openai_api_key:
                 target_model = getattr(self, "openai_chat_model", "gpt-4o-mini")
                 llm_inference_started = True
+                self._speech_authorization = SpeechAuthorization(
+                    user_turn_id=u_turn_id,
+                    generation_id=current_gen_id,
+                    explicit_user_turn=True,
+                    should_speak=True,
+                    response_origin="openai_chat",
+                    llm_inference_completed=False,
+                    response_final=False,
+                )
                 try:
                     t_model_start = time.monotonic()
                     first_token_seen = False
@@ -10776,12 +10819,22 @@ class AstroRealtimeNode(Node):
             self.get_logger().warn(f"Fallback turn notice: {e}")
         finally:
             if getattr(self, "_speech_authorization", None):
-                self._last_speech_authorization = self._speech_authorization
-                self._speech_authorization.invalidated = True
-                self._speech_authorization = None
-            self._current_user_turn_id = None
-            self._is_processing_fallback = False
-            self._is_responding = False
+                if getattr(self._speech_authorization, "generation_id", None) == current_gen_id:
+                    self._last_speech_authorization = self._speech_authorization
+                    self._speech_authorization.invalidated = True
+                    self._speech_authorization = None
+            if getattr(self, "_current_user_turn_id", None) == u_turn_id:
+                self._current_user_turn_id = None
+            if getattr(self, "_fallback_generation_id", None) == current_gen_id:
+                self._is_processing_fallback = False
+                self._is_responding = False
+
+            # Ensure state machine leaves THINKING state if playback never started
+            if hasattr(self, "state_machine") and self.state_machine and self.state_machine.is_thinking():
+                if not getattr(self, "_is_playback_active", False):
+                    target_state = RobotState.DEEP_IDLE if (getattr(self, "_is_sleeping", False) or self.state_machine.is_deep_idle()) else RobotState.LISTENING
+                    self.state_machine.transition_to(target_state)
+
             self._is_playback_active = False
             self._playback_end_time = time.monotonic()
             self._follow_up_listening_deadline = time.monotonic() + 10.0
