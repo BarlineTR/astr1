@@ -11,6 +11,8 @@ FILES_TO_SYNC = [
     ("ros2_ws/src/astro_ai/astro_ai/provider_registry.py", "/home/okistech/Desktop/astr1/ros2_ws/src/astro_ai/astro_ai/provider_registry.py"),
     ("ros2_ws/src/astro_base/astro_base/standalone_gaze_ros_node.py", "/home/okistech/Desktop/astr1/ros2_ws/src/astro_base/astro_base/standalone_gaze_ros_node.py"),
     ("ros2_ws/src/astro_ai/astro_ai/astro_realtime_node.py", "/home/okistech/Desktop/astr1/ros2_ws/src/astro_ai/astro_ai/astro_realtime_node.py"),
+    ("ros2_ws/src/astro_audio/astro_audio/audio_stream_node.py", "/home/okistech/Desktop/astr1/ros2_ws/src/astro_audio/astro_audio/audio_stream_node.py"),
+    (".env", "/home/okistech/Desktop/astr1/.env"),
     ("scripts/astro_web_agent.py", "/home/okistech/Desktop/astr1/scripts/astro_web_agent.py"),
     ("apps/site/src/app/api/kamera/route.ts", "/home/okistech/Desktop/astr1/apps/site/src/app/api/kamera/route.ts"),
     ("apps/site/src/app/api/lidar/route.ts", "/home/okistech/Desktop/astr1/apps/site/src/app/api/lidar/route.ts"),

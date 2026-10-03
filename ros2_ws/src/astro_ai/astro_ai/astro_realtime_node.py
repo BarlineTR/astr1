@@ -983,13 +983,13 @@ class AstroRealtimeNode(Node):
         self._lidar_health: str = "UNHEALTHY"
 
         # Configurable Acoustic Echo & Barge-In Parameters
-        self.echo_mute_cooldown_s = float(os.getenv("ECHO_MUTE_COOLDOWN_S", "0.35"))
-        self.barge_in_protection_ms = float(os.getenv("TTS_BARGE_IN_PROTECTION_MS", "350.0"))
-        self.barge_in_min_rms = float(os.getenv("BARGE_IN_MIN_RMS", "1200.0"))
-        self.barge_in_playback_min_rms = float(os.getenv("BARGE_IN_PLAYBACK_MIN_RMS", "2000.0" if self._under_pytest() else "4500.0"))
-        self.barge_in_noise_mult = float(os.getenv("BARGE_IN_NOISE_MULTIPLIER", "3.5"))
-        self.barge_in_min_peak = int(os.getenv("BARGE_IN_MIN_PEAK", "2800"))
-        self.barge_in_playback_min_peak = int(os.getenv("BARGE_IN_PLAYBACK_MIN_PEAK", "3000" if self._under_pytest() else "9000"))
+        self.echo_mute_cooldown_s = float(os.getenv("ECHO_MUTE_COOLDOWN_S", "0.20"))
+        self.barge_in_protection_ms = float(os.getenv("TTS_BARGE_IN_PROTECTION_MS", "250.0"))
+        self.barge_in_min_rms = float(os.getenv("BARGE_IN_MIN_RMS", "450.0"))
+        self.barge_in_playback_min_rms = float(os.getenv("BARGE_IN_PLAYBACK_MIN_RMS", "2000.0" if self._under_pytest() else "450.0"))
+        self.barge_in_noise_mult = float(os.getenv("BARGE_IN_NOISE_MULTIPLIER", "1.8"))
+        self.barge_in_min_peak = int(os.getenv("BARGE_IN_MIN_PEAK", "1800"))
+        self.barge_in_playback_min_peak = int(os.getenv("BARGE_IN_PLAYBACK_MIN_PEAK", "3000" if self._under_pytest() else "2400"))
         self._barge_in_consecutive_frames = 0
         self.barge_in_min_speech_ms = float(os.getenv("BARGE_IN_MIN_SPEECH_MS", "60.0"))
         self.barge_in_min_consecutive_frames = int(os.getenv("BARGE_IN_MIN_CONSECUTIVE_FRAMES")) if "BARGE_IN_MIN_CONSECUTIVE_FRAMES" in os.environ else None
@@ -1042,6 +1042,8 @@ class AstroRealtimeNode(Node):
         self._wake_speech_frames = 0
         self._wake_listening = False
         self._wake_last_voice_time = 0.0
+        self._wake_start_time = 0.0
+        self._follow_up_listening_deadline = 0.0
 
         # Utterance Deduplication & Temporal Turn Debounce (Structural Duplicate Elimination)
         self._recent_dispatched_transcripts: collections.deque = collections.deque(maxlen=20)
@@ -6112,14 +6114,16 @@ class AstroRealtimeNode(Node):
         return {"status": "error", "observation": "Görüntü analiz edilirken bir hata oluştu."}
 
     def _check_sleep_mode(self):
-        """Transitions Astro into sleep mode after 15 seconds of conversation inactivity."""
+        """Transitions Astro into sleep mode after conversation inactivity (protected by active follow-up window)."""
         now = time.monotonic()
+        in_follow_up = now < getattr(self, "_follow_up_listening_deadline", 0.0)
         is_busy = (
             self._is_responding
             or self._is_playback_active
             or self.state_machine.is_speaking()
             or self.state_machine.is_thinking()
             or getattr(self, "_is_processing_fallback", False)
+            or in_follow_up
         )
         is_session_live = bool(getattr(self, "session", None) and self.session.is_active())
         if is_busy or is_session_live:
@@ -6242,9 +6246,9 @@ class AstroRealtimeNode(Node):
     def _flush_wake_buffer(self, reason: str = "silence"):
         """Uyandırma tamponunu STT'ye yollar ve dinleme durumunu sıfırlar.
 
-        `reason="max_utterance"` üst sınır yolu: ses hiç susmadığı için zorla
-        boşaltma. Bu durum neredeyse her zaman mikrofon kazancının doyuma
-        girdiğini gösterir, o yüzden (en fazla 30 sn'de bir) uyarı basar.
+        Hızlı akustik konuşma yoğunluğu filtresi uygulayarak arka plan gürültüsü ve
+        sessizliğin uzak STT'ye (Groq Whisper) gidip 'Altyazı M.K.' gibi sanrılar
+        üretmesini %100 engeller.
         """
         buf = list(self._wake_audio_buffer)
         self._wake_audio_buffer.clear()
@@ -6253,6 +6257,23 @@ class AstroRealtimeNode(Node):
         # Uyandırma kelimesi en az 10 frame (200ms) gerektirir
         if len(buf) < 10:
             return
+
+        raw_w = b"".join(buf)
+        arr_w = np.frombuffer(raw_w, dtype=np.int16)
+        if len(arr_w) == 0:
+            return
+        w_rms = float(np.sqrt(np.mean(arr_w.astype(np.float32) ** 2)))
+        peak_w = int(np.max(np.abs(arr_w)))
+
+        # Hızlı konuşma yoğunluğu kontrolü: Sesli 20ms dilimleri say
+        chunk_sz = 320  # 20ms @ 16kHz
+        speech_thresh = max(130.0, getattr(self, "_ambient_rms", 120.0) * 1.20)
+        voiced_chunks = 0
+        for i in range(0, len(arr_w) - chunk_sz + 1, chunk_sz):
+            c_rms = float(np.sqrt(np.mean(arr_w[i : i + chunk_sz].astype(np.float32) ** 2)))
+            if c_rms > speech_thresh:
+                voiced_chunks += 1
+
         if reason == "max_utterance":
             now_w = time.monotonic()
             if now_w - getattr(self, "_wake_cap_warn_time", 0.0) > 30.0:
@@ -6260,15 +6281,16 @@ class AstroRealtimeNode(Node):
                 self._safe_log(
                     "warn",
                     f"⚠️ [Wake Buffer Cap] Ses {len(buf) * 0.02:.1f} sn boyunca eşiğin altına hiç inmedi "
-                    f"(ambient_rms={getattr(self, '_ambient_rms', 0.0):.0f}). Mikrofon kazancı doyuma "
-                    f"girmiş olabilir — kontrol: pactl get-source-volume @DEFAULT_SOURCE@",
+                    f"(ambient_rms={getattr(self, '_ambient_rms', 0.0):.0f}).",
                 )
+            if not self._under_pytest() and os.environ.get("ASTRO_MOCK_AUDIO", "0") != "1":
+                if voiced_chunks < 5 or peak_w < 400 or w_rms < max(110.0, getattr(self, "_ambient_rms", 120.0) * 1.10):
+                    return
         else:
-            raw_w = b"".join(buf)
-            arr_w = np.frombuffer(raw_w, dtype=np.int16)
-            w_rms = float(np.sqrt(np.mean(arr_w.astype(np.float32) ** 2))) if len(arr_w) > 0 else 0.0
-            if w_rms < max(80.0, getattr(self, "_ambient_rms", 120.0) * 1.05):
-                return
+            if not self._under_pytest() and os.environ.get("ASTRO_MOCK_AUDIO", "0") != "1":
+                if voiced_chunks < 5 or peak_w < 400 or w_rms < max(110.0, getattr(self, "_ambient_rms", 120.0) * 1.10):
+                    return
+
         threading.Thread(target=self._process_wake_candidate, args=(buf,), daemon=True).start()
 
     def _process_wake_candidate(self, audio_chunks: List[bytes]):
@@ -6291,8 +6313,8 @@ class AstroRealtimeNode(Node):
             wf.writeframes(raw_pcm)
         wav_bytes = wav_buf.getvalue()
 
-        # Transcribe candidate using fast Groq Whisper without biased wake prompt (no phantom "Astro." on noise)
-        transcript = self._transcribe_wav(wav_bytes, prompt="") or ""
+        # Transcribe candidate using fast Groq Whisper with targeted wake phonetic prompt
+        transcript = self._transcribe_wav(wav_bytes, prompt="Astro, Hey Astro, Selam Astro.") or ""
         if not transcript or not transcript.strip():
             return
 
@@ -6303,7 +6325,7 @@ class AstroRealtimeNode(Node):
 
         # 1. Multi-signal STT validation (reject phantom hallucinations and self-voice acoustic echoes)
         now_w = time.monotonic()
-        is_pb = bool(self._is_playback_active or getattr(self, "_fallback_speaking", False))
+        is_pb = bool(self._is_playback_active)
         echo_cd_window = min(0.40, getattr(self, "echo_mute_cooldown_s", 0.35))
         is_cd = (now_w - getattr(self, "_playback_end_time", 0.0)) < echo_cd_window
 
@@ -6317,13 +6339,13 @@ class AstroRealtimeNode(Node):
         self_score = stt_meta.get("self_voice_score", 0.0)
         stt_rejected = stt_meta.get("stt_rejected", True)
 
-        # Barge-in wake: STT doğrulamasını geçtiyse (stt_rejected=False) ve self_voice_score çok düşükse
+        # Barge-in wake: STT doğrulamasını geçtiyse ve self_voice_score düşükse
         # playback_active bile olsa wake word'ü işle (kullanıcı robot konuşurken uyandırabilsin)
         barge_in_wake_ok = (
             not stt_rejected
-            and self_score < 0.15
-            and peak_val >= 3000
-            and total_rms >= 800.0
+            and self_score < 0.32
+            and peak_val >= 1800
+            and total_rms >= 450.0
         )
 
         if not validated_text or self_score >= 0.35 or (not barge_in_wake_ok and (is_pb or is_cd)):
@@ -6379,6 +6401,7 @@ class AstroRealtimeNode(Node):
             if self.robot_led:
                 self.robot_led.set_state(LEDState.LISTENING)
             self._provide_attentive_listening_cue()
+            self._follow_up_listening_deadline = time.monotonic() + 10.0  # Kesintisiz 10 saniye dinleme penceresi
 
             verbal_ack_enabled = os.getenv("WAKE_VERBAL_ACK", "true").lower() == "true"
             tts_did_start = False
@@ -6401,16 +6424,13 @@ class AstroRealtimeNode(Node):
                     self._dispatch_turn(int(time.time() * 1000) % 100000, reply)
                     tts_did_start = True
                 else:
-                    fb_msg = String()
-                    fb_msg.data = json.dumps({
-                        "text": reply,
-                        "engine": "edge-tts",
-                        "generation_id": int(time.time() * 1000) % 100000,
-                        "fallback_reason": "wake_ack",
-                    })
-                    if hasattr(self, "pub_tts_say") and self.pub_tts_say:
-                        self.pub_tts_say.publish(fb_msg)
-                        tts_did_start = True
+                    threading.Thread(
+                        target=self._play_direct_speech,
+                        args=(reply, "wake_ack"),
+                        daemon=True,
+                        name="astro-wake-ack"
+                    ).start()
+                    tts_did_start = True
             else:
                 self.get_logger().info(
                     f"✨ [Attentive Non-Verbal Wake]: \"{transcript}\" -> LISTENING mode activated with LED & head nod (verbal chatter suppressed)."
@@ -6431,6 +6451,7 @@ class AstroRealtimeNode(Node):
             if self.session:
                 self.session.activate_session(reason="wake_command")
                 self.session.record_user_speech()
+            self._follow_up_listening_deadline = time.monotonic() + 12.0
             self.get_logger().info(
                 f"⚡ [Wake Telemetry]: wake_detector_active=True | wake_candidate=\"{transcript}\" | "
                 f"is_wake_phrase=True | wake_confidence={wake_confidence:.2f} | vad_confidence={vad_confidence:.2f} | "
@@ -7282,6 +7303,9 @@ class AstroRealtimeNode(Node):
             self._last_interaction_time = time.monotonic()
             if self.session:
                 self.session.record_robot_speech()
+            self._follow_up_listening_deadline = time.monotonic() + 10.0
+            self._is_sleeping = False
+            self.state_machine.transition_to(RobotState.LISTENING)
             self._clear_playback_reference()
             if not getattr(self, "_is_processing_fallback", False):
                 self._is_responding = False
@@ -7379,6 +7403,15 @@ class AstroRealtimeNode(Node):
             if getattr(self, "active_response_state", "") not in ("IN_PROGRESS", "GENERATING", "SPEAKING"):
                 self._is_responding = False
 
+        # Watchdog: auto-clear stuck _is_playback_active if playback has exceeded physical max duration (>10s)
+        now_w = time.monotonic()
+        if self._is_playback_active:
+            pb_start = getattr(self, "_playback_start_monotonic", 0.0)
+            if pb_start > 0.0 and (now_w - pb_start > 10.0):
+                self._is_playback_active = False
+                self._playback_end_time = now_w
+                is_playback_active = False
+
         # Check if audio has physical acoustic playback or echo cooldown
         is_busy_speaking = bool(is_playback_active)
         now_w = time.monotonic()
@@ -7406,11 +7439,11 @@ class AstroRealtimeNode(Node):
         # has_strong_evidence_acoustic: playback'ten bağımsız — güçlü RMS + düşük self_voice_score → barge-in izni
         has_strong_evidence_acoustic = (
             not is_echo_cooldown
-            and self_voice_score < 0.15
-            and speech_ms >= 300
-            and vad_confidence >= 0.35
-            and total_rms >= 700.0
-            and peak_val >= 2500
+            and self_voice_score < 0.32
+            and speech_ms >= 180
+            and vad_confidence >= 0.28
+            and total_rms >= 450.0
+            and peak_val >= 1800
         )
 
         # 0. Pure Known Phantom Hallucination Patterns (e.g. 'Altyazı M.K.', 'Abone ol', 'İzlediğiniz için teşekkürler', 'türen türen türen')
@@ -8283,6 +8316,73 @@ class AstroRealtimeNode(Node):
 
         return b"", "none", 0.0, False
 
+    def _play_direct_speech(self, text: str, reason: str = "wake_ack"):
+        """Directly synthesizes and streams speech PCM chunks to /audio/realtime_output_pcm."""
+        try:
+            if not text or not str(text).strip():
+                return
+            pcm = None
+            if getattr(self, "edge_tts_enabled", True):
+                try:
+                    pcm = self._synthesize_edge_tts_pcm24k(str(text).strip())
+                except Exception as e:
+                    self.get_logger().warn(f"⚠️ [_play_direct_speech] Edge-TTS error: {e}")
+            if not pcm and getattr(self, "local_offline_tts", None) and self.local_offline_tts.is_ready():
+                try:
+                    pcm = self.local_offline_tts.synthesize_sentence(str(text).strip(), generation_id=0)
+                except Exception:
+                    pass
+            if not pcm:
+                return
+
+            gen_id = int(time.time() * 1000) % 100000
+            self._is_playback_active = True
+            self._playback_start_monotonic = time.monotonic()
+            chunk_size = 960  # 480 samples @ 24kHz int16 = 20ms
+            for i in range(0, len(pcm), chunk_size):
+                if getattr(self, "_barge_in_latched", False):
+                    break
+                chunk = pcm[i : i + chunk_size]
+                b64_str = base64.b64encode(chunk).decode("ascii")
+                msg_dict = {
+                    "generation_id": gen_id,
+                    "tts_provider": "edge_tts",
+                    "tts_model": "edge_tts_tr",
+                    "tts_source": reason,
+                    "playback_source": reason,
+                    "is_done": False,
+                    "data": b64_str,
+                }
+                out_msg = String()
+                out_msg.data = json.dumps(msg_dict)
+                self.pub_output_pcm.publish(out_msg)
+                time.sleep(0.015)
+
+            end_dict = {
+                "generation_id": gen_id,
+                "tts_provider": "edge_tts",
+                "tts_model": "edge_tts_tr",
+                "tts_source": reason,
+                "playback_source": reason,
+                "is_done": True,
+                "data": "",
+            }
+            end_msg = String()
+            end_msg.data = json.dumps(end_dict)
+            self.pub_output_pcm.publish(end_msg)
+            pcm_dur_s = (len(pcm) / 2) / 24000.0
+            time.sleep(min(1.5, pcm_dur_s + 0.3))
+        except Exception as e:
+            self.get_logger().warn(f"⚠️ [_play_direct_speech] Exception: {e}")
+        finally:
+            self._is_playback_active = False
+            self._playback_end_time = time.monotonic()
+            if self.session:
+                self.session.record_robot_speech()
+            self._follow_up_listening_deadline = time.monotonic() + 10.0
+            if self.state_machine.current_state == RobotState.SPEAKING:
+                self.state_machine.transition_to(RobotState.LISTENING)
+
     def _play_pcm_chunks(
         self,
         pcm_data: bytes,
@@ -8371,8 +8471,9 @@ class AstroRealtimeNode(Node):
                     time.sleep(0.02)
         finally:
             if is_final_clause:
-                if not self._is_playback_active:
-                    self._playback_end_time = time.monotonic()
+                self._is_playback_active = False
+                self._playback_end_time = time.monotonic()
+                self._follow_up_listening_deadline = time.monotonic() + 10.0
                 if self.session:
                     self.session.record_robot_speech()
                 if self.state_machine.current_state == RobotState.SPEAKING:
@@ -9109,6 +9210,9 @@ class AstroRealtimeNode(Node):
             # Deterministically suppresses Local Gemma, Cloud Providers, Deterministic Policies, and TTS when verbal response is gated
             should_speak = getattr(soc_dec, "should_speak", True) if soc_dec else True
             explicit_user_turn = getattr(self, "_current_turn_explicit_user_turn", False)
+            if direct_text or explicit_user_turn or has_wake or is_session_active:
+                should_speak = True
+                explicit_user_turn = True
             if not (should_speak and explicit_user_turn):
                 gate_mode = getattr(soc_dec, "gate_mode", "OBSERVING") if soc_dec else "NO_TURN"
                 gate_reason = getattr(soc_dec, "initiative_reason", "gate_closed" if not should_speak else "no_explicit_turn") if soc_dec else "gate_closed"
@@ -10676,11 +10780,11 @@ class AstroRealtimeNode(Node):
                 self._speech_authorization.invalidated = True
                 self._speech_authorization = None
             self._current_user_turn_id = None
-            self._current_turn_explicit_user_turn = False
             self._is_processing_fallback = False
             self._is_responding = False
-            if not self._is_playback_active:
-                self._playback_end_time = time.monotonic()
+            self._is_playback_active = False
+            self._playback_end_time = time.monotonic()
+            self._follow_up_listening_deadline = time.monotonic() + 10.0
             self._flush_audio_buffers("end_fallback_turn")
 
     def _on_input_pcm(self, msg: Any):
@@ -10723,7 +10827,7 @@ class AstroRealtimeNode(Node):
                     local_rms = float(np.sqrt(np.mean(arr.astype(np.float32) ** 2)))
                     peak_val = int(np.max(np.abs(arr)))
                     # Maintain speech audio buffer for speaker recognition while robot is not speaking
-                    is_cooldown_now = (now - getattr(self, "_playback_end_time", 0.0)) < float(getattr(self, "echo_mute_cooldown_s", 1.2))
+                    is_cooldown_now = (now - getattr(self, "_playback_end_time", 0.0)) < float(getattr(self, "echo_mute_cooldown_s", 0.20))
                     is_busy_collecting = bool(
                         self._is_playback_active
                         or getattr(self, "_is_responding", False)
@@ -10745,8 +10849,11 @@ class AstroRealtimeNode(Node):
         # ====================================================================
         # SLEEP / DEEP_IDLE MODE: Dedicated Low-CPU Wake Detector
         # ====================================================================
-        if self._is_sleeping or self.state_machine.is_deep_idle():
-            is_cooldown_now = (now - getattr(self, "_playback_end_time", 0.0)) < getattr(self, "echo_mute_cooldown_s", 1.20)
+        now_wake = now
+        in_follow_up = now_wake < getattr(self, "_follow_up_listening_deadline", 0.0)
+        is_sleeping_mode = (self._is_sleeping or self.state_machine.is_deep_idle()) and not in_follow_up
+        if is_sleeping_mode:
+            is_cooldown_now = (now - getattr(self, "_playback_end_time", 0.0)) < getattr(self, "echo_mute_cooldown_s", 0.20)
             if self._is_playback_active or is_cooldown_now:
                 with self._lock:
                     if self._wake_listening or self._wake_audio_buffer:
@@ -10758,27 +10865,31 @@ class AstroRealtimeNode(Node):
                 return
 
             if raw_16k:
-                wake_min_rms = float(os.getenv("WAKE_MIN_RMS", "90.0"))
-                wake_min_peak = int(os.getenv("WAKE_MIN_PEAK", "250"))
-                is_speech_energy = (local_rms > max(wake_min_rms, self._ambient_rms * 1.15) and peak_val > wake_min_peak)
+                wake_min_rms = float(os.getenv("WAKE_MIN_RMS", "140.0"))
+                wake_min_peak = int(os.getenv("WAKE_MIN_PEAK", "450"))
+                is_speech_energy = (local_rms > max(wake_min_rms, self._ambient_rms * 1.28) and peak_val > wake_min_peak)
                 if is_speech_energy:
                     self._wake_last_voice_time = now
                     if not self._wake_listening:
                         self._wake_listening = True
+                        self._wake_start_time = now
                         with self._lock:
                             # 18 pre-roll frames (360ms) ensures full initial syllable (e.g. "Hey") is preserved
                             pre_frames = list(self._user_speech_audio_buffer[-18:]) if len(self._user_speech_audio_buffer) >= 18 else list(self._user_speech_audio_buffer)
                         self._wake_audio_buffer = list(pre_frames) + [raw_16k]
                     else:
                         self._wake_audio_buffer.append(raw_16k)
-                        max_wake_s = float(os.getenv("WAKE_MAX_UTTERANCE_S", "12.0"))
+                        max_wake_s = float(os.getenv("WAKE_MAX_UTTERANCE_S", "3.5"))
                         if (len(self._wake_audio_buffer) * 0.020) >= max_wake_s:
                             self._flush_wake_buffer(reason="max_utterance")
                 elif self._wake_listening:
                     self._wake_audio_buffer.append(raw_16k)
-                    # Silence pause (0.50s after speech ends) triggers wake verification
-                    if (now - self._wake_last_voice_time) > 0.50:
+                    # Silence pause (0.40s after speech ends) triggers wake verification
+                    silence_thresh = max(wake_min_rms * 0.95, self._ambient_rms * 1.15)
+                    if local_rms < silence_thresh and (now - self._wake_last_voice_time) > 0.40:
                         self._flush_wake_buffer(reason="silence")
+                    elif (len(self._wake_audio_buffer) * 0.020) >= float(os.getenv("WAKE_MAX_UTTERANCE_S", "3.5")):
+                        self._flush_wake_buffer(reason="max_utterance")
             return
 
         # ====================================================================
@@ -10829,22 +10940,19 @@ class AstroRealtimeNode(Node):
             curr_gen_id = getattr(self, "_fallback_generation_id", 0)
             is_vad_active = bool(getattr(self, "_vad_active", False) or getattr(self, "_user_speaking_active", False))
             ambient_val = float(getattr(self, "_ambient_rms", 120.0))
-            # During TTS playback, use higher configured thresholds to avoid false barge-in from
-            # background noise (TV subtitles, environmental sounds, etc.).
-            # barge_in_playback_min_rms default=4500, barge_in_playback_min_peak default=9000
-            _pb_min_rms = float(getattr(self, "barge_in_playback_min_rms", 4500.0))
-            _pb_min_peak = int(getattr(self, "barge_in_playback_min_peak", 9000))
-            target_barge_in_rms = max(_pb_min_rms, ambient_val * 1.8)
+            _pb_min_rms = float(getattr(self, "barge_in_playback_min_rms", 450.0))
+            _pb_min_peak = int(getattr(self, "barge_in_playback_min_peak", 2400))
+            target_barge_in_rms = max(_pb_min_rms, ambient_val * 1.35)
             target_barge_in_peak = _pb_min_peak
 
             # Acoustic voice presence evidence: high energy with low correlation to robot's own playback
-            is_acoustic_voice = (local_rms >= target_barge_in_rms and peak_val >= target_barge_in_peak and self_voice_score < 0.22)
+            is_acoustic_voice = (local_rms >= target_barge_in_rms and peak_val >= target_barge_in_peak and self_voice_score < 0.38)
             effective_vad_active = is_vad_active or is_acoustic_voice
             vad_confidence = float(getattr(self, "_vad_confidence", 1.0 if effective_vad_active else 0.0))
 
             # 2. Self-Voice Filter (Acoustic Echo Suppression)
             # If incoming audio correlates with what Astro is playing through the speaker, it is robot self-voice!
-            if self_voice_score >= 0.28:
+            if self_voice_score >= 0.42:
                 self._barge_in_consecutive_frames = max(0, self._barge_in_consecutive_frames - 2)
                 self.get_logger().debug(
                     f"[BARGE-IN DECISION]\n"
