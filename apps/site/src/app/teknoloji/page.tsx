@@ -1,4 +1,5 @@
 import { SayfaKabuk } from "@/components/SayfaKabuk";
+import { RobotDurumuBolumu } from "@/components/RobotDurumuBolumu";
 import { TeknikTablo } from "@/components/TeknikTablo";
 import { sayfaMetadata } from "@/lib/seo";
 
@@ -96,6 +97,8 @@ export default function TeknolojiSayfasi() {
           <TeknikTablo />
         </div>
       </section>
+
+      <RobotDurumuBolumu />
     </SayfaKabuk>
   );
 }

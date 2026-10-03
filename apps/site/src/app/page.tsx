@@ -4,6 +4,7 @@ import { CLOSING, FEATURES, FIGURES, HERO, SITE } from "@/data/icerik";
 import { Belirenler } from "@/components/Belirenler";
 import { Gosteri } from "@/components/Gosteri";
 import { HeroBolum } from "@/components/HeroBolum";
+import { RobotDurumuBolumu } from "@/components/RobotDurumuBolumu";
 import { SiteFooter } from "@/components/SiteFooter";
 import { SiteHeader } from "@/components/SiteHeader";
 import { JsonLd } from "@/components/JsonLd";
@@ -66,6 +67,8 @@ export default function AnaSayfa() {
         <Gosteri />
 
         <Belirenler>
+          <RobotDurumuBolumu />
+
           <section className="section" id="diger">
             <div className="page">
               <div className="section__head">

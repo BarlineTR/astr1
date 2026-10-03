@@ -205,6 +205,7 @@ export function LidarHarita({
       if (points.length > 0) {
         for (let i = 0; i < points.length; i++) {
           const pt = points[i];
+          if (!pt) continue;
           const x = pt[0]; // Robot ileri (ROS X)
           const y = pt[1]; // Robot sol (ROS Y)
           const r = pt[2]; // Mesafe metre

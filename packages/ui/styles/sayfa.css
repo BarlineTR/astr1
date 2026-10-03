@@ -217,3 +217,251 @@
 }
 .hukuki__no { color: var(--accent); font-size: var(--t-small); }
 .hukuki p { color: var(--ink-muted); margin: 0 0 var(--s-2); }
+
+/* ──────────────────────────  Robot Durumu ve Stabilite  ────────────────────────── */
+
+.robot-durumu {
+  margin-top: var(--s-4);
+}
+
+.robot-durumu__serit {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(13.5rem, 1fr));
+  gap: 1px;
+  background: var(--rule);
+  border: 1px solid var(--rule);
+  margin-bottom: var(--s-4);
+}
+
+.robot-durumu__kpi {
+  background: var(--surface);
+  padding: var(--s-3);
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+}
+
+.robot-durumu__kpi-etiket {
+  font-family: var(--font-mono);
+  font-size: var(--t-micro);
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--ink-faint);
+}
+
+.robot-durumu__kpi-deger {
+  font-family: var(--font-mono);
+  font-size: var(--t-h3);
+  color: var(--accent);
+  line-height: 1.1;
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+}
+
+.robot-durumu__kpi-deger.is-ok {
+  color: var(--ok);
+}
+
+.robot-durumu__kpi-alt {
+  font-size: var(--t-small);
+  color: var(--ink-muted);
+}
+
+.robot-durumu__kontroller {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--s-2);
+  margin-bottom: var(--s-3);
+  padding-bottom: var(--s-2);
+  border-bottom: 1px solid var(--rule);
+}
+
+.robot-durumu__sekmeler {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+}
+
+.robot-durumu__sekme {
+  background: transparent;
+  border: 1px solid var(--rule-strong);
+  color: var(--ink-muted);
+  font-family: var(--font-mono);
+  font-size: var(--t-small);
+  padding: 0.35rem 0.85rem;
+  border-radius: 3px;
+  cursor: pointer;
+  transition: all 180ms ease;
+}
+
+.robot-durumu__sekme:hover {
+  color: var(--ink);
+  border-color: var(--ink-faint);
+}
+
+.robot-durumu__sekme.is-active {
+  background: var(--accent-sunken);
+  color: var(--accent-bright);
+  border-color: var(--accent);
+}
+
+.robot-durumu__grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(18rem, 1fr));
+  gap: var(--s-3);
+}
+
+.robot-durumu__kart {
+  background: var(--surface);
+  border: 1px solid var(--rule);
+  padding: var(--s-3);
+  display: flex;
+  flex-direction: column;
+  gap: var(--s-2);
+  transition: border-color 200ms ease;
+}
+
+.robot-durumu__kart:hover {
+  border-color: var(--rule-accent);
+}
+
+.robot-durumu__kart-ust {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--s-1);
+}
+
+.robot-durumu__kart-kategori {
+  font-family: var(--font-mono);
+  font-size: var(--t-micro);
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--accent);
+}
+
+.robot-durumu__kart-ad {
+  font-family: var(--font-display);
+  font-size: var(--t-h3);
+  font-weight: 400;
+  margin: 0.2rem 0 0;
+  color: var(--ink);
+}
+
+.robot-durumu__kart-model {
+  font-family: var(--font-mono);
+  font-size: var(--t-micro);
+  color: var(--ink-faint);
+  display: block;
+}
+
+.robot-durumu__kart-aciklama {
+  font-size: var(--t-small);
+  color: var(--ink-muted);
+  line-height: 1.5;
+  margin: 0;
+  flex: 1;
+}
+
+.robot-durumu__metrikler {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 0.5rem;
+  margin: 0;
+  padding: var(--s-2);
+  background: var(--bg-sunken);
+  border: 1px solid var(--rule);
+}
+
+.robot-durumu__metrik-ogesi dt {
+  font-family: var(--font-mono);
+  font-size: var(--t-micro);
+  color: var(--ink-faint);
+}
+
+.robot-durumu__metrik-ogesi dd {
+  margin: 0.15rem 0 0;
+  font-family: var(--font-mono);
+  font-size: var(--t-small);
+  color: var(--ink);
+}
+
+.robot-durumu__olcum {
+  font-size: var(--t-micro);
+  color: var(--ink-faint);
+  border-top: 1px solid var(--rule);
+  padding-top: var(--s-1);
+  margin-top: auto;
+}
+
+/* Stabilite Paneli */
+.robot-durumu__stabilite-panel {
+  display: grid;
+  grid-template-columns: minmax(0, 1.4fr) minmax(0, 1fr);
+  gap: var(--s-4);
+  margin-top: var(--s-4);
+}
+
+@media (max-width: 58rem) {
+  .robot-durumu__stabilite-panel {
+    grid-template-columns: 1fr;
+  }
+}
+
+.robot-durumu__guvenlik-karti {
+  background: var(--surface);
+  border: 1px solid var(--rule);
+  padding: var(--s-3);
+  display: flex;
+  flex-direction: column;
+  gap: var(--s-3);
+}
+
+.robot-durumu__guvenlik-karti h3 {
+  font-family: var(--font-display);
+  font-size: var(--t-h3);
+  font-weight: 400;
+  margin: 0;
+}
+
+.robot-durumu__adimlar {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--s-2);
+}
+
+.robot-durumu__adim {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--s-2);
+  padding: var(--s-2);
+  background: var(--bg);
+  border: 1px solid var(--rule);
+}
+
+.robot-durumu__adim-no {
+  font-family: var(--font-mono);
+  font-size: var(--t-small);
+  color: var(--accent);
+  background: var(--accent-sunken);
+  padding: 0.2rem 0.45rem;
+  border-radius: 2px;
+}
+
+.robot-durumu__adim-metin strong {
+  display: block;
+  font-size: var(--t-small);
+  color: var(--ink);
+}
+
+.robot-durumu__adim-metin span {
+  font-size: var(--t-micro);
+  color: var(--ink-muted);
+}
+

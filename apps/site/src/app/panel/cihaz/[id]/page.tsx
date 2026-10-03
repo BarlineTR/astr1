@@ -52,7 +52,7 @@ export default async function CihazSayfasi({ params }: PageProps<"/panel/cihaz/[
         </div>
         <div style={{ display: "flex", alignItems: "center", gap: "0.75rem" }}>
           <Link
-            href={`/panel/cihaz/${cihaz.id}/kamera`}
+            href={`/panel/cihaz/${cihaz.id}/kamera` as any}
             className="btn btn--sm"
             style={{ display: "inline-flex", alignItems: "center", gap: "0.4rem" }}
           >

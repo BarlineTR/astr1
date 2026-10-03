@@ -2,6 +2,7 @@ import Link from "next/link";
 
 import { FEATURES, SHOWCASE } from "@/data/icerik";
 import { SayfaKabuk } from "@/components/SayfaKabuk";
+import { RobotDurumuBolumu } from "@/components/RobotDurumuBolumu";
 import { TeknikTablo } from "@/components/TeknikTablo";
 import { sayfaMetadata, breadcrumbJsonLd, productJsonLd } from "@/lib/seo";
 import { JsonLd } from "@/components/JsonLd";
@@ -66,6 +67,8 @@ export default function PlatformSayfasi() {
           <TeknikTablo />
         </div>
       </section>
+ 
+      <RobotDurumuBolumu />
 
       <section className="section">
         <div className="page">

@@ -263,7 +263,7 @@ export function Konsol({
             )}
             {cihazId && (
               <Link
-                href={`/panel/cihaz/${cihazId}/kamera`}
+                href={`/panel/cihaz/${cihazId}/kamera` as any}
                 className="btn btn--sm"
                 style={{
                   marginLeft: "auto",
