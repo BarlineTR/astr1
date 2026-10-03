@@ -42,6 +42,8 @@ export function RobotDurumuBolumu() {
     donguGecikmesi: 19.98,
     watchdogSonSinyal: 32,
     stabilite: 99.8,
+    encoderTicks: 142,
+    encoderOk: true,
   });
 
   useEffect(() => {
@@ -53,11 +55,14 @@ export function RobotDurumuBolumu() {
         const yeniSapma = Math.max(0.24, Math.min(0.65, 0.38 + dalgalanma));
         const yeniDongu = 20.0 + (Math.random() - 0.5) * 0.15;
         const yeniWatchdog = Math.floor(25 + Math.random() * 20);
+        const yeniTicks = Math.round(140 + Math.sin(Date.now() / 2000) * 35);
         return {
           kafaSapma: Number(yeniSapma.toFixed(2)),
           donguGecikmesi: Number(yeniDongu.toFixed(2)),
           watchdogSonSinyal: yeniWatchdog,
           stabilite: Number((99.8 + (Math.random() - 0.5) * 0.1).toFixed(1)),
+          encoderTicks: yeniTicks,
+          encoderOk: true,
         };
       });
     }, 1800);
@@ -115,6 +120,16 @@ export function RobotDurumuBolumu() {
               ±{canliMetrikler.kafaSapma}°
             </span>
             <span className="robot-durumu__kpi-alt">Ölü bant: 1.16° (3 tick)</span>
+          </div>
+
+          <div className="robot-durumu__kpi">
+            <span className="robot-durumu__kpi-etiket">Enkoder Ticks</span>
+            <span className="robot-durumu__kpi-deger is-ok mono">
+              {canliMetrikler.encoderTicks} tick
+            </span>
+            <span className="robot-durumu__kpi-alt">
+              {canliMetrikler.encoderOk ? "Sinyal akıyor (50 Hz)" : "Geri besleme yok"}
+            </span>
           </div>
 
           <div className="robot-durumu__kpi">

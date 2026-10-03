@@ -43,6 +43,8 @@ export const headTelemetrySchema = z.object({
    * bu bayrak arayüzde sessizce yutulmamalıdır.
    */
   encoderOk: z.boolean(),
+  /** Donanımdan gelen ham enkoder tick sayısı (440 tick / 170°). */
+  ticks: z.number().optional(),
 });
 
 export const gazeTelemetrySchema = z.object({

@@ -22,7 +22,7 @@ try:
     from diagnostic_msgs.msg import DiagnosticArray, DiagnosticStatus, KeyValue
     from geometry_msgs.msg import Twist
     from sensor_msgs.msg import Imu, JointState
-    from std_msgs.msg import Float32, Empty
+    from std_msgs.msg import Float32, Empty, String
     from astro_base.msg import HeadCmd, WheelCmd
     try:
         from astro_base.msg import HeadState
@@ -335,6 +335,9 @@ class SerialBridge(Node):
             self.pub_head_state = None
         self.pub_head_yaw = self.create_publisher(
             Float32, "/head/yaw_deg", 10
+        )
+        self.pub_raw_enc = self.create_publisher(
+            String, "/arduino/raw_encoders", 10
         )
 
         self.sub_wheel = self.create_subscription(
@@ -1003,6 +1006,20 @@ class SerialBridge(Node):
             self._rx_count_enc = getattr(self, "_rx_count_enc", 0) + 1
             if len(payload) == 16:
                 l, r, head_ticks, dt_us = struct.unpack("<iiiI", payload)
+                now_mono = time.monotonic()
+                if hasattr(self, "pub_raw_enc") and self.pub_raw_enc is not None:
+                    import json
+                    self.pub_raw_enc.publish(String(data=json.dumps({
+                        "timestamp": now_mono,
+                        "hex": payload.hex(),
+                        "dl_l": l,
+                        "dl_r": r,
+                        "head_ticks": head_ticks,
+                        "dt_us": dt_us
+                    })))
+                self.get_logger().debug(
+                    f"[RAW 0x11] hex={payload.hex()} dl_l={l} dl_r={r} head_ticks={head_ticks} dt_us={dt_us}"
+                )
                 self.publish_joint_states(l, r, dt_us, head_ticks=head_ticks)
             elif len(payload) == 12:
                 l, r, dt_us = struct.unpack("<iiI", payload)

@@ -145,6 +145,7 @@ class BrowserMockSource implements ConsoleSource {
         desiredYawDeg: round(desired),
         actualYawDeg: round(this.actualYaw),
         encoderOk: true,
+        ticks: Math.round(this.actualYaw * 2.5882),
       },
       gaze: {
         attentionOwner: state.faceVisible ? "visual" : state.vad ? "audio" : "none",

@@ -137,6 +137,8 @@ class AstroRobotAjan:
         self.hedef_yaw = 0.0
         self.gercek_yaw = 0.0
         self.encoder_ok = True
+        self.head_ticks = 0
+        self.last_encoder_time = 0.0
         self.watchdog_ok = True
         self.estop = False
         self.doa_deg = 0.0
@@ -282,6 +284,7 @@ class AstroRobotAjan:
             self.ros_node.create_subscription(RosString, "/astro/telemetry", self._on_astro_telemetry, 10)
             self.ros_node.create_subscription(RosString, "/astro/turn_telemetry", self._on_turn_telemetry, 10)
             self.ros_node.create_subscription(RosString, "/astro/dispatched_transcript", self._on_speech_text, 10)
+            self.ros_node.create_subscription(RosString, "/arduino/raw_encoders", self._on_raw_encoders, 10)
 
             # Canlı Kamera Görüntüsü Abonelikleri (Sensör verisi için BEST_EFFORT qos_profile_sensor_data)
             cam_qos = qos_profile_sensor_data if 'qos_profile_sensor_data' in globals() else QoSProfile(depth=5, reliability=ReliabilityPolicy.BEST_EFFORT)
@@ -461,6 +464,15 @@ class AstroRobotAjan:
         except Exception:
             pass
 
+    def _on_raw_encoders(self, msg):
+        try:
+            data = json.loads(msg.data)
+            self.head_ticks = int(data.get("head_ticks", 0))
+            self.last_encoder_time = time.monotonic()
+            self.encoder_ok = True
+        except Exception:
+            pass
+
     def _on_head_state(self, msg):
         try:
             pos = getattr(msg, "actual_yaw_deg", None)
@@ -475,7 +487,10 @@ class AstroRobotAjan:
             if tgt is not None and not math.isnan(tgt):
                 self.hedef_yaw = float(tgt)
 
-            self.encoder_ok = bool(getattr(msg, "encoder_valid", True))
+            enc_valid = bool(getattr(msg, "encoder_valid", True))
+            enc_stale = bool(getattr(msg, "encoder_stale", False))
+            enc_avail = bool(getattr(msg, "encoder_available", True))
+            self.encoder_ok = enc_valid and enc_avail and not enc_stale
             self.watchdog_ok = bool(getattr(msg, "watchdog_healthy", True))
         except Exception:
             pass
@@ -768,6 +783,7 @@ class AstroRobotAjan:
                     "desiredYawDeg": round(self.hedef_yaw, 1),
                     "actualYawDeg": round(self.gercek_yaw, 1),
                     "encoderOk": self.encoder_ok,
+                    "ticks": int(getattr(self, "head_ticks", 0)),
                 },
                 "visual_tracking": {
                     "camera_alive": cam_alive,
@@ -1140,6 +1156,7 @@ class AstroRobotAjan:
                         "desiredYawDeg": round(self.hedef_yaw, 1),
                         "actualYawDeg": round(self.gercek_yaw, 1),
                         "encoderOk": bool(self.encoder_ok),
+                        "ticks": int(getattr(self, "head_ticks", 0)),
                     },
                     "audio": {
                         "doaDeg": round(self.doa_deg, 1) if self.vad else None,

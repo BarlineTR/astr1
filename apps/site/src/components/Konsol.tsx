@@ -313,6 +313,18 @@ export function Konsol({
               }
             />
             <Okuma
+              ad="Enkoder ticks"
+              deger={
+                !telemetri
+                  ? "—"
+                  : telemetri.head.ticks !== undefined
+                    ? `${telemetri.head.ticks} tick · ${telemetri.head.encoderOk ? "akıyor" : "kesik"}`
+                    : telemetri.head.encoderOk
+                      ? "akıyor (aktif)"
+                      : "geri besleme yok"
+              }
+            />
+            <Okuma
               ad="Dikkat"
               deger={telemetri ? (SAHIP_ADI[telemetri.gaze.attentionOwner] ?? "—") : "—"}
             />
