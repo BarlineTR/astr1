@@ -57,6 +57,17 @@ export function KameraGorunumu({
     imgRef.current.src = `${streamUrl}${streamUrl.includes("?") ? "&" : "?"}t=${Date.now()}`;
   }, [yeniden, streamUrl]);
 
+  // Stream'in ilk karesi indiğinde (naturalWidth > 0) hemen canlıya geç
+  useEffect(() => {
+    if (!imgRef.current) return;
+    const interval = setInterval(() => {
+      if (imgRef.current && imgRef.current.naturalWidth > 0) {
+        setDurum("canli");
+      }
+    }, 200);
+    return () => clearInterval(interval);
+  }, [streamUrl, yeniden]);
+
   return (
     <div className="kamera-tam-ekran">
       {/* Durum rozeti */}
@@ -77,14 +88,18 @@ export function KameraGorunumu({
         )}
       </div>
 
-      {/* Kamera görüntüsü */}
+      {/* Kamera görüntüsü: display:none yerine opacity ile yüklenmeyi ve decode'u asla engelleme */}
       {streamUrl && (
         <img
           ref={imgRef}
           src={`${streamUrl}${streamUrl.includes("?") ? "&" : "?"}t=${Date.now()}`}
           alt="OAK-D Lite Canlı Video"
           className="kamera-tam-ekran__img"
-          style={{ display: durum === "canli" ? "block" : "none" }}
+          style={{
+            opacity: durum === "canli" ? 1 : 0,
+            transition: "opacity 0.25s ease",
+            position: durum === "canli" ? "relative" : "absolute",
+          }}
           onLoad={handleLoad}
           onError={handleError}
         />

@@ -884,10 +884,15 @@ class StandaloneGazeRosNode(Node):
                 if self.pub_camera_image is not None and (t_read_done - self._last_camera_pub_time) >= (1.0 / max(1.0, self.camera_publish_fps)):
                     self._last_camera_pub_time = t_read_done
                     try:
+                        pub_frame = frame
+                        if hasattr(self.camera, "read_highres"):
+                            ok_hr, hr_frame = self.camera.read_highres()
+                            if ok_hr and hr_frame is not None and getattr(hr_frame, "size", 0) > 0:
+                                pub_frame = hr_frame
                         hdr = Header()
                         hdr.stamp = self.get_clock().now().to_msg()
                         hdr.frame_id = "camera_link"
-                        self.pub_camera_image.publish(bgr_to_imgmsg(frame, hdr))
+                        self.pub_camera_image.publish(bgr_to_imgmsg(pub_frame, hdr))
                     except Exception as pub_err:
                         self.get_logger().debug(f"Camera frame publish error: {pub_err}")
 
@@ -1017,28 +1022,61 @@ class StandaloneGazeRosNode(Node):
         try:
             sorted_dets = sorted(detections, key=lambda d: d.w * d.h, reverse=True)[:2]
             h, w = frame.shape[:2]
+
+            # Obtain high-resolution frame (1080p) if available for sharp facial features
+            recog_frame = frame
+            scale_x = 1.0
+            scale_y = 1.0
+            if getattr(self, "camera", None) and hasattr(self.camera, "read_highres"):
+                ret_hr, hr_frame = self.camera.read_highres()
+                if ret_hr and hr_frame is not None and hr_frame.size > 0:
+                    recog_frame = hr_frame
+                    hr_h, hr_w = hr_frame.shape[:2]
+                    scale_x = hr_w / float(w)
+                    scale_y = hr_h / float(h)
+
+            h_rec, w_rec = recog_frame.shape[:2]
             roi_items = []
             for det in sorted_dets:
-                margin_x = int(det.w * 0.35)
-                margin_y = int(det.h * 0.35)
-                x1 = max(0, det.x - margin_x)
-                y1 = max(0, det.y - margin_y)
-                x2 = min(w, det.x + det.w + margin_x)
-                y2 = min(h, det.y + det.h + margin_y)
+                # Scale detection coordinates to recognition frame space
+                dx = int(det.x * scale_x)
+                dy = int(det.y * scale_y)
+                dw = int(det.w * scale_x)
+                dh = int(det.h * scale_y)
+                margin_x = int(dw * 0.35)
+                margin_y = int(dh * 0.35)
+                x1 = max(0, dx - margin_x)
+                y1 = max(0, dy - margin_y)
+                x2 = min(w_rec, dx + dw + margin_x)
+                y2 = min(h_rec, dy + dh + margin_y)
                 if x2 > x1 and y2 > y1:
                     u_norm = float(det.x + det.w / 2.0) / max(1.0, float(w))
-                    roi_items.append((frame[y1:y2, x1:x2].copy(), u_norm, det))
+                    raw_r = getattr(det, "raw_row", None)
+                    scaled_raw = None
+                    if raw_r is not None:
+                        try:
+                            scaled_raw = np.array(raw_r, dtype=np.float32).flatten()
+                            # YuNet landmark coordinates: x in [0,2,4,6,8,10,12], y in [1,3,5,7,9,11,13]
+                            for xi in (0, 2, 4, 6, 8, 10, 12):
+                                if xi < len(scaled_raw):
+                                    scaled_raw[xi] *= scale_x
+                            for yi in (1, 3, 5, 7, 9, 11, 13):
+                                if yi < len(scaled_raw):
+                                    scaled_raw[yi] *= scale_y
+                        except Exception:
+                            scaled_raw = raw_r
+                    roi_items.append((recog_frame[y1:y2, x1:x2].copy(), u_norm, det, scaled_raw))
 
             if not roi_items:
                 return
 
             def _worker(items, full_img):
                 try:
-                    for face_roi, u_norm, det in items:
+                    for face_roi, u_norm, det, scaled_raw in items:
                         # Skip face recognition on very small blurry crops (<20px) or extreme edges until gaze centers
                         if getattr(det, "w", 0) < 20 or getattr(det, "h", 0) < 20 or u_norm < 0.08 or u_norm > 0.92:
                             continue
-                        raw_r = getattr(det, "raw_row", None)
+                        raw_r = scaled_raw if scaled_raw is not None else getattr(det, "raw_row", None)
                         name, conf, meta = self.face_recognizer.recognize_face(
                             face_roi,
                             full_frame=full_img,
@@ -1106,7 +1144,7 @@ class StandaloneGazeRosNode(Node):
                 except Exception as rec_err:
                     self.get_logger().error(f"❌ [_maybe_recognize_face worker notice]: {rec_err}")
 
-            threading.Thread(target=_worker, args=(roi_items, frame.copy()), daemon=True).start()
+            threading.Thread(target=_worker, args=(roi_items, recog_frame.copy()), daemon=True).start()
         except Exception as exc:
             self.get_logger().debug(f"_maybe_recognize_face notice: {exc}")
 

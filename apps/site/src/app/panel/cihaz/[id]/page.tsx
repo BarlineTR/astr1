@@ -58,6 +58,13 @@ export default async function CihazSayfasi({ params }: PageProps<"/panel/cihaz/[
           >
             <span>📹</span> Canlı Kamera
           </Link>
+          <Link
+            href="/panel/harita"
+            className="btn btn--sm"
+            style={{ display: "inline-flex", alignItems: "center", gap: "0.4rem" }}
+          >
+            <span>📡</span> 2D LiDAR Radar
+          </Link>
           <span className="cihaz__durum">{DURUM_ADI[cihaz.status] ?? cihaz.status}</span>
         </div>
       </div>

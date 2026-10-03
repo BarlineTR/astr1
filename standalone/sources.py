@@ -174,10 +174,23 @@ class CameraSource:
                 cam.setFps(30.0)
                 if hasattr(cam, "setPreviewSize"):
                     cam.setPreviewSize(width, height)
+                if hasattr(cam, "setPreviewKeepAspectRatio"):
+                    cam.setPreviewKeepAspectRatio(True)
+                video_w = int(os.getenv("CAM_VIDEO_WIDTH", "1280"))
+                video_h = int(os.getenv("CAM_VIDEO_HEIGHT", "720"))
+                if hasattr(cam, "setVideoSize"):
+                    cam.setVideoSize(video_w, video_h)
+
                 if hasattr(cam, "initialControl"):
                     try:
-                        # IMX214 AF voice coil shakes under head movement; lock to hyperfocal distance (~1.5m to inf)
-                        cam.initialControl.setManualFocus(130)
+                        focus_mode = os.getenv("CAM_FOCUS_MODE", "auto").strip().lower()
+                        if focus_mode == "auto" and hasattr(dai, "CameraControl") and hasattr(dai.CameraControl, "AutoFocusMode"):
+                            cam.initialControl.setAutoFocusMode(dai.CameraControl.AutoFocusMode.CONTINUOUS_VIDEO)
+                        else:
+                            # DAC 0 = infinity, DAC 255 = macro (~8cm).
+                            # Conversational distance (1m-3m) hyperfocal focus is ~15 (not 102!).
+                            focus_val = int(os.getenv("CAM_MANUAL_FOCUS", "15"))
+                            cam.initialControl.setManualFocus(focus_val)
                     except Exception:
                         pass
 
@@ -203,6 +216,20 @@ class CameraSource:
                     cam.preview.link(xout.input)
                 else:
                     cam.video.link(xout.input)
+
+                # High-resolution (1080P) stream for facial recognition crops
+                self._has_highres = False
+                if hasattr(cam, "video") and hasattr(cam, "preview"):
+                    try:
+                        if xout_cls is not None and hasattr(self.pipeline, "create"):
+                            xout_hr = self.pipeline.create(xout_cls)
+                        else:
+                            xout_hr = xout_cls(self.pipeline)
+                        xout_hr.setStreamName("highres")
+                        cam.video.link(xout_hr.input)
+                        self._has_highres = True
+                    except Exception:
+                        self._has_highres = False
 
                 # StereoDepth Engine (Hardware Accelerated Stereo on OAK-D Lite)
                 has_depth = False
@@ -243,6 +270,8 @@ class CameraSource:
 
                 self.device = dai.Device(self.pipeline)
                 self.queue = self.device.getOutputQueue(name="rgb", maxSize=2, blocking=False)
+                self.queue_highres = self.device.getOutputQueue(name="highres", maxSize=1, blocking=False) if self._has_highres else None
+                self._latest_highres_frame = None
                 self.queue_depth = self.device.getOutputQueue(name="depth", maxSize=2, blocking=False) if has_depth else None
                 self._latest_depth_frame = None
                 self.available = True
@@ -332,6 +361,23 @@ class CameraSource:
                 return False, None
 
         return False, None
+
+    def read_highres(self) -> Tuple[bool, Optional[np.ndarray]]:
+        """Returns the high-resolution (1080p) frame if available, else falls back to read()."""
+        if getattr(self, "queue_highres", None) is not None:
+            try:
+                in_frame = self.queue_highres.tryGet()
+                if in_frame is not None:
+                    cv_frame = in_frame.getCvFrame()
+                    if cv_frame is not None and cv_frame.size > 0:
+                        self._latest_highres_frame = cv_frame
+                        return True, cv_frame
+            except Exception:
+                pass
+        cached = getattr(self, "_latest_highres_frame", None)
+        if cached is not None and getattr(cached, "size", 0) > 0:
+            return True, cached
+        return self.read()
 
     def get_roi_depth(self, x: int, y: int, w: int, h: int, frame_w: int = 640) -> float:
         """Returns measured 3D median depth in meters from StereoDepth, or falls back to monocular estimation."""

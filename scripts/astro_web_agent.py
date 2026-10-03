@@ -53,10 +53,11 @@ try:
     from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, qos_profile_sensor_data
     from std_msgs.msg import String as RosString, Float32 as RosFloat32, Bool as RosBool, Int32 as RosInt32
     try:
-        from sensor_msgs.msg import Image as RosImage, CompressedImage as RosCompressedImage
+        from sensor_msgs.msg import Image as RosImage, CompressedImage as RosCompressedImage, LaserScan as RosLaserScan
     except ImportError:
         RosImage = None
         RosCompressedImage = None
+        RosLaserScan = None
     try:
         from astro_base.msg import HeadState as RosHeadState, HeadCmd as RosHeadCmd
     except ImportError:
@@ -190,6 +191,28 @@ class AstroRobotAjan:
         self.events: List[Dict[str, Any]] = []
         self._add_event("SYSTEM", "Astro Web Köprüsü ve Bilinç Konsolu başlatıldı.")
 
+        # RPLIDAR 2D Lazer / Engel Telemetrisi
+        self.lidar_active = False
+        self.lidar_timestamp = 0.0
+        self.lidar_hz = 0.0
+        self._lidar_frame_counter = 0
+        self._lidar_hz_timer = time.time()
+        self.lidar_points: List[List[float]] = []  # [[x, y, range, angle_deg], ...]
+        self.lidar_stats: Dict[str, Any] = {
+            "active": False,
+            "status": "BEKLENİYOR",
+            "point_count": 0,
+            "nearest_obstacle_m": None,
+            "nearest_obstacle_deg": None,
+            "nearest_sector": "Bilinmiyor",
+            "sectors": {
+                "front": {"distance_m": None, "clear": True},
+                "left": {"distance_m": None, "clear": True},
+                "right": {"distance_m": None, "clear": True},
+                "back": {"distance_m": None, "clear": True},
+            },
+        }
+
         # Ayar senkronizasyonu
         self.son_ayar_guncelleme = ""
 
@@ -268,6 +291,11 @@ class AstroRobotAjan:
             if RosCompressedImage is not None:
                 self.ros_node.create_subscription(RosCompressedImage, "/oak/rgb/image_raw/compressed", self._on_camera_compressed, cam_qos)
 
+            # RPLIDAR 2D Lazer Taraması (/scan_filtered veya /scan)
+            if RosLaserScan is not None:
+                self.ros_node.create_subscription(RosLaserScan, "/scan_filtered", self._on_laser_scan, cam_qos)
+                self.ros_node.create_subscription(RosLaserScan, "/scan", self._on_laser_scan, cam_qos)
+
             self._ros_thread = threading.Thread(target=self._ros_spin_loop, daemon=True)
             self._ros_thread.start()
             print("🚀 ROS 2 Konuları dinleniyor (/oak/rgb/image_raw, /astro/telemetry, /head/state, /audio/doa...)")
@@ -293,7 +321,8 @@ class AstroRobotAjan:
                 arr = np.frombuffer(msg.data, dtype=np.uint8).reshape((h, w, 3))
                 if enc == "rgb8":
                     arr = cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
-                success, encoded = cv2.imencode(".jpg", arr, [cv2.IMWRITE_JPEG_QUALITY, 75])
+                quality = int(os.getenv("CAMERA_STREAM_QUALITY", "90"))
+                success, encoded = cv2.imencode(".jpg", arr, [cv2.IMWRITE_JPEG_QUALITY, quality])
                 if success:
                     with self._lock:
                         self.latest_jpeg = encoded.tobytes()
@@ -312,6 +341,123 @@ class AstroRobotAjan:
             with self._lock:
                 self.latest_jpeg = bytes(msg.data)
                 self.latest_jpeg_time = time.time()
+        except Exception:
+            pass
+
+    def _on_laser_scan(self, msg):
+        """RPLIDAR LaserScan mesajını işler, 360° nokta bulutunu ve sektör engellerini hesaplar."""
+        try:
+            stamp = getattr(getattr(msg, "header", None), "stamp", None)
+            if stamp is not None:
+                st_tuple = (getattr(stamp, "sec", 0), getattr(stamp, "nanosec", 0))
+                if getattr(self, "_last_scan_stamp", None) == st_tuple:
+                    return
+                self._last_scan_stamp = st_tuple
+
+            now = time.time()
+            self._lidar_frame_counter += 1
+            if now - self._lidar_hz_timer >= 1.0:
+                self.lidar_hz = round(self._lidar_frame_counter / (now - self._lidar_hz_timer), 1)
+                self._lidar_frame_counter = 0
+                self._lidar_hz_timer = now
+
+            ranges = list(getattr(msg, "ranges", []))
+            n = len(ranges)
+            if n == 0:
+                return
+
+            angle_min = float(getattr(msg, "angle_min", -math.pi))
+            angle_inc = float(getattr(msg, "angle_increment", 2.0 * math.pi / n))
+
+            # Web aktarımı için ~360 noktaya optimize et (hafif ve kesintisiz)
+            step = max(1, n // 360)
+            valid_pts = []
+            min_dist = float("inf")
+            min_angle_deg = 0.0
+
+            sec_front = float("inf")
+            sec_left = float("inf")
+            sec_right = float("inf")
+            sec_back = float("inf")
+
+            for i in range(0, n, step):
+                r = ranges[i]
+                if math.isnan(r) or math.isinf(r) or r < 0.15 or r > 12.0:
+                    continue
+
+                ang = angle_min + i * angle_inc
+                deg = math.degrees(ang)
+                while deg > 180.0:
+                    deg -= 360.0
+                while deg < -180.0:
+                    deg += 360.0
+
+                # Robot koordinat sistemi (ROS base_link: X ileri, Y sol)
+                x = round(r * math.cos(ang), 3)
+                y = round(r * math.sin(ang), 3)
+                valid_pts.append([x, y, round(r, 2), round(deg, 1)])
+
+                if r < min_dist:
+                    min_dist = r
+                    min_angle_deg = deg
+
+                # Sektör dağılımı (Ön: -45°..+45°, Sol: +45°..+135°, Sağ: -135°..-45°, Arka: kalan)
+                if -45.0 <= deg <= 45.0:
+                    if r < sec_front:
+                        sec_front = r
+                elif 45.0 < deg <= 135.0:
+                    if r < sec_left:
+                        sec_left = r
+                elif -135.0 <= deg < -45.0:
+                    if r < sec_right:
+                        sec_right = r
+                else:
+                    if r < sec_back:
+                        sec_back = r
+
+            def _sec_info(val):
+                if math.isinf(val):
+                    return {"distance_m": None, "clear": True}
+                return {"distance_m": round(val, 2), "clear": val >= 0.80}
+
+            nearest_sector = "Bilinmiyor"
+            if not math.isinf(min_dist):
+                if -45.0 <= min_angle_deg <= 45.0:
+                    nearest_sector = "Ön"
+                elif 45.0 < min_angle_deg <= 135.0:
+                    nearest_sector = "Sol"
+                elif -135.0 <= min_angle_deg < -45.0:
+                    nearest_sector = "Sağ"
+                else:
+                    nearest_sector = "Arka"
+
+            status = "GÜVENLİ - ALAN TEMİZ"
+            if min_dist < 0.60:
+                status = "TEHLİKE - ÇARPIŞMA RİSKİ"
+            elif min_dist < 1.20:
+                status = "DİKKAT - YAKIN ENGEL"
+
+            with self._lock:
+                self.lidar_active = True
+                self.lidar_timestamp = now
+                self.lidar_points = valid_pts
+                self.lidar_stats = {
+                    "active": True,
+                    "status": status,
+                    "timestamp": now,
+                    "scan_hz": self.lidar_hz or 7.3,
+                    "point_count": len(valid_pts),
+                    "total_samples": n,
+                    "nearest_obstacle_m": round(min_dist, 2) if not math.isinf(min_dist) else None,
+                    "nearest_obstacle_deg": round(min_angle_deg, 1) if not math.isinf(min_dist) else None,
+                    "nearest_sector": nearest_sector,
+                    "sectors": {
+                        "front": _sec_info(sec_front),
+                        "left": _sec_info(sec_left),
+                        "right": _sec_info(sec_right),
+                        "back": _sec_info(sec_back),
+                    },
+                }
         except Exception:
             pass
 
@@ -667,6 +813,15 @@ class AstroRobotAjan:
                     "estop": self.estop,
                     "watchdog_ok": self.watchdog_ok,
                 },
+                "lidar": {
+                    "active": self.lidar_active,
+                    "status": self.lidar_stats.get("status", "BEKLENİYOR"),
+                    "nearest_obstacle_m": self.lidar_stats.get("nearest_obstacle_m"),
+                    "nearest_sector": self.lidar_stats.get("nearest_sector", "Bilinmiyor"),
+                    "point_count": self.lidar_stats.get("point_count", 0),
+                    "scan_hz": self.lidar_stats.get("scan_hz", 0.0),
+                    "sectors": self.lidar_stats.get("sectors", {}),
+                },
                 "events": list(self.events[-15:]),
             }
 
@@ -690,7 +845,7 @@ class AstroRobotAjan:
                     self.send_header("Content-Type", "image/jpeg")
                     self.send_header("Access-Control-Allow-Origin", "*")
                     self.end_headers()
-                elif self.path == "/api/telemetry":
+                elif self.path in ("/api/telemetry", "/api/lidar", "/api/events"):
                     self.send_response(200)
                     self.send_header("Content-Type", "application/json; charset=utf-8")
                     self.send_header("Access-Control-Allow-Origin", "*")
@@ -741,6 +896,21 @@ class AstroRobotAjan:
                     self.send_response(200)
                     self.send_header("Content-Type", "application/json; charset=utf-8")
                     self.send_header("Access-Control-Allow-Origin", "*")
+                    self.send_header("Content-Length", str(len(payload)))
+                    self.end_headers()
+                    self.wfile.write(payload)
+
+                elif self.path == "/api/lidar":
+                    with agent_ref._lock:
+                        data = dict(agent_ref.lidar_stats)
+                        data["points"] = agent_ref.lidar_points
+                        data["robot_yaw_deg"] = round(agent_ref.gercek_yaw, 1)
+                        data["head_desired_deg"] = round(agent_ref.hedef_yaw, 1)
+                    payload = json.dumps(data, ensure_ascii=False).encode("utf-8")
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json; charset=utf-8")
+                    self.send_header("Access-Control-Allow-Origin", "*")
+                    self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
                     self.send_header("Content-Length", str(len(payload)))
                     self.end_headers()
                     self.wfile.write(payload)

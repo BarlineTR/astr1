@@ -26,4 +26,10 @@ __pycache__/
 .env.local
 .env.*.local
 
-
+# Scratch, test artifacts and logs
+scratch/
+*.jpg
+*.jpeg
+*.png
+*.log
+focus_tests/

@@ -13,7 +13,12 @@ FILES_TO_SYNC = [
     ("ros2_ws/src/astro_ai/astro_ai/astro_realtime_node.py", "/home/okistech/Desktop/astr1/ros2_ws/src/astro_ai/astro_ai/astro_realtime_node.py"),
     ("scripts/astro_web_agent.py", "/home/okistech/Desktop/astr1/scripts/astro_web_agent.py"),
     ("apps/site/src/app/api/kamera/route.ts", "/home/okistech/Desktop/astr1/apps/site/src/app/api/kamera/route.ts"),
+    ("apps/site/src/app/api/lidar/route.ts", "/home/okistech/Desktop/astr1/apps/site/src/app/api/lidar/route.ts"),
+    ("apps/site/src/app/panel/cihaz/[id]/page.tsx", "/home/okistech/Desktop/astr1/apps/site/src/app/panel/cihaz/[id]/page.tsx"),
     ("apps/site/src/components/KameraGorunumu.tsx", "/home/okistech/Desktop/astr1/apps/site/src/components/KameraGorunumu.tsx"),
+    ("apps/site/src/components/LidarHarita.tsx", "/home/okistech/Desktop/astr1/apps/site/src/components/LidarHarita.tsx"),
+    ("standalone/sources.py", "/home/okistech/Desktop/astr1/standalone/sources.py"),
+    ("standalone/test/test_sources.py", "/home/okistech/Desktop/astr1/standalone/test/test_sources.py"),
     ("scripts/verify_4o_field_fixes.py", "/home/okistech/Desktop/astr1/scripts/verify_4o_field_fixes.py"),
     ("scripts/test_real_field.py", "/home/okistech/Desktop/astr1/scripts/test_real_field.py"),
 ]
@@ -41,11 +46,14 @@ def sync():
         stdin, stdout, stderr = ssh.exec_command(f"mkdir -p '{remote_dir}'")
         stdout.read()
 
-        local_md5 = md5(local)
         print(f"Uploading {local} -> {remote} ...")
-        sftp.put(local, remote)
+        with open(local, "rb") as f:
+            content = f.read().replace(b"\r\n", b"\n")
+        with sftp.file(remote, "wb") as rf:
+            rf.write(content)
 
         # verify remote md5
+        local_md5 = hashlib.md5(content).hexdigest()
         stdin, stdout, stderr = ssh.exec_command(f"md5sum '{remote}'")
         res = stdout.read().decode().strip()
         rem_md5 = res.split()[0] if res else ""

@@ -98,6 +98,14 @@ class TestCameraSource(unittest.TestCase):
 
         self.assertTrue(capture.released)
 
+    def test_read_highres_fallback_to_standard_read(self):
+        frame = np.zeros((480, 640, 3), np.uint8)
+        camera = CameraSource(capture=_FakeCapture([frame]))
+
+        ok, out = camera.read_highres()
+        self.assertTrue(ok)
+        self.assertEqual(out.shape, (480, 640, 3))
+
 
 class TestAudioSource(unittest.TestCase):
     def test_without_a_microphone_there_is_simply_no_bearing(self):
